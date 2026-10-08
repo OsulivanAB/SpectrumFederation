@@ -4,9 +4,9 @@ local addonName, SF = ...
 SF.SyncProtocol = SF.SyncProtocol or {}
 local P = SF.SyncProtocol
 
-P.PROTO_MIN     = 7
-P.PROTO_MAX     = 7
-P.PROTO_CURRENT = 7
+P.PROTO_MIN     = 8
+P.PROTO_MAX     = 8
+P.PROTO_CURRENT = 8
 
 -- Encoding constants
 P.ENC_NONE      = "NONE"
@@ -76,9 +76,10 @@ end
 -- Throttling (prevent spam)
 -- ================================================================
 -- Network NACKs stay on a short cooldown so a peer who /reloads can still
--- be told the protocols differ. User-visible warnings are once per sender
--- and incompatibility signature until reload; otherwise raid traffic plus
--- mixed-version clients reprint the same chat line every inbound message.
+-- be told the protocols differ. Debug incompatibility notices are once per
+-- sender and signature until reload; otherwise raid traffic plus mixed-version
+-- clients would spam the same debug line every inbound message. Incompatibility
+-- never prints to normal WoW chat.
 local NACK_COOLDOWN_SECONDS = 10
 
 local lastNackAt = {}    -- [senderKey] = time
@@ -310,10 +311,11 @@ end
 -- Graceful fallback: warnings + PROTO_NACK
 -- ================================================================
 
--- Function to determine if we should print a user-facing protocol warning
+-- Function to determine if we should record a debug incompatibility notice.
+-- Protocol incompatibility stays debug-only; it never prints to normal chat.
 -- @param sender string Sender name
 -- @param signature string|nil Stable incompatibility signature
--- @return boolean True if we should print
+-- @return boolean True if we should record the debug notice
 function P.ShouldWarn(sender, signature)
     local key = SenderKey(sender)
     signature = tostring(signature or "")

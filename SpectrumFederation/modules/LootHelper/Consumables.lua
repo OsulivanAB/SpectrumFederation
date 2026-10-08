@@ -23,6 +23,7 @@ C.MAX_EVENTS_PER_ACTOR = 512
 C.MAX_EVENT_SEQ = 2147483647
 C.MAX_EVENT_ID = 192
 C.MAX_EVENT_NAME = 64
+C.MAX_GOAL = 100000
 
 local projectionCache = setmetatable({}, { __mode = "k" })
 local listeners = {}
@@ -421,6 +422,26 @@ local function RebuildIndex(profile)
     end
 end
 
+-- Non-negative whole-number goal. Missing/nil is not valid here; callers that
+-- migrate legacy rows supply 0 explicitly. Explicit malformed values return nil.
+function C.ValidGoal(value)
+    local goal = tonumber(value)
+    if not goal or goal ~= goal or goal == math.huge or goal == -math.huge then
+        return nil
+    end
+    if goal ~= math.floor(goal) or goal < 0 or goal > C.MAX_GOAL then
+        return nil
+    end
+    return goal
+end
+
+local function GoalFromRow(row)
+    if type(row) ~= "table" or row.goal == nil then
+        return 0
+    end
+    return C.ValidGoal(row.goal)
+end
+
 local function CopyRequestedMap(source)
     local out = {}
     if type(source) ~= "table" then return out end
@@ -441,11 +462,43 @@ local function CopyRequestedMap(source)
             itemId = tonumber(key) or tonumber(row)
         end
         if IsItemId(itemId) then
-            out[ItemKey(itemId)] = { itemId = itemId }
+            -- Legacy rows without goal migrate to 0 / No Goal. Corrupt local
+            -- goals also normalize to 0 here; sync/config input is validated
+            -- separately and rejects explicit malformed goals.
+            local goal = GoalFromRow(row)
+            if goal == nil then
+                goal = 0
+            end
+            out[ItemKey(itemId)] = { itemId = itemId, goal = goal }
             count = count + 1
         end
     end
     return out
+end
+
+function C.ValidateRequestedItems(map)
+    if map == nil then return true end
+    if type(map) ~= "table" then
+        return false, "snapshot.consumables.requestedItems must be a table"
+    end
+    for key, row in pairs(map) do
+        if type(row) == "table" and row.goal ~= nil then
+            if C.ValidGoal(row.goal) == nil then
+                return false, "snapshot.consumables.requestedItems.goal must be a non-negative whole number"
+            end
+        end
+        local itemId = nil
+        if type(row) == "table" then
+            itemId = tonumber(row.itemId) or tonumber(key)
+        else
+            itemId = tonumber(key) or tonumber(row)
+        end
+        if itemId ~= nil and not IsItemId(itemId) then
+            -- Invalid item ids are dropped by CopyRequestedMap; do not fail the
+            -- whole payload for legacy junk keys.
+        end
+    end
+    return true
 end
 
 local function NormalizeRequestedItems(cfg)
@@ -460,10 +513,12 @@ local function NormalizeRequestedItems(cfg)
                     local crafters = row.crafters
                     local itemId = tonumber(row.itemId) or tonumber(key)
                     if IsItemId(itemId) and type(crafters) == "table" and #crafters > 0 then
-                        migrated[ItemKey(itemId)] = { itemId = itemId }
+                        migrated[ItemKey(itemId)] = { itemId = itemId, goal = 0 }
                     elseif IsItemId(itemId) and crafters == nil and row.itemId then
                         -- Already a flat requested row under the old key name.
-                        migrated[ItemKey(itemId)] = { itemId = itemId }
+                        local goal = GoalFromRow(row)
+                        if goal == nil then goal = 0 end
+                        migrated[ItemKey(itemId)] = { itemId = itemId, goal = goal }
                     end
                 end
             end
@@ -691,19 +746,23 @@ local function ConfigFingerprint(cfg)
     end
     local hash = MixConfigText(0, "g:" .. guid)
     hash = MixConfigText(hash, "t:" .. tostring(tonumber(cfg.bankTab) or 0))
-    local ids = {}
+    local rows = {}
     for key, row in pairs(cfg.requestedItems or {}) do
         local itemId = type(row) == "table" and tonumber(row.itemId) or tonumber(key)
         if IsItemId(itemId) then
-            ids[#ids + 1] = itemId
+            local goal = 0
+            if type(row) == "table" then
+                goal = C.ValidGoal(row.goal) or 0
+            end
+            rows[#rows + 1] = { itemId = itemId, goal = goal }
         end
     end
-    table.sort(ids)
-    local limit = #ids
+    table.sort(rows, function(a, b) return a.itemId < b.itemId end)
+    local limit = #rows
     if limit > C.MAX_REQUESTED_ITEMS then limit = C.MAX_REQUESTED_ITEMS end
-    hash = MixConfigText(hash, "r:" .. tostring(#ids))
+    hash = MixConfigText(hash, "r:" .. tostring(#rows))
     for i = 1, limit do
-        hash = MixConfigText(hash, "i:" .. tostring(ids[i]))
+        hash = MixConfigText(hash, "i:" .. tostring(rows[i].itemId) .. ":g:" .. tostring(rows[i].goal))
     end
     return hash
 end
@@ -794,9 +853,41 @@ function C.AddRequestedItem(profile, actor, itemId, opts)
             return false, "Raid Consumables already has the maximum number of requested items."
         end
     end
-    cfg.requestedItems[ItemKey(itemId)] = { itemId = itemId }
+    cfg.requestedItems[ItemKey(itemId)] = { itemId = itemId, goal = 0 }
     BumpConfig(profile)
     Debug("Info", "Requested item %s", tostring(itemId))
+    Notify()
+    return true
+end
+
+function C.SetRequestedGoal(profile, actor, itemId, goal, opts)
+    opts = opts or {}
+    itemId = tonumber(itemId)
+    actor = Norm(actor)
+    goal = C.ValidGoal(goal)
+    if goal == nil then
+        return false, "Enter a non-negative whole-number goal."
+    end
+    if not IsItemId(itemId) or not actor then
+        return false, "Choose a requested material."
+    end
+    if not AllowAdmin(profile, actor, opts) then
+        return false, "Only a profile admin can change requested-item goals."
+    end
+    if not C.IsRequested(profile, itemId) then
+        return false, "That material is not currently requested."
+    end
+    local cfg = C.Ensure(profile)
+    local row = cfg.requestedItems[ItemKey(itemId)]
+    if type(row) ~= "table" then
+        return false, "That material is not currently requested."
+    end
+    if (C.ValidGoal(row.goal) or 0) == goal then
+        return true
+    end
+    row.goal = goal
+    BumpConfig(profile)
+    Debug("Info", "Requested item %s goal %s", tostring(itemId), tostring(goal))
     Notify()
     return true
 end
@@ -1231,7 +1322,11 @@ local function BuildProjection(profile, cfg)
     end
     table.sort(ordered, EventLess)
 
+    -- One bounded pass over current-generation donation events feeds both
+    -- raw per-actor contributions and raw per-item totals. Item totals are
+    -- accounting totals (one add per accepted event), not identity totals.
     local contributions = {}
+    local itemTotals = {}
     for i = 1, #ordered do
         local event = ordered[i]
         if tonumber(event.generation) == cfg.generation then
@@ -1240,12 +1335,14 @@ local function BuildProjection(profile, cfg)
             if event.type == C.EVENT.DONATION and event.actor and itemId and qty > 0 then
                 contributions[event.actor] = contributions[event.actor] or {}
                 contributions[event.actor][itemId] = (contributions[event.actor][itemId] or 0) + qty
+                itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
             end
         end
     end
 
     return {
         contributions = contributions,
+        itemTotals = itemTotals,
     }
 end
 
@@ -1288,6 +1385,60 @@ function C.ContributionTotal(profile, memberId, itemId)
         end
     end
     return total
+end
+
+-- Raw current-generation donated total for an exact item id. Does not apply
+-- linked-character identity grouping; goal math must use this view.
+function C.ItemDonatedTotal(profile, itemId)
+    itemId = tonumber(itemId)
+    if not IsItemId(itemId) then return 0 end
+    local totals = C.Project(profile).itemTotals
+    return (totals and totals[itemId]) or 0
+end
+
+-- Reusable per-item / overall goal progress for Settings, Logs, and #352.
+-- Individual positive-goal percents may exceed 100. Overall progress caps each
+-- positive-goal item at its own goal and excludes goal-0 items entirely.
+function C.GoalProgress(profile)
+    local cfg = C.Ensure(profile)
+    local totals = C.Project(profile).itemTotals or {}
+    local items = {}
+    local sumCapped = 0
+    local sumGoal = 0
+    for _, row in pairs(cfg.requestedItems or {}) do
+        local itemId = type(row) == "table" and tonumber(row.itemId) or nil
+        if IsItemId(itemId) then
+            local goal = C.ValidGoal(row.goal) or 0
+            local donated = totals[itemId] or 0
+            local entry = {
+                itemId = itemId,
+                goal = goal,
+                donated = donated,
+                noGoal = goal == 0,
+                percent = nil,
+            }
+            if goal > 0 then
+                entry.percent = math.floor((100 * donated) / goal)
+                sumCapped = sumCapped + math.min(donated, goal)
+                sumGoal = sumGoal + goal
+            end
+            items[#items + 1] = entry
+        end
+    end
+    table.sort(items, function(a, b) return a.itemId < b.itemId end)
+    local hasPositiveGoal = sumGoal > 0
+    local overallPercent = nil
+    if hasPositiveGoal then
+        overallPercent = math.floor((100 * sumCapped) / sumGoal)
+    end
+    return {
+        items = items,
+        hasPositiveGoal = hasPositiveGoal,
+        overallPercent = overallPercent,
+        overallEmptyText = "No goals configured.",
+        sumCapped = sumCapped,
+        sumGoal = sumGoal,
+    }
 end
 
 function C.ItemName(itemId, itemName)
@@ -1417,6 +1568,10 @@ function C.ValidateSnapshot(data)
     if data.requestedItems ~= nil and type(data.requestedItems) ~= "table" then
         return false, "snapshot.consumables.requestedItems must be a table"
     end
+    local okRequested, errRequested = C.ValidateRequestedItems(data.requestedItems)
+    if not okRequested then
+        return false, errRequested
+    end
     -- Legacy development snapshots may still carry crafters/assignments.
     if data.crafters ~= nil and type(data.crafters) ~= "table" then
         return false, "snapshot.consumables.crafters must be a table"
@@ -1495,7 +1650,7 @@ local function RequestedFromPayload(payload)
                 local itemId = tonumber(row.itemId) or tonumber(key)
                 local crafters = row.crafters
                 if IsItemId(itemId) and (crafters == nil or (type(crafters) == "table" and #crafters > 0)) then
-                    migrated[ItemKey(itemId)] = { itemId = itemId }
+                    migrated[ItemKey(itemId)] = { itemId = itemId, goal = 0 }
                 end
             end
         end
@@ -1504,6 +1659,15 @@ local function RequestedFromPayload(payload)
 end
 
 function C.ReplaceConfig(profile, payload)
+    if type(payload) ~= "table" then
+        return false, "invalid"
+    end
+    if type(payload.requestedItems) == "table" then
+        local okRequested, errRequested = C.ValidateRequestedItems(payload.requestedItems)
+        if not okRequested then
+            return false, errRequested or "invalid"
+        end
+    end
     local cfg = C.Ensure(profile)
     local generation = C.ValidGeneration(payload.generation)
     if generation then
@@ -1829,6 +1993,8 @@ function C.ApplyOp(profile, op, actor, opts)
         return C.AddRequestedItem(profile, actor, op.itemId, opts)
     elseif op.name == "remove_item" then
         return C.RemoveRequestedItem(profile, actor, op.itemId, opts)
+    elseif op.name == "set_goal" then
+        return C.SetRequestedGoal(profile, actor, op.itemId, op.goal, opts)
     elseif op.name == "set_guild" then
         return C.SetGuild(profile, actor, op.guild, op.bankTab, opts)
     elseif op.name == "set_bank_tab" then
@@ -1923,7 +2089,9 @@ function C.SettingsModel(profile, actor, asAdmin)
             rows[#rows + 1] = {
                 itemId = itemId,
                 text = tostring(itemId),
+                goal = C.ValidGoal(row.goal) or 0,
                 canRemove = asAdmin and true or false,
+                canEditGoal = asAdmin and true or false,
             }
         end
     end

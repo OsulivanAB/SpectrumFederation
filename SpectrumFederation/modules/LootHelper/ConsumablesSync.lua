@@ -44,8 +44,8 @@ end
 
 function S.AuthorizeOp(profile, op, sender)
     if type(op) ~= "table" then return false end
-    if op.name == "add_item" or op.name == "remove_item" or op.name == "set_guild"
-        or op.name == "set_bank_tab" or op.name == "clear"
+    if op.name == "add_item" or op.name == "remove_item" or op.name == "set_goal"
+        or op.name == "set_guild" or op.name == "set_bank_tab" or op.name == "clear"
     then
         return C.IsCanonicalAdmin(profile, sender)
     end
@@ -143,7 +143,10 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
         if not WatermarkIsNewer(remoteGen, remoteSeq, coordinatorWatermark[profile], epoch) then
             return true, "stale"
         end
-        C.ReplaceConfig(profile, payload)
+        local replaced, replaceErr = C.ReplaceConfig(profile, payload)
+        if not replaced then
+            return false, replaceErr or "invalid"
+        end
         S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq, epoch)
         return true, "applied"
     end
@@ -156,7 +159,10 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
     if remoteGen > localDesc.generation + 1 or remoteSeq > localDesc.configSeq + 1 then
         return false, "gap"
     end
-    C.ReplaceConfig(profile, payload)
+    local replaced, replaceErr = C.ReplaceConfig(profile, payload)
+    if not replaced then
+        return false, replaceErr or "invalid"
+    end
     S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq, epoch)
     return true, "applied"
 end

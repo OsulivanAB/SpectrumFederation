@@ -101,6 +101,19 @@ local function HistoryHelp()
 	)
 end
 
+local function GoalProgressModel()
+	local C = SF.Consumables
+	local profile = ActiveProfile()
+	if not C or not profile or not C.GoalProgress then
+		return {
+			items = {},
+			hasPositiveGoal = false,
+			overallEmptyText = "No goals configured.",
+		}
+	end
+	return C.GoalProgress(profile)
+end
+
 local function Definition()
 	return {
 		sections = {
@@ -109,6 +122,11 @@ local function Definition()
 				title = "Raid Consumable Logs",
 				items = {
 					{ type = "help", indent = "label", text = HistoryHelp() },
+					{
+						type = "consumableGoalSummary",
+						label = "Goal Progress",
+						getProgress = GoalProgressModel,
+					},
 					{
 						type = "button",
 						label = "Newer entries",
@@ -134,7 +152,7 @@ local function Definition()
 					{
 						type = "scrollList",
 						label = "History",
-						height = 360,
+						height = 280,
 						getItems = LogItems,
 					},
 				},

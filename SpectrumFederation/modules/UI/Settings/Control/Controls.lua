@@ -1526,6 +1526,371 @@ function Controls:AddScrollList(section, opts)
 	end)
 end
 
+-- Consumables-specific requested-item list: item label, editable Goal, remove X
+-- placed beside the item (not pinned to the far-right edge).
+-- @param section table Section to add row into
+-- @param opts table Options with getItems, onRemove, onGoalCommit, sizing
+-- @return Frame The created row
+function Controls:AddConsumableRequestedList(section, opts)
+	opts = opts or {}
+
+	local getItems = opts.getItems
+	if type(getItems) ~= "function" then
+		getItems = function() return {} end
+	end
+
+	local rowHeight = opts.rowHeight or 24
+	local rowSpacing = opts.rowSpacing or 2
+	local removeButtonSize = opts.removeButtonSize or 18
+	local removeColumnGap = opts.removeColumnGap or 6
+	local goalWidth = opts.goalWidth or 56
+	local goalLabelGap = opts.goalLabelGap or 8
+	local fixedHeight = opts.height or 180
+	local maxHeight = opts.maxHeight or fixedHeight
+	local resize = (opts.resize ~= false)
+
+	local minRowHeight = rowHeight
+	if fixedHeight < minRowHeight then fixedHeight = minRowHeight end
+	if maxHeight < minRowHeight then maxHeight = minRowHeight end
+	local initialHeight = resize and minRowHeight or fixedHeight
+
+	return section:AddRow(initialHeight, function(row)
+		local _, control = self:InitRow(row, opts)
+
+		local scroll = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+		scroll:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", 0, 0)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		local rows = {}
+
+		local function EnsureRow(i)
+			if rows[i] then return rows[i] end
+
+			local r = CreateFrame("Frame", nil, content)
+			r:SetHeight(rowHeight)
+
+			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", removeButtonSize)
+			r.Remove = remove
+
+			local goalEdit = CreateFrame("EditBox", nil, r, "InputBoxTemplate")
+			goalEdit:SetAutoFocus(false)
+			goalEdit:SetSize(goalWidth, 20)
+			goalEdit:SetNumeric(true)
+			goalEdit:SetMaxLetters(6)
+			goalEdit:SetTextColor(1, 1, 1)
+			if goalEdit.SetHighlightColor then
+				goalEdit:SetHighlightColor(0.25, 0.5, 1, 0.35)
+			end
+			r.GoalEdit = goalEdit
+
+			local goalLabel = r:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+			goalLabel:SetText("Goal")
+			goalLabel:SetJustifyH("RIGHT")
+			r.GoalLabel = goalLabel
+
+			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			fs:SetJustifyH("LEFT")
+			r.Text = fs
+
+			rows[i] = r
+			return r
+		end
+
+		local function SetScrollBarShown(show)
+			local sb = scroll.ScrollBar
+			if not sb then return 0 end
+			sb:SetShown(show)
+			if not show then
+				scroll:SetVerticalScroll(0)
+				if sb.SetValue then sb:SetValue(0) end
+				if sb.Disable then sb:Disable() end
+				return 0
+			end
+			if sb.Enable then sb:Enable() end
+			return sb:GetWidth() or 20
+		end
+
+		local function Refresh()
+			if row.__sfConsumableListRefreshing then return end
+			row.__sfConsumableListRefreshing = true
+
+			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
+			local items = getItems() or {}
+			local y = 0
+
+			for i = 1, #items do
+				local item = items[i]
+				local r = EnsureRow(i)
+				r:ClearAllPoints()
+				r:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+				r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
+
+				r.Text:SetText(item.text or "")
+				r.Text:ClearAllPoints()
+				r.GoalLabel:ClearAllPoints()
+				r.GoalEdit:ClearAllPoints()
+				r.Remove:ClearAllPoints()
+
+				r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+				r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
+				r.GoalLabel:SetPoint("LEFT", r.Remove, "RIGHT", goalLabelGap, 0)
+				r.GoalEdit:SetPoint("LEFT", r.GoalLabel, "RIGHT", 4, 0)
+
+				local textWidth = r.Text:GetStringWidth() or 0
+				r.Text:SetWidth(math.max(1, textWidth + 4))
+
+				local canRemove = item.canRemove and true or false
+				r.Remove:SetShown(canRemove)
+				if canRemove then
+					r.Remove:SetAlpha(enabled and 1 or 0.45)
+					r.Remove:SetScript("OnClick", function()
+						if not enabled then return end
+						if opts.onRemove then
+							opts.onRemove(item)
+						end
+					end)
+				else
+					r.Remove:SetAlpha(0.45)
+					r.Remove:SetScript("OnClick", nil)
+				end
+
+				local canEditGoal = item.canEditGoal and true or false
+				r.GoalLabel:SetShown(true)
+				r.GoalEdit:SetShown(true)
+				local editing = r.GoalEdit.HasFocus and r.GoalEdit:HasFocus()
+				if not editing then
+					r.GoalEdit.__sfIgnore = true
+					r.GoalEdit:SetText(tostring(item.goal or 0))
+					if r.GoalEdit.SetCursorPosition then
+						r.GoalEdit:SetCursorPosition(0)
+					end
+					r.GoalEdit.__sfIgnore = false
+				end
+				if canEditGoal and enabled then
+					r.GoalEdit:Enable()
+					r.GoalEdit:SetTextColor(1, 1, 1)
+					r.GoalLabel:SetTextColor(1, 0.82, 0)
+				else
+					r.GoalEdit:Disable()
+					r.GoalEdit:SetTextColor(0.6, 0.6, 0.6)
+					r.GoalLabel:SetTextColor(0.6, 0.6, 0.6)
+				end
+
+				local commitItem = item
+				local function CommitGoal()
+					if r.GoalEdit.__sfIgnore then return end
+					if not (canEditGoal and enabled) then return end
+					if opts.onGoalCommit then
+						opts.onGoalCommit(commitItem, r.GoalEdit:GetText() or "")
+					end
+				end
+				r.GoalEdit:SetScript("OnEnterPressed", function(selfEdit)
+					CommitGoal()
+					selfEdit:ClearFocus()
+				end)
+				r.GoalEdit:SetScript("OnEditFocusLost", function()
+					CommitGoal()
+				end)
+
+				r:SetAlpha(enabled and 1 or 0.45)
+				r:Show()
+				y = y + rowHeight + rowSpacing
+			end
+
+			for i = #items + 1, #rows do
+				rows[i]:Hide()
+			end
+
+			local contentH = (y > 0) and (y - rowSpacing) or 0
+			content:SetHeight(math.max(1, contentH))
+
+			local sbw = 0
+			if resize then
+				local maxVisible = math.max(rowHeight, maxHeight)
+				local needVisible = math.max(rowHeight, contentH)
+				local showScroll = needVisible > maxVisible
+				sbw = SetScrollBarShown(showScroll)
+				local targetVisible = math.min(needVisible, maxVisible)
+				if math.abs((row:GetHeight() or 0) - targetVisible) > 0.5 then
+					row:SetHeight(targetVisible)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+			else
+				SetScrollBarShown(true)
+				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
+					row:SetHeight(fixedHeight)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+				local sb = scroll.ScrollBar
+				sbw = (sb and sb:GetWidth()) or 20
+			end
+
+			local w = scroll:GetWidth() or 0
+			if w > 0 then
+				content:SetWidth(math.max(1, w - sbw - 4))
+			end
+
+			row.__sfConsumableListRefreshing = false
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+		scroll:HookScript("OnSizeChanged", Refresh)
+	end)
+end
+
+-- Consumables Logs goal/progress summary: overall bar + per-item icon/percent.
+-- @param section table Section to add row into
+-- @param opts table Options with getProgress returning GoalProgress model
+-- @return Frame The created row
+function Controls:AddConsumableGoalSummary(section, opts)
+	opts = opts or {}
+
+	local getProgress = opts.getProgress
+	if type(getProgress) ~= "function" then
+		getProgress = function() return nil end
+	end
+
+	local rowHeight = opts.itemRowHeight or 22
+	local iconSize = opts.iconSize or 18
+	local maxItems = opts.maxItems or 64
+	local barHeight = opts.barHeight or 16
+	local fixedHeight = opts.height or 160
+
+	return section:AddRow(fixedHeight, function(row)
+		local _, control = self:InitRow(row, opts)
+
+		local overallLabel = control:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+		overallLabel:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+		overallLabel:SetJustifyH("LEFT")
+		overallLabel:SetText("Overall progress")
+
+		local emptyText = control:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+		emptyText:SetPoint("TOPLEFT", overallLabel, "BOTTOMLEFT", 0, -4)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:SetText("No goals configured.")
+
+		local bar = CreateFrame("StatusBar", nil, control)
+		bar:SetPoint("TOPLEFT", overallLabel, "BOTTOMLEFT", 0, -6)
+		bar:SetSize(opts.barWidth or 280, barHeight)
+		bar:SetMinMaxValues(0, 100)
+		bar:SetValue(0)
+		if bar.SetStatusBarTexture then
+			bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+		end
+		if bar.SetStatusBarColor then
+			bar:SetStatusBarColor(0.2, 0.7, 0.3, 1)
+		end
+		local barBg = bar:CreateTexture(nil, "BACKGROUND")
+		barBg:SetAllPoints(bar)
+		barBg:SetTexture("Interface\\Buttons\\WHITE8x8")
+		barBg:SetVertexColor(0.15, 0.15, 0.15, 0.8)
+		local barText = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		barText:SetPoint("CENTER", bar, "CENTER", 0, 0)
+
+		local itemAnchor = CreateFrame("Frame", nil, control)
+		itemAnchor:SetPoint("TOPLEFT", bar, "BOTTOMLEFT", 0, -10)
+		itemAnchor:SetPoint("TOPRIGHT", control, "TOPRIGHT", 0, -10)
+		itemAnchor:SetHeight(1)
+
+		local itemRows = {}
+
+		local function EnsureItemRow(i)
+			if itemRows[i] then return itemRows[i] end
+			local r = CreateFrame("Frame", nil, itemAnchor)
+			r:SetHeight(rowHeight)
+			local icon = r:CreateTexture(nil, "ARTWORK")
+			icon:SetSize(iconSize, iconSize)
+			icon:SetPoint("LEFT", r, "LEFT", 0, 0)
+			r.Icon = icon
+			local label = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			label:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+			label:SetJustifyH("LEFT")
+			r.Label = label
+			itemRows[i] = r
+			return r
+		end
+
+		local function ItemIcon(itemId)
+			if GetItemIcon and itemId then
+				local ok, tex = pcall(GetItemIcon, itemId)
+				if ok and tex then return tex end
+			end
+			return "Interface\\Icons\\INV_Misc_QuestionMark"
+		end
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, {bar})
+			local progress = getProgress() or {}
+			local items = progress.items or {}
+			local hasPositive = progress.hasPositiveGoal and true or false
+
+			if hasPositive then
+				emptyText:Hide()
+				bar:Show()
+				local pct = tonumber(progress.overallPercent) or 0
+				bar:SetValue(math.max(0, math.min(100, pct)))
+				barText:SetText(string.format("%d%%", pct))
+				overallLabel:SetText("Overall progress")
+				itemAnchor:ClearAllPoints()
+				itemAnchor:SetPoint("TOPLEFT", bar, "BOTTOMLEFT", 0, -10)
+				itemAnchor:SetPoint("TOPRIGHT", control, "TOPRIGHT", 0, -10)
+			else
+				bar:Hide()
+				emptyText:Show()
+				emptyText:SetText(progress.overallEmptyText or "No goals configured.")
+				overallLabel:SetText("Overall progress")
+				itemAnchor:ClearAllPoints()
+				itemAnchor:SetPoint("TOPLEFT", emptyText, "BOTTOMLEFT", 0, -10)
+				itemAnchor:SetPoint("TOPRIGHT", control, "TOPRIGHT", 0, -10)
+			end
+
+			local y = 0
+			local limit = #items
+			if limit > maxItems then limit = maxItems end
+			for i = 1, limit do
+				local entry = items[i]
+				local r = EnsureItemRow(i)
+				r:ClearAllPoints()
+				r:SetPoint("TOPLEFT", itemAnchor, "TOPLEFT", 0, -y)
+				r:SetPoint("TOPRIGHT", itemAnchor, "TOPRIGHT", 0, -y)
+				r.Icon:SetTexture(ItemIcon(entry.itemId))
+				if entry.noGoal then
+					r.Label:SetText("No Goal")
+				else
+					r.Label:SetText(string.format("%d%%", tonumber(entry.percent) or 0))
+				end
+				r:Show()
+				y = y + rowHeight + 2
+			end
+			for i = limit + 1, #itemRows do
+				itemRows[i]:Hide()
+			end
+
+			local headerH = 22 + (hasPositive and (barHeight + 16) or 28)
+			local need = headerH + math.max(rowHeight, y)
+			if math.abs((row:GetHeight() or 0) - need) > 0.5 then
+				row:SetHeight(need)
+				if section.RequestReflow then
+					section:RequestReflow()
+				end
+			end
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 function Controls:AddLogTable(section, opts)
 	opts = opts or {}
 
