@@ -310,20 +310,43 @@ local createdFrames = {}
 local FrameMethods = {}
 local function FrameMock(kind, parent)
     frameCount = frameCount + 1
-    return setmetatable({ kind = kind, parent = parent, scripts = {}, hooks = {}, shown = true, enabled = true, text = "" },
-        { __index = FrameMethods })
+    return setmetatable({
+        kind = kind,
+        parent = parent,
+        scripts = {},
+        hooks = {},
+        shown = true,
+        enabled = true,
+        text = "",
+        width = 0,
+        height = 0,
+    }, { __index = FrameMethods })
 end
 local function noop() end
 for _, name in ipairs({
-    "SetSize", "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
-    "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH", "SetWidth",
+    "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
+    "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH",
     "SetAutoFocus", "SetNumeric", "SetScrollChild", "RegisterEvent",
-    "SetMinMaxValues", "SetStatusBarTexture", "SetStatusBarColor",
+    "SetMinMaxValues", "SetStatusBarTexture", "SetStatusBarColor", "SetWordWrap",
 }) do
     FrameMethods[name] = noop
 end
-function FrameMethods:SetHeight(h) self.height = h end
-function FrameMethods:GetHeight() return self.height or 380 end
+function FrameMethods:SetWidth(w)
+    self.width = tonumber(w) or 0
+end
+function FrameMethods:GetWidth()
+    return self.width or 0
+end
+function FrameMethods:SetHeight(h)
+    self.height = tonumber(h) or 0
+end
+function FrameMethods:GetHeight()
+    return self.height or 380
+end
+function FrameMethods:SetSize(w, h)
+    self:SetWidth(w)
+    self:SetHeight(h)
+end
 function FrameMethods:GetLeft() return self.pointLeft or 100 end
 function FrameMethods:GetBottom() return self.pointBottom or 200 end
 function FrameMethods:SetPoint(point, relative, relativePoint, x, y)
@@ -404,6 +427,9 @@ local GUILD_BANK_SIDE_TAB_ANCHOR_X = -1
 local GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT =
     GUILD_BANK_SIDE_TAB_ANCHOR_X + GUILD_BANK_SIDE_TAB_TEXTURE_WIDTH
 -- Visible art ends ~63 past GuildBankFrame TOPRIGHT; helper must clear that.
+-- Compact donation helper target (~half of the previous 480 width).
+local REVIEW_COMPACT_WIDTH_MIN = 230
+local REVIEW_COMPACT_WIDTH_MAX = 280
 
 -- ---------------------------------------------------------------------------
 -- SF namespace and production modules
@@ -3143,6 +3169,13 @@ local function checkSmartDonationHelper()
     RT:OnBankOpened()
     local review = RT.review
     assertTrue(review ~= nil and review:IsShown(), "smart helper auto-opens with mixed goals")
+    local reviewWidth = review:GetWidth()
+    assertTrue(reviewWidth >= REVIEW_COMPACT_WIDTH_MIN and reviewWidth <= REVIEW_COMPACT_WIDTH_MAX,
+        "donation helper uses a compact width near half of 480")
+    assertTrue(reviewWidth < 480, "donation helper is narrower than the previous 480 width")
+    assertTrue(review.Child ~= nil and review.Child:GetWidth() > 0
+            and review.Child:GetWidth() < reviewWidth,
+        "scroll child is narrower than the compact helper frame")
     assertTrue(review.anchor and review.anchor.relative == GuildBankFrame,
         "opening aligns the helper to the Guild Bank")
     assertEq(review.anchor.point, "TOPLEFT", "helper top aligns beside the Guild Bank")
@@ -3170,6 +3203,14 @@ local function checkSmartDonationHelper()
     end
     assertTrue(aqRow ~= nil, "finite-goal item row is shown")
     assertTrue(flaskRow ~= nil, "goal-0 item row is shown")
+    assertTrue(aqRow:GetWidth() > 0 and aqRow:GetWidth() <= review.Child:GetWidth(),
+        "item rows fit inside the compact scroll child")
+    local rowControlsWidth = (aqRow.IconButton and aqRow.IconButton:GetWidth() or 0)
+        + (aqRow.Progress and aqRow.Progress:GetWidth() or 0)
+        + (aqRow.Edit and aqRow.Edit:GetWidth() or 0)
+        + (aqRow.Button and aqRow.Button:GetWidth() or 0)
+    assertTrue(rowControlsWidth > 0 and rowControlsWidth <= aqRow:GetWidth(),
+        "icon, progress, qty, and Deposit fit inside the compact row width")
     assertEq(aqRow.Progress.text, "87%", "finite-goal row shows the floor percent")
     assertEq(aqRow.Edit.text, "25", "finite-goal suggestion is min(available, remaining)")
     assertTrue(aqRow.Button:IsShown(), "incomplete finite goals keep Deposit")

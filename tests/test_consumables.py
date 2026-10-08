@@ -190,3 +190,8 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
     assert 'Loc("RAID_SUPPLIES_GOAL_ALREADY_MET"' in domain
     assert "row.boundItemId" in runtime
     assert "sameItem" in runtime
+    assert "local REVIEW_WIDTH = 256" in runtime
+    assert "frame:SetSize(REVIEW_WIDTH, REVIEW_DEFAULT_HEIGHT)" in runtime
+    assert "frame:SetSize(480," not in runtime
+    assert "REVIEW_ROW_WIDTH" in runtime
+    assert "REVIEW_DEPOSIT_WIDTH" in runtime

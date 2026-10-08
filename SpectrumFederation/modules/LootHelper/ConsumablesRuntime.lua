@@ -1153,6 +1153,25 @@ end
 -- mode tabs GuildBankFrameTab1-4.
 local GUILD_BANK_SIDE_TAB_CLEARANCE = 74
 
+-- Compact donation helper (~half the previous 480). Slightly above 240 so a
+-- single item row (icon + progress + qty + Deposit) stays readable without
+-- clipping beside the Guild Bank side tabs.
+local REVIEW_WIDTH = 256
+local REVIEW_DEFAULT_HEIGHT = 380
+local REVIEW_PAD_X = 12
+local REVIEW_SCROLL_LEFT = 10
+local REVIEW_SCROLL_RIGHT = 26
+local REVIEW_SCROLL_TOP = -118
+local REVIEW_SCROLL_BOTTOM = 44
+local REVIEW_CONTENT_WIDTH = REVIEW_WIDTH - REVIEW_SCROLL_LEFT - REVIEW_SCROLL_RIGHT
+local REVIEW_ROW_WIDTH = REVIEW_CONTENT_WIDTH - 8
+local REVIEW_ROW_HEIGHT = 26
+local REVIEW_ICON_SIZE = 18
+local REVIEW_PROGRESS_WIDTH = 56
+local REVIEW_EDIT_WIDTH = 34
+local REVIEW_DEPOSIT_WIDTH = 72
+local REVIEW_MOBILE_WIDTH = 140
+
 -- Align beside the Guild Bank on opening. Height keeps following afterward;
 -- manual drag is preserved until the next ShowReview opening.
 function Runtime:AlignReviewToGuildBank(forcePosition)
@@ -1170,7 +1189,7 @@ end
 function Runtime:EnsureReview()
     if self.review then return self.review end
     local frame = CreateFrame("Frame", "SpectrumFederationRaidSupplies", UIParent, "BackdropTemplate")
-    frame:SetSize(480, 380)
+    frame:SetSize(REVIEW_WIDTH, REVIEW_DEFAULT_HEIGHT)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("DIALOG")
     frame:EnableMouse(true)
@@ -1199,31 +1218,32 @@ function Runtime:EnsureReview()
             insets = { left = 11, right = 12, top = 12, bottom = 11 },
         })
     end
-    local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    title:SetPoint("TOP", frame, "TOP", 0, -16)
+    local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    title:SetPoint("TOP", frame, "TOP", 0, -12)
     title:SetText("Raid supplies")
     -- No X/close control: visibility follows Guild Bank + configured-tab lifecycle.
-    local status = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    status:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -42)
-    status:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, -42)
+    local status = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    status:SetPoint("TOPLEFT", frame, "TOPLEFT", REVIEW_PAD_X, -34)
+    status:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -REVIEW_PAD_X, -34)
     status:SetJustifyH("LEFT")
+    if status.SetWordWrap then status:SetWordWrap(true) end
     status:SetText("")
     frame.Status = status
 
-    local progressLabel = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    progressLabel:SetPoint("TOPLEFT", status, "BOTTOMLEFT", 0, -8)
+    local progressLabel = frame:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    progressLabel:SetPoint("TOPLEFT", status, "BOTTOMLEFT", 0, -6)
     progressLabel:SetText(Loc("RAID_SUPPLIES_OVERALL_PROGRESS", "Overall progress"))
     frame.ProgressLabel = progressLabel
     local progressEmpty = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     progressEmpty:SetPoint("TOPLEFT", progressLabel, "BOTTOMLEFT", 0, -4)
-    progressEmpty:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, 0)
+    progressEmpty:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -REVIEW_PAD_X, 0)
     progressEmpty:SetJustifyH("LEFT")
     progressEmpty:SetText(Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."))
     frame.ProgressEmpty = progressEmpty
     local progressBar = CreateFrame("StatusBar", nil, frame)
-    progressBar:SetHeight(16)
+    progressBar:SetHeight(14)
     progressBar:SetPoint("TOPLEFT", progressLabel, "BOTTOMLEFT", 0, -4)
-    progressBar:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, 0)
+    progressBar:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -REVIEW_PAD_X, 0)
     if progressBar.SetMinMaxValues then progressBar:SetMinMaxValues(0, 100) end
     if progressBar.SetValue then progressBar:SetValue(0) end
     if progressBar.SetStatusBarTexture then
@@ -1242,10 +1262,10 @@ function Runtime:EnsureReview()
     frame.ProgressBar = progressBar
 
     local scroll = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
-    scroll:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -108)
-    scroll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -32, 48)
+    scroll:SetPoint("TOPLEFT", frame, "TOPLEFT", REVIEW_SCROLL_LEFT, REVIEW_SCROLL_TOP)
+    scroll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -REVIEW_SCROLL_RIGHT, REVIEW_SCROLL_BOTTOM)
     local child = CreateFrame("Frame", nil, scroll)
-    child:SetSize(420, 1)
+    child:SetSize(REVIEW_CONTENT_WIDTH, 1)
     scroll:SetScrollChild(child)
     frame.Child = child
     frame.Rows = {}
@@ -1266,7 +1286,7 @@ function Runtime:PlaceMobileHolder()
     if not left or not bottom then return end
     if holder.ClearAllPoints then holder:ClearAllPoints() end
     -- Screen coordinates only. Anchoring to the review would protect it in combat.
-    holder:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left + 16, bottom + 14)
+    holder:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left + REVIEW_PAD_X, bottom + 12)
 end
 
 function Runtime:EnsureMobileButton()
@@ -1281,13 +1301,13 @@ function Runtime:EnsureMobileButton()
     local holder = self.mobileHolder
     if not holder then
         holder = CreateFrame("Frame", "SpectrumFederationRaidSuppliesMobile", UIParent)
-        holder:SetSize(160, 22)
+        holder:SetSize(REVIEW_MOBILE_WIDTH, 20)
         if holder.SetFrameStrata then holder:SetFrameStrata("DIALOG") end
         holder:Hide()
         self.mobileHolder = holder
     end
     local mobile = CreateFrame("Button", nil, holder, "SecureActionButtonTemplate,UIPanelButtonTemplate")
-    mobile:SetSize(160, 22)
+    mobile:SetSize(REVIEW_MOBILE_WIDTH, 20)
     if mobile.SetAllPoints then mobile:SetAllPoints(holder) end
     mobile:SetText("Mobile Banking")
     mobile:Hide()
@@ -1375,34 +1395,34 @@ function Runtime:AcquireRow(index)
         return row
     end
     row = CreateFrame("Frame", nil, frame.Child)
-    row:SetSize(400, 26)
+    row:SetSize(REVIEW_ROW_WIDTH, REVIEW_ROW_HEIGHT)
     local iconBtn = CreateFrame("Button", nil, row)
-    iconBtn:SetSize(20, 20)
+    iconBtn:SetSize(REVIEW_ICON_SIZE, REVIEW_ICON_SIZE)
     iconBtn:SetPoint("LEFT", row, "LEFT", 0, 0)
     local icon = iconBtn:CreateTexture(nil, "ARTWORK")
     if icon.SetAllPoints then icon:SetAllPoints(iconBtn) end
     iconBtn.Icon = icon
     row.IconButton = iconBtn
     row.Icon = icon
-    local progress = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    progress:SetPoint("LEFT", iconBtn, "RIGHT", 6, 0)
-    progress:SetWidth(70)
+    local progress = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    progress:SetPoint("LEFT", iconBtn, "RIGHT", 4, 0)
+    progress:SetWidth(REVIEW_PROGRESS_WIDTH)
     progress:SetJustifyH("LEFT")
     row.Progress = progress
-    local text = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    local text = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     text:SetPoint("LEFT", row, "LEFT", 0, 0)
-    text:SetWidth(230)
+    text:SetWidth(REVIEW_ROW_WIDTH)
     text:SetJustifyH("LEFT")
     row.Text = text
     local edit = CreateFrame("EditBox", nil, row, "InputBoxTemplate")
-    edit:SetSize(40, 20)
-    edit:SetPoint("LEFT", progress, "RIGHT", 8, 0)
+    edit:SetSize(REVIEW_EDIT_WIDTH, 18)
+    edit:SetPoint("LEFT", progress, "RIGHT", 4, 0)
     edit:SetAutoFocus(false)
     edit:SetNumeric(true)
     row.Edit = edit
     local button = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    button:SetSize(90, 20)
-    button:SetPoint("LEFT", edit, "RIGHT", 8, 0)
+    button:SetSize(REVIEW_DEPOSIT_WIDTH, 18)
+    button:SetPoint("LEFT", edit, "RIGHT", 4, 0)
     row.Button = button
     frame.Rows[index] = row
     return row
