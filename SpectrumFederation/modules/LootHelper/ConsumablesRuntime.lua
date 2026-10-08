@@ -1145,6 +1145,14 @@ function Runtime:MatchReviewHeightToGuildBank()
     end
 end
 
+-- Blizzard GuildBankTabTemplate (vertical side tabs GuildBankTab1-8, also
+-- GuildBankFrame.BankTabs): clickable frame is 42 wide, but the BACKGROUND
+-- texture is 64x64. Tab1 anchors TOPLEFT to GuildBankFrame TOPRIGHT at x=-1,
+-- so the visible tab art extends ~63 UI units past the bank frame. Clear that
+-- decorative overhang plus ~10 units of spacing. Distinct from the bottom
+-- mode tabs GuildBankFrameTab1-4.
+local GUILD_BANK_SIDE_TAB_CLEARANCE = 74
+
 -- Align beside the Guild Bank on opening. Height keeps following afterward;
 -- manual drag is preserved until the next ShowReview opening.
 function Runtime:AlignReviewToGuildBank(forcePosition)
@@ -1156,7 +1164,7 @@ function Runtime:AlignReviewToGuildBank(forcePosition)
     if type(frame.ClearAllPoints) == "function" then
         frame:ClearAllPoints()
     end
-    frame:SetPoint("TOPLEFT", gb, "TOPRIGHT", 4, 0)
+    frame:SetPoint("TOPLEFT", gb, "TOPRIGHT", GUILD_BANK_SIDE_TAB_CLEARANCE, 0)
 end
 
 function Runtime:EnsureReview()

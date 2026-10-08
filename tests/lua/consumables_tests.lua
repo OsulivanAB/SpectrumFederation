@@ -396,6 +396,14 @@ UIParent = FrameMock("Frame")
 GuildBankFrame = FrameMock("Frame")
 GuildBankFrame.height = 420
 function GuildBankFrame:IsShown() return world.bankOpen end
+-- Blizzard GuildBankTabTemplate geometry used for alignment clearance tests.
+-- Clickable frame is 42 wide; BACKGROUND texture is 64 wide and overhangs.
+local GUILD_BANK_SIDE_TAB_FRAME_WIDTH = 42
+local GUILD_BANK_SIDE_TAB_TEXTURE_WIDTH = 64
+local GUILD_BANK_SIDE_TAB_ANCHOR_X = -1
+local GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT =
+    GUILD_BANK_SIDE_TAB_ANCHOR_X + GUILD_BANK_SIDE_TAB_TEXTURE_WIDTH
+-- Visible art ends ~63 past GuildBankFrame TOPRIGHT; helper must clear that.
 
 -- ---------------------------------------------------------------------------
 -- SF namespace and production modules
@@ -3139,6 +3147,14 @@ local function checkSmartDonationHelper()
         "opening aligns the helper to the Guild Bank")
     assertEq(review.anchor.point, "TOPLEFT", "helper top aligns beside the Guild Bank")
     assertEq(review.anchor.relativePoint, "TOPRIGHT", "helper sits alongside the Guild Bank")
+    assertEq(review.anchor.y, 0, "helper top edge stays level with the Guild Bank")
+    assertTrue(review.anchor.x ~= nil and review.anchor.x > GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT,
+        "helper clears the Guild Bank side-tab decorative overhang")
+    assertTrue(review.anchor.x >= GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT + 8
+            and review.anchor.x <= GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT + 12,
+        "helper leaves about 8-10 UI units after the visible side-tab art")
+    assertTrue(GUILD_BANK_SIDE_TAB_TEXTURE_WIDTH > GUILD_BANK_SIDE_TAB_FRAME_WIDTH,
+        "side-tab mock reflects decorative texture wider than the clickable frame")
     assertEq(review:GetHeight(), 450, "helper height matches the Guild Bank")
     assertTrue(review.ProgressBar:IsShown(), "positive goals show the overall progress bar")
     assertEq(review.ProgressBar.Text.text, "87%", "overall progress uses GoalProgress (175/200)")
@@ -3245,6 +3261,9 @@ local function checkSmartDonationHelper()
     assertTrue(review:IsShown(), "reopening can show the helper again")
     assertEq(RT.qtyOverrides[aqirite], nil, "a new visit starts without prior overrides")
     assertEq(review.anchor.point, "TOPLEFT", "reopening restores Guild Bank alignment")
+    assertEq(review.anchor.relativePoint, "TOPRIGHT", "reopening restores side-of-bank anchoring")
+    assertTrue(review.anchor.x ~= nil and review.anchor.x > GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT,
+        "reopening still clears the Guild Bank side-tab decorative overhang")
     assertEq(review:GetHeight(), 430, "reopening matches the current Guild Bank height")
     for i = 1, #review.Rows do
         local row = review.Rows[i]
