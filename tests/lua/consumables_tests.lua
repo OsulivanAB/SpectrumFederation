@@ -2867,10 +2867,27 @@ local function checkGoalsAndProgress()
     assertEq(dest._consumables.requestedItems[tostring(aqirite)].goal, 75, "rejected replace leaves prior goals")
 
     local follower = profile("goals-follow", admin)
-    assertEq(select(2, S.ApplyRemoteConfig(follower, snap, admin)), "applied", "remote config applies goals")
+    assertEq(select(2, S.ApplyRemoteConfig(follower, snap, admin, { coordinatorAuthoritative = true })),
+        "applied", "remote config applies goals")
     assertEq(follower._consumables.requestedItems[tostring(aqirite)].goal, 75, "follower receives goals")
     assertEq(C.Descriptor(follower).configFingerprint, C.Descriptor(source).configFingerprint,
         "goal-aware fingerprints converge")
+
+    -- Sequential non-authoritative catch-up for a goal mutation.
+    local stepSrc = profile("goals-step-src", admin)
+    local stepDst = profile("goals-step-dst", admin)
+    C.SetGuild(stepSrc, admin, GUILD, 2)
+    assertEq(select(2, S.ApplyRemoteConfig(stepDst, C.ExportSnapshot(stepSrc, { omitEvents = true }), admin)),
+        "applied", "follower applies guild configuration")
+    C.AddRequestedItem(stepSrc, admin, aqirite)
+    assertEq(select(2, S.ApplyRemoteConfig(stepDst, C.ExportSnapshot(stepSrc, { omitEvents = true }), admin)),
+        "applied", "follower applies the add_item step")
+    C.SetRequestedGoal(stepSrc, admin, aqirite, 33)
+    assertEq(select(2, S.ApplyRemoteConfig(stepDst, C.ExportSnapshot(stepSrc, { omitEvents = true }), admin)),
+        "applied", "follower applies a goal change as the next config step")
+    assertEq(stepDst._consumables.requestedItems[tostring(aqirite)].goal, 33, "stepped sync delivers the goal")
+    assertEq(C.Descriptor(stepDst).configFingerprint, C.Descriptor(stepSrc).configFingerprint,
+        "stepped goal sync fingerprints converge")
 
     local copyDest = profile("goals-copy-dst", admin)
     C.CopyConfiguration(source, copyDest)
