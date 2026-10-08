@@ -2934,6 +2934,29 @@ local function checkGoalCommitGate()
         "text bound to a different item id does not commit")
     assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", nil),
         "a missing commit item id does not commit")
+
+    local maxWidth, reserved = SF.SettingsUI.Controls.ConsumableRequestedTextMaxWidth(300)
+    assertTrue(type(reserved) == "number" and reserved > 0, "requested-list reserved width is exported")
+    assertEq(maxWidth, 300 - reserved, "requested-list text max width subtracts reserved controls")
+    assertEq(
+        table.concat(SF.SettingsUI.Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER, ","),
+        "text,goalLabel,goalEdit,remove",
+        "requested-list control order is Name → Goal → Input → Remove"
+    )
+    local effectiveGap, visualGap, inputInset = SF.SettingsUI.Controls.ConsumableRequestedGoalEditGap()
+    assertEq(visualGap, 8, "Goal→input visual gap targets about 8px")
+    assertTrue(inputInset > 0, "Goal→input gap includes InputBoxTemplate left inset")
+    assertEq(effectiveGap, visualGap + inputInset, "effective Goal→input gap combines visual and inset")
+    assertEq(
+        SF.SettingsUI.Controls.ConsumableRequestedNameColumnWidth(300, 80),
+        84,
+        "shared name column uses longest string width plus padding when it fits"
+    )
+    assertEq(
+        SF.SettingsUI.Controls.ConsumableRequestedNameColumnWidth(100, 500),
+        SF.SettingsUI.Controls.ConsumableRequestedTextMaxWidth(100),
+        "shared name column clamps to the reserved max when labels are too long"
+    )
 end
 
 local function checkSessionProfileNoticeRemoved()

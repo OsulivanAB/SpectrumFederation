@@ -1550,8 +1550,81 @@ function Controls.ShouldCommitConsumableGoal(state, text, commitItemId)
 	return true
 end
 
+-- Requested Items row: Item Name → Goal label → Goal input → Remove.
+-- Name column width is shared across rows (longest label, clamped to viewport)
+-- so Goal/input/X align in consistent columns. Helpers stay unit-testable.
+Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER = { "text", "goalLabel", "goalEdit", "remove" }
+
+Controls.CONSUMABLE_REQUESTED_DEFAULTS = {
+	removeButtonSize = 18,
+	removeColumnGap = 6,
+	goalWidth = 56,
+	goalLabelGap = 8,
+	goalLabelWidth = 36,
+	-- Clear space between Goal text and the visible InputBox border.
+	goalEditGap = 8,
+	-- InputBoxTemplate left decoration sits inside the edit-box frame bounds;
+	-- include it so the ~8px visual gap is not eaten by the Left texture.
+	goalEditInputInset = 8,
+	edgePad = 4,
+	minTextWidth = 40,
+}
+
+-- Effective Goal→input gap: desired clear pixels plus InputBoxTemplate left inset.
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number effectiveGap, number visualGap, number inputInset
+function Controls.ConsumableRequestedGoalEditGap(sizes)
+	sizes = sizes or {}
+	local d = Controls.CONSUMABLE_REQUESTED_DEFAULTS
+	local visualGap = sizes.goalEditGap or d.goalEditGap
+	local inputInset = sizes.goalEditInputInset or d.goalEditInputInset
+	return visualGap + inputInset, visualGap, inputInset
+end
+
+-- Max item-name width after reserving Goal/remove controls.
+-- @param availableWidth number Visible content width for the list
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number textMaxWidth, number reservedControls
+function Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
+	sizes = sizes or {}
+	local d = Controls.CONSUMABLE_REQUESTED_DEFAULTS
+	local removeButtonSize = sizes.removeButtonSize or d.removeButtonSize
+	local removeColumnGap = sizes.removeColumnGap or d.removeColumnGap
+	local goalWidth = sizes.goalWidth or d.goalWidth
+	local goalLabelGap = sizes.goalLabelGap or d.goalLabelGap
+	local goalLabelWidth = sizes.goalLabelWidth or d.goalLabelWidth
+	local goalEditGap = Controls.ConsumableRequestedGoalEditGap(sizes)
+	local edgePad = sizes.edgePad or d.edgePad
+	local minTextWidth = sizes.minTextWidth or d.minTextWidth
+
+	-- Name → Goal → Input → X: reserve trailing controls so names cannot overlap.
+	local reservedControls = goalLabelGap + goalLabelWidth + goalEditGap + goalWidth
+		+ removeColumnGap + removeButtonSize + edgePad
+	local width = tonumber(availableWidth) or 0
+	return math.max(minTextWidth, width - reservedControls), reservedControls
+end
+
+-- Shared name-column width: longest label, clamped to available space.
+-- @param availableWidth number Visible content width for the list
+-- @param maxStringWidth number Widest FontString:GetStringWidth() among rows
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number nameColumnWidth
+function Controls.ConsumableRequestedNameColumnWidth(availableWidth, maxStringWidth, sizes)
+	local textMaxWidth = Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
+	return math.min(textMaxWidth, math.max(1, (tonumber(maxStringWidth) or 0) + 4))
+end
+
+-- Alias for single-string clamp; shared-column layout prefers NameColumnWidth.
+-- @param availableWidth number Visible content width for the list
+-- @param stringWidth number FontString:GetStringWidth() for the item text
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number textWidth
+function Controls.ConsumableRequestedTextWidth(availableWidth, stringWidth, sizes)
+	return Controls.ConsumableRequestedNameColumnWidth(availableWidth, stringWidth, sizes)
+end
+
 -- Consumables-specific requested-item list: item label, editable Goal, remove X
--- placed beside the item (not pinned to the far-right edge).
+-- with a shared name column so Goal/input/X align across rows.
 -- @param section table Section to add row into
 -- @param opts table Options with getItems, onRemove, onGoalCommit, sizing
 -- @return Frame The created row
@@ -1563,15 +1636,29 @@ function Controls:AddConsumableRequestedList(section, opts)
 		getItems = function() return {} end
 	end
 
+	local defaults = Controls.CONSUMABLE_REQUESTED_DEFAULTS
 	local rowHeight = opts.rowHeight or 24
 	local rowSpacing = opts.rowSpacing or 2
-	local removeButtonSize = opts.removeButtonSize or 18
-	local removeColumnGap = opts.removeColumnGap or 6
-	local goalWidth = opts.goalWidth or 56
-	local goalLabelGap = opts.goalLabelGap or 8
+	local removeButtonSize = opts.removeButtonSize or defaults.removeButtonSize
+	local removeColumnGap = opts.removeColumnGap or defaults.removeColumnGap
+	local goalWidth = opts.goalWidth or defaults.goalWidth
+	local goalLabelGap = opts.goalLabelGap or defaults.goalLabelGap
+	local goalLabelWidth = opts.goalLabelWidth or defaults.goalLabelWidth
+	local goalEditGap = opts.goalEditGap or defaults.goalEditGap
+	local goalEditInputInset = opts.goalEditInputInset or defaults.goalEditInputInset
 	local fixedHeight = opts.height or 180
 	local maxHeight = opts.maxHeight or fixedHeight
 	local resize = (opts.resize ~= false)
+	local layoutSizes = {
+		removeButtonSize = removeButtonSize,
+		removeColumnGap = removeColumnGap,
+		goalWidth = goalWidth,
+		goalLabelGap = goalLabelGap,
+		goalLabelWidth = goalLabelWidth,
+		goalEditGap = goalEditGap,
+		goalEditInputInset = goalEditInputInset,
+	}
+	local effectiveGoalEditGap = Controls.ConsumableRequestedGoalEditGap(layoutSizes)
 
 	local minRowHeight = rowHeight
 	if fixedHeight < minRowHeight then fixedHeight = minRowHeight end
@@ -1615,10 +1702,16 @@ function Controls:AddConsumableRequestedList(section, opts)
 			local goalLabel = r:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 			goalLabel:SetText("Goal")
 			goalLabel:SetJustifyH("RIGHT")
+			if goalLabel.SetJustifyV then
+				goalLabel:SetJustifyV("MIDDLE")
+			end
 			r.GoalLabel = goalLabel
 
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetJustifyH("LEFT")
+			if fs.SetJustifyV then
+				fs:SetJustifyV("MIDDLE")
+			end
 			if fs.SetWordWrap then
 				fs:SetWordWrap(false)
 			end
@@ -1648,6 +1741,29 @@ function Controls:AddConsumableRequestedList(section, opts)
 			return sb:GetWidth() or 20
 		end
 
+		-- Column layout after content width accounts for the scrollbar.
+		-- All rows share nameColumnWidth so Goal/input/X start at the same x.
+		-- Goal label stays vertically centered on its input box.
+		local function LayoutRowColumns(r, nameColumnWidth)
+			r.Text:ClearAllPoints()
+			r.GoalLabel:ClearAllPoints()
+			r.GoalEdit:ClearAllPoints()
+			r.Remove:ClearAllPoints()
+
+			r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+			r.Text:SetWidth(nameColumnWidth)
+			r.GoalEdit:SetPoint(
+				"LEFT",
+				r.Text,
+				"RIGHT",
+				goalLabelGap + goalLabelWidth + effectiveGoalEditGap,
+				0
+			)
+			r.GoalLabel:SetWidth(goalLabelWidth)
+			r.GoalLabel:SetPoint("RIGHT", r.GoalEdit, "LEFT", -effectiveGoalEditGap, 0)
+			r.Remove:SetPoint("LEFT", r.GoalEdit, "RIGHT", removeColumnGap, 0)
+		end
+
 		local function Refresh()
 			if row.__sfConsumableListRefreshing then return end
 			row.__sfConsumableListRefreshing = true
@@ -1655,13 +1771,6 @@ function Controls:AddConsumableRequestedList(section, opts)
 			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 			local items = getItems() or {}
 			local y = 0
-			local availableWidth = content:GetWidth() or scroll:GetWidth() or 0
-			-- Reserve room for remove + Goal label + edit so long names cannot push
-			-- the controls out of the visible row. Remove stays beside the label.
-			local goalLabelWidth = 36
-			local reservedControls = removeButtonSize + removeColumnGap + goalLabelGap
-				+ goalLabelWidth + 4 + goalWidth + 4
-			local textMaxWidth = math.max(40, availableWidth - reservedControls)
 
 			for i = 1, #items do
 				local item = items[i]
@@ -1671,18 +1780,6 @@ function Controls:AddConsumableRequestedList(section, opts)
 				r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
 
 				r.Text:SetText(item.text or "")
-				r.Text:ClearAllPoints()
-				r.GoalLabel:ClearAllPoints()
-				r.GoalEdit:ClearAllPoints()
-				r.Remove:ClearAllPoints()
-
-				local textWidth = math.min(textMaxWidth, math.max(1, (r.Text:GetStringWidth() or 0) + 4))
-				r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
-				r.Text:SetWidth(textWidth)
-				r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
-				r.GoalLabel:SetPoint("LEFT", r.Remove, "RIGHT", goalLabelGap, 0)
-				r.GoalLabel:SetWidth(goalLabelWidth)
-				r.GoalEdit:SetPoint("LEFT", r.GoalLabel, "RIGHT", 4, 0)
 
 				local canRemove = item.canRemove and true or false
 				r.Remove:SetShown(canRemove)
@@ -1784,35 +1881,68 @@ function Controls:AddConsumableRequestedList(section, opts)
 			local contentH = (y > 0) and (y - rowSpacing) or 0
 			content:SetHeight(math.max(1, contentH))
 
-			local sbw = 0
-			if resize then
-				local maxVisible = math.max(rowHeight, maxHeight)
-				local needVisible = math.max(rowHeight, contentH)
-				local showScroll = needVisible > maxVisible
-				sbw = SetScrollBarShown(showScroll)
-				local targetVisible = math.min(needVisible, maxVisible)
-				if math.abs((row:GetHeight() or 0) - targetVisible) > 0.5 then
-					row:SetHeight(targetVisible)
-					if section.RequestReflow then
-						section:RequestReflow()
+			local function ApplyScrollAndColumns()
+				local sbw = 0
+				if resize then
+					local maxVisible = math.max(rowHeight, maxHeight)
+					local needVisible = math.max(rowHeight, contentH)
+					local showScroll = needVisible > maxVisible
+					sbw = SetScrollBarShown(showScroll)
+					local targetVisible = math.min(needVisible, maxVisible)
+					if math.abs((row:GetHeight() or 0) - targetVisible) > 0.5 then
+						row:SetHeight(targetVisible)
+						if section.RequestReflow then
+							section:RequestReflow()
+						end
+					end
+				else
+					SetScrollBarShown(true)
+					if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
+						row:SetHeight(fixedHeight)
+						if section.RequestReflow then
+							section:RequestReflow()
+						end
+					end
+					local sb = scroll.ScrollBar
+					sbw = (sb and sb:GetWidth()) or 20
+				end
+
+				-- Measure from the live scroll viewport (minus scrollbar), not a
+				-- stale content:GetWidth() from a previous pass.
+				local w = scroll:GetWidth() or 0
+				local availableWidth = 0
+				if w > 0 then
+					availableWidth = math.max(1, w - sbw - 4)
+					content:SetWidth(availableWidth)
+				else
+					availableWidth = content:GetWidth() or 0
+				end
+
+				local maxStringWidth = 0
+				for i = 1, #items do
+					local r = rows[i]
+					if r and r:IsShown() then
+						maxStringWidth = math.max(maxStringWidth, r.Text:GetStringWidth() or 0)
 					end
 				end
-			else
-				SetScrollBarShown(true)
-				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
-					row:SetHeight(fixedHeight)
-					if section.RequestReflow then
-						section:RequestReflow()
+				local nameColumnWidth = Controls.ConsumableRequestedNameColumnWidth(
+					availableWidth,
+					maxStringWidth,
+					layoutSizes
+				)
+
+				for i = 1, #items do
+					local r = rows[i]
+					if r and r:IsShown() then
+						LayoutRowColumns(r, nameColumnWidth)
 					end
 				end
-				local sb = scroll.ScrollBar
-				sbw = (sb and sb:GetWidth()) or 20
 			end
 
-			local w = scroll:GetWidth() or 0
-			if w > 0 then
-				content:SetWidth(math.max(1, w - sbw - 4))
-			end
+			-- Two passes so scrollbar show/hide can settle while nested
+			-- OnSizeChanged is ignored by the reentrancy guard.
+			ApplyScrollAndColumns()
+			ApplyScrollAndColumns()
 
 			row.__sfConsumableListRefreshing = false
 		end

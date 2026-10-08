@@ -99,7 +99,15 @@ def test_consumables_goal_editor_guards_are_present():
     assert "__sfLastCommittedText" in controls
     assert "__sfBoundItemId" in controls
     assert "__sfCancelCommit" in controls
-    assert "textMaxWidth" in controls
+    assert "function Controls.ConsumableRequestedTextMaxWidth" in controls
+    assert "function Controls.ConsumableRequestedTextWidth" in controls
+    assert "function Controls.ConsumableRequestedNameColumnWidth" in controls
+    assert "function Controls.ConsumableRequestedGoalEditGap" in controls
+    assert 'Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER = { "text", "goalLabel", "goalEdit", "remove" }' in controls
+    assert "goalEditInputInset" in controls
+    assert "LayoutRowColumns" in controls
+    assert "ApplyScrollAndColumns" in controls
+    assert "nameColumnWidth" in controls
     assert "C.ValidGoal" in page
     # Enter must clear focus only; focus-loss is the sole goal-commit path.
     enter_at = controls.find('r.GoalEdit:SetScript("OnEnterPressed"')
@@ -109,6 +117,35 @@ def test_consumables_goal_editor_guards_are_present():
     assert "ClearFocus()" in enter_body
     assert "CommitGoal()" not in enter_body
     assert "CommitGoal()" in controls[lost_at : lost_at + 120]
+    # Shared name column with Goal label centered on the input.
+    flow_at = controls.find("local function LayoutRowColumns")
+    assert flow_at != -1
+    flow_body = controls[flow_at : flow_at + 1200]
+    assert "r.GoalEdit:SetPoint(" in flow_body
+    assert "r.Text" in flow_body[flow_body.find("r.GoalEdit:SetPoint(") : flow_body.find("r.GoalEdit:SetPoint(") + 160]
+    assert 'r.GoalLabel:SetPoint("RIGHT", r.GoalEdit, "LEFT"' in flow_body
+    assert 'r.Remove:SetPoint("LEFT", r.GoalEdit, "RIGHT"' in flow_body
+    assert 'r.Remove:SetPoint("LEFT", r.Text, "RIGHT"' not in flow_body
+    assert "effectiveGoalEditGap" in flow_body
+    assert "nameColumnWidth" in flow_body
+
+
+def test_consumable_requested_list_layout_production_lua():
+    layout_tests = REPO_ROOT / "tests" / "lua" / "consumable_requested_list_layout_tests.lua"
+    result = subprocess.run(
+        [_lua51(), str(layout_tests)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Consumable requested-list layout tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert re.search(r"(?m)^\d+ passed, 0 failed$", result.stdout), result.stdout
 
 
 def test_consumables_snapshot_merge_is_inside_import():
