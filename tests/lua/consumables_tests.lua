@@ -2947,6 +2947,16 @@ local function checkGoalCommitGate()
     assertEq(visualGap, 8, "Goal→input visual gap targets about 8px")
     assertTrue(inputInset > 0, "Goal→input gap includes InputBoxTemplate left inset")
     assertEq(effectiveGap, visualGap + inputInset, "effective Goal→input gap combines visual and inset")
+    assertEq(
+        SF.SettingsUI.Controls.ConsumableRequestedNameColumnWidth(300, 80),
+        84,
+        "shared name column uses longest string width plus padding when it fits"
+    )
+    assertEq(
+        SF.SettingsUI.Controls.ConsumableRequestedNameColumnWidth(100, 500),
+        SF.SettingsUI.Controls.ConsumableRequestedTextMaxWidth(100),
+        "shared name column clamps to the reserved max when labels are too long"
+    )
 end
 
 local function checkSessionProfileNoticeRemoved()

@@ -1550,8 +1550,9 @@ function Controls.ShouldCommitConsumableGoal(state, text, commitItemId)
 	return true
 end
 
--- Flowing Requested Items row: Item Name → Goal label → Goal input → Remove.
--- Exported sizing defaults and helpers keep layout math unit-testable.
+-- Requested Items row: Item Name → Goal label → Goal input → Remove.
+-- Name column width is shared across rows (longest label, clamped to viewport)
+-- so Goal/input/X align in consistent columns. Helpers stay unit-testable.
 Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER = { "text", "goalLabel", "goalEdit", "remove" }
 
 Controls.CONSUMABLE_REQUESTED_DEFAULTS = {
@@ -1603,18 +1604,27 @@ function Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
 	return math.max(minTextWidth, width - reservedControls), reservedControls
 end
 
--- Clamped display width for one requested-item name.
+-- Shared name-column width: longest label, clamped to available space.
+-- @param availableWidth number Visible content width for the list
+-- @param maxStringWidth number Widest FontString:GetStringWidth() among rows
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number nameColumnWidth
+function Controls.ConsumableRequestedNameColumnWidth(availableWidth, maxStringWidth, sizes)
+	local textMaxWidth = Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
+	return math.min(textMaxWidth, math.max(1, (tonumber(maxStringWidth) or 0) + 4))
+end
+
+-- Alias for single-string clamp; shared-column layout prefers NameColumnWidth.
 -- @param availableWidth number Visible content width for the list
 -- @param stringWidth number FontString:GetStringWidth() for the item text
 -- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
 -- @return number textWidth
 function Controls.ConsumableRequestedTextWidth(availableWidth, stringWidth, sizes)
-	local textMaxWidth = Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
-	return math.min(textMaxWidth, math.max(1, (tonumber(stringWidth) or 0) + 4))
+	return Controls.ConsumableRequestedNameColumnWidth(availableWidth, stringWidth, sizes)
 end
 
 -- Consumables-specific requested-item list: item label, editable Goal, remove X
--- flowing after the rendered name (not pinned to fixed table columns).
+-- with a shared name column so Goal/input/X align across rows.
 -- @param section table Section to add row into
 -- @param opts table Options with getItems, onRemove, onGoalCommit, sizing
 -- @return Frame The created row
@@ -1731,23 +1741,17 @@ function Controls:AddConsumableRequestedList(section, opts)
 			return sb:GetWidth() or 20
 		end
 
-		-- Flowing horizontal layout after content width accounts for the scrollbar.
-		-- Vertical centering: name/edit/remove share the row mid-line; Goal label
-		-- is anchored to the edit box so it stays centered on the input, not the
-		-- item-name font metrics.
-		local function LayoutRowFlow(r, availableWidth)
+		-- Column layout after content width accounts for the scrollbar.
+		-- All rows share nameColumnWidth so Goal/input/X start at the same x.
+		-- Goal label stays vertically centered on its input box.
+		local function LayoutRowColumns(r, nameColumnWidth)
 			r.Text:ClearAllPoints()
 			r.GoalLabel:ClearAllPoints()
 			r.GoalEdit:ClearAllPoints()
 			r.Remove:ClearAllPoints()
 
-			local textWidth = Controls.ConsumableRequestedTextWidth(
-				availableWidth,
-				r.Text:GetStringWidth() or 0,
-				layoutSizes
-			)
 			r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
-			r.Text:SetWidth(textWidth)
+			r.Text:SetWidth(nameColumnWidth)
 			r.GoalEdit:SetPoint(
 				"LEFT",
 				r.Text,
@@ -1877,7 +1881,7 @@ function Controls:AddConsumableRequestedList(section, opts)
 			local contentH = (y > 0) and (y - rowSpacing) or 0
 			content:SetHeight(math.max(1, contentH))
 
-			local function ApplyScrollAndFlow()
+			local function ApplyScrollAndColumns()
 				local sbw = 0
 				if resize then
 					local maxVisible = math.max(rowHeight, maxHeight)
@@ -1914,18 +1918,31 @@ function Controls:AddConsumableRequestedList(section, opts)
 					availableWidth = content:GetWidth() or 0
 				end
 
+				local maxStringWidth = 0
 				for i = 1, #items do
 					local r = rows[i]
 					if r and r:IsShown() then
-						LayoutRowFlow(r, availableWidth)
+						maxStringWidth = math.max(maxStringWidth, r.Text:GetStringWidth() or 0)
+					end
+				end
+				local nameColumnWidth = Controls.ConsumableRequestedNameColumnWidth(
+					availableWidth,
+					maxStringWidth,
+					layoutSizes
+				)
+
+				for i = 1, #items do
+					local r = rows[i]
+					if r and r:IsShown() then
+						LayoutRowColumns(r, nameColumnWidth)
 					end
 				end
 			end
 
 			-- Two passes so scrollbar show/hide can settle while nested
 			-- OnSizeChanged is ignored by the reentrancy guard.
-			ApplyScrollAndFlow()
-			ApplyScrollAndFlow()
+			ApplyScrollAndColumns()
+			ApplyScrollAndColumns()
 
 			row.__sfConsumableListRefreshing = false
 		end

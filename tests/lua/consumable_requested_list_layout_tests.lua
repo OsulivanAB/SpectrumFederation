@@ -388,22 +388,33 @@ local function buildList(items, scrollWidth)
     end
 end
 
--- Pure helpers: reserved width and clamping.
+-- Pure helpers: reserved width, shared column clamp, and Goal→input gap.
 do
     local maxWide, reserved = Controls.ConsumableRequestedTextMaxWidth(400)
     assertTrue(reserved > 0, "reserved controls width is positive")
     assertEq(maxWide, 400 - reserved, "wide viewport yields available minus reserved")
 
     local shortName = "Flask (123)"
-    local shortWidth = Controls.ConsumableRequestedTextWidth(400, #shortName * 7)
-    assertEq(shortWidth, (#shortName * 7) + 4, "short names use natural string width")
-
     local longName = "Wonderfully Long Consumable Item Name (345678)"
     local longNatural = (#longName * 7) + 4
-    local longWidth = Controls.ConsumableRequestedTextWidth(160, #longName * 7)
+    local roomyWidth = longNatural + 200
+    local sharedWide = Controls.ConsumableRequestedNameColumnWidth(roomyWidth, #longName * 7)
+    assertEq(sharedWide, longNatural, "shared column uses the longest natural width when it fits")
+    assertEq(
+        Controls.ConsumableRequestedNameColumnWidth(roomyWidth, #shortName * 7, nil),
+        (#shortName * 7) + 4,
+        "a shorter max string yields a narrower shared column"
+    )
+
     local longMax = Controls.ConsumableRequestedTextMaxWidth(160)
+    local sharedNarrow = Controls.ConsumableRequestedNameColumnWidth(160, #longName * 7)
     assertTrue(longNatural > longMax, "fixture long name exceeds a narrow viewport")
-    assertEq(longWidth, longMax, "long names clamp to textMaxWidth")
+    assertEq(sharedNarrow, longMax, "shared column clamps to textMaxWidth when needed")
+    assertEq(
+        Controls.ConsumableRequestedTextWidth(160, #longName * 7),
+        sharedNarrow,
+        "TextWidth aliases NameColumnWidth for a single string"
+    )
 
     local order = Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER
     assertEq(table.concat(order, ","), "text,goalLabel,goalEdit,remove",
@@ -415,7 +426,7 @@ do
     assertEq(effectiveGap, visualGap + inputInset, "effective Goal→input gap is visual plus inset")
 end
 
--- Runtime order and flowing widths for short vs long names.
+-- Shared columns: short and long names align Goal/input/X horizontally.
 do
     local shortText = "Flask (111)"
     local longText = "Wonderfully Long Consumable Item Name (345678)"
@@ -433,11 +444,14 @@ do
     local shortGoalAnchor = rightAnchor(shortRow.GoalLabel)
     local shortEditAnchor = leftAnchor(shortRow.GoalEdit)
     local shortRemoveAnchor = leftAnchor(shortRow.Remove)
+    local longGoalAnchor = rightAnchor(longRow.GoalLabel)
+    local longEditAnchor = leftAnchor(longRow.GoalEdit)
+    local longRemoveAnchor = leftAnchor(longRow.Remove)
     local effectiveGap = Controls.ConsumableRequestedGoalEditGap()
     local defaults = Controls.CONSUMABLE_REQUESTED_DEFAULTS
     assertTrue(shortTextAnchor and shortTextAnchor.relativeTo == shortRow, "item name anchors to row")
     assertTrue(shortEditAnchor and shortEditAnchor.relativeTo == shortRow.Text,
-        "Goal input follows the item name in the flowing chain")
+        "Goal input follows the shared name column")
     assertEq(
         shortEditAnchor and shortEditAnchor.x or nil,
         defaults.goalLabelGap + defaults.goalLabelWidth + effectiveGap,
@@ -455,42 +469,56 @@ do
         "Remove keeps a small consistent gap after the input")
 
     local availableWidth = scroll.scrollChild:GetWidth()
-    local expectedShort = Controls.ConsumableRequestedTextWidth(availableWidth, #shortText * 7)
-    local expectedLong = Controls.ConsumableRequestedTextWidth(availableWidth, #longText * 7)
-    assertEq(shortRow.Text.width, expectedShort, "short name uses natural flowing width")
-    assertEq(longRow.Text.width, expectedLong, "long name uses clamped flowing width")
-    assertTrue(shortRow.Text.width < longRow.Text.width,
-        "rows keep flowing widths rather than a shared fixed name column")
+    local expectedColumn = Controls.ConsumableRequestedNameColumnWidth(
+        availableWidth,
+        math.max(#shortText, #longText) * 7
+    )
+    assertEq(shortRow.Text.width, expectedColumn, "short row uses the shared name column width")
+    assertEq(longRow.Text.width, expectedColumn, "long row uses the same shared name column width")
+    assertEq(shortRow.Text.width, longRow.Text.width, "all rows share one name column width")
+    assertTrue((#shortText * 7) + 4 < expectedColumn,
+        "shorter names leave empty space before the shared Goal column")
+    assertEq(shortEditAnchor.x, longEditAnchor.x, "Goal inputs share the same horizontal offset")
+    assertEq(shortGoalAnchor.x, longGoalAnchor.x, "Goal labels share the same horizontal offset")
+    assertEq(shortRemoveAnchor.x, longRemoveAnchor.x, "Remove buttons share the same horizontal offset")
     local _, reserved = Controls.ConsumableRequestedTextMaxWidth(availableWidth)
     assertTrue(shortRow.Text.width + reserved <= availableWidth + 0.5,
-        "short row controls fit inside available width")
-    assertTrue(longRow.Text.width + reserved <= availableWidth + 0.5,
-        "long row controls fit inside available width")
+        "shared name column plus controls fit inside available width")
     assertTrue(getCalls() <= 80, "getItems stays bounded during layout")
 end
 
--- Narrow resize clamps names; wide resize restores fuller names.
+-- Narrow resize clamps the shared column; wide resize restores fuller names.
 do
+    local shortText = "Flask (111)"
     local longText = "Wonderfully Long Consumable Item Name (345678)"
     local _, scroll, getCalls, _, getRows = buildList({
+        { text = shortText, itemId = 111, goal = 5, canRemove = true, canEditGoal = true },
         { text = longText, itemId = 333, goal = 5, canRemove = true, canEditGoal = true },
     }, 200)
 
     fireEvent(scroll, "OnSizeChanged", 200, 180)
-    local narrowRow = getRows()[1]
-    local narrowWidth = narrowRow.Text.width
+    local narrowRows = getRows()
+    local narrowWidth = narrowRows[1].Text.width
     local narrowMax = Controls.ConsumableRequestedTextMaxWidth(scroll.scrollChild:GetWidth())
-    assertEq(narrowWidth, narrowMax, "narrow viewport clamps the item name")
+    assertEq(narrowWidth, narrowMax, "narrow viewport clamps the shared name column")
+    assertEq(narrowRows[1].Text.width, narrowRows[2].Text.width,
+        "narrow resize keeps Goal/input/X columns aligned")
+    assertEq(leftAnchor(narrowRows[1].GoalEdit).x, leftAnchor(narrowRows[2].GoalEdit).x,
+        "narrow resize keeps Goal input offsets identical")
 
     scroll:SetSize(420, 180)
     fireEvent(scroll, "OnSizeChanged", 420, 180)
-    local wideRow = getRows()[1]
-    local wideWidth = wideRow.Text.width
+    local wideRows = getRows()
+    local wideWidth = wideRows[1].Text.width
     local natural = (#longText * 7) + 4
     local wideMax = Controls.ConsumableRequestedTextMaxWidth(scroll.scrollChild:GetWidth())
-    assertTrue(wideWidth > narrowWidth, "widening the list increases name width")
+    assertTrue(wideWidth > narrowWidth, "widening the list increases the shared name column")
     assertEq(wideWidth, math.min(natural, wideMax),
-        "wide viewport uses natural width when space allows, else clamps")
+        "wide viewport uses longest natural width when space allows, else clamps")
+    assertEq(wideRows[1].Text.width, wideRows[2].Text.width,
+        "wide resize keeps a shared name column across rows")
+    assertEq(leftAnchor(wideRows[1].GoalEdit).x, leftAnchor(wideRows[2].GoalEdit).x,
+        "wide resize keeps Goal input offsets identical")
     assertTrue(getCalls() <= 80, "resize refreshes stay bounded")
 end
 
