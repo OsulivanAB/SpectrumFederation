@@ -268,6 +268,13 @@ function Controller:_HookSettingsStore()
             return
         end
 
+        if path == "lootHelper.minimizedHeaderOpacity" then
+            if LH.Window and LH.Window.ApplyMinimizedOpacity then
+                LH.Window:ApplyMinimizedOpacity()
+            end
+            return
+        end
+
         if path == "lootHelper.showMembersNotInRaid" then
             self:RequestRefresh("SettingsChanged:" .. path)
             return
@@ -426,6 +433,10 @@ function Controller:ApplyStyle()
     if not f then return end
     if LH.Style and LH.Style.Apply then
         LH.Style:Apply(f)
+    end
+    -- Style may refresh backdrop/title texture alphas; keep overall frame alpha.
+    if LH.Window and LH.Window.ApplyMinimizedOpacity then
+        LH.Window:ApplyMinimizedOpacity()
     end
 end
 

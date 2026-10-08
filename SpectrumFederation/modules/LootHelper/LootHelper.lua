@@ -11,6 +11,7 @@ function SF:InitializeLootHelperDatabase()
 			showWindowOutsideRaid = false,
 			lockLootWindow = false,
 			showMembersNotInRaid = false,
+			minimizedHeaderOpacity = 100,
 
 			window = {},
             syncSession = {}, -- Active session snapshot persisted across /reload
@@ -30,6 +31,7 @@ function SF:InitializeLootHelperDatabase()
 		if lh.showWindowOutsideRaid == nil then lh.showWindowOutsideRaid = false end
 		if lh.lockLootWindow == nil then lh.lockLootWindow = false end
 		if lh.showMembersNotInRaid == nil then lh.showMembersNotInRaid = false end
+		if lh.minimizedHeaderOpacity == nil then lh.minimizedHeaderOpacity = 100 end
 
 		if type(lh.window) ~= "table" then
 			lh.window = {}
@@ -828,6 +830,32 @@ function SF:ResetAllLootHelperSettings()
 	db.profiles = {}
 	db.activeProfileId = nil
 	db.activeProfile = nil
+
+	-- Account-local window opacity is not profile data; restore the schema default
+	-- and refresh a live minimized window through the SettingsStore path when available.
+	local defaultOpacity = 100
+	if SF.SettingsSchema
+		and SF.SettingsSchema.DEFAULTS
+		and SF.SettingsSchema.DEFAULTS.lootHelper
+		and SF.SettingsSchema.DEFAULTS.lootHelper.minimizedHeaderOpacity ~= nil
+	then
+		defaultOpacity = SF.SettingsSchema.DEFAULTS.lootHelper.minimizedHeaderOpacity
+	end
+	-- Require an initialized store (Store.db). A loaded-but-uninitialized SettingsStore
+	-- must not crash Reset All in tests or early-init paths.
+	local store = SF.SettingsStore
+	local storeReady = store
+		and type(store.Set) == "function"
+		and type(store.db) == "table"
+	if storeReady then
+		store:Set("lootHelper.minimizedHeaderOpacity", defaultOpacity)
+	else
+		db.minimizedHeaderOpacity = defaultOpacity
+		local window = SF.LootHelperWindow and SF.LootHelperWindow.Window
+		if window and window.ApplyMinimizedOpacity then
+			window:ApplyMinimizedOpacity()
+		end
+	end
 
 	if SF.Debug then
 		SF.Debug:Info("DATABASE", "Reset all loot helper settings - cleared %d profiles", profileCount)

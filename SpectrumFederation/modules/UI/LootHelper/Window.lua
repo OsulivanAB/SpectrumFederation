@@ -39,6 +39,11 @@ local function Round(v)
     return math.floor(v + 0.5)
 end
 
+-- Minimized overall-frame opacity (percent). Style texture alphas stay separate.
+local MINIMIZED_OPACITY_DEFAULT = 100
+local MINIMIZED_OPACITY_MIN = 15
+local MINIMIZED_OPACITY_MAX = 100
+
 -- Smallest window width that keeps the logo and every title-bar control from
 -- overlapping, with minTextWidth reserved for the profile name between them.
 function Window.MinimumTitleWidth(minTextWidth)
@@ -216,6 +221,42 @@ function Window:_UpdateMinimizeButtonState()
         or "Collapse the Loot Helper window to its title bar."
 end
 
+-- Normalize a stored opacity percent: missing/nonnumeric -> 100, else clamp 15-100.
+function Window:_NormalizeMinimizedOpacity(value)
+    local n = tonumber(value)
+    if not n then
+        return MINIMIZED_OPACITY_DEFAULT
+    end
+    return Clamp(n, MINIMIZED_OPACITY_MIN, MINIMIZED_OPACITY_MAX)
+end
+
+function Window:_ReadMinimizedOpacitySetting()
+    local raw
+    if SF.SettingsStore and SF.SettingsStore.Get then
+        raw = SF.SettingsStore:Get("lootHelper.minimizedHeaderOpacity")
+    else
+        local db = SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper)
+        raw = db and db.minimizedHeaderOpacity
+    end
+    return self:_NormalizeMinimizedOpacity(raw)
+end
+
+-- Apply overall main-frame alpha from minimized state + setting.
+-- Does not alter style-specific backdrop/title-bar texture alphas.
+function Window:ApplyMinimizedOpacity()
+    local f = self._frame
+    if not f or type(f.SetAlpha) ~= "function" then
+        return
+    end
+
+    if f.__sfMinimized then
+        local pct = self:_ReadMinimizedOpacitySetting()
+        f:SetAlpha(pct / 100)
+    else
+        f:SetAlpha(1)
+    end
+end
+
 function Window:_ApplyMinimizedState()
     local f = self._frame
     if not f then return end
@@ -241,6 +282,7 @@ function Window:_ApplyMinimizedState()
 
     self:_UpdateResizeHandleState()
     self:_UpdateMinimizeButtonState()
+    self:ApplyMinimizedOpacity()
     self:RequestScrollInsetsUpdate()
 end
 
@@ -840,6 +882,9 @@ function Window:Create()
     if LH.Style and LH.Style.Apply then
         LH.Style:Apply(frame)
     end
+
+    -- Style touches texture alphas only; reaffirm overall frame opacity after it.
+    self:ApplyMinimizedOpacity()
 
     -- ConsumablesRuntime may have initialized before this frame existed. Attach
     -- reminder hooks now so a later Show reevaluates without polling.
