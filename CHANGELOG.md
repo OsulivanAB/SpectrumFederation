@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.10] - 2026-10-08
+
+### Fixed
+- Fix Consumables Requested Items layout and control order (#362)
+
 ## [1.5.8-beta.9] - 2026-10-08
 
 ### Added
