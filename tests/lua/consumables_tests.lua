@@ -2943,6 +2943,10 @@ local function checkGoalCommitGate()
         "text,goalLabel,goalEdit,remove",
         "requested-list control order is Name → Goal → Input → Remove"
     )
+    local effectiveGap, visualGap, inputInset = SF.SettingsUI.Controls.ConsumableRequestedGoalEditGap()
+    assertEq(visualGap, 8, "Goal→input visual gap targets about 8px")
+    assertTrue(inputInset > 0, "Goal→input gap includes InputBoxTemplate left inset")
+    assertEq(effectiveGap, visualGap + inputInset, "effective Goal→input gap combines visual and inset")
 end
 
 local function checkSessionProfileNoticeRemoved()

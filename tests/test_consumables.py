@@ -101,7 +101,9 @@ def test_consumables_goal_editor_guards_are_present():
     assert "__sfCancelCommit" in controls
     assert "function Controls.ConsumableRequestedTextMaxWidth" in controls
     assert "function Controls.ConsumableRequestedTextWidth" in controls
+    assert "function Controls.ConsumableRequestedGoalEditGap" in controls
     assert 'Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER = { "text", "goalLabel", "goalEdit", "remove" }' in controls
+    assert "goalEditInputInset" in controls
     assert "LayoutRowFlow" in controls
     assert "ApplyScrollAndFlow" in controls
     assert "C.ValidGoal" in page
@@ -113,14 +115,16 @@ def test_consumables_goal_editor_guards_are_present():
     assert "ClearFocus()" in enter_body
     assert "CommitGoal()" not in enter_body
     assert "CommitGoal()" in controls[lost_at : lost_at + 120]
-    # Flowing order: Goal follows the name; Remove follows the goal input.
+    # Flowing order with Goal label centered on the input (not chained off the name).
     flow_at = controls.find("local function LayoutRowFlow")
     assert flow_at != -1
-    flow_body = controls[flow_at : flow_at + 900]
-    assert 'r.GoalLabel:SetPoint("LEFT", r.Text, "RIGHT"' in flow_body
-    assert 'r.GoalEdit:SetPoint("LEFT", r.GoalLabel, "RIGHT"' in flow_body
+    flow_body = controls[flow_at : flow_at + 1200]
+    assert "r.GoalEdit:SetPoint(" in flow_body
+    assert "r.Text" in flow_body[flow_body.find("r.GoalEdit:SetPoint(") : flow_body.find("r.GoalEdit:SetPoint(") + 160]
+    assert 'r.GoalLabel:SetPoint("RIGHT", r.GoalEdit, "LEFT"' in flow_body
     assert 'r.Remove:SetPoint("LEFT", r.GoalEdit, "RIGHT"' in flow_body
     assert 'r.Remove:SetPoint("LEFT", r.Text, "RIGHT"' not in flow_body
+    assert "effectiveGoalEditGap" in flow_body
 
 
 def test_consumable_requested_list_layout_production_lua():

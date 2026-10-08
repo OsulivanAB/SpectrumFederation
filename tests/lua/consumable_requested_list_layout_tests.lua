@@ -332,13 +332,21 @@ local function findRequestedRows(content)
     return found
 end
 
-local function leftAnchor(region)
+local function pointAnchor(region, pointName)
     for _, point in ipairs(region.points or {}) do
-        if point.point == "LEFT" then
+        if point.point == pointName then
             return point
         end
     end
     return nil
+end
+
+local function leftAnchor(region)
+    return pointAnchor(region, "LEFT")
+end
+
+local function rightAnchor(region)
+    return pointAnchor(region, "RIGHT")
 end
 
 local function buildList(items, scrollWidth)
@@ -400,6 +408,11 @@ do
     local order = Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER
     assertEq(table.concat(order, ","), "text,goalLabel,goalEdit,remove",
         "control order is Item Name → Goal → Input → Remove")
+
+    local effectiveGap, visualGap, inputInset = Controls.ConsumableRequestedGoalEditGap()
+    assertEq(visualGap, 8, "Goal→input visual gap targets ~8px clear separation")
+    assertTrue(inputInset > 0, "Goal→input gap accounts for InputBoxTemplate left inset")
+    assertEq(effectiveGap, visualGap + inputInset, "effective Goal→input gap is visual plus inset")
 end
 
 -- Runtime order and flowing widths for short vs long names.
@@ -417,16 +430,29 @@ do
 
     local shortRow, longRow = rows[1], rows[2]
     local shortTextAnchor = leftAnchor(shortRow.Text)
-    local shortGoalAnchor = leftAnchor(shortRow.GoalLabel)
+    local shortGoalAnchor = rightAnchor(shortRow.GoalLabel)
     local shortEditAnchor = leftAnchor(shortRow.GoalEdit)
     local shortRemoveAnchor = leftAnchor(shortRow.Remove)
+    local effectiveGap = Controls.ConsumableRequestedGoalEditGap()
+    local defaults = Controls.CONSUMABLE_REQUESTED_DEFAULTS
     assertTrue(shortTextAnchor and shortTextAnchor.relativeTo == shortRow, "item name anchors to row")
-    assertTrue(shortGoalAnchor and shortGoalAnchor.relativeTo == shortRow.Text,
-        "Goal label follows item name")
-    assertTrue(shortEditAnchor and shortEditAnchor.relativeTo == shortRow.GoalLabel,
-        "Goal input follows Goal label")
+    assertTrue(shortEditAnchor and shortEditAnchor.relativeTo == shortRow.Text,
+        "Goal input follows the item name in the flowing chain")
+    assertEq(
+        shortEditAnchor and shortEditAnchor.x or nil,
+        defaults.goalLabelGap + defaults.goalLabelWidth + effectiveGap,
+        "Goal input offset reserves label width plus Goal→input visual/inset gap"
+    )
+    assertTrue(shortGoalAnchor and shortGoalAnchor.relativeTo == shortRow.GoalEdit,
+        "Goal label is vertically centered against the input box")
+    assertEq(shortGoalAnchor and shortGoalAnchor.x or nil, -effectiveGap,
+        "Goal label keeps the effective clear gap before the input")
+    assertEq(shortGoalAnchor and shortGoalAnchor.y or nil, 0,
+        "Goal label uses a zero vertical offset against the input")
     assertTrue(shortRemoveAnchor and shortRemoveAnchor.relativeTo == shortRow.GoalEdit,
         "Remove follows Goal input")
+    assertEq(shortRemoveAnchor and shortRemoveAnchor.x or nil, defaults.removeColumnGap,
+        "Remove keeps a small consistent gap after the input")
 
     local availableWidth = scroll.scrollChild:GetWidth()
     local expectedShort = Controls.ConsumableRequestedTextWidth(availableWidth, #shortText * 7)

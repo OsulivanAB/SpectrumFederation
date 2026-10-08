@@ -1560,10 +1560,25 @@ Controls.CONSUMABLE_REQUESTED_DEFAULTS = {
 	goalWidth = 56,
 	goalLabelGap = 8,
 	goalLabelWidth = 36,
-	goalEditGap = 4,
+	-- Clear space between Goal text and the visible InputBox border.
+	goalEditGap = 8,
+	-- InputBoxTemplate left decoration sits inside the edit-box frame bounds;
+	-- include it so the ~8px visual gap is not eaten by the Left texture.
+	goalEditInputInset = 8,
 	edgePad = 4,
 	minTextWidth = 40,
 }
+
+-- Effective Goal→input gap: desired clear pixels plus InputBoxTemplate left inset.
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number effectiveGap, number visualGap, number inputInset
+function Controls.ConsumableRequestedGoalEditGap(sizes)
+	sizes = sizes or {}
+	local d = Controls.CONSUMABLE_REQUESTED_DEFAULTS
+	local visualGap = sizes.goalEditGap or d.goalEditGap
+	local inputInset = sizes.goalEditInputInset or d.goalEditInputInset
+	return visualGap + inputInset, visualGap, inputInset
+end
 
 -- Max item-name width after reserving Goal/remove controls.
 -- @param availableWidth number Visible content width for the list
@@ -1577,7 +1592,7 @@ function Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
 	local goalWidth = sizes.goalWidth or d.goalWidth
 	local goalLabelGap = sizes.goalLabelGap or d.goalLabelGap
 	local goalLabelWidth = sizes.goalLabelWidth or d.goalLabelWidth
-	local goalEditGap = sizes.goalEditGap or d.goalEditGap
+	local goalEditGap = Controls.ConsumableRequestedGoalEditGap(sizes)
 	local edgePad = sizes.edgePad or d.edgePad
 	local minTextWidth = sizes.minTextWidth or d.minTextWidth
 
@@ -1620,6 +1635,7 @@ function Controls:AddConsumableRequestedList(section, opts)
 	local goalLabelGap = opts.goalLabelGap or defaults.goalLabelGap
 	local goalLabelWidth = opts.goalLabelWidth or defaults.goalLabelWidth
 	local goalEditGap = opts.goalEditGap or defaults.goalEditGap
+	local goalEditInputInset = opts.goalEditInputInset or defaults.goalEditInputInset
 	local fixedHeight = opts.height or 180
 	local maxHeight = opts.maxHeight or fixedHeight
 	local resize = (opts.resize ~= false)
@@ -1630,7 +1646,9 @@ function Controls:AddConsumableRequestedList(section, opts)
 		goalLabelGap = goalLabelGap,
 		goalLabelWidth = goalLabelWidth,
 		goalEditGap = goalEditGap,
+		goalEditInputInset = goalEditInputInset,
 	}
+	local effectiveGoalEditGap = Controls.ConsumableRequestedGoalEditGap(layoutSizes)
 
 	local minRowHeight = rowHeight
 	if fixedHeight < minRowHeight then fixedHeight = minRowHeight end
@@ -1674,10 +1692,16 @@ function Controls:AddConsumableRequestedList(section, opts)
 			local goalLabel = r:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 			goalLabel:SetText("Goal")
 			goalLabel:SetJustifyH("RIGHT")
+			if goalLabel.SetJustifyV then
+				goalLabel:SetJustifyV("MIDDLE")
+			end
 			r.GoalLabel = goalLabel
 
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetJustifyH("LEFT")
+			if fs.SetJustifyV then
+				fs:SetJustifyV("MIDDLE")
+			end
 			if fs.SetWordWrap then
 				fs:SetWordWrap(false)
 			end
@@ -1708,6 +1732,9 @@ function Controls:AddConsumableRequestedList(section, opts)
 		end
 
 		-- Flowing horizontal layout after content width accounts for the scrollbar.
+		-- Vertical centering: name/edit/remove share the row mid-line; Goal label
+		-- is anchored to the edit box so it stays centered on the input, not the
+		-- item-name font metrics.
 		local function LayoutRowFlow(r, availableWidth)
 			r.Text:ClearAllPoints()
 			r.GoalLabel:ClearAllPoints()
@@ -1721,9 +1748,15 @@ function Controls:AddConsumableRequestedList(section, opts)
 			)
 			r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
 			r.Text:SetWidth(textWidth)
-			r.GoalLabel:SetPoint("LEFT", r.Text, "RIGHT", goalLabelGap, 0)
+			r.GoalEdit:SetPoint(
+				"LEFT",
+				r.Text,
+				"RIGHT",
+				goalLabelGap + goalLabelWidth + effectiveGoalEditGap,
+				0
+			)
 			r.GoalLabel:SetWidth(goalLabelWidth)
-			r.GoalEdit:SetPoint("LEFT", r.GoalLabel, "RIGHT", goalEditGap, 0)
+			r.GoalLabel:SetPoint("RIGHT", r.GoalEdit, "LEFT", -effectiveGoalEditGap, 0)
 			r.Remove:SetPoint("LEFT", r.GoalEdit, "RIGHT", removeColumnGap, 0)
 		end
 
