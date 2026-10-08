@@ -41,7 +41,7 @@ end
 
 -- Minimized overall-frame opacity (percent). Style texture alphas stay separate.
 local MINIMIZED_OPACITY_DEFAULT = 100
-local MINIMIZED_OPACITY_MIN = 5
+local MINIMIZED_OPACITY_MIN = 15
 local MINIMIZED_OPACITY_MAX = 100
 
 -- Smallest window width that keeps the logo and every title-bar control from
@@ -221,7 +221,7 @@ function Window:_UpdateMinimizeButtonState()
         or "Collapse the Loot Helper window to its title bar."
 end
 
--- Normalize a stored opacity percent: missing/nonnumeric -> 100, else clamp 5-100.
+-- Normalize a stored opacity percent: missing/nonnumeric -> 100, else clamp 15-100.
 function Window:_NormalizeMinimizedOpacity(value)
     local n = tonumber(value)
     if not n then

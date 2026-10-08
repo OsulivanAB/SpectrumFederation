@@ -877,7 +877,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					label = "Minimized Loot Window Opacity",
 					tooltip = "Adjust the opacity of the entire Loot Helper window while minimized, including its background, text, logo, and buttons. The expanded window is unaffected.",
 					path = "lootHelper.minimizedHeaderOpacity",
-					min = 5,
+					min = 15,
 					max = 100,
 					step = 5,
 				},
