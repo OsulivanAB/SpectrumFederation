@@ -2934,6 +2934,15 @@ local function checkGoalCommitGate()
         "text bound to a different item id does not commit")
     assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", nil),
         "a missing commit item id does not commit")
+
+    local maxWidth, reserved = SF.SettingsUI.Controls.ConsumableRequestedTextMaxWidth(300)
+    assertTrue(type(reserved) == "number" and reserved > 0, "requested-list reserved width is exported")
+    assertEq(maxWidth, 300 - reserved, "requested-list text max width subtracts reserved controls")
+    assertEq(
+        table.concat(SF.SettingsUI.Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER, ","),
+        "text,goalLabel,goalEdit,remove",
+        "requested-list control order is Name → Goal → Input → Remove"
+    )
 end
 
 local function checkSessionProfileNoticeRemoved()
