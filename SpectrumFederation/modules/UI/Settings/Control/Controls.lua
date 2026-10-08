@@ -1526,6 +1526,30 @@ function Controls:AddScrollList(section, opts)
 	end)
 end
 
+-- Pure gate for consumable goal edits. Used by AddConsumableRequestedList and tests.
+-- Returns true only when a genuine, still-bound edit should invoke onGoalCommit.
+-- @param state table { ignore, cancel, boundItemId, lastCommittedText }
+-- @param text string Current edit-box text
+-- @param commitItemId number|nil Item id the commit callback would target
+-- @return boolean
+function Controls.ShouldCommitConsumableGoal(state, text, commitItemId)
+	state = state or {}
+	if state.ignore or state.cancel then
+		return false
+	end
+	if state.boundItemId == nil or commitItemId == nil then
+		return false
+	end
+	if state.boundItemId ~= commitItemId then
+		return false
+	end
+	text = tostring(text or "")
+	if text == tostring(state.lastCommittedText or "") then
+		return false
+	end
+	return true
+end
+
 -- Consumables-specific requested-item list: item label, editable Goal, remove X
 -- placed beside the item (not pinned to the far-right edge).
 -- @param section table Section to add row into
@@ -1595,6 +1619,15 @@ function Controls:AddConsumableRequestedList(section, opts)
 
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetJustifyH("LEFT")
+			if fs.SetWordWrap then
+				fs:SetWordWrap(false)
+			end
+			if fs.SetNonSpaceWrap then
+				fs:SetNonSpaceWrap(false)
+			end
+			if fs.SetMaxLines then
+				fs:SetMaxLines(1)
+			end
 			r.Text = fs
 
 			rows[i] = r
@@ -1622,6 +1655,13 @@ function Controls:AddConsumableRequestedList(section, opts)
 			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 			local items = getItems() or {}
 			local y = 0
+			local availableWidth = content:GetWidth() or scroll:GetWidth() or 0
+			-- Reserve room for remove + Goal label + edit so long names cannot push
+			-- the controls out of the visible row. Remove stays beside the label.
+			local goalLabelWidth = 36
+			local reservedControls = removeButtonSize + removeColumnGap + goalLabelGap
+				+ goalLabelWidth + 4 + goalWidth + 4
+			local textMaxWidth = math.max(40, availableWidth - reservedControls)
 
 			for i = 1, #items do
 				local item = items[i]
@@ -1636,13 +1676,13 @@ function Controls:AddConsumableRequestedList(section, opts)
 				r.GoalEdit:ClearAllPoints()
 				r.Remove:ClearAllPoints()
 
+				local textWidth = math.min(textMaxWidth, math.max(1, (r.Text:GetStringWidth() or 0) + 4))
 				r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+				r.Text:SetWidth(textWidth)
 				r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
 				r.GoalLabel:SetPoint("LEFT", r.Remove, "RIGHT", goalLabelGap, 0)
+				r.GoalLabel:SetWidth(goalLabelWidth)
 				r.GoalEdit:SetPoint("LEFT", r.GoalLabel, "RIGHT", 4, 0)
-
-				local textWidth = r.Text:GetStringWidth() or 0
-				r.Text:SetWidth(math.max(1, textWidth + 4))
 
 				local canRemove = item.canRemove and true or false
 				r.Remove:SetShown(canRemove)
@@ -1663,13 +1703,36 @@ function Controls:AddConsumableRequestedList(section, opts)
 				r.GoalLabel:SetShown(true)
 				r.GoalEdit:SetShown(true)
 				local editing = r.GoalEdit.HasFocus and r.GoalEdit:HasFocus()
-				if not editing then
+				local newItemId = item.itemId
+				local boundId = r.__sfBoundItemId
+				if editing and boundId ~= nil and boundId ~= newItemId then
+					-- Row was rebound to a different item while focused: cancel the
+					-- in-progress edit rather than committing old text to the new id.
+					r.GoalEdit.__sfCancelCommit = true
+					r.GoalEdit.__sfIgnore = true
+					if r.GoalEdit.ClearFocus then
+						r.GoalEdit:ClearFocus()
+					end
+					r.GoalEdit:SetText(tostring(item.goal or 0))
+					if r.GoalEdit.SetCursorPosition then
+						r.GoalEdit:SetCursorPosition(0)
+					end
+					r.GoalEdit.__sfIgnore = false
+					r.GoalEdit.__sfCancelCommit = false
+					r.__sfBoundItemId = newItemId
+					r.__sfLastCommittedText = tostring(item.goal or 0)
+				elseif not editing then
 					r.GoalEdit.__sfIgnore = true
 					r.GoalEdit:SetText(tostring(item.goal or 0))
 					if r.GoalEdit.SetCursorPosition then
 						r.GoalEdit:SetCursorPosition(0)
 					end
 					r.GoalEdit.__sfIgnore = false
+					r.__sfBoundItemId = newItemId
+					r.__sfLastCommittedText = tostring(item.goal or 0)
+				else
+					-- Same item still focused: keep typed text and binding.
+					r.__sfBoundItemId = newItemId
 				end
 				if canEditGoal and enabled then
 					r.GoalEdit:Enable()
@@ -1683,10 +1746,22 @@ function Controls:AddConsumableRequestedList(section, opts)
 
 				local commitItem = item
 				local function CommitGoal()
-					if r.GoalEdit.__sfIgnore then return end
 					if not (canEditGoal and enabled) then return end
+					local text = r.GoalEdit:GetText() or ""
+					local allowed = Controls.ShouldCommitConsumableGoal({
+						ignore = r.GoalEdit.__sfIgnore and true or false,
+						cancel = r.GoalEdit.__sfCancelCommit and true or false,
+						boundItemId = r.__sfBoundItemId,
+						lastCommittedText = r.__sfLastCommittedText,
+					}, text, commitItem and commitItem.itemId)
+					if not allowed then
+						return
+					end
+					-- Record before the callback so Enter→ClearFocus→FocusLost
+					-- cannot send a second CONSUMABLES_OP for the same edit.
+					r.__sfLastCommittedText = text
 					if opts.onGoalCommit then
-						opts.onGoalCommit(commitItem, r.GoalEdit:GetText() or "")
+						opts.onGoalCommit(commitItem, text)
 					end
 				end
 				r.GoalEdit:SetScript("OnEnterPressed", function(selfEdit)

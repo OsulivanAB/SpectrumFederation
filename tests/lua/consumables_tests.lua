@@ -2735,6 +2735,10 @@ local function checkGoalsAndProgress()
     assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, 1.5)), "a fractional goal is rejected")
     assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, "nope")), "a non-numeric goal is rejected")
     assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, math.huge)), "an infinite goal is rejected")
+    assertEq(C.ValidGoal(999999), nil, "values above MAX_GOAL fail domain validation")
+    assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, C.MAX_GOAL + 1)),
+        "out-of-range goals are rejected before sync")
+    assertEq(C.ValidGoal(C.MAX_GOAL), C.MAX_GOAL, "MAX_GOAL itself is accepted")
     assertTrue(select(1, C.ApplyOp(p, { name = "set_goal", itemId = aqirite, goal = 100 }, admin)),
         "ApplyOp set_goal works for an admin")
     assertEq(p._consumables.requestedItems[tostring(aqirite)].goal, 100, "ApplyOp stores the goal")
@@ -2815,8 +2819,15 @@ local function checkGoalsAndProgress()
     C.Clear(rr, admin)
     assertEq(C.ItemDonatedTotal(rr, aqirite), 0, "a new generation resets item totals")
     assertEq(#C.GoalProgress(rr).items, 0, "clear removes requested items from progress")
-    assertTrue(#(rr._consumableEventArchive or {}) > 0 or #rr._consumableEvents >= 0,
-        "clear preserves historical ledger data")
+    local historyAfterClear = C.HistoryRows(rr)
+    local preservedDonation = false
+    for i = 1, #historyAfterClear do
+        if contains(historyAfterClear[i].text, "donated 25") then
+            preservedDonation = true
+            break
+        end
+    end
+    assertTrue(preservedDonation, "clear preserves the prior donation in historical ledger")
 
     -- Linked characters: two donations each count once toward item totals.
     local linked = configured("goals-linked")
@@ -2907,6 +2918,24 @@ local function checkGoalsAndProgress()
     assertEq(C.Project(multi).contributions[vann][aqirite], 15, "raw actor contributions stay separate for each actor")
 end
 
+local function checkGoalCommitGate()
+    load("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    local should = SF.SettingsUI.Controls.ShouldCommitConsumableGoal
+    assertTrue(type(should) == "function", "goal commit gate is exported for regression coverage")
+    assertTrue(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", aqirite),
+        "a changed goal text is eligible to commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "10" }, "10", aqirite),
+        "an unchanged goal text does not commit again")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0", ignore = true }, "10", aqirite),
+        "ignored refresh updates do not commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0", cancel = true }, "10", aqirite),
+        "cancelled rebound edits do not commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", flask),
+        "text bound to a different item id does not commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", nil),
+        "a missing commit item id does not commit")
+end
+
 local function checkSessionProfileNoticeRemoved()
     resetWorld()
     local active = profile("active-profile", admin)
@@ -2962,6 +2991,7 @@ checkRuntimeCancelAndDeferredDelete()
 checkClear()
 checkCopyConfiguration()
 checkGoalsAndProgress()
+checkGoalCommitGate()
 checkSessionProfileNoticeRemoved()
 
 if failures > 0 then

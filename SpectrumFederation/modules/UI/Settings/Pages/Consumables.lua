@@ -339,12 +339,16 @@ local function Definition(panel)
 								ctx.section:SetMessage("Only a profile admin can change requested-item goals.", "error")
 								return
 							end
-							local goal = tonumber(text)
+							local C = SF.Consumables
+							local goal = C and C.ValidGoal and C.ValidGoal(text) or nil
 							if goal == nil then
 								ctx.section:SetMessage("Enter a non-negative whole-number goal.", "error")
 								if ctx.pageBuilder and ctx.pageBuilder.Refresh then
 									ctx.pageBuilder:Refresh()
 								end
+								return
+							end
+							if item and tonumber(item.goal) == goal then
 								return
 							end
 							Commit(ctx, { name = "set_goal", itemId = item.itemId, goal = goal })
