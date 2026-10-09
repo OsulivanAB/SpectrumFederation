@@ -246,6 +246,10 @@ function BankLog:ProcessLogUpdate(reason)
         Debug("Warn", "log update skipped: incomplete snapshot reason=%s", tostring(reason))
         return
     end
+    local C = SF.Consumables
+    if C and C.EligibilitySnapshot then
+        snapshot.eligibility = C.EligibilitySnapshot(ctx.profile)
+    end
 
     local db = self:ObservationDB()
     local O = SF.ConsumablesObservation
@@ -263,6 +267,27 @@ function BankLog:ProcessLogUpdate(reason)
         tostring(stats.ambiguous),
         tostring(stats.suppressed),
         tostring(#snapshot.rows))
+
+    if C and C.NoteObservationBaseline then
+        C.NoteObservationBaseline(ctx.profile)
+    end
+
+    local V = SF.ConsumablesVerification
+    local scope = O.EnsureScope(store, ctx.guildGuid, ctx.bankTab)
+    if V and V.ProcessLocalAfterReconcile and scope then
+        local verifyStats = V.ProcessLocalAfterReconcile(ctx.profile, ctx.profileId, store, scope, {
+            selfId = ctx.observedBy,
+        })
+        self.lastVerifyStats = verifyStats
+        if verifyStats and (verifyStats.trusted or 0) > 0 then
+            Debug("Info", "local admin trust committed=%s", tostring(verifyStats.trusted))
+            -- Commit path already wrote the ledger; flush unsent events if a session is live.
+            local Sync = SF.LootHelperSync
+            if Sync and Sync._FlushUnsentConsumablesEvents then
+                Sync:_FlushUnsentConsumablesEvents(ctx.profile)
+            end
+        end
+    end
 end
 
 function BankLog:BeginObservation(reason)

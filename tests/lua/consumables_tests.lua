@@ -792,8 +792,10 @@ local function checkMigration()
     assertEq(migrated.configSeq, 7, "migration keeps the config sequence")
     assertEq(migrated.guild.guid, "club-1", "migration keeps the guild")
     assertEq(migrated.bankTab, 2, "migration keeps the bank tab")
-    assertEq(#old._consumableEvents, 1, "migration keeps existing accounting events")
-    assertEq(C.ContributionTotal(old, donor, aqirite), 5, "migrated donations still count")
+    -- Issue #366 PR2: unreleased legacy deposit-assistant donations are discarded once.
+    assertEq(#old._consumableEvents, 0, "observation-accounting migration discards legacy donations")
+    assertEq(C.ContributionTotal(old, donor, aqirite), 0, "legacy donations no longer count after migration")
+    assertEq(tonumber(migrated.obsAccountingSchema), C.OBS_ACCOUNTING_SCHEMA, "observation accounting schema is marked")
     unchanged(old, "migration")
 
     local seq = old._consumables.configSeq
@@ -1125,7 +1127,8 @@ end
 
 local function donation(id, actor, qty, extra)
     local event = { id = id, type = C.EVENT.DONATION, actor = actor, itemId = aqirite, quantity = qty or 5,
-        source = "guildbank", generation = 1, timestamp = 10 }
+        source = "guildbank", generation = 1, timestamp = 10,
+        txnId = "ctx:test:" .. tostring(id) }
     for k, v in pairs(extra or {}) do event[k] = v end
     return event
 end
@@ -1185,15 +1188,20 @@ end
 
 local function checkRemoteEvents()
     local p = configured("remote-events")
-    local legit = donation("ce:remote:Donor-Realm:1", donor, 5)
-    assertTrue(select(1, S.ApplyRemoteEvent(p, legit, donor)), "a member's own guild bank donation is accepted")
-    assertEq(C.ContributionTotal(p, donor, aqirite), 5, "the accepted donation counts")
-    local ok, status = S.ApplyRemoteEvent(p, donation("ce:remote:Donor-Realm:1", donor, 5), donor)
+    -- Non-admins cannot insert canonical donations; admins may with verified txnId.
+    local memberAttempt = donation("ce:remote:Donor-Realm:1", donor, 5)
+    assertFalse(select(1, S.ApplyRemoteEvent(p, memberAttempt, donor)),
+        "a non-admin cannot insert a canonical donation event")
+    local adminForDonor = donation("ce:remote:Admin-Realm:1", donor, 5)
+    assertTrue(select(1, S.ApplyRemoteEvent(p, adminForDonor, admin)),
+        "an admin-trusted donation for another donor is accepted")
+    assertEq(C.ContributionTotal(p, donor, aqirite), 5, "the accepted donation counts for the actual donor")
+    local ok, status = S.ApplyRemoteEvent(p, donation("ce:remote:Admin-Realm:1", donor, 5), admin)
     assertTrue(ok and status == "duplicate", "replaying a remote donation is idempotent")
     assertEq(#p._consumableEvents, 1, "a replayed remote donation is stored once")
 
     local cases = {
-        { donation("ce:remote:Donor-Realm:2", vann, 5), donor, "unauthorized", "a donation credited to another player is rejected" },
+        { donation("ce:remote:Donor-Realm:2", vann, 5), donor, "unauthorized", "a non-admin donation for another player is rejected" },
         { donation("ce:remote:Vann-Realm:3", vann, 5), donor, "unauthorized", "an event id naming another player is rejected" },
         { donation("ce:remote:Donor-Realm:4", donor, 5, { source = "trade" }), donor, "unauthorized", "a trade donation is rejected" },
         { donation("ce:remote:Donor-Realm:5", donor, 5, { source = false }), donor, "unauthorized", "a donation without a guild bank source is rejected" },
@@ -1202,6 +1210,7 @@ local function checkRemoteEvents()
         { donation("ce:remote:Donor-Realm:8", donor, S.MAX_EVENT_QUANTITY + 1), donor, "unauthorized", "an oversized donation is rejected" },
         { donation("ce:remote:Donor-Realm:9", donor, 0 / 0), donor, "unauthorized", "a NaN donation is rejected" },
         { donation("ce:remote:Donor-Realm:10", donor, 5, { itemId = -1 }), donor, "unauthorized", "an invalid item id is rejected" },
+        { donation("ce:remote:Admin-Realm:17", donor, 5, { txnId = false }), admin, "unauthorized", "a donation without txnId is rejected" },
         { { id = "ce:remote:Vann-Realm:11", type = C.EVENT.RECEIPT, actor = vann, itemId = aqirite, quantity = 5, generation = 1 },
             vann, "invalid", "a crafter receipt is rejected" },
         { { id = "ce:remote:Admin-Realm:12", type = C.EVENT.CUSTODY, actor = admin, holder = admin, itemId = aqirite, quantity = 5, generation = 1 },
@@ -1217,6 +1226,7 @@ local function checkRemoteEvents()
     for i = 1, #cases do
         local event, sender, want, message = cases[i][1], cases[i][2], cases[i][3], cases[i][4]
         if event.source == false then event.source = nil end
+        if event.txnId == false then event.txnId = nil end
         local accepted, why = S.ApplyRemoteEvent(p, event, sender)
         assertTrue(not accepted and why == want, message)
     end
@@ -1227,11 +1237,13 @@ local function checkRemoteEvents()
     assertTrue(select(1, S.ApplyRemoteEvent(p, { id = "ce:remote:Admin-Realm:20", type = C.EVENT.RESET, actor = admin,
         generation = 1, timestamp = 20 }, admin)), "an admin's own reset is accepted")
 
-    local relay = donation("ce:remote:Donor-Realm:30", donor, 3, { order = 4, writer = donor })
-    assertTrue(select(1, S.ApplyRemoteEvent(p, relay, admin, { coordinatorRelay = true })), "a coordinator relay keeps the member writer")
+    -- Coordinator relay may credit a different donor when txnId provenance is present.
+    local relay = donation("ce:remote:Admin-Realm:30", donor, 3, { order = 4, writer = admin })
+    assertTrue(select(1, S.ApplyRemoteEvent(p, relay, admin, { coordinatorRelay = true })),
+        "a coordinator relay accepts verified donor≠writer donations")
     local forgedRelay = donation("ce:remote:Donor-Realm:31", vann, 3, { order = 5, writer = donor })
-    assertFalse(select(1, S.ApplyRemoteEvent(p, forgedRelay, admin, { coordinatorRelay = true })),
-        "a relay cannot credit another player")
+    assertTrue(select(1, S.ApplyRemoteEvent(p, forgedRelay, admin, { coordinatorRelay = true })),
+        "a coordinator relay with txnId may credit the stated donor under coordinator authority")
     local noWriter = donation("ce:remote:Donor-Realm:32", donor, 3, { order = 6, writer = vann })
     assertFalse(select(1, S.ApplyRemoteEvent(p, noWriter, admin, { coordinatorRelay = true })),
         "a relay whose writer does not own the id is rejected")
@@ -1324,15 +1336,19 @@ end
 local function checkQueuedResendProtection()
     resetWorld()
     resetSync()
+    local helperAdmin = "HelperAdmin-Realm"
     local follower = configured("queue-race")
+    follower._adminUsers = { admin, helperAdmin }
     local coordinator = configured("queue-race")
-    local event = donation("ce:queue-race:Donor-Realm:1", donor, 7, { order = 17, writer = donor })
+    coordinator._adminUsers = { admin, helperAdmin }
+    -- Admin-trusted donation for another donor; queue protection still applies.
+    local event = donation("ce:queue-race:HelperAdmin-Realm:1", donor, 7, { order = 17, writer = helperAdmin })
     assertTrue(C.AppendEvent(follower, event), "the follower retains an authored ordered event")
     local sent = {}
     local followerState = { active = true, isCoordinator = false, coordinator = admin, sessionId = "queue-session",
         profileId = follower._profileId, peers = { [admin] = { consumablesCapable = true } } }
     sessionStubs(followerState, { [follower._profileId] = follower }, sent)
-    Sync._SelfId = function() return donor end
+    Sync._SelfId = function() return helperAdmin end
     Sync.MSG.NEED_PROFILE = "NP"
     Sync._GetAddonVersion = function() return "test" end
     -- Real Comm.Send and its paced queue; only wire encoding and delivery are mocked.
@@ -1398,12 +1414,12 @@ local function checkQueuedResendProtection()
     sessionStubs({ active = true, isCoordinator = true, coordinator = admin, sessionId = "queue-session",
         profileId = coordinator._profileId, peers = {} }, { [coordinator._profileId] = coordinator }, relay)
     Sync._SelfId = function() return admin end
-    for i = 1, #bulk do Sync:HandleConsumablesEvent(donor, bulk[i]) end
+    for i = 1, #bulk do Sync:HandleConsumablesEvent(helperAdmin, bulk[i]) end
     assertEq(#coordinator._consumableEvents, 1, "repeated resends are idempotent at the coordinator")
     assertEq(C.ContributionTotal(coordinator, donor, aqirite), 7, "the coordinator credits the donation once")
     sessionStubs(followerState, { [follower._profileId] = follower }, {})
-    Sync._SelfId = function() return donor end
-    local bogus = donation(event.id, donor, 7, { order = 1, writer = donor, source = "trade" })
+    Sync._SelfId = function() return helperAdmin end
+    local bogus = donation(event.id, donor, 7, { order = 1, writer = helperAdmin, source = "trade" })
     Sync:HandleConsumablesEvent(admin, { sessionId = "queue-session", profileId = follower._profileId, event = bogus })
     assertEq(#follower._consumablesUnsent, 1, "a rejected stamped relay cannot acknowledge the pending event")
     for i = 1, #relay do Sync:HandleConsumablesEvent(admin, relay[i].payload) end
@@ -1419,7 +1435,7 @@ local function checkQueuedResendProtection()
         return true
     end
     for i = 2, 18 do
-        local row = donation("ce:queue-race:Donor-Realm:" .. tostring(i), donor, 1)
+        local row = donation("ce:queue-race:HelperAdmin-Realm:" .. tostring(i), donor, 1)
         assert(C.AppendEvent(follower, row))
         Sync:_QueueUnsentConsumablesEvent(follower, row.id)
     end
@@ -1443,9 +1459,13 @@ local function checkSessionTransport()
     local function member(event, sender)
         Sync:HandleConsumablesEvent(sender, { sessionId = "s1", profileId = coordP._profileId, event = event })
     end
+    -- Non-admins cannot insert canonical donations; admins submit verified provenance.
     member(donation("ce:session:Donor-Realm:1", donor, 6), donor)
-    assertEq(#coordP._consumableEvents, 1, "the coordinator stores a member's guild bank donation")
+    assertEq(#coordP._consumableEvents, 0, "the coordinator rejects a non-admin canonical donation")
+    member(donation("ce:session:Admin-Realm:1", donor, 6), admin)
+    assertEq(#coordP._consumableEvents, 1, "the coordinator stores an admin-trusted donation for another donor")
     assertEq(coordP._consumableEvents[1].order, 1, "the coordinator stamps the donation order")
+    assertEq(coordP._consumableEvents[1].actor, donor, "the stamped donation preserves the actual donor")
     assertEq(countMsg(sent, "CE"), 1, "the coordinator relays the stamped donation once")
     member(donation("ce:session:Donor-Realm:2", vann, 6), donor)
     member(donation("ce:session:Donor-Realm:3", donor, 6, { source = "trade" }), donor)
@@ -1454,7 +1474,7 @@ local function checkSessionTransport()
     assertEq(#coordP._consumableEvents, 1, "forged, trade, custody, and spoofed events are not stored by the coordinator")
     assertEq(countMsg(sent, "CE"), 1, "rejected events are not relayed")
     Sync:HandleConsumablesEvent(donor, { sessionId = "other", profileId = coordP._profileId,
-        event = donation("ce:session:Donor-Realm:6", donor, 6) })
+        event = donation("ce:session:Admin-Realm:6", donor, 6) })
     assertEq(#coordP._consumableEvents, 1, "events for another session are ignored")
 
     local function op(sender, actor, body)
@@ -2431,20 +2451,20 @@ local function checkRuntimeDeposit()
     RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
     assertEq(RT.depositIntent, nil, "the confirmed deposit clears its intent")
     assertEq(#liveTimers(), 0, "the confirmed deposit cancels its deadline")
-    assertEq(#p._consumableEvents, 1, "a confirmed deposit records one donation")
-    local event = p._consumableEvents[1]
-    assertEq(event.type, C.EVENT.DONATION, "the recorded event is a donation")
-    assertEq(event.source, "guildbank", "the recorded donation is from the guild bank")
-    assertEq(event.actor, donor, "the recorded donation credits the depositor")
-    assertEq(event.quantity, 25, "the recorded donation matches what landed")
-    assertTrue(S.RemoteEventIdOk(event.id, donor), "the donation id names the depositor for sync authorization")
-    assertEq(C.ContributionTotal(p, donor, aqirite), 25, "the depositor's contribution total updates")
+    -- Issue #366 PR2: deposit assistant no longer creates CONSUMABLE_DONATION.
+    -- Guild Bank transaction observation/verification is the accounting source.
+    assertEq(#p._consumableEvents, 0, "a confirmed deposit does not directly record a donation")
+    assertEq(C.ContributionTotal(p, donor, aqirite), 0, "deposit assistant does not update contribution totals")
+    assertTrue(#world.infos > 0, "a clean deposit still reports materials were moved")
+    local infoText = table.concat(world.infos, "\n")
+    assertTrue(contains(infoText, "verification") or contains(infoText, "Guild Bank"),
+        "deposit success mentions verification wait")
     assertEq(#world.warnings, 0, "a clean deposit shows no warnings")
-    assertEq(#(p._consumablesUnsent or {}), 1, "an out-of-session deposit is queued for later sync")
+    assertEq(#(p._consumablesUnsent or {}), 0, "no donation is queued from the deposit assistant")
 
     RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
     RT:OnEvent("BAG_UPDATE_DELAYED")
-    assertEq(#p._consumableEvents, 1, "later bank events do not record the deposit again")
+    assertEq(#p._consumableEvents, 0, "later bank events do not invent a deposit-assistant donation")
     assertEq(fireTimers(), 0, "no timers remain after the deposit")
     local ok, bad = onlyDonationAndReset(p)
     assertTrue(ok, "runtime deposits create no receipt or custody events (" .. tostring(bad) .. ")")
@@ -2490,7 +2510,8 @@ local function checkStaleDepositReview()
     RT.review.Rows[2].Button.scripts.OnClick()
     drainAfter(32)
     RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
-    assertEq(#b._consumableEvents, 1, "the refreshed unchanged-profile button deposits against B")
+    assertEq(#b._consumableEvents, 0, "the refreshed button deposits against B without direct accounting")
+    assertTrue(#world.places > 0, "the refreshed unchanged-profile button still moves items for B")
     assertEq(#a._consumableEvents, 0, "the completed B deposit leaves A unchanged")
 end
 
@@ -2526,8 +2547,7 @@ local function checkOccupiedDepositCursor()
     assertEq(#world.places, 1, "an occupied deferred cursor stops further bank placements")
     assertTrue(world.cursor == held, "cancellation leaves the manual cursor item untouched")
     assertEq(RT.depositWork, nil, "cursor interruption cancels future placement work")
-    assertEq(#p._consumableEvents, 1, "cursor interruption retains the verified contribution")
-    assertEq(p._consumableEvents[1].quantity, 2, "only the completed placement is credited")
+    assertEq(#p._consumableEvents, 0, "cursor interruption does not create deposit-assistant accounting")
     assertEq(#world.after, 0, "cursor interruption leaves no continuations")
     assertEq(#liveTimers(), 0, "cursor interruption leaves no deadline")
     -- A non-item payload must not be confused with the requested item, either.
@@ -2550,8 +2570,7 @@ local function checkRuntimeDepositPartialAndFailure()
     assertEq(#p._consumableEvents, 0, "a partial deposit is not recorded before the deadline")
     fireTimers()
     assertEq(RT.depositIntent, nil, "the deadline finishes a partial deposit")
-    assertEq(#p._consumableEvents, 1, "the deadline records the partial deposit once")
-    assertEq(p._consumableEvents[1].quantity, 2, "a partial deposit records only what landed")
+    assertEq(#p._consumableEvents, 0, "the deadline does not create deposit-assistant accounting")
     assertTrue(contains(world.infos[#world.infos], "The rest is still in your bags"), "a partial deposit explains the remainder")
 
     p = runtimeFixture("rt-bank-only")
@@ -2572,8 +2591,7 @@ local function checkRuntimeDepositPartialAndFailure()
     world.bags[0][2].count = 10
     RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
     fireTimers()
-    assertEq(#p._consumableEvents, 1, "joint slot and bag evidence records a partial deposit")
-    assertEq(p._consumableEvents[1].quantity, 2, "slot evidence cannot credit more than the corresponding bag decrease")
+    assertEq(#p._consumableEvents, 0, "joint slot and bag evidence no longer creates deposit-assistant accounting")
 
     p = runtimeFixture("rt-split-observation")
     world.bankOpen = true
@@ -2587,7 +2605,7 @@ local function checkRuntimeDepositPartialAndFailure()
     RT:OnEvent("BAG_UPDATE_DELAYED")
     assertTrue(RT.depositIntent ~= nil, "separate bag evidence verifies the partial transfer without committing early")
     fireTimers()
-    assertEq(p._consumableEvents[1].quantity, 2, "separately arriving slot and bag evidence converges on valid credit")
+    assertEq(#p._consumableEvents, 0, "separately arriving evidence does not create deposit-assistant accounting")
 
     p = runtimeFixture("rt-failed")
     world.bankOpen = true
@@ -2707,8 +2725,7 @@ local function checkRuntimeDepositPartialAndFailure()
     assertEq(#world.places, placesBeforeConfig, "a mid-deposit config change stops further placements")
     assertEq(RT.depositWork, nil, "a mid-deposit config change clears deposit work")
     assertEq(RT.depositIntent, nil, "a mid-deposit config change does not open a deposit intent")
-    assertEq(#p._consumableEvents, 1, "a mid-deposit config change preserves confirmed donation credit")
-    assertEq(p._consumableEvents[1].quantity, 2, "only the placement confirmed before the config change is credited")
+    assertEq(#p._consumableEvents, 0, "a mid-deposit config change does not create deposit-assistant accounting")
     assertTrue(contains(world.warnings[#world.warnings], "configuration changed"),
         "a mid-deposit config change warns the player")
 
@@ -2720,8 +2737,7 @@ local function checkRuntimeDepositPartialAndFailure()
     assertTrue(select(1, C.SetBankTab(p, admin, 3)), "changing the bank tab bumps configSeq during confirmation")
     RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
     assertEq(RT.depositIntent, nil, "a config change during confirmation clears the intent")
-    assertEq(#p._consumableEvents, 1, "a config change during confirmation preserves the captured deposit")
-    assertEq(p._consumableEvents[1].quantity, 25, "the captured tab observations determine confirmation credit")
+    assertEq(#p._consumableEvents, 0, "a config change during confirmation does not create deposit-assistant accounting")
 end
 
 local function checkRuntimeCancelAndDeferredDelete()
@@ -2768,11 +2784,10 @@ local function checkRuntimeCancelAndDeferredDelete()
     assertEq(RT.depositWork and RT.depositWork.bestActual, 2, "partial credit is verified before closure")
     world.bankReadable = false
     RT:OnBankClosed()
-    assertEq(#p._consumableEvents, 1, "bank closure preserves confirmed partial credit")
-    assertEq(p._consumableEvents[1].quantity, 2, "bank closure credits exactly the confirmed slot increase")
+    assertEq(#p._consumableEvents, 0, "bank closure does not create deposit-assistant accounting")
     drainAfter(32)
     fireTimers()
-    assertEq(#p._consumableEvents, 1, "delayed continuations and timers cannot duplicate closed-bank credit")
+    assertEq(#p._consumableEvents, 0, "delayed continuations and timers cannot invent closed-bank credit")
     SF.DeleteLootHelperProfile = nil
 end
 

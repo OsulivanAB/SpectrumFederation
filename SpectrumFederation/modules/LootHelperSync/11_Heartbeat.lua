@@ -140,6 +140,9 @@ function Sync:HandleSessionStart(sender, payload)
         if profile.NormalizePersistedLegacyBonusRolls then
             profile:NormalizePersistedLegacyBonusRolls()
         end
+        if self._FlushPendingConsumableObservations then
+            self:_FlushPendingConsumableObservations(profile)
+        end
     end
     if self.BackfillAutomaticBisOnPromotion then
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionStart")

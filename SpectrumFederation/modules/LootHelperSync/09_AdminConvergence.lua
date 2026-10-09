@@ -734,6 +734,9 @@ function Sync:BroadcastSessionStart()
                 self:BroadcastConsumablesConfig(announcedProfile)
             end
             self:_FlushUnsentConsumablesEvents(announcedProfile)
+            if self._FlushPendingConsumableObservations then
+                self:_FlushPendingConsumableObservations(announcedProfile)
+            end
         end
     end
 

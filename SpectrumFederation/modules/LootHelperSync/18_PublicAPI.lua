@@ -896,6 +896,9 @@ function Sync:_ResetSessionState(reason)
     if earlyPrep and earlyPrep.OnSessionReset then
         earlyPrep:OnSessionReset(reason)
     end
+    if SF.ConsumablesVerification and SF.ConsumablesVerification.ClearSessionClusters then
+        SF.ConsumablesVerification.ClearSessionClusters()
+    end
 
     if SF.Debug then
         local outstandingReqCount = 0
@@ -1450,6 +1453,9 @@ function Sync:ReannounceSession()
         local announcedProfile = self:FindLocalProfileById(profileId)
         if announcedProfile then
             self:_FlushUnsentConsumablesEvents(announcedProfile)
+            if self._FlushPendingConsumableObservations then
+                self:_FlushPendingConsumableObservations(announcedProfile)
+            end
         end
     end
 

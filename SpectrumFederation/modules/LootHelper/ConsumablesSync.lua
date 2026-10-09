@@ -211,7 +211,10 @@ function S.AuthoritativeEventBodyOk(event)
     if event.type == C.EVENT.DONATION then
         if event.source ~= "guildbank" then return false end
         if type(event.actor) ~= "string" or event.actor == "" then return false end
-        return PositiveQuantity(event)
+        if not PositiveQuantity(event) then return false end
+        -- Post-migration: reject legacy donation rows that lack verified provenance.
+        if not (C.ValidTxnId and C.ValidTxnId(event.txnId)) then return false end
+        return true
     end
     if event.type == C.EVENT.RESET then
         return type(event.actor) == "string" and event.actor ~= ""
@@ -269,12 +272,27 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.DONATION then
-        -- Guild-bank deposits only. The depositor client is authoritative.
+        -- Verified Guild Bank provenance: donor (actor) may differ from writer.
         if event.source ~= "guildbank" then
             return false, "unauthorized"
         end
-        if not (event.actor and Same(event.actor, writer) and PositiveQuantity(event)) then
+        if not (event.actor and PositiveQuantity(event)) then
             return false, "unauthorized"
+        end
+        local txnId = C.ValidTxnId and C.ValidTxnId(event.txnId)
+        if not txnId then
+            return false, "unauthorized"
+        end
+        if opts.coordinatorRelay then
+            -- Coordinator already validated; writer must own the event id.
+            if not writer then
+                return false, "unauthorized"
+            end
+        else
+            -- Non-admins cannot insert canonical contributions over the wire.
+            if not C.IsCanonicalAdmin(profile, writer) then
+                return false, "unauthorized"
+            end
         end
     else
         -- Receipt/custody/trade events are no longer accepted.

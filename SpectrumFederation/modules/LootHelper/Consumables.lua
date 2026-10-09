@@ -31,6 +31,9 @@ C.MAX_EVENT_SEQ = 2147483647
 C.MAX_EVENT_ID = 192
 C.MAX_EVENT_NAME = 64
 C.MAX_GOAL = 100000
+C.MAX_TXN_ID = 160
+-- One-time migration marker for Guild Bank observation accounting (Issue #366 PR2).
+C.OBS_ACCOUNTING_SCHEMA = 1
 
 local projectionCache = setmetatable({}, { __mode = "k" })
 local listeners = {}
@@ -222,6 +225,9 @@ local function BodyToken(event)
         BodyText(copy.tradeToken),
         BodyText(copy.withdrawToken),
         BodyText(copy.reason),
+        BodyText(copy.txnId),
+        BodyText(copy.verification),
+        BodyNumber(copy.goldValueCopper),
     }, "\0")
 end
 
@@ -377,8 +383,30 @@ function C.InvalidateEventIndex(profile)
     end
 end
 
+local function ValidTxnId(txnId)
+    if type(txnId) ~= "string" or txnId == "" or #txnId > C.MAX_TXN_ID then
+        return nil
+    end
+    if not txnId:match("^ctx:") then
+        return nil
+    end
+    return txnId
+end
+
+C.ValidTxnId = ValidTxnId
+
+local function ValidGoldValueCopper(value)
+    if value == nil then return nil end
+    local n = tonumber(value)
+    if not n or n ~= math.floor(n) or n < 0 then
+        return nil
+    end
+    return n
+end
+
 local function RebuildIndex(profile)
     local index = {}
+    local txnIds = {}
     local actorCounts = {}
     local events = profile._consumableEvents or {}
     local maxSeq = 0
@@ -388,6 +416,8 @@ local function RebuildIndex(profile)
         local event = events[i]
         if type(event) == "table" and type(event.id) == "string" then
             index[event.id] = event
+            local txnId = ValidTxnId(event.txnId)
+            if txnId then txnIds[txnId] = event end
             NoteQuota(actorCounts, event)
             local seq = AdoptedEventSeq(event.id)
             if seq and seq > maxSeq then maxSeq = seq end
@@ -403,6 +433,8 @@ local function RebuildIndex(profile)
             local archived = archive[i]
             if type(archived) == "table" and type(archived.id) == "string" then
                 index[archived.id] = archived
+                local txnId = ValidTxnId(archived.txnId)
+                if txnId and not txnIds[txnId] then txnIds[txnId] = archived end
                 local seq = AdoptedEventSeq(archived.id)
                 if seq and seq > maxSeq then maxSeq = seq end
                 NoteArchiveQuota(archiveCounts, archived)
@@ -411,6 +443,7 @@ local function RebuildIndex(profile)
     end
     local bound = EventIds(profile)
     bound.ids = index
+    bound.txnIds = txnIds
     bound.actorCounts = actorCounts
     bound.archiveCounts = archiveCounts
     bound.count = #events
@@ -539,6 +572,54 @@ local function NormalizeRequestedItems(cfg)
     -- Also drop development-era freeze grants persisted beside the profile.
 end
 
+local function EnsureEligibility(cfg)
+    if type(cfg.eligibility) ~= "table" then
+        cfg.eligibility = { items = {}, tabEligibleFrom = nil }
+    end
+    if type(cfg.eligibility.items) ~= "table" then
+        cfg.eligibility.items = {}
+    end
+    return cfg.eligibility
+end
+
+local function MigrateObservationAccountingOnce(profile, cfg)
+    if tonumber(cfg.obsAccountingSchema) == C.OBS_ACCOUNTING_SCHEMA then
+        return false
+    end
+    -- Unreleased feature: discard legacy donation accounting once; keep config.
+    local kept = {}
+    local live = profile._consumableEvents
+    if type(live) == "table" then
+        for i = 1, #live do
+            local event = live[i]
+            if type(event) == "table" and event.type == C.EVENT.RESET then
+                kept[#kept + 1] = event
+            end
+        end
+    end
+    profile._consumableEvents = kept
+    local archiveKept = {}
+    local archive = profile._consumableEventArchive
+    if type(archive) == "table" then
+        for i = 1, #archive do
+            local event = archive[i]
+            if type(event) == "table" and event.type == C.EVENT.RESET then
+                archiveKept[#archiveKept + 1] = event
+            end
+        end
+    end
+    profile._consumableEventArchive = archiveKept
+    profile._consumablesUnsent = nil
+    profile._consumablesPendingFreezes = nil
+    cfg.eventFingerprint = 0
+    cfg.archiveFingerprint = 0
+    cfg.archiveCount = #archiveKept
+    cfg.obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA
+    EnsureEligibility(cfg)
+    Debug("Info", "migrated consumables ledger to observation accounting schema %s", tostring(C.OBS_ACCOUNTING_SCHEMA))
+    return true
+end
+
 function C.Ensure(profile)
     if type(profile) ~= "table" then return nil end
     if type(profile._consumables) ~= "table" then
@@ -549,6 +630,8 @@ function C.Ensure(profile)
             guild = nil,
             bankTab = nil,
             requestedItems = {},
+            obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
+            eligibility = { items = {}, tabEligibleFrom = nil },
         }
     end
     local cfg = profile._consumables
@@ -588,14 +671,49 @@ function C.Ensure(profile)
     if type(profile._consumableEvents) ~= "table" then
         profile._consumableEvents = {}
     end
+    local migrated = MigrateObservationAccountingOnce(profile, cfg)
+    EnsureEligibility(cfg)
     profile._consumableEventIds = nil
     profile._consumableIndexCount = nil
     local bound = eventIndexes[profile]
-    if not indexBound[profile] or not bound or bound.count ~= #profile._consumableEvents then
+    if migrated or not indexBound[profile] or not bound or bound.count ~= #profile._consumableEvents then
         RebuildIndex(profile)
     end
     indexBound[profile] = true
     return cfg
+end
+
+function C.HasTxnId(profile, txnId)
+    txnId = ValidTxnId(txnId)
+    if not txnId or type(profile) ~= "table" then return false end
+    C.Ensure(profile)
+    local bound = EventIds(profile)
+    return bound.txnIds and bound.txnIds[txnId] ~= nil
+end
+
+function C.EligibilitySnapshot(profile)
+    local cfg = C.Ensure(profile)
+    local eligibility = EnsureEligibility(cfg)
+    local items = {}
+    for key, value in pairs(eligibility.items or {}) do
+        items[tostring(key)] = tonumber(value)
+    end
+    return {
+        items = items,
+        tabEligibleFrom = tonumber(eligibility.tabEligibleFrom),
+        baselineEstablished = eligibility.baselineEstablished == true,
+    }
+end
+
+function C.NoteObservationBaseline(profile)
+    if type(profile) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local eligibility = EnsureEligibility(cfg)
+    if eligibility.baselineEstablished then return false end
+    eligibility.baselineEstablished = true
+    eligibility.baselineAt = Now()
+    Debug("Info", "observation eligibility baseline established")
+    return true
 end
 
 local function ArchiveList(profile)
@@ -861,6 +979,13 @@ function C.AddRequestedItem(profile, actor, itemId, opts)
         end
     end
     cfg.requestedItems[ItemKey(itemId)] = { itemId = itemId, goal = 0 }
+    local eligibility = EnsureEligibility(cfg)
+    -- After the initial observation baseline, newly requested items must not
+    -- back-credit earlier Guild Bank history. Pre-baseline adds stay eligible
+    -- for the first authoritative scan's historical import.
+    if eligibility.baselineEstablished then
+        eligibility.items[ItemKey(itemId)] = Now()
+    end
     BumpConfig(profile)
     Debug("Info", "Requested item %s", tostring(itemId))
     Notify()
@@ -941,6 +1066,10 @@ function C.SetGuild(profile, actor, guild, bankTab, opts)
         realm = type(guild.realm) == "string" and guild.realm or "",
     }
     cfg.bankTab = bankTab
+    local eligibility = EnsureEligibility(cfg)
+    -- Initial guild/tab setup: first authoritative scan may backfill Blizzard history.
+    -- Do not set tabEligibleFrom here; item cutovers still apply when items are added later.
+    eligibility.tabEligibleFrom = nil
     BumpConfig(profile)
     Debug("Info", "Set guild %s tab %s", cfg.guild.guid, tostring(bankTab))
     Notify()
@@ -963,6 +1092,10 @@ function C.SetBankTab(profile, actor, bankTab, opts)
         return true
     end
     cfg.bankTab = bankTab
+    local eligibility = EnsureEligibility(cfg)
+    if eligibility.baselineEstablished then
+        eligibility.tabEligibleFrom = Now()
+    end
     BumpConfig(profile)
     Debug("Info", "Set guild bank tab %s", tostring(bankTab))
     Notify()
@@ -985,6 +1118,10 @@ function CopyEvent(event)
             source = nil
         end
     end
+    local verification = event.verification
+    if verification ~= "admin_trust" and verification ~= "witnesses" and verification ~= "manual" then
+        verification = nil
+    end
     return {
         id = event.id,
         type = event.type,
@@ -996,6 +1133,10 @@ function CopyEvent(event)
         source = source,
         order = tonumber(event.order),
         writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= C.MAX_EVENT_NAME and event.writer or nil,
+        txnId = ValidTxnId(event.txnId),
+        verification = verification,
+        -- Optional future monetary field: preserve when valid; leave unset when nil.
+        goldValueCopper = ValidGoldValueCopper(event.goldValueCopper),
     }
 end
 
@@ -1175,6 +1316,9 @@ local function AssignStoredBody(stored, event)
     stored.tradeToken = incoming.tradeToken
     stored.withdrawToken = incoming.withdrawToken
     stored.writer = incoming.writer
+    stored.txnId = incoming.txnId
+    stored.verification = incoming.verification
+    stored.goldValueCopper = incoming.goldValueCopper
     if incoming.order ~= nil then
         stored.order = incoming.order
     end
@@ -1247,9 +1391,28 @@ function C.AppendEvent(profile, event, opts)
     event.timestamp = tonumber(event.timestamp) or Now()
     event.generation = tonumber(event.generation) or C.Ensure(profile).generation
     if event.actor then event.actor = Norm(event.actor) or event.actor end
+    -- Local/test commits may omit txnId; assign a stable identity so exactly-once
+    -- accounting and snapshot admission stay consistent after migration.
+    if event.type == C.EVENT.DONATION and not ValidTxnId(event.txnId) then
+        local cfg = profile._consumables
+        cfg.txnSeq = (tonumber(cfg.txnSeq) or 0) + 1
+        local profileId = tostring(profile._profileId or "profile")
+        if #profileId > 48 then profileId = profileId:sub(1, 48) end
+        event.txnId = string.format("ctx:%s:local:%d", profileId, cfg.txnSeq)
+    end
+    local txnId = ValidTxnId(event.txnId)
+    if txnId then
+        bound.txnIds = bound.txnIds or {}
+        if bound.txnIds[txnId] then
+            return true, "duplicate"
+        end
+    end
     local record = CopyEvent(event)
     profile._consumableEvents[#profile._consumableEvents + 1] = record
     bound.ids[event.id] = record
+    if txnId then
+        bound.txnIds[txnId] = record
+    end
     bound.count = #profile._consumableEvents
     bound.actorCounts = bound.actorCounts or {}
     local storedGen = tonumber(record.generation) or currentGen
@@ -1302,6 +1465,7 @@ function C.Clear(profile, actor, opts)
     cfg.guild = nil
     cfg.bankTab = nil
     cfg.requestedItems = {}
+    cfg.eligibility = { items = {}, tabEligibleFrom = nil }
     BumpConfig(profile)
     Debug("Info", "%s cleared Raid Consumables", actor)
     Notify()
@@ -1466,6 +1630,21 @@ function C.FormatEvent(event, itemName)
         return string.format("%s cleared the Raid Consumables configuration.", tostring(event.actor or "An admin"))
     end
     return ""
+end
+
+function C.FormatObservation(obs, itemName, statusOverride)
+    if type(obs) ~= "table" then return "" end
+    local name = C.ItemName(obs.itemId, itemName)
+    local qty = tonumber(obs.quantity) or 0
+    local donor = tostring(obs.donor or "Someone")
+    local status = statusOverride or obs.status or "pending"
+    if status == "verified" then
+        return string.format("%s donated %d %s — Verified", donor, qty, name)
+    end
+    if status == "ambiguous" then
+        return string.format("%s donated %d %s — Needs review", donor, qty, name)
+    end
+    return string.format("%s donated %d %s — Pending verification", donor, qty, name)
 end
 
 function C.HistoryRows(profile, nameForItem, limit, offset)
