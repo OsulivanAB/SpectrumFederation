@@ -2098,16 +2098,12 @@ function Runtime:FinishDeposit(fromTimer)
         return
     end
     actual = intent.bestActual or actual
-    local events = Workflow.DepositEvents({
-        generation = intent.generation,
-        itemId = intent.itemId,
-        donor = self:SelfId(),
-        requested = intent.requested == true,
-        timestamp = C.Now and C.Now() or nil,
-    }, actual)
-    local committed = self:Commit(profile, intent.token, events)
-    if committed and actual < intent.intended then
-        Info(string.format("Deposited %d. The rest is still in your bags.", actual))
+    -- Issue #366 PR2: deposit assistant no longer creates CONSUMABLE_DONATION
+    -- events. Guild Bank transaction observation/verification is authoritative.
+    if actual < intent.intended then
+        Info(string.format("Deposited %d. The rest is still in your bags. Contribution credit waits for Guild Bank verification.", actual))
+    elseif actual > 0 then
+        Info("Deposit moved to the guild bank. Contribution credit waits for Guild Bank verification.")
     end
     self:CompleteDeferredProfileDeletes()
 end

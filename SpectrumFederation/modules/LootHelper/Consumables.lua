@@ -31,6 +31,10 @@ C.MAX_EVENT_SEQ = 2147483647
 C.MAX_EVENT_ID = 192
 C.MAX_EVENT_NAME = 64
 C.MAX_GOAL = 100000
+C.MAX_TXN_ID = 160
+C.MAX_TXN_REGISTRY = 512
+-- One-time migration marker for Guild Bank observation accounting (Issue #366 PR2).
+C.OBS_ACCOUNTING_SCHEMA = 1
 
 local projectionCache = setmetatable({}, { __mode = "k" })
 local listeners = {}
@@ -139,6 +143,11 @@ function C.RegisterUIListener(fn)
     return fn
 end
 
+-- Explicit UI poke for sync-driven refreshes (review summaries, remote decisions).
+function C.NotifyUI()
+    Notify()
+end
+
 local function Invalidate(profile)
     projectionCache[profile] = nil
 end
@@ -178,6 +187,10 @@ end
 
 local function IdHash(id)
     return HashText(id, HASH_BYTES)
+end
+
+local function MixConfigText(hash, text)
+    return Xor32(hash, IdHash(text))
 end
 
 local function FingerprintToken(id, order)
@@ -222,6 +235,9 @@ local function BodyToken(event)
         BodyText(copy.tradeToken),
         BodyText(copy.withdrawToken),
         BodyText(copy.reason),
+        BodyText(copy.txnId),
+        BodyText(copy.verification),
+        BodyNumber(copy.goldValueCopper),
     }, "\0")
 end
 
@@ -377,8 +393,30 @@ function C.InvalidateEventIndex(profile)
     end
 end
 
+local function ValidTxnId(txnId)
+    if type(txnId) ~= "string" or txnId == "" or #txnId > C.MAX_TXN_ID then
+        return nil
+    end
+    if not txnId:match("^ctx:") then
+        return nil
+    end
+    return txnId
+end
+
+C.ValidTxnId = ValidTxnId
+
+local function ValidGoldValueCopper(value)
+    if value == nil then return nil end
+    local n = tonumber(value)
+    if not n or n ~= math.floor(n) or n < 0 then
+        return nil
+    end
+    return n
+end
+
 local function RebuildIndex(profile)
     local index = {}
+    local txnIds = {}
     local actorCounts = {}
     local events = profile._consumableEvents or {}
     local maxSeq = 0
@@ -388,6 +426,8 @@ local function RebuildIndex(profile)
         local event = events[i]
         if type(event) == "table" and type(event.id) == "string" then
             index[event.id] = event
+            local txnId = ValidTxnId(event.txnId)
+            if txnId then txnIds[txnId] = event end
             NoteQuota(actorCounts, event)
             local seq = AdoptedEventSeq(event.id)
             if seq and seq > maxSeq then maxSeq = seq end
@@ -403,6 +443,8 @@ local function RebuildIndex(profile)
             local archived = archive[i]
             if type(archived) == "table" and type(archived.id) == "string" then
                 index[archived.id] = archived
+                local txnId = ValidTxnId(archived.txnId)
+                if txnId and not txnIds[txnId] then txnIds[txnId] = archived end
                 local seq = AdoptedEventSeq(archived.id)
                 if seq and seq > maxSeq then maxSeq = seq end
                 NoteArchiveQuota(archiveCounts, archived)
@@ -411,6 +453,7 @@ local function RebuildIndex(profile)
     end
     local bound = EventIds(profile)
     bound.ids = index
+    bound.txnIds = txnIds
     bound.actorCounts = actorCounts
     bound.archiveCounts = archiveCounts
     bound.count = #events
@@ -539,6 +582,277 @@ local function NormalizeRequestedItems(cfg)
     -- Also drop development-era freeze grants persisted beside the profile.
 end
 
+local function EnsureEligibility(cfg)
+    if type(cfg.eligibility) ~= "table" then
+        cfg.eligibility = { items = {}, tabEligibleFrom = nil }
+    end
+    if type(cfg.eligibility.items) ~= "table" then
+        cfg.eligibility.items = {}
+    end
+    return cfg.eligibility
+end
+
+local function EnsureRejections(cfg)
+    if type(cfg.rejections) ~= "table" then
+        cfg.rejections = {}
+    end
+    return cfg.rejections
+end
+
+local function EnsurePendingWitnesses(cfg)
+    if type(cfg.pendingWitnesses) ~= "table" then
+        cfg.pendingWitnesses = {}
+    end
+    return cfg.pendingWitnesses
+end
+
+-- Forward-declared: C.Ensure calls this before the full registry helpers load.
+local function EnsureTxnRegistry(cfg)
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    local seq = tonumber(cfg.txnAllocSeq)
+    if not seq or seq ~= seq or seq ~= math.floor(seq) or seq < 0 then
+        cfg.txnAllocSeq = 0
+    else
+        cfg.txnAllocSeq = seq
+    end
+    return cfg.txnRegistry
+end
+
+local function CopyWitnessMap(witnesses)
+    local out = {}
+    if type(witnesses) ~= "table" then return out end
+    local count = 0
+    for key, meta in pairs(witnesses) do
+        if type(key) == "string" and key ~= "" and count < 16 then
+            if type(meta) == "table" then
+                out[key] = {
+                    submittedBy = type(meta.submittedBy) == "string" and meta.submittedBy or key,
+                    observedBy = type(meta.observedBy) == "string" and meta.observedBy or nil,
+                    firstReported = tonumber(meta.firstReported),
+                }
+            else
+                out[key] = { submittedBy = key }
+            end
+            count = count + 1
+        end
+    end
+    return out
+end
+
+local function CopyPendingWitnessList(list)
+    local out = {}
+    if type(list) ~= "table" then return out end
+    local V = SF.ConsumablesVerification
+    local maxN = (V and V.MAX_PENDING_WITNESS_AGGREGATES) or 128
+    local limit = #list
+    if limit > maxN then limit = maxN end
+    for i = 1, limit do
+        local row = list[i]
+        if type(row) == "table" and type(row.evidence) == "table"
+            and type(row.evidence.coreSignature) == "string"
+        then
+            out[#out + 1] = {
+                evidence = {
+                    coreSignature = row.evidence.coreSignature,
+                    approxTxnTime = tonumber(row.evidence.approxTxnTime),
+                    donor = type(row.evidence.donor) == "string" and row.evidence.donor or nil,
+                    itemId = tonumber(row.evidence.itemId),
+                    quantity = tonumber(row.evidence.quantity),
+                    guildGuid = type(row.evidence.guildGuid) == "string" and row.evidence.guildGuid or nil,
+                    bankTab = tonumber(row.evidence.bankTab),
+                    generation = tonumber(row.evidence.generation),
+                    occurrenceIndex = tonumber(row.evidence.occurrenceIndex),
+                    neighborsOlder = type(row.evidence.neighborsOlder) == "table" and row.evidence.neighborsOlder or nil,
+                    neighborsNewer = type(row.evidence.neighborsNewer) == "table" and row.evidence.neighborsNewer or nil,
+                    type = type(row.evidence.type) == "string" and row.evidence.type or "deposit",
+                },
+                witnesses = CopyWitnessMap(row.witnesses),
+                updatedAt = tonumber(row.updatedAt),
+            }
+        end
+    end
+    return out
+end
+
+-- Forward decl: used by peer-path witness merge before the full definition.
+local PendingWitnessMatches
+
+local function ReplacePendingWitnessesFromPayload(cfg, payload, opts)
+    opts = opts or {}
+    if type(payload) ~= "table" or type(payload.pendingWitnesses) ~= "table" then
+        return EnsurePendingWitnesses(cfg)
+    end
+    -- Authoritative snapshots replace. Peer recovery must not wipe coordinator-
+    -- authenticated aggregates and must not import peer-asserted witness names
+    -- into quorum (witnesses are authenticated only on the coordinator path).
+    if opts.forceReplace == true then
+        cfg.pendingWitnesses = CopyPendingWitnessList(payload.pendingWitnesses)
+        return cfg.pendingWitnesses
+    end
+    return EnsurePendingWitnesses(cfg)
+end
+
+local function CopyEligibility(eligibility)
+    if type(eligibility) ~= "table" then
+        return { items = {}, tabEligibleFrom = nil, baselineEstablished = false }
+    end
+    local items = {}
+    if type(eligibility.items) == "table" then
+        for key, value in pairs(eligibility.items) do
+            local ts = tonumber(value)
+            if ts then
+                items[tostring(key)] = ts
+            end
+        end
+    end
+    return {
+        items = items,
+        tabEligibleFrom = tonumber(eligibility.tabEligibleFrom),
+        baselineEstablished = eligibility.baselineEstablished == true,
+        baselineAt = tonumber(eligibility.baselineAt),
+    }
+end
+
+-- Later cutover timestamps win so followers never loosen an established boundary.
+local function MergeEligibilityInto(cfg, remote)
+    local localElig = EnsureEligibility(cfg)
+    if type(remote) ~= "table" then return localElig end
+    if remote.baselineEstablished == true then
+        localElig.baselineEstablished = true
+        local remoteAt = tonumber(remote.baselineAt)
+        local localAt = tonumber(localElig.baselineAt)
+        if remoteAt and (not localAt or remoteAt < localAt) then
+            localElig.baselineAt = remoteAt
+        elseif not localAt and remoteAt then
+            localElig.baselineAt = remoteAt
+        end
+    end
+    local remoteTab = tonumber(remote.tabEligibleFrom)
+    local localTab = tonumber(localElig.tabEligibleFrom)
+    if remoteTab and (not localTab or remoteTab > localTab) then
+        localElig.tabEligibleFrom = remoteTab
+    end
+    if type(remote.items) == "table" then
+        for key, value in pairs(remote.items) do
+            local remoteTs = tonumber(value)
+            if remoteTs then
+                local itemKey = tostring(key)
+                local localTs = tonumber(localElig.items[itemKey])
+                if not localTs or remoteTs > localTs then
+                    localElig.items[itemKey] = remoteTs
+                end
+            end
+        end
+    end
+    return localElig
+end
+
+local function CopyRejectionList(list)
+    local out = {}
+    if type(list) ~= "table" then return out end
+    local V = SF.ConsumablesVerification
+    local limit = #list
+    local maxN = (V and V.MAX_REJECTIONS_PER_SCOPE) or 128
+    if limit > maxN then limit = maxN end
+    for i = 1, limit do
+        local row = list[i]
+        if type(row) == "table" and type(row.coreSignature) == "string" then
+            out[#out + 1] = {
+                type = "deposit",
+                coreSignature = row.coreSignature,
+                approxTxnTime = tonumber(row.approxTxnTime),
+                donor = type(row.donor) == "string" and row.donor or nil,
+                itemId = tonumber(row.itemId),
+                quantity = tonumber(row.quantity),
+                guildGuid = type(row.guildGuid) == "string" and row.guildGuid or nil,
+                bankTab = tonumber(row.bankTab),
+                generation = tonumber(row.generation),
+                occurrenceIndex = tonumber(row.occurrenceIndex),
+                neighborsOlder = type(row.neighborsOlder) == "table" and row.neighborsOlder or nil,
+                neighborsNewer = type(row.neighborsNewer) == "table" and row.neighborsNewer or nil,
+                decidedBy = type(row.decidedBy) == "string" and row.decidedBy or nil,
+                decidedAt = tonumber(row.decidedAt),
+                reason = type(row.reason) == "string" and row.reason or nil,
+                txnId = type(row.txnId) == "string" and row.txnId or nil,
+                observedBy = type(row.observedBy) == "string" and row.observedBy or nil,
+                firstSeen = tonumber(row.firstSeen),
+                status = "rejected",
+            }
+        end
+    end
+    return out
+end
+
+local function BumpRejectionSeq(cfg, opts)
+    opts = opts or {}
+    local seq = tonumber(cfg.rejectionSeq) or 0
+    if seq < 0 or seq ~= math.floor(seq) then seq = 0 end
+    cfg.rejectionSeq = seq + 1
+    -- Rejection-only updates must advance the admitted config watermark so
+    -- ApplyRemoteConfig / catch-up cannot treat the snapshot as stale.
+    -- Callers that already bump configSeq (for example Clear) pass bumpConfig=false.
+    if opts.bumpConfig ~= false then
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return cfg.rejectionSeq
+end
+
+-- Authoritative replace. Scope transitions always replace; otherwise seq wins.
+local function ReplaceRejectionsFromPayload(cfg, payload, opts)
+    opts = opts or {}
+    if type(payload) ~= "table" or type(payload.rejections) ~= "table" then
+        return EnsureRejections(cfg)
+    end
+    local remoteSeq = tonumber(payload.rejectionSeq) or 0
+    local localSeq = tonumber(cfg.rejectionSeq) or 0
+    if not opts.forceReplace and remoteSeq < localSeq then
+        return EnsureRejections(cfg)
+    end
+    cfg.rejections = CopyRejectionList(payload.rejections)
+    cfg.rejectionSeq = remoteSeq
+    return cfg.rejections
+end
+
+local function MigrateObservationAccountingOnce(profile, cfg)
+    if tonumber(cfg.obsAccountingSchema) == C.OBS_ACCOUNTING_SCHEMA then
+        return false
+    end
+    -- Unreleased feature: discard legacy donation accounting once; keep config.
+    local kept = {}
+    local live = profile._consumableEvents
+    if type(live) == "table" then
+        for i = 1, #live do
+            local event = live[i]
+            if type(event) == "table" and event.type == C.EVENT.RESET then
+                kept[#kept + 1] = event
+            end
+        end
+    end
+    profile._consumableEvents = kept
+    local archiveKept = {}
+    local archive = profile._consumableEventArchive
+    if type(archive) == "table" then
+        for i = 1, #archive do
+            local event = archive[i]
+            if type(event) == "table" and event.type == C.EVENT.RESET then
+                archiveKept[#archiveKept + 1] = event
+            end
+        end
+    end
+    profile._consumableEventArchive = archiveKept
+    profile._consumablesUnsent = nil
+    profile._consumablesPendingFreezes = nil
+    cfg.eventFingerprint = 0
+    cfg.archiveFingerprint = 0
+    cfg.archiveCount = #archiveKept
+    cfg.obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA
+    EnsureEligibility(cfg)
+    Debug("Info", "migrated consumables ledger to observation accounting schema %s", tostring(C.OBS_ACCOUNTING_SCHEMA))
+    return true
+end
+
 function C.Ensure(profile)
     if type(profile) ~= "table" then return nil end
     if type(profile._consumables) ~= "table" then
@@ -549,6 +863,13 @@ function C.Ensure(profile)
             guild = nil,
             bankTab = nil,
             requestedItems = {},
+            obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
+            eligibility = { items = {}, tabEligibleFrom = nil },
+            rejections = {},
+            rejectionSeq = 0,
+            pendingWitnesses = {},
+            txnRegistry = {},
+            txnAllocSeq = 0,
         }
     end
     local cfg = profile._consumables
@@ -588,14 +909,584 @@ function C.Ensure(profile)
     if type(profile._consumableEvents) ~= "table" then
         profile._consumableEvents = {}
     end
+    local migrated = MigrateObservationAccountingOnce(profile, cfg)
+    EnsureEligibility(cfg)
+    EnsureRejections(cfg)
+    EnsurePendingWitnesses(cfg)
+    EnsureTxnRegistry(cfg)
+    if not cfg._txnRegistrySeeded then
+        cfg._txnRegistrySeeded = true
+        C.SeedTxnRegistryFromLedger(profile)
+    end
+    do
+        local seq = tonumber(cfg.rejectionSeq)
+        if not seq or seq ~= seq or seq ~= math.floor(seq) or seq < 0 then
+            cfg.rejectionSeq = 0
+        else
+            cfg.rejectionSeq = seq
+        end
+    end
     profile._consumableEventIds = nil
     profile._consumableIndexCount = nil
     local bound = eventIndexes[profile]
-    if not indexBound[profile] or not bound or bound.count ~= #profile._consumableEvents then
+    if migrated or not indexBound[profile] or not bound or bound.count ~= #profile._consumableEvents then
         RebuildIndex(profile)
     end
     indexBound[profile] = true
     return cfg
+end
+
+function C.HasTxnId(profile, txnId)
+    txnId = ValidTxnId(txnId)
+    if not txnId or type(profile) ~= "table" then return false end
+    C.Ensure(profile)
+    local bound = EventIds(profile)
+    return bound.txnIds and bound.txnIds[txnId] ~= nil
+end
+
+function C.EligibilitySnapshot(profile)
+    local cfg = C.Ensure(profile)
+    local eligibility = EnsureEligibility(cfg)
+    local items = {}
+    for key, value in pairs(eligibility.items or {}) do
+        items[tostring(key)] = tonumber(value)
+    end
+    return {
+        items = items,
+        tabEligibleFrom = tonumber(eligibility.tabEligibleFrom),
+        baselineEstablished = eligibility.baselineEstablished == true,
+        baselineAt = tonumber(eligibility.baselineAt),
+    }
+end
+
+function C.DurableRejections(profile)
+    local cfg = C.Ensure(profile)
+    return EnsureRejections(cfg)
+end
+
+function C.RecordDurableRejection(profile, evidence, decidedBy, reason, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsureRejections(cfg)
+    local V = SF.ConsumablesVerification
+    if V and V.IsRejected and V.IsRejected({ rejections = list }, evidence) then
+        return true
+    end
+    local record
+    if V and V.RejectionRecord then
+        record = V.RejectionRecord(evidence, decidedBy, Now(), reason)
+    else
+        record = {
+            coreSignature = evidence.coreSignature,
+            approxTxnTime = tonumber(evidence.approxTxnTime),
+            donor = evidence.donor,
+            itemId = tonumber(evidence.itemId),
+            quantity = tonumber(evidence.quantity),
+            guildGuid = evidence.guildGuid,
+            bankTab = tonumber(evidence.bankTab),
+            occurrenceIndex = tonumber(evidence.occurrenceIndex),
+            neighborsOlder = evidence.neighborsOlder,
+            neighborsNewer = evidence.neighborsNewer,
+            decidedBy = decidedBy,
+            decidedAt = Now(),
+            reason = reason or "rejected",
+        }
+    end
+    list[#list + 1] = record
+    local maxN = (V and V.MAX_REJECTIONS_PER_SCOPE) or 128
+    while #list > maxN do
+        table.remove(list, 1)
+    end
+    -- Coordinator/local authority bumps seq; follower notice apply does not.
+    if opts.bumpSeq ~= false then
+        BumpRejectionSeq(cfg)
+    end
+    return true
+end
+
+function C.ClearDurableRejection(profile, evidence, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsureRejections(cfg)
+    local V = SF.ConsumablesVerification
+    if not (V and V.RejectionMatches) then return false end
+    local kept = {}
+    local cleared = false
+    for i = 1, #list do
+        if V.RejectionMatches(list[i], evidence) then
+            cleared = true
+        else
+            kept[#kept + 1] = list[i]
+        end
+    end
+    if not cleared then return false end
+    cfg.rejections = kept
+    if opts.bumpSeq ~= false then
+        BumpRejectionSeq(cfg)
+    end
+    return true
+end
+
+function C.PendingWitnesses(profile)
+    local cfg = C.Ensure(profile)
+    return EnsurePendingWitnesses(cfg)
+end
+
+PendingWitnessMatches = function(agg, evidence)
+    if type(agg) ~= "table" or type(agg.evidence) ~= "table" or type(evidence) ~= "table" then
+        return false
+    end
+    -- Require positively supported continuity. Do not fall back to bare
+    -- coreSignature identity: identical deposits at different times must stay
+    -- separate when MatchScore rejects contextual continuity.
+    local O = SF.ConsumablesObservation
+    if not (O and O.MatchScore) then
+        return false
+    end
+    local score = O.MatchScore(agg.evidence, evidence)
+    return score and score >= (O.MIN_MATCH_SCORE or 100) and true or false
+end
+
+-- Authenticated coordinator-side witness persistence. Never trusts client counts.
+function C.UpsertPendingWitness(profile, evidence, submittedBy, witnessMap, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    submittedBy = type(submittedBy) == "string" and submittedBy or nil
+    if not submittedBy then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsurePendingWitnesses(cfg)
+    local V = SF.ConsumablesVerification
+    local agg = nil
+    for i = 1, #list do
+        if PendingWitnessMatches(list[i], evidence) then
+            agg = list[i]
+            break
+        end
+    end
+    if not agg then
+        agg = {
+            evidence = {
+                coreSignature = evidence.coreSignature,
+                approxTxnTime = tonumber(evidence.approxTxnTime),
+                donor = evidence.donor,
+                itemId = tonumber(evidence.itemId),
+                quantity = tonumber(evidence.quantity),
+                guildGuid = evidence.guildGuid,
+                bankTab = tonumber(evidence.bankTab),
+                generation = tonumber(evidence.generation),
+                occurrenceIndex = tonumber(evidence.occurrenceIndex),
+                neighborsOlder = evidence.neighborsOlder,
+                neighborsNewer = evidence.neighborsNewer,
+                type = evidence.type or "deposit",
+            },
+            witnesses = {},
+            updatedAt = Now(),
+        }
+        list[#list + 1] = agg
+    end
+    if type(witnessMap) == "table" then
+        agg.witnesses = CopyWitnessMap(witnessMap)
+    else
+        agg.witnesses = agg.witnesses or {}
+        agg.witnesses[submittedBy] = {
+            submittedBy = submittedBy,
+            observedBy = type(evidence.observedBy) == "string" and evidence.observedBy or nil,
+            firstReported = Now(),
+        }
+    end
+    agg.updatedAt = Now()
+    local maxN = (V and V.MAX_PENDING_WITNESS_AGGREGATES) or 128
+    while #list > maxN do
+        table.remove(list, 1)
+    end
+    if opts.bumpSeq ~= false then
+        -- Advance admitted config watermark so catch-up carries witness progress.
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return true
+end
+
+function C.ClearPendingWitness(profile, evidence, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsurePendingWitnesses(cfg)
+    local kept = {}
+    local cleared = false
+    for i = 1, #list do
+        if PendingWitnessMatches(list[i], evidence) then
+            cleared = true
+        else
+            kept[#kept + 1] = list[i]
+        end
+    end
+    if not cleared then return false end
+    cfg.pendingWitnesses = kept
+    if opts.bumpSeq ~= false then
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Canonical transaction registry (Issue #366): Spectrum-owned identities.
+-- Blizzard Guild Bank fields are evidence for matching only — never ID sources.
+-- ---------------------------------------------------------------------------
+
+local function CopyNeighborList(list)
+    if type(list) ~= "table" then return nil end
+    local out = {}
+    local limit = #list
+    if limit > 4 then limit = 4 end
+    for i = 1, limit do
+        if type(list[i]) == "string" then
+            out[#out + 1] = list[i]
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+local function CopyTxnRegistryEntry(row)
+    if type(row) ~= "table" then return nil end
+    local txnId = ValidTxnId(row.txnId)
+    if not txnId then return nil end
+    local status = row.status
+    if status ~= "verified" and status ~= "rejected" then
+        status = "verified"
+    end
+    return {
+        txnId = txnId,
+        status = status,
+        committed = row.committed == true,
+        coreSignature = type(row.coreSignature) == "string" and row.coreSignature or nil,
+        approxTxnTime = tonumber(row.approxTxnTime),
+        donor = type(row.donor) == "string" and row.donor or nil,
+        itemId = tonumber(row.itemId),
+        quantity = tonumber(row.quantity),
+        guildGuid = type(row.guildGuid) == "string" and row.guildGuid or nil,
+        bankTab = tonumber(row.bankTab),
+        generation = tonumber(row.generation),
+        occurrenceIndex = tonumber(row.occurrenceIndex),
+        neighborsOlder = CopyNeighborList(row.neighborsOlder),
+        neighborsNewer = CopyNeighborList(row.neighborsNewer),
+        verification = type(row.verification) == "string" and row.verification or nil,
+        decidedBy = type(row.decidedBy) == "string" and row.decidedBy or nil,
+        decidedAt = tonumber(row.decidedAt),
+        reason = type(row.reason) == "string" and row.reason or nil,
+    }
+end
+
+local function CopyTxnRegistry(list)
+    local out = {}
+    if type(list) ~= "table" then return out end
+    local limit = #list
+    if limit > C.MAX_TXN_REGISTRY then limit = C.MAX_TXN_REGISTRY end
+    -- Prefer newest entries when truncating.
+    local start = #list - limit + 1
+    if start < 1 then start = 1 end
+    for i = start, #list do
+        local copy = CopyTxnRegistryEntry(list[i])
+        if copy then
+            out[#out + 1] = copy
+        end
+    end
+    return out
+end
+
+local function PreferRegistryEntry(localEntry, remoteEntry)
+    if not localEntry then return remoteEntry end
+    if not remoteEntry then return localEntry end
+    local localAt = tonumber(localEntry.decidedAt)
+    local remoteAt = tonumber(remoteEntry.decidedAt)
+    local decisionSide = nil
+    if localAt and remoteAt then
+        if remoteAt > localAt then
+            decisionSide = "remote"
+        elseif localAt > remoteAt then
+            decisionSide = "local"
+        end
+    elseif remoteAt and not localAt then
+        decisionSide = "remote"
+    elseif localAt and not remoteAt then
+        decisionSide = "local"
+    end
+
+    local decision = remoteEntry
+    if decisionSide == "local" then
+        decision = localEntry
+    elseif decisionSide == "remote" then
+        decision = remoteEntry
+    else
+        -- No comparable newer decision: protect committed credits, then use a
+        -- commutative status tie-break so merge order cannot diverge.
+        if localEntry.committed and localEntry.status == "verified" then
+            decision = localEntry
+        elseif remoteEntry.committed and remoteEntry.status == "verified" then
+            decision = remoteEntry
+        elseif localEntry.status == remoteEntry.status then
+            decision = localEntry
+        elseif localEntry.status == "verified" and remoteEntry.status ~= "verified" then
+            -- Equal/missing decidedAt: prefer verified (reject→correct same tick).
+            decision = localEntry
+        elseif remoteEntry.status == "verified" and localEntry.status ~= "verified" then
+            decision = remoteEntry
+        else
+            decision = localEntry
+        end
+    end
+
+    local out = CopyTxnRegistryEntry(decision)
+    if not out then
+        out = CopyTxnRegistryEntry(localEntry) or CopyTxnRegistryEntry(remoteEntry)
+    end
+    if not out then return nil end
+
+    -- Committed credit is sticky across merges once either side recorded it.
+    if localEntry.committed or remoteEntry.committed then
+        out.committed = true
+        if out.status ~= "rejected" then
+            out.status = "verified"
+        elseif decisionSide == "remote" and remoteEntry.status == "rejected"
+            and not remoteEntry.committed and localEntry.committed then
+            -- An uncommitted remote rejection cannot un-credit a committed donation.
+            out.status = "verified"
+            out.verification = localEntry.verification or out.verification
+            out.decidedBy = localEntry.decidedBy or out.decidedBy
+            out.decidedAt = localAt or out.decidedAt
+            out.reason = nil
+        end
+    end
+
+    local other = decision == localEntry and remoteEntry or localEntry
+    out.neighborsOlder = out.neighborsOlder or other.neighborsOlder
+    out.neighborsNewer = out.neighborsNewer or other.neighborsNewer
+    out.coreSignature = out.coreSignature or other.coreSignature
+    out.approxTxnTime = out.approxTxnTime or other.approxTxnTime
+    out.verification = out.verification or other.verification
+    out.decidedBy = out.decidedBy or other.decidedBy
+    if out.status == "rejected" then
+        out.reason = out.reason or other.reason
+    else
+        out.reason = decision.reason
+    end
+    return out
+end
+
+-- Union-merge registries. Blind replace would let an incomplete new coordinator
+-- wipe richer peer history before Tuesday credits are recovered.
+local function ReplaceTxnRegistryFromPayload(cfg, payload)
+    if type(payload) ~= "table" or type(payload.txnRegistry) ~= "table" then
+        return EnsureTxnRegistry(cfg)
+    end
+    local localList = EnsureTxnRegistry(cfg)
+    local byId = {}
+    local order = {}
+    for i = 1, #localList do
+        local row = localList[i]
+        if type(row) == "table" and ValidTxnId(row.txnId) and not byId[row.txnId] then
+            byId[row.txnId] = CopyTxnRegistryEntry(row)
+            order[#order + 1] = row.txnId
+        end
+    end
+    local remote = CopyTxnRegistry(payload.txnRegistry)
+    for i = 1, #remote do
+        local row = remote[i]
+        local txnId = row and row.txnId
+        if txnId then
+            if byId[txnId] then
+                byId[txnId] = PreferRegistryEntry(byId[txnId], row)
+            else
+                byId[txnId] = row
+                order[#order + 1] = txnId
+            end
+        end
+    end
+    local merged = {}
+    for i = 1, #order do
+        local copy = byId[order[i]]
+        if copy then
+            merged[#merged + 1] = copy
+        end
+    end
+    while #merged > C.MAX_TXN_REGISTRY do
+        table.remove(merged, 1)
+    end
+    cfg.txnRegistry = merged
+    local remoteAlloc = tonumber(payload.txnAllocSeq)
+    if remoteAlloc and remoteAlloc == math.floor(remoteAlloc) and remoteAlloc >= 0 then
+        local localAlloc = tonumber(cfg.txnAllocSeq) or 0
+        if remoteAlloc > localAlloc then
+            cfg.txnAllocSeq = remoteAlloc
+        end
+    end
+    return cfg.txnRegistry
+end
+
+local function ShortWriterToken(writer)
+    writer = Norm(writer) or "local"
+    writer = writer:gsub("[^%w%-]", "")
+    if writer == "" then writer = "local" end
+    if #writer > 24 then writer = writer:sub(1, 24) end
+    return writer
+end
+
+function C.TxnRegistry(profile)
+    local cfg = C.Ensure(profile)
+    return EnsureTxnRegistry(cfg)
+end
+
+function C.FindRegistryTxn(profile, txnId)
+    txnId = ValidTxnId(txnId)
+    if not txnId or type(profile) ~= "table" then return nil end
+    local list = EnsureTxnRegistry(C.Ensure(profile))
+    for i = 1, #list do
+        if list[i].txnId == txnId then
+            return list[i]
+        end
+    end
+    return nil
+end
+
+-- Collision-resistant Spectrum-owned ID. Never derived from Blizzard evidence.
+function C.AllocateCanonicalTxnId(profile, writer)
+    if type(profile) ~= "table" then return nil end
+    local cfg = C.Ensure(profile)
+    EnsureTxnRegistry(cfg)
+    cfg.txnAllocSeq = (tonumber(cfg.txnAllocSeq) or 0) + 1
+    local profileId = tostring(profile._profileId or "profile")
+    if type(profile.GetProfileId) == "function" then
+        local ok, id = pcall(profile.GetProfileId, profile)
+        if ok and type(id) == "string" and id ~= "" then
+            profileId = id
+        end
+    end
+    if #profileId > 40 then profileId = profileId:sub(1, 40) end
+    local w = ShortWriterToken(writer)
+    local entropy = 0
+    entropy = MixConfigText(entropy, w)
+    entropy = MixConfigText(entropy, tostring(Now()))
+    local gt = 0
+    if type(GetTime) == "function" then
+        gt = tonumber(GetTime()) or 0
+    end
+    entropy = MixConfigText(entropy, tostring(gt))
+    entropy = MixConfigText(entropy, tostring(cfg.txnAllocSeq))
+    local txnId = string.format("ctx:%s:%s:%d:%x", profileId, w, cfg.txnAllocSeq, entropy)
+    return ValidTxnId(txnId)
+end
+
+function C.RegisterCanonicalTxn(profile, entry, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(entry) ~= "table" then return false end
+    local copy = CopyTxnRegistryEntry(entry)
+    if not copy then return false end
+    -- Prefer the live cfg table: C.Ensure/RebuildIndex mid-AppendEvent would
+    -- fingerprint the new row twice and XOR the eventFingerprint back to 0.
+    local cfg = profile._consumables
+    if type(cfg) ~= "table" then
+        cfg = C.Ensure(profile)
+    end
+    if type(cfg) ~= "table" then return false end
+    local list = EnsureTxnRegistry(cfg)
+    for i = 1, #list do
+        if list[i].txnId == copy.txnId then
+            -- Preserve committed once set; allow status/evidence refresh.
+            if list[i].committed then copy.committed = true end
+            list[i] = copy
+            if opts.bumpSeq ~= false then
+                cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+            end
+            return true
+        end
+    end
+    list[#list + 1] = copy
+    while #list > C.MAX_TXN_REGISTRY do
+        table.remove(list, 1)
+    end
+    if opts.bumpSeq ~= false then
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return true
+end
+
+function C.MarkRegistryCommitted(profile, txnId, opts)
+    opts = opts or {}
+    local entry = C.FindRegistryTxn(profile, txnId)
+    if not entry then return false end
+    if entry.committed then return true end
+    entry.committed = true
+    if opts.bumpSeq ~= false then
+        local cfg = C.Ensure(profile)
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return true
+end
+
+local function RegistryEntryFromEvent(event)
+    if type(event) ~= "table" then return nil end
+    local txnId = ValidTxnId(event.txnId)
+    if not txnId then return nil end
+    return {
+        txnId = txnId,
+        status = "verified",
+        committed = true,
+        coreSignature = event.coreSignature,
+        approxTxnTime = tonumber(event.timestamp) or tonumber(event.approxTxnTime),
+        donor = event.actor or event.donor,
+        itemId = event.itemId,
+        quantity = event.quantity,
+        guildGuid = event.guildGuid,
+        bankTab = event.bankTab,
+        generation = event.generation,
+        occurrenceIndex = event.occurrenceIndex,
+        neighborsOlder = event.neighborsOlder,
+        neighborsNewer = event.neighborsNewer,
+        verification = event.verification,
+        decidedBy = event.writer,
+        decidedAt = tonumber(event.timestamp),
+    }
+end
+
+function C.SeedTxnRegistryFromLedger(profile)
+    if type(profile) ~= "table" then return 0 end
+    local cfg = C.Ensure(profile)
+    EnsureTxnRegistry(cfg)
+    local added = 0
+    local lists = { profile._consumableEventArchive, profile._consumableEvents }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local event = list[i]
+                if type(event) == "table"
+                    and event.type == C.EVENT.DONATION
+                    and event.source == "guildbank"
+                    and ValidTxnId(event.txnId)
+                    and not C.FindRegistryTxn(profile, event.txnId)
+                then
+                    local entry = RegistryEntryFromEvent(event)
+                    if entry and C.RegisterCanonicalTxn(profile, entry, { bumpSeq = false }) then
+                        added = added + 1
+                    end
+                end
+            end
+        end
+    end
+    return added
+end
+
+function C.NoteObservationBaseline(profile)
+    if type(profile) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local eligibility = EnsureEligibility(cfg)
+    if eligibility.baselineEstablished then return false end
+    eligibility.baselineEstablished = true
+    eligibility.baselineAt = Now()
+    Debug("Info", "observation eligibility baseline established")
+    return true
 end
 
 local function ArchiveList(profile)
@@ -742,10 +1633,6 @@ local function RestoreAdoptedGeneration(profile)
     return true
 end
 
-local function MixConfigText(hash, text)
-    return Xor32(hash, IdHash(text))
-end
-
 local function ConfigFingerprint(cfg)
     local guid = ""
     if type(cfg.guild) == "table" and type(cfg.guild.guid) == "string" then
@@ -771,6 +1658,66 @@ local function ConfigFingerprint(cfg)
     for i = 1, limit do
         hash = MixConfigText(hash, "i:" .. tostring(rows[i].itemId) .. ":g:" .. tostring(rows[i].goal))
     end
+    -- Eligibility cutovers are part of the effective configuration contract.
+    local eligibility = EnsureEligibility(cfg)
+    hash = MixConfigText(hash, "eb:" .. tostring(eligibility.baselineEstablished and 1 or 0))
+    hash = MixConfigText(hash, "et:" .. tostring(tonumber(eligibility.tabEligibleFrom) or 0))
+    local eligRows = {}
+    for key, value in pairs(eligibility.items or {}) do
+        local itemId = tonumber(key)
+        local ts = tonumber(value)
+        if itemId and ts then
+            eligRows[#eligRows + 1] = { itemId = itemId, ts = ts }
+        end
+    end
+    table.sort(eligRows, function(a, b) return a.itemId < b.itemId end)
+    local eligLimit = #eligRows
+    if eligLimit > C.MAX_REQUESTED_ITEMS then eligLimit = C.MAX_REQUESTED_ITEMS end
+    hash = MixConfigText(hash, "ei:" .. tostring(#eligRows))
+    for i = 1, eligLimit do
+        hash = MixConfigText(hash, "e:" .. tostring(eligRows[i].itemId) .. ":" .. tostring(eligRows[i].ts))
+    end
+    hash = MixConfigText(hash, "rj:" .. tostring(tonumber(cfg.rejectionSeq) or 0))
+    -- Hash pending witnesses and registry as order-independent sets so merge
+    -- order and local txnAllocSeq cannot keep CoordinatorConfigDiffers true.
+    local pending = EnsurePendingWitnesses(cfg)
+    local pendingKeys = {}
+    for i = 1, #pending do
+        local agg = pending[i]
+        if type(agg) == "table" and type(agg.evidence) == "table" then
+            local wcount = 0
+            if type(agg.witnesses) == "table" then
+                for _ in pairs(agg.witnesses) do wcount = wcount + 1 end
+            end
+            pendingKeys[#pendingKeys + 1] = table.concat({
+                tostring(agg.evidence.coreSignature or ""),
+                tostring(tonumber(agg.evidence.approxTxnTime) or 0),
+                tostring(tonumber(agg.evidence.occurrenceIndex) or 0),
+                tostring(wcount),
+            }, ":")
+        end
+    end
+    table.sort(pendingKeys)
+    hash = MixConfigText(hash, "pw:" .. tostring(#pendingKeys))
+    for i = 1, #pendingKeys do
+        hash = MixConfigText(hash, "p:" .. pendingKeys[i])
+    end
+    local registry = EnsureTxnRegistry(cfg)
+    local regKeys = {}
+    for i = 1, #registry do
+        local row = registry[i]
+        if type(row) == "table" and type(row.txnId) == "string" and row.txnId ~= "" then
+            regKeys[#regKeys + 1] = tostring(row.txnId) .. ":" .. tostring(row.status or "")
+        end
+    end
+    table.sort(regKeys)
+    hash = MixConfigText(hash, "tr:" .. tostring(#regKeys))
+    local regLimit = #regKeys
+    if regLimit > 32 then regLimit = 32 end
+    -- Stable prefix of sorted ids (not merge-order tail).
+    for i = 1, regLimit do
+        hash = MixConfigText(hash, "t:" .. regKeys[i])
+    end
     return hash
 end
 
@@ -779,6 +1726,8 @@ function C.Descriptor(profile)
     return {
         generation = cfg.generation,
         configSeq = cfg.configSeq,
+        rejectionSeq = tonumber(cfg.rejectionSeq) or 0,
+        txnAllocSeq = tonumber(cfg.txnAllocSeq) or 0,
         configFingerprint = ConfigFingerprint(cfg),
         eventCount = #(profile._consumableEvents or {}),
         eventFingerprint = tonumber(cfg.eventFingerprint) or 0,
@@ -861,6 +1810,13 @@ function C.AddRequestedItem(profile, actor, itemId, opts)
         end
     end
     cfg.requestedItems[ItemKey(itemId)] = { itemId = itemId, goal = 0 }
+    local eligibility = EnsureEligibility(cfg)
+    -- After the initial observation baseline, newly requested items must not
+    -- back-credit earlier Guild Bank history. Pre-baseline adds stay eligible
+    -- for the first authoritative scan's historical import.
+    if eligibility.baselineEstablished then
+        eligibility.items[ItemKey(itemId)] = Now()
+    end
     BumpConfig(profile)
     Debug("Info", "Requested item %s", tostring(itemId))
     Notify()
@@ -941,6 +1897,12 @@ function C.SetGuild(profile, actor, guild, bankTab, opts)
         realm = type(guild.realm) == "string" and guild.realm or "",
     }
     cfg.bankTab = bankTab
+    local eligibility = EnsureEligibility(cfg)
+    -- Initial guild/tab setup (never cleared): first scan may backfill history.
+    -- After Clear, baselineEstablished stays true with a post-clear floor — keep it.
+    if not eligibility.baselineEstablished then
+        eligibility.tabEligibleFrom = nil
+    end
     BumpConfig(profile)
     Debug("Info", "Set guild %s tab %s", cfg.guild.guid, tostring(bankTab))
     Notify()
@@ -963,6 +1925,10 @@ function C.SetBankTab(profile, actor, bankTab, opts)
         return true
     end
     cfg.bankTab = bankTab
+    local eligibility = EnsureEligibility(cfg)
+    if eligibility.baselineEstablished then
+        eligibility.tabEligibleFrom = Now()
+    end
     BumpConfig(profile)
     Debug("Info", "Set guild bank tab %s", tostring(bankTab))
     Notify()
@@ -985,6 +1951,10 @@ function CopyEvent(event)
             source = nil
         end
     end
+    local verification = event.verification
+    if verification ~= "admin_trust" and verification ~= "witnesses" and verification ~= "manual" then
+        verification = nil
+    end
     return {
         id = event.id,
         type = event.type,
@@ -996,6 +1966,16 @@ function CopyEvent(event)
         source = source,
         order = tonumber(event.order),
         writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= C.MAX_EVENT_NAME and event.writer or nil,
+        txnId = ValidTxnId(event.txnId),
+        verification = verification,
+        coreSignature = type(event.coreSignature) == "string" and event.coreSignature or nil,
+        occurrenceIndex = tonumber(event.occurrenceIndex),
+        guildGuid = type(event.guildGuid) == "string" and event.guildGuid or nil,
+        bankTab = tonumber(event.bankTab),
+        neighborsOlder = type(event.neighborsOlder) == "table" and event.neighborsOlder or nil,
+        neighborsNewer = type(event.neighborsNewer) == "table" and event.neighborsNewer or nil,
+        -- Optional future monetary field: preserve when valid; leave unset when nil.
+        goldValueCopper = ValidGoldValueCopper(event.goldValueCopper),
     }
 end
 
@@ -1175,6 +2155,9 @@ local function AssignStoredBody(stored, event)
     stored.tradeToken = incoming.tradeToken
     stored.withdrawToken = incoming.withdrawToken
     stored.writer = incoming.writer
+    stored.txnId = incoming.txnId
+    stored.verification = incoming.verification
+    stored.goldValueCopper = incoming.goldValueCopper
     if incoming.order ~= nil then
         stored.order = incoming.order
     end
@@ -1247,9 +2230,28 @@ function C.AppendEvent(profile, event, opts)
     event.timestamp = tonumber(event.timestamp) or Now()
     event.generation = tonumber(event.generation) or C.Ensure(profile).generation
     if event.actor then event.actor = Norm(event.actor) or event.actor end
+    -- Local/test commits may omit txnId; assign a stable identity so exactly-once
+    -- accounting and snapshot admission stay consistent after migration.
+    if event.type == C.EVENT.DONATION and not ValidTxnId(event.txnId) then
+        local cfg = profile._consumables
+        cfg.txnSeq = (tonumber(cfg.txnSeq) or 0) + 1
+        local profileId = tostring(profile._profileId or "profile")
+        if #profileId > 48 then profileId = profileId:sub(1, 48) end
+        event.txnId = string.format("ctx:%s:local:%d", profileId, cfg.txnSeq)
+    end
+    local txnId = ValidTxnId(event.txnId)
+    if txnId then
+        bound.txnIds = bound.txnIds or {}
+        if bound.txnIds[txnId] then
+            return true, "duplicate"
+        end
+    end
     local record = CopyEvent(event)
     profile._consumableEvents[#profile._consumableEvents + 1] = record
     bound.ids[event.id] = record
+    if txnId then
+        bound.txnIds[txnId] = record
+    end
     bound.count = #profile._consumableEvents
     bound.actorCounts = bound.actorCounts or {}
     local storedGen = tonumber(record.generation) or currentGen
@@ -1268,6 +2270,14 @@ function C.AppendEvent(profile, event, opts)
     local seq = AdoptedEventSeq(event.id)
     if seq and seq > (tonumber(cfg.eventSeq) or 0) then
         cfg.eventSeq = seq
+    end
+    -- Registry alignment after bound.count/fingerprint so Ensure cannot rebuild
+    -- mid-append and double-mix the new event into eventFingerprint.
+    if txnId and record.source == "guildbank" then
+        local entry = RegistryEntryFromEvent(record)
+        if entry then
+            C.RegisterCanonicalTxn(profile, entry, { bumpSeq = false })
+        end
     end
     Invalidate(profile)
     if not opts.silent then
@@ -1302,6 +2312,22 @@ function C.Clear(profile, actor, opts)
     cfg.guild = nil
     cfg.bankTab = nil
     cfg.requestedItems = {}
+    -- Post-clear floor: subsequent reconfiguration must not back-credit older
+    -- still-visible Guild Bank history. First-ever installs keep baseline unset
+    -- until NoteObservationBaseline so initial migration backfill still works.
+    local clearAt = Now()
+    cfg.eligibility = {
+        items = {},
+        tabEligibleFrom = clearAt,
+        baselineEstablished = true,
+        baselineAt = clearAt,
+    }
+    cfg.rejections = {}
+    cfg.pendingWitnesses = {}
+    -- Keep prior-generation registry rows for rematch against archived ledger
+    -- identities; new evidence is stamped with the new generation.
+    EnsureTxnRegistry(cfg)
+    BumpRejectionSeq(cfg, { bumpConfig = false })
     BumpConfig(profile)
     Debug("Info", "%s cleared Raid Consumables", actor)
     Notify()
@@ -1468,6 +2494,21 @@ function C.FormatEvent(event, itemName)
     return ""
 end
 
+function C.FormatObservation(obs, itemName, statusOverride)
+    if type(obs) ~= "table" then return "" end
+    local name = C.ItemName(obs.itemId, itemName)
+    local qty = tonumber(obs.quantity) or 0
+    local donor = tostring(obs.donor or "Someone")
+    local status = statusOverride or obs.status or "pending"
+    if status == "verified" then
+        return string.format("%s donated %d %s — Verified", donor, qty, name)
+    end
+    if status == "ambiguous" then
+        return string.format("%s donated %d %s — Needs review", donor, qty, name)
+    end
+    return string.format("%s donated %d %s — Pending verification", donor, qty, name)
+end
+
 function C.HistoryRows(profile, nameForItem, limit, offset)
     C.Ensure(profile)
     local ordered = {}
@@ -1557,6 +2598,12 @@ function C.ExportSnapshot(profile, opts)
         guild = CopyGuild(cfg.guild),
         bankTab = cfg.bankTab,
         requestedItems = requestedItems,
+        eligibility = CopyEligibility(EnsureEligibility(cfg)),
+        rejections = CopyRejectionList(EnsureRejections(cfg)),
+        rejectionSeq = tonumber(cfg.rejectionSeq) or 0,
+        pendingWitnesses = CopyPendingWitnessList(EnsurePendingWitnesses(cfg)),
+        txnRegistry = CopyTxnRegistry(EnsureTxnRegistry(cfg)),
+        txnAllocSeq = tonumber(cfg.txnAllocSeq) or 0,
         events = events,
     }
 end
@@ -1676,6 +2723,9 @@ function C.ReplaceConfig(profile, payload)
         end
     end
     local cfg = C.Ensure(profile)
+    local priorGeneration = tonumber(cfg.generation) or 1
+    local priorGuid = type(cfg.guild) == "table" and cfg.guild.guid or nil
+    local priorTab = tonumber(cfg.bankTab)
     local generation = C.ValidGeneration(payload.generation)
     if generation then
         cfg.generation = generation
@@ -1697,6 +2747,22 @@ function C.ReplaceConfig(profile, payload)
     cfg.bankTab = tonumber(payload.bankTab)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
     cfg.requestedItems = RequestedFromPayload(payload)
+    local incomingGen = tonumber(cfg.generation) or priorGeneration
+    local incomingGuid = type(cfg.guild) == "table" and cfg.guild.guid or nil
+    local incomingTab = tonumber(cfg.bankTab)
+    -- Same generation/guild/tab: merge cutovers conservatively (later wins).
+    -- Generation/guild/tab change (Clear, reconfigure): take authoritative eligibility.
+    local scopeChanged = incomingGen ~= priorGeneration
+        or incomingGuid ~= priorGuid
+        or incomingTab ~= priorTab
+    if scopeChanged then
+        cfg.eligibility = CopyEligibility(payload.eligibility)
+    else
+        MergeEligibilityInto(cfg, payload.eligibility)
+    end
+    ReplaceRejectionsFromPayload(cfg, payload, { forceReplace = scopeChanged })
+    ReplacePendingWitnessesFromPayload(cfg, payload, { forceReplace = true })
+    ReplaceTxnRegistryFromPayload(cfg, payload)
     cfg.crafters = nil
     cfg.assignments = nil
     cfg.itemEpochs = nil
@@ -1752,11 +2818,19 @@ local function ReconcileAuthoritativeEvents(profile, events)
         if type(selfId) ~= "string" or selfId == "" then return false end
         return Rules and Rules.RemoteEventIdOk and Rules.RemoteEventIdOk(event.id, selfId) and true or false
     end
+    local function canonicalCredit(event)
+        return type(event) == "table"
+            and event.type == C.EVENT.DONATION
+            and event.source == "guildbank"
+            and ValidTxnId(event.txnId) ~= nil
+    end
     local function keepEvent(event)
         if type(event) ~= "table" or type(event.id) ~= "string" then return false end
         if keep[event.id] or unsent[event.id] then return true end
         -- Sent, then dropped before the coordinator stamped it. The id still names this client.
-        return authoredUnacked(event)
+        if authoredUnacked(event) then return true end
+        -- Incomplete coordinator snapshots must not erase Spectrum-owned credits.
+        return canonicalCredit(event)
     end
     local function filterList(list)
         local keptRows = {}
@@ -1776,15 +2850,28 @@ local function ReconcileAuthoritativeEvents(profile, events)
     local requeued = false
     for i = 1, #live do
         local event = live[i]
-        if authoredUnacked(event) then
+        -- Preserve third-party canonical credits locally, but only enqueue a
+        -- normal event resend when this client authored the event id. Foreign
+        -- credits recover through authorized history/snapshot paths instead.
+        local selfAuthoredCredit = canonicalCredit(event)
+            and not keep[event.id]
+            and not unsent[event.id]
+            and type(selfId) == "string"
+            and selfId ~= ""
+            and Rules and Rules.RemoteEventIdOk
+            and Rules.RemoteEventIdOk(event.id, selfId)
+        local shouldResend = authoredUnacked(event) or selfAuthoredCredit
+        if shouldResend then
             if type(queue) ~= "table" then
                 queue = {}
                 profile._consumablesUnsent = queue
             end
             if #queue >= maxEvents then break end
-            queue[#queue + 1] = event.id
-            unsent[event.id] = true
-            requeued = true
+            if not unsent[event.id] then
+                queue[#queue + 1] = event.id
+                unsent[event.id] = true
+                requeued = true
+            end
         end
     end
     if not liveRemoved and not archiveRemoved then return requeued end
@@ -1852,20 +2939,66 @@ function C.MergeSnapshot(profile, data, opts)
     local sessionActive = type(syncState) == "table" and syncState.active == true
     if opts.consumablesFromCoordinator == false then
         local Rules = SF.ConsumablesSync
+        local cfg = profile._consumables
         if type(data.events) == "table" and Rules and Rules.ApplyRemoteEvent and Rules.RelayWriter then
             local limit = #data.events
             local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
             if limit > maxEvents then limit = maxEvents end
             for i = 1, limit do
                 local event = data.events[i]
-                local order = type(event) == "table" and C.ValidOrder(event.order) or nil
-                if order and Rules.RelayWriter(event) then
-                    Rules.ApplyRemoteEvent(profile, event, nil, {
-                        coordinatorRelay = true,
-                        silent = true,
-                        skipGrantUse = true,
-                    })
+                -- RelayWriter binds event.id to event.writer. Local commits may lack
+                -- order until a coordinator flush; do not require order up front.
+                local writer = Rules.RelayWriter and Rules.RelayWriter(event) or nil
+                if writer then
+                    -- Accept previously stamped, writer-bound rows. Admin-authored
+                    -- rows always qualify. Stamped guildbank donations with a
+                    -- Spectrum txnId also qualify so three-witness credits
+                    -- (writer may be a non-admin witness) survive peer recovery.
+                    local stampedDonation = type(event) == "table"
+                        and event.type == C.EVENT.DONATION
+                        and ValidTxnId(event.txnId)
+                        and (not Rules.AuthoritativeEventBodyOk
+                            or Rules.AuthoritativeEventBodyOk(event))
+                    if C.IsCanonicalAdmin(profile, writer) or stampedDonation then
+                        Rules.ApplyRemoteEvent(profile, event, nil, {
+                            coordinatorRelay = true,
+                            silent = true,
+                            skipGrantUse = true,
+                        })
+                    end
                 end
+            end
+        end
+        -- Peer snapshots do not replace full config, but must union-merge the
+        -- canonical registry so recovery does not depend on re-authoring events.
+        -- Peers are not authorities for durable rejection lists: PreferRegistryEntry
+        -- already reconciles registry rejection↔approval by decidedAt.
+        if type(cfg) == "table" then
+            if type(data.txnRegistry) == "table" then
+                local filtered = {
+                    txnAllocSeq = data.txnAllocSeq,
+                    txnRegistry = {},
+                }
+                for i = 1, #data.txnRegistry do
+                    local row = data.txnRegistry[i]
+                    if type(row) == "table" and ValidTxnId(row.txnId) then
+                        local known = C.FindRegistryTxn(profile, row.txnId) ~= nil
+                            or (C.HasTxnId and C.HasTxnId(profile, row.txnId))
+                        local adminDecision = type(row.decidedBy) == "string"
+                            and row.decidedBy ~= ""
+                            and C.IsCanonicalAdmin(profile, row.decidedBy)
+                        -- After stamped events apply above, matching ledger txnIds
+                        -- authorize the registry row even when decidedBy was a witness.
+                        local hasLedger = C.HasTxnId and C.HasTxnId(profile, row.txnId)
+                        if known or adminDecision or hasLedger then
+                            filtered.txnRegistry[#filtered.txnRegistry + 1] = row
+                        end
+                    end
+                end
+                ReplaceTxnRegistryFromPayload(cfg, filtered)
+            end
+            if type(data.pendingWitnesses) == "table" then
+                ReplacePendingWitnessesFromPayload(cfg, data, { forceReplace = false })
             end
         end
         Notify()
@@ -1986,6 +3119,15 @@ function C.CopyConfiguration(source, dest)
         guild = CopyGuild(src.guild),
         bankTab = src.bankTab,
         requestedItems = CopyRequestedMap(src.requestedItems),
+        eligibility = CopyEligibility(EnsureEligibility(src)),
+        rejections = CopyRejectionList(EnsureRejections(src)),
+        rejectionSeq = tonumber(src.rejectionSeq) or 0,
+        pendingWitnesses = CopyPendingWitnessList(EnsurePendingWitnesses(src)),
+        -- Fresh ledger on the destination: do not copy canonical txn identities
+        -- without their donation events (would invite registry-only double credit).
+        txnRegistry = {},
+        txnAllocSeq = 0,
+        obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
     }
     Invalidate(dest)
     Invalidate(source)

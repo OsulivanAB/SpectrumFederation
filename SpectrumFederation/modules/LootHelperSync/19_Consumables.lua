@@ -36,6 +36,9 @@ local function SessionFor(profile)
 end
 
 local CONFIG_CATCHUP_GRACE = 15
+-- Newly elected coordinators wait this long for authorized peers to advertise
+-- richer consumables history before treating "no peer ahead" as completeness.
+Sync.CONSUMABLES_HISTORY_BASELINE_GRACE_SEC = 90
 
 local function LedgerMatches(localDesc, remote)
     localDesc = localDesc or {}
@@ -154,11 +157,191 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     local desc = C.Descriptor(profile)
     payload.consumablesGeneration = desc.generation
     payload.consumablesConfigSeq = desc.configSeq
+    payload.consumablesRejectionSeq = desc.rejectionSeq
+    payload.consumablesTxnAllocSeq = desc.txnAllocSeq
     payload.consumablesConfigFingerprint = desc.configFingerprint
     payload.consumablesEventCount = desc.eventCount
     payload.consumablesEventFingerprint = desc.eventFingerprint
     payload.consumablesArchiveCount = desc.archiveCount
     payload.consumablesArchiveFingerprint = desc.archiveFingerprint
+end
+
+function Sync:_MarkConsumablesHistoryBaseline(profile, reason)
+    if type(profile) ~= "table" then return end
+    local now = (self._Now and self:_Now()) or (Consumables() and Consumables().Now and Consumables().Now()) or 0
+    profile._consumablesHistoryBaselineAt = now
+    profile._consumablesHistoryUnconfirmedAt = now
+    Debug("Info", "consumables history baseline started (%s) at=%s",
+        tostring(reason or "promotion"), tostring(now))
+end
+
+-- Session-start / promotion: do not equate "no known richer peer" with complete history.
+function Sync:_OnBecameConsumablesCoordinator(wasCoordinator, reason)
+    if wasCoordinator == true or not (self.state and self.state.isCoordinator == true) then
+        return
+    end
+    if type(self.state.profileId) ~= "string" or not self.FindLocalProfileById then
+        return
+    end
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    if profile then
+        self:_MarkConsumablesHistoryBaseline(profile, reason)
+    end
+end
+
+function Sync:_RefreshConsumablesHistoryGate(profile)
+    if type(profile) ~= "table" then return end
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S then return end
+    local now = (self._Now and self:_Now()) or (C.Now and C.Now()) or 0
+    local wasBlocking = profile._consumablesPeerHistoryAhead
+        or tonumber(profile._consumablesHistoryUnconfirmedAt)
+    local caughtUpFromPeer = false
+    local remote = profile._consumablesCatchUpRemote
+    if type(remote) ~= "table" then
+        profile._consumablesPeerHistoryAhead = nil
+        profile._consumablesHistoryPeer = nil
+    else
+        local localDesc = C.Descriptor(profile)
+        -- Credit hold is history-scoped (events/registry/archive). Config-only drift
+        -- must not keep verification blocked after ledger recovery from a peer.
+        local historyBehind = S.PeerHistoryAhead and S.PeerHistoryAhead(localDesc, remote)
+        if not historyBehind then
+            if profile._consumablesPeerHistoryAhead then
+                caughtUpFromPeer = true
+            end
+            profile._consumablesPeerHistoryAhead = nil
+            profile._consumablesHistoryPeer = nil
+            profile._consumablesPeerRecoveryAt = nil
+            if not (S.NeedsCatchUp and S.NeedsCatchUp(localDesc, remote)) then
+                profile._consumablesCatchUpRemote = nil
+            end
+        end
+    end
+    -- Peer absorb that clears ahead ends the pre-advertisement hold entirely.
+    if caughtUpFromPeer then
+        profile._consumablesHistoryUnconfirmedAt = nil
+        profile._consumablesHistoryBaselineAt = nil
+    elseif not profile._consumablesPeerHistoryAhead then
+        -- Grace ends the hold, but keep baselineAt so reevaluation still applies
+        -- conservative clearly-new checks before minting.
+        local unconfirmedAt = tonumber(profile._consumablesHistoryUnconfirmedAt)
+        local grace = tonumber(self.CONSUMABLES_HISTORY_BASELINE_GRACE_SEC) or 90
+        if unconfirmedAt and (now - unconfirmedAt) >= grace then
+            profile._consumablesHistoryUnconfirmedAt = nil
+        end
+    end
+    local stillBlocking = profile._consumablesPeerHistoryAhead
+        or tonumber(profile._consumablesHistoryUnconfirmedAt)
+    if wasBlocking and not stillBlocking and self._ReevaluateHeldConsumablesObservations then
+        -- Gate-unblock transitions must always reevaluate (bypass spam cooldown).
+        self:_ReevaluateHeldConsumablesObservations(profile, { force = true })
+    end
+end
+
+function Sync:_NotePeerConsumablesHistory(sender, payload)
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or type(payload) ~= "table" then return end
+    if not (self.state and self.state.active and self.state.isCoordinator) then return end
+    if payload.profileId ~= self.state.profileId then return end
+    if payload.sessionId and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
+        return
+    end
+    -- Ignore self-advertisements; peer recovery is for other authorized members.
+    local selfId = nil
+    if type(self._SelfId) == "function" then
+        selfId = self:_SelfId()
+    end
+    if type(sender) == "string" and type(selfId) == "string" and self._SamePlayer
+        and self:_SamePlayer(sender, selfId) then
+        return
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return end
+    local peerDesc = {
+        generation = payload.consumablesGeneration,
+        configSeq = payload.consumablesConfigSeq,
+        rejectionSeq = payload.consumablesRejectionSeq,
+        txnAllocSeq = payload.consumablesTxnAllocSeq,
+        configFingerprint = payload.consumablesConfigFingerprint,
+        eventCount = payload.consumablesEventCount,
+        eventFingerprint = payload.consumablesEventFingerprint,
+        archiveCount = payload.consumablesArchiveCount,
+        archiveFingerprint = payload.consumablesArchiveFingerprint,
+    }
+    local localDesc = C.Descriptor(profile)
+    if not (S.PeerHistoryAhead and S.PeerHistoryAhead(localDesc, peerDesc)) then
+        self:_RefreshConsumablesHistoryGate(profile)
+        return
+    end
+    -- Only recover from canonical admins. Ordinary members cannot seed verified history.
+    if not C.IsCanonicalAdmin(profile, sender) then
+        return
+    end
+    profile._consumablesCatchUpRemote = (S.MergeHistoryWatermark and S.MergeHistoryWatermark(
+        profile._consumablesCatchUpRemote, peerDesc)) or peerDesc
+    profile._consumablesPeerHistoryAhead = true
+    profile._consumablesHistoryPeer = sender
+    Debug("Info", "coordinator holding consumables credits until peer history converges from %s",
+        tostring(sender))
+    -- Ask the ahead authorized peer for a consumables snapshot even when they are
+    -- not the original event writer (and not the session helper).
+    self:_MaybeRequestConsumablesPeerHistory(profile, sender)
+end
+
+-- Request NEED_PROFILE from an authorized peer holding richer consumables history.
+-- @param profile table
+-- @param preferredTarget string|nil
+-- @return boolean
+function Sync:_MaybeRequestConsumablesPeerHistory(profile, preferredTarget)
+    if type(profile) ~= "table" then return false end
+    if not (self.state and self.state.active and self.state.isCoordinator) then return false end
+    if not self.RequestProfileSnapshot then return false end
+    local C = Consumables()
+    local target = preferredTarget or profile._consumablesHistoryPeer
+    if type(target) ~= "string" or target == "" then return false end
+    if C and C.IsCanonicalAdmin and not C.IsCanonicalAdmin(profile, target) then
+        return false
+    end
+    local now = self._Now and self:_Now() or 0
+    local lastAt = tonumber(profile._consumablesPeerRecoveryAt)
+    if lastAt and (now - lastAt) < 120 then
+        return false
+    end
+    local requested = self:RequestProfileSnapshot("consumables-peer-history", {
+        preferredTarget = target,
+        acceptAuthorizedAdmins = true,
+        consumablesHistoryOnly = true,
+    }) and true or false
+    if requested then
+        profile._consumablesPeerRecoveryAt = now
+        Debug("Info", "requesting consumables history recovery from authorized peer %s", tostring(target))
+    end
+    return requested
+end
+
+function Sync:_ConsumablesHistoryReady(profile)
+    if type(profile) ~= "table" then return true end
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S then return true end
+    self:_RefreshConsumablesHistoryGate(profile)
+    if profile._consumablesPeerHistoryAhead then return false end
+    -- Newly elected coordinator: wait for peer advertisements or grace expiry.
+    if tonumber(profile._consumablesHistoryUnconfirmedAt) then
+        return false
+    end
+    local remote = profile._consumablesCatchUpRemote
+    if type(remote) ~= "table" then return true end
+    if S.PeerHistoryAhead then
+        return not S.PeerHistoryAhead(C.Descriptor(profile), remote)
+    end
+    if S.NeedsCatchUp then
+        return not S.NeedsCatchUp(C.Descriptor(profile), remote)
+    end
+    return true
 end
 
 function Sync:_ConsiderConsumablesCatchUp(payload, opts)
@@ -178,6 +361,8 @@ function Sync:_ConsiderConsumablesCatchUp(payload, opts)
     local remote = {
         generation = payload.consumablesGeneration,
         configSeq = payload.consumablesConfigSeq,
+        rejectionSeq = payload.consumablesRejectionSeq,
+        txnAllocSeq = payload.consumablesTxnAllocSeq,
         configFingerprint = payload.consumablesConfigFingerprint,
         eventCount = payload.consumablesEventCount,
         eventFingerprint = payload.consumablesEventFingerprint,
@@ -833,6 +1018,9 @@ function Sync:HandleConsumablesEvent(sender, payload)
     end
     if isCoordinator and ok and not hadOrder and C.StampOrder then
         if not C.StampOrder(profile, event) then return end
+        if self._RefreshConsumablesHistoryGate then
+            self:_RefreshConsumablesHistoryGate(profile)
+        end
         self:BroadcastConsumablesEvent(profile, event)
         return
     end
@@ -840,11 +1028,473 @@ function Sync:HandleConsumablesEvent(sender, payload)
         and S.RemoteEventIdOk and S.RemoteEventIdOk(event.id, sender) then
         local stamped = type(stored) == "table" and stored or nil
         if type(stamped) == "table" and C.ValidOrder(stamped.order) ~= nil then
+            if self._RefreshConsumablesHistoryGate then
+                self:_RefreshConsumablesHistoryGate(profile)
+            end
             self:BroadcastConsumablesEvent(profile, stamped)
         end
         return
     end
+    if isCoordinator and ok and self._RefreshConsumablesHistoryGate then
+        self:_RefreshConsumablesHistoryGate(profile)
+    end
     if not ok and status ~= "duplicate" then
         Debug("Verbose", "Ignored consumables event from %s (%s)", tostring(sender), tostring(status))
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Guild Bank observation reports, admin review, and decisions (Issue #366 PR2)
+-- ---------------------------------------------------------------------------
+
+local function ObservationDB()
+    local db = SF.lootHelperDB
+    if type(db) ~= "table" then
+        db = {}
+        SF.lootHelperDB = db
+    end
+    return db
+end
+
+local function ObservationScopeFor(profile)
+    local C = Consumables()
+    local O = SF.ConsumablesObservation
+    if not C or not O or type(profile) ~= "table" then return nil, nil, nil end
+    local cfg = C.Ensure(profile)
+    if type(cfg.guild) ~= "table" or type(cfg.guild.guid) ~= "string" then return nil, nil, nil end
+    local tab = tonumber(cfg.bankTab)
+    if not tab then return nil, nil, nil end
+    local profileId = ProfileIdOf(profile)
+    local store = O.EnsureProfileStore(ObservationDB(), profileId)
+    if not store then return nil, nil, nil end
+    local scope = O.EnsureScope(store, cfg.guild.guid, tab)
+    return store, scope, { guildGuid = cfg.guild.guid, bankTab = tab, profileId = profileId }
+end
+
+-- Bounded coordinator retry of already-authenticated pending clusters when the
+-- history gate transitions to ready. Does not trust peer witness maps.
+-- opts.force: gate-unblock transitions bypass the spam cooldown.
+function Sync:_ReevaluateHeldConsumablesObservations(profile, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" then return end
+    if not (self.state and self.state.active and self.state.isCoordinator) then return end
+    if self:_ConsumablesHistoryReady(profile) == false then return end
+    local V = SF.ConsumablesVerification
+    local C = Consumables()
+    if not V or not V.ReevaluateHeldClusters or not C then return end
+    local _, _, meta = ObservationScopeFor(profile)
+    if not meta then return end
+    local now = (self._Now and self:_Now()) or (C.Now and C.Now()) or 0
+    local lastAt = tonumber(profile._consumablesHistoryReevalAt)
+    if not opts.force and lastAt and (now - lastAt) < 5 then
+        -- Non-transition spam path: one delayed retry so a real transition that
+        -- raced the cooldown still runs. Force path never takes this branch.
+        if not profile._consumablesHistoryReevalPending and self.RunAfter then
+            profile._consumablesHistoryReevalPending = true
+            local delay = 5 - (now - lastAt) + 0.05
+            if delay < 0.05 then delay = 0.05 end
+            self:RunAfter(delay, function()
+                profile._consumablesHistoryReevalPending = nil
+                if self._ReevaluateHeldConsumablesObservations then
+                    self:_ReevaluateHeldConsumablesObservations(profile, { force = true })
+                end
+            end)
+        end
+        return
+    end
+    profile._consumablesHistoryReevalAt = now
+    profile._consumablesHistoryReevalPending = nil
+    local stats = V.ReevaluateHeldClusters(profile, meta.profileId, {
+        historyComplete = true,
+        historyBaselineAt = tonumber(profile._consumablesHistoryBaselineAt),
+        clearPendingWitness = function(evidence)
+            if C.ClearPendingWitness then
+                C.ClearPendingWitness(profile, evidence)
+            end
+        end,
+    })
+    if ((stats.verified or 0) > 0 or (stats.committed or 0) > 0)
+        and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(profile)
+    end
+    if (stats.committed or 0) > 0 and self._FlushUnsentConsumablesEvents then
+        self:_FlushUnsentConsumablesEvents(profile)
+    end
+    Debug("Info", "reevaluated held consumables observations verified=%s adopted=%s committed=%s pending=%s",
+        tostring(stats.verified), tostring(stats.adopted),
+        tostring(stats.committed), tostring(stats.pending))
+end
+
+function Sync:_FlushPendingConsumableObservations(profile)
+    if not SessionFor(profile) then return end
+    if not (self.state and self.state.active and SF.LootHelperComm and self.MSG) then return end
+    if self.IsSafeModeEnabled and self:IsSafeModeEnabled() then return end
+    local V = SF.ConsumablesVerification
+    local O = SF.ConsumablesObservation
+    if not V or not O then return end
+    local store, scope, meta = ObservationScopeFor(profile)
+    if not store or not meta then return end
+    local batch, hasMore, remaining = V.CollectUnresolvedForSubmit(store, meta.guildGuid, meta.bankTab, {
+        profileId = meta.profileId,
+    })
+    if #batch == 0 then
+        return
+    end
+    local payload = {
+        sessionId = self.state.sessionId,
+        profileId = meta.profileId,
+        observations = batch,
+    }
+    local accepted = false
+    if self.state.isCoordinator then
+        accepted = self:HandleConsumablesObsReport(self._SelfId and self:_SelfId() or "", payload) == true
+    else
+        local coordinator = self.state.coordinator
+        if type(coordinator) ~= "string" or coordinator == "" then return end
+        if not self:_ConsumablesCoordinatorAccepts() then return end
+        accepted = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_REPORT, payload, "WHISPER", coordinator, "NORMAL") ~= false
+    end
+    -- Do not retire submitted keys after a rejected/dropped page (limiter/backpressure).
+    if not accepted then
+        Debug("Verbose", "consumable observation page not accepted; submitted keys retained")
+        return
+    end
+    if V.MarkObservationsSubmitted then
+        V.MarkObservationsSubmitted(store, batch, meta.profileId)
+    end
+    Debug("Info", "submitted %s unresolved consumable observations (remaining=%s)",
+        tostring(#batch), tostring(remaining - #batch))
+    -- Continue draining later batches without flooding the coordinator.
+    if hasMore then
+        if not self._consumablesObsFlushScheduled then
+            self._consumablesObsFlushScheduled = true
+            local function continueFlush()
+                self._consumablesObsFlushScheduled = false
+                if self._FlushPendingConsumableObservations then
+                    self:_FlushPendingConsumableObservations(profile)
+                end
+            end
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0.35, continueFlush)
+            else
+                continueFlush()
+            end
+        end
+    end
+end
+
+local function BroadcastObsDecision(self, profileId, decision)
+    if not (self.state and self.state.active and SF.LootHelperComm and self.MSG) then return end
+    local notice = {
+        sessionId = self.state.sessionId,
+        profileId = profileId,
+        decision = decision,
+    }
+    local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("ConsumablesObsDecision")
+    if dist then
+        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_DECISION, notice, dist, nil, "NORMAL")
+    end
+end
+
+function Sync:HandleConsumablesObsReport(sender, payload)
+    if not SessionPayloadOk(payload, sender) then return false end
+    if not (self.state and self.state.isCoordinator) then return false end
+    local C = Consumables()
+    local V = SF.ConsumablesVerification
+    if not C or not V or type(payload.observations) ~= "table" then return false end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return false end
+    self._consumablesObsLimits = self._consumablesObsLimits or {}
+    local now = (C.Now and C.Now()) or 0
+    local S = Rules()
+    local selfId = self._SelfId and self:_SelfId() or ""
+    local isSelf = type(selfId) == "string" and selfId ~= ""
+        and self._SamePlayer and self:_SamePlayer(sender, selfId)
+    -- One remote-op credit per report message. Charging per observation made a
+    -- full MAX_OBS_BATCH page exceed the window and drop valid pages.
+    if not isSelf and S and S.AllowRemoteOp then
+        if not S.AllowRemoteOp(self._consumablesObsLimits, sender, now) then
+            return false
+        end
+    end
+    local store, scope, meta = ObservationScopeFor(profile)
+    if not meta then return false end
+    local isAdmin = C.IsCanonicalAdmin(profile, sender)
+    local historyReady = true
+    if self._ConsumablesHistoryReady then
+        historyReady = self:_ConsumablesHistoryReady(profile) ~= false
+    end
+    local historyBaselineAt = tonumber(profile._consumablesHistoryBaselineAt)
+    local stats = V.IngestReport(profile, meta.profileId, sender, payload.observations, {
+        isAdmin = isAdmin,
+        scope = scope,
+        obsStore = store,
+        guildGuid = meta.guildGuid,
+        bankTab = meta.bankTab,
+        eligibility = C.EligibilitySnapshot and C.EligibilitySnapshot(profile) or nil,
+        durableRejections = C.DurableRejections and C.DurableRejections(profile) or nil,
+        historyComplete = historyReady,
+        historyBaselineAt = historyBaselineAt,
+        isRequested = function(itemId)
+            return C.IsRequested(profile, itemId)
+        end,
+        recordPendingWitness = function(evidence, submittedBy, witnessMap)
+            if C.UpsertPendingWitness then
+                C.UpsertPendingWitness(profile, evidence, submittedBy, witnessMap)
+            end
+        end,
+        clearPendingWitness = function(evidence)
+            if C.ClearPendingWitness then
+                C.ClearPendingWitness(profile, evidence)
+            end
+        end,
+    })
+    Debug("Info", "obs report from %s accepted=%s verified=%s skipped=%s historyReady=%s",
+        tostring(sender), tostring(stats.accepted), tostring(stats.verified),
+        tostring(stats.skipped), tostring(historyReady))
+    if ((stats.witnessChanged or 0) > 0 or (stats.verified or 0) > 0)
+        and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(profile)
+    end
+    local verified = V.ListVerifiedClusters(meta.profileId)
+    for i = 1, #verified do
+        local cluster = verified[i]
+        if cluster and not cluster._committed then
+            -- Prefer an admin/coordinator stamp writer so peer-recovery filters can
+            -- re-admit three-witness credits; verification mode retains provenance.
+            local writer = cluster.decidedBy or (self._SelfId and self:_SelfId()) or sender
+            local selfId = self._SelfId and self:_SelfId() or nil
+            if cluster.verification == V.VERIFICATION.WITNESSES then
+                if type(selfId) == "string" and C.IsCanonicalAdmin(profile, selfId) then
+                    writer = selfId
+                elseif type(sender) == "string" and C.IsCanonicalAdmin(profile, sender) then
+                    writer = sender
+                end
+            end
+            local ok, commitStatus = V.CommitVerifiedCluster(profile, cluster, writer)
+            if ok then
+                cluster._committed = true
+                if scope and cluster.txnId then
+                    scope.verifiedTxnIds = scope.verifiedTxnIds or {}
+                    scope.verifiedTxnIds[cluster.txnId] = true
+                end
+                local decision = {
+                    action = "verified",
+                    txnId = cluster.txnId,
+                    verification = cluster.verification,
+                    evidence = cluster.evidence and V.SerializeObservation(cluster.evidence) or cluster.evidence,
+                    decidedBy = writer,
+                    clusterId = cluster.clusterId,
+                    profileId = meta.profileId,
+                }
+                if store and meta then
+                    V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decision)
+                end
+                -- Followers must learn automatic verification or they keep re-reporting.
+                BroadcastObsDecision(self, meta.profileId, decision)
+            elseif commitStatus ~= "duplicate" then
+                Debug("Warn", "verified cluster commit failed txn=%s status=%s",
+                    tostring(cluster.txnId), tostring(commitStatus))
+            end
+        end
+    end
+    self:_FlushUnsentConsumablesEvents(profile)
+    return true
+end
+
+function Sync:RequestConsumablesReviewSummary(profile)
+    if not SessionFor(profile) then return false end
+    local C = Consumables()
+    if not C then return false end
+    local who = self._SelfId and self:_SelfId() or nil
+    if not C.IsCanonicalAdmin(profile, who) then return false end
+    local payload = {
+        sessionId = self.state.sessionId,
+        profileId = ProfileIdOf(profile),
+    }
+    if self.state.isCoordinator then
+        self:HandleConsumablesReviewReq(who, payload)
+        return true
+    end
+    local coordinator = self.state.coordinator
+    if type(coordinator) ~= "string" or coordinator == "" then return false end
+    return SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_REVIEW_REQ, payload, "WHISPER", coordinator, "NORMAL") ~= false
+end
+
+function Sync:HandleConsumablesReviewReq(sender, payload)
+    if not SessionPayloadOk(payload, sender) then return end
+    if not (self.state and self.state.isCoordinator) then return end
+    local C = Consumables()
+    local V = SF.ConsumablesVerification
+    if not C or not V then return end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile or not C.IsCanonicalAdmin(profile, sender) then return end
+    local summary = V.ReviewSummary(payload.profileId, { profile = profile })
+    local response = {
+        sessionId = self.state.sessionId,
+        profileId = payload.profileId,
+        pending = summary,
+    }
+    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_REVIEW_SUMMARY, response, "WHISPER", sender, "NORMAL")
+    Debug("Info", "sent review summary (%s) to %s", tostring(#summary), tostring(sender))
+end
+
+function Sync:HandleConsumablesReviewSummary(sender, payload)
+    if not SessionPayloadOk(payload, sender) then return end
+    local coordinator = self.state and self.state.coordinator
+    if not (type(coordinator) == "string" and self._SamePlayer and self:_SamePlayer(sender, coordinator)) then
+        return
+    end
+    if self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then
+        Debug("Verbose", "Ignored review summary from unproven coordinator %s", tostring(sender))
+        return
+    end
+    if self._RouteWasRevoked and self:_RouteWasRevoked(sender) then
+        Debug("Verbose", "Ignored review summary from revoked coordinator %s", tostring(sender))
+        return
+    end
+    self._consumablesReviewSummary = type(payload.pending) == "table" and payload.pending or {}
+    self._consumablesReviewSummaryAt = (Consumables() and Consumables().Now and Consumables().Now()) or time()
+    local C = Consumables()
+    if C and C.NotifyUI then
+        C.NotifyUI()
+    end
+    Debug("Info", "received review summary rows=%s", tostring(#self._consumablesReviewSummary))
+end
+
+function Sync:SubmitConsumablesObsDecision(profile, decision)
+    if not SessionFor(profile) or type(decision) ~= "table" then return false end
+    local C = Consumables()
+    if not C then return false end
+    local who = self._SelfId and self:_SelfId() or nil
+    if not C.IsCanonicalAdmin(profile, who) then return false end
+    local payload = {
+        sessionId = self.state.sessionId,
+        profileId = ProfileIdOf(profile),
+        decision = decision,
+    }
+    if self.state.isCoordinator then
+        self:HandleConsumablesObsDecision(who, payload)
+        return true
+    end
+    local coordinator = self.state.coordinator
+    if type(coordinator) ~= "string" or coordinator == "" then return false end
+    return SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_DECISION, payload, "WHISPER", coordinator, "NORMAL") ~= false
+end
+
+function Sync:HandleConsumablesObsDecision(sender, payload)
+    if not SessionPayloadOk(payload, sender) then return end
+    local C = Consumables()
+    local V = SF.ConsumablesVerification
+    if not C or not V or type(payload.decision) ~= "table" then return end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return end
+
+    -- Followers only apply coordinator-distributed decision notices.
+    if not (self.state and self.state.isCoordinator) then
+        local coordinator = self.state and self.state.coordinator
+        if not (type(coordinator) == "string" and self._SamePlayer and self:_SamePlayer(sender, coordinator)) then
+            return
+        end
+        if self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then
+            Debug("Verbose", "Ignored obs decision from unproven coordinator %s", tostring(sender))
+            return
+        end
+        if self._RouteWasRevoked and self:_RouteWasRevoked(sender) then
+            Debug("Verbose", "Ignored obs decision from revoked coordinator %s", tostring(sender))
+            return
+        end
+        local store, _, meta = ObservationScopeFor(profile)
+        local decision = payload.decision
+        if store and meta then
+            V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decision)
+        end
+        -- Keep durable rejection state aligned with coordinator notices without
+        -- bumping rejectionSeq (config snapshots remain the authority clock).
+        local evidence = decision and (decision.evidence or decision) or nil
+        if evidence then
+            if decision.action == "reject" and C.RecordDurableRejection then
+                C.RecordDurableRejection(profile, evidence, decision.decidedBy, decision.reason, {
+                    bumpSeq = false,
+                })
+            elseif decision.action == "correct" and C.ClearDurableRejection then
+                C.ClearDurableRejection(profile, evidence, { bumpSeq = false })
+            end
+        end
+        if C.NotifyUI then C.NotifyUI() end
+        return
+    end
+
+    -- Coordinator: authenticated admin decisions only (never trust client isAdmin).
+    if not C.IsCanonicalAdmin(profile, sender) then return end
+    local store, scope, meta = ObservationScopeFor(profile)
+    local historyReady = true
+    if self._ConsumablesHistoryReady then
+        historyReady = self:_ConsumablesHistoryReady(profile) ~= false
+    end
+    local ok, status, cluster = V.ApplyDecision(profile, payload.profileId, sender, payload.decision, {
+        isAdmin = true,
+        scope = scope,
+        obsStore = store,
+        historyComplete = historyReady,
+        historyBaselineAt = tonumber(profile._consumablesHistoryBaselineAt),
+        recordDurableRejection = function(evidence, decidedBy, reason)
+            if C.RecordDurableRejection then
+                C.RecordDurableRejection(profile, evidence, decidedBy, reason)
+            end
+        end,
+        clearDurableRejection = function(evidence)
+            if C.ClearDurableRejection then
+                C.ClearDurableRejection(profile, evidence)
+            end
+        end,
+        clearPendingWitness = function(evidence)
+            if C.ClearPendingWitness then
+                C.ClearPendingWitness(profile, evidence)
+            end
+        end,
+    })
+    if not ok then
+        Debug("Verbose", "ignored obs decision from %s (%s)", tostring(sender), tostring(status))
+        return
+    end
+    local decisionNotice = {
+        action = payload.decision.action,
+        clusterId = cluster and cluster.clusterId or payload.decision.clusterId,
+        txnId = cluster and cluster.txnId or nil,
+        verification = cluster and cluster.verification or nil,
+        decidedBy = sender,
+        evidence = cluster and V.SerializeObservation(cluster.evidence) or payload.decision.evidence,
+        reason = payload.decision.reason,
+        profileId = payload.profileId,
+    }
+    if status == "verified" and cluster then
+        local commitOk, commitStatus = V.CommitVerifiedCluster(profile, cluster, sender)
+        if not commitOk and commitStatus ~= "duplicate" then
+            -- Keep the row reviewable; do not announce a credit that never landed.
+            cluster.status = "pending"
+            cluster.verification = nil
+            cluster._committed = false
+            Debug("Warn", "approval commit failed; not broadcasting txn=%s status=%s",
+                tostring(cluster.txnId), tostring(commitStatus))
+            return
+        end
+        cluster._committed = true
+        decisionNotice.action = payload.decision.action == "correct" and "correct" or "approve"
+        decisionNotice.txnId = cluster.txnId
+        decisionNotice.verification = cluster.verification
+        self:_FlushUnsentConsumablesEvents(profile)
+    elseif status == "rejected" then
+        decisionNotice.action = "reject"
+    end
+    BroadcastObsDecision(self, payload.profileId, decisionNotice)
+    if store and meta then
+        V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decisionNotice)
+    end
+    -- Push rejectionSeq-backed durable state so followers/promotions converge.
+    if (status == "rejected" or payload.decision.action == "correct")
+        and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(profile)
+    end
+    if C.NotifyUI then C.NotifyUI() end
 end

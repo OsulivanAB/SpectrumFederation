@@ -853,6 +853,9 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
+    if self._OnBecameConsumablesCoordinator then
+        self:_OnBecameConsumablesCoordinator(false, "StartSession")
+    end
     -- A stale admin list can pass CanSelfCoordinate and then lose that
     -- authority when history is rebuilt. The session has not been announced.
     -- Do not mark backfill, record this peer as an admin, or start convergence.
@@ -896,6 +899,13 @@ function Sync:_ResetSessionState(reason)
     if earlyPrep and earlyPrep.OnSessionReset then
         earlyPrep:OnSessionReset(reason)
     end
+    if SF.ConsumablesVerification and SF.ConsumablesVerification.ClearSessionClusters then
+        SF.ConsumablesVerification.ClearSessionClusters()
+    end
+    -- Stale review rows can reuse clusterIds (cl:1) after reset; clear the UI cache.
+    self._consumablesReviewSummary = nil
+    self._consumablesReviewSummaryAt = nil
+    self._consumablesObsFlushScheduled = nil
 
     if SF.Debug then
         local outstandingReqCount = 0
@@ -1222,6 +1232,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
         if self.BackfillAutomaticBisOnPromotion then
             self:BackfillAutomaticBisOnPromotion(false, "TakeoverSession")
         end
+        if self._OnBecameConsumablesCoordinator then
+            self:_OnBecameConsumablesCoordinator(false, "TakeoverSession")
+        end
         self:ReannounceSession()
         return true
     end
@@ -1450,6 +1463,9 @@ function Sync:ReannounceSession()
         local announcedProfile = self:FindLocalProfileById(profileId)
         if announcedProfile then
             self:_FlushUnsentConsumablesEvents(announcedProfile)
+            if self._FlushPendingConsumableObservations then
+                self:_FlushPendingConsumableObservations(announcedProfile)
+            end
         end
     end
 

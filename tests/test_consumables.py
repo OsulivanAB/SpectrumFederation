@@ -12,9 +12,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS = REPO_ROOT / "tests" / "lua" / "consumables_tests.lua"
 OBSERVATION_TESTS = REPO_ROOT / "tests" / "lua" / "consumables_observation_tests.lua"
+VERIFICATION_TESTS = REPO_ROOT / "tests" / "lua" / "consumables_verification_tests.lua"
 RUNTIME = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesRuntime.lua"
 WORKFLOW = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesWorkflow.lua"
 OBSERVATION = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesObservation.lua"
+VERIFICATION = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesVerification.lua"
 BANK_LOG = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesBankLog.lua"
 SYNC_TRANSPORT = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "19_Consumables.lua"
 
@@ -60,6 +62,23 @@ def test_consumables_observation_production_lua():
     assert re.search(r"(?m)^\d+ passed, 0 failed$", result.stdout), result.stdout
 
 
+def test_consumables_verification_production_lua():
+    result = subprocess.run(
+        [_lua51(), str(VERIFICATION_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Raid Consumables verification tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert re.search(r"(?m)^\d+ passed, 0 failed$", result.stdout), result.stdout
+
+
 def test_consumables_runtime_is_guild_bank_deposit_only():
     root = REPO_ROOT / "SpectrumFederation" / "modules"
     paths = list(root.rglob("Consumables*.lua")) + [SYNC_TRANSPORT]
@@ -95,6 +114,13 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "DepositEvents" not in observation
     assert "CommitEvents" not in bank_log
     assert "DepositEvents" not in bank_log
+    verification = VERIFICATION.read_text(encoding="utf-8")
+    assert "WITNESS_THRESHOLD" in verification
+    assert "admin_trust" in verification
+    assert "goldValueCopper" in verification
+    assert "DepositEvents(" not in runtime
+    assert "Contribution credit waits for Guild Bank verification" in runtime
+    assert "CONSUMABLES_OBS_REPORT" in SYNC_TRANSPORT.read_text(encoding="utf-8")
     assert "SF.ConsumablesBankLog:Init()" in runtime
     assert "ConsumablesBankLog:OnProfileMaybeChanged" in runtime
     assert "ScheduleRescan" not in bank_log
@@ -210,19 +236,32 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
     runtime_at = toc.find("modules/LootHelper/ConsumablesRuntime.lua")
     domain_at = toc.find("modules/LootHelper/Consumables.lua")
     observation_at = toc.find("modules/LootHelper/ConsumablesObservation.lua")
+    verification_at = toc.find("modules/LootHelper/ConsumablesVerification.lua")
     bank_log_at = toc.find("modules/LootHelper/ConsumablesBankLog.lua")
     assert locale_at != -1, "locale/enUS.lua must be listed in the parent TOC"
     assert locale_at < domain_at < runtime_at
-    assert domain_at < observation_at < bank_log_at < runtime_at
+    assert domain_at < observation_at < verification_at < bank_log_at < runtime_at
 
+    logs_page = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidConsumableLogs.lua"
+    ).read_text(encoding="utf-8")
     for key in (
         "RAID_SUPPLIES_OVERALL_PROGRESS",
         "RAID_SUPPLIES_NO_GOALS_CONFIGURED",
         "RAID_SUPPLIES_NO_GOAL",
         "RAID_SUPPLIES_GOAL_ALREADY_MET",
+        "RAID_CONSUMABLE_LOGS_HELP",
+        "RAID_CONSUMABLE_LOGS_TITLE",
+        "RAID_CONSUMABLE_REVIEW_TITLE",
+        "RAID_CONSUMABLE_REVIEW_HELP",
+        "RAID_CONSUMABLE_REVIEW_APPROVE",
+        "RAID_CONSUMABLE_REVIEW_REJECT",
+        "RAID_CONSUMABLE_REVIEW_CORRECT",
+        "RAID_CONSUMABLE_REVIEW_SELECTED",
+        "RAID_CONSUMABLE_REVIEW_ROW",
     ):
         assert f'L["{key}"]' in locale, key
-        assert key in domain or key in runtime, key
+        assert key in domain or key in runtime or key in logs_page, key
 
     assert "function ns.LocaleText" in locale
     assert 'Loc("RAID_SUPPLIES_OVERALL_PROGRESS"' in runtime

@@ -174,6 +174,11 @@ function S.CoordinatorConfigDiffers(localDesc, remote)
     local remoteSeq = tonumber(remote.configSeq)
     if remoteGen and remoteGen ~= (localDesc.generation or 1) then return true end
     if remoteSeq and remoteSeq ~= (localDesc.configSeq or 0) then return true end
+    local remoteRej = tonumber(remote.rejectionSeq)
+    local localRej = tonumber(localDesc.rejectionSeq)
+    if remoteRej and localRej and remoteRej ~= localRej then return true end
+    -- txnAllocSeq is a local allocator watermark, not shared config identity.
+    -- Ahead-only catch-up still uses it via NeedsCatchUp / PeerHistoryAhead.
     local remoteFp = tonumber(remote.configFingerprint)
     local localFp = tonumber(localDesc.configFingerprint)
     if remoteFp and localFp and remoteFp ~= localFp then return true end
@@ -187,6 +192,7 @@ function S.CatchUpKind(localDesc, remote)
     local ahead = (tonumber(remote.generation) or 0) > (localDesc.generation or 1)
         or (tonumber(remote.configSeq) or 0) > (localDesc.configSeq or 0)
         or (tonumber(remote.eventCount) or 0) > (localDesc.eventCount or 0)
+        or (tonumber(remote.txnAllocSeq) or 0) > (localDesc.txnAllocSeq or 0)
     if ahead then return "ahead" end
     return "fingerprint"
 end
@@ -211,7 +217,10 @@ function S.AuthoritativeEventBodyOk(event)
     if event.type == C.EVENT.DONATION then
         if event.source ~= "guildbank" then return false end
         if type(event.actor) ~= "string" or event.actor == "" then return false end
-        return PositiveQuantity(event)
+        if not PositiveQuantity(event) then return false end
+        -- Post-migration: reject legacy donation rows that lack verified provenance.
+        if not (C.ValidTxnId and C.ValidTxnId(event.txnId)) then return false end
+        return true
     end
     if event.type == C.EVENT.RESET then
         return type(event.actor) == "string" and event.actor ~= ""
@@ -269,12 +278,27 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.DONATION then
-        -- Guild-bank deposits only. The depositor client is authoritative.
+        -- Verified Guild Bank provenance: donor (actor) may differ from writer.
         if event.source ~= "guildbank" then
             return false, "unauthorized"
         end
-        if not (event.actor and Same(event.actor, writer) and PositiveQuantity(event)) then
+        if not (event.actor and PositiveQuantity(event)) then
             return false, "unauthorized"
+        end
+        local txnId = C.ValidTxnId and C.ValidTxnId(event.txnId)
+        if not txnId then
+            return false, "unauthorized"
+        end
+        if opts.coordinatorRelay then
+            -- Coordinator already validated; writer must own the event id.
+            if not writer then
+                return false, "unauthorized"
+            end
+        else
+            -- Non-admins cannot insert canonical contributions over the wire.
+            if not C.IsCanonicalAdmin(profile, writer) then
+                return false, "unauthorized"
+            end
         end
     else
         -- Receipt/custody/trade events are no longer accepted.
@@ -294,15 +318,17 @@ function S.NeedsCatchUp(localDesc, remote)
     local remoteGen = tonumber(remote.generation)
     local remoteSeq = tonumber(remote.configSeq)
     local remoteEvents = tonumber(remote.eventCount)
+    local remoteAlloc = tonumber(remote.txnAllocSeq)
     local remoteArchiveCount = tonumber(remote.archiveCount)
     local remoteArchiveFingerprint = tonumber(remote.archiveFingerprint)
-    if not remoteGen and not remoteSeq and not remoteEvents
+    if not remoteGen and not remoteSeq and not remoteEvents and not remoteAlloc
         and not remoteArchiveCount and not remoteArchiveFingerprint then
         return false
     end
     if remoteGen and remoteGen > (localDesc.generation or 1) then return true end
     if remoteSeq and remoteSeq > (localDesc.configSeq or 0) then return true end
     if remoteEvents and remoteEvents > (localDesc.eventCount or 0) then return true end
+    if remoteAlloc and remoteAlloc > (localDesc.txnAllocSeq or 0) then return true end
     local remoteFingerprint = tonumber(remote.eventFingerprint)
     local localFingerprint = tonumber(localDesc.eventFingerprint)
     if remoteFingerprint and localFingerprint and remoteFingerprint ~= localFingerprint then
@@ -316,4 +342,54 @@ function S.NeedsCatchUp(localDesc, remote)
         return true
     end
     return false
+end
+
+-- True when a peer advertises consumables history the local coordinator lacks.
+function S.PeerHistoryAhead(localDesc, peerDesc)
+    localDesc = localDesc or {}
+    peerDesc = peerDesc or {}
+    local peerEvents = tonumber(peerDesc.eventCount)
+    local localEvents = tonumber(localDesc.eventCount) or 0
+    if peerEvents and peerEvents > localEvents then return true end
+    local peerAlloc = tonumber(peerDesc.txnAllocSeq)
+    local localAlloc = tonumber(localDesc.txnAllocSeq) or 0
+    if peerAlloc and peerAlloc > localAlloc then return true end
+    local peerArchive = tonumber(peerDesc.archiveCount)
+    local localArchive = tonumber(localDesc.archiveCount) or 0
+    if peerArchive and peerArchive > localArchive then return true end
+    local peerFp = tonumber(peerDesc.eventFingerprint)
+    local localFp = tonumber(localDesc.eventFingerprint)
+    if peerFp and localFp and peerFp ~= localFp and (peerEvents or 0) >= localEvents then
+        return true
+    end
+    return false
+end
+
+function S.MergeHistoryWatermark(current, peerDesc)
+    peerDesc = peerDesc or {}
+    current = type(current) == "table" and current or {}
+    local function maxNum(a, b)
+        a, b = tonumber(a), tonumber(b)
+        if a and b then return math.max(a, b) end
+        return a or b
+    end
+    local out = {
+        generation = maxNum(current.generation, peerDesc.generation) or 1,
+        configSeq = maxNum(current.configSeq, peerDesc.configSeq) or 0,
+        rejectionSeq = maxNum(current.rejectionSeq, peerDesc.rejectionSeq) or 0,
+        txnAllocSeq = maxNum(current.txnAllocSeq, peerDesc.txnAllocSeq) or 0,
+        eventCount = maxNum(current.eventCount, peerDesc.eventCount) or 0,
+        archiveCount = maxNum(current.archiveCount, peerDesc.archiveCount) or 0,
+        eventFingerprint = tonumber(peerDesc.eventFingerprint) or tonumber(current.eventFingerprint),
+        archiveFingerprint = tonumber(peerDesc.archiveFingerprint) or tonumber(current.archiveFingerprint),
+        configFingerprint = tonumber(peerDesc.configFingerprint) or tonumber(current.configFingerprint),
+    }
+    -- Prefer the peer fingerprint when they are ahead so NeedsCatchUp stays true
+    -- until local ledger/registry converge on that richer history.
+    if S.PeerHistoryAhead(current, peerDesc) then
+        out.eventFingerprint = tonumber(peerDesc.eventFingerprint) or out.eventFingerprint
+        out.archiveFingerprint = tonumber(peerDesc.archiveFingerprint) or out.archiveFingerprint
+        out.configFingerprint = tonumber(peerDesc.configFingerprint) or out.configFingerprint
+    end
+    return out
 end

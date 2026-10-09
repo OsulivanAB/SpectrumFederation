@@ -128,6 +128,10 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.CONSUMABLES_CONFIG then return self:HandleConsumablesConfig(sender, payload) end
         if msgType == self.MSG.CONSUMABLES_EVENT then return self:HandleConsumablesEvent(sender, payload) end
         if msgType == self.MSG.CONSUMABLES_OP then return self:HandleConsumablesOp(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_OBS_REPORT then return self:HandleConsumablesObsReport(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_REVIEW_REQ then return self:HandleConsumablesReviewReq(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_REVIEW_SUMMARY then return self:HandleConsumablesReviewSummary(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_OBS_DECISION then return self:HandleConsumablesObsDecision(sender, payload) end
         -- Older clients may still send trade/withdraw freezes; v1 ignores them.
         if msgType == self.MSG.CONSUMABLES_TRADE_FREEZE then return true end
         

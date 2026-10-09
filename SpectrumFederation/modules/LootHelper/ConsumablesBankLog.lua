@@ -246,6 +246,10 @@ function BankLog:ProcessLogUpdate(reason)
         Debug("Warn", "log update skipped: incomplete snapshot reason=%s", tostring(reason))
         return
     end
+    local C = SF.Consumables
+    if C and C.EligibilitySnapshot then
+        snapshot.eligibility = C.EligibilitySnapshot(ctx.profile)
+    end
 
     local db = self:ObservationDB()
     local O = SF.ConsumablesObservation
@@ -263,6 +267,43 @@ function BankLog:ProcessLogUpdate(reason)
         tostring(stats.ambiguous),
         tostring(stats.suppressed),
         tostring(#snapshot.rows))
+
+    if C and C.NoteObservationBaseline then
+        C.NoteObservationBaseline(ctx.profile)
+    end
+
+    local V = SF.ConsumablesVerification
+    local scope = O.EnsureScope(store, ctx.guildGuid, ctx.bankTab)
+    local Sync = SF.LootHelperSync
+    local sessionActive = Sync and Sync.state and Sync.state.active
+        and Sync.state.profileId == ctx.profileId
+    if V and V.ProcessLocalAfterReconcile and scope then
+        local historyReady = true
+        local historyBaselineAt = nil
+        if sessionActive and Sync._ConsumablesHistoryReady then
+            historyReady = Sync:_ConsumablesHistoryReady(ctx.profile) ~= false
+            historyBaselineAt = tonumber(ctx.profile._consumablesHistoryBaselineAt)
+        end
+        local verifyStats = V.ProcessLocalAfterReconcile(ctx.profile, ctx.profileId, store, scope, {
+            selfId = ctx.observedBy,
+            -- During a live session the coordinator owns verification/txn minting.
+            deferToCoordinator = sessionActive and true or false,
+            historyComplete = historyReady,
+            historyBaselineAt = historyBaselineAt,
+        })
+        self.lastVerifyStats = verifyStats
+        if verifyStats and (verifyStats.trusted or 0) > 0 then
+            Debug("Info", "local admin trust committed=%s", tostring(verifyStats.trusted))
+            if Sync and Sync._FlushUnsentConsumablesEvents then
+                Sync:_FlushUnsentConsumablesEvents(ctx.profile)
+            end
+        end
+    end
+    -- Non-admin (and deferred admin) observations must reach the coordinator while
+    -- a session is active; do not wait for a local trust commit.
+    if sessionActive and Sync and Sync._FlushPendingConsumableObservations then
+        Sync:_FlushPendingConsumableObservations(ctx.profile)
+    end
 end
 
 function BankLog:BeginObservation(reason)

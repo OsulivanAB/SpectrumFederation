@@ -309,6 +309,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self.BackfillAutomaticBisOnPromotion then
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionReannounce")
     end
+    if self._OnBecameConsumablesCoordinator then
+        self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleSessionReannounce")
+    end
 
     if self._MergeAuthorMaxFrontier then
         self:_MergeAuthorMaxFrontier(payload.authorMax)
@@ -505,8 +508,13 @@ function Sync:HandleSessionHeartbeat(sender, payload)
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via SES_HEARTBEAT")
-    elseif self.BackfillAutomaticBisOnPromotion then
-        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionHeartbeat")
+    else
+        if self.BackfillAutomaticBisOnPromotion then
+            self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionHeartbeat")
+        end
+        if self._OnBecameConsumablesCoordinator then
+            self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleSessionHeartbeat")
+        end
     end
 
     -- Keep helper list + authorMax current. Helper-only changes must retarget
@@ -750,8 +758,13 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
         if earlyPrep and earlyPrep.Notify then
             earlyPrep:Notify("coordinator_lost")
         end
-    elseif self.BackfillAutomaticBisOnPromotion then
-        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleCoordinatorTakeover")
+    else
+        if self.BackfillAutomaticBisOnPromotion then
+            self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleCoordinatorTakeover")
+        end
+        if self._OnBecameConsumablesCoordinator then
+            self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleCoordinatorTakeover")
+        end
     end
 
     -- Allow re-sending join status to the new coordinator
@@ -824,6 +837,11 @@ function Sync:HandleHaveProfile(sender, payload)
     if self._ConsiderJoinAcceptedRCConfig then
         self:_ConsiderJoinAcceptedRCConfig(sender, payload)
     end
+    -- New coordinators learn richer Tuesday history from joining peers before
+    -- verifying potentially overlapping Guild Bank deposits.
+    if self._NotePeerConsumablesHistory then
+        self:_NotePeerConsumablesHistory(sender, payload)
+    end
 end
 
 -- Function Handle NEED_PROFILE as a helper/coordinator: respond with PROFILE_SNAPSHOT (bulk).
@@ -859,24 +877,33 @@ function Sync:HandleNeedProfile(sender, payload)
         return false, "safe mode (bulk disabled)"
     end
 
-    -- Serve eligibility: coordinator or helper. A missed grant is a log reply,
-    -- not a reason for a non-helper admin to export the profile.
+    -- Serve eligibility: coordinator or helper, or an authorized admin serving
+    -- the session coordinator for consumables history recovery (writer offline).
     if not self.state.active then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: no active session (sender=%s)", tostring(sender))
         end
         return
     end
-    if not (self.state.isCoordinator or self:IsSelfHelper()) then
+    local selfId = self:_SelfId()
+    local canServe = self.state.isCoordinator or self:IsSelfHelper()
+    if not canServe then
+        local requesterIsCoordinator = type(self.state.coordinator) == "string"
+            and self:_SamePlayer(sender, self.state.coordinator)
+        if requesterIsCoordinator and self:IsSenderAuthorized(self.state.profileId, selfId) then
+            canServe = true
+        end
+    end
+    if not canServe then
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper (sender=%s)", tostring(sender))
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper/recovery-admin (sender=%s)", tostring(sender))
         end
         return
     end
     
     -- Verify we're still authorized for this profile (Issue #9 fix).
     -- Cached coordinator/helper role is not an authorization grant.
-    if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
+    if not self:IsSenderAuthorized(self.state.profileId, selfId) then
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Not authorized to serve profile (no longer admin)")
         end
@@ -893,7 +920,8 @@ function Sync:HandleNeedProfile(sender, payload)
         return
     end
 
-    local serveRole = self.state.isCoordinator and "coordinator" or "helper"
+    local serveRole = self.state.isCoordinator and "coordinator"
+        or (self:IsSelfHelper() and "helper" or "authorized-admin")
     if not self:_ProfileSnapshotServeAllowed(sender) then
         return
     end
@@ -928,8 +956,19 @@ function Sync:HandleNeedProfile(sender, payload)
     -- Small jitter in case multiple people need it at once
     self:RunWithJitter(0, 250, function()
         if not self.state.active then return end
-        if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
-        if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
+        -- Revalidate the same serve eligibility as the outer handler, including
+        -- authorized non-helper admins serving the session coordinator.
+        local stillSelf = self:_SelfId()
+        local stillCanServe = self.state.isCoordinator or self:IsSelfHelper()
+        if not stillCanServe then
+            local requesterIsCoordinator = type(self.state.coordinator) == "string"
+                and self:_SamePlayer(sender, self.state.coordinator)
+            if requesterIsCoordinator and self:IsSenderAuthorized(self.state.profileId, stillSelf) then
+                stillCanServe = true
+            end
+        end
+        if not stillCanServe then return end
+        if not self:IsSenderAuthorized(self.state.profileId, stillSelf) then return end
         if not SF.LootHelperComm then return end
 
         if enc then

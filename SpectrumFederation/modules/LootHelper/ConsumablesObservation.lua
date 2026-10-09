@@ -1,5 +1,5 @@
 -- Pure Guild Bank transaction observation evidence and local reconciliation.
--- PR1 foundation for Issue #366: no canonical ledger writes, no sync protocol.
+-- Ledger writes and sync live in ConsumablesVerification / ConsumablesSync (PR2).
 local _, SF = ...
 
 SF.ConsumablesObservation = SF.ConsumablesObservation or {}
@@ -20,6 +20,12 @@ O.EMPTY_CONTEXT_CONTINUITY_SECONDS = 15 * 60
 O.AGE_WALL_SLACK_HOURS = 1.05
 O.MIN_MATCH_SCORE = 100
 O.AMBIGUITY_MARGIN = 15
+-- Statuses that never expire under the 14-day pending rule.
+O.NON_EXPIRING_STATUS = {
+    verified = true,
+    rejected = true,
+    trusted = true,
+}
 
 local function Debug(level, message, ...)
     if SF.Debug and SF.Debug[level] then
@@ -298,12 +304,75 @@ function O.EnsureScope(store, guildGuid, bankTab)
             bankTab = tonumber(bankTab),
             observations = {},
             suppressions = {},
+            rejections = {},
+            verifiedTxnIds = {},
+            backfillCompleted = false,
         }
         store.scopes[key] = scope
     end
     if type(scope.observations) ~= "table" then scope.observations = {} end
     if type(scope.suppressions) ~= "table" then scope.suppressions = {} end
+    if type(scope.rejections) ~= "table" then scope.rejections = {} end
+    if type(scope.verifiedTxnIds) ~= "table" then scope.verifiedTxnIds = {} end
     return scope, key
+end
+
+-- True when Blizzard's hour-granular age can place the deposit on either side of
+-- a cutover. Floored ageHours means real time may be up to ~1h earlier than
+-- approxTxnTime for every whole-hour age, not only age 0.
+function O.EvidenceSpansEligibilityBoundary(evidence, eligibility)
+    if type(evidence) ~= "table" or type(eligibility) ~= "table" then
+        return false
+    end
+    local txnTime = tonumber(evidence.approxTxnTime) or tonumber(evidence.observedAt)
+    if not txnTime then return false end
+    local ageHours = tonumber(evidence.ageHours)
+    local function spans(cutover)
+        cutover = tonumber(cutover)
+        if not cutover or txnTime < cutover then return false end
+        if ageHours == nil then return false end
+        -- Whole-hour ages (including 0, 1, 2, …) carry up to one hour of uncertainty.
+        if ageHours == math.floor(ageHours) and (txnTime - 3600) < cutover then
+            return true
+        end
+        return false
+    end
+    if spans(eligibility.tabEligibleFrom) then return true end
+    local itemId = tonumber(evidence.itemId)
+    if itemId and type(eligibility.items) == "table" then
+        if spans(eligibility.items[tostring(itemId)] or eligibility.items[itemId]) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Eligibility cutover: ignore transactions that predate an item/tab becoming eligible.
+function O.IsEvidenceEligible(evidence, eligibility)
+    if type(evidence) ~= "table" then return false end
+    if type(eligibility) ~= "table" then return true end
+    local txnTime = tonumber(evidence.approxTxnTime) or tonumber(evidence.observedAt)
+    if not txnTime then
+        -- Fail closed for unclear boundaries after a cutover exists.
+        if eligibility.tabEligibleFrom or (eligibility.items and next(eligibility.items)) then
+            return false
+        end
+        return true
+    end
+    local tabFrom = tonumber(eligibility.tabEligibleFrom)
+    if tabFrom and txnTime < tabFrom then
+        return false
+    end
+    local itemId = tonumber(evidence.itemId)
+    if itemId and type(eligibility.items) == "table" then
+        local itemFrom = tonumber(eligibility.items[tostring(itemId)] or eligibility.items[itemId])
+        if itemFrom and txnTime < itemFrom then
+            return false
+        end
+    end
+    -- Boundary-spanning rows stay visible but must not auto-credit; callers mark
+    -- them ambiguous for admin review.
+    return true
 end
 
 local function NextLocalId(store, profileId)
@@ -353,7 +422,11 @@ function O.PruneScope(scope, now)
             local status = obs.status or "pending"
             local firstSeen = tonumber(obs.firstSeen) or now
             local expired = false
-            if status == "pending" or status == "ambiguous" then
+            -- Admin-retained and verified/rejected observations do not expire.
+            if (status == "pending" or status == "ambiguous")
+                and not obs.retainBeyondExpiry
+                and not O.NON_EXPIRING_STATUS[status]
+            then
                 if (now - firstSeen) >= O.PENDING_TTL_SECONDS then
                     expired = true
                 end
@@ -513,6 +586,17 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
         observedAt = tonumber(snapshot.observedAt) or now,
     })
 
+    local eligibility = snapshot.eligibility
+    if type(eligibility) == "table" then
+        local filtered = {}
+        for i = 1, #evidenceRows do
+            if O.IsEvidenceEligible(evidenceRows[i], eligibility) then
+                filtered[#filtered + 1] = evidenceRows[i]
+            end
+        end
+        evidenceRows = filtered
+    end
+
     local stats = { created = 0, updated = 0, ambiguous = 0, suppressed = 0, ignored = 0 }
     local observations = scope.observations
     local usedObs = {}
@@ -580,10 +664,20 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                 local obs = observations[p.obs]
                 CopyEvidenceFields(obs, evidenceRows[p.row])
                 obs.lastSeen = now
-                if obs.status == "ambiguous" then
-                    -- Keep ambiguous until admin review (PR2); still refresh evidence.
+                if obs.status == "verified" or obs.status == "rejected" or obs.status == "trusted" then
+                    -- Keep terminal statuses; still refresh evidence timestamps.
+                elseif obs.status == "ambiguous" then
+                    -- Keep ambiguous until admin review; still refresh evidence.
                 else
                     obs.status = "pending"
+                end
+                -- Hour-bucket age can place a deposit on either side of a Clear cutover.
+                if (obs.status == "pending")
+                    and snapshot.eligibility
+                    and O.EvidenceSpansEligibilityBoundary(obs, snapshot.eligibility)
+                then
+                    obs.status = "ambiguous"
+                    stats.ambiguous = stats.ambiguous + 1
                 end
                 obs.seenCount = FloorNonNeg(obs.seenCount) + 1
                 stats.updated = stats.updated + 1
@@ -595,7 +689,12 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
     for r = 1, #evidenceRows do
         if not usedRow[r] then
             local evidence = evidenceRows[r]
-            if IsSuppressed(scope, evidence) then
+            local V = SF.ConsumablesVerification
+            if V and V.IsRejected and V.IsRejected(scope, evidence) then
+                stats.suppressed = stats.suppressed + 1
+                Debug("Info", "rejection-suppressed rediscovery donor=%s item=%s qty=%s",
+                    tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
+            elseif IsSuppressed(scope, evidence) then
                 stats.suppressed = stats.suppressed + 1
                 Debug("Info", "suppressed rediscovery donor=%s item=%s qty=%s",
                     tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
@@ -626,9 +725,11 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                         end
                     end
                 end
+                local boundaryAmbiguous = snapshot.eligibility
+                    and O.EvidenceSpansEligibilityBoundary(evidence, snapshot.eligibility)
                 local obs = {
                     localId = NextLocalId(store, profileId),
-                    status = conflict and "ambiguous" or "pending",
+                    status = (conflict or boundaryAmbiguous) and "ambiguous" or "pending",
                     firstSeen = now,
                     lastSeen = now,
                     seenCount = 1,
@@ -645,6 +746,10 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                     stats.ambiguous = stats.ambiguous + 1
                     Debug("Info", "ambiguous empty-context collision donor=%s item=%s qty=%s",
                         tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
+                elseif boundaryAmbiguous then
+                    stats.ambiguous = stats.ambiguous + 1
+                    Debug("Info", "ambiguous eligibility-boundary deposit donor=%s item=%s qty=%s",
+                        tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
                 else
                     Debug("Info", "captured observation %s donor=%s item=%s qty=%s occ=%s",
                         tostring(obs.localId), tostring(obs.donor), tostring(obs.itemId),
@@ -655,6 +760,10 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
     end
 
     O.PruneScope(scope, now)
+    if scope.backfillCompleted ~= true and snapshot.authoritative ~= false then
+        scope.backfillCompleted = true
+        Debug("Info", "initial observation backfill baseline set for %s tab=%s", guildGuid, tostring(bankTab))
+    end
     return stats
 end
 
@@ -669,6 +778,23 @@ function O.ListPending(store, guildGuid, bankTab, opts)
         local obs = scope.observations[i]
         local status = obs and obs.status or ""
         if status == "pending" or status == "ambiguous" then
+            out[#out + 1] = obs
+        end
+    end
+    return out
+end
+
+function O.ListDisplayObservations(store, guildGuid, bankTab, opts)
+    opts = opts or {}
+    local scope = O.EnsureScope(store, guildGuid, bankTab)
+    if not scope then return {} end
+    local now = tonumber(opts.now) or Now()
+    O.PruneScope(scope, now)
+    local out = {}
+    for i = 1, #scope.observations do
+        local obs = scope.observations[i]
+        local status = obs and obs.status or ""
+        if status == "pending" or status == "ambiguous" or status == "verified" then
             out[#out + 1] = obs
         end
     end
