@@ -452,16 +452,19 @@ do
     local idB = V.TxnIdFromEvidence("stable-txn", ev)
     assertEq(idA, idB, "TxnIdFromEvidence is deterministic")
     assertEq(idA, txnId, "committed txnId matches evidence-derived identity")
-    -- Cross-observer: reconstructed time / neighbors differ, identity must not.
-    local shifted = evidence({
+    -- Cross-observer: reconstructed time may differ; identical neighbors keep identity.
+    local shiftedTime = evidence({
         quantity = 15,
         approxTxnTime = (ev.approxTxnTime or clock) + 1800,
-        neighborsOlder = { "different-older" },
-        neighborsNewer = { "different-newer" },
-        occurrenceIndex = ev.occurrenceIndex,
+        neighborsOlder = ev.neighborsOlder,
+        neighborsNewer = ev.neighborsNewer,
+        occurrenceIndex = 99,
     })
-    assertEq(V.TxnIdFromEvidence("stable-txn", shifted), txnId,
-        "TxnIdFromEvidence ignores observer-specific time/neighbors")
+    assertEq(V.TxnIdFromEvidence("stable-txn", shiftedTime), txnId,
+        "TxnIdFromEvidence ignores observer-specific time/occurrenceIndex")
+    assertTrue(V.TxnIdFromEvidence("stable-txn", evidence({
+        quantity = 15, neighborsOlder = {}, neighborsNewer = {},
+    })) == nil, "empty neighbor context has no guaranteed evidence txnId")
 end
 
 -- ---------------------------------------------------------------------------
@@ -579,7 +582,7 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- CollectUnresolvedForSubmit paginates beyond MAX_OBS_BATCH
+-- CollectUnresolvedForSubmit paginates by submitted keys (no offset starve)
 -- ---------------------------------------------------------------------------
 do
     local db = {}
@@ -590,17 +593,28 @@ do
             localId = "co:paginate:" .. i,
             quantity = 1,
             occurrenceIndex = i,
+            neighborsOlder = { "n-" .. i },
             coreSignature = O.CoreSignature("deposit", donor, flask, 1) .. ":" .. i,
             approxTxnTime = clock - i,
         })
     end
-    local batch1, next1, total = V.CollectUnresolvedForSubmit(store, "club-1", 2, { offset = 0 })
+    local batch1, more1, rem1 = V.CollectUnresolvedForSubmit(store, "club-1", 2, {
+        profileId = "paginate",
+    })
     assertEq(#batch1, V.MAX_OBS_BATCH, "first page is MAX_OBS_BATCH")
-    assertEq(total, V.MAX_OBS_BATCH + 5, "total unresolved count includes later rows")
-    assertTrue(next1 > 0, "next offset advances when more remain")
-    local batch2, next2 = V.CollectUnresolvedForSubmit(store, "club-1", 2, { offset = next1 })
-    assertEq(#batch2, 5, "second page drains remaining observations")
-    assertEq(next2, 0, "offset wraps to 0 after the final page")
+    assertEq(rem1, V.MAX_OBS_BATCH + 5, "total unresolved count includes later rows")
+    assertTrue(more1, "hasMore when later rows remain")
+    V.MarkObservationsSubmitted(store, batch1, "paginate")
+    -- Simulate first page becoming verified (shrinking unresolved set).
+    for i = 1, V.MAX_OBS_BATCH do
+        scope.observations[i].status = "verified"
+    end
+    local batch2, more2, rem2 = V.CollectUnresolvedForSubmit(store, "club-1", 2, {
+        profileId = "paginate",
+    })
+    assertEq(#batch2, 5, "second page drains remaining observations after shrink")
+    assertEq(rem2, 5, "remaining count is the unsubmitted unresolved rows")
+    assertFalse(more2, "no more after final page")
     assertTrue(batch2[1].coreSignature ~= batch1[1].coreSignature, "later rows are not starved")
 end
 
@@ -666,15 +680,15 @@ do
     local storeB = O.EnsureProfileStore(dbB, "two-admin-offline")
     local scopeA = O.EnsureScope(storeA, "club-1", 2)
     local scopeB = O.EnsureScope(storeB, "club-1", 2)
-    local sharedOcc = 3
+    local sharedNeighbors = { "shared-older" }
     local obsA = evidence({
-        quantity = 14, occurrenceIndex = sharedOcc,
-        approxTxnTime = clock - 120, neighborsOlder = { "a1" },
+        quantity = 14, occurrenceIndex = 3,
+        approxTxnTime = clock - 120, neighborsOlder = sharedNeighbors,
         status = "pending",
     })
     local obsB = evidence({
-        quantity = 14, occurrenceIndex = sharedOcc,
-        approxTxnTime = clock - 120 + 1800, neighborsOlder = { "b1" },
+        quantity = 14, occurrenceIndex = 1,
+        approxTxnTime = clock - 120 + 1800, neighborsOlder = sharedNeighbors,
         status = "pending",
     })
     scopeA.observations[1] = obsA
@@ -690,7 +704,7 @@ do
     assertEq(sB.trusted, 1, "second offline admin converges")
     assertEq(C.ContributionTotal(p, donor, flask), 14, "second offline admin does not double-credit")
     assertEq(V.TxnIdFromEvidence("two-admin-offline", obsA), V.TxnIdFromEvidence("two-admin-offline", obsB),
-        "both observers derive the same txnId")
+        "both observers derive the same neighbor-anchored txnId")
 end
 
 -- ---------------------------------------------------------------------------
@@ -805,6 +819,230 @@ do
         if count > S.MAX_REMOTE_OPS + 5 then break end
     end
     assertEq(count, S.MAX_REMOTE_OPS, "window still bounds reports, not observations")
+end
+
+-- ---------------------------------------------------------------------------
+-- Rejection updates advance admitted configSeq / descriptor catch-up
+-- ---------------------------------------------------------------------------
+do
+    local p = makeProfile("rej-watermark")
+    local before = C.Descriptor(p)
+    local ev = evidence({ quantity = 7 })
+    assertTrue(C.RecordDurableRejection(p, ev, admin, "rejected"))
+    local after = C.Descriptor(p)
+    assertTrue((tonumber(after.configSeq) or 0) > (tonumber(before.configSeq) or 0),
+        "rejection bumps configSeq for ApplyRemoteConfig admission")
+    assertTrue((tonumber(after.rejectionSeq) or 0) > (tonumber(before.rejectionSeq) or 0),
+        "rejection bumps rejectionSeq")
+    assertTrue(after.configFingerprint ~= before.configFingerprint,
+        "rejection changes config fingerprint")
+    assertTrue(S.CoordinatorConfigDiffers(before, after),
+        "catch-up sees rejectionSeq/config difference")
+end
+
+-- ---------------------------------------------------------------------------
+-- Scope change (Clear) replaces follower durable rejections
+-- ---------------------------------------------------------------------------
+do
+    local coord = makeProfile("rej-scope-coord")
+    local follower = makeProfile("rej-scope-follower")
+    local ev = evidence({ quantity = 11, occurrenceIndex = 2 })
+    assertTrue(C.RecordDurableRejection(follower, ev, admin, "rejected"))
+    -- Inflate follower rejectionSeq above a fresh clear snapshot.
+    for _ = 1, 3 do
+        C.RecordDurableRejection(follower, evidence({
+            quantity = 11 + _,
+            coreSignature = O.CoreSignature("deposit", donor, flask, 11 + _),
+            neighborsOlder = { "x" .. _ },
+        }), admin, "rejected")
+    end
+    assertTrue(select(1, C.Clear(coord, admin)), "coordinator clears")
+    local snap = C.ExportSnapshot(coord, { omitEvents = true })
+    assertTrue(select(1, C.ReplaceConfig(follower, snap)), "follower accepts clear snapshot")
+    assertFalse(V.IsRejected({ rejections = C.DurableRejections(follower) }, ev),
+        "scope change replaces stale durable rejections")
+end
+
+-- ---------------------------------------------------------------------------
+-- Cross-generation identical deposit is not absorbed from archive
+-- ---------------------------------------------------------------------------
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("cross-gen")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "cross-gen")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local first = evidence({
+        quantity = 20, occurrenceIndex = 1, generation = 1,
+        neighborsOlder = { "old-a" }, neighborsNewer = { "new-a" },
+    })
+    V.IngestReport(p, "cross-gen", admin, { first }, { isAdmin = true, scope = scope, obsStore = store })
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("cross-gen")[1], admin))
+    assertEq(C.ContributionTotal(p, donor, flask), 20, "first generation deposit credited")
+    assertTrue(select(1, C.Clear(p, admin)), "clear advances generation")
+    assertTrue(C.SetGuild(p, admin, GUILD, 2))
+    assertTrue(C.AddRequestedItem(p, admin, flask))
+    local gen = tonumber(C.Ensure(p).generation) or 2
+    V.ClearSessionClusters()
+    local second = evidence({
+        quantity = 20, occurrenceIndex = 1, generation = gen,
+        neighborsOlder = { "old-a" }, neighborsNewer = { "new-a" },
+        approxTxnTime = clock - 10,
+    })
+    local stats = V.IngestReport(p, "cross-gen", admin, { second }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    })
+    assertEq(stats.verified, 1, "post-clear identical deposit verifies anew")
+    local cluster = V.ListVerifiedClusters("cross-gen")[1]
+    assertFalse(cluster._committed == true, "post-clear deposit is not archive-absorbed")
+    assertTrue(V.CommitVerifiedCluster(p, cluster, admin), "post-clear deposit commits")
+    -- Clear shelves prior-generation totals; current generation must still credit 20.
+    assertEq(C.ContributionTotal(p, donor, flask), 20, "new generation credits the post-clear deposit")
+    local matched = V.FindEquivalentLedgerDonation(p, "cross-gen", second)
+    assertTrue(matched ~= nil, "ledger match finds the new-generation donation")
+    assertEq(tonumber(matched.generation), tonumber(second.generation),
+        "matched ledger donation is the new generation, not the archive")
+end
+
+-- ---------------------------------------------------------------------------
+-- Offline admin trust honors durable profile rejections
+-- ---------------------------------------------------------------------------
+do
+    local p = makeProfile("offline-durable-rej")
+    local ev = evidence({ quantity = 13, neighborsOlder = { "n1" } })
+    assertTrue(C.RecordDurableRejection(p, ev, admin, "rejected"))
+    local db = {}
+    local store = O.EnsureProfileStore(db, "offline-durable-rej")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    scope.observations[1] = evidence({
+        quantity = 13, neighborsOlder = { "n1" }, status = "pending",
+    })
+    local stats = V.ProcessLocalAfterReconcile(p, "offline-durable-rej", store, scope, {
+        selfId = admin, asAdmin = true, deferToCoordinator = false,
+    })
+    assertEq(stats.trusted, 0, "durable rejection blocks offline admin trust")
+    assertEq(stats.suppressed, 1, "durable rejection suppresses the observation")
+    assertEq(scope.observations[1].status, "rejected", "observation marked rejected")
+    assertEq(C.ContributionTotal(p, donor, flask), 0, "rejected deposit is not credited")
+end
+
+-- ---------------------------------------------------------------------------
+-- Uncertain empty-window offline rows defer instead of minting colliding IDs
+-- ---------------------------------------------------------------------------
+do
+    local p = makeProfile("uncertain-offline")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "uncertain-offline")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    scope.observations[1] = evidence({
+        quantity = 5, occurrenceIndex = 1,
+        neighborsOlder = {}, neighborsNewer = {},
+        status = "pending",
+    })
+    local stats = V.ProcessLocalAfterReconcile(p, "uncertain-offline", store, scope, {
+        selfId = admin, asAdmin = true, deferToCoordinator = false,
+    })
+    assertEq(stats.trusted, 0, "empty-context offline trust is deferred")
+    assertEq(stats.deferred, 1, "uncertain identity waits for review")
+    assertEq(C.ContributionTotal(p, donor, flask), 0, "no credit without stable identity")
+end
+
+-- ---------------------------------------------------------------------------
+-- Staggered witnesses across session resets still reach threshold
+-- ---------------------------------------------------------------------------
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("staggered-witness")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "staggered-witness")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local ev = evidence({ quantity = 16 })
+    local s1 = V.IngestReport(p, "staggered-witness", w1, { ev }, {
+        scope = scope, obsStore = store,
+        recordPendingWitness = function(evidence, submittedBy, witnessMap)
+            C.UpsertPendingWitness(p, evidence, submittedBy, witnessMap)
+        end,
+    })
+    assertEq(s1.verified, 0, "first session witness stays pending")
+    assertTrue(#C.PendingWitnesses(p) >= 1, "witness aggregate persisted")
+    V.ClearSessionClusters()
+    local s2 = V.IngestReport(p, "staggered-witness", w2, { ev }, {
+        scope = scope, obsStore = store,
+        recordPendingWitness = function(evidence, submittedBy, witnessMap)
+            C.UpsertPendingWitness(p, evidence, submittedBy, witnessMap)
+        end,
+    })
+    assertEq(s2.verified, 0, "second session still pending after hydrate")
+    V.ClearSessionClusters()
+    local s3 = V.IngestReport(p, "staggered-witness", w3, { ev }, {
+        scope = scope, obsStore = store,
+        recordPendingWitness = function(evidence, submittedBy, witnessMap)
+            C.UpsertPendingWitness(p, evidence, submittedBy, witnessMap)
+        end,
+        clearPendingWitness = function(evidence)
+            C.ClearPendingWitness(p, evidence)
+        end,
+    })
+    assertEq(s3.verified, 1, "third staggered session verifies from durable witnesses")
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("staggered-witness")[1], w3))
+    assertEq(C.ContributionTotal(p, donor, flask), 16, "staggered witnesses credit once")
+end
+
+-- ---------------------------------------------------------------------------
+-- ReviewSummary exposes durable rejections after session reset
+-- ---------------------------------------------------------------------------
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("durable-review")
+    local ev = evidence({ quantity = 18, neighborsOlder = { "r1" } })
+    assertTrue(C.RecordDurableRejection(p, ev, admin, "rejected"))
+    V.ClearSessionClusters()
+    local summary = V.ReviewSummary("durable-review", { profile = p })
+    local found = false
+    for i = 1, #summary do
+        if summary[i].status == "rejected" and summary[i].quantity == 18 then
+            found = true
+            assertTrue(select(1, V.ApplyDecision(p, "durable-review", admin, {
+                action = "correct", evidence = summary[i].evidence or ev,
+            }, {
+                isAdmin = true,
+                clearDurableRejection = function(evidence)
+                    C.ClearDurableRejection(p, evidence)
+                end,
+            })), "durable rejection can be corrected after session reset")
+        end
+    end
+    assertTrue(found, "review summary includes durable rejection after session reset")
+    assertFalse(V.IsRejected({ rejections = C.DurableRejections(p) }, ev),
+        "correction clears durable rejection")
+end
+
+-- ---------------------------------------------------------------------------
+-- Eligibility boundary-spanning deposits become ambiguous
+-- ---------------------------------------------------------------------------
+do
+    local cutover = clock - 100
+    local eligibility = {
+        items = {},
+        tabEligibleFrom = cutover,
+        baselineEstablished = true,
+    }
+    local spanning = evidence({
+        approxTxnTime = cutover + 10,
+        ageHours = 0,
+        neighborsOlder = { "b1" },
+    })
+    assertTrue(O.EvidenceSpansEligibilityBoundary(spanning, eligibility),
+        "age-zero deposit near cutover spans boundary")
+    assertTrue(O.IsEvidenceEligible(spanning, eligibility),
+        "boundary-spanning rows remain visible/eligible for review")
+    local safe = evidence({
+        approxTxnTime = cutover + 7200,
+        ageHours = 2,
+        neighborsOlder = { "b2" },
+    })
+    assertFalse(O.EvidenceSpansEligibilityBoundary(safe, eligibility),
+        "well-after-cutover deposits are not ambiguous by boundary")
 end
 
 if failures > 0 then

@@ -594,6 +594,81 @@ local function EnsureRejections(cfg)
     return cfg.rejections
 end
 
+local function EnsurePendingWitnesses(cfg)
+    if type(cfg.pendingWitnesses) ~= "table" then
+        cfg.pendingWitnesses = {}
+    end
+    return cfg.pendingWitnesses
+end
+
+local function CopyWitnessMap(witnesses)
+    local out = {}
+    if type(witnesses) ~= "table" then return out end
+    local count = 0
+    for key, meta in pairs(witnesses) do
+        if type(key) == "string" and key ~= "" and count < 16 then
+            if type(meta) == "table" then
+                out[key] = {
+                    submittedBy = type(meta.submittedBy) == "string" and meta.submittedBy or key,
+                    observedBy = type(meta.observedBy) == "string" and meta.observedBy or nil,
+                    firstReported = tonumber(meta.firstReported),
+                }
+            else
+                out[key] = { submittedBy = key }
+            end
+            count = count + 1
+        end
+    end
+    return out
+end
+
+local function CopyPendingWitnessList(list)
+    local out = {}
+    if type(list) ~= "table" then return out end
+    local V = SF.ConsumablesVerification
+    local maxN = (V and V.MAX_PENDING_WITNESS_AGGREGATES) or 128
+    local limit = #list
+    if limit > maxN then limit = maxN end
+    for i = 1, limit do
+        local row = list[i]
+        if type(row) == "table" and type(row.evidence) == "table"
+            and type(row.evidence.coreSignature) == "string"
+        then
+            out[#out + 1] = {
+                evidence = {
+                    coreSignature = row.evidence.coreSignature,
+                    approxTxnTime = tonumber(row.evidence.approxTxnTime),
+                    donor = type(row.evidence.donor) == "string" and row.evidence.donor or nil,
+                    itemId = tonumber(row.evidence.itemId),
+                    quantity = tonumber(row.evidence.quantity),
+                    guildGuid = type(row.evidence.guildGuid) == "string" and row.evidence.guildGuid or nil,
+                    bankTab = tonumber(row.evidence.bankTab),
+                    generation = tonumber(row.evidence.generation),
+                    occurrenceIndex = tonumber(row.evidence.occurrenceIndex),
+                    neighborsOlder = type(row.evidence.neighborsOlder) == "table" and row.evidence.neighborsOlder or nil,
+                    neighborsNewer = type(row.evidence.neighborsNewer) == "table" and row.evidence.neighborsNewer or nil,
+                    type = type(row.evidence.type) == "string" and row.evidence.type or "deposit",
+                },
+                witnesses = CopyWitnessMap(row.witnesses),
+                updatedAt = tonumber(row.updatedAt),
+            }
+        end
+    end
+    return out
+end
+
+local function ReplacePendingWitnessesFromPayload(cfg, payload, opts)
+    opts = opts or {}
+    if type(payload) ~= "table" or type(payload.pendingWitnesses) ~= "table" then
+        return EnsurePendingWitnesses(cfg)
+    end
+    -- Scope transitions and authoritative snapshots replace witness aggregates.
+    if opts.forceReplace or payload.pendingWitnesses then
+        cfg.pendingWitnesses = CopyPendingWitnessList(payload.pendingWitnesses)
+    end
+    return cfg.pendingWitnesses
+end
+
 local function CopyEligibility(eligibility)
     if type(eligibility) ~= "table" then
         return { items = {}, tabEligibleFrom = nil, baselineEstablished = false }
@@ -660,6 +735,7 @@ local function CopyRejectionList(list)
         local row = list[i]
         if type(row) == "table" and type(row.coreSignature) == "string" then
             out[#out + 1] = {
+                type = "deposit",
                 coreSignature = row.coreSignature,
                 approxTxnTime = tonumber(row.approxTxnTime),
                 donor = type(row.donor) == "string" and row.donor or nil,
@@ -675,27 +751,38 @@ local function CopyRejectionList(list)
                 decidedAt = tonumber(row.decidedAt),
                 reason = type(row.reason) == "string" and row.reason or nil,
                 txnId = type(row.txnId) == "string" and row.txnId or nil,
+                observedBy = type(row.observedBy) == "string" and row.observedBy or nil,
+                firstSeen = tonumber(row.firstSeen),
+                status = "rejected",
             }
         end
     end
     return out
 end
 
-local function BumpRejectionSeq(cfg)
+local function BumpRejectionSeq(cfg, opts)
+    opts = opts or {}
     local seq = tonumber(cfg.rejectionSeq) or 0
     if seq < 0 or seq ~= math.floor(seq) then seq = 0 end
     cfg.rejectionSeq = seq + 1
+    -- Rejection-only updates must advance the admitted config watermark so
+    -- ApplyRemoteConfig / catch-up cannot treat the snapshot as stale.
+    -- Callers that already bump configSeq (for example Clear) pass bumpConfig=false.
+    if opts.bumpConfig ~= false then
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
     return cfg.rejectionSeq
 end
 
--- Authoritative replace when the remote rejectionSeq is at least as new.
-local function ReplaceRejectionsFromPayload(cfg, payload)
+-- Authoritative replace. Scope transitions always replace; otherwise seq wins.
+local function ReplaceRejectionsFromPayload(cfg, payload, opts)
+    opts = opts or {}
     if type(payload) ~= "table" or type(payload.rejections) ~= "table" then
         return EnsureRejections(cfg)
     end
     local remoteSeq = tonumber(payload.rejectionSeq) or 0
     local localSeq = tonumber(cfg.rejectionSeq) or 0
-    if remoteSeq < localSeq then
+    if not opts.forceReplace and remoteSeq < localSeq then
         return EnsureRejections(cfg)
     end
     cfg.rejections = CopyRejectionList(payload.rejections)
@@ -755,6 +842,7 @@ function C.Ensure(profile)
             eligibility = { items = {}, tabEligibleFrom = nil },
             rejections = {},
             rejectionSeq = 0,
+            pendingWitnesses = {},
         }
     end
     local cfg = profile._consumables
@@ -797,6 +885,7 @@ function C.Ensure(profile)
     local migrated = MigrateObservationAccountingOnce(profile, cfg)
     EnsureEligibility(cfg)
     EnsureRejections(cfg)
+    EnsurePendingWitnesses(cfg)
     do
         local seq = tonumber(cfg.rejectionSeq)
         if not seq or seq ~= seq or seq ~= math.floor(seq) or seq < 0 then
@@ -904,6 +993,109 @@ function C.ClearDurableRejection(profile, evidence, opts)
     cfg.rejections = kept
     if opts.bumpSeq ~= false then
         BumpRejectionSeq(cfg)
+    end
+    return true
+end
+
+function C.PendingWitnesses(profile)
+    local cfg = C.Ensure(profile)
+    return EnsurePendingWitnesses(cfg)
+end
+
+local function PendingWitnessMatches(agg, evidence)
+    if type(agg) ~= "table" or type(agg.evidence) ~= "table" or type(evidence) ~= "table" then
+        return false
+    end
+    local O = SF.ConsumablesObservation
+    if O and O.MatchScore then
+        local score = O.MatchScore(agg.evidence, evidence)
+        if score and score >= (O.MIN_MATCH_SCORE or 100) then
+            return true
+        end
+    end
+    return agg.evidence.coreSignature == evidence.coreSignature
+        and tostring(agg.evidence.guildGuid or "") == tostring(evidence.guildGuid or "")
+        and tonumber(agg.evidence.bankTab) == tonumber(evidence.bankTab)
+        and tonumber(agg.evidence.generation) == tonumber(evidence.generation)
+end
+
+-- Authenticated coordinator-side witness persistence. Never trusts client counts.
+function C.UpsertPendingWitness(profile, evidence, submittedBy, witnessMap, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    submittedBy = type(submittedBy) == "string" and submittedBy or nil
+    if not submittedBy then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsurePendingWitnesses(cfg)
+    local V = SF.ConsumablesVerification
+    local agg = nil
+    for i = 1, #list do
+        if PendingWitnessMatches(list[i], evidence) then
+            agg = list[i]
+            break
+        end
+    end
+    if not agg then
+        agg = {
+            evidence = {
+                coreSignature = evidence.coreSignature,
+                approxTxnTime = tonumber(evidence.approxTxnTime),
+                donor = evidence.donor,
+                itemId = tonumber(evidence.itemId),
+                quantity = tonumber(evidence.quantity),
+                guildGuid = evidence.guildGuid,
+                bankTab = tonumber(evidence.bankTab),
+                generation = tonumber(evidence.generation),
+                occurrenceIndex = tonumber(evidence.occurrenceIndex),
+                neighborsOlder = evidence.neighborsOlder,
+                neighborsNewer = evidence.neighborsNewer,
+                type = evidence.type or "deposit",
+            },
+            witnesses = {},
+            updatedAt = Now(),
+        }
+        list[#list + 1] = agg
+    end
+    if type(witnessMap) == "table" then
+        agg.witnesses = CopyWitnessMap(witnessMap)
+    else
+        agg.witnesses = agg.witnesses or {}
+        agg.witnesses[submittedBy] = {
+            submittedBy = submittedBy,
+            observedBy = type(evidence.observedBy) == "string" and evidence.observedBy or nil,
+            firstReported = Now(),
+        }
+    end
+    agg.updatedAt = Now()
+    local maxN = (V and V.MAX_PENDING_WITNESS_AGGREGATES) or 128
+    while #list > maxN do
+        table.remove(list, 1)
+    end
+    if opts.bumpSeq ~= false then
+        -- Advance admitted config watermark so catch-up carries witness progress.
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return true
+end
+
+function C.ClearPendingWitness(profile, evidence, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsurePendingWitnesses(cfg)
+    local kept = {}
+    local cleared = false
+    for i = 1, #list do
+        if PendingWitnessMatches(list[i], evidence) then
+            cleared = true
+        else
+            kept[#kept + 1] = list[i]
+        end
+    end
+    if not cleared then return false end
+    cfg.pendingWitnesses = kept
+    if opts.bumpSeq ~= false then
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
     end
     return true
 end
@@ -1111,6 +1303,20 @@ local function ConfigFingerprint(cfg)
     for i = 1, eligLimit do
         hash = MixConfigText(hash, "e:" .. tostring(eligRows[i].itemId) .. ":" .. tostring(eligRows[i].ts))
     end
+    hash = MixConfigText(hash, "rj:" .. tostring(tonumber(cfg.rejectionSeq) or 0))
+    local pending = EnsurePendingWitnesses(cfg)
+    hash = MixConfigText(hash, "pw:" .. tostring(#pending))
+    for i = 1, #pending do
+        local agg = pending[i]
+        if type(agg) == "table" and type(agg.evidence) == "table" then
+            local wcount = 0
+            if type(agg.witnesses) == "table" then
+                for _ in pairs(agg.witnesses) do wcount = wcount + 1 end
+            end
+            hash = MixConfigText(hash, "p:" .. tostring(agg.evidence.coreSignature or "")
+                .. ":" .. tostring(wcount))
+        end
+    end
     return hash
 end
 
@@ -1119,6 +1325,7 @@ function C.Descriptor(profile)
     return {
         generation = cfg.generation,
         configSeq = cfg.configSeq,
+        rejectionSeq = tonumber(cfg.rejectionSeq) or 0,
         configFingerprint = ConfigFingerprint(cfg),
         eventCount = #(profile._consumableEvents or {}),
         eventFingerprint = tonumber(cfg.eventFingerprint) or 0,
@@ -1361,6 +1568,10 @@ function CopyEvent(event)
         verification = verification,
         coreSignature = type(event.coreSignature) == "string" and event.coreSignature or nil,
         occurrenceIndex = tonumber(event.occurrenceIndex),
+        guildGuid = type(event.guildGuid) == "string" and event.guildGuid or nil,
+        bankTab = tonumber(event.bankTab),
+        neighborsOlder = type(event.neighborsOlder) == "table" and event.neighborsOlder or nil,
+        neighborsNewer = type(event.neighborsNewer) == "table" and event.neighborsNewer or nil,
         -- Optional future monetary field: preserve when valid; leave unset when nil.
         goldValueCopper = ValidGoldValueCopper(event.goldValueCopper),
     }
@@ -1702,7 +1913,8 @@ function C.Clear(profile, actor, opts)
         baselineAt = clearAt,
     }
     cfg.rejections = {}
-    BumpRejectionSeq(cfg)
+    cfg.pendingWitnesses = {}
+    BumpRejectionSeq(cfg, { bumpConfig = false })
     BumpConfig(profile)
     Debug("Info", "%s cleared Raid Consumables", actor)
     Notify()
@@ -1976,6 +2188,7 @@ function C.ExportSnapshot(profile, opts)
         eligibility = CopyEligibility(EnsureEligibility(cfg)),
         rejections = CopyRejectionList(EnsureRejections(cfg)),
         rejectionSeq = tonumber(cfg.rejectionSeq) or 0,
+        pendingWitnesses = CopyPendingWitnessList(EnsurePendingWitnesses(cfg)),
         events = events,
     }
 end
@@ -2124,12 +2337,16 @@ function C.ReplaceConfig(profile, payload)
     local incomingTab = tonumber(cfg.bankTab)
     -- Same generation/guild/tab: merge cutovers conservatively (later wins).
     -- Generation/guild/tab change (Clear, reconfigure): take authoritative eligibility.
-    if incomingGen ~= priorGeneration or incomingGuid ~= priorGuid or incomingTab ~= priorTab then
+    local scopeChanged = incomingGen ~= priorGeneration
+        or incomingGuid ~= priorGuid
+        or incomingTab ~= priorTab
+    if scopeChanged then
         cfg.eligibility = CopyEligibility(payload.eligibility)
     else
         MergeEligibilityInto(cfg, payload.eligibility)
     end
-    ReplaceRejectionsFromPayload(cfg, payload)
+    ReplaceRejectionsFromPayload(cfg, payload, { forceReplace = scopeChanged })
+    ReplacePendingWitnessesFromPayload(cfg, payload, { forceReplace = true })
     cfg.crafters = nil
     cfg.assignments = nil
     cfg.itemEpochs = nil
@@ -2422,6 +2639,7 @@ function C.CopyConfiguration(source, dest)
         eligibility = CopyEligibility(EnsureEligibility(src)),
         rejections = CopyRejectionList(EnsureRejections(src)),
         rejectionSeq = tonumber(src.rejectionSeq) or 0,
+        pendingWitnesses = CopyPendingWitnessList(EnsurePendingWitnesses(src)),
         obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
     }
     Invalidate(dest)

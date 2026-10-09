@@ -154,6 +154,7 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     local desc = C.Descriptor(profile)
     payload.consumablesGeneration = desc.generation
     payload.consumablesConfigSeq = desc.configSeq
+    payload.consumablesRejectionSeq = desc.rejectionSeq
     payload.consumablesConfigFingerprint = desc.configFingerprint
     payload.consumablesEventCount = desc.eventCount
     payload.consumablesEventFingerprint = desc.eventFingerprint
@@ -178,6 +179,7 @@ function Sync:_ConsiderConsumablesCatchUp(payload, opts)
     local remote = {
         generation = payload.consumablesGeneration,
         configSeq = payload.consumablesConfigSeq,
+        rejectionSeq = payload.consumablesRejectionSeq,
         configFingerprint = payload.consumablesConfigFingerprint,
         eventCount = payload.consumablesEventCount,
         eventFingerprint = payload.consumablesEventFingerprint,
@@ -886,12 +888,10 @@ function Sync:_FlushPendingConsumableObservations(profile)
     if not V or not O then return end
     local store, scope, meta = ObservationScopeFor(profile)
     if not store or not meta then return end
-    local offset = tonumber(store.submitOffset) or 0
-    local batch, nextOffset, total = V.CollectUnresolvedForSubmit(store, meta.guildGuid, meta.bankTab, {
-        offset = offset,
+    local batch, hasMore, remaining = V.CollectUnresolvedForSubmit(store, meta.guildGuid, meta.bankTab, {
+        profileId = meta.profileId,
     })
     if #batch == 0 then
-        store.submitOffset = 0
         return
     end
     local payload = {
@@ -908,16 +908,18 @@ function Sync:_FlushPendingConsumableObservations(profile)
         if not self:_ConsumablesCoordinatorAccepts() then return end
         accepted = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_REPORT, payload, "WHISPER", coordinator, "NORMAL") ~= false
     end
-    -- Do not advance pagination after a rejected/dropped page (limiter/backpressure).
+    -- Do not retire submitted keys after a rejected/dropped page (limiter/backpressure).
     if not accepted then
-        Debug("Verbose", "consumable observation page not accepted; offset retained at %s", tostring(offset))
+        Debug("Verbose", "consumable observation page not accepted; submitted keys retained")
         return
     end
-    store.submitOffset = nextOffset
-    Debug("Info", "submitted %s unresolved consumable observations (offset=%s total=%s)",
-        tostring(#batch), tostring(offset), tostring(total))
+    if V.MarkObservationsSubmitted then
+        V.MarkObservationsSubmitted(store, batch, meta.profileId)
+    end
+    Debug("Info", "submitted %s unresolved consumable observations (remaining=%s)",
+        tostring(#batch), tostring(remaining - #batch))
     -- Continue draining later batches without flooding the coordinator.
-    if nextOffset > 0 and total > nextOffset then
+    if hasMore then
         if not self._consumablesObsFlushScheduled then
             self._consumablesObsFlushScheduled = true
             local function continueFlush()
@@ -983,9 +985,22 @@ function Sync:HandleConsumablesObsReport(sender, payload)
         isRequested = function(itemId)
             return C.IsRequested(profile, itemId)
         end,
+        recordPendingWitness = function(evidence, submittedBy, witnessMap)
+            if C.UpsertPendingWitness then
+                C.UpsertPendingWitness(profile, evidence, submittedBy, witnessMap)
+            end
+        end,
+        clearPendingWitness = function(evidence)
+            if C.ClearPendingWitness then
+                C.ClearPendingWitness(profile, evidence)
+            end
+        end,
     })
     Debug("Info", "obs report from %s accepted=%s verified=%s skipped=%s",
         tostring(sender), tostring(stats.accepted), tostring(stats.verified), tostring(stats.skipped))
+    if (stats.witnessChanged or 0) > 0 and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(profile)
+    end
     local verified = V.ListVerifiedClusters(meta.profileId)
     for i = 1, #verified do
         local cluster = verified[i]
@@ -1005,6 +1020,7 @@ function Sync:HandleConsumablesObsReport(sender, payload)
                     evidence = cluster.evidence and V.SerializeObservation(cluster.evidence) or cluster.evidence,
                     decidedBy = writer,
                     clusterId = cluster.clusterId,
+                    profileId = meta.profileId,
                 }
                 if store and meta then
                     V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decision)
@@ -1161,6 +1177,11 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
                 C.ClearDurableRejection(profile, evidence)
             end
         end,
+        clearPendingWitness = function(evidence)
+            if C.ClearPendingWitness then
+                C.ClearPendingWitness(profile, evidence)
+            end
+        end,
     })
     if not ok then
         Debug("Verbose", "ignored obs decision from %s (%s)", tostring(sender), tostring(status))
@@ -1174,6 +1195,7 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
         decidedBy = sender,
         evidence = cluster and V.SerializeObservation(cluster.evidence) or payload.decision.evidence,
         reason = payload.decision.reason,
+        profileId = payload.profileId,
     }
     if status == "verified" and cluster then
         local commitOk, commitStatus = V.CommitVerifiedCluster(profile, cluster, sender)

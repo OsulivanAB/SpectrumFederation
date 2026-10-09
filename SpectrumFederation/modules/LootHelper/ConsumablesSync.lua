@@ -174,6 +174,9 @@ function S.CoordinatorConfigDiffers(localDesc, remote)
     local remoteSeq = tonumber(remote.configSeq)
     if remoteGen and remoteGen ~= (localDesc.generation or 1) then return true end
     if remoteSeq and remoteSeq ~= (localDesc.configSeq or 0) then return true end
+    local remoteRej = tonumber(remote.rejectionSeq)
+    local localRej = tonumber(localDesc.rejectionSeq)
+    if remoteRej and localRej and remoteRej ~= localRej then return true end
     local remoteFp = tonumber(remote.configFingerprint)
     local localFp = tonumber(localDesc.configFingerprint)
     if remoteFp and localFp and remoteFp ~= localFp then return true end

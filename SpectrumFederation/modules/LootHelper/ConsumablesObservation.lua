@@ -317,6 +317,34 @@ function O.EnsureScope(store, guildGuid, bankTab)
     return scope, key
 end
 
+-- True when Blizzard's hour-granular age can place the deposit on either side of
+-- a cutover (ageHours < 1 and reconstructed time is after the cutover).
+function O.EvidenceSpansEligibilityBoundary(evidence, eligibility)
+    if type(evidence) ~= "table" or type(eligibility) ~= "table" then
+        return false
+    end
+    local txnTime = tonumber(evidence.approxTxnTime) or tonumber(evidence.observedAt)
+    if not txnTime then return false end
+    local ageHours = tonumber(evidence.ageHours)
+    local function spans(cutover)
+        cutover = tonumber(cutover)
+        if not cutover or txnTime < cutover then return false end
+        -- Whole-hour age 0: real time may be up to ~1h earlier than approxTxnTime.
+        if ageHours ~= nil and ageHours < 1 and (txnTime - 3600) < cutover then
+            return true
+        end
+        return false
+    end
+    if spans(eligibility.tabEligibleFrom) then return true end
+    local itemId = tonumber(evidence.itemId)
+    if itemId and type(eligibility.items) == "table" then
+        if spans(eligibility.items[tostring(itemId)] or eligibility.items[itemId]) then
+            return true
+        end
+    end
+    return false
+end
+
 -- Eligibility cutover: ignore transactions that predate an item/tab becoming eligible.
 function O.IsEvidenceEligible(evidence, eligibility)
     if type(evidence) ~= "table" then return false end
@@ -340,6 +368,8 @@ function O.IsEvidenceEligible(evidence, eligibility)
             return false
         end
     end
+    -- Boundary-spanning rows stay visible but must not auto-credit; callers mark
+    -- them ambiguous for admin review.
     return true
 end
 
@@ -639,6 +669,14 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                 else
                     obs.status = "pending"
                 end
+                -- Hour-bucket age can place a deposit on either side of a Clear cutover.
+                if (obs.status == "pending")
+                    and snapshot.eligibility
+                    and O.EvidenceSpansEligibilityBoundary(obs, snapshot.eligibility)
+                then
+                    obs.status = "ambiguous"
+                    stats.ambiguous = stats.ambiguous + 1
+                end
                 obs.seenCount = FloorNonNeg(obs.seenCount) + 1
                 stats.updated = stats.updated + 1
                 Debug("Verbose", "updated observation %s score=%s", tostring(obs.localId), tostring(p.score))
@@ -685,9 +723,11 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                         end
                     end
                 end
+                local boundaryAmbiguous = snapshot.eligibility
+                    and O.EvidenceSpansEligibilityBoundary(evidence, snapshot.eligibility)
                 local obs = {
                     localId = NextLocalId(store, profileId),
-                    status = conflict and "ambiguous" or "pending",
+                    status = (conflict or boundaryAmbiguous) and "ambiguous" or "pending",
                     firstSeen = now,
                     lastSeen = now,
                     seenCount = 1,
@@ -703,6 +743,10 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                     end
                     stats.ambiguous = stats.ambiguous + 1
                     Debug("Info", "ambiguous empty-context collision donor=%s item=%s qty=%s",
+                        tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
+                elseif boundaryAmbiguous then
+                    stats.ambiguous = stats.ambiguous + 1
+                    Debug("Info", "ambiguous eligibility-boundary deposit donor=%s item=%s qty=%s",
                         tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
                 else
                     Debug("Info", "captured observation %s donor=%s item=%s qty=%s occ=%s",
