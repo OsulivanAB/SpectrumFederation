@@ -308,6 +308,44 @@ do
     assertEq(stats.created, 1, "disjoint identical deposit creates a new observation")
     assertEq(stats.updated, 0, "disjoint identical deposit does not update the prior observation")
     assertEq(#O.ListPending(store, "club-1", 2), 2, "both disjoint identical deposits remain pending")
+    assertTrue(stats.ambiguous >= 1, "empty-context collision is marked ambiguous, not two confident rows")
+end
+
+do
+    -- Unchanged lone transaction must rematch after bank close and a 45-minute gap
+    -- even when Blizzard's hour age bucket has not advanced (approxTxnTime drifts).
+    local db = { consumableObservations = {} }
+    local store = O.EnsureProfileStore(db, "profile-obs")
+    O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Stable-Realm", flask, 11, 0, 0, 0, 0),
+    }, { observedAt = clock }))
+    local firstId = O.ListPending(store, "club-1", 2)[1].localId
+    advance(45 * 60)
+    local stats = O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Stable-Realm", flask, 11, 0, 0, 0, 0),
+    }, { observedAt = clock }))
+    assertEq(stats.created, 0, "reopen of unchanged lone deposit does not duplicate")
+    assertEq(stats.updated, 1, "reopen of unchanged lone deposit updates the same observation")
+    local pending = O.ListPending(store, "club-1", 2)
+    assertEq(#pending, 1, "single pending after reopen continuity")
+    assertEq(pending[1].localId, firstId, "same local id retained across reopen gap")
+end
+
+do
+    -- Same still-visible row after ~70 minutes where ageHours ticks from 0 to 1.
+    local db = { consumableObservations = {} }
+    local store = O.EnsureProfileStore(db, "profile-obs")
+    O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Aged-Realm", flask, 4, nil, nil, nil, nil, 0),
+    }, { observedAt = clock }))
+    local firstId = O.ListPending(store, "club-1", 2)[1].localId
+    advance(70 * 60)
+    local stats = O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Aged-Realm", flask, 4, nil, nil, nil, nil, 1),
+    }, { observedAt = clock }))
+    assertEq(stats.created, 0, "age-tick continuity does not duplicate")
+    assertEq(stats.updated, 1, "age-tick continuity updates existing observation")
+    assertEq(O.ListPending(store, "club-1", 2)[1].localId, firstId, "same id after age tick")
 end
 
 do
@@ -590,6 +628,45 @@ do
     BankLog:OnEvent("GUILDBANKLOG_UPDATE")
     local store = O.EnsureProfileStore(SF.lootHelperDB, "profile-obs")
     assertEq(#O.ListPending(store, "club-1", 2), 1, "captures after late profile availability")
+    BankLog:OnBankClosed()
+end
+
+do
+    -- Missing GUILDBANKLOG_UPDATE: retries exhaust, then a later slot event can start again.
+    resetWorld()
+    world.now = clock
+    world.activeProfile = makeProfile()
+    SF.lootHelperDB = { profiles = { [world.activeProfile._profileId] = world.activeProfile } }
+    SF.ConsumablesRuntime = {
+        AccountingProfile = function() return world.activeProfile end,
+        CurrentGuild = function()
+            return { guid = tostring(world.clubId), name = "Spectrum", realm = "Realm" }
+        end,
+    }
+    BankLog.frame = nil
+    BankLog.active = false
+    BankLog.bankOpen = false
+    BankLog.awaitingLogUpdate = false
+    BankLog.queryRetries = 0
+    BankLog:Init()
+    world.logRows[2] = { deposit("Retry-Realm", flask, 1, 0, 0, 0, 0) }
+    BankLog:OnBankOpened()
+    assertTrue(BankLog.awaitingLogUpdate, "awaiting log update after open query")
+    -- Drain retry callbacks until the cycle ends (no GUILDBANKLOG_UPDATE).
+    local guard = 0
+    while BankLog.awaitingLogUpdate and guard < 40 do
+        assertTrue(#world.after > 0, "retry/terminal callback queued while awaiting")
+        local fn = table.remove(world.after, 1)
+        fn()
+        guard = guard + 1
+    end
+    assertFalse(BankLog.awaitingLogUpdate, "retries exhausted clears awaitingLogUpdate")
+    local queriesAfterExhaust = #world.logQueries
+    advance(2)
+    world.now = clock
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(#world.logQueries > queriesAfterExhaust, "slot change starts a new query cycle after exhaustion")
+    assertTrue(BankLog.awaitingLogUpdate, "new cycle awaits log update again")
     BankLog:OnBankClosed()
 end
 

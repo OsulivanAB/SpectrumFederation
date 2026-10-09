@@ -148,6 +148,9 @@ function BankLog:RequestLog(reason)
             return
         end
     end
+    if reason ~= "retry" then
+        self.queryRetries = 0
+    end
     self.awaitingLogUpdate = true
     self.lastQueryAt = now
     self.lastQueryReason = reason
@@ -156,19 +159,23 @@ function BankLog:RequestLog(reason)
     Debug("Info", "query guild bank log tab=%s reason=%s", tostring(ctx.bankTab), tostring(reason or "scan"))
     pcall(QueryGuildBankLog, ctx.bankTab)
 
+    local tokenField = "queryToken"
     local retries = self.queryRetries or 0
     if retries < MAX_QUERY_RETRIES then
-        local tokenField = "queryToken"
         self:ScheduleAfter(QUERY_RETRY_DELAY, tokenField, function()
             if not self.awaitingLogUpdate then return end
             self.queryRetries = (self.queryRetries or 0) + 1
-            if self.queryRetries > MAX_QUERY_RETRIES then
-                self.awaitingLogUpdate = false
-                Debug("Warn", "guild bank log query retries exhausted")
-                return
-            end
             Debug("Info", "retry guild bank log query attempt=%s", tostring(self.queryRetries))
             self:RequestLog("retry")
+        end)
+    else
+        -- Final attempt already issued above. Clear awaiting so a later genuine
+        -- bank-change event can start a new bounded cycle without reopen.
+        self:ScheduleAfter(QUERY_RETRY_DELAY, tokenField, function()
+            if not self.awaitingLogUpdate then return end
+            self.awaitingLogUpdate = false
+            self.queryRetries = 0
+            Debug("Warn", "guild bank log query retries exhausted; idle until next event")
         end)
     end
 end

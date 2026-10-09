@@ -11,10 +11,13 @@ O.MAX_OBSERVATIONS_PER_SCOPE = 256
 O.MAX_SUPPRESSIONS_PER_SCOPE = 128
 O.MAX_NEIGHBORS = 3
 O.TIME_TOLERANCE_SECONDS = 3 * 60 * 60
--- Empty-context rematches (no neighbor overlap) only cover rescan/age drift of the
--- same visible row. Distinct same-signature deposits in disjoint windows must not
--- qualify merely because they fall inside TIME_TOLERANCE_SECONDS.
+-- Empty-context rematches (no neighbor overlap): short wall-clock gaps can rematch
+-- immediately. Longer gaps require Blizzard relative-age fields to advance
+-- consistently with elapsed time so an unchanged still-visible row can reopen
+-- after 30–60 minutes without treating a later disjoint identical deposit as the
+-- same transaction.
 O.EMPTY_CONTEXT_CONTINUITY_SECONDS = 15 * 60
+O.AGE_WALL_SLACK_HOURS = 1.05
 O.MIN_MATCH_SCORE = 100
 O.AMBIGUITY_MARGIN = 15
 
@@ -182,6 +185,36 @@ function O.BuildEvidence(row, ctx)
     }
 end
 
+local function EmptyContextContinuity(existing, evidence)
+    -- Fast path: recent rescans while Blizzard's hour bucket has not moved.
+    local tExisting = tonumber(existing.approxTxnTime)
+    local tEvidence = tonumber(evidence.approxTxnTime)
+    if tExisting and tEvidence and math.abs(tExisting - tEvidence) <= O.EMPTY_CONTEXT_CONTINUITY_SECONDS then
+        return true
+    end
+
+    -- Longer gaps: require relative-age advancement to track elapsed wall time.
+    -- Same still-visible row: ageHours rises with wall time (hour granularity).
+    -- Distinct later deposit often reappears as ageHours == 0 after a long gap.
+    local lastSeen = tonumber(existing.lastSeen) or tonumber(existing.firstSeen)
+    local observedAt = tonumber(evidence.observedAt) or lastSeen
+    if not lastSeen or not observedAt or observedAt < lastSeen then
+        return false
+    end
+    local wallHours = (observedAt - lastSeen) / 3600
+    local agePrev = FloorNonNeg(existing.ageHours)
+    local ageNow = FloorNonNeg(evidence.ageHours)
+    local ageDelta = ageNow - agePrev
+    if ageDelta < 0 then
+        return false
+    end
+    if ageDelta == 0 then
+        -- Age bucket unchanged: only trust short gaps (same hour bucket).
+        return wallHours < 1.0
+    end
+    return math.abs(ageDelta - wallHours) <= O.AGE_WALL_SLACK_HOURS
+end
+
 function O.MatchScore(existing, evidence)
     if type(existing) ~= "table" or type(evidence) ~= "table" then return nil end
     if existing.coreSignature ~= evidence.coreSignature then return nil end
@@ -202,13 +235,13 @@ function O.MatchScore(existing, evidence)
     local neighborHits = olderHits + newerHits
     local sameOccurrence = tonumber(existing.occurrenceIndex) == tonumber(evidence.occurrenceIndex)
 
-    -- Require positive continuity evidence. Neighbor overlap is preferred.
-    -- Empty-context rematch is allowed only for tight time continuity so a
-    -- lone visible row can rescan without letting a later disjoint identical
-    -- deposit consume the prior observation.
+    -- Neighbor overlap is preferred continuity evidence. Empty-context rematch
+    -- needs short reconstructed-time continuity or age-vs-wall consistency so
+    -- reopen of an unchanged lone row works across 30–60 minutes without merging
+    -- a later disjoint identical deposit.
     if neighborHits < 1 then
         if not sameOccurrence then return nil end
-        if drift > O.EMPTY_CONTEXT_CONTINUITY_SECONDS then return nil end
+        if not EmptyContextContinuity(existing, evidence) then return nil end
     end
 
     local score = O.MIN_MATCH_SCORE
@@ -567,9 +600,35 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                 Debug("Info", "suppressed rediscovery donor=%s item=%s qty=%s",
                     tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
             else
+                -- Fail-conservative: when an unmatched row could collide with an
+                -- unmatched empty-context pending observation, mark ambiguity
+                -- instead of leaving two confident authoritative candidates.
+                local conflict = nil
+                for o = 1, #observations do
+                    if not usedObs[o] then
+                        local prior = observations[o]
+                        if prior.coreSignature == evidence.coreSignature
+                            and tonumber(prior.generation) == tonumber(evidence.generation)
+                            and tostring(prior.guildGuid or "") == tostring(evidence.guildGuid or "")
+                            and tonumber(prior.bankTab) == tonumber(evidence.bankTab)
+                            and (prior.status == "pending" or prior.status == "ambiguous")
+                            and #(prior.neighborsOlder or {}) == 0
+                            and #(prior.neighborsNewer or {}) == 0
+                            and #(evidence.neighborsOlder or {}) == 0
+                            and #(evidence.neighborsNewer or {}) == 0
+                        then
+                            local tPrior = tonumber(prior.approxTxnTime)
+                            local tEv = tonumber(evidence.approxTxnTime)
+                            if tPrior and tEv and math.abs(tPrior - tEv) <= O.TIME_TOLERANCE_SECONDS then
+                                conflict = prior
+                                break
+                            end
+                        end
+                    end
+                end
                 local obs = {
                     localId = NextLocalId(store, profileId),
-                    status = "pending",
+                    status = conflict and "ambiguous" or "pending",
                     firstSeen = now,
                     lastSeen = now,
                     seenCount = 1,
@@ -578,9 +637,19 @@ function O.ReconcileSnapshot(store, profileId, snapshot, opts)
                 CopyEvidenceFields(obs, evidence)
                 observations[#observations + 1] = obs
                 stats.created = stats.created + 1
-                Debug("Info", "captured observation %s donor=%s item=%s qty=%s occ=%s",
-                    tostring(obs.localId), tostring(obs.donor), tostring(obs.itemId),
-                    tostring(obs.quantity), tostring(obs.occurrenceIndex))
+                if conflict then
+                    if conflict.status ~= "ambiguous" then
+                        conflict.status = "ambiguous"
+                        stats.ambiguous = stats.ambiguous + 1
+                    end
+                    stats.ambiguous = stats.ambiguous + 1
+                    Debug("Info", "ambiguous empty-context collision donor=%s item=%s qty=%s",
+                        tostring(evidence.donor), tostring(evidence.itemId), tostring(evidence.quantity))
+                else
+                    Debug("Info", "captured observation %s donor=%s item=%s qty=%s occ=%s",
+                        tostring(obs.localId), tostring(obs.donor), tostring(obs.itemId),
+                        tostring(obs.quantity), tostring(obs.occurrenceIndex))
+                end
             end
         end
     end
