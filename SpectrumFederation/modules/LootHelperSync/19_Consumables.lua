@@ -155,11 +155,22 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesGeneration = desc.generation
     payload.consumablesConfigSeq = desc.configSeq
     payload.consumablesRejectionSeq = desc.rejectionSeq
+    payload.consumablesTxnAllocSeq = desc.txnAllocSeq
     payload.consumablesConfigFingerprint = desc.configFingerprint
     payload.consumablesEventCount = desc.eventCount
     payload.consumablesEventFingerprint = desc.eventFingerprint
     payload.consumablesArchiveCount = desc.archiveCount
     payload.consumablesArchiveFingerprint = desc.archiveFingerprint
+end
+
+function Sync:_ConsumablesHistoryReady(profile)
+    if type(profile) ~= "table" then return true end
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or not S.NeedsCatchUp then return true end
+    local remote = profile._consumablesCatchUpRemote
+    if type(remote) ~= "table" then return true end
+    return not S.NeedsCatchUp(C.Descriptor(profile), remote)
 end
 
 function Sync:_ConsiderConsumablesCatchUp(payload, opts)
@@ -180,6 +191,7 @@ function Sync:_ConsiderConsumablesCatchUp(payload, opts)
         generation = payload.consumablesGeneration,
         configSeq = payload.consumablesConfigSeq,
         rejectionSeq = payload.consumablesRejectionSeq,
+        txnAllocSeq = payload.consumablesTxnAllocSeq,
         configFingerprint = payload.consumablesConfigFingerprint,
         eventCount = payload.consumablesEventCount,
         eventFingerprint = payload.consumablesEventFingerprint,
@@ -974,6 +986,10 @@ function Sync:HandleConsumablesObsReport(sender, payload)
     local store, scope, meta = ObservationScopeFor(profile)
     if not meta then return false end
     local isAdmin = C.IsCanonicalAdmin(profile, sender)
+    local historyReady = true
+    if self._ConsumablesHistoryReady then
+        historyReady = self:_ConsumablesHistoryReady(profile) ~= false
+    end
     local stats = V.IngestReport(profile, meta.profileId, sender, payload.observations, {
         isAdmin = isAdmin,
         scope = scope,
@@ -982,6 +998,7 @@ function Sync:HandleConsumablesObsReport(sender, payload)
         bankTab = meta.bankTab,
         eligibility = C.EligibilitySnapshot and C.EligibilitySnapshot(profile) or nil,
         durableRejections = C.DurableRejections and C.DurableRejections(profile) or nil,
+        historyComplete = historyReady,
         isRequested = function(itemId)
             return C.IsRequested(profile, itemId)
         end,
@@ -996,9 +1013,11 @@ function Sync:HandleConsumablesObsReport(sender, payload)
             end
         end,
     })
-    Debug("Info", "obs report from %s accepted=%s verified=%s skipped=%s",
-        tostring(sender), tostring(stats.accepted), tostring(stats.verified), tostring(stats.skipped))
-    if (stats.witnessChanged or 0) > 0 and self.BroadcastConsumablesConfig then
+    Debug("Info", "obs report from %s accepted=%s verified=%s skipped=%s historyReady=%s",
+        tostring(sender), tostring(stats.accepted), tostring(stats.verified),
+        tostring(stats.skipped), tostring(historyReady))
+    if ((stats.witnessChanged or 0) > 0 or (stats.verified or 0) > 0)
+        and self.BroadcastConsumablesConfig then
         self:BroadcastConsumablesConfig(profile)
     end
     local verified = V.ListVerifiedClusters(meta.profileId)

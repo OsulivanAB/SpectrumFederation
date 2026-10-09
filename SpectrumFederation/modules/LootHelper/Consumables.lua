@@ -32,6 +32,7 @@ C.MAX_EVENT_ID = 192
 C.MAX_EVENT_NAME = 64
 C.MAX_GOAL = 100000
 C.MAX_TXN_ID = 160
+C.MAX_TXN_REGISTRY = 512
 -- One-time migration marker for Guild Bank observation accounting (Issue #366 PR2).
 C.OBS_ACCOUNTING_SCHEMA = 1
 
@@ -186,6 +187,10 @@ end
 
 local function IdHash(id)
     return HashText(id, HASH_BYTES)
+end
+
+local function MixConfigText(hash, text)
+    return Xor32(hash, IdHash(text))
 end
 
 local function FingerprintToken(id, order)
@@ -601,6 +606,20 @@ local function EnsurePendingWitnesses(cfg)
     return cfg.pendingWitnesses
 end
 
+-- Forward-declared: C.Ensure calls this before the full registry helpers load.
+local function EnsureTxnRegistry(cfg)
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    local seq = tonumber(cfg.txnAllocSeq)
+    if not seq or seq ~= seq or seq ~= math.floor(seq) or seq < 0 then
+        cfg.txnAllocSeq = 0
+    else
+        cfg.txnAllocSeq = seq
+    end
+    return cfg.txnRegistry
+end
+
 local function CopyWitnessMap(witnesses)
     local out = {}
     if type(witnesses) ~= "table" then return out end
@@ -843,6 +862,8 @@ function C.Ensure(profile)
             rejections = {},
             rejectionSeq = 0,
             pendingWitnesses = {},
+            txnRegistry = {},
+            txnAllocSeq = 0,
         }
     end
     local cfg = profile._consumables
@@ -886,6 +907,11 @@ function C.Ensure(profile)
     EnsureEligibility(cfg)
     EnsureRejections(cfg)
     EnsurePendingWitnesses(cfg)
+    EnsureTxnRegistry(cfg)
+    if not cfg._txnRegistrySeeded then
+        cfg._txnRegistrySeeded = true
+        C.SeedTxnRegistryFromLedger(profile)
+    end
     do
         local seq = tonumber(cfg.rejectionSeq)
         if not seq or seq ~= seq or seq ~= math.floor(seq) or seq < 0 then
@@ -1100,6 +1126,240 @@ function C.ClearPendingWitness(profile, evidence, opts)
     return true
 end
 
+-- ---------------------------------------------------------------------------
+-- Canonical transaction registry (Issue #366): Spectrum-owned identities.
+-- Blizzard Guild Bank fields are evidence for matching only — never ID sources.
+-- ---------------------------------------------------------------------------
+
+local function CopyNeighborList(list)
+    if type(list) ~= "table" then return nil end
+    local out = {}
+    local limit = #list
+    if limit > 4 then limit = 4 end
+    for i = 1, limit do
+        if type(list[i]) == "string" then
+            out[#out + 1] = list[i]
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
+local function CopyTxnRegistryEntry(row)
+    if type(row) ~= "table" then return nil end
+    local txnId = ValidTxnId(row.txnId)
+    if not txnId then return nil end
+    local status = row.status
+    if status ~= "verified" and status ~= "rejected" then
+        status = "verified"
+    end
+    return {
+        txnId = txnId,
+        status = status,
+        committed = row.committed == true,
+        coreSignature = type(row.coreSignature) == "string" and row.coreSignature or nil,
+        approxTxnTime = tonumber(row.approxTxnTime),
+        donor = type(row.donor) == "string" and row.donor or nil,
+        itemId = tonumber(row.itemId),
+        quantity = tonumber(row.quantity),
+        guildGuid = type(row.guildGuid) == "string" and row.guildGuid or nil,
+        bankTab = tonumber(row.bankTab),
+        generation = tonumber(row.generation),
+        occurrenceIndex = tonumber(row.occurrenceIndex),
+        neighborsOlder = CopyNeighborList(row.neighborsOlder),
+        neighborsNewer = CopyNeighborList(row.neighborsNewer),
+        verification = type(row.verification) == "string" and row.verification or nil,
+        decidedBy = type(row.decidedBy) == "string" and row.decidedBy or nil,
+        decidedAt = tonumber(row.decidedAt),
+        reason = type(row.reason) == "string" and row.reason or nil,
+    }
+end
+
+local function CopyTxnRegistry(list)
+    local out = {}
+    if type(list) ~= "table" then return out end
+    local limit = #list
+    if limit > C.MAX_TXN_REGISTRY then limit = C.MAX_TXN_REGISTRY end
+    -- Prefer newest entries when truncating.
+    local start = #list - limit + 1
+    if start < 1 then start = 1 end
+    for i = start, #list do
+        local copy = CopyTxnRegistryEntry(list[i])
+        if copy then
+            out[#out + 1] = copy
+        end
+    end
+    return out
+end
+
+local function ReplaceTxnRegistryFromPayload(cfg, payload)
+    if type(payload) ~= "table" or type(payload.txnRegistry) ~= "table" then
+        return EnsureTxnRegistry(cfg)
+    end
+    cfg.txnRegistry = CopyTxnRegistry(payload.txnRegistry)
+    local remoteAlloc = tonumber(payload.txnAllocSeq)
+    if remoteAlloc and remoteAlloc == math.floor(remoteAlloc) and remoteAlloc >= 0 then
+        local localAlloc = tonumber(cfg.txnAllocSeq) or 0
+        if remoteAlloc > localAlloc then
+            cfg.txnAllocSeq = remoteAlloc
+        end
+    end
+    return cfg.txnRegistry
+end
+
+local function ShortWriterToken(writer)
+    writer = Norm(writer) or "local"
+    writer = writer:gsub("[^%w%-]", "")
+    if writer == "" then writer = "local" end
+    if #writer > 24 then writer = writer:sub(1, 24) end
+    return writer
+end
+
+function C.TxnRegistry(profile)
+    local cfg = C.Ensure(profile)
+    return EnsureTxnRegistry(cfg)
+end
+
+function C.FindRegistryTxn(profile, txnId)
+    txnId = ValidTxnId(txnId)
+    if not txnId or type(profile) ~= "table" then return nil end
+    local list = EnsureTxnRegistry(C.Ensure(profile))
+    for i = 1, #list do
+        if list[i].txnId == txnId then
+            return list[i]
+        end
+    end
+    return nil
+end
+
+-- Collision-resistant Spectrum-owned ID. Never derived from Blizzard evidence.
+function C.AllocateCanonicalTxnId(profile, writer)
+    if type(profile) ~= "table" then return nil end
+    local cfg = C.Ensure(profile)
+    EnsureTxnRegistry(cfg)
+    cfg.txnAllocSeq = (tonumber(cfg.txnAllocSeq) or 0) + 1
+    local profileId = tostring(profile._profileId or "profile")
+    if type(profile.GetProfileId) == "function" then
+        local ok, id = pcall(profile.GetProfileId, profile)
+        if ok and type(id) == "string" and id ~= "" then
+            profileId = id
+        end
+    end
+    if #profileId > 40 then profileId = profileId:sub(1, 40) end
+    local w = ShortWriterToken(writer)
+    local entropy = 0
+    entropy = MixConfigText(entropy, w)
+    entropy = MixConfigText(entropy, tostring(Now()))
+    local gt = 0
+    if type(GetTime) == "function" then
+        gt = tonumber(GetTime()) or 0
+    end
+    entropy = MixConfigText(entropy, tostring(gt))
+    entropy = MixConfigText(entropy, tostring(cfg.txnAllocSeq))
+    local txnId = string.format("ctx:%s:%s:%d:%x", profileId, w, cfg.txnAllocSeq, entropy)
+    return ValidTxnId(txnId)
+end
+
+function C.RegisterCanonicalTxn(profile, entry, opts)
+    opts = opts or {}
+    if type(profile) ~= "table" or type(entry) ~= "table" then return false end
+    local copy = CopyTxnRegistryEntry(entry)
+    if not copy then return false end
+    -- Prefer the live cfg table: C.Ensure/RebuildIndex mid-AppendEvent would
+    -- fingerprint the new row twice and XOR the eventFingerprint back to 0.
+    local cfg = profile._consumables
+    if type(cfg) ~= "table" then
+        cfg = C.Ensure(profile)
+    end
+    if type(cfg) ~= "table" then return false end
+    local list = EnsureTxnRegistry(cfg)
+    for i = 1, #list do
+        if list[i].txnId == copy.txnId then
+            -- Preserve committed once set; allow status/evidence refresh.
+            if list[i].committed then copy.committed = true end
+            list[i] = copy
+            if opts.bumpSeq ~= false then
+                cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+            end
+            return true
+        end
+    end
+    list[#list + 1] = copy
+    while #list > C.MAX_TXN_REGISTRY do
+        table.remove(list, 1)
+    end
+    if opts.bumpSeq ~= false then
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return true
+end
+
+function C.MarkRegistryCommitted(profile, txnId, opts)
+    opts = opts or {}
+    local entry = C.FindRegistryTxn(profile, txnId)
+    if not entry then return false end
+    if entry.committed then return true end
+    entry.committed = true
+    if opts.bumpSeq ~= false then
+        local cfg = C.Ensure(profile)
+        cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    end
+    return true
+end
+
+local function RegistryEntryFromEvent(event)
+    if type(event) ~= "table" then return nil end
+    local txnId = ValidTxnId(event.txnId)
+    if not txnId then return nil end
+    return {
+        txnId = txnId,
+        status = "verified",
+        committed = true,
+        coreSignature = event.coreSignature,
+        approxTxnTime = tonumber(event.timestamp) or tonumber(event.approxTxnTime),
+        donor = event.actor or event.donor,
+        itemId = event.itemId,
+        quantity = event.quantity,
+        guildGuid = event.guildGuid,
+        bankTab = event.bankTab,
+        generation = event.generation,
+        occurrenceIndex = event.occurrenceIndex,
+        neighborsOlder = event.neighborsOlder,
+        neighborsNewer = event.neighborsNewer,
+        verification = event.verification,
+        decidedBy = event.writer,
+        decidedAt = tonumber(event.timestamp),
+    }
+end
+
+function C.SeedTxnRegistryFromLedger(profile)
+    if type(profile) ~= "table" then return 0 end
+    local cfg = C.Ensure(profile)
+    EnsureTxnRegistry(cfg)
+    local added = 0
+    local lists = { profile._consumableEventArchive, profile._consumableEvents }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local event = list[i]
+                if type(event) == "table"
+                    and event.type == C.EVENT.DONATION
+                    and event.source == "guildbank"
+                    and ValidTxnId(event.txnId)
+                    and not C.FindRegistryTxn(profile, event.txnId)
+                then
+                    local entry = RegistryEntryFromEvent(event)
+                    if entry and C.RegisterCanonicalTxn(profile, entry, { bumpSeq = false }) then
+                        added = added + 1
+                    end
+                end
+            end
+        end
+    end
+    return added
+end
+
 function C.NoteObservationBaseline(profile)
     if type(profile) ~= "table" then return false end
     local cfg = C.Ensure(profile)
@@ -1255,10 +1515,6 @@ local function RestoreAdoptedGeneration(profile)
     return true
 end
 
-local function MixConfigText(hash, text)
-    return Xor32(hash, IdHash(text))
-end
-
 local function ConfigFingerprint(cfg)
     local guid = ""
     if type(cfg.guild) == "table" and type(cfg.guild.guid) == "string" then
@@ -1317,6 +1573,20 @@ local function ConfigFingerprint(cfg)
                 .. ":" .. tostring(wcount))
         end
     end
+    local registry = EnsureTxnRegistry(cfg)
+    hash = MixConfigText(hash, "tr:" .. tostring(#registry)
+        .. ":" .. tostring(tonumber(cfg.txnAllocSeq) or 0))
+    local regLimit = #registry
+    if regLimit > 32 then regLimit = 32 end
+    local regStart = #registry - regLimit + 1
+    if regStart < 1 then regStart = 1 end
+    for i = regStart, #registry do
+        local row = registry[i]
+        if type(row) == "table" then
+            hash = MixConfigText(hash, "t:" .. tostring(row.txnId or "")
+                .. ":" .. tostring(row.status or ""))
+        end
+    end
     return hash
 end
 
@@ -1326,6 +1596,7 @@ function C.Descriptor(profile)
         generation = cfg.generation,
         configSeq = cfg.configSeq,
         rejectionSeq = tonumber(cfg.rejectionSeq) or 0,
+        txnAllocSeq = tonumber(cfg.txnAllocSeq) or 0,
         configFingerprint = ConfigFingerprint(cfg),
         eventCount = #(profile._consumableEvents or {}),
         eventFingerprint = tonumber(cfg.eventFingerprint) or 0,
@@ -1869,6 +2140,14 @@ function C.AppendEvent(profile, event, opts)
     if seq and seq > (tonumber(cfg.eventSeq) or 0) then
         cfg.eventSeq = seq
     end
+    -- Registry alignment after bound.count/fingerprint so Ensure cannot rebuild
+    -- mid-append and double-mix the new event into eventFingerprint.
+    if txnId and record.source == "guildbank" then
+        local entry = RegistryEntryFromEvent(record)
+        if entry then
+            C.RegisterCanonicalTxn(profile, entry, { bumpSeq = false })
+        end
+    end
     Invalidate(profile)
     if not opts.silent then
         Debug("Info", "Recorded %s %s", event.type, event.id)
@@ -1914,6 +2193,9 @@ function C.Clear(profile, actor, opts)
     }
     cfg.rejections = {}
     cfg.pendingWitnesses = {}
+    -- Keep prior-generation registry rows for rematch against archived ledger
+    -- identities; new evidence is stamped with the new generation.
+    EnsureTxnRegistry(cfg)
     BumpRejectionSeq(cfg, { bumpConfig = false })
     BumpConfig(profile)
     Debug("Info", "%s cleared Raid Consumables", actor)
@@ -2189,6 +2471,8 @@ function C.ExportSnapshot(profile, opts)
         rejections = CopyRejectionList(EnsureRejections(cfg)),
         rejectionSeq = tonumber(cfg.rejectionSeq) or 0,
         pendingWitnesses = CopyPendingWitnessList(EnsurePendingWitnesses(cfg)),
+        txnRegistry = CopyTxnRegistry(EnsureTxnRegistry(cfg)),
+        txnAllocSeq = tonumber(cfg.txnAllocSeq) or 0,
         events = events,
     }
 end
@@ -2347,6 +2631,7 @@ function C.ReplaceConfig(profile, payload)
     end
     ReplaceRejectionsFromPayload(cfg, payload, { forceReplace = scopeChanged })
     ReplacePendingWitnessesFromPayload(cfg, payload, { forceReplace = true })
+    ReplaceTxnRegistryFromPayload(cfg, payload)
     cfg.crafters = nil
     cfg.assignments = nil
     cfg.itemEpochs = nil
@@ -2640,6 +2925,10 @@ function C.CopyConfiguration(source, dest)
         rejections = CopyRejectionList(EnsureRejections(src)),
         rejectionSeq = tonumber(src.rejectionSeq) or 0,
         pendingWitnesses = CopyPendingWitnessList(EnsurePendingWitnesses(src)),
+        -- Fresh ledger on the destination: do not copy canonical txn identities
+        -- without their donation events (would invite registry-only double credit).
+        txnRegistry = {},
+        txnAllocSeq = 0,
         obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
     }
     Invalidate(dest)

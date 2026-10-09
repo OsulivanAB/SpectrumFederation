@@ -446,13 +446,12 @@ do
     })
     assertEq(s2.verified, 0, "rematched verified report does not re-verify")
     assertEq(#V.ListVerifiedClusters("stable-txn"), 1, "still one verified cluster")
-    assertEq(V.ListVerifiedClusters("stable-txn")[1].txnId, txnId, "txnId stays evidence-stable")
+    assertEq(V.ListVerifiedClusters("stable-txn")[1].txnId, txnId, "txnId stays registry-stable")
     assertEq(C.ContributionTotal(p, donor, flask), 15, "no double credit after rematch")
-    local idA = V.TxnIdFromEvidence("stable-txn", ev)
-    local idB = V.TxnIdFromEvidence("stable-txn", ev)
-    assertEq(idA, idB, "TxnIdFromEvidence is deterministic")
-    assertEq(idA, txnId, "committed txnId matches evidence-derived identity")
-    -- Cross-observer: reconstructed time may differ; identical neighbors keep identity.
+    assertTrue(C.FindRegistryTxn(p, txnId) ~= nil, "canonical registry retains verified txn")
+    assertTrue(V.TxnIdFromEvidence("stable-txn", ev) == nil,
+        "Blizzard evidence no longer mints permanent txnIds")
+    -- Cross-observer: reconstructed time may differ; registry rematch reuses the ID.
     local shiftedTime = evidence({
         quantity = 15,
         approxTxnTime = (ev.approxTxnTime or clock) + 1800,
@@ -460,11 +459,12 @@ do
         neighborsNewer = ev.neighborsNewer,
         occurrenceIndex = 99,
     })
-    assertEq(V.TxnIdFromEvidence("stable-txn", shiftedTime), txnId,
-        "TxnIdFromEvidence ignores observer-specific time/occurrenceIndex")
-    assertTrue(V.TxnIdFromEvidence("stable-txn", evidence({
-        quantity = 15, neighborsOlder = {}, neighborsNewer = {},
-    })) == nil, "empty neighbor context has no guaranteed evidence txnId")
+    local how, entry = V.ReconcileAgainstRegistry(p, shiftedTime)
+    assertEq(how, "verified", "shifted-time rematch hits registry")
+    assertEq(entry.txnId, txnId, "registry rematch reuses Spectrum-owned txnId")
+    local emptyCtx = evidence({ quantity = 15, neighborsOlder = {}, neighborsNewer = {} })
+    assertTrue(V.HasStrongIdentityContext(emptyCtx) == false,
+        "empty neighbor context is weak identity evidence")
 end
 
 -- ---------------------------------------------------------------------------
@@ -703,8 +703,9 @@ do
     })
     assertEq(sB.trusted, 1, "second offline admin converges")
     assertEq(C.ContributionTotal(p, donor, flask), 14, "second offline admin does not double-credit")
-    assertEq(V.TxnIdFromEvidence("two-admin-offline", obsA), V.TxnIdFromEvidence("two-admin-offline", obsB),
-        "both observers derive the same neighbor-anchored txnId")
+    local match = V.FindEquivalentLedgerDonation(p, "two-admin-offline", obsB)
+    assertTrue(match and V.ValidTxnId(match.txnId), "second observer rematches via registry/ledger")
+    assertEq(#C.TxnRegistry(p), 1, "one canonical registry entry for both observers")
 end
 
 -- ---------------------------------------------------------------------------
@@ -1045,8 +1046,404 @@ do
         "well-after-cutover deposits are not ambiguous by boundary")
 end
 
+-- ---------------------------------------------------------------------------
+-- Canonical transaction registry regressions (Issue #366 remaining work)
+-- ---------------------------------------------------------------------------
+
+-- 1. Same transaction, different relative timestamps across clients
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("reg-shift-time")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-shift-time")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local base = evidence({
+        quantity = 11,
+        approxTxnTime = clock - 120,
+        neighborsOlder = { "anchor-older" },
+        neighborsNewer = { "anchor-newer" },
+    })
+    assertEq(V.IngestReport(p, "reg-shift-time", admin, { base }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#1 first admin verifies")
+    local txnId = V.ListVerifiedClusters("reg-shift-time")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-shift-time")[1], admin))
+    V.ClearSessionClusters()
+    local shifted = evidence({
+        quantity = 11,
+        approxTxnTime = clock - 120 + 2400,
+        occurrenceIndex = 7,
+        neighborsOlder = { "anchor-older" },
+        neighborsNewer = { "anchor-newer" },
+    })
+    local stats = V.IngestReport(p, "reg-shift-time", w1, { shifted }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    })
+    assertEq(stats.verified, 0, "registry#1 rematch does not re-verify")
+    local how, entry = V.ReconcileAgainstRegistry(p, shifted)
+    assertEq(how, "verified", "registry#1 shifted time rematches")
+    assertEq(entry.txnId, txnId, "registry#1 reuses Spectrum txnId")
+    assertEq(C.ContributionTotal(p, donor, flask), 11, "registry#1 no double credit")
+end
+
+-- 2. Same transaction, different surrounding Guild Bank records
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("reg-neighbors")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-neighbors")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local first = evidence({
+        quantity = 12,
+        neighborsOlder = { "n-a", "n-b" },
+        neighborsNewer = { "n-c" },
+        approxTxnTime = clock - 90,
+    })
+    assertEq(V.IngestReport(p, "reg-neighbors", admin, { first }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#2 verifies")
+    local txnId = V.ListVerifiedClusters("reg-neighbors")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-neighbors")[1], admin))
+    local altNeighbors = evidence({
+        quantity = 12,
+        neighborsOlder = { "n-b", "n-x" },
+        neighborsNewer = { "n-c", "n-y" },
+        approxTxnTime = clock - 80,
+        occurrenceIndex = 1,
+    })
+    local how, entry = V.ReconcileAgainstRegistry(p, altNeighbors)
+    assertEq(how, "verified", "registry#2 partial neighbor overlap rematches")
+    assertEq(entry.txnId, txnId, "registry#2 keeps canonical id with different surround")
+end
+
+-- 3. Two distinct identical-item deposits stay separate
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("reg-twin-deposits")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-twin-deposits")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local a = evidence({
+        quantity = 20, occurrenceIndex = 1,
+        neighborsOlder = { "twin-old-1" }, neighborsNewer = { "twin-new-1" },
+        approxTxnTime = clock - 200,
+    })
+    local b = evidence({
+        quantity = 20, occurrenceIndex = 2,
+        neighborsOlder = { "twin-old-2" }, neighborsNewer = { "twin-new-2" },
+        approxTxnTime = clock - 40,
+    })
+    assertEq(V.IngestReport(p, "reg-twin-deposits", admin, { a }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#3 first deposit verifies")
+    local idA = V.ListVerifiedClusters("reg-twin-deposits")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-twin-deposits")[1], admin))
+    V.ClearSessionClusters()
+    assertEq(V.IngestReport(p, "reg-twin-deposits", admin, { b }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#3 second deposit verifies separately")
+    local idB = V.ListVerifiedClusters("reg-twin-deposits")[1].txnId
+    assertTrue(idA ~= idB, "registry#3 distinct Spectrum IDs")
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-twin-deposits")[1], admin))
+    assertEq(C.ContributionTotal(p, donor, flask), 40, "registry#3 both deposits credit")
+    assertEq(#C.TxnRegistry(p), 2, "registry#3 two registry rows")
+end
+
+-- 4. Two deposits with identical surrounding patterns remain separate when far apart
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("reg-same-pattern")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-same-pattern")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local pattern = { "pat-older" }
+    local newer = { "pat-newer" }
+    local early = evidence({
+        quantity = 9, occurrenceIndex = 1,
+        neighborsOlder = pattern, neighborsNewer = newer,
+        approxTxnTime = clock - (4 * 3600),
+        ageHours = 4,
+    })
+    local late = evidence({
+        quantity = 9, occurrenceIndex = 1,
+        neighborsOlder = pattern, neighborsNewer = newer,
+        approxTxnTime = clock - 30,
+        ageHours = 0,
+    })
+    assertEq(V.IngestReport(p, "reg-same-pattern", admin, { early }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#4 early pattern verifies")
+    local idEarly = V.ListVerifiedClusters("reg-same-pattern")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-same-pattern")[1], admin))
+    V.ClearSessionClusters()
+    local how = select(1, V.ReconcileAgainstRegistry(p, late))
+    assertEq(how, "none", "registry#4 late identical pattern does not auto-merge (>3h)")
+    assertEq(V.IngestReport(p, "reg-same-pattern", admin, { late }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#4 late deposit verifies as new txn")
+    local idLate = V.ListVerifiedClusters("reg-same-pattern")[1].txnId
+    assertTrue(idEarly ~= idLate, "registry#4 distinct IDs for same pattern later")
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-same-pattern")[1], admin))
+    assertEq(C.ContributionTotal(p, donor, flask), 18, "registry#4 both pattern deposits credit")
+end
+
+-- 5. Visible history disappears; later matching-looking deposit is not auto-merged
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("reg-disappear")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-disappear")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local first = evidence({
+        quantity = 7, occurrenceIndex = 1,
+        neighborsOlder = {}, neighborsNewer = {},
+        approxTxnTime = clock - (4 * 3600),
+        ageHours = 4,
+        firstSeen = clock - (4 * 3600),
+        lastSeen = clock - (4 * 3600),
+    })
+    assertEq(V.IngestReport(p, "reg-disappear", admin, { first }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#5 first verifies")
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-disappear")[1], admin))
+    local later = evidence({
+        quantity = 7, occurrenceIndex = 1,
+        neighborsOlder = {}, neighborsNewer = {},
+        approxTxnTime = clock - 10,
+        ageHours = 0,
+        firstSeen = clock - 10,
+        lastSeen = clock - 10,
+        observedAt = clock,
+    })
+    local how = select(1, V.ReconcileAgainstRegistry(p, later))
+    assertEq(how, "none", "registry#5 later empty-context lookalike is not auto-matched")
+    V.ClearSessionClusters()
+    assertEq(V.IngestReport(p, "reg-disappear", admin, { later }, {
+        isAdmin = true, scope = scope, obsStore = store, historyComplete = true,
+    }).verified, 1, "registry#5 later deposit verifies as new when distinct")
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-disappear")[1], admin))
+    assertEq(C.ContributionTotal(p, donor, flask), 14, "registry#5 two credits when distinct")
+end
+
+-- 6. Verified transaction survives reload / new raid session via profile sync payload
+do
+    V.ClearSessionClusters()
+    local tuesday = makeProfile("reg-reload")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-reload")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local ev = evidence({ quantity = 13, neighborsOlder = { "reload-n" } })
+    assertEq(V.IngestReport(tuesday, "reg-reload", admin, { ev }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "registry#6 verifies before reload")
+    local txnId = V.ListVerifiedClusters("reg-reload")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(tuesday, V.ListVerifiedClusters("reg-reload")[1], admin))
+    local snap = C.ExportSnapshot(tuesday)
+    assertTrue(type(snap.txnRegistry) == "table" and #snap.txnRegistry >= 1,
+        "registry#6 snapshot includes txnRegistry")
+    assertTrue(tonumber(snap.txnAllocSeq) and snap.txnAllocSeq >= 1,
+        "registry#6 snapshot includes txnAllocSeq")
+    V.ClearSessionClusters()
+    local thursday = makeProfile("reg-reload-restored")
+    assertTrue(select(1, C.MergeSnapshot(thursday, snap, { consumablesFromCoordinator = true })),
+        "registry#6 merge restores registry+ledger across session")
+    assertTrue(C.FindRegistryTxn(thursday, txnId) ~= nil, "registry#6 txn survives reload")
+    assertEq(C.ContributionTotal(thursday, donor, flask), 13, "registry#6 credit survives reload")
+    local how, entry = V.ReconcileAgainstRegistry(thursday, ev)
+    assertEq(how, "verified", "registry#6 rematch after reload")
+    assertEq(entry.txnId, txnId, "registry#6 same Spectrum id after reload")
+end
+
+-- 7. Coordinator A Tuesday → Coordinator B Thursday
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("reg-handoff", { admin, "CoordB-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "reg-handoff")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local tuesdayEv = evidence({
+        quantity = 16, neighborsOlder = { "tue-n" }, approxTxnTime = clock - 100,
+    })
+    assertEq(V.IngestReport(coordA, "reg-handoff", admin, { tuesdayEv }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA,
+    }).verified, 1, "registry#7 Coord A verifies Tuesday")
+    local txnId = V.ListVerifiedClusters("reg-handoff")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(coordA, V.ListVerifiedClusters("reg-handoff")[1], admin))
+    local snap = C.ExportSnapshot(coordA)
+    V.ClearSessionClusters()
+    local coordB = makeProfile("reg-handoff-b", { admin, "CoordB-Realm" })
+    assertTrue(select(1, C.MergeSnapshot(coordB, snap, { consumablesFromCoordinator = true })),
+        "registry#7 Coord B receives Tuesday registry+ledger")
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "reg-handoff-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local reobserve = evidence({
+        quantity = 16, neighborsOlder = { "tue-n" },
+        approxTxnTime = clock - 100 + 900,
+        occurrenceIndex = 4,
+    })
+    local stats = V.IngestReport(coordB, "reg-handoff-b", "CoordB-Realm", { reobserve }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = true,
+    })
+    assertEq(stats.verified, 0, "registry#7 Coord B does not re-verify Tuesday txn")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 16, "registry#7 Tuesday credit intact")
+    local how, entry = V.ReconcileAgainstRegistry(coordB, reobserve)
+    assertEq(how, "verified", "registry#7 Coord B rematches registry")
+    assertEq(entry.txnId, txnId, "registry#7 Coord B reuses Tuesday Spectrum id")
+    local fresh = evidence({
+        quantity = 5, neighborsOlder = { "thu-n" },
+        approxTxnTime = clock - 20, occurrenceIndex = 1,
+        coreSignature = O.CoreSignature("deposit", donor, flask, 5),
+    })
+    assertEq(V.IngestReport(coordB, "reg-handoff-b", "CoordB-Realm", { fresh }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = true,
+    }).verified, 1, "registry#7 Thursday new deposit still verifies")
+    local newId = nil
+    local verified = V.ListVerifiedClusters("reg-handoff-b")
+    for i = 1, #verified do
+        if verified[i].txnId ~= txnId then newId = verified[i].txnId end
+    end
+    assertTrue(newId ~= nil and newId ~= txnId, "registry#7 new Thursday id is distinct")
+end
+
+-- 8. New coordinator with incomplete history holds uncertain credit
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("reg-incomplete")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-incomplete")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    -- Simulate remote coordinator ahead on events/registry watermarks.
+    p._consumablesCatchUpRemote = {
+        generation = 1,
+        configSeq = 5,
+        eventCount = 3,
+        eventFingerprint = 999,
+        txnAllocSeq = 3,
+        archiveCount = 0,
+        archiveFingerprint = 0,
+    }
+    assertTrue(S.NeedsCatchUp(C.Descriptor(p), p._consumablesCatchUpRemote),
+        "registry#8 catch-up required")
+    local uncertain = evidence({
+        quantity = 4, neighborsOlder = { "inc-n" }, approxTxnTime = clock - 50,
+    })
+    local stats = V.IngestReport(p, "reg-incomplete", admin, { uncertain }, {
+        isAdmin = true, scope = scope, obsStore = store, historyComplete = false,
+    })
+    assertEq(stats.verified, 0, "registry#8 incomplete history does not verify")
+    assertEq(stats.pending, 1, "registry#8 holds pending for review")
+    assertEq(C.ContributionTotal(p, donor, flask), 0, "registry#8 no speculative credit")
+end
+
+-- 9. Three independent witnesses converge without combining separate deposits
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("reg-witnesses")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-witnesses")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local depA = evidence({
+        quantity = 8, occurrenceIndex = 1,
+        neighborsOlder = { "w-a1" }, neighborsNewer = { "w-a2" },
+        approxTxnTime = clock - 300,
+    })
+    local depB = evidence({
+        quantity = 8, occurrenceIndex = 2,
+        neighborsOlder = { "w-b1" }, neighborsNewer = { "w-b2" },
+        approxTxnTime = clock - 60,
+    })
+    assertEq(V.IngestReport(p, "reg-witnesses", w1, { depA }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "registry#9 depA witness1 pending")
+    assertEq(V.IngestReport(p, "reg-witnesses", w2, { depA }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "registry#9 depA witness2 pending")
+    local s3 = V.IngestReport(p, "reg-witnesses", w3, { depA }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    })
+    assertEq(s3.verified, 1, "registry#9 depA third witness verifies")
+    local idA = V.ListVerifiedClusters("reg-witnesses")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-witnesses")[1], w3))
+    V.ClearSessionClusters()
+    assertEq(V.IngestReport(p, "reg-witnesses", w1, { depB }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "registry#9 depB witness1 pending")
+    assertEq(V.IngestReport(p, "reg-witnesses", w2, { depB }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "registry#9 depB witness2 pending")
+    local sB = V.IngestReport(p, "reg-witnesses", w3, { depB }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    })
+    assertEq(sB.verified, 1, "registry#9 depB verifies independently")
+    local idB = V.ListVerifiedClusters("reg-witnesses")[1].txnId
+    assertTrue(idA ~= idB, "registry#9 witness paths do not merge distinct deposits")
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("reg-witnesses")[1], w3))
+    assertEq(C.ContributionTotal(p, donor, flask), 16, "registry#9 both witness-verified deposits credit")
+end
+
+-- 10. Admin rejection/correction survives registry sync and coordinator change
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("reg-reject-sync", { admin, "CoordB-Realm" })
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-reject-sync")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local ev = evidence({
+        quantity = 6, neighborsOlder = { "rej-n" }, approxTxnTime = clock - 70,
+    })
+    assertEq(V.IngestReport(coordA, "reg-reject-sync", w1, { ev }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "registry#10 pending before reject")
+    local clusters = V.EnsureClusterStore("reg-reject-sync").clusters
+    local clusterId = clusters[1] and clusters[1].clusterId
+    assertTrue(select(1, V.ApplyDecision(coordA, "reg-reject-sync", admin, {
+        action = "reject", clusterId = clusterId, reason = "duplicate bank scan",
+    }, {
+        isAdmin = true,
+        recordDurableRejection = function(evidence, decidedBy, reason)
+            C.RecordDurableRejection(coordA, evidence, decidedBy, reason)
+        end,
+    })), "registry#10 admin rejects")
+    local rejEntry = nil
+    for i = 1, #C.TxnRegistry(coordA) do
+        if C.TxnRegistry(coordA)[i].status == "rejected" then
+            rejEntry = C.TxnRegistry(coordA)[i]
+        end
+    end
+    assertTrue(rejEntry ~= nil, "registry#10 rejection recorded in txnRegistry")
+    local snap = C.ExportSnapshot(coordA, { omitEvents = true })
+    V.ClearSessionClusters()
+    local coordB = makeProfile("reg-reject-sync-b", { admin, "CoordB-Realm" })
+    assertTrue(select(1, C.ReplaceConfig(coordB, snap)), "registry#10 Coord B receives rejection snapshot")
+    assertTrue(V.IsRejected({ rejections = C.DurableRejections(coordB) }, ev),
+        "registry#10 durable rejection present on Coord B")
+    local how = select(1, V.ReconcileAgainstRegistry(coordB, ev))
+    assertEq(how, "rejected", "registry#10 registry rejection survives sync")
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "reg-reject-sync-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local stats = V.IngestReport(coordB, "reg-reject-sync-b", w2, { ev }, {
+        isAdmin = false, scope = scopeB, obsStore = storeB,
+        durableRejections = C.DurableRejections(coordB),
+    })
+    assertEq(stats.rejected, 1, "registry#10 re-report stays rejected after handoff")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "registry#10 no credit after rejection sync")
+    assertTrue(select(1, V.ApplyDecision(coordB, "reg-reject-sync-b", "CoordB-Realm", {
+        action = "correct", evidence = ev,
+    }, {
+        isAdmin = true,
+        clearDurableRejection = function(evidence)
+            C.ClearDurableRejection(coordB, evidence)
+        end,
+    })), "registry#10 Coord B can correct after sync")
+    local howAfter = select(1, V.ReconcileAgainstRegistry(coordB, ev))
+    assertEq(howAfter, "verified", "registry#10 correction flips registry status")
+end
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)
 end
 io.stdout:write(string.format("%d passed, 0 failed\n", passes))
+

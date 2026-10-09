@@ -177,6 +177,9 @@ function S.CoordinatorConfigDiffers(localDesc, remote)
     local remoteRej = tonumber(remote.rejectionSeq)
     local localRej = tonumber(localDesc.rejectionSeq)
     if remoteRej and localRej and remoteRej ~= localRej then return true end
+    local remoteAlloc = tonumber(remote.txnAllocSeq)
+    local localAlloc = tonumber(localDesc.txnAllocSeq)
+    if remoteAlloc and localAlloc and remoteAlloc ~= localAlloc then return true end
     local remoteFp = tonumber(remote.configFingerprint)
     local localFp = tonumber(localDesc.configFingerprint)
     if remoteFp and localFp and remoteFp ~= localFp then return true end
@@ -190,6 +193,7 @@ function S.CatchUpKind(localDesc, remote)
     local ahead = (tonumber(remote.generation) or 0) > (localDesc.generation or 1)
         or (tonumber(remote.configSeq) or 0) > (localDesc.configSeq or 0)
         or (tonumber(remote.eventCount) or 0) > (localDesc.eventCount or 0)
+        or (tonumber(remote.txnAllocSeq) or 0) > (localDesc.txnAllocSeq or 0)
     if ahead then return "ahead" end
     return "fingerprint"
 end
@@ -324,6 +328,8 @@ function S.NeedsCatchUp(localDesc, remote)
     if remoteGen and remoteGen > (localDesc.generation or 1) then return true end
     if remoteSeq and remoteSeq > (localDesc.configSeq or 0) then return true end
     if remoteEvents and remoteEvents > (localDesc.eventCount or 0) then return true end
+    local remoteAlloc = tonumber(remote.txnAllocSeq)
+    if remoteAlloc and remoteAlloc > (localDesc.txnAllocSeq or 0) then return true end
     local remoteFingerprint = tonumber(remote.eventFingerprint)
     local localFingerprint = tonumber(localDesc.eventFingerprint)
     if remoteFingerprint and localFingerprint and remoteFingerprint ~= localFingerprint then

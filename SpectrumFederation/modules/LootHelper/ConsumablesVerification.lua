@@ -11,6 +11,7 @@ V.WITNESS_THRESHOLD = 3
 V.MAX_WITNESSES_PER_CLUSTER = 16
 V.MAX_REJECTIONS_PER_SCOPE = 128
 V.MAX_PENDING_WITNESS_AGGREGATES = 128
+V.MAX_TXN_REGISTRY_SCAN = 256
 V.MAX_OBS_BATCH = 32
 V.MAX_CLUSTERS = 256
 V.MAX_REVIEW_SUMMARY = 40
@@ -199,8 +200,8 @@ local function MixText(hash, text)
     return h
 end
 
--- Neighbor context is required before minting a shared evidence-derived identity.
--- Window-relative occurrenceIndex alone is not stable across Blizzard log movement.
+-- Neighbor / continuity context used for conservative matching only.
+-- Not used to mint canonical Spectrum transaction IDs.
 function V.HasStrongIdentityContext(evidence)
     if type(evidence) ~= "table" then return false end
     local older = evidence.neighborsOlder
@@ -210,59 +211,25 @@ function V.HasStrongIdentityContext(evidence)
     return false
 end
 
-local function MixNeighborList(hash, list)
-    if type(list) ~= "table" then
-        return MixText(hash, "-")
-    end
-    local limit = #list
-    if limit > 4 then limit = 4 end
-    for i = 1, limit do
-        hash = MixText(hash, tostring(list[i] or ""))
-    end
-    return hash
+-- Deprecated: Blizzard-derived IDs are not used. Kept as a nil stub for older tests/callers.
+function V.TxnIdFromEvidence(_profileId, _evidence)
+    return nil
 end
 
--- Evidence-stable transaction identity when neighbor anchors are present.
--- Does not use occurrenceIndex (resets per visible window) or approxTxnTime
--- (hour-bucket reconstruction differs between observers).
-function V.TxnIdFromEvidence(profileId, evidence)
-    if type(evidence) ~= "table" then return nil end
-    if not V.HasStrongIdentityContext(evidence) then
-        return nil
-    end
-    local pid = tostring(profileId or "profile")
-    if #pid > 40 then pid = pid:sub(1, 40) end
-    local donor = Norm(evidence.donor) or ""
-    local hash = 0
-    hash = MixText(hash, evidence.coreSignature or "")
-    hash = MixText(hash, evidence.guildGuid or "")
-    hash = MixText(hash, tostring(tonumber(evidence.bankTab) or 0))
-    hash = MixText(hash, tostring(tonumber(evidence.generation) or 0))
-    hash = MixText(hash, donor)
-    hash = MixText(hash, tostring(tonumber(evidence.itemId) or 0))
-    hash = MixText(hash, tostring(FloorNonNeg(evidence.quantity)))
-    hash = MixNeighborList(hash, evidence.neighborsOlder)
-    hash = MixNeighborList(hash, evidence.neighborsNewer)
-    local txnId = string.format("ctx:%s:%x", pid, hash)
-    return V.ValidTxnId(txnId)
-end
-
-function V.NextTxnId(store, profileId, evidence)
-    if type(evidence) == "table" then
-        local derived = V.TxnIdFromEvidence(profileId, evidence)
-        if derived then return derived end
-    end
-    if type(store) ~= "table" then return nil end
-    store.txnSeq = FloorNonNeg(store.txnSeq) + 1
-    local pid = tostring(profileId or "profile")
-    if #pid > 40 then pid = pid:sub(1, 40) end
-    local writer = ""
-    if SF.NameUtil and SF.NameUtil.GetSelfId then
-        writer = Norm(SF.NameUtil.GetSelfId()) or ""
-    end
-    if #writer > 32 then writer = writer:sub(1, 32) end
-    -- Writer-namespaced fallback for coordinator-owned minting only.
-    return string.format("ctx:%s:%s:%d", pid, writer ~= "" and writer or "local", store.txnSeq)
+local function RegistryMatchView(entry)
+    return {
+        coreSignature = entry.coreSignature,
+        guildGuid = entry.guildGuid,
+        bankTab = entry.bankTab,
+        generation = entry.generation,
+        approxTxnTime = tonumber(entry.approxTxnTime),
+        occurrenceIndex = entry.occurrenceIndex,
+        neighborsOlder = entry.neighborsOlder,
+        neighborsNewer = entry.neighborsNewer,
+        firstSeen = entry.approxTxnTime,
+        lastSeen = entry.approxTxnTime,
+        status = "pending",
+    }
 end
 
 local function LedgerEvidenceView(event)
@@ -282,13 +249,169 @@ local function LedgerEvidenceView(event)
     }
 end
 
--- Match an existing guildbank donation by stable txnId or MatchScore continuity.
--- Requires generation/guild/tab scope; never absorbs cross-generation archive rows.
+-- Conservative reconciliation against the synchronized canonical registry.
+-- Returns how ("verified"|"rejected"|"ambiguous"|"none"), entry, score.
+function V.ReconcileAgainstRegistry(profile, evidence)
+    if not C or not C.TxnRegistry or type(profile) ~= "table" or type(evidence) ~= "table" then
+        return "none", nil, nil
+    end
+    if not (O and O.MatchScore) then
+        return "none", nil, nil
+    end
+    local list = C.TxnRegistry(profile)
+    local bestVerified, bestVerifiedScore = nil, nil
+    local secondVerifiedScore = nil
+    local bestRejected, bestRejectedScore = nil, nil
+    local scanned = 0
+    local start = #list
+    for i = start, 1, -1 do
+        scanned = scanned + 1
+        if scanned > V.MAX_TXN_REGISTRY_SCAN then break end
+        local entry = list[i]
+        if type(entry) == "table"
+            and tonumber(entry.generation) == tonumber(evidence.generation)
+            and tostring(entry.guildGuid or "") == tostring(evidence.guildGuid or "")
+            and tonumber(entry.bankTab) == tonumber(evidence.bankTab)
+        then
+            local score = O.MatchScore(RegistryMatchView(entry), evidence)
+            if score and score >= (O.MIN_MATCH_SCORE or 100) then
+                if entry.status == "rejected" then
+                    if not bestRejectedScore or score > bestRejectedScore then
+                        bestRejected, bestRejectedScore = entry, score
+                    end
+                else
+                    if not bestVerifiedScore or score > bestVerifiedScore then
+                        secondVerifiedScore = bestVerifiedScore
+                        bestVerified, bestVerifiedScore = entry, score
+                    elseif not secondVerifiedScore or score > secondVerifiedScore then
+                        secondVerifiedScore = score
+                    end
+                end
+            end
+        end
+    end
+    if bestVerified and secondVerifiedScore
+        and (bestVerifiedScore - secondVerifiedScore) < (O.AMBIGUITY_MARGIN or 15)
+    then
+        return "ambiguous", bestVerified, bestVerifiedScore
+    end
+    if bestVerified then
+        return "verified", bestVerified, bestVerifiedScore
+    end
+    if bestRejected then
+        return "rejected", bestRejected, bestRejectedScore
+    end
+    return "none", nil, nil
+end
+
+function V.RegistryEntryFromEvidence(evidence, txnId, status, writer, verification, opts)
+    opts = opts or {}
+    if type(evidence) ~= "table" then return nil end
+    txnId = V.ValidTxnId(txnId)
+    if not txnId then return nil end
+    return {
+        txnId = txnId,
+        status = status == "rejected" and "rejected" or "verified",
+        committed = opts.committed == true,
+        coreSignature = evidence.coreSignature,
+        approxTxnTime = tonumber(evidence.approxTxnTime),
+        donor = Norm(evidence.donor),
+        itemId = tonumber(evidence.itemId),
+        quantity = FloorNonNeg(evidence.quantity),
+        guildGuid = evidence.guildGuid,
+        bankTab = tonumber(evidence.bankTab),
+        generation = tonumber(evidence.generation),
+        occurrenceIndex = tonumber(evidence.occurrenceIndex),
+        neighborsOlder = evidence.neighborsOlder,
+        neighborsNewer = evidence.neighborsNewer,
+        verification = verification,
+        decidedBy = Norm(writer),
+        decidedAt = Now(),
+        reason = opts.reason,
+    }
+end
+
+-- Mint a Spectrum-owned ID and register evidence for future reconciliation.
+function V.AllocateCanonicalTxn(profile, evidence, writer, verification, opts)
+    opts = opts or {}
+    if not C or not C.AllocateCanonicalTxnId or type(profile) ~= "table" then
+        return nil
+    end
+    local txnId = C.AllocateCanonicalTxnId(profile, writer)
+    if not txnId then return nil end
+    local entry = V.RegistryEntryFromEvidence(evidence, txnId, "verified", writer, verification, opts)
+    if entry then
+        C.RegisterCanonicalTxn(profile, entry, { bumpSeq = opts.bumpSeq })
+    end
+    return txnId
+end
+
+-- Compatibility wrapper: prefer registry allocation when a profile is supplied.
+function V.NextTxnId(store, profileId, evidence, opts)
+    opts = opts or {}
+    local profile = opts.profile
+    local writer = opts.writer
+    if profile and C and C.AllocateCanonicalTxnId then
+        return V.AllocateCanonicalTxn(profile, evidence, writer or (SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.GetSelfId()), opts.verification, {
+            bumpSeq = opts.bumpSeq,
+            committed = false,
+        })
+    end
+    -- Last-resort local mint when no profile is available (tests / early boot).
+    if type(store) ~= "table" then return nil end
+    store.txnSeq = FloorNonNeg(store.txnSeq) + 1
+    local pid = tostring(profileId or "profile")
+    if #pid > 40 then pid = pid:sub(1, 40) end
+    writer = Norm(writer)
+    if not writer and SF.NameUtil and SF.NameUtil.GetSelfId then
+        writer = Norm(SF.NameUtil.GetSelfId())
+    end
+    if writer and #writer > 32 then writer = writer:sub(1, 32) end
+    return string.format("ctx:%s:%s:%d", pid, writer or "local", store.txnSeq)
+end
+
+-- Match an existing guildbank donation via registry first, then ledger MatchScore.
 function V.FindEquivalentLedgerDonation(profile, profileId, evidence)
     if not C or type(profile) ~= "table" or type(evidence) ~= "table" then
         return nil
     end
-    local expectedTxn = V.TxnIdFromEvidence(profileId, evidence)
+    local how, entry = V.ReconcileAgainstRegistry(profile, evidence)
+    if how == "verified" and entry and V.ValidTxnId(entry.txnId) then
+        if C.HasTxnId and C.HasTxnId(profile, entry.txnId) then
+            local lists = { profile._consumableEvents, profile._consumableEventArchive }
+            for li = 1, #lists do
+                local list = lists[li]
+                if type(list) == "table" then
+                    for i = 1, #list do
+                        local event = list[i]
+                        if type(event) == "table" and V.ValidTxnId(event.txnId) == entry.txnId then
+                            return event
+                        end
+                    end
+                end
+            end
+        end
+        -- Registry hit without ledger row yet: synthesize a continuity view.
+        return {
+            txnId = entry.txnId,
+            verification = entry.verification,
+            writer = entry.decidedBy,
+            generation = entry.generation,
+            guildGuid = entry.guildGuid,
+            bankTab = entry.bankTab,
+            coreSignature = entry.coreSignature,
+            occurrenceIndex = entry.occurrenceIndex,
+            neighborsOlder = entry.neighborsOlder,
+            neighborsNewer = entry.neighborsNewer,
+            timestamp = entry.approxTxnTime,
+            source = "guildbank",
+            type = C.EVENT and C.EVENT.DONATION or "CONSUMABLE_DONATION",
+            _registryOnly = true,
+        }
+    end
+    if how == "ambiguous" then
+        return nil
+    end
     local lists = { profile._consumableEvents, profile._consumableEventArchive }
     local best, bestScore = nil, nil
     for li = 1, #lists do
@@ -300,9 +423,6 @@ function V.FindEquivalentLedgerDonation(profile, profileId, evidence)
                     and event.type == (C.EVENT and C.EVENT.DONATION or "CONSUMABLE_DONATION")
                     and event.source == "guildbank"
                 then
-                    if expectedTxn and V.ValidTxnId(event.txnId) == expectedTxn then
-                        return event
-                    end
                     if tonumber(event.generation) == tonumber(evidence.generation)
                         and tostring(event.guildGuid or "") == tostring(evidence.guildGuid or "")
                         and tonumber(event.bankTab) == tonumber(evidence.bankTab)
@@ -690,22 +810,39 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                         and V.IsRejected({ rejections = opts.durableRejections }, evidence) then
                         rejected = true
                     end
-                    if rejected then
+                    local regHow, regEntry = V.ReconcileAgainstRegistry(profile, evidence)
+                    if rejected or regHow == "rejected" then
                         stats.rejected = stats.rejected + 1
                         Debug("Info", "report suppressed by prior rejection donor=%s item=%s",
                             tostring(evidence.donor), tostring(evidence.itemId))
                     else
                         local cluster, how = V.MatchCluster(store, evidence)
-                        if how ~= "verified" then
+                        if regHow == "ambiguous" then
+                            if not cluster then
+                                cluster = NewCluster(store, evidence)
+                            end
+                            cluster.status = "ambiguous"
+                            cluster.evidence = evidence
+                            how = "ambiguous"
+                        elseif how ~= "verified" then
                             local ledgerHit = V.FindEquivalentLedgerDonation(profile, profileId, evidence)
                             if not cluster and ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
-                                -- Continuity hit only: never absorb a distinct deposit.
                                 cluster = NewCluster(store, evidence)
                                 cluster.status = "verified"
                                 cluster.verification = ledgerHit.verification or V.VERIFICATION.MANUAL
                                 cluster.txnId = ledgerHit.txnId
-                                cluster._committed = true
+                                cluster._committed = (not ledgerHit._registryOnly)
+                                    and C.HasTxnId and C.HasTxnId(profile, ledgerHit.txnId)
                                 cluster.decidedBy = Norm(ledgerHit.writer) or submittedBy
+                                how = "verified"
+                            elseif regHow == "verified" and regEntry and not cluster then
+                                cluster = NewCluster(store, evidence)
+                                cluster.status = "verified"
+                                cluster.verification = regEntry.verification or V.VERIFICATION.MANUAL
+                                cluster.txnId = regEntry.txnId
+                                cluster._committed = regEntry.committed == true
+                                    or (C.HasTxnId and C.HasTxnId(profile, regEntry.txnId))
+                                cluster.decidedBy = Norm(regEntry.decidedBy) or submittedBy
                                 how = "verified"
                             elseif not cluster then
                                 cluster = NewCluster(store, evidence)
@@ -729,18 +866,24 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                             end
                         end
 
+                        local historyReady = opts.historyComplete ~= false
                         if how == "verified" or cluster.status == "verified" or cluster.status == "rejected" then
-                            -- Already terminal: rematch only records the witness.
                             if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
                                 opts.clearPendingWitness(evidence)
                             end
+                        elseif cluster.status == "ambiguous" then
+                            stats.pending = stats.pending + 1
+                        elseif not historyReady and not cluster.txnId then
+                            -- Incomplete synchronized history: never mint overlapping credits.
+                            stats.pending = stats.pending + 1
+                            Debug("Info", "holding uncertain credit until history converges donor=%s",
+                                tostring(evidence.donor))
                         elseif isAdmin and cluster.status ~= "ambiguous" then
-                            -- Ambiguous rows require manual review; never auto-trust them.
                             cluster.status = "verified"
                             cluster.verification = V.VERIFICATION.ADMIN_TRUST
                             cluster.decidedBy = submittedBy
-                            cluster.txnId = cluster.txnId
-                                or V.NextTxnId(opts.obsStore or store, profileId, evidence)
+                            cluster.txnId = cluster.txnId or V.AllocateCanonicalTxn(
+                                profile, evidence, submittedBy, V.VERIFICATION.ADMIN_TRUST)
                             stats.verified = stats.verified + 1
                             if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
                                 opts.clearPendingWitness(evidence)
@@ -750,17 +893,21 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                         elseif cluster.status ~= "ambiguous" then
                             local witnesses = after
                             if witnesses >= V.WITNESS_THRESHOLD then
-                                cluster.status = "verified"
-                                cluster.verification = V.VERIFICATION.WITNESSES
-                                cluster.decidedBy = submittedBy
-                                cluster.txnId = cluster.txnId
-                                    or V.NextTxnId(opts.obsStore or store, profileId, evidence)
-                                stats.verified = stats.verified + 1
-                                if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
-                                    opts.clearPendingWitness(evidence)
+                                if not historyReady and not cluster.txnId then
+                                    stats.pending = stats.pending + 1
+                                else
+                                    cluster.status = "verified"
+                                    cluster.verification = V.VERIFICATION.WITNESSES
+                                    cluster.decidedBy = submittedBy
+                                    cluster.txnId = cluster.txnId or V.AllocateCanonicalTxn(
+                                        profile, evidence, submittedBy, V.VERIFICATION.WITNESSES)
+                                    stats.verified = stats.verified + 1
+                                    if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
+                                        opts.clearPendingWitness(evidence)
+                                    end
+                                    Debug("Info", "three-witness verification txn=%s witnesses=%s",
+                                        tostring(cluster.txnId), tostring(witnesses))
                                 end
-                                Debug("Info", "three-witness verification txn=%s witnesses=%s",
-                                    tostring(cluster.txnId), tostring(witnesses))
                             else
                                 stats.pending = stats.pending + 1
                             end
@@ -875,6 +1022,16 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
         if opts.recordDurableRejection and type(opts.recordDurableRejection) == "function" then
             opts.recordDurableRejection(cluster.evidence, decidedBy, decision.reason)
         end
+        if C and C.RegisterCanonicalTxn and cluster.evidence then
+            local rejTxn = V.ValidTxnId(cluster.txnId)
+                or (C.AllocateCanonicalTxnId and C.AllocateCanonicalTxnId(profile, decidedBy))
+            local entry = V.RegistryEntryFromEvidence(
+                cluster.evidence, rejTxn, "rejected", decidedBy, nil, { reason = decision.reason })
+            if entry then
+                C.RegisterCanonicalTxn(profile, entry)
+            end
+            cluster.txnId = rejTxn
+        end
         if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
             opts.clearPendingWitness(cluster.evidence)
         end
@@ -896,8 +1053,19 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
     cluster.verification = V.VERIFICATION.MANUAL
     cluster.decidedBy = decidedBy
     cluster.updatedAt = Now()
-    cluster.txnId = cluster.txnId
-        or V.NextTxnId(opts.obsStore or store, profileId, cluster.evidence)
+    if not V.ValidTxnId(cluster.txnId) then
+        cluster.txnId = V.AllocateCanonicalTxn(
+            profile, cluster.evidence, decidedBy, V.VERIFICATION.MANUAL)
+    elseif C and C.RegisterCanonicalTxn and cluster.evidence then
+        -- Correction/approve of a prior rejection must flip registry status.
+        local entry = V.RegistryEntryFromEvidence(
+            cluster.evidence, cluster.txnId, "verified", decidedBy, V.VERIFICATION.MANUAL, {
+                committed = C.HasTxnId and C.HasTxnId(profile, cluster.txnId) or false,
+            })
+        if entry then
+            C.RegisterCanonicalTxn(profile, entry)
+        end
+    end
     if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
         opts.clearPendingWitness(cluster.evidence)
     end
@@ -1037,6 +1205,15 @@ function V.CommitVerifiedCluster(profile, cluster, writer)
         ok, err = C.CommitEvents(profile, token, { event }, { writer = event.writer })
     end
     if ok then
+        if C.MarkRegistryCommitted then
+            C.MarkRegistryCommitted(profile, cluster.txnId, { bumpSeq = false })
+        elseif C.RegisterCanonicalTxn then
+            local entry = V.RegistryEntryFromEvidence(
+                cluster.evidence, cluster.txnId, "verified", writer, cluster.verification, { committed = true })
+            if entry then
+                C.RegisterCanonicalTxn(profile, entry, { bumpSeq = false })
+            end
+        end
         Debug("Info", "committed verified donation txn=%s donor=%s item=%s qty=%s",
             tostring(cluster.txnId), tostring(event.actor), tostring(event.itemId), tostring(event.quantity))
     end
@@ -1066,32 +1243,58 @@ function V.ProcessLocalAfterReconcile(profile, profileId, store, scope, opts)
     -- Local admins report observations instead of minting competing txnIds.
     local deferToCoordinator = opts.deferToCoordinator == true
     local durableRejections = C.DurableRejections and C.DurableRejections(profile) or nil
+    local historyReady = opts.historyComplete ~= false
     local stats = { trusted = 0, suppressed = 0, deferred = 0 }
     for i = 1, #(scope.observations or {}) do
         local obs = scope.observations[i]
         if type(obs) == "table" and (obs.status == "pending" or obs.status == "ambiguous") then
             local durableRejected = durableRejections
                 and V.IsRejected({ rejections = durableRejections }, obs)
-            if V.IsRejected(scope, obs) or durableRejected then
+            local regHow = select(1, V.ReconcileAgainstRegistry(profile, obs))
+            if V.IsRejected(scope, obs) or durableRejected or regHow == "rejected" then
                 obs.status = "rejected"
                 stats.suppressed = stats.suppressed + 1
-            elseif obs.status == "ambiguous" then
+            elseif obs.status == "ambiguous" or regHow == "ambiguous" then
                 -- Ambiguous matches stay pending review; never auto-trust.
+                if obs.status ~= "ambiguous" then obs.status = "ambiguous" end
                 stats.deferred = stats.deferred + 1
             elseif deferToCoordinator then
                 stats.deferred = stats.deferred + 1
             elseif effectiveAdmin and selfId then
                 local prior = V.FindEquivalentLedgerDonation(profile, profileId, obs)
                 if prior and V.ValidTxnId(prior.txnId) then
-                    -- Another offline admin already credited this bank row.
-                    V.MarkLocalObservationVerified(obs, prior.txnId, prior.verification or V.VERIFICATION.ADMIN_TRUST)
-                    scope.verifiedTxnIds[prior.txnId] = true
-                    stats.trusted = stats.trusted + 1
-                    Debug("Info", "local admin trust converges on existing txn=%s", tostring(prior.txnId))
+                    if prior._registryOnly and not (C.HasTxnId and C.HasTxnId(profile, prior.txnId)) then
+                        -- Registry knows the identity but ledger credit is missing: commit once.
+                        local cluster = {
+                            status = "verified",
+                            txnId = prior.txnId,
+                            evidence = obs,
+                            verification = prior.verification or V.VERIFICATION.ADMIN_TRUST,
+                            decidedBy = selfId,
+                        }
+                        local ok = V.CommitVerifiedCluster(profile, cluster, selfId)
+                        if ok then
+                            V.MarkLocalObservationVerified(obs, prior.txnId, cluster.verification)
+                            scope.verifiedTxnIds[prior.txnId] = true
+                            stats.trusted = stats.trusted + 1
+                        else
+                            stats.deferred = stats.deferred + 1
+                        end
+                    else
+                        V.MarkLocalObservationVerified(obs, prior.txnId, prior.verification or V.VERIFICATION.ADMIN_TRUST)
+                        scope.verifiedTxnIds[prior.txnId] = true
+                        stats.trusted = stats.trusted + 1
+                        Debug("Info", "local admin trust converges on existing txn=%s", tostring(prior.txnId))
+                    end
+                elseif not historyReady then
+                    -- Incomplete synchronized history: do not mint potentially overlapping credits.
+                    stats.deferred = stats.deferred + 1
+                elseif not V.HasStrongIdentityContext(obs) then
+                    -- Uncertain empty-window evidence waits for session/admin review.
+                    stats.deferred = stats.deferred + 1
                 else
-                    -- Offline multi-admin path may only mint neighbor-anchored IDs.
-                    -- Uncertain empty-window rows wait for session/coordinator review.
-                    local txnId = V.ValidTxnId(obs.txnId) or V.TxnIdFromEvidence(profileId, obs)
+                    local txnId = V.ValidTxnId(obs.txnId)
+                        or V.AllocateCanonicalTxn(profile, obs, selfId, V.VERIFICATION.ADMIN_TRUST)
                     if not txnId then
                         stats.deferred = stats.deferred + 1
                     else
@@ -1121,19 +1324,21 @@ end
 
 function V.ObservationSubmitKey(obs, profileId)
     if type(obs) ~= "table" then return nil end
-    local txn = V.TxnIdFromEvidence(profileId, obs)
-    if txn then return txn end
+    if V.ValidTxnId(obs.txnId) then
+        return obs.txnId
+    end
     if type(obs.localId) == "string" and obs.localId ~= "" then
         return "local:" .. obs.localId
     end
     local donor = Norm(obs.donor) or ""
     return string.format(
-        "fp:%s:%s:%s:%s:%s",
+        "fp:%s:%s:%s:%s:%s:%s",
         tostring(obs.coreSignature or ""),
         tostring(obs.guildGuid or ""),
         tostring(tonumber(obs.bankTab) or 0),
         tostring(tonumber(obs.generation) or 0),
-        donor
+        donor,
+        tostring(tonumber(obs.approxTxnTime) or 0)
     )
 end
 
