@@ -199,7 +199,9 @@ local function MixText(hash, text)
 end
 
 -- Evidence-stable transaction identity shared across observers/stores.
--- Exactly-once accounting must not depend on a per-client sequence counter.
+-- Uses only fields every observer reconstructs identically for the same bank row:
+-- core signature, guild/tab/generation, and occurrence index. Reconstructed
+-- approxTxnTime and neighbor windows vary by observer and must not participate.
 function V.TxnIdFromEvidence(profileId, evidence)
     if type(evidence) ~= "table" then return nil end
     local pid = tostring(profileId or "profile")
@@ -209,15 +211,12 @@ function V.TxnIdFromEvidence(profileId, evidence)
     hash = MixText(hash, evidence.coreSignature or "")
     hash = MixText(hash, evidence.guildGuid or "")
     hash = MixText(hash, tostring(tonumber(evidence.bankTab) or 0))
+    hash = MixText(hash, tostring(tonumber(evidence.generation) or 0))
     hash = MixText(hash, donor)
     hash = MixText(hash, tostring(tonumber(evidence.itemId) or 0))
     hash = MixText(hash, tostring(FloorNonNeg(evidence.quantity)))
-    hash = MixText(hash, tostring(tonumber(evidence.approxTxnTime) or 0))
+    -- Occurrence distinguishes two identical deposits; same bank row shares it.
     hash = MixText(hash, tostring(tonumber(evidence.occurrenceIndex) or 0))
-    local older = evidence.neighborsOlder
-    if type(older) == "table" and older[1] then
-        hash = MixText(hash, older[1])
-    end
     local txnId = string.format("ctx:%s:%x", pid, hash)
     return V.ValidTxnId(txnId)
 end
@@ -240,16 +239,18 @@ function V.NextTxnId(store, profileId, evidence)
     return string.format("ctx:%s:%s:%d", pid, writer ~= "" and writer or "local", store.txnSeq)
 end
 
-function V.FindEquivalentLedgerDonation(profile, evidence)
+-- Strict ledger identity only. Donor/item/qty + time proximity alone is never enough
+-- (two legitimate identical deposits within 3h must both credit).
+function V.FindEquivalentLedgerDonation(profile, profileId, evidence)
     if not C or type(profile) ~= "table" or type(evidence) ~= "table" then
         return nil
     end
-    local donor = Norm(evidence.donor)
-    local itemId = tonumber(evidence.itemId)
-    local quantity = FloorNonNeg(evidence.quantity)
-    local tEv = tonumber(evidence.approxTxnTime)
-    if not donor or not itemId or quantity < 1 or not tEv then return nil end
-    local tolerance = (O and O.TIME_TOLERANCE_SECONDS) or (3 * 60 * 60)
+    local expectedTxn = V.TxnIdFromEvidence(profileId, evidence)
+    local core = type(evidence.coreSignature) == "string" and evidence.coreSignature or nil
+    local occ = tonumber(evidence.occurrenceIndex)
+    if not expectedTxn and not (core and occ) then
+        return nil
+    end
     local lists = { profile._consumableEvents, profile._consumableEventArchive }
     for li = 1, #lists do
         local list = lists[li]
@@ -259,12 +260,14 @@ function V.FindEquivalentLedgerDonation(profile, evidence)
                 if type(event) == "table"
                     and event.type == (C.EVENT and C.EVENT.DONATION or "CONSUMABLE_DONATION")
                     and event.source == "guildbank"
-                    and Same(Norm(event.actor), donor)
-                    and tonumber(event.itemId) == itemId
-                    and FloorNonNeg(event.quantity) == quantity
                 then
-                    local tEvent = tonumber(event.timestamp)
-                    if tEvent and math.abs(tEvent - tEv) <= tolerance then
+                    if expectedTxn and V.ValidTxnId(event.txnId) == expectedTxn then
+                        return event
+                    end
+                    if core and occ
+                        and event.coreSignature == core
+                        and tonumber(event.occurrenceIndex) == occ
+                    then
                         return event
                     end
                 end
@@ -296,6 +299,9 @@ function V.BuildDonationEvent(evidence, writer, txnId, verification, opts)
         writer = writer,
         txnId = txnId,
         verification = verification,
+        -- Durable identity context for cross-observer ledger matching.
+        coreSignature = type(evidence.coreSignature) == "string" and evidence.coreSignature or nil,
+        occurrenceIndex = tonumber(evidence.occurrenceIndex),
         -- Reserved for a future monetary feature; leave unset (nil), never 0.
         goldValueCopper = V.ValidGoldValueCopper(opts.goldValueCopper),
     }
@@ -596,9 +602,9 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                     else
                         local cluster, how = V.MatchCluster(store, evidence)
                         if how ~= "verified" then
-                            local ledgerHit = V.FindEquivalentLedgerDonation(profile, evidence)
+                            local ledgerHit = V.FindEquivalentLedgerDonation(profile, profileId, evidence)
                             if not cluster and ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
-                                -- Across sessions, avoid re-crediting the same Guild Bank row.
+                                -- Strict identity hit only: never absorb a distinct deposit.
                                 cluster = NewCluster(store, evidence)
                                 cluster.status = "verified"
                                 cluster.verification = ledgerHit.verification or V.VERIFICATION.MANUAL
@@ -888,20 +894,29 @@ function V.ProcessLocalAfterReconcile(profile, profileId, store, scope, opts)
             elseif effectiveAdmin and selfId then
                 -- Offline/local admin trust: authenticated local admin character only.
                 local txnId = obs.txnId or V.NextTxnId(store, profileId, obs)
-                local cluster = {
-                    status = "verified",
-                    txnId = txnId,
-                    evidence = obs,
-                    verification = V.VERIFICATION.ADMIN_TRUST,
-                    decidedBy = selfId,
-                }
-                local ok, status = V.CommitVerifiedCluster(profile, cluster, selfId)
-                if ok then
-                    V.MarkLocalObservationVerified(obs, txnId, V.VERIFICATION.ADMIN_TRUST)
-                    scope.verifiedTxnIds[txnId] = true
+                local prior = V.FindEquivalentLedgerDonation(profile, profileId, obs)
+                if prior and V.ValidTxnId(prior.txnId) then
+                    -- Another offline admin already credited this bank row.
+                    V.MarkLocalObservationVerified(obs, prior.txnId, prior.verification or V.VERIFICATION.ADMIN_TRUST)
+                    scope.verifiedTxnIds[prior.txnId] = true
                     stats.trusted = stats.trusted + 1
-                    if status ~= "duplicate" then
-                        Debug("Info", "local admin trust committed txn=%s", tostring(txnId))
+                    Debug("Info", "local admin trust converges on existing txn=%s", tostring(prior.txnId))
+                else
+                    local cluster = {
+                        status = "verified",
+                        txnId = txnId,
+                        evidence = obs,
+                        verification = V.VERIFICATION.ADMIN_TRUST,
+                        decidedBy = selfId,
+                    }
+                    local ok, status = V.CommitVerifiedCluster(profile, cluster, selfId)
+                    if ok then
+                        V.MarkLocalObservationVerified(obs, txnId, V.VERIFICATION.ADMIN_TRUST)
+                        scope.verifiedTxnIds[txnId] = true
+                        stats.trusted = stats.trusted + 1
+                        if status ~= "duplicate" then
+                            Debug("Info", "local admin trust committed txn=%s", tostring(txnId))
+                        end
                     end
                 end
             end

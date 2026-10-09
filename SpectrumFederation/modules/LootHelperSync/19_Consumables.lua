@@ -899,13 +899,19 @@ function Sync:_FlushPendingConsumableObservations(profile)
         profileId = meta.profileId,
         observations = batch,
     }
+    local accepted = false
     if self.state.isCoordinator then
-        self:HandleConsumablesObsReport(self._SelfId and self:_SelfId() or "", payload)
+        accepted = self:HandleConsumablesObsReport(self._SelfId and self:_SelfId() or "", payload) == true
     else
         local coordinator = self.state.coordinator
         if type(coordinator) ~= "string" or coordinator == "" then return end
         if not self:_ConsumablesCoordinatorAccepts() then return end
-        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_REPORT, payload, "WHISPER", coordinator, "NORMAL")
+        accepted = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_REPORT, payload, "WHISPER", coordinator, "NORMAL") ~= false
+    end
+    -- Do not advance pagination after a rejected/dropped page (limiter/backpressure).
+    if not accepted then
+        Debug("Verbose", "consumable observation page not accepted; offset retained at %s", tostring(offset))
+        return
     end
     store.submitOffset = nextOffset
     Debug("Info", "submitted %s unresolved consumable observations (offset=%s total=%s)",
@@ -943,29 +949,28 @@ local function BroadcastObsDecision(self, profileId, decision)
 end
 
 function Sync:HandleConsumablesObsReport(sender, payload)
-    if not SessionPayloadOk(payload, sender) then return end
-    if not (self.state and self.state.isCoordinator) then return end
+    if not SessionPayloadOk(payload, sender) then return false end
+    if not (self.state and self.state.isCoordinator) then return false end
     local C = Consumables()
     local V = SF.ConsumablesVerification
-    if not C or not V or type(payload.observations) ~= "table" then return end
+    if not C or not V or type(payload.observations) ~= "table" then return false end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
-    if not profile then return end
+    if not profile then return false end
     self._consumablesObsLimits = self._consumablesObsLimits or {}
     local now = (C.Now and C.Now()) or 0
     local S = Rules()
-    -- Charge the remote-op limiter per observation, not only per message.
-    local charge = #payload.observations
-    if charge < 1 then charge = 1 end
-    if charge > (V.MAX_OBS_BATCH or 32) then charge = V.MAX_OBS_BATCH or 32 end
-    if S and S.AllowRemoteOp then
-        for _ = 1, charge do
-            if not S.AllowRemoteOp(self._consumablesObsLimits, sender, now) then
-                return
-            end
+    local selfId = self._SelfId and self:_SelfId() or ""
+    local isSelf = type(selfId) == "string" and selfId ~= ""
+        and self._SamePlayer and self:_SamePlayer(sender, selfId)
+    -- One remote-op credit per report message. Charging per observation made a
+    -- full MAX_OBS_BATCH page exceed the window and drop valid pages.
+    if not isSelf and S and S.AllowRemoteOp then
+        if not S.AllowRemoteOp(self._consumablesObsLimits, sender, now) then
+            return false
         end
     end
     local store, scope, meta = ObservationScopeFor(profile)
-    if not meta then return end
+    if not meta then return false end
     local isAdmin = C.IsCanonicalAdmin(profile, sender)
     local stats = V.IngestReport(profile, meta.profileId, sender, payload.observations, {
         isAdmin = isAdmin,
@@ -1013,6 +1018,7 @@ function Sync:HandleConsumablesObsReport(sender, payload)
         end
     end
     self:_FlushUnsentConsumablesEvents(profile)
+    return true
 end
 
 function Sync:RequestConsumablesReviewSummary(profile)
@@ -1118,8 +1124,21 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
             return
         end
         local store, _, meta = ObservationScopeFor(profile)
+        local decision = payload.decision
         if store and meta then
-            V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, payload.decision)
+            V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decision)
+        end
+        -- Keep durable rejection state aligned with coordinator notices without
+        -- bumping rejectionSeq (config snapshots remain the authority clock).
+        local evidence = decision and (decision.evidence or decision) or nil
+        if evidence then
+            if decision.action == "reject" and C.RecordDurableRejection then
+                C.RecordDurableRejection(profile, evidence, decision.decidedBy, decision.reason, {
+                    bumpSeq = false,
+                })
+            elseif decision.action == "correct" and C.ClearDurableRejection then
+                C.ClearDurableRejection(profile, evidence, { bumpSeq = false })
+            end
         end
         if C.NotifyUI then C.NotifyUI() end
         return
@@ -1178,6 +1197,11 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
     BroadcastObsDecision(self, payload.profileId, decisionNotice)
     if store and meta then
         V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decisionNotice)
+    end
+    -- Push rejectionSeq-backed durable state so followers/promotions converge.
+    if (status == "rejected" or payload.decision.action == "correct")
+        and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(profile)
     end
     if C.NotifyUI then C.NotifyUI() end
 end

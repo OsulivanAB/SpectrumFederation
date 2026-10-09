@@ -452,6 +452,16 @@ do
     local idB = V.TxnIdFromEvidence("stable-txn", ev)
     assertEq(idA, idB, "TxnIdFromEvidence is deterministic")
     assertEq(idA, txnId, "committed txnId matches evidence-derived identity")
+    -- Cross-observer: reconstructed time / neighbors differ, identity must not.
+    local shifted = evidence({
+        quantity = 15,
+        approxTxnTime = (ev.approxTxnTime or clock) + 1800,
+        neighborsOlder = { "different-older" },
+        neighborsNewer = { "different-newer" },
+        occurrenceIndex = ev.occurrenceIndex,
+    })
+    assertEq(V.TxnIdFromEvidence("stable-txn", shifted), txnId,
+        "TxnIdFromEvidence ignores observer-specific time/neighbors")
 end
 
 -- ---------------------------------------------------------------------------
@@ -644,6 +654,157 @@ do
     })
     assertEq(stats.trusted, 0, "session-active path defers local admin trust")
     assertEq(stats.deferred, 1, "deferred count tracks unresolved rows")
+end
+
+-- ---------------------------------------------------------------------------
+-- Two offline admins with different reconstructed times credit once
+-- ---------------------------------------------------------------------------
+do
+    local p = makeProfile("two-admin-offline")
+    local dbA, dbB = {}, {}
+    local storeA = O.EnsureProfileStore(dbA, "two-admin-offline")
+    local storeB = O.EnsureProfileStore(dbB, "two-admin-offline")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local sharedOcc = 3
+    local obsA = evidence({
+        quantity = 14, occurrenceIndex = sharedOcc,
+        approxTxnTime = clock - 120, neighborsOlder = { "a1" },
+        status = "pending",
+    })
+    local obsB = evidence({
+        quantity = 14, occurrenceIndex = sharedOcc,
+        approxTxnTime = clock - 120 + 1800, neighborsOlder = { "b1" },
+        status = "pending",
+    })
+    scopeA.observations[1] = obsA
+    scopeB.observations[1] = obsB
+    local sA = V.ProcessLocalAfterReconcile(p, "two-admin-offline", storeA, scopeA, {
+        selfId = admin, asAdmin = true, deferToCoordinator = false,
+    })
+    assertEq(sA.trusted, 1, "first offline admin commits")
+    assertEq(C.ContributionTotal(p, donor, flask), 14, "first offline credit applied")
+    local sB = V.ProcessLocalAfterReconcile(p, "two-admin-offline", storeB, scopeB, {
+        selfId = "AdminTwo-Realm", asAdmin = true, deferToCoordinator = false,
+    })
+    assertEq(sB.trusted, 1, "second offline admin converges")
+    assertEq(C.ContributionTotal(p, donor, flask), 14, "second offline admin does not double-credit")
+    assertEq(V.TxnIdFromEvidence("two-admin-offline", obsA), V.TxnIdFromEvidence("two-admin-offline", obsB),
+        "both observers derive the same txnId")
+end
+
+-- ---------------------------------------------------------------------------
+-- Distinct identical deposits within 3h remain separately creditable
+-- ---------------------------------------------------------------------------
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("distinct-identical")
+    local db = {}
+    local store = O.EnsureProfileStore(db, "distinct-identical")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local first = evidence({
+        quantity = 20, occurrenceIndex = 1,
+        neighborsOlder = { "old-a" }, neighborsNewer = { "new-a" },
+        approxTxnTime = clock - 60,
+    })
+    local second = evidence({
+        quantity = 20, occurrenceIndex = 2,
+        neighborsOlder = { "old-b" }, neighborsNewer = { "new-b" },
+        approxTxnTime = clock - 30,
+    })
+    local s1 = V.IngestReport(p, "distinct-identical", admin, { first }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    })
+    assertEq(s1.verified, 1, "first identical deposit verifies")
+    assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters("distinct-identical")[1], admin))
+    V.ClearSessionClusters()
+    local s2 = V.IngestReport(p, "distinct-identical", admin, { second }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    })
+    assertEq(s2.verified, 1, "second identical deposit verifies as its own txn")
+    local clusters = V.ListVerifiedClusters("distinct-identical")
+    assertEq(#clusters, 1, "fresh session has one new verified cluster")
+    assertFalse(clusters[1]._committed == true, "second deposit is not absorbed as already committed")
+    assertTrue(V.CommitVerifiedCluster(p, clusters[1], admin), "second distinct deposit commits")
+    assertEq(C.ContributionTotal(p, donor, flask), 40, "both identical deposits credit")
+    assertTrue(V.FindEquivalentLedgerDonation(p, "distinct-identical", second) ~= nil,
+        "strict ledger match finds the second deposit by occurrence")
+    assertTrue(V.FindEquivalentLedgerDonation(p, "distinct-identical", first) ~= nil,
+        "strict ledger match still finds the first deposit")
+end
+
+-- ---------------------------------------------------------------------------
+-- Coordinator Clear replaces follower eligibility (convergence)
+-- ---------------------------------------------------------------------------
+do
+    local coord = makeProfile("elig-clear-coord")
+    C.NoteObservationBaseline(coord)
+    local item = 190003
+    assertTrue(C.AddRequestedItem(coord, admin, item))
+    local follower = makeProfile("elig-clear-follower")
+    assertTrue(select(1, C.ReplaceConfig(follower, C.ExportSnapshot(coord, { omitEvents = true }))),
+        "follower adopts coordinator config")
+    assertTrue(C.EligibilitySnapshot(follower).baselineEstablished, "follower has baseline")
+    assertTrue(select(1, C.Clear(coord, admin)), "coordinator clears")
+    local clearedSnap = C.ExportSnapshot(coord, { omitEvents = true })
+    assertTrue(clearedSnap.eligibility.baselineEstablished, "clear keeps baseline floor")
+    assertTrue(tonumber(clearedSnap.eligibility.tabEligibleFrom) ~= nil, "clear sets tabEligibleFrom floor")
+    assertTrue(select(1, C.ReplaceConfig(follower, clearedSnap)), "follower receives clear snapshot")
+    local fpCoord = C.Descriptor(coord).configFingerprint
+    local fpFollow = C.Descriptor(follower).configFingerprint
+    assertEq(fpFollow, fpCoord, "fingerprints converge after clear")
+    -- Reconfigure same guild/tab/item: old history stays ineligible.
+    assertTrue(C.SetGuild(coord, admin, GUILD, 2))
+    assertTrue(C.AddRequestedItem(coord, admin, flask))
+    local elig = C.EligibilitySnapshot(coord)
+    local oldRow = {
+        type = "deposit", donor = donor, itemId = flask, quantity = 5,
+        guildGuid = "club-1", bankTab = 2, generation = 1,
+        approxTxnTime = (elig.tabEligibleFrom or clock) - 3600,
+        coreSignature = O.CoreSignature("deposit", donor, flask, 5),
+        occurrenceIndex = 1, neighborsOlder = {}, neighborsNewer = {},
+    }
+    assertFalse(O.IsEvidenceEligible(oldRow, elig), "pre-clear history is ineligible after reconfigure")
+    oldRow.approxTxnTime = (elig.tabEligibleFrom or clock) + 10
+    assertTrue(O.IsEvidenceEligible(oldRow, elig), "post-clear donation remains eligible")
+end
+
+-- ---------------------------------------------------------------------------
+-- Durable rejection correction survives authoritative ReplaceConfig
+-- ---------------------------------------------------------------------------
+do
+    local coord = makeProfile("rej-correct-coord")
+    local follower = makeProfile("rej-correct-follower")
+    local ev = evidence({ quantity = 12, occurrenceIndex = 4 })
+    assertTrue(C.RecordDurableRejection(coord, ev, admin, "rejected"))
+    local snap1 = C.ExportSnapshot(coord, { omitEvents = true })
+    assertTrue(select(1, C.ReplaceConfig(follower, snap1)), "follower receives rejection")
+    assertTrue(V.IsRejected({ rejections = C.DurableRejections(follower) }, ev),
+        "follower durable rejection present")
+    assertTrue(C.ClearDurableRejection(coord, ev), "coordinator corrects rejection")
+    local snap2 = C.ExportSnapshot(coord, { omitEvents = true })
+    assertTrue((tonumber(snap2.rejectionSeq) or 0) > (tonumber(snap1.rejectionSeq) or 0),
+        "correction bumps rejectionSeq")
+    assertTrue(select(1, C.ReplaceConfig(follower, snap2)), "follower receives correction snapshot")
+    assertFalse(V.IsRejected({ rejections = C.DurableRejections(follower) }, ev),
+        "follower durable rejection removed after authoritative correction")
+end
+
+-- ---------------------------------------------------------------------------
+-- AllowRemoteOp still admits a full observation page (one credit per report)
+-- ---------------------------------------------------------------------------
+do
+    local bucket = {}
+    local now = 1000
+    assertTrue(S.AllowRemoteOp(bucket, "Reporter-Realm", now), "first report admitted")
+    -- A full page must not require 32 credits.
+    assertTrue(S.AllowRemoteOp(bucket, "Reporter-Realm", now), "second report in window admitted")
+    local count = 2
+    while S.AllowRemoteOp(bucket, "Reporter-Realm", now) do
+        count = count + 1
+        if count > S.MAX_REMOTE_OPS + 5 then break end
+    end
+    assertEq(count, S.MAX_REMOTE_OPS, "window still bounds reports, not observations")
 end
 
 if failures > 0 then

@@ -681,32 +681,26 @@ local function CopyRejectionList(list)
     return out
 end
 
-local function MergeRejectionsInto(cfg, remoteList)
-    local list = EnsureRejections(cfg)
-    if type(remoteList) ~= "table" then return list end
-    local V = SF.ConsumablesVerification
-    local maxN = (V and V.MAX_REJECTIONS_PER_SCOPE) or 128
-    for i = 1, #remoteList do
-        local remote = remoteList[i]
-        if type(remote) == "table" and type(remote.coreSignature) == "string" then
-            local exists = false
-            if V and V.RejectionMatches then
-                for j = 1, #list do
-                    if V.RejectionMatches(list[j], remote) then
-                        exists = true
-                        break
-                    end
-                end
-            end
-            if not exists then
-                list[#list + 1] = remote
-            end
-        end
+local function BumpRejectionSeq(cfg)
+    local seq = tonumber(cfg.rejectionSeq) or 0
+    if seq < 0 or seq ~= math.floor(seq) then seq = 0 end
+    cfg.rejectionSeq = seq + 1
+    return cfg.rejectionSeq
+end
+
+-- Authoritative replace when the remote rejectionSeq is at least as new.
+local function ReplaceRejectionsFromPayload(cfg, payload)
+    if type(payload) ~= "table" or type(payload.rejections) ~= "table" then
+        return EnsureRejections(cfg)
     end
-    while #list > maxN do
-        table.remove(list, 1)
+    local remoteSeq = tonumber(payload.rejectionSeq) or 0
+    local localSeq = tonumber(cfg.rejectionSeq) or 0
+    if remoteSeq < localSeq then
+        return EnsureRejections(cfg)
     end
-    return list
+    cfg.rejections = CopyRejectionList(payload.rejections)
+    cfg.rejectionSeq = remoteSeq
+    return cfg.rejections
 end
 
 local function MigrateObservationAccountingOnce(profile, cfg)
@@ -760,6 +754,7 @@ function C.Ensure(profile)
             obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
             eligibility = { items = {}, tabEligibleFrom = nil },
             rejections = {},
+            rejectionSeq = 0,
         }
     end
     local cfg = profile._consumables
@@ -802,6 +797,14 @@ function C.Ensure(profile)
     local migrated = MigrateObservationAccountingOnce(profile, cfg)
     EnsureEligibility(cfg)
     EnsureRejections(cfg)
+    do
+        local seq = tonumber(cfg.rejectionSeq)
+        if not seq or seq ~= seq or seq ~= math.floor(seq) or seq < 0 then
+            cfg.rejectionSeq = 0
+        else
+            cfg.rejectionSeq = seq
+        end
+    end
     profile._consumableEventIds = nil
     profile._consumableIndexCount = nil
     local bound = eventIndexes[profile]
@@ -840,7 +843,8 @@ function C.DurableRejections(profile)
     return EnsureRejections(cfg)
 end
 
-function C.RecordDurableRejection(profile, evidence, decidedBy, reason)
+function C.RecordDurableRejection(profile, evidence, decidedBy, reason, opts)
+    opts = opts or {}
     if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
     local cfg = C.Ensure(profile)
     local list = EnsureRejections(cfg)
@@ -873,10 +877,15 @@ function C.RecordDurableRejection(profile, evidence, decidedBy, reason)
     while #list > maxN do
         table.remove(list, 1)
     end
+    -- Coordinator/local authority bumps seq; follower notice apply does not.
+    if opts.bumpSeq ~= false then
+        BumpRejectionSeq(cfg)
+    end
     return true
 end
 
-function C.ClearDurableRejection(profile, evidence)
+function C.ClearDurableRejection(profile, evidence, opts)
+    opts = opts or {}
     if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
     local cfg = C.Ensure(profile)
     local list = EnsureRejections(cfg)
@@ -891,8 +900,12 @@ function C.ClearDurableRejection(profile, evidence)
             kept[#kept + 1] = list[i]
         end
     end
+    if not cleared then return false end
     cfg.rejections = kept
-    return cleared
+    if opts.bumpSeq ~= false then
+        BumpRejectionSeq(cfg)
+    end
+    return true
 end
 
 function C.NoteObservationBaseline(profile)
@@ -1276,9 +1289,11 @@ function C.SetGuild(profile, actor, guild, bankTab, opts)
     }
     cfg.bankTab = bankTab
     local eligibility = EnsureEligibility(cfg)
-    -- Initial guild/tab setup: first authoritative scan may backfill Blizzard history.
-    -- Do not set tabEligibleFrom here; item cutovers still apply when items are added later.
-    eligibility.tabEligibleFrom = nil
+    -- Initial guild/tab setup (never cleared): first scan may backfill history.
+    -- After Clear, baselineEstablished stays true with a post-clear floor — keep it.
+    if not eligibility.baselineEstablished then
+        eligibility.tabEligibleFrom = nil
+    end
     BumpConfig(profile)
     Debug("Info", "Set guild %s tab %s", cfg.guild.guid, tostring(bankTab))
     Notify()
@@ -1344,6 +1359,8 @@ function CopyEvent(event)
         writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= C.MAX_EVENT_NAME and event.writer or nil,
         txnId = ValidTxnId(event.txnId),
         verification = verification,
+        coreSignature = type(event.coreSignature) == "string" and event.coreSignature or nil,
+        occurrenceIndex = tonumber(event.occurrenceIndex),
         -- Optional future monetary field: preserve when valid; leave unset when nil.
         goldValueCopper = ValidGoldValueCopper(event.goldValueCopper),
     }
@@ -1674,8 +1691,18 @@ function C.Clear(profile, actor, opts)
     cfg.guild = nil
     cfg.bankTab = nil
     cfg.requestedItems = {}
-    cfg.eligibility = { items = {}, tabEligibleFrom = nil }
+    -- Post-clear floor: subsequent reconfiguration must not back-credit older
+    -- still-visible Guild Bank history. First-ever installs keep baseline unset
+    -- until NoteObservationBaseline so initial migration backfill still works.
+    local clearAt = Now()
+    cfg.eligibility = {
+        items = {},
+        tabEligibleFrom = clearAt,
+        baselineEstablished = true,
+        baselineAt = clearAt,
+    }
     cfg.rejections = {}
+    BumpRejectionSeq(cfg)
     BumpConfig(profile)
     Debug("Info", "%s cleared Raid Consumables", actor)
     Notify()
@@ -1948,6 +1975,7 @@ function C.ExportSnapshot(profile, opts)
         requestedItems = requestedItems,
         eligibility = CopyEligibility(EnsureEligibility(cfg)),
         rejections = CopyRejectionList(EnsureRejections(cfg)),
+        rejectionSeq = tonumber(cfg.rejectionSeq) or 0,
         events = events,
     }
 end
@@ -2067,6 +2095,9 @@ function C.ReplaceConfig(profile, payload)
         end
     end
     local cfg = C.Ensure(profile)
+    local priorGeneration = tonumber(cfg.generation) or 1
+    local priorGuid = type(cfg.guild) == "table" and cfg.guild.guid or nil
+    local priorTab = tonumber(cfg.bankTab)
     local generation = C.ValidGeneration(payload.generation)
     if generation then
         cfg.generation = generation
@@ -2088,8 +2119,17 @@ function C.ReplaceConfig(profile, payload)
     cfg.bankTab = tonumber(payload.bankTab)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
     cfg.requestedItems = RequestedFromPayload(payload)
-    MergeEligibilityInto(cfg, payload.eligibility)
-    MergeRejectionsInto(cfg, payload.rejections)
+    local incomingGen = tonumber(cfg.generation) or priorGeneration
+    local incomingGuid = type(cfg.guild) == "table" and cfg.guild.guid or nil
+    local incomingTab = tonumber(cfg.bankTab)
+    -- Same generation/guild/tab: merge cutovers conservatively (later wins).
+    -- Generation/guild/tab change (Clear, reconfigure): take authoritative eligibility.
+    if incomingGen ~= priorGeneration or incomingGuid ~= priorGuid or incomingTab ~= priorTab then
+        cfg.eligibility = CopyEligibility(payload.eligibility)
+    else
+        MergeEligibilityInto(cfg, payload.eligibility)
+    end
+    ReplaceRejectionsFromPayload(cfg, payload)
     cfg.crafters = nil
     cfg.assignments = nil
     cfg.itemEpochs = nil
@@ -2381,6 +2421,7 @@ function C.CopyConfiguration(source, dest)
         requestedItems = CopyRequestedMap(src.requestedItems),
         eligibility = CopyEligibility(EnsureEligibility(src)),
         rejections = CopyRejectionList(EnsureRejections(src)),
+        rejectionSeq = tonumber(src.rejectionSeq) or 0,
         obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
     }
     Invalidate(dest)
