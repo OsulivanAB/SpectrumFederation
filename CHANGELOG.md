@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.14] - 2026-10-09
+
+### Changed
+- Raid Consumables: verification, sync, and Guild Bank accounting (#366 PR2)
+
 ## [1.5.8-beta.13] - 2026-10-09
 
 ### Changed
