@@ -1366,8 +1366,16 @@ function Controls:AddScrollList(section, opts)
 		local function EnsureRow(i)
 			if rows[i] then return rows[i] end
 
-			local r = CreateFrame("Frame", nil, content)
+			local r = CreateFrame("Button", nil, content)
 			r:SetHeight(rowHeight)
+			r:RegisterForClicks("LeftButtonUp")
+			r:EnableMouse(true)
+
+			local selected = r:CreateTexture(nil, "BACKGROUND")
+			selected:SetAllPoints()
+			selected:SetColorTexture(0.2, 0.55, 1.0, 0.22)
+			selected:Hide()
+			r.Selected = selected
 
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetPoint("LEFT", r, "LEFT", 0, 0)
@@ -1406,6 +1414,10 @@ function Controls:AddScrollList(section, opts)
 			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 
 			local items = getItems() or {}
+			local selectedKey = nil
+			if type(opts.getSelectedKey) == "function" then
+				selectedKey = opts.getSelectedKey()
+			end
 
 			local y = 0
 			local maxTextWidth = 0
@@ -1455,6 +1467,20 @@ function Controls:AddScrollList(section, opts)
 				else
 					r.Remove:SetAlpha(0.45)
 					r.Remove:SetScript("OnClick", nil)
+				end
+
+				local itemKey = item.clusterId or item.id or item.key or i
+				local isSelected = selectedKey ~= nil and selectedKey == itemKey
+				if r.Selected then
+					if isSelected then r.Selected:Show() else r.Selected:Hide() end
+				end
+				if type(opts.onSelect) == "function" then
+					r:SetScript("OnClick", function()
+						if not enabled then return end
+						opts.onSelect(item, i)
+					end)
+				else
+					r:SetScript("OnClick", nil)
 				end
 
 				if compactColumns and availableWidth > 0 then

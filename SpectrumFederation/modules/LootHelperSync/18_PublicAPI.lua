@@ -899,6 +899,10 @@ function Sync:_ResetSessionState(reason)
     if SF.ConsumablesVerification and SF.ConsumablesVerification.ClearSessionClusters then
         SF.ConsumablesVerification.ClearSessionClusters()
     end
+    -- Stale review rows can reuse clusterIds (cl:1) after reset; clear the UI cache.
+    self._consumablesReviewSummary = nil
+    self._consumablesReviewSummaryAt = nil
+    self._consumablesObsFlushScheduled = nil
 
     if SF.Debug then
         local outstandingReqCount = 0

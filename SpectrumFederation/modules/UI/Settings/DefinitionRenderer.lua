@@ -212,11 +212,19 @@ function R:Build(panel, pageDef)
 
 			elseif t == "scrollList" then
 				local opts = item
-				if type(opts.onRemove) == "function" then
-					local fn = opts.onRemove
+				if type(opts.onRemove) == "function" or type(opts.onSelect) == "function" then
 					opts = CopyTable(opts)
-					opts.onRemove = function(item)
-						return fn(MakeCtx(panel, sec), item)
+					if type(opts.onRemove) == "function" then
+						local fn = opts.onRemove
+						opts.onRemove = function(listItem)
+							return fn(MakeCtx(panel, sec), listItem)
+						end
+					end
+					if type(opts.onSelect) == "function" then
+						local fn = opts.onSelect
+						opts.onSelect = function(listItem, index)
+							return fn(MakeCtx(panel, sec), listItem, index)
+						end
 					end
 				end
 				controls:AddScrollList(sec, opts)

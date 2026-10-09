@@ -886,8 +886,14 @@ function Sync:_FlushPendingConsumableObservations(profile)
     if not V or not O then return end
     local store, scope, meta = ObservationScopeFor(profile)
     if not store or not meta then return end
-    local batch = V.CollectUnresolvedForSubmit(store, meta.guildGuid, meta.bankTab)
-    if #batch == 0 then return end
+    local offset = tonumber(store.submitOffset) or 0
+    local batch, nextOffset, total = V.CollectUnresolvedForSubmit(store, meta.guildGuid, meta.bankTab, {
+        offset = offset,
+    })
+    if #batch == 0 then
+        store.submitOffset = 0
+        return
+    end
     local payload = {
         sessionId = self.state.sessionId,
         profileId = meta.profileId,
@@ -895,13 +901,45 @@ function Sync:_FlushPendingConsumableObservations(profile)
     }
     if self.state.isCoordinator then
         self:HandleConsumablesObsReport(self._SelfId and self:_SelfId() or "", payload)
-        return
+    else
+        local coordinator = self.state.coordinator
+        if type(coordinator) ~= "string" or coordinator == "" then return end
+        if not self:_ConsumablesCoordinatorAccepts() then return end
+        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_REPORT, payload, "WHISPER", coordinator, "NORMAL")
     end
-    local coordinator = self.state.coordinator
-    if type(coordinator) ~= "string" or coordinator == "" then return end
-    if not self:_ConsumablesCoordinatorAccepts() then return end
-    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_REPORT, payload, "WHISPER", coordinator, "NORMAL")
-    Debug("Info", "submitted %s unresolved consumable observations", tostring(#batch))
+    store.submitOffset = nextOffset
+    Debug("Info", "submitted %s unresolved consumable observations (offset=%s total=%s)",
+        tostring(#batch), tostring(offset), tostring(total))
+    -- Continue draining later batches without flooding the coordinator.
+    if nextOffset > 0 and total > nextOffset then
+        if not self._consumablesObsFlushScheduled then
+            self._consumablesObsFlushScheduled = true
+            local function continueFlush()
+                self._consumablesObsFlushScheduled = false
+                if self._FlushPendingConsumableObservations then
+                    self:_FlushPendingConsumableObservations(profile)
+                end
+            end
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0.35, continueFlush)
+            else
+                continueFlush()
+            end
+        end
+    end
+end
+
+local function BroadcastObsDecision(self, profileId, decision)
+    if not (self.state and self.state.active and SF.LootHelperComm and self.MSG) then return end
+    local notice = {
+        sessionId = self.state.sessionId,
+        profileId = profileId,
+        decision = decision,
+    }
+    local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("ConsumablesObsDecision")
+    if dist then
+        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_DECISION, notice, dist, nil, "NORMAL")
+    end
 end
 
 function Sync:HandleConsumablesObsReport(sender, payload)
@@ -915,40 +953,62 @@ function Sync:HandleConsumablesObsReport(sender, payload)
     self._consumablesObsLimits = self._consumablesObsLimits or {}
     local now = (C.Now and C.Now()) or 0
     local S = Rules()
-    if S and S.AllowRemoteOp and not S.AllowRemoteOp(self._consumablesObsLimits, sender, now) then
-        return
+    -- Charge the remote-op limiter per observation, not only per message.
+    local charge = #payload.observations
+    if charge < 1 then charge = 1 end
+    if charge > (V.MAX_OBS_BATCH or 32) then charge = V.MAX_OBS_BATCH or 32 end
+    if S and S.AllowRemoteOp then
+        for _ = 1, charge do
+            if not S.AllowRemoteOp(self._consumablesObsLimits, sender, now) then
+                return
+            end
+        end
     end
     local store, scope, meta = ObservationScopeFor(profile)
+    if not meta then return end
     local isAdmin = C.IsCanonicalAdmin(profile, sender)
-    local stats = V.IngestReport(profile, meta and meta.profileId or payload.profileId, sender, payload.observations, {
+    local stats = V.IngestReport(profile, meta.profileId, sender, payload.observations, {
         isAdmin = isAdmin,
         scope = scope,
         obsStore = store,
+        guildGuid = meta.guildGuid,
+        bankTab = meta.bankTab,
+        eligibility = C.EligibilitySnapshot and C.EligibilitySnapshot(profile) or nil,
+        durableRejections = C.DurableRejections and C.DurableRejections(profile) or nil,
+        isRequested = function(itemId)
+            return C.IsRequested(profile, itemId)
+        end,
     })
-    Debug("Info", "obs report from %s accepted=%s verified=%s",
-        tostring(sender), tostring(stats.accepted), tostring(stats.verified))
-    local verified = V.ListVerifiedClusters(meta and meta.profileId or payload.profileId)
+    Debug("Info", "obs report from %s accepted=%s verified=%s skipped=%s",
+        tostring(sender), tostring(stats.accepted), tostring(stats.verified), tostring(stats.skipped))
+    local verified = V.ListVerifiedClusters(meta.profileId)
     for i = 1, #verified do
         local cluster = verified[i]
         if cluster and not cluster._committed then
             local writer = cluster.decidedBy or (self._SelfId and self:_SelfId()) or sender
-            local ok = V.CommitVerifiedCluster(profile, cluster, writer)
+            local ok, commitStatus = V.CommitVerifiedCluster(profile, cluster, writer)
             if ok then
                 cluster._committed = true
                 if scope and cluster.txnId then
                     scope.verifiedTxnIds = scope.verifiedTxnIds or {}
                     scope.verifiedTxnIds[cluster.txnId] = true
                 end
-                -- Mark matching local observations and propagate decision evidence.
+                local decision = {
+                    action = "verified",
+                    txnId = cluster.txnId,
+                    verification = cluster.verification,
+                    evidence = cluster.evidence and V.SerializeObservation(cluster.evidence) or cluster.evidence,
+                    decidedBy = writer,
+                    clusterId = cluster.clusterId,
+                }
                 if store and meta then
-                    V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, {
-                        action = "verified",
-                        txnId = cluster.txnId,
-                        verification = cluster.verification,
-                        evidence = cluster.evidence,
-                        decidedBy = writer,
-                    })
+                    V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decision)
                 end
+                -- Followers must learn automatic verification or they keep re-reporting.
+                BroadcastObsDecision(self, meta.profileId, decision)
+            elseif commitStatus ~= "duplicate" then
+                Debug("Warn", "verified cluster commit failed txn=%s status=%s",
+                    tostring(cluster.txnId), tostring(commitStatus))
             end
         end
     end
@@ -998,22 +1058,19 @@ function Sync:HandleConsumablesReviewSummary(sender, payload)
     if not (type(coordinator) == "string" and self._SamePlayer and self:_SamePlayer(sender, coordinator)) then
         return
     end
+    if self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then
+        Debug("Verbose", "Ignored review summary from unproven coordinator %s", tostring(sender))
+        return
+    end
+    if self._RouteWasRevoked and self:_RouteWasRevoked(sender) then
+        Debug("Verbose", "Ignored review summary from revoked coordinator %s", tostring(sender))
+        return
+    end
     self._consumablesReviewSummary = type(payload.pending) == "table" and payload.pending or {}
     self._consumablesReviewSummaryAt = (Consumables() and Consumables().Now and Consumables().Now()) or time()
-    if SF.Consumables and SF.Consumables.RegisterUIListener then
-        -- Trigger UI refresh listeners without mutating ledger state.
-        local C = Consumables()
-        if C and C.NotifyUI then
-            C.NotifyUI()
-        end
-    end
-    -- Fall back: poke registered listeners via a no-op ensure/notify path.
     local C = Consumables()
-    if C and C.Ensure and self.FindLocalProfileById then
-        local profile = self:FindLocalProfileById(payload.profileId)
-        if profile then
-            C.Ensure(profile)
-        end
+    if C and C.NotifyUI then
+        C.NotifyUI()
     end
     Debug("Info", "received review summary rows=%s", tostring(#self._consumablesReviewSummary))
 end
@@ -1052,10 +1109,19 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
         if not (type(coordinator) == "string" and self._SamePlayer and self:_SamePlayer(sender, coordinator)) then
             return
         end
+        if self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then
+            Debug("Verbose", "Ignored obs decision from unproven coordinator %s", tostring(sender))
+            return
+        end
+        if self._RouteWasRevoked and self:_RouteWasRevoked(sender) then
+            Debug("Verbose", "Ignored obs decision from revoked coordinator %s", tostring(sender))
+            return
+        end
         local store, _, meta = ObservationScopeFor(profile)
         if store and meta then
             V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, payload.decision)
         end
+        if C.NotifyUI then C.NotifyUI() end
         return
     end
 
@@ -1066,36 +1132,52 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
         isAdmin = true,
         scope = scope,
         obsStore = store,
+        recordDurableRejection = function(evidence, decidedBy, reason)
+            if C.RecordDurableRejection then
+                C.RecordDurableRejection(profile, evidence, decidedBy, reason)
+            end
+        end,
+        clearDurableRejection = function(evidence)
+            if C.ClearDurableRejection then
+                C.ClearDurableRejection(profile, evidence)
+            end
+        end,
     })
     if not ok then
         Debug("Verbose", "ignored obs decision from %s (%s)", tostring(sender), tostring(status))
         return
     end
-    if status == "verified" and cluster then
-        local commitOk = V.CommitVerifiedCluster(profile, cluster, sender)
-        if commitOk then
-            cluster._committed = true
-        end
-        self:_FlushUnsentConsumablesEvents(profile)
-    end
-    local notice = {
-        sessionId = self.state.sessionId,
-        profileId = payload.profileId,
-        decision = {
-            action = payload.decision.action,
-            clusterId = cluster and cluster.clusterId or payload.decision.clusterId,
-            txnId = cluster and cluster.txnId or nil,
-            verification = cluster and cluster.verification or nil,
-            decidedBy = sender,
-            evidence = cluster and V.SerializeObservation(cluster.evidence) or payload.decision.evidence,
-            reason = payload.decision.reason,
-        },
+    local decisionNotice = {
+        action = payload.decision.action,
+        clusterId = cluster and cluster.clusterId or payload.decision.clusterId,
+        txnId = cluster and cluster.txnId or nil,
+        verification = cluster and cluster.verification or nil,
+        decidedBy = sender,
+        evidence = cluster and V.SerializeObservation(cluster.evidence) or payload.decision.evidence,
+        reason = payload.decision.reason,
     }
-    local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("ConsumablesObsDecision")
-    if dist then
-        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OBS_DECISION, notice, dist, nil, "NORMAL")
+    if status == "verified" and cluster then
+        local commitOk, commitStatus = V.CommitVerifiedCluster(profile, cluster, sender)
+        if not commitOk and commitStatus ~= "duplicate" then
+            -- Keep the row reviewable; do not announce a credit that never landed.
+            cluster.status = "pending"
+            cluster.verification = nil
+            cluster._committed = false
+            Debug("Warn", "approval commit failed; not broadcasting txn=%s status=%s",
+                tostring(cluster.txnId), tostring(commitStatus))
+            return
+        end
+        cluster._committed = true
+        decisionNotice.action = payload.decision.action == "correct" and "correct" or "approve"
+        decisionNotice.txnId = cluster.txnId
+        decisionNotice.verification = cluster.verification
+        self:_FlushUnsentConsumablesEvents(profile)
+    elseif status == "rejected" then
+        decisionNotice.action = "reject"
     end
-    if store and meta and notice.decision then
-        V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, notice.decision)
+    BroadcastObsDecision(self, payload.profileId, decisionNotice)
+    if store and meta then
+        V.ApplyRemoteDecisionToLocal(store, meta.guildGuid, meta.bankTab, decisionNotice)
     end
+    if C.NotifyUI then C.NotifyUI() end
 end

@@ -242,19 +242,26 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
     assert locale_at < domain_at < runtime_at
     assert domain_at < observation_at < verification_at < bank_log_at < runtime_at
 
+    logs_page = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidConsumableLogs.lua"
+    ).read_text(encoding="utf-8")
     for key in (
         "RAID_SUPPLIES_OVERALL_PROGRESS",
         "RAID_SUPPLIES_NO_GOALS_CONFIGURED",
         "RAID_SUPPLIES_NO_GOAL",
         "RAID_SUPPLIES_GOAL_ALREADY_MET",
         "RAID_CONSUMABLE_LOGS_HELP",
+        "RAID_CONSUMABLE_LOGS_TITLE",
         "RAID_CONSUMABLE_REVIEW_TITLE",
         "RAID_CONSUMABLE_REVIEW_HELP",
+        "RAID_CONSUMABLE_REVIEW_APPROVE",
+        "RAID_CONSUMABLE_REVIEW_REJECT",
+        "RAID_CONSUMABLE_REVIEW_CORRECT",
+        "RAID_CONSUMABLE_REVIEW_SELECTED",
+        "RAID_CONSUMABLE_REVIEW_ROW",
     ):
         assert f'L["{key}"]' in locale, key
-        assert key in domain or key in runtime or key in (
-            REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidConsumableLogs.lua"
-        ).read_text(encoding="utf-8"), key
+        assert key in domain or key in runtime or key in logs_page, key
 
     assert "function ns.LocaleText" in locale
     assert 'Loc("RAID_SUPPLIES_OVERALL_PROGRESS"' in runtime

@@ -11,8 +11,10 @@ V.WITNESS_THRESHOLD = 3
 V.MAX_WITNESSES_PER_CLUSTER = 16
 V.MAX_REJECTIONS_PER_SCOPE = 128
 V.MAX_OBS_BATCH = 32
+V.MAX_CLUSTERS = 256
 V.MAX_REVIEW_SUMMARY = 40
 V.MAX_TXN_ID = 160
+V.MAX_OBS_QUANTITY = 100000
 V.VERIFICATION = {
     ADMIN_TRUST = "admin_trust",
     WITNESSES = "witnesses",
@@ -176,17 +178,100 @@ function V.ValidateObservationPayload(obs)
     local itemId = tonumber(obs.itemId)
     if not itemId or itemId < 1 or itemId ~= math.floor(itemId) then return false, "invalid" end
     local qty = tonumber(obs.quantity)
-    if not qty or qty < 1 or qty ~= math.floor(qty) then return false, "invalid" end
+    local maxQty = V.MAX_OBS_QUANTITY
+    if SF.ConsumablesSync and tonumber(SF.ConsumablesSync.MAX_EVENT_QUANTITY) then
+        maxQty = tonumber(SF.ConsumablesSync.MAX_EVENT_QUANTITY)
+    end
+    if not qty or qty < 1 or qty ~= math.floor(qty) or qty > maxQty then
+        return false, "invalid"
+    end
     if type(obs.coreSignature) ~= "string" or obs.coreSignature == "" then return false, "invalid" end
     return true
 end
 
-function V.NextTxnId(store, profileId)
+local function MixText(hash, text)
+    text = tostring(text or "")
+    local h = FloorNonNeg(hash)
+    for i = 1, #text do
+        h = (h * 33 + text:byte(i)) % 2147483647
+    end
+    return h
+end
+
+-- Evidence-stable transaction identity shared across observers/stores.
+-- Exactly-once accounting must not depend on a per-client sequence counter.
+function V.TxnIdFromEvidence(profileId, evidence)
+    if type(evidence) ~= "table" then return nil end
+    local pid = tostring(profileId or "profile")
+    if #pid > 40 then pid = pid:sub(1, 40) end
+    local donor = Norm(evidence.donor) or ""
+    local hash = 0
+    hash = MixText(hash, evidence.coreSignature or "")
+    hash = MixText(hash, evidence.guildGuid or "")
+    hash = MixText(hash, tostring(tonumber(evidence.bankTab) or 0))
+    hash = MixText(hash, donor)
+    hash = MixText(hash, tostring(tonumber(evidence.itemId) or 0))
+    hash = MixText(hash, tostring(FloorNonNeg(evidence.quantity)))
+    hash = MixText(hash, tostring(tonumber(evidence.approxTxnTime) or 0))
+    hash = MixText(hash, tostring(tonumber(evidence.occurrenceIndex) or 0))
+    local older = evidence.neighborsOlder
+    if type(older) == "table" and older[1] then
+        hash = MixText(hash, older[1])
+    end
+    local txnId = string.format("ctx:%s:%x", pid, hash)
+    return V.ValidTxnId(txnId)
+end
+
+function V.NextTxnId(store, profileId, evidence)
+    if type(evidence) == "table" then
+        local derived = V.TxnIdFromEvidence(profileId, evidence)
+        if derived then return derived end
+    end
     if type(store) ~= "table" then return nil end
     store.txnSeq = FloorNonNeg(store.txnSeq) + 1
     local pid = tostring(profileId or "profile")
-    if #pid > 48 then pid = pid:sub(1, 48) end
-    return string.format("ctx:%s:%d", pid, store.txnSeq)
+    if #pid > 40 then pid = pid:sub(1, 40) end
+    local writer = ""
+    if SF.NameUtil and SF.NameUtil.GetSelfId then
+        writer = Norm(SF.NameUtil.GetSelfId()) or ""
+    end
+    if #writer > 32 then writer = writer:sub(1, 32) end
+    -- Writer-namespaced fallback prevents cross-client sequence collisions.
+    return string.format("ctx:%s:%s:%d", pid, writer ~= "" and writer or "local", store.txnSeq)
+end
+
+function V.FindEquivalentLedgerDonation(profile, evidence)
+    if not C or type(profile) ~= "table" or type(evidence) ~= "table" then
+        return nil
+    end
+    local donor = Norm(evidence.donor)
+    local itemId = tonumber(evidence.itemId)
+    local quantity = FloorNonNeg(evidence.quantity)
+    local tEv = tonumber(evidence.approxTxnTime)
+    if not donor or not itemId or quantity < 1 or not tEv then return nil end
+    local tolerance = (O and O.TIME_TOLERANCE_SECONDS) or (3 * 60 * 60)
+    local lists = { profile._consumableEvents, profile._consumableEventArchive }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local event = list[i]
+                if type(event) == "table"
+                    and event.type == (C.EVENT and C.EVENT.DONATION or "CONSUMABLE_DONATION")
+                    and event.source == "guildbank"
+                    and Same(Norm(event.actor), donor)
+                    and tonumber(event.itemId) == itemId
+                    and FloorNonNeg(event.quantity) == quantity
+                then
+                    local tEvent = tonumber(event.timestamp)
+                    if tEvent and math.abs(tEvent - tEv) <= tolerance then
+                        return event
+                    end
+                end
+            end
+        end
+    end
+    return nil
 end
 
 function V.BuildDonationEvent(evidence, writer, txnId, verification, opts)
@@ -237,25 +322,35 @@ function V.RejectionRecord(evidence, decidedBy, now, reason)
     }
 end
 
-function V.RejectionMatches(rejection, evidence)
-    if type(rejection) ~= "table" or type(evidence) ~= "table" then return false end
-    if O and O.SuppressionMatches and O.SuppressionMatches(rejection, evidence) then
-        -- Prefer neighbor continuity when both sides have it.
-        local rOlder = rejection.neighborsOlder
-        local eOlder = evidence.neighborsOlder
-        if type(rOlder) == "table" and #rOlder > 0 and type(eOlder) == "table" and #eOlder > 0 then
-            local hit = false
-            for i = 1, #rOlder do
-                for j = 1, #eOlder do
-                    if rOlder[i] == eOlder[j] then hit = true break end
-                end
-                if hit then break end
-            end
-            if not hit then return false end
+local function NeighborOverlap(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" or #a == 0 or #b == 0 then
+        return nil
+    end
+    for i = 1, #a do
+        for j = 1, #b do
+            if a[i] == b[j] then return true end
         end
-        return true
     end
     return false
+end
+
+function V.RejectionMatches(rejection, evidence)
+    if type(rejection) ~= "table" or type(evidence) ~= "table" then return false end
+    if not (O and O.SuppressionMatches and O.SuppressionMatches(rejection, evidence)) then
+        return false
+    end
+    -- Distinct deposits that share donor/item/qty inside the time window must not
+    -- collapse onto one rejection. Prefer occurrence index and neighbor context.
+    local rOcc = tonumber(rejection.occurrenceIndex)
+    local eOcc = tonumber(evidence.occurrenceIndex)
+    if rOcc and eOcc and rOcc ~= eOcc then
+        return false
+    end
+    local olderHit = NeighborOverlap(rejection.neighborsOlder, evidence.neighborsOlder)
+    if olderHit == false then return false end
+    local newerHit = NeighborOverlap(rejection.neighborsNewer, evidence.neighborsNewer)
+    if newerHit == false then return false end
+    return true
 end
 
 function V.EnsureScopeExtras(scope)
@@ -359,6 +454,26 @@ function V.EnsureClusterStore(profileId)
     return store
 end
 
+local function PruneClusters(store)
+    local clusters = store.clusters
+    if type(clusters) ~= "table" or #clusters <= V.MAX_CLUSTERS then return end
+    -- Drop oldest terminal clusters first, then oldest pending.
+    local function rank(c)
+        if c.status == "rejected" then return 0 end
+        if c.status == "verified" and c._committed then return 1 end
+        if c.status == "verified" then return 2 end
+        return 3
+    end
+    table.sort(clusters, function(a, b)
+        local ra, rb = rank(a), rank(b)
+        if ra ~= rb then return ra < rb end
+        return FloorNonNeg(a.updatedAt) < FloorNonNeg(b.updatedAt)
+    end)
+    while #clusters > V.MAX_CLUSTERS do
+        table.remove(clusters, 1)
+    end
+end
+
 local function NewCluster(store, evidence)
     store.seq = FloorNonNeg(store.seq) + 1
     local cluster = {
@@ -372,6 +487,7 @@ local function NewCluster(store, evidence)
         updatedAt = Now(),
     }
     store.clusters[#store.clusters + 1] = cluster
+    PruneClusters(store)
     return cluster
 end
 
@@ -380,25 +496,50 @@ function V.MatchCluster(store, evidence)
         return nil, nil
     end
     local best, bestScore, second = nil, nil, nil
+    local bestVerified, bestVerifiedScore = nil, nil
     for i = 1, #store.clusters do
         local cluster = store.clusters[i]
-        if cluster.status ~= "rejected" and cluster.status ~= "verified" then
+        if cluster.status ~= "rejected" then
             local score = O.MatchScore(cluster.evidence, evidence)
             if score and score >= (O.MIN_MATCH_SCORE or 100) then
-                if not bestScore or score > bestScore then
-                    second = bestScore
-                    best, bestScore = cluster, score
-                elseif not second or score > second then
-                    second = score
+                if cluster.status == "verified" then
+                    if not bestVerifiedScore or score > bestVerifiedScore then
+                        bestVerified, bestVerifiedScore = cluster, score
+                    end
+                else
+                    if not bestScore or score > bestScore then
+                        second = bestScore
+                        best, bestScore = cluster, score
+                    elseif not second or score > second then
+                        second = score
+                    end
                 end
             end
         end
+    end
+    -- Prefer an already-verified match so rematches never mint a second txnId.
+    if bestVerified then
+        return bestVerified, "verified"
     end
     if best and second and (bestScore - second) < (O.AMBIGUITY_MARGIN or 15) then
         best.status = "ambiguous"
         return best, "ambiguous"
     end
     return best, best and "match" or nil
+end
+
+local function AddWitness(cluster, submittedBy, evidence, profile)
+    if V.WitnessAlreadyCounted(cluster.witnesses, submittedBy, profile) then
+        return
+    end
+    local count = 0
+    for _ in pairs(cluster.witnesses) do count = count + 1 end
+    if count >= V.MAX_WITNESSES_PER_CLUSTER then return end
+    cluster.witnesses[submittedBy] = {
+        submittedBy = submittedBy,
+        observedBy = evidence.observedBy,
+        firstReported = Now(),
+    }
 end
 
 function V.IngestReport(profile, profileId, submittedBy, observations, opts)
@@ -408,59 +549,86 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
         return { accepted = 0, verified = 0, rejected = 0 }
     end
     local store = V.EnsureClusterStore(profileId)
-    local stats = { accepted = 0, verified = 0, rejected = 0, pending = 0 }
+    local stats = { accepted = 0, verified = 0, rejected = 0, pending = 0, skipped = 0 }
     local isAdmin = opts.isAdmin == true
     local limit = #observations
     if limit > V.MAX_OBS_BATCH then limit = V.MAX_OBS_BATCH end
+    local eligibility = opts.eligibility
+    local requiredGuild = opts.guildGuid
+    local requiredTab = tonumber(opts.bankTab)
+    local isRequested = opts.isRequested
 
     for i = 1, limit do
         local raw = observations[i]
-        local ok = V.ValidateObservationPayload(raw)
-        if ok then
+        if V.ValidateObservationPayload(raw) then
             local evidence = V.SerializeObservation(raw)
             if evidence then
-                -- Authenticated sender is the witness; never trust client isAdmin.
-                evidence.submittedBy = submittedBy
-                local rejected = false
-                if opts.scope and V.IsRejected(opts.scope, evidence) then
-                    rejected = true
-                    stats.rejected = stats.rejected + 1
-                    Debug("Info", "report suppressed by prior rejection donor=%s item=%s",
-                        tostring(evidence.donor), tostring(evidence.itemId))
+                local inScope = true
+                if type(requiredGuild) == "string" and evidence.guildGuid ~= requiredGuild then
+                    inScope = false
                 end
-                if not rejected then
-                    local cluster, how = V.MatchCluster(store, evidence)
-                    if not cluster then
-                        cluster = NewCluster(store, evidence)
+                if requiredTab and tonumber(evidence.bankTab) ~= requiredTab then
+                    inScope = false
+                end
+                if inScope and type(isRequested) == "function" and not isRequested(evidence.itemId) then
+                    inScope = false
+                end
+                if inScope and eligibility and O and O.IsEvidenceEligible
+                    and not O.IsEvidenceEligible(evidence, eligibility) then
+                    inScope = false
+                end
+                if not inScope then
+                    stats.skipped = stats.skipped + 1
+                else
+                    -- Authenticated sender is the witness; never trust client isAdmin.
+                    evidence.submittedBy = submittedBy
+                    local rejected = false
+                    if opts.scope and V.IsRejected(opts.scope, evidence) then
+                        rejected = true
+                    elseif opts.durableRejections
+                        and V.IsRejected({ rejections = opts.durableRejections }, evidence) then
+                        rejected = true
+                    end
+                    if rejected then
+                        stats.rejected = stats.rejected + 1
+                        Debug("Info", "report suppressed by prior rejection donor=%s item=%s",
+                            tostring(evidence.donor), tostring(evidence.itemId))
                     else
-                        -- Refresh evidence with newer observation context.
-                        cluster.evidence = evidence
-                        if how == "ambiguous" then
-                            cluster.status = "ambiguous"
+                        local cluster, how = V.MatchCluster(store, evidence)
+                        if how ~= "verified" then
+                            local ledgerHit = V.FindEquivalentLedgerDonation(profile, evidence)
+                            if not cluster and ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
+                                -- Across sessions, avoid re-crediting the same Guild Bank row.
+                                cluster = NewCluster(store, evidence)
+                                cluster.status = "verified"
+                                cluster.verification = ledgerHit.verification or V.VERIFICATION.MANUAL
+                                cluster.txnId = ledgerHit.txnId
+                                cluster._committed = true
+                                cluster.decidedBy = Norm(ledgerHit.writer) or submittedBy
+                                how = "verified"
+                            elseif not cluster then
+                                cluster = NewCluster(store, evidence)
+                            else
+                                cluster.evidence = evidence
+                                if how == "ambiguous" then
+                                    cluster.status = "ambiguous"
+                                end
+                            end
                         end
-                    end
-                    if not V.WitnessAlreadyCounted(cluster.witnesses, submittedBy, profile) then
-                        local count = 0
-                        for _ in pairs(cluster.witnesses) do count = count + 1 end
-                        if count < V.MAX_WITNESSES_PER_CLUSTER then
-                            cluster.witnesses[submittedBy] = {
-                                submittedBy = submittedBy,
-                                observedBy = evidence.observedBy,
-                                firstReported = Now(),
-                            }
-                        end
-                    end
-                    cluster.updatedAt = Now()
-                    stats.accepted = stats.accepted + 1
 
-                    if cluster.status ~= "verified" and cluster.status ~= "rejected" then
-                        if isAdmin then
+                        AddWitness(cluster, submittedBy, evidence, profile)
+                        cluster.updatedAt = Now()
+                        stats.accepted = stats.accepted + 1
+
+                        if how == "verified" or cluster.status == "verified" or cluster.status == "rejected" then
+                            -- Already terminal: rematch only records the witness.
+                        elseif isAdmin and cluster.status ~= "ambiguous" then
+                            -- Ambiguous rows require manual review; never auto-trust them.
                             cluster.status = "verified"
                             cluster.verification = V.VERIFICATION.ADMIN_TRUST
                             cluster.decidedBy = submittedBy
-                            if not cluster.txnId then
-                                cluster.txnId = V.NextTxnId(opts.obsStore or store, profileId)
-                            end
+                            cluster.txnId = cluster.txnId
+                                or V.NextTxnId(opts.obsStore or store, profileId, evidence)
                             stats.verified = stats.verified + 1
                             Debug("Info", "admin-trusted verification txn=%s donor=%s",
                                 tostring(cluster.txnId), tostring(evidence.donor))
@@ -470,9 +638,8 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                                 cluster.status = "verified"
                                 cluster.verification = V.VERIFICATION.WITNESSES
                                 cluster.decidedBy = submittedBy
-                                if not cluster.txnId then
-                                    cluster.txnId = V.NextTxnId(opts.obsStore or store, profileId)
-                                end
+                                cluster.txnId = cluster.txnId
+                                    or V.NextTxnId(opts.obsStore or store, profileId, evidence)
                                 stats.verified = stats.verified + 1
                                 Debug("Info", "three-witness verification txn=%s witnesses=%s",
                                     tostring(cluster.txnId), tostring(witnesses))
@@ -515,6 +682,22 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
     end
     if not cluster and type(decision.evidence) == "table" then
         cluster = select(1, V.MatchCluster(store, decision.evidence))
+        -- MatchCluster skips rejected rows; correction/reject-by-evidence must still find them.
+        if not cluster and O and O.MatchScore then
+            local best, bestScore = nil, nil
+            for i = 1, #store.clusters do
+                local candidate = store.clusters[i]
+                if candidate.status == "rejected" then
+                    local score = O.MatchScore(candidate.evidence, decision.evidence)
+                    if score and score >= (O.MIN_MATCH_SCORE or 100) then
+                        if not bestScore or score > bestScore then
+                            best, bestScore = candidate, score
+                        end
+                    end
+                end
+            end
+            cluster = best
+        end
         if not cluster then
             local ok = V.ValidateObservationPayload(decision.evidence)
             if ok then
@@ -527,13 +710,23 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
     end
 
     if action == "reject" then
-        -- Authoritative rejection wins races with automatic verification.
+        -- Do not un-credit a donation already committed to the canonical ledger.
+        if cluster.status == "verified" and cluster.txnId and C and C.HasTxnId
+            and C.HasTxnId(profile, cluster.txnId) then
+            return false, "committed", cluster
+        end
+        if cluster._committed and cluster.txnId then
+            return false, "committed", cluster
+        end
         cluster.status = "rejected"
         cluster.verification = nil
         cluster.decidedBy = decidedBy
         cluster.updatedAt = Now()
         if opts.scope then
             V.RecordRejection(opts.scope, cluster.evidence, decidedBy, Now(), decision.reason)
+        end
+        if opts.recordDurableRejection and type(opts.recordDurableRejection) == "function" then
+            opts.recordDurableRejection(cluster.evidence, decidedBy, decision.reason)
         end
         Debug("Info", "admin rejected cluster=%s donor=%s", tostring(cluster.clusterId), tostring(cluster.evidence and cluster.evidence.donor))
         return true, "rejected", cluster
@@ -543,6 +736,9 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
         if opts.scope then
             V.ClearMatchingRejection(opts.scope, cluster.evidence)
         end
+        if opts.clearDurableRejection and type(opts.clearDurableRejection) == "function" then
+            opts.clearDurableRejection(cluster.evidence)
+        end
         -- Fall through to approve after clearing rejection.
     end
 
@@ -550,11 +746,34 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
     cluster.verification = V.VERIFICATION.MANUAL
     cluster.decidedBy = decidedBy
     cluster.updatedAt = Now()
-    if not cluster.txnId then
-        cluster.txnId = V.NextTxnId(opts.obsStore or store, profileId)
-    end
+    cluster.txnId = cluster.txnId
+        or V.NextTxnId(opts.obsStore or store, profileId, cluster.evidence)
     Debug("Info", "admin approved cluster=%s txn=%s", tostring(cluster.clusterId), tostring(cluster.txnId))
     return true, "verified", cluster
+end
+
+local function SummaryRow(cluster, profile)
+    local evidence = cluster.evidence or {}
+    return {
+        clusterId = cluster.clusterId,
+        status = cluster.status,
+        donor = evidence.donor,
+        itemId = evidence.itemId,
+        quantity = evidence.quantity,
+        approxTxnTime = evidence.approxTxnTime,
+        generation = evidence.generation,
+        witnessCount = V.CountIndependentWitnesses(cluster.witnesses, profile),
+        coreSignature = evidence.coreSignature,
+        guildGuid = evidence.guildGuid,
+        bankTab = evidence.bankTab,
+        occurrenceIndex = evidence.occurrenceIndex,
+        neighborsOlder = evidence.neighborsOlder,
+        neighborsNewer = evidence.neighborsNewer,
+        observedBy = evidence.observedBy,
+        firstSeen = evidence.firstSeen,
+        type = evidence.type or "deposit",
+        txnId = V.ValidTxnId(cluster.txnId),
+    }
 end
 
 function V.ReviewSummary(profileId, opts)
@@ -563,29 +782,18 @@ function V.ReviewSummary(profileId, opts)
     local out = {}
     local limit = tonumber(opts.limit) or V.MAX_REVIEW_SUMMARY
     if limit > V.MAX_REVIEW_SUMMARY then limit = V.MAX_REVIEW_SUMMARY end
+    -- Pending/ambiguous first for approve/reject; rejected rows follow for correction.
     for i = 1, #store.clusters do
         local cluster = store.clusters[i]
         if cluster.status == "pending" or cluster.status == "ambiguous" then
-            local evidence = cluster.evidence or {}
-            out[#out + 1] = {
-                clusterId = cluster.clusterId,
-                status = cluster.status,
-                donor = evidence.donor,
-                itemId = evidence.itemId,
-                quantity = evidence.quantity,
-                approxTxnTime = evidence.approxTxnTime,
-                generation = evidence.generation,
-                witnessCount = V.CountIndependentWitnesses(cluster.witnesses, opts.profile),
-                coreSignature = evidence.coreSignature,
-                guildGuid = evidence.guildGuid,
-                bankTab = evidence.bankTab,
-                occurrenceIndex = evidence.occurrenceIndex,
-                neighborsOlder = evidence.neighborsOlder,
-                neighborsNewer = evidence.neighborsNewer,
-                observedBy = evidence.observedBy,
-                firstSeen = evidence.firstSeen,
-                type = evidence.type or "deposit",
-            }
+            out[#out + 1] = SummaryRow(cluster, opts.profile)
+            if #out >= limit then return out end
+        end
+    end
+    for i = 1, #store.clusters do
+        local cluster = store.clusters[i]
+        if cluster.status == "rejected" then
+            out[#out + 1] = SummaryRow(cluster, opts.profile)
             if #out >= limit then break end
         end
     end
@@ -662,17 +870,24 @@ function V.ProcessLocalAfterReconcile(profile, profileId, store, scope, opts)
     if effectiveAdmin == nil then
         effectiveAdmin = V.IsEffectiveLocalAdmin(profile)
     end
-    local stats = { trusted = 0, suppressed = 0 }
+    -- During an active sync session, verification ownership is the coordinator.
+    -- Local admins report observations instead of minting competing txnIds.
+    local deferToCoordinator = opts.deferToCoordinator == true
+    local stats = { trusted = 0, suppressed = 0, deferred = 0 }
     for i = 1, #(scope.observations or {}) do
         local obs = scope.observations[i]
         if type(obs) == "table" and (obs.status == "pending" or obs.status == "ambiguous") then
             if V.IsRejected(scope, obs) then
                 obs.status = "rejected"
                 stats.suppressed = stats.suppressed + 1
+            elseif obs.status == "ambiguous" then
+                -- Ambiguous matches stay pending review; never auto-trust.
+                stats.deferred = stats.deferred + 1
+            elseif deferToCoordinator then
+                stats.deferred = stats.deferred + 1
             elseif effectiveAdmin and selfId then
-                -- Admin trust is based on the authenticated local admin character,
-                -- not an unverified historical observedBy flag.
-                local txnId = obs.txnId or V.NextTxnId(store, profileId)
+                -- Offline/local admin trust: authenticated local admin character only.
+                local txnId = obs.txnId or V.NextTxnId(store, profileId, obs)
                 local cluster = {
                     status = "verified",
                     txnId = txnId,
@@ -697,11 +912,12 @@ end
 
 function V.CollectUnresolvedForSubmit(store, guildGuid, bankTab, opts)
     opts = opts or {}
-    if not O or not O.EnsureScope then return {} end
+    if not O or not O.EnsureScope then return {}, 0, 0 end
     local scope = O.EnsureScope(store, guildGuid, bankTab)
-    if not scope then return {} end
+    if not scope then return {}, 0, 0 end
     V.EnsureScopeExtras(scope)
-    local out = {}
+    local offset = FloorNonNeg(opts.offset)
+    local candidates = {}
     for i = 1, #(scope.observations or {}) do
         local obs = scope.observations[i]
         local status = obs and obs.status or ""
@@ -709,13 +925,24 @@ function V.CollectUnresolvedForSubmit(store, guildGuid, bankTab, opts)
             if not V.IsRejected(scope, obs) then
                 local wire = V.SerializeObservation(obs)
                 if wire then
-                    out[#out + 1] = wire
-                    if #out >= V.MAX_OBS_BATCH then break end
+                    candidates[#candidates + 1] = wire
                 end
             end
         end
     end
-    return out
+    local total = #candidates
+    local out = {}
+    for i = offset + 1, total do
+        out[#out + 1] = candidates[i]
+        if #out >= V.MAX_OBS_BATCH then
+            break
+        end
+    end
+    local nextOffset = offset + #out
+    if nextOffset >= total then
+        nextOffset = 0
+    end
+    return out, nextOffset, total
 end
 
 function V.ApplyRemoteDecisionToLocal(store, guildGuid, bankTab, decision)

@@ -142,6 +142,11 @@ function C.RegisterUIListener(fn)
     return fn
 end
 
+-- Explicit UI poke for sync-driven refreshes (review summaries, remote decisions).
+function C.NotifyUI()
+    Notify()
+end
+
 local function Invalidate(profile)
     projectionCache[profile] = nil
 end
@@ -582,6 +587,128 @@ local function EnsureEligibility(cfg)
     return cfg.eligibility
 end
 
+local function EnsureRejections(cfg)
+    if type(cfg.rejections) ~= "table" then
+        cfg.rejections = {}
+    end
+    return cfg.rejections
+end
+
+local function CopyEligibility(eligibility)
+    if type(eligibility) ~= "table" then
+        return { items = {}, tabEligibleFrom = nil, baselineEstablished = false }
+    end
+    local items = {}
+    if type(eligibility.items) == "table" then
+        for key, value in pairs(eligibility.items) do
+            local ts = tonumber(value)
+            if ts then
+                items[tostring(key)] = ts
+            end
+        end
+    end
+    return {
+        items = items,
+        tabEligibleFrom = tonumber(eligibility.tabEligibleFrom),
+        baselineEstablished = eligibility.baselineEstablished == true,
+        baselineAt = tonumber(eligibility.baselineAt),
+    }
+end
+
+-- Later cutover timestamps win so followers never loosen an established boundary.
+local function MergeEligibilityInto(cfg, remote)
+    local localElig = EnsureEligibility(cfg)
+    if type(remote) ~= "table" then return localElig end
+    if remote.baselineEstablished == true then
+        localElig.baselineEstablished = true
+        local remoteAt = tonumber(remote.baselineAt)
+        local localAt = tonumber(localElig.baselineAt)
+        if remoteAt and (not localAt or remoteAt < localAt) then
+            localElig.baselineAt = remoteAt
+        elseif not localAt and remoteAt then
+            localElig.baselineAt = remoteAt
+        end
+    end
+    local remoteTab = tonumber(remote.tabEligibleFrom)
+    local localTab = tonumber(localElig.tabEligibleFrom)
+    if remoteTab and (not localTab or remoteTab > localTab) then
+        localElig.tabEligibleFrom = remoteTab
+    end
+    if type(remote.items) == "table" then
+        for key, value in pairs(remote.items) do
+            local remoteTs = tonumber(value)
+            if remoteTs then
+                local itemKey = tostring(key)
+                local localTs = tonumber(localElig.items[itemKey])
+                if not localTs or remoteTs > localTs then
+                    localElig.items[itemKey] = remoteTs
+                end
+            end
+        end
+    end
+    return localElig
+end
+
+local function CopyRejectionList(list)
+    local out = {}
+    if type(list) ~= "table" then return out end
+    local V = SF.ConsumablesVerification
+    local limit = #list
+    local maxN = (V and V.MAX_REJECTIONS_PER_SCOPE) or 128
+    if limit > maxN then limit = maxN end
+    for i = 1, limit do
+        local row = list[i]
+        if type(row) == "table" and type(row.coreSignature) == "string" then
+            out[#out + 1] = {
+                coreSignature = row.coreSignature,
+                approxTxnTime = tonumber(row.approxTxnTime),
+                donor = type(row.donor) == "string" and row.donor or nil,
+                itemId = tonumber(row.itemId),
+                quantity = tonumber(row.quantity),
+                guildGuid = type(row.guildGuid) == "string" and row.guildGuid or nil,
+                bankTab = tonumber(row.bankTab),
+                generation = tonumber(row.generation),
+                occurrenceIndex = tonumber(row.occurrenceIndex),
+                neighborsOlder = type(row.neighborsOlder) == "table" and row.neighborsOlder or nil,
+                neighborsNewer = type(row.neighborsNewer) == "table" and row.neighborsNewer or nil,
+                decidedBy = type(row.decidedBy) == "string" and row.decidedBy or nil,
+                decidedAt = tonumber(row.decidedAt),
+                reason = type(row.reason) == "string" and row.reason or nil,
+                txnId = type(row.txnId) == "string" and row.txnId or nil,
+            }
+        end
+    end
+    return out
+end
+
+local function MergeRejectionsInto(cfg, remoteList)
+    local list = EnsureRejections(cfg)
+    if type(remoteList) ~= "table" then return list end
+    local V = SF.ConsumablesVerification
+    local maxN = (V and V.MAX_REJECTIONS_PER_SCOPE) or 128
+    for i = 1, #remoteList do
+        local remote = remoteList[i]
+        if type(remote) == "table" and type(remote.coreSignature) == "string" then
+            local exists = false
+            if V and V.RejectionMatches then
+                for j = 1, #list do
+                    if V.RejectionMatches(list[j], remote) then
+                        exists = true
+                        break
+                    end
+                end
+            end
+            if not exists then
+                list[#list + 1] = remote
+            end
+        end
+    end
+    while #list > maxN do
+        table.remove(list, 1)
+    end
+    return list
+end
+
 local function MigrateObservationAccountingOnce(profile, cfg)
     if tonumber(cfg.obsAccountingSchema) == C.OBS_ACCOUNTING_SCHEMA then
         return false
@@ -632,6 +759,7 @@ function C.Ensure(profile)
             requestedItems = {},
             obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
             eligibility = { items = {}, tabEligibleFrom = nil },
+            rejections = {},
         }
     end
     local cfg = profile._consumables
@@ -673,6 +801,7 @@ function C.Ensure(profile)
     end
     local migrated = MigrateObservationAccountingOnce(profile, cfg)
     EnsureEligibility(cfg)
+    EnsureRejections(cfg)
     profile._consumableEventIds = nil
     profile._consumableIndexCount = nil
     local bound = eventIndexes[profile]
@@ -702,7 +831,68 @@ function C.EligibilitySnapshot(profile)
         items = items,
         tabEligibleFrom = tonumber(eligibility.tabEligibleFrom),
         baselineEstablished = eligibility.baselineEstablished == true,
+        baselineAt = tonumber(eligibility.baselineAt),
     }
+end
+
+function C.DurableRejections(profile)
+    local cfg = C.Ensure(profile)
+    return EnsureRejections(cfg)
+end
+
+function C.RecordDurableRejection(profile, evidence, decidedBy, reason)
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsureRejections(cfg)
+    local V = SF.ConsumablesVerification
+    if V and V.IsRejected and V.IsRejected({ rejections = list }, evidence) then
+        return true
+    end
+    local record
+    if V and V.RejectionRecord then
+        record = V.RejectionRecord(evidence, decidedBy, Now(), reason)
+    else
+        record = {
+            coreSignature = evidence.coreSignature,
+            approxTxnTime = tonumber(evidence.approxTxnTime),
+            donor = evidence.donor,
+            itemId = tonumber(evidence.itemId),
+            quantity = tonumber(evidence.quantity),
+            guildGuid = evidence.guildGuid,
+            bankTab = tonumber(evidence.bankTab),
+            occurrenceIndex = tonumber(evidence.occurrenceIndex),
+            neighborsOlder = evidence.neighborsOlder,
+            neighborsNewer = evidence.neighborsNewer,
+            decidedBy = decidedBy,
+            decidedAt = Now(),
+            reason = reason or "rejected",
+        }
+    end
+    list[#list + 1] = record
+    local maxN = (V and V.MAX_REJECTIONS_PER_SCOPE) or 128
+    while #list > maxN do
+        table.remove(list, 1)
+    end
+    return true
+end
+
+function C.ClearDurableRejection(profile, evidence)
+    if type(profile) ~= "table" or type(evidence) ~= "table" then return false end
+    local cfg = C.Ensure(profile)
+    local list = EnsureRejections(cfg)
+    local V = SF.ConsumablesVerification
+    if not (V and V.RejectionMatches) then return false end
+    local kept = {}
+    local cleared = false
+    for i = 1, #list do
+        if V.RejectionMatches(list[i], evidence) then
+            cleared = true
+        else
+            kept[#kept + 1] = list[i]
+        end
+    end
+    cfg.rejections = kept
+    return cleared
 end
 
 function C.NoteObservationBaseline(profile)
@@ -888,6 +1078,25 @@ local function ConfigFingerprint(cfg)
     hash = MixConfigText(hash, "r:" .. tostring(#rows))
     for i = 1, limit do
         hash = MixConfigText(hash, "i:" .. tostring(rows[i].itemId) .. ":g:" .. tostring(rows[i].goal))
+    end
+    -- Eligibility cutovers are part of the effective configuration contract.
+    local eligibility = EnsureEligibility(cfg)
+    hash = MixConfigText(hash, "eb:" .. tostring(eligibility.baselineEstablished and 1 or 0))
+    hash = MixConfigText(hash, "et:" .. tostring(tonumber(eligibility.tabEligibleFrom) or 0))
+    local eligRows = {}
+    for key, value in pairs(eligibility.items or {}) do
+        local itemId = tonumber(key)
+        local ts = tonumber(value)
+        if itemId and ts then
+            eligRows[#eligRows + 1] = { itemId = itemId, ts = ts }
+        end
+    end
+    table.sort(eligRows, function(a, b) return a.itemId < b.itemId end)
+    local eligLimit = #eligRows
+    if eligLimit > C.MAX_REQUESTED_ITEMS then eligLimit = C.MAX_REQUESTED_ITEMS end
+    hash = MixConfigText(hash, "ei:" .. tostring(#eligRows))
+    for i = 1, eligLimit do
+        hash = MixConfigText(hash, "e:" .. tostring(eligRows[i].itemId) .. ":" .. tostring(eligRows[i].ts))
     end
     return hash
 end
@@ -1466,6 +1675,7 @@ function C.Clear(profile, actor, opts)
     cfg.bankTab = nil
     cfg.requestedItems = {}
     cfg.eligibility = { items = {}, tabEligibleFrom = nil }
+    cfg.rejections = {}
     BumpConfig(profile)
     Debug("Info", "%s cleared Raid Consumables", actor)
     Notify()
@@ -1736,6 +1946,8 @@ function C.ExportSnapshot(profile, opts)
         guild = CopyGuild(cfg.guild),
         bankTab = cfg.bankTab,
         requestedItems = requestedItems,
+        eligibility = CopyEligibility(EnsureEligibility(cfg)),
+        rejections = CopyRejectionList(EnsureRejections(cfg)),
         events = events,
     }
 end
@@ -1876,6 +2088,8 @@ function C.ReplaceConfig(profile, payload)
     cfg.bankTab = tonumber(payload.bankTab)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
     cfg.requestedItems = RequestedFromPayload(payload)
+    MergeEligibilityInto(cfg, payload.eligibility)
+    MergeRejectionsInto(cfg, payload.rejections)
     cfg.crafters = nil
     cfg.assignments = nil
     cfg.itemEpochs = nil
@@ -2165,6 +2379,9 @@ function C.CopyConfiguration(source, dest)
         guild = CopyGuild(src.guild),
         bankTab = src.bankTab,
         requestedItems = CopyRequestedMap(src.requestedItems),
+        eligibility = CopyEligibility(EnsureEligibility(src)),
+        rejections = CopyRejectionList(EnsureRejections(src)),
+        obsAccountingSchema = C.OBS_ACCOUNTING_SCHEMA,
     }
     Invalidate(dest)
     Invalidate(source)

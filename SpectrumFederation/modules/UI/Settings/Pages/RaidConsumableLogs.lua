@@ -38,6 +38,8 @@ local historyOffset = 0
 local historyProfileId = nil
 local reuseHistory = false
 local reusedHistory = nil
+local selectedReviewClusterId = nil
+local selectedReviewProfileId = nil
 
 local function ActiveProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
@@ -192,11 +194,20 @@ local function GoalProgressModel()
 	return C.GoalProgress(profile)
 end
 
+local function ReviewStatusLabel(status)
+	if status == "ambiguous" then
+		return Loc("RAID_CONSUMABLE_REVIEW_STATUS_AMBIGUOUS", "Needs review")
+	end
+	if status == "rejected" then
+		return Loc("RAID_CONSUMABLE_REVIEW_STATUS_REJECTED", "Rejected")
+	end
+	return Loc("RAID_CONSUMABLE_REVIEW_STATUS_PENDING", "Pending")
+end
+
 local function ReviewSummaryItems()
 	local Sync = SF.LootHelperSync
 	local summary = Sync and Sync._consumablesReviewSummary
 	if type(summary) ~= "table" then return {} end
-	local C = SF.Consumables
 	local items = {}
 	for i = 1, #summary do
 		local row = summary[i]
@@ -204,19 +215,19 @@ local function ReviewSummaryItems()
 			local name = ItemName(row.itemId) or ("item " .. tostring(row.itemId or "?"))
 			local qty = tonumber(row.quantity) or 0
 			local witnesses = tonumber(row.witnessCount) or 0
-			local status = row.status == "ambiguous" and "Needs review" or "Pending"
 			items[#items + 1] = {
 				text = string.format(
-					"%s donated %d %s — %s (%d witnesses)",
-					tostring(row.donor or "Someone"),
+					Loc("RAID_CONSUMABLE_REVIEW_ROW", "%s donated %d %s — %s (%d witnesses)"),
+					tostring(row.donor or Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")),
 					qty,
 					name,
-					status,
+					ReviewStatusLabel(row.status),
 					witnesses
 				),
 				canRemove = false,
 				clusterId = row.clusterId,
 				evidence = row,
+				status = row.status,
 			}
 		end
 	end
@@ -229,6 +240,47 @@ local function InActiveSession(profile)
 	return ProfileKey(profile) == Sync.state.profileId
 end
 
+local function SelectedReviewRow()
+	local Sync = SF.LootHelperSync
+	local summary = Sync and Sync._consumablesReviewSummary
+	if type(summary) ~= "table" or not selectedReviewClusterId then return nil end
+	for i = 1, #summary do
+		local row = summary[i]
+		if type(row) == "table" and row.clusterId == selectedReviewClusterId then
+			return row
+		end
+	end
+	return nil
+end
+
+local function EnsureReviewSelection(profile)
+	local profileId = ProfileKey(profile)
+	if profileId ~= selectedReviewProfileId then
+		selectedReviewProfileId = profileId
+		selectedReviewClusterId = nil
+	end
+	local Sync = SF.LootHelperSync
+	local summary = Sync and Sync._consumablesReviewSummary
+	if type(summary) ~= "table" or #summary == 0 then
+		selectedReviewClusterId = nil
+		return
+	end
+	if selectedReviewClusterId and SelectedReviewRow() then
+		return
+	end
+	-- Default to the first pending/ambiguous row; otherwise the first rejected row.
+	for i = 1, #summary do
+		local row = summary[i]
+		if type(row) == "table" and row.status ~= "rejected" and row.clusterId then
+			selectedReviewClusterId = row.clusterId
+			return
+		end
+	end
+	if type(summary[1]) == "table" then
+		selectedReviewClusterId = summary[1].clusterId
+	end
+end
+
 local function Decide(action, row)
 	local profile = ActiveProfile()
 	local Sync = SF.LootHelperSync
@@ -237,7 +289,7 @@ local function Decide(action, row)
 	local decision = {
 		action = action,
 		clusterId = row and row.clusterId or nil,
-		evidence = row and row.evidence or nil,
+		evidence = row and (row.evidence or row) or nil,
 	}
 	Sync:SubmitConsumablesObsDecision(profile, decision)
 	if Page.Refresh and Page.panel then
@@ -249,21 +301,24 @@ local function Definition()
 	local profile = ActiveProfile()
 	local admin = profile and IsEffectiveAdmin(profile)
 	local inSession = profile and InActiveSession(profile)
+	if admin then
+		EnsureReviewSelection(profile)
+	end
 	local sections = {
 		{
 			id = "consumableLogs",
-			title = "Raid Consumable Logs",
+			title = Loc("RAID_CONSUMABLE_LOGS_TITLE", "Raid Consumable Logs"),
 			items = {
 				{ type = "help", indent = "label", text = HistoryHelp() },
 				{
 					type = "consumableGoalSummary",
-					label = "Goal Progress",
+					label = Loc("RAID_CONSUMABLE_LOGS_GOAL_PROGRESS", "Goal Progress"),
 					getProgress = GoalProgressModel,
 				},
 				{
 					type = "button",
-					label = "Newer entries",
-					buttonText = "Newer",
+					label = Loc("RAID_CONSUMABLE_LOGS_NEWER", "Newer entries"),
+					buttonText = Loc("RAID_CONSUMABLE_LOGS_NEWER_BUTTON", "Newer"),
 					width = 100,
 					enabled = function() return historyOffset > 0 end,
 					onClick = function()
@@ -272,8 +327,8 @@ local function Definition()
 				},
 				{
 					type = "button",
-					label = "Older entries",
-					buttonText = "Older",
+					label = Loc("RAID_CONSUMABLE_LOGS_OLDER", "Older entries"),
+					buttonText = Loc("RAID_CONSUMABLE_LOGS_OLDER_BUTTON", "Older"),
 					width = 100,
 					enabled = function()
 						return historyOffset + PageSize() < (Page.historyTotal or 0)
@@ -284,7 +339,7 @@ local function Definition()
 				},
 				{
 					type = "scrollList",
-					label = "History",
+					label = Loc("RAID_CONSUMABLE_LOGS_HISTORY", "History"),
 					height = 280,
 					getItems = LogItems,
 				},
@@ -292,6 +347,19 @@ local function Definition()
 		},
 	}
 	if admin then
+		local selected = SelectedReviewRow()
+		local selectedHelp
+		if selected then
+			local name = ItemName(selected.itemId) or ("item " .. tostring(selected.itemId or "?"))
+			selectedHelp = string.format(
+				Loc("RAID_CONSUMABLE_REVIEW_SELECTED", "Selected: %s donated %d %s"),
+				tostring(selected.donor or Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")),
+				tonumber(selected.quantity) or 0,
+				name
+			)
+		else
+			selectedHelp = Loc("RAID_CONSUMABLE_REVIEW_NONE_SELECTED", "Select a row to approve, reject, or correct.")
+		end
 		local reviewItems = {
 			{
 				type = "help",
@@ -303,8 +371,8 @@ local function Definition()
 			},
 			{
 				type = "button",
-				label = "Request pending review",
-				buttonText = "Refresh pending",
+				label = Loc("RAID_CONSUMABLE_REVIEW_REQUEST", "Request pending review"),
+				buttonText = Loc("RAID_CONSUMABLE_REVIEW_REFRESH", "Refresh pending"),
 				width = 140,
 				enabled = function()
 					return InActiveSession(ActiveProfile()) and IsEffectiveAdmin(ActiveProfile())
@@ -319,16 +387,31 @@ local function Definition()
 			},
 			{
 				type = "scrollList",
-				label = "Pending review",
+				label = Loc("RAID_CONSUMABLE_REVIEW_PENDING_LIST", "Pending review"),
 				height = 160,
 				getItems = ReviewSummaryItems,
+				getSelectedKey = function()
+					return selectedReviewClusterId
+				end,
+				onSelect = function(_ctx, item)
+					if type(item) == "table" and item.clusterId then
+						selectedReviewClusterId = item.clusterId
+						if Page.Refresh and Page.panel then
+							Page:Refresh(Page.panel)
+						end
+					end
+				end,
+			},
+			{
+				type = "help",
+				indent = "label",
+				text = selectedHelp,
 			},
 		}
-		-- Batch approve all currently summarized pending (non-ambiguous) rows.
 		reviewItems[#reviewItems + 1] = {
 			type = "button",
-			label = "Approve all pending",
-			buttonText = "Approve all",
+			label = Loc("RAID_CONSUMABLE_REVIEW_APPROVE_ALL", "Approve all pending"),
+			buttonText = Loc("RAID_CONSUMABLE_REVIEW_APPROVE_ALL_BUTTON", "Approve all"),
 			width = 120,
 			enabled = function()
 				local Sync = SF.LootHelperSync
@@ -343,7 +426,7 @@ local function Definition()
 				if not (Sync and summary and p) then return end
 				for i = 1, #summary do
 					local row = summary[i]
-					if type(row) == "table" and row.status ~= "ambiguous" then
+					if type(row) == "table" and row.status ~= "ambiguous" and row.status ~= "rejected" then
 						Sync:SubmitConsumablesObsDecision(p, {
 							action = "approve",
 							clusterId = row.clusterId,
@@ -356,61 +439,54 @@ local function Definition()
 				end
 			end,
 		}
-		-- Per-row approve/reject for the first summarized entry (minimal workflow).
 		reviewItems[#reviewItems + 1] = {
 			type = "button",
-			label = "Approve selected",
-			buttonText = "Approve first",
+			label = Loc("RAID_CONSUMABLE_REVIEW_APPROVE", "Approve selected"),
+			buttonText = Loc("RAID_CONSUMABLE_REVIEW_APPROVE_BUTTON", "Approve"),
 			width = 120,
 			enabled = function()
-				local Sync = SF.LootHelperSync
-				local summary = Sync and Sync._consumablesReviewSummary
+				local row = SelectedReviewRow()
 				return InActiveSession(ActiveProfile()) and IsEffectiveAdmin(ActiveProfile())
-					and type(summary) == "table" and #summary > 0
+					and row ~= nil and row.status ~= "rejected"
 			end,
 			onClick = function()
-				local Sync = SF.LootHelperSync
-				local summary = Sync and Sync._consumablesReviewSummary
-				if type(summary) == "table" and summary[1] then
-					Decide("approve", { clusterId = summary[1].clusterId, evidence = summary[1] })
+				local row = SelectedReviewRow()
+				if row then
+					Decide("approve", { clusterId = row.clusterId, evidence = row })
 				end
 			end,
 		}
 		reviewItems[#reviewItems + 1] = {
 			type = "button",
-			label = "Reject selected",
-			buttonText = "Reject first",
+			label = Loc("RAID_CONSUMABLE_REVIEW_REJECT", "Reject selected"),
+			buttonText = Loc("RAID_CONSUMABLE_REVIEW_REJECT_BUTTON", "Reject"),
 			width = 120,
 			enabled = function()
-				local Sync = SF.LootHelperSync
-				local summary = Sync and Sync._consumablesReviewSummary
+				local row = SelectedReviewRow()
 				return InActiveSession(ActiveProfile()) and IsEffectiveAdmin(ActiveProfile())
-					and type(summary) == "table" and #summary > 0
+					and row ~= nil and row.status ~= "rejected"
 			end,
 			onClick = function()
-				local Sync = SF.LootHelperSync
-				local summary = Sync and Sync._consumablesReviewSummary
-				if type(summary) == "table" and summary[1] then
-					Decide("reject", { clusterId = summary[1].clusterId, evidence = summary[1] })
+				local row = SelectedReviewRow()
+				if row then
+					Decide("reject", { clusterId = row.clusterId, evidence = row })
 				end
 			end,
 		}
 		reviewItems[#reviewItems + 1] = {
 			type = "button",
-			label = "Correct rejection",
-			buttonText = "Override reject",
+			label = Loc("RAID_CONSUMABLE_REVIEW_CORRECT", "Correct rejection"),
+			buttonText = Loc("RAID_CONSUMABLE_REVIEW_CORRECT_BUTTON", "Override reject"),
 			width = 130,
 			enabled = function()
-				local Sync = SF.LootHelperSync
-				local summary = Sync and Sync._consumablesReviewSummary
+				local row = SelectedReviewRow()
 				return InActiveSession(ActiveProfile()) and IsEffectiveAdmin(ActiveProfile())
-					and type(summary) == "table" and #summary > 0
+					and row ~= nil and row.status == "rejected"
 			end,
 			onClick = function()
-				local Sync = SF.LootHelperSync
-				local summary = Sync and Sync._consumablesReviewSummary
-				if type(summary) == "table" and summary[1] then
-					Decide("correct", { clusterId = summary[1].clusterId, evidence = summary[1] })
+				local row = SelectedReviewRow()
+				if row then
+					Decide("correct", { clusterId = row.clusterId, evidence = row })
 				end
 			end,
 		}

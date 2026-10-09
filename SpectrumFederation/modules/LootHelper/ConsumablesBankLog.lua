@@ -274,19 +274,27 @@ function BankLog:ProcessLogUpdate(reason)
 
     local V = SF.ConsumablesVerification
     local scope = O.EnsureScope(store, ctx.guildGuid, ctx.bankTab)
+    local Sync = SF.LootHelperSync
+    local sessionActive = Sync and Sync.state and Sync.state.active
+        and Sync.state.profileId == ctx.profileId
     if V and V.ProcessLocalAfterReconcile and scope then
         local verifyStats = V.ProcessLocalAfterReconcile(ctx.profile, ctx.profileId, store, scope, {
             selfId = ctx.observedBy,
+            -- During a live session the coordinator owns verification/txn minting.
+            deferToCoordinator = sessionActive and true or false,
         })
         self.lastVerifyStats = verifyStats
         if verifyStats and (verifyStats.trusted or 0) > 0 then
             Debug("Info", "local admin trust committed=%s", tostring(verifyStats.trusted))
-            -- Commit path already wrote the ledger; flush unsent events if a session is live.
-            local Sync = SF.LootHelperSync
             if Sync and Sync._FlushUnsentConsumablesEvents then
                 Sync:_FlushUnsentConsumablesEvents(ctx.profile)
             end
         end
+    end
+    -- Non-admin (and deferred admin) observations must reach the coordinator while
+    -- a session is active; do not wait for a local trust commit.
+    if sessionActive and Sync and Sync._FlushPendingConsumableObservations then
+        Sync:_FlushPendingConsumableObservations(ctx.profile)
     end
 end
 
