@@ -1520,6 +1520,211 @@ do
     assertEq(howAfter, "verified", "registry#10 correction flips registry status")
 end
 
+-- 11. Writer-offline peer recovery: authorized non-writer peer supplies stamped history
+do
+    V.ClearSessionClusters()
+    local writer = admin
+    local peerAdmin = "PeerAdmin-Realm"
+    local coordB = "CoordB-Realm"
+    local coordA = makeProfile("peer-recover-a", { writer, peerAdmin, coordB })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "peer-recover-a")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local tuesdayEv = evidence({
+        quantity = 19, neighborsOlder = { "peer-tue" }, approxTxnTime = clock - 400,
+    })
+    assertEq(V.IngestReport(coordA, "peer-recover-a", writer, { tuesdayEv }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA,
+    }).verified, 1, "peer-recover writer verifies Tuesday")
+    local txnId = V.ListVerifiedClusters("peer-recover-a")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(coordA, V.ListVerifiedClusters("peer-recover-a")[1], writer))
+    -- Simulate coordinator-stamped provenance a synchronized peer would hold.
+    for i = 1, #(coordA._consumableEvents or {}) do
+        local event = coordA._consumableEvents[i]
+        if type(event) == "table" and event.txnId == txnId then
+            C.StampOrder(coordA, event)
+            C.NoteStoredWriter(coordA, event, writer)
+        end
+    end
+    local peerCopy = makeProfile("peer-recover-holder", { writer, peerAdmin, coordB })
+    assertTrue(select(1, C.MergeSnapshot(peerCopy, C.ExportSnapshot(coordA), { consumablesFromCoordinator = true })),
+        "peer-recover authorized peer holds synchronized Tuesday history")
+    assertTrue(C.FindRegistryTxn(peerCopy, txnId) ~= nil, "peer-recover peer has original txnId")
+    assertEq(C.ContributionTotal(peerCopy, donor, flask), 19, "peer-recover peer has Tuesday credit")
+
+    -- New coordinator B has empty history; original writer is offline.
+    V.ClearSessionClusters()
+    local late = makeProfile("peer-recover-b", { writer, peerAdmin, coordB })
+    assertEq(#(C.TxnRegistry(late) or {}), 0, "peer-recover B starts without Tuesday registry")
+    local peerSnap = C.ExportSnapshot(peerCopy)
+    -- Peer path: stamped RelayWriter events + registry union (writer offline).
+    assertTrue(select(1, C.MergeSnapshot(late, peerSnap, { consumablesFromCoordinator = false })),
+        "peer-recover B absorbs history from non-writer authorized peer")
+    assertTrue(C.FindRegistryTxn(late, txnId) ~= nil, "peer-recover B recovered original txnId")
+    local recovered = C.FindRegistryTxn(late, txnId)
+    assertEq(recovered.status, "verified", "peer-recover recovered status stays verified")
+    assertTrue(recovered.committed == true, "peer-recover recovered committed provenance")
+    assertEq(C.ContributionTotal(late, donor, flask), 19, "peer-recover B credits Tuesday once")
+
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "peer-recover-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local reobserve = evidence({
+        quantity = 19, neighborsOlder = { "peer-tue" },
+        approxTxnTime = clock - 400 + 800, occurrenceIndex = 2,
+    })
+    local after = V.IngestReport(late, "peer-recover-b", coordB, { reobserve }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = true,
+    })
+    assertEq(after.verified, 0, "peer-recover rematch does not re-verify")
+    assertEq(C.ContributionTotal(late, donor, flask), 19, "peer-recover no duplicate credit after rematch")
+    local how, entry = V.ReconcileAgainstRegistry(late, reobserve)
+    assertEq(how, "verified", "peer-recover rematch hits recovered registry")
+    assertEq(entry.txnId, txnId, "peer-recover reuses original Spectrum id")
+end
+
+-- 12. Older rejection cannot overwrite a newer authorized correction/approval
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("decision-order", { admin, "CoordB-Realm" })
+    local db = {}
+    local store = O.EnsureProfileStore(db, "decision-order")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local ev = evidence({
+        quantity = 11, neighborsOlder = { "dec-n" }, approxTxnTime = clock - 90,
+    })
+    assertEq(V.IngestReport(p, "decision-order", w1, { ev }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "decision-order pending before reject")
+    local clusterId = V.EnsureClusterStore("decision-order").clusters[1].clusterId
+    clock = clock + 10
+    assertTrue(select(1, V.ApplyDecision(p, "decision-order", admin, {
+        action = "reject", clusterId = clusterId, reason = "false positive",
+    }, {
+        isAdmin = true,
+        recordDurableRejection = function(evidence, decidedBy, reason)
+            C.RecordDurableRejection(p, evidence, decidedBy, reason)
+        end,
+    })), "decision-order rejects first")
+    local rejected = nil
+    for i = 1, #C.TxnRegistry(p) do
+        if C.TxnRegistry(p)[i].status == "rejected" then
+            rejected = C.TxnRegistry(p)[i]
+        end
+    end
+    assertTrue(rejected ~= nil, "decision-order rejection row exists")
+    local rejectAt = tonumber(rejected.decidedAt)
+    local rejectSnap = C.ExportSnapshot(p, { omitEvents = true })
+
+    clock = clock + 50
+    assertTrue(select(1, V.ApplyDecision(p, "decision-order", "CoordB-Realm", {
+        action = "correct", clusterId = clusterId, evidence = ev,
+    }, {
+        isAdmin = true,
+        clearDurableRejection = function(evidence)
+            C.ClearDurableRejection(p, evidence)
+        end,
+    })), "decision-order corrects later")
+    local corrected = C.FindRegistryTxn(p, rejected.txnId)
+    assertTrue(corrected ~= nil and corrected.status == "verified",
+        "decision-order local correction is verified")
+    assertTrue(tonumber(corrected.decidedAt) > (rejectAt or 0),
+        "decision-order correction decidedAt is newer")
+
+    -- Stale rejection snapshot must not win over newer correction.
+    local peer = makeProfile("decision-order-peer", { admin, "CoordB-Realm" })
+    assertTrue(select(1, C.ReplaceConfig(peer, C.ExportSnapshot(p, { omitEvents = true }))),
+        "decision-order peer starts with correction")
+    assertTrue(select(1, C.ReplaceConfig(peer, rejectSnap)),
+        "decision-order older rejection snapshot merges")
+    local afterStale = C.FindRegistryTxn(peer, rejected.txnId)
+    assertEq(afterStale.status, "verified",
+        "decision-order older rejection does not overwrite newer correction")
+
+    -- Reverse merge order converges to the same verified decision.
+    local peer2 = makeProfile("decision-order-peer2", { admin, "CoordB-Realm" })
+    assertTrue(select(1, C.ReplaceConfig(peer2, rejectSnap)), "decision-order peer2 starts rejected")
+    assertTrue(select(1, C.ReplaceConfig(peer2, C.ExportSnapshot(p, { omitEvents = true }))),
+        "decision-order peer2 then merges correction")
+    local afterFresh = C.FindRegistryTxn(peer2, rejected.txnId)
+    assertEq(afterFresh.status, "verified",
+        "decision-order newer correction wins regardless of merge order")
+    assertEq(afterStale.status, afterFresh.status,
+        "decision-order repeated sync converges on the same status")
+    assertEq(tonumber(afterStale.decidedAt), tonumber(afterFresh.decidedAt),
+        "decision-order repeated sync converges on the same decidedAt")
+end
+
+-- 13. Untrusted fabricated peer snapshot events cannot mint verified credits
+do
+    V.ClearSessionClusters()
+    local victim = makeProfile("untrusted-inject", { admin })
+    local fakeTxn = "ctx:untrusted-inject:Evil-Realm:1:deadbeef"
+    local fabricated = {
+        generation = 1,
+        configSeq = 1,
+        ledgerSeq = 1,
+        eventSeq = 1,
+        txnAllocSeq = 1,
+        txnRegistry = {
+            {
+                txnId = fakeTxn,
+                status = "verified",
+                committed = true,
+                donor = donor,
+                itemId = flask,
+                quantity = 99,
+                coreSignature = O.CoreSignature("deposit", donor, flask, 99),
+                approxTxnTime = clock - 10,
+                decidedBy = "Evil-Realm",
+                decidedAt = clock,
+            },
+        },
+        events = {
+            {
+                id = "ce:remote:Evil-Realm:1",
+                type = C.EVENT.DONATION,
+                source = "guildbank",
+                actor = donor,
+                itemId = flask,
+                quantity = 99,
+                generation = 1,
+                timestamp = clock,
+                txnId = fakeTxn,
+                order = 1,
+                writer = "Evil-Realm",
+                verification = "admin",
+            },
+        },
+    }
+    -- Peer MergeSnapshot requires canonical-admin writers / decidedBy. Fabricated
+    -- non-admin provenance must not credit or register verified donations.
+    assertTrue(select(1, C.MergeSnapshot(victim, fabricated, { consumablesFromCoordinator = false })),
+        "untrusted-inject peer merge does not error")
+    assertEq(C.ContributionTotal(victim, donor, flask), 0,
+        "untrusted-inject fabricated event does not credit the ledger")
+    assertTrue(C.FindRegistryTxn(victim, fakeTxn) == nil,
+        "untrusted-inject fabricated registry row is not accepted")
+    -- Explicit forged relay claiming an admin writer but id owned by attacker.
+    local forged = {
+        id = "ce:remote:Evil-Realm:9",
+        type = C.EVENT.DONATION,
+        source = "guildbank",
+        actor = donor,
+        itemId = flask,
+        quantity = 5,
+        generation = 1,
+        timestamp = clock,
+        txnId = "ctx:untrusted-inject:Evil-Realm:9:cafe",
+        order = 2,
+        writer = admin,
+    }
+    assertFalse(select(1, S.ApplyRemoteEvent(victim, forged, nil, { coordinatorRelay = true })),
+        "untrusted-inject forged admin-writer claim is rejected when id is not admin-owned")
+    assertEq(C.ContributionTotal(victim, donor, flask), 0,
+        "untrusted-inject forged relay leaves ledger empty")
+end
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

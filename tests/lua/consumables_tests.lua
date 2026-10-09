@@ -1551,12 +1551,19 @@ local function checkSessionTransport()
     -- New coordinator with empty history holds until a joining peer supplies richer watermarks.
     local lateCoord = profile("late-coord", admin)
     lateCoord._profileId = coordP._profileId
+    lateCoord._adminUsers = { admin, vann }
     C.SetGuild(lateCoord, admin, GUILD, 2)
     C.AddRequestedItem(lateCoord, admin, aqirite)
     sessionStubs({ active = true, isCoordinator = true, coordinator = admin, sessionId = "s1",
-        profileId = lateCoord._profileId, peers = {} },
+        profileId = lateCoord._profileId, peers = { [vann] = { inGroup = true } } },
         { [lateCoord._profileId] = lateCoord }, {})
     Sync._SelfId = function() return admin end
+    local peerRecoveryReqs = {}
+    local previousRequestProfileSnapshot = Sync.RequestProfileSnapshot
+    Sync.RequestProfileSnapshot = function(_, reason, opts)
+        peerRecoveryReqs[#peerRecoveryReqs + 1] = { reason = reason, opts = opts }
+        return true
+    end
     local peerDesc = C.Descriptor(coordP)
     Sync:_NotePeerConsumablesHistory(vann, {
         profileId = lateCoord._profileId,
@@ -1575,19 +1582,45 @@ local function checkSessionTransport()
         "a new coordinator marks peer-ahead history from HAVE_PROFILE watermarks")
     assertFalse(Sync:_ConsumablesHistoryReady(lateCoord),
         "peer-ahead history gates verification until local ledger catches up")
-    assertTrue(select(1, C.MergeSnapshot(lateCoord, C.ExportSnapshot(coordP), { consumablesFromCoordinator = true })),
-        "new coordinator absorbs the peer's richer consumables snapshot")
+    assertEq(#peerRecoveryReqs, 1, "peer-ahead history requests recovery from the authorized peer")
+    assertEq(peerRecoveryReqs[1].reason, "consumables-peer-history",
+        "recovery request uses the consumables-peer-history reason")
+    assertEq(peerRecoveryReqs[1].opts and peerRecoveryReqs[1].opts.preferredTarget, vann,
+        "recovery prefers the ahead authorized peer (not only the original writer)")
+    assertTrue(peerRecoveryReqs[1].opts and peerRecoveryReqs[1].opts.acceptAuthorizedAdmins == true,
+        "recovery accepts an authorized admin snapshot")
+    assertTrue(peerRecoveryReqs[1].opts and peerRecoveryReqs[1].opts.consumablesHistoryOnly == true,
+        "recovery absorbs consumables history only from that admin")
+    -- Peer is not the original writer; stamped RelayWriter events still recover.
+    local peerSnap = C.ExportSnapshot(coordP)
+    assertTrue(select(1, C.MergeSnapshot(lateCoord, peerSnap, { consumablesFromCoordinator = false })),
+        "new coordinator absorbs stamped history from a non-writer authorized peer")
     Sync:_RefreshConsumablesHistoryGate(lateCoord)
     assertTrue(Sync:_ConsumablesHistoryReady(lateCoord),
         "history gate clears after the missing ledger/registry is absorbed")
     assertEq(C.ContributionTotal(lateCoord, donor, aqirite), 6,
         "recovered Tuesday donation credits once on the new coordinator")
+    -- Untrusted stranger advertisements do not open recovery.
+    local strangerReqs = #peerRecoveryReqs
+    Sync:_NotePeerConsumablesHistory("Stranger-Realm", {
+        profileId = lateCoord._profileId,
+        sessionId = "s1",
+        consumablesGeneration = peerDesc.generation,
+        consumablesConfigSeq = peerDesc.configSeq,
+        consumablesTxnAllocSeq = (peerDesc.txnAllocSeq or 0) + 5,
+        consumablesEventCount = (peerDesc.eventCount or 0) + 5,
+        consumablesEventFingerprint = 424242,
+    })
+    assertEq(#peerRecoveryReqs, strangerReqs,
+        "unauthorized peers cannot trigger consumables history recovery")
+    Sync.RequestProfileSnapshot = previousRequestProfileSnapshot
 
     -- Restore the follower session under test before Preview as Non-Admin checks.
     sessionStubs({ active = true, isCoordinator = false, coordinator = admin, sessionId = "s1",
         profileId = coordP._profileId, peers = { [admin] = { consumablesCapable = true } } },
         { [coordP._profileId] = followerP }, fsent)
     Sync._SelfId = function() return vann end
+    Sync.RequestProfileSnapshot = previousRequestProfileSnapshot
 
     local previewSent = #fsent
     local previewOk, previewErr = Sync:CommitConsumablesOp(followerP, { name = "add_item", itemId = flask }, admin,

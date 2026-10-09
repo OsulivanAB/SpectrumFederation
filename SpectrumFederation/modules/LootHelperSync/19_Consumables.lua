@@ -167,15 +167,24 @@ function Sync:_RefreshConsumablesHistoryGate(profile)
     if type(profile) ~= "table" then return end
     local C = Consumables()
     local S = Rules()
-    if not C or not S or not S.NeedsCatchUp then return end
+    if not C or not S then return end
     local remote = profile._consumablesCatchUpRemote
     if type(remote) ~= "table" then
         profile._consumablesPeerHistoryAhead = nil
+        profile._consumablesHistoryPeer = nil
         return
     end
-    if not S.NeedsCatchUp(C.Descriptor(profile), remote) then
-        profile._consumablesCatchUpRemote = nil
+    local localDesc = C.Descriptor(profile)
+    -- Credit hold is history-scoped (events/registry/archive). Config-only drift
+    -- must not keep verification blocked after ledger recovery from a peer.
+    local historyBehind = S.PeerHistoryAhead and S.PeerHistoryAhead(localDesc, remote)
+    if not historyBehind then
         profile._consumablesPeerHistoryAhead = nil
+        profile._consumablesHistoryPeer = nil
+        profile._consumablesPeerRecoveryAt = nil
+        if not (S.NeedsCatchUp and S.NeedsCatchUp(localDesc, remote)) then
+            profile._consumablesCatchUpRemote = nil
+        end
     end
 end
 
@@ -215,22 +224,68 @@ function Sync:_NotePeerConsumablesHistory(sender, payload)
         self:_RefreshConsumablesHistoryGate(profile)
         return
     end
+    -- Only recover from canonical admins. Ordinary members cannot seed verified history.
+    if not C.IsCanonicalAdmin(profile, sender) then
+        return
+    end
     profile._consumablesCatchUpRemote = (S.MergeHistoryWatermark and S.MergeHistoryWatermark(
         profile._consumablesCatchUpRemote, peerDesc)) or peerDesc
     profile._consumablesPeerHistoryAhead = true
+    profile._consumablesHistoryPeer = sender
     Debug("Info", "coordinator holding consumables credits until peer history converges from %s",
         tostring(sender))
+    -- Ask the ahead authorized peer for a consumables snapshot even when they are
+    -- not the original event writer (and not the session helper).
+    self:_MaybeRequestConsumablesPeerHistory(profile, sender)
+end
+
+-- Request NEED_PROFILE from an authorized peer holding richer consumables history.
+-- @param profile table
+-- @param preferredTarget string|nil
+-- @return boolean
+function Sync:_MaybeRequestConsumablesPeerHistory(profile, preferredTarget)
+    if type(profile) ~= "table" then return false end
+    if not (self.state and self.state.active and self.state.isCoordinator) then return false end
+    if not self.RequestProfileSnapshot then return false end
+    local C = Consumables()
+    local target = preferredTarget or profile._consumablesHistoryPeer
+    if type(target) ~= "string" or target == "" then return false end
+    if C and C.IsCanonicalAdmin and not C.IsCanonicalAdmin(profile, target) then
+        return false
+    end
+    local now = self._Now and self:_Now() or 0
+    local lastAt = tonumber(profile._consumablesPeerRecoveryAt)
+    if lastAt and (now - lastAt) < 120 then
+        return false
+    end
+    local requested = self:RequestProfileSnapshot("consumables-peer-history", {
+        preferredTarget = target,
+        acceptAuthorizedAdmins = true,
+        consumablesHistoryOnly = true,
+    }) and true or false
+    if requested then
+        profile._consumablesPeerRecoveryAt = now
+        Debug("Info", "requesting consumables history recovery from authorized peer %s", tostring(target))
+    end
+    return requested
 end
 
 function Sync:_ConsumablesHistoryReady(profile)
     if type(profile) ~= "table" then return true end
     local C = Consumables()
     local S = Rules()
-    if not C or not S or not S.NeedsCatchUp then return true end
+    if not C or not S then return true end
     self:_RefreshConsumablesHistoryGate(profile)
+    if profile._consumablesPeerHistoryAhead then return false end
     local remote = profile._consumablesCatchUpRemote
     if type(remote) ~= "table" then return true end
-    return not S.NeedsCatchUp(C.Descriptor(profile), remote)
+    if S.PeerHistoryAhead then
+        return not S.PeerHistoryAhead(C.Descriptor(profile), remote)
+    end
+    if S.NeedsCatchUp then
+        return not S.NeedsCatchUp(C.Descriptor(profile), remote)
+    end
+    return true
 end
 
 function Sync:_ConsiderConsumablesCatchUp(payload, opts)

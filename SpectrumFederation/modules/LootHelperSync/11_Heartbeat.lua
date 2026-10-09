@@ -347,7 +347,10 @@ end
 
 -- Function Request profile snapshot from helpers (preferred) or coordinator (fallback).
 -- @param reason string Reason for request (for logging)
--- @param opts table|nil coordinatorOnly asks the session coordinator and no helper
+-- @param opts table|nil coordinatorOnly asks the session coordinator and no helper;
+--   preferredTarget asks an authorized admin first (consumables history recovery);
+--   acceptAuthorizedAdmins lets the coordinator accept that admin's snapshot;
+--   consumablesHistoryOnly absorbs only consumables ledger/registry from that admin
 -- @return boolean True if request was registered, false otherwise
 function Sync:RequestProfileSnapshot(reason, opts)
     if not self.state.active then return false end
@@ -364,7 +367,38 @@ function Sync:RequestProfileSnapshot(reason, opts)
     -- Consumables configuration asks the coordinator only, because a helper snapshot merges events and does not replace config.
     -- Once the profile is local, drop targets who are no longer canonical admins.
     local targets
-    if opts.coordinatorOnly then
+    local preferred = opts.preferredTarget
+    if type(preferred) == "string" and preferred ~= "" then
+        -- Consumables history recovery: ask the ahead authorized peer even when
+        -- they are not the session helper/coordinator (original writer may be offline).
+        if self:_SamePlayer(preferred, self:_SelfId()) then
+            return false
+        end
+        local preferredOk = false
+        if self.IsSenderAuthorized and self._GetProfileAdminUsers then
+            preferredOk = self:IsSenderAuthorized(self.state.profileId, preferred) == true
+        end
+        if not preferredOk then
+            local C = SF.Consumables
+            local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+            preferredOk = profile and C and C.IsCanonicalAdmin and C.IsCanonicalAdmin(profile, preferred) == true
+        end
+        if not preferredOk then
+            return false
+        end
+        targets = { preferred }
+        -- Fall back to ordinary helper/coordinator routes if the preferred peer fails.
+        local fallback = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
+            or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+        if type(fallback) == "table" then
+            for i = 1, #fallback do
+                local name = fallback[i]
+                if type(name) == "string" and name ~= "" and not self:_SamePlayer(name, preferred) then
+                    targets[#targets + 1] = name
+                end
+            end
+        end
+    elseif opts.coordinatorOnly then
         local coordinator = self.state.coordinator
         if type(coordinator) ~= "string" or coordinator == "" then
             self:_NoteMissingRoute("_noProfileTargetWarnedFor", "Cannot request profile: no targets available", reason)
@@ -407,6 +441,15 @@ function Sync:RequestProfileSnapshot(reason, opts)
         targets     = targets,  -- fallback list
         reason      = reason,
     }
+    if opts.acceptAuthorizedAdmins == true then
+        profileMeta.acceptAuthorizedAdmins = true
+    end
+    if opts.consumablesHistoryOnly == true then
+        profileMeta.consumablesHistoryOnly = true
+    end
+    if type(preferred) == "string" and preferred ~= "" then
+        profileMeta.preferredTarget = preferred
+    end
     if self._StampUserInitiatedRequest then
         self:_StampUserInitiatedRequest(profileMeta)
     end

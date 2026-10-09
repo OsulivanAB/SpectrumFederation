@@ -864,24 +864,33 @@ function Sync:HandleNeedProfile(sender, payload)
         return false, "safe mode (bulk disabled)"
     end
 
-    -- Serve eligibility: coordinator or helper. A missed grant is a log reply,
-    -- not a reason for a non-helper admin to export the profile.
+    -- Serve eligibility: coordinator or helper, or an authorized admin serving
+    -- the session coordinator for consumables history recovery (writer offline).
     if not self.state.active then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: no active session (sender=%s)", tostring(sender))
         end
         return
     end
-    if not (self.state.isCoordinator or self:IsSelfHelper()) then
+    local selfId = self:_SelfId()
+    local canServe = self.state.isCoordinator or self:IsSelfHelper()
+    if not canServe then
+        local requesterIsCoordinator = type(self.state.coordinator) == "string"
+            and self:_SamePlayer(sender, self.state.coordinator)
+        if requesterIsCoordinator and self:IsSenderAuthorized(self.state.profileId, selfId) then
+            canServe = true
+        end
+    end
+    if not canServe then
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper (sender=%s)", tostring(sender))
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper/recovery-admin (sender=%s)", tostring(sender))
         end
         return
     end
     
     -- Verify we're still authorized for this profile (Issue #9 fix).
     -- Cached coordinator/helper role is not an authorization grant.
-    if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
+    if not self:IsSenderAuthorized(self.state.profileId, selfId) then
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Not authorized to serve profile (no longer admin)")
         end
@@ -898,7 +907,8 @@ function Sync:HandleNeedProfile(sender, payload)
         return
     end
 
-    local serveRole = self.state.isCoordinator and "coordinator" or "helper"
+    local serveRole = self.state.isCoordinator and "coordinator"
+        or (self:IsSelfHelper() and "helper" or "authorized-admin")
     if not self:_ProfileSnapshotServeAllowed(sender) then
         return
     end

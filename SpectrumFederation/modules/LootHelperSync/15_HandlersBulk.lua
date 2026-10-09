@@ -500,18 +500,24 @@ function Sync:HandleProfileSnapshot(sender, payload)
         return
     end
 
-    -- Full snapshots remain coordinator/helper-only. Ordinary admins cannot
-    -- supply owner, roster, logs, loot mode, Reward Pot, Raid Check, or
-    -- equipment state through this path. RC settings use RC_CONFIG_REQ/SET.
+    -- Full snapshots remain coordinator/helper-only unless the coordinator
+    -- explicitly requested consumables history recovery from an authorized admin.
+    -- Ordinary admins still cannot supply owner/roster/logs through an unsolicited
+    -- path. RC settings use RC_CONFIG_REQ/SET.
     -- Canonical admin revocation outranks a cached helper or in-flight request.
     local snapReq = nil
     if type(payload.requestId) == "string" and self.state.requests then
         snapReq = self.state.requests[payload.requestId]
     end
+    local acceptAuthorizedAdmins = type(snapReq) == "table" and type(snapReq.meta) == "table"
+        and snapReq.meta.acceptAuthorizedAdmins == true
+        and self.state.isCoordinator == true
+    local consumablesHistoryOnly = acceptAuthorizedAdmins and type(snapReq) == "table"
+        and type(snapReq.meta) == "table" and snapReq.meta.consumablesHistoryOnly == true
     local snapDisposition = "untrusted"
     if self._ClassifyPrivilegedResponse then
         local classifyOpts = {
-            coordinatorAcceptsAdmins = false,
+            coordinatorAcceptsAdmins = acceptAuthorizedAdmins,
             expectedKinds = { NEED_PROFILE = true },
         }
         if self._CatchUpResponseCanProve
@@ -521,7 +527,9 @@ function Sync:HandleProfileSnapshot(sender, payload)
             classifyOpts.catchUpProven = self:_CatchUpSnapshotProvesGrant(sender, payload.snapshot) == true
         end
         snapDisposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, snapReq, classifyOpts)
-    elseif self:IsSenderAuthorized(payload.profileId, sender) and self:IsTrustedDataSender(sender) then
+    elseif self:IsSenderAuthorized(payload.profileId, sender) and (
+        self:IsTrustedDataSender(sender) or acceptAuthorizedAdmins
+    ) then
         snapDisposition = "accept"
     elseif not self:IsSenderAuthorized(payload.profileId, sender) then
         snapDisposition = "unauthorized"
@@ -556,7 +564,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     local senderRole =
         (self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator)) and "coordinator"
-        or (self:IsHelper(sender) and "helper" or "unknown")
+        or (self:IsHelper(sender) and "helper"
+            or (acceptAuthorizedAdmins and "authorized-admin" or "unknown"))
     if SF.Debug then
         SF.Debug:Info("SYNC", "Accepting PROFILE_SNAPSHOT from %s as %s (profile: %s)",
             tostring(sender), senderRole, tostring(payload.profileId))
@@ -571,17 +580,6 @@ function Sync:HandleProfileSnapshot(sender, payload)
             numMembers, numLogs, numAdmins, pointName)
     end
 
-    -- Validate snapshot
-    if SF.LootProfile and SF.LootProfile.ValidateSnapshot then
-        local okSnap, snapErr = SF.LootProfile.ValidateSnapshot(payload.snapshot)
-        if not okSnap then
-            if SF.Debug then
-                SF.Debug:Warn("SYNC", "PROFILE_SNAPSHOT invalid: %s", tostring(snapErr or "unknown"))
-            end
-            return
-        end
-    end
-
     -- Ensure payload.profileId matches snapshot meta profileId
     local meta = payload.snapshot.meta
     if not meta or type(meta._profileId) ~= "string" then return end
@@ -593,6 +591,64 @@ function Sync:HandleProfileSnapshot(sender, payload)
         return
     end
 
+    local profileId = payload.profileId
+    local profile = self:FindLocalProfileById(profileId)
+
+    -- Narrow consumables history recovery: merge stamped ledger/registry only.
+    -- Do not replace owner, roster, logs, or other profile authority fields from
+    -- an ordinary admin who is not a helper/coordinator.
+    if consumablesHistoryOnly and profile and not self:IsTrustedDataSender(sender) then
+        local consumables = payload.snapshot.consumables
+        if type(consumables) ~= "table" then
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "consumables history snapshot from %s missing consumables payload",
+                    tostring(sender))
+            end
+            return
+        end
+        if SF.Consumables and SF.Consumables.ValidateSnapshot then
+            local okSnap, snapErr = SF.Consumables.ValidateSnapshot(consumables)
+            if not okSnap then
+                if SF.Debug then
+                    SF.Debug:Warn("SYNC", "consumables history snapshot invalid: %s", tostring(snapErr or "unknown"))
+                end
+                return
+            end
+        end
+        if SF.Consumables and SF.Consumables.MergeSnapshot then
+            SF.Consumables.MergeSnapshot(profile, consumables, { consumablesFromCoordinator = false })
+        end
+        if self._NoteConsumablesSnapshot then
+            self:_NoteConsumablesSnapshot(profile, false)
+        end
+        if self._RefreshConsumablesHistoryGate then
+            self:_RefreshConsumablesHistoryGate(profile)
+        end
+        if type(payload.requestId) == "string" and payload.requestId ~= "" then
+            self:CompleteRequest(payload.requestId)
+        end
+        if self.state._profileReqInFlight == self.state.sessionId then
+            self.state._profileReqInFlight = nil
+        end
+        self.state.pendingProfileSnapshot = nil
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Absorbed consumables history recovery from authorized admin %s",
+                tostring(sender))
+        end
+        return
+    end
+
+    -- Validate snapshot
+    if SF.LootProfile and SF.LootProfile.ValidateSnapshot then
+        local okSnap, snapErr = SF.LootProfile.ValidateSnapshot(payload.snapshot)
+        if not okSnap then
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "PROFILE_SNAPSHOT invalid: %s", tostring(snapErr or "unknown"))
+            end
+            return
+        end
+    end
+
     -- Metrics: count logs received from snapshot
     local snapshotLogs = payload.snapshot.logs or payload.snapshot.lootLogs or payload.snapshot._lootLogs
     local recvLogs = (type(snapshotLogs) == "table") and #snapshotLogs or 0
@@ -602,8 +658,6 @@ function Sync:HandleProfileSnapshot(sender, payload)
     SF.lootHelperDB = SF.lootHelperDB or { profiles = {}, activeProfileId = nil }
     SF.lootHelperDB.profiles = SF.lootHelperDB.profiles or {}
 
-    local profileId = payload.profileId
-    local profile = self:FindLocalProfileById(profileId)
     local isNew = false
 
     if not profile then
@@ -636,6 +690,9 @@ function Sync:HandleProfileSnapshot(sender, payload)
     end
     if self._NoteConsumablesSnapshot then
         self:_NoteConsumablesSnapshot(profile, fromCoordinator)
+    end
+    if self._RefreshConsumablesHistoryGate then
+        self:_RefreshConsumablesHistoryGate(profile)
     end
 
     self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0

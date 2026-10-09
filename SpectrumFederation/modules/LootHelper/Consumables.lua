@@ -1195,28 +1195,79 @@ end
 local function PreferRegistryEntry(localEntry, remoteEntry)
     if not localEntry then return remoteEntry end
     if not remoteEntry then return localEntry end
-    local out = CopyTxnRegistryEntry(remoteEntry) or CopyTxnRegistryEntry(localEntry)
+    local localAt = tonumber(localEntry.decidedAt)
+    local remoteAt = tonumber(remoteEntry.decidedAt)
+    local decisionSide = nil
+    if localAt and remoteAt then
+        if remoteAt > localAt then
+            decisionSide = "remote"
+        elseif localAt > remoteAt then
+            decisionSide = "local"
+        end
+    elseif remoteAt and not localAt then
+        decisionSide = "remote"
+    elseif localAt and not remoteAt then
+        decisionSide = "local"
+    end
+
+    local decision = remoteEntry
+    if decisionSide == "local" then
+        decision = localEntry
+    elseif decisionSide == "remote" then
+        decision = remoteEntry
+    else
+        -- No comparable newer decision: protect committed credits, then use a
+        -- commutative status tie-break so merge order cannot diverge.
+        if localEntry.committed and localEntry.status == "verified" then
+            decision = localEntry
+        elseif remoteEntry.committed and remoteEntry.status == "verified" then
+            decision = remoteEntry
+        elseif localEntry.status == remoteEntry.status then
+            decision = localEntry
+        elseif localEntry.status == "verified" and remoteEntry.status ~= "verified" then
+            -- Equal/missing decidedAt: prefer verified (reject→correct same tick).
+            decision = localEntry
+        elseif remoteEntry.status == "verified" and localEntry.status ~= "verified" then
+            decision = remoteEntry
+        else
+            decision = localEntry
+        end
+    end
+
+    local out = CopyTxnRegistryEntry(decision)
+    if not out then
+        out = CopyTxnRegistryEntry(localEntry) or CopyTxnRegistryEntry(remoteEntry)
+    end
     if not out then return nil end
-    -- Never lose a committed credit or a durable rejection during incomplete sync.
+
+    -- Committed credit is sticky across merges once either side recorded it.
     if localEntry.committed or remoteEntry.committed then
         out.committed = true
-    end
-    if localEntry.status == "rejected" or remoteEntry.status == "rejected" then
-        if localEntry.committed and localEntry.status == "verified" then
+        if out.status ~= "rejected" then
             out.status = "verified"
-        else
-            out.status = "rejected"
+        elseif decisionSide == "remote" and remoteEntry.status == "rejected"
+            and not remoteEntry.committed and localEntry.committed then
+            -- An uncommitted remote rejection cannot un-credit a committed donation.
+            out.status = "verified"
+            out.verification = localEntry.verification or out.verification
+            out.decidedBy = localEntry.decidedBy or out.decidedBy
+            out.decidedAt = localAt or out.decidedAt
+            out.reason = nil
         end
-    elseif localEntry.status == "verified" or remoteEntry.status == "verified" then
-        out.status = "verified"
     end
-    out.verification = out.verification or localEntry.verification or remoteEntry.verification
-    out.decidedBy = out.decidedBy or localEntry.decidedBy or remoteEntry.decidedBy
-    out.reason = out.reason or localEntry.reason or remoteEntry.reason
-    out.neighborsOlder = out.neighborsOlder or localEntry.neighborsOlder
-    out.neighborsNewer = out.neighborsNewer or localEntry.neighborsNewer
-    out.coreSignature = out.coreSignature or localEntry.coreSignature
-    out.approxTxnTime = out.approxTxnTime or localEntry.approxTxnTime
+
+    local other = decision == localEntry and remoteEntry or localEntry
+    out.neighborsOlder = out.neighborsOlder or other.neighborsOlder
+    out.neighborsNewer = out.neighborsNewer or other.neighborsNewer
+    out.coreSignature = out.coreSignature or other.coreSignature
+    out.approxTxnTime = out.approxTxnTime or other.approxTxnTime
+    out.verification = out.verification or other.verification
+    out.decidedBy = out.decidedBy or other.decidedBy
+    if out.status == "rejected" then
+        out.reason = out.reason or other.reason
+    else
+        out.reason = decision.reason
+    end
     return out
 end
 
@@ -2862,6 +2913,7 @@ function C.MergeSnapshot(profile, data, opts)
     local sessionActive = type(syncState) == "table" and syncState.active == true
     if opts.consumablesFromCoordinator == false then
         local Rules = SF.ConsumablesSync
+        local cfg = profile._consumables
         if type(data.events) == "table" and Rules and Rules.ApplyRemoteEvent and Rules.RelayWriter then
             local limit = #data.events
             local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
@@ -2869,13 +2921,49 @@ function C.MergeSnapshot(profile, data, opts)
             for i = 1, limit do
                 local event = data.events[i]
                 local order = type(event) == "table" and C.ValidOrder(event.order) or nil
-                if order and Rules.RelayWriter(event) then
+                -- Accept only previously stamped, writer-bound rows from a
+                -- canonical admin. A peer may relay history they did not author,
+                -- but cannot manufacture credits under a non-admin writer.
+                local writer = order and Rules.RelayWriter(event) or nil
+                if writer and C.IsCanonicalAdmin(profile, writer) then
                     Rules.ApplyRemoteEvent(profile, event, nil, {
                         coordinatorRelay = true,
                         silent = true,
                         skipGrantUse = true,
                     })
                 end
+            end
+        end
+        -- Peer snapshots do not replace full config, but must union-merge the
+        -- canonical registry (and authoritative rejection watermark) so recovery
+        -- does not depend on re-authoring events locally. New registry rows must
+        -- carry admin decision provenance or already exist locally / on ledger.
+        if type(cfg) == "table" then
+            if type(data.txnRegistry) == "table" then
+                local filtered = {
+                    txnAllocSeq = data.txnAllocSeq,
+                    txnRegistry = {},
+                }
+                for i = 1, #data.txnRegistry do
+                    local row = data.txnRegistry[i]
+                    if type(row) == "table" and ValidTxnId(row.txnId) then
+                        local known = C.FindRegistryTxn(profile, row.txnId) ~= nil
+                            or (C.HasTxnId and C.HasTxnId(profile, row.txnId))
+                        local adminDecision = type(row.decidedBy) == "string"
+                            and row.decidedBy ~= ""
+                            and C.IsCanonicalAdmin(profile, row.decidedBy)
+                        if known or adminDecision then
+                            filtered.txnRegistry[#filtered.txnRegistry + 1] = row
+                        end
+                    end
+                end
+                ReplaceTxnRegistryFromPayload(cfg, filtered)
+            end
+            if type(data.rejections) == "table" then
+                ReplaceRejectionsFromPayload(cfg, data)
+            end
+            if type(data.pendingWitnesses) == "table" then
+                ReplacePendingWitnessesFromPayload(cfg, data, { forceReplace = false })
             end
         end
         Notify()
