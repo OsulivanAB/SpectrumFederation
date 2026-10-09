@@ -2229,6 +2229,13 @@ function Runtime:OnProfileChanged(profile)
     end
     if id ~= nil and id == self._seenProfileId then
         self:RefreshReminder()
+        -- Same profile id: consumables config edits are covered by
+        -- Consumables.RegisterUIListener. Still nudge the bank-log observer so
+        -- an ineligible open → later activation path is not missed when the
+        -- active profile pointer is refreshed without an id change.
+        if SF.ConsumablesBankLog and SF.ConsumablesBankLog.OnProfileMaybeChanged then
+            SF.ConsumablesBankLog:OnProfileMaybeChanged()
+        end
         return
     end
     self._seenProfileId = id
@@ -2238,6 +2245,9 @@ function Runtime:OnProfileChanged(profile)
     end
     self.qtyOverrides = {}
     self:RefreshReminder()
+    if SF.ConsumablesBankLog and SF.ConsumablesBankLog.OnProfileMaybeChanged then
+        SF.ConsumablesBankLog:OnProfileMaybeChanged()
+    end
 end
 
 function Runtime:OnEvent(event, arg1)

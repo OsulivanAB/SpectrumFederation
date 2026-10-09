@@ -5,9 +5,9 @@ local _, SF = ...
 SF.ConsumablesBankLog = SF.ConsumablesBankLog or {}
 local BankLog = SF.ConsumablesBankLog
 
-local RESCAN_DELAY = 2.0
 local QUERY_RETRY_DELAY = 1.0
 local MAX_QUERY_RETRIES = 5
+local SLOTS_THROTTLE_SECONDS = 1
 
 local function Debug(level, message, ...)
     if SF.Debug and SF.Debug[level] then
@@ -115,7 +115,6 @@ end
 
 function BankLog:CancelTimers(reason)
     self.queryToken = (self.queryToken or 0) + 1
-    self.rescanToken = (self.rescanToken or 0) + 1
     self.queryRetries = 0
     self.awaitingLogUpdate = false
     if reason then
@@ -141,22 +140,33 @@ function BankLog:RequestLog(reason)
         return
     end
     local now = WallNow()
-    -- Slot churn can be frequent; coalesce into the existing rescan cadence.
-    if reason == "slots_changed" and self.lastQueryAt and (now - self.lastQueryAt) < 1 then
-        return
+    -- Slot churn can be frequent; coalesce while a query is already outstanding
+    -- or a recent query just completed successfully.
+    if reason == "slots_changed" then
+        if self.awaitingLogUpdate then return end
+        if self.lastQueryAt and (now - self.lastQueryAt) < SLOTS_THROTTLE_SECONDS then
+            return
+        end
     end
     self.awaitingLogUpdate = true
     self.lastQueryAt = now
     self.lastQueryReason = reason
+    -- New query attempt invalidates any prior retry callback.
+    self.queryToken = (self.queryToken or 0) + 1
     Debug("Info", "query guild bank log tab=%s reason=%s", tostring(ctx.bankTab), tostring(reason or "scan"))
     pcall(QueryGuildBankLog, ctx.bankTab)
-    local tokenField = "queryToken"
-    self.queryToken = (self.queryToken or 0) + 1
+
     local retries = self.queryRetries or 0
     if retries < MAX_QUERY_RETRIES then
+        local tokenField = "queryToken"
         self:ScheduleAfter(QUERY_RETRY_DELAY, tokenField, function()
             if not self.awaitingLogUpdate then return end
             self.queryRetries = (self.queryRetries or 0) + 1
+            if self.queryRetries > MAX_QUERY_RETRIES then
+                self.awaitingLogUpdate = false
+                Debug("Warn", "guild bank log query retries exhausted")
+                return
+            end
             Debug("Info", "retry guild bank log query attempt=%s", tostring(self.queryRetries))
             self:RequestLog("retry")
         end)
@@ -221,6 +231,8 @@ function BankLog:ProcessLogUpdate(reason)
     self.activeContext = ctx
     self.awaitingLogUpdate = false
     self.queryRetries = 0
+    -- Successful update cancels outstanding retry callbacks.
+    self.queryToken = (self.queryToken or 0) + 1
 
     local snapshot = self:ReadSnapshot(ctx)
     if not snapshot then
@@ -246,36 +258,38 @@ function BankLog:ProcessLogUpdate(reason)
         tostring(#snapshot.rows))
 end
 
-function BankLog:ScheduleRescan()
-    if not self.active then return end
-    self.rescanToken = (self.rescanToken or 0) + 1
-    self:ScheduleAfter(RESCAN_DELAY, "rescanToken", function()
-        self:RequestLog("rescan")
-        self:ScheduleRescan()
-    end)
+function BankLog:BeginObservation(reason)
+    local ctx = self:EligibleContext()
+    if not ctx then
+        self.active = false
+        self.activeContext = nil
+        self:CancelTimers(reason or "ineligible")
+        return false
+    end
+    local prev = self.activeContext
+    local changed = not self.active
+        or not prev
+        or prev.profileId ~= ctx.profileId
+        or prev.guildGuid ~= ctx.guildGuid
+        or prev.bankTab ~= ctx.bankTab
+        or tonumber(prev.generation) ~= tonumber(ctx.generation)
+    self.active = true
+    self.activeContext = ctx
+    if changed then
+        self.queryRetries = 0
+        self:RequestLog(reason or "start")
+    end
+    return true
 end
 
 function BankLog:OnBankOpened()
-    local first = not self.active
     self.bankOpen = true
-    local ctx = self:EligibleContext()
-    if not ctx then
-        -- Profile/config may arrive later while the bank stays open.
-        self.active = false
-        self.activeContext = nil
-        self:CancelTimers("ineligible_open")
+    if not self:BeginObservation("open") then
         Debug("Info", "bank open: observation idle (no eligible profile/config)")
         return
     end
-    self.active = true
-    self.activeContext = ctx
-    self.queryRetries = 0
-    if first then
-        Debug("Info", "bank open: start observation profile=%s tab=%s",
-            tostring(ctx.profileId), tostring(ctx.bankTab))
-    end
-    self:RequestLog(first and "open" or "reopen")
-    self:ScheduleRescan()
+    Debug("Info", "bank open: start observation profile=%s tab=%s",
+        tostring(self.activeContext.profileId), tostring(self.activeContext.bankTab))
 end
 
 function BankLog:OnBankClosed()
@@ -288,29 +302,16 @@ end
 
 function BankLog:OnProfileMaybeChanged()
     if not self.bankOpen then return end
-    local ctx = self:EligibleContext()
-    if not ctx then
+    if not self:BeginObservation("profile_ready") then
         if self.active then
             self.active = false
             self.activeContext = nil
             self:CancelTimers("profile_ineligible")
-            Debug("Info", "profile change: stop observation while bank open")
         end
+        Debug("Info", "profile change: stop observation while bank open")
         return
     end
-    local prev = self.activeContext
-    local changed = not prev
-        or prev.profileId ~= ctx.profileId
-        or prev.guildGuid ~= ctx.guildGuid
-        or prev.bankTab ~= ctx.bankTab
-    self.active = true
-    self.activeContext = ctx
-    if changed then
-        self.queryRetries = 0
-        Debug("Info", "profile/config eligible while bank open; querying log")
-        self:RequestLog("profile_ready")
-        self:ScheduleRescan()
-    end
+    Debug("Info", "profile/config eligible while bank open; observation armed")
 end
 
 function BankLog:OnEvent(event, arg1)
@@ -332,8 +333,6 @@ function BankLog:OnEvent(event, arg1)
         end
     elseif event == "GUILDBANKBAGSLOTS_CHANGED" then
         if self.active then
-            -- Throttle via existing rescan loop; nudge an immediate query token reset.
-            self.queryRetries = 0
             self:RequestLog("slots_changed")
         end
     end
@@ -344,7 +343,6 @@ function BankLog:Init()
     self.active = false
     self.bankOpen = false
     self.queryToken = 0
-    self.rescanToken = 0
     self.queryRetries = 0
     local frame = CreateFrame("Frame")
     self.frame = frame

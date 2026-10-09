@@ -268,49 +268,154 @@ end
 do
     local db = { consumableObservations = {} }
     local store = O.EnsureProfileStore(db, "profile-obs")
-    local rows = { deposit("Kyrius-Realm", flask, 20, 0, 0, 0, 1) }
+    -- Shared neighbor context lets later observers rematch despite scan-time drift.
+    local rows = {
+        deposit("Noise-Realm", vial, 1, 0, 0, 0, 2),
+        deposit("Kyrius-Realm", flask, 20, 0, 0, 0, 1),
+    }
     O.ReconcileSnapshot(store, "profile-obs", snapshot(rows, { observedAt = clock }))
-    -- Second observer, later scan time, same relative age → same approx txn time neighborhood.
+    assertEq(#O.ListPending(store, "club-1", 2), 2, "neighbor row plus target captured")
     advance(1800)
     local stats = O.ReconcileSnapshot(store, "profile-obs", snapshot(rows, {
         observedAt = clock,
         observedBy = "Witness-Realm",
     }))
     assertEq(stats.created, 0, "time-drifted second observer does not duplicate")
-    assertEq(stats.updated, 1, "time-drifted observation reconciles")
-    assertEq(#O.ListPending(store, "club-1", 2), 1, "single pending after multi-observer reconcile")
+    assertEq(stats.updated, 2, "time-drifted observation reconciles through shared neighbors")
+    local kyrius = 0
+    local pending = O.ListPending(store, "club-1", 2)
+    for i = 1, #pending do
+        if pending[i].donor == "Kyrius-Realm" and pending[i].itemId == flask then
+            kyrius = kyrius + 1
+        end
+    end
+    assertEq(kyrius, 1, "single Kyrius flask pending after multi-observer reconcile")
+end
+
+do
+    -- Disjoint same-signature deposits must remain distinct (no silent merge).
+    local db = { consumableObservations = {} }
+    local store = O.EnsureProfileStore(db, "profile-obs")
+    O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Anthony-Realm", flask, 20, 0, 0, 0, 1),
+    }, { observedAt = clock }))
+    assertEq(#O.ListPending(store, "club-1", 2), 1, "first disjoint deposit captured")
+    -- One hour later the prior row has rolled out; a new identical deposit appears alone.
+    advance(60 * 60)
+    local stats = O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Anthony-Realm", flask, 20, 0, 0, 0, 1),
+    }, { observedAt = clock }))
+    assertEq(stats.created, 1, "disjoint identical deposit creates a new observation")
+    assertEq(stats.updated, 0, "disjoint identical deposit does not update the prior observation")
+    assertEq(#O.ListPending(store, "club-1", 2), 2, "both disjoint identical deposits remain pending")
+end
+
+do
+    -- Matching is scoped to configuration generation.
+    local db = { consumableObservations = {} }
+    local store = O.EnsureProfileStore(db, "profile-obs")
+    O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Reset-Realm", flask, 9, 0, 0, 0, 1),
+    }, { generation = 1, observedAt = clock }))
+    local first = O.ListPending(store, "club-1", 2)
+    assertEq(#first, 1, "generation-1 observation captured")
+    assertEq(first[1].generation, 1, "stored generation is 1")
+    advance(60)
+    local stats = O.ReconcileSnapshot(store, "profile-obs", snapshot({
+        deposit("Reset-Realm", flask, 9, 0, 0, 0, 1),
+    }, { generation = 2, observedAt = clock }))
+    assertEq(stats.created, 1, "new generation creates a distinct observation")
+    assertEq(stats.updated, 0, "new generation does not overwrite prior-generation evidence")
+    local pending = O.ListPending(store, "club-1", 2)
+    assertEq(#pending, 2, "both generations remain until expiry/review")
+    local gens = {}
+    for i = 1, #pending do
+        gens[tonumber(pending[i].generation)] = true
+    end
+    assertTrue(gens[1] and gens[2], "prior and current generations both retained")
 end
 
 do
     local db = { consumableObservations = {} }
     local store = O.EnsureProfileStore(db, "profile-obs")
-    -- Seed two pending identical cores with poor neighbor separation, then present one row that ties.
-    local first = {
-        deposit("Twin-Realm", flask, 7, 0, 0, 0, 5),
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local cfg = C.Ensure(makeProfile())
+    local sharedOlder = { O.CoreSignature("deposit", "Noise-Realm", vial, 1) }
+    local base = {
+        coreSignature = O.CoreSignature("deposit", "Twin-Realm", flask, 7),
+        type = "deposit",
+        donor = "Twin-Realm",
+        itemId = flask,
+        quantity = 7,
+        guildGuid = "club-1",
+        bankTab = 2,
+        generation = cfg.generation,
+        approxTxnTime = clock - 3600,
+        ageHours = 1,
+        occurrenceIndex = 1,
+        neighborsOlder = sharedOlder,
+        neighborsNewer = {},
+        observedBy = "Observer-Realm",
+        firstSeen = clock,
+        lastSeen = clock,
+        seenCount = 1,
+        status = "pending",
     }
-    O.ReconcileSnapshot(store, "profile-obs", snapshot(first, { observedAt = clock }))
-    advance(10)
-    local second = {
-        deposit("Twin-Realm", flask, 7, 0, 0, 0, 5),
+    scope.observations[1] = {
+        localId = "co:profile-obs:1",
+        status = "pending",
+        firstSeen = clock,
+        lastSeen = clock,
+        seenCount = 1,
+        observedBy = "Observer-Realm",
+        coreSignature = base.coreSignature,
+        type = base.type,
+        donor = base.donor,
+        itemId = base.itemId,
+        quantity = base.quantity,
+        guildGuid = base.guildGuid,
+        bankTab = base.bankTab,
+        generation = base.generation,
+        approxTxnTime = base.approxTxnTime,
+        ageHours = base.ageHours,
+        occurrenceIndex = 1,
+        neighborsOlder = sharedOlder,
+        neighborsNewer = {},
     }
-    -- Force a second observation by using a far time so it does not match.
-    O.ReconcileSnapshot(store, "profile-obs", snapshot(second, {
-        observedAt = clock + (4 * 60 * 60),
-    }))
-    assertEq(#O.ListPending(store, "club-1", 2), 2, "two far-apart identical cores stored separately")
+    scope.observations[2] = {
+        localId = "co:profile-obs:2",
+        status = "pending",
+        firstSeen = clock,
+        lastSeen = clock,
+        seenCount = 1,
+        observedBy = "Observer-Realm",
+        coreSignature = base.coreSignature,
+        type = base.type,
+        donor = base.donor,
+        itemId = base.itemId,
+        quantity = base.quantity,
+        guildGuid = base.guildGuid,
+        bankTab = base.bankTab,
+        generation = base.generation,
+        approxTxnTime = base.approxTxnTime,
+        ageHours = base.ageHours,
+        occurrenceIndex = 1,
+        neighborsOlder = sharedOlder,
+        neighborsNewer = {},
+    }
+    store.seq = 2
 
-    -- A new scan in the middle with no distinguishing neighbors should be ambiguous, not silent merge.
-    local mid = clock + (2 * 60 * 60)
     local stats = O.ReconcileSnapshot(store, "profile-obs", snapshot({
-        deposit("Twin-Realm", flask, 7, 0, 0, 0, 5),
-    }, { observedAt = mid }))
-    assertTrue(stats.ambiguous >= 1 or stats.created == 0, "ambiguous or non-creating reconcile when ties exist")
+        deposit("Noise-Realm", vial, 1, 0, 0, 0, 2),
+        deposit("Twin-Realm", flask, 7, 0, 0, 0, 1),
+    }, { observedAt = clock, generation = cfg.generation }))
+    assertTrue(stats.ambiguous >= 1, "reconcile reports ambiguity when ties exist")
     local pending = O.ListPending(store, "club-1", 2)
     local ambiguous = 0
     for i = 1, #pending do
         if pending[i].status == "ambiguous" then ambiguous = ambiguous + 1 end
     end
-    assertTrue(ambiguous >= 1 or #pending >= 2, "ambiguity retained for review rather than collapsed")
+    assertTrue(ambiguous >= 1, "ambiguity retained for review rather than collapsed")
 end
 
 do
@@ -410,18 +515,35 @@ do
     local store = O.EnsureProfileStore(SF.lootHelperDB, "profile-obs")
     assertEq(#O.ListPending(store, "club-1", 2), 2, "bank-log host captures eligible deposits")
 
-    local afterOpen = #world.after
-    BankLog:OnBankClosed()
-    assertFalse(BankLog.active, "observer inactive after bank close")
-    local token = BankLog.rescanToken
-    -- Drain previously queued callbacks; closed state must keep them no-ops.
+    local queriesAfterUpdate = #world.logQueries
+    -- Drain any retry callbacks queued before the successful update; they must no-op.
     local drained = 0
     while #world.after > 0 and drained < 50 do
         local fn = table.remove(world.after, 1)
         fn()
         drained = drained + 1
     end
-    assertEq(BankLog.rescanToken, token, "closed bank does not keep rescheduling rescans")
+    assertEq(#world.logQueries, queriesAfterUpdate, "successful update leaves observer idle without continuous queries")
+    assertFalse(BankLog.awaitingLogUpdate, "not awaiting log update after success")
+
+    -- A later deposit / slot change still arms a new query after the throttle window.
+    advance(2)
+    world.now = clock
+    world.logRows[2][#world.logRows[2] + 1] = deposit("Fresh-Realm", vial, 3, 0, 0, 0, 0)
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(#world.logQueries > queriesAfterUpdate, "slot change triggers a fresh query while bank open")
+    BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+
+    BankLog:OnBankClosed()
+    assertFalse(BankLog.active, "observer inactive after bank close")
+    local token = BankLog.queryToken
+    drained = 0
+    while #world.after > 0 and drained < 50 do
+        local fn = table.remove(world.after, 1)
+        fn()
+        drained = drained + 1
+    end
+    assertEq(BankLog.queryToken, token, "closed bank does not keep issuing query retries")
     assertFalse(BankLog.active, "callbacks after close leave observer idle")
 
     -- Repeated open/close must not accumulate frames.
@@ -444,6 +566,13 @@ do
         CurrentGuild = function()
             return { guid = tostring(world.clubId), name = "Spectrum", realm = "Realm" }
         end,
+        OnProfileChanged = function(_, profile)
+            -- Mirror production: runtime notifies bank-log on active-profile changes.
+            world.activeProfile = profile
+            if SF.ConsumablesBankLog and SF.ConsumablesBankLog.OnProfileMaybeChanged then
+                SF.ConsumablesBankLog:OnProfileMaybeChanged()
+            end
+        end,
     }
     BankLog.frame = nil
     BankLog:Init()
@@ -451,12 +580,13 @@ do
     assertFalse(BankLog.active, "no observation without applicable profile")
     assertEq(#world.logQueries, 0, "does not query unrelated guild banks without config")
 
-    world.activeProfile = makeProfile()
-    SF.lootHelperDB.profiles[world.activeProfile._profileId] = world.activeProfile
+    local profile = makeProfile()
+    SF.lootHelperDB.profiles[profile._profileId] = profile
     world.logRows[2] = { deposit("Later-Realm", vial, 2, 0, 0, 0, 0) }
     BankLog.bankOpen = true
-    BankLog:OnProfileMaybeChanged()
-    assertTrue(BankLog.active, "starts when profile becomes available while bank open")
+    -- Active-profile selection (not only Consumables UI listener) must arm observation.
+    SF.ConsumablesRuntime:OnProfileChanged(profile)
+    assertTrue(BankLog.active, "starts when active profile is selected while bank open")
     BankLog:OnEvent("GUILDBANKLOG_UPDATE")
     local store = O.EnsureProfileStore(SF.lootHelperDB, "profile-obs")
     assertEq(#O.ListPending(store, "club-1", 2), 1, "captures after late profile availability")

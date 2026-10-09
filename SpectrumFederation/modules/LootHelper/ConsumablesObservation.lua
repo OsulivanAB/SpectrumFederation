@@ -11,6 +11,10 @@ O.MAX_OBSERVATIONS_PER_SCOPE = 256
 O.MAX_SUPPRESSIONS_PER_SCOPE = 128
 O.MAX_NEIGHBORS = 3
 O.TIME_TOLERANCE_SECONDS = 3 * 60 * 60
+-- Empty-context rematches (no neighbor overlap) only cover rescan/age drift of the
+-- same visible row. Distinct same-signature deposits in disjoint windows must not
+-- qualify merely because they fall inside TIME_TOLERANCE_SECONDS.
+O.EMPTY_CONTEXT_CONTINUITY_SECONDS = 15 * 60
 O.MIN_MATCH_SCORE = 100
 O.AMBIGUITY_MARGIN = 15
 
@@ -183,6 +187,7 @@ function O.MatchScore(existing, evidence)
     if existing.coreSignature ~= evidence.coreSignature then return nil end
     if tostring(existing.guildGuid or "") ~= tostring(evidence.guildGuid or "") then return nil end
     if tonumber(existing.bankTab) ~= tonumber(evidence.bankTab) then return nil end
+    if tonumber(existing.generation) ~= tonumber(evidence.generation) then return nil end
     local status = existing.status or "pending"
     if status == "expired" or status == "rejected" then return nil end
 
@@ -192,26 +197,27 @@ function O.MatchScore(existing, evidence)
     local drift = math.abs(tExisting - tEvidence)
     if drift > O.TIME_TOLERANCE_SECONDS then return nil end
 
+    local olderHits = NeighborOverlap(existing.neighborsOlder, evidence.neighborsOlder)
+    local newerHits = NeighborOverlap(existing.neighborsNewer, evidence.neighborsNewer)
+    local neighborHits = olderHits + newerHits
+    local sameOccurrence = tonumber(existing.occurrenceIndex) == tonumber(evidence.occurrenceIndex)
+
+    -- Require positive continuity evidence. Neighbor overlap is preferred.
+    -- Empty-context rematch is allowed only for tight time continuity so a
+    -- lone visible row can rescan without letting a later disjoint identical
+    -- deposit consume the prior observation.
+    if neighborHits < 1 then
+        if not sameOccurrence then return nil end
+        if drift > O.EMPTY_CONTEXT_CONTINUITY_SECONDS then return nil end
+    end
+
     local score = O.MIN_MATCH_SCORE
     -- Closer reconstructed times score higher (max +30).
     score = score + math.floor(30 * (1 - (drift / O.TIME_TOLERANCE_SECONDS)))
-
-    if tonumber(existing.occurrenceIndex) == tonumber(evidence.occurrenceIndex) then
+    if sameOccurrence then
         score = score + 20
     end
-
-    local olderHits = NeighborOverlap(existing.neighborsOlder, evidence.neighborsOlder)
-    local newerHits = NeighborOverlap(existing.neighborsNewer, evidence.neighborsNewer)
     score = score + (olderHits * 10) + (newerHits * 10)
-
-    -- Partial one-sided context still helps when the other side is empty.
-    if #(existing.neighborsOlder or {}) == 0 and #(evidence.neighborsOlder or {}) == 0 then
-        score = score + 5
-    end
-    if #(existing.neighborsNewer or {}) == 0 and #(evidence.neighborsNewer or {}) == 0 then
-        score = score + 5
-    end
-
     return score
 end
 

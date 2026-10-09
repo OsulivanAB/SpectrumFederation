@@ -96,6 +96,10 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "CommitEvents" not in bank_log
     assert "DepositEvents" not in bank_log
     assert "SF.ConsumablesBankLog:Init()" in runtime
+    assert "ConsumablesBankLog:OnProfileMaybeChanged" in runtime
+    assert "ScheduleRescan" not in bank_log
+    assert "EMPTY_CONTEXT_CONTINUITY_SECONDS" in observation
+    assert "tonumber(existing.generation) ~= tonumber(evidence.generation)" in observation
     assert "C_SpellBook.IsSpellKnown" in runtime
     assert "SecureActionButtonTemplate" in runtime
     assert 'TryRegister(frame, "SPELL_UPDATE_COOLDOWN")' in runtime
