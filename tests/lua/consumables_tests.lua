@@ -1404,7 +1404,8 @@ local function checkManualAdjustments()
     assertEq(found.donated, 20, "goal progress uses the adjusted item total")
 
     local rows, total = C.HistoryRows(p, function() return "Aqirite" end)
-    assertTrue(total >= 6, "history includes donation and adjustment rows")
+    assertTrue(total >= 5, "history includes donation and adjustment rows")
+    assertEq(total, 5, "history counts the seed donation and four adjustments")
     local sawUnattributed, sawCredited = false, false
     for i = 1, #rows do
         if contains(rows[i].text, "unattributed / miscellaneous") then sawUnattributed = true end
