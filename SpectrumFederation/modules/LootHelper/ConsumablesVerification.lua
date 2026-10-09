@@ -960,12 +960,22 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
 
                         local historyReady = opts.historyComplete ~= false
                         local clearlyNew = EvidenceClearlyNew(evidence, opts.historyBaselineAt)
+                        -- Match local reconciliation: hour-rounded ages that straddle an
+                        -- item/tab eligibility cutover stay reviewable, never auto-mint.
+                        local boundaryAmbiguous = eligibility and O
+                            and O.EvidenceSpansEligibilityBoundary
+                            and O.EvidenceSpansEligibilityBoundary(evidence, eligibility)
                         if how == "verified" or cluster.status == "verified" or cluster.status == "rejected" then
                             if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
                                 opts.clearPendingWitness(evidence)
                             end
                         elseif cluster.status == "ambiguous" then
                             stats.pending = stats.pending + 1
+                        elseif boundaryAmbiguous then
+                            cluster.status = "ambiguous"
+                            stats.pending = stats.pending + 1
+                            Debug("Info", "eligibility-boundary ambiguous donor=%s item=%s",
+                                tostring(evidence.donor), tostring(evidence.itemId))
                         elseif not historyReady and not cluster.txnId and not clearlyNew then
                             -- Incomplete synchronized history: never mint overlapping credits.
                             -- Clearly-new requires earliest-possible time at/after baseline.

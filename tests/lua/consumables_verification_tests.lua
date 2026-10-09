@@ -2377,6 +2377,87 @@ do
     assertFalse(queuedForeign, "foreign-resend does not queue third-party event for resend")
 end
 
+-- 21. Eligibility-cutoff boundary uncertainty blocks auto-credit on ingest
+do
+    V.ClearSessionClusters()
+    local cutover = clock - 30
+    local eligibility = {
+        items = { [tostring(flask)] = cutover },
+        tabEligibleFrom = cutover,
+        baselineEstablished = true,
+    }
+    local spanning = evidence({
+        quantity = 14,
+        neighborsOlder = { "elig-bound" },
+        approxTxnTime = cutover + 10,
+        ageHours = 0,
+        occurrenceIndex = 1,
+    })
+    assertTrue(O.IsEvidenceEligible(spanning, eligibility),
+        "elig-bound spanning row remains visible")
+    assertTrue(O.EvidenceSpansEligibilityBoundary(spanning, eligibility),
+        "elig-bound age-0 near cutover spans eligibility boundary")
+
+    local adminP = makeProfile("elig-bound-admin", { admin, "CoordB-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "elig-bound-admin")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local adminStats = V.IngestReport(adminP, "elig-bound-admin", admin, { spanning }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA, historyComplete = true,
+        eligibility = eligibility,
+    })
+    assertEq(adminStats.verified, 0, "elig-bound admin report does not auto-verify")
+    assertEq(adminStats.pending, 1, "elig-bound admin report stays pending/ambiguous")
+    local adminCluster = V.EnsureClusterStore("elig-bound-admin").clusters[1]
+    assertEq(adminCluster.status, "ambiguous", "elig-bound admin cluster is ambiguous")
+    assertTrue(not V.ValidTxnId(adminCluster.txnId), "elig-bound admin mint is blocked")
+    assertEq(C.ContributionTotal(adminP, donor, flask), 0, "elig-bound admin path credits nothing")
+
+    V.ClearSessionClusters()
+    local witP = makeProfile("elig-bound-witness", { admin })
+    local dbW = {}
+    local storeW = O.EnsureProfileStore(dbW, "elig-bound-witness")
+    local scopeW = O.EnsureScope(storeW, "club-1", 2)
+    local optsW = { isAdmin = false, scope = scopeW, obsStore = storeW, historyComplete = true,
+        eligibility = eligibility }
+    assertEq(V.IngestReport(witP, "elig-bound-witness", w1, { spanning }, optsW).verified, 0,
+        "elig-bound first witness does not verify")
+    assertEq(V.IngestReport(witP, "elig-bound-witness", w2, { spanning }, optsW).verified, 0,
+        "elig-bound second witness does not verify")
+    local three = V.IngestReport(witP, "elig-bound-witness", w3, { spanning }, optsW)
+    assertEq(three.verified, 0, "elig-bound three witnesses do not auto-verify")
+    assertTrue((three.pending or 0) >= 1, "elig-bound three-witness path stays pending")
+    local witCluster = V.EnsureClusterStore("elig-bound-witness").clusters[1]
+    assertEq(witCluster.status, "ambiguous", "elig-bound witness cluster is ambiguous")
+    assertTrue(not V.ValidTxnId(witCluster.txnId), "elig-bound witness mint is blocked")
+    assertEq(C.ContributionTotal(witP, donor, flask), 0, "elig-bound witness path credits nothing")
+
+    -- Already-verified identity still adopts without minting a second credit.
+    V.ClearSessionClusters()
+    local priorP = makeProfile("elig-bound-prior", { admin })
+    local dbP = {}
+    local storeP = O.EnsureProfileStore(dbP, "elig-bound-prior")
+    local scopeP = O.EnsureScope(storeP, "club-1", 2)
+    local priorEv = evidence({
+        quantity = 14, neighborsOlder = { "elig-bound-safe" },
+        approxTxnTime = cutover + 7200, ageHours = 0, occurrenceIndex = 2,
+    })
+    assertEq(V.IngestReport(priorP, "elig-bound-prior", admin, { priorEv }, {
+        isAdmin = true, scope = scopeP, obsStore = storeP, historyComplete = true,
+        eligibility = eligibility,
+    }).verified, 1, "elig-bound safe post-cutover deposit still verifies")
+    local txnId = V.ListVerifiedClusters("elig-bound-prior")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(priorP, V.ListVerifiedClusters("elig-bound-prior")[1], admin))
+    assertEq(C.ContributionTotal(priorP, donor, flask), 14, "elig-bound safe credit once")
+    local rematch = V.IngestReport(priorP, "elig-bound-prior", admin, { priorEv }, {
+        isAdmin = true, scope = scopeP, obsStore = storeP, historyComplete = true,
+        eligibility = eligibility,
+    })
+    assertEq(rematch.verified, 0, "elig-bound rematch of verified identity does not re-mint")
+    assertEq(C.ContributionTotal(priorP, donor, flask), 14, "elig-bound rematch no duplicate")
+    assertTrue(C.FindRegistryTxn(priorP, txnId) ~= nil, "elig-bound keeps original txnId")
+end
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)
