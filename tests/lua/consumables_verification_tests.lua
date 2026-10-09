@@ -1037,6 +1037,13 @@ do
         "age-zero deposit near cutover spans boundary")
     assertTrue(O.IsEvidenceEligible(spanning, eligibility),
         "boundary-spanning rows remain visible/eligible for review")
+    local spanningHour = evidence({
+        approxTxnTime = cutover + 10,
+        ageHours = 1,
+        neighborsOlder = { "b1h" },
+    })
+    assertTrue(O.EvidenceSpansEligibilityBoundary(spanningHour, eligibility),
+        "whole-hour age=1 near cutover also spans boundary")
     local safe = evidence({
         approxTxnTime = cutover + 7200,
         ageHours = 2,
@@ -1653,6 +1660,138 @@ do
         "decision-order repeated sync converges on the same status")
     assertEq(tonumber(afterStale.decidedAt), tonumber(afterFresh.decidedAt),
         "decision-order repeated sync converges on the same decidedAt")
+end
+
+-- 13b. Same-signature deposits stay separate in durable pending witnesses
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("witness-separate")
+    local depA = evidence({
+        quantity = 9, occurrenceIndex = 1,
+        neighborsOlder = { "sep-a1" }, neighborsNewer = { "sep-a2" },
+        approxTxnTime = clock - 500,
+    })
+    local depB = evidence({
+        quantity = 9, occurrenceIndex = 2,
+        neighborsOlder = { "sep-b1" }, neighborsNewer = { "sep-b2" },
+        approxTxnTime = clock - 40,
+    })
+    assertTrue(C.UpsertPendingWitness(p, depA, w1, { [w1] = clock }))
+    assertTrue(C.UpsertPendingWitness(p, depB, w2, { [w2] = clock }))
+    local pending = C.PendingWitnesses(p)
+    assertEq(#pending, 2, "witness-separate keeps two same-signature aggregates")
+    assertTrue(C.UpsertPendingWitness(p, depA, w3, { [w1] = clock, [w3] = clock }))
+    pending = C.PendingWitnesses(p)
+    assertEq(#pending, 2, "witness-separate third witness joins only matching aggregate")
+    local aCount, bCount = 0, 0
+    for i = 1, #pending do
+        local n = 0
+        for _ in pairs(pending[i].witnesses or {}) do n = n + 1 end
+        if pending[i].evidence.occurrenceIndex == 1 then aCount = n end
+        if pending[i].evidence.occurrenceIndex == 2 then bCount = n end
+    end
+    assertEq(aCount, 2, "witness-separate deposit A has two witnesses")
+    assertEq(bCount, 1, "witness-separate deposit B stays at one witness")
+end
+
+-- 13c. Peer recovery must not wipe local pending witnesses or durable rejections
+do
+    V.ClearSessionClusters()
+    local coord = makeProfile("peer-preserve-decisions", { admin, "PeerAdmin-Realm" })
+    local ev = evidence({
+        quantity = 4, neighborsOlder = { "pres-n" }, approxTxnTime = clock - 80,
+    })
+    assertTrue(C.UpsertPendingWitness(coord, ev, w1, { [w1] = clock }))
+    assertTrue(C.UpsertPendingWitness(coord, ev, w2, { [w1] = clock, [w2] = clock }))
+    assertEq(#C.PendingWitnesses(coord), 1, "peer-preserve starts with one aggregate")
+    assertTrue(C.RecordDurableRejection(coord, ev, admin, "not a real deposit"))
+    local localRejSeq = tonumber(coord._consumables.rejectionSeq) or 0
+    local peer = makeProfile("peer-preserve-stale", { admin, "PeerAdmin-Realm" })
+    -- Stale peer: empty witnesses/rejections but equal/higher rejectionSeq.
+    peer._consumables.rejectionSeq = localRejSeq + 1
+    peer._consumables.pendingWitnesses = {}
+    peer._consumables.rejections = {}
+    local stale = C.ExportSnapshot(peer)
+    assertTrue(select(1, C.MergeSnapshot(coord, stale, { consumablesFromCoordinator = false })),
+        "peer-preserve peer merge applies")
+    assertEq(#C.PendingWitnesses(coord), 1,
+        "peer-preserve forceReplace=false keeps local pending witnesses")
+    local wcount = 0
+    for _ in pairs(C.PendingWitnesses(coord)[1].witnesses or {}) do wcount = wcount + 1 end
+    assertEq(wcount, 2, "peer-preserve keeps authenticated witness maps")
+    assertTrue(V.IsRejected({ rejections = C.DurableRejections(coord) }, ev),
+        "peer-preserve durable rejection survives peer recovery")
+end
+
+-- 13d. Pending cluster without txnId adopts recovered registry identity (no double credit)
+do
+    V.ClearSessionClusters()
+    local tuesday = makeProfile("pending-adopt", { admin, "CoordB-Realm" })
+    local db = {}
+    local store = O.EnsureProfileStore(db, "pending-adopt")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local ev = evidence({
+        quantity = 14, neighborsOlder = { "adopt-n" }, approxTxnTime = clock - 300,
+    })
+    assertEq(V.IngestReport(tuesday, "pending-adopt", admin, { ev }, {
+        isAdmin = true, scope = scope, obsStore = store,
+    }).verified, 1, "pending-adopt Tuesday verifies")
+    local txnId = V.ListVerifiedClusters("pending-adopt")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(tuesday, V.ListVerifiedClusters("pending-adopt")[1], admin))
+    local rich = C.ExportSnapshot(tuesday)
+
+    V.ClearSessionClusters()
+    local late = makeProfile("pending-adopt-b", { admin, "CoordB-Realm" })
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "pending-adopt-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local held = V.IngestReport(late, "pending-adopt-b", w1, { ev }, {
+        isAdmin = false, scope = scopeB, obsStore = storeB, historyComplete = false,
+    })
+    assertEq(held.pending, 1, "pending-adopt B holds pending cluster before recovery")
+    local pendingCluster = V.EnsureClusterStore("pending-adopt-b").clusters[1]
+    assertTrue(pendingCluster and not V.ValidTxnId(pendingCluster.txnId),
+        "pending-adopt held cluster has no txnId yet")
+    assertTrue(select(1, C.MergeSnapshot(late, rich, { consumablesFromCoordinator = true })),
+        "pending-adopt recovers Tuesday registry+ledger")
+    assertEq(C.ContributionTotal(late, donor, flask), 14, "pending-adopt credit once after recovery")
+    local after = V.IngestReport(late, "pending-adopt-b", admin, { ev }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = true,
+    })
+    assertEq(after.verified, 0, "pending-adopt admin rematch does not re-verify")
+    assertEq(C.ContributionTotal(late, donor, flask), 14, "pending-adopt no duplicate credit")
+    local how, entry = V.ReconcileAgainstRegistry(late, ev)
+    assertEq(how, "verified", "pending-adopt rematch hits registry")
+    assertEq(entry.txnId, txnId, "pending-adopt reuses original txnId")
+end
+
+-- 13e. Config fingerprint ignores merge order and local txnAllocSeq drift
+do
+    local a = makeProfile("fp-order-a")
+    local b = makeProfile("fp-order-b")
+    C.RegisterCanonicalTxn(a, {
+        txnId = "ctx:fp:a:1:1", status = "verified", committed = true,
+        donor = donor, itemId = flask, quantity = 1, decidedBy = admin, decidedAt = clock,
+    }, { bumpSeq = false })
+    C.RegisterCanonicalTxn(a, {
+        txnId = "ctx:fp:a:2:2", status = "rejected", committed = false,
+        donor = donor, itemId = flask, quantity = 2, decidedBy = admin, decidedAt = clock,
+    }, { bumpSeq = false })
+    C.RegisterCanonicalTxn(b, {
+        txnId = "ctx:fp:a:2:2", status = "rejected", committed = false,
+        donor = donor, itemId = flask, quantity = 2, decidedBy = admin, decidedAt = clock,
+    }, { bumpSeq = false })
+    C.RegisterCanonicalTxn(b, {
+        txnId = "ctx:fp:a:1:1", status = "verified", committed = true,
+        donor = donor, itemId = flask, quantity = 1, decidedBy = admin, decidedAt = clock,
+    }, { bumpSeq = false })
+    a._consumables.txnAllocSeq = 1
+    b._consumables.txnAllocSeq = 99
+    local da, db = C.Descriptor(a), C.Descriptor(b)
+    assertEq(da.configFingerprint, db.configFingerprint,
+        "fp-order registry merge order does not change config fingerprint")
+    assertFalse(S.CoordinatorConfigDiffers(da, db),
+        "fp-order unequal txnAllocSeq alone is not config drift")
 end
 
 -- 13. Untrusted fabricated peer snapshot events cannot mint verified credits

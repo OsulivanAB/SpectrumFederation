@@ -676,14 +676,47 @@ local function CopyPendingWitnessList(list)
     return out
 end
 
+-- Forward decl: used by peer-path witness merge before the full definition.
+local PendingWitnessMatches
+
 local function ReplacePendingWitnessesFromPayload(cfg, payload, opts)
     opts = opts or {}
     if type(payload) ~= "table" or type(payload.pendingWitnesses) ~= "table" then
         return EnsurePendingWitnesses(cfg)
     end
-    -- Scope transitions and authoritative snapshots replace witness aggregates.
-    if opts.forceReplace or payload.pendingWitnesses then
+    -- Authoritative snapshots replace. Peer recovery must not wipe coordinator-
+    -- authenticated aggregates (forceReplace=false): only union witnesses into
+    -- aggregates that already exist locally via positively supported MatchScore.
+    if opts.forceReplace == true then
         cfg.pendingWitnesses = CopyPendingWitnessList(payload.pendingWitnesses)
+        return cfg.pendingWitnesses
+    end
+    local localList = EnsurePendingWitnesses(cfg)
+    local remote = CopyPendingWitnessList(payload.pendingWitnesses)
+    for i = 1, #remote do
+        local remoteAgg = remote[i]
+        if type(remoteAgg) == "table" and type(remoteAgg.evidence) == "table" then
+            local localAgg = nil
+            for j = 1, #localList do
+                if PendingWitnessMatches(localList[j], remoteAgg.evidence) then
+                    localAgg = localList[j]
+                    break
+                end
+            end
+            if localAgg and type(remoteAgg.witnesses) == "table" then
+                localAgg.witnesses = localAgg.witnesses or {}
+                for name, stamped in pairs(remoteAgg.witnesses) do
+                    if type(name) == "string" and name ~= "" and localAgg.witnesses[name] == nil then
+                        localAgg.witnesses[name] = stamped
+                    end
+                end
+                local remoteAt = tonumber(remoteAgg.updatedAt)
+                local localAt = tonumber(localAgg.updatedAt)
+                if remoteAt and (not localAt or remoteAt > localAt) then
+                    localAgg.updatedAt = remoteAt
+                end
+            end
+        end
     end
     return cfg.pendingWitnesses
 end
@@ -1028,21 +1061,19 @@ function C.PendingWitnesses(profile)
     return EnsurePendingWitnesses(cfg)
 end
 
-local function PendingWitnessMatches(agg, evidence)
+PendingWitnessMatches = function(agg, evidence)
     if type(agg) ~= "table" or type(agg.evidence) ~= "table" or type(evidence) ~= "table" then
         return false
     end
+    -- Require positively supported continuity. Do not fall back to bare
+    -- coreSignature identity: identical deposits at different times must stay
+    -- separate when MatchScore rejects contextual continuity.
     local O = SF.ConsumablesObservation
-    if O and O.MatchScore then
-        local score = O.MatchScore(agg.evidence, evidence)
-        if score and score >= (O.MIN_MATCH_SCORE or 100) then
-            return true
-        end
+    if not (O and O.MatchScore) then
+        return false
     end
-    return agg.evidence.coreSignature == evidence.coreSignature
-        and tostring(agg.evidence.guildGuid or "") == tostring(evidence.guildGuid or "")
-        and tonumber(agg.evidence.bankTab) == tonumber(evidence.bankTab)
-        and tonumber(agg.evidence.generation) == tonumber(evidence.generation)
+    local score = O.MatchScore(agg.evidence, evidence)
+    return score and score >= (O.MIN_MATCH_SCORE or 100) and true or false
 end
 
 -- Authenticated coordinator-side witness persistence. Never trusts client counts.
@@ -1674,8 +1705,10 @@ local function ConfigFingerprint(cfg)
         hash = MixConfigText(hash, "e:" .. tostring(eligRows[i].itemId) .. ":" .. tostring(eligRows[i].ts))
     end
     hash = MixConfigText(hash, "rj:" .. tostring(tonumber(cfg.rejectionSeq) or 0))
+    -- Hash pending witnesses and registry as order-independent sets so merge
+    -- order and local txnAllocSeq cannot keep CoordinatorConfigDiffers true.
     local pending = EnsurePendingWitnesses(cfg)
-    hash = MixConfigText(hash, "pw:" .. tostring(#pending))
+    local pendingKeys = {}
     for i = 1, #pending do
         local agg = pending[i]
         if type(agg) == "table" and type(agg.evidence) == "table" then
@@ -1683,23 +1716,34 @@ local function ConfigFingerprint(cfg)
             if type(agg.witnesses) == "table" then
                 for _ in pairs(agg.witnesses) do wcount = wcount + 1 end
             end
-            hash = MixConfigText(hash, "p:" .. tostring(agg.evidence.coreSignature or "")
-                .. ":" .. tostring(wcount))
+            pendingKeys[#pendingKeys + 1] = table.concat({
+                tostring(agg.evidence.coreSignature or ""),
+                tostring(tonumber(agg.evidence.approxTxnTime) or 0),
+                tostring(tonumber(agg.evidence.occurrenceIndex) or 0),
+                tostring(wcount),
+            }, ":")
         end
     end
+    table.sort(pendingKeys)
+    hash = MixConfigText(hash, "pw:" .. tostring(#pendingKeys))
+    for i = 1, #pendingKeys do
+        hash = MixConfigText(hash, "p:" .. pendingKeys[i])
+    end
     local registry = EnsureTxnRegistry(cfg)
-    hash = MixConfigText(hash, "tr:" .. tostring(#registry)
-        .. ":" .. tostring(tonumber(cfg.txnAllocSeq) or 0))
-    local regLimit = #registry
-    if regLimit > 32 then regLimit = 32 end
-    local regStart = #registry - regLimit + 1
-    if regStart < 1 then regStart = 1 end
-    for i = regStart, #registry do
+    local regKeys = {}
+    for i = 1, #registry do
         local row = registry[i]
-        if type(row) == "table" then
-            hash = MixConfigText(hash, "t:" .. tostring(row.txnId or "")
-                .. ":" .. tostring(row.status or ""))
+        if type(row) == "table" and type(row.txnId) == "string" and row.txnId ~= "" then
+            regKeys[#regKeys + 1] = tostring(row.txnId) .. ":" .. tostring(row.status or "")
         end
+    end
+    table.sort(regKeys)
+    hash = MixConfigText(hash, "tr:" .. tostring(#regKeys))
+    local regLimit = #regKeys
+    if regLimit > 32 then regLimit = 32 end
+    -- Stable prefix of sorted ids (not merge-order tail).
+    for i = 1, regLimit do
+        hash = MixConfigText(hash, "t:" .. regKeys[i])
     end
     return hash
 end
@@ -2935,9 +2979,9 @@ function C.MergeSnapshot(profile, data, opts)
             end
         end
         -- Peer snapshots do not replace full config, but must union-merge the
-        -- canonical registry (and authoritative rejection watermark) so recovery
-        -- does not depend on re-authoring events locally. New registry rows must
-        -- carry admin decision provenance or already exist locally / on ledger.
+        -- canonical registry so recovery does not depend on re-authoring events.
+        -- Peers are not authorities for durable rejection lists: PreferRegistryEntry
+        -- already reconciles registry rejection↔approval by decidedAt.
         if type(cfg) == "table" then
             if type(data.txnRegistry) == "table" then
                 local filtered = {
@@ -2958,9 +3002,6 @@ function C.MergeSnapshot(profile, data, opts)
                     end
                 end
                 ReplaceTxnRegistryFromPayload(cfg, filtered)
-            end
-            if type(data.rejections) == "table" then
-                ReplaceRejectionsFromPayload(cfg, data)
             end
             if type(data.pendingWitnesses) == "table" then
                 ReplacePendingWitnessesFromPayload(cfg, data, { forceReplace = false })

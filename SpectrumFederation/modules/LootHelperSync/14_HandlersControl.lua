@@ -943,8 +943,19 @@ function Sync:HandleNeedProfile(sender, payload)
     -- Small jitter in case multiple people need it at once
     self:RunWithJitter(0, 250, function()
         if not self.state.active then return end
-        if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
-        if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
+        -- Revalidate the same serve eligibility as the outer handler, including
+        -- authorized non-helper admins serving the session coordinator.
+        local stillSelf = self:_SelfId()
+        local stillCanServe = self.state.isCoordinator or self:IsSelfHelper()
+        if not stillCanServe then
+            local requesterIsCoordinator = type(self.state.coordinator) == "string"
+                and self:_SamePlayer(sender, self.state.coordinator)
+            if requesterIsCoordinator and self:IsSenderAuthorized(self.state.profileId, stillSelf) then
+                stillCanServe = true
+            end
+        end
+        if not stillCanServe then return end
+        if not self:IsSenderAuthorized(self.state.profileId, stillSelf) then return end
         if not SF.LootHelperComm then return end
 
         if enc then

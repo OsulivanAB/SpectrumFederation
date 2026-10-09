@@ -1696,6 +1696,184 @@ local function checkSessionTransport()
     resetSync()
 end
 
+local function checkPeerHistoryRecoveryServePath()
+    -- Load the production NEED_PROFILE / PROFILE_SNAPSHOT handlers used for
+    -- writer-offline recovery (not covered by MergeSnapshot-only unit tests).
+    load("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua")
+    load("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
+    load("SpectrumFederation/modules/LootHelperSync/05_Scheduling.lua")
+    load("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+    load("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
+    load("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
+    load("SpectrumFederation/modules/LootHelperSync/16_ProfileIntegration.lua")
+    Sync = SF.LootHelperSync
+
+    local writer = admin
+    local peerAdmin = vann
+    local coordB = "CoordB-Realm"
+    local peerP = configured("recovery-peer")
+    peerP._adminUsers = { writer, peerAdmin, coordB }
+    peerP._profileId = "recovery-profile"
+    C.SetGuild(peerP, writer, GUILD, 2)
+    C.AddRequestedItem(peerP, writer, aqirite)
+    local event = donation("ce:recovery-profile:Admin-Realm:1", donor, 8, { order = 1, writer = writer })
+    assertTrue(C.AppendEvent(peerP, event), "recovery-serve peer stores stamped donation")
+    C.StampOrder(peerP, peerP._consumableEvents[1])
+    C.NoteStoredWriter(peerP, peerP._consumableEvents[1], writer)
+
+    local late = profile("recovery-late", writer)
+    late._profileId = "recovery-profile"
+    late._adminUsers = { writer, peerAdmin, coordB }
+    C.SetGuild(late, writer, GUILD, 2)
+    C.AddRequestedItem(late, writer, aqirite)
+
+    local sends = {}
+    Sync.RunWithJitter = function(_, _, _, fn) fn() end
+    Sync.UpdatePeersFromRoster = function() end
+    Sync.GetPeer = function(_, name)
+        return { inGroup = true, name = name }
+    end
+    Sync.IsBulkTransferAllowed = function() return true end
+    Sync._ProfileSnapshotServeAllowed = function() return true end
+    Sync._NoteProfileSnapshotServe = function() end
+    Sync._CachedProfileSnapshot = function(_, profileId)
+        local p = Sync:FindLocalProfileById(profileId)
+        if not p then return nil end
+        return {
+            sessionId = Sync.state.sessionId,
+            profileId = profileId,
+            snapshot = {
+                meta = { _profileId = profileId },
+                adminUsers = p._adminUsers,
+                consumables = C.ExportSnapshot(p),
+                lootLogs = {},
+            },
+        }
+    end
+    Sync.ValidateSessionPayload = function() return true end
+    Sync._RecordHandshakeReply = function() end
+    Sync._HandlePeerIntegrityAdvertisement = function() end
+    Sync.IsSenderAuthorized = function(_, _, name)
+        return name == writer or name == peerAdmin or name == coordB
+    end
+    Sync._GetProfileAdminUsers = function(_, p) return p and p._adminUsers or {} end
+    Sync.IsSelfHelper = function() return false end
+    Sync.IsHelper = function() return false end
+    Sync.IsTrustedDataSender = function(_, name)
+        return name == coordB
+    end
+    Sync._SamePlayer = function(_, a, b) return a == b end
+    Sync._SelfId = function() return peerAdmin end
+    Sync._Now = function() return clock end
+    Sync.FindLocalProfileById = function(_, id)
+        if id == late._profileId then
+            if Sync.state and Sync.state.isCoordinator then return late end
+            return peerP
+        end
+        return nil
+    end
+    Sync.CompleteRequest = function(_, id)
+        if Sync.state and Sync.state.requests then Sync.state.requests[id] = nil end
+        return true
+    end
+    Sync._ClassifyPrivilegedResponse = function(_, sender, _, req, opts)
+        if opts and opts.coordinatorAcceptsAdmins and Sync.state.isCoordinator
+            and Sync:IsSenderAuthorized(Sync.state.profileId, sender) then
+            return "accept"
+        end
+        return "untrusted"
+    end
+    SF.LootHelperComm = {
+        Send = function(_, _, msg, payload, dist, target)
+            sends[#sends + 1] = { msg = msg, payload = payload, dist = dist, target = target }
+            return true
+        end,
+    }
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.NEED_PROFILE = "NEED_PROFILE"
+    Sync.MSG.PROFILE_SNAPSHOT = "PROFILE_SNAPSHOT"
+    Sync.MSG.HAVE_PROFILE = "HAVE_PROFILE"
+
+    -- Peer (non-helper admin) serves NEED_PROFILE from the session coordinator.
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = coordB,
+        sessionId = "recovery-s1",
+        profileId = "recovery-profile",
+        helpers = {},
+        requests = {},
+    }
+    Sync:HandleNeedProfile(coordB, {
+        sessionId = "recovery-s1",
+        profileId = "recovery-profile",
+        requestId = "need-recovery-1",
+    })
+    local snapSend = nil
+    for i = 1, #sends do
+        if sends[i].msg == "PROFILE_SNAPSHOT" then snapSend = sends[i] end
+    end
+    assertTrue(snapSend ~= nil, "recovery-serve authorized admin sends PROFILE_SNAPSHOT")
+    assertEq(snapSend.target, coordB, "recovery-serve whispers the requesting coordinator")
+    assertTrue(type(snapSend.payload.snapshot) == "table"
+        and type(snapSend.payload.snapshot.consumables) == "table",
+        "recovery-serve payload includes consumables history")
+
+    -- Coordinator absorbs consumables-only recovery and clears the history gate.
+    Sync._SelfId = function() return coordB end
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = coordB,
+        sessionId = "recovery-s1",
+        profileId = "recovery-profile",
+        helpers = {},
+        requests = {
+            ["need-recovery-1"] = {
+                id = "need-recovery-1",
+                kind = "NEED_PROFILE",
+                meta = {
+                    acceptAuthorizedAdmins = true,
+                    consumablesHistoryOnly = true,
+                    preferredTarget = peerAdmin,
+                },
+            },
+        },
+    }
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.FindLocalProfileById = function(_, id)
+        return id == late._profileId and late or nil
+    end
+    Sync._NextNonce = function() return "n1" end
+    Sync.RequestProfileSnapshot = function(_, reason, opts)
+        return true
+    end
+    local peerDesc = C.Descriptor(peerP)
+    Sync:_NotePeerConsumablesHistory(peerAdmin, {
+        profileId = late._profileId,
+        sessionId = "recovery-s1",
+        consumablesGeneration = peerDesc.generation,
+        consumablesConfigSeq = peerDesc.configSeq,
+        consumablesRejectionSeq = peerDesc.rejectionSeq,
+        consumablesTxnAllocSeq = peerDesc.txnAllocSeq,
+        consumablesEventCount = peerDesc.eventCount,
+        consumablesEventFingerprint = peerDesc.eventFingerprint,
+        consumablesArchiveCount = peerDesc.archiveCount,
+        consumablesArchiveFingerprint = peerDesc.archiveFingerprint,
+    })
+    assertFalse(Sync:_ConsumablesHistoryReady(late), "recovery-serve gate holds before absorb")
+    Sync:HandleProfileSnapshot(peerAdmin, {
+        sessionId = "recovery-s1",
+        profileId = "recovery-profile",
+        requestId = "need-recovery-1",
+        snapshot = snapSend.payload.snapshot,
+    })
+    assertTrue(Sync:_ConsumablesHistoryReady(late), "recovery-serve gate clears after absorb")
+    assertEq(C.ContributionTotal(late, donor, aqirite), 8,
+        "recovery-serve credits the recovered donation once")
+    resetSync()
+end
+
 local function checkCatchUpRules()
     local base = { generation = 2, configSeq = 3, eventCount = 4, eventFingerprint = 11, archiveCount = 1, archiveFingerprint = 7 }
     local function remote(changes)
@@ -3485,6 +3663,7 @@ checkAuthorizeAndConfigSync()
 checkRemoteEvents()
 checkCatchUpRules()
 checkSessionTransport()
+checkPeerHistoryRecoveryServePath()
 checkQueuedResendProtection()
 checkRuntimeInventory()
 checkRuntimeReminder()

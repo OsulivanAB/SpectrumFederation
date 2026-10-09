@@ -177,9 +177,8 @@ function S.CoordinatorConfigDiffers(localDesc, remote)
     local remoteRej = tonumber(remote.rejectionSeq)
     local localRej = tonumber(localDesc.rejectionSeq)
     if remoteRej and localRej and remoteRej ~= localRej then return true end
-    local remoteAlloc = tonumber(remote.txnAllocSeq)
-    local localAlloc = tonumber(localDesc.txnAllocSeq)
-    if remoteAlloc and localAlloc and remoteAlloc ~= localAlloc then return true end
+    -- txnAllocSeq is a local allocator watermark, not shared config identity.
+    -- Ahead-only catch-up still uses it via NeedsCatchUp / PeerHistoryAhead.
     local remoteFp = tonumber(remote.configFingerprint)
     local localFp = tonumber(localDesc.configFingerprint)
     if remoteFp and localFp and remoteFp ~= localFp then return true end

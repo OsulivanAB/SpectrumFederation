@@ -318,7 +318,8 @@ function O.EnsureScope(store, guildGuid, bankTab)
 end
 
 -- True when Blizzard's hour-granular age can place the deposit on either side of
--- a cutover (ageHours < 1 and reconstructed time is after the cutover).
+-- a cutover. Floored ageHours means real time may be up to ~1h earlier than
+-- approxTxnTime for every whole-hour age, not only age 0.
 function O.EvidenceSpansEligibilityBoundary(evidence, eligibility)
     if type(evidence) ~= "table" or type(eligibility) ~= "table" then
         return false
@@ -329,8 +330,9 @@ function O.EvidenceSpansEligibilityBoundary(evidence, eligibility)
     local function spans(cutover)
         cutover = tonumber(cutover)
         if not cutover or txnTime < cutover then return false end
-        -- Whole-hour age 0: real time may be up to ~1h earlier than approxTxnTime.
-        if ageHours ~= nil and ageHours < 1 and (txnTime - 3600) < cutover then
+        if ageHours == nil then return false end
+        -- Whole-hour ages (including 0, 1, 2, …) carry up to one hour of uncertainty.
+        if ageHours == math.floor(ageHours) and (txnTime - 3600) < cutover then
             return true
         end
         return false

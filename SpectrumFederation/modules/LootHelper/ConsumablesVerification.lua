@@ -826,23 +826,37 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                             how = "ambiguous"
                         elseif how ~= "verified" then
                             local ledgerHit = V.FindEquivalentLedgerDonation(profile, profileId, evidence)
-                            if not cluster and ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
-                                cluster = NewCluster(store, evidence)
+                            -- Apply recovered ledger/registry identity even when a
+                            -- pending session cluster already exists without txnId.
+                            -- Otherwise Tuesday recovery + later admin/witness report
+                            -- mints a second canonical credit for the same deposit.
+                            if ledgerHit and V.ValidTxnId(ledgerHit.txnId)
+                                and (not cluster or not V.ValidTxnId(cluster.txnId))
+                            then
+                                if not cluster then
+                                    cluster = NewCluster(store, evidence)
+                                end
                                 cluster.status = "verified"
                                 cluster.verification = ledgerHit.verification or V.VERIFICATION.MANUAL
                                 cluster.txnId = ledgerHit.txnId
                                 cluster._committed = (not ledgerHit._registryOnly)
                                     and C.HasTxnId and C.HasTxnId(profile, ledgerHit.txnId)
                                 cluster.decidedBy = Norm(ledgerHit.writer) or submittedBy
+                                cluster.evidence = evidence
                                 how = "verified"
-                            elseif regHow == "verified" and regEntry and not cluster then
-                                cluster = NewCluster(store, evidence)
+                            elseif regHow == "verified" and regEntry
+                                and (not cluster or not V.ValidTxnId(cluster.txnId))
+                            then
+                                if not cluster then
+                                    cluster = NewCluster(store, evidence)
+                                end
                                 cluster.status = "verified"
                                 cluster.verification = regEntry.verification or V.VERIFICATION.MANUAL
                                 cluster.txnId = regEntry.txnId
                                 cluster._committed = regEntry.committed == true
                                     or (C.HasTxnId and C.HasTxnId(profile, regEntry.txnId))
                                 cluster.decidedBy = Norm(regEntry.decidedBy) or submittedBy
+                                cluster.evidence = evidence
                                 how = "verified"
                             elseif not cluster then
                                 cluster = NewCluster(store, evidence)
