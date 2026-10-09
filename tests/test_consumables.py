@@ -259,9 +259,17 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
         "RAID_CONSUMABLE_REVIEW_CORRECT",
         "RAID_CONSUMABLE_REVIEW_SELECTED",
         "RAID_CONSUMABLE_REVIEW_ROW",
+        "RAID_CONSUMABLE_ADJUST_TITLE",
+        "RAID_CONSUMABLE_ADJUST_HELP",
+        "RAID_CONSUMABLE_ADJUST_UNATTRIBUTED",
+        "RAID_CONSUMABLE_ADJUST_CONFIRM_HEADER",
+        "RAID_CONSUMABLE_ADJUST_CONFIRM_RECEIVED",
     ):
         assert f'L["{key}"]' in locale, key
         assert key in domain or key in runtime or key in logs_page, key
+    assert "CONSUMABLE_ADJUSTMENT" in domain
+    assert "CommitConsumablesManualAdjustment" in SYNC_TRANSPORT.read_text(encoding="utf-8")
+    assert "Manual adjustment" in logs_page or "RAID_CONSUMABLE_ADJUST_TITLE" in logs_page
 
     assert "function ns.LocaleText" in locale
     assert 'Loc("RAID_SUPPLIES_OVERALL_PROGRESS"' in runtime

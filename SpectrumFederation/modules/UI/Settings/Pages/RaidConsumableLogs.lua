@@ -1,4 +1,5 @@
--- Raid Consumable Logs: verified ledger history, pending observations, admin review.
+-- Raid Consumable Logs: verified ledger history, pending observations,
+-- admin manual adjustments, and admin review.
 local _, SF = ...
 
 local Page = {
@@ -6,7 +7,7 @@ local Page = {
 	parentId = "lootHelper",
 	name = "Raid Consumable Logs",
 	navLabel = "Consumable Logs",
-	description = "Review raid-supply Guild Bank donations, pending verification, and configuration clears.",
+	description = "Review raid-supply Guild Bank donations, pending verification, manual adjustments, and configuration clears.",
 	order = 23.7,
 }
 
@@ -40,6 +41,10 @@ local reuseHistory = false
 local reusedHistory = nil
 local selectedReviewClusterId = nil
 local selectedReviewProfileId = nil
+local adjustProfileId = nil
+local adjustItemId = nil
+local adjustMemberId = nil -- nil means unattributed / miscellaneous
+local adjustQuantityText = ""
 
 local function ActiveProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
@@ -175,10 +180,156 @@ local function HistoryHelp()
 	return string.format(
 		Loc(
 			"RAID_CONSUMABLE_LOGS_HELP",
-			"Newest entries are first. Pending Guild Bank observations appear until verified. Each page shows up to %d verified entries, including configuration clears from every generation."
+			"Newest entries are first. Pending Guild Bank observations appear until verified. Each page shows up to %d verified entries, including manual adjustments and configuration clears from every generation."
 		),
 		limit
 	)
+end
+
+local function EnsureAdjustSelection(profile)
+	local profileId = ProfileKey(profile)
+	if profileId ~= adjustProfileId then
+		adjustProfileId = profileId
+		adjustItemId = nil
+		adjustMemberId = nil
+		adjustQuantityText = ""
+	end
+end
+
+local function AdjustItemOptions()
+	local C = SF.Consumables
+	local profile = ActiveProfile()
+	if not C or not profile or not C.RequestedItemIds then return {} end
+	local options = {}
+	local ids = C.RequestedItemIds(profile) or {}
+	for i = 1, #ids do
+		local itemId = ids[i]
+		local name = ItemName(itemId) or ("item " .. tostring(itemId))
+		options[#options + 1] = {
+			value = itemId,
+			label = string.format("%s (%d)", name, itemId),
+		}
+	end
+	return options
+end
+
+local function AdjustMemberOptions()
+	local profile = ActiveProfile()
+	local options = {
+		{
+			value = "",
+			label = Loc("RAID_CONSUMABLE_ADJUST_UNATTRIBUTED", "Unattributed / Miscellaneous"),
+		},
+	}
+	if not profile then return options end
+	local ids = {}
+	if profile.GetMemberIds then
+		local ok, list = pcall(profile.GetMemberIds, profile)
+		if ok and type(list) == "table" then
+			ids = list
+		end
+	elseif type(profile._members) == "table" then
+		for i = 1, #profile._members do
+			local m = profile._members[i]
+			local mid = m and (m.identifier or (m.GetFullIdentifier and m:GetFullIdentifier()))
+			if type(mid) == "string" and mid ~= "" then
+				ids[#ids + 1] = mid
+			end
+		end
+	end
+	for i = 1, #ids do
+		local memberId = ids[i]
+		if type(memberId) == "string" and memberId ~= "" then
+			options[#options + 1] = { value = memberId, label = memberId }
+		end
+	end
+	table.sort(options, function(a, b)
+		if a.value == "" then return true end
+		if b.value == "" then return false end
+		return tostring(a.label) < tostring(b.label)
+	end)
+	return options
+end
+
+local function AdjustQuantity()
+	local text = adjustQuantityText
+	if type(text) ~= "string" then return nil end
+	text = text:gsub("^%s+", ""):gsub("%s+$", "")
+	if text == "" then return nil end
+	return tonumber(text)
+end
+
+local function AdjustPreviewText()
+	local C = SF.Consumables
+	local profile = ActiveProfile()
+	if not C or not profile or not C.PreviewManualAdjustment then
+		return Loc("RAID_CONSUMABLE_ADJUST_PREVIEW_EMPTY", "Select an item and enter a non-zero quantity to preview the resulting totals.")
+	end
+	local qty = AdjustQuantity()
+	if not adjustItemId or not qty then
+		return Loc("RAID_CONSUMABLE_ADJUST_PREVIEW_EMPTY", "Select an item and enter a non-zero quantity to preview the resulting totals.")
+	end
+	local preview, err = C.PreviewManualAdjustment(profile, adjustItemId, qty, adjustMemberId)
+	if not preview then
+		return err or Loc("RAID_CONSUMABLE_ADJUST_PREVIEW_EMPTY", "Select an item and enter a non-zero quantity to preview the resulting totals.")
+	end
+	return C.ManualAdjustmentConfirmation(preview, ItemName(preview.itemId))
+end
+
+local function CommitAdjustment(ctx)
+	local C = SF.Consumables
+	local profile = ActiveProfile()
+	if not C or not profile then
+		ctx.section:SetMessage("No active profile.", "error")
+		return
+	end
+	if not IsEffectiveAdmin(profile) then
+		ctx.section:SetMessage("Only a profile admin can adjust raid supplies.", "error")
+		return
+	end
+	local qty = AdjustQuantity()
+	local preview, err = C.PreviewManualAdjustment(profile, adjustItemId, qty, adjustMemberId)
+	if not preview then
+		ctx.section:SetMessage(err or "Could not preview that adjustment.", "error")
+		return
+	end
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not (dialogs and dialogs.Confirm) then return end
+	local originId = ProfileKey(profile)
+	local message = C.ManualAdjustmentConfirmation(preview, ItemName(preview.itemId))
+	dialogs:Confirm(message, Loc("RAID_CONSUMABLE_ADJUST_APPLY_BUTTON", "Confirm"), function()
+		local active = ActiveProfile()
+		if ProfileKey(active) ~= originId then
+			ctx.section:SetMessage("The active profile changed, so the adjustment was not applied.", "error")
+			return
+		end
+		if not IsEffectiveAdmin(active) then
+			ctx.section:SetMessage("Only a profile admin can adjust raid supplies.", "error")
+			return
+		end
+		local sync = SF.LootHelperSync
+		local ok, commitErr
+		local opts = { asAdmin = IsEffectiveAdmin(active), actor = Actor() }
+		if sync and sync.CommitConsumablesManualAdjustment then
+			ok, commitErr = sync:CommitConsumablesManualAdjustment(
+				active, preview.itemId, preview.quantity, preview.attributed, opts)
+		else
+			ok, commitErr = C.RecordManualAdjustment(
+				active, Actor(), preview.itemId, preview.quantity, preview.attributed, opts)
+		end
+		if ok then
+			adjustQuantityText = ""
+			ctx.section:SetMessage(
+				Loc("RAID_CONSUMABLE_ADJUST_SUCCESS", "Adjustment recorded."),
+				"success"
+			)
+			if Page.Refresh and Page.panel then
+				Page:Refresh(Page.panel)
+			end
+		else
+			ctx.section:SetMessage(commitErr or "Could not record that adjustment.", "error")
+		end
+	end)
 end
 
 local function GoalProgressModel()
@@ -302,6 +453,7 @@ local function Definition()
 	local admin = profile and IsEffectiveAdmin(profile)
 	local inSession = profile and InActiveSession(profile)
 	if admin then
+		EnsureAdjustSelection(profile)
 		EnsureReviewSelection(profile)
 	end
 	local sections = {
@@ -347,6 +499,109 @@ local function Definition()
 		},
 	}
 	if admin then
+		sections[#sections + 1] = {
+			id = "consumableAdjust",
+			title = Loc("RAID_CONSUMABLE_ADJUST_TITLE", "Manual adjustment"),
+			adminOnly = true,
+			items = {
+				{
+					type = "help",
+					indent = "label",
+					text = Loc(
+						"RAID_CONSUMABLE_ADJUST_HELP",
+						"Admins can correct received quantities or record supplies received outside Guild Bank verification. Adjustments are permanent ledger entries. Preview as Non-Admin hides these controls."
+					),
+				},
+				{
+					type = "dropdown",
+					label = Loc("RAID_CONSUMABLE_ADJUST_ITEM", "Requested item"),
+					adminOnly = true,
+					defaultText = Loc("RAID_CONSUMABLE_ADJUST_ITEM_DEFAULT", "Select a requested item"),
+					options = AdjustItemOptions,
+					get = function()
+						return adjustItemId
+					end,
+					set = function(value)
+						adjustItemId = tonumber(value) or value
+						if Page.Refresh and Page.panel then
+							Page:Refresh(Page.panel)
+						end
+					end,
+					enabled = function()
+						return IsEffectiveAdmin(ActiveProfile())
+					end,
+				},
+				{
+					type = "dropdown",
+					label = Loc("RAID_CONSUMABLE_ADJUST_MEMBER", "Credit to"),
+					adminOnly = true,
+					defaultText = Loc("RAID_CONSUMABLE_ADJUST_MEMBER_DEFAULT", "Unattributed / Miscellaneous"),
+					options = AdjustMemberOptions,
+					get = function()
+						return adjustMemberId or ""
+					end,
+					set = function(value)
+						if value == nil or value == "" then
+							adjustMemberId = nil
+						else
+							adjustMemberId = value
+						end
+						if Page.Refresh and Page.panel then
+							Page:Refresh(Page.panel)
+						end
+					end,
+					enabled = function()
+						return IsEffectiveAdmin(ActiveProfile())
+					end,
+				},
+				{
+					type = "editbox",
+					label = Loc("RAID_CONSUMABLE_ADJUST_QUANTITY", "Quantity (+/-)"),
+					adminOnly = true,
+					maxLetters = 8,
+					get = function()
+						return adjustQuantityText
+					end,
+					set = function(value)
+						adjustQuantityText = type(value) == "string" and value or tostring(value or "")
+					end,
+					onCommit = function(ctx, text)
+						adjustQuantityText = type(text) == "string" and text or ""
+						if Page.Refresh and Page.panel then
+							Page:Refresh(Page.panel)
+						elseif ctx and ctx.pageBuilder and ctx.pageBuilder.Refresh then
+							ctx.pageBuilder:Refresh()
+						end
+					end,
+					enabled = function()
+						return IsEffectiveAdmin(ActiveProfile())
+					end,
+				},
+				{
+					type = "help",
+					indent = "label",
+					text = AdjustPreviewText(),
+				},
+				{
+					type = "button",
+					label = Loc("RAID_CONSUMABLE_ADJUST_APPLY", "Apply adjustment"),
+					buttonText = Loc("RAID_CONSUMABLE_ADJUST_APPLY_BUTTON", "Confirm"),
+					adminOnly = true,
+					width = 120,
+					enabled = function()
+						local C = SF.Consumables
+						local p = ActiveProfile()
+						if not (C and p and IsEffectiveAdmin(p)) then return false end
+						local qty = AdjustQuantity()
+						if not adjustItemId or not qty then return false end
+						return select(1, C.PreviewManualAdjustment(p, adjustItemId, qty, adjustMemberId)) and true or false
+					end,
+					onClick = function(ctx)
+						CommitAdjustment(ctx)
+					end,
+				},
+			},
+		}
 		local selected = SelectedReviewRow()
 		local selectedHelp
 		if selected then

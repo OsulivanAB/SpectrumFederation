@@ -968,6 +968,29 @@ function Sync:CommitConsumablesEvents(profile, token, events)
     return true
 end
 
+-- Admin manual received-quantity adjustment. Works in and outside sessions:
+-- outside a session the event persists locally and joins the unsent queue for
+-- eventual synchronization; inside a session it uses the normal event path.
+function Sync:CommitConsumablesManualAdjustment(profile, itemId, quantity, attributed, opts)
+    local C = Consumables()
+    if not C then return false, "Raid Consumables is unavailable." end
+    opts = opts or {}
+    if opts.asAdmin == false then
+        return false, "Raid Consumables settings are in Preview as Non-Admin mode."
+    end
+    local actor = opts.actor
+    if type(actor) ~= "string" or actor == "" then
+        actor = self._SelfId and self:_SelfId() or nil
+    end
+    local token, events, err = C.ManualAdjustmentEvents(profile, actor, itemId, quantity, attributed, {
+        asAdmin = opts.asAdmin,
+    })
+    if not events then
+        return false, err or "Could not create that adjustment."
+    end
+    return self:CommitConsumablesEvents(profile, token, events)
+end
+
 function Sync:HandleConsumablesEvent(sender, payload)
     if not SessionPayloadOk(payload, sender) then return end
     local C = Consumables()

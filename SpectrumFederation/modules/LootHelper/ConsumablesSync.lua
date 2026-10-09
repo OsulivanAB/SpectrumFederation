@@ -208,6 +208,21 @@ local function PositiveQuantity(event)
     return true
 end
 
+-- Non-zero signed quantity for admin manual adjustments.
+local function SignedQuantity(event)
+    local qty = tonumber(event.quantity)
+    local itemId = tonumber(event.itemId)
+    if not itemId or itemId <= 0 or itemId ~= math.floor(itemId) then return false end
+    if not qty or qty ~= qty or qty == 0 or qty ~= math.floor(qty) then
+        return false
+    end
+    if math.abs(qty) > S.MAX_EVENT_QUANTITY then
+        return false
+    end
+    if type(event.generation) ~= "number" then return false end
+    return true
+end
+
 -- Semantic body checks for coordinator snapshot rows (no sender binding).
 function S.AuthoritativeEventBodyOk(event)
     if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
@@ -220,6 +235,16 @@ function S.AuthoritativeEventBodyOk(event)
         if not PositiveQuantity(event) then return false end
         -- Post-migration: reject legacy donation rows that lack verified provenance.
         if not (C.ValidTxnId and C.ValidTxnId(event.txnId)) then return false end
+        return true
+    end
+    if event.type == C.EVENT.ADJUSTMENT then
+        -- Manual adjustments are never Guild Bank observations.
+        if event.source == "guildbank" then return false end
+        if type(event.actor) ~= "string" or event.actor == "" then return false end
+        if not SignedQuantity(event) then return false end
+        if event.attributed ~= nil and event.attributed ~= "" then
+            if type(event.attributed) ~= "string" then return false end
+        end
         return true
     end
     if event.type == C.EVENT.RESET then
@@ -299,6 +324,18 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
             if not C.IsCanonicalAdmin(profile, writer) then
                 return false, "unauthorized"
             end
+        end
+    elseif event.type == C.EVENT.ADJUSTMENT then
+        -- Admin-authored manual adjustment; actor is the admin, not a donor.
+        if event.source == "guildbank" then
+            return false, "unauthorized"
+        end
+        if not (event.actor and Same(event.actor, writer) and SignedQuantity(event)
+            and C.IsCanonicalAdmin(profile, writer)) then
+            return false, "unauthorized"
+        end
+        if event.attributed ~= nil and event.attributed ~= "" and type(event.attributed) ~= "string" then
+            return false, "unauthorized"
         end
     else
         -- Receipt/custody/trade events are no longer accepted.
