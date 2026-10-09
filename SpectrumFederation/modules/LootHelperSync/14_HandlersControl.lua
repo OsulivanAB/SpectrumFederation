@@ -824,6 +824,11 @@ function Sync:HandleHaveProfile(sender, payload)
     if self._ConsiderJoinAcceptedRCConfig then
         self:_ConsiderJoinAcceptedRCConfig(sender, payload)
     end
+    -- New coordinators learn richer Tuesday history from joining peers before
+    -- verifying potentially overlapping Guild Bank deposits.
+    if self._NotePeerConsumablesHistory then
+        self:_NotePeerConsumablesHistory(sender, payload)
+    end
 end
 
 -- Function Handle NEED_PROFILE as a helper/coordinator: respond with PROFILE_SNAPSHOT (bulk).

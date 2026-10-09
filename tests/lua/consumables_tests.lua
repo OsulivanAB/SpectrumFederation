@@ -1548,6 +1548,47 @@ local function checkSessionTransport()
     heartbeat()
     assertEq(#requests, 1, "a converged follower does not request again")
 
+    -- New coordinator with empty history holds until a joining peer supplies richer watermarks.
+    local lateCoord = profile("late-coord", admin)
+    lateCoord._profileId = coordP._profileId
+    C.SetGuild(lateCoord, admin, GUILD, 2)
+    C.AddRequestedItem(lateCoord, admin, aqirite)
+    sessionStubs({ active = true, isCoordinator = true, coordinator = admin, sessionId = "s1",
+        profileId = lateCoord._profileId, peers = {} },
+        { [lateCoord._profileId] = lateCoord }, {})
+    Sync._SelfId = function() return admin end
+    local peerDesc = C.Descriptor(coordP)
+    Sync:_NotePeerConsumablesHistory(vann, {
+        profileId = lateCoord._profileId,
+        sessionId = "s1",
+        consumablesGeneration = peerDesc.generation,
+        consumablesConfigSeq = peerDesc.configSeq,
+        consumablesRejectionSeq = peerDesc.rejectionSeq,
+        consumablesTxnAllocSeq = peerDesc.txnAllocSeq,
+        consumablesConfigFingerprint = peerDesc.configFingerprint,
+        consumablesEventCount = peerDesc.eventCount,
+        consumablesEventFingerprint = peerDesc.eventFingerprint,
+        consumablesArchiveCount = peerDesc.archiveCount,
+        consumablesArchiveFingerprint = peerDesc.archiveFingerprint,
+    })
+    assertTrue(lateCoord._consumablesPeerHistoryAhead == true,
+        "a new coordinator marks peer-ahead history from HAVE_PROFILE watermarks")
+    assertFalse(Sync:_ConsumablesHistoryReady(lateCoord),
+        "peer-ahead history gates verification until local ledger catches up")
+    assertTrue(select(1, C.MergeSnapshot(lateCoord, C.ExportSnapshot(coordP), { consumablesFromCoordinator = true })),
+        "new coordinator absorbs the peer's richer consumables snapshot")
+    Sync:_RefreshConsumablesHistoryGate(lateCoord)
+    assertTrue(Sync:_ConsumablesHistoryReady(lateCoord),
+        "history gate clears after the missing ledger/registry is absorbed")
+    assertEq(C.ContributionTotal(lateCoord, donor, aqirite), 6,
+        "recovered Tuesday donation credits once on the new coordinator")
+
+    -- Restore the follower session under test before Preview as Non-Admin checks.
+    sessionStubs({ active = true, isCoordinator = false, coordinator = admin, sessionId = "s1",
+        profileId = coordP._profileId, peers = { [admin] = { consumablesCapable = true } } },
+        { [coordP._profileId] = followerP }, fsent)
+    Sync._SelfId = function() return vann end
+
     local previewSent = #fsent
     local previewOk, previewErr = Sync:CommitConsumablesOp(followerP, { name = "add_item", itemId = flask }, admin,
         { asAdmin = false })

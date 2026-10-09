@@ -319,16 +319,16 @@ function S.NeedsCatchUp(localDesc, remote)
     local remoteGen = tonumber(remote.generation)
     local remoteSeq = tonumber(remote.configSeq)
     local remoteEvents = tonumber(remote.eventCount)
+    local remoteAlloc = tonumber(remote.txnAllocSeq)
     local remoteArchiveCount = tonumber(remote.archiveCount)
     local remoteArchiveFingerprint = tonumber(remote.archiveFingerprint)
-    if not remoteGen and not remoteSeq and not remoteEvents
+    if not remoteGen and not remoteSeq and not remoteEvents and not remoteAlloc
         and not remoteArchiveCount and not remoteArchiveFingerprint then
         return false
     end
     if remoteGen and remoteGen > (localDesc.generation or 1) then return true end
     if remoteSeq and remoteSeq > (localDesc.configSeq or 0) then return true end
     if remoteEvents and remoteEvents > (localDesc.eventCount or 0) then return true end
-    local remoteAlloc = tonumber(remote.txnAllocSeq)
     if remoteAlloc and remoteAlloc > (localDesc.txnAllocSeq or 0) then return true end
     local remoteFingerprint = tonumber(remote.eventFingerprint)
     local localFingerprint = tonumber(localDesc.eventFingerprint)
@@ -343,4 +343,54 @@ function S.NeedsCatchUp(localDesc, remote)
         return true
     end
     return false
+end
+
+-- True when a peer advertises consumables history the local coordinator lacks.
+function S.PeerHistoryAhead(localDesc, peerDesc)
+    localDesc = localDesc or {}
+    peerDesc = peerDesc or {}
+    local peerEvents = tonumber(peerDesc.eventCount)
+    local localEvents = tonumber(localDesc.eventCount) or 0
+    if peerEvents and peerEvents > localEvents then return true end
+    local peerAlloc = tonumber(peerDesc.txnAllocSeq)
+    local localAlloc = tonumber(localDesc.txnAllocSeq) or 0
+    if peerAlloc and peerAlloc > localAlloc then return true end
+    local peerArchive = tonumber(peerDesc.archiveCount)
+    local localArchive = tonumber(localDesc.archiveCount) or 0
+    if peerArchive and peerArchive > localArchive then return true end
+    local peerFp = tonumber(peerDesc.eventFingerprint)
+    local localFp = tonumber(localDesc.eventFingerprint)
+    if peerFp and localFp and peerFp ~= localFp and (peerEvents or 0) >= localEvents then
+        return true
+    end
+    return false
+end
+
+function S.MergeHistoryWatermark(current, peerDesc)
+    peerDesc = peerDesc or {}
+    current = type(current) == "table" and current or {}
+    local function maxNum(a, b)
+        a, b = tonumber(a), tonumber(b)
+        if a and b then return math.max(a, b) end
+        return a or b
+    end
+    local out = {
+        generation = maxNum(current.generation, peerDesc.generation) or 1,
+        configSeq = maxNum(current.configSeq, peerDesc.configSeq) or 0,
+        rejectionSeq = maxNum(current.rejectionSeq, peerDesc.rejectionSeq) or 0,
+        txnAllocSeq = maxNum(current.txnAllocSeq, peerDesc.txnAllocSeq) or 0,
+        eventCount = maxNum(current.eventCount, peerDesc.eventCount) or 0,
+        archiveCount = maxNum(current.archiveCount, peerDesc.archiveCount) or 0,
+        eventFingerprint = tonumber(peerDesc.eventFingerprint) or tonumber(current.eventFingerprint),
+        archiveFingerprint = tonumber(peerDesc.archiveFingerprint) or tonumber(current.archiveFingerprint),
+        configFingerprint = tonumber(peerDesc.configFingerprint) or tonumber(current.configFingerprint),
+    }
+    -- Prefer the peer fingerprint when they are ahead so NeedsCatchUp stays true
+    -- until local ledger/registry converge on that richer history.
+    if S.PeerHistoryAhead(current, peerDesc) then
+        out.eventFingerprint = tonumber(peerDesc.eventFingerprint) or out.eventFingerprint
+        out.archiveFingerprint = tonumber(peerDesc.archiveFingerprint) or out.archiveFingerprint
+        out.configFingerprint = tonumber(peerDesc.configFingerprint) or out.configFingerprint
+    end
+    return out
 end

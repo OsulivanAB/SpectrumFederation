@@ -1336,6 +1336,85 @@ do
     assertEq(C.ContributionTotal(p, donor, flask), 0, "registry#8 no speculative credit")
 end
 
+-- 8b. Incomplete new coordinator must recover peer history before overlapping credit
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("reg-handoff-recover", { admin, "CoordB-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "reg-handoff-recover")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local tuesdayEv = evidence({
+        quantity = 17, neighborsOlder = { "tue-recover" }, approxTxnTime = clock - 200,
+    })
+    assertEq(V.IngestReport(coordA, "reg-handoff-recover", admin, { tuesdayEv }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA,
+    }).verified, 1, "handoff-recover A verifies Tuesday")
+    local txnId = V.ListVerifiedClusters("reg-handoff-recover")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(coordA, V.ListVerifiedClusters("reg-handoff-recover")[1], admin))
+    local richSnap = C.ExportSnapshot(coordA)
+    assertTrue(S.PeerHistoryAhead(C.Descriptor(makeProfile("empty-desc")), C.Descriptor(coordA)),
+        "handoff-recover peer-ahead helper sees richer history")
+
+    -- B starts Thursday with no Tuesday registry.
+    V.ClearSessionClusters()
+    local coordB = makeProfile("reg-handoff-recover-b", { admin, "CoordB-Realm" })
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "reg-handoff-recover-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local incompleteSnap = C.ExportSnapshot(coordB)
+    assertEq(#(C.TxnRegistry(coordB) or {}), 0, "handoff-recover B starts empty")
+
+    -- A's richer history must survive B's incomplete authoritative snapshot.
+    assertTrue(select(1, C.MergeSnapshot(coordA, incompleteSnap, { consumablesFromCoordinator = true })),
+        "handoff-recover incomplete B snapshot applies without error")
+    assertTrue(C.FindRegistryTxn(coordA, txnId) ~= nil,
+        "handoff-recover A keeps Tuesday registry after incomplete B overwrite attempt")
+    assertEq(C.ContributionTotal(coordA, donor, flask), 17,
+        "handoff-recover A keeps Tuesday ledger credit")
+    assertTrue(type(coordA._consumablesUnsent) == "table" and #coordA._consumablesUnsent >= 1,
+        "handoff-recover A requeues canonical credit for coordinator recovery")
+
+    -- B holds overlapping observations until peer history is absorbed.
+    local reobserve = evidence({
+        quantity = 17, neighborsOlder = { "tue-recover" },
+        approxTxnTime = clock - 200 + 600, occurrenceIndex = 3,
+    })
+    local held = V.IngestReport(coordB, "reg-handoff-recover-b", "CoordB-Realm", { reobserve }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = false,
+    })
+    assertEq(held.verified, 0, "handoff-recover B holds until history recovered")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "handoff-recover B no duplicate yet")
+
+    -- A supplies missing history; B converges on original Spectrum txnId.
+    assertTrue(select(1, C.MergeSnapshot(coordB, richSnap, { consumablesFromCoordinator = true })),
+        "handoff-recover B absorbs A's Tuesday snapshot")
+    assertTrue(C.FindRegistryTxn(coordB, txnId) ~= nil, "handoff-recover B has Tuesday txnId")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 17, "handoff-recover B credits Tuesday once")
+    V.ClearSessionClusters()
+    local after = V.IngestReport(coordB, "reg-handoff-recover-b", "CoordB-Realm", { reobserve }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = true,
+    })
+    assertEq(after.verified, 0, "handoff-recover rematch does not re-verify")
+    local how, entry = V.ReconcileAgainstRegistry(coordB, reobserve)
+    assertEq(how, "verified", "handoff-recover rematch hits registry")
+    assertEq(entry.txnId, txnId, "handoff-recover reuses original canonical id")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 17, "handoff-recover no duplicate credit")
+
+    local thursday = evidence({
+        quantity = 3, neighborsOlder = { "thu-recover" },
+        approxTxnTime = clock - 15, occurrenceIndex = 1,
+        coreSignature = O.CoreSignature("deposit", donor, flask, 3),
+    })
+    V.ClearSessionClusters()
+    assertEq(V.IngestReport(coordB, "reg-handoff-recover-b", "CoordB-Realm", { thursday }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = true,
+    }).verified, 1, "handoff-recover new Thursday deposit still verifies")
+    local thuCluster = V.ListVerifiedClusters("reg-handoff-recover-b")[1]
+    assertTrue(thuCluster and thuCluster.txnId ~= txnId, "handoff-recover Thursday gets a distinct txnId")
+    assertTrue(V.CommitVerifiedCluster(coordB, thuCluster, "CoordB-Realm"))
+    assertEq(C.ContributionTotal(coordB, donor, flask), 20, "handoff-recover Thursday credits normally")
+end
+
 -- 9. Three independent witnesses converge without combining separate deposits
 do
     V.ClearSessionClusters()

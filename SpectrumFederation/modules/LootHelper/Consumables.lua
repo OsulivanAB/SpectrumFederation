@@ -1192,11 +1192,74 @@ local function CopyTxnRegistry(list)
     return out
 end
 
+local function PreferRegistryEntry(localEntry, remoteEntry)
+    if not localEntry then return remoteEntry end
+    if not remoteEntry then return localEntry end
+    local out = CopyTxnRegistryEntry(remoteEntry) or CopyTxnRegistryEntry(localEntry)
+    if not out then return nil end
+    -- Never lose a committed credit or a durable rejection during incomplete sync.
+    if localEntry.committed or remoteEntry.committed then
+        out.committed = true
+    end
+    if localEntry.status == "rejected" or remoteEntry.status == "rejected" then
+        if localEntry.committed and localEntry.status == "verified" then
+            out.status = "verified"
+        else
+            out.status = "rejected"
+        end
+    elseif localEntry.status == "verified" or remoteEntry.status == "verified" then
+        out.status = "verified"
+    end
+    out.verification = out.verification or localEntry.verification or remoteEntry.verification
+    out.decidedBy = out.decidedBy or localEntry.decidedBy or remoteEntry.decidedBy
+    out.reason = out.reason or localEntry.reason or remoteEntry.reason
+    out.neighborsOlder = out.neighborsOlder or localEntry.neighborsOlder
+    out.neighborsNewer = out.neighborsNewer or localEntry.neighborsNewer
+    out.coreSignature = out.coreSignature or localEntry.coreSignature
+    out.approxTxnTime = out.approxTxnTime or localEntry.approxTxnTime
+    return out
+end
+
+-- Union-merge registries. Blind replace would let an incomplete new coordinator
+-- wipe richer peer history before Tuesday credits are recovered.
 local function ReplaceTxnRegistryFromPayload(cfg, payload)
     if type(payload) ~= "table" or type(payload.txnRegistry) ~= "table" then
         return EnsureTxnRegistry(cfg)
     end
-    cfg.txnRegistry = CopyTxnRegistry(payload.txnRegistry)
+    local localList = EnsureTxnRegistry(cfg)
+    local byId = {}
+    local order = {}
+    for i = 1, #localList do
+        local row = localList[i]
+        if type(row) == "table" and ValidTxnId(row.txnId) and not byId[row.txnId] then
+            byId[row.txnId] = CopyTxnRegistryEntry(row)
+            order[#order + 1] = row.txnId
+        end
+    end
+    local remote = CopyTxnRegistry(payload.txnRegistry)
+    for i = 1, #remote do
+        local row = remote[i]
+        local txnId = row and row.txnId
+        if txnId then
+            if byId[txnId] then
+                byId[txnId] = PreferRegistryEntry(byId[txnId], row)
+            else
+                byId[txnId] = row
+                order[#order + 1] = txnId
+            end
+        end
+    end
+    local merged = {}
+    for i = 1, #order do
+        local copy = byId[order[i]]
+        if copy then
+            merged[#merged + 1] = copy
+        end
+    end
+    while #merged > C.MAX_TXN_REGISTRY do
+        table.remove(merged, 1)
+    end
+    cfg.txnRegistry = merged
     local remoteAlloc = tonumber(payload.txnAllocSeq)
     if remoteAlloc and remoteAlloc == math.floor(remoteAlloc) and remoteAlloc >= 0 then
         local localAlloc = tonumber(cfg.txnAllocSeq) or 0
@@ -2687,11 +2750,19 @@ local function ReconcileAuthoritativeEvents(profile, events)
         if type(selfId) ~= "string" or selfId == "" then return false end
         return Rules and Rules.RemoteEventIdOk and Rules.RemoteEventIdOk(event.id, selfId) and true or false
     end
+    local function canonicalCredit(event)
+        return type(event) == "table"
+            and event.type == C.EVENT.DONATION
+            and event.source == "guildbank"
+            and ValidTxnId(event.txnId) ~= nil
+    end
     local function keepEvent(event)
         if type(event) ~= "table" or type(event.id) ~= "string" then return false end
         if keep[event.id] or unsent[event.id] then return true end
         -- Sent, then dropped before the coordinator stamped it. The id still names this client.
-        return authoredUnacked(event)
+        if authoredUnacked(event) then return true end
+        -- Incomplete coordinator snapshots must not erase Spectrum-owned credits.
+        return canonicalCredit(event)
     end
     local function filterList(list)
         local keptRows = {}
@@ -2711,15 +2782,19 @@ local function ReconcileAuthoritativeEvents(profile, events)
     local requeued = false
     for i = 1, #live do
         local event = live[i]
-        if authoredUnacked(event) then
+        local shouldResend = authoredUnacked(event)
+            or (canonicalCredit(event) and not keep[event.id] and not unsent[event.id])
+        if shouldResend then
             if type(queue) ~= "table" then
                 queue = {}
                 profile._consumablesUnsent = queue
             end
             if #queue >= maxEvents then break end
-            queue[#queue + 1] = event.id
-            unsent[event.id] = true
-            requeued = true
+            if not unsent[event.id] then
+                queue[#queue + 1] = event.id
+                unsent[event.id] = true
+                requeued = true
+            end
         end
     end
     if not liveRemoved and not archiveRemoved then return requeued end

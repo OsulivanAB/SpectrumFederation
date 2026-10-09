@@ -163,11 +163,71 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesArchiveFingerprint = desc.archiveFingerprint
 end
 
+function Sync:_RefreshConsumablesHistoryGate(profile)
+    if type(profile) ~= "table" then return end
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or not S.NeedsCatchUp then return end
+    local remote = profile._consumablesCatchUpRemote
+    if type(remote) ~= "table" then
+        profile._consumablesPeerHistoryAhead = nil
+        return
+    end
+    if not S.NeedsCatchUp(C.Descriptor(profile), remote) then
+        profile._consumablesCatchUpRemote = nil
+        profile._consumablesPeerHistoryAhead = nil
+    end
+end
+
+function Sync:_NotePeerConsumablesHistory(sender, payload)
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or type(payload) ~= "table" then return end
+    if not (self.state and self.state.active and self.state.isCoordinator) then return end
+    if payload.profileId ~= self.state.profileId then return end
+    if payload.sessionId and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
+        return
+    end
+    -- Ignore self-advertisements; peer recovery is for other authorized members.
+    local selfId = nil
+    if type(self._SelfId) == "function" then
+        selfId = self:_SelfId()
+    end
+    if type(sender) == "string" and type(selfId) == "string" and self._SamePlayer
+        and self:_SamePlayer(sender, selfId) then
+        return
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return end
+    local peerDesc = {
+        generation = payload.consumablesGeneration,
+        configSeq = payload.consumablesConfigSeq,
+        rejectionSeq = payload.consumablesRejectionSeq,
+        txnAllocSeq = payload.consumablesTxnAllocSeq,
+        configFingerprint = payload.consumablesConfigFingerprint,
+        eventCount = payload.consumablesEventCount,
+        eventFingerprint = payload.consumablesEventFingerprint,
+        archiveCount = payload.consumablesArchiveCount,
+        archiveFingerprint = payload.consumablesArchiveFingerprint,
+    }
+    local localDesc = C.Descriptor(profile)
+    if not (S.PeerHistoryAhead and S.PeerHistoryAhead(localDesc, peerDesc)) then
+        self:_RefreshConsumablesHistoryGate(profile)
+        return
+    end
+    profile._consumablesCatchUpRemote = (S.MergeHistoryWatermark and S.MergeHistoryWatermark(
+        profile._consumablesCatchUpRemote, peerDesc)) or peerDesc
+    profile._consumablesPeerHistoryAhead = true
+    Debug("Info", "coordinator holding consumables credits until peer history converges from %s",
+        tostring(sender))
+end
+
 function Sync:_ConsumablesHistoryReady(profile)
     if type(profile) ~= "table" then return true end
     local C = Consumables()
     local S = Rules()
     if not C or not S or not S.NeedsCatchUp then return true end
+    self:_RefreshConsumablesHistoryGate(profile)
     local remote = profile._consumablesCatchUpRemote
     if type(remote) ~= "table" then return true end
     return not S.NeedsCatchUp(C.Descriptor(profile), remote)
@@ -847,6 +907,9 @@ function Sync:HandleConsumablesEvent(sender, payload)
     end
     if isCoordinator and ok and not hadOrder and C.StampOrder then
         if not C.StampOrder(profile, event) then return end
+        if self._RefreshConsumablesHistoryGate then
+            self:_RefreshConsumablesHistoryGate(profile)
+        end
         self:BroadcastConsumablesEvent(profile, event)
         return
     end
@@ -854,9 +917,15 @@ function Sync:HandleConsumablesEvent(sender, payload)
         and S.RemoteEventIdOk and S.RemoteEventIdOk(event.id, sender) then
         local stamped = type(stored) == "table" and stored or nil
         if type(stamped) == "table" and C.ValidOrder(stamped.order) ~= nil then
+            if self._RefreshConsumablesHistoryGate then
+                self:_RefreshConsumablesHistoryGate(profile)
+            end
             self:BroadcastConsumablesEvent(profile, stamped)
         end
         return
+    end
+    if isCoordinator and ok and self._RefreshConsumablesHistoryGate then
+        self:_RefreshConsumablesHistoryGate(profile)
     end
     if not ok and status ~= "duplicate" then
         Debug("Verbose", "Ignored consumables event from %s (%s)", tostring(sender), tostring(status))
