@@ -481,6 +481,8 @@ load("SpectrumFederation/modules/LootHelper/Consumables.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesRouting.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesWorkflow.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesSync.lua")
+load("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
+load("SpectrumFederation/modules/LootHelper/ConsumablesVerification.lua")
 load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
 load("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
 load("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
@@ -492,10 +494,19 @@ local W = SF.ConsumablesWorkflow
 local S = SF.ConsumablesSync
 local Sync = SF.LootHelperSync
 local RT = SF.ConsumablesRuntime
+local O = SF.ConsumablesObservation
+local V = SF.ConsumablesVerification
 C._clock = function()
     clock = clock + 1
     return clock
 end
+if O then
+    O._clock = function() return clock end
+end
+if V then
+    V._clock = function() return clock end
+end
+_G.time = function() return clock end
 
 local notifyCount = 0
 C.RegisterUIListener(function() notifyCount = notifyCount + 1 end)
@@ -1639,7 +1650,88 @@ local function checkSessionTransport()
         "history-ready after baseline grace with no peer ahead")
     assertTrue(baselineCoord._consumablesHistoryUnconfirmedAt == nil,
         "baseline unconfirmed flag clears after grace")
+    assertTrue(tonumber(baselineCoord._consumablesHistoryBaselineAt) == nowBase,
+        "baseline timestamp retained after grace for clearly-new checks")
     Sync._Now = nil
+
+    -- Held pending clusters reevaluate when peer catch-up clears the history gate.
+    do
+        local V = SF.ConsumablesVerification
+        local O = SF.ConsumablesObservation
+        assertTrue(type(V) == "table" and type(O) == "table",
+            "verification/observation modules available for reeval lifecycle")
+        V.ClearSessionClusters()
+        local richPeer = profile("reeval-lifecycle-rich", admin)
+        richPeer._profileId = "reeval-lifecycle-rich"
+        richPeer._adminUsers = { admin, vann }
+        C.SetGuild(richPeer, admin, GUILD, 2)
+        C.AddRequestedItem(richPeer, admin, aqirite)
+        local dbRich = {}
+        local storeRich = O.EnsureProfileStore(dbRich, richPeer._profileId)
+        local scopeRich = O.EnsureScope(storeRich, GUILD.guid, 2)
+        local tuesday = {
+            localId = "co:reeval-life:1",
+            type = "deposit",
+            donor = donor,
+            itemId = aqirite,
+            quantity = 9,
+            guildGuid = GUILD.guid,
+            bankTab = 2,
+            generation = 1,
+            approxTxnTime = clock - 300,
+            ageHours = 0,
+            occurrenceIndex = 1,
+            neighborsOlder = { "deposit|Other-Realm|1|1" },
+            neighborsNewer = {},
+            observedBy = admin,
+            firstSeen = clock - 300,
+            status = "pending",
+            coreSignature = O.CoreSignature("deposit", donor, aqirite, 9),
+        }
+        assertEq(V.IngestReport(richPeer, richPeer._profileId, admin, { tuesday }, {
+            isAdmin = true, scope = scopeRich, obsStore = storeRich, historyComplete = true,
+        }).verified, 1, "reeval-lifecycle rich peer verifies Tuesday")
+        assertTrue(V.CommitVerifiedCluster(richPeer, V.ListVerifiedClusters(richPeer._profileId)[1], admin))
+        local txnRich = V.ListVerifiedClusters(richPeer._profileId)[1].txnId
+        local richSnap = C.ExportSnapshot(richPeer)
+
+        V.ClearSessionClusters()
+        local lateHold = profile("reeval-lifecycle-late", admin)
+        lateHold._profileId = "reeval-lifecycle-late"
+        lateHold._adminUsers = { admin, vann }
+        C.SetGuild(lateHold, admin, GUILD, 2)
+        C.AddRequestedItem(lateHold, admin, aqirite)
+        sessionStubs({ active = true, isCoordinator = true, coordinator = admin, sessionId = "s-reeval",
+            profileId = lateHold._profileId, peers = {} },
+            { [lateHold._profileId] = lateHold }, {})
+        Sync._SelfId = function() return admin end
+        Sync._Now = function() return clock end
+        Sync:_MarkConsumablesHistoryBaseline(lateHold, "reeval-lifecycle")
+        lateHold._consumablesPeerHistoryAhead = true
+        lateHold._consumablesCatchUpRemote = C.Descriptor(richPeer)
+        SF.lootHelperDB = {}
+        local storeLate = O.EnsureProfileStore(SF.lootHelperDB, lateHold._profileId)
+        local scopeLate = O.EnsureScope(storeLate, GUILD.guid, 2)
+        local held = V.IngestReport(lateHold, lateHold._profileId, admin, { tuesday }, {
+            isAdmin = true, scope = scopeLate, obsStore = storeLate, historyComplete = false,
+            historyBaselineAt = lateHold._consumablesHistoryBaselineAt,
+        })
+        assertEq(held.pending, 1, "reeval-lifecycle holds pending during peer-ahead")
+        assertEq(C.ContributionTotal(lateHold, donor, aqirite), 0, "reeval-lifecycle no premature credit")
+        assertTrue(select(1, C.MergeSnapshot(lateHold, richSnap, { consumablesFromCoordinator = false })),
+            "reeval-lifecycle absorbs peer history")
+        Sync:_RefreshConsumablesHistoryGate(lateHold)
+        assertTrue(Sync:_ConsumablesHistoryReady(lateHold),
+            "reeval-lifecycle history ready after peer absorb")
+        assertTrue(C.FindRegistryTxn(lateHold, txnRich) ~= nil,
+            "reeval-lifecycle recovered original txnId")
+        local cluster = V.EnsureClusterStore(lateHold._profileId).clusters[1]
+        assertTrue(cluster and (cluster.status == "verified" or V.ValidTxnId(cluster.txnId)),
+            "reeval-lifecycle pending cluster reconsidered after gate clears")
+        assertEq(C.ContributionTotal(lateHold, donor, aqirite), 9,
+            "reeval-lifecycle credits Tuesday once after reevaluation")
+        Sync._Now = nil
+    end
 
     -- Restore the follower session under test before Preview as Non-Admin checks.
     sessionStubs({ active = true, isCoordinator = false, coordinator = admin, sessionId = "s1",

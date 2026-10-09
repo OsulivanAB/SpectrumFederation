@@ -195,6 +195,9 @@ function Sync:_RefreshConsumablesHistoryGate(profile)
     local S = Rules()
     if not C or not S then return end
     local now = (self._Now and self:_Now()) or (C.Now and C.Now()) or 0
+    local wasBlocking = profile._consumablesPeerHistoryAhead
+        or tonumber(profile._consumablesHistoryUnconfirmedAt)
+    local caughtUpFromPeer = false
     local remote = profile._consumablesCatchUpRemote
     if type(remote) ~= "table" then
         profile._consumablesPeerHistoryAhead = nil
@@ -205,6 +208,9 @@ function Sync:_RefreshConsumablesHistoryGate(profile)
         -- must not keep verification blocked after ledger recovery from a peer.
         local historyBehind = S.PeerHistoryAhead and S.PeerHistoryAhead(localDesc, remote)
         if not historyBehind then
+            if profile._consumablesPeerHistoryAhead then
+                caughtUpFromPeer = true
+            end
             profile._consumablesPeerHistoryAhead = nil
             profile._consumablesHistoryPeer = nil
             profile._consumablesPeerRecoveryAt = nil
@@ -213,14 +219,23 @@ function Sync:_RefreshConsumablesHistoryGate(profile)
             end
         end
     end
-    -- Clear the pre-advertisement baseline once grace elapses with no peer-ahead.
-    if not profile._consumablesPeerHistoryAhead then
+    -- Peer absorb that clears ahead ends the pre-advertisement hold entirely.
+    if caughtUpFromPeer then
+        profile._consumablesHistoryUnconfirmedAt = nil
+        profile._consumablesHistoryBaselineAt = nil
+    elseif not profile._consumablesPeerHistoryAhead then
+        -- Grace ends the hold, but keep baselineAt so reevaluation still applies
+        -- conservative clearly-new checks before minting.
         local unconfirmedAt = tonumber(profile._consumablesHistoryUnconfirmedAt)
         local grace = tonumber(self.CONSUMABLES_HISTORY_BASELINE_GRACE_SEC) or 90
         if unconfirmedAt and (now - unconfirmedAt) >= grace then
             profile._consumablesHistoryUnconfirmedAt = nil
-            profile._consumablesHistoryBaselineAt = nil
         end
+    end
+    local stillBlocking = profile._consumablesPeerHistoryAhead
+        or tonumber(profile._consumablesHistoryUnconfirmedAt)
+    if wasBlocking and not stillBlocking and self._ReevaluateHeldConsumablesObservations then
+        self:_ReevaluateHeldConsumablesObservations(profile)
     end
 end
 
@@ -1053,6 +1068,42 @@ local function ObservationScopeFor(profile)
     if not store then return nil, nil, nil end
     local scope = O.EnsureScope(store, cfg.guild.guid, tab)
     return store, scope, { guildGuid = cfg.guild.guid, bankTab = tab, profileId = profileId }
+end
+
+-- Bounded coordinator retry of already-authenticated pending clusters when the
+-- history gate transitions to ready. Does not trust peer witness maps.
+function Sync:_ReevaluateHeldConsumablesObservations(profile)
+    if type(profile) ~= "table" then return end
+    if not (self.state and self.state.active and self.state.isCoordinator) then return end
+    if self:_ConsumablesHistoryReady(profile) == false then return end
+    local V = SF.ConsumablesVerification
+    local C = Consumables()
+    if not V or not V.ReevaluateHeldClusters or not C then return end
+    local _, _, meta = ObservationScopeFor(profile)
+    if not meta then return end
+    local now = (self._Now and self:_Now()) or (C.Now and C.Now()) or 0
+    local lastAt = tonumber(profile._consumablesHistoryReevalAt)
+    if lastAt and (now - lastAt) < 5 then return end
+    profile._consumablesHistoryReevalAt = now
+    local stats = V.ReevaluateHeldClusters(profile, meta.profileId, {
+        historyComplete = true,
+        historyBaselineAt = tonumber(profile._consumablesHistoryBaselineAt),
+        clearPendingWitness = function(evidence)
+            if C.ClearPendingWitness then
+                C.ClearPendingWitness(profile, evidence)
+            end
+        end,
+    })
+    if ((stats.verified or 0) > 0 or (stats.committed or 0) > 0)
+        and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(profile)
+    end
+    if (stats.committed or 0) > 0 and self._FlushUnsentConsumablesEvents then
+        self:_FlushUnsentConsumablesEvents(profile)
+    end
+    Debug("Info", "reevaluated held consumables observations verified=%s adopted=%s committed=%s pending=%s",
+        tostring(stats.verified), tostring(stats.adopted),
+        tostring(stats.committed), tostring(stats.pending))
 end
 
 function Sync:_FlushPendingConsumableObservations(profile)

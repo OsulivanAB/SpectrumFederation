@@ -2850,8 +2850,17 @@ local function ReconcileAuthoritativeEvents(profile, events)
     local requeued = false
     for i = 1, #live do
         local event = live[i]
-        local shouldResend = authoredUnacked(event)
-            or (canonicalCredit(event) and not keep[event.id] and not unsent[event.id])
+        -- Preserve third-party canonical credits locally, but only enqueue a
+        -- normal event resend when this client authored the event id. Foreign
+        -- credits recover through authorized history/snapshot paths instead.
+        local selfAuthoredCredit = canonicalCredit(event)
+            and not keep[event.id]
+            and not unsent[event.id]
+            and type(selfId) == "string"
+            and selfId ~= ""
+            and Rules and Rules.RemoteEventIdOk
+            and Rules.RemoteEventIdOk(event.id, selfId)
+        local shouldResend = authoredUnacked(event) or selfAuthoredCredit
         if shouldResend then
             if type(queue) ~= "table" then
                 queue = {}

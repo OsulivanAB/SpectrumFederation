@@ -760,6 +760,48 @@ function V.HydrateClustersFromDurable(profile, profileId)
     return added
 end
 
+-- Floored whole-hour Guild Bank ages can place the real deposit up to ~1h earlier
+-- than approxTxnTime. Only treat evidence as clearly post-baseline when that
+-- earliest bound is still at/after the baseline; missing age stays held.
+local function EvidenceClearlyNew(evidence, baselineAt)
+    local baseline = tonumber(baselineAt)
+    if not baseline or type(evidence) ~= "table" then return false end
+    local approx = tonumber(evidence.approxTxnTime)
+    local ageHours = tonumber(evidence.ageHours)
+    if not approx or ageHours == nil then return false end
+    return (approx - 3600) >= baseline
+end
+
+local function HasRecoveredVerifiedIdentity(profile, cluster)
+    if type(cluster) ~= "table" or not C then return false end
+    local txnId = V.ValidTxnId(cluster.txnId)
+    if not txnId then return false end
+    if C.HasTxnId and C.HasTxnId(profile, txnId) then return true end
+    local entry = C.FindRegistryTxn and C.FindRegistryTxn(profile, txnId)
+    return type(entry) == "table" and entry.status == "verified"
+end
+
+-- Adopt a recovered verified ledger/registry identity onto the cluster.
+-- Local rejection IDs do not count as recovered; evidence match can replace them.
+local function AdoptRecoveredTxnId(profile, profileId, cluster)
+    if not cluster or type(cluster.evidence) ~= "table" then return false end
+    if HasRecoveredVerifiedIdentity(profile, cluster) then return true end
+    local ledgerHit = V.FindEquivalentLedgerDonation and V.FindEquivalentLedgerDonation(
+        profile, profileId, cluster.evidence)
+    if ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
+        cluster.txnId = ledgerHit.txnId
+        cluster.verification = ledgerHit.verification or cluster.verification or V.VERIFICATION.MANUAL
+        return true
+    end
+    local regHow, regEntry = V.ReconcileAgainstRegistry(profile, cluster.evidence)
+    if regHow == "verified" and regEntry and V.ValidTxnId(regEntry.txnId) then
+        cluster.txnId = regEntry.txnId
+        cluster.verification = regEntry.verification or cluster.verification or V.VERIFICATION.MANUAL
+        return true
+    end
+    return false
+end
+
 function V.IngestReport(profile, profileId, submittedBy, observations, opts)
     opts = opts or {}
     submittedBy = Norm(submittedBy)
@@ -882,9 +924,7 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                         end
 
                         local historyReady = opts.historyComplete ~= false
-                        local baselineAt = tonumber(opts.historyBaselineAt)
-                        local approxAt = tonumber(evidence.approxTxnTime)
-                        local clearlyNew = baselineAt and approxAt and approxAt >= baselineAt
+                        local clearlyNew = EvidenceClearlyNew(evidence, opts.historyBaselineAt)
                         if how == "verified" or cluster.status == "verified" or cluster.status == "rejected" then
                             if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
                                 opts.clearPendingWitness(evidence)
@@ -893,7 +933,7 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                             stats.pending = stats.pending + 1
                         elseif not historyReady and not cluster.txnId and not clearlyNew then
                             -- Incomplete synchronized history: never mint overlapping credits.
-                            -- Clearly-new deposits (approxTxnTime at/after baseline) may still mint.
+                            -- Clearly-new requires earliest-possible time at/after baseline.
                             stats.pending = stats.pending + 1
                             Debug("Info", "holding uncertain credit until history converges donor=%s",
                                 tostring(evidence.donor))
@@ -939,32 +979,6 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
         end
     end
     return stats
-end
-
-local function EvidenceClearlyNew(evidence, baselineAt)
-    local baseline = tonumber(baselineAt)
-    local approx = type(evidence) == "table" and tonumber(evidence.approxTxnTime) or nil
-    return baseline and approx and approx >= baseline
-end
-
-local function AdoptRecoveredTxnId(profile, profileId, cluster)
-    if not cluster or V.ValidTxnId(cluster.txnId) or type(cluster.evidence) ~= "table" then
-        return false
-    end
-    local ledgerHit = V.FindEquivalentLedgerDonation and V.FindEquivalentLedgerDonation(
-        profile, profileId, cluster.evidence)
-    if ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
-        cluster.txnId = ledgerHit.txnId
-        cluster.verification = ledgerHit.verification or cluster.verification or V.VERIFICATION.MANUAL
-        return true
-    end
-    local regHow, regEntry = V.ReconcileAgainstRegistry(profile, cluster.evidence)
-    if regHow == "verified" and regEntry and V.ValidTxnId(regEntry.txnId) then
-        cluster.txnId = regEntry.txnId
-        cluster.verification = regEntry.verification or cluster.verification or V.VERIFICATION.MANUAL
-        return true
-    end
-    return false
 end
 
 function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
@@ -1084,25 +1098,30 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
         return true, "rejected", cluster
     end
 
+    -- Prefer a recovered verified ledger/registry identity over a local rejection ID.
+    if not HasRecoveredVerifiedIdentity(profile, cluster) then
+        AdoptRecoveredTxnId(profile, profileId, cluster)
+    end
+
+    -- Incomplete history: do not commit unless identity is recovered verified or
+    -- evidence is conservatively clearly-new. A local rejection txnId alone is not enough.
+    local historyReady = opts.historyComplete ~= false
+    if not historyReady then
+        if not HasRecoveredVerifiedIdentity(profile, cluster)
+            and not EvidenceClearlyNew(cluster.evidence, opts.historyBaselineAt) then
+            Debug("Info", "approve/correct held until history converges cluster=%s",
+                tostring(cluster.clusterId))
+            return false, "history_incomplete", cluster
+        end
+    end
+
+    -- Clear rejection only after history/identity validation succeeds.
     if action == "correct" then
         if opts.scope then
             V.ClearMatchingRejection(opts.scope, cluster.evidence)
         end
         if opts.clearDurableRejection and type(opts.clearDurableRejection) == "function" then
             opts.clearDurableRejection(cluster.evidence)
-        end
-        -- Fall through to approve after clearing rejection.
-    end
-
-    -- Incomplete history: never mint a new canonical ID. Adopt a recovered
-    -- registry/ledger identity when available; allow clearly-new deposits.
-    local historyReady = opts.historyComplete ~= false
-    if not historyReady and not V.ValidTxnId(cluster.txnId) then
-        if not AdoptRecoveredTxnId(profile, profileId, cluster)
-            and not EvidenceClearlyNew(cluster.evidence, opts.historyBaselineAt) then
-            Debug("Info", "approve held until history converges cluster=%s",
-                tostring(cluster.clusterId))
-            return false, "history_incomplete", cluster
         end
     end
 
@@ -1114,7 +1133,8 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
         cluster.txnId = V.AllocateCanonicalTxn(
             profile, cluster.evidence, decidedBy, V.VERIFICATION.MANUAL)
     elseif C and C.RegisterCanonicalTxn and cluster.evidence then
-        -- Correction/approve of a prior rejection must flip registry status.
+        -- Correction/approve flips registry status (same ID when correcting a rejection
+        -- with no recovered alternate, or the adopted recovered verified ID).
         local entry = V.RegistryEntryFromEvidence(
             cluster.evidence, cluster.txnId, "verified", decidedBy, V.VERIFICATION.MANUAL, {
                 committed = C.HasTxnId and C.HasTxnId(profile, cluster.txnId) or false,
@@ -1275,6 +1295,93 @@ function V.CommitVerifiedCluster(profile, cluster, writer)
             tostring(cluster.txnId), tostring(event.actor), tostring(event.itemId), tostring(event.quantity))
     end
     return ok, err
+end
+
+-- Reconsider pending clusters after history becomes ready (peer absorb / grace).
+-- Prefers recovered verified identities; may complete admin/witness quorum without
+-- minting duplicates. Ambiguous rows stay for manual review.
+function V.ReevaluateHeldClusters(profile, profileId, opts)
+    opts = opts or {}
+    local stats = { verified = 0, pending = 0, adopted = 0, committed = 0 }
+    if type(profile) ~= "table" or type(profileId) ~= "string" then return stats end
+    if opts.historyComplete == false then return stats end
+    local store = V.EnsureClusterStore(profileId)
+    local baselineAt = opts.historyBaselineAt
+    for i = 1, #store.clusters do
+        local cluster = store.clusters[i]
+        if type(cluster) == "table"
+            and (cluster.status == "pending" or cluster.status == "ambiguous")
+        then
+            if cluster.status == "ambiguous" then
+                stats.pending = stats.pending + 1
+            elseif AdoptRecoveredTxnId(profile, profileId, cluster) then
+                cluster.status = "verified"
+                cluster.verification = cluster.verification or V.VERIFICATION.MANUAL
+                cluster.updatedAt = Now()
+                stats.adopted = stats.adopted + 1
+                stats.verified = stats.verified + 1
+            else
+                local witnesses = V.CountIndependentWitnesses(cluster.witnesses, profile)
+                local adminReporter = nil
+                if type(cluster.witnesses) == "table" and C and C.IsCanonicalAdmin then
+                    for name in pairs(cluster.witnesses) do
+                        if type(name) == "string" and C.IsCanonicalAdmin(profile, name) then
+                            adminReporter = name
+                            break
+                        end
+                    end
+                end
+                -- After readiness, complete held admin/witness quorums only when
+                -- evidence is conservatively post-baseline (or no baseline remains
+                -- after peer recovery cleared it). Otherwise keep pending for review.
+                local mayMint = EvidenceClearlyNew(cluster.evidence, baselineAt)
+                    or baselineAt == nil
+                if mayMint and adminReporter then
+                    cluster.status = "verified"
+                    cluster.verification = V.VERIFICATION.ADMIN_TRUST
+                    cluster.decidedBy = adminReporter
+                    cluster.txnId = cluster.txnId or V.AllocateCanonicalTxn(
+                        profile, cluster.evidence, adminReporter, V.VERIFICATION.ADMIN_TRUST)
+                    cluster.updatedAt = Now()
+                    stats.verified = stats.verified + 1
+                elseif mayMint and witnesses >= V.WITNESS_THRESHOLD then
+                    local decidedBy = cluster.decidedBy
+                    if type(cluster.witnesses) == "table" then
+                        for name in pairs(cluster.witnesses) do
+                            decidedBy = name
+                        end
+                    end
+                    decidedBy = Norm(decidedBy) or "local"
+                    cluster.status = "verified"
+                    cluster.verification = V.VERIFICATION.WITNESSES
+                    cluster.decidedBy = decidedBy
+                    cluster.txnId = cluster.txnId or V.AllocateCanonicalTxn(
+                        profile, cluster.evidence, decidedBy, V.VERIFICATION.WITNESSES)
+                    cluster.updatedAt = Now()
+                    stats.verified = stats.verified + 1
+                else
+                    stats.pending = stats.pending + 1
+                end
+            end
+        end
+    end
+    for i = 1, #store.clusters do
+        local cluster = store.clusters[i]
+        if cluster and cluster.status == "verified" and not cluster._committed
+            and V.ValidTxnId(cluster.txnId) then
+            local writer = cluster.decidedBy
+            local ok = V.CommitVerifiedCluster(profile, cluster, writer)
+            if ok then
+                cluster._committed = true
+                stats.committed = stats.committed + 1
+                if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function"
+                    and cluster.evidence then
+                    opts.clearPendingWitness(cluster.evidence)
+                end
+            end
+        end
+    end
+    return stats
 end
 
 function V.MarkLocalObservationVerified(obs, txnId, verification)

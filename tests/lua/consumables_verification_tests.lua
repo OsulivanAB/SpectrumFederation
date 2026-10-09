@@ -1372,8 +1372,12 @@ do
     assertEq(#(C.TxnRegistry(coordB) or {}), 0, "handoff-recover B starts empty")
 
     -- A's richer history must survive B's incomplete authoritative snapshot.
+    -- Resend enqueue is scoped to this client's authored event ids.
+    local prevSelfHandoff = SF.NameUtil.GetSelfId
+    SF.NameUtil.GetSelfId = function() return admin end
     assertTrue(select(1, C.MergeSnapshot(coordA, incompleteSnap, { consumablesFromCoordinator = true })),
         "handoff-recover incomplete B snapshot applies without error")
+    SF.NameUtil.GetSelfId = prevSelfHandoff
     assertTrue(C.FindRegistryTxn(coordA, txnId) ~= nil,
         "handoff-recover A keeps Tuesday registry after incomplete B overwrite attempt")
     assertEq(C.ContributionTotal(coordA, donor, flask), 17,
@@ -2103,6 +2107,7 @@ do
     local scopeA = O.EnsureScope(storeA, "club-1", 2)
     local tuesday = evidence({
         quantity = 11, neighborsOlder = { "pre-adv" }, approxTxnTime = clock - 500,
+        ageHours = 0,
     })
     assertEq(V.IngestReport(coordA, "pre-adv-a", admin, { tuesday }, {
         isAdmin = true, scope = scopeA, obsStore = storeA, historyComplete = true,
@@ -2114,28 +2119,40 @@ do
     V.ClearSessionClusters()
     local coordB = makeProfile("pre-adv-b", { admin, "CoordB-Realm" })
     -- Simulate newly elected coordinator before any HAVE_PROFILE: baseline unconfirmed.
-    coordB._consumablesHistoryBaselineAt = clock - 10
-    coordB._consumablesHistoryUnconfirmedAt = clock - 10
+    local baselineAt = clock - 10
+    coordB._consumablesHistoryBaselineAt = baselineAt
+    coordB._consumablesHistoryUnconfirmedAt = baselineAt
     local dbB = {}
     local storeB = O.EnsureProfileStore(dbB, "pre-adv-b")
     local scopeB = O.EnsureScope(storeB, "club-1", 2)
-    local held = V.IngestReport(coordB, "pre-adv-b", "CoordB-Realm", { tuesday }, {
+    -- Age-0 observation just after promotion can describe a pre-baseline deposit.
+    local age0 = evidence({
+        quantity = 11, neighborsOlder = { "pre-adv" },
+        approxTxnTime = clock, ageHours = 0, occurrenceIndex = 3,
+    })
+    local heldAge0 = V.IngestReport(coordB, "pre-adv-b", "CoordB-Realm", { age0 }, {
         isAdmin = true, scope = scopeB, obsStore = storeB,
         historyComplete = false,
-        historyBaselineAt = coordB._consumablesHistoryBaselineAt,
+        historyBaselineAt = baselineAt,
     })
-    assertEq(held.verified, 0, "pre-adv B does not mint before peer advertisement")
-    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "pre-adv B no premature credit")
-    -- Clearly-new deposit at/after baseline may still verify.
+    assertEq(heldAge0.verified, 0, "pre-adv age-0 post-promotion observation stays held")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "pre-adv age-0 does not mint")
+    local okAge0 = V.ApplyDecision(coordB, "pre-adv-b", "CoordB-Realm", {
+        action = "approve", clusterId = V.EnsureClusterStore("pre-adv-b").clusters[1].clusterId,
+    }, {
+        isAdmin = true, scope = scopeB, historyComplete = false, historyBaselineAt = baselineAt,
+    })
+    assertFalse(okAge0, "pre-adv age-0 manual approve also held")
+    -- Conservatively clearly-new: earliest bound (approx-3600) still >= baseline.
     local fresh = evidence({
         quantity = 2, neighborsOlder = { "pre-adv-new" },
-        approxTxnTime = clock, occurrenceIndex = 1,
+        approxTxnTime = baselineAt + 3600 + 30, ageHours = 0, occurrenceIndex = 1,
         coreSignature = O.CoreSignature("deposit", donor, flask, 2),
     })
     assertEq(V.IngestReport(coordB, "pre-adv-b", "CoordB-Realm", { fresh }, {
         isAdmin = true, scope = scopeB, obsStore = storeB,
         historyComplete = false,
-        historyBaselineAt = coordB._consumablesHistoryBaselineAt,
+        historyBaselineAt = baselineAt,
     }).verified, 1, "pre-adv clearly-new deposit still verifies during baseline")
     local freshCluster = V.ListVerifiedClusters("pre-adv-b")[1]
     assertTrue(V.CommitVerifiedCluster(coordB, freshCluster, "CoordB-Realm"))
@@ -2146,6 +2163,159 @@ do
     assertTrue(C.FindRegistryTxn(coordB, txnA) ~= nil, "pre-adv recovered Tuesday txnId")
     assertEq(C.ContributionTotal(coordB, donor, flask), 13,
         "pre-adv Tuesday + clearly-new credits without duplicate Tuesday")
+end
+
+-- 17. Rejected txnId must not bypass history hold on correct
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("rej-hold-a", { admin, "CoordB-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "rej-hold-a")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local tuesday = evidence({
+        quantity = 19, neighborsOlder = { "rej-hold" }, approxTxnTime = clock - 450,
+        ageHours = 0,
+    })
+    assertEq(V.IngestReport(coordA, "rej-hold-a", admin, { tuesday }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA, historyComplete = true,
+    }).verified, 1, "rej-hold A verifies Tuesday")
+    local txnA = V.ListVerifiedClusters("rej-hold-a")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(coordA, V.ListVerifiedClusters("rej-hold-a")[1], admin))
+    local rich = C.ExportSnapshot(coordA)
+
+    V.ClearSessionClusters()
+    local coordB = makeProfile("rej-hold-b", { admin, "CoordB-Realm" })
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "rej-hold-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local held = V.IngestReport(coordB, "rej-hold-b", "CoordB-Realm", { tuesday }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = false,
+    })
+    assertEq(held.pending, 1, "rej-hold B holds pending")
+    local pending = V.EnsureClusterStore("rej-hold-b").clusters[1]
+    assertTrue(select(1, V.ApplyDecision(coordB, "rej-hold-b", "CoordB-Realm", {
+        action = "reject", clusterId = pending.clusterId, reason = "wait",
+    }, {
+        isAdmin = true, scope = scopeB, historyComplete = false,
+        recordDurableRejection = function(evidence, decidedBy, reason)
+            C.RecordDurableRejection(coordB, evidence, decidedBy, reason)
+        end,
+    })), "rej-hold reject allowed during hold")
+    assertTrue(V.ValidTxnId(pending.txnId) ~= nil, "rej-hold reject allocated a txnId")
+    assertTrue(V.IsRejected(scopeB, tuesday), "rej-hold scope rejection recorded")
+    local ok, status = V.ApplyDecision(coordB, "rej-hold-b", "CoordB-Realm", {
+        action = "correct", clusterId = pending.clusterId,
+    }, {
+        isAdmin = true, scope = scopeB, historyComplete = false,
+        clearDurableRejection = function(evidence)
+            C.ClearDurableRejection(coordB, evidence)
+        end,
+    })
+    assertFalse(ok, "rej-hold correct blocked before recovery")
+    assertEq(status, "history_incomplete", "rej-hold correct reports history_incomplete")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "rej-hold no credit from blocked correct")
+    assertTrue(V.IsRejected(scopeB, tuesday), "rej-hold rejection preserved after blocked correct")
+    assertTrue(select(1, C.MergeSnapshot(coordB, rich, { consumablesFromCoordinator = true })),
+        "rej-hold B absorbs original Tuesday history")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 19, "rej-hold credits original once")
+    local ok2, status2, cluster2 = V.ApplyDecision(coordB, "rej-hold-b", "CoordB-Realm", {
+        action = "correct", clusterId = pending.clusterId,
+    }, {
+        isAdmin = true, scope = scopeB, historyComplete = true,
+        clearDurableRejection = function(evidence)
+            C.ClearDurableRejection(coordB, evidence)
+        end,
+    })
+    assertTrue(ok2, "rej-hold correct after recovery succeeds")
+    assertEq(status2, "verified", "rej-hold correct verifies")
+    assertEq(cluster2.txnId, txnA, "rej-hold correct adopts original txnId")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 19, "rej-hold no duplicate after correct")
+end
+
+-- 18. Held pending clusters reevaluate when history becomes ready
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("reeval-a", { admin, "CoordB-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "reeval-a")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local tuesday = evidence({
+        quantity = 13, neighborsOlder = { "reeval-n" }, approxTxnTime = clock - 480,
+        ageHours = 0,
+    })
+    assertEq(V.IngestReport(coordA, "reeval-a", admin, { tuesday }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA, historyComplete = true,
+    }).verified, 1, "reeval A verifies Tuesday")
+    local txnA = V.ListVerifiedClusters("reeval-a")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(coordA, V.ListVerifiedClusters("reeval-a")[1], admin))
+    local rich = C.ExportSnapshot(coordA)
+
+    V.ClearSessionClusters()
+    local coordB = makeProfile("reeval-b", { admin, "CoordB-Realm" })
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "reeval-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local held = V.IngestReport(coordB, "reeval-b", "CoordB-Realm", { tuesday }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = false,
+    })
+    assertEq(held.pending, 1, "reeval B holds pending cluster")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "reeval B no credit yet")
+    assertTrue(select(1, C.MergeSnapshot(coordB, rich, { consumablesFromCoordinator = false })),
+        "reeval B absorbs peer history")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 13, "reeval ledger recovered")
+    local stats = V.ReevaluateHeldClusters(coordB, "reeval-b", {
+        historyComplete = true,
+        clearPendingWitness = function(evidence)
+            C.ClearPendingWitness(coordB, evidence)
+        end,
+    })
+    assertTrue((stats.adopted or 0) >= 1 or (stats.verified or 0) >= 1,
+        "reeval adopts recovered identity onto held cluster")
+    local how, entry = V.ReconcileAgainstRegistry(coordB, tuesday)
+    assertEq(how, "verified", "reeval registry still verified")
+    assertEq(entry.txnId, txnA, "reeval keeps original txnId")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 13, "reeval no duplicate credit")
+end
+
+-- 19. Followers do not resend third-party canonical credits
+do
+    V.ClearSessionClusters()
+    local author = makeProfile("foreign-resend-a", { admin, "Helper-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "foreign-resend-a")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local ev = evidence({
+        quantity = 6, neighborsOlder = { "foreign-n" }, approxTxnTime = clock - 200,
+    })
+    assertEq(V.IngestReport(author, "foreign-resend-a", admin, { ev }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA, historyComplete = true,
+    }).verified, 1, "foreign-resend author verifies")
+    assertTrue(V.CommitVerifiedCluster(author, V.ListVerifiedClusters("foreign-resend-a")[1], admin))
+    local txnId = V.ListVerifiedClusters("foreign-resend-a")[1].txnId
+    local authoredId = author._consumableEvents[1].id
+    assertTrue(S.RemoteEventIdOk(authoredId, admin), "foreign-resend event id belongs to author")
+
+    local follower = makeProfile("foreign-resend-b", { admin, "Helper-Realm" })
+    assertTrue(select(1, C.MergeSnapshot(follower, C.ExportSnapshot(author), {
+        consumablesFromCoordinator = true,
+    })), "foreign-resend follower receives author credit")
+    assertEq(C.ContributionTotal(follower, donor, flask), 6, "foreign-resend follower has credit")
+    assertTrue(C.HasTxnId(follower, txnId), "foreign-resend follower has txnId")
+    local emptyCoord = makeProfile("foreign-resend-empty", { admin, "Helper-Realm" })
+    local prevSelf = SF.NameUtil.GetSelfId
+    SF.NameUtil.GetSelfId = function() return "Helper-Realm" end
+    assertTrue(select(1, C.MergeSnapshot(follower, C.ExportSnapshot(emptyCoord), {
+        consumablesFromCoordinator = true,
+    })), "foreign-resend incomplete coordinator snapshot applies")
+    SF.NameUtil.GetSelfId = prevSelf
+    assertEq(C.ContributionTotal(follower, donor, flask), 6,
+        "foreign-resend follower preserves third-party credit locally")
+    local unsent = follower._consumablesUnsent or {}
+    local queuedForeign = false
+    for i = 1, #unsent do
+        if unsent[i] == authoredId then queuedForeign = true end
+    end
+    assertFalse(queuedForeign, "foreign-resend does not queue third-party event for resend")
 end
 
 if failures > 0 then
