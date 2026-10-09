@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.13] - 2026-10-09
+
+### Changed
+- Raid Consumables: Guild Bank observation and reconciliation foundation (#366 PR1)
+
 ## [1.5.8-beta.12] - 2026-10-08
 
 ### Added
