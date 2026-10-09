@@ -11,8 +11,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS = REPO_ROOT / "tests" / "lua" / "consumables_tests.lua"
+OBSERVATION_TESTS = REPO_ROOT / "tests" / "lua" / "consumables_observation_tests.lua"
 RUNTIME = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesRuntime.lua"
 WORKFLOW = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesWorkflow.lua"
+OBSERVATION = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesObservation.lua"
+BANK_LOG = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesBankLog.lua"
 SYNC_TRANSPORT = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "19_Consumables.lua"
 
 
@@ -34,6 +37,23 @@ def test_consumables_production_lua():
     if result.returncode != 0:
         pytest.fail(
             "lua5.1 Raid Consumables tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert re.search(r"(?m)^\d+ passed, 0 failed$", result.stdout), result.stdout
+
+
+def test_consumables_observation_production_lua():
+    result = subprocess.run(
+        [_lua51(), str(OBSERVATION_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Raid Consumables observation tests failed\n"
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
@@ -63,6 +83,19 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     runtime = RUNTIME.read_text(encoding="utf-8")
     assert 'TryRegister(frame, "GUILDBANKBAGSLOTS_CHANGED")' in runtime
     assert "PickupGuildBankItem(work.tab" in runtime
+    observation = OBSERVATION.read_text(encoding="utf-8")
+    bank_log = BANK_LOG.read_text(encoding="utf-8")
+    assert "function O.ReconcileSnapshot" in observation
+    assert "PENDING_TTL_SECONDS" in observation
+    assert "QueryGuildBankLog" in bank_log
+    assert 'TryRegister(frame, "GUILDBANKLOG_UPDATE")' in bank_log
+    assert "GetGuildBankTransaction" in bank_log
+    assert "GetNumGuildBankTransactions" in bank_log
+    assert "CommitEvents" not in observation
+    assert "DepositEvents" not in observation
+    assert "CommitEvents" not in bank_log
+    assert "DepositEvents" not in bank_log
+    assert "SF.ConsumablesBankLog:Init()" in runtime
     assert "C_SpellBook.IsSpellKnown" in runtime
     assert "SecureActionButtonTemplate" in runtime
     assert 'TryRegister(frame, "SPELL_UPDATE_COOLDOWN")' in runtime
@@ -172,8 +205,11 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
     locale_at = toc.find("locale/enUS.lua")
     runtime_at = toc.find("modules/LootHelper/ConsumablesRuntime.lua")
     domain_at = toc.find("modules/LootHelper/Consumables.lua")
+    observation_at = toc.find("modules/LootHelper/ConsumablesObservation.lua")
+    bank_log_at = toc.find("modules/LootHelper/ConsumablesBankLog.lua")
     assert locale_at != -1, "locale/enUS.lua must be listed in the parent TOC"
     assert locale_at < domain_at < runtime_at
+    assert domain_at < observation_at < bank_log_at < runtime_at
 
     for key in (
         "RAID_SUPPLIES_OVERALL_PROGRESS",

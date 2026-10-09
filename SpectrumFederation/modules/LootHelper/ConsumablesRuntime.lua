@@ -2404,5 +2404,8 @@ function Runtime:Init()
         end)
     end
     self:CompleteDeferredProfileDeletes()
+    if SF.ConsumablesBankLog and SF.ConsumablesBankLog.Init then
+        SF.ConsumablesBankLog:Init()
+    end
     Debug("Info", "Raid Consumables runtime initialized")
 end
