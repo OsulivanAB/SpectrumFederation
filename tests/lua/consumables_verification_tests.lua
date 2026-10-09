@@ -1723,6 +1723,133 @@ do
         "peer-preserve durable rejection survives peer recovery")
 end
 
+-- 13c1. Peer-asserted forged witnesses must not pad coordinator quorum
+do
+    V.ClearSessionClusters()
+    local coord = makeProfile("peer-forge-quorum", { admin, "PeerAdmin-Realm" })
+    local ev = evidence({
+        quantity = 7, neighborsOlder = { "forge-n" }, approxTxnTime = clock - 70,
+    })
+    -- One authenticated local witness only; peer will try to invent the rest.
+    assertTrue(C.UpsertPendingWitness(coord, ev, w1, { [w1] = clock }))
+    assertEq(#C.PendingWitnesses(coord), 1, "peer-forge starts with one aggregate")
+    local forgedPeer = makeProfile("peer-forge-source", { admin, "PeerAdmin-Realm" })
+    forgedPeer._consumables.pendingWitnesses = {
+        {
+            evidence = {
+                coreSignature = ev.coreSignature,
+                approxTxnTime = ev.approxTxnTime,
+                donor = ev.donor,
+                itemId = ev.itemId,
+                quantity = ev.quantity,
+                guildGuid = ev.guildGuid,
+                bankTab = ev.bankTab,
+                generation = ev.generation,
+                occurrenceIndex = ev.occurrenceIndex,
+                neighborsOlder = ev.neighborsOlder,
+                neighborsNewer = ev.neighborsNewer,
+                type = "deposit",
+            },
+            witnesses = {
+                [w1] = clock,
+                ["ForgedTwo-Realm"] = clock,
+                ["ForgedThree-Realm"] = clock,
+            },
+            updatedAt = clock,
+        },
+    }
+    assertTrue(select(1, C.MergeSnapshot(coord, C.ExportSnapshot(forgedPeer), {
+        consumablesFromCoordinator = false,
+    })), "peer-forge peer merge applies")
+    local wcount, sawForged = 0, false
+    for name in pairs(C.PendingWitnesses(coord)[1].witnesses or {}) do
+        wcount = wcount + 1
+        if name == "ForgedTwo-Realm" or name == "ForgedThree-Realm" then
+            sawForged = true
+        end
+    end
+    assertEq(wcount, 1, "peer-forge does not import peer witness identities")
+    assertFalse(sawForged, "peer-forge forged names stay out of durable maps")
+    V.ClearSessionClusters()
+    V.HydrateClustersFromDurable(coord, "peer-forge-quorum")
+    local afterForge = V.IngestReport(coord, "peer-forge-quorum", w2, { ev }, {
+        isAdmin = false,
+        scope = O.EnsureScope(O.EnsureProfileStore({}, "peer-forge-quorum"), "club-1", 2),
+        obsStore = O.EnsureProfileStore({}, "peer-forge-quorum"),
+        historyComplete = true,
+    })
+    assertEq(afterForge.verified, 0,
+        "peer-forge forged peer witnesses cannot pad three-witness quorum")
+    assertEq(afterForge.pending, 1, "peer-forge stays pending with two real witnesses")
+    assertEq(C.ContributionTotal(coord, donor, flask), 0,
+        "peer-forge no auto-credit from peer-asserted quorum")
+    local cluster = V.EnsureClusterStore("peer-forge-quorum").clusters[1]
+    local realCount = 0
+    for name in pairs((cluster and cluster.witnesses) or {}) do
+        if name == w1 or name == w2 then realCount = realCount + 1 end
+    end
+    assertEq(realCount, 2, "peer-forge cluster holds only authenticated witnesses")
+end
+
+-- 13c2. Ambiguous cluster match must not adopt a recovered registry/ledger ID
+do
+    V.ClearSessionClusters()
+    local p = makeProfile("ambig-adopt", { admin })
+    local db = {}
+    local store = O.EnsureProfileStore(db, "ambig-adopt")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local depA = evidence({
+        quantity = 5, occurrenceIndex = 1,
+        neighborsOlder = { "ambig-a" }, neighborsNewer = {},
+        approxTxnTime = clock - 120,
+    })
+    local depB = evidence({
+        quantity = 5, occurrenceIndex = 2,
+        neighborsOlder = { "ambig-b" }, neighborsNewer = {},
+        approxTxnTime = clock - 120,
+    })
+    assertEq(V.IngestReport(p, "ambig-adopt", w1, { depA }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "ambig-adopt seeds cluster A")
+    assertEq(V.IngestReport(p, "ambig-adopt", w2, { depB }, {
+        isAdmin = false, scope = scope, obsStore = store,
+    }).pending, 1, "ambig-adopt seeds cluster B")
+    assertEq(#V.EnsureClusterStore("ambig-adopt").clusters, 2, "ambig-adopt has two pending clusters")
+    -- One recovered registry identity that matches the shared core signature.
+    local txnId = "ctx:ambig-adopt:Admin-Realm:1:cafe"
+    assertTrue(C.RegisterCanonicalTxn(p, {
+        txnId = txnId, status = "verified", committed = true,
+        donor = donor, itemId = flask, quantity = 5,
+        coreSignature = depA.coreSignature,
+        approxTxnTime = clock - 120,
+        guildGuid = "club-1", bankTab = 2, generation = 1,
+        decidedBy = admin, decidedAt = clock - 50,
+        neighborsOlder = { "ambig-a" },
+    }, { bumpSeq = false }))
+    local report = evidence({
+        quantity = 5,
+        occurrenceIndex = false,
+        neighborsOlder = { "ambig-a", "ambig-b" },
+        neighborsNewer = {},
+        approxTxnTime = clock - 120,
+    })
+    report.occurrenceIndex = nil
+    local stats = V.IngestReport(p, "ambig-adopt", w3, { report }, {
+        isAdmin = false, scope = scope, obsStore = store, historyComplete = true,
+    })
+    assertEq(stats.verified, 0, "ambig-adopt competing match does not auto-verify")
+    local clusters = V.EnsureClusterStore("ambig-adopt").clusters
+    local ambiguousCount, withTxn = 0, 0
+    for i = 1, #clusters do
+        if clusters[i].status == "ambiguous" then ambiguousCount = ambiguousCount + 1 end
+        if V.ValidTxnId(clusters[i].txnId) then withTxn = withTxn + 1 end
+    end
+    assertTrue(ambiguousCount >= 1, "ambig-adopt keeps ambiguity for review")
+    assertEq(withTxn, 0, "ambig-adopt does not attach recovered txnId to ambiguous cluster")
+    assertEq(C.ContributionTotal(p, donor, flask), 0,
+        "ambig-adopt no ledger credit from ambiguous adoption")
+end
+
 -- 13d. Pending cluster without txnId adopts recovered registry identity (no double credit)
 do
     V.ClearSessionClusters()

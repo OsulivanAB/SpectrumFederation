@@ -826,13 +826,16 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                             how = "ambiguous"
                         elseif how ~= "verified" then
                             local ledgerHit = V.FindEquivalentLedgerDonation(profile, profileId, evidence)
-                            -- Apply recovered ledger/registry identity even when a
-                            -- pending session cluster already exists without txnId.
-                            -- Otherwise Tuesday recovery + later admin/witness report
-                            -- mints a second canonical credit for the same deposit.
-                            if ledgerHit and V.ValidTxnId(ledgerHit.txnId)
-                                and (not cluster or not V.ValidTxnId(cluster.txnId))
-                            then
+                            -- Adopt recovered ledger/registry identity onto an
+                            -- unambiguous pending cluster that still lacks txnId.
+                            -- Competing ambiguous matches must stay for review:
+                            -- attaching a recovered ID could verify the wrong deposit.
+                            local canAdopt = how ~= "ambiguous"
+                                and (not cluster or (
+                                    not V.ValidTxnId(cluster.txnId)
+                                    and cluster.status ~= "ambiguous"
+                                ))
+                            if ledgerHit and V.ValidTxnId(ledgerHit.txnId) and canAdopt then
                                 if not cluster then
                                     cluster = NewCluster(store, evidence)
                                 end
@@ -844,9 +847,7 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                                 cluster.decidedBy = Norm(ledgerHit.writer) or submittedBy
                                 cluster.evidence = evidence
                                 how = "verified"
-                            elseif regHow == "verified" and regEntry
-                                and (not cluster or not V.ValidTxnId(cluster.txnId))
-                            then
+                            elseif regHow == "verified" and regEntry and canAdopt then
                                 if not cluster then
                                     cluster = NewCluster(store, evidence)
                                 end

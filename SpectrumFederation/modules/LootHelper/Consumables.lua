@@ -685,40 +685,13 @@ local function ReplacePendingWitnessesFromPayload(cfg, payload, opts)
         return EnsurePendingWitnesses(cfg)
     end
     -- Authoritative snapshots replace. Peer recovery must not wipe coordinator-
-    -- authenticated aggregates (forceReplace=false): only union witnesses into
-    -- aggregates that already exist locally via positively supported MatchScore.
+    -- authenticated aggregates and must not import peer-asserted witness names
+    -- into quorum (witnesses are authenticated only on the coordinator path).
     if opts.forceReplace == true then
         cfg.pendingWitnesses = CopyPendingWitnessList(payload.pendingWitnesses)
         return cfg.pendingWitnesses
     end
-    local localList = EnsurePendingWitnesses(cfg)
-    local remote = CopyPendingWitnessList(payload.pendingWitnesses)
-    for i = 1, #remote do
-        local remoteAgg = remote[i]
-        if type(remoteAgg) == "table" and type(remoteAgg.evidence) == "table" then
-            local localAgg = nil
-            for j = 1, #localList do
-                if PendingWitnessMatches(localList[j], remoteAgg.evidence) then
-                    localAgg = localList[j]
-                    break
-                end
-            end
-            if localAgg and type(remoteAgg.witnesses) == "table" then
-                localAgg.witnesses = localAgg.witnesses or {}
-                for name, stamped in pairs(remoteAgg.witnesses) do
-                    if type(name) == "string" and name ~= "" and localAgg.witnesses[name] == nil then
-                        localAgg.witnesses[name] = stamped
-                    end
-                end
-                local remoteAt = tonumber(remoteAgg.updatedAt)
-                local localAt = tonumber(localAgg.updatedAt)
-                if remoteAt and (not localAt or remoteAt > localAt) then
-                    localAgg.updatedAt = remoteAt
-                end
-            end
-        end
-    end
-    return cfg.pendingWitnesses
+    return EnsurePendingWitnesses(cfg)
 end
 
 local function CopyEligibility(eligibility)
