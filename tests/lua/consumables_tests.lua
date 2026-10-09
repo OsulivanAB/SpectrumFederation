@@ -1733,6 +1733,106 @@ local function checkSessionTransport()
         Sync._Now = nil
     end
 
+    -- Two peer-ahead holds clearing within five seconds both reevaluate.
+    do
+        local V = SF.ConsumablesVerification
+        local O = SF.ConsumablesObservation
+        V.ClearSessionClusters()
+        local function seedRich(profileId, qty, neighbor)
+            local p = profile(profileId, admin)
+            p._profileId = profileId
+            p._adminUsers = { admin, vann }
+            C.SetGuild(p, admin, GUILD, 2)
+            C.AddRequestedItem(p, admin, aqirite)
+            local store = O.EnsureProfileStore({}, profileId)
+            local scope = O.EnsureScope(store, GUILD.guid, 2)
+            local ev = {
+                localId = "co:" .. profileId .. ":1",
+                type = "deposit",
+                donor = donor,
+                itemId = aqirite,
+                quantity = qty,
+                guildGuid = GUILD.guid,
+                bankTab = 2,
+                generation = 1,
+                approxTxnTime = clock - 250,
+                ageHours = 0,
+                occurrenceIndex = 1,
+                neighborsOlder = { neighbor },
+                neighborsNewer = {},
+                observedBy = admin,
+                firstSeen = clock - 250,
+                status = "pending",
+                coreSignature = O.CoreSignature("deposit", donor, aqirite, qty),
+            }
+            assertEq(V.IngestReport(p, profileId, admin, { ev }, {
+                isAdmin = true, scope = scope, obsStore = store, historyComplete = true,
+            }).verified, 1, "cooldown-race seeds " .. profileId)
+            assertTrue(V.CommitVerifiedCluster(p, V.ListVerifiedClusters(profileId)[1], admin))
+            return p, ev, V.ListVerifiedClusters(profileId)[1].txnId
+        end
+        local rich1, ev1, txn1 = seedRich("cooldown-race-rich1", 4, "cool-a")
+        local rich2, ev2, txn2 = seedRich("cooldown-race-rich2", 5, "cool-b")
+        V.ClearSessionClusters()
+        local late = profile("cooldown-race-late", admin)
+        late._profileId = "cooldown-race-late"
+        late._adminUsers = { admin, vann }
+        C.SetGuild(late, admin, GUILD, 2)
+        C.AddRequestedItem(late, admin, aqirite)
+        sessionStubs({ active = true, isCoordinator = true, coordinator = admin, sessionId = "s-cool",
+            profileId = late._profileId, peers = {} },
+            { [late._profileId] = late }, {})
+        Sync._SelfId = function() return admin end
+        local t0 = clock
+        Sync._Now = function() return t0 end
+        Sync:_MarkConsumablesHistoryBaseline(late, "cooldown-race")
+        SF.lootHelperDB = {}
+        local storeLate = O.EnsureProfileStore(SF.lootHelperDB, late._profileId)
+        local scopeLate = O.EnsureScope(storeLate, GUILD.guid, 2)
+        -- First hold + absorb.
+        late._consumablesPeerHistoryAhead = true
+        late._consumablesCatchUpRemote = C.Descriptor(rich1)
+        assertEq(V.IngestReport(late, late._profileId, admin, { ev1 }, {
+            isAdmin = true, scope = scopeLate, obsStore = storeLate, historyComplete = false,
+            historyBaselineAt = late._consumablesHistoryBaselineAt,
+        }).pending, 1, "cooldown-race holds first observation")
+        assertTrue(select(1, C.MergeSnapshot(late, C.ExportSnapshot(rich1), {
+            consumablesFromCoordinator = false,
+        })), "cooldown-race absorbs first peer")
+        Sync:_RefreshConsumablesHistoryGate(late)
+        assertTrue(C.HasTxnId(late, txn1), "cooldown-race first txn recovered")
+        assertEq(C.ContributionTotal(late, donor, aqirite), 4, "cooldown-race first credit")
+        -- Second hold clears within five seconds of the first reevaluation.
+        t0 = t0 + 1
+        Sync._Now = function() return t0 end
+        late._consumablesPeerHistoryAhead = true
+        late._consumablesCatchUpRemote = C.Descriptor(rich2)
+        late._consumablesHistoryUnconfirmedAt = t0
+        late._consumablesHistoryBaselineAt = t0
+        assertEq(V.IngestReport(late, late._profileId, admin, { ev2 }, {
+            isAdmin = true, scope = scopeLate, obsStore = storeLate, historyComplete = false,
+            historyBaselineAt = late._consumablesHistoryBaselineAt,
+        }).pending, 1, "cooldown-race holds second observation")
+        assertTrue(select(1, C.MergeSnapshot(late, C.ExportSnapshot(rich2), {
+            consumablesFromCoordinator = false,
+        })), "cooldown-race absorbs second peer")
+        Sync:_RefreshConsumablesHistoryGate(late)
+        assertTrue(C.HasTxnId(late, txn2), "cooldown-race second txn recovered despite 5s window")
+        assertEq(C.ContributionTotal(late, donor, aqirite), 9,
+            "cooldown-race both credits after two rapid gate clears")
+        local cluster2 = nil
+        local store = V.EnsureClusterStore(late._profileId)
+        for i = 1, #store.clusters do
+            if store.clusters[i].txnId == txn2 or (store.clusters[i].evidence
+                and store.clusters[i].evidence.quantity == 5) then
+                cluster2 = store.clusters[i]
+            end
+        end
+        assertTrue(cluster2 and (cluster2.status == "verified" or V.ValidTxnId(cluster2.txnId)),
+            "cooldown-race second held cluster reconsidered")
+        Sync._Now = nil
+    end
+
     -- Restore the follower session under test before Preview as Non-Admin checks.
     sessionStubs({ active = true, isCoordinator = false, coordinator = admin, sessionId = "s1",
         profileId = coordP._profileId, peers = { [admin] = { consumablesCapable = true } } },

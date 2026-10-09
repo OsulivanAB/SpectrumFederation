@@ -781,22 +781,57 @@ local function HasRecoveredVerifiedIdentity(profile, cluster)
     return type(entry) == "table" and entry.status == "verified"
 end
 
+-- Preserve recovered decision provenance without treating it as the commit writer.
+local function ApplyRecoveredProvenance(cluster, writer, verification)
+    if type(cluster) ~= "table" then return end
+    if verification then
+        cluster.verification = verification
+    elseif not cluster.verification then
+        cluster.verification = V.VERIFICATION.MANUAL
+    end
+    if not Norm(cluster.decidedBy) then
+        cluster.decidedBy = Norm(writer)
+    end
+end
+
+-- Authorized writer for a newly emitted ledger event. Prefer the current self
+-- when they are a canonical admin; otherwise fall back to recovered decidedBy.
+local function CommitWriterForCluster(profile, cluster)
+    local selfId = SF.NameUtil and SF.NameUtil.GetSelfId and Norm(SF.NameUtil.GetSelfId()) or nil
+    if selfId and C and C.IsCanonicalAdmin and C.IsCanonicalAdmin(profile, selfId) then
+        return selfId
+    end
+    return Norm(cluster and cluster.decidedBy) or selfId
+end
+
 -- Adopt a recovered verified ledger/registry identity onto the cluster.
 -- Local rejection IDs do not count as recovered; evidence match can replace them.
 local function AdoptRecoveredTxnId(profile, profileId, cluster)
     if not cluster or type(cluster.evidence) ~= "table" then return false end
-    if HasRecoveredVerifiedIdentity(profile, cluster) then return true end
+    if HasRecoveredVerifiedIdentity(profile, cluster) then
+        if not Norm(cluster.decidedBy) and C and C.FindRegistryTxn then
+            local entry = C.FindRegistryTxn(profile, cluster.txnId)
+            if type(entry) == "table" then
+                ApplyRecoveredProvenance(cluster, entry.decidedBy, entry.verification)
+            end
+        end
+        return true
+    end
     local ledgerHit = V.FindEquivalentLedgerDonation and V.FindEquivalentLedgerDonation(
         profile, profileId, cluster.evidence)
     if ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
         cluster.txnId = ledgerHit.txnId
-        cluster.verification = ledgerHit.verification or cluster.verification or V.VERIFICATION.MANUAL
+        ApplyRecoveredProvenance(
+            cluster,
+            ledgerHit.writer or ledgerHit.decidedBy,
+            ledgerHit.verification
+        )
         return true
     end
     local regHow, regEntry = V.ReconcileAgainstRegistry(profile, cluster.evidence)
     if regHow == "verified" and regEntry and V.ValidTxnId(regEntry.txnId) then
         cluster.txnId = regEntry.txnId
-        cluster.verification = regEntry.verification or cluster.verification or V.VERIFICATION.MANUAL
+        ApplyRecoveredProvenance(cluster, regEntry.decidedBy, regEntry.verification)
         return true
     end
     return false
@@ -1317,6 +1352,7 @@ function V.ReevaluateHeldClusters(profile, profileId, opts)
             elseif AdoptRecoveredTxnId(profile, profileId, cluster) then
                 cluster.status = "verified"
                 cluster.verification = cluster.verification or V.VERIFICATION.MANUAL
+                -- decidedBy holds recovered provenance; commit writer is chosen below.
                 cluster.updatedAt = Now()
                 stats.adopted = stats.adopted + 1
                 stats.verified = stats.verified + 1
@@ -1369,7 +1405,9 @@ function V.ReevaluateHeldClusters(profile, profileId, opts)
         local cluster = store.clusters[i]
         if cluster and cluster.status == "verified" and not cluster._committed
             and V.ValidTxnId(cluster.txnId) then
-            local writer = cluster.decidedBy
+            -- Emit under an authorized current writer so event.id is syncable;
+            -- cluster.decidedBy retains recovered decision provenance.
+            local writer = CommitWriterForCluster(profile, cluster)
             local ok = V.CommitVerifiedCluster(profile, cluster, writer)
             if ok then
                 cluster._committed = true

@@ -235,7 +235,8 @@ function Sync:_RefreshConsumablesHistoryGate(profile)
     local stillBlocking = profile._consumablesPeerHistoryAhead
         or tonumber(profile._consumablesHistoryUnconfirmedAt)
     if wasBlocking and not stillBlocking and self._ReevaluateHeldConsumablesObservations then
-        self:_ReevaluateHeldConsumablesObservations(profile)
+        -- Gate-unblock transitions must always reevaluate (bypass spam cooldown).
+        self:_ReevaluateHeldConsumablesObservations(profile, { force = true })
     end
 end
 
@@ -1072,7 +1073,9 @@ end
 
 -- Bounded coordinator retry of already-authenticated pending clusters when the
 -- history gate transitions to ready. Does not trust peer witness maps.
-function Sync:_ReevaluateHeldConsumablesObservations(profile)
+-- opts.force: gate-unblock transitions bypass the spam cooldown.
+function Sync:_ReevaluateHeldConsumablesObservations(profile, opts)
+    opts = opts or {}
     if type(profile) ~= "table" then return end
     if not (self.state and self.state.active and self.state.isCoordinator) then return end
     if self:_ConsumablesHistoryReady(profile) == false then return end
@@ -1083,8 +1086,24 @@ function Sync:_ReevaluateHeldConsumablesObservations(profile)
     if not meta then return end
     local now = (self._Now and self:_Now()) or (C.Now and C.Now()) or 0
     local lastAt = tonumber(profile._consumablesHistoryReevalAt)
-    if lastAt and (now - lastAt) < 5 then return end
+    if not opts.force and lastAt and (now - lastAt) < 5 then
+        -- Non-transition spam path: one delayed retry so a real transition that
+        -- raced the cooldown still runs. Force path never takes this branch.
+        if not profile._consumablesHistoryReevalPending and self.RunAfter then
+            profile._consumablesHistoryReevalPending = true
+            local delay = 5 - (now - lastAt) + 0.05
+            if delay < 0.05 then delay = 0.05 end
+            self:RunAfter(delay, function()
+                profile._consumablesHistoryReevalPending = nil
+                if self._ReevaluateHeldConsumablesObservations then
+                    self:_ReevaluateHeldConsumablesObservations(profile, { force = true })
+                end
+            end)
+        end
+        return
+    end
     profile._consumablesHistoryReevalAt = now
+    profile._consumablesHistoryReevalPending = nil
     local stats = V.ReevaluateHeldClusters(profile, meta.profileId, {
         historyComplete = true,
         historyBaselineAt = tonumber(profile._consumablesHistoryBaselineAt),

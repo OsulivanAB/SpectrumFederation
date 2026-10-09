@@ -2277,7 +2277,66 @@ do
     assertEq(C.ContributionTotal(coordB, donor, flask), 13, "reeval no duplicate credit")
 end
 
--- 19. Followers do not resend third-party canonical credits
+-- 19. Registry-only recovery sets provenance and commits under current writer
+do
+    V.ClearSessionClusters()
+    local coord = makeProfile("reg-only-reeval", { admin, "CoordB-Realm" })
+    local db = {}
+    local store = O.EnsureProfileStore(db, "reg-only-reeval")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local tuesday = evidence({
+        quantity = 8, neighborsOlder = { "reg-only-n" }, approxTxnTime = clock - 420,
+        ageHours = 0,
+    })
+    -- Hold first with no registry, then inject a registry-only verified identity.
+    local held = V.IngestReport(coord, "reg-only-reeval", "CoordB-Realm", { tuesday }, {
+        isAdmin = true, scope = scope, obsStore = store, historyComplete = false,
+    })
+    assertEq(held.pending, 1, "reg-only holds pending during incomplete history")
+    local txnId = "ctx:reg-only-reeval:Admin-Realm:1:regonly01"
+    assertTrue(C.RegisterCanonicalTxn(coord, {
+        txnId = txnId, status = "verified", committed = false,
+        donor = donor, itemId = flask, quantity = 8,
+        coreSignature = tuesday.coreSignature,
+        approxTxnTime = tuesday.approxTxnTime,
+        guildGuid = "club-1", bankTab = 2, generation = 1,
+        occurrenceIndex = 1,
+        neighborsOlder = tuesday.neighborsOlder,
+        neighborsNewer = tuesday.neighborsNewer,
+        decidedBy = admin, decidedAt = clock - 100,
+        verification = "admin",
+    }, { bumpSeq = false }))
+    assertFalse(C.HasTxnId(coord, txnId), "reg-only starts without ledger credit")
+    local prevSelf = SF.NameUtil.GetSelfId
+    SF.NameUtil.GetSelfId = function() return "CoordB-Realm" end
+    local stats = V.ReevaluateHeldClusters(coord, "reg-only-reeval", {
+        historyComplete = true,
+        clearPendingWitness = function(evidence)
+            C.ClearPendingWitness(coord, evidence)
+        end,
+    })
+    SF.NameUtil.GetSelfId = prevSelf
+    assertTrue((stats.adopted or 0) >= 1, "reg-only adopts registry identity")
+    assertTrue((stats.committed or 0) >= 1, "reg-only commits registry-only credit")
+    assertEq(C.ContributionTotal(coord, donor, flask), 8, "reg-only credits once")
+    assertTrue(C.HasTxnId(coord, txnId), "reg-only ledger has recovered txnId")
+    local cluster = V.EnsureClusterStore("reg-only-reeval").clusters[1]
+    assertEq(cluster.decidedBy, admin, "reg-only preserves recovered decidedBy provenance")
+    local event = coord._consumableEvents[1]
+    assertTrue(event ~= nil, "reg-only emitted a ledger event")
+    assertEq(event.txnId, txnId, "reg-only event uses recovered txnId")
+    assertTrue(S.RemoteEventIdOk(event.id, "CoordB-Realm"),
+        "reg-only event.id is bound to the current commit writer")
+    assertEq(event.writer, "CoordB-Realm", "reg-only event.writer is the current commit writer")
+    -- Repeated reevaluation stays idempotent.
+    SF.NameUtil.GetSelfId = function() return "CoordB-Realm" end
+    local again = V.ReevaluateHeldClusters(coord, "reg-only-reeval", { historyComplete = true })
+    SF.NameUtil.GetSelfId = prevSelf
+    assertEq(again.committed or 0, 0, "reg-only second reevaluation commits nothing")
+    assertEq(C.ContributionTotal(coord, donor, flask), 8, "reg-only no duplicate credit")
+end
+
+-- 20. Followers do not resend third-party canonical credits
 do
     V.ClearSessionClusters()
     local author = makeProfile("foreign-resend-a", { admin, "Helper-Realm" })
