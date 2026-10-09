@@ -1926,7 +1926,8 @@ do
     V.ClearSessionClusters()
     local victim = makeProfile("untrusted-inject", { admin })
     local fakeTxn = "ctx:untrusted-inject:Evil-Realm:1:deadbeef"
-    local fabricated = {
+    -- Registry-only fabrication (no stamped ledger event) must not register.
+    local registryOnly = {
         generation = 1,
         configSeq = 1,
         ledgerSeq = 1,
@@ -1944,33 +1945,40 @@ do
                 approxTxnTime = clock - 10,
                 decidedBy = "Evil-Realm",
                 decidedAt = clock,
+                verification = "witnesses",
             },
         },
+        events = {},
+    }
+    assertTrue(select(1, C.MergeSnapshot(victim, registryOnly, { consumablesFromCoordinator = false })),
+        "untrusted-inject peer merge does not error")
+    assertEq(C.ContributionTotal(victim, donor, flask), 0,
+        "untrusted-inject registry-only fabrication does not credit the ledger")
+    assertTrue(C.FindRegistryTxn(victim, fakeTxn) == nil,
+        "untrusted-inject fabricated registry row without ledger is not accepted")
+    -- Event missing Spectrum txnId is rejected even with a RelayWriter binding.
+    local noTxn = {
+        generation = 1,
+        configSeq = 1,
         events = {
             {
-                id = "ce:remote:Evil-Realm:1",
+                id = "ce:remote:Evil-Realm:2",
                 type = C.EVENT.DONATION,
                 source = "guildbank",
                 actor = donor,
                 itemId = flask,
-                quantity = 99,
+                quantity = 7,
                 generation = 1,
                 timestamp = clock,
-                txnId = fakeTxn,
                 order = 1,
                 writer = "Evil-Realm",
-                verification = "admin",
             },
         },
     }
-    -- Peer MergeSnapshot requires canonical-admin writers / decidedBy. Fabricated
-    -- non-admin provenance must not credit or register verified donations.
-    assertTrue(select(1, C.MergeSnapshot(victim, fabricated, { consumablesFromCoordinator = false })),
-        "untrusted-inject peer merge does not error")
+    assertTrue(select(1, C.MergeSnapshot(victim, noTxn, { consumablesFromCoordinator = false })),
+        "untrusted-inject no-txnId peer merge applies")
     assertEq(C.ContributionTotal(victim, donor, flask), 0,
-        "untrusted-inject fabricated event does not credit the ledger")
-    assertTrue(C.FindRegistryTxn(victim, fakeTxn) == nil,
-        "untrusted-inject fabricated registry row is not accepted")
+        "untrusted-inject donation without txnId does not credit")
     -- Explicit forged relay claiming an admin writer but id owned by attacker.
     local forged = {
         id = "ce:remote:Evil-Realm:9",
@@ -1989,6 +1997,155 @@ do
         "untrusted-inject forged admin-writer claim is rejected when id is not admin-owned")
     assertEq(C.ContributionTotal(victim, donor, flask), 0,
         "untrusted-inject forged relay leaves ledger empty")
+end
+
+-- 14. Three-witness credits survive writer-offline peer recovery
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("witness-peer-a", { admin, "CoordB-Realm" })
+    local db = {}
+    local store = O.EnsureProfileStore(db, "witness-peer-a")
+    local scope = O.EnsureScope(store, "club-1", 2)
+    local ev = evidence({
+        quantity = 8, neighborsOlder = { "wit-peer" }, approxTxnTime = clock - 180,
+    })
+    assertEq(V.IngestReport(coordA, "witness-peer-a", w1, { ev }, {
+        isAdmin = false, scope = scope, obsStore = store, historyComplete = true,
+    }).pending, 1, "witness-peer seeds with first witness")
+    assertEq(V.IngestReport(coordA, "witness-peer-a", w2, { ev }, {
+        isAdmin = false, scope = scope, obsStore = store, historyComplete = true,
+    }).pending, 1, "witness-peer second witness still pending")
+    assertEq(V.IngestReport(coordA, "witness-peer-a", w3, { ev }, {
+        isAdmin = false, scope = scope, obsStore = store, historyComplete = true,
+    }).verified, 1, "witness-peer third witness verifies")
+    local cluster = V.ListVerifiedClusters("witness-peer-a")[1]
+    assertTrue(cluster and cluster.verification == V.VERIFICATION.WITNESSES,
+        "witness-peer verification mode is witnesses")
+    -- Commit under the last witness writer (pre-stamp-admin behavior) to prove
+    -- peer recovery admits ValidTxnId RelayWriter donations, not only admins.
+    assertTrue(V.CommitVerifiedCluster(coordA, cluster, w3), "witness-peer commits under witness writer")
+    local txnId = cluster.txnId
+    assertEq(C.ContributionTotal(coordA, donor, flask), 8, "witness-peer A has credit")
+    assertTrue(C.FindRegistryTxn(coordA, txnId) ~= nil, "witness-peer A has registry row")
+    local peer = makeProfile("witness-peer-holder", { admin, "CoordB-Realm" })
+    assertTrue(select(1, C.MergeSnapshot(peer, C.ExportSnapshot(coordA), {
+        consumablesFromCoordinator = true,
+    })), "witness-peer holder absorbs coordinator snapshot")
+    assertEq(C.ContributionTotal(peer, donor, flask), 8, "witness-peer holder has credit")
+    local late = makeProfile("witness-peer-late", { admin, "CoordB-Realm" })
+    assertEq(C.ContributionTotal(late, donor, flask), 0, "witness-peer late starts empty")
+    assertTrue(select(1, C.MergeSnapshot(late, C.ExportSnapshot(peer), {
+        consumablesFromCoordinator = false,
+    })), "witness-peer late recovers via peer path")
+    assertEq(C.ContributionTotal(late, donor, flask), 8,
+        "witness-peer late recovers three-witness ledger credit")
+    assertTrue(C.FindRegistryTxn(late, txnId) ~= nil,
+        "witness-peer late recovers original registry txnId")
+    assertTrue(C.HasTxnId(late, txnId), "witness-peer late HasTxnId for recovered credit")
+end
+
+-- 15. Manual approve during history hold cannot mint a duplicate credit
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("approve-hold-a", { admin, "CoordB-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "approve-hold-a")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local tuesday = evidence({
+        quantity = 17, neighborsOlder = { "apr-hold" }, approxTxnTime = clock - 400,
+    })
+    assertEq(V.IngestReport(coordA, "approve-hold-a", admin, { tuesday }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA, historyComplete = true,
+    }).verified, 1, "approve-hold A verifies Tuesday")
+    local txnA = V.ListVerifiedClusters("approve-hold-a")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(coordA, V.ListVerifiedClusters("approve-hold-a")[1], admin))
+    local rich = C.ExportSnapshot(coordA)
+
+    V.ClearSessionClusters()
+    local coordB = makeProfile("approve-hold-b", { admin, "CoordB-Realm" })
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "approve-hold-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local held = V.IngestReport(coordB, "approve-hold-b", "CoordB-Realm", { tuesday }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = false,
+    })
+    assertEq(held.verified, 0, "approve-hold B holds auto-verify")
+    assertEq(held.pending, 1, "approve-hold B keeps pending cluster")
+    local pending = V.EnsureClusterStore("approve-hold-b").clusters[1]
+    assertTrue(pending and not V.ValidTxnId(pending.txnId), "approve-hold pending has no txnId")
+    local ok, status = V.ApplyDecision(coordB, "approve-hold-b", "CoordB-Realm", {
+        action = "approve", clusterId = pending.clusterId,
+    }, {
+        isAdmin = true, scope = scopeB, historyComplete = false,
+    })
+    assertFalse(ok, "approve-hold manual approve refused while history incomplete")
+    assertEq(status, "history_incomplete", "approve-hold reports history_incomplete")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "approve-hold no credit from blocked approve")
+    assertTrue(select(1, C.MergeSnapshot(coordB, rich, { consumablesFromCoordinator = true })),
+        "approve-hold B absorbs original Tuesday history")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 17, "approve-hold credits once after absorb")
+    assertTrue(C.FindRegistryTxn(coordB, txnA) ~= nil, "approve-hold keeps original txnId")
+    -- After absorb, approve may adopt recovered identity (no second mint).
+    V.ClearSessionClusters()
+    local rematch = V.IngestReport(coordB, "approve-hold-b", "CoordB-Realm", { tuesday }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB, historyComplete = true,
+    })
+    assertEq(rematch.verified, 0, "approve-hold rematch does not re-verify")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 17, "approve-hold no duplicate after rematch")
+end
+
+-- 16. Pre-advertisement window: production gate holds until baseline/peer history
+do
+    V.ClearSessionClusters()
+    local coordA = makeProfile("pre-adv-a", { admin, "CoordB-Realm" })
+    local dbA = {}
+    local storeA = O.EnsureProfileStore(dbA, "pre-adv-a")
+    local scopeA = O.EnsureScope(storeA, "club-1", 2)
+    local tuesday = evidence({
+        quantity = 11, neighborsOlder = { "pre-adv" }, approxTxnTime = clock - 500,
+    })
+    assertEq(V.IngestReport(coordA, "pre-adv-a", admin, { tuesday }, {
+        isAdmin = true, scope = scopeA, obsStore = storeA, historyComplete = true,
+    }).verified, 1, "pre-adv A verifies Tuesday")
+    local txnA = V.ListVerifiedClusters("pre-adv-a")[1].txnId
+    assertTrue(V.CommitVerifiedCluster(coordA, V.ListVerifiedClusters("pre-adv-a")[1], admin))
+    local rich = C.ExportSnapshot(coordA)
+
+    V.ClearSessionClusters()
+    local coordB = makeProfile("pre-adv-b", { admin, "CoordB-Realm" })
+    -- Simulate newly elected coordinator before any HAVE_PROFILE: baseline unconfirmed.
+    coordB._consumablesHistoryBaselineAt = clock - 10
+    coordB._consumablesHistoryUnconfirmedAt = clock - 10
+    local dbB = {}
+    local storeB = O.EnsureProfileStore(dbB, "pre-adv-b")
+    local scopeB = O.EnsureScope(storeB, "club-1", 2)
+    local held = V.IngestReport(coordB, "pre-adv-b", "CoordB-Realm", { tuesday }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB,
+        historyComplete = false,
+        historyBaselineAt = coordB._consumablesHistoryBaselineAt,
+    })
+    assertEq(held.verified, 0, "pre-adv B does not mint before peer advertisement")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 0, "pre-adv B no premature credit")
+    -- Clearly-new deposit at/after baseline may still verify.
+    local fresh = evidence({
+        quantity = 2, neighborsOlder = { "pre-adv-new" },
+        approxTxnTime = clock, occurrenceIndex = 1,
+        coreSignature = O.CoreSignature("deposit", donor, flask, 2),
+    })
+    assertEq(V.IngestReport(coordB, "pre-adv-b", "CoordB-Realm", { fresh }, {
+        isAdmin = true, scope = scopeB, obsStore = storeB,
+        historyComplete = false,
+        historyBaselineAt = coordB._consumablesHistoryBaselineAt,
+    }).verified, 1, "pre-adv clearly-new deposit still verifies during baseline")
+    local freshCluster = V.ListVerifiedClusters("pre-adv-b")[1]
+    assertTrue(V.CommitVerifiedCluster(coordB, freshCluster, "CoordB-Realm"))
+    assertEq(C.ContributionTotal(coordB, donor, flask), 2, "pre-adv clearly-new credits once")
+    -- Later absorb of Tuesday history converges without duplicating Tuesday.
+    assertTrue(select(1, C.MergeSnapshot(coordB, rich, { consumablesFromCoordinator = false })),
+        "pre-adv B absorbs Tuesday from peer")
+    assertTrue(C.FindRegistryTxn(coordB, txnA) ~= nil, "pre-adv recovered Tuesday txnId")
+    assertEq(C.ContributionTotal(coordB, donor, flask), 13,
+        "pre-adv Tuesday + clearly-new credits without duplicate Tuesday")
 end
 
 if failures > 0 then

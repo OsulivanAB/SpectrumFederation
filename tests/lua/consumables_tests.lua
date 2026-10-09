@@ -1615,6 +1615,32 @@ local function checkSessionTransport()
         "unauthorized peers cannot trigger consumables history recovery")
     Sync.RequestProfileSnapshot = previousRequestProfileSnapshot
 
+    -- Pre-advertisement baseline: newly elected coordinator is not history-ready
+    -- until grace elapses or peer-ahead catch-up completes.
+    local baselineCoord = profile("baseline-coord", admin)
+    baselineCoord._profileId = "baseline-profile"
+    baselineCoord._adminUsers = { admin, vann }
+    C.SetGuild(baselineCoord, admin, GUILD, 2)
+    sessionStubs({ active = true, isCoordinator = true, coordinator = admin, sessionId = "s-base",
+        profileId = baselineCoord._profileId, peers = {} },
+        { [baselineCoord._profileId] = baselineCoord }, {})
+    Sync._SelfId = function() return admin end
+    local nowBase = clock
+    Sync._Now = function() return nowBase end
+    Sync:_OnBecameConsumablesCoordinator(false, "test-baseline")
+    assertEq(tonumber(baselineCoord._consumablesHistoryUnconfirmedAt), nowBase,
+        "promotion marks consumables history unconfirmed")
+    assertFalse(Sync:_ConsumablesHistoryReady(baselineCoord),
+        "pre-advertisement window holds history-ready false")
+    -- Advance past grace with no peer-ahead watermark.
+    local grace = Sync.CONSUMABLES_HISTORY_BASELINE_GRACE_SEC or 90
+    Sync._Now = function() return nowBase + grace + 1 end
+    assertTrue(Sync:_ConsumablesHistoryReady(baselineCoord),
+        "history-ready after baseline grace with no peer ahead")
+    assertTrue(baselineCoord._consumablesHistoryUnconfirmedAt == nil,
+        "baseline unconfirmed flag clears after grace")
+    Sync._Now = nil
+
     -- Restore the follower session under test before Preview as Non-Admin checks.
     sessionStubs({ active = true, isCoordinator = false, coordinator = admin, sessionId = "s1",
         profileId = coordP._profileId, peers = { [admin] = { consumablesCapable = true } } },

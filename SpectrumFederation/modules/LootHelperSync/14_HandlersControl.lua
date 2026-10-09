@@ -309,6 +309,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self.BackfillAutomaticBisOnPromotion then
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionReannounce")
     end
+    if self._OnBecameConsumablesCoordinator then
+        self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleSessionReannounce")
+    end
 
     if self._MergeAuthorMaxFrontier then
         self:_MergeAuthorMaxFrontier(payload.authorMax)
@@ -505,8 +508,13 @@ function Sync:HandleSessionHeartbeat(sender, payload)
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via SES_HEARTBEAT")
-    elseif self.BackfillAutomaticBisOnPromotion then
-        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionHeartbeat")
+    else
+        if self.BackfillAutomaticBisOnPromotion then
+            self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionHeartbeat")
+        end
+        if self._OnBecameConsumablesCoordinator then
+            self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleSessionHeartbeat")
+        end
     end
 
     -- Keep helper list + authorMax current. Helper-only changes must retarget
@@ -750,8 +758,13 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
         if earlyPrep and earlyPrep.Notify then
             earlyPrep:Notify("coordinator_lost")
         end
-    elseif self.BackfillAutomaticBisOnPromotion then
-        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleCoordinatorTakeover")
+    else
+        if self.BackfillAutomaticBisOnPromotion then
+            self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleCoordinatorTakeover")
+        end
+        if self._OnBecameConsumablesCoordinator then
+            self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleCoordinatorTakeover")
+        end
     end
 
     -- Allow re-sending join status to the new coordinator

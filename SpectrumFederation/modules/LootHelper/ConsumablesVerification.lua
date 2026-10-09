@@ -882,14 +882,18 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                         end
 
                         local historyReady = opts.historyComplete ~= false
+                        local baselineAt = tonumber(opts.historyBaselineAt)
+                        local approxAt = tonumber(evidence.approxTxnTime)
+                        local clearlyNew = baselineAt and approxAt and approxAt >= baselineAt
                         if how == "verified" or cluster.status == "verified" or cluster.status == "rejected" then
                             if opts.clearPendingWitness and type(opts.clearPendingWitness) == "function" then
                                 opts.clearPendingWitness(evidence)
                             end
                         elseif cluster.status == "ambiguous" then
                             stats.pending = stats.pending + 1
-                        elseif not historyReady and not cluster.txnId then
+                        elseif not historyReady and not cluster.txnId and not clearlyNew then
                             -- Incomplete synchronized history: never mint overlapping credits.
+                            -- Clearly-new deposits (approxTxnTime at/after baseline) may still mint.
                             stats.pending = stats.pending + 1
                             Debug("Info", "holding uncertain credit until history converges donor=%s",
                                 tostring(evidence.donor))
@@ -908,7 +912,7 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
                         elseif cluster.status ~= "ambiguous" then
                             local witnesses = after
                             if witnesses >= V.WITNESS_THRESHOLD then
-                                if not historyReady and not cluster.txnId then
+                                if not historyReady and not cluster.txnId and not clearlyNew then
                                     stats.pending = stats.pending + 1
                                 else
                                     cluster.status = "verified"
@@ -935,6 +939,32 @@ function V.IngestReport(profile, profileId, submittedBy, observations, opts)
         end
     end
     return stats
+end
+
+local function EvidenceClearlyNew(evidence, baselineAt)
+    local baseline = tonumber(baselineAt)
+    local approx = type(evidence) == "table" and tonumber(evidence.approxTxnTime) or nil
+    return baseline and approx and approx >= baseline
+end
+
+local function AdoptRecoveredTxnId(profile, profileId, cluster)
+    if not cluster or V.ValidTxnId(cluster.txnId) or type(cluster.evidence) ~= "table" then
+        return false
+    end
+    local ledgerHit = V.FindEquivalentLedgerDonation and V.FindEquivalentLedgerDonation(
+        profile, profileId, cluster.evidence)
+    if ledgerHit and V.ValidTxnId(ledgerHit.txnId) then
+        cluster.txnId = ledgerHit.txnId
+        cluster.verification = ledgerHit.verification or cluster.verification or V.VERIFICATION.MANUAL
+        return true
+    end
+    local regHow, regEntry = V.ReconcileAgainstRegistry(profile, cluster.evidence)
+    if regHow == "verified" and regEntry and V.ValidTxnId(regEntry.txnId) then
+        cluster.txnId = regEntry.txnId
+        cluster.verification = regEntry.verification or cluster.verification or V.VERIFICATION.MANUAL
+        return true
+    end
+    return false
 end
 
 function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
@@ -1062,6 +1092,18 @@ function V.ApplyDecision(profile, profileId, decidedBy, decision, opts)
             opts.clearDurableRejection(cluster.evidence)
         end
         -- Fall through to approve after clearing rejection.
+    end
+
+    -- Incomplete history: never mint a new canonical ID. Adopt a recovered
+    -- registry/ledger identity when available; allow clearly-new deposits.
+    local historyReady = opts.historyComplete ~= false
+    if not historyReady and not V.ValidTxnId(cluster.txnId) then
+        if not AdoptRecoveredTxnId(profile, profileId, cluster)
+            and not EvidenceClearlyNew(cluster.evidence, opts.historyBaselineAt) then
+            Debug("Info", "approve held until history converges cluster=%s",
+                tostring(cluster.clusterId))
+            return false, "history_incomplete", cluster
+        end
     end
 
     cluster.status = "verified"
@@ -1259,6 +1301,7 @@ function V.ProcessLocalAfterReconcile(profile, profileId, store, scope, opts)
     local deferToCoordinator = opts.deferToCoordinator == true
     local durableRejections = C.DurableRejections and C.DurableRejections(profile) or nil
     local historyReady = opts.historyComplete ~= false
+    local historyBaselineAt = opts.historyBaselineAt
     local stats = { trusted = 0, suppressed = 0, deferred = 0 }
     for i = 1, #(scope.observations or {}) do
         local obs = scope.observations[i]
@@ -1301,7 +1344,7 @@ function V.ProcessLocalAfterReconcile(profile, profileId, store, scope, opts)
                         stats.trusted = stats.trusted + 1
                         Debug("Info", "local admin trust converges on existing txn=%s", tostring(prior.txnId))
                     end
-                elseif not historyReady then
+                elseif not historyReady and not EvidenceClearlyNew(obs, historyBaselineAt) then
                     -- Incomplete synchronized history: do not mint potentially overlapping credits.
                     stats.deferred = stats.deferred + 1
                 elseif not V.HasStrongIdentityContext(obs) then

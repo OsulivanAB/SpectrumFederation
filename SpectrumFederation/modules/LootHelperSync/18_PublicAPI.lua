@@ -853,6 +853,9 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
+    if self._OnBecameConsumablesCoordinator then
+        self:_OnBecameConsumablesCoordinator(false, "StartSession")
+    end
     -- A stale admin list can pass CanSelfCoordinate and then lose that
     -- authority when history is rebuilt. The session has not been announced.
     -- Do not mark backfill, record this peer as an admin, or start convergence.
@@ -1228,6 +1231,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
         self.state._bisBackfillPendingReason = nil
         if self.BackfillAutomaticBisOnPromotion then
             self:BackfillAutomaticBisOnPromotion(false, "TakeoverSession")
+        end
+        if self._OnBecameConsumablesCoordinator then
+            self:_OnBecameConsumablesCoordinator(false, "TakeoverSession")
         end
         self:ReannounceSession()
         return true

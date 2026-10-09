@@ -278,10 +278,18 @@ function BankLog:ProcessLogUpdate(reason)
     local sessionActive = Sync and Sync.state and Sync.state.active
         and Sync.state.profileId == ctx.profileId
     if V and V.ProcessLocalAfterReconcile and scope then
+        local historyReady = true
+        local historyBaselineAt = nil
+        if sessionActive and Sync._ConsumablesHistoryReady then
+            historyReady = Sync:_ConsumablesHistoryReady(ctx.profile) ~= false
+            historyBaselineAt = tonumber(ctx.profile._consumablesHistoryBaselineAt)
+        end
         local verifyStats = V.ProcessLocalAfterReconcile(ctx.profile, ctx.profileId, store, scope, {
             selfId = ctx.observedBy,
             -- During a live session the coordinator owns verification/txn minting.
             deferToCoordinator = sessionActive and true or false,
+            historyComplete = historyReady,
+            historyBaselineAt = historyBaselineAt,
         })
         self.lastVerifyStats = verifyStats
         if verifyStats and (verifyStats.trusted or 0) > 0 then

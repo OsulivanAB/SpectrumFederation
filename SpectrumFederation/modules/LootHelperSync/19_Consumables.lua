@@ -36,6 +36,9 @@ local function SessionFor(profile)
 end
 
 local CONFIG_CATCHUP_GRACE = 15
+-- Newly elected coordinators wait this long for authorized peers to advertise
+-- richer consumables history before treating "no peer ahead" as completeness.
+Sync.CONSUMABLES_HISTORY_BASELINE_GRACE_SEC = 90
 
 local function LedgerMatches(localDesc, remote)
     localDesc = localDesc or {}
@@ -163,27 +166,60 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesArchiveFingerprint = desc.archiveFingerprint
 end
 
+function Sync:_MarkConsumablesHistoryBaseline(profile, reason)
+    if type(profile) ~= "table" then return end
+    local now = (self._Now and self:_Now()) or (Consumables() and Consumables().Now and Consumables().Now()) or 0
+    profile._consumablesHistoryBaselineAt = now
+    profile._consumablesHistoryUnconfirmedAt = now
+    Debug("Info", "consumables history baseline started (%s) at=%s",
+        tostring(reason or "promotion"), tostring(now))
+end
+
+-- Session-start / promotion: do not equate "no known richer peer" with complete history.
+function Sync:_OnBecameConsumablesCoordinator(wasCoordinator, reason)
+    if wasCoordinator == true or not (self.state and self.state.isCoordinator == true) then
+        return
+    end
+    if type(self.state.profileId) ~= "string" or not self.FindLocalProfileById then
+        return
+    end
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    if profile then
+        self:_MarkConsumablesHistoryBaseline(profile, reason)
+    end
+end
+
 function Sync:_RefreshConsumablesHistoryGate(profile)
     if type(profile) ~= "table" then return end
     local C = Consumables()
     local S = Rules()
     if not C or not S then return end
+    local now = (self._Now and self:_Now()) or (C.Now and C.Now()) or 0
     local remote = profile._consumablesCatchUpRemote
     if type(remote) ~= "table" then
         profile._consumablesPeerHistoryAhead = nil
         profile._consumablesHistoryPeer = nil
-        return
+    else
+        local localDesc = C.Descriptor(profile)
+        -- Credit hold is history-scoped (events/registry/archive). Config-only drift
+        -- must not keep verification blocked after ledger recovery from a peer.
+        local historyBehind = S.PeerHistoryAhead and S.PeerHistoryAhead(localDesc, remote)
+        if not historyBehind then
+            profile._consumablesPeerHistoryAhead = nil
+            profile._consumablesHistoryPeer = nil
+            profile._consumablesPeerRecoveryAt = nil
+            if not (S.NeedsCatchUp and S.NeedsCatchUp(localDesc, remote)) then
+                profile._consumablesCatchUpRemote = nil
+            end
+        end
     end
-    local localDesc = C.Descriptor(profile)
-    -- Credit hold is history-scoped (events/registry/archive). Config-only drift
-    -- must not keep verification blocked after ledger recovery from a peer.
-    local historyBehind = S.PeerHistoryAhead and S.PeerHistoryAhead(localDesc, remote)
-    if not historyBehind then
-        profile._consumablesPeerHistoryAhead = nil
-        profile._consumablesHistoryPeer = nil
-        profile._consumablesPeerRecoveryAt = nil
-        if not (S.NeedsCatchUp and S.NeedsCatchUp(localDesc, remote)) then
-            profile._consumablesCatchUpRemote = nil
+    -- Clear the pre-advertisement baseline once grace elapses with no peer-ahead.
+    if not profile._consumablesPeerHistoryAhead then
+        local unconfirmedAt = tonumber(profile._consumablesHistoryUnconfirmedAt)
+        local grace = tonumber(self.CONSUMABLES_HISTORY_BASELINE_GRACE_SEC) or 90
+        if unconfirmedAt and (now - unconfirmedAt) >= grace then
+            profile._consumablesHistoryUnconfirmedAt = nil
+            profile._consumablesHistoryBaselineAt = nil
         end
     end
 end
@@ -277,6 +313,10 @@ function Sync:_ConsumablesHistoryReady(profile)
     if not C or not S then return true end
     self:_RefreshConsumablesHistoryGate(profile)
     if profile._consumablesPeerHistoryAhead then return false end
+    -- Newly elected coordinator: wait for peer advertisements or grace expiry.
+    if tonumber(profile._consumablesHistoryUnconfirmedAt) then
+        return false
+    end
     local remote = profile._consumablesCatchUpRemote
     if type(remote) ~= "table" then return true end
     if S.PeerHistoryAhead then
@@ -1114,6 +1154,7 @@ function Sync:HandleConsumablesObsReport(sender, payload)
     if self._ConsumablesHistoryReady then
         historyReady = self:_ConsumablesHistoryReady(profile) ~= false
     end
+    local historyBaselineAt = tonumber(profile._consumablesHistoryBaselineAt)
     local stats = V.IngestReport(profile, meta.profileId, sender, payload.observations, {
         isAdmin = isAdmin,
         scope = scope,
@@ -1123,6 +1164,7 @@ function Sync:HandleConsumablesObsReport(sender, payload)
         eligibility = C.EligibilitySnapshot and C.EligibilitySnapshot(profile) or nil,
         durableRejections = C.DurableRejections and C.DurableRejections(profile) or nil,
         historyComplete = historyReady,
+        historyBaselineAt = historyBaselineAt,
         isRequested = function(itemId)
             return C.IsRequested(profile, itemId)
         end,
@@ -1148,7 +1190,17 @@ function Sync:HandleConsumablesObsReport(sender, payload)
     for i = 1, #verified do
         local cluster = verified[i]
         if cluster and not cluster._committed then
+            -- Prefer an admin/coordinator stamp writer so peer-recovery filters can
+            -- re-admit three-witness credits; verification mode retains provenance.
             local writer = cluster.decidedBy or (self._SelfId and self:_SelfId()) or sender
+            local selfId = self._SelfId and self:_SelfId() or nil
+            if cluster.verification == V.VERIFICATION.WITNESSES then
+                if type(selfId) == "string" and C.IsCanonicalAdmin(profile, selfId) then
+                    writer = selfId
+                elseif type(sender) == "string" and C.IsCanonicalAdmin(profile, sender) then
+                    writer = sender
+                end
+            end
             local ok, commitStatus = V.CommitVerifiedCluster(profile, cluster, writer)
             if ok then
                 cluster._committed = true
@@ -1306,10 +1358,16 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
     -- Coordinator: authenticated admin decisions only (never trust client isAdmin).
     if not C.IsCanonicalAdmin(profile, sender) then return end
     local store, scope, meta = ObservationScopeFor(profile)
+    local historyReady = true
+    if self._ConsumablesHistoryReady then
+        historyReady = self:_ConsumablesHistoryReady(profile) ~= false
+    end
     local ok, status, cluster = V.ApplyDecision(profile, payload.profileId, sender, payload.decision, {
         isAdmin = true,
         scope = scope,
         obsStore = store,
+        historyComplete = historyReady,
+        historyBaselineAt = tonumber(profile._consumablesHistoryBaselineAt),
         recordDurableRejection = function(evidence, decidedBy, reason)
             if C.RecordDurableRejection then
                 C.RecordDurableRejection(profile, evidence, decidedBy, reason)

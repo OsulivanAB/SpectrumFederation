@@ -147,6 +147,9 @@ function Sync:HandleSessionStart(sender, payload)
     if self.BackfillAutomaticBisOnPromotion then
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionStart")
     end
+    if self._OnBecameConsumablesCoordinator then
+        self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleSessionStart")
+    end
 
     if SF.Debug then
         SF.Debug:Info("SYNC_SESSION", "Session start (role=%s sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",

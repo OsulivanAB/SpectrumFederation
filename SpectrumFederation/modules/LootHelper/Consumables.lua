@@ -2937,17 +2937,26 @@ function C.MergeSnapshot(profile, data, opts)
             if limit > maxEvents then limit = maxEvents end
             for i = 1, limit do
                 local event = data.events[i]
-                local order = type(event) == "table" and C.ValidOrder(event.order) or nil
-                -- Accept only previously stamped, writer-bound rows from a
-                -- canonical admin. A peer may relay history they did not author,
-                -- but cannot manufacture credits under a non-admin writer.
-                local writer = order and Rules.RelayWriter(event) or nil
-                if writer and C.IsCanonicalAdmin(profile, writer) then
-                    Rules.ApplyRemoteEvent(profile, event, nil, {
-                        coordinatorRelay = true,
-                        silent = true,
-                        skipGrantUse = true,
-                    })
+                -- RelayWriter binds event.id to event.writer. Local commits may lack
+                -- order until a coordinator flush; do not require order up front.
+                local writer = Rules.RelayWriter and Rules.RelayWriter(event) or nil
+                if writer then
+                    -- Accept previously stamped, writer-bound rows. Admin-authored
+                    -- rows always qualify. Stamped guildbank donations with a
+                    -- Spectrum txnId also qualify so three-witness credits
+                    -- (writer may be a non-admin witness) survive peer recovery.
+                    local stampedDonation = type(event) == "table"
+                        and event.type == C.EVENT.DONATION
+                        and ValidTxnId(event.txnId)
+                        and (not Rules.AuthoritativeEventBodyOk
+                            or Rules.AuthoritativeEventBodyOk(event))
+                    if C.IsCanonicalAdmin(profile, writer) or stampedDonation then
+                        Rules.ApplyRemoteEvent(profile, event, nil, {
+                            coordinatorRelay = true,
+                            silent = true,
+                            skipGrantUse = true,
+                        })
+                    end
                 end
             end
         end
@@ -2969,7 +2978,10 @@ function C.MergeSnapshot(profile, data, opts)
                         local adminDecision = type(row.decidedBy) == "string"
                             and row.decidedBy ~= ""
                             and C.IsCanonicalAdmin(profile, row.decidedBy)
-                        if known or adminDecision then
+                        -- After stamped events apply above, matching ledger txnIds
+                        -- authorize the registry row even when decidedBy was a witness.
+                        local hasLedger = C.HasTxnId and C.HasTxnId(profile, row.txnId)
+                        if known or adminDecision or hasLedger then
                             filtered.txnRegistry[#filtered.txnRegistry + 1] = row
                         end
                     end
