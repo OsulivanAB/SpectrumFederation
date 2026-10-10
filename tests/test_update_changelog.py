@@ -483,3 +483,33 @@ def test_ambiguous_ai_output_does_not_write_when_fallback_is_empty(monkeypatch):
     monkeypatch.setattr(changelog, "request_ai_entries", lambda _context, _token: (None, "model confidence was 'low'"))
     monkeypatch.setattr(changelog, "fallback_entries", lambda _context: [])
     assert changelog.choose_entries(context, token=None) is None
+
+
+def test_compatibility_mode_writes_deterministic_section(tmp_path, monkeypatch):
+    repo = init_repo(tmp_path)
+    monkeypatch.chdir(repo)
+
+    changed = changelog.apply_compatibility_changelog(
+        "1.5.9",
+        "12.1.5",
+        "120105",
+        "2026-10-10",
+    )
+    assert changed is True
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## [1.5.9] - 2026-10-10" in text
+    assert "Updated Retail game compatibility to Interface 120105 (12.1.5)." in text
+    assert "## [1.2.0] - 2026-08-26" in text
+
+    changed_again = changelog.apply_compatibility_changelog(
+        "1.5.9",
+        "12.1.5",
+        "120105",
+        "2026-10-11",
+    )
+    assert changed_again is False
+
+
+def test_determine_mode_accepts_compatibility_override(monkeypatch):
+    monkeypatch.setenv("CHANGELOG_MODE", "compatibility")
+    assert changelog.determine_mode("main", "1.5.9") == "compatibility"

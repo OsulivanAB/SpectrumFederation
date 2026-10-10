@@ -15,7 +15,8 @@ on:
       - 'pkgmeta.yaml'
 
 concurrency:
-  group: beta-release
+  # Shared with Promote Beta to Main and Update WoW Game Version.
+  group: release-channels
   cancel-in-progress: false  # Don't cancel in-progress releases
 
 jobs:

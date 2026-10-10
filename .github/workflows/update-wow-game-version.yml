@@ -1,0 +1,530 @@
+name: Update WoW Game Version
+
+# Manual-only Retail Interface/version update for main and beta without promoting
+# unfinished beta features. Installed workflow must live on the default branch.
+on:
+  workflow_dispatch:
+    inputs:
+      game_version:
+        description: Human-readable Retail version (for example 12.1.5)
+        required: true
+        type: string
+      dry_run:
+        description: Preview only; do not mutate branches or publish releases
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# Serialize with Promote Beta to Main and Post-Merge Beta release mutations.
+concurrency:
+  group: release-channels
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Preflight Plan
+    runs-on: ubuntu-latest
+    outputs:
+      dry_run: ${{ steps.flags.outputs.dry_run }}
+      interface: ${{ steps.plan.outputs.interface }}
+      game_version: ${{ steps.plan.outputs.game_version }}
+      live_game_version: ${{ steps.plan.outputs.live_game_version }}
+      main_sha: ${{ steps.plan.outputs.main_sha }}
+      beta_sha: ${{ steps.plan.outputs.beta_sha }}
+      main_action: ${{ steps.plan.outputs.main_action }}
+      beta_action: ${{ steps.plan.outputs.beta_action }}
+      main_update_needed: ${{ steps.plan.outputs.main_update_needed }}
+      beta_update_needed: ${{ steps.plan.outputs.beta_update_needed }}
+      main_current_version: ${{ steps.plan.outputs.main_current_version }}
+      beta_current_version: ${{ steps.plan.outputs.beta_current_version }}
+      main_target_version: ${{ steps.plan.outputs.main_target_version }}
+      beta_target_version: ${{ steps.plan.outputs.beta_target_version }}
+
+    steps:
+      - name: Require main branch dispatch
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Update WoW Game Version must be run from the main branch (selected '${{ github.ref }}')."
+          exit 1
+
+      - name: Record dry-run flag
+        id: flags
+        run: |
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch main and beta tips
+        run: |
+          set -euo pipefail
+          git fetch origin main beta
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Plan Interface and version updates
+        id: plan
+        env:
+          REQUESTED_VERSION: ${{ inputs.game_version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/wow_interface_sync.py \
+            --plan \
+            --requested-version "$REQUESTED_VERSION" \
+            --main-ref origin/main \
+            --beta-ref origin/beta \
+            --dry-run
+
+      - name: Validate packaging helpers on current tree
+        run: python3 .github/scripts/validate_packaging.py
+
+      - name: Simulate publish dry-run for main
+        if: steps.plan.outputs.main_action == 'update' || steps.plan.outputs.main_action == 'publish'
+        env:
+          SOURCE_SHA: ${{ steps.plan.outputs.main_sha }}
+          TARGET_VERSION: ${{ steps.plan.outputs.main_target_version }}
+          TARGET_INTERFACE: ${{ steps.plan.outputs.interface }}
+          UPDATE_NEEDED: ${{ steps.plan.outputs.main_update_needed }}
+        run: |
+          set -euo pipefail
+          git checkout --force "$SOURCE_SHA"
+          if [[ "$UPDATE_NEEDED" == "true" ]]; then
+            python3 .github/scripts/wow_interface_sync.py \
+              --apply-interface "$TARGET_INTERFACE" \
+              --apply-toc-version "$TARGET_VERSION"
+          fi
+          python3 .github/scripts/publish_release.py "$TARGET_VERSION" \
+            --interface "$TARGET_INTERFACE" \
+            --dry-run
+
+      - name: Simulate publish dry-run for beta
+        if: steps.plan.outputs.beta_action == 'update' || steps.plan.outputs.beta_action == 'publish'
+        env:
+          SOURCE_SHA: ${{ steps.plan.outputs.beta_sha }}
+          TARGET_VERSION: ${{ steps.plan.outputs.beta_target_version }}
+          TARGET_INTERFACE: ${{ steps.plan.outputs.interface }}
+          UPDATE_NEEDED: ${{ steps.plan.outputs.beta_update_needed }}
+        run: |
+          set -euo pipefail
+          git checkout --force "$SOURCE_SHA"
+          if [[ "$UPDATE_NEEDED" == "true" ]]; then
+            python3 .github/scripts/wow_interface_sync.py \
+              --apply-interface "$TARGET_INTERFACE" \
+              --apply-toc-version "$TARGET_VERSION"
+          fi
+          python3 .github/scripts/publish_release.py "$TARGET_VERSION" \
+            --interface "$TARGET_INTERFACE" \
+            --dry-run
+
+  update-main:
+    name: Update Main Branch
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: |
+      needs.preflight.outputs.dry_run != 'true' &&
+      needs.preflight.outputs.main_update_needed == 'true'
+    outputs:
+      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
+      completed: ${{ steps.push.outputs.completed }}
+
+    steps:
+      - name: Checkout main tip
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          # Prefer GITHUB_TOKEN so this push does not trigger Post-Merge Beta.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Verify captured main SHA
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          python3 .github/scripts/wow_interface_sync.py \
+            --verify-ref origin/main \
+            --verify-sha "$EXPECTED_SHA"
+          git reset --hard "$EXPECTED_SHA"
+
+      - name: Apply TOC, changelog, and README updates
+        env:
+          TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
+          TARGET_VERSION: ${{ needs.preflight.outputs.main_target_version }}
+          GAME_VERSION: ${{ needs.preflight.outputs.game_version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/wow_interface_sync.py \
+            --apply-interface "$TARGET_INTERFACE" \
+            --apply-toc-version "$TARGET_VERSION" \
+            --update-readme main
+          BRANCH_NAME=main \
+          CHANGELOG_MODE=compatibility \
+          CHANGELOG_VERSION="$TARGET_VERSION" \
+          CHANGELOG_INTERFACE="$TARGET_INTERFACE" \
+          CHANGELOG_GAME_VERSION="$GAME_VERSION" \
+            python3 .github/scripts/update_changelog.py
+          python3 .github/scripts/validate_packaging.py
+
+      - name: Commit and push main
+        id: push
+        env:
+          TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
+          TARGET_VERSION: ${{ needs.preflight.outputs.main_target_version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add \
+            SpectrumFederation/SpectrumFederation.toc \
+            SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc \
+            SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc \
+            CHANGELOG.md \
+            README.md
+          if git diff --cached --quiet; then
+            echo "::error::Main update produced no staged changes"
+            exit 1
+          fi
+          git commit -m "chore: bump Interface to ${TARGET_INTERFACE} and version to ${TARGET_VERSION} [skip ci]"
+          if ! git push origin HEAD:main; then
+            echo "::error::Failed to push main. If branch protection blocks github-actions[bot], allow that actor for this workflow without weakening required checks. Do not force-push."
+            exit 1
+          fi
+          echo "pushed_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+  publish-main:
+    name: Publish Main Release
+    runs-on: ubuntu-latest
+    needs: [preflight, update-main]
+    if: |
+      always() &&
+      needs.preflight.outputs.dry_run != 'true' &&
+      (needs.preflight.outputs.main_action == 'update' || needs.preflight.outputs.main_action == 'publish') &&
+      (
+        needs.preflight.outputs.main_update_needed != 'true' ||
+        needs.update-main.result == 'success'
+      )
+    outputs:
+      completed: ${{ steps.publish.outputs.completed }}
+
+    steps:
+      - name: Resolve publish source SHA
+        id: source
+        env:
+          UPDATE_NEEDED: ${{ needs.preflight.outputs.main_update_needed }}
+          CAPTURED_SHA: ${{ needs.preflight.outputs.main_sha }}
+          PUSHED_SHA: ${{ needs.update-main.outputs.pushed_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$UPDATE_NEEDED" == "true" ]]; then
+            echo "sha=$PUSHED_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$CAPTURED_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout publish source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Verify main tip has not drifted before publish-only
+        if: needs.preflight.outputs.main_update_needed != 'true'
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          python3 .github/scripts/wow_interface_sync.py \
+            --verify-ref origin/main \
+            --verify-sha "$EXPECTED_SHA"
+
+      - name: Package and publish stable release
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WAGO_API_KEY: ${{ secrets.WAGO_API_KEY }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_API_TOKEN }}
+          TARGET_VERSION: ${{ needs.preflight.outputs.main_target_version }}
+          TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/publish_release.py "$TARGET_VERSION" --interface "$TARGET_INTERFACE"
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+  update-beta:
+    name: Update Beta Branch
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: |
+      needs.preflight.outputs.dry_run != 'true' &&
+      needs.preflight.outputs.beta_update_needed == 'true'
+    outputs:
+      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
+      completed: ${{ steps.push.outputs.completed }}
+
+    steps:
+      - name: Checkout beta tip
+        uses: actions/checkout@v6
+        with:
+          ref: beta
+          fetch-depth: 0
+          # GITHUB_TOKEN avoids triggering Post-Merge Beta for this TOC bump.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Verify captured beta SHA
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.beta_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin beta
+          python3 .github/scripts/wow_interface_sync.py \
+            --verify-ref origin/beta \
+            --verify-sha "$EXPECTED_SHA"
+          git reset --hard "$EXPECTED_SHA"
+
+      - name: Apply TOC, changelog, and README updates
+        env:
+          TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
+          TARGET_VERSION: ${{ needs.preflight.outputs.beta_target_version }}
+          GAME_VERSION: ${{ needs.preflight.outputs.game_version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/wow_interface_sync.py \
+            --apply-interface "$TARGET_INTERFACE" \
+            --apply-toc-version "$TARGET_VERSION" \
+            --update-readme beta
+          BRANCH_NAME=beta \
+          CHANGELOG_MODE=compatibility \
+          CHANGELOG_VERSION="$TARGET_VERSION" \
+          CHANGELOG_INTERFACE="$TARGET_INTERFACE" \
+          CHANGELOG_GAME_VERSION="$GAME_VERSION" \
+            python3 .github/scripts/update_changelog.py
+          python3 .github/scripts/validate_packaging.py
+
+      - name: Commit and push beta
+        id: push
+        env:
+          TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
+          TARGET_VERSION: ${{ needs.preflight.outputs.beta_target_version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add \
+            SpectrumFederation/SpectrumFederation.toc \
+            SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc \
+            SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc \
+            CHANGELOG.md \
+            README.md
+          if git diff --cached --quiet; then
+            echo "::error::Beta update produced no staged changes"
+            exit 1
+          fi
+          git commit -m "chore: bump Interface to ${TARGET_INTERFACE} and version to ${TARGET_VERSION} [skip ci]"
+          if ! git push origin HEAD:beta; then
+            echo "::error::Failed to push beta. If branch protection blocks github-actions[bot], allow that actor for this workflow without weakening required checks. Do not force-push."
+            exit 1
+          fi
+          echo "pushed_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+  publish-beta:
+    name: Publish Beta Release
+    runs-on: ubuntu-latest
+    needs: [preflight, update-beta]
+    if: |
+      always() &&
+      needs.preflight.outputs.dry_run != 'true' &&
+      (needs.preflight.outputs.beta_action == 'update' || needs.preflight.outputs.beta_action == 'publish') &&
+      (
+        needs.preflight.outputs.beta_update_needed != 'true' ||
+        needs.update-beta.result == 'success'
+      )
+    outputs:
+      completed: ${{ steps.publish.outputs.completed }}
+
+    steps:
+      - name: Resolve publish source SHA
+        id: source
+        env:
+          UPDATE_NEEDED: ${{ needs.preflight.outputs.beta_update_needed }}
+          CAPTURED_SHA: ${{ needs.preflight.outputs.beta_sha }}
+          PUSHED_SHA: ${{ needs.update-beta.outputs.pushed_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$UPDATE_NEEDED" == "true" ]]; then
+            echo "sha=$PUSHED_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$CAPTURED_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout publish source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Verify beta tip has not drifted before publish-only
+        if: needs.preflight.outputs.beta_update_needed != 'true'
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.beta_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin beta
+          python3 .github/scripts/wow_interface_sync.py \
+            --verify-ref origin/beta \
+            --verify-sha "$EXPECTED_SHA"
+
+      - name: Overlay live generated notes when publishing a prior tip
+        if: needs.preflight.outputs.beta_update_needed != 'true'
+        run: |
+          set -euo pipefail
+          git fetch origin beta
+          git checkout origin/beta -- CHANGELOG.md README.md || true
+
+      - name: Package and publish beta release
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WAGO_API_KEY: ${{ secrets.WAGO_API_KEY }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_API_TOKEN }}
+          TARGET_VERSION: ${{ needs.preflight.outputs.beta_target_version }}
+          TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/publish_release.py "$TARGET_VERSION" --interface "$TARGET_INTERFACE"
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [preflight, update-main, publish-main, update-beta, publish-beta]
+    if: always()
+
+    steps:
+      - name: Write outcome summary
+        env:
+          DRY_RUN: ${{ needs.preflight.outputs.dry_run }}
+          INTERFACE: ${{ needs.preflight.outputs.interface }}
+          GAME_VERSION: ${{ needs.preflight.outputs.game_version }}
+          MAIN_ACTION: ${{ needs.preflight.outputs.main_action }}
+          BETA_ACTION: ${{ needs.preflight.outputs.beta_action }}
+          MAIN_UPDATE: ${{ needs.preflight.outputs.main_update_needed }}
+          BETA_UPDATE: ${{ needs.preflight.outputs.beta_update_needed }}
+          MAIN_VERSION: ${{ needs.preflight.outputs.main_target_version }}
+          BETA_VERSION: ${{ needs.preflight.outputs.beta_target_version }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          UPDATE_MAIN_RESULT: ${{ needs.update-main.result }}
+          PUBLISH_MAIN_RESULT: ${{ needs.publish-main.result }}
+          UPDATE_BETA_RESULT: ${{ needs.update-beta.result }}
+          PUBLISH_BETA_RESULT: ${{ needs.publish-beta.result }}
+        run: |
+          set -euo pipefail
+
+          icon() {
+            case "$1" in
+              success) echo "✅" ;;
+              skipped) echo "⏭️" ;;
+              *) echo "❌" ;;
+            esac
+          }
+
+          ERRORS=()
+          if [[ "$PREFLIGHT_RESULT" != "success" ]]; then
+            ERRORS+=("Preflight failed with result '$PREFLIGHT_RESULT'")
+          fi
+          if [[ "$DRY_RUN" != "true" && "$MAIN_UPDATE" == "true" && "$UPDATE_MAIN_RESULT" != "success" ]]; then
+            ERRORS+=("Main branch update failed ($UPDATE_MAIN_RESULT)")
+          fi
+          if [[ "$DRY_RUN" != "true" && "$MAIN_ACTION" != "none" && "$PUBLISH_MAIN_RESULT" != "success" && "$PUBLISH_MAIN_RESULT" != "skipped" ]]; then
+            ERRORS+=("Main publish failed ($PUBLISH_MAIN_RESULT). Rerun the workflow to retry publishing without bumping versions when Interface is already current.")
+          fi
+          if [[ "$DRY_RUN" != "true" && "$BETA_UPDATE" == "true" && "$UPDATE_BETA_RESULT" != "success" ]]; then
+            ERRORS+=("Beta branch update failed ($UPDATE_BETA_RESULT)")
+          fi
+          if [[ "$DRY_RUN" != "true" && "$BETA_ACTION" != "none" && "$PUBLISH_BETA_RESULT" != "success" && "$PUBLISH_BETA_RESULT" != "skipped" ]]; then
+            ERRORS+=("Beta publish failed ($PUBLISH_BETA_RESULT). Rerun the workflow to retry publishing without bumping versions when Interface is already current.")
+          fi
+
+          if [[ ${#ERRORS[@]} -gt 0 ]]; then
+            TITLE="## Update WoW Game Version Failed ❌"
+          elif [[ "$DRY_RUN" == "true" ]]; then
+            TITLE="## Update WoW Game Version Dry Run Complete ✅"
+          else
+            TITLE="## Update WoW Game Version Complete ✅"
+          fi
+
+          {
+            echo "$TITLE"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Dry run | $DRY_RUN |"
+            echo "| Game version | $GAME_VERSION |"
+            echo "| Interface | $INTERFACE |"
+            echo "| Main version | $MAIN_VERSION |"
+            echo "| Beta version | $BETA_VERSION |"
+            echo "| Main action | $MAIN_ACTION |"
+            echo "| Beta action | $BETA_ACTION |"
+            echo ""
+            echo "| Job | Result |"
+            echo "| --- | --- |"
+            echo "| $(icon "$PREFLIGHT_RESULT") Preflight | $PREFLIGHT_RESULT |"
+            echo "| $(icon "$UPDATE_MAIN_RESULT") Update main | $UPDATE_MAIN_RESULT |"
+            echo "| $(icon "$PUBLISH_MAIN_RESULT") Publish main | $PUBLISH_MAIN_RESULT |"
+            echo "| $(icon "$UPDATE_BETA_RESULT") Update beta | $UPDATE_BETA_RESULT |"
+            echo "| $(icon "$PUBLISH_BETA_RESULT") Publish beta | $PUBLISH_BETA_RESULT |"
+            echo ""
+            echo "Main and beta are updated independently. Unfinished beta features are never merged into main."
+            echo "Promote Beta to Main remains the path for feature promotion."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ${#ERRORS[@]} -gt 0 ]]; then
+            echo "### Failures / recovery" >> "$GITHUB_STEP_SUMMARY"
+            for error in "${ERRORS[@]}"; do
+              echo "::error::$error"
+              echo "- $error" >> "$GITHUB_STEP_SUMMARY"
+            done
+            exit 1
+          fi
