@@ -45,6 +45,9 @@ function Sync:_PersistSessionState(reason)
         persisted.coordinator = nil
         persisted.coordEpoch = nil
         persisted.helpers = nil
+        persisted.prepNotice = nil
+        persisted.deferredPrepNotices = nil
+        persisted.prepClaims = nil
         return
     end
 
@@ -54,6 +57,10 @@ function Sync:_PersistSessionState(reason)
     persisted.coordinator = self.state.coordinator
     persisted.coordEpoch = tonumber(self.state.coordEpoch)
     persisted.helpers = CopyStringArray(self.state.helpers)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.WritePersisted then
+        earlyPrep:WritePersisted(persisted)
+    end
 
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "Persisted active session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s)",
@@ -118,6 +125,10 @@ function Sync:TryRestorePersistedSession(reason)
         self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
     end
     self.state.helpers = CopyStringArray(persisted.helpers)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.RestorePersisted then
+        earlyPrep:RestorePersisted(persisted)
+    end
     self.state.authorMax = {}
     self.state.authorWindowSummary = {}
     self.state._sentJoinStatusForSessionId = nil
@@ -137,6 +148,8 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
+    self.state._profileSnapshotBodyCache = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
@@ -144,6 +157,8 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._catchUpGrantScanOther = nil
     self.state._catchUpProofScan = nil
     self.state._sessionAnnounced = nil
+    self.state._reannounceRetry = nil
+    self.state._reannounceExhaustedFor = nil
     self.state._sessionDescriptorAt = self:_Now()
 
     if self._ClearIdentitySessionBookkeeping then
@@ -665,6 +680,9 @@ function Sync:OnGroupRosterUpdate()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     -- Find targets who are in-group but haven't been announced to for this sessionId
     local targets = {}
@@ -689,6 +707,11 @@ function Sync:OnGroupRosterUpdate()
             if not (self.state.active and self.state.isCoordinator) then return end
             if self.state.sessionId ~= sid then return end
             if not SF.LootHelperComm then return end
+
+            local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+            if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
+                earlyPrepAttach:AttachToPayload(payload)
+            end
 
             local okSend = SF.LootHelperComm:Send(
                 "CONTROL",
@@ -820,6 +843,8 @@ function Sync:StartSession(profileId, opts)
     self.state.isCoordinator = true
     self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
     self.state._sessionAnnounced = nil
+    self.state._reannounceRetry = nil
+    self.state._reannounceExhaustedFor = nil
     self.state._sessionStartFailedFor = nil
     self:_PersistSessionState("StartSession")
 
@@ -828,6 +853,9 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
+    if self._OnBecameConsumablesCoordinator then
+        self:_OnBecameConsumablesCoordinator(false, "StartSession")
+    end
     -- A stale admin list can pass CanSelfCoordinate and then lose that
     -- authority when history is rebuilt. The session has not been announced.
     -- Do not mark backfill, record this peer as an admin, or start convergence.
@@ -848,6 +876,9 @@ function Sync:StartSession(profileId, opts)
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
 
     if SF.Debug then
         SF.Debug:Info("SYNC_SESSION", "Session start (role=coordinator sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",
@@ -864,6 +895,18 @@ end
 -- @param reason string|nil Human-readable reason for reset.
 -- @return nil
 function Sync:_ResetSessionState(reason)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.OnSessionReset then
+        earlyPrep:OnSessionReset(reason)
+    end
+    if SF.ConsumablesVerification and SF.ConsumablesVerification.ClearSessionClusters then
+        SF.ConsumablesVerification.ClearSessionClusters()
+    end
+    -- Stale review rows can reuse clusterIds (cl:1) after reset; clear the UI cache.
+    self._consumablesReviewSummary = nil
+    self._consumablesReviewSummaryAt = nil
+    self._consumablesObsFlushScheduled = nil
+
     if SF.Debug then
         local outstandingReqCount = 0
         if type(self.state.requests) == "table" then
@@ -910,6 +953,10 @@ function Sync:_ResetSessionState(reason)
     self.state.adminStatuses = {}
     self.state.handshake = nil
 
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
+
     -- Clear session identity
     self.state.active = false
     self.state.sessionId = nil
@@ -947,6 +994,8 @@ function Sync:_ResetSessionState(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
+    self.state._profileSnapshotBodyCache = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
@@ -954,6 +1003,8 @@ function Sync:_ResetSessionState(reason)
     self.state._catchUpGrantScanOther = nil
     self.state._catchUpProofScan = nil
     self.state._sessionAnnounced = nil
+    self.state._reannounceRetry = nil
+    self.state._reannounceExhaustedFor = nil
     self.state._sessionDescriptorAt = nil
 
     -- Clear gap repair cooldowns
@@ -1118,6 +1169,8 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state._bisRestoreBackfillHold = nil
     self.state.handshake = nil
     self.state._sessionAnnounced = nil
+    self.state._reannounceRetry = nil
+    self.state._reannounceExhaustedFor = nil
     self.state.containedExactWindows = {}
 
     local me = self:_SelfId()
@@ -1132,12 +1185,20 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state.coordinator = me
     self.state.isCoordinator = true
 
-    -- Ensure strictly increasing epoch
+    -- Ensure a strictly increasing epoch before Early Preparation adopts
+    -- transferred warning claims. Adopting under the predecessor epoch lets the
+    -- following persist path expire those leases immediately.
     local newEpoch = self:_Now()
     if newEpoch <= oldEpoch then
         newEpoch = oldEpoch + 1
     end
     self.state.coordEpoch = newEpoch
+
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("takeover")
+    end
+
     -- Adopt this client's last accepted RC seq so the first post-takeover
     -- SET continues from local accepted state. Peers compare (coordEpoch, seq),
     -- so a colliding seq after a missed SET is still accepted under the new epoch.
@@ -1171,6 +1232,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
         if self.BackfillAutomaticBisOnPromotion then
             self:BackfillAutomaticBisOnPromotion(false, "TakeoverSession")
         end
+        if self._OnBecameConsumablesCoordinator then
+            self:_OnBecameConsumablesCoordinator(false, "TakeoverSession")
+        end
         self:ReannounceSession()
         return true
     end
@@ -1185,6 +1249,111 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     })
 
     return true
+end
+
+local REANNOUNCE_RETRY_MAX = 3
+local REANNOUNCE_RETRY_DELAY = 2
+
+-- Arm one retry after a rejected SES_REANNOUNCE. One timer at a time, and only
+-- while this client is still coordinator of that unannounced session.
+-- @param sessionId string
+-- @return string "schedule"|"wait"|"stop"|"exhausted"
+function Sync:_ScheduleReannounceRetry(sessionId)
+    if type(sessionId) ~= "string" or sessionId == "" then
+        return "stop"
+    end
+    self.state = self.state or {}
+    local retry = self.state._reannounceRetry
+    local attempts = 0
+    local pending = false
+    if type(retry) == "table" and retry.sessionId == sessionId then
+        attempts = tonumber(retry.attempts) or 0
+        pending = retry.pending == true
+    end
+    local decision = "stop"
+    if type(Sync.ReannounceRetryDecision) == "function" then
+        decision = Sync.ReannounceRetryDecision(
+            self.state.active == true,
+            self.state.isCoordinator == true,
+            sessionId,
+            self.state._sessionAnnounced,
+            attempts,
+            pending,
+            REANNOUNCE_RETRY_MAX
+        )
+    end
+    if decision ~= "schedule" then
+        return decision
+    end
+    if type(self.RunAfter) ~= "function" then
+        return "exhausted"
+    end
+    local scheduledAttempt = attempts + 1
+    self.state._reannounceRetry = {
+        sessionId = sessionId,
+        attempts = scheduledAttempt,
+        pending = true,
+    }
+    self:RunAfter(REANNOUNCE_RETRY_DELAY, function()
+        local state = self.state
+        local current = state and state._reannounceRetry
+        if type(current) ~= "table" or current.sessionId ~= sessionId or current.attempts ~= scheduledAttempt then
+            return
+        end
+        current.pending = false
+        if state.active ~= true or state.isCoordinator ~= true or state.sessionId ~= sessionId then
+            state._reannounceRetry = nil
+            return
+        end
+        if state._sessionAnnounced == sessionId then
+            state._reannounceRetry = nil
+            return
+        end
+        if self.ReannounceSession then
+            self:ReannounceSession()
+        end
+    end)
+    return "schedule"
+end
+
+-- Terminal path after SES_REANNOUNCE retries are exhausted. Early Preparation
+-- stays closed (send was never accepted). Heartbeat and handshake finalization
+-- still run so the coordinator is not left silent with an open handshake.
+-- @param sessionId string
+-- @return nil
+function Sync:_HandleExhaustedReannounce(sessionId)
+    if type(sessionId) ~= "string" or sessionId == "" then
+        return
+    end
+    local state = self.state
+    if type(state) ~= "table" then
+        return
+    end
+    if state.active ~= true or state.isCoordinator ~= true or state.sessionId ~= sessionId then
+        return
+    end
+    if state._sessionAnnounced == sessionId then
+        return
+    end
+    state._reannounceRetry = nil
+    state._reannounceExhaustedFor = sessionId
+    if SF.Debug then
+        SF.Debug:Error("SYNC", "SES_REANNOUNCE retries exhausted (sessionId=%s); heartbeat continues without early preparation",
+            tostring(sessionId))
+    end
+    local sid = sessionId
+    if type(self.RunAfter) == "function" and type(self.FinalizeHandshakeWindow) == "function" then
+        self:RunAfter(self.cfg.handshakeCollectSec or 3, function()
+            if not self.state.active or not self.state.isCoordinator then return end
+            if self.state.sessionId ~= sid then return end
+            self:FinalizeHandshakeWindow()
+        end)
+    else
+        state.handshake = nil
+    end
+    if self.EnsureHeartbeatSender then
+        self:EnsureHeartbeatSender("ReannounceExhausted")
+    end
 end
 
 -- Function Re-announce session state to raid (typically after takeover or helper refresh).
@@ -1220,6 +1389,18 @@ function Sync:ReannounceSession()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
+        earlyPrepAttach:AttachToPayload(payload)
+    end
+
+    local announcedProfile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if announcedProfile and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(announcedProfile)
+    end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
@@ -1243,11 +1424,50 @@ function Sync:ReannounceSession()
         replies     = {},
     }
 
-    SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, payload, dist, nil, "ALERT")
+    local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, payload, dist, nil, "ALERT") and true or false
+    local accepted = false
+    if type(Sync.ApplySesStartSendResult) == "function" then
+        accepted = Sync.ApplySesStartSendResult(self.state, self.state.sessionId, sendOk) and true or false
+    elseif sendOk and self.state and self.state.active == true and type(self.state.sessionId) == "string" and self.state.sessionId ~= "" then
+        -- The shared helper is loaded with admin convergence. Keep the same
+        -- send-accepted boundary if this file is exercised before that module.
+        self.state._sessionAnnounced = self.state.sessionId
+        accepted = true
+    end
+    if not accepted then
+        if SF.Debug then
+            SF.Debug:Error("SYNC", "SES_REANNOUNCE send was not accepted (sessionId=%s); early preparation stays closed",
+                tostring(self.state.sessionId))
+        end
+        local decision = "stop"
+        if self._ScheduleReannounceRetry then
+            decision = self:_ScheduleReannounceRetry(self.state.sessionId)
+        end
+        if decision == "exhausted" and self._HandleExhaustedReannounce then
+            self:_HandleExhaustedReannounce(self.state.sessionId)
+        end
+        return
+    end
 
+    self.state._reannounceRetry = nil
+    self.state._reannounceExhaustedFor = nil
     -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
     self.state._sessionAnnounced = self.state.sessionId
     self:_MarkRosterAnnounced(self.state.sessionId)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("session_reannounced")
+    end
+    
+    if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
+        local announcedProfile = self:FindLocalProfileById(profileId)
+        if announcedProfile then
+            self:_FlushUnsentConsumablesEvents(announcedProfile)
+            if self._FlushPendingConsumableObservations then
+                self:_FlushPendingConsumableObservations(announcedProfile)
+            end
+        end
+    end
 
     -- Start/re-ensure coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("ReannounceSession")

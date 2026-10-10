@@ -85,6 +85,13 @@ chunk("SpectrumFederation", SF)
 
 local P = SF.SyncProtocol
 
+assertEq(P.PROTO_CURRENT, 9, "protocol current is 9")
+assertEq(P.PROTO_MIN, 9, "protocol min is 9")
+assertEq(P.PROTO_MAX, 9, "protocol max is 9")
+assertTrue(not select(1, P.ValidateProtocolVersion(7)), "protocol 7 is rejected")
+assertTrue(not select(1, P.ValidateProtocolVersion(8)), "protocol 8 is rejected")
+assertTrue(select(1, P.ValidateProtocolVersion(9)), "protocol 9 is accepted")
+
 local function nackPayload(overrides)
     local payload = {
         seenProto = 2,
@@ -100,41 +107,78 @@ local function nackPayload(overrides)
     return payload
 end
 
+local function countDebug(needle)
+    local count = 0
+    for i = 1, #debugWarns do
+        if debugWarns[i]:find(needle, 1, false) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
 local screenshotPayload = nackPayload()
 
 for i = 1, 20 do
     P.OnProtoNack("Suspenders-Icecrown", screenshotPayload)
 end
-assertEq(#warnings, 1, "repeat PROTO_NACK from one peer prints once")
-assertTrue(
-    warnings[1]:find("Suspenders%-Icecrown says our protocol/version is incompatible", 1, false) ~= nil,
-    "first PROTO_NACK keeps the user-facing incompatibility text"
+assertEq(#warnings, 0, "PROTO_NACK incompatibility never prints to chat")
+assertEq(
+    countDebug("Suspenders%-Icecrown says our protocol/version is incompatible"),
+    1,
+    "first PROTO_NACK records the incompatibility text in debug"
 )
-assertTrue(#debugWarns >= 19, "repeat PROTO_NACK is logged as debug instead of chat")
+assertTrue(countDebug("Suppressed repeat PROTO_NACK from Suspenders%-Icecrown") >= 19,
+    "repeat PROTO_NACK is logged as suppressed debug instead of chat")
 
 P.OnProtoNack("suspenders-icecrown", screenshotPayload)
-assertEq(#warnings, 1, "PROTO_NACK sender key is case-insensitive")
+assertEq(
+    countDebug("Suspenders%-Icecrown says our protocol/version is incompatible")
+        + countDebug("suspenders%-icecrown says our protocol/version is incompatible"),
+    1,
+    "PROTO_NACK sender key is case-insensitive for debug latches"
+)
 
+local beforeOther = #debugWarns
 P.OnProtoNack("Otherplayer-Icecrown", screenshotPayload)
-assertEq(#warnings, 2, "a different peer still gets one warning")
+assertTrue(countDebug("Otherplayer%-Icecrown says our protocol/version is incompatible") == 1,
+    "a different peer still gets one debug incompatibility record")
+assertTrue(#debugWarns > beforeOther, "different peer appends debug")
 
+local beforeChanged = #debugWarns
 P.OnProtoNack("Suspenders-Icecrown", nackPayload({ addonVersion = "1.5.0-beta.2" }))
-assertEq(#warnings, 3, "changed incompatibility details can warn again")
+assertTrue(countDebug("addon ver=1%.5%.0%-beta%.2") == 1,
+    "changed incompatibility details can debug again")
+assertTrue(#debugWarns > beforeChanged, "changed details append debug")
 
-local beforeUnsupported = #warnings
+assertEq(#warnings, 0, "PROTO_NACK path still never prints to chat after more peers")
+
 local firstNack = P.OnUnsupportedProto("Oldclient-Icecrown", 1, "SES_HEARTBEAT")
 assertTrue(type(firstNack) == "string" and firstNack:find("^PROTO_NACK\t", 1, false) ~= nil,
     "first unsupported proto returns a NACK envelope")
-assertEq(#warnings, beforeUnsupported + 1, "first unsupported proto prints once")
+assertEq(
+    countDebug("Oldclient%-Icecrown is using unsupported protocol"),
+    1,
+    "first unsupported proto records the ask-to-update text in debug"
+)
+assertEq(#warnings, 0, "unsupported proto never prints to chat")
 
 local secondNack = P.OnUnsupportedProto("Oldclient-Icecrown", 1, "SES_START")
 assertNil(secondNack, "unsupported proto NACK respects the 10s network cooldown")
-assertEq(#warnings, beforeUnsupported + 1, "repeat unsupported proto does not reprint")
+assertEq(
+    countDebug("Oldclient%-Icecrown is using unsupported protocol"),
+    1,
+    "repeat unsupported proto does not re-log the ask-to-update debug text"
+)
 
 now = now + 10
 local thirdNack = P.OnUnsupportedProto("Oldclient-Icecrown", 1, "SES_HEARTBEAT")
 assertTrue(type(thirdNack) == "string", "NACK can be sent again after cooldown")
-assertEq(#warnings, beforeUnsupported + 1, "NACK resend after cooldown still does not reprint")
+assertEq(
+    countDebug("Oldclient%-Icecrown is using unsupported protocol"),
+    1,
+    "NACK resend after cooldown still does not re-log ask-to-update debug"
+)
 
 local altSender = "Mixedpeer-Icecrown"
 P.OnUnsupportedProto(altSender, 1, "SES_HEARTBEAT")
@@ -142,12 +186,15 @@ P.OnProtoNack(altSender, screenshotPayload)
 P.OnUnsupportedProto(altSender, 1, "NEED_LOGS")
 P.OnProtoNack(altSender, screenshotPayload)
 local mixedCount = 0
-for i = 1, #warnings do
-    if warnings[i]:find("Mixedpeer%-Icecrown", 1, false) then
+for i = 1, #debugWarns do
+    local line = debugWarns[i]
+    if line:find("Mixedpeer%-Icecrown is using unsupported protocol", 1, false)
+        or line:find("Mixedpeer%-Icecrown says our protocol/version is incompatible", 1, false) then
         mixedCount = mixedCount + 1
     end
 end
-assertEq(mixedCount, 2, "alternating NACK and unsupported warnings do not retrigger")
+assertEq(mixedCount, 2, "alternating NACK and unsupported debug notices do not retrigger")
+assertEq(#warnings, 0, "mixed unsupported/NACK traffic never prints to chat")
 
 assertTrue(P.ShouldNack("Cooldown-One"), "first ShouldNack allows send")
 assertTrue(not P.ShouldNack("Cooldown-One"), "second ShouldNack within 10s is blocked")
@@ -155,9 +202,43 @@ assertTrue(not P.ShouldNack("cooldown-one"), "ShouldNack sender key is case-inse
 now = now + 10
 assertTrue(P.ShouldNack("Cooldown-One"), "ShouldNack allows send after 10s")
 
-assertTrue(P.ShouldWarn("Warnpeer", "sig-a"), "first ShouldWarn allows print")
+assertTrue(P.ShouldWarn("Warnpeer", "sig-a"), "first ShouldWarn allows debug emit")
 assertTrue(not P.ShouldWarn("Warnpeer", "sig-a"), "repeat ShouldWarn signature is blocked")
 assertTrue(P.ShouldWarn("Warnpeer", "sig-b"), "new ShouldWarn signature is allowed")
+
+-- Source guards for Remove / Debug Only chat decisions that are not covered above.
+local function readFile(path)
+    local f = assert(io.open(path, "r"))
+    local body = f:read("*a")
+    f:close()
+    return body
+end
+
+local mainAddon = readFile("SpectrumFederation/SpectrumFederation.lua")
+assertTrue(
+    mainAddon:find('PrintSuccess%("Online%. Type /sf to open settings."%)', 1, false) == nil,
+    "login online banner PrintSuccess is removed"
+)
+
+local slash = readFile("SpectrumFederation/modules/SlashCommands.lua")
+assertTrue(
+    slash:find("Session started successfully", 1, true) == nil,
+    "slash session start success chat is removed"
+)
+assertTrue(
+    slash:find("Session ended successfully", 1, true) == nil,
+    "slash session end success chat is removed"
+)
+
+local controller = readFile("SpectrumFederation/modules/UI/LootHelper/Controller.lua")
+assertTrue(
+    controller:find("Session started successfully", 1, true) == nil,
+    "controller session start success chat is removed"
+)
+assertTrue(
+    controller:find("Session ended successfully", 1, true) == nil,
+    "controller session end success chat is removed"
+)
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

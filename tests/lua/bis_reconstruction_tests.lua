@@ -737,11 +737,12 @@ local fallback = makeProfile("Fallback")
 addMember(fallback, ALT_A)
 assertFalse(fallback:IsItemAwareEquipmentPopup(), "no BiS config or events keeps manual popup")
 
--- Protocol 3 rejected, 4 accepted. Tier-token classification and forced
--- Gear Override assignments are not safe to mix with protocol 3 clients.
-assertEq(SF.SyncProtocol.PROTO_CURRENT, 4, "protocol is 4")
-assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(3)), "protocol 3 is rejected")
-assertTrue(SF.SyncProtocol.ValidateProtocolVersion(4), "protocol 4 is accepted")
+-- Protocol 8 rejected, 9 accepted. Adjustment ledger events are not safe
+-- to mix with protocol 8 clients.
+assertEq(SF.SyncProtocol.PROTO_CURRENT, 9, "protocol is 9")
+assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(7)), "protocol 7 is rejected")
+assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(8)), "protocol 8 is rejected")
+assertTrue(select(1, SF.SyncProtocol.ValidateProtocolVersion(9)), "protocol 9 is accepted")
 
 -- Back icon is distinct from Chest
 local eqSource = io.open("SpectrumFederation/modules/UI/LootHelper/EquipmentWindow.lua"):read("*a")

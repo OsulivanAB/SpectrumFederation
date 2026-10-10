@@ -39,6 +39,11 @@ local function Round(v)
     return math.floor(v + 0.5)
 end
 
+-- Minimized overall-frame opacity (percent). Style texture alphas stay separate.
+local MINIMIZED_OPACITY_DEFAULT = 100
+local MINIMIZED_OPACITY_MIN = 15
+local MINIMIZED_OPACITY_MAX = 100
+
 -- Smallest window width that keeps the logo and every title-bar control from
 -- overlapping, with minTextWidth reserved for the profile name between them.
 function Window.MinimumTitleWidth(minTextWidth)
@@ -216,6 +221,42 @@ function Window:_UpdateMinimizeButtonState()
         or "Collapse the Loot Helper window to its title bar."
 end
 
+-- Normalize a stored opacity percent: missing/nonnumeric -> 100, else clamp 15-100.
+function Window:_NormalizeMinimizedOpacity(value)
+    local n = tonumber(value)
+    if not n then
+        return MINIMIZED_OPACITY_DEFAULT
+    end
+    return Clamp(n, MINIMIZED_OPACITY_MIN, MINIMIZED_OPACITY_MAX)
+end
+
+function Window:_ReadMinimizedOpacitySetting()
+    local raw
+    if SF.SettingsStore and SF.SettingsStore.Get then
+        raw = SF.SettingsStore:Get("lootHelper.minimizedHeaderOpacity")
+    else
+        local db = SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper)
+        raw = db and db.minimizedHeaderOpacity
+    end
+    return self:_NormalizeMinimizedOpacity(raw)
+end
+
+-- Apply overall main-frame alpha from minimized state + setting.
+-- Does not alter style-specific backdrop/title-bar texture alphas.
+function Window:ApplyMinimizedOpacity()
+    local f = self._frame
+    if not f or type(f.SetAlpha) ~= "function" then
+        return
+    end
+
+    if f.__sfMinimized then
+        local pct = self:_ReadMinimizedOpacitySetting()
+        f:SetAlpha(pct / 100)
+    else
+        f:SetAlpha(1)
+    end
+end
+
 function Window:_ApplyMinimizedState()
     local f = self._frame
     if not f then return end
@@ -241,6 +282,7 @@ function Window:_ApplyMinimizedState()
 
     self:_UpdateResizeHandleState()
     self:_UpdateMinimizeButtonState()
+    self:ApplyMinimizedOpacity()
     self:RequestScrollInsetsUpdate()
 end
 
@@ -371,6 +413,11 @@ function Window:SetMinimized(minimized)
 
     if LH.Controller and LH.Controller.OnMinimizedStateChanged then
         LH.Controller:OnMinimizedStateChanged(minimized)
+    end
+    -- Consumables banner Mobile Banking uses a UIParent secure holder that must
+    -- hide/reposition with Content visibility, not only with the outer frame.
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.RefreshReminder then
+        SF.ConsumablesRuntime:RefreshReminder()
     end
 end
 
@@ -725,10 +772,32 @@ function Window:Create()
     content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -C.CONTENT_PADDING, C.CONTENT_PADDING)
     frame.Content = content
 
+    local reminder = CreateFrame("Frame", nil, content)
+    reminder:SetHeight(0)
+    reminder:Hide()
+    reminder:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+    reminder:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, 0)
+    content.SupplyReminder = reminder
+
+    local reminderText = reminder:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    reminderText:SetPoint("LEFT", reminder, "LEFT", 4, 0)
+    reminderText:SetJustifyH("LEFT")
+    reminderText:SetText("Raid Supplies Available to Donate")
+    reminder.Text = reminderText
+
+    -- Layout reserve for the compact secure Mobile Banking icon owned by ConsumablesRuntime.
+    local mobileAnchor = CreateFrame("Frame", nil, reminder)
+    mobileAnchor:SetSize(22, 22)
+    mobileAnchor:SetPoint("RIGHT", reminder, "RIGHT", -4, 0)
+    mobileAnchor:Hide()
+    reminder.MobileAnchor = mobileAnchor
+
+    reminderText:SetPoint("RIGHT", mobileAnchor, "LEFT", -6, 0)
+
     local potHeader = CreateFrame("Frame", nil, content)
     potHeader:SetHeight(C.POT_HEADER_HEIGHT or 22)
-    potHeader:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
-    potHeader:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, 0)
+    potHeader:SetPoint("TOPLEFT", reminder, "BOTTOMLEFT", 0, 0)
+    potHeader:SetPoint("TOPRIGHT", reminder, "BOTTOMRIGHT", 0, 0)
     potHeader:Hide()
     content.PotHeader = potHeader
 
@@ -814,6 +883,15 @@ function Window:Create()
         LH.Style:Apply(frame)
     end
 
+    -- Style touches texture alphas only; reaffirm overall frame opacity after it.
+    self:ApplyMinimizedOpacity()
+
+    -- ConsumablesRuntime may have initialized before this frame existed. Attach
+    -- reminder hooks now so a later Show reevaluates without polling.
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.RefreshReminder then
+        SF.ConsumablesRuntime:RefreshReminder()
+    end
+
     return frame
 end
 
@@ -857,6 +935,30 @@ function Window:SetPointName(name)
             f.Title.UpdateTitleLayout()
         end        
     end
+end
+
+function Window:SetSupplyReminder(isVisible, mobileState)
+    local f = self._frame
+    if not f or not f.Content or not f.Content.SupplyReminder then return end
+    local reminder = f.Content.SupplyReminder
+    isVisible = isVisible and true or false
+    reminder:SetShown(isVisible)
+    reminder:SetHeight(isVisible and (C.POT_HEADER_HEIGHT or 22) or 0)
+
+    local showMobile = isVisible and mobileState and mobileState.visible and true or false
+    local mobileAnchor = reminder.MobileAnchor
+    if mobileAnchor then
+        mobileAnchor:SetShown(showMobile)
+    end
+    if reminder.Text then
+        if showMobile and mobileAnchor then
+            reminder.Text:SetPoint("RIGHT", mobileAnchor, "LEFT", -6, 0)
+        else
+            reminder.Text:SetPoint("RIGHT", reminder, "RIGHT", -4, 0)
+        end
+    end
+
+    self:RequestScrollInsetsUpdate()
 end
 
 function Window:SetRewardPotHeader(isVisible, text)
@@ -981,11 +1083,15 @@ function Window:UpdateScrollInsets()
 		bottomInset = h + (C.RESIZE_HANDLE_GAP or 6)
 	end
 
-	-- Reserve top inset if the Reward Pot header is shown
+	-- Reserve top inset for the supply reminder and Reward Pot header when shown.
 	local topInset = 0
+	local reminder = content.SupplyReminder
+	if reminder and reminder:IsShown() then
+		topInset = topInset + (reminder:GetHeight() or 0)
+	end
 	local potHeader = content.PotHeader
 	if potHeader and potHeader:IsShown() then
-		topInset = potHeader:GetHeight() or (C.POT_HEADER_HEIGHT or 22)
+		topInset = topInset + (potHeader:GetHeight() or (C.POT_HEADER_HEIGHT or 22))
 	end
 
 	-- Apply anchors

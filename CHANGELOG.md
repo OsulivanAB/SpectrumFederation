@@ -2,6 +2,80 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.15] - 2026-10-10
+
+### Added
+- Add admin manual adjustments for Raid Consumables (#370)
+
+## [1.5.8-beta.14] - 2026-10-09
+
+### Changed
+- Raid Consumables: verification, sync, and Guild Bank accounting (#366 PR2)
+
+## [1.5.8-beta.13] - 2026-10-09
+
+### Changed
+- Raid Consumables: Guild Bank observation and reconciliation foundation (#366 PR1)
+
+## [1.5.8-beta.12] - 2026-10-08
+
+### Added
+- Enhance Raid Supplies Guild Bank donation helper with goal progress, smart suggestions, and bank alignment (#352)
+
+## [1.5.8-beta.11] - 2026-10-08
+
+### Added
+- Add minimized Loot Helper window opacity slider (#313)
+
+## [1.5.8-beta.10] - 2026-10-08
+
+### Fixed
+- Fix Consumables Requested Items layout and control order (#362)
+
+## [1.5.8-beta.9] - 2026-10-08
+
+### Added
+- Add per-item Raid Consumables donation goals (protocol 8)
+
+## [1.5.8-beta.8] - 2026-10-07
+
+### Fixed
+- Fix Raid Supplies Guild Bank window lifecycle (#344)
+
+## [1.5.8-beta.7] - 2026-10-07
+
+### Changed
+- Simplify Raid Supplies banner to compact Mobile Banking flow (#354)
+
+## [1.5.8-beta.6] - 2026-10-07
+
+### Fixed
+- Fix Raid Supply reminder not attaching to Loot Helper window (#350)
+
+## [1.5.8-beta.5] - 2026-10-07
+
+### Changed
+- Restore Raid Supply reminder for Mobile Banking (#341)
+
+## [1.5.8-beta.4] - 2026-10-07
+
+### Changed
+- Reduce Spectrum chat noise per #331 classifications
+
+## [1.5.8-beta.3] - 2026-10-06
+
+### Fixed
+- Fixes
+
+## [1.5.8-beta.1] - 2026-10-06
+
+### Added
+- Add Loot Helper Raid Consumables
+
+### Changed
+- Consumables: validate event ordering and preserve deposit evidence; snapshot cache, CI, and version bumps
+- Stabilize Guild-Bank consumables: preserve confirmed deposits, snapshot cache revisions, and bounded order validation
+
 ## [1.5.7] - 2026-10-03
 
 ### Changed

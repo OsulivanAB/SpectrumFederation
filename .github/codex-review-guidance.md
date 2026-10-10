@@ -13,10 +13,11 @@ introduced it, when the PR has already been reviewed, or when fixing it is
 inconvenient. Discovery of a finding does not itself authorize a repair,
 another review, or paid continuation.
 
-An intentionally subscribed Cursor agent may assess a delivered finding and
-post a disposition reply under `.cursor/skills/ai-review-loop/SKILL.md` and
-`.cursor/skills/pr-review-comments/SKILL.md`. That subscription triage is not
-repair authorization. Repair batches, additional reviews, and other paid
+Cursor may assess delivered findings and post disposition replies only when a
+current owner request authorizes that assessment (and any reply) under
+`.cursor/skills/ai-review-loop/SKILL.md` and
+`.cursor/skills/pr-review-comments/SKILL.md`. Arriving review comments alone
+are not authorization. Repair batches, additional reviews, and other paid
 continuation still require a current owner request under
 `.cursor/skills/ai-review-loop/SKILL.md`.
 
@@ -144,9 +145,9 @@ the final integration checkpoint while the latest applicable incremental
 coverage has unresolved findings.
 
 A finding from the final integration review does not authorize or schedule a
-repair or another review. An intentionally subscribed Cursor agent may still
-assess and reply to the finding under the review skills; that reply is not
-repair authorization. Follow
+repair or another review. Cursor may assess or reply to the finding only when
+the owner explicitly requests that assessment; that reply is not repair
+authorization. Follow
 [When the Final Integration Review Finds an Issue](#when-the-final-integration-review-finds-an-issue)
 only when the owner authorizes the applicable repair or re-review operation.
 
@@ -188,8 +189,9 @@ Require another full review of the PR against its merge base only when the new f
 
 There is no numeric cap on legitimate findings within an authorized review, and
 a late defect remains actionable. That quality rule does not authorize another
-review or repair batch. Subscription triage may assess and reply; it must still
-stop without implementing. Stop when the current authorized operation is
+review or repair batch. Owner-requested assessment may classify and recommend
+(and reply only when authorized); it must still stop without implementing
+unless repair was authorized. Stop when the current authorized operation is
 delivered; report unresolved coverage and defects for an owner decision.
 
 ### Fall Back to a Full Review When Review History Is Unreliable
@@ -591,9 +593,9 @@ Lead with **actionable findings**, ordered by severity. Those must be resolved
 or explicitly accepted by the owner before readiness. Submit the distinct
 high-confidence findings from the completed review scope together. Do not
 withhold an in-scope defect because another finding has already been written.
-Reporting them does not authorize repairs or another review. A subscribed
-Cursor agent may triage and reply to delivered findings; that is still not
-repair authorization. See
+Reporting them does not authorize repairs or another review. Cursor may assess
+and reply to delivered findings only under a current owner request; that is
+still not repair authorization. See
 [Exhaust the Current Review Scope](#exhaust-the-current-review-scope).
 
 For each actionable finding include:

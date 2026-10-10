@@ -872,10 +872,20 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 				},
 				{ type = "checkbox", label = "Lock Loot Window", tooltip = "Prevent the Loot Helper window from being moved or resized.", path = "lootHelper.lockLootWindow" },
+				{
+					type = "slider",
+					label = "Minimized Loot Window Opacity",
+					tooltip = "Adjust the opacity of the entire Loot Helper window while minimized, including its background, text, logo, and buttons. The expanded window is unaffected.",
+					path = "lootHelper.minimizedHeaderOpacity",
+					min = 15,
+					max = 100,
+					step = 5,
+				},
 				{ type = "checkbox", label = "Show Members not in raid", tooltip = "Show profile members even when they are not currently in your raid. Turn this off to focus only on people who are present.", path = "lootHelper.showMembersNotInRaid" },
 				{ type = "checkbox", label = "Show Loot Window outside of Raid", tooltip = "Allow the Loot Helper window to appear even when you are not currently in a raid.", path = "lootHelper.showWindowOutsideRaid" },
 				{ type = "checkbox", label = "Enable Local Safemode", tooltip = "Pause bulk sync and profile transfer work on your client. Use this if you want to avoid large data updates locally; it does not affect other players.", path = "lootHelper.localSafeMode" },
 				{ type = "checkbox", label = "Enable Local Safemode on Combat", tooltip = "Automatically turn on local safemode when you enter combat so bulk sync and profile transfers pause on your client.", path = "lootHelper.localSafeModeOnCombat" },
+				{ type = "checkbox", label = "Show Raid Supply Reminders", tooltip = "Show the Raid supplies reminder and open the donation review when you interact with the configured guild bank. This does not turn off donation or custody accounting.", path = "lootHelper.showRaidSupplyReminders" },
 				{ type = "spacer", height = 10 },
 				{
 					type = "button",
@@ -1334,6 +1344,18 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					type = "help",
 					indent = "label",
 					text = "Syncing between addons only happens during a session.",
+				},
+				{
+					type = "checkbox",
+					label = "Enable Early Preparation Whispers",
+					tooltip = "While you are the Loot Helper session coordinator, automatically inspect raid members and whisper profile members who are confirmed to be missing required preparation before Raid Check begins. Each player is contacted at most once per session.",
+					path = "lootHelper.earlyPreparationWhispers",
+					onValueChanged = function()
+						local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+						if earlyPrep and earlyPrep.Notify then
+							earlyPrep:Notify("setting")
+						end
+					end,
 				},
 				{ type = "button", label = "Session Control", adminOnly = true, buttonText = function() if IsSessionActive() then return "End Session" end return "Start Session" end, width = 120, tooltip = "Start a Loot Helper session for the active profile, or end the current one if a session is already running.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then ctx.section:SetMessage("Loot Helper Sync system not available", "error") return end if IsSessionActive() then local ok = SF.LootHelperSync:EndSession("manual") if ok then ctx.section:SetMessage("Session ended successfully", "success") else ctx.section:SetMessage("Failed to end session", "error") end else local profileId = GetActiveProfileId(ctx.store) if not profileId then ctx.section:SetMessage("No active profile selected", "error") return end local sessionId = SF.LootHelperSync:StartSession(profileId) if sessionId then ctx.section:SetMessage("Session started successfully", "success") else ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error") end end ctx.pageBuilder:Refresh() end },
 				{ type = "text", text = "Enable Raid Wide Safe Mode" },

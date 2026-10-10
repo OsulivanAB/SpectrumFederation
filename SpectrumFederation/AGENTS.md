@@ -209,8 +209,8 @@ described as an executed test.
 
 Choose representative, risk-based event sequences. Do not demand exhaustive
 permutations, a new simulator for every feature, or every suite after every
-edit. This execution guidance applies to authorized implementation/validation.
-Automatic subscription triage remains non-executing inspection.
+edit. This execution guidance applies to authorized implementation/validation
+and to owner-requested assessment only when that request includes execution.
 
 ### Reviews and audits
 
@@ -275,8 +275,16 @@ When you need a new toggle/option:
 - Do not log in hot paths (tight loops, per-frame handlers).
 
 ## User-visible messaging
-- Prefer `modules/MessageHelpers.lua` helpers (`SF:PrintSuccess/Error/Warning/Info`) when you need to tell the user something.
-- Do not spam chat for debugging (use `SF.Debug` instead).
+
+User-facing chat output is opt-in.
+Do not add new output to normal WoW chat unless:
+1. The task/issue explicitly asks for that message or behavior to be shown in chat; or
+2. The user has explicitly approved adding it.
+Do not infer permission because a message seems useful, actionable, important, or error-related.
+If an implementation would benefit from new chat output but the request does not authorize it, ask the user before adding it. If interactive clarification is not possible, do not add the chat output; note the proposed message for the user instead.
+If the information is useful for diagnostics, troubleshooting, or development, use `SF.Debug` rather than normal chat. If it has no diagnostic value, it does not need replacement output at all.
+
+When chat output *is* authorized, prefer `modules/MessageHelpers.lua` helpers (`SF:PrintSuccess/Error/Warning/Info`, `SF:SystemMessage`) over ad-hoc `print` / `DEFAULT_CHAT_FRAME:AddMessage`. Do not spam chat for debugging.
 
 ### Anti-spam and repetition (proactive requirement)
 
@@ -309,9 +317,32 @@ Recurring processing (heartbeats, sync ticks, retries) should continue as needed
 
 For sync/comm warning deduplication patterns, see `tests/test_sync_protocol.py` and existing Loot Helper sync code.
 
-## Localization
-- If the repo has `locale/enUS.lua` and `ns.L`, use it for new user-facing strings.
-- If existing code is not fully localized yet, keep your additions consistent with the existing direction (don’t introduce a third pattern).
+## Localization (mandatory pre-delivery check)
+
+Canonical policy for packaged addon user-facing text. Other instruction files
+should reference this section rather than restating a weaker version.
+
+Before declaring packaged addon work complete, explicitly audit every **new or
+modified** user-facing string introduced by the change—not only Settings pages:
+
+- Labels, button text, status/empty states, tooltips, warnings, errors, and
+  other player-visible copy in Lua/UI modules
+- Route those strings through the established localization system:
+  `locale/enUS.lua` + `ns.L` / `SF.L`, typically via `SF.LocaleText(key, default)`
+- Verify `locale/enUS.lua` (and any new locale file) is listed in the owning
+  addon's TOC **before** modules that render those strings
+- Prefer stable locale keys; keep English defaults as fallbacks so tests and
+  incomplete locale tables remain usable
+- Internal identifiers, protocol field names, debug/diagnostic output, and
+  other non-user-facing strings do **not** require localization
+- Do **not** expand a task into a wholesale migration of unrelated legacy
+  hardcoded strings unless the owner explicitly asks for that migration
+- The PR checklist item for `locale/enUS.lua` may be checked only after this
+  audit against the actual diff. Do not check it automatically, assume it is
+  satisfied, or treat localization as optional follow-up for automated review
+
+Localization compliance is part of implementation completion for packaged
+addon changes.
 
 ## Packaging + versioning
 - **Any new Lua file must be listed in** the TOC of the addon that owns it (`SpectrumFederation.toc` or the owning child-addon TOC).
@@ -336,5 +367,7 @@ work, at minimum:
 - for layout, sizing, callback, event, timer, listener, queue, inspect, sync,
   cache, or retry changes: prefer tests that assert bounded execution,
   convergence, and the relevant behavioral sequences above
+- complete the **Localization** audit above for any new or modified
+  user-facing strings (locale keys, TOC load order, PR checkbox honesty)
 - recommend human Retail checks such as `/reload`, settings smoke tests, and
   any contract-specific in-game scenarios — do not fabricate Retail evidence

@@ -138,6 +138,14 @@ Singleton characters keep their local Ring1/Ring2 and Trinket1/Trinket2. Linked 
 
 Historical **Main Swap** entries remain in Loot Logs as lineage. They are not offered as a live transfer action.
 
+## Raid Consumables
+
+Loot Helper → Consumables is shared profile configuration for raid supplies. An admin locks one guild, using a stable guild id, and one Guild Bank tab, then lists the exact items the guild currently accepts as donations. A different quality is a different item. There are no Crafters, recipient assignments, or material routing.
+
+Loot Helper → General → Show Raid Supply Reminders is personal. It only controls the reminder and the automatic deposit review when the configured Guild Bank opens. Turning it off does not stop accounting.
+
+Members who carry a requested item can see a compact Raid Supplies reminder with a secure Mobile Banking icon when that path is relevant (including while Mobile Banking is on cooldown). Opening Mobile Banking from that banner selects the configured Guild Bank tab once; the existing deposit assistant then handles quantities and deposits when the tab is usable. Spectrum records contribution credit only for quantities observed successfully entering that tab. What happens to the materials afterward is not tracked. Historical Raid Consumable Logs remain when an admin clears the current configuration.
+
 ## Related pages
 
 - [Point Based](point-based.md)

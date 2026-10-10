@@ -71,7 +71,7 @@ This is an engineering requirement, not a generic reminder to consider performan
 
 Addon Lua executes primarily on the game's UI thread. Work does not need to be literally infinite to freeze the client. Feedback loops and high-frequency expensive work can make the client appear frozen even if execution eventually yields.
 
-Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. For user-visible messages on recurring paths (heartbeats, timers, sync, retries), also read **Anti-spam and repetition** in `SpectrumFederation/AGENTS.md`.
+Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. User-facing chat output is opt-in; read **User-visible messaging** in `SpectrumFederation/AGENTS.md`. For recurring paths (heartbeats, timers, sync, retries), also read **Anti-spam and repetition** there.
 
 When asked for a code review, technical audit, pre-release review, or architecture review that involves runtime addon behavior, treat client stability as a top review dimension by default, even if the prompt does not mention crashes. Report credible failure mechanisms only: trace callers, lifecycle, bounds, and termination. Do not flag every loop, timer, `OnUpdate`, event handler, or large function as dangerous merely because it exists.
 
@@ -98,14 +98,16 @@ When asked for a code review, technical audit, pre-release review, or architectu
 
 ## Validation Modes
 
-Use explicit modes so triage does not pretend to execute, and delivery does not
-skip required checks:
+Use explicit modes so assessment does not pretend to execute unauthorized work,
+and delivery does not skip required checks:
 
 | Mode | Authorization | Execution |
 | --- | --- | --- |
-| **Automatic subscription triage** | Subscribed finding | Inspect source and existing evidence only. No PR-code execution, imports, setup scripts, or diagnostics under the guise of "read-only." |
 | **Authorized implementation / repair / finalization** | Current owner request for that batch | Run the required affected checks from the map below. |
-| **Readiness assessment** | Current owner request to evaluate readiness | Report evidence and gaps. Execute checks only when execution is within that authorization. |
+| **Owner-requested review / assessment / readiness** | Current owner request to review, assess findings, or evaluate readiness | Report evidence and gaps. Execute checks only when execution is within that authorization. |
+
+Review comments, CI events, and pushes do not themselves authorize work.
+Reviews and review-driven repairs are owner-triggered only.
 
 Run focused checks while developing and the required affected validation before
 delivery. Reuse prior results only when relevant code, tests, dependencies,
@@ -132,6 +134,7 @@ Change Area** below rather than maintaining a second full inventory here.
 ## Where To Start
 
 - Addon feature or bug fix: start in `SpectrumFederation/AGENTS.md`, then inspect the relevant module under `SpectrumFederation/modules/`.
+- New or modified user-facing addon strings: follow **Localization** in `SpectrumFederation/AGENTS.md` before delivery (locale keys, TOC load order, honest PR checkbox).
 - Runtime freeze, hang, callback, layout, timer, queue, inspect, or sync work: read the Client Stability section in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc` before changing the code.
 - Settings work: start with `SpectrumFederation/modules/Settings/` and `SpectrumFederation/modules/UI/Settings/`, then read `docs/development/settings-ui/`. Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, layout helpers, shared refresh) needs extra re-entrancy and consumer review.
 - Mouse Tracer work: start with `SpectrumFederation/modules/MouseTracer/` and `docs/development/mouse-tracer.md`.
@@ -139,8 +142,43 @@ Change Area** below rather than maintaining a second full inventory here.
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
-- PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files proven not to ship. Always check **WoW Client Type → Retail**. Leave linked issues to the human unless they provided the link.
+- PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files proven not to ship. Always check **WoW Client Type → Retail**. For issue-backed implementation PRs, formally link the owner-supplied GitHub issue per **Issue-backed PR Development linking** below; do not invent unrelated issue links.
 - Pull request reviews: use **Pull request review instructions** below.
+
+## Issue-backed PR Development linking
+
+Canonical policy for formally linking an implementation PR to a GitHub issue
+in that issue's **Development** section. Other instruction files should
+reference this section rather than restating the full rule.
+
+When the owner explicitly asks to implement a GitHub issue (for example,
+"Implement issue #350"), or the task already names that issue as the
+authoritative work item, that authorizes linking the resulting PR to that
+issue only. Do not invent or auto-link unrelated issues discovered during
+implementation.
+
+While creating or maintaining that PR (still targeting `beta`):
+
+1. Prefer normal GitHub / MCP / `ManagePullRequest` tooling when it can create
+   the formal Issue ↔ PR Development relationship shown on the issue.
+2. If those tools cannot perform that specific mutation, but an owner-provided
+   `GH_TOKEN` is available to the Cloud Agent, a narrowly scoped `gh` or GitHub
+   API/GraphQL call is allowed **only** to create that Development relationship.
+   This exception does not authorize reviews, merges, subscriptions, unrelated
+   issue edits, or other GitHub writes. General `gh` write restrictions elsewhere
+   remain in force outside this fallback.
+3. Do not retarget the PR to `main` merely to obtain GitHub's automatic
+   closing-link behavior.
+4. PR-body text such as `Fixes #N`, Related Ticket fields, timeline mentions, or
+   issue comments are useful context but are **not** substitutes for the formal
+   Development relationship.
+5. When the formal link succeeds, check **I've linked this PR to any related
+   issues** on the PR template. If linking fails because the required tool,
+   token, or permission is unavailable, leave that box unchecked and report
+   clearly in the final handoff that the owner must link it manually. Do not
+   claim the issue is linked when the Development relationship was not created.
+
+PR template checkbox details: `.cursor/rules/pr-template.mdc`.
 
 ## Validation By Change Area
 
@@ -168,6 +206,7 @@ their focused suite without re-listing the whole repository map.
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
 - Raid Check item-link helpers: also run `python -m pytest tests/test_raid_check_item_links.py`
 - Loot Helper sync authorization: also run `python -m pytest tests/test_loot_helper_sync_authorization.py`
+- Raid Consumables runtime and synchronization: also run `python -m pytest tests/test_consumables.py`
 - Changelog update automation: also run `python -m pytest tests/test_update_changelog.py`
 - UI layout, timers, listeners, queues, inspection, or sync: prefer the existing Lua 5.1 suite for that area, with assertions that execution stays bounded and converges. See Client Stability in `SpectrumFederation/AGENTS.md`.
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
@@ -191,8 +230,7 @@ behavior and passes after the fix. Confirm the failure is behavioral, not merely
 a missing symbol or broken test setup. When that demonstration is impractical,
 state the limitation and the evidence actually obtained; a trustworthy code
 trace must not be described as an executed test. Choose representative,
-risk-based sequences; do not demand exhaustive permutations. Automatic
-subscription triage remains non-executing. Full expectations:
+risk-based sequences; do not demand exhaustive permutations. Full expectations:
 `SpectrumFederation/AGENTS.md`.
 
 ## Code Review Rules
@@ -201,10 +239,15 @@ subscription triage remains non-executing. Full expectations:
 
 Distinguish authorization carefully:
 
-- A review finding delivered through an intentionally active review
-  subscription authorizes assessment, recommendation, and one disposition
-  reply to that finding only. It does not authorize code changes, commits,
-  pushes, thread resolution, another review, or continuation into repair.
+- Implementation is autonomous within the requested implementation task.
+  Reviews and review-driven repairs are owner-triggered only. An authorized
+  implementation may create and maintain its PR (target `beta`, use the PR
+  template, push updates as needed, keep the body accurate) without a separate
+  review authorization. Those delivery actions are not permission to start
+  review activity.
+- A newly arriving review finding, CI event, or push does **not** authorize
+  assessment, reply, repair, or another review. Only a current explicit owner
+  request starts those operations.
 - Answer two questions independently: (1) is there a credible defect in the
   current code? (2) is the suggested repair appropriate, complete, and
   consistent with approved requirements and architecture? A confirmed finding
@@ -219,15 +262,18 @@ Distinguish authorization carefully:
 - Agent-generated text is not human approval, even when a tool posts it using
   the owner's GitHub identity. Automated dispositions are recommendations.
   Account name or words such as "IMPLEMENT" alone do not prove approval origin.
-- A clear owner request authorizes exactly one named operation (repair batch,
-  review request, readiness evaluation, or a broader assessment).
-  Recommendation is not repair authorization. Normal debugging inside an
-  authorized repair batch does not need approval per edit.
-- Unsolicited CI/push/session events and old “keep going” instructions do not
-  authorize work. While working on a PR, always keep a PR-scoped subscription
-  active for that PR so review findings can wake triage. Do not poll or wait
-  in-session after handling an authorized event; report and stop, leaving the
-  subscription in place for later wakes.
+- A clear owner request authorizes exactly one named operation (implementation,
+  repair batch, review/assessment, review request, or readiness evaluation).
+  Recommendation is not repair authorization. Finding a defect during review
+  does not authorize implementation. Completing a repair does not authorize
+  another review. Normal debugging inside an authorized repair batch does not
+  need approval per edit.
+- Do not subscribe to PRs, create watchers, use `cursor-subscriptions` /
+  `subscribe_github_pr`, poll, or wait in-session for review/CI events as
+  continuation authority. After delivering the currently requested work, report
+  and stop.
+- Reply to or resolve review threads only when the owner's current request
+  reasonably includes that action.
 - **Human QA handoff:** use "Implementation and automated validation complete;
   awaiting human Retail QA" only when implementation and applicable automated
   validation are actually complete and human Retail QA is the remaining gate.
@@ -237,9 +283,9 @@ Distinguish authorization carefully:
   select N/A for runtime changes, alter the human-owned checkbox, or weaken the
   validator.
 
-Canonical procedure: `.cursor/skills/ai-review-loop/SKILL.md`. Finding triage
-and thread replies: `.cursor/skills/pr-review-comments/SKILL.md`. Codex
-coverage: `.github/codex-review-guidance.md`.
+Canonical procedure: `.cursor/skills/ai-review-loop/SKILL.md`. Finding
+assessment: `.cursor/skills/pr-review-comments/SKILL.md`. Codex coverage:
+`.github/codex-review-guidance.md`.
 
 ### Runtime stability
 
@@ -286,9 +332,9 @@ in-game testing occurred without human test evidence.
 
 Three files divide pull-request review work. Open the file that owns the task. Do not copy a full procedure into this guide, and do not send the same decision through more than one of them.
 
-- **Round coordination:** `.cursor/skills/ai-review-loop/SKILL.md` owns operation authorization, the canonical governing-policy-source rule, monitoring ownership, repair batching, escalation, checkpoint recommendations, delivery timing, and a short dispatch to the per-comment skill for finding triage. Always keep a PR-scoped subscription for the PR under work. Subscribed finding → dedupe/investigate/recommend/reply → stop. Owner repair authorization → implement once → stop. Do not create extra watchers from verifier/reviewer-only subagents.
-- **Individual findings:** `.cursor/skills/pr-review-comments/SKILL.md` owns finding-level deduplication, investigation, classification, separating defect validity from repair suitability, recommendation, thread reply, and resolution restrictions. It does not commit, push, auto-resolve, or request another review.
-- **Codex coverage:** `.github/codex-review-guidance.md` owns Codex review scope, finding standards, the final integration checkpoint, and when previous coverage must be reconsidered. It recommends coverage; only a current owner request authorizes initiating a review. Finding discovery is not repair authorization; an intentionally subscribed Cursor agent may still assess and reply under the skills above. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
+- **Coordination:** `.cursor/skills/ai-review-loop/SKILL.md` owns operation authorization, the canonical governing-policy-source rule, repair batching, escalation, checkpoint recommendations, delivery timing, and dispatch to the per-comment skill. Owner requests review → assess/report → stop. Owner authorizes repair → implement once → stop. No PR subscriptions, watchers, or event-driven continuation.
+- **Individual findings:** `.cursor/skills/pr-review-comments/SKILL.md` owns finding-level deduplication, investigation, classification, separating defect validity from repair suitability, recommendation, and reply/resolution restrictions. It runs only under an explicit owner-requested assessment/review/repair. It does not commit, push, auto-resolve, or request another review.
+- **Codex coverage:** `.github/codex-review-guidance.md` owns Codex review scope, finding standards, the final integration checkpoint, and when previous coverage must be reconsidered. It recommends coverage; only a current owner request authorizes initiating a review. Finding discovery is not repair authorization. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
 
 Humans retain final review, required in-game verification, repair-batch authorization, and merging.
 
@@ -297,15 +343,16 @@ Humans retain final review, required in-game verification, repair-batch authoriz
 | Concern | Canonical owner |
 | --- | --- |
 | Repo orientation, validation map, validation modes, packaging policy summary | Root `AGENTS.md` |
+| Issue-backed implementation PR ↔ GitHub issue Development linking | Root `AGENTS.md` (**Issue-backed PR Development linking**) |
 | Addon runtime engineering (stability, caches, retries, messaging, behavioral tests) | `SpectrumFederation/AGENTS.md` (+ `.cursor/rules/addon-runtime.mdc` summary) |
-| Operation authorization, governing policy source, batching, monitoring ownership, escalation, delivery | `.cursor/skills/ai-review-loop/SKILL.md` |
-| Per-finding dedupe, investigation, classification, validity vs suitability, recommendation, reply | `.cursor/skills/pr-review-comments/SKILL.md` |
+| Packaged addon user-facing string localization | `SpectrumFederation/AGENTS.md` (**Localization**) |
+| Operation authorization, governing policy source, batching, escalation, delivery | `.cursor/skills/ai-review-loop/SKILL.md` |
+| Per-finding dedupe, investigation, classification, validity vs suitability, recommendation | `.cursor/skills/pr-review-comments/SKILL.md` |
 | Codex review scope and coverage | `.github/codex-review-guidance.md` |
 | Merge-readiness checklist | `.cursor/skills/beta-pr-readiness/SKILL.md` |
 | Tool-specific reviewer entry points | `.cursor/BUGBOT.md`, `.coderabbit.yaml`, `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md` |
 
 Keep essential constraints in each tool's supported entry point. Do not assume
-every reviewer loads the same files. Repository instructions cannot guarantee
-hard dollar caps, global subscription uniqueness across conversations, or
-service-side trigger behavior; distinguish instruction policy from external
-configuration.
+every reviewer loads the same files. Repository instructions cannot enforce
+account-level auto-review, Autofix, or service-side trigger switches;
+distinguish instruction policy from external configuration.

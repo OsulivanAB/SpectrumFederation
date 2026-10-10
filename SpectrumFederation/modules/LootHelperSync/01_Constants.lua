@@ -6,7 +6,7 @@ local Sync = SF.LootHelperSync
 -- Constants / Message Types
 -- ============================================================================
 
-Sync.PROTO_VERSION = 4
+Sync.PROTO_VERSION = 9
 
 Sync.PREFIX = {
     CONTROL = "SF_LH",
@@ -47,4 +47,23 @@ Sync.MSG = {
     -- Raid Check minimum item level (config-only; not a profile snapshot)
     RAID_CHECK_ILVL_REQ = "RAID_CHECK_ILVL_REQ",
     RAID_CHECK_ILVL_SET = "RAID_CHECK_ILVL_SET",
+
+    -- Session-scoped missing-requirements warning dedupe. Not profile history.
+    PREP_NOTICE = "PREP_NOTICE",
+    -- Coordinator-serialized exclusive claim before a missing-requirements whisper.
+    PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ",
+    PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK",
+    PREP_WARN_CLAIM_RELEASE = "PREP_WARN_CLAIM_RELEASE",
+    -- Group-visible grant replication before ACK/delivery.
+    PREP_WARN_CLAIM_GRANT = "PREP_WARN_CLAIM_GRANT",
+    -- Raid Consumables config and append-only accounting
+    CONSUMABLES_OP = "CONSUMABLES_OP",
+    CONSUMABLES_CONFIG = "CONSUMABLES_CONFIG",
+    CONSUMABLES_EVENT = "CONSUMABLES_EVENT",
+    CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE",
+    -- Guild Bank observation verification (Issue #366 PR2)
+    CONSUMABLES_OBS_REPORT = "CONSUMABLES_OBS_REPORT",
+    CONSUMABLES_REVIEW_REQ = "CONSUMABLES_REVIEW_REQ",
+    CONSUMABLES_REVIEW_SUMMARY = "CONSUMABLES_REVIEW_SUMMARY",
+    CONSUMABLES_OBS_DECISION = "CONSUMABLES_OBS_DECISION",
 }

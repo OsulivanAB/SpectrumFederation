@@ -57,7 +57,12 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.RC_CONFIG_SET then return self:HandleRCConfigSet(sender, payload) end
         if msgType == self.MSG.RAID_CHECK_ILVL_REQ then return self:HandleRaidCheckItemLevelRequest(sender, payload) end
         if msgType == self.MSG.RAID_CHECK_ILVL_SET then return self:HandleRaidCheckItemLevelSet(sender, payload) end
-        
+        if msgType == self.MSG.PREP_NOTICE then return self:HandlePrepNotice(sender, payload) end
+        if msgType == self.MSG.PREP_WARN_CLAIM_REQ then return self:HandlePrepWarnClaimRequest(sender, payload) end
+        if msgType == self.MSG.PREP_WARN_CLAIM_ACK then return self:HandlePrepWarnClaimAck(sender, payload) end
+        if msgType == self.MSG.PREP_WARN_CLAIM_RELEASE then return self:HandlePrepWarnClaimRelease(sender, payload) end
+        if msgType == self.MSG.PREP_WARN_CLAIM_GRANT then return self:HandlePrepWarnClaimGrant(sender, payload) end
+
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Unknown CONTROL message type (msgType=%s, sender=%s, dist=%s)",
                 tostring(msgType), tostring(sender), tostring(distribution))
@@ -120,6 +125,15 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
         if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
         if msgType == self.MSG.NEW_LOG then return self:HandleNewLog(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_CONFIG then return self:HandleConsumablesConfig(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_EVENT then return self:HandleConsumablesEvent(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_OP then return self:HandleConsumablesOp(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_OBS_REPORT then return self:HandleConsumablesObsReport(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_REVIEW_REQ then return self:HandleConsumablesReviewReq(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_REVIEW_SUMMARY then return self:HandleConsumablesReviewSummary(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_OBS_DECISION then return self:HandleConsumablesObsDecision(sender, payload) end
+        -- Older clients may still send trade/withdraw freezes; v1 ignores them.
+        if msgType == self.MSG.CONSUMABLES_TRADE_FREEZE then return true end
         
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Unknown BULK message type (msgType=%s, sender=%s, dist=%s)",

@@ -268,6 +268,13 @@ function Controller:_HookSettingsStore()
             return
         end
 
+        if path == "lootHelper.minimizedHeaderOpacity" then
+            if LH.Window and LH.Window.ApplyMinimizedOpacity then
+                LH.Window:ApplyMinimizedOpacity()
+            end
+            return
+        end
+
         if path == "lootHelper.showMembersNotInRaid" then
             self:RequestRefresh("SettingsChanged:" .. path)
             return
@@ -427,6 +434,10 @@ function Controller:ApplyStyle()
     if LH.Style and LH.Style.Apply then
         LH.Style:Apply(f)
     end
+    -- Style may refresh backdrop/title texture alphas; keep overall frame alpha.
+    if LH.Window and LH.Window.ApplyMinimizedOpacity then
+        LH.Window:ApplyMinimizedOpacity()
+    end
 end
 
 -- Refresh the title bar information
@@ -540,12 +551,8 @@ function Controller:OnPlayClicked()
                 return
             end
             local ok = SF.LootHelperSync:EndSession("manual")
-            if SF.PrintSuccess and SF.PrintError then
-                if ok then
-                    SF:PrintSuccess("Session ended successfully")
-                else
-                    SF:PrintError("Failed to end session (no active session?)")
-                end
+            if not ok and SF.PrintError then
+                SF:PrintError("Failed to end session (no active session?)")
             end
             self:RequestRefresh("PlayButtonEndSession")
         end)
@@ -578,12 +585,8 @@ function Controller:OnPlayClicked()
             return
         end
         local sessionId = SF.LootHelperSync:StartSession(profileId)
-        if SF.PrintSuccess and SF.PrintError then
-            if sessionId then
-                SF:PrintSuccess("Session started successfully")
-            else
-                SF:PrintError("Failed to start session (not in a group/raid?)")
-            end
+        if not sessionId and SF.PrintError then
+            SF:PrintError("Failed to start session (not in a group/raid?)")
         end
         self:RequestRefresh("PlayButtonStartSession")
     end)

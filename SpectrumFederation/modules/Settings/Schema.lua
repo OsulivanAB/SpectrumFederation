@@ -18,7 +18,12 @@ SF.SettingsSchema = {
 			enabled = true,
 			localSafeMode = false,
 			localSafeModeOnCombat = false,
+			showRaidSupplyReminders = true,
 			raidCheckAuditAutoRefresh = false,
+			-- Missing values merge to true so existing users start enabled.
+			earlyPreparationWhispers = true,
+			-- Account-local minimized window opacity (percent). Not profile-synced.
+			minimizedHeaderOpacity = 100,
 
 			-- Profile system
 			activeProfileId = nil,

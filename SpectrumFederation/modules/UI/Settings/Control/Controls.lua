@@ -1366,8 +1366,16 @@ function Controls:AddScrollList(section, opts)
 		local function EnsureRow(i)
 			if rows[i] then return rows[i] end
 
-			local r = CreateFrame("Frame", nil, content)
+			local r = CreateFrame("Button", nil, content)
 			r:SetHeight(rowHeight)
+			r:RegisterForClicks("LeftButtonUp")
+			r:EnableMouse(true)
+
+			local selected = r:CreateTexture(nil, "BACKGROUND")
+			selected:SetAllPoints()
+			selected:SetColorTexture(0.2, 0.55, 1.0, 0.22)
+			selected:Hide()
+			r.Selected = selected
 
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetPoint("LEFT", r, "LEFT", 0, 0)
@@ -1406,6 +1414,10 @@ function Controls:AddScrollList(section, opts)
 			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 
 			local items = getItems() or {}
+			local selectedKey = nil
+			if type(opts.getSelectedKey) == "function" then
+				selectedKey = opts.getSelectedKey()
+			end
 
 			local y = 0
 			local maxTextWidth = 0
@@ -1455,6 +1467,20 @@ function Controls:AddScrollList(section, opts)
 				else
 					r.Remove:SetAlpha(0.45)
 					r.Remove:SetScript("OnClick", nil)
+				end
+
+				local itemKey = item.clusterId or item.id or item.key or i
+				local isSelected = selectedKey ~= nil and selectedKey == itemKey
+				if r.Selected then
+					if isSelected then r.Selected:Show() else r.Selected:Hide() end
+				end
+				if type(opts.onSelect) == "function" then
+					r:SetScript("OnClick", function()
+						if not enabled then return end
+						opts.onSelect(item, i)
+					end)
+				else
+					r:SetScript("OnClick", nil)
 				end
 
 				if compactColumns and availableWidth > 0 then
@@ -1523,6 +1549,576 @@ function Controls:AddScrollList(section, opts)
 		RegisterRefresh(section, Refresh)
 
 		scroll:HookScript("OnSizeChanged", Refresh)
+	end)
+end
+
+-- Pure gate for consumable goal edits. Used by AddConsumableRequestedList and tests.
+-- Returns true only when a genuine, still-bound edit should invoke onGoalCommit.
+-- @param state table { ignore, cancel, boundItemId, lastCommittedText }
+-- @param text string Current edit-box text
+-- @param commitItemId number|nil Item id the commit callback would target
+-- @return boolean
+function Controls.ShouldCommitConsumableGoal(state, text, commitItemId)
+	state = state or {}
+	if state.ignore or state.cancel then
+		return false
+	end
+	if state.boundItemId == nil or commitItemId == nil then
+		return false
+	end
+	if state.boundItemId ~= commitItemId then
+		return false
+	end
+	text = tostring(text or "")
+	if text == tostring(state.lastCommittedText or "") then
+		return false
+	end
+	return true
+end
+
+-- Requested Items row: Item Name → Goal label → Goal input → Remove.
+-- Name column width is shared across rows (longest label, clamped to viewport)
+-- so Goal/input/X align in consistent columns. Helpers stay unit-testable.
+Controls.CONSUMABLE_REQUESTED_CONTROL_ORDER = { "text", "goalLabel", "goalEdit", "remove" }
+
+Controls.CONSUMABLE_REQUESTED_DEFAULTS = {
+	removeButtonSize = 18,
+	removeColumnGap = 6,
+	goalWidth = 56,
+	goalLabelGap = 8,
+	goalLabelWidth = 36,
+	-- Clear space between Goal text and the visible InputBox border.
+	goalEditGap = 8,
+	-- InputBoxTemplate left decoration sits inside the edit-box frame bounds;
+	-- include it so the ~8px visual gap is not eaten by the Left texture.
+	goalEditInputInset = 8,
+	edgePad = 4,
+	minTextWidth = 40,
+}
+
+-- Effective Goal→input gap: desired clear pixels plus InputBoxTemplate left inset.
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number effectiveGap, number visualGap, number inputInset
+function Controls.ConsumableRequestedGoalEditGap(sizes)
+	sizes = sizes or {}
+	local d = Controls.CONSUMABLE_REQUESTED_DEFAULTS
+	local visualGap = sizes.goalEditGap or d.goalEditGap
+	local inputInset = sizes.goalEditInputInset or d.goalEditInputInset
+	return visualGap + inputInset, visualGap, inputInset
+end
+
+-- Max item-name width after reserving Goal/remove controls.
+-- @param availableWidth number Visible content width for the list
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number textMaxWidth, number reservedControls
+function Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
+	sizes = sizes or {}
+	local d = Controls.CONSUMABLE_REQUESTED_DEFAULTS
+	local removeButtonSize = sizes.removeButtonSize or d.removeButtonSize
+	local removeColumnGap = sizes.removeColumnGap or d.removeColumnGap
+	local goalWidth = sizes.goalWidth or d.goalWidth
+	local goalLabelGap = sizes.goalLabelGap or d.goalLabelGap
+	local goalLabelWidth = sizes.goalLabelWidth or d.goalLabelWidth
+	local goalEditGap = Controls.ConsumableRequestedGoalEditGap(sizes)
+	local edgePad = sizes.edgePad or d.edgePad
+	local minTextWidth = sizes.minTextWidth or d.minTextWidth
+
+	-- Name → Goal → Input → X: reserve trailing controls so names cannot overlap.
+	local reservedControls = goalLabelGap + goalLabelWidth + goalEditGap + goalWidth
+		+ removeColumnGap + removeButtonSize + edgePad
+	local width = tonumber(availableWidth) or 0
+	return math.max(minTextWidth, width - reservedControls), reservedControls
+end
+
+-- Shared name-column width: longest label, clamped to available space.
+-- @param availableWidth number Visible content width for the list
+-- @param maxStringWidth number Widest FontString:GetStringWidth() among rows
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number nameColumnWidth
+function Controls.ConsumableRequestedNameColumnWidth(availableWidth, maxStringWidth, sizes)
+	local textMaxWidth = Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
+	return math.min(textMaxWidth, math.max(1, (tonumber(maxStringWidth) or 0) + 4))
+end
+
+-- Alias for single-string clamp; shared-column layout prefers NameColumnWidth.
+-- @param availableWidth number Visible content width for the list
+-- @param stringWidth number FontString:GetStringWidth() for the item text
+-- @param sizes table|nil Overrides for CONSUMABLE_REQUESTED_DEFAULTS fields
+-- @return number textWidth
+function Controls.ConsumableRequestedTextWidth(availableWidth, stringWidth, sizes)
+	return Controls.ConsumableRequestedNameColumnWidth(availableWidth, stringWidth, sizes)
+end
+
+-- Consumables-specific requested-item list: item label, editable Goal, remove X
+-- with a shared name column so Goal/input/X align across rows.
+-- @param section table Section to add row into
+-- @param opts table Options with getItems, onRemove, onGoalCommit, sizing
+-- @return Frame The created row
+function Controls:AddConsumableRequestedList(section, opts)
+	opts = opts or {}
+
+	local getItems = opts.getItems
+	if type(getItems) ~= "function" then
+		getItems = function() return {} end
+	end
+
+	local defaults = Controls.CONSUMABLE_REQUESTED_DEFAULTS
+	local rowHeight = opts.rowHeight or 24
+	local rowSpacing = opts.rowSpacing or 2
+	local removeButtonSize = opts.removeButtonSize or defaults.removeButtonSize
+	local removeColumnGap = opts.removeColumnGap or defaults.removeColumnGap
+	local goalWidth = opts.goalWidth or defaults.goalWidth
+	local goalLabelGap = opts.goalLabelGap or defaults.goalLabelGap
+	local goalLabelWidth = opts.goalLabelWidth or defaults.goalLabelWidth
+	local goalEditGap = opts.goalEditGap or defaults.goalEditGap
+	local goalEditInputInset = opts.goalEditInputInset or defaults.goalEditInputInset
+	local fixedHeight = opts.height or 180
+	local maxHeight = opts.maxHeight or fixedHeight
+	local resize = (opts.resize ~= false)
+	local layoutSizes = {
+		removeButtonSize = removeButtonSize,
+		removeColumnGap = removeColumnGap,
+		goalWidth = goalWidth,
+		goalLabelGap = goalLabelGap,
+		goalLabelWidth = goalLabelWidth,
+		goalEditGap = goalEditGap,
+		goalEditInputInset = goalEditInputInset,
+	}
+	local effectiveGoalEditGap = Controls.ConsumableRequestedGoalEditGap(layoutSizes)
+
+	local minRowHeight = rowHeight
+	if fixedHeight < minRowHeight then fixedHeight = minRowHeight end
+	if maxHeight < minRowHeight then maxHeight = minRowHeight end
+	local initialHeight = resize and minRowHeight or fixedHeight
+
+	return section:AddRow(initialHeight, function(row)
+		local _, control = self:InitRow(row, opts)
+
+		local scroll = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+		scroll:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", 0, 0)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		local rows = {}
+
+		local function EnsureRow(i)
+			if rows[i] then return rows[i] end
+
+			local r = CreateFrame("Frame", nil, content)
+			r:SetHeight(rowHeight)
+
+			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", removeButtonSize)
+			r.Remove = remove
+
+			local goalEdit = CreateFrame("EditBox", nil, r, "InputBoxTemplate")
+			goalEdit:SetAutoFocus(false)
+			goalEdit:SetSize(goalWidth, 20)
+			goalEdit:SetNumeric(true)
+			goalEdit:SetMaxLetters(6)
+			goalEdit:SetTextColor(1, 1, 1)
+			if goalEdit.SetHighlightColor then
+				goalEdit:SetHighlightColor(0.25, 0.5, 1, 0.35)
+			end
+			r.GoalEdit = goalEdit
+
+			local goalLabel = r:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+			goalLabel:SetText("Goal")
+			goalLabel:SetJustifyH("RIGHT")
+			if goalLabel.SetJustifyV then
+				goalLabel:SetJustifyV("MIDDLE")
+			end
+			r.GoalLabel = goalLabel
+
+			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			fs:SetJustifyH("LEFT")
+			if fs.SetJustifyV then
+				fs:SetJustifyV("MIDDLE")
+			end
+			if fs.SetWordWrap then
+				fs:SetWordWrap(false)
+			end
+			if fs.SetNonSpaceWrap then
+				fs:SetNonSpaceWrap(false)
+			end
+			if fs.SetMaxLines then
+				fs:SetMaxLines(1)
+			end
+			r.Text = fs
+
+			rows[i] = r
+			return r
+		end
+
+		local function SetScrollBarShown(show)
+			local sb = scroll.ScrollBar
+			if not sb then return 0 end
+			sb:SetShown(show)
+			if not show then
+				scroll:SetVerticalScroll(0)
+				if sb.SetValue then sb:SetValue(0) end
+				if sb.Disable then sb:Disable() end
+				return 0
+			end
+			if sb.Enable then sb:Enable() end
+			return sb:GetWidth() or 20
+		end
+
+		-- Column layout after content width accounts for the scrollbar.
+		-- All rows share nameColumnWidth so Goal/input/X start at the same x.
+		-- Goal label stays vertically centered on its input box.
+		local function LayoutRowColumns(r, nameColumnWidth)
+			r.Text:ClearAllPoints()
+			r.GoalLabel:ClearAllPoints()
+			r.GoalEdit:ClearAllPoints()
+			r.Remove:ClearAllPoints()
+
+			r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+			r.Text:SetWidth(nameColumnWidth)
+			r.GoalEdit:SetPoint(
+				"LEFT",
+				r.Text,
+				"RIGHT",
+				goalLabelGap + goalLabelWidth + effectiveGoalEditGap,
+				0
+			)
+			r.GoalLabel:SetWidth(goalLabelWidth)
+			r.GoalLabel:SetPoint("RIGHT", r.GoalEdit, "LEFT", -effectiveGoalEditGap, 0)
+			r.Remove:SetPoint("LEFT", r.GoalEdit, "RIGHT", removeColumnGap, 0)
+		end
+
+		local function Refresh()
+			if row.__sfConsumableListRefreshing then return end
+			row.__sfConsumableListRefreshing = true
+
+			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
+			local items = getItems() or {}
+			local y = 0
+
+			for i = 1, #items do
+				local item = items[i]
+				local r = EnsureRow(i)
+				r:ClearAllPoints()
+				r:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+				r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
+
+				r.Text:SetText(item.text or "")
+
+				local canRemove = item.canRemove and true or false
+				r.Remove:SetShown(canRemove)
+				if canRemove then
+					r.Remove:SetAlpha(enabled and 1 or 0.45)
+					r.Remove:SetScript("OnClick", function()
+						if not enabled then return end
+						if opts.onRemove then
+							opts.onRemove(item)
+						end
+					end)
+				else
+					r.Remove:SetAlpha(0.45)
+					r.Remove:SetScript("OnClick", nil)
+				end
+
+				local canEditGoal = item.canEditGoal and true or false
+				r.GoalLabel:SetShown(true)
+				r.GoalEdit:SetShown(true)
+				local editing = r.GoalEdit.HasFocus and r.GoalEdit:HasFocus()
+				local newItemId = item.itemId
+				local boundId = r.__sfBoundItemId
+				if editing and boundId ~= nil and boundId ~= newItemId then
+					-- Row was rebound to a different item while focused: cancel the
+					-- in-progress edit rather than committing old text to the new id.
+					r.GoalEdit.__sfCancelCommit = true
+					r.GoalEdit.__sfIgnore = true
+					if r.GoalEdit.ClearFocus then
+						r.GoalEdit:ClearFocus()
+					end
+					r.GoalEdit:SetText(tostring(item.goal or 0))
+					if r.GoalEdit.SetCursorPosition then
+						r.GoalEdit:SetCursorPosition(0)
+					end
+					r.GoalEdit.__sfIgnore = false
+					r.GoalEdit.__sfCancelCommit = false
+					r.__sfBoundItemId = newItemId
+					r.__sfLastCommittedText = tostring(item.goal or 0)
+				elseif not editing then
+					r.GoalEdit.__sfIgnore = true
+					r.GoalEdit:SetText(tostring(item.goal or 0))
+					if r.GoalEdit.SetCursorPosition then
+						r.GoalEdit:SetCursorPosition(0)
+					end
+					r.GoalEdit.__sfIgnore = false
+					r.__sfBoundItemId = newItemId
+					r.__sfLastCommittedText = tostring(item.goal or 0)
+				else
+					-- Same item still focused: keep typed text and binding.
+					r.__sfBoundItemId = newItemId
+				end
+				if canEditGoal and enabled then
+					r.GoalEdit:Enable()
+					r.GoalEdit:SetTextColor(1, 1, 1)
+					r.GoalLabel:SetTextColor(1, 0.82, 0)
+				else
+					r.GoalEdit:Disable()
+					r.GoalEdit:SetTextColor(0.6, 0.6, 0.6)
+					r.GoalLabel:SetTextColor(0.6, 0.6, 0.6)
+				end
+
+				local commitItem = item
+				local function CommitGoal()
+					if not (canEditGoal and enabled) then return end
+					local text = r.GoalEdit:GetText() or ""
+					local allowed = Controls.ShouldCommitConsumableGoal({
+						ignore = r.GoalEdit.__sfIgnore and true or false,
+						cancel = r.GoalEdit.__sfCancelCommit and true or false,
+						boundItemId = r.__sfBoundItemId,
+						lastCommittedText = r.__sfLastCommittedText,
+					}, text, commitItem and commitItem.itemId)
+					if not allowed then
+						return
+					end
+					-- Record before invoking onGoalCommit so a successful focus-loss
+					-- submit is not repeated for the same text. Enter only clears
+					-- focus and relies on this path, so a rejected submit can retry.
+					r.__sfLastCommittedText = text
+					if opts.onGoalCommit then
+						opts.onGoalCommit(commitItem, text)
+					end
+				end
+				r.GoalEdit:SetScript("OnEnterPressed", function(selfEdit)
+					selfEdit:ClearFocus()
+				end)
+				r.GoalEdit:SetScript("OnEditFocusLost", function()
+					CommitGoal()
+				end)
+
+				r:SetAlpha(enabled and 1 or 0.45)
+				r:Show()
+				y = y + rowHeight + rowSpacing
+			end
+
+			for i = #items + 1, #rows do
+				rows[i]:Hide()
+			end
+
+			local contentH = (y > 0) and (y - rowSpacing) or 0
+			content:SetHeight(math.max(1, contentH))
+
+			local function ApplyScrollAndColumns()
+				local sbw = 0
+				if resize then
+					local maxVisible = math.max(rowHeight, maxHeight)
+					local needVisible = math.max(rowHeight, contentH)
+					local showScroll = needVisible > maxVisible
+					sbw = SetScrollBarShown(showScroll)
+					local targetVisible = math.min(needVisible, maxVisible)
+					if math.abs((row:GetHeight() or 0) - targetVisible) > 0.5 then
+						row:SetHeight(targetVisible)
+						if section.RequestReflow then
+							section:RequestReflow()
+						end
+					end
+				else
+					SetScrollBarShown(true)
+					if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
+						row:SetHeight(fixedHeight)
+						if section.RequestReflow then
+							section:RequestReflow()
+						end
+					end
+					local sb = scroll.ScrollBar
+					sbw = (sb and sb:GetWidth()) or 20
+				end
+
+				-- Measure from the live scroll viewport (minus scrollbar), not a
+				-- stale content:GetWidth() from a previous pass.
+				local w = scroll:GetWidth() or 0
+				local availableWidth = 0
+				if w > 0 then
+					availableWidth = math.max(1, w - sbw - 4)
+					content:SetWidth(availableWidth)
+				else
+					availableWidth = content:GetWidth() or 0
+				end
+
+				local maxStringWidth = 0
+				for i = 1, #items do
+					local r = rows[i]
+					if r and r:IsShown() then
+						maxStringWidth = math.max(maxStringWidth, r.Text:GetStringWidth() or 0)
+					end
+				end
+				local nameColumnWidth = Controls.ConsumableRequestedNameColumnWidth(
+					availableWidth,
+					maxStringWidth,
+					layoutSizes
+				)
+
+				for i = 1, #items do
+					local r = rows[i]
+					if r and r:IsShown() then
+						LayoutRowColumns(r, nameColumnWidth)
+					end
+				end
+			end
+
+			-- Two passes so scrollbar show/hide can settle while nested
+			-- OnSizeChanged is ignored by the reentrancy guard.
+			ApplyScrollAndColumns()
+			ApplyScrollAndColumns()
+
+			row.__sfConsumableListRefreshing = false
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+		scroll:HookScript("OnSizeChanged", Refresh)
+	end)
+end
+
+-- Consumables Logs goal/progress summary: overall bar + per-item icon/percent.
+-- @param section table Section to add row into
+-- @param opts table Options with getProgress returning GoalProgress model
+-- @return Frame The created row
+function Controls:AddConsumableGoalSummary(section, opts)
+	opts = opts or {}
+
+	local getProgress = opts.getProgress
+	if type(getProgress) ~= "function" then
+		getProgress = function() return nil end
+	end
+
+	local rowHeight = opts.itemRowHeight or 22
+	local iconSize = opts.iconSize or 18
+	local maxItems = opts.maxItems or 64
+	local barHeight = opts.barHeight or 16
+	local fixedHeight = opts.height or 160
+
+	return section:AddRow(fixedHeight, function(row)
+		local _, control = self:InitRow(row, opts)
+
+		local overallLabel = control:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+		overallLabel:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+		overallLabel:SetJustifyH("LEFT")
+		overallLabel:SetText("Overall progress")
+
+		local emptyText = control:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+		emptyText:SetPoint("TOPLEFT", overallLabel, "BOTTOMLEFT", 0, -4)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:SetText("No goals configured.")
+
+		local bar = CreateFrame("StatusBar", nil, control)
+		bar:SetPoint("TOPLEFT", overallLabel, "BOTTOMLEFT", 0, -6)
+		bar:SetSize(opts.barWidth or 280, barHeight)
+		bar:SetMinMaxValues(0, 100)
+		bar:SetValue(0)
+		if bar.SetStatusBarTexture then
+			bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+		end
+		if bar.SetStatusBarColor then
+			bar:SetStatusBarColor(0.2, 0.7, 0.3, 1)
+		end
+		local barBg = bar:CreateTexture(nil, "BACKGROUND")
+		barBg:SetAllPoints(bar)
+		barBg:SetTexture("Interface\\Buttons\\WHITE8x8")
+		barBg:SetVertexColor(0.15, 0.15, 0.15, 0.8)
+		local barText = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		barText:SetPoint("CENTER", bar, "CENTER", 0, 0)
+
+		local itemAnchor = CreateFrame("Frame", nil, control)
+		itemAnchor:SetPoint("TOPLEFT", bar, "BOTTOMLEFT", 0, -10)
+		itemAnchor:SetPoint("TOPRIGHT", control, "TOPRIGHT", 0, -10)
+		itemAnchor:SetHeight(1)
+
+		local itemRows = {}
+
+		local function EnsureItemRow(i)
+			if itemRows[i] then return itemRows[i] end
+			local r = CreateFrame("Frame", nil, itemAnchor)
+			r:SetHeight(rowHeight)
+			local icon = r:CreateTexture(nil, "ARTWORK")
+			icon:SetSize(iconSize, iconSize)
+			icon:SetPoint("LEFT", r, "LEFT", 0, 0)
+			r.Icon = icon
+			local label = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			label:SetPoint("LEFT", icon, "RIGHT", 6, 0)
+			label:SetJustifyH("LEFT")
+			r.Label = label
+			itemRows[i] = r
+			return r
+		end
+
+		local function ItemIcon(itemId)
+			if GetItemIcon and itemId then
+				local ok, tex = pcall(GetItemIcon, itemId)
+				if ok and tex then return tex end
+			end
+			return "Interface\\Icons\\INV_Misc_QuestionMark"
+		end
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, {bar})
+			local progress = getProgress() or {}
+			local items = progress.items or {}
+			local hasPositive = progress.hasPositiveGoal and true or false
+
+			if hasPositive then
+				emptyText:Hide()
+				bar:Show()
+				local pct = tonumber(progress.overallPercent) or 0
+				bar:SetValue(math.max(0, math.min(100, pct)))
+				barText:SetText(string.format("%d%%", pct))
+				overallLabel:SetText("Overall progress")
+				itemAnchor:ClearAllPoints()
+				itemAnchor:SetPoint("TOPLEFT", bar, "BOTTOMLEFT", 0, -10)
+				itemAnchor:SetPoint("TOPRIGHT", control, "TOPRIGHT", 0, -10)
+			else
+				bar:Hide()
+				emptyText:Show()
+				emptyText:SetText(progress.overallEmptyText or "No goals configured.")
+				overallLabel:SetText("Overall progress")
+				itemAnchor:ClearAllPoints()
+				itemAnchor:SetPoint("TOPLEFT", emptyText, "BOTTOMLEFT", 0, -10)
+				itemAnchor:SetPoint("TOPRIGHT", control, "TOPRIGHT", 0, -10)
+			end
+
+			local y = 0
+			local limit = #items
+			if limit > maxItems then limit = maxItems end
+			for i = 1, limit do
+				local entry = items[i]
+				local r = EnsureItemRow(i)
+				r:ClearAllPoints()
+				r:SetPoint("TOPLEFT", itemAnchor, "TOPLEFT", 0, -y)
+				r:SetPoint("TOPRIGHT", itemAnchor, "TOPRIGHT", 0, -y)
+				r.Icon:SetTexture(ItemIcon(entry.itemId))
+				if entry.noGoal then
+					r.Label:SetText("No Goal")
+				else
+					r.Label:SetText(string.format("%d%%", tonumber(entry.percent) or 0))
+				end
+				r:Show()
+				y = y + rowHeight + 2
+			end
+			for i = limit + 1, #itemRows do
+				itemRows[i]:Hide()
+			end
+
+			local headerH = 22 + (hasPositive and (barHeight + 16) or 28)
+			local need = headerH + math.max(rowHeight, y)
+			if math.abs((row:GetHeight() or 0) - need) > 0.5 then
+				row:SetHeight(need)
+				if section.RequestReflow then
+					section:RequestReflow()
+				end
+			end
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
 	end)
 end
 
@@ -1829,14 +2425,17 @@ function Controls:AddHelpText(section, opts)
 		fs:SetJustifyH("LEFT")
 		fs:SetJustifyV("TOP")
 		fs:SetWordWrap(true)
-		fs:SetText(opts.text or "")
-
-		local function Refresh()
-			self:_ApplyRowState(row, section, opts, {editBox, scrollFrame})
+		local function ResolveText()
+			if type(opts.getText) == "function" then
+				local ok, value = pcall(opts.getText)
+				if ok and value ~= nil then
+					return tostring(value)
+				end
+				return ""
+			end
+			return opts.text or ""
 		end
-
-		Refresh()
-		RegisterRefresh(section, Refresh)
+		fs:SetText(ResolveText())
 
 		local function UpdateHeight()
 			-- Width is sometimes 0 during the first layout pass; try again later.
@@ -1856,6 +2455,17 @@ function Controls:AddHelpText(section, opts)
 				end
 			end
 		end
+
+		local function Refresh()
+			if type(opts.getText) == "function" then
+				fs:SetText(ResolveText())
+			end
+			self:_ApplyRowState(row, section, opts, {})
+			UpdateHeight()
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
 
 		local function ScheduleUpdate()
 			-- Coalesce multiple size changes into one next-frame calc

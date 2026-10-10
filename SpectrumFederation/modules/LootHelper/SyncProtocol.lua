@@ -4,9 +4,9 @@ local addonName, SF = ...
 SF.SyncProtocol = SF.SyncProtocol or {}
 local P = SF.SyncProtocol
 
-P.PROTO_MIN     = 4
-P.PROTO_MAX     = 4
-P.PROTO_CURRENT = 4
+P.PROTO_MIN     = 9
+P.PROTO_MAX     = 9
+P.PROTO_CURRENT = 9
 
 -- Encoding constants
 P.ENC_NONE      = "NONE"
@@ -76,9 +76,10 @@ end
 -- Throttling (prevent spam)
 -- ================================================================
 -- Network NACKs stay on a short cooldown so a peer who /reloads can still
--- be told the protocols differ. User-visible warnings are once per sender
--- and incompatibility signature until reload; otherwise raid traffic plus
--- mixed-version clients reprint the same chat line every inbound message.
+-- be told the protocols differ. Debug incompatibility notices are once per
+-- sender and signature until reload; otherwise raid traffic plus mixed-version
+-- clients would spam the same debug line every inbound message. Incompatibility
+-- never prints to normal WoW chat.
 local NACK_COOLDOWN_SECONDS = 10
 
 local lastNackAt = {}    -- [senderKey] = time
@@ -127,17 +128,6 @@ local function GetAddonVersion()
         return SF:GetAddonVersion()
     end
     return "unknown"
-end
-
--- Function to print a warning message
--- @param msg string Message to print
--- @return none
-local function PrintWarning(msg)
-    if SF.PrintWarning then
-        SF:PrintWarning(msg)
-    else
-        print(addonName .. ": WARNING: " .. msg)
-    end
 end
 
 -- Function to log a Debug warning message
@@ -321,10 +311,11 @@ end
 -- Graceful fallback: warnings + PROTO_NACK
 -- ================================================================
 
--- Function to determine if we should print a user-facing protocol warning
+-- Function to determine if we should record a debug incompatibility notice.
+-- Protocol incompatibility stays debug-only; it never prints to normal chat.
 -- @param sender string Sender name
 -- @param signature string|nil Stable incompatibility signature
--- @return boolean True if we should print
+-- @return boolean True if we should record the debug notice
 function P.ShouldWarn(sender, signature)
     local key = SenderKey(sender)
     signature = tostring(signature or "")
@@ -369,7 +360,7 @@ function P.BuildProtoNackPayload(seenProto, msgType)
     }
 end
 
--- Function Handle an unsupported protocol version event (local warn + return an optional NACK envelope)
+-- Function Handle an unsupported protocol version event (debug + return an optional NACK envelope)
 -- IMPORTANT: This does not send anything; it just returns the envelope string so transport can whisper it.
 -- @param sender string Sender name
 -- @param seenProto number Protocol version seen
@@ -379,8 +370,8 @@ function P.OnUnsupportedProto(sender, seenProto, seenType)
     DebugWarn("Unsupported proto from %s: type=%s proto=%s", tostring(sender), tostring(seenType), tostring(seenProto))
 
     if P.ShouldWarn(sender, WarningSignature("unsupported", seenProto)) then
-        PrintWarning(("Sync: %s is using unsupported protocol %s (this client supports %d..%d). Ask them to update."):
-            format(tostring(sender), tostring(seenProto), P.PROTO_MIN, P.PROTO_MAX))
+        DebugWarn("Sync: %s is using unsupported protocol %s (this client supports %d..%d). Ask them to update.",
+            tostring(sender), tostring(seenProto), P.PROTO_MIN, P.PROTO_MAX)
     end
 
     if not P.ShouldNack(sender) then
@@ -397,8 +388,8 @@ function P.OnUnsupportedProto(sender, seenProto, seenType)
     return P.PackEnvelope(P.MSG_PROTO_NACK, P.PROTO_CURRENT, P.ENC_B64CBOR, b64)
 end
 
--- Function Handle receiving a PROTO_NACK (print once per sender + incompatibility).
--- Repeat NACKs from mixed-version raid traffic stay in debug logs.
+-- Function Handle receiving a PROTO_NACK (debug once per sender + incompatibility).
+-- Repeat NACKs from mixed-version raid traffic stay suppressed in debug logs.
 -- @param sender string Sender name
 -- @param payload table|nil Decoded payload table
 -- @return nil
@@ -415,6 +406,6 @@ function P.OnProtoNack(sender, payload)
         return
     end
 
-    PrintWarning(("Sync: %s says our protocol/version is incompatible (they saw proto=%s; they support %s..%s; addon ver=%s)."):
-        format(tostring(sender), tostring(theirs), tostring(minV), tostring(maxV), tostring(ver)))
+    DebugWarn("Sync: %s says our protocol/version is incompatible (they saw proto=%s; they support %s..%s; addon ver=%s).",
+        tostring(sender), tostring(theirs), tostring(minV), tostring(maxV), tostring(ver))
 end

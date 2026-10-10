@@ -17,6 +17,9 @@ RANGED_OFFHAND_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_ranged_offh
 RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
 FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
+EARLY_PREP_TESTS = REPO_ROOT / "tests" / "lua" / "early_preparation_tests.lua"
+BACKGROUND_QUEUE_TESTS = REPO_ROOT / "tests" / "lua" / "background_inspect_queue_tests.lua"
+EARLY_PREP = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "EarlyPreparation.lua"
 PRESENCE_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_presence_tests.lua"
 ITEM_LEVEL_CONFIG_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_item_level_config_tests.lua"
 GLANCE_TESTS = REPO_ROOT / "tests" / "lua" / "roster_glance_tests.lua"
@@ -133,6 +136,170 @@ def test_roster_glance_production_lua():
 def test_raid_equipment_auto_refresh_defaults_off():
     schema = SCHEMA.read_text(encoding="utf-8")
     assert "raidCheckAuditAutoRefresh = false" in schema
+
+
+def test_background_inspect_queue_stops_with_last_consumer():
+    _run_lua(BACKGROUND_QUEUE_TESTS, "background inspect queue")
+
+
+def test_early_preparation_whispers_production_lua():
+    _run_lua(EARLY_PREP_TESTS, "Early Preparation")
+    source = EARLY_PREP.read_text(encoding="utf-8")
+    raid_check = (REPO_ROOT / "SpectrumFederation" / "modules" / "RaidCheck.lua").read_text(encoding="utf-8")
+    routing = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "13_Routing.lua"
+    ).read_text(encoding="utf-8")
+    parent = PARENT_TOC.read_text(encoding="utf-8")
+    assert "C_Timer" not in source
+    assert "CreateFrame" not in source
+    assert "NotifyInspect(" not in source
+    assert "Policy.EvaluateObservation" in raid_check
+    assert "PREP_NOTICE" in routing
+    assert "modules/RaidEquipment/EarlyPreparation.lua" in parent
+    assert parent.index("modules/RaidCheck.lua") < parent.index("modules/RaidEquipment/EarlyPreparation.lua")
+    consequences = raid_check.split("function RC:_ApplyCheckConsequences", 1)[1]
+    consequences = consequences.split("\nfunction RC:_TryReleaseCheckConsequences", 1)[0]
+    unprepared, prepared = consequences.split("elseif classId == CheckRun.CLASS.PREPARED then", 1)
+    assert "WasWarned" in unprepared
+    assert "WasWarned" not in prepared
+    assert "WhisperPrepared" in prepared
+    assert "DeliverMissingRequirementsWhisper" in unprepared
+    assert unprepared.index("DeliverMissingRequirementsWhisper") < unprepared.index("CommitWarned")
+    equipment = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidEquipment.lua"
+    ).read_text(encoding="utf-8")
+    public_api = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "18_PublicAPI.lua"
+    ).read_text(encoding="utf-8")
+    reannounce = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "14_HandlersControl.lua"
+    ).read_text(encoding="utf-8")
+    session_start = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "09_AdminConvergence.lua"
+    ).read_text(encoding="utf-8")
+    session_start_handler = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "11_Heartbeat.lua"
+    ).read_text(encoding="utf-8")
+    assert 'consumerId = "equipment page"' in equipment
+    assert "EarlyPrep.ConsumerId" in raid_check or "opts.consumerId" in raid_check
+    assert "SessionAnnouncedForDedupe" in raid_check
+    assert public_api.count("AttachToPayload") >= 2
+    reannounce_fn = reannounce.split("function Sync:HandleSessionReannounce", 1)[1]
+    reannounce_fn = reannounce_fn.split("\nfunction ", 1)[0]
+    assert "AcceptRemotePrepNotice" in reannounce_fn
+    heartbeat_fn = reannounce.split("function Sync:HandleSessionHeartbeat", 1)[1]
+    heartbeat_fn = heartbeat_fn.split("\nfunction ", 1)[0]
+    assert "AcceptRemotePrepNotice" in heartbeat_fn
+    start_fn = session_start.split("function Sync:BroadcastSessionStart", 1)[1]
+    start_fn = start_fn.split("\nfunction ", 1)[0]
+    assert start_fn.index("AttachToPayload") < start_fn.index("SES_START")
+    start_handler = session_start_handler.split("function Sync:HandleSessionStart", 1)[1]
+    start_handler = start_handler.split("\nfunction ", 1)[0]
+    assert "AcceptRemotePrepNotice" in start_handler
+    assert start_handler.index("AcceptRemotePrepNotice") < start_handler.index('_PersistSessionState("HandleSessionStart")')
+    assert "ApplySesStartSendResult" in public_api
+    assert "entry.blended" in raid_check
+    evaluate = source.split("function EarlyPrep:EvaluateMember", 1)[1]
+    evaluate = evaluate.split("\nfunction ", 1)[0]
+    assert evaluate.count(":GetAuthoritativePreparation") == 1
+    assert evaluate.index("GetPreparationObservationStamp") < evaluate.index(":GetAuthoritativePreparation")
+    record_at = evaluate.index("WarningRecordable")
+    claim_at = evaluate.index("BeginMissingWhisper")
+    deliver_at = evaluate.index(":DeliverMissingRequirementsWhisper")
+    assert record_at < claim_at < deliver_at
+    deliver = raid_check.split("function RC:DeliverMissingRequirementsWhisper", 1)[1]
+    deliver = deliver.split("\nfunction ", 1)[0]
+    assert deliver.index("InChatMessagingLockdown") < deliver.index("WhisperMissing")
+    stamp = raid_check.split("function RC:GetPreparationObservationStamp", 1)[1]
+    stamp = stamp.split("\nfunction ", 1)[0]
+    assert "PreparationFromCaptured" not in stamp
+    reannounce_send = public_api.split("function Sync:ReannounceSession", 1)[1]
+    assert reannounce_send.index("if not accepted") < reannounce_send.index("_ScheduleReannounceRetry")
+    assert "_HandleExhaustedReannounce" in reannounce_send
+    assert "function Sync.ReannounceRetryDecision" in session_start
+    assert "coordinator_lost" in reannounce
+    reset = source.split("function EarlyPrep:OnSessionReset", 1)[1]
+    reset = reset.split("\nfunction ", 1)[0]
+    assert "_evaluating = false" in reset
+    assert "_refreshing = false" in reset
+    assert "IsRequesterInGroup" in source
+    assert "deferredPrepNotices" in source
+    assert "function EarlyPrep.RemoteCoversLocal" in source
+    assert "RetryOutboundNotice" in source
+    roster = raid_check.split('elseif event == "GROUP_ROSTER_UPDATE" then', 1)[1]
+    roster = roster.split("\n\tend)", 1)[0]
+    assert roster.index('RC.CallEarlyPrep("Notify", "roster")') < roster.index("self:_ProcessInspectQueue()")
+    assert roster.index('RC.CallEarlyPrep("Notify", "roster")') < roster.index("self:_RunBackgroundInspectPass()")
+    assert "deferredPrepNotices" in public_api
+    assert "function RC.CallEarlyPrep" in raid_check
+    assert "function RC.InspectFallbackEntry" in raid_check
+    tick = raid_check.split("local function BackgroundInspectTick()", 1)[1]
+    tick = tick.split("\n\tend", 1)[0]
+    assert "pcall" in tick
+    assert tick.index('RC.CallEarlyPrep("OnBackgroundPass")') < tick.index("C_Timer.After")
+    inspect_ready_fn = raid_check.split("function RC:_HandleInspectReady", 1)[1]
+    inspect_ready_fn = inspect_ready_fn.split("\nfunction RC:", 1)[0]
+    assert "RC.InspectFallbackEntry(entry)" in inspect_ready_fn
+    assert "RC.InspectUnresolvedEntry(entry)" in inspect_ready_fn
+    assert "entry and entry.slotsByInventory" not in inspect_ready_fn
+    assert "entry and entry.overallEquippedItemLevel" not in inspect_ready_fn
+    assert "First capture has no prior evidence" in inspect_ready_fn
+    assert "SenderIsCoordinator" in source
+    assert "OUTBOUND_BACKOFF_HEARTBEATS" in source
+    assert "MAX_OUTBOUND_BURST" in source
+    assert "MAX_OUTBOUND_RETRIES" not in source
+    stamp_fn = raid_check.split("function RC:GetPreparationObservationStamp", 1)[1]
+    stamp_fn = stamp_fn.split("\nfunction RC:", 1)[0]
+    assert "GetItemDataGeneration()" in stamp_fn
+    assert "GetLocalEquipmentGeneration()" in stamp_fn
+    assert "GetTroubleshootingVersion()" not in stamp_fn
+    assert 'RC.CallEarlyPrep("InvalidateObservationSkips"' in raid_check
+    assert "_InvalidateLocalTroubleshootingSnapshot()" in raid_check.split(
+        "function RC:_ApplyTooltipDataRefresh", 1
+    )[1].split("\nfunction ", 1)[0]
+    assert "_BumpItemDataGeneration()" in raid_check
+    assert "localEquipmentGeneration" in raid_check
+    assert "function EarlyPrep:RestoreOutboundPending" in source
+    assert "function EarlyPrep:InvalidateObservationSkips" in source
+    assert "function EarlyPrep:BeginMissingWhisper" in source
+    assert "CLAIM_FAILSAFE_SECONDS" in source
+    assert "ReleaseClaimsForWarned" in source
+    assert "IsEffectiveAdmin" in source.split("function EarlyPrep:CompleteClaimedWhisper", 1)[1].split(
+        "\nfunction ", 1
+    )[0]
+    assert "PROTO_CURRENT = 9" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "SyncProtocol.lua"
+    ).read_text(encoding="utf-8")
+    assert "PROTO_VERSION = 9" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
+    ).read_text(encoding="utf-8")
+    constants = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
+    ).read_text(encoding="utf-8")
+    assert "PREP_WARN_CLAIM_REQ" in constants
+    assert "PREP_WARN_CLAIM_RELEASE" in constants
+    assert "PREP_WARN_CLAIM_GRANT" in constants
+    routing = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "13_Routing.lua"
+    ).read_text(encoding="utf-8")
+    assert "HandlePrepWarnClaimRequest" in routing
+    assert "HandlePrepWarnClaimAck" in routing
+    assert "HandlePrepWarnClaimRelease" in routing
+    assert "HandlePrepWarnClaimGrant" in routing
+    assert "function EarlyPrep:AbandonWarningClaim" in source
+    assert "function EarlyPrep:AdoptRemoteClaims" in source
+    assert "function EarlyPrep:ClaimsSnapshot" in source
+    assert "function EarlyPrep:MergeRemoteClaims" in source
+    assert "function EarlyPrep:_FinalizeGrantedClaim" in source
+    assert "expiresAtWall" in source
+    assert "function EarlyPrep:_WallNow" in source
+    assert 'RC.CallEarlyPrep("Notify", "world")' in raid_check
+    assert "reannounceExhausted" in raid_check
+    public_api = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "18_PublicAPI.lua"
+    ).read_text(encoding="utf-8")
+    takeover = public_api.split("function Sync:TakeoverSession", 1)[1].split("\nfunction ", 1)[0]
+    assert takeover.index("self.state.coordEpoch = newEpoch") < takeover.index('earlyPrep:Notify("takeover")')
 
 
 def test_parent_toc_loads_raid_equipment_modules():

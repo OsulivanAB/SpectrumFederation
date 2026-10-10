@@ -86,6 +86,10 @@ function Sync:HandleSessionStart(sender, payload)
     if self._NoteAdvertisedCoordinator then
         self:_NoteAdvertisedCoordinator(payload.coordinator)
     end
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if type(payload.prepNotice) == "table" and earlyPrep and earlyPrep.AcceptRemotePrepNotice then
+        earlyPrep:AcceptRemotePrepNotice(sender, payload.sessionId, payload.profileId, payload.prepNotice)
+    end
     self:_PersistSessionState("HandleSessionStart")
 
     if type(payload.safeMode) == "table" then
@@ -125,6 +129,9 @@ function Sync:HandleSessionStart(sender, payload)
     if self._ApplyAdvertisedRCConfig then
         self:_ApplyAdvertisedRCConfig(payload)
     end
+    if self._ConsiderConsumablesCatchUp then
+        self:_ConsiderConsumablesCatchUp(payload, { deferLedgerCatchUp = true })
+    end
 
     -- Rebuild immediately when we already have the profile to avoid stale point/member UI.
     local profile = self:FindLocalProfileById(payload.profileId)
@@ -133,9 +140,15 @@ function Sync:HandleSessionStart(sender, payload)
         if profile.NormalizePersistedLegacyBonusRolls then
             profile:NormalizePersistedLegacyBonusRolls()
         end
+        if self._FlushPendingConsumableObservations then
+            self:_FlushPendingConsumableObservations(profile)
+        end
     end
     if self.BackfillAutomaticBisOnPromotion then
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionStart")
+    end
+    if self._OnBecameConsumablesCoordinator then
+        self:_OnBecameConsumablesCoordinator(wasCoordinator, "HandleSessionStart")
     end
 
     if SF.Debug then
@@ -173,6 +186,11 @@ function Sync:HandleSessionStart(sender, payload)
     end)
 
     self:TouchPeer(sender, { inGroup = true })
+
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("session_start")
+    end
 end
 
 -- Function Handle session end announcement (SES_END).
@@ -332,11 +350,16 @@ end
 
 -- Function Request profile snapshot from helpers (preferred) or coordinator (fallback).
 -- @param reason string Reason for request (for logging)
+-- @param opts table|nil coordinatorOnly asks the session coordinator and no helper;
+--   preferredTarget asks an authorized admin first (consumables history recovery);
+--   acceptAuthorizedAdmins lets the coordinator accept that admin's snapshot;
+--   consumablesHistoryOnly absorbs only consumables ledger/registry from that admin
 -- @return boolean True if request was registered, false otherwise
-function Sync:RequestProfileSnapshot(reason)
+function Sync:RequestProfileSnapshot(reason, opts)
     if not self.state.active then return false end
     if not self.state.sessionId then return false end
     if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
+    opts = type(opts) == "table" and opts or {}
 
     -- Lightweight dedupe: don't spam profile requests for same session
     if self.state._profileReqInFlight == self.state.sessionId then
@@ -344,9 +367,67 @@ function Sync:RequestProfileSnapshot(reason)
     end
 
     -- Build ordered target list: helpers first, coordinator fallback.
+    -- Consumables configuration asks the coordinator only, because a helper snapshot merges events and does not replace config.
     -- Once the profile is local, drop targets who are no longer canonical admins.
-    local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
-        or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    local targets
+    local preferred = opts.preferredTarget
+    if type(preferred) == "string" and preferred ~= "" then
+        -- Consumables history recovery: ask the ahead authorized peer even when
+        -- they are not the session helper/coordinator (original writer may be offline).
+        if self:_SamePlayer(preferred, self:_SelfId()) then
+            return false
+        end
+        local preferredOk = false
+        if self.IsSenderAuthorized and self._GetProfileAdminUsers then
+            preferredOk = self:IsSenderAuthorized(self.state.profileId, preferred) == true
+        end
+        if not preferredOk then
+            local C = SF.Consumables
+            local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+            preferredOk = profile and C and C.IsCanonicalAdmin and C.IsCanonicalAdmin(profile, preferred) == true
+        end
+        if not preferredOk then
+            return false
+        end
+        targets = { preferred }
+        -- Fall back to ordinary helper/coordinator routes if the preferred peer fails.
+        local fallback = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
+            or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+        if type(fallback) == "table" then
+            for i = 1, #fallback do
+                local name = fallback[i]
+                if type(name) == "string" and name ~= "" and not self:_SamePlayer(name, preferred) then
+                    targets[#targets + 1] = name
+                end
+            end
+        end
+    elseif opts.coordinatorOnly then
+        local coordinator = self.state.coordinator
+        if type(coordinator) ~= "string" or coordinator == "" then
+            self:_NoteMissingRoute("_noProfileTargetWarnedFor", "Cannot request profile: no targets available", reason)
+            return false
+        end
+        -- Same authority rule as helper routing: once the profile is local,
+        -- do not whisper NEED_PROFILE to a coordinator who is no longer an
+        -- authorized route target.
+        local authorized = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets()
+        if type(authorized) == "table" then
+            local allowed = false
+            for i = 1, #authorized do
+                if self:_SamePlayer(authorized[i], coordinator) then
+                    allowed = true
+                    break
+                end
+            end
+            if not allowed then
+                return false
+            end
+        end
+        targets = { coordinator }
+    else
+        targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
+            or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    end
     if not targets or #targets == 0 then
         self:_NoteMissingRoute("_noProfileTargetWarnedFor", "Cannot request profile: no targets available", reason)
         local profileMissing = not (self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId))
@@ -363,6 +444,15 @@ function Sync:RequestProfileSnapshot(reason)
         targets     = targets,  -- fallback list
         reason      = reason,
     }
+    if opts.acceptAuthorizedAdmins == true then
+        profileMeta.acceptAuthorizedAdmins = true
+    end
+    if opts.consumablesHistoryOnly == true then
+        profileMeta.consumablesHistoryOnly = true
+    end
+    if type(preferred) == "string" and preferred ~= "" then
+        profileMeta.preferredTarget = preferred
+    end
     if self._StampUserInitiatedRequest then
         self:_StampUserInitiatedRequest(profileMeta)
     end
@@ -609,6 +699,9 @@ function Sync:SendJoinStatus()
     payloadBase.localAuthorMax = localAuthorMax
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payloadBase, profileId)
+    end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payloadBase, profileId)
     end
     payloadBase.rcConfigDirty = profile._rcConfigDirty == true
 

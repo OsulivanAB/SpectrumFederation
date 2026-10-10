@@ -33,6 +33,7 @@ These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for 
   - Schema/Store/Apply: `SpectrumFederation/modules/Settings/`
   - Settings UI: `SpectrumFederation/modules/UI/Settings/`
 - Use the built-in debug logger (`SpectrumFederation/modules/debug.lua`) instead of chat spam.
+- User-facing chat output is opt-in: do not add new normal WoW chat messages unless the task/issue explicitly asks for them or the user explicitly approves. See `SpectrumFederation/AGENTS.md` (User-visible messaging).
 - Proactively evaluate user-visible output for repetition/spam risk on recurring paths (heartbeats, timers, sync, retries). See `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
 - Prefer reusing existing settings controls and renderers; don’t introduce a second settings framework.
 
@@ -53,7 +54,7 @@ Prefer behavioral sequence evidence for stateful fixes over source-string-only a
 - Fill out every section **to the best of your ability** using the information available from the task, code changes, validation, and testing performed.
 - If a section does not apply or you do not have the information, keep the template section and state that clearly instead of omitting it.
 - When a tool asks for a PR title/description, first read the template and then format the response to match it.
-- **Never check `I have tested these changes in-game`.** That box is human-owned after Retail QA. You MAY check **In-game testing is not applicable to this change** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files the release zip demonstrably excludes (`*/AGENTS.md`). Do not infer harmlessness from extension. Unknown packaged files and assets require human QA. Always check **WoW Client Type → Retail** (product target, not in-game proof). You may optionally add suggested in-game test checkboxes for the human; never mark them complete. Never check **I've linked this PR to any related issues** unless the user explicitly provided the link information. Do not claim in-game testing was performed when it was not.
+- **Never check `I have tested these changes in-game`.** That box is human-owned after Retail QA. You MAY check **In-game testing is not applicable to this change** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files the release zip demonstrably excludes (`*/AGENTS.md`). Do not infer harmlessness from extension. Unknown packaged files and assets require human QA. Always check **WoW Client Type → Retail** (product target, not in-game proof). You may optionally add suggested in-game test checkboxes for the human; never mark them complete. For issue-backed implementation PRs, formally link the owner-supplied GitHub issue in Development and only then check **I've linked this PR to any related issues** — see root `AGENTS.md` (**Issue-backed PR Development linking**). Do not invent unrelated issue links. Do not claim in-game testing was performed when it was not.
 
 ## Optional local references
 A Blizzard UI source mirror may exist at:
