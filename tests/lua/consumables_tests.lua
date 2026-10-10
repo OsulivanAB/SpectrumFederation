@@ -529,6 +529,8 @@ local function profile(id, owner, admins)
         _lootLogs = { "keep-me" },
         _rewardPotStartingCopper = 42,
         _identity = {},
+        -- Default roster used by attribution guards; tests may mutate _memberIds.
+        _memberIds = { admin, donor, vann, "DonorAlt-Realm", "HelperAdmin-Realm" },
     }
     function p:IsAdminMemberId(memberId)
         for i = 1, #self._adminUsers do
@@ -538,6 +540,17 @@ local function profile(id, owner, admins)
     end
     function p:GetIdentityMembers(memberId)
         return self._identity[memberId] or { memberId }
+    end
+    function p:GetMemberIds()
+        return self._memberIds or {}
+    end
+    function p:getMemberByID(memberId)
+        for i = 1, #(self._memberIds or {}) do
+            if self._memberIds[i] == memberId then
+                return { identifier = memberId }
+            end
+        end
+        return nil
     end
     C.Ensure(p)
     return p
@@ -571,12 +584,17 @@ local function eventTypes(p)
     return seen
 end
 
-local function onlyDonationAndReset(p)
+local function onlyKnownAccountingEvents(p)
     for t in pairs(eventTypes(p)) do
-        if t ~= C.EVENT.DONATION and t ~= C.EVENT.RESET then return false, t end
+        if t ~= C.EVENT.DONATION and t ~= C.EVENT.RESET and t ~= C.EVENT.ADJUSTMENT then
+            return false, t
+        end
     end
     return true
 end
+
+-- Compatibility alias used by older deposit-path assertions.
+local onlyDonationAndReset = onlyKnownAccountingEvents
 
 local function resetRuntime()
     RT.depositWork = nil
@@ -1301,6 +1319,18 @@ local function checkRemoteEvents()
         itemId = aqirite, quantity = 1, generation = 1 }), "a custody body is not authoritative")
     assertTrue(S.AuthoritativeEventBodyOk(donation("ce:body:Donor-Realm:3", donor, 5)),
         "a guild bank donation body is authoritative")
+    assertTrue(S.AuthoritativeEventBodyOk({
+        id = "ce:body:Admin-Realm:4", type = C.EVENT.ADJUSTMENT, actor = admin, itemId = aqirite,
+        quantity = -3, generation = 1,
+    }), "a signed manual adjustment body is authoritative")
+    assertFalse(S.AuthoritativeEventBodyOk({
+        id = "ce:body:Admin-Realm:5", type = C.EVENT.ADJUSTMENT, actor = admin, itemId = aqirite,
+        quantity = -3, generation = 1, source = "guildbank",
+    }), "a guildbank-sourced adjustment body is not authoritative")
+    assertFalse(S.AuthoritativeEventBodyOk({
+        id = "ce:body:Admin-Realm:6", type = C.EVENT.ADJUSTMENT, actor = admin, itemId = aqirite,
+        quantity = 0, generation = 1,
+    }), "a zero-quantity adjustment body is not authoritative")
     local snapFollower = profile("snap-body", admin)
     C.MergeSnapshot(snapFollower, {
         generation = 1,
@@ -1313,10 +1343,13 @@ local function checkRemoteEvents()
             donation("ce:snap:Donor-Realm:2", donor, 5, { source = "trade" }),
             { id = "ce:snap:Donor-Realm:3", type = C.EVENT.CUSTODY, actor = donor, itemId = aqirite,
               quantity = 1, generation = 1 },
+            { id = "ce:snap:Admin-Realm:4", type = C.EVENT.ADJUSTMENT, actor = admin, itemId = aqirite,
+              quantity = 2, generation = 1, order = 2 },
         },
     }, { consumablesFromCoordinator = true })
-    assertEq(C.ContributionTotal(snapFollower, donor, aqirite), 5, "only valid guild bank snapshot bodies count")
-    assertEq(#snapFollower._consumableEvents, 1, "invalid authoritative snapshot bodies are skipped")
+    assertEq(C.ContributionTotal(snapFollower, donor, aqirite), 5, "only valid guild bank snapshot bodies count for donors")
+    assertEq(C.ItemDonatedTotal(snapFollower, aqirite), 7, "authoritative snapshot adjustments count toward item totals")
+    assertEq(#snapFollower._consumableEvents, 2, "invalid authoritative snapshot bodies are skipped")
 end
 
 local function sessionStubs(state, profiles, sent)
@@ -1343,6 +1376,471 @@ local function countMsg(sent, msg)
     return n
 end
 
+local function checkManualAdjustments()
+    resetWorld()
+    local p = configured("manual-adjust")
+    C.CommitEvents(p, "deposit-Donor-Realm-adj",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 20))
+    assertEq(C.ItemDonatedTotal(p, aqirite), 20, "seed donation establishes the item total")
+    assertEq(C.ContributionTotal(p, donor, aqirite), 20, "seed donation establishes the player total")
+
+    assertFalse(select(1, C.RecordManualAdjustment(p, donor, aqirite, 5, nil)),
+        "a non-admin cannot create a manual adjustment")
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, 0, nil)),
+        "a zero adjustment is rejected")
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, 1.5, nil)),
+        "a fractional adjustment is rejected")
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, flask, 5, nil)),
+        "an unrequested item cannot be adjusted")
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, -21, nil)),
+        "an adjustment that would make the item total negative is rejected")
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, -1, vann)),
+        "an attributed negative adjustment cannot drive a player's contribution negative")
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, 5, nil, { asAdmin = false })),
+        "Preview as Non-Admin blocks manual adjustments")
+
+    local preview = C.PreviewManualAdjustment(p, aqirite, 5, nil)
+    assertTrue(preview ~= nil, "an unattributed positive adjustment previews")
+    assertEq(preview.currentItem, 20, "preview shows the current item total")
+    assertEq(preview.nextItem, 25, "preview shows the resulting item total")
+    assertEq(preview.attributed, nil, "unattributed preview has no player credit")
+    assertTrue(contains(C.ManualAdjustmentConfirmation(preview, "Aqirite"), "25"),
+        "confirmation text includes the resulting quantity")
+    assertTrue(contains(C.ManualAdjustmentConfirmation(preview, "Aqirite"), "Unattributed"),
+        "confirmation text marks unattributed credit")
+
+    assertTrue(select(1, C.RecordManualAdjustment(p, admin, aqirite, 5, nil)),
+        "an admin can apply an unattributed positive adjustment")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 25, "unattributed positive adjustments increase the item total")
+    assertEq(C.ContributionTotal(p, donor, aqirite), 20, "unattributed adjustments do not change player totals")
+    assertEq(C.ContributionTotal(p, admin, aqirite), 0, "unattributed adjustments do not credit the admin")
+
+    assertTrue(select(1, C.RecordManualAdjustment(p, admin, aqirite, -3, nil)),
+        "an admin can apply an unattributed negative adjustment")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 22, "unattributed negative adjustments decrease the item total")
+    assertEq(C.ContributionTotal(p, donor, aqirite), 20, "unattributed negatives still leave player totals alone")
+
+    assertTrue(select(1, C.RecordManualAdjustment(p, admin, aqirite, 4, donor)),
+        "an admin can credit a positive adjustment to a player")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 26, "attributed positives increase the item total")
+    assertEq(C.ContributionTotal(p, donor, aqirite), 24, "attributed positives increase the player total")
+
+    assertTrue(select(1, C.RecordManualAdjustment(p, admin, aqirite, -6, donor)),
+        "an admin can attribute a negative adjustment to a player")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 20, "attributed negatives decrease the item total")
+    assertEq(C.ContributionTotal(p, donor, aqirite), 18, "attributed negatives decrease the player total")
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, -19, donor)),
+        "attributed negatives stop at the player's contribution floor")
+
+    local progress = C.GoalProgress(p)
+    local found
+    for i = 1, #(progress.items or {}) do
+        if progress.items[i].itemId == aqirite then found = progress.items[i] end
+    end
+    assertTrue(found ~= nil, "goal progress includes the adjusted item")
+    assertEq(found.donated, 20, "goal progress uses the adjusted item total")
+
+    local rows, total = C.HistoryRows(p, function() return "Aqirite" end)
+    assertTrue(total >= 5, "history includes donation and adjustment rows")
+    assertEq(total, 5, "history counts the seed donation and four adjustments")
+    local sawUnattributed, sawCredited = false, false
+    for i = 1, #rows do
+        if contains(rows[i].text, "unattributed / miscellaneous") then sawUnattributed = true end
+        if contains(rows[i].text, "credited to Donor-Realm") then sawCredited = true end
+        if contains(rows[i].text, "adjusted") then
+            assertTrue(contains(rows[i].text, "Admin-Realm"), "adjustment history names the admin")
+        end
+    end
+    assertTrue(sawUnattributed, "history distinguishes unattributed adjustments")
+    assertTrue(sawCredited, "history distinguishes attributed adjustments")
+    assertEq(C.FormatEvent({
+        type = C.EVENT.DONATION, actor = donor, itemId = aqirite, quantity = 1, source = "guildbank",
+    }, "Aqirite"), "Donor-Realm donated 1 Aqirite to the guild bank.",
+        "donation formatting remains unchanged")
+
+    -- Stale attribution target after roster removal.
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, 1, "Gone-Realm")),
+        "attribution to a non-member is rejected at commit time")
+    local staleMember = "Leaving-Realm"
+    p._memberIds[#p._memberIds + 1] = staleMember
+    assertTrue(select(1, C.PreviewManualAdjustment(p, aqirite, 1, staleMember)),
+        "a current member can be selected for attribution")
+    p._memberIds[#p._memberIds] = nil
+    assertFalse(select(1, C.RecordManualAdjustment(p, admin, aqirite, 1, staleMember)),
+        "member removal between selection and confirmation rejects the adjustment")
+
+    -- Author-bound IDs, idempotent remote delivery, and coordinator relay.
+    local token, events = C.ManualAdjustmentEvents(p, admin, aqirite, 2, vann)
+    assertTrue(events ~= nil and token ~= nil, "manual adjustment events can be built")
+    assertTrue(contains(token, admin), "adjustment tokens embed the admin author")
+    local builtId = string.format("ce:%s:%s:1", p._profileId, token)
+    assertTrue(S.RemoteEventIdOk(builtId, admin), "built adjustment IDs satisfy RemoteEventIdOk")
+    assertEq(events[1].type, C.EVENT.ADJUSTMENT, "built events use the adjustment type")
+    assertEq(events[1].source, nil, "adjustments are not guildbank-sourced")
+    assertTrue(select(1, C.CommitEvents(p, token, events, { writer = admin })),
+        "a prepared adjustment commits")
+    local storedAdj = p._consumableEvents[#p._consumableEvents]
+    assertTrue(S.RemoteEventIdOk(storedAdj.id, admin), "committed adjustment IDs bind the admin author")
+    assertEq(C.ContributionTotal(p, vann, aqirite), 2, "attributed remote-style commit credits the player")
+    local okDup, statusDup = C.CommitEvents(p, token, events, { writer = admin })
+    assertTrue(okDup and statusDup == nil, "replaying the same adjustment commit succeeds")
+    assertEq(C.ContributionTotal(p, vann, aqirite), 2, "replaying the same adjustment does not double-apply")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 22, "item total stays stable across the replay")
+
+    local remote = {
+        id = "ce:remote-adj:Admin-Realm:99",
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        writer = admin,
+        itemId = aqirite,
+        quantity = -1,
+        attributed = vann,
+        generation = 1,
+    }
+    assertTrue(select(1, S.ApplyRemoteEvent(p, remote, admin)),
+        "an admin remote adjustment is accepted")
+    assertEq(C.ContributionTotal(p, vann, aqirite), 1, "remote attributed adjustments update player totals")
+    local okReplay, replayStatus = S.ApplyRemoteEvent(p, remote, admin)
+    assertTrue(okReplay and replayStatus == "duplicate", "remote adjustment delivery is idempotent")
+    assertEq(C.ContributionTotal(p, vann, aqirite), 1, "duplicate remote adjustments do not reapply")
+    assertFalse(select(1, S.ApplyRemoteEvent(p, {
+        id = "ce:remote-adj:Donor-Realm:100",
+        type = C.EVENT.ADJUSTMENT,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+    }, donor)), "a non-admin remote adjustment is rejected")
+    assertFalse(select(1, S.ApplyRemoteEvent(p, {
+        id = "ce:remote-adj:Admin-Realm:101",
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+    }, admin)), "guildbank-sourced adjustments are rejected on the wire")
+
+    local relay = {
+        id = "ce:remote-adj:Admin-Realm:102",
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        writer = admin,
+        itemId = aqirite,
+        quantity = 3,
+        generation = 1,
+        order = 50,
+    }
+    assertTrue(select(1, S.ApplyRemoteEvent(p, relay, admin, { coordinatorRelay = true })),
+        "coordinator relay accepts admin adjustments")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 24, "relayed unattributed adjustments update item totals")
+
+    -- Historical attribution survives later roster removal.
+    p._memberIds = { admin }
+    assertEq(C.ContributionTotal(p, vann, aqirite), 1, "historical attributed totals remain after member removal")
+    assertFalse(select(1, S.ApplyRemoteEvent(p, {
+        id = "ce:remote-adj:Admin-Realm:103",
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        writer = admin,
+        itemId = aqirite,
+        quantity = 1,
+        attributed = vann,
+        generation = 1,
+    }, admin)), "direct admission rejects attribution to a departed member")
+    assertTrue(select(1, S.ApplyRemoteEvent(p, {
+        id = "ce:remote-adj:Admin-Realm:104",
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        writer = admin,
+        itemId = aqirite,
+        quantity = 1,
+        attributed = vann,
+        generation = 1,
+        order = 51,
+    }, admin, { coordinatorRelay = true })),
+        "coordinator relay still delivers historical attribution after member leave")
+    assertEq(C.ContributionTotal(p, vann, aqirite), 2, "relayed historical attribution still credits the departed member")
+
+    -- Outside-session persistence queues for eventual sync.
+    resetSync()
+    local outside = configured("manual-adjust-outside")
+    C.CommitEvents(outside, "seed-outside",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    Sync.state = { active = false }
+    Sync._SelfId = function() return admin end
+    Sync.MSG = { CONSUMABLES_EVENT = "CE" }
+    assertTrue(select(1, Sync:CommitConsumablesManualAdjustment(outside, aqirite, 7, nil, { asAdmin = true })),
+        "manual adjustments work outside an active session")
+    assertEq(C.ItemDonatedTotal(outside, aqirite), 17, "outside-session adjustments persist locally")
+    assertTrue(#(outside._consumablesUnsent or {}) >= 1, "outside-session adjustments join the unsent queue")
+    local queuedId = outside._consumablesUnsent[1]
+    assertTrue(S.RemoteEventIdOk(queuedId, admin), "queued outside-session IDs remain author-bound")
+    assertFalse(select(1, Sync:CommitConsumablesManualAdjustment(outside, aqirite, 1, nil, { asAdmin = false })),
+        "Preview as Non-Admin blocks the sync adjustment path")
+
+    -- Competing offline negatives: coordinator floor rejection + originator retract.
+    local helperAdmin = "HelperAdmin-Realm"
+    local coord = configured("floor-coord")
+    coord._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(coord, "seed-floor-coord",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    local peer = configured("floor-peer")
+    peer._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(peer, "seed-floor-peer",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    assertTrue(select(1, C.RecordManualAdjustment(coord, admin, aqirite, -10, nil)),
+        "first offline negative adjustment applies locally on the coordinator")
+    assertTrue(select(1, C.RecordManualAdjustment(peer, helperAdmin, aqirite, -10, nil)),
+        "second offline negative adjustment applies locally on the peer")
+    assertEq(C.ItemDonatedTotal(coord, aqirite), 0, "coordinator local total reaches zero")
+    assertEq(C.ItemDonatedTotal(peer, aqirite), 0, "peer local total reaches zero before sync")
+    local peerEvent = peer._consumableEvents[#peer._consumableEvents]
+    peer._consumablesUnsent = { peerEvent.id }
+    local floorOk, floorStatus = S.ApplyRemoteEvent(coord, {
+        id = peerEvent.id,
+        type = C.EVENT.ADJUSTMENT,
+        actor = helperAdmin,
+        writer = helperAdmin,
+        itemId = aqirite,
+        quantity = -10,
+        generation = 1,
+    }, helperAdmin)
+    assertFalse(floorOk, "coordinator rejects a competing negative adjustment")
+    assertEq(floorStatus, "floor", "competing negatives report a floor status")
+    assertEq(C.ItemDonatedTotal(coord, aqirite), 0, "rejected competing adjustment does not change the coordinator")
+    assertTrue(C.RetractEvent(peer, peerEvent.id), "originator retracts the floor-rejected adjustment")
+    assertEq(C.ItemDonatedTotal(peer, aqirite), 10, "retract restores the peer's pre-adjustment total")
+    assertEq(#(peer._consumablesUnsent or {}), 0, "retract clears endless unsent retries")
+    assertFalse(C.RetractEvent(peer, peerEvent.id), "retract is idempotent once the event is gone")
+
+    -- Session path: floor reject whisper from coordinator retracts peer state.
+    resetSync()
+    local sent = {}
+    local sessionCoord = configured("floor-session-coord")
+    sessionCoord._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(sessionCoord, "seed-session-coord",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 5))
+    assertTrue(select(1, C.RecordManualAdjustment(sessionCoord, admin, aqirite, -5, nil)),
+        "session coordinator consumes the remaining balance")
+    local sessionPeer = configured("floor-session-peer")
+    sessionPeer._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(sessionPeer, "seed-session-peer",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 5))
+    assertTrue(select(1, C.RecordManualAdjustment(sessionPeer, helperAdmin, aqirite, -5, nil)),
+        "session peer also applies a competing offline negative")
+    local competing = sessionPeer._consumableEvents[#sessionPeer._consumableEvents]
+    sessionPeer._consumablesUnsent = { competing.id }
+    local profiles = {
+        [sessionCoord._profileId] = sessionCoord,
+        [sessionPeer._profileId] = sessionPeer,
+    }
+    sessionStubs({
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "floor-session",
+        profileId = sessionCoord._profileId,
+    }, profiles, sent)
+    Sync:HandleConsumablesEvent(helperAdmin, {
+        sessionId = "floor-session",
+        profileId = sessionCoord._profileId,
+        event = {
+            id = competing.id,
+            type = C.EVENT.ADJUSTMENT,
+            actor = helperAdmin,
+            writer = helperAdmin,
+            itemId = aqirite,
+            quantity = -5,
+            generation = 1,
+        },
+    })
+    local sawReject = false
+    for i = 1, #sent do
+        local payload = sent[i].payload
+        if type(payload) == "table" and type(payload.event) == "table"
+            and payload.event.reject == "floor" and payload.event.id == competing.id then
+            sawReject = true
+            assertEq(sent[i].target, helperAdmin, "floor rejection whispers the author")
+        end
+    end
+    assertTrue(sawReject, "coordinator whispers a floor rejection for competing negatives")
+    sessionStubs({
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        sessionId = "floor-session",
+        profileId = sessionPeer._profileId,
+    }, profiles, {})
+    Sync:HandleConsumablesEvent(admin, {
+        sessionId = "floor-session",
+        profileId = sessionPeer._profileId,
+        event = { id = competing.id, type = C.EVENT.ADJUSTMENT, reject = "floor", generation = 1 },
+    })
+    assertEq(C.ItemDonatedTotal(sessionPeer, aqirite), 5, "peer converges after floor-reject retract")
+    assertEq(#(sessionPeer._consumablesUnsent or {}), 0, "peer stops retrying after floor-reject retract")
+
+    -- Delayed duplicate of an already-accepted adjustment remains idempotent.
+    assertTrue(select(1, S.ApplyRemoteEvent(sessionCoord, {
+        id = "ce:delay:Admin-Realm:1",
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 2,
+        generation = 1,
+    }, admin)), "a delayed positive adjustment is accepted once")
+    local okDelay, delayStatus = S.ApplyRemoteEvent(sessionCoord, {
+        id = "ce:delay:Admin-Realm:1",
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 2,
+        generation = 1,
+    }, admin)
+    assertTrue(okDelay and delayStatus == "duplicate", "delayed duplicate delivery is idempotent")
+
+    -- Lost confirmation: accepted negative retransmission must be duplicate, not floor.
+    -- Coordinator accepts -10 against 10 (balance 0). Stamped relay is lost, so the
+    -- follower still has the unordered event + unsent ID and retransmits. Floor
+    -- checks against the post-admit balance must not reject the known ID.
+    resetSync()
+    local lostSent = {}
+    local lostCoord = configured("lost-relay-coord")
+    lostCoord._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(lostCoord, "seed-lost-coord",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    local lostPeer = configured("lost-relay-peer")
+    lostPeer._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(lostPeer, "seed-lost-peer",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    assertTrue(select(1, C.RecordManualAdjustment(lostPeer, helperAdmin, aqirite, -10, nil)),
+        "follower applies a legitimate negative that consumes the remaining balance")
+    local lostEvent = lostPeer._consumableEvents[#lostPeer._consumableEvents]
+    assertTrue(type(lostEvent) == "table" and type(lostEvent.id) == "string",
+        "follower retains the adjustment event for retransmission")
+    lostPeer._consumablesUnsent = { lostEvent.id }
+    local lostProfiles = {
+        [lostCoord._profileId] = lostCoord,
+        [lostPeer._profileId] = lostPeer,
+    }
+    sessionStubs({
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+    }, lostProfiles, lostSent)
+    local firstPayload = {
+        id = lostEvent.id,
+        type = C.EVENT.ADJUSTMENT,
+        actor = helperAdmin,
+        writer = helperAdmin,
+        itemId = aqirite,
+        quantity = -10,
+        generation = 1,
+    }
+    Sync:HandleConsumablesEvent(helperAdmin, {
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+        event = firstPayload,
+    })
+    assertEq(C.ItemDonatedTotal(lostCoord, aqirite), 0, "coordinator accepts the first negative transmission")
+    local stamped = C.EventIndex(lostCoord)[lostEvent.id]
+    assertTrue(type(stamped) == "table" and C.ValidOrder(stamped.order) ~= nil,
+        "coordinator stamps the accepted negative adjustment")
+    local firstReject = false
+    local firstBroadcast = false
+    for i = 1, #lostSent do
+        local payload = lostSent[i].payload
+        if type(payload) == "table" and type(payload.event) == "table" then
+            if payload.event.reject and payload.event.id == lostEvent.id then
+                firstReject = true
+            end
+            if payload.event.id == lostEvent.id and not payload.event.reject then
+                firstBroadcast = true
+            end
+        end
+    end
+    assertFalse(firstReject, "first legitimate negative is not floor-rejected")
+    assertTrue(firstBroadcast, "coordinator broadcasts the stamped adjustment")
+    -- Lost confirmation: discard the broadcast and leave the follower unsent.
+    assertEq(#(lostPeer._consumablesUnsent or {}), 1, "follower still queues the unconfirmed event")
+    assertEq(C.ValidOrder(lostEvent.order), nil, "follower still lacks a stamped order after the lost relay")
+    lostSent = {}
+    sessionStubs({
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+    }, lostProfiles, lostSent)
+    Sync:HandleConsumablesEvent(helperAdmin, {
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+        event = {
+            id = lostEvent.id,
+            type = C.EVENT.ADJUSTMENT,
+            actor = helperAdmin,
+            writer = helperAdmin,
+            itemId = aqirite,
+            quantity = -10,
+            generation = 1,
+        },
+    })
+    assertEq(C.ItemDonatedTotal(lostCoord, aqirite), 0,
+        "retransmission of an accepted negative does not change the coordinator total")
+    local sawFloorReject = false
+    local sawStampedRebroadcast = false
+    for i = 1, #lostSent do
+        local payload = lostSent[i].payload
+        if type(payload) == "table" and type(payload.event) == "table"
+            and payload.event.id == lostEvent.id then
+            if payload.event.reject == "floor" or payload.event.reject == "member" then
+                sawFloorReject = true
+            elseif C.ValidOrder(payload.event.order) ~= nil then
+                sawStampedRebroadcast = true
+            end
+        end
+    end
+    assertFalse(sawFloorReject,
+        "retransmission of an already-accepted negative is not floor/member rejected")
+    assertTrue(sawStampedRebroadcast,
+        "coordinator rebroadcasts the stamped duplicate after a lost confirmation")
+    local okRetransmit, retransmitStatus = S.ApplyRemoteEvent(lostCoord, {
+        id = lostEvent.id,
+        type = C.EVENT.ADJUSTMENT,
+        actor = helperAdmin,
+        writer = helperAdmin,
+        itemId = aqirite,
+        quantity = -10,
+        generation = 1,
+    }, helperAdmin)
+    assertTrue(okRetransmit and retransmitStatus == "duplicate",
+        "ApplyRemoteEvent classifies the lost-confirmation retransmission as duplicate")
+    assertEq(C.ItemDonatedTotal(lostPeer, aqirite), 0, "follower keeps its legitimate negative credit")
+    assertTrue(type(C.EventIndex(lostPeer)[lostEvent.id]) == "table",
+        "follower still holds the original adjustment after the duplicate path")
+    assertEq(C.ValidOrder(lostEvent.order), nil,
+        "lost confirmation leaves the follower unordered; duplicate path must not retract it")
+
+    -- Generation / clear: history kept, new generation unaffected.
+    assertTrue(select(1, C.Clear(p, admin)), "clear after adjustments succeeds")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 0, "clear restarts item totals for the new generation")
+    local hist = C.HistoryRows(p, function() return "Aqirite" end)
+    local sawAdj = false
+    for i = 1, #hist do
+        if contains(hist[i].text, "adjusted") then sawAdj = true end
+    end
+    assertTrue(sawAdj, "adjustment history remains after configuration clear")
+    assertTrue(select(1, C.SetGuild(p, admin, GUILD, 2)), "guild can be reconfigured after clear")
+    assertTrue(select(1, C.AddRequestedItem(p, admin, aqirite)), "items can be re-requested after clear")
+    assertTrue(select(1, C.RecordManualAdjustment(p, admin, aqirite, 1, nil)),
+        "new-generation adjustments start from zero")
+    assertEq(C.ItemDonatedTotal(p, aqirite), 1, "new-generation adjustments do not inherit prior totals")
+
+    local okTypes, badType = onlyKnownAccountingEvents(p)
+    assertTrue(okTypes, "manual adjustments stay within known accounting event types (" .. tostring(badType) .. ")")
+end
 
 local function checkQueuedResendProtection()
     resetWorld()
@@ -3879,6 +4377,7 @@ checkPlanAndWorkflow()
 checkAccounting()
 checkAuthorizeAndConfigSync()
 checkRemoteEvents()
+checkManualAdjustments()
 checkCatchUpRules()
 checkSessionTransport()
 checkPeerHistoryRecoveryServePath()

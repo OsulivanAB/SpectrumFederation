@@ -259,9 +259,32 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
         "RAID_CONSUMABLE_REVIEW_CORRECT",
         "RAID_CONSUMABLE_REVIEW_SELECTED",
         "RAID_CONSUMABLE_REVIEW_ROW",
+        "RAID_CONSUMABLE_ADJUST_TITLE",
+        "RAID_CONSUMABLE_ADJUST_HELP",
+        "RAID_CONSUMABLE_ADJUST_UNATTRIBUTED",
+        "RAID_CONSUMABLE_ADJUST_CONFIRM_HEADER",
+        "RAID_CONSUMABLE_ADJUST_CONFIRM_RECEIVED",
     ):
         assert f'L["{key}"]' in locale, key
         assert key in domain or key in runtime or key in logs_page, key
+    assert "CONSUMABLE_ADJUSTMENT" in domain
+    assert "CommitConsumablesManualAdjustment" in SYNC_TRANSPORT.read_text(encoding="utf-8")
+    assert "Manual adjustment" in logs_page or "RAID_CONSUMABLE_ADJUST_TITLE" in logs_page
+    assert "RetractEvent" in domain
+    assert "AdjustmentFloorOk" in domain
+    transport = SYNC_TRANSPORT.read_text(encoding="utf-8")
+    assert "reject = status" in transport
+    assert 'event.reject == "floor"' in transport or 'reject == "floor"' in transport
+    assert 'status == "member"' in transport
+    assert "PROTO_CURRENT = 9" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "SyncProtocol.lua"
+    ).read_text(encoding="utf-8")
+    assert "PROTO_VERSION = 9" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
+    ).read_text(encoding="utf-8")
+    assert "getText" in logs_page
+    assert "RAID_CONSUMABLE_ADJUST_HISTORY_ATTRIBUTED" in locale
+    assert "RAID_CONSUMABLE_ADJUST_ERR_NOT_MEMBER" in locale
 
     assert "function ns.LocaleText" in locale
     assert 'Loc("RAID_SUPPLIES_OVERALL_PROGRESS"' in runtime

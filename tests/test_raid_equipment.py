@@ -267,10 +267,10 @@ def test_early_preparation_whispers_production_lua():
     assert "IsEffectiveAdmin" in source.split("function EarlyPrep:CompleteClaimedWhisper", 1)[1].split(
         "\nfunction ", 1
     )[0]
-    assert "PROTO_CURRENT = 8" in (
+    assert "PROTO_CURRENT = 9" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "SyncProtocol.lua"
     ).read_text(encoding="utf-8")
-    assert "PROTO_VERSION = 8" in (
+    assert "PROTO_VERSION = 9" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
     ).read_text(encoding="utf-8")
     constants = (

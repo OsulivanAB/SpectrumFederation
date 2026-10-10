@@ -2425,14 +2425,17 @@ function Controls:AddHelpText(section, opts)
 		fs:SetJustifyH("LEFT")
 		fs:SetJustifyV("TOP")
 		fs:SetWordWrap(true)
-		fs:SetText(opts.text or "")
-
-		local function Refresh()
-			self:_ApplyRowState(row, section, opts, {editBox, scrollFrame})
+		local function ResolveText()
+			if type(opts.getText) == "function" then
+				local ok, value = pcall(opts.getText)
+				if ok and value ~= nil then
+					return tostring(value)
+				end
+				return ""
+			end
+			return opts.text or ""
 		end
-
-		Refresh()
-		RegisterRefresh(section, Refresh)
+		fs:SetText(ResolveText())
 
 		local function UpdateHeight()
 			-- Width is sometimes 0 during the first layout pass; try again later.
@@ -2452,6 +2455,17 @@ function Controls:AddHelpText(section, opts)
 				end
 			end
 		end
+
+		local function Refresh()
+			if type(opts.getText) == "function" then
+				fs:SetText(ResolveText())
+			end
+			self:_ApplyRowState(row, section, opts, {})
+			UpdateHeight()
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
 
 		local function ScheduleUpdate()
 			-- Coalesce multiple size changes into one next-frame calc

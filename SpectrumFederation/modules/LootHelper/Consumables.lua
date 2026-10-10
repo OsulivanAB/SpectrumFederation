@@ -14,6 +14,7 @@ end
 
 C.EVENT = {
     DONATION = "CONSUMABLE_DONATION",
+    ADJUSTMENT = "CONSUMABLE_ADJUSTMENT",
     RESET = "CONSUMABLE_CONFIG_RESET",
     -- Legacy event type strings may still appear in archived development data.
     RECEIPT = "CONSUMABLE_CRAFTER_RECEIPT",
@@ -238,6 +239,7 @@ local function BodyToken(event)
         BodyText(copy.txnId),
         BodyText(copy.verification),
         BodyNumber(copy.goldValueCopper),
+        BodyText(copy.attributed),
     }, "\0")
 end
 
@@ -1976,6 +1978,8 @@ function CopyEvent(event)
         neighborsNewer = type(event.neighborsNewer) == "table" and event.neighborsNewer or nil,
         -- Optional future monetary field: preserve when valid; leave unset when nil.
         goldValueCopper = ValidGoldValueCopper(event.goldValueCopper),
+        -- Manual adjustment credit target; nil means unattributed / miscellaneous.
+        attributed = BoundedName(event.attributed),
     }
 end
 
@@ -2158,6 +2162,7 @@ local function AssignStoredBody(stored, event)
     stored.txnId = incoming.txnId
     stored.verification = incoming.verification
     stored.goldValueCopper = incoming.goldValueCopper
+    stored.attributed = incoming.attributed
     if incoming.order ~= nil then
         stored.order = incoming.order
     end
@@ -2355,9 +2360,10 @@ local function BuildProjection(profile, cfg)
     end
     table.sort(ordered, EventLess)
 
-    -- One bounded pass over current-generation donation events feeds both
-    -- raw per-actor contributions and raw per-item totals. Item totals are
-    -- accounting totals (one add per accepted event), not identity totals.
+    -- One bounded pass over current-generation donation and manual-adjustment
+    -- events feeds both raw per-actor contributions and raw per-item totals.
+    -- Item totals are accounting totals (one add per accepted event), not
+    -- identity totals. Unattributed adjustments change item totals only.
     local contributions = {}
     local itemTotals = {}
     for i = 1, #ordered do
@@ -2369,6 +2375,13 @@ local function BuildProjection(profile, cfg)
                 contributions[event.actor] = contributions[event.actor] or {}
                 contributions[event.actor][itemId] = (contributions[event.actor][itemId] or 0) + qty
                 itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
+            elseif event.type == C.EVENT.ADJUSTMENT and itemId and qty ~= 0 then
+                itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
+                local credit = BoundedName(event.attributed)
+                if credit then
+                    contributions[credit] = contributions[credit] or {}
+                    contributions[credit][itemId] = (contributions[credit][itemId] or 0) + qty
+                end
             end
         end
     end
@@ -2488,6 +2501,19 @@ function C.FormatEvent(event, itemName)
             return ""
         end
         return string.format("%s donated %d %s to the guild bank.", tostring(event.actor or "Someone"), qty, name)
+    elseif event.type == C.EVENT.ADJUSTMENT then
+        local who = tostring(event.actor or Loc("RAID_CONSUMABLE_ADJUST_ADMIN_FALLBACK", "An admin"))
+        local credit = BoundedName(event.attributed)
+        if credit then
+            return string.format(
+                Loc("RAID_CONSUMABLE_ADJUST_HISTORY_ATTRIBUTED", "%s adjusted %s by %+d (credited to %s)."),
+                who, name, qty, credit
+            )
+        end
+        return string.format(
+            Loc("RAID_CONSUMABLE_ADJUST_HISTORY_UNATTRIBUTED", "%s adjusted %s by %+d (unattributed / miscellaneous)."),
+            who, name, qty
+        )
     elseif event.type == C.EVENT.RESET then
         return string.format("%s cleared the Raid Consumables configuration.", tostring(event.actor or "An admin"))
     end
@@ -2528,6 +2554,7 @@ function C.HistoryRows(profile, nameForItem, limit, offset)
     for i = 1, #ordered do
         local event = ordered[i]
         if type(event) == "table" and (event.type == C.EVENT.RESET
+            or event.type == C.EVENT.ADJUSTMENT
             or (event.type == C.EVENT.DONATION and event.source == "guildbank")) then
             displayable[#displayable + 1] = event
         end
@@ -2560,6 +2587,250 @@ end
 
 function C.ClearConfirmation(profile)
     return "Clear Raid Consumables configuration? Guild, Guild Bank tab, and requested items will be removed. Historical Raid Consumable Logs are kept."
+end
+
+local function MaxEventQuantity()
+    local Rules = SF.ConsumablesSync
+    if Rules and tonumber(Rules.MAX_EVENT_QUANTITY) then
+        return tonumber(Rules.MAX_EVENT_QUANTITY)
+    end
+    return C.MAX_GOAL
+end
+
+local function RawActorItemTotal(profile, actor, itemId)
+    actor = Norm(actor)
+    itemId = tonumber(itemId)
+    if not actor or not IsItemId(itemId) then return 0 end
+    local byItem = C.Project(profile).contributions[actor]
+    return (byItem and byItem[itemId]) or 0
+end
+
+-- True when memberId is on the profile roster right now. Historical ledger
+-- rows keep their attribution even after a later leave; new commits must pass.
+function C.IsCurrentProfileMember(profile, memberId)
+    memberId = Norm(memberId)
+    if not memberId or type(profile) ~= "table" then return false end
+    if type(profile.getMemberByID) == "function" then
+        local ok, member = pcall(profile.getMemberByID, profile, memberId)
+        return ok and member ~= nil
+    end
+    if type(profile.GetMemberIds) == "function" then
+        local ok, ids = pcall(profile.GetMemberIds, profile)
+        if ok and type(ids) == "table" then
+            for i = 1, #ids do
+                if Same(ids[i], memberId) then return true end
+            end
+        end
+    end
+    if type(profile._members) == "table" then
+        for i = 1, #profile._members do
+            local m = profile._members[i]
+            local mid = m and (m.identifier or (m.GetFullIdentifier and m:GetFullIdentifier()))
+            if Same(mid, memberId) then return true end
+        end
+    end
+    return false
+end
+
+-- Floor checks against the current authoritative projection. Used for local
+-- preview/create and for coordinator admission of unsynchronized adjustments.
+-- Does not require the item to still be requested (historical remote apply).
+function C.AdjustmentFloorOk(profile, itemId, quantity, attributed)
+    itemId = tonumber(itemId)
+    quantity = tonumber(quantity)
+    if not IsItemId(itemId) then
+        return false, Loc("RAID_CONSUMABLE_ADJUST_ERR_ITEM", "Select a requested consumable.")
+    end
+    if not quantity or quantity ~= quantity or quantity ~= math.floor(quantity) or quantity == 0 then
+        return false, Loc("RAID_CONSUMABLE_ADJUST_ERR_QUANTITY", "Enter a non-zero whole-number quantity.")
+    end
+    if math.abs(quantity) > MaxEventQuantity() then
+        return false, Loc("RAID_CONSUMABLE_ADJUST_ERR_TOO_LARGE", "That quantity is too large.")
+    end
+    if attributed ~= nil and attributed ~= "" then
+        attributed = Norm(attributed)
+        if not attributed then
+            return false, Loc(
+                "RAID_CONSUMABLE_ADJUST_ERR_MEMBER",
+                "Choose a valid profile member, or leave the adjustment unattributed."
+            )
+        end
+    else
+        attributed = nil
+    end
+    local currentItem = C.ItemDonatedTotal(profile, itemId)
+    if currentItem + quantity < 0 then
+        return false, Loc(
+            "RAID_CONSUMABLE_ADJUST_ERR_ITEM_NEGATIVE",
+            "Received quantity cannot become negative."
+        )
+    end
+    if attributed and RawActorItemTotal(profile, attributed, itemId) + quantity < 0 then
+        return false, Loc(
+            "RAID_CONSUMABLE_ADJUST_ERR_PLAYER_NEGATIVE",
+            "That player's contribution cannot become negative."
+        )
+    end
+    return true, nil, attributed
+end
+
+-- Preview a manual received-quantity adjustment before it is committed.
+-- attributed nil/empty means unattributed / miscellaneous (item totals only).
+function C.PreviewManualAdjustment(profile, itemId, quantity, attributed)
+    itemId = tonumber(itemId)
+    quantity = tonumber(quantity)
+    if not IsItemId(itemId) then
+        return nil, Loc("RAID_CONSUMABLE_ADJUST_ERR_ITEM", "Select a requested consumable.")
+    end
+    if not C.IsRequested(profile, itemId) then
+        return nil, Loc("RAID_CONSUMABLE_ADJUST_ERR_ITEM", "Select a requested consumable.")
+    end
+    local floorOk, floorErr, normalizedAttributed = C.AdjustmentFloorOk(profile, itemId, quantity, attributed)
+    if not floorOk then
+        return nil, floorErr
+    end
+    attributed = normalizedAttributed
+    if attributed and not C.IsCurrentProfileMember(profile, attributed) then
+        return nil, Loc(
+            "RAID_CONSUMABLE_ADJUST_ERR_NOT_MEMBER",
+            "That player is not a current profile member."
+        )
+    end
+    local currentItem = C.ItemDonatedTotal(profile, itemId)
+    local currentPlayer = attributed and RawActorItemTotal(profile, attributed, itemId) or nil
+    return {
+        itemId = itemId,
+        quantity = quantity,
+        attributed = attributed,
+        currentItem = currentItem,
+        nextItem = currentItem + quantity,
+        currentPlayer = currentPlayer,
+        nextPlayer = currentPlayer and (currentPlayer + quantity) or nil,
+    }
+end
+
+-- Build a unique commit token and one CONSUMABLE_ADJUSTMENT event.
+-- Does not mutate the ledger; callers commit through CommitEvents / sync.
+-- Token embeds the admin identity so CommitEvents IDs satisfy RemoteEventIdOk.
+function C.ManualAdjustmentEvents(profile, admin, itemId, quantity, attributed, opts)
+    opts = opts or {}
+    admin = Norm(admin)
+    if not admin then
+        return nil, nil, Loc("RAID_CONSUMABLE_ADJUST_ERR_MISSING_ADMIN", "Missing admin.")
+    end
+    if not AllowAdmin(profile, admin, opts) then
+        return nil, nil, Loc(
+            "RAID_CONSUMABLE_ADJUST_ERR_ADMIN_ONLY",
+            "Only a profile admin can adjust raid supplies."
+        )
+    end
+    local preview, err = C.PreviewManualAdjustment(profile, itemId, quantity, attributed)
+    if not preview then
+        return nil, nil, err or Loc(
+            "RAID_CONSUMABLE_ADJUST_ERR_PREVIEW",
+            "Could not preview that adjustment."
+        )
+    end
+    local cfg = C.Ensure(profile)
+    cfg.manualAdjSeq = (tonumber(cfg.manualAdjSeq) or 0) + 1
+    -- Author-bound token: ce:<profile>:<admin>:madj-<seq>:<i> passes RemoteEventIdOk.
+    local token = string.format("%s:madj-%d", admin, cfg.manualAdjSeq)
+    local event = {
+        type = C.EVENT.ADJUSTMENT,
+        actor = admin,
+        writer = admin,
+        itemId = preview.itemId,
+        quantity = preview.quantity,
+        attributed = preview.attributed,
+        generation = cfg.generation,
+        timestamp = Now(),
+    }
+    return token, { event }, nil
+end
+
+function C.RecordManualAdjustment(profile, admin, itemId, quantity, attributed, opts)
+    local token, events, err = C.ManualAdjustmentEvents(profile, admin, itemId, quantity, attributed, opts)
+    if not events then
+        return false, err
+    end
+    return C.CommitEvents(profile, token, events, { writer = admin })
+end
+
+-- Retract an unconfirmed (unordered) adjustment after authoritative rejection.
+-- Stamped ledger rows are left alone; historical attribution stays intact.
+function C.RetractEvent(profile, eventId)
+    if type(profile) ~= "table" or type(eventId) ~= "string" or eventId == "" then
+        return false
+    end
+    C.Ensure(profile)
+    local function strip(list)
+        local removed = false
+        if type(list) ~= "table" then return false end
+        for i = #list, 1, -1 do
+            local row = list[i]
+            if type(row) == "table" and row.id == eventId
+                and row.type == C.EVENT.ADJUSTMENT
+                and not C.ValidOrder(row.order) then
+                table.remove(list, i)
+                removed = true
+            end
+        end
+        return removed
+    end
+    local removed = strip(profile._consumableEvents)
+    removed = strip(profile._consumableEventArchive) or removed
+    local queue = profile._consumablesUnsent
+    if type(queue) == "table" then
+        for i = #queue, 1, -1 do
+            if queue[i] == eventId then
+                table.remove(queue, i)
+                removed = true
+            end
+        end
+    end
+    if removed then
+        RebuildIndex(profile)
+        Invalidate(profile)
+        Notify()
+        Debug("Info", "Retracted unconfirmed adjustment %s", eventId)
+    end
+    return removed
+end
+
+function C.ManualAdjustmentConfirmation(preview, itemName)
+    if type(preview) ~= "table" then return "" end
+    local name = C.ItemName(preview.itemId, itemName)
+    local qty = tonumber(preview.quantity) or 0
+    local credit
+    if preview.attributed then
+        credit = tostring(preview.attributed)
+    else
+        credit = Loc("RAID_CONSUMABLE_ADJUST_UNATTRIBUTED", "Unattributed / Miscellaneous")
+    end
+    local lines = {
+        string.format(
+            Loc("RAID_CONSUMABLE_ADJUST_CONFIRM_HEADER", "Adjust %s by %+d?"),
+            name,
+            qty
+        ),
+        string.format(
+            Loc("RAID_CONSUMABLE_ADJUST_CONFIRM_RECEIVED", "Received: %d → %d"),
+            tonumber(preview.currentItem) or 0,
+            tonumber(preview.nextItem) or 0
+        ),
+    }
+    if preview.attributed then
+        lines[#lines + 1] = string.format(
+            Loc("RAID_CONSUMABLE_ADJUST_CONFIRM_PLAYER", "Player contribution: %d → %d"),
+            tonumber(preview.currentPlayer) or 0,
+            tonumber(preview.nextPlayer) or 0
+        )
+    end
+    lines[#lines + 1] = string.format(
+        Loc("RAID_CONSUMABLE_ADJUST_CONFIRM_CREDIT", "Credit: %s"),
+        credit
+    )
+    return table.concat(lines, "\n")
 end
 
 local function CopyGuild(guild)

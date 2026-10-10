@@ -968,6 +968,35 @@ function Sync:CommitConsumablesEvents(profile, token, events)
     return true
 end
 
+-- Admin manual received-quantity adjustment. Works in and outside sessions:
+-- outside a session the event persists locally and joins the unsent queue for
+-- eventual synchronization; inside a session it uses the normal event path.
+function Sync:CommitConsumablesManualAdjustment(profile, itemId, quantity, attributed, opts)
+    local C = Consumables()
+    if not C then return false, "Raid Consumables is unavailable." end
+    opts = opts or {}
+    if opts.asAdmin == false then
+        return false, (SF.LocaleText and SF.LocaleText(
+            "RAID_CONSUMABLE_ADJUST_ERR_PREVIEW_NON_ADMIN",
+            "Raid Consumables settings are in Preview as Non-Admin mode."
+        )) or "Raid Consumables settings are in Preview as Non-Admin mode."
+    end
+    local actor = opts.actor
+    if type(actor) ~= "string" or actor == "" then
+        actor = self._SelfId and self:_SelfId() or nil
+    end
+    local token, events, err = C.ManualAdjustmentEvents(profile, actor, itemId, quantity, attributed, {
+        asAdmin = opts.asAdmin,
+    })
+    if not events then
+        return false, err or (SF.LocaleText and SF.LocaleText(
+            "RAID_CONSUMABLE_ADJUST_ERR_CREATE",
+            "Could not create that adjustment."
+        )) or "Could not create that adjustment."
+    end
+    return self:CommitConsumablesEvents(profile, token, events)
+end
+
 function Sync:HandleConsumablesEvent(sender, payload)
     if not SessionPayloadOk(payload, sender) then return end
     local C = Consumables()
@@ -993,6 +1022,18 @@ function Sync:HandleConsumablesEvent(sender, payload)
     -- false. Still reject relays from a revoked coordinator route.
     if fromCoordinator and self._RouteWasRevoked and self:_RouteWasRevoked(sender) then
         Debug("Verbose", "Ignored consumables event from revoked coordinator %s", tostring(sender))
+        return
+    end
+    -- Authoritative admission rejection: retract the local optimistic apply and
+    -- stop unsent retries. Handled before admission so unordered reject
+    -- markers do not need a stamped order.
+    if fromCoordinator and type(event.id) == "string"
+        and (event.reject == "floor" or event.reject == "member") then
+        if C.RetractEvent then
+            C.RetractEvent(profile, event.id)
+        end
+        Debug("Info", "Retracted %s-rejected adjustment %s from %s",
+            tostring(event.reject), tostring(event.id), tostring(sender))
         return
     end
     local accept, relay = S.RemoteEventAdmission(isCoordinator, fromCoordinator, event)
@@ -1037,6 +1078,24 @@ function Sync:HandleConsumablesEvent(sender, payload)
     end
     if isCoordinator and ok and self._RefreshConsumablesHistoryGate then
         self:_RefreshConsumablesHistoryGate(profile)
+    end
+    -- Competing offline negatives / stale attribution: tell the author to
+    -- retract so the optimistic local credit and unsent retry cannot diverge.
+    if isCoordinator and not ok and (status == "floor" or status == "member")
+        and type(event.id) == "string" and SF.LootHelperComm and self.MSG then
+        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, {
+            sessionId = self.state.sessionId,
+            profileId = ProfileIdOf(profile),
+            event = {
+                id = event.id,
+                type = event.type,
+                reject = status,
+                generation = event.generation,
+            },
+        }, "WHISPER", sender, "NORMAL")
+        Debug("Info", "Rejected %s adjustment %s from %s",
+            tostring(status), tostring(event.id), tostring(sender))
+        return
     end
     if not ok and status ~= "duplicate" then
         Debug("Verbose", "Ignored consumables event from %s (%s)", tostring(sender), tostring(status))
