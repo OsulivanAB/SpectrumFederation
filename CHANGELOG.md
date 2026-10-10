@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.15] - 2026-10-10
+
+### Added
+- Add admin manual adjustments for Raid Consumables (#370)
+
 ## [1.5.8-beta.14] - 2026-10-09
 
 ### Changed
