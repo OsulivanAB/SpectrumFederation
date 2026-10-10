@@ -280,11 +280,16 @@ Behavior:
 3. Plans independent `main` (`X.Y.Z`) and `beta` (`X.Y.Z-beta.N`) version bumps, keeping packaged child TOCs in lockstep.
 4. Writes a deterministic compatibility changelog entry (no invented gameplay notes).
 5. Updates README badges, then publishes GitHub/Wago/CurseForge via the existing publisher.
-6. Uses `GITHUB_TOKEN` for branch pushes so Post-Merge Beta is not also triggered for the same TOC bump.
-7. Shares the `release-channels` concurrency group with Promote Beta to Main and Post-Merge Beta.
-8. Is safe to rerun after partial publish failure: when Interface is already correct, it retries publishing without bumping versions again.
+6. Always materializes automation helpers from the dispatched workflow commit, so an older beta tip can be updated without first promoting unfinished beta code that lacks those helpers.
+7. Uses `PAT_TOKEN` (repository Admin) for protected branch pushes because main/beta rulesets require pull requests and only Admin role bypasses them. Do not disable protection.
+8. Skips Post-Merge Beta for `chore: bump Interface to …` commits once that guard is on beta; until then, preflight also fails on active/queued Post-Merge Beta / Promote / Rollback runs by workflow name (covers live beta's older `beta-release` concurrency group).
+9. Distinguishes `none` / `update` / `publish`: never publishes a stable TOC version from beta, avoids tag collisions after rollbacks, and retries channel-matched publishes after partial failures without bumping again.
 
 Planning and TOC helpers live in `.github/scripts/wow_interface_sync.py`.
+
+### Required secret / ruleset configuration
+
+Before the first live run, confirm repository secret `PAT_TOKEN` is a token for a user with the repository **Admin** role (the Main/Beta rulesets bypass `RepositoryRole` Admin). The default `GITHUB_TOKEN` cannot push through those pull-request rulesets. Alternatively, an administrator may add an explicit ruleset bypass for the GitHub Actions app; do not remove required reviews or status checks.
 
 When changing parser or version-plan behavior, run:
 

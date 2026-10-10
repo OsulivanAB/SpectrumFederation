@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 from pathlib import Path
 from urllib import error
@@ -196,8 +197,14 @@ def test_verify_requested_matches_live():
         wow.verify_requested_matches_live(requested, 120100, live_game_version="12.1.0.1")
 
 
-def test_build_update_plan_idempotent_when_already_current(monkeypatch):
-    monkeypatch.setattr(wow, "github_release_exists", lambda *_args, **_kwargs: True)
+def test_build_update_plan_noop_for_already_current_stable_on_both_branches(monkeypatch):
+    monkeypatch.setattr(
+        wow,
+        "fetch_github_release",
+        lambda version, *_args, **_kwargs: {"tag_name": f"v{version}", "prerelease": False}
+        if version == "1.5.8"
+        else None,
+    )
     requested = wow.parse_human_game_version("12.1.0")
     plan = wow.build_update_plan(
         requested=requested,
@@ -206,7 +213,7 @@ def test_build_update_plan_idempotent_when_already_current(monkeypatch):
         main_interface="120100",
         main_version_raw="1.5.8",
         beta_interface="120100",
-        beta_version_raw="1.6.0-beta.7",
+        beta_version_raw="1.5.8",
         main_sha="abc",
         beta_sha="def",
         repo="owner/repo",
@@ -215,13 +222,15 @@ def test_build_update_plan_idempotent_when_already_current(monkeypatch):
     assert plan["main_update_needed"] is False
     assert plan["beta_update_needed"] is False
     assert plan["main_target_version"] == "1.5.8"
-    assert plan["beta_target_version"] == "1.6.0-beta.7"
+    assert plan["beta_target_version"] == "1.5.8"
+    # Main may retry a channel-matched publish; beta must never publish stable 1.5.8.
     assert plan["main_action"] == "publish"
-    assert plan["beta_action"] == "publish"
+    assert plan["beta_action"] == "none"
+    assert plan["any_work"] is True
 
 
 def test_build_update_plan_updates_both_branches(monkeypatch):
-    monkeypatch.setattr(wow, "github_release_exists", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_args, **_kwargs: None)
     requested = wow.parse_human_game_version("12.1.5")
     plan = wow.build_update_plan(
         requested=requested,
@@ -235,6 +244,7 @@ def test_build_update_plan_updates_both_branches(monkeypatch):
         beta_sha="def",
         repo="owner/repo",
         token="token",
+        occupied_tags=set(),
     )
     assert plan["main_update_needed"] is True
     assert plan["beta_update_needed"] is True
@@ -245,7 +255,7 @@ def test_build_update_plan_updates_both_branches(monkeypatch):
 
 
 def test_build_update_plan_rejects_unavailable_version(monkeypatch):
-    monkeypatch.setattr(wow, "github_release_exists", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_args, **_kwargs: None)
     requested = wow.parse_human_game_version("12.2.0")
     with pytest.raises(RuntimeError, match="does not match live Retail"):
         wow.build_update_plan(
@@ -259,6 +269,206 @@ def test_build_update_plan_rejects_unavailable_version(monkeypatch):
             main_sha="abc",
             beta_sha="def",
         )
+
+
+def test_plan_branch_action_recovers_incomplete_channel_matched_publish(monkeypatch):
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_args, **_kwargs: None)
+    assert (
+        wow.plan_branch_action(
+            channel="main",
+            interface_matches=True,
+            version_raw="1.5.9",
+            repo="owner/repo",
+            token="token",
+        )
+        == "publish"
+    )
+    assert (
+        wow.plan_branch_action(
+            channel="beta",
+            interface_matches=True,
+            version_raw="1.6.0-beta.8",
+            repo="owner/repo",
+            token="token",
+        )
+        == "publish"
+    )
+
+
+def test_plan_branch_action_refuses_stable_beta_and_wrong_channel_release(monkeypatch):
+    assert (
+        wow.plan_branch_action(
+            channel="beta",
+            interface_matches=True,
+            version_raw="1.5.8",
+            repo="owner/repo",
+            token="token",
+        )
+        == "none"
+    )
+
+    monkeypatch.setattr(
+        wow,
+        "fetch_github_release",
+        lambda *_args, **_kwargs: {"tag_name": "v1.5.9", "prerelease": True},
+    )
+    with pytest.raises(RuntimeError, match="prerelease"):
+        wow.plan_branch_action(
+            channel="main",
+            interface_matches=True,
+            version_raw="1.5.9",
+            repo="owner/repo",
+            token="token",
+        )
+
+
+def test_build_update_plan_avoids_tag_collisions_after_rollback(monkeypatch):
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_args, **_kwargs: None)
+    requested = wow.parse_human_game_version("12.1.5")
+    plan = wow.build_update_plan(
+        requested=requested,
+        live_game_version="12.1.5.1",
+        live_interface=120105,
+        main_interface="120100",
+        main_version_raw="1.5.8",
+        beta_interface="120100",
+        beta_version_raw="1.6.0-beta.7",
+        main_sha="abc",
+        beta_sha="def",
+        repo="owner/repo",
+        token="token",
+        occupied_tags={"v1.5.9", "v1.6.0-beta.8"},
+    )
+    assert plan["main_target_version"] == "1.5.10"
+    assert plan["beta_target_version"] == "1.6.0-beta.9"
+
+
+def test_materialize_workflow_helpers_from_newer_commit(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+
+    scripts = repo / ".github" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in (
+        "wow_interface_sync.py",
+        "update_changelog.py",
+        "publish_release.py",
+        "validate_packaging.py",
+        "blizzard_api.py",
+    ):
+        (scripts / name).write_text(f"# old {name}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "old helpers"], cwd=repo, check=True)
+    old_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    for name in (
+        "wow_interface_sync.py",
+        "update_changelog.py",
+        "publish_release.py",
+        "validate_packaging.py",
+        "blizzard_api.py",
+    ):
+        (scripts / name).write_text(f"# new {name}\nAPPLY_OK=1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "new helpers"], cwd=repo, check=True)
+    new_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Simulate operating on the older beta tip while helpers come from main/workflow.
+    subprocess.run(["git", "checkout", "-q", old_sha], cwd=repo, check=True)
+    destination = tmp_path / "helpers"
+    paths = wow.materialize_workflow_helpers(repo, new_sha, destination)
+    assert len(paths) >= 5
+    assert "APPLY_OK=1" in (destination / "wow_interface_sync.py").read_text(encoding="utf-8")
+    assert "# old wow_interface_sync.py" in (repo / ".github/scripts/wow_interface_sync.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_assert_no_conflicting_workflow_runs_detects_post_merge(monkeypatch):
+    class DummyResponse:
+        def __init__(self, payload):
+            self.payload = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return self.payload
+
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=30):
+        calls["n"] += 1
+        url = req.full_url
+        if "status=in_progress" in url:
+            return DummyResponse(
+                {
+                    "workflow_runs": [
+                        {
+                            "id": 99,
+                            "name": "Post-Merge Beta",
+                            "run_number": 12,
+                            "html_url": "https://example.test/runs/99",
+                        }
+                    ]
+                }
+            )
+        return DummyResponse({"workflow_runs": []})
+
+    monkeypatch.setattr(wow.request, "urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="Post-Merge Beta"):
+        wow.assert_no_conflicting_workflow_runs("owner/repo", "token", current_run_id="1")
+
+
+def test_ensure_beta_release_concurrency_rewrites_old_group(tmp_path):
+    path = tmp_path / "post-merge-beta.yml"
+    path.write_text(
+        "concurrency:\n  group: beta-release\n  cancel-in-progress: false\n",
+        encoding="utf-8",
+    )
+    assert wow.ensure_release_channels_concurrency(path) is True
+    assert "group: release-channels" in path.read_text(encoding="utf-8")
+    assert wow.ensure_release_channels_concurrency(path) is False
+
+
+def test_workflow_pins_helpers_and_requires_admin_pat():
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "update-wow-game-version.yml"
+    ).read_text(encoding="utf-8")
+    assert "--materialize-helpers" in workflow
+    assert "HELPERS_DIR" in workflow
+    assert "secrets.PAT_TOKEN" in workflow
+    assert "--assert-no-conflicts" in workflow
+    assert "Refuse stable-version beta publish" in workflow
+    post_merge = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "post-merge-beta.yml"
+    ).read_text(encoding="utf-8")
+    assert "chore: bump Interface to" in post_merge
+    assert "group: release-channels" in post_merge
 
 
 def test_update_packaged_tocs_keeps_children_in_lockstep(tmp_path):

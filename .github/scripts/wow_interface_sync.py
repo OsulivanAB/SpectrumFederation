@@ -655,8 +655,22 @@ def verify_git_sha(repo_path, git_ref, expected_sha, *, label):
     return current
 
 
+def is_beta_semver(version_raw):
+    """Return True when version is X.Y.Z-beta.N."""
+    info = parse_version(version_raw)
+    return info.kind == "semver" and info.label is not None and info.pre is not None
+
+
 def github_release_exists(version, repo, token):
-    """Return True when GitHub already has release tag v{version}."""
+    """Return True/False when GitHub already has release tag v{version}, or None if unverifiable."""
+    release = fetch_github_release(version, repo, token)
+    if release is None and (not repo or not token):
+        return None
+    return release is not None
+
+
+def fetch_github_release(version, repo, token):
+    """Return the GitHub release JSON for v{version}, or None when missing/unverifiable."""
     if not repo or not token:
         return None
 
@@ -673,26 +687,249 @@ def github_release_exists(version, repo, token):
     )
     try:
         with request.urlopen(req, timeout=30) as resp:
-            return 200 <= getattr(resp, "status", 200) < 300
+            payload = resp.read().decode("utf-8")
+            return json.loads(payload)
     except error.HTTPError as exc:
         if exc.code == 404:
-            return False
+            return None
         raise RuntimeError(f"GitHub release lookup failed for {tag}: HTTP {exc.code}") from exc
-    except (error.URLError, TimeoutError, ConnectionError) as exc:
+    except (error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"GitHub release lookup failed for {tag}: {exc}") from exc
 
 
-def plan_branch_action(*, interface_matches, version_raw, repo, token):
-    """Return update, publish, or none for one branch."""
+def list_remote_release_tags(repo_path):
+    """Return tag names like v1.5.8 from origin, without the refs/tags/ prefix."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "ls-remote", "--tags", "origin"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tags = set()
+    for line in result.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        _sha, ref = line.split("\t", 1)
+        if ref.endswith("^{}"):
+            continue
+        if ref.startswith("refs/tags/"):
+            tags.add(ref[len("refs/tags/") :])
+    return tags
+
+
+def version_tag_occupied(version_raw, occupied_tags):
+    """Return True when v{version} is already present in occupied_tags."""
+    return f"v{version_raw}" in occupied_tags
+
+
+def avoid_stable_tag_collision(version_info, occupied_tags):
+    """Bump a stable X.Y.Z until vX.Y.Z is free."""
+    candidate = version_info
+    for _ in range(100):
+        if not version_tag_occupied(candidate.raw, occupied_tags):
+            return candidate
+        candidate = bump_main_version(candidate)
+    raise RuntimeError(f"Could not find a free stable tag after {version_info.raw}")
+
+
+def avoid_beta_tag_collision(version_info, occupied_tags):
+    """Bump a beta prerelease until its tag is free."""
+    candidate = version_info
+    for _ in range(200):
+        if not version_tag_occupied(candidate.raw, occupied_tags):
+            return candidate
+        candidate = bump_beta_prerelease(candidate)
+    raise RuntimeError(f"Could not find a free beta tag after {version_info.raw}")
+
+
+def plan_branch_action(*, channel, interface_matches, version_raw, repo, token):
+    """Return update, publish, or none for one branch.
+
+    - update: Interface must change; version will bump before publish
+    - publish: Interface already correct; safe channel-matched publish/retry
+    - none: no mutation and no publish (including stable versions on beta)
+    """
+    if channel not in {"main", "beta"}:
+        raise RuntimeError(f"Unsupported channel '{channel}'")
+
     if not interface_matches:
         return "update"
 
-    exists = github_release_exists(version_raw, repo, token)
-    if exists is False:
+    version_is_beta = is_beta_semver(version_raw)
+    if channel == "beta" and not version_is_beta:
+        # Already-current stable TOC on beta must never publish over a stable release.
+        return "none"
+    if channel == "main" and version_is_beta:
+        return "none"
+
+    release = fetch_github_release(version_raw, repo, token)
+    if release is None and (not repo or not token):
+        # Unverifiable without credentials: do not invent a publish.
+        return "none"
+    if release is None:
         return "publish"
-    # Release present or unverifiable: still allow idempotent publish retries for
-    # CurseForge/Wago partial failures without bumping the addon version again.
+
+    release_is_prerelease = bool(release.get("prerelease"))
+    if channel == "main" and release_is_prerelease:
+        raise RuntimeError(
+            f"GitHub tag v{version_raw} is a prerelease; refusing to treat it as a stable main release."
+        )
+    if channel == "beta" and not release_is_prerelease:
+        raise RuntimeError(
+            f"GitHub tag v{version_raw} is a stable release; refusing to publish it from beta."
+        )
+
+    # Matching GitHub release exists: allow idempotent CF/Wago recovery publish.
     return "publish"
+
+
+def assert_no_conflicting_workflow_runs(repo, token, *, current_run_id=None):
+    """Fail when promote, rollback, post-merge beta, or another game-version run is active."""
+    if not repo or not token:
+        raise RuntimeError(
+            "GITHUB_TOKEN is required to check for conflicting workflow runs before mutation."
+        )
+
+    conflicting_names = {
+        "Post-Merge Beta",
+        "Promote Beta to Main",
+        "Rollback Release",
+        "Update WoW Game Version",
+    }
+    url = (
+        f"https://api.github.com/repos/{repo}/actions/runs"
+        f"?status=in_progress&per_page=50"
+    )
+    req = request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        raise RuntimeError(f"Failed to list workflow runs: HTTP {exc.code}") from exc
+    except (error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to list workflow runs: {exc}") from exc
+
+    blockers = []
+    for run in payload.get("workflow_runs", []):
+        run_id = run.get("id")
+        if current_run_id is not None and str(run_id) == str(current_run_id):
+            continue
+        name = run.get("name") or ""
+        if name in conflicting_names:
+            blockers.append(f"{name} #{run.get('run_number')} ({run.get('html_url')})")
+
+    # Also catch queued runs that would start once the current lock releases.
+    queued_url = (
+        f"https://api.github.com/repos/{repo}/actions/runs"
+        f"?status=queued&per_page=50"
+    )
+    req = request.Request(
+        queued_url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            queued_payload = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        raise RuntimeError(f"Failed to list queued workflow runs: HTTP {exc.code}") from exc
+    except (error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to list queued workflow runs: {exc}") from exc
+
+    for run in queued_payload.get("workflow_runs", []):
+        run_id = run.get("id")
+        if current_run_id is not None and str(run_id) == str(current_run_id):
+            continue
+        name = run.get("name") or ""
+        if name in conflicting_names:
+            blockers.append(f"{name} #{run.get('run_number')} queued ({run.get('html_url')})")
+
+    if blockers:
+        details = "; ".join(blockers)
+        raise RuntimeError(
+            "Conflicting release workflow activity detected. Wait for it to finish, then re-run. "
+            f"Active/queued: {details}"
+        )
+
+
+def ensure_release_channels_concurrency(workflow_path):
+    """Rewrite an outdated `group: beta-release` concurrency entry to release-channels."""
+    path = Path(workflow_path)
+    content = path.read_text(encoding="utf-8")
+    updated = re.sub(
+        r"(?m)^(\s*group:\s*)beta-release\s*$",
+        r"\1release-channels",
+        content,
+    )
+    if updated != content:
+        path.write_text(updated, encoding="utf-8")
+        return True
+    return False
+
+
+def materialize_workflow_helpers(repo_path, workflow_sha, destination):
+    """Copy pinned automation helpers from workflow_sha into destination.
+
+    The Update WoW Game Version workflow must run helpers from the dispatched
+    main/workflow commit even when the working tree is checked out at an older
+    beta tip that does not yet contain those helpers.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    helpers = (
+        "wow_interface_sync.py",
+        "update_changelog.py",
+        "publish_release.py",
+        "validate_packaging.py",
+        "blizzard_api.py",
+        "classify_promotion_scope.py",
+        "check_duplicate_release.py",
+    )
+    materialized = []
+    for name in helpers:
+        rel = f".github/scripts/{name}"
+        probe = subprocess.run(
+            ["git", "-C", str(repo_path), "cat-file", "-e", f"{workflow_sha}:{rel}"],
+            check=False,
+            capture_output=True,
+        )
+        if probe.returncode != 0:
+            continue
+        content = subprocess.run(
+            ["git", "-C", str(repo_path), "show", f"{workflow_sha}:{rel}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        target = destination / name
+        target.write_text(content, encoding="utf-8")
+        materialized.append(str(target))
+    required = {
+        "wow_interface_sync.py",
+        "update_changelog.py",
+        "publish_release.py",
+        "validate_packaging.py",
+        "blizzard_api.py",
+    }
+    present = {Path(path).name for path in materialized}
+    missing = sorted(required - present)
+    if missing:
+        raise RuntimeError(
+            f"Workflow commit {workflow_sha} is missing required helpers: {', '.join(missing)}"
+        )
+    return materialized
 
 
 def build_update_plan(
@@ -708,6 +945,7 @@ def build_update_plan(
     beta_sha,
     repo=None,
     token=None,
+    occupied_tags=None,
 ):
     """Build the immutable plan consumed by the workflow."""
     target_interface = verify_requested_matches_live(
@@ -726,6 +964,7 @@ def build_update_plan(
 
     main_update_needed = main_interface != target_interface_str
     beta_update_needed = beta_interface != target_interface_str
+    occupied_tags = set(occupied_tags or ())
 
     new_main_version, new_beta_version, beta_ahead = compute_updated_versions(
         main_version,
@@ -734,25 +973,50 @@ def build_update_plan(
         beta_update_needed=beta_update_needed,
     )
 
+    if main_update_needed:
+        new_main_version = avoid_stable_tag_collision(new_main_version, occupied_tags)
+        occupied_tags.add(f"v{new_main_version.raw}")
+    if beta_update_needed:
+        # Recompute beta against the collision-adjusted main train when needed.
+        if train_tuple(beta_version) > train_tuple(new_main_version):
+            new_beta_version = bump_beta_prerelease(beta_version)
+        else:
+            new_beta_version = next_beta_after_stable(new_main_version)
+        new_beta_version = avoid_beta_tag_collision(new_beta_version, occupied_tags)
+        if version_value(new_beta_version) <= version_value(new_main_version):
+            raise RuntimeError(
+                f"Computed beta version {new_beta_version.raw} is not ahead of "
+                f"main version {new_main_version.raw}"
+            )
+        beta_ahead = True
+
     main_target_version = new_main_version.raw if main_update_needed else main_version.raw
     beta_target_version = new_beta_version.raw if beta_update_needed else beta_version.raw
 
     main_action = plan_branch_action(
+        channel="main",
         interface_matches=not main_update_needed,
         version_raw=main_target_version,
         repo=repo,
         token=token,
     )
     beta_action = plan_branch_action(
+        channel="beta",
         interface_matches=not beta_update_needed,
         version_raw=beta_target_version,
         repo=repo,
         token=token,
     )
+    # An update action always publishes after the branch mutation.
+    if main_action == "update":
+        pass
+    if beta_action == "update":
+        pass
 
-    # When the Interface is already correct and the GitHub release exists, the
-    # branch still uses action=publish so a rerun can repair partial CF/Wago
-    # uploads without commits. Callers may treat that as an idempotent retry.
+    any_work = (
+        main_action in {"update", "publish"}
+        or beta_action in {"update", "publish"}
+    )
     return {
         "requested_version": requested["normalized"],
         "game_version": requested["normalized"],
@@ -772,7 +1036,7 @@ def build_update_plan(
         "beta_action": beta_action,
         "beta_ahead": beta_ahead,
         "any_toc_update": main_update_needed or beta_update_needed,
-        "any_work": True,
+        "any_work": any_work,
     }
 
 
@@ -883,6 +1147,8 @@ def run_plan_mode(args):
     beta_sha = resolve_git_sha(repo_path, beta_ref)
     main_interface, main_version_raw = read_toc_fields_from_git(repo_path, main_ref, args.toc_path)
     beta_interface, beta_version_raw = read_toc_fields_from_git(repo_path, beta_ref, args.toc_path)
+    occupied_tags = list_remote_release_tags(repo_path)
+    print(f"[sync] Remote release tags considered for collisions: {len(occupied_tags)}")
 
     plan = build_update_plan(
         requested=requested,
@@ -896,6 +1162,7 @@ def run_plan_mode(args):
         beta_sha=beta_sha,
         repo=os.environ.get("GITHUB_REPOSITORY"),
         token=os.environ.get("GITHUB_TOKEN"),
+        occupied_tags=occupied_tags,
     )
     plan["resolver_strategy"] = resolver_strategy
 
@@ -958,7 +1225,61 @@ def main():
         choices=("main", "beta"),
         help="Update README badges for TRACK using --apply-interface and --apply-toc-version",
     )
+    parser.add_argument(
+        "--materialize-helpers",
+        metavar="DIR",
+        help="Copy pinned helpers from --workflow-sha into DIR and exit",
+    )
+    parser.add_argument(
+        "--workflow-sha",
+        help="Commit SHA that owns the automation helpers to materialize",
+    )
+    parser.add_argument(
+        "--assert-no-conflicts",
+        action="store_true",
+        help="Fail when a conflicting release workflow run is in progress or queued",
+    )
+    parser.add_argument(
+        "--current-run-id",
+        help="GitHub Actions run id to ignore while checking conflicting runs",
+    )
+    parser.add_argument(
+        "--ensure-beta-release-concurrency",
+        metavar="PATH",
+        help="Rewrite post-merge-beta concurrency group to release-channels when outdated",
+    )
     args = parser.parse_args()
+
+    if args.assert_no_conflicts:
+        assert_no_conflicting_workflow_runs(
+            os.environ.get("GITHUB_REPOSITORY"),
+            os.environ.get("GITHUB_TOKEN"),
+            current_run_id=args.current_run_id,
+        )
+        print("[sync] No conflicting release workflow runs detected")
+        return 0
+
+    if args.materialize_helpers:
+        if not args.workflow_sha:
+            parser.error("--materialize-helpers requires --workflow-sha")
+        paths = materialize_workflow_helpers(
+            Path(args.repo_path or "."),
+            args.workflow_sha,
+            args.materialize_helpers,
+        )
+        print(f"[sync] Materialized {len(paths)} helpers into {args.materialize_helpers}")
+        for path in paths:
+            print(f"[sync]   {path}")
+        return 0
+
+    if args.ensure_beta_release_concurrency:
+        path = Path(args.ensure_beta_release_concurrency)
+        changed = ensure_release_channels_concurrency(path)
+        if changed:
+            print(f"[sync] Updated concurrency group in {path} to release-channels")
+        else:
+            print(f"[sync] No beta-release concurrency group rewrite needed in {path}")
+        return 0
 
     if args.verify_sha:
         if not args.verify_ref:
