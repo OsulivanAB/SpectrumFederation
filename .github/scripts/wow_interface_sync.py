@@ -901,7 +901,6 @@ def run_plan_mode(args):
 
     print(json.dumps(plan, indent=2, sort_keys=True))
     _emit_plan_outputs(plan)
-    write_output("resolver_strategy", resolver_strategy)
     write_step_summary(plan, dry_run=args.dry_run)
     return 0
 
