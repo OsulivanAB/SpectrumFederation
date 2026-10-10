@@ -1699,6 +1699,130 @@ local function checkManualAdjustments()
     }, admin)
     assertTrue(okDelay and delayStatus == "duplicate", "delayed duplicate delivery is idempotent")
 
+    -- Lost confirmation: accepted negative retransmission must be duplicate, not floor.
+    -- Coordinator accepts -10 against 10 (balance 0). Stamped relay is lost, so the
+    -- follower still has the unordered event + unsent ID and retransmits. Floor
+    -- checks against the post-admit balance must not reject the known ID.
+    resetSync()
+    local lostSent = {}
+    local lostCoord = configured("lost-relay-coord")
+    lostCoord._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(lostCoord, "seed-lost-coord",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    local lostPeer = configured("lost-relay-peer")
+    lostPeer._adminUsers = { admin, helperAdmin }
+    C.CommitEvents(lostPeer, "seed-lost-peer",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    assertTrue(select(1, C.RecordManualAdjustment(lostPeer, helperAdmin, aqirite, -10, nil)),
+        "follower applies a legitimate negative that consumes the remaining balance")
+    local lostEvent = lostPeer._consumableEvents[#lostPeer._consumableEvents]
+    assertTrue(type(lostEvent) == "table" and type(lostEvent.id) == "string",
+        "follower retains the adjustment event for retransmission")
+    lostPeer._consumablesUnsent = { lostEvent.id }
+    local lostProfiles = {
+        [lostCoord._profileId] = lostCoord,
+        [lostPeer._profileId] = lostPeer,
+    }
+    sessionStubs({
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+    }, lostProfiles, lostSent)
+    local firstPayload = {
+        id = lostEvent.id,
+        type = C.EVENT.ADJUSTMENT,
+        actor = helperAdmin,
+        writer = helperAdmin,
+        itemId = aqirite,
+        quantity = -10,
+        generation = 1,
+    }
+    Sync:HandleConsumablesEvent(helperAdmin, {
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+        event = firstPayload,
+    })
+    assertEq(C.ItemDonatedTotal(lostCoord, aqirite), 0, "coordinator accepts the first negative transmission")
+    local stamped = C.EventIndex(lostCoord)[lostEvent.id]
+    assertTrue(type(stamped) == "table" and C.ValidOrder(stamped.order) ~= nil,
+        "coordinator stamps the accepted negative adjustment")
+    local firstReject = false
+    local firstBroadcast = false
+    for i = 1, #lostSent do
+        local payload = lostSent[i].payload
+        if type(payload) == "table" and type(payload.event) == "table" then
+            if payload.event.reject and payload.event.id == lostEvent.id then
+                firstReject = true
+            end
+            if payload.event.id == lostEvent.id and not payload.event.reject then
+                firstBroadcast = true
+            end
+        end
+    end
+    assertFalse(firstReject, "first legitimate negative is not floor-rejected")
+    assertTrue(firstBroadcast, "coordinator broadcasts the stamped adjustment")
+    -- Lost confirmation: discard the broadcast and leave the follower unsent.
+    assertEq(#(lostPeer._consumablesUnsent or {}), 1, "follower still queues the unconfirmed event")
+    assertEq(C.ValidOrder(lostEvent.order), nil, "follower still lacks a stamped order after the lost relay")
+    lostSent = {}
+    sessionStubs({
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+    }, lostProfiles, lostSent)
+    Sync:HandleConsumablesEvent(helperAdmin, {
+        sessionId = "lost-relay-session",
+        profileId = lostCoord._profileId,
+        event = {
+            id = lostEvent.id,
+            type = C.EVENT.ADJUSTMENT,
+            actor = helperAdmin,
+            writer = helperAdmin,
+            itemId = aqirite,
+            quantity = -10,
+            generation = 1,
+        },
+    })
+    assertEq(C.ItemDonatedTotal(lostCoord, aqirite), 0,
+        "retransmission of an accepted negative does not change the coordinator total")
+    local sawFloorReject = false
+    local sawStampedRebroadcast = false
+    for i = 1, #lostSent do
+        local payload = lostSent[i].payload
+        if type(payload) == "table" and type(payload.event) == "table"
+            and payload.event.id == lostEvent.id then
+            if payload.event.reject == "floor" or payload.event.reject == "member" then
+                sawFloorReject = true
+            elseif C.ValidOrder(payload.event.order) ~= nil then
+                sawStampedRebroadcast = true
+            end
+        end
+    end
+    assertFalse(sawFloorReject,
+        "retransmission of an already-accepted negative is not floor/member rejected")
+    assertTrue(sawStampedRebroadcast,
+        "coordinator rebroadcasts the stamped duplicate after a lost confirmation")
+    local okRetransmit, retransmitStatus = S.ApplyRemoteEvent(lostCoord, {
+        id = lostEvent.id,
+        type = C.EVENT.ADJUSTMENT,
+        actor = helperAdmin,
+        writer = helperAdmin,
+        itemId = aqirite,
+        quantity = -10,
+        generation = 1,
+    }, helperAdmin)
+    assertTrue(okRetransmit and retransmitStatus == "duplicate",
+        "ApplyRemoteEvent classifies the lost-confirmation retransmission as duplicate")
+    assertEq(C.ItemDonatedTotal(lostPeer, aqirite), 0, "follower keeps its legitimate negative credit")
+    assertTrue(type(C.EventIndex(lostPeer)[lostEvent.id]) == "table",
+        "follower still holds the original adjustment after the duplicate path")
+    assertEq(C.ValidOrder(lostEvent.order), nil,
+        "lost confirmation leaves the follower unordered; duplicate path must not retract it")
+
     -- Generation / clear: history kept, new generation unaffected.
     assertTrue(select(1, C.Clear(p, admin)), "clear after adjustments succeeds")
     assertEq(C.ItemDonatedTotal(p, aqirite), 0, "clear restarts item totals for the new generation")

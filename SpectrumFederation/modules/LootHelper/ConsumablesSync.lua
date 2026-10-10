@@ -342,16 +342,28 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
         -- current roster membership so competing negatives / stale attribution
         -- cannot enter the canonical ledger. Historical stamped rows keep credit
         -- after a later leave via coordinatorRelay.
+        --
+        -- Previously accepted IDs skip floor/member: after a legitimate negative
+        -- consumes the remaining balance, a lost confirmation + retransmission
+        -- must be AppendEvent's duplicate path (and stamped rebroadcast), not a
+        -- false floor/member reject that can RetractEvent the originator's still-
+        -- unordered apply. Do not treat a known ID as a new admission merely
+        -- because the retransmission body differs; AppendEvent keeps the stored
+        -- body unless replaceBody is set.
         if not opts.coordinatorRelay then
-            if event.attributed and event.attributed ~= ""
-                and C.IsCurrentProfileMember
-                and not C.IsCurrentProfileMember(profile, event.attributed) then
-                return false, "member"
-            end
-            if C.AdjustmentFloorOk then
-                local floorOk = C.AdjustmentFloorOk(profile, event.itemId, event.quantity, event.attributed)
-                if not floorOk then
-                    return false, "floor"
+            local ids = C.EventIndex and C.EventIndex(profile)
+            local alreadyAccepted = type(event.id) == "string" and ids and type(ids[event.id]) == "table"
+            if not alreadyAccepted then
+                if event.attributed and event.attributed ~= ""
+                    and C.IsCurrentProfileMember
+                    and not C.IsCurrentProfileMember(profile, event.attributed) then
+                    return false, "member"
+                end
+                if C.AdjustmentFloorOk then
+                    local floorOk = C.AdjustmentFloorOk(profile, event.itemId, event.quantity, event.attributed)
+                    if not floorOk then
+                        return false, "floor"
+                    end
                 end
             end
         end
