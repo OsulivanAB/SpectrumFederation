@@ -280,17 +280,23 @@ local function CommitAdjustment(ctx)
 	local C = SF.Consumables
 	local profile = ActiveProfile()
 	if not C or not profile then
-		ctx.section:SetMessage("No active profile.", "error")
+		ctx.section:SetMessage(Loc("RAID_CONSUMABLE_ADJUST_ERR_NO_PROFILE", "No active profile."), "error")
 		return
 	end
 	if not IsEffectiveAdmin(profile) then
-		ctx.section:SetMessage("Only a profile admin can adjust raid supplies.", "error")
+		ctx.section:SetMessage(
+			Loc("RAID_CONSUMABLE_ADJUST_ERR_ADMIN_ONLY", "Only a profile admin can adjust raid supplies."),
+			"error"
+		)
 		return
 	end
 	local qty = AdjustQuantity()
 	local preview, err = C.PreviewManualAdjustment(profile, adjustItemId, qty, adjustMemberId)
 	if not preview then
-		ctx.section:SetMessage(err or "Could not preview that adjustment.", "error")
+		ctx.section:SetMessage(
+			err or Loc("RAID_CONSUMABLE_ADJUST_ERR_PREVIEW", "Could not preview that adjustment."),
+			"error"
+		)
 		return
 	end
 	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
@@ -300,11 +306,17 @@ local function CommitAdjustment(ctx)
 	dialogs:Confirm(message, Loc("RAID_CONSUMABLE_ADJUST_APPLY_BUTTON", "Confirm"), function()
 		local active = ActiveProfile()
 		if ProfileKey(active) ~= originId then
-			ctx.section:SetMessage("The active profile changed, so the adjustment was not applied.", "error")
+			ctx.section:SetMessage(
+				Loc("RAID_CONSUMABLE_ADJUST_ERR_PROFILE_CHANGED", "The active profile changed, so the adjustment was not applied."),
+				"error"
+			)
 			return
 		end
 		if not IsEffectiveAdmin(active) then
-			ctx.section:SetMessage("Only a profile admin can adjust raid supplies.", "error")
+			ctx.section:SetMessage(
+				Loc("RAID_CONSUMABLE_ADJUST_ERR_ADMIN_ONLY", "Only a profile admin can adjust raid supplies."),
+				"error"
+			)
 			return
 		end
 		local sync = SF.LootHelperSync
@@ -327,7 +339,10 @@ local function CommitAdjustment(ctx)
 				Page:Refresh(Page.panel)
 			end
 		else
-			ctx.section:SetMessage(commitErr or "Could not record that adjustment.", "error")
+			ctx.section:SetMessage(
+				commitErr or Loc("RAID_CONSUMABLE_ADJUST_ERR_COMMIT", "Could not record that adjustment."),
+				"error"
+			)
 		end
 	end)
 end
@@ -580,7 +595,7 @@ local function Definition()
 				{
 					type = "help",
 					indent = "label",
-					text = AdjustPreviewText(),
+					getText = AdjustPreviewText,
 				},
 				{
 					type = "button",

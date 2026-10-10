@@ -337,6 +337,24 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
         if event.attributed ~= nil and event.attributed ~= "" and type(event.attributed) ~= "string" then
             return false, "unauthorized"
         end
+        -- Coordinator-stamped relays are already authoritative. Direct admission
+        -- (including offline flush to the coordinator) must recheck floors and
+        -- current roster membership so competing negatives / stale attribution
+        -- cannot enter the canonical ledger. Historical stamped rows keep credit
+        -- after a later leave via coordinatorRelay.
+        if not opts.coordinatorRelay then
+            if event.attributed and event.attributed ~= ""
+                and C.IsCurrentProfileMember
+                and not C.IsCurrentProfileMember(profile, event.attributed) then
+                return false, "member"
+            end
+            if C.AdjustmentFloorOk then
+                local floorOk = C.AdjustmentFloorOk(profile, event.itemId, event.quantity, event.attributed)
+                if not floorOk then
+                    return false, "floor"
+                end
+            end
+        end
     else
         -- Receipt/custody/trade events are no longer accepted.
         return false, "invalid"
