@@ -57,6 +57,7 @@ Beta and main changelog updates share `.github/scripts/update_changelog.py`. The
 
 - **Beta:** `.github/workflows/post-merge-beta.yml` runs the script after an addon change is pushed to `beta`. The new `## [X.Y.Z-beta.N]` section describes that incremental development update.
 - **Main:** `.github/workflows/promote-beta-to-main.yml` runs the same script after beta is merged to `main` and the TOC version is stripped to `X.Y.Z`. That section describes the net user-facing result since the previous main release.
+- **Compatibility:** `.github/workflows/update-wow-game-version.yml` sets `CHANGELOG_MODE=compatibility` and writes a deterministic Interface-only note without inventing gameplay changes.
 
 ### Deterministic vs AI work
 
@@ -259,9 +260,38 @@ Run and review the default dry run before setting `dry_run` to false.
 
 ## Interface synchronization
 
-`.github/scripts/blizzard_api.py` queries Blizzard's public version endpoint for current metadata and formats the README Interface badge from that 6-digit Interface number (`120100` → `12.1.0`). `.github/scripts/wow_interface_sync.py` updates interface metadata through its own workflow/script integration and has focused parser tests in `tests/test_wow_interface_sync.py`.
+`.github/scripts/blizzard_api.py` queries Blizzard's public version endpoint for current metadata and formats the README Interface badge from that 6-digit Interface number (`120100` → `12.1.0`).
 
-When changing parser behavior, run:
+### Manual Update WoW Game Version workflow
+
+`.github/workflows/update-wow-game-version.yml` is a `workflow_dispatch`-only workflow that updates Retail compatibility on `main` and `beta` without promoting unfinished beta features.
+
+Typical use: Blizzard ships a Retail patch while `beta` still contains unfinished work. Promote Beta to Main would either wait or ship unfinished features; this workflow updates Interface/version metadata on each branch independently and republishes both channels through `publish_release.py`.
+
+Inputs:
+
+- `game_version`: human-readable Retail version such as `12.1.5` (converted to Interface `120105`);
+- `dry_run`: defaults to `true`; previews the plan and validates packaging/publish dry-runs without mutating branches or publishing.
+
+Behavior:
+
+1. Must be dispatched from `main` (the workflow file must already be on the default branch).
+2. Validates the requested version against live Retail before any mutation.
+3. Plans independent `main` (`X.Y.Z`) and `beta` (`X.Y.Z-beta.N`) version bumps, keeping packaged child TOCs in lockstep.
+4. Writes a deterministic compatibility changelog entry (no invented gameplay notes).
+5. Updates README badges, then publishes GitHub/Wago/CurseForge via the existing publisher.
+6. Always materializes automation helpers from the dispatched workflow commit, so an older beta tip can be updated without first promoting unfinished beta code that lacks those helpers.
+7. Uses `PAT_TOKEN` (repository Admin) for protected branch pushes because main/beta rulesets require pull requests and only Admin role bypasses them. Do not disable protection.
+8. Skips Post-Merge Beta for `chore: bump Interface to …` commits once that guard is on beta; until then, preflight also fails on active/queued Post-Merge Beta / Promote / Rollback runs by workflow name (covers live beta's older `beta-release` concurrency group).
+9. Distinguishes `none` / `update` / `publish`: never publishes a stable TOC version from beta, avoids tag collisions after rollbacks, and retries channel-matched publishes after partial failures without bumping again.
+
+Planning and TOC helpers live in `.github/scripts/wow_interface_sync.py`.
+
+### Required secret / ruleset configuration
+
+Before the first live run, confirm repository secret `PAT_TOKEN` is a token for a user with the repository **Admin** role (the Main/Beta rulesets bypass `RepositoryRole` Admin). The default `GITHUB_TOKEN` cannot push through those pull-request rulesets. Alternatively, an administrator may add an explicit ruleset bypass for the GitHub Actions app; do not remove required reviews or status checks.
+
+When changing parser or version-plan behavior, run:
 
 ```bash
 python -m pytest tests/test_wow_interface_sync.py

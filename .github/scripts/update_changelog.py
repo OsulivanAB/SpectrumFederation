@@ -1,9 +1,11 @@
 """
-Update CHANGELOG.md for beta post-merge and Promote Beta to Main.
+Update CHANGELOG.md for beta post-merge, Promote Beta to Main, and
+compatibility-only game-version updates.
 
 Called by:
 - post-merge-beta.yml after addon changes land on beta
 - promote-beta-to-main.yml after beta is merged to main
+- update-wow-game-version.yml for Interface-only releases
 
 Deterministic logic owns versions, git ranges, changelog structure,
 idempotency, and validation. AI is used only for semantic judgments
@@ -51,6 +53,7 @@ AUTOMATION_MESSAGE_PREFIXES = (
     "docs: update badges",
     "chore: update version to",
     "chore: update interface to",
+    "chore: bump Interface to",
     "chore: promote beta to main",
     "chore: promote non-addon",
 )
@@ -1204,10 +1207,50 @@ def apply_changelog(context, entries, date_text):
     return True
 
 
+def compatibility_entries(game_version, interface):
+    """Return the deterministic changelog entries for an Interface-only release."""
+    display = (game_version or "").strip() or str(interface)
+    return [
+        {
+            "category": "Changed",
+            "text": (
+                f"Updated Retail game compatibility to Interface {interface} "
+                f"({display})."
+            ),
+        }
+    ]
+
+
+def apply_compatibility_changelog(version, game_version, interface, date_text):
+    """Write or keep a compatibility-only changelog section for version."""
+    changelog_text = load_changelog_text()
+    _preface, sections = parse_changelog_sections(changelog_text)
+    existing = find_section(sections, version)
+    if existing and not is_placeholder_text(existing.get("text", "")):
+        print(f"[changelog] Section for {version} already exists; leaving it unchanged")
+        return False
+
+    entries = compatibility_entries(game_version, interface)
+    rendered = render_section(version, date_text, entries)
+    updated, changed = replace_or_insert_section(
+        changelog_text,
+        version,
+        rendered,
+        allow_replace=is_placeholder_text((existing or {}).get("text", "")),
+    )
+    if not changed:
+        print("[changelog] Changelog already contained this version; no write needed")
+        return False
+    CHANGELOG_PATH.write_text(updated, encoding="utf-8")
+    print(f"[changelog] Wrote compatibility section for {version}")
+    print(rendered)
+    return True
+
+
 def determine_mode(branch_name, version):
-    """Return beta or promote from branch + version, with env override."""
+    """Return beta, promote, or compatibility from branch + version, with env override."""
     override = os.environ.get("CHANGELOG_MODE", "").strip().lower()
-    if override in {"beta", "promote"}:
+    if override in {"beta", "promote", "compatibility"}:
         return override
     if branch_name == "main" and not is_beta_version(version):
         return "promote"
@@ -1244,6 +1287,20 @@ def main(argv=None):
     print(f"[changelog] version={version} branch={branch_name or '(unset)'} mode={mode}")
 
     try:
+        if mode == "compatibility":
+            interface = os.environ.get("CHANGELOG_INTERFACE", "").strip()
+            game_version = os.environ.get("CHANGELOG_GAME_VERSION", "").strip()
+            if not interface:
+                raise ChangelogError("CHANGELOG_INTERFACE is required for compatibility mode")
+            entries = compatibility_entries(game_version, interface)
+            if args.print_plan:
+                print("[changelog] plan entries:")
+                print(json.dumps(entries, indent=2))
+                print(render_section(version, date_text, entries))
+                return 0
+            apply_compatibility_changelog(version, game_version, interface, date_text)
+            return 0
+
         context = gather_context(
             mode,
             version,
