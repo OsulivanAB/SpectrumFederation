@@ -701,6 +701,25 @@ def release_exists(tag_name, env):
         raise
 
 
+def resolve_release_target_sha(repo_path="."):
+    """Return the commit SHA that a newly created release tag must point to.
+
+    Callers check out the captured publishing source before invoking the
+    publisher, so HEAD is the authoritative release source for both stable and
+    beta channels. New tags must not default to the repository default branch.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sha = (result.stdout or "").strip()
+    if not sha:
+        raise RuntimeError("Could not resolve git HEAD for GitHub release --target")
+    return sha
+
+
 def update_github_release(tag_name, release_name, notes_path, zip_path, json_path, is_prerelease, env):
     """Update an existing GitHub release and replace assets."""
     print(f"[publish-release] Release {tag_name} already exists; updating it instead")
@@ -750,11 +769,17 @@ def create_github_release(version, zip_path, json_path, repo, classification, no
     tag_name = f"v{version}"
     release_name = f"Release {version}"
     is_prerelease = classification.is_prerelease
+    try:
+        target_sha = resolve_release_target_sha()
+    except (RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"::error ::Failed to resolve GitHub release target SHA: {error}")
+        return None
 
     if dry_run:
         print("[publish-release] DRY RUN - Would create GitHub release:")
         print(f"  Tag: {tag_name}")
         print(f"  Name: {release_name}")
+        print(f"  Target: {target_sha}")
         print(f"  GitHub classification: {classification.github_release_kind}")
         print(f"  Prerelease: {is_prerelease}")
         print(f"  Assets: {zip_path}, {json_path}")
@@ -769,7 +794,7 @@ def create_github_release(version, zip_path, json_path, repo, classification, no
 
     gh_env = {**os.environ, "GH_TOKEN": github_token}
 
-    print(f"[publish-release] Creating GitHub release: {tag_name}")
+    print(f"[publish-release] Creating GitHub release: {tag_name} (target {target_sha})")
 
     cmd = [
         "gh", "release", "create",
@@ -778,6 +803,7 @@ def create_github_release(version, zip_path, json_path, repo, classification, no
         str(json_path),
         "--title", release_name,
         "--notes-file", str(notes_path),
+        "--target", target_sha,
     ]
 
     if is_prerelease:
@@ -785,6 +811,7 @@ def create_github_release(version, zip_path, json_path, repo, classification, no
 
     try:
         if release_exists(tag_name, gh_env):
+            # Existing tags are left alone; only newly created tags set --target.
             return update_github_release(
                 tag_name,
                 release_name,

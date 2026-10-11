@@ -1,9 +1,11 @@
 """
-Update CHANGELOG.md for beta post-merge and Promote Beta to Main.
+Update CHANGELOG.md for beta post-merge, Promote Beta to Main, and
+compatibility-only game-version updates.
 
 Called by:
 - post-merge-beta.yml after addon changes land on beta
 - promote-beta-to-main.yml after beta is merged to main
+- update-wow-game-version.yml for Interface-only releases
 
 Deterministic logic owns versions, git ranges, changelog structure,
 idempotency, and validation. AI is used only for semantic judgments
@@ -51,6 +53,7 @@ AUTOMATION_MESSAGE_PREFIXES = (
     "docs: update badges",
     "chore: update version to",
     "chore: update interface to",
+    "chore: bump Interface to",
     "chore: promote beta to main",
     "chore: promote non-addon",
 )
@@ -1204,10 +1207,111 @@ def apply_changelog(context, entries, date_text):
     return True
 
 
+def compatibility_entries(game_version, interface):
+    """Return the deterministic changelog entries for an Interface-only release."""
+    display = (game_version or "").strip() or str(interface)
+    return [
+        {
+            "category": "Changed",
+            "text": (
+                f"Updated Retail game compatibility to Interface {interface} "
+                f"({display})."
+            ),
+        }
+    ]
+
+
+def is_compatibility_note(text):
+    """Return True for the deterministic Interface-compatibility changelog bullet."""
+    return bool(
+        re.match(
+            r"^Updated Retail game compatibility to Interface\b",
+            (text or "").strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def prior_beta_train_feature_entries(sections, version):
+    """Return feature bullets from the highest beta train strictly below version.
+
+    When a game-version update rolls beta from e.g. 1.5.9-beta.N to 1.5.10-beta.1,
+    existing feature notes remain under the prior train. Promote later selects
+    beta sections by train, so those notes must be carried into the new section.
+    """
+    parsed_new = parse_version(version)
+    if not parsed_new or parsed_new[3] is None:
+        return []
+    new_train = parsed_new[:3]
+    prior_sections = []
+    for section in sections:
+        if not section.get("is_beta"):
+            continue
+        parsed = parse_version(section.get("version"))
+        if not parsed:
+            continue
+        if parsed[:3] < new_train:
+            prior_sections.append(section)
+    if not prior_sections:
+        return []
+    rolled_train = max(parse_version(section["version"])[:3] for section in prior_sections)
+    entries = []
+    seen = set()
+    for section in prior_sections:
+        if parse_version(section["version"])[:3] != rolled_train:
+            continue
+        for category, text in extract_bullets(section.get("text", "")):
+            cleaned = normalize_bullet_text(text)
+            if not cleaned or is_placeholder_text(cleaned) or is_compatibility_note(cleaned):
+                continue
+            key = (category, cleaned.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"category": category, "text": cleaned})
+    return entries
+
+
+def apply_compatibility_changelog(version, game_version, interface, date_text):
+    """Write or keep a compatibility changelog section for version.
+
+    On beta train rollover, carry forward prior-train feature notes so a later
+    stable promotion can still see them via beta_sections_for_train().
+    """
+    changelog_text = load_changelog_text()
+    _preface, sections = parse_changelog_sections(changelog_text)
+    existing = find_section(sections, version)
+    if existing and not is_placeholder_text(existing.get("text", "")):
+        print(f"[changelog] Section for {version} already exists; leaving it unchanged")
+        return False
+
+    entries = []
+    if is_beta_version(version):
+        carried = prior_beta_train_feature_entries(sections, version)
+        if carried:
+            entries.extend(carried)
+            print(f"[changelog] Carried {len(carried)} feature note(s) from prior beta train")
+    entries.extend(compatibility_entries(game_version, interface))
+    rendered = render_section(version, date_text, entries)
+    updated, changed = replace_or_insert_section(
+        changelog_text,
+        version,
+        rendered,
+        allow_replace=is_placeholder_text((existing or {}).get("text", "")),
+    )
+    if not changed:
+        print("[changelog] Changelog already contained this version; no write needed")
+        return False
+    CHANGELOG_PATH.write_text(updated, encoding="utf-8")
+    print(f"[changelog] Wrote compatibility section for {version}")
+    print(rendered)
+    return True
+
+
 def determine_mode(branch_name, version):
-    """Return beta or promote from branch + version, with env override."""
+    """Return beta, promote, or compatibility from branch + version, with env override."""
     override = os.environ.get("CHANGELOG_MODE", "").strip().lower()
-    if override in {"beta", "promote"}:
+    if override in {"beta", "promote", "compatibility"}:
         return override
     if branch_name == "main" and not is_beta_version(version):
         return "promote"
@@ -1244,6 +1348,20 @@ def main(argv=None):
     print(f"[changelog] version={version} branch={branch_name or '(unset)'} mode={mode}")
 
     try:
+        if mode == "compatibility":
+            interface = os.environ.get("CHANGELOG_INTERFACE", "").strip()
+            game_version = os.environ.get("CHANGELOG_GAME_VERSION", "").strip()
+            if not interface:
+                raise ChangelogError("CHANGELOG_INTERFACE is required for compatibility mode")
+            entries = compatibility_entries(game_version, interface)
+            if args.print_plan:
+                print("[changelog] plan entries:")
+                print(json.dumps(entries, indent=2))
+                print(render_section(version, date_text, entries))
+                return 0
+            apply_compatibility_changelog(version, game_version, interface, date_text)
+            return 0
+
         context = gather_context(
             mode,
             version,

@@ -377,6 +377,7 @@ def test_github_dry_run_does_not_invoke_gh(monkeypatch, tmp_path):
         raise AssertionError("dry-run must not invoke gh")
 
     monkeypatch.setattr(publish.subprocess, "run", fail_run)
+    monkeypatch.setattr(publish, "resolve_release_target_sha", lambda repo_path=".": "dry-run-sha")
     classification = publish.classify_release("1.5.0-beta.1")
     result = publish.create_github_release(
         "1.5.0-beta.1",
@@ -405,6 +406,7 @@ def test_github_create_uses_prerelease_for_beta(monkeypatch, tmp_path):
         return type("Result", (), {"stdout": "created", "returncode": 0})()
 
     monkeypatch.setattr(publish, "release_exists", lambda tag_name, env: False)
+    monkeypatch.setattr(publish, "resolve_release_target_sha", lambda repo_path=".": "abc123def")
     monkeypatch.setattr(publish.subprocess, "run", fake_run)
     result = publish.create_github_release(
         "1.5.0-beta.1",
@@ -418,8 +420,67 @@ def test_github_create_uses_prerelease_for_beta(monkeypatch, tmp_path):
     assert result == "created"
     assert commands[0][:3] == ["gh", "release", "create"]
     assert "--prerelease" in commands[0]
+    assert "--target" in commands[0]
+    assert commands[0][commands[0].index("--target") + 1] == "abc123def"
     assert str(zip_path) in commands[0]
     assert str(json_path) in commands[0]
+
+
+def test_github_create_targets_checkout_head_sha(monkeypatch, tmp_path):
+    monkeypatch.setenv("GITHUB_TOKEN", "github-token")
+    zip_path = tmp_path / "addon.zip"
+    json_path = tmp_path / "release.json"
+    notes_path = tmp_path / "notes.md"
+    zip_path.write_bytes(b"zip")
+    json_path.write_text("{}", encoding="utf-8")
+    notes_path.write_text("notes", encoding="utf-8")
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        return type("Result", (), {"stdout": "created", "returncode": 0})()
+
+    monkeypatch.setattr(publish, "release_exists", lambda tag_name, env: False)
+    monkeypatch.setattr(
+        publish,
+        "resolve_release_target_sha",
+        lambda repo_path=".": "deadbeefcafebabe0123456789abcdef01234567",
+    )
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    result = publish.create_github_release(
+        "1.5.8",
+        zip_path,
+        json_path,
+        "OsulivanAB/SpectrumFederation",
+        publish.classify_release("1.5.8"),
+        notes_path,
+        dry_run=False,
+    )
+    assert result == "created"
+    create_cmd = commands[0]
+    assert create_cmd[:3] == ["gh", "release", "create"]
+    assert "--target" in create_cmd
+    assert create_cmd[create_cmd.index("--target") + 1] == "deadbeefcafebabe0123456789abcdef01234567"
+    assert "--prerelease" not in create_cmd
+
+
+def test_resolve_release_target_sha_reads_git_head(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    (repo / "file.txt").write_text("release source\n", encoding="utf-8")
+    subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "source"], cwd=repo, check=True)
+    expected = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert publish.resolve_release_target_sha(repo) == expected
 
 
 def test_github_stable_release_is_not_prerelease(monkeypatch, tmp_path):
@@ -437,6 +498,7 @@ def test_github_stable_release_is_not_prerelease(monkeypatch, tmp_path):
         return type("Result", (), {"stdout": "created", "returncode": 0})()
 
     monkeypatch.setattr(publish, "release_exists", lambda tag_name, env: False)
+    monkeypatch.setattr(publish, "resolve_release_target_sha", lambda repo_path=".": "stable-sha")
     monkeypatch.setattr(publish.subprocess, "run", fake_run)
     result = publish.create_github_release(
         "1.5.0",
@@ -449,6 +511,8 @@ def test_github_stable_release_is_not_prerelease(monkeypatch, tmp_path):
     )
     assert result == "created"
     assert "--prerelease" not in commands[0]
+    assert "--target" in commands[0]
+    assert commands[0][commands[0].index("--target") + 1] == "stable-sha"
 
 
 def test_github_existing_release_is_updated(monkeypatch, tmp_path):
@@ -466,6 +530,7 @@ def test_github_existing_release_is_updated(monkeypatch, tmp_path):
         return type("Result", (), {"stdout": "", "returncode": 0})()
 
     monkeypatch.setattr(publish, "release_exists", lambda tag_name, env: True)
+    monkeypatch.setattr(publish, "resolve_release_target_sha", lambda repo_path=".": "existing-sha")
     monkeypatch.setattr(publish.subprocess, "run", fake_run)
     result = publish.create_github_release(
         "1.5.0-beta.1",
@@ -478,6 +543,7 @@ def test_github_existing_release_is_updated(monkeypatch, tmp_path):
     )
     assert result == "updated"
     assert commands[0][:3] == ["gh", "release", "edit"]
+    assert "--target" not in commands[0]
     assert commands[1][:3] == ["gh", "release", "upload"]
     assert "--clobber" in commands[1]
 

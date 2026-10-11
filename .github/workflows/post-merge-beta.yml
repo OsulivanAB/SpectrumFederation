@@ -15,13 +15,20 @@ on:
       - 'pkgmeta.yaml'
 
 concurrency:
-  group: beta-release
+  # Shared with Promote Beta to Main and Update WoW Game Version.
+  # queue: max: do not drop an ordinary pending beta release when another
+  # release-channel workflow queues behind an in-progress run.
+  group: release-channels
+  queue: max
   cancel-in-progress: false  # Don't cancel in-progress releases
 
 jobs:
   detect-release-scope:
     name: Detect Release Scope
     runs-on: ubuntu-latest
+    # Update WoW Game Version publishes beta itself. Skip this path for its
+    # Interface-bump commits so PAT-triggered pushes do not double-publish.
+    if: "${{ !startsWith(github.event.head_commit.message, 'chore: bump Interface to') }}"
     outputs:
       addon_changed: ${{ steps.scope.outputs.addon_changed }}
       release_required: ${{ steps.scope.outputs.release_required }}
@@ -350,7 +357,7 @@ jobs:
       - update-changelog
       - update-readme-badges
       - publish-beta-release
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() && !cancelled() && needs.detect-release-scope.result != 'skipped' }}
 
     steps:
       - name: Checkout code
@@ -398,6 +405,7 @@ jobs:
           print("Post-merge beta jobs matched packaged-addon release scope.")
           PY
 
+  # Skipped automatically when detect-release-scope is skipped for Interface-bump commits.
   cleanup-merged-branch:
     name: Cleanup Merged Branch
     runs-on: ubuntu-latest

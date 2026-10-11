@@ -14,7 +14,10 @@ on:
         default: true
 
 concurrency:
-  group: rollback-release
+  # Shared with promotion, beta release, and Update WoW Game Version.
+  # queue: max keeps pending release-channel runs instead of replacing them.
+  group: release-channels
+  queue: max
   cancel-in-progress: false
 
 jobs:

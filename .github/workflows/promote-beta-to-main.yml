@@ -9,7 +9,10 @@ permissions:
   id-token: write
 
 concurrency:
-  group: main-release
+  # Shared with Post-Merge Beta and Update WoW Game Version.
+  # queue: max keeps pending promote/beta/rollback runs instead of replacing them.
+  group: release-channels
+  queue: max
   cancel-in-progress: false
 
 # GitHub Actions default `if: success()` is false when ANY ancestor job was
