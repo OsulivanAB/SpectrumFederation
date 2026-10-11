@@ -779,6 +779,7 @@ def plan_branch_action(*, channel, interface_matches, version_raw, repo, token):
         # Unverifiable without credentials: do not invent a publish.
         return "none"
     if release is None:
+        # Channel-matched Interface with no GitHub release: recover a partial publish.
         return "publish"
 
     release_is_prerelease = bool(release.get("prerelease"))
@@ -791,8 +792,9 @@ def plan_branch_action(*, channel, interface_matches, version_raw, repo, token):
             f"GitHub tag v{version_raw} is a stable release; refusing to publish it from beta."
         )
 
-    # Matching GitHub release exists: allow idempotent CF/Wago recovery publish.
-    return "publish"
+    # Matching GitHub release already exists: do not republish a completed release.
+    # Downstream-only CF/Wago recovery remains available via publish_release.py.
+    return "none"
 
 
 def assert_no_conflicting_workflow_runs(repo, token, *, current_run_id=None):
@@ -991,13 +993,15 @@ def build_update_plan(
         raise RuntimeError(f"Main TOC version must be stable X.Y.Z, got {main_version_raw}")
 
     main_update_needed = main_interface != target_interface_str
-    # Beta must advance when its Interface is stale OR when it would not remain
-    # strictly ahead of the post-plan main version (main catching the beta train).
+    # Matching stable TOC on main and beta after promotion is normal and must not
+    # invent a beta prerelease. Only force a beta version advance when a real main
+    # compatibility bump would catch or pass beta's current train.
     provisional_main = bump_main_version(main_version) if main_update_needed else main_version
-    beta_update_needed = (
-        beta_interface != target_interface_str
-        or version_value(beta_version) <= version_value(provisional_main)
+    beta_caught_by_main = (
+        main_update_needed
+        and version_value(beta_version) <= version_value(provisional_main)
     )
+    beta_update_needed = beta_interface != target_interface_str or beta_caught_by_main
     occupied_tags = set(occupied_tags or ())
 
     new_main_version, new_beta_version, beta_ahead = compute_updated_versions(

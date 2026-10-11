@@ -199,6 +199,7 @@ def test_verify_requested_matches_live():
 
 
 def test_build_update_plan_noop_for_already_current_stable_on_both_branches(monkeypatch):
+    """Post-promotion main=beta stable with matching Interface must not invent work."""
     monkeypatch.setattr(
         wow,
         "fetch_github_release",
@@ -221,14 +222,13 @@ def test_build_update_plan_noop_for_already_current_stable_on_both_branches(monk
         token="token",
     )
     assert plan["main_update_needed"] is False
-    # Beta on the same stable version is not ahead of main; advance the train.
-    assert plan["beta_update_needed"] is True
+    assert plan["beta_update_needed"] is False
     assert plan["main_target_version"] == "1.5.8"
-    assert plan["beta_target_version"] == "1.5.9-beta.1"
-    # Main may retry a channel-matched publish; beta must never publish stable 1.5.8.
-    assert plan["main_action"] == "publish"
-    assert plan["beta_action"] == "update"
-    assert plan["any_work"] is True
+    assert plan["beta_target_version"] == "1.5.8"
+    # Completed GitHub release + matching Interface: no bump and no republish.
+    assert plan["main_action"] == "none"
+    assert plan["beta_action"] == "none"
+    assert plan["any_work"] is False
 
 
 def test_build_update_plan_advances_beta_when_main_catches_train(monkeypatch):
@@ -320,6 +320,37 @@ def test_plan_branch_action_recovers_incomplete_channel_matched_publish(monkeypa
             token="token",
         )
         == "publish"
+    )
+
+
+def test_plan_branch_action_skips_already_completed_channel_release(monkeypatch):
+    monkeypatch.setattr(
+        wow,
+        "fetch_github_release",
+        lambda version, *_args, **_kwargs: {
+            "tag_name": f"v{version}",
+            "prerelease": "-" in version,
+        },
+    )
+    assert (
+        wow.plan_branch_action(
+            channel="main",
+            interface_matches=True,
+            version_raw="1.5.8",
+            repo="owner/repo",
+            token="token",
+        )
+        == "none"
+    )
+    assert (
+        wow.plan_branch_action(
+            channel="beta",
+            interface_matches=True,
+            version_raw="1.6.0-beta.8",
+            repo="owner/repo",
+            token="token",
+        )
+        == "none"
     )
 
 
