@@ -510,6 +510,53 @@ def test_compatibility_mode_writes_deterministic_section(tmp_path, monkeypatch):
     assert changed_again is False
 
 
+def test_compatibility_rollover_carries_prior_beta_feature_notes(tmp_path, monkeypatch):
+    """Train rollover must keep prior beta feature notes for later promote."""
+    repo = init_repo(tmp_path)
+    monkeypatch.chdir(repo)
+    (repo / "CHANGELOG.md").write_text(
+        """# Changelog
+
+## [1.5.9-beta.7] - 2026-10-09
+
+### Added
+- Added Linked Characters identity linking
+
+### Fixed
+- Fixed Loot Helper window minimize restore
+
+### Changed
+- Updated Retail game compatibility to Interface 120100 (12.1.0).
+
+## [1.5.8] - 2026-10-01
+
+### Added
+- Added prior stable feature
+""",
+        encoding="utf-8",
+    )
+
+    changed = changelog.apply_compatibility_changelog(
+        "1.5.10-beta.1",
+        "12.1.5",
+        "120105",
+        "2026-10-10",
+    )
+    assert changed is True
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## [1.5.10-beta.1] - 2026-10-10" in text
+    assert "Added Linked Characters identity linking" in text
+    assert "Fixed Loot Helper window minimize restore" in text
+    assert "Updated Retail game compatibility to Interface 120105 (12.1.5)." in text
+    # Prior-train section remains; new section must also carry notes for promote.
+    assert "## [1.5.9-beta.7] - 2026-10-09" in text
+    _preface, sections = changelog.parse_changelog_sections(text)
+    promote_notes = changelog.beta_sections_for_train(sections, "1.5.10")
+    assert len(promote_notes) == 1
+    assert "Linked Characters" in promote_notes[0]["text"]
+    assert "Loot Helper" in promote_notes[0]["text"]
+
+
 def test_determine_mode_accepts_compatibility_override(monkeypatch):
     monkeypatch.setenv("CHANGELOG_MODE", "compatibility")
     assert changelog.determine_mode("main", "1.5.9") == "compatibility"

@@ -280,10 +280,11 @@ Behavior:
 3. Plans independent `main` (`X.Y.Z`) and `beta` (`X.Y.Z-beta.N`) version bumps, keeping packaged child TOCs in lockstep.
 4. Writes a deterministic compatibility changelog entry (no invented gameplay notes).
 5. Updates README badges, then publishes GitHub/Wago/CurseForge via the existing publisher.
-6. Always materializes automation helpers from the dispatched workflow commit, so an older beta tip can be updated without first promoting unfinished beta code that lacks those helpers.
-7. Uses `PAT_TOKEN` (repository Admin) for protected branch pushes because main/beta rulesets require pull requests and only Admin role bypasses them. Do not disable protection.
+6. Always materializes automation helpers from the dispatched workflow commit via `git show` into a shared helpers directory (imports included), so an older beta tip can be updated without first promoting unfinished beta code that lacks those helpers.
+7. Uses `PAT_TOKEN` (repository Admin) for protected branch pushes because main/beta rulesets require pull requests and only Admin role bypasses them. Do not disable protection. The token must also be allowed to push workflow-file changes on `beta` when this workflow rewrites `post-merge-beta.yml` concurrency settings.
 8. Skips Post-Merge Beta for `chore: bump Interface to …` commits once that guard is on beta; until then, preflight also fails on active/queued Post-Merge Beta / Promote / Rollback runs by workflow name (covers live beta's older `beta-release` concurrency group).
-9. Distinguishes `none` / `update` / `publish`: never publishes a stable TOC version from beta, avoids tag collisions after rollbacks, and retries channel-matched publishes after partial failures without bumping again.
+9. Distinguishes `none` / `update` / `publish`: never publishes a stable TOC version from beta, avoids tag collisions after rollbacks, and retries channel-matched publishes after partial failures without bumping again. When main catches beta's release train, beta advances even if its Interface already matches.
+10. Shares the `release-channels` concurrency group with `queue: max` so ordinary pending beta releases are not silently replaced while another release-channel workflow is queued.
 
 Planning and TOC helpers live in `.github/scripts/wow_interface_sync.py`.
 

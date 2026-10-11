@@ -22,8 +22,10 @@ permissions:
 # Serialize with Promote Beta to Main / Rollback / Post-Merge Beta once those
 # workflows also use this group. Preflight additionally fails on active runs of
 # those workflows by name so live beta's older `beta-release` group is covered.
+# queue: max keeps ordinary pending beta releases instead of replacing them.
 concurrency:
   group: release-channels
+  queue: max
   cancel-in-progress: false
 
 env:
@@ -197,11 +199,35 @@ jobs:
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # Materialize helpers via git show so imports exist before any Python
+          # bootstrap (wow_interface_sync imports validate_packaging at use time).
           git fetch --no-tags origin "$WORKFLOW_SHA"
-          git show "$WORKFLOW_SHA:.github/scripts/wow_interface_sync.py" > /tmp/bootstrap_wow_interface_sync.py
-          python3 /tmp/bootstrap_wow_interface_sync.py \
-            --materialize-helpers "$HELPERS_DIR" \
-            --workflow-sha "$WORKFLOW_SHA"
+          mkdir -p "$HELPERS_DIR"
+          for name in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py \
+            classify_promotion_scope.py \
+            check_duplicate_release.py
+          do
+            if git cat-file -e "$WORKFLOW_SHA:.github/scripts/$name" 2>/dev/null; then
+              git show "$WORKFLOW_SHA:.github/scripts/$name" > "$HELPERS_DIR/$name"
+            fi
+          done
+          for required in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py
+          do
+            if [[ ! -f "$HELPERS_DIR/$required" ]]; then
+              echo "::error::Missing required helper $required from $WORKFLOW_SHA"
+              exit 1
+            fi
+          done
 
       - name: Verify captured main SHA
         env:
@@ -308,10 +334,32 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin "$WORKFLOW_SHA"
-          git show "$WORKFLOW_SHA:.github/scripts/wow_interface_sync.py" > /tmp/bootstrap_wow_interface_sync.py
-          python3 /tmp/bootstrap_wow_interface_sync.py \
-            --materialize-helpers "$HELPERS_DIR" \
-            --workflow-sha "$WORKFLOW_SHA"
+          mkdir -p "$HELPERS_DIR"
+          for name in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py \
+            classify_promotion_scope.py \
+            check_duplicate_release.py
+          do
+            if git cat-file -e "$WORKFLOW_SHA:.github/scripts/$name" 2>/dev/null; then
+              git show "$WORKFLOW_SHA:.github/scripts/$name" > "$HELPERS_DIR/$name"
+            fi
+          done
+          for required in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py
+          do
+            if [[ ! -f "$HELPERS_DIR/$required" ]]; then
+              echo "::error::Missing required helper $required from $WORKFLOW_SHA"
+              exit 1
+            fi
+          done
 
       - name: Verify main tip has not drifted before publish-only
         if: needs.preflight.outputs.main_action == 'publish'
@@ -380,12 +428,35 @@ jobs:
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Beta tip may lack the new helper CLI; bootstrap from the workflow SHA.
+          # Beta tip may lack the new helper CLI; materialize from the workflow SHA
+          # with all imports together (no single-file Python bootstrap).
           git fetch --no-tags origin "$WORKFLOW_SHA"
-          git show "$WORKFLOW_SHA:.github/scripts/wow_interface_sync.py" > /tmp/bootstrap_wow_interface_sync.py
-          python3 /tmp/bootstrap_wow_interface_sync.py \
-            --materialize-helpers "$HELPERS_DIR" \
-            --workflow-sha "$WORKFLOW_SHA"
+          mkdir -p "$HELPERS_DIR"
+          for name in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py \
+            classify_promotion_scope.py \
+            check_duplicate_release.py
+          do
+            if git cat-file -e "$WORKFLOW_SHA:.github/scripts/$name" 2>/dev/null; then
+              git show "$WORKFLOW_SHA:.github/scripts/$name" > "$HELPERS_DIR/$name"
+            fi
+          done
+          for required in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py
+          do
+            if [[ ! -f "$HELPERS_DIR/$required" ]]; then
+              echo "::error::Missing required helper $required from $WORKFLOW_SHA"
+              exit 1
+            fi
+          done
 
       - name: Verify captured beta SHA
         env:
@@ -500,10 +571,32 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin "$WORKFLOW_SHA"
-          git show "$WORKFLOW_SHA:.github/scripts/wow_interface_sync.py" > /tmp/bootstrap_wow_interface_sync.py
-          python3 /tmp/bootstrap_wow_interface_sync.py \
-            --materialize-helpers "$HELPERS_DIR" \
-            --workflow-sha "$WORKFLOW_SHA"
+          mkdir -p "$HELPERS_DIR"
+          for name in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py \
+            classify_promotion_scope.py \
+            check_duplicate_release.py
+          do
+            if git cat-file -e "$WORKFLOW_SHA:.github/scripts/$name" 2>/dev/null; then
+              git show "$WORKFLOW_SHA:.github/scripts/$name" > "$HELPERS_DIR/$name"
+            fi
+          done
+          for required in \
+            wow_interface_sync.py \
+            update_changelog.py \
+            publish_release.py \
+            validate_packaging.py \
+            blizzard_api.py
+          do
+            if [[ ! -f "$HELPERS_DIR/$required" ]]; then
+              echo "::error::Missing required helper $required from $WORKFLOW_SHA"
+              exit 1
+            fi
+          done
 
       - name: Verify beta tip has not drifted before publish-only
         if: needs.preflight.outputs.beta_action == 'publish'

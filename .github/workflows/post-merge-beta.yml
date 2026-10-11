@@ -16,7 +16,10 @@ on:
 
 concurrency:
   # Shared with Promote Beta to Main and Update WoW Game Version.
+  # queue: max: do not drop an ordinary pending beta release when another
+  # release-channel workflow queues behind an in-progress run.
   group: release-channels
+  queue: max
   cancel-in-progress: false  # Don't cancel in-progress releases
 
 jobs:

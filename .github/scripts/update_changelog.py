@@ -1221,8 +1221,63 @@ def compatibility_entries(game_version, interface):
     ]
 
 
+def is_compatibility_note(text):
+    """Return True for the deterministic Interface-compatibility changelog bullet."""
+    return bool(
+        re.match(
+            r"^Updated Retail game compatibility to Interface\b",
+            (text or "").strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def prior_beta_train_feature_entries(sections, version):
+    """Return feature bullets from the highest beta train strictly below version.
+
+    When a game-version update rolls beta from e.g. 1.5.9-beta.N to 1.5.10-beta.1,
+    existing feature notes remain under the prior train. Promote later selects
+    beta sections by train, so those notes must be carried into the new section.
+    """
+    parsed_new = parse_version(version)
+    if not parsed_new or parsed_new[3] is None:
+        return []
+    new_train = parsed_new[:3]
+    prior_sections = []
+    for section in sections:
+        if not section.get("is_beta"):
+            continue
+        parsed = parse_version(section.get("version"))
+        if not parsed:
+            continue
+        if parsed[:3] < new_train:
+            prior_sections.append(section)
+    if not prior_sections:
+        return []
+    rolled_train = max(parse_version(section["version"])[:3] for section in prior_sections)
+    entries = []
+    seen = set()
+    for section in prior_sections:
+        if parse_version(section["version"])[:3] != rolled_train:
+            continue
+        for category, text in extract_bullets(section.get("text", "")):
+            cleaned = normalize_bullet_text(text)
+            if not cleaned or is_placeholder_text(cleaned) or is_compatibility_note(cleaned):
+                continue
+            key = (category, cleaned.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"category": category, "text": cleaned})
+    return entries
+
+
 def apply_compatibility_changelog(version, game_version, interface, date_text):
-    """Write or keep a compatibility-only changelog section for version."""
+    """Write or keep a compatibility changelog section for version.
+
+    On beta train rollover, carry forward prior-train feature notes so a later
+    stable promotion can still see them via beta_sections_for_train().
+    """
     changelog_text = load_changelog_text()
     _preface, sections = parse_changelog_sections(changelog_text)
     existing = find_section(sections, version)
@@ -1230,7 +1285,13 @@ def apply_compatibility_changelog(version, game_version, interface, date_text):
         print(f"[changelog] Section for {version} already exists; leaving it unchanged")
         return False
 
-    entries = compatibility_entries(game_version, interface)
+    entries = []
+    if is_beta_version(version):
+        carried = prior_beta_train_feature_entries(sections, version)
+        if carried:
+            entries.extend(carried)
+            print(f"[changelog] Carried {len(carried)} feature note(s) from prior beta train")
+    entries.extend(compatibility_entries(game_version, interface))
     rendered = render_section(version, date_text, entries)
     updated, changed = replace_or_insert_section(
         changelog_text,

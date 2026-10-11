@@ -24,7 +24,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import validate_packaging
+# Lazy import: --materialize-helpers must work when this file is bootstrapped alone
+# into /tmp before validate_packaging.py exists beside it.
+validate_packaging = None
 
 PATCH_VERSIONS_URL_TEMPLATE = "https://{region}.patch.battle.net:1119/wow/versions"
 BLIZZTRACK_VERSIONS_URL = "https://blizztrack.com/view/wow?type=versions"
@@ -43,6 +45,16 @@ SCORING_CONTEXT_CHARS = 240
 NON_RETAIL_PATTERN = re.compile(
     rf"\b(?:{'|'.join(re.escape(token) for token in NON_RETAIL_TOKENS)})\b"
 )
+
+
+def _validate_packaging():
+    """Import validate_packaging from SCRIPTS_DIR on first use."""
+    global validate_packaging
+    if validate_packaging is None:
+        import validate_packaging as _vp
+
+        validate_packaging = _vp
+    return validate_packaging
 
 
 class VersionInfo:
@@ -503,7 +515,7 @@ def extra_packaged_toc_paths(toc_path):
     toc_path = Path(toc_path)
     repo_root = toc_path.parent.parent
     extra = []
-    for child_name in validate_packaging.CHILD_ADDON_NAMES:
+    for child_name in _validate_packaging().CHILD_ADDON_NAMES:
         child_toc = repo_root / child_name / f"{child_name}.toc"
         if child_toc.exists() and child_toc.resolve() != toc_path.resolve():
             extra.append(child_toc)
@@ -515,7 +527,7 @@ def packaged_toc_relpaths(toc_path="SpectrumFederation/SpectrumFederation.toc"):
     toc_path = Path(toc_path)
     paths = [str(toc_path).replace("\\", "/")]
     parent_name = toc_path.parent.name
-    for child_name in validate_packaging.CHILD_ADDON_NAMES:
+    for child_name in _validate_packaging().CHILD_ADDON_NAMES:
         if child_name == parent_name:
             continue
         paths.append(f"{child_name}/{child_name}.toc")
@@ -865,13 +877,29 @@ def assert_no_conflicting_workflow_runs(repo, token, *, current_run_id=None):
 
 
 def ensure_release_channels_concurrency(workflow_path):
-    """Rewrite an outdated `group: beta-release` concurrency entry to release-channels."""
+    """Rewrite concurrency to `release-channels` with `queue: max`.
+
+    Older beta tips may still use `group: beta-release` and omit `queue: max`.
+    Without `queue: max`, GitHub keeps only one pending run per group and
+    cancels older waiting releases when another release workflow queues.
+    """
     path = Path(workflow_path)
     content = path.read_text(encoding="utf-8")
     updated = re.sub(
         r"(?m)^(\s*group:\s*)beta-release\s*$",
         r"\1release-channels",
         content,
+    )
+
+    def _ensure_queue(match):
+        indent = match.group("indent")
+        return f"{indent}group: release-channels\n{indent}queue: max\n"
+
+    updated = re.sub(
+        r"(?m)^(?P<indent>\s*)group:\s*release-channels\s*\n"
+        r"(?:(?P=indent)queue:\s*\S+\s*\n)?",
+        _ensure_queue,
+        updated,
     )
     if updated != content:
         path.write_text(updated, encoding="utf-8")
@@ -963,7 +991,13 @@ def build_update_plan(
         raise RuntimeError(f"Main TOC version must be stable X.Y.Z, got {main_version_raw}")
 
     main_update_needed = main_interface != target_interface_str
-    beta_update_needed = beta_interface != target_interface_str
+    # Beta must advance when its Interface is stale OR when it would not remain
+    # strictly ahead of the post-plan main version (main catching the beta train).
+    provisional_main = bump_main_version(main_version) if main_update_needed else main_version
+    beta_update_needed = (
+        beta_interface != target_interface_str
+        or version_value(beta_version) <= version_value(provisional_main)
+    )
     occupied_tags = set(occupied_tags or ())
 
     new_main_version, new_beta_version, beta_ahead = compute_updated_versions(

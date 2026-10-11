@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from urllib import error
 
@@ -220,13 +221,40 @@ def test_build_update_plan_noop_for_already_current_stable_on_both_branches(monk
         token="token",
     )
     assert plan["main_update_needed"] is False
-    assert plan["beta_update_needed"] is False
+    # Beta on the same stable version is not ahead of main; advance the train.
+    assert plan["beta_update_needed"] is True
     assert plan["main_target_version"] == "1.5.8"
-    assert plan["beta_target_version"] == "1.5.8"
+    assert plan["beta_target_version"] == "1.5.9-beta.1"
     # Main may retry a channel-matched publish; beta must never publish stable 1.5.8.
     assert plan["main_action"] == "publish"
-    assert plan["beta_action"] == "none"
+    assert plan["beta_action"] == "update"
     assert plan["any_work"] is True
+
+
+def test_build_update_plan_advances_beta_when_main_catches_train(monkeypatch):
+    """Main Interface bump to 1.5.9 must roll beta off 1.5.9-beta.N even if Interface matches."""
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_args, **_kwargs: None)
+    requested = wow.parse_human_game_version("12.1.5")
+    plan = wow.build_update_plan(
+        requested=requested,
+        live_game_version="12.1.5.1",
+        live_interface=120105,
+        main_interface="120100",
+        main_version_raw="1.5.8",
+        beta_interface="120105",
+        beta_version_raw="1.5.9-beta.7",
+        main_sha="abc",
+        beta_sha="def",
+        repo="owner/repo",
+        token="token",
+        occupied_tags=set(),
+    )
+    assert plan["main_update_needed"] is True
+    assert plan["beta_update_needed"] is True
+    assert plan["main_target_version"] == "1.5.9"
+    assert plan["beta_target_version"] == "1.5.10-beta.1"
+    assert plan["main_action"] == "update"
+    assert plan["beta_action"] == "update"
 
 
 def test_build_update_plan_updates_both_branches(monkeypatch):
@@ -445,8 +473,85 @@ def test_ensure_beta_release_concurrency_rewrites_old_group(tmp_path):
         encoding="utf-8",
     )
     assert wow.ensure_release_channels_concurrency(path) is True
-    assert "group: release-channels" in path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    assert "group: release-channels" in text
+    assert "queue: max" in text
     assert wow.ensure_release_channels_concurrency(path) is False
+
+
+def test_materialize_helpers_bootstrap_works_without_sibling_imports(tmp_path):
+    """Isolated bootstrap of wow_interface_sync.py must still materialize deps."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+
+    scripts = repo / ".github" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in (
+        "wow_interface_sync.py",
+        "update_changelog.py",
+        "publish_release.py",
+        "validate_packaging.py",
+        "blizzard_api.py",
+    ):
+        (scripts / name).write_text(f"# pin {name}\nPINNED=1\n", encoding="utf-8")
+    # Overwrite sync with the real module so import/lazy-load behavior is exercised.
+    real_sync = (
+        Path(__file__).resolve().parents[1] / ".github" / "scripts" / "wow_interface_sync.py"
+    ).read_text(encoding="utf-8")
+    (scripts / "wow_interface_sync.py").write_text(real_sync, encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "pinned helpers"], cwd=repo, check=True)
+    workflow_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Older beta tip: strip helpers from the working tree.
+    for name in (
+        "wow_interface_sync.py",
+        "update_changelog.py",
+        "publish_release.py",
+        "validate_packaging.py",
+        "blizzard_api.py",
+    ):
+        (scripts / name).write_text("# ancient stub\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "ancient beta tip"], cwd=repo, check=True)
+
+    bootstrap = tmp_path / "bootstrap_wow_interface_sync.py"
+    content = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{workflow_sha}:.github/scripts/wow_interface_sync.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    bootstrap.write_text(content, encoding="utf-8")
+    destination = tmp_path / "helpers"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(bootstrap),
+            "--materialize-helpers",
+            str(destination),
+            "--workflow-sha",
+            workflow_sha,
+            "--repo-path",
+            str(repo),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert (destination / "validate_packaging.py").exists()
+    assert "PINNED=1" in (destination / "validate_packaging.py").read_text(encoding="utf-8")
+    assert (destination / "wow_interface_sync.py").exists()
 
 
 def test_workflow_pins_helpers_and_requires_admin_pat():
@@ -456,11 +561,13 @@ def test_workflow_pins_helpers_and_requires_admin_pat():
         / "workflows"
         / "update-wow-game-version.yml"
     ).read_text(encoding="utf-8")
-    assert "--materialize-helpers" in workflow
     assert "HELPERS_DIR" in workflow
     assert "secrets.PAT_TOKEN" in workflow
     assert "--assert-no-conflicts" in workflow
     assert "Refuse stable-version beta publish" in workflow
+    assert "bootstrap_wow_interface_sync.py" not in workflow
+    assert 'git show "$WORKFLOW_SHA:.github/scripts/$name"' in workflow
+    assert "queue: max" in workflow
     post_merge = (
         Path(__file__).resolve().parents[1]
         / ".github"
@@ -469,6 +576,13 @@ def test_workflow_pins_helpers_and_requires_admin_pat():
     ).read_text(encoding="utf-8")
     assert "chore: bump Interface to" in post_merge
     assert "group: release-channels" in post_merge
+    assert "queue: max" in post_merge
+    for name in ("promote-beta-to-main.yml", "rollback-release.yml"):
+        text = (
+            Path(__file__).resolve().parents[1] / ".github" / "workflows" / name
+        ).read_text(encoding="utf-8")
+        assert "group: release-channels" in text
+        assert "queue: max" in text
 
 
 def test_update_packaged_tocs_keeps_children_in_lockstep(tmp_path):
