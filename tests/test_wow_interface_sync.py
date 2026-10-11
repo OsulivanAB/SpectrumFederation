@@ -354,6 +354,84 @@ def test_plan_branch_action_skips_already_completed_channel_release(monkeypatch)
     )
 
 
+def test_plan_branch_action_retry_publication_republishes_existing_release(monkeypatch):
+    monkeypatch.setattr(
+        wow,
+        "fetch_github_release",
+        lambda version, *_args, **_kwargs: {
+            "tag_name": f"v{version}",
+            "prerelease": "-" in version,
+        },
+    )
+    assert (
+        wow.plan_branch_action(
+            channel="main",
+            interface_matches=True,
+            version_raw="1.5.8",
+            repo="owner/repo",
+            token="token",
+            retry_publication=True,
+        )
+        == "publish"
+    )
+    assert (
+        wow.plan_branch_action(
+            channel="beta",
+            interface_matches=True,
+            version_raw="1.6.0-beta.8",
+            repo="owner/repo",
+            token="token",
+            retry_publication=True,
+        )
+        == "publish"
+    )
+    # Stable TOC on beta remains forbidden even during deliberate retry.
+    assert (
+        wow.plan_branch_action(
+            channel="beta",
+            interface_matches=True,
+            version_raw="1.5.8",
+            repo="owner/repo",
+            token="token",
+            retry_publication=True,
+        )
+        == "none"
+    )
+
+
+def test_build_update_plan_retry_publication_no_toc_bump(monkeypatch):
+    monkeypatch.setattr(
+        wow,
+        "fetch_github_release",
+        lambda version, *_args, **_kwargs: {
+            "tag_name": f"v{version}",
+            "prerelease": "-" in version,
+        },
+    )
+    requested = wow.parse_human_game_version("12.1.0")
+    plan = wow.build_update_plan(
+        requested=requested,
+        live_game_version="12.1.0.66263",
+        live_interface=120100,
+        main_interface="120100",
+        main_version_raw="1.5.8",
+        beta_interface="120100",
+        beta_version_raw="1.5.9-beta.7",
+        main_sha="abc",
+        beta_sha="def",
+        repo="owner/repo",
+        token="token",
+        retry_publication=True,
+    )
+    assert plan["main_update_needed"] is False
+    assert plan["beta_update_needed"] is False
+    assert plan["main_target_version"] == "1.5.8"
+    assert plan["beta_target_version"] == "1.5.9-beta.7"
+    assert plan["main_action"] == "publish"
+    assert plan["beta_action"] == "publish"
+    assert plan["any_work"] is True
+
+
 def test_plan_branch_action_refuses_stable_beta_and_wrong_channel_release(monkeypatch):
     assert (
         wow.plan_branch_action(
@@ -599,6 +677,8 @@ def test_workflow_pins_helpers_and_requires_admin_pat():
     assert "bootstrap_wow_interface_sync.py" not in workflow
     assert 'git show "$WORKFLOW_SHA:.github/scripts/$name"' in workflow
     assert "queue: max" in workflow
+    assert "retry_publication:" in workflow
+    assert "--retry-publication" in workflow
     post_merge = (
         Path(__file__).resolve().parents[1]
         / ".github"

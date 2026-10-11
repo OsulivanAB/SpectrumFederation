@@ -754,12 +754,24 @@ def avoid_beta_tag_collision(version_info, occupied_tags):
     raise RuntimeError(f"Could not find a free beta tag after {version_info.raw}")
 
 
-def plan_branch_action(*, channel, interface_matches, version_raw, repo, token):
+def plan_branch_action(
+    *,
+    channel,
+    interface_matches,
+    version_raw,
+    repo,
+    token,
+    retry_publication=False,
+):
     """Return update, publish, or none for one branch.
 
     - update: Interface must change; version will bump before publish
     - publish: Interface already correct; safe channel-matched publish/retry
     - none: no mutation and no publish (including stable versions on beta)
+
+    When retry_publication is true and a channel-matched GitHub release already
+    exists, return publish so an idempotent publisher can recover downstream
+    CurseForge/Wago failures without bumping TOC versions.
     """
     if channel not in {"main", "beta"}:
         raise RuntimeError(f"Unsupported channel '{channel}'")
@@ -792,8 +804,10 @@ def plan_branch_action(*, channel, interface_matches, version_raw, repo, token):
             f"GitHub tag v{version_raw} is a stable release; refusing to publish it from beta."
         )
 
-    # Matching GitHub release already exists: do not republish a completed release.
-    # Downstream-only CF/Wago recovery remains available via publish_release.py.
+    if retry_publication:
+        return "publish"
+
+    # Matching GitHub release already exists: ordinary runs stay no-ops.
     return "none"
 
 
@@ -976,6 +990,7 @@ def build_update_plan(
     repo=None,
     token=None,
     occupied_tags=None,
+    retry_publication=False,
 ):
     """Build the immutable plan consumed by the workflow."""
     target_interface = verify_requested_matches_live(
@@ -1037,6 +1052,7 @@ def build_update_plan(
         version_raw=main_target_version,
         repo=repo,
         token=token,
+        retry_publication=retry_publication,
     )
     beta_action = plan_branch_action(
         channel="beta",
@@ -1044,6 +1060,7 @@ def build_update_plan(
         version_raw=beta_target_version,
         repo=repo,
         token=token,
+        retry_publication=retry_publication,
     )
     # An update action always publishes after the branch mutation.
     if main_action == "update":
@@ -1124,6 +1141,7 @@ def write_step_summary(plan, *, dry_run=False):
         f"- Live Retail: `{plan['live_game_version'] or 'unknown'}`",
         f"- Main SHA: `{plan['main_sha']}`",
         f"- Beta SHA: `{plan['beta_sha']}`",
+        f"- Retry publication: `{'true' if plan.get('retry_publication') else 'false'}`",
         "",
         "| Branch | Interface | Version | Action |",
         "| --- | --- | --- | --- |",
@@ -1154,6 +1172,7 @@ def _emit_plan_outputs(plan):
         "beta_ahead",
         "any_toc_update",
         "any_work",
+        "retry_publication",
     )
     for key, value in plan.items():
         if key in bool_keys:
@@ -1201,8 +1220,10 @@ def run_plan_mode(args):
         repo=os.environ.get("GITHUB_REPOSITORY"),
         token=os.environ.get("GITHUB_TOKEN"),
         occupied_tags=occupied_tags,
+        retry_publication=bool(args.retry_publication),
     )
     plan["resolver_strategy"] = resolver_strategy
+    plan["retry_publication"] = bool(args.retry_publication)
 
     print(json.dumps(plan, indent=2, sort_keys=True))
     _emit_plan_outputs(plan)
@@ -1234,6 +1255,14 @@ def main():
         "--plan",
         action="store_true",
         help="Emit a main/beta update plan for the requested version without mutating branches",
+    )
+    parser.add_argument(
+        "--retry-publication",
+        action="store_true",
+        help=(
+            "When Interface already matches, republish the existing channel-matched "
+            "version through the idempotent publisher (downstream CF/Wago recovery)"
+        ),
     )
     parser.add_argument("--repo-path", default=".", help="Repository path for --plan git reads")
     parser.add_argument("--main-ref", default="origin/main", help="Git ref for main when planning")

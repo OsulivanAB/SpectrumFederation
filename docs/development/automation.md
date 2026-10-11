@@ -271,7 +271,8 @@ Typical use: Blizzard ships a Retail patch while `beta` still contains unfinishe
 Inputs:
 
 - `game_version`: human-readable Retail version such as `12.1.5` (converted to Interface `120105`);
-- `dry_run`: defaults to `true`; previews the plan and validates packaging/publish dry-runs without mutating branches or publishing.
+- `dry_run`: defaults to `true`; previews the plan and validates packaging/publish dry-runs without mutating branches or publishing;
+- `retry_publication`: defaults to `false`; when `true`, reuses the existing channel-matched TOC versions and runs the idempotent publisher again (CurseForge/Wago recovery after GitHub already succeeded). Does not bump versions or invent new releases.
 
 Behavior:
 
@@ -283,8 +284,9 @@ Behavior:
 6. Always materializes automation helpers from the dispatched workflow commit via `git show` into a shared helpers directory (imports included), so an older beta tip can be updated without first promoting unfinished beta code that lacks those helpers.
 7. Uses `PAT_TOKEN` (repository Admin) for protected branch pushes because main/beta rulesets require pull requests and only Admin role bypasses them. Do not disable protection. The token must also be allowed to push workflow-file changes on `beta` when this workflow rewrites `post-merge-beta.yml` concurrency settings.
 8. Skips Post-Merge Beta for `chore: bump Interface to …` commits once that guard is on beta; until then, preflight also fails on active/queued Post-Merge Beta / Promote / Rollback runs by workflow name (covers live beta's older `beta-release` concurrency group).
-9. Distinguishes `none` / `update` / `publish`: never publishes a stable TOC version from beta, avoids tag collisions after rollbacks, and retries channel-matched publishes only when the GitHub release is missing (partial failure recovery) without bumping again. An already-completed matching release is left alone. When a real Interface bump causes main to catch beta's prerelease train, beta advances even if its Interface already matches. Matching stable TOC on both branches after promotion is a no-op.
+9. Distinguishes `none` / `update` / `publish`: never publishes a stable TOC version from beta, avoids tag collisions after rollbacks, and recovers a missing GitHub release without bumping. An already-completed matching release is a no-op unless `retry_publication` is explicitly enabled for downstream CurseForge/Wago recovery. When a real Interface bump causes main to catch beta's prerelease train, beta advances even if its Interface already matches. Matching stable TOC on both branches after promotion is a no-op.
 10. Shares the `release-channels` concurrency group with `queue: max` so ordinary pending beta releases are not silently replaced while another release-channel workflow is queued.
+11. Newly created GitHub release tags set `--target` to the captured publishing checkout SHA so stable and beta tags point at their release source rather than the repository default branch.
 
 Planning and TOC helpers live in `.github/scripts/wow_interface_sync.py`.
 

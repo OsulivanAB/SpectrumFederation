@@ -14,6 +14,11 @@ on:
         required: true
         type: boolean
         default: true
+      retry_publication:
+        description: Re-publish existing channel-matched versions (CF/Wago recovery); do not bump TOC versions
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -60,13 +65,18 @@ jobs:
           echo "::error::Update WoW Game Version must be run from the main branch (selected '${{ github.ref }}')."
           exit 1
 
-      - name: Record dry-run flag
+      - name: Record dry-run and retry flags
         id: flags
         run: |
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
             echo "dry_run=true" >> "$GITHUB_OUTPUT"
           else
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "${{ inputs.retry_publication }}" == "true" ]]; then
+            echo "retry_publication=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "retry_publication=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout workflow commit
@@ -107,16 +117,22 @@ jobs:
         id: plan
         env:
           REQUESTED_VERSION: ${{ inputs.game_version }}
+          RETRY_PUBLICATION: ${{ steps.flags.outputs.retry_publication }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          python3 "$HELPERS_DIR/wow_interface_sync.py" \
-            --plan \
-            --requested-version "$REQUESTED_VERSION" \
-            --main-ref origin/main \
-            --beta-ref origin/beta \
+          PLAN_ARGS=(
+            --plan
+            --requested-version "$REQUESTED_VERSION"
+            --main-ref origin/main
+            --beta-ref origin/beta
             --dry-run
+          )
+          if [[ "$RETRY_PUBLICATION" == "true" ]]; then
+            PLAN_ARGS+=(--retry-publication)
+          fi
+          python3 "$HELPERS_DIR/wow_interface_sync.py" "${PLAN_ARGS[@]}"
 
       - name: Validate packaging helpers on current tree
         run: python3 "$HELPERS_DIR/validate_packaging.py"
@@ -681,13 +697,13 @@ jobs:
             ERRORS+=("Main branch update failed ($UPDATE_MAIN_RESULT)")
           fi
           if [[ "$DRY_RUN" != "true" && ( "$MAIN_ACTION" == "update" || "$MAIN_ACTION" == "publish" ) && "$PUBLISH_MAIN_RESULT" != "success" ]]; then
-            ERRORS+=("Main publish failed ($PUBLISH_MAIN_RESULT). Rerun to retry publishing without bumping when Interface is already current and the version matches the main channel.")
+            ERRORS+=("Main publish failed ($PUBLISH_MAIN_RESULT). If GitHub succeeded but CurseForge/Wago failed, rerun with retry_publication=true (no TOC bump). If the GitHub release is missing, a normal rerun recovers publish without a bump when Interface is already current.")
           fi
           if [[ "$DRY_RUN" != "true" && "$BETA_ACTION" == "update" && "$UPDATE_BETA_RESULT" != "success" ]]; then
             ERRORS+=("Beta branch update failed ($UPDATE_BETA_RESULT)")
           fi
           if [[ "$DRY_RUN" != "true" && ( "$BETA_ACTION" == "update" || "$BETA_ACTION" == "publish" ) && "$PUBLISH_BETA_RESULT" != "success" ]]; then
-            ERRORS+=("Beta publish failed ($PUBLISH_BETA_RESULT). Rerun to retry publishing without bumping when Interface is already current and the version is a beta prerelease.")
+            ERRORS+=("Beta publish failed ($PUBLISH_BETA_RESULT). If GitHub succeeded but CurseForge/Wago failed, rerun with retry_publication=true (no TOC bump). If the GitHub release is missing, a normal rerun recovers publish without a bump when Interface is already current.")
           fi
 
           if [[ ${#ERRORS[@]} -gt 0 ]]; then
