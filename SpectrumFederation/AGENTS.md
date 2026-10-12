@@ -293,8 +293,10 @@ When chat output *is* authorized, prefer `modules/MessageHelpers.lua` helpers (`
 CI/lint runs `.github/scripts/check_chat_output.py` (via `lint_all.py`) against
 `.github/chat_output_baseline.json`. Unapproved new `Print*` / `print` /
 `SystemMessage` / `SendChatMessage` / `DEFAULT_CHAT_FRAME:AddMessage` sites in
-Spectrum-owned Lua fail validation. `SF.Debug` is not player chat. Vendored
-`Libs/` trees are excluded.
+Spectrum-owned Lua fail validation. Matching is occurrence-aware: an extra
+identical call in the same file fails even when one copy was already approved.
+Line-number movement alone does not invalidate an approval. `SF.Debug` is not
+player chat. Vendored `Libs/` trees are excluded.
 
 Before adding chat output, evaluate: necessity; user-initiated vs background;
 repeatability / duplicate emission; multi-layer duplicate reporting (caller +
@@ -304,10 +306,12 @@ layer over generic fallbacks at every caller.
 
 Approve intentional new sites only after owner authorization, then:
 `python3 .github/scripts/check_chat_output.py --write-baseline`.
-Moving an approved site into a recurring hot-path function name also fails
-unless the baseline entry sets `hotpath_ok` after explicit review. Static
-detection is incomplete for “same call, more frequent triggers”; pair it with
-focused Lua regression tests (`tests/lua/chat_noise_regression_tests.lua`).
+Moving an approved site into a recurring hot-path function name or anonymous
+callback (`SetScript("OnUpdate"|"OnEvent"|...)`, `C_Timer.NewTicker` /
+`NewTimer` / `After`) also fails unless the baseline entry sets `hotpath_ok`
+after explicit review. Static detection is incomplete for “same call, more
+frequent triggers”; pair it with focused Lua regression tests
+(`tests/lua/chat_noise_regression_tests.lua`).
 
 ### Anti-spam and repetition (proactive requirement)
 

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import json
+import importlib.util
+import sys
 import textwrap
 from pathlib import Path
 
 import pytest
-
-import importlib.util
-import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / ".github" / "scripts" / "check_chat_output.py"
@@ -94,6 +92,82 @@ def test_new_site_fails_until_baseline_updated(addon_tree: Path, tmp_path: Path)
     assert not removed
 
 
+def test_duplicate_identical_occurrence_fails(addon_tree: Path, tmp_path: Path):
+    _write(
+        addon_tree / "modules" / "Feature.lua",
+        """
+        function Feature:Once()
+            SF:PrintInfo("same")
+        end
+        """,
+    )
+    sites = check_chat_output.scan_repo()
+    baseline = tmp_path / "baseline.json"
+    check_chat_output.write_baseline(baseline, sites)
+    assert check_chat_output.compare(sites, check_chat_output.load_baseline(baseline)) == (
+        [],
+        [],
+        [],
+    )
+
+    # Line numbers moved and a second identical call was added.
+    _write(
+        addon_tree / "modules" / "Feature.lua",
+        """
+        function Feature:Once()
+            local noop = true
+            SF:PrintInfo("same")
+        end
+
+        function Feature:Again()
+            SF:PrintInfo("same")
+        end
+        """,
+    )
+    sites2 = check_chat_output.scan_repo()
+    assert len(sites2) == 2
+    new_errors, hotpath_errors, removed = check_chat_output.compare(
+        sites2, check_chat_output.load_baseline(baseline)
+    )
+    assert len(new_errors) == 1, new_errors
+    assert "unapproved chat output" in new_errors[0]
+    assert not hotpath_errors
+    assert not removed
+
+
+def test_line_number_movement_alone_does_not_fail(addon_tree: Path, tmp_path: Path):
+    _write(
+        addon_tree / "modules" / "Feature.lua",
+        """
+        function Feature:Work()
+            SF:PrintInfo("stable")
+        end
+        """,
+    )
+    sites = check_chat_output.scan_repo()
+    baseline = tmp_path / "baseline.json"
+    check_chat_output.write_baseline(baseline, sites)
+
+    _write(
+        addon_tree / "modules" / "Feature.lua",
+        """
+        function Feature:Work()
+            -- moved down
+            local x = 1
+            SF:PrintInfo("stable")
+        end
+        """,
+    )
+    sites2 = check_chat_output.scan_repo()
+    assert sites2[0].line != sites[0].line
+    new_errors, hotpath_errors, removed = check_chat_output.compare(
+        sites2, check_chat_output.load_baseline(baseline)
+    )
+    assert not new_errors
+    assert not hotpath_errors
+    assert not removed
+
+
 def test_hotpath_move_requires_explicit_ok(addon_tree: Path, tmp_path: Path):
     _write(
         addon_tree / "modules" / "Feature.lua",
@@ -119,6 +193,63 @@ def test_hotpath_move_requires_explicit_ok(addon_tree: Path, tmp_path: Path):
     assert not hotpath_errors
 
 
+def test_anonymous_onupdate_callback_is_hotpath(addon_tree: Path, tmp_path: Path):
+    _write(
+        addon_tree / "modules" / "Feature.lua",
+        """
+        function Feature:Enable(frame)
+            frame:SetScript("OnUpdate", function(self, elapsed)
+                SF:PrintInfo("anon tick")
+            end)
+        end
+        """,
+    )
+    sites = check_chat_output.scan_repo()
+    assert len(sites) == 1
+    assert sites[0].hotpath
+    assert sites[0].enclosing == "<SetScript:OnUpdate>"
+
+    baseline = tmp_path / "baseline.json"
+    check_chat_output.write_baseline(baseline, sites)
+    data = check_chat_output.load_baseline(baseline)
+    _, hotpath_errors, _ = check_chat_output.compare(sites, data)
+    assert hotpath_errors
+
+
+def test_multiline_timer_callback_is_hotpath(addon_tree: Path, tmp_path: Path):
+    _write(
+        addon_tree / "modules" / "Feature.lua",
+        """
+        function Feature:Start()
+            C_Timer.NewTicker(1, function()
+                SF:PrintWarning("ticker")
+            end)
+        end
+        """,
+    )
+    sites = check_chat_output.scan_repo()
+    assert len(sites) == 1
+    assert sites[0].hotpath
+    assert sites[0].enclosing == "<C_Timer.NewTicker>"
+
+    # Pretend the call was previously approved in a non-hotpath context.
+    data = {
+        "version": 2,
+        "sites": [
+            {
+                "path": sites[0].path,
+                "line": 1,
+                "kind": sites[0].kind,
+                "signature": sites[0].signature,
+                "enclosing": "Feature:Start",
+                "hotpath_ok": False,
+                "note": "",
+            }
+        ],
+    }
+    _, hotpath_errors, _ = check_chat_output.compare(sites, data)
+    assert hotpath_errors
+
+
 def test_cli_passes_against_repo_baseline():
-    # Integration smoke: current repository baseline must validate.
     assert check_chat_output.main([]) == 0

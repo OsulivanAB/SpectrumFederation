@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "Audited Spectrum-owned player-facing chat output sites. New sites or hotpath moves require owner authorization; update with: python3 .github/scripts/check_chat_output.py --write-baseline",
+  "version": 2,
+  "description": "Audited Spectrum-owned player-facing chat output sites. Matching is occurrence-aware: duplicate identical call sites each need approval. New sites or hotpath/callback moves require owner authorization; update with: python3 .github/scripts/check_chat_output.py --write-baseline",
   "policy": "SpectrumFederation/AGENTS.md#user-visible-messaging",
   "sites": [
     {
@@ -8,45 +8,45 @@
       "line": 64,
       "kind": "PrintSuccess",
       "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logging enabled. Use '/sf debug show' to view logs.\")",
-      "enclosing": "<module>",
-      "hotpath_ok": false,
-      "note": ""
+      "enclosing": "<SetScript:OnEvent>",
+      "hotpath_ok": true,
+      "note": "pre-existing approved site; hotpath_ok after callback-context detection"
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
       "line": 67,
       "kind": "PrintInfo",
       "signature": "PrintInfo|SF:PrintInfo(\"Debug logging disabled\")",
-      "enclosing": "<module>",
-      "hotpath_ok": false,
-      "note": ""
+      "enclosing": "<SetScript:OnEvent>",
+      "hotpath_ok": true,
+      "note": "pre-existing approved site; hotpath_ok after callback-context detection"
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
       "line": 73,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Settings Window is not available.\")",
-      "enclosing": "<module>",
-      "hotpath_ok": false,
-      "note": ""
+      "enclosing": "<SetScript:OnEvent>",
+      "hotpath_ok": true,
+      "note": "pre-existing approved site; hotpath_ok after callback-context detection"
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
       "line": 78,
       "kind": "PrintSuccess",
       "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logs cleared\")",
-      "enclosing": "<module>",
-      "hotpath_ok": false,
-      "note": ""
+      "enclosing": "<SetScript:OnEvent>",
+      "hotpath_ok": true,
+      "note": "pre-existing approved site; hotpath_ok after callback-context detection"
     },
     {
       "path": "SpectrumFederation/SpectrumFederation.lua",
       "line": 81,
       "kind": "PrintError",
       "signature": "PrintError|SF:PrintError(\"Unknown debug command. Use: on, off, show, clear\")",
-      "enclosing": "<module>",
-      "hotpath_ok": false,
-      "note": ""
+      "enclosing": "<SetScript:OnEvent>",
+      "hotpath_ok": true,
+      "note": "pre-existing approved site; hotpath_ok after callback-context detection"
     },
     {
       "path": "SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua",
@@ -356,7 +356,7 @@
     },
     {
       "path": "SpectrumFederation/modules/LootHelper/Profiles.lua",
-      "line": 4148,
+      "line": 4153,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(\"Change saved locally, but it could not be synchronized to the raid.\")",
       "enclosing": "LootProfile:AddLootLog",
@@ -365,7 +365,7 @@
     },
     {
       "path": "SpectrumFederation/modules/LootHelper/Profiles.lua",
-      "line": 4688,
+      "line": 4693,
       "kind": "PrintWarning",
       "signature": "PrintWarning|SF:PrintWarning(\"Linked characters share equipment history with overlapping slot usage.\")",
       "enclosing": "LootProfile:LinkCharacters",
