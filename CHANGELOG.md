@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.9-beta.2] - 2026-10-12
+
+### Added
+- Silence remaining chat noise and add chat-output regression guards
+
 ## [1.5.9-beta.1] - 2026-10-12
 
 ### Changed
