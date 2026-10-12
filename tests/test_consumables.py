@@ -119,7 +119,10 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "admin_trust" in verification
     assert "goldValueCopper" in verification
     assert "DepositEvents(" not in runtime
-    assert "Contribution credit waits for Guild Bank verification" in runtime
+    assert "Contribution credit waits for Guild Bank verification" not in runtime
+    assert "Deposit moved to the guild bank" not in runtime
+    assert "deposit settled" in runtime
+    assert "PrintInfo" not in runtime
     assert "CONSUMABLES_OBS_REPORT" in SYNC_TRANSPORT.read_text(encoding="utf-8")
     assert "SF.ConsumablesBankLog:Init()" in runtime
     assert "ConsumablesBankLog:OnProfileMaybeChanged" in runtime
