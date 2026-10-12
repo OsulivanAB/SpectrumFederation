@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.9-beta.1] - 2026-10-12
+
+### Changed
+- Silence unnecessary raid-supply deposit chat messages
+
 ## [1.5.8] - 2026-10-10
 
 ### Added
