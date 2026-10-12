@@ -2492,7 +2492,106 @@ function C.ItemName(itemId, itemName)
     return "item " .. tostring(itemId or "")
 end
 
-function C.FormatEvent(event, itemName)
+-- Presentation helpers: optional display coloring without changing ledger data.
+local function ClassColorCode(classToken)
+    if type(classToken) ~= "string" or classToken == "" then
+        return nil
+    end
+    local key = classToken:upper()
+    local classData = SF.WOW_CLASSES and SF.WOW_CLASSES[key]
+    local color = classData and classData.colorCode
+    if type(color) ~= "table" then
+        return nil
+    end
+    local r = math.max(0, math.min(1, tonumber(color.r) or 1))
+    local g = math.max(0, math.min(1, tonumber(color.g) or 1))
+    local b = math.max(0, math.min(1, tonumber(color.b) or 1))
+    return ("|cff%02x%02x%02x"):format(
+        math.floor(r * 255 + 0.5),
+        math.floor(g * 255 + 0.5),
+        math.floor(b * 255 + 0.5)
+    )
+end
+
+-- Wrap a character name in its class color when known. Unknown/ambiguous class
+-- leaves the plain name unchanged so surrounding history text stays readable.
+function C.ColorizeCharacterName(name, classToken)
+    if type(name) ~= "string" or name == "" then
+        return tostring(name or "")
+    end
+    local code = ClassColorCode(classToken)
+    if not code then
+        return name
+    end
+    return code .. name .. "|r"
+end
+
+-- Resolve class for display: active profile member first, then an optional
+-- guild-roster lookup table keyed by normalized Name-Realm (case-insensitive).
+-- Values may be a class token string, or false when the key is ambiguous.
+-- Never substitutes a linked main's class for an alt.
+function C.ResolveCharacterClass(profile, characterId, guildClassByKey)
+    local id = Norm(characterId)
+    if not id then
+        return nil
+    end
+    if type(profile) == "table" then
+        local member
+        if type(profile.getMemberByID) == "function" then
+            local ok, found = pcall(profile.getMemberByID, profile, id)
+            if ok then member = found end
+        elseif type(profile.GetMemberByID) == "function" then
+            local ok, found = pcall(profile.GetMemberByID, profile, id)
+            if ok then member = found end
+        end
+        if type(member) == "table" then
+            local classToken
+            if type(member.GetClass) == "function" then
+                local ok, value = pcall(member.GetClass, member)
+                if ok then classToken = value end
+            end
+            if type(classToken) ~= "string" or classToken == "" then
+                classToken = member.class
+            end
+            if type(classToken) == "string" and classToken ~= "" then
+                local key = classToken:upper()
+                if SF.WOW_CLASSES and SF.WOW_CLASSES[key] then
+                    return key
+                end
+            end
+        end
+    end
+    if type(guildClassByKey) ~= "table" then
+        return nil
+    end
+    local lookupKey = id:lower()
+    local guildClass = guildClassByKey[lookupKey]
+    if guildClass == false then
+        return nil
+    end
+    if type(guildClass) == "string" and guildClass ~= "" then
+        local key = guildClass:upper()
+        if SF.WOW_CLASSES and SF.WOW_CLASSES[key] then
+            return key
+        end
+    end
+    return nil
+end
+
+local function FormatDisplayName(raw, formatName, fallback)
+    if type(raw) == "string" and raw ~= "" then
+        if type(formatName) == "function" then
+            local ok, formatted = pcall(formatName, raw)
+            if ok and type(formatted) == "string" and formatted ~= "" then
+                return formatted
+            end
+        end
+        return raw
+    end
+    return fallback
+end
+
+function C.FormatEvent(event, itemName, formatName)
     if type(event) ~= "table" then return "" end
     local name = C.ItemName(event.itemId, itemName)
     local qty = tonumber(event.quantity) or 0
@@ -2500,11 +2599,17 @@ function C.FormatEvent(event, itemName)
         if event.source ~= "guildbank" then
             return ""
         end
-        return string.format("%s donated %d %s to the guild bank.", tostring(event.actor or "Someone"), qty, name)
+        local who = FormatDisplayName(event.actor, formatName, "Someone")
+        return string.format("%s donated %d %s to the guild bank.", who, qty, name)
     elseif event.type == C.EVENT.ADJUSTMENT then
-        local who = tostring(event.actor or Loc("RAID_CONSUMABLE_ADJUST_ADMIN_FALLBACK", "An admin"))
+        local who = FormatDisplayName(
+            event.actor,
+            formatName,
+            Loc("RAID_CONSUMABLE_ADJUST_ADMIN_FALLBACK", "An admin")
+        )
         local credit = BoundedName(event.attributed)
         if credit then
+            credit = FormatDisplayName(credit, formatName, credit)
             return string.format(
                 Loc("RAID_CONSUMABLE_ADJUST_HISTORY_ATTRIBUTED", "%s adjusted %s by %+d (credited to %s)."),
                 who, name, qty, credit
@@ -2515,16 +2620,17 @@ function C.FormatEvent(event, itemName)
             who, name, qty
         )
     elseif event.type == C.EVENT.RESET then
-        return string.format("%s cleared the Raid Consumables configuration.", tostring(event.actor or "An admin"))
+        local who = FormatDisplayName(event.actor, formatName, "An admin")
+        return string.format("%s cleared the Raid Consumables configuration.", who)
     end
     return ""
 end
 
-function C.FormatObservation(obs, itemName, statusOverride)
+function C.FormatObservation(obs, itemName, statusOverride, formatName)
     if type(obs) ~= "table" then return "" end
     local name = C.ItemName(obs.itemId, itemName)
     local qty = tonumber(obs.quantity) or 0
-    local donor = tostring(obs.donor or "Someone")
+    local donor = FormatDisplayName(obs.donor, formatName, "Someone")
     local status = statusOverride or obs.status or "pending"
     if status == "verified" then
         return string.format("%s donated %d %s — Verified", donor, qty, name)
@@ -2535,7 +2641,7 @@ function C.FormatObservation(obs, itemName, statusOverride)
     return string.format("%s donated %d %s — Pending verification", donor, qty, name)
 end
 
-function C.HistoryRows(profile, nameForItem, limit, offset)
+function C.HistoryRows(profile, nameForItem, limit, offset, formatName)
     C.Ensure(profile)
     local ordered = {}
     local archive = profile._consumableEventArchive
@@ -2577,7 +2683,7 @@ function C.HistoryRows(profile, nameForItem, limit, offset)
             itemName = nameForItem(event.itemId)
         end
         rows[#rows + 1] = {
-            text = C.FormatEvent(event, itemName),
+            text = C.FormatEvent(event, itemName, formatName),
             timestamp = event.timestamp,
             generation = event.generation,
         }
@@ -2797,13 +2903,13 @@ function C.RetractEvent(profile, eventId)
     return removed
 end
 
-function C.ManualAdjustmentConfirmation(preview, itemName)
+function C.ManualAdjustmentConfirmation(preview, itemName, formatName)
     if type(preview) ~= "table" then return "" end
     local name = C.ItemName(preview.itemId, itemName)
     local qty = tonumber(preview.quantity) or 0
     local credit
     if preview.attributed then
-        credit = tostring(preview.attributed)
+        credit = FormatDisplayName(tostring(preview.attributed), formatName, tostring(preview.attributed))
     else
         credit = Loc("RAID_CONSUMABLE_ADJUST_UNATTRIBUTED", "Unattributed / Miscellaneous")
     end

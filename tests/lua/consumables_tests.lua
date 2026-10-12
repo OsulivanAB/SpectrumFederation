@@ -4398,6 +4398,163 @@ local function checkSmartDonationHelper()
     unchanged(p, "smart donation helper")
 end
 
+local function checkClassColoredDisplayNames()
+    -- Issue #348: presentation-only class colors for Consumable Logs.
+    SF.WOW_CLASSES = {
+        WARRIOR = { colorCode = { r = 0.78, g = 0.61, b = 0.43 } },
+        MAGE = { colorCode = { r = 0.25, g = 0.78, b = 0.92 } },
+        HUNTER = { colorCode = { r = 0.67, g = 0.83, b = 0.45 } },
+    }
+    local priorNormalize = SF.NameUtil.NormalizeNameRealm
+    local priorSame = SF.NameUtil.SamePlayer
+    SF.NameUtil.NormalizeNameRealm = function(name)
+        if type(name) ~= "string" then return nil end
+        name = name:gsub("^%s+", ""):gsub("%s+$", "")
+        if name == "" then return nil end
+        if not name:find("-", 1, true) then
+            return name .. "-Realm"
+        end
+        return name:gsub("%s+", "")
+    end
+    SF.NameUtil.SamePlayer = function(a, b)
+        local na = SF.NameUtil.NormalizeNameRealm(a)
+        local nb = SF.NameUtil.NormalizeNameRealm(b)
+        return na and nb and na:lower() == nb:lower()
+    end
+
+    local main = "Main-Realm"
+    local alt = "Alt-Realm"
+    local guildOnly = "GuildAlt-Realm"
+    local otherRealm = "Main-OtherRealm"
+    local unknown = "Stranger-Realm"
+
+    local members = {
+        [main:lower()] = {
+            class = "WARRIOR",
+            GetClass = function(self) return self.class end,
+        },
+        [alt:lower()] = {
+            class = "MAGE",
+            GetClass = function(self) return self.class end,
+        },
+    }
+    local profile = {
+        getMemberByID = function(_, id)
+            local key = SF.NameUtil.NormalizeNameRealm(id)
+            return key and members[key:lower()] or nil
+        end,
+    }
+
+    local guildClassByKey = {
+        [guildOnly:lower()] = "HUNTER",
+        [otherRealm:lower()] = "MAGE",
+        -- Ambiguous collision after normalization must stay uncolored.
+        ["collision-realm"] = false,
+    }
+
+    assertEq(C.ResolveCharacterClass(profile, main, guildClassByKey), "WARRIOR",
+        "profile member class is preferred")
+    assertEq(C.ResolveCharacterClass(profile, alt, guildClassByKey), "MAGE",
+        "linked alt keeps its own class, not the main's")
+    assertEq(C.ResolveCharacterClass(profile, guildOnly, guildClassByKey), "HUNTER",
+        "guild-only alt resolves from the roster lookup")
+    assertEq(C.ResolveCharacterClass(profile, otherRealm, guildClassByKey), "MAGE",
+        "same character name on another realm resolves independently")
+    assertEq(C.ResolveCharacterClass(profile, unknown, guildClassByKey), nil,
+        "unknown characters resolve to no class")
+    assertEq(C.ResolveCharacterClass(profile, "Collision-Realm", guildClassByKey), nil,
+        "ambiguous guild roster keys stay unresolved")
+    assertEq(C.ResolveCharacterClass(nil, guildOnly, guildClassByKey), "HUNTER",
+        "guild lookup works without a profile")
+
+    local warriorColor = C.ColorizeCharacterName(main, "WARRIOR")
+    local mageColor = C.ColorizeCharacterName(alt, "MAGE")
+    local hunterColor = C.ColorizeCharacterName(guildOnly, "HUNTER")
+    assertTrue(contains(warriorColor, "|cff"), "warrior names receive a color code")
+    assertTrue(contains(warriorColor, main) and contains(warriorColor, "|r"),
+        "colored names keep the character identity and reset")
+    assertEq(C.ColorizeCharacterName(unknown, nil), unknown,
+        "unknown class leaves the plain name unchanged")
+    assertFalse(warriorColor == mageColor, "different classes produce different colors")
+
+    local formatName = function(name)
+        return C.ColorizeCharacterName(name, C.ResolveCharacterClass(profile, name, guildClassByKey))
+    end
+
+    assertEq(
+        C.FormatEvent({
+            type = C.EVENT.DONATION, actor = main, itemId = aqirite, quantity = 3, source = "guildbank",
+        }, "Aqirite"),
+        "Main-Realm donated 3 Aqirite to the guild bank.",
+        "plain FormatEvent remains compatible without a formatter"
+    )
+    local donationText = C.FormatEvent({
+        type = C.EVENT.DONATION, actor = main, itemId = aqirite, quantity = 3, source = "guildbank",
+    }, "Aqirite", formatName)
+    assertTrue(contains(donationText, warriorColor), "donation history colors the donor")
+    assertTrue(contains(donationText, " donated 3 Aqirite to the guild bank."),
+        "donation history keeps surrounding text")
+
+    local adjustText = C.FormatEvent({
+        type = C.EVENT.ADJUSTMENT, actor = main, attributed = alt, itemId = aqirite, quantity = 2,
+    }, "Aqirite", formatName)
+    assertTrue(contains(adjustText, warriorColor), "adjustment history colors the admin")
+    assertTrue(contains(adjustText, mageColor), "adjustment history colors the credited alt")
+
+    local resetText = C.FormatEvent({
+        type = C.EVENT.RESET, actor = main,
+    }, nil, formatName)
+    assertTrue(contains(resetText, warriorColor), "configuration clear history colors the admin")
+
+    local pendingText = C.FormatObservation({
+        donor = guildOnly, itemId = aqirite, quantity = 4, status = "pending",
+    }, "Aqirite", nil, formatName)
+    assertTrue(contains(pendingText, hunterColor), "pending observations color guild-only donors")
+    assertTrue(contains(pendingText, " — Pending verification"),
+        "pending observation status text stays uncolored")
+
+    local reviewText = C.FormatObservation({
+        donor = unknown, itemId = aqirite, quantity = 1, status = "ambiguous",
+    }, "Aqirite", nil, formatName)
+    assertEq(reviewText, "Stranger-Realm donated 1 Aqirite — Needs review",
+        "unknown donors stay readable without color codes")
+
+    local p = configured("class-colors-history")
+    C.AppendEvent(p, {
+        id = "ce:class-colors-history:Main-Realm:1",
+        type = C.EVENT.DONATION,
+        actor = main,
+        itemId = aqirite,
+        quantity = 1,
+        source = "guildbank",
+        generation = 1,
+        timestamp = 1,
+    }, { silent = true })
+    local rows = C.HistoryRows(p, function() return "Aqirite" end, 10, 0, formatName)
+    assertTrue(#rows >= 1 and contains(rows[1].text, warriorColor),
+        "HistoryRows applies the optional display-name formatter")
+    local plainRows = C.HistoryRows(p, function() return "Aqirite" end, 10, 0)
+    assertTrue(#plainRows >= 1 and not contains(plainRows[1].text, "|cff"),
+        "HistoryRows without a formatter stays plain text")
+
+    local preview = {
+        itemId = aqirite,
+        quantity = 5,
+        attributed = alt,
+        currentItem = 1,
+        nextItem = 6,
+        currentPlayer = 0,
+        nextPlayer = 5,
+    }
+    local confirm = C.ManualAdjustmentConfirmation(preview, "Aqirite", formatName)
+    assertTrue(contains(confirm, mageColor), "manual adjustment preview colors the credited member")
+    assertFalse(contains(confirm, warriorColor),
+        "manual adjustment credit uses the attributed character, not a linked main")
+
+    SF.NameUtil.NormalizeNameRealm = priorNormalize
+    SF.NameUtil.SamePlayer = priorSame
+end
+
 checkGuildConfiguration()
 checkRequestedItems()
 checkApplyOpAndSettingsModel()
@@ -4409,6 +4566,7 @@ checkAccounting()
 checkAuthorizeAndConfigSync()
 checkRemoteEvents()
 checkManualAdjustments()
+checkClassColoredDisplayNames()
 checkCatchUpRules()
 checkSessionTransport()
 checkPeerHistoryRecoveryServePath()
