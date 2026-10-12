@@ -864,6 +864,22 @@ local function Definition()
 	return { sections = sections }
 end
 
+-- Standalone settings can hide the parent while the page panel stays IsShown.
+-- Prefer IsVisible so roster-driven work does not run against a closed window.
+local function PanelEffectivelyVisible(panel)
+	panel = panel or Page.panel
+	if not panel then
+		return false
+	end
+	if panel.IsVisible then
+		return panel:IsVisible() and true or false
+	end
+	if panel.IsShown then
+		return panel:IsShown() and true or false
+	end
+	return false
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer then return end
@@ -880,7 +896,7 @@ function Page:Build(panel)
 end
 
 function Page:Refresh(panel)
-	if panel and panel.IsShown and not panel:IsShown() then
+	if panel and not PanelEffectivelyVisible(panel) then
 		return
 	end
 	reuseHistory = false
@@ -900,14 +916,16 @@ local refreshQueued = false
 local function QueueRefresh()
 	local panel = Page.panel
 	if not panel or not Page.Refresh then return end
-	if panel.IsShown and not panel:IsShown() then return end
+	-- Gate scheduling: hidden parent + shown child must not queue roster work.
+	if not PanelEffectivelyVisible(panel) then return end
 	if refreshQueued then return end
 	refreshQueued = true
 	local function run()
 		refreshQueued = false
-		if Page.panel and Page.Refresh then
-			Page:Refresh(Page.panel)
-		end
+		-- Re-check after the delay: the window may have closed while queued.
+		if not Page.panel or not Page.Refresh then return end
+		if not PanelEffectivelyVisible(Page.panel) then return end
+		Page:Refresh(Page.panel)
 	end
 	-- One sort per quarter second while events arrive, not one sort per frame.
 	if C_Timer and C_Timer.After then
@@ -925,6 +943,7 @@ EnsureGuildRosterListener = function()
 	guildRosterFrame = frame
 	frame:RegisterEvent("GUILD_ROSTER_UPDATE")
 	frame:SetScript("OnEvent", function()
+		-- Always drop the ephemeral index so the next visible open rebuilds it.
 		InvalidateGuildClassIndex()
 		QueueRefresh()
 	end)

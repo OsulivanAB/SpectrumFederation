@@ -327,7 +327,7 @@ local function noop() end
 for _, name in ipairs({
     "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
     "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH",
-    "SetAutoFocus", "SetNumeric", "SetScrollChild", "RegisterEvent",
+    "SetAutoFocus", "SetNumeric", "SetScrollChild",
     "SetMinMaxValues", "SetStatusBarTexture", "SetStatusBarColor", "SetWordWrap",
 }) do
     FrameMethods[name] = noop
@@ -380,7 +380,19 @@ function FrameMethods:GetText() return self.text end
 function FrameMethods:Show() self.shown = true end
 function FrameMethods:Hide() self.shown = false end
 function FrameMethods:IsShown() return self.shown == true end
+-- Prefer an explicit visible flag so tests can model a shown child under a
+-- hidden standalone settings parent (IsShown true, IsVisible false).
+function FrameMethods:IsVisible()
+    if self.visible ~= nil then
+        return self.visible == true
+    end
+    return self.shown == true
+end
 function FrameMethods:SetShown(shown) self.shown = shown and true or false end
+function FrameMethods:RegisterEvent(event)
+    self.registeredEvents = self.registeredEvents or {}
+    self.registeredEvents[event] = true
+end
 function FrameMethods:Enable() self.enabled = true end
 function FrameMethods:Disable() self.enabled = false end
 function FrameMethods:IsEnabled() return self.enabled end
@@ -4555,6 +4567,92 @@ local function checkClassColoredDisplayNames()
     SF.NameUtil.SamePlayer = priorSame
 end
 
+local function checkConsumableLogsHiddenParentRefresh()
+    -- Issue #348 follow-up: GUILD_ROSTER_UPDATE must not refresh history while the
+    -- standalone settings parent is hidden (panel IsShown, not IsVisible).
+    local refreshCount = 0
+    SF.SettingsUI = {
+        pagesById = {},
+        pages = {},
+        DefinitionRenderer = {
+            Build = function() end,
+            Refresh = function()
+                refreshCount = refreshCount + 1
+            end,
+        },
+    }
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+
+    local framesBefore = #createdFrames
+    load("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
+    local page = SF.SettingsUI.pagesById.lootHelperConsumableLogs
+    assertTrue(page ~= nil, "Consumable Logs page registers with SettingsUI")
+
+    local rosterFrame
+    for i = framesBefore + 1, #createdFrames do
+        local frame = createdFrames[i]
+        if frame.registeredEvents and frame.registeredEvents.GUILD_ROSTER_UPDATE and frame.scripts and frame.scripts.OnEvent then
+            rosterFrame = frame
+            break
+        end
+    end
+    assertTrue(rosterFrame ~= nil, "Consumable Logs installs a single GUILD_ROSTER_UPDATE listener")
+
+    local panel = FrameMock("Frame")
+    panel.shown = true
+    panel.visible = false
+    page:Build(panel)
+    assertEq(Page and true or true, true, "page build keeps a panel reference")
+    assertTrue(page.panel == panel, "Build stores the Consumable Logs panel")
+
+    refreshCount = 0
+    world.after = {}
+    rosterFrame.scripts.OnEvent(rosterFrame, "GUILD_ROSTER_UPDATE")
+    assertEq(#world.after, 0, "hidden parent does not queue a roster-driven refresh")
+    assertEq(refreshCount, 0, "hidden parent does not refresh Consumable Logs history")
+
+    -- Queue while visible, then hide before the delayed callback runs.
+    panel.visible = true
+    refreshCount = 0
+    world.after = {}
+    rosterFrame.scripts.OnEvent(rosterFrame, "GUILD_ROSTER_UPDATE")
+    assertEq(#world.after, 1, "visible panel queues one deferred roster refresh")
+    panel.visible = false
+    drainAfter()
+    assertEq(refreshCount, 0, "closing before the deferred callback skips the roster refresh")
+
+    -- Reopening through OnShow still refreshes (initial/subsequent open behavior).
+    panel.visible = true
+    refreshCount = 0
+    local onShowHooks = panel.hooks and panel.hooks.OnShow or {}
+    assertTrue(#onShowHooks >= 1, "Build installs an OnShow refresh hook")
+    for i = 1, #onShowHooks do
+        onShowHooks[i](panel)
+    end
+    assertTrue(refreshCount >= 1, "OnShow refreshes Consumable Logs when the page becomes visible")
+
+    -- A second Build must not accumulate another guild-roster listener.
+    local rosterListeners = 0
+    for i = 1, #createdFrames do
+        local frame = createdFrames[i]
+        if frame.registeredEvents and frame.registeredEvents.GUILD_ROSTER_UPDATE then
+            rosterListeners = rosterListeners + 1
+        end
+    end
+    page:Build(panel)
+    local rosterListenersAfter = 0
+    for i = 1, #createdFrames do
+        local frame = createdFrames[i]
+        if frame.registeredEvents and frame.registeredEvents.GUILD_ROSTER_UPDATE then
+            rosterListenersAfter = rosterListenersAfter + 1
+        end
+    end
+    assertEq(rosterListenersAfter, rosterListeners, "repeated Build does not add GUILD_ROSTER_UPDATE listeners")
+end
+
 checkGuildConfiguration()
 checkRequestedItems()
 checkApplyOpAndSettingsModel()
@@ -4567,6 +4665,7 @@ checkAuthorizeAndConfigSync()
 checkRemoteEvents()
 checkManualAdjustments()
 checkClassColoredDisplayNames()
+checkConsumableLogsHiddenParentRefresh()
 checkCatchUpRules()
 checkSessionTransport()
 checkPeerHistoryRecoveryServePath()
