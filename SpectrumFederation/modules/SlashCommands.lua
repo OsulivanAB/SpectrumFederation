@@ -356,10 +356,11 @@ function SF:RegisterLootHelperSlashCommands()
                 return
             end
             
-            -- Start the session (success is recorded by StartSession via SF.Debug)
+            -- StartSession records success via SF.Debug and prints specific failures.
+            -- Do not add a second generic PrintError here (duplicate session-start noise).
             local sessionId = SF.LootHelperSync:StartSession(profileId)
-            if not sessionId then
-                SF:PrintError("Failed to start session (not in a group/raid?)")
+            if not sessionId and SF.Debug then
+                SF.Debug:Warn("SlashCommands", "loot session start returned nil (callee reported the failure)")
             end
             return
         end

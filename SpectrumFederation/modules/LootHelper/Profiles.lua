@@ -4129,13 +4129,24 @@ function LootProfile:AddLootLog(lootLog, opts)
             local broadcastOk, broadcastErr = SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())
             if not broadcastOk then
                 local profileId = self.GetProfileId and self:GetProfileId() or ""
-                unsyncedChangeNoted[profileId] = unsyncedChangeNoted[profileId] or false
-                if not unsyncedChangeNoted[profileId] and SF.PrintWarning then
-                    unsyncedChangeNoted[profileId] = true
-                    SF:PrintWarning("Change saved locally, but it could not be synchronized to the raid.")
-                end
+                local reason = tostring(broadcastErr or "unknown error")
+                -- Editing/recording logs outside an active session is expected.
+                -- Do not present that as a synchronization failure to the player.
+                local expectedOffline = reason == "no active session" or reason == "missing sessionId"
                 if SF.Debug then
-                    SF.Debug:Warn("LootProfile", "Local change was not broadcast: %s", tostring(broadcastErr or "unknown error"))
+                    SF.Debug:Warn(
+                        "LootProfile",
+                        "Local change was not broadcast: %s%s",
+                        reason,
+                        expectedOffline and " (expected offline; no chat warning)" or ""
+                    )
+                end
+                if not expectedOffline then
+                    unsyncedChangeNoted[profileId] = unsyncedChangeNoted[profileId] or false
+                    if not unsyncedChangeNoted[profileId] and SF.PrintWarning then
+                        unsyncedChangeNoted[profileId] = true
+                        SF:PrintWarning("Change saved locally, but it could not be synchronized to the raid.")
+                    end
                 end
             elseif self.GetProfileId then
                 unsyncedChangeNoted[self:GetProfileId() or ""] = nil
