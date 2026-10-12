@@ -79,6 +79,7 @@ local function resetWorld()
         timers = {},
         warnings = {},
         infos = {},
+        debugs = {},
         activeProfile = nil,
     }
 end
@@ -437,9 +438,30 @@ local REVIEW_COMPACT_WIDTH_MAX = 280
 
 local SF = {
     Debug = {
-        Info = function() end,
-        Warn = function() end,
-        Error = function() end,
+        Info = function(_, category, fmt, ...)
+            world.debugs = world.debugs or {}
+            world.debugs[#world.debugs + 1] = {
+                level = "Info",
+                category = category,
+                text = string.format(tostring(fmt), ...),
+            }
+        end,
+        Warn = function(_, category, fmt, ...)
+            world.debugs = world.debugs or {}
+            world.debugs[#world.debugs + 1] = {
+                level = "Warn",
+                category = category,
+                text = string.format(tostring(fmt), ...),
+            }
+        end,
+        Error = function(_, category, fmt, ...)
+            world.debugs = world.debugs or {}
+            world.debugs[#world.debugs + 1] = {
+                level = "Error",
+                category = category,
+                text = string.format(tostring(fmt), ...),
+            }
+        end,
         Verbose = function() end,
     },
 }
@@ -3423,10 +3445,13 @@ local function checkRuntimeDeposit()
     -- Guild Bank transaction observation/verification is the accounting source.
     assertEq(#p._consumableEvents, 0, "a confirmed deposit does not directly record a donation")
     assertEq(C.ContributionTotal(p, donor, aqirite), 0, "deposit assistant does not update contribution totals")
-    assertTrue(#world.infos > 0, "a clean deposit still reports materials were moved")
-    local infoText = table.concat(world.infos, "\n")
-    assertTrue(contains(infoText, "verification") or contains(infoText, "Guild Bank"),
-        "deposit success mentions verification wait")
+    assertEq(#world.infos, 0, "a clean deposit stays silent in normal chat")
+    local debugText = ""
+    for i = 1, #(world.debugs or {}) do
+        debugText = debugText .. tostring(world.debugs[i].text) .. "\n"
+    end
+    assertTrue(contains(debugText, "deposit settled"),
+        "deposit success is logged to Debug only")
     assertEq(#world.warnings, 0, "a clean deposit shows no warnings")
     assertEq(#(p._consumablesUnsent or {}), 0, "no donation is queued from the deposit assistant")
 
@@ -3539,7 +3564,13 @@ local function checkRuntimeDepositPartialAndFailure()
     fireTimers()
     assertEq(RT.depositIntent, nil, "the deadline finishes a partial deposit")
     assertEq(#p._consumableEvents, 0, "the deadline does not create deposit-assistant accounting")
-    assertTrue(contains(world.infos[#world.infos], "The rest is still in your bags"), "a partial deposit explains the remainder")
+    assertEq(#world.infos, 0, "a partial deposit stays silent in normal chat")
+    local partialDebug = ""
+    for i = 1, #(world.debugs or {}) do
+        partialDebug = partialDebug .. tostring(world.debugs[i].text) .. "\n"
+    end
+    assertTrue(contains(partialDebug, "deposit settled partial"),
+        "partial deposit remainder is logged to Debug only")
 
     p = runtimeFixture("rt-bank-only")
     world.bankOpen = true
