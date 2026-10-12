@@ -501,6 +501,28 @@ local function SelectedReviewRow()
 	return nil
 end
 
+-- Dynamic help text: Refresh must re-evaluate selection and class colors.
+-- Static Definition() text would stay stale across selection and roster updates.
+local function SelectedReviewHelpText()
+	local selected = SelectedReviewRow()
+	if not selected then
+		return Loc("RAID_CONSUMABLE_REVIEW_NONE_SELECTED", "Select a row to approve, reject, or correct.")
+	end
+	local name = ItemName(selected.itemId) or ("item " .. tostring(selected.itemId or "?"))
+	local donor
+	if type(selected.donor) == "string" and selected.donor ~= "" then
+		donor = FormatCharacterDisplayName(selected.donor)
+	else
+		donor = Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")
+	end
+	return string.format(
+		Loc("RAID_CONSUMABLE_REVIEW_SELECTED", "Selected: %s donated %d %s"),
+		donor,
+		tonumber(selected.quantity) or 0,
+		name
+	)
+end
+
 local function EnsureReviewSelection(profile)
 	local profileId = ProfileKey(profile)
 	if profileId ~= selectedReviewProfileId then
@@ -699,25 +721,6 @@ local function Definition()
 				},
 			},
 		}
-		local selected = SelectedReviewRow()
-		local selectedHelp
-		if selected then
-			local name = ItemName(selected.itemId) or ("item " .. tostring(selected.itemId or "?"))
-			local donor
-			if type(selected.donor) == "string" and selected.donor ~= "" then
-				donor = FormatCharacterDisplayName(selected.donor)
-			else
-				donor = Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")
-			end
-			selectedHelp = string.format(
-				Loc("RAID_CONSUMABLE_REVIEW_SELECTED", "Selected: %s donated %d %s"),
-				donor,
-				tonumber(selected.quantity) or 0,
-				name
-			)
-		else
-			selectedHelp = Loc("RAID_CONSUMABLE_REVIEW_NONE_SELECTED", "Select a row to approve, reject, or correct.")
-		end
 		local reviewItems = {
 			{
 				type = "help",
@@ -763,7 +766,7 @@ local function Definition()
 			{
 				type = "help",
 				indent = "label",
-				text = selectedHelp,
+				getText = SelectedReviewHelpText,
 			},
 		}
 		reviewItems[#reviewItems + 1] = {

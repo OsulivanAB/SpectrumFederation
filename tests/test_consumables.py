@@ -286,6 +286,12 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
     ).read_text(encoding="utf-8")
     assert "getText" in logs_page
+    # Admin review selected-details must be dynamic: DefinitionRenderer:Refresh does
+    # not rebuild the page, and AddHelpText only updates via getText.
+    assert "getText = SelectedReviewHelpText" in logs_page
+    assert "text = selectedHelp" not in logs_page
+    assert "local function SelectedReviewHelpText" in logs_page
+    assert "RAID_CONSUMABLE_REVIEW_SELECTED" in logs_page
     assert "RAID_CONSUMABLE_ADJUST_HISTORY_ATTRIBUTED" in locale
     assert "RAID_CONSUMABLE_ADJUST_ERR_NOT_MEMBER" in locale
 
