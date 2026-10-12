@@ -139,9 +139,13 @@ loadModule("SpectrumFederation/modules/SlashCommands.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/02_State.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/03_Metrics.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/10_Handshake.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua")
+loadModule("SpectrumFederation/modules/RaidEquipment/CheckRun.lua")
+loadModule("SpectrumFederation/modules/RaidCheck.lua")
 loadModule("SpectrumFederation/modules/UI/LootHelper/Controller.lua")
 
 function SF:GetPlayerFullIdentifier()
@@ -259,10 +263,22 @@ function Sync:_ResetSessionState()
     self.state.isCoordinator = false
 end
 
-if type(Sync.IsSessionActive) ~= "function" then
-    function Sync:IsSessionActive()
-        return self.state and self.state.active and true or false
-    end
+function Sync:_MInc() end
+function Sync:_RefreshAdvertisedAuthorMax() end
+function Sync:ComputeAuthorWindowSummary()
+    return {}
+end
+function Sync:_GetSessionSafeModePayload()
+    return {}
+end
+function Sync:GetGroupDistribution()
+    return "RAID"
+end
+
+-- Production IsSessionActive may clear state when ungrouped; keep a simple
+-- active flag for these chat-noise lifecycle assertions.
+function Sync:IsSessionActive()
+    return self.state and self.state.active and true or false
 end
 
 local function countPrinted(kind, needle)
@@ -476,9 +492,108 @@ assertTrue(
 assertEq(countPrinted("warn", "Change saved locally, but it could not be synchronized to the raid."), 1,
     "unsyncedChangeNoted dedupes repeated in-session sync warnings")
 
+-- Active session with unexpected missing sessionId still warns (not offline).
+resetDB()
+profile = makeProfile("MissingSid")
+setActive(profile)
+Sync.state.active = true
+Sync.state.sessionId = nil
+Sync.state.profileId = profile:GetProfileId()
+function Sync:BroadcastNewLog()
+    return false, "missing sessionId"
+end
+printed = {}
+debugLogs = {}
+assertTrue(
+    profile:AddLootLog(makePointLog(profile, 1), { skipPermission = true }),
+    "active missing-sessionId AddLootLog still inserts locally"
+)
+assertEq(countPrinted("warn", "Change saved locally, but it could not be synchronized to the raid."), 1,
+    "active session missing sessionId preserves the sync warning")
+assertTrue(countDebug("missing sessionId") >= 1, "active missing sessionId is recorded in Debug")
+assertEq(countDebug("expected offline"), 0, "active missing sessionId is not classified as offline")
+
 -- ---------------------------------------------------------------------------
--- Protocol / background-style silence: repeated incompatible traffic stays quiet
+-- Raid Check Yes-path: behavioral single-error session-start failure
 -- ---------------------------------------------------------------------------
+resetDB()
+profile = makeProfile("RaidCheckPreflight")
+setActive(profile)
+function profile:GetRaidCheckConfig()
+    return {
+        pointsAwardPerRaidCheck = 0,
+    }
+end
+
+function Sync:_EnforceGroupedSessionActive()
+    return nil
+end
+
+local yesCallback
+SF.SettingsUI = SF.SettingsUI or {}
+SF.SettingsUI.Dialogs = {
+    ConfirmChoice = function(_, _message, _yes, _no, onYes, _onNo, _onCancel)
+        yesCallback = onYes
+        return true
+    end,
+}
+
+local startedAdhoc = false
+function SF.RaidCheck:_StartAdhocRun()
+    startedAdhoc = true
+    return "started"
+end
+
+printed = {}
+debugLogs = {}
+local status = SF.RaidCheck:BeginCheck("raid")
+assertEq(status, "prompt", "Raid Check without a session opens the preflight prompt")
+assertTrue(type(yesCallback) == "function", "Raid Check captured the Yes callback")
+yesCallback()
+assertEq(countPrinted("error", "Cannot start session: not in a group/raid."), 1,
+    "Raid Check Yes-path prints exactly one specific StartSession error")
+assertEq(countPrinted("error", "Failed to start a Loot Helper session"), 0,
+    "Raid Check Yes-path does not print a second generic StartSession error")
+assertTrue(countDebug("Session preflight Yes-path StartSession failed") >= 1,
+    "Raid Check Yes-path records the failure in Debug")
+assertFalse(startedAdhoc, "Raid Check does not start the adhoc run after StartSession failure")
+
+-- ---------------------------------------------------------------------------
+-- Repeated heartbeat / background events stay out of player chat
+-- ---------------------------------------------------------------------------
+resetDB()
+profile = makeProfile("HeartbeatQuiet")
+setActive(profile)
+Sync.state.active = true
+Sync.state.sessionId = "SES-HB"
+Sync.state.profileId = profile:GetProfileId()
+Sync.state.coordinator = PLAYER
+Sync.state.coordEpoch = 1
+Sync.state.isCoordinator = true
+Sync.state.helpers = {}
+Sync.state.authorMax = {}
+Sync.state.authorWindowSummary = {}
+Sync.cfg = Sync.cfg or {}
+
+local heartbeatSends = 0
+SF.LootHelperComm = {
+    Send = function()
+        heartbeatSends = heartbeatSends + 1
+        return true
+    end,
+}
+function Sync:_EnforceGroupedSessionActive()
+    return "RAID"
+end
+
+printed = {}
+debugLogs = {}
+for _ = 1, 12 do
+    assertTrue(Sync:BroadcastSessionHeartbeat() == true, "idle heartbeat send succeeds")
+end
+assertEq(heartbeatSends, 12, "heartbeat processing continues across repeated ticks")
+assertEq(#printed, 0, "repeated heartbeats produce no player-facing chat")
+
 printed = {}
 debugLogs = {}
 local P = SF.SyncProtocol
