@@ -1,0 +1,1573 @@
+{
+  "version": 1,
+  "description": "Audited Spectrum-owned player-facing chat output sites. New sites or hotpath moves require owner authorization; update with: python3 .github/scripts/check_chat_output.py --write-baseline",
+  "policy": "SpectrumFederation/AGENTS.md#user-visible-messaging",
+  "sites": [
+    {
+      "path": "SpectrumFederation/SpectrumFederation.lua",
+      "line": 64,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logging enabled. Use '/sf debug show' to view logs.\")",
+      "enclosing": "<module>",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/SpectrumFederation.lua",
+      "line": 67,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"Debug logging disabled\")",
+      "enclosing": "<module>",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/SpectrumFederation.lua",
+      "line": 73,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Settings Window is not available.\")",
+      "enclosing": "<module>",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/SpectrumFederation.lua",
+      "line": 78,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logs cleared\")",
+      "enclosing": "<module>",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/SpectrumFederation.lua",
+      "line": 81,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Unknown debug command. Use: on, off, show, clear\")",
+      "enclosing": "<module>",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua",
+      "line": 34,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(text)",
+      "enclosing": "Warn",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Identity.lua",
+      "line": 2810,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning((\"Loot Helper restored %s from historical logs with no Main Swap lineage. Link it manually if it should share an identity.\"):format(tostring(sou",
+      "enclosing": "Identity.ApplyToProfileMembers",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 36,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|local function PrintInfo(message)",
+      "enclosing": "PrintInfo",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 38,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(message)",
+      "enclosing": "PrintInfo",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 42,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|local function PrintSuccess(message)",
+      "enclosing": "PrintSuccess",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 44,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(message)",
+      "enclosing": "PrintSuccess",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 48,
+      "kind": "PrintError",
+      "signature": "PrintError|local function PrintError(message)",
+      "enclosing": "PrintError",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 50,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(message)",
+      "enclosing": "PrintError",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 267,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode ended because Loot Helper settings were reset.\")",
+      "enclosing": "Imp:ValidateBoundState",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 269,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode ended because you are no longer an admin of this profile.\")",
+      "enclosing": "Imp:ValidateBoundState",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 271,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode ended because the active profile changed.\")",
+      "enclosing": "Imp:ValidateBoundState",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 278,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode ended because you are no longer an admin of this profile.\")",
+      "enclosing": "Imp:ValidateBoundState",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 303,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(FormatStatus())",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 304,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(USAGE)",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 308,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(FormatStatus())",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 315,
+      "kind": "PrintError",
+      "signature": "PrintError|PrintError(err or \"Cannot enable impersonation mode.\")",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 317,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode is already on.\")",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 319,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|PrintSuccess(\"Impersonation mode enabled. Local UI now matches a non-admin. Sync identity is unchanged.\")",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 326,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|PrintSuccess(\"Impersonation mode disabled.\")",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 328,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode is already off.\")",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 333,
+      "kind": "PrintError",
+      "signature": "PrintError|PrintError(USAGE)",
+      "enclosing": "Imp:HandleSlash",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 368,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode ended because Loot Helper settings were reset.\")",
+      "enclosing": "Imp:InstallHooks",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Impersonation.lua",
+      "line": 395,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|PrintInfo(\"Impersonation mode ended because Loot Helper settings were reset.\")",
+      "enclosing": "Imp:InstallHooks",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 409,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to create loot log entry for role change.\")",
+      "enclosing": "Member:SetRole",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 458,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Invalid role specified. Role not changed.\")",
+      "enclosing": "Member:SetRole",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 596,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to create loot log entry for point increment.\")",
+      "enclosing": "Member:IncrementPoints",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 667,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to create loot log entry for point decrement.\")",
+      "enclosing": "Member:DecrementPoints",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 729,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to create loot log entry for attendance increment.\")",
+      "enclosing": "Member:IncrementAttendance",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 793,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to create loot log entry for attendance decrement.\")",
+      "enclosing": "Member:DecrementAttendance",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 818,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Invalid armor slot specified: \" .. tostring(slot))",
+      "enclosing": "Member:ApplyAwardedItem",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 937,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Invalid armor slot specified: \" .. tostring(slot))",
+      "enclosing": "Member:ClearAwardedItem",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 1056,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Invalid armor slot specified: \" .. tostring(slot))",
+      "enclosing": "Member:ToggleEquipment",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Members.lua",
+      "line": 1073,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to create loot log entry for armor slot toggle.\")",
+      "enclosing": "Member:ToggleEquipment",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Profiles.lua",
+      "line": 2845,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(message)",
+      "enclosing": "WarnLiveBisConflict",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Profiles.lua",
+      "line": 4148,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"Change saved locally, but it could not be synchronized to the raid.\")",
+      "enclosing": "LootProfile:AddLootLog",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelper/Profiles.lua",
+      "line": 4688,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"Linked characters share equipment history with overlapping slot usage.\")",
+      "enclosing": "LootProfile:LinkCharacters",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/08_Requests.lua",
+      "line": 470,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(guidance)",
+      "enclosing": "Sync:_FailRequest",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua",
+      "line": 231,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo((\"Loot Helper session ended by coordinator (%s).\"):format(tostring(reason or \"no reason given\")))",
+      "enclosing": "Sync:HandleSessionEnd",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua",
+      "line": 1358,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo((\"Session safe mode %s (set by %s).\"):format(",
+      "enclosing": "Sync:HandleSafeModeSet",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/17_DebugSlash.lua",
+      "line": 73,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(line)",
+      "enclosing": "Sync:_DebugPrintLine",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/17_DebugSlash.lua",
+      "line": 78,
+      "kind": "DEFAULT_CHAT_FRAME:AddMessage",
+      "signature": "DEFAULT_CHAT_FRAME:AddMessage|DEFAULT_CHAT_FRAME:AddMessage(\"|cff33ff99SF LootHelper Sync|r \" .. tostring(line))",
+      "enclosing": "Sync:_DebugPrintLine",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/17_DebugSlash.lua",
+      "line": 82,
+      "kind": "print",
+      "signature": "print|print(\"SF LootHelper Sync \" .. tostring(line))",
+      "enclosing": "Sync:_DebugPrintLine",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/17_DebugSlash.lua",
+      "line": 373,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning((\"LootHelper Sync debug slash error: %s\"):format(tostring(err)))",
+      "enclosing": "Sync:_InstallDebugSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/17_DebugSlash.lua",
+      "line": 375,
+      "kind": "print",
+      "signature": "print|print(\"LootHelper Sync debug slash error: \" .. tostring(err))",
+      "enclosing": "Sync:_InstallDebugSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 519,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"Synchronization did not start. Too many sync requests are already in progress.\")",
+      "enclosing": "Sync:RequestManualSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 795,
+      "kind": "PrintError",
+      "signature": "PrintError|if SF.PrintError then SF:PrintError(\"Cannot start a session while previewing as a non-admin.\") end",
+      "enclosing": "Sync:StartSession",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 801,
+      "kind": "PrintError",
+      "signature": "PrintError|if SF.PrintError then SF:PrintError(\"Cannot start session: not in a group/raid.\") end",
+      "enclosing": "Sync:StartSession",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 808,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError((\"Cannot start session: %s\"):format(tostring(why or \"unknown reason\")))",
+      "enclosing": "Sync:StartSession",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 817,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Cannot start session: profile not loaded locally\")",
+      "enclosing": "Sync:StartSession",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 867,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Cannot start session: you are not an admin for this profile\")",
+      "enclosing": "Sync:StartSession",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 1123,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo((\"Loot Helper session ended (%s).\"):format(tostring(reason)))",
+      "enclosing": "Sync:EndSession",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua",
+      "line": 1161,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError((\"Cannot takeover session: %s\"):format(tostring(why or \"unknown reason\")))",
+      "enclosing": "Sync:TakeoverSession",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 14,
+      "kind": "printWithPrefix",
+      "signature": "printWithPrefix|local function printWithPrefix(message)",
+      "enclosing": "printWithPrefix",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 17,
+      "kind": "print",
+      "signature": "print|print(string.format(\"%s%s%s: %s\", COLOR_PREFIX, addonName, COLOR_RESET, colored))",
+      "enclosing": "printWithPrefix",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 23,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|function SF:PrintSuccess(message)",
+      "enclosing": "SF:PrintSuccess",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 24,
+      "kind": "printWithPrefix",
+      "signature": "printWithPrefix|printWithPrefix(message)",
+      "enclosing": "SF:PrintSuccess",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 30,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|function SF:PrintInfo(message)",
+      "enclosing": "SF:PrintInfo",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 31,
+      "kind": "printWithPrefix",
+      "signature": "printWithPrefix|printWithPrefix(message)",
+      "enclosing": "SF:PrintInfo",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 37,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|function SF:PrintWarning(message)",
+      "enclosing": "SF:PrintWarning",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 38,
+      "kind": "printWithPrefix",
+      "signature": "printWithPrefix|printWithPrefix(message)",
+      "enclosing": "SF:PrintWarning",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 44,
+      "kind": "PrintError",
+      "signature": "PrintError|function SF:PrintError(message)",
+      "enclosing": "SF:PrintError",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 45,
+      "kind": "printWithPrefix",
+      "signature": "printWithPrefix|printWithPrefix(message)",
+      "enclosing": "SF:PrintError",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 51,
+      "kind": "SystemMessage",
+      "signature": "SystemMessage|function SF:SystemMessage(message)",
+      "enclosing": "SF:SystemMessage",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/MessageHelpers.lua",
+      "line": 54,
+      "kind": "print",
+      "signature": "print|print(string.format(\"%sSpectrum Federation:%s %s\", COLOR_PREFIX, COLOR_RESET, colored))",
+      "enclosing": "SF:SystemMessage",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3004,
+      "kind": "SendChatMessage",
+      "signature": "SendChatMessage|SendChatMessage(message, \"WHISPER\", nil, target)",
+      "enclosing": "SendWhisper",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3026,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"No active loot profile selected. Set an active profile before running a raid check.\")",
+      "enclosing": "ValidateCanRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3031,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Only admins can run raid checks.\")",
+      "enclosing": "ValidateCanRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3036,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Raid Check settings are unavailable for the active profile.\")",
+      "enclosing": "ValidateCanRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3042,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Invalid Raid Check mode.\")",
+      "enclosing": "ValidateCanRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3327,
+      "kind": "SystemMessage",
+      "signature": "SystemMessage|SF:SystemMessage(message)",
+      "enclosing": "EmitAdminMessage",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3329,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(message)",
+      "enclosing": "EmitAdminMessage",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3556,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(string.format(\"[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.\", ModeLabel(run.mode)))",
+      "enclosing": "RC:_ApplyCheckConsequences",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3565,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Raid Check results were not applied because you are viewing the profile as a non-admin.\")",
+      "enclosing": "RC:_ApplyCheckConsequences",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3567,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Raid Check results were not applied because you are not an admin of this profile.\")",
+      "enclosing": "RC:_ApplyCheckConsequences",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3588,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] The check completed, but Loot Helper session synchronization could not be established. Results were saved locally.\", ModeLab",
+      "enclosing": "RC:_ApplyCheckConsequences",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3590,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] The expected session is no longer active. Results are saved locally and were not synchronized.\", ModeLabel(mode)))",
+      "enclosing": "RC:_ApplyCheckConsequences",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3592,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] Consequences stay on the selected profile and will not synchronize through the unrelated session.\", ModeLabel(mode)))",
+      "enclosing": "RC:_ApplyCheckConsequences",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3594,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(string.format(\"[%s] Session-backed synchronization did not complete. Results were saved locally.\", ModeLabel(mode)))",
+      "enclosing": "RC:_ApplyCheckConsequences",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 3968,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Raid Equipment check runtime is unavailable.\")",
+      "enclosing": "RC:_StartAdhocRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4017,
+      "kind": "SystemMessage",
+      "signature": "SystemMessage|SF:SystemMessage(label .. \" started.\")",
+      "enclosing": "RC:_StartAdhocRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4019,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\"[%s] Initiated.\", label))",
+      "enclosing": "RC:_StartAdhocRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4026,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\"[%s] Paused in combat. Inspection resumes when combat ends.\", label))",
+      "enclosing": "RC:_StartAdhocRun",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4039,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Invalid Raid Check mode.\")",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4045,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Raid Equipment check runtime is unavailable.\")",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4063,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"A Raid Check is already in progress.\")",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4079,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"This check uses the selected profile. Its consequences will not synchronize through the unrelated active session.\")",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4096,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Session preflight dialog is unavailable.\")",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4114,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Loot Helper Sync is unavailable. The check was not started.\")",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4150,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\"[%s] Cancelled.\", ModeLabel(mode)))",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/RaidCheck.lua",
+      "line": 4155,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Could not show the session prompt. The check was not started.\")",
+      "enclosing": "RC:BeginCheck",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 34,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Commands:\")",
+      "enclosing": "ShowHelp",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 35,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"|cFFFFFF00/sf|r - Toggle settings window\")",
+      "enclosing": "ShowHelp",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 36,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"|cFFFFFF00/sf help|r - Show this help message\")",
+      "enclosing": "ShowHelp",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 50,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\"|cFFFFFF00/sf %s|r - %s\", cmd, cmdData.description))",
+      "enclosing": "ShowHelp",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 67,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Settings Window is not available.\")",
+      "enclosing": "SlashCommandHandler",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 90,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Error executing command: \" .. tostring(err))",
+      "enclosing": "SlashCommandHandler",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 95,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Unknown command '\" .. command .. \"'. Type |cFFFFFF00/sf help|r for a list of commands.\")",
+      "enclosing": "SlashCommandHandler",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 118,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Loot Helper Sync system not available\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 125,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"You are the session coordinator, so your local profile already defines the session state.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 127,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"No active Loot Helper session.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 129,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"No session coordinator is available.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 131,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"The active session does not have a valid profile selected.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 135,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(tostring(status or \"Manual sync failed.\"))",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 141,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Profile sync requested. The session coordinator or a helper will compare your state and send any missing profile data.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 143,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"A profile sync is already in progress.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 145,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Sync check requested. Missing logs will be compared with the session and synchronized as needed.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 147,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"A log sync is already in progress.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 149,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Your local Loot Helper data already matches the current session.\")",
+      "enclosing": "RunManualLootSync",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 156,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"No profiles found!\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 161,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"Available Loot Profiles:\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 169,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" %d. %s (ID: %s)%s\", count, name, profileId, marker))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 173,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"No profiles found. Create one with /sf createprofile <name>\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 182,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"No active profile set\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 195,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"Active Profile:\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 196,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" Name: %s\", name))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 197,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" ID: %s\", profileId))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 198,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" Author: %s\", author))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 199,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" Owner: %s\", owner))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 200,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" Created: %s\", SF:FormatTimestampForUser(created)))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 201,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" Modified: %s\", SF:FormatTimestampForUser(modified)))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 202,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" Members: %d\", #members))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 203,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(string.format(\" Logs: %d\", #logs))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 209,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Usage: /sf createprofile <name>\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 215,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to create profile\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 220,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(string.format(\"Created and activated profile: %s (ID: %s)\",",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 223,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to add profile to database\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 230,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Usage: /sf switchprofile <name or ID>\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 238,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(string.format(\"Switched to profile: %s\", profile:GetProfileName()))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 240,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to switch profile\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 250,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(string.format(\"Switched to profile: %s (ID: %s)\", args, profileId))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 252,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to switch profile\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 260,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(string.format(\"Profile not found: %s\", args))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 261,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"Use /sf profiles to see available profiles\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 268,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Usage: /sf deleteprofile <name or ID>\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 291,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(string.format(\"Profile not found: %s\", args))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 300,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"Cleared active profile (deleted)\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 305,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(string.format(\"Deleted profile: %s (ID: %s)\", profileName, profileId))",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 316,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Raid Check module not available.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 323,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Raid Check module not available.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 328,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"Usage: /sf raidcheck pre|raid\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 343,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Cannot start a session while previewing as a non-admin.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 348,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Loot Helper Sync system not available\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 355,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"No active profile selected. Use /sf switchprofile <name> or /sf createprofile <name>\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 371,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Cannot end a session while previewing as a non-admin.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 376,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Loot Helper Sync system not available\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 383,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to end session (no active session?)\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 401,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"Loot Helper is already enabled.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 403,
+      "kind": "print",
+      "signature": "print|print(\"SpectrumFederation: Loot Helper is already enabled.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 415,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Loot Helper enabled.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 417,
+      "kind": "print",
+      "signature": "print|print(\"SpectrumFederation: Loot Helper enabled.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 438,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"Cannot show Loot Helper window: No active profile set.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 440,
+      "kind": "print",
+      "signature": "print|print(\"SpectrumFederation: Cannot show Loot Helper window: No active profile set.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 444,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(\"Cannot show Loot Helper window: You are not in a raid.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/SlashCommands.lua",
+      "line": 446,
+      "kind": "print",
+      "signature": "print|print(\"SpectrumFederation: Cannot show Loot Helper window: You are not in a raid.\")",
+      "enclosing": "SF:RegisterLootHelperSlashCommands",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
+      "line": 505,
+      "kind": "print",
+      "signature": "print|print(\"SpectrumFederation: Open Settings \u2192 AddOns \u2192 Spectrum Federation Settings \u2192 Loot Helper Settings\")",
+      "enclosing": "Controller:OpenSettings",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
+      "line": 528,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Loot Helper Sync system not available\")",
+      "enclosing": "Controller:OnPlayClicked",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
+      "line": 548,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Cannot end a session while previewing as a non-admin.\")",
+      "enclosing": "Controller:OnPlayClicked",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
+      "line": 555,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Failed to end session (no active session?)\")",
+      "enclosing": "Controller:OnPlayClicked",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
+      "line": 565,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"No active profile selected. Use /sf switchprofile <name> or /sf createprofile <name>\")",
+      "enclosing": "Controller:OnPlayClicked",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
+      "line": 573,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Cannot start a session while previewing as a non-admin.\")",
+      "enclosing": "Controller:OnPlayClicked",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/LootHelper/Controller.lua",
+      "line": 582,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Cannot start a session while previewing as a non-admin.\")",
+      "enclosing": "Controller:OnPlayClicked",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/Settings/Pages/Debugging.lua",
+      "line": 153,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(\"Debug logging disabled\")",
+      "enclosing": "onClick",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/Settings/Pages/Debugging.lua",
+      "line": 156,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logging enabled\")",
+      "enclosing": "onClick",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/UI/Settings/Pages/Debugging.lua",
+      "line": 169,
+      "kind": "PrintSuccess",
+      "signature": "PrintSuccess|SF:PrintSuccess(\"Debug logs cleared\")",
+      "enclosing": "onClick",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation/modules/VersionCheck.lua",
+      "line": 676,
+      "kind": "PrintError",
+      "signature": "PrintError|SF:PrintError(\"Addon version window is not available.\")",
+      "enclosing": "VC:ShowWindow",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation_CursedSurgeTracker/DebugSlash.lua",
+      "line": 30,
+      "kind": "PrintInfo",
+      "signature": "PrintInfo|SF:PrintInfo(line)",
+      "enclosing": "PrintLine",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation_CursedSurgeTracker/DebugSlash.lua",
+      "line": 33,
+      "kind": "print",
+      "signature": "print|print(\"|cff40c7ffSpectrumFederation CST|r: \" .. tostring(line))",
+      "enclosing": "PrintLine",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation_RCLootCouncilIntegration/Integration.lua",
+      "line": 420,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(message)",
+      "enclosing": "Integration.WarnNonMember",
+      "hotpath_ok": false,
+      "note": ""
+    },
+    {
+      "path": "SpectrumFederation_RCLootCouncilIntegration/Integration.lua",
+      "line": 767,
+      "kind": "PrintWarning",
+      "signature": "PrintWarning|SF:PrintWarning(message)",
+      "enclosing": "Integration.WarnBisResponseConflict",
+      "hotpath_ok": false,
+      "note": ""
+    }
+  ]
+}
