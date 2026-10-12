@@ -135,6 +135,10 @@ reviews:
         For recurring user-visible output, check whether an unchanged condition
         can repeatedly emit the same message. Prefer state-transition-based or
         appropriately rate-limited behavior without hiding useful errors.
+        New player-facing chat is prohibited by default unless owner-authorized;
+        see SpectrumFederation/AGENTS.md (User-visible messaging) and the
+        chat-output baseline guard (.github/scripts/check_chat_output.py).
+        Flag duplicate caller/callee chat for the same failure.
 
         Keep optional integrations optional. Prefer established repository
         adapters, helpers, and lifecycle patterns over parallel implementations.

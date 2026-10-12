@@ -27,7 +27,7 @@ applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*
 - Debugging:
   - use `SF.Debug` (see `SpectrumFederation/modules/debug.lua`)
   - avoid chat spam for diagnostics
-- User-facing chat output is opt-in. Do not add new normal WoW chat messages unless the task/issue explicitly asks for them or the user explicitly approves; do not infer permission from usefulness or severity. Prefer `SF.Debug` for diagnostics. When chat output is authorized, use `SF:PrintSuccess/Error/Warning/Info` (see `modules/MessageHelpers.lua`). Canonical guidance: `SpectrumFederation/AGENTS.md` (User-visible messaging).
+- User-facing chat output is opt-in and prohibited by default. Do not add new normal WoW chat messages unless the task/issue explicitly asks for them or the user explicitly approves; do not infer permission from usefulness or severity. Prefer `SF.Debug` for diagnostics. When chat output is authorized, use `SF:PrintSuccess/Error/Warning/Info` (see `modules/MessageHelpers.lua`) and update the chat-output baseline (`python3 .github/scripts/check_chat_output.py --write-baseline`). Avoid duplicate caller/callee chat for the same failure. Canonical guidance: `SpectrumFederation/AGENTS.md` (User-visible messaging).
 - Proactively guard user-visible output against repetition/spam, especially on recurring paths (heartbeats, timers, sync, retries). Prefer state-transition messaging, deduplication, or meaningful-change detection over arbitrary cooldowns. Canonical guidance: `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
 - Inspect existing architecture, callers, and lifecycle before assuming a Lua change is local or safe.
 

@@ -254,6 +254,24 @@ If intent is unclear, use the code, tests, documentation, ticket/issue discussio
 
 ---
 
+## User-visible chat output
+
+New player-facing chat is prohibited by default unless the owner or an approved
+issue authorizes it. Canonical policy:
+`SpectrumFederation/AGENTS.md` (**User-visible messaging**).
+
+When reviewing addon Lua that emits or moves chat output, also check:
+
+- whether the path is user-initiated or background-triggered
+- whether unchanged conditions can repeat the same message
+- whether caller and callee both report the same failure
+- whether `SF.Debug` is more appropriate
+- whether `.github/chat_output_baseline.json` / `check_chat_output.py` would
+  require an intentional baseline update
+
+Do not treat `SF.Debug` as player chat. Do not reopen previously approved
+Issue #331 keep/remove decisions unless the current ticket explicitly changes them.
+
 ## Prioritize Correctness Over Polish
 
 Focus findings on concrete, actionable problems such as:
@@ -269,6 +287,7 @@ Focus findings on concrete, actionable problems such as:
 - meaningful performance problems
 - CI, packaging, versioning, release, or documentation-deployment errors
 - tests that do not actually prove the behavior they claim to cover
+- unapproved or spammy player-facing chat output on recurring paths
 
 Do not report these as actionable findings:
 

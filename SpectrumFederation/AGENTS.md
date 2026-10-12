@@ -277,6 +277,8 @@ When you need a new toggle/option:
 ## User-visible messaging
 
 User-facing chat output is opt-in.
+**New user-visible chat output is prohibited by default** unless explicitly
+authorized by the owner or requested by an approved issue.
 Do not add new output to normal WoW chat unless:
 1. The task/issue explicitly asks for that message or behavior to be shown in chat; or
 2. The user has explicitly approved adding it.
@@ -285,6 +287,31 @@ If an implementation would benefit from new chat output but the request does not
 If the information is useful for diagnostics, troubleshooting, or development, use `SF.Debug` rather than normal chat. If it has no diagnostic value, it does not need replacement output at all.
 
 When chat output *is* authorized, prefer `modules/MessageHelpers.lua` helpers (`SF:PrintSuccess/Error/Warning/Info`, `SF:SystemMessage`) over ad-hoc `print` / `DEFAULT_CHAT_FRAME:AddMessage`. Do not spam chat for debugging.
+
+### Automated chat-output guard
+
+CI/lint runs `.github/scripts/check_chat_output.py` (via `lint_all.py`) against
+`.github/chat_output_baseline.json`. Unapproved new `Print*` / `print` /
+`SystemMessage` / `SendChatMessage` / `DEFAULT_CHAT_FRAME:AddMessage` sites in
+Spectrum-owned Lua fail validation. Matching is occurrence-aware: an extra
+identical call in the same file fails even when one copy was already approved.
+Line-number movement alone does not invalidate an approval. `SF.Debug` is not
+player chat. Vendored `Libs/` trees are excluded.
+
+Before adding chat output, evaluate: necessity; user-initiated vs background;
+repeatability / duplicate emission; multi-layer duplicate reporting (caller +
+callee); whether `SF.Debug` is enough; and whether tests cover silence under
+repeated background activity. Prefer one specific error at the authoritative
+layer over generic fallbacks at every caller.
+
+Approve intentional new sites only after owner authorization, then:
+`python3 .github/scripts/check_chat_output.py --write-baseline`.
+Moving an approved site into a recurring hot-path function name or anonymous
+callback (`SetScript("OnUpdate"|"OnEvent"|...)`, `C_Timer.NewTicker` /
+`NewTimer` / `After`) also fails unless the baseline entry sets `hotpath_ok`
+after explicit review. Static detection is incomplete for “same call, more
+frequent triggers”; pair it with focused Lua regression tests
+(`tests/lua/chat_noise_regression_tests.lua`).
 
 ### Anti-spam and repetition (proactive requirement)
 
@@ -314,8 +341,11 @@ Recurring processing (heartbeats, sync ticks, retries) should continue as needed
 5. What constitutes a genuinely new occurrence?
 6. Does the design already include state, deduplication, edge detection, aggregation, or rate limiting?
 7. Could failure/retry behavior accidentally multiply the output?
+8. Is the same failure also reported by a caller or callee (duplicate layer)?
+9. Would `SF.Debug` be enough for non-user-initiated / expected offline cases?
 
-For sync/comm warning deduplication patterns, see `tests/test_sync_protocol.py` and existing Loot Helper sync code.
+For sync/comm warning deduplication patterns, see `tests/test_sync_protocol.py`,
+`tests/test_chat_noise_regression.py`, and existing Loot Helper sync code.
 
 ## Localization (mandatory pre-delivery check)
 

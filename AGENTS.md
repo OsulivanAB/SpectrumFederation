@@ -71,7 +71,7 @@ This is an engineering requirement, not a generic reminder to consider performan
 
 Addon Lua executes primarily on the game's UI thread. Work does not need to be literally infinite to freeze the client. Feedback loops and high-frequency expensive work can make the client appear frozen even if execution eventually yields.
 
-Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. User-facing chat output is opt-in; read **User-visible messaging** in `SpectrumFederation/AGENTS.md`. For recurring paths (heartbeats, timers, sync, retries), also read **Anti-spam and repetition** there.
+Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. User-facing chat output is opt-in and **prohibited by default** unless the owner or an approved issue explicitly authorizes it; read **User-visible messaging** in `SpectrumFederation/AGENTS.md`. For recurring paths (heartbeats, timers, sync, retries), also read **Anti-spam and repetition** there. New chat-output sites are also gated by `.github/scripts/check_chat_output.py` (via `lint_all.py`) against `.github/chat_output_baseline.json`.
 
 When asked for a code review, technical audit, pre-release review, or architecture review that involves runtime addon behavior, treat client stability as a top review dimension by default, even if the prompt does not mention crashes. Report credible failure mechanisms only: trace callers, lifecycle, bounds, and termination. Do not flag every loop, timer, `OnUpdate`, event handler, or large function as dangerous merely because it exists.
 
@@ -186,7 +186,8 @@ This is the **canonical** change-area → validation map. Other procedures shoul
 reference it rather than maintaining a second full copy. Domain skills may name
 their focused suite without re-listing the whole repository map.
 
-- Addon Lua, TOC, workflows, or CI scripts: run `python3 .github/scripts/lint_all.py`
+- Addon Lua, TOC, workflows, or CI scripts: run `python3 .github/scripts/lint_all.py` (includes the chat-output baseline guard)
+- Player-facing chat-output policy or baseline: also run `python -m pytest tests/test_chat_output_guard.py tests/test_chat_noise_regression.py`
 - Packaging or release behavior: also run `python3 .github/scripts/validate_packaging.py`
 - Docs, `README.md`, or `mkdocs.yml`: also run `python3 .github/scripts/validate_docs.py`
 - `wow_interface_sync.py` or parser fixtures/tests: also run `python -m pytest tests/test_wow_interface_sync.py`

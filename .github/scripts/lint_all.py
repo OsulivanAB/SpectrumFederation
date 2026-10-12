@@ -75,6 +75,14 @@ def lint_python(ci_scripts_dir):
     )
 
 
+def lint_chat_output():
+    """Fail on unapproved Spectrum-owned player-facing chat output sites."""
+    return run_command(
+        [sys.executable, str(Path(__file__).resolve().parent / "check_chat_output.py")],
+        "chat-output guard (player-facing messaging baseline)",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run all linters for SpectrumFederation"
@@ -108,6 +116,11 @@ def main():
         "--skip-python",
         action="store_true",
         help="Skip Python linting"
+    )
+    parser.add_argument(
+        "--skip-chat-output",
+        action="store_true",
+        help="Skip player-facing chat-output baseline guard",
     )
     
     args = parser.parse_args()
@@ -150,6 +163,9 @@ def main():
     
     if not args.skip_python:
         results.append(("Python", lint_python(args.ci_scripts_dir)))
+
+    if not args.skip_chat_output:
+        results.append(("ChatOut", lint_chat_output()))
     
     # Summary
     print("\n" + "=" * 70)

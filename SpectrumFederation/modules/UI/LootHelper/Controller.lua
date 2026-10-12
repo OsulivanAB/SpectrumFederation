@@ -584,9 +584,11 @@ function Controller:OnPlayClicked()
             self:RequestRefresh("PlayButtonStartSessionDenied")
             return
         end
+        -- StartSession prints the specific failure reason when chat is warranted.
+        -- Do not add a second generic PrintError here (duplicate session-start noise).
         local sessionId = SF.LootHelperSync:StartSession(profileId)
-        if not sessionId and SF.PrintError then
-            SF:PrintError("Failed to start session (not in a group/raid?)")
+        if not sessionId and SF.Debug then
+            SF.Debug:Warn("LootHelperUI", "Play-button StartSession returned nil (callee reported the failure)")
         end
         self:RequestRefresh("PlayButtonStartSession")
     end)

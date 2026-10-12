@@ -33,8 +33,8 @@ These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for 
   - Schema/Store/Apply: `SpectrumFederation/modules/Settings/`
   - Settings UI: `SpectrumFederation/modules/UI/Settings/`
 - Use the built-in debug logger (`SpectrumFederation/modules/debug.lua`) instead of chat spam.
-- User-facing chat output is opt-in: do not add new normal WoW chat messages unless the task/issue explicitly asks for them or the user explicitly approves. See `SpectrumFederation/AGENTS.md` (User-visible messaging).
-- Proactively evaluate user-visible output for repetition/spam risk on recurring paths (heartbeats, timers, sync, retries). See `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
+- User-facing chat output is opt-in and prohibited by default: do not add new normal WoW chat messages unless the task/issue explicitly asks for them or the user explicitly approves. Authorized sites must update `.github/chat_output_baseline.json` via `check_chat_output.py --write-baseline`. See `SpectrumFederation/AGENTS.md` (User-visible messaging).
+- Proactively evaluate user-visible output for repetition/spam risk on recurring paths (heartbeats, timers, sync, retries), including duplicate caller/callee reporting. See `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
 - Prefer reusing existing settings controls and renderers; don’t introduce a second settings framework.
 
 ## Validation (always do before finalizing)

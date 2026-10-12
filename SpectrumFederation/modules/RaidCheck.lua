@@ -4114,9 +4114,13 @@ function RC:BeginCheck(mode)
 				SF:PrintError("Loot Helper Sync is unavailable. The check was not started.")
 				return
 			end
+			-- StartSession prints the specific failure reason when chat is warranted.
+			-- Do not add a second PrintError here (duplicate session-start noise).
 			local sessionId = SF.LootHelperSync:StartSession(profile:GetProfileId())
 			if not sessionId then
-				SF:PrintError("Failed to start a Loot Helper session. The check was not started.")
+				if SF.Debug then
+					SF.Debug:Warn("RaidCheck", "Session preflight Yes-path StartSession failed; check was not started")
+				end
 				return
 			end
 			local liveCfg = cfg
