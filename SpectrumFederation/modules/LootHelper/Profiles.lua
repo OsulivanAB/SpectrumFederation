@@ -4132,7 +4132,12 @@ function LootProfile:AddLootLog(lootLog, opts)
                 local reason = tostring(broadcastErr or "unknown error")
                 -- Editing/recording logs outside an active session is expected.
                 -- Do not present that as a synchronization failure to the player.
-                local expectedOffline = reason == "no active session" or reason == "missing sessionId"
+                -- "missing sessionId" is expected offline only when sync is inactive;
+                -- an active session with a missing ID is a genuine sync defect.
+                local syncState = SF.LootHelperSync and SF.LootHelperSync.state
+                local syncActive = syncState and syncState.active == true
+                local expectedOffline = reason == "no active session"
+                    or (reason == "missing sessionId" and not syncActive)
                 if SF.Debug then
                     SF.Debug:Warn(
                         "LootProfile",
