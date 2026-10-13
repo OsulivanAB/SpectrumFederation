@@ -46,8 +46,80 @@ local adjustItemId = nil
 local adjustMemberId = nil -- nil means unattributed / miscellaneous
 local adjustQuantityText = ""
 
+-- Ephemeral guild-roster class lookup for display only. Rebuilt on demand after
+-- GUILD_ROSTER_UPDATE; never persisted or synchronized.
+local guildClassByKey = nil
+local guildRosterFrame = nil
+local EnsureGuildRosterListener
+
 local function ActiveProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
+end
+
+local function InvalidateGuildClassIndex()
+	guildClassByKey = nil
+end
+
+local function EnsureGuildClassIndex()
+	if guildClassByKey then
+		return guildClassByKey
+	end
+	local index = {}
+	guildClassByKey = index
+	if not (IsInGuild and IsInGuild()) then
+		return index
+	end
+	if type(GetNumGuildMembers) ~= "function" or type(GetGuildRosterInfo) ~= "function" then
+		return index
+	end
+	local total = select(1, GetNumGuildMembers())
+	total = tonumber(total) or 0
+	if total <= 0 then
+		return index
+	end
+	local NameUtil = SF.NameUtil
+	for i = 1, total do
+		local name, _, _, _, _, _, _, _, _, _, classFile = GetGuildRosterInfo(i)
+		if type(name) == "string" and name ~= "" and type(classFile) == "string" and classFile ~= "" then
+			local normalized = name
+			if NameUtil and NameUtil.NormalizeNameRealm then
+				normalized = NameUtil.NormalizeNameRealm(name) or name
+			end
+			local key = tostring(normalized):lower()
+			local classToken = classFile:upper()
+			local prior = index[key]
+			if prior == nil then
+				index[key] = classToken
+			elseif prior ~= classToken then
+				-- Ambiguous Name-Realm after normalization: leave uncolored.
+				index[key] = false
+			end
+		end
+	end
+	return index
+end
+
+local function RequestGuildRoster()
+	if not (IsInGuild and IsInGuild()) then
+		return
+	end
+	if C_GuildInfo and C_GuildInfo.GuildRoster then
+		C_GuildInfo.GuildRoster()
+	elseif GuildRoster then
+		GuildRoster()
+	end
+end
+
+local function FormatCharacterDisplayName(name)
+	local C = SF.Consumables
+	if type(name) ~= "string" or name == "" or not C then
+		return name
+	end
+	if type(C.ResolveCharacterClass) ~= "function" or type(C.ColorizeCharacterName) ~= "function" then
+		return name
+	end
+	local classToken = C.ResolveCharacterClass(ActiveProfile(), name, EnsureGuildClassIndex())
+	return C.ColorizeCharacterName(name, classToken)
 end
 
 local function ProfileKey(profile)
@@ -113,7 +185,7 @@ local function PendingRows(profile)
 		local obs = pending[i]
 		if type(obs) == "table" and not (obs.txnId and verifiedTxn[obs.txnId]) then
 			items[#items + 1] = {
-				text = C.FormatObservation(obs, ItemName(obs.itemId)),
+				text = C.FormatObservation(obs, ItemName(obs.itemId), nil, FormatCharacterDisplayName),
 				canRemove = false,
 				pending = true,
 				clusterId = obs.localId,
@@ -140,11 +212,11 @@ local function LogItems()
 		historyOffset = 0
 	end
 	local limit = PageSize()
-	local rows, total = C.HistoryRows(profile, ItemName, limit, historyOffset)
+	local rows, total = C.HistoryRows(profile, ItemName, limit, historyOffset, FormatCharacterDisplayName)
 	total = tonumber(total) or #rows
 	if historyOffset > 0 and historyOffset >= total then
 		historyOffset = 0
-		rows, total = C.HistoryRows(profile, ItemName, limit, 0)
+		rows, total = C.HistoryRows(profile, ItemName, limit, 0, FormatCharacterDisplayName)
 		total = tonumber(total) or #rows
 	end
 	Page.historyTotal = total
@@ -240,13 +312,17 @@ local function AdjustMemberOptions()
 	for i = 1, #ids do
 		local memberId = ids[i]
 		if type(memberId) == "string" and memberId ~= "" then
-			options[#options + 1] = { value = memberId, label = memberId }
+			options[#options + 1] = {
+				value = memberId,
+				label = FormatCharacterDisplayName(memberId),
+			}
 		end
 	end
 	table.sort(options, function(a, b)
 		if a.value == "" then return true end
 		if b.value == "" then return false end
-		return tostring(a.label) < tostring(b.label)
+		-- Sort by identity, not color codes, so class colors do not reorder members.
+		return tostring(a.value) < tostring(b.value)
 	end)
 	return options
 end
@@ -273,7 +349,7 @@ local function AdjustPreviewText()
 	if not preview then
 		return err or Loc("RAID_CONSUMABLE_ADJUST_PREVIEW_EMPTY", "Select an item and enter a non-zero quantity to preview the resulting totals.")
 	end
-	return C.ManualAdjustmentConfirmation(preview, ItemName(preview.itemId))
+	return C.ManualAdjustmentConfirmation(preview, ItemName(preview.itemId), FormatCharacterDisplayName)
 end
 
 local function CommitAdjustment(ctx)
@@ -302,7 +378,7 @@ local function CommitAdjustment(ctx)
 	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 	if not (dialogs and dialogs.Confirm) then return end
 	local originId = ProfileKey(profile)
-	local message = C.ManualAdjustmentConfirmation(preview, ItemName(preview.itemId))
+	local message = C.ManualAdjustmentConfirmation(preview, ItemName(preview.itemId), FormatCharacterDisplayName)
 	dialogs:Confirm(message, Loc("RAID_CONSUMABLE_ADJUST_APPLY_BUTTON", "Confirm"), function()
 		local active = ActiveProfile()
 		if ProfileKey(active) ~= originId then
@@ -381,10 +457,16 @@ local function ReviewSummaryItems()
 			local name = ItemName(row.itemId) or ("item " .. tostring(row.itemId or "?"))
 			local qty = tonumber(row.quantity) or 0
 			local witnesses = tonumber(row.witnessCount) or 0
+			local donor
+			if type(row.donor) == "string" and row.donor ~= "" then
+				donor = FormatCharacterDisplayName(row.donor)
+			else
+				donor = Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")
+			end
 			items[#items + 1] = {
 				text = string.format(
 					Loc("RAID_CONSUMABLE_REVIEW_ROW", "%s donated %d %s — %s (%d witnesses)"),
-					tostring(row.donor or Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")),
+					donor,
 					qty,
 					name,
 					ReviewStatusLabel(row.status),
@@ -417,6 +499,28 @@ local function SelectedReviewRow()
 		end
 	end
 	return nil
+end
+
+-- Dynamic help text: Refresh must re-evaluate selection and class colors.
+-- Static Definition() text would stay stale across selection and roster updates.
+local function SelectedReviewHelpText()
+	local selected = SelectedReviewRow()
+	if not selected then
+		return Loc("RAID_CONSUMABLE_REVIEW_NONE_SELECTED", "Select a row to approve, reject, or correct.")
+	end
+	local name = ItemName(selected.itemId) or ("item " .. tostring(selected.itemId or "?"))
+	local donor
+	if type(selected.donor) == "string" and selected.donor ~= "" then
+		donor = FormatCharacterDisplayName(selected.donor)
+	else
+		donor = Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")
+	end
+	return string.format(
+		Loc("RAID_CONSUMABLE_REVIEW_SELECTED", "Selected: %s donated %d %s"),
+		donor,
+		tonumber(selected.quantity) or 0,
+		name
+	)
 end
 
 local function EnsureReviewSelection(profile)
@@ -617,19 +721,6 @@ local function Definition()
 				},
 			},
 		}
-		local selected = SelectedReviewRow()
-		local selectedHelp
-		if selected then
-			local name = ItemName(selected.itemId) or ("item " .. tostring(selected.itemId or "?"))
-			selectedHelp = string.format(
-				Loc("RAID_CONSUMABLE_REVIEW_SELECTED", "Selected: %s donated %d %s"),
-				tostring(selected.donor or Loc("RAID_CONSUMABLE_REVIEW_SOMEONE", "Someone")),
-				tonumber(selected.quantity) or 0,
-				name
-			)
-		else
-			selectedHelp = Loc("RAID_CONSUMABLE_REVIEW_NONE_SELECTED", "Select a row to approve, reject, or correct.")
-		end
 		local reviewItems = {
 			{
 				type = "help",
@@ -675,7 +766,7 @@ local function Definition()
 			{
 				type = "help",
 				indent = "label",
-				text = selectedHelp,
+				getText = SelectedReviewHelpText,
 			},
 		}
 		reviewItems[#reviewItems + 1] = {
@@ -773,21 +864,39 @@ local function Definition()
 	return { sections = sections }
 end
 
+-- Standalone settings can hide the parent while the page panel stays IsShown.
+-- Prefer IsVisible so roster-driven work does not run against a closed window.
+local function PanelEffectivelyVisible(panel)
+	panel = panel or Page.panel
+	if not panel then
+		return false
+	end
+	if panel.IsVisible then
+		return panel:IsVisible() and true or false
+	end
+	if panel.IsShown then
+		return panel:IsShown() and true or false
+	end
+	return false
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer then return end
+	EnsureGuildRosterListener()
 	renderer:Build(panel, Definition())
 	self.panel = panel
 	if panel.HookScript and not panel.__sfConsumableLogsHook then
 		panel.__sfConsumableLogsHook = true
 		panel:HookScript("OnShow", function()
+			RequestGuildRoster()
 			Page:Refresh(panel)
 		end)
 	end
 end
 
 function Page:Refresh(panel)
-	if panel and panel.IsShown and not panel:IsShown() then
+	if panel and not PanelEffectivelyVisible(panel) then
 		return
 	end
 	reuseHistory = false
@@ -807,14 +916,16 @@ local refreshQueued = false
 local function QueueRefresh()
 	local panel = Page.panel
 	if not panel or not Page.Refresh then return end
-	if panel.IsShown and not panel:IsShown() then return end
+	-- Gate scheduling: hidden parent + shown child must not queue roster work.
+	if not PanelEffectivelyVisible(panel) then return end
 	if refreshQueued then return end
 	refreshQueued = true
 	local function run()
 		refreshQueued = false
-		if Page.panel and Page.Refresh then
-			Page:Refresh(Page.panel)
-		end
+		-- Re-check after the delay: the window may have closed while queued.
+		if not Page.panel or not Page.Refresh then return end
+		if not PanelEffectivelyVisible(Page.panel) then return end
+		Page:Refresh(Page.panel)
 	end
 	-- One sort per quarter second while events arrive, not one sort per frame.
 	if C_Timer and C_Timer.After then
@@ -824,8 +935,26 @@ local function QueueRefresh()
 	end
 end
 
+EnsureGuildRosterListener = function()
+	if guildRosterFrame or type(CreateFrame) ~= "function" then
+		return
+	end
+	local frame = CreateFrame("Frame")
+	guildRosterFrame = frame
+	frame:RegisterEvent("GUILD_ROSTER_UPDATE")
+	frame:SetScript("OnEvent", function()
+		-- Always drop the ephemeral index so the next visible open rebuilds it.
+		InvalidateGuildClassIndex()
+		QueueRefresh()
+	end)
+end
+
 if SF.Consumables and SF.Consumables.RegisterUIListener then
 	SF.Consumables.RegisterUIListener(QueueRefresh)
 end
+
+-- Listen once at load so roster updates can color names even if Build has not
+-- run yet; CreateFrame may be absent in offline Lua tests.
+EnsureGuildRosterListener()
 
 SF.SettingsUI:RegisterPage(Page)
