@@ -1422,6 +1422,16 @@ local function advanceOutPull(limits, now)
         return true
     end
 
+    if not pull.finalSubmitted and pull.outstanding
+        and now >= (pull.usableProgressAt or now)
+        and (now - (pull.usableProgressAt or now)) >= GG.PAGE_RETRY_BACKOFF[1] then
+        -- Queue admission is not final-fragment submission. If a lower layer
+        -- neither invokes its callback nor cancels the item, retain the exact
+        -- correlated obligation and recover on the first bounded backoff.
+        scheduleOutPullRetry(pull, "submission_unconfirmed")
+        return true
+    end
+
     if pull.finalSubmitted and pull.awaitingSince and pull.outstanding
         and now >= (pull.usableProgressAt or pull.awaitingSince)
         and (now - (pull.usableProgressAt or pull.awaitingSince)) > GG.VIEW_IDLE_TIMEOUT_SEC then
