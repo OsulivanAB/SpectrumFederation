@@ -18,16 +18,24 @@ local function newBucket()
         fingerprint = 0,
         bySeq = {},
         order = {},
+        posBySeq = {}, -- seq -> order index for O(1) seek start
     }
+end
+
+local function nextEpoch()
+    GG._epochSeq = (tonumber(GG._epochSeq) or 0) + 1
+    return GG._epochSeq
 end
 
 function GG.CreateIndex()
     local index = {
-        epoch = 1,
+        epoch = nextEpoch(),
         buckets = {},
         byId = {},
         pendingBuild = {},
         buildCursor = 1,
+        buildComplete = false,
+        dirty = true,
     }
     for i = 0, GG.BUCKET_COUNT - 1 do
         index.buckets[i] = newBucket()
@@ -39,11 +47,21 @@ function GG.BumpIndexEpoch(index)
     if type(index) ~= "table" then
         return
     end
-    index.epoch = (tonumber(index.epoch) or 0) + 1
+    if GG._providers and GG._providers.byId and GG.InvalidateProviderBookmarks then
+        for _, entry in pairs(GG._providers.byId) do
+            if entry and entry.index == index then
+                GG.InvalidateProviderBookmarks(entry)
+                break
+            end
+        end
+    end
+    index.epoch = nextEpoch()
     index.buckets = {}
     index.byId = {}
     index.pendingBuild = {}
     index.buildCursor = 1
+    index.buildComplete = false
+    index.dirty = true
     for i = 0, GG.BUCKET_COUNT - 1 do
         index.buckets[i] = newBucket()
     end
@@ -90,11 +108,15 @@ function GG.IndexUpsert(index, recordId, versionFp, meta)
         meta = meta,
     }
     bucket.bySeq[seq] = entry
-    bucket.order[#bucket.order + 1] = seq
+    local pos = #bucket.order + 1
+    bucket.order[pos] = seq
+    bucket.posBySeq[seq] = pos
     bucket.lastSeq = seq
     bucket.count = (bucket.count or 0) + 1
     bucket.fingerprint = GG.CombineFingerprint(bucket.fingerprint, recordId, versionFp)
     index.byId[recordId] = entry
+    index.buildComplete = false
+    index.dirty = true
     return true, entry
 end
 
@@ -177,10 +199,12 @@ function GG.CaptureViewSummaries(index, eligibilityGen, scopeId, providerId, sch
 end
 
 -- Seek manifest entries: afterSeq < sequence <= endSeq in increasing order.
+-- Starts at the order position after afterSeq (direct seek); returns examined count.
 function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit)
     local out = {}
+    local examined = 0
     if type(index) ~= "table" then
-        return out
+        return out, { examined = 0 }
     end
     bucketId = tonumber(bucketId)
     afterSeq = tonumber(afterSeq) or 0
@@ -188,9 +212,30 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit)
     limit = tonumber(limit) or 1
     local bucket = index.buckets[bucketId]
     if not bucket then
-        return out
+        return out, { examined = 0 }
     end
-    for _, seq in ipairs(bucket.order) do
+    local startPos = 1
+    if afterSeq > 0 and bucket.posBySeq and bucket.posBySeq[afterSeq] then
+        startPos = bucket.posBySeq[afterSeq] + 1
+    elseif afterSeq > 0 then
+        -- afterSeq missing (hole): binary-ish scan for first seq > afterSeq without
+        -- walking the entire prefix when posBySeq is available for nearby seqs.
+        local guess = afterSeq
+        while guess > 0 and not (bucket.posBySeq and bucket.posBySeq[guess]) do
+            guess = guess - 1
+            examined = examined + 1
+            if examined > 8 then
+                break
+            end
+        end
+        if guess > 0 and bucket.posBySeq and bucket.posBySeq[guess] then
+            startPos = bucket.posBySeq[guess] + 1
+        end
+    end
+    examined = 0
+    for i = startPos, #bucket.order do
+        local seq = bucket.order[i]
+        examined = examined + 1
         if seq > afterSeq and seq <= endSeq then
             local entry = bucket.bySeq[seq]
             if entry then
@@ -203,9 +248,11 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit)
                     break
                 end
             end
+        elseif seq > endSeq then
+            break
         end
     end
-    return out
+    return out, { examined = examined }
 end
 
 function GG.IndexGetEntry(index, recordId)

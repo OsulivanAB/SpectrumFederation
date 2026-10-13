@@ -8,6 +8,7 @@ GG._providers = GG._providers or {
     byId = {},
     order = {},
     activeCount = 0,
+    discRotate = 0,
 }
 
 local RESULT = {
@@ -97,6 +98,9 @@ function GG.UnregisterProvider(providerId)
     if not entry then
         return false
     end
+    if GG.InvalidateProviderBookmarks then
+        GG.InvalidateProviderBookmarks(entry)
+    end
     reg.byId[id] = nil
     for i, oid in ipairs(reg.order) do
         if oid == id then
@@ -134,10 +138,15 @@ function GG.SetProviderEnabled(providerId, enabled)
         if GG.ScheduleDiscovery then
             GG.ScheduleDiscovery(true)
         end
-    elseif not GG.HasActiveProvider() then
-        GG._StopScheduler()
-        if GG.StopDiscovery then
-            GG.StopDiscovery()
+    else
+        if GG.OnProviderRemoved then
+            GG.OnProviderRemoved(entry.id)
+        end
+        if not GG.HasActiveProvider() then
+            GG._StopScheduler()
+            if GG.StopDiscovery then
+                GG.StopDiscovery()
+            end
         end
     end
     return true
@@ -175,9 +184,28 @@ function GG.ProviderIsPeerEligible(entry, peerName, ctx)
     return GG.IsGuildMember(peerName)
 end
 
+function GG.InvalidateProviderBookmarks(entry)
+    if entry then
+        entry.bookmarks = {}
+    end
+end
+
 function GG.BuildDiscoveryCaps()
     local caps = {}
-    for _, entry in ipairs(GG.ListActiveProviders()) do
+    local active = GG.ListActiveProviders()
+    local count = #active
+    if count == 0 then
+        return {
+            proto = GG.PROTO_CURRENT,
+            enc = { GG.ENC_B64CBOR },
+            providers = caps,
+        }
+    end
+    local reg = GG._providers
+    local start = ((tonumber(reg.discRotate) or 0) % count) + 1
+    reg.discRotate = start % count
+    for offset = 0, count - 1 do
+        local entry = active[((start + offset - 1) % count) + 1]
         local c = {
             id = entry.id,
             schema = entry.schema,
@@ -207,6 +235,7 @@ function GG.EnsureProviderIndex(entry, limits)
         return false
     end
     local api = entry.api
+    entry.lastIndexExamined = 0
     if type(api.EnsureIndex) == "function" then
         local ok, more = pcall(api.EnsureIndex, entry.index, limits)
         if ok then
@@ -217,6 +246,10 @@ function GG.EnsureProviderIndex(entry, limits)
     end
     -- Default cold build from ListRecordIds + GetRecordVersionFp.
     if type(api.ListRecordIds) ~= "function" then
+        return false
+    end
+    local index = entry.index
+    if index and index.buildComplete and not index.dirty and not entry._buildList then
         return false
     end
     if not entry._buildList then
@@ -249,8 +282,13 @@ function GG.EnsureProviderIndex(entry, limits)
         end
         n = n + 1
     end
+    entry.lastIndexExamined = n
     if entry._buildPos > #entry._buildList then
         entry._buildList = nil
+        if index then
+            index.buildComplete = true
+            index.dirty = false
+        end
         return false
     end
     return true

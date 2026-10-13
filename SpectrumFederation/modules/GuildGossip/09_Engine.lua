@@ -17,6 +17,7 @@ GG._engine = GG._engine or {
     streamBusy = {}, -- [dist|target] = true while multipart submit in flight
     admittedOutBytes = 0,
     generation = 0,
+    requestSeq = 0,
     lastNackAt = {},
     peerCooldownUntil = {},
     unresolved = {}, -- bounded unresolved bookkeeping
@@ -97,7 +98,7 @@ local function expirePeers(now)
         local p = e.peers[key]
         if p then
             local active = p.activeExchange
-            local fresh = (now - (p.lastSeen or 0)) < GG.PEER_EXPIRE_SEC
+            local fresh = not p.lastSeen or (now - p.lastSeen) < GG.PEER_EXPIRE_SEC
             if active or fresh then
                 keep[#keep + 1] = key
             else
@@ -176,6 +177,7 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         callback = callback,
         proto = GG.PROTO_CURRENT,
         gossip = true,
+        gossipProviderId = opts.providerId or (type(payload) == "table" and payload.providerId),
     })
     if not ok then
         e.streamBusy[sk] = nil
@@ -341,6 +343,70 @@ local function closeInPull(reason)
     GG._DVerbose("In pull closed (%s)", tostring(reason))
 end
 
+local function providerScope(entry)
+    if not entry or not entry.api then
+        return nil
+    end
+    if type(entry.api.GetScopeId) == "function" then
+        local ok, scopeId = pcall(entry.api.GetScopeId)
+        if ok then
+            return scopeId
+        end
+        return nil
+    end
+    return GG.GetGuildScopeId()
+end
+
+local function providerEligible(entry, peerName, scopeId)
+    return entry
+        and entry.enabled
+        and entry.ready
+        and scopeId ~= nil
+        and providerScope(entry) == scopeId
+        and GG.ProviderIsPeerEligible(entry, peerName, { scopeId = scopeId })
+end
+
+local function nextRequestId(pull, kind)
+    local e = GG._engine
+    e.requestSeq = (e.requestSeq or 0) + 1
+    return table.concat({
+        tostring(pull.viewId),
+        tostring(kind),
+        tostring(e.generation),
+        tostring(e.requestSeq),
+    }, ":")
+end
+
+local function noteInPullSubmission(pull, success)
+    if GG._engine.inPull == pull then
+        pull.finalSubmitted = success and true or false
+        if pull.finalSubmitted then
+            pull.awaitingSince = GG._Now()
+            pull.usableProgressAt = pull.awaitingSince
+        end
+    end
+end
+
+function GG.OnGossipPauseChanged(paused, now)
+    now = now or GG._Now()
+    local e = GG._engine
+    for _, pull in ipairs({ e.outPull, e.inPull }) do
+        if pull then
+            if paused then
+                pull.pauseStartedAt = pull.pauseStartedAt or now
+            elseif pull.pauseStartedAt then
+                local elapsed = math.max(0, now - pull.pauseStartedAt)
+                pull.pauseExcluded = (pull.pauseExcluded or 0) + elapsed
+                pull.usableProgressAt = (pull.usableProgressAt or now) + elapsed
+                if pull.awaitingSince then
+                    pull.awaitingSince = pull.awaitingSince + elapsed
+                end
+                pull.pauseStartedAt = nil
+            end
+        end
+    end
+end
+
 function GG.InvalidateRuntime(reason)
     local e = GG._engine
     e.generation = (e.generation or 0) + 1
@@ -365,11 +431,18 @@ end
 
 GG.OnProviderRemoved = function(providerId)
     local e = GG._engine
+    local entry = GG.GetProvider(providerId)
+    if entry and GG.InvalidateProviderBookmarks then
+        GG.InvalidateProviderBookmarks(entry)
+    end
     if e.outPull and e.outPull.providerId == providerId then
         closeOutPull("provider_removed")
     end
     if e.inPull and e.inPull.providerId == providerId then
         closeInPull("provider_removed")
+    end
+    if GG.CancelQueuedGossipForProvider then
+        GG.CancelQueuedGossipForProvider(providerId)
     end
 end
 
@@ -381,17 +454,8 @@ local function startOutPull(peer, providerEntry)
     if not GG.IsGuildReady() then
         return false
     end
-    local scopeId = GG.GetGuildScopeId()
-    if providerEntry.api and type(providerEntry.api.GetScopeId) == "function" then
-        local ok, sid = pcall(providerEntry.api.GetScopeId)
-        if ok and sid then
-            scopeId = sid
-        end
-    end
-    if not scopeId then
-        return false
-    end
-    if not GG.ProviderIsPeerEligible(providerEntry, peer.name, { scopeId = scopeId }) then
+    local scopeId = providerScope(providerEntry)
+    if not providerEligible(providerEntry, peer.name, scopeId) then
         return false
     end
     local cooldown = e.peerCooldownUntil[peer.key]
@@ -406,8 +470,6 @@ local function startOutPull(peer, providerEntry)
         providerEntry.id,
         providerEntry.schema
     )
-    -- Request remote view by sending our summaries; peer responds with theirs
-    -- for mismatching buckets (or full if we send empty request flag).
     local payload = {
         op = "request",
         viewId = view.viewId,
@@ -420,19 +482,7 @@ local function startOutPull(peer, providerEntry)
         mode = GG.GetSchedMode(),
         engineGen = e.generation,
     }
-    local ok = GG.SendGossip(GG.MSG.VIEW, payload, "WHISPER", peer.name, {
-        onFinalSubmitted = function(success)
-            if e.outPull and e.outPull.viewId == view.viewId then
-                e.outPull.awaitingSince = GG._Now()
-                e.outPull.finalSubmitted = success and true or false
-            end
-        end,
-    })
-    if not ok then
-        return false
-    end
-    peer.activeExchange = true
-    e.outPull = {
+    local pull = {
         peer = peer.name,
         providerId = providerEntry.id,
         viewId = view.viewId,
@@ -448,12 +498,28 @@ local function startOutPull(peer, providerEntry)
         retries = 0,
         usableProgressAt = GG._Now(),
         finalSubmitted = false,
-        pausedAccum = 0,
+        pauseExcluded = 0,
         mode = GG.GetSchedMode(),
         neededBodies = nil,
         bodyOffset = 0,
+        outstanding = { msgType = GG.MSG.VIEW, payload = payload },
         engineGen = e.generation,
     }
+    peer.activeExchange = true
+    e.outPull = pull
+    local ok = GG.SendGossip(GG.MSG.VIEW, payload, "WHISPER", peer.name, {
+        providerId = providerEntry.id,
+        onFinalSubmitted = function(success)
+            if e.outPull == pull then
+                pull.awaitingSince = GG._Now()
+                pull.finalSubmitted = success and true or false
+            end
+        end,
+    })
+    if not ok then
+        closeOutPull("view_queue_rejected")
+        return false
+    end
     GG.MarkWorkPending()
     return true
 end
@@ -487,7 +553,7 @@ end
 -- Receive admission + dispatch
 ---------------------------------------------------------------------------
 
-local function enqueueReceive(sender, msgType, payload, bytes)
+local function enqueueReceive(sender, msgType, payloadStr, enc, bytes)
     local e = GG._engine
     bytes = tonumber(bytes) or 0
     if #(e.recvQueue) >= GG.MAX_RECV_QUEUE_MESSAGES then
@@ -501,7 +567,8 @@ local function enqueueReceive(sender, msgType, payload, bytes)
     e.recvQueue[#e.recvQueue + 1] = {
         sender = sender,
         msgType = msgType,
-        payload = payload,
+        payloadStr = payloadStr,
+        enc = enc,
         bytes = bytes,
         at = GG._Now(),
     }
@@ -560,12 +627,6 @@ function GG.OnGossipCommReceived(prefix, text, distribution, sender)
         return
     end
 
-    local payload, derr = GG.DecodePayload(payloadStr, enc)
-    if derr then
-        GG._DVerbose("Gossip decode failed from %s (%s)", tostring(sender), tostring(derr))
-        return
-    end
-
     -- Guild membership check for all gossip (fail closed).
     if distribution == "GUILD" or distribution == "WHISPER" then
         if not GG.IsGuildMember(sender) then
@@ -577,7 +638,8 @@ function GG.OnGossipCommReceived(prefix, text, distribution, sender)
         return
     end
 
-    enqueueReceive(sender, msgType, payload, #text)
+    -- Payload decoding is intentionally deferred until the bounded dispatcher.
+    enqueueReceive(sender, msgType, payloadStr, enc, #text)
 end
 
 local function handleDisc(sender, payload)
@@ -606,11 +668,11 @@ local function handleView(sender, payload)
     if tonumber(payload.schema) ~= tonumber(providerEntry.schema) then
         return
     end
-    local scopeId = GG.GetGuildScopeId()
-    if payload.scopeId and scopeId and payload.scopeId ~= scopeId then
+    local scopeId = providerScope(providerEntry)
+    if not scopeId or payload.scopeId ~= scopeId then
         return
     end
-    if not GG.ProviderIsPeerEligible(providerEntry, sender, { scopeId = scopeId }) then
+    if not providerEligible(providerEntry, sender, scopeId) then
         return
     end
 
@@ -659,14 +721,24 @@ local function handleView(sender, payload)
             buckets = view.buckets,
             phase = "serving",
             engineGen = e.generation,
+            usableProgressAt = GG._Now(),
+            pauseExcluded = 0,
+            finalSubmitted = false,
         }
-        GG.SendGossip(GG.MSG.VIEW, reply, "WHISPER", sender)
+        GG.SendGossip(GG.MSG.VIEW, reply, "WHISPER", sender, {
+            providerId = providerEntry.id,
+            onFinalSubmitted = function(success)
+                noteInPullSubmission(e.inPull, success)
+            end,
+        })
         return
     end
 
     if payload.op == "offer" then
         local pull = e.outPull
-        if not pull or pull.viewId ~= payload.viewId or pull.peer ~= sender then
+        if not pull or pull.phase ~= "wait_view" or pull.viewId ~= payload.viewId
+            or pull.peer ~= sender or pull.providerId ~= payload.providerId
+            or pull.scopeId ~= payload.scopeId then
             return
         end
         if pull.engineGen ~= e.generation then
@@ -684,18 +756,17 @@ end
 
 local function handleManifest(sender, payload)
     local e = GG._engine
-    if type(payload) ~= "table" then
-        return
-    end
     if payload.op == "request" then
         local pull = e.inPull
-        if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId then
+        if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId
+            or type(payload.requestId) ~= "string" then
             return
         end
         local entry = GG.GetProvider(pull.providerId)
-        if not entry then
+        if not providerEligible(entry, sender, pull.scopeId) then
             return
         end
+        pull.usableProgressAt = GG._Now()
         local limits = GG.GetStepLimits(payload.mode or GG.GetSchedMode())
         local endSeq = 0
         local bucketId = tonumber(payload.bucketId) or 0
@@ -710,37 +781,63 @@ local function handleManifest(sender, payload)
             endSeq,
             limits.manifestEntries
         )
-        GG.SendGossip(GG.MSG.MANIFEST, {
+        local response = {
             op = "page",
             viewId = pull.viewId,
             providerId = pull.providerId,
+            scopeId = pull.scopeId,
+            requestId = payload.requestId,
+            subpage = tonumber(payload.subpage) or 1,
             bucketId = bucketId,
             afterSeq = payload.afterSeq or 0,
             endSeq = endSeq,
             entries = entries,
             done = (#entries == 0) or ((entries[#entries].seq or 0) >= endSeq),
             engineGen = e.generation,
-        }, "WHISPER", sender)
+        }
+        -- A manifest must also be sendable as one bounded gossip envelope.
+        while #response.entries > 0 and not GG.BuildWireMessage(GG.MSG.MANIFEST, response) do
+            table.remove(response.entries)
+            response.done = false
+        end
+        GG.SendGossip(GG.MSG.MANIFEST, response, "WHISPER", sender, {
+            providerId = pull.providerId,
+            onFinalSubmitted = function(success)
+                noteInPullSubmission(pull, success)
+            end,
+        })
         return
     end
 
     if payload.op == "page" then
         local pull = e.outPull
-        if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId then
+        if not pull or pull.phase ~= "wait_manifest" or pull.peer ~= sender
+            or pull.viewId ~= payload.viewId or pull.providerId ~= payload.providerId
+            or pull.scopeId ~= payload.scopeId
+            or payload.requestId ~= pull.expectedRequestId
+            or tonumber(payload.subpage) ~= tonumber(pull.expectedSubpage)
+            or tonumber(payload.bucketId) ~= tonumber(pull.activeBucket)
+            or tonumber(payload.afterSeq) ~= tonumber(pull.afterSeq) then
+            return
+        end
+        local entry = GG.GetProvider(pull.providerId)
+        if not providerEligible(entry, sender, pull.scopeId) then
+            closeOutPull("provider_ineligible")
             return
         end
         pull.manifest = payload
         pull.phase = "need_bodies"
         pull.neededBodies = {}
         pull.bodyOffset = 0
+        pull.bodySubpage = 0
+        pull.expectedRequestId = nil
+        pull.expectedSubpage = nil
+        pull.outstanding = nil
         pull.usableProgressAt = GG._Now()
-        local entry = GG.GetProvider(pull.providerId)
-        if entry then
-            for _, ent in ipairs(payload.entries or {}) do
-                local have = GG.IndexGetEntry(entry.index, ent.id)
-                if not have or have.versionFp ~= ent.versionFp then
-                    pull.neededBodies[#pull.neededBodies + 1] = ent
-                end
+        for _, ent in ipairs(payload.entries) do
+            local have = GG.IndexGetEntry(entry.index, ent.id)
+            if not have or have.versionFp ~= ent.versionFp then
+                pull.neededBodies[#pull.neededBodies + 1] = ent
             end
         end
         GG.MarkWorkPending()
@@ -749,41 +846,124 @@ end
 
 local function handleBody(sender, payload)
     local e = GG._engine
-    if type(payload) ~= "table" then
-        return
-    end
     if payload.op == "request" then
         local pull = e.inPull
-        if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId then
+        if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId
+            or type(payload.requestId) ~= "string" or type(payload.ids) ~= "table" then
             return
         end
         local entry = GG.GetProvider(pull.providerId)
-        if not entry or not entry.api or type(entry.api.GetRecordBody) ~= "function" then
+        if not providerEligible(entry, sender, pull.scopeId)
+            or not entry.api or type(entry.api.GetRecordBody) ~= "function" then
             return
         end
+        pull.usableProgressAt = GG._Now()
         local records = {}
-        for _, rid in ipairs(payload.ids or {}) do
+        local skippedIds = {}
+        local more = false
+        for _, rid in ipairs(payload.ids) do
             local ok, body = pcall(entry.api.GetRecordBody, rid)
             if ok and type(body) == "table" then
-                records[#records + 1] = body
+                local rawOk, raw = false, nil
+                if C_EncodingUtil and C_EncodingUtil.SerializeCBOR then
+                    rawOk, raw = pcall(C_EncodingUtil.SerializeCBOR, body)
+                end
+                if not rawOk or type(raw) ~= "string" or #raw > GG.MAX_RECORD_CBOR then
+                    skippedIds[#skippedIds + 1] = rid
+                else
+                    local candidate = {
+                        op = "page", viewId = pull.viewId, providerId = pull.providerId,
+                        scopeId = pull.scopeId, requestId = payload.requestId,
+                        subpage = tonumber(payload.subpage) or 1, records = {},
+                        skippedIds = skippedIds, more = false, engineGen = e.generation,
+                    }
+                    for i, record in ipairs(records) do
+                        candidate.records[i] = record
+                    end
+                    candidate.records[#candidate.records + 1] = body
+                    if GG.BuildWireMessage(GG.MSG.BODY, candidate) then
+                        records[#records + 1] = body
+                    elseif #records == 0 then
+                        -- It fits the record cap but not a gossip envelope: never retry forever.
+                        skippedIds[#skippedIds + 1] = rid
+                    else
+                        more = true
+                        break
+                    end
+                end
+            else
+                skippedIds[#skippedIds + 1] = rid
             end
         end
         GG.SendGossip(GG.MSG.BODY, {
             op = "page",
             viewId = pull.viewId,
             providerId = pull.providerId,
+            scopeId = pull.scopeId,
+            requestId = payload.requestId,
+            subpage = tonumber(payload.subpage) or 1,
             records = records,
+            skippedIds = skippedIds,
+            more = more,
             engineGen = e.generation,
-        }, "WHISPER", sender)
+        }, "WHISPER", sender, {
+            providerId = pull.providerId,
+            onFinalSubmitted = function(success)
+                noteInPullSubmission(pull, success)
+            end,
+        })
         return
     end
 
     if payload.op == "page" then
         local pull = e.outPull
-        if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId then
+        if not pull or pull.phase ~= "wait_bodies" or pull.peer ~= sender
+            or pull.viewId ~= payload.viewId or pull.providerId ~= payload.providerId
+            or pull.scopeId ~= payload.scopeId
+            or payload.requestId ~= pull.expectedRequestId
+            or tonumber(payload.subpage) ~= tonumber(pull.expectedSubpage) then
+            return
+        end
+        local expected = pull.expectedIds or {}
+        local expectedFp = pull.expectedFingerprints or {}
+        local function isExpected(id)
+            for key, value in pairs(expected) do
+                if tostring(key) == tostring(id) or tostring(value) == tostring(id) then
+                    return true
+                end
+            end
+            return false
+        end
+        local seen = {}
+        for _, record in ipairs(payload.records) do
+            if not isExpected(record.id)
+                or seen[tostring(record.id)]
+                or (expectedFp[tostring(record.id)] and expectedFp[tostring(record.id)] ~= record.versionFp) then
+                return
+            end
+            seen[tostring(record.id)] = true
+        end
+        if payload.skippedIds ~= nil and type(payload.skippedIds) ~= "table" then
+            return
+        end
+        for _, recordId in ipairs(payload.skippedIds or {}) do
+            if not isExpected(recordId) or seen[tostring(recordId)] then
+                return
+            end
+            seen[tostring(recordId)] = true
+        end
+        local entry = GG.GetProvider(pull.providerId)
+        if not providerEligible(entry, sender, pull.scopeId) then
+            closeOutPull("provider_ineligible")
             return
         end
         pull.bodyPage = payload
+        pull.bodyApplyCursor = 0
+        pull.pendingBodyCount = #payload.records + #(payload.skippedIds or {})
+        pull.bodyMore = payload.more == true
+        pull.expectedRequestId = nil
+        pull.expectedSubpage = nil
+        pull.outstanding = nil
         pull.phase = "apply_bodies"
         pull.usableProgressAt = GG._Now()
         GG.MarkWorkPending()
@@ -812,18 +992,81 @@ local function handleAck(sender, payload)
     end
 end
 
+local function boundedValue(value, depth, state, seen)
+    if type(value) ~= "table" then
+        return true
+    end
+    if depth > GG.MAX_CBOR_DEPTH or seen[value] then
+        return false
+    end
+    seen[value] = true
+    for _, child in pairs(value) do
+        state.nodes = state.nodes + 1
+        if state.nodes > GG.MAX_CBOR_NODES or not boundedValue(child, depth + 1, state, seen) then
+            return false
+        end
+    end
+    seen[value] = nil
+    return true
+end
+
+local function hasValidEntries(entries)
+    if type(entries) ~= "table" then
+        return false
+    end
+    for _, entry in ipairs(entries) do
+        if type(entry) ~= "table" or entry.id == nil or entry.versionFp == nil then
+            return false
+        end
+    end
+    return true
+end
+
+local function hasValidRecords(records)
+    if type(records) ~= "table" then
+        return false
+    end
+    for _, record in ipairs(records) do
+        if type(record) ~= "table" or record.id == nil or record.versionFp == nil then
+            return false
+        end
+    end
+    return true
+end
+
+local function validPayloadForMessage(msgType, payload)
+    if type(payload) ~= "table" then
+        return false
+    end
+    if not boundedValue(payload, 1, { nodes = 1 }, {}) then
+        return false
+    end
+    if msgType == GG.MSG.MANIFEST and payload.op == "page" then
+        return hasValidEntries(payload.entries)
+    end
+    if msgType == GG.MSG.BODY and payload.op == "page" then
+        return hasValidRecords(payload.records)
+    end
+    return true
+end
+
 local function dispatchOne(item, limits)
     local msgType = item.msgType
+    local payload, err = GG.DecodePayload(item.payloadStr, item.enc)
+    if err or not validPayloadForMessage(msgType, payload) then
+        GG._DVerbose("Drop malformed gossip %s from %s", tostring(msgType), tostring(item.sender))
+        return
+    end
     if msgType == GG.MSG.DISC then
-        handleDisc(item.sender, item.payload)
+        handleDisc(item.sender, payload)
     elseif msgType == GG.MSG.VIEW then
-        handleView(item.sender, item.payload)
+        handleView(item.sender, payload)
     elseif msgType == GG.MSG.MANIFEST then
-        handleManifest(item.sender, item.payload)
+        handleManifest(item.sender, payload)
     elseif msgType == GG.MSG.BODY then
-        handleBody(item.sender, item.payload)
+        handleBody(item.sender, payload)
     elseif msgType == GG.MSG.ACK then
-        handleAck(item.sender, item.payload)
+        handleAck(item.sender, payload)
     elseif msgType == GG.MSG.NACK then
         GG._DVerbose("Gossip NACK from %s", tostring(item.sender))
     end
@@ -832,6 +1075,58 @@ end
 ---------------------------------------------------------------------------
 -- Processor step
 ---------------------------------------------------------------------------
+
+local function resendOutstanding(pull)
+    local outstanding = pull and pull.outstanding
+    if not outstanding then
+        return false
+    end
+    local entry = GG.GetProvider(pull.providerId)
+    if not providerEligible(entry, pull.peer, pull.scopeId) then
+        closeOutPull("provider_ineligible")
+        return false
+    end
+    pull.finalSubmitted = false
+    return GG.SendGossip(outstanding.msgType, outstanding.payload, "WHISPER", pull.peer, {
+        providerId = pull.providerId,
+        onFinalSubmitted = function(success)
+            if GG._engine.outPull == pull then
+                pull.finalSubmitted = success and true or false
+                pull.awaitingSince = GG._Now()
+            end
+        end,
+    })
+end
+
+local function recordUnresolved(providerId, recordId, result, now)
+    local e = GG._engine
+    local key = tostring(providerId) .. "|" .. tostring(recordId)
+    e.unresolved[key] = {
+        at = now,
+        providerId = providerId,
+        recordId = recordId,
+        result = result,
+    }
+    local oldestKey, oldestAt, count = nil, nil, 0
+    for unresolvedKey, item in pairs(e.unresolved) do
+        count = count + 1
+        if not oldestAt or (item.at or 0) < oldestAt then
+            oldestKey, oldestAt = unresolvedKey, item.at or 0
+        end
+    end
+    if count > GG.MAX_UNRESOLVED and oldestKey then
+        e.unresolved[oldestKey] = nil
+    end
+end
+
+local function hasUnresolvedForProvider(providerId)
+    for _, item in pairs(GG._engine.unresolved) do
+        if item.providerId == providerId then
+            return true
+        end
+    end
+    return false
+end
 
 local function advanceOutPull(limits, now)
     local e = GG._engine
@@ -844,41 +1139,22 @@ local function advanceOutPull(limits, now)
         return false
     end
 
-    -- Idle timeout uses usable-work time; combat pause does not consume it.
-    if not GG.IsSchedPaused() then
-        if pull.finalSubmitted and pull.awaitingSince then
-            if (now - (pull.usableProgressAt or pull.awaitingSince)) > GG.VIEW_IDLE_TIMEOUT_SEC then
-                pull.retries = (pull.retries or 0) + 1
-                if pull.retries > GG.PAGE_RETRY_MAX then
-                    closeOutPull("exhausted")
-                    return false
-                end
-                local backoff = GG.PAGE_RETRY_BACKOFF[pull.retries] or 15
-                pull.usableProgressAt = now + backoff
-                pull.phase = "wait_view"
-                -- Resend same correlated request.
-                local entry = GG.GetProvider(pull.providerId)
-                if entry then
-                    GG.SendGossip(GG.MSG.VIEW, {
-                        op = "request",
-                        viewId = pull.viewId,
-                        providerId = pull.providerId,
-                        schema = entry.schema,
-                        scopeId = pull.scopeId,
-                        eligibilityGen = pull.eligibilityGen,
-                        epoch = pull.localEpoch,
-                        packedBuckets = pull.localPacked,
-                        mode = limits.mode,
-                        engineGen = e.generation,
-                    }, "WHISPER", pull.peer)
-                end
-                return true
-            end
+    if pull.finalSubmitted and pull.awaitingSince and pull.outstanding
+        and now >= (pull.usableProgressAt or pull.awaitingSince)
+        and (now - (pull.usableProgressAt or pull.awaitingSince)) > GG.VIEW_IDLE_TIMEOUT_SEC then
+        pull.retries = (pull.retries or 0) + 1
+        if pull.retries > GG.PAGE_RETRY_MAX then
+            closeOutPull("exhausted")
+            return false
         end
+        local backoff = GG.PAGE_RETRY_BACKOFF[pull.retries] or 15
+        pull.usableProgressAt = now + backoff
+        resendOutstanding(pull)
+        return true
     end
 
     local entry = GG.GetProvider(pull.providerId)
-    if not entry or not entry.enabled then
+    if not providerEligible(entry, pull.peer, pull.scopeId) then
         closeOutPull("provider_gone")
         return false
     end
@@ -911,7 +1187,7 @@ local function advanceOutPull(limits, now)
                 providerId = pull.providerId,
             }, "WHISPER", pull.peer)
             local p = e.peers[peerKey(pull.peer)]
-            if p then
+            if p and not hasUnresolvedForProvider(pull.providerId) then
                 p.covered = p.covered or {}
                 p.covered[pull.providerId] = true
             end
@@ -929,24 +1205,28 @@ local function advanceOutPull(limits, now)
     end
 
     if pull.phase == "request_manifest" then
-        local ok = GG.SendGossip(GG.MSG.MANIFEST, {
+        local requestId = nextRequestId(pull, "manifest")
+        local payload = {
             op = "request",
             viewId = pull.viewId,
             providerId = pull.providerId,
+            scopeId = pull.scopeId,
+            requestId = requestId,
+            subpage = 1,
             bucketId = pull.activeBucket,
             afterSeq = pull.afterSeq,
             mode = limits.mode,
             engineGen = e.generation,
-        }, "WHISPER", pull.peer, {
-            onFinalSubmitted = function(success)
-                if e.outPull and e.outPull.viewId == pull.viewId then
-                    e.outPull.finalSubmitted = success and true or false
-                    e.outPull.awaitingSince = GG._Now()
-                end
-            end,
-        })
+        }
+        pull.expectedRequestId = requestId
+        pull.expectedSubpage = 1
+        pull.expectedIds = nil
+        pull.outstanding = { msgType = GG.MSG.MANIFEST, payload = payload }
+        local ok = resendOutstanding(pull)
         if ok then
             pull.phase = "wait_manifest"
+        else
+            pull.outstanding = nil
         end
         return true
     end
@@ -978,28 +1258,40 @@ local function advanceOutPull(limits, now)
             end
             return true
         end
-        local ids = {}
+        local ids, expectedFingerprints = {}, {}
         local maxBodies = limits.bodies
         for i = (pull.bodyOffset or 0) + 1, math.min(#pull.neededBodies, (pull.bodyOffset or 0) + maxBodies) do
-            ids[#ids + 1] = pull.neededBodies[i].id
+            local needed = pull.neededBodies[i]
+            ids[#ids + 1] = needed.id
+            expectedFingerprints[tostring(needed.id)] = needed.versionFp
         end
-        pull.pendingBodyCount = #ids
-        local ok = GG.SendGossip(GG.MSG.BODY, {
+        if #ids == 0 then
+            closeOutPull("body_cursor_invalid")
+            return false
+        end
+        pull.bodySubpage = (pull.bodySubpage or 0) + 1
+        local requestId = nextRequestId(pull, "body")
+        local payload = {
             op = "request",
             viewId = pull.viewId,
             providerId = pull.providerId,
+            scopeId = pull.scopeId,
+            requestId = requestId,
+            subpage = pull.bodySubpage,
             ids = ids,
             engineGen = e.generation,
-        }, "WHISPER", pull.peer, {
-            onFinalSubmitted = function(success)
-                if e.outPull and e.outPull.viewId == pull.viewId then
-                    e.outPull.finalSubmitted = success and true or false
-                    e.outPull.awaitingSince = GG._Now()
-                end
-            end,
-        })
+        }
+        pull.pendingBodyCount = #ids
+        pull.expectedRequestId = requestId
+        pull.expectedSubpage = pull.bodySubpage
+        pull.expectedIds = ids
+        pull.expectedFingerprints = expectedFingerprints
+        pull.outstanding = { msgType = GG.MSG.BODY, payload = payload }
+        local ok = resendOutstanding(pull)
         if ok then
             pull.phase = "wait_bodies"
+        else
+            pull.outstanding = nil
         end
         return true
     end
@@ -1013,30 +1305,43 @@ local function advanceOutPull(limits, now)
             viewId = pull.viewId,
             distribution = "WHISPER",
         }
-        for _, rec in ipairs(pull.bodyPage.records or {}) do
-            if apps >= limits.apps then
-                break
+        local records = pull.bodyPage.records or {}
+        local cursor = tonumber(pull.bodyApplyCursor) or 0
+        while cursor < #records and apps < limits.apps do
+            local rec = records[cursor + 1]
+            -- Re-check eligibility immediately before the provider side effect.
+            if not providerEligible(entry, pull.peer, pull.scopeId) then
+                closeOutPull("provider_ineligible")
+                return false
             end
-            -- Only admit requested ids.
-            local wanted = false
-            for _, ent in ipairs(pull.neededBodies or {}) do
-                if tostring(ent.id) == tostring(rec.id) then
-                    wanted = true
-                    break
-                end
+            local result = GG.ApplyRecordToProvider(entry, rec, ctx)
+            if result == GG.DELIVERY.PENDING or result == GG.DELIVERY.REJECTED then
+                recordUnresolved(pull.providerId, rec.id, result, now)
             end
-            if wanted then
-                local result = GG.ApplyRecordToProvider(entry, rec, ctx)
-                if result == GG.DELIVERY.PENDING or result == GG.DELIVERY.REJECTED then
-                    -- Bounded unresolved bookkeeping; advance enumeration later.
-                    local uk = tostring(pull.providerId) .. "|" .. tostring(rec.id)
-                    e.unresolved[uk] = { at = now, result = result }
-                end
-                apps = apps + 1
-            end
+            cursor = cursor + 1
+            apps = apps + 1
+            pull.bodyApplyCursor = cursor
         end
-        pull.bodyOffset = (pull.bodyOffset or 0) + (pull.pendingBodyCount or apps)
+        if cursor < #records then
+            -- SLOW mode may make one application at a time; retain this page.
+            pull.usableProgressAt = now
+            return true
+        end
+        local skipped = pull.bodyPage.skippedIds or {}
+        for _, recordId in ipairs(skipped) do
+            recordUnresolved(pull.providerId, recordId, GG.DELIVERY.REJECTED, now)
+        end
+        local appliedCount = pull.pendingBodyCount or (#records + #skipped)
+        pull.bodyOffset = (pull.bodyOffset or 0) + appliedCount
         pull.bodyPage = nil
+        pull.bodyApplyCursor = 0
+        pull.pendingBodyCount = nil
+        if pull.bodyMore then
+            pull.bodyMore = nil
+            pull.phase = "need_bodies"
+            pull.usableProgressAt = now
+            return true
+        end
         if pull.bodyOffset >= #(pull.neededBodies or {}) then
             -- Finished body subpages for this manifest.
             local page = pull.manifest
@@ -1072,6 +1377,32 @@ local function advanceOutPull(limits, now)
     return false
 end
 
+local function advanceInPull(now)
+    local pull = GG._engine.inPull
+    if not pull then
+        return false
+    end
+    if pull.engineGen ~= GG._engine.generation then
+        closeInPull("stale_gen")
+        return true
+    end
+    if pull.finalSubmitted and now >= (pull.usableProgressAt or now)
+        and (now - (pull.usableProgressAt or now)) > GG.SERVED_VIEW_IDLE_TIMEOUT_SEC then
+        closeInPull("served_view_idle")
+        return true
+    end
+    return false
+end
+
+local function expireUnresolved(now)
+    local unresolved = GG._engine.unresolved
+    for key, item in pairs(unresolved) do
+        if not item.at or (now - item.at) > GG.UNRESOLVED_TTL_SEC then
+            unresolved[key] = nil
+        end
+    end
+end
+
 function GG.OnSchedulerStep(limits, now)
     local e = GG._engine
     if not GG.HasActiveProvider() then
@@ -1081,9 +1412,26 @@ function GG.OnSchedulerStep(limits, now)
         return
     end
 
-    -- Index maintenance
+    local stepStartedAt = debugprofilestop and debugprofilestop() or nil
+    local indexRemaining = limits.indexEntries or 0
+    e.stepStats = { indexExamined = 0, receivedApps = 0, cpuMs = 0 }
+    -- Index maintenance uses one aggregate entry budget across providers.
     for _, entry in ipairs(GG.ListActiveProviders()) do
-        GG.EnsureProviderIndex(entry, limits)
+        if indexRemaining <= 0 then
+            break
+        end
+        local indexLimits = {}
+        for key, value in pairs(limits) do
+            indexLimits[key] = value
+        end
+        indexLimits.indexEntries = indexRemaining
+        GG.EnsureProviderIndex(entry, indexLimits)
+        local examined = math.max(0, tonumber(entry.lastIndexExamined) or 0)
+        e.stepStats.indexExamined = e.stepStats.indexExamined + examined
+        indexRemaining = math.max(0, indexRemaining - examined)
+        if stepStartedAt and (debugprofilestop() - stepStartedAt) >= (limits.cpuMs or math.huge) then
+            break
+        end
     end
 
     -- Drain receive queue under app budget.
@@ -1094,9 +1442,11 @@ function GG.OnSchedulerStep(limits, now)
         dispatchOne(item, limits)
         apps = apps + 1
     end
+    e.stepStats.receivedApps = apps
 
     GG.ConsumeChangeDebounce(now)
     expirePeers(now)
+    expireUnresolved(now)
     GG.ExpireStalePartials(now)
 
     if not e.outPull then
@@ -1107,6 +1457,10 @@ function GG.OnSchedulerStep(limits, now)
     end
 
     advanceOutPull(limits, now)
+    advanceInPull(now)
+    if stepStartedAt then
+        e.stepStats.cpuMs = debugprofilestop() - stepStartedAt
+    end
 
     -- Idle detection: no pulls, empty recv, no debounce, discovery-only.
     local sched = GG._sched

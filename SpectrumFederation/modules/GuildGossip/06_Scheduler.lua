@@ -193,6 +193,9 @@ function GG.UpdatePauseState(now)
         if not st.paused then
             st.paused = true
             st.pauseReason = inCombat and "combat" or "loading"
+            if GG.OnGossipPauseChanged then
+                GG.OnGossipPauseChanged(true, now)
+            end
             GG._DVerbose("Gossip paused (%s)", st.pauseReason)
         end
         st.resumeAt = nil
@@ -210,6 +213,9 @@ function GG.UpdatePauseState(now)
         st.paused = false
         st.pauseReason = nil
         st.resumeAt = nil
+        if GG.OnGossipPauseChanged then
+            GG.OnGossipPauseChanged(false, now)
+        end
         -- Start SLOW after recovery; FPS sampling may promote later.
         st.mode = "SLOW"
         clearFpsStreak(st)
