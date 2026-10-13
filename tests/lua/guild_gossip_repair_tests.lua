@@ -319,7 +319,8 @@ do
     e.outPull = {
         peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v1",
         scopeId = A.GuildGossip.GetGuildScopeId(), eligibilityGen = 1,
-        localEpoch = 1, localBuckets = {}, remoteView = { epoch = 1, buckets = {} },
+        localEpoch = A.GuildGossip.GetProvider("sf.synthetic.gossip").index.epoch,
+        localBuckets = {}, remoteView = { epoch = 1, buckets = {} },
         bucketCursor = 64, afterSeq = 0, activeBucket = 0, phase = "apply_bodies",
         retries = 0, usableProgressAt = world.time, finalSubmitted = true,
         neededBodies = {},
