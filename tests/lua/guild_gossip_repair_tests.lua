@@ -565,6 +565,7 @@ do
     e.inPull = {
         peer = "Alice-Garona", providerId = "sf.synthetic.gossip", viewId = "vb",
         scopeId = B.GuildGossip.GetGuildScopeId(), epoch = entryB.index.epoch,
+        eligibilityGen = entryB.eligibilityGen,
         buckets = {}, phase = "serving", engineGen = e.generation,
         usableProgressAt = world.time, finalSubmitted = true,
     }
