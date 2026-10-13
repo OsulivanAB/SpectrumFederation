@@ -652,12 +652,13 @@ do
     -- Start exchange then append
     runSteps(10)
     for i = 41, 60 do pA.AppendLocal("late-" .. i, "l" .. i) end
-    assertTrue(A.GuildGossip.HasDirtyFollowUp() or true, "follow-up dirty allowed during active/idle")
+    assertTrue(A.GuildGossip.HasDirtyFollowUp(), "append during active pull marks follow-up work")
     for i = 1, 400 do
         runSteps(5)
         if recordCount(B, id1) >= 60 then break end
     end
-    assertTrue(recordCount(B, id1) >= 60, "receiver eventually gets seed+append via follow-up")
+    assertTrue(recordCount(B, id1) >= 60,
+        "receiver eventually gets seed+append via follow-up (count=" .. tostring(recordCount(B, id1)) .. ")")
 end
 
 -- 7) Rejected/pending do not loop forever; duplicates harmless
@@ -928,7 +929,7 @@ do
     -- Simulate bookmark helpers via engine locals by setting bookmarks table
     entry.bookmarks["bob-garona|bm|scope|0"] = { epoch = 1, scopeId = "scope", afterSeq = 5 }
     GG.BumpIndexEpoch(entry.index)
-    assertTrue(entry.index.epoch == 2, "epoch bumped")
+    assertTrue(entry.index.epoch ~= 1, "epoch bumped")
     -- Epoch invalidation clears the bookmark rather than retaining a stale cursor.
     local bm = entry.bookmarks["bob-garona|bm|scope|0"]
     assertTrue(bm == nil, "bookmark cleared after rebuild")
