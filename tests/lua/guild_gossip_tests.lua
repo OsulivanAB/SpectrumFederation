@@ -649,8 +649,14 @@ do
     world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
     world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
     advanceTime(0.3)
-    -- Start exchange then append
-    runSteps(10)
+    -- Append while a real pull is active; the change must schedule one
+    -- follow-up pass instead of being lost or restarting the current page.
+    for i = 1, 50 do
+        runSteps(1)
+        if A.GuildGossip._engine.outPull or B.GuildGossip._engine.outPull then break end
+    end
+    assertTrue(A.GuildGossip._engine.outPull or B.GuildGossip._engine.outPull,
+        "initial pull started before follow-up append")
     for i = 41, 60 do pA.AppendLocal("late-" .. i, "l" .. i) end
     assertTrue(A.GuildGossip.HasDirtyFollowUp(), "append during active pull marks follow-up work")
     for i = 1, 400 do

@@ -1587,6 +1587,12 @@ local function advanceOutPull(limits, now)
                 return false
             end
             local result = GG.ApplyRecordToProvider(entry, rec, ctx)
+            -- Applying an accepted replacement can intentionally rebuild the
+            -- local provider index. The next record still revalidates against
+            -- the epoch produced by this provider-owned side effect.
+            if result == GG.DELIVERY.ACCEPTED or result == GG.DELIVERY.DUPLICATE then
+                pull.localEpoch = entry.index and entry.index.epoch or pull.localEpoch
+            end
             if result == GG.DELIVERY.PENDING or result == GG.DELIVERY.REJECTED then
                 recordUnresolved(pull.providerId, rec.id, result, now, pull.peer, pull.scopeId)
             end
