@@ -47,19 +47,26 @@ Provider contract (Phase 1):
   GetScopeId()  -> string|nil   data scope (often guild scope)
   IsPeerEligible(peerName, ctx) -> bool
   GetCapabilities() -> table    compact capability flags for discovery
-  EnsureIndex(index, budget) -> remaining work bool
+  EnsureIndex(index, limits) -> moreWork[, examined]   preferred budgeted index path
   OnIndexInvalidated()
   ValidateAndApply(record, ctx) -> "accepted"|"duplicate"|"rejected"|"pending", detail
   GetRecordBody(recordId) -> table|nil  opaque body for eligible export
   GetRecordVersionFp(recordId) -> string|nil
-  ListRecordIds() -> {id...}   for cold index build (bounded by EnsureIndex)
+  ListRecordIds(cursor, limit) -> pageIds, nextCursor|nil   bounded cold enumeration
   NotifyChange(cb) / optional; engine also exposes GG.NotifyProviderChanged(id)
 
 Registration is idempotent. Unregister clears engine runtime state for that provider.
+Enabled providers must supply EnsureIndex or ListRecordIds+GetRecordVersionFp.
 ]]
 function GG.RegisterProvider(spec)
     if type(spec) ~= "table" or type(spec.id) ~= "string" or spec.id == "" then
         return false, "invalid_spec"
+    end
+    local hasEnsure = type(spec.EnsureIndex) == "function"
+    local hasPagedList = type(spec.ListRecordIds) == "function"
+        and type(spec.GetRecordVersionFp) == "function"
+    if not hasEnsure and not hasPagedList then
+        return false, "no_index_api"
     end
     local id = spec.id
     local reg = GG._providers
@@ -75,6 +82,9 @@ function GG.RegisterProvider(spec)
     entry.ready = spec.ready ~= false
     entry.api = spec
     entry.synthetic = spec.synthetic == true
+    entry.indexFailed = nil
+    entry.indexFailReason = nil
+    entry.indexFailCount = 0
     if not existing then
         reg.byId[id] = entry
         reg.order[#reg.order + 1] = id
@@ -82,9 +92,12 @@ function GG.RegisterProvider(spec)
     GG._RecountActiveProviders()
     if entry.enabled and entry.ready then
         GG.MarkWorkPending()
-        GG._EnsureScheduler()
-        if GG.ScheduleDiscovery then
-            GG.ScheduleDiscovery(true)
+        -- Do not start the work ticker or discovery while guild readiness is absent.
+        if GG.IsGuildReady and GG.IsGuildReady() then
+            GG._EnsureScheduler()
+            if GG.ScheduleDiscovery then
+                GG.ScheduleDiscovery(true)
+            end
         end
     end
     GG._DInfo("Provider registered id=%s enabled=%s", id, tostring(entry.enabled))
@@ -133,15 +146,21 @@ function GG.SetProviderEnabled(providerId, enabled)
     GG._RecountActiveProviders()
     if entry.enabled and entry.ready then
         entry.eligibilityGen = (entry.eligibilityGen or 0) + 1
+        entry.indexFailed = nil
+        entry.indexFailReason = nil
+        entry.indexFailCount = 0
         -- Durable changes retained while disabled must reconcile before transport.
         if entry.index and (entry.index.dirty or not entry.index.buildComplete) then
             entry._buildList = nil
             entry._buildPos = nil
+            entry._listCursor = nil
         end
         GG.MarkWorkPending()
-        GG._EnsureScheduler()
-        if GG.ScheduleDiscovery then
-            GG.ScheduleDiscovery(true)
+        if GG.IsGuildReady and GG.IsGuildReady() then
+            GG._EnsureScheduler()
+            if GG.ScheduleDiscovery then
+                GG.ScheduleDiscovery(true)
+            end
         end
     else
         if GG.OnProviderRemoved then
@@ -181,6 +200,17 @@ function GG.NotifyProviderChanged(providerId)
     if not entry then
         return
     end
+    -- Explicit recovery trigger for terminal index failures / scope mismatch.
+    entry.indexFailed = nil
+    entry.indexFailReason = nil
+    entry.indexFailCount = 0
+    if GG._engine and GG._engine.peers then
+        for _, peer in pairs(GG._engine.peers) do
+            if peer.scopeIncompat then
+                peer.scopeIncompat[providerId] = nil
+            end
+        end
+    end
     -- Provider-owned storage changed outside the engine's append path. Retain
     -- dirty/changeGen even while disabled so re-enable reconciles durable writes
     -- without starting transport. Enabled providers keep the live index usable
@@ -193,6 +223,7 @@ function GG.NotifyProviderChanged(providerId)
     end
     entry._buildList = nil
     entry._buildPos = nil
+    entry._listCursor = nil
     GG.BumpProviderChangeGen(providerId)
     if not entry.enabled then
         return
@@ -201,6 +232,31 @@ function GG.NotifyProviderChanged(providerId)
         GG.MarkWorkPending()
     end
     GG.NotifyMeaningfulChange()
+end
+
+local INDEX_FAIL_THRESHOLD = 3
+
+local function markIndexFailed(entry, reason)
+    if not entry then
+        return
+    end
+    entry.indexFailed = true
+    entry.indexFailReason = tostring(reason or "index_failed")
+    entry.indexFailCount = 0
+    entry._buildList = nil
+    entry._buildPos = nil
+    entry._listCursor = nil
+    entry.lastIndexExamined = 0
+    GG._DError("Index failed provider=%s reason=%s", entry.id, entry.indexFailReason)
+end
+
+local function noteIndexAttemptFailure(entry, reason)
+    entry.indexFailCount = (tonumber(entry.indexFailCount) or 0) + 1
+    if entry.indexFailCount >= INDEX_FAIL_THRESHOLD then
+        markIndexFailed(entry, reason)
+        return true
+    end
+    return false
 end
 
 function GG.ProviderIsPeerEligible(entry, peerName, ctx)
@@ -244,6 +300,8 @@ function GG.BuildDiscoveryCaps()
             schema = entry.schema,
             -- Bounded change identity for discovery coverage. Ordinary remote
             -- appends bump changeGen; schema/id alone must not reopen pulls.
+            -- Scope is matched on the VIEW path (not advertised) to preserve
+            -- the 240-byte discovery envelope under rotation.
             changeGen = tonumber(entry.changeGen) or 0,
             eligibilityGen = tonumber(entry.eligibilityGen) or 0,
         }
@@ -271,64 +329,141 @@ function GG.EnsureProviderIndex(entry, limits)
     if not entry or not entry.api then
         return false
     end
-    local api = entry.api
-    entry.lastIndexExamined = 0
-    if type(api.EnsureIndex) == "function" then
-        local ok, more = pcall(api.EnsureIndex, entry.index, limits)
-        if ok then
-            return more and true or false
-        end
-        GG._DError("EnsureIndex failed provider=%s err=%s", entry.id, tostring(more))
+    if entry.indexFailed then
+        entry.lastIndexExamined = 0
         return false
     end
-    -- Default cold build from ListRecordIds + GetRecordVersionFp.
-    if type(api.ListRecordIds) ~= "function" then
+    local api = entry.api
+    entry.lastIndexExamined = 0
+    local budget = math.max(1, tonumber(limits and limits.indexEntries) or GG.INDEX_ENTRIES_PER_STEP.SLOW)
+
+    if type(api.EnsureIndex) == "function" then
+        local ok, more, examined = pcall(api.EnsureIndex, entry.index, limits)
+        if not ok then
+            GG._DError("EnsureIndex failed provider=%s err=%s", entry.id, tostring(more))
+            noteIndexAttemptFailure(entry, "ensure_index_error")
+            return false
+        end
+        entry.lastIndexExamined = math.max(0, tonumber(examined) or 0)
+        if more then
+            entry.indexFailCount = 0
+            return true
+        end
+        -- Custom EnsureIndex owns completion: no remaining work requires a usable index.
+        if not entry.index or not entry.index.buildComplete or entry.index.dirty then
+            markIndexFailed(entry, "ensure_index_incomplete")
+            return false
+        end
+        entry.indexFailCount = 0
+        return false
+    end
+
+    -- Bounded cold/dirty enumeration: ListRecordIds(cursor, limit) -> page, nextCursor.
+    if type(api.ListRecordIds) ~= "function" or type(api.GetRecordVersionFp) ~= "function" then
+        markIndexFailed(entry, "no_index_api")
         return false
     end
     local index = entry.index
-    if index and index.buildComplete and not index.dirty and not entry._buildList then
+    if index and index.buildComplete and not index.dirty
+        and not entry._buildList and not entry._listCursor then
         return false
     end
-    if not entry._buildList then
-        local ok, list = pcall(api.ListRecordIds)
-        if not ok or type(list) ~= "table" then
+
+    local function upsertId(rid)
+        local vfp = nil
+        local ok, res = pcall(api.GetRecordVersionFp, rid)
+        if ok then
+            vfp = res
+        end
+        if not vfp then
             return false
         end
-        entry._buildList = list
-        entry._buildPos = 1
-    end
-    local budget = limits and limits.indexEntries or GG.INDEX_ENTRIES_PER_STEP.SLOW
-    local n = 0
-    while entry._buildPos <= #entry._buildList and n < budget do
-        local rid = entry._buildList[entry._buildPos]
-        entry._buildPos = entry._buildPos + 1
-        local vfp = nil
-        if type(api.GetRecordVersionFp) == "function" then
-            local ok, res = pcall(api.GetRecordVersionFp, rid)
-            if ok then
-                vfp = res
-            end
+        local _, detail = GG.IndexUpsert(entry.index, rid, vfp)
+        if detail == "replaced" then
+            GG.BumpIndexEpoch(entry.index)
+            entry._buildList = nil
+            entry._buildPos = nil
+            entry._listCursor = 1
+            return "restart"
         end
-        if vfp then
-            local added, detail = GG.IndexUpsert(entry.index, rid, vfp)
-            if detail == "replaced" then
-                GG.BumpIndexEpoch(entry.index)
-                entry._buildList = nil
+        return true
+    end
+
+    -- Legacy one-shot list retained only while walking under budget after first page.
+    if entry._buildList then
+        local n = 0
+        while entry._buildPos <= #entry._buildList and n < budget do
+            local rid = entry._buildList[entry._buildPos]
+            entry._buildPos = entry._buildPos + 1
+            local status = upsertId(rid)
+            if status == "restart" then
+                entry.lastIndexExamined = n + 1
                 return true
             end
+            n = n + 1
+        end
+        entry.lastIndexExamined = n
+        if entry._buildPos > #entry._buildList then
+            entry._buildList = nil
+            entry._buildPos = nil
+            if index then
+                index.buildComplete = true
+                index.dirty = false
+            end
+            entry.indexFailCount = 0
+            return false
+        end
+        return true
+    end
+
+    local cursor = entry._listCursor or 1
+    local ok, page, nextCursor = pcall(api.ListRecordIds, cursor, budget)
+    if not ok then
+        GG._DError("ListRecordIds failed provider=%s err=%s", entry.id, tostring(page))
+        noteIndexAttemptFailure(entry, "list_record_ids_error")
+        return false
+    end
+    if type(page) ~= "table" then
+        noteIndexAttemptFailure(entry, "list_record_ids_invalid")
+        return false
+    end
+
+    -- Legacy ListRecordIds() ignoring cursor/limit: materializes a full snapshot.
+    -- Walk it under budget and do not call ListRecordIds again until complete.
+    if nextCursor == nil and #page > budget then
+        entry._buildList = page
+        entry._buildPos = 1
+        entry._listCursor = nil
+        entry.lastIndexExamined = 0
+        return true
+    end
+
+    local n = 0
+    for i = 1, #page do
+        if n >= budget then
+            break
+        end
+        local status = upsertId(page[i])
+        if status == "restart" then
+            entry.lastIndexExamined = n + 1
+            return true
         end
         n = n + 1
     end
     entry.lastIndexExamined = n
-    if entry._buildPos > #entry._buildList then
-        entry._buildList = nil
-        if index then
-            index.buildComplete = true
-            index.dirty = false
-        end
-        return false
+    entry.indexFailCount = 0
+
+    if type(nextCursor) == "number" and nextCursor > cursor then
+        entry._listCursor = nextCursor
+        return true
     end
-    return true
+    -- Empty page or final page with no next cursor completes the build.
+    entry._listCursor = nil
+    if index then
+        index.buildComplete = true
+        index.dirty = false
+    end
+    return false
 end
 
 function GG.ApplyRecordToProvider(entry, record, ctx)
@@ -344,14 +479,9 @@ function GG.ApplyRecordToProvider(entry, record, ctx)
         end
         return RESULT.REJECTED, "provider_error"
     end
-    -- Whitelist the four contract outcomes; anything else is non-success.
-    if result == true then
-        result = RESULT.ACCEPTED
-    elseif result == false or result == nil then
-        result = RESULT.REJECTED
-        detail = detail or "invalid_outcome"
-    else
-        result = tostring(result)
+    -- Accept only the four documented string outcomes; booleans are invalid.
+    if type(result) ~= "string" then
+        return RESULT.REJECTED, "invalid_outcome"
     end
     if result ~= RESULT.ACCEPTED and result ~= RESULT.DUPLICATE
         and result ~= RESULT.REJECTED and result ~= RESULT.PENDING then
@@ -412,12 +542,52 @@ function GG.CreateSyntheticProvider(opts)
         GetCapabilities = function()
             return { synthetic = true, appendOnly = true }
         end,
-        ListRecordIds = function()
-            local out = {}
-            for i = 1, #store.order do
-                out[i] = store.order[i]
+        -- Budget-aware index path: never materializes the full order in one step.
+        EnsureIndex = function(index, limits)
+            local budget = math.max(1, tonumber(limits and limits.indexEntries) or GG.INDEX_ENTRIES_PER_STEP.SLOW)
+            if index.buildComplete and not index.dirty then
+                return false, 0
             end
-            return out
+            if index.dirty or not store._enumPos then
+                store._enumPos = 1
+            end
+            local n = 0
+            while store._enumPos <= #store.order and n < budget do
+                local rid = store.order[store._enumPos]
+                store._enumPos = store._enumPos + 1
+                local r = store.records[tostring(rid)]
+                if r then
+                    local _, detail = GG.IndexUpsert(index, rid, r.versionFp, r)
+                    if detail == "replaced" then
+                        GG.BumpIndexEpoch(index)
+                        store._enumPos = 1
+                        return true, n + 1
+                    end
+                end
+                n = n + 1
+            end
+            if store._enumPos > #store.order then
+                store._enumPos = nil
+                index.buildComplete = true
+                index.dirty = false
+                return false, n
+            end
+            return true, n
+        end,
+        -- Bounded page API for callers/tests; engine prefers EnsureIndex above.
+        ListRecordIds = function(cursor, limit)
+            cursor = math.max(1, tonumber(cursor) or 1)
+            limit = math.max(1, tonumber(limit) or #store.order)
+            local page = {}
+            local i = cursor
+            while i <= #store.order and #page < limit do
+                page[#page + 1] = store.order[i]
+                i = i + 1
+            end
+            if i <= #store.order then
+                return page, i
+            end
+            return page, nil
         end,
         GetRecordVersionFp = function(recordId)
             local r = store.records[tostring(recordId)]
@@ -509,6 +679,7 @@ function GG.CreateSyntheticProvider(opts)
         store.order = {}
         store.pending = {}
         store.rejected = {}
+        store._enumPos = nil
     end
 
     return provider

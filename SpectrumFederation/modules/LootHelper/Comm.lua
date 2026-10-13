@@ -233,6 +233,12 @@ function Comm:RegisterGossipHandler(fn)
     self._gossipHandler = fn
 end
 
+-- Intentionally clear the gossip sink (Shutdown). false ≠ nil: nil still allows
+-- the Init-not-yet-registered fallback, while false keeps traffic inert.
+function Comm:ClearGossipHandler()
+    self._gossipHandler = false
+end
+
 -- Function Send a protocol-envelope message via AceComm
 -- payload: nil (no payload) or table (CBOR+Base64)
 -- @param channelKey string - the target channel key (for logging/tracking)
@@ -720,7 +726,7 @@ function Comm:OnCommReceived(prefix, text, distribution, sender)
 
 	-- Gossip uses an independent receive path (own proto/encoding/NACK policy).
 	if kind == "GOSSIP" then
-		if self._gossipHandler then
+		if type(self._gossipHandler) == "function" then
 			local ok, err = pcall(self._gossipHandler, prefix, text, distribution, sender)
 			if not ok then
 				DError("Gossip handler error from=%s err=%s", tostring(sender), tostring(err))
@@ -728,7 +734,12 @@ function Comm:OnCommReceived(prefix, text, distribution, sender)
                     pcall(geterrorhandler(), err)
                 end
 			end
-		elseif SF.GuildGossip and SF.GuildGossip.OnGossipCommReceived then
+		elseif self._gossipHandler ~= false
+			and SF.GuildGossip
+			and SF.GuildGossip._engine
+			and SF.GuildGossip._engine.inited
+			and SF.GuildGossip.OnGossipCommReceived then
+			-- Fallback only when Init has not registered a sink yet.
 			local ok, err = pcall(SF.GuildGossip.OnGossipCommReceived, prefix, text, distribution, sender)
 			if not ok then
 				DError("Gossip engine error from=%s err=%s", tostring(sender), tostring(err))

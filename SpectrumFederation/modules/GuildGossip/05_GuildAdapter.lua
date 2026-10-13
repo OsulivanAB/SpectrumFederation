@@ -159,6 +159,7 @@ function GG.RefreshGuildState()
         end
     end
 
+    local wasReady = g.ready == true
     local scopeChanged = g.lastVerifiedScopeId and g.lastVerifiedScopeId ~= scopeId
     g.inGuild = true
     g.ready = true
@@ -175,9 +176,10 @@ function GG.RefreshGuildState()
     if scopeChanged and GG.OnGuildInvalidated then
         GG.OnGuildInvalidated("scope_changed")
     end
-    -- Always wake readiness after a verified guild identity is installed,
-    -- including when an old scope was just invalidated.
-    if GG.OnGuildReady then
+    -- Restart initial discovery only on readiness recovery or verified scope change.
+    -- Unchanged roster refreshes keep periodic discovery timing intact.
+    local becameReady = (not wasReady) and g.ready
+    if (becameReady or scopeChanged) and GG.OnGuildReady then
         GG.OnGuildReady()
     end
 end

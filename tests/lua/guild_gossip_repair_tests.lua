@@ -295,6 +295,9 @@ local function reset()
     timers = {}
     activeAceComm = makeAceComm()
     installTimers()
+    world.guild.inGuild = true
+    world.guild.name = "Spectrum"
+    world.guild.realm = "Garona"
     world.guild.clubId = 42
     world.guild.members = {
         { name = "Alice-Garona", online = true },
@@ -826,10 +829,23 @@ do
     for i = 1, 6 do pB.AppendLocal("old-" .. i, "old-" .. i) end
     local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
     local oldEpoch = entryB.index.epoch
-    -- Alice retains a bookmark into Bob's pre-reload source.
+    local scope = A.GuildGossip.GetGuildScopeId()
+    -- Pick a bucket that will differ after reload so compare actually reads the bookmark.
+    local bookmarkBucket = 0
+    for b = 0, 63 do
+        if (entryB.index.buckets[b].count or 0) > 0 then
+            bookmarkBucket = b
+            break
+        end
+    end
     local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
-    entryA.bookmarks["bob-garona|sf.synthetic.gossip|" .. tostring(A.GuildGossip.GetGuildScopeId()) .. "|0"] = {
-        epoch = oldEpoch, scopeId = A.GuildGossip.GetGuildScopeId(), afterSeq = 3,
+    local bmKey = "bob-garona|sf.synthetic.gossip|" .. tostring(scope) .. "|" .. tostring(bookmarkBucket)
+    -- All bookmark dimensions valid except the foreign source epoch.
+    entryA.bookmarks[bmKey] = {
+        epoch = oldEpoch,
+        scopeId = scope,
+        eligibilityGen = entryB.eligibilityGen,
+        afterSeq = 3,
     }
     -- Simulate Bob /reload: new incarnation + rebuilt provider index.
     B.GuildGossip._epochIncarnation = nil
@@ -840,14 +856,34 @@ do
     for i = 1, 6 do
         B.GuildGossip.IndexUpsert(entryB.index, "new-" .. i, "v")
     end
+    -- Ensure the bookmarked bucket still differs after rebuild.
+    if (entryB.index.buckets[bookmarkBucket].count or 0) == 0 then
+        for b = 0, 63 do
+            if (entryB.index.buckets[b].count or 0) > 0 then
+                bookmarkBucket = b
+                bmKey = "bob-garona|sf.synthetic.gossip|" .. tostring(scope) .. "|" .. tostring(bookmarkBucket)
+                entryA.bookmarks[bmKey] = {
+                    epoch = oldEpoch,
+                    scopeId = scope,
+                    eligibilityGen = entryB.eligibilityGen,
+                    afterSeq = 3,
+                }
+                break
+            end
+        end
+    end
     assertTrue(entryB.index.epoch ~= oldEpoch, "F16: reload mints a new source epoch")
-    local bm = entryA.bookmarks["bob-garona|sf.synthetic.gossip|" .. tostring(A.GuildGossip.GetGuildScopeId()) .. "|0"]
+    local bm = entryA.bookmarks[bmKey]
     assertTrue(bm.epoch ~= entryB.index.epoch, "F16: receiver bookmark epoch is foreign after sender reload")
-    -- Engine compare path must ignore foreign bookmarks.
+    assertTrue(bm.eligibilityGen == entryB.eligibilityGen and bm.scopeId == scope,
+        "F16: non-epoch bookmark dimensions remain valid")
+    -- Control: identical epoch would authorize resume; only epoch mismatch rejects.
+    assertTrue(not (bm.epoch == entryB.index.epoch), "F16: epoch check is the isolating mismatch")
     world._unitName = "Alice"; world._sendAs = "Alice-Garona"
     local peer = { name = "Bob-Garona", key = "bob-garona", caps = {
         proto = 1, enc = { "B64CBOR" },
-        providers = { { id = "sf.synthetic.gossip", schema = 1, changeGen = 1 } },
+        providers = { { id = "sf.synthetic.gossip", schema = 1, changeGen = 1,
+            scopeId = scope, eligibilityGen = entryB.eligibilityGen } },
     }, covered = {} }
     A.GuildGossip._engine.peers["bob-garona"] = peer
     A.GuildGossip._engine.peerOrder = { "bob-garona" }
@@ -855,9 +891,15 @@ do
     local pull = A.GuildGossip._engine.outPull
     assertTrue(pull ~= nil, "F16: outPull starts against reloaded sender")
     if pull then
-        -- Force compare with remote view using Bob's new epoch.
-        local remoteView = B.GuildGossip.CaptureViewSummaries(entryB.index, 1, pull.scopeId,
+        local remoteView = B.GuildGossip.CaptureViewSummaries(entryB.index, entryB.eligibilityGen, pull.scopeId,
             "sf.synthetic.gossip", 1)
+        -- Force the bookmarked bucket to be the first differing bucket.
+        for b = 0, 63 do
+            if b ~= bookmarkBucket then
+                remoteView.buckets[b] = pull.localBuckets and pull.localBuckets[b]
+                    or { lastSeq = 0, count = 0, fingerprint = 0 }
+            end
+        end
         pull.remoteView = {
             epoch = entryB.index.epoch,
             eligibilityGen = entryB.eligibilityGen,
@@ -866,8 +908,11 @@ do
         pull.phase = "compare"
         pull.bucketCursor = 0
         stepClient(A, A.GuildGossip.GetStepLimits())
-        assertTrue(pull.afterSeq == 0 or (A.GuildGossip._engine.outPull and A.GuildGossip._engine.outPull.afterSeq == 0),
-            "F16: foreign bookmark does not resume afterSeq past new prefix")
+        local cur = A.GuildGossip._engine.outPull
+        assertTrue(cur == pull and (cur.phase == "request_manifest" or cur.phase == "wait_manifest"),
+            "F16: same pull compared foreign bookmark to manifest (phase=" .. tostring(cur and cur.phase) .. ")")
+        assertEq(cur.activeBucket, bookmarkBucket, "F16: compare selected the bookmarked bucket")
+        assertEq(cur.afterSeq, 0, "F16: foreign bookmark does not resume afterSeq past new prefix")
     end
 end
 
@@ -1539,7 +1584,12 @@ do
     result = A.GuildGossip.ApplyRecordToProvider(entry, {
         id = "x3", versionFp = "v3", body = "z",
     }, { sender = "Bob-Garona" })
-    assertEq(result, "accepted", "F30: boolean true remains accepted")
+    assertEq(result, "rejected", "F30: boolean true is not an accepted outcome")
+    entry.api.ValidateAndApply = function() return false end
+    result = A.GuildGossip.ApplyRecordToProvider(entry, {
+        id = "x3b", versionFp = "v3b", body = "zb",
+    }, { sender = "Bob-Garona" })
+    assertEq(result, "rejected", "F30: boolean false mapped to rejected")
     entry.api.ValidateAndApply = function() return nil end
     result = A.GuildGossip.ApplyRecordToProvider(entry, {
         id = "x4", versionFp = "v4", body = "w",
@@ -1713,6 +1763,449 @@ do
         if pB.GetStore().records["wd1"] then break end
     end
     assertTrue(pB.GetStore().records["wd1"] ~= nil, "F34: peer receives record written while disabled")
+end
+
+---------------------------------------------------------------------------
+-- F35: pending outgoing capture resumes before peer rotation (multi-peer)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local ids = {}
+    for i = 1, 80 do ids[i] = "f35-" .. i end
+    A.GuildGossip.RegisterProvider({
+        id = "filt35", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            cursor = tonumber(cursor) or 1
+            limit = tonumber(limit) or 8
+            local page = {}
+            local i = cursor
+            while i <= #ids and #page < limit do
+                page[#page + 1] = ids[i]; i = i + 1
+            end
+            if i <= #ids then return page, i end
+            return page, nil
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        IsRecordExportable = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    local limits = A.GuildGossip.GetStepLimits("SLOW")
+    for i = 1, 20 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local entry = A.GuildGossip.GetProvider("filt35")
+    assertTrue(entry.index.buildComplete, "F35: index ready")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local function seedPeer(name, key)
+        A.GuildGossip._engine.peers[key] = {
+            name = name, key = key, covered = {},
+            caps = { proto = 1, enc = { "B64CBOR" },
+                providers = { { id = "filt35", schema = 1, changeGen = 1 } } },
+        }
+        return key
+    end
+    seedPeer("Bob-Garona", "bob-garona")
+    seedPeer("Carol-Garona", "carol-garona")
+    A.GuildGossip._engine.peerOrder = { "bob-garona", "carol-garona" }
+    -- First step starts a filtered capture that cannot finish under SLOW budget.
+    stepClient(A, limits)
+    assertTrue(A.GuildGossip._engine.pendingOutCapture ~= nil, "F35: capture pending after first step")
+    local pinned = A.GuildGossip._engine.pendingOutCapture.peerKey
+    for i = 1, 30 do
+        stepClient(A, limits)
+        if A.GuildGossip._engine.outPull then break end
+        local pc = A.GuildGossip._engine.pendingOutCapture
+        if pc then
+            assertEq(pc.peerKey, pinned, "F35: pending capture stays pinned across rotation")
+        end
+    end
+    assertTrue(A.GuildGossip._engine.outPull ~= nil, "F35: pull starts after capture completes")
+    assertEq(A.GuildGossip._engine.outPull.peer, A.GuildGossip._engine.peers[pinned].name,
+        "F35: completed capture belongs to pinned peer")
+end
+
+---------------------------------------------------------------------------
+-- F36: sparse filtered manifest scans bound examined entries
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local GG = A.GuildGossip
+    local idx = GG.CreateIndex()
+    idx.buildComplete = true
+    idx.dirty = false
+    -- Force many records into the same bucket by probing Hash32 buckets.
+    local targetBucket = nil
+    local placedIds = {}
+    local i = 1
+    while #placedIds < 40 and i < 5000 do
+        local id = "sparse-" .. i
+        local b = GG.BucketForId(id)
+        if not targetBucket then targetBucket = b end
+        if b == targetBucket then
+            GG.IndexUpsert(idx, id, "v")
+            placedIds[#placedIds + 1] = id
+        end
+        i = i + 1
+    end
+    local endSeq = idx.buckets[targetBucket].lastSeq
+    local allowed = {}
+    for j = #placedIds - 2, #placedIds do
+        if placedIds[j] then allowed[placedIds[j]] = true end
+    end
+    local calls = 0
+    local exportable = function(id)
+        calls = calls + 1
+        return allowed[id] == true
+    end
+    local entries, meta = GG.IndexSeekManifest(idx, targetBucket, 0, endSeq, 4, exportable, 8)
+    assertTrue((meta.examined or 0) <= 8, "F36: examined bounded (examined=" .. tostring(meta.examined) .. ")")
+    assertTrue(calls <= 8, "F36: filter callbacks bounded (calls=" .. tostring(calls) .. ")")
+    assertTrue(meta.done == false, "F36: examine-budget cut does not claim bucket complete")
+    -- Continue budgeted seeks until an exportable record surfaces.
+    local after, found, steps = 0, 0, 0
+    while steps < 40 do
+        steps = steps + 1
+        local page, m = GG.IndexSeekManifest(idx, targetBucket, after, endSeq, 4, exportable, 8)
+        if #page > 0 then
+            found = found + #page
+            after = page[#page].seq
+            break
+        elseif m.done then
+            break
+        else
+            -- Budget exhausted with no hits: advance afterSeq using last examined order slot.
+            local bucket = idx.buckets[targetBucket]
+            local pos = 1
+            if after > 0 and bucket.posBySeq and bucket.posBySeq[after] then
+                pos = bucket.posBySeq[after] + 1
+            end
+            local advanceTo = bucket.order[math.min(#bucket.order, pos + (m.examined or 8) - 1)]
+            if not advanceTo or advanceTo <= after then break end
+            after = advanceTo
+        end
+    end
+    assertTrue(found > 0, "F36: sparse filter eventually surfaces late exportable records")
+end
+
+---------------------------------------------------------------------------
+-- F37: cold enumeration is budgeted from the first ListRecordIds call
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local listCalls, maxPage = 0, 0
+    local ids = {}
+    for i = 1, 50 do ids[i] = "f37-" .. i end
+    A.GuildGossip.RegisterProvider({
+        id = "paged37", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            listCalls = listCalls + 1
+            cursor = tonumber(cursor) or 1
+            limit = tonumber(limit) or 8
+            local page = {}
+            local i = cursor
+            while i <= #ids and #page < limit do
+                page[#page + 1] = ids[i]; i = i + 1
+            end
+            maxPage = math.max(maxPage, #page)
+            if i <= #ids then return page, i end
+            return page, nil
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    local limits = { mode = "SLOW", indexEntries = 8, bodies = 1, apps = 1, cpuMs = 10, manifestEntries = 4 }
+    stepClient(A, limits)
+    assertTrue(maxPage <= 8, "F37: first enumeration page bounded (maxPage=" .. tostring(maxPage) .. ")")
+    assertTrue(listCalls >= 1, "F37: ListRecordIds invoked")
+    local entry = A.GuildGossip.GetProvider("paged37")
+    assertTrue(not entry.index.buildComplete, "F37: incomplete after one SLOW page")
+    for i = 1, 10 do stepClient(A, limits) end
+    assertTrue(entry.index.buildComplete, "F37: eventually completes under paged budget")
+end
+
+---------------------------------------------------------------------------
+-- F38: failed index providers stop polling; recovery via NotifyProviderChanged
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local badCalls, goodBuilt = 0, false
+    A.GuildGossip.RegisterProvider({
+        id = "bad38", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function()
+            badCalls = badCalls + 1
+            error("boom")
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    A.GuildGossip.RegisterProvider({
+        id = "good38", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return { "g1" } end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return { id = "g1", versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for i = 1, 10 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local bad = A.GuildGossip.GetProvider("bad38")
+    local good = A.GuildGossip.GetProvider("good38")
+    assertTrue(bad.indexFailed == true, "F38: failing provider marked indexFailed")
+    local callsAtFail = badCalls
+    for i = 1, 5 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    assertEq(badCalls, callsAtFail, "F38: failed provider not polled further")
+    assertTrue(good.index.buildComplete, "F38: healthy provider still progresses")
+    assertTrue(not bad.index.buildComplete, "F38: failed index remains unready")
+    -- Recovery trigger.
+    bad.api.ListRecordIds = function() return { "recovered" } end
+    A.GuildGossip.NotifyProviderChanged("bad38")
+    for i = 1, 5 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    assertTrue(bad.indexFailed ~= true, "F38: NotifyProviderChanged clears failure")
+    assertTrue(bad.index.buildComplete, "F38: recovered provider builds")
+end
+
+---------------------------------------------------------------------------
+-- F39: discovery fingerprints retain only registered provider IDs
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f39" })
+    for i = 1, 20 do
+        A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.DISC, {
+            proto = 1, enc = { "B64CBOR" },
+            providers = {
+                { id = "sf.synthetic.gossip", schema = 1, changeGen = 1 },
+                { id = "bogus-" .. i, schema = 1, changeGen = i },
+            },
+        }), "GUILD", "Bob-Garona")
+        stepClient(A, A.GuildGossip.GetStepLimits())
+    end
+    local peer = A.GuildGossip._engine.peers["bob-garona"]
+    assertTrue(peer ~= nil, "F39: peer tracked")
+    local n = 0
+    for id in pairs(peer.capFingerprints or {}) do
+        n = n + 1
+        assertTrue(A.GuildGossip.GetProvider(id) ~= nil, "F39: retained id is registered (" .. tostring(id) .. ")")
+    end
+    assertTrue(n <= 2, "F39: cumulative fingerprints bounded (n=" .. tostring(n) .. ")")
+end
+
+---------------------------------------------------------------------------
+-- F40: work ticker suspends without guild readiness and restarts on ready
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f40" })
+    A.GuildGossip.MarkWorkPending()
+    A.GuildGossip._EnsureScheduler()
+    assertTrue(A.GuildGossip._sched.ticker ~= nil, "F40: ticker running while ready")
+    -- Lose readiness.
+    world.guild.inGuild = false
+    A.GuildGossip.RefreshGuildState()
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    assertTrue(not A.GuildGossip.IsGuildReady(), "F40: not ready")
+    assertTrue(A.GuildGossip._sched.ticker == nil, "F40: ticker stopped while unguilded")
+    -- Recover.
+    world.guild.inGuild = true
+    world.guild.clubId = 42
+    A.GuildGossip.RefreshGuildState()
+    assertTrue(A.GuildGossip.IsGuildReady(), "F40: readiness recovered")
+    assertTrue(A.GuildGossip._sched.workPending or A.GuildGossip._sched.ticker ~= nil
+        or A.GuildGossip._engine.nextDiscoveryAt ~= nil,
+        "F40: readiness transition restarts work/discovery")
+end
+
+---------------------------------------------------------------------------
+-- F41: unchanged roster refreshes do not reset discovery to initial jitter
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f41" })
+    A.GuildGossip.OnGuildReady()
+    local firstAt = A.GuildGossip._engine.nextDiscoveryAt
+    assertTrue(firstAt ~= nil, "F41: initial discovery scheduled")
+    -- Force periodic deadline into the long interval, then refresh roster unchanged.
+    A.GuildGossip.ScheduleDiscovery(false)
+    local periodicAt = A.GuildGossip._engine.nextDiscoveryAt
+    assertTrue(periodicAt ~= nil and periodicAt >= world.time + 100,
+        "F41: periodic discovery uses long interval")
+    A.GuildGossip.RefreshGuildState() -- already ready, same scope
+    assertEq(A.GuildGossip._engine.nextDiscoveryAt, periodicAt,
+        "F41: unchanged roster preserves periodic discovery deadline")
+end
+
+---------------------------------------------------------------------------
+-- F42: shutdown clears engine runtime and inert incoming traffic
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f42a" })
+    B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f42b" })
+    assertTrue(A.GuildGossip.IsGuildReady(), "F42: guild ready before traffic")
+    world._unitName = "Alice"; world._sendAs = "Alice-Garona"
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.DISC, {
+        proto = 1, enc = { "B64CBOR" },
+        providers = { { id = "sf.synthetic.gossip", schema = 1, changeGen = 1 } },
+    }), "GUILD", "Bob-Garona")
+    assertTrue(#(A.GuildGossip._engine.recvQueue or {}) >= 1, "F42: discovery admitted to recv queue")
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    assertTrue(A.GuildGossip._engine.peers["bob-garona"] ~= nil, "F42: peer present before shutdown")
+    A.GuildGossip.Shutdown()
+    assertTrue(A.GuildGossip._engine.inited == false, "F42: engine not inited")
+    assertTrue(next(A.GuildGossip._engine.peers) == nil, "F42: peers cleared")
+    assertTrue(A.LootHelperComm._gossipHandler == false, "F42: Comm sink cleared")
+    -- Incoming traffic must not repopulate state while stopped.
+    world._unitName = "Alice"; world._sendAs = "Alice-Garona"
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.DISC, {
+        proto = 1, enc = { "B64CBOR" },
+        providers = { { id = "sf.synthetic.gossip", schema = 1, changeGen = 2 } },
+    }), "GUILD", "Bob-Garona")
+    assertTrue(next(A.GuildGossip._engine.peers) == nil, "F42: stopped engine ignores traffic")
+    -- Reinitialize and confirm provider durable store survives.
+    world._unitName = "Alice"
+    A.GuildGossip.Init()
+    assertTrue(A.GuildGossip.GetProvider("sf.synthetic.gossip") ~= nil, "F42: provider registration retained")
+end
+
+---------------------------------------------------------------------------
+-- F43: scope mismatch blocks one provider without starving another
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    A.GuildGossip.RegisterProvider({
+        id = "scopeA", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return { "a1" } end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return { id = "a1", versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return "scope-alpha" end,
+    })
+    A.GuildGossip.RegisterProvider({
+        id = "scopeB", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return { "b1" } end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return { id = "b1", versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    B.GuildGossip.RegisterProvider({
+        id = "scopeA", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return {} end,
+        GetRecordVersionFp = function() return nil end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function() return "accepted" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return "scope-beta" end, -- mismatch
+    })
+    B.GuildGossip.RegisterProvider({
+        id = "scopeB", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return {} end,
+        GetRecordVersionFp = function() return nil end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function(rec)
+            if type(rec) == "table" then return "accepted" end
+            return "rejected"
+        end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return B.GuildGossip.GetGuildScopeId() end,
+    })
+    for i = 1, 5 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    end
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.2)
+    local sawScopeB = false
+    for i = 1, 60 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.05)
+        local peer = A.GuildGossip._engine.peers["bob-garona"]
+        if peer and peer.scopeIncompat and peer.scopeIncompat["scopeA"] then
+            -- mismatched provider blocked; compatible scopeB should still be selectable
+            if A.GuildGossip._engine.outPull and A.GuildGossip._engine.outPull.providerId == "scopeB" then
+                sawScopeB = true
+                break
+            end
+            if peer.covered and peer.covered["scopeB"] then
+                sawScopeB = true
+                break
+            end
+        end
+        local store = B.GuildGossip.GetProvider("scopeB")
+        if store and store.index and store.index.byId and store.index.byId["b1"] then
+            sawScopeB = true
+            break
+        end
+    end
+    local peer = A.GuildGossip._engine.peers["bob-garona"]
+    assertTrue(peer and peer.scopeIncompat and peer.scopeIncompat["scopeA"],
+        "F43: scope mismatch recorded for incompatible provider")
+    assertTrue(sawScopeB or (peer.covered and peer.covered["scopeB"])
+        or (B.GuildGossip.GetProvider("scopeB").index.byId["b1"] ~= nil),
+        "F43: compatible provider still progresses")
+end
+
+---------------------------------------------------------------------------
+-- F44: aggregate stepMetaRemaining shared across index + capture paths
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local ids = {}
+    for i = 1, 40 do ids[i] = "f44-" .. i end
+    A.GuildGossip.RegisterProvider({
+        id = "meta44", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            cursor = tonumber(cursor) or 1
+            limit = tonumber(limit) or 8
+            local page = {}
+            local i = cursor
+            while i <= #ids and #page < limit do
+                page[#page + 1] = ids[i]; i = i + 1
+            end
+            if i <= #ids then return page, i end
+            return page, nil
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        IsRecordExportable = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    local limits = {
+        mode = "NORMAL", indexEntries = 16, bodies = 1, apps = 1, cpuMs = 50, manifestEntries = 4,
+    }
+    world._unitName = "Alice"; world._sendAs = "Alice-Garona"
+    A.GuildGossip.OnSchedulerStep(limits, world.time)
+    local examined = A.GuildGossip._engine.stepStats.indexExamined or 0
+    local remaining = A.GuildGossip._engine.stepMetaRemaining
+    assertTrue(examined > 0, "F44: index work charged examined")
+    assertTrue(remaining == math.max(0, 16 - examined),
+        "F44: residual meta budget after index (examined=" .. tostring(examined)
+            .. " remaining=" .. tostring(remaining) .. ")")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

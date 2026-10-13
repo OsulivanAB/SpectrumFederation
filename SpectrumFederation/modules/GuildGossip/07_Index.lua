@@ -315,8 +315,9 @@ function GG.CaptureViewSummaries(index, eligibilityGen, scopeId, providerId, sch
 end
 
 -- Seek manifest entries: afterSeq < sequence <= endSeq in increasing order.
--- Starts at the order position after afterSeq (direct seek); returns examined count.
-function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportable)
+-- Starts at the order position after afterSeq (direct seek). Bounds both returned
+-- entries (limit) and examined order slots / filter callbacks (examineLimit).
+function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportable, examineLimit)
     local out = {}
     local examined = 0
     if type(index) ~= "table" then
@@ -326,6 +327,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
     afterSeq = tonumber(afterSeq) or 0
     endSeq = tonumber(endSeq) or 0
     limit = tonumber(limit) or 1
+    examineLimit = math.max(1, tonumber(examineLimit) or limit)
     local bucket = index.buckets[bucketId]
     if not bucket then
         return out, { examined = 0, done = true }
@@ -334,14 +336,13 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
     if afterSeq > 0 and bucket.posBySeq and bucket.posBySeq[afterSeq] then
         startPos = bucket.posBySeq[afterSeq] + 1
     elseif afterSeq > 0 then
-        -- afterSeq missing (hole): binary-ish scan for first seq > afterSeq without
-        -- walking the entire prefix when posBySeq is available for nearby seqs.
+        -- afterSeq missing (hole): bounded probe for a nearby posBySeq anchor.
         local guess = afterSeq
         while guess > 0 and not (bucket.posBySeq and bucket.posBySeq[guess]) do
             guess = guess - 1
             examined = examined + 1
-            if examined > 8 then
-                break
+            if examined >= examineLimit then
+                return out, { examined = examined, done = false }
             end
         end
         if guess > 0 and bucket.posBySeq and bucket.posBySeq[guess] then
@@ -351,6 +352,10 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
     examined = 0
     local done = true
     for i = startPos, #bucket.order do
+        if examined >= examineLimit then
+            done = false
+            break
+        end
         local seq = bucket.order[i]
         examined = examined + 1
         if seq > afterSeq and seq <= endSeq then

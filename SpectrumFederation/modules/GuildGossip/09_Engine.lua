@@ -129,15 +129,27 @@ local function touchPeer(name, info)
         peer.covered = peer.covered or {}
         -- Discovery is deliberately rotated. Only an advertised provider whose
         -- bounded change identity differs reopens coverage; omission says
-        -- nothing about providers absent from this packet.
+        -- nothing about providers absent from this packet. Retain fingerprints
+        -- only for locally registered providers so cumulative bogus IDs cannot
+        -- grow the map without bound.
         for _, cap in ipairs(info.caps.providers or {}) do
             if type(cap) == "table" and cap.id then
                 local id = tostring(cap.id)
-                local fingerprint = providerAnnouncementFingerprint(cap)
-                if peer.capFingerprints[id] and peer.capFingerprints[id] ~= fingerprint then
+                if GG.GetProvider(id) then
+                    local fingerprint = providerAnnouncementFingerprint(cap)
+                    if peer.capFingerprints[id] and peer.capFingerprints[id] ~= fingerprint then
+                        peer.covered[id] = nil
+                    end
+                    peer.capFingerprints[id] = fingerprint
+                end
+            end
+        end
+        for id in pairs(peer.capFingerprints) do
+            if not GG.GetProvider(id) then
+                peer.capFingerprints[id] = nil
+                if peer.covered then
                     peer.covered[id] = nil
                 end
-                peer.capFingerprints[id] = fingerprint
             end
         end
     end
@@ -524,7 +536,11 @@ local function providerNeedsIndexWork(entry)
     if not entry or not entry.enabled or not entry.ready or not entry.index then
         return false
     end
-    if entry._buildList then
+    -- Terminal index failure: stop polling; recovery is NotifyProviderChanged / re-register.
+    if entry.indexFailed then
+        return false
+    end
+    if entry._buildList or entry._listCursor then
         return true
     end
     return entry.index.dirty == true or entry.index.buildComplete ~= true
@@ -663,13 +679,42 @@ function GG.InvalidateRuntime(reason)
     GG._DInfo("Gossip runtime invalidated (%s)", tostring(reason))
 end
 
+local function clearEngineOwnedRuntimeState()
+    local e = GG._engine
+    e.peers = {}
+    e.peerOrder = {}
+    e.unresolved = {}
+    e.peerCooldownUntil = {}
+    e.lastNackAt = {}
+    e.unresolvedBackoffUntil = {}
+    e.pendingOutCapture = nil
+    e.recvQueue = {}
+    e.recvBytes = 0
+    e.streamBusy = {}
+    e.admittedOutBytes = 0
+    if GG._providers and GG._providers.byId then
+        for _, entry in pairs(GG._providers.byId) do
+            if entry then
+                entry.bookmarks = {}
+            end
+        end
+    end
+end
+
 GG.OnGuildInvalidated = function(reason)
+    GG.StopDiscovery()
     GG.InvalidateRuntime(reason)
+    -- Suspend the work ticker until readiness returns; preserve unfinished
+    -- obligations via generation bump / closed pulls above.
+    if GG._StopScheduler then
+        GG._StopScheduler()
+    end
 end
 
 GG.OnGuildReady = function()
     if GG.HasActiveProvider() then
         GG.MarkWorkPending()
+        GG._EnsureScheduler()
         GG.ScheduleDiscovery(true)
     end
 end
@@ -686,6 +731,9 @@ GG.OnProviderRemoved = function(providerId)
     if e.inPull and e.inPull.providerId == providerId then
         closeInPull("provider_removed")
     end
+    if e.pendingOutCapture and e.pendingOutCapture.providerId == providerId then
+        e.pendingOutCapture = nil
+    end
     if GG.CancelQueuedGossipForProvider then
         GG.CancelQueuedGossipForProvider(providerId)
     end
@@ -693,6 +741,14 @@ GG.OnProviderRemoved = function(providerId)
     for key, item in pairs(e.unresolved or {}) do
         if item.providerId == providerId then
             e.unresolved[key] = nil
+        end
+    end
+    for _, peer in pairs(e.peers or {}) do
+        if peer.capFingerprints then
+            peer.capFingerprints[providerId] = nil
+        end
+        if peer.covered then
+            peer.covered[providerId] = nil
         end
     end
 end
@@ -725,6 +781,16 @@ local function startOutPull(peer, providerEntry)
     end
 
     local limits = e.stepLimits or GG.GetStepLimits()
+    local metaBudget = math.max(0, tonumber(e.stepMetaRemaining) or tonumber(limits.indexEntries) or 0)
+    if metaBudget <= 0 and viewExportFilter(providerEntry, peer.name, scopeId) then
+        GG.MarkWorkPending()
+        return false
+    end
+    local captureLimits = {}
+    for key, value in pairs(limits) do
+        captureLimits[key] = value
+    end
+    captureLimits.indexEntries = metaBudget > 0 and metaBudget or (limits.indexEntries or 1)
     local filter = viewExportFilter(providerEntry, peer.name, scopeId)
     local resume = nil
     if e.pendingOutCapture
@@ -742,11 +808,16 @@ local function startOutPull(peer, providerEntry)
         providerEntry.id,
         providerEntry.schema,
         filter,
-        limits,
+        captureLimits,
         resume
     )
+    examined = math.max(0, tonumber(examined) or 0)
     if e.stepStats then
-        e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + (tonumber(examined) or 0)
+        e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + examined
+    end
+    e.stepMetaRemaining = math.max(0, (tonumber(e.stepMetaRemaining) or metaBudget) - examined)
+    if e.stepLimits then
+        e.stepLimits.indexEntries = e.stepMetaRemaining
     end
     if pending then
         e.pendingOutCapture = {
@@ -835,8 +906,10 @@ local function selectPullPeer()
                 local scopeId = providerScope(entry)
                 local ub = e.unresolvedBackoffUntil
                     and e.unresolvedBackoffUntil[unresolvedBackoffKey(peer.name, entry.id, scopeId)]
+                local scopeBlocked = peer.scopeIncompat and peer.scopeIncompat[entry.id]
                 if providerEligible(entry, peer.name, scopeId)
                     and not (peer.covered and peer.covered[entry.id])
+                    and not scopeBlocked
                     and not (ub and now < ub)
                     and indexReadyForView(entry) then
                     return peer, entry
@@ -878,6 +951,10 @@ end
 
 function GG.OnGossipCommReceived(prefix, text, distribution, sender)
     if prefix ~= GG.PREFIX then
+        return
+    end
+    -- Inert while stopped: Shutdown clears inited and the Comm sink.
+    if not GG._engine or not GG._engine.inited then
         return
     end
     if not GG.HasActiveProvider() then
@@ -974,6 +1051,15 @@ local function handleView(sender, payload)
     end
     local scopeId = providerScope(providerEntry)
     if not scopeId or payload.scopeId ~= scopeId then
+        -- Bound scoped incompatibility so a mismatched provider cannot starve
+        -- another compatible provider for this peer after peer-wide cooldown.
+        if payload.op == "request" and payload.providerId then
+            GG.SendGossip(GG.MSG.ACK, {
+                viewId = payload.viewId,
+                providerId = payload.providerId,
+                scopeMismatch = true,
+            }, "WHISPER", sender, { ignoreStreamBusy = true })
+        end
         return
     end
     if not providerEligible(providerEntry, sender, scopeId) then
@@ -1081,6 +1167,7 @@ local function handleManifest(sender, payload, stepLimits)
             endSeq = pull.buckets[bucketId].lastSeq or 0
         end
         -- Capture was fixed at serve time; use captured end marker.
+        local examineBudget = math.max(1, tonumber(e.stepMetaRemaining) or manifestBudget)
         local entries, seekMeta = GG.IndexSeekManifest(
             entry.index,
             bucketId,
@@ -1089,8 +1176,14 @@ local function handleManifest(sender, payload, stepLimits)
             manifestBudget,
             function(recordId, indexEntry)
                 return recordExportable(entry, sender, pull.scopeId, recordId, indexEntry)
-            end
+            end,
+            examineBudget
         )
+        local examined = math.max(0, tonumber(seekMeta and seekMeta.examined) or 0)
+        if e.stepStats then
+            e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + examined
+        end
+        e.stepMetaRemaining = math.max(0, (tonumber(e.stepMetaRemaining) or examineBudget) - examined)
         local response = {
             op = "page",
             viewId = pull.viewId,
@@ -1349,6 +1442,19 @@ end
 local function handleAck(sender, payload)
     local e = GG._engine
     if type(payload) ~= "table" then
+        return
+    end
+    if payload.scopeMismatch and payload.providerId then
+        local peer = e.peers[peerKey(sender)] or touchPeer(sender, {})
+        if peer then
+            peer.scopeIncompat = peer.scopeIncompat or {}
+            peer.scopeIncompat[tostring(payload.providerId)] = true
+        end
+        local pull = e.outPull
+        if pull and pull.peer == sender and pull.providerId == payload.providerId then
+            closeOutPull("scope_mismatch")
+            GG.MarkWorkPending()
+        end
         return
     end
     if payload.busy then
@@ -1861,6 +1967,16 @@ local function advanceInPull(now)
             return true
         end
         local limits = e.stepLimits or GG.GetStepLimits()
+        local metaBudget = math.max(0, tonumber(e.stepMetaRemaining) or tonumber(limits.indexEntries) or 0)
+        if metaBudget <= 0 and viewExportFilter(entry, pull.peer, pull.scopeId) then
+            GG.MarkWorkPending()
+            return true
+        end
+        local captureLimits = {}
+        for key, value in pairs(limits) do
+            captureLimits[key] = value
+        end
+        captureLimits.indexEntries = metaBudget > 0 and metaBudget or (limits.indexEntries or 1)
         local filter = viewExportFilter(entry, pull.peer, pull.scopeId)
         local view, pending, examined = GG.CaptureViewSummaries(
             entry.index,
@@ -1869,11 +1985,16 @@ local function advanceInPull(now)
             entry.id,
             entry.schema,
             filter,
-            limits,
+            captureLimits,
             pull.captureState
         )
+        examined = math.max(0, tonumber(examined) or 0)
         if e.stepStats then
-            e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + (tonumber(examined) or 0)
+            e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + examined
+        end
+        e.stepMetaRemaining = math.max(0, (tonumber(e.stepMetaRemaining) or metaBudget) - examined)
+        if e.stepLimits then
+            e.stepLimits.indexEntries = e.stepMetaRemaining
         end
         if pending then
             pull.captureState = pending
@@ -1940,6 +2061,14 @@ function GG.OnSchedulerStep(limits, now)
         return
     end
     if not GG.IsGuildReady() then
+        -- Suspend the work ticker while readiness is absent; OnGuildReady restarts.
+        GG.StopDiscovery()
+        if GG.ExpireStalePartials then
+            GG.ExpireStalePartials(now)
+        end
+        if GG._StopScheduler then
+            GG._StopScheduler()
+        end
         return
     end
 
@@ -1948,6 +2077,7 @@ function GG.OnSchedulerStep(limits, now)
     local indexRemaining = limits.indexEntries or 0
     e.indexWorkPending = false
     e.stepLimits = limits
+    e.stepMetaRemaining = indexRemaining
     e.stepExportBudget = {
         bodies = limits.bodies or 0,
         manifestEntries = limits.manifestEntries or 0,
@@ -1971,6 +2101,7 @@ function GG.OnSchedulerStep(limits, now)
         local examined = math.max(0, tonumber(entry.lastIndexExamined) or 0)
         e.stepStats.indexExamined = e.stepStats.indexExamined + examined
         indexRemaining = math.max(0, indexRemaining - examined)
+        e.stepMetaRemaining = indexRemaining
         if stepStartedAt and (debugprofilestop() - stepStartedAt) >= (limits.cpuMs or math.huge) then
             break
         end
@@ -1984,6 +2115,12 @@ function GG.OnSchedulerStep(limits, now)
             end
         end
     end
+    -- Share remaining metadata budget with capture / manifest scans this step.
+    e.stepLimits = {}
+    for key, value in pairs(limits) do
+        e.stepLimits[key] = value
+    end
+    e.stepLimits.indexEntries = indexRemaining
 
     -- Drain receive queue under app + shared export budgets.
     local apps = 0
@@ -2008,13 +2145,34 @@ function GG.OnSchedulerStep(limits, now)
     GG.ExpireStalePartials(now)
 
     if not e.outPull then
-        local peer, entry = selectPullPeer()
-        if peer and entry then
-            startOutPull(peer, entry)
+        local started = false
+        if e.pendingOutCapture then
+            local pc = e.pendingOutCapture
+            local peer = e.peers[pc.peerKey]
+            local entry = GG.GetProvider(pc.providerId)
+            local scopeId = entry and providerScope(entry)
+            local stillValid = peer and entry and not peer.activeExchange
+                and indexReadyForView(entry)
+                and scopeId ~= nil
+                and scopeId == pc.scopeId
+                and entry.eligibilityGen == pc.eligibilityGen
+                and entry.index and entry.index.epoch == pc.epoch
+                and providerEligible(entry, peer.name, scopeId)
+            if stillValid then
+                started = startOutPull(peer, entry) and true or false
+            else
+                e.pendingOutCapture = nil
+            end
+        end
+        if not started and not e.outPull and not e.pendingOutCapture then
+            local peer, entry = selectPullPeer()
+            if peer and entry then
+                startOutPull(peer, entry)
+            end
         end
     end
 
-    advanceOutPull(limits, now)
+    advanceOutPull(e.stepLimits or limits, now)
     advanceInPull(now)
     if stepStartedAt then
         e.stepStats.cpuMs = debugprofilestop() - stepStartedAt
@@ -2104,7 +2262,14 @@ function GG.Shutdown()
     GG.StopDiscovery()
     GG._StopScheduler()
     GG.InvalidateRuntime("shutdown")
+    clearEngineOwnedRuntimeState()
     GG.ShutdownGuildAdapter()
+    local Comm = SF.LootHelperComm
+    if Comm and Comm.ClearGossipHandler then
+        Comm:ClearGossipHandler()
+    elseif Comm then
+        Comm._gossipHandler = false
+    end
     local guard = GG._recvGuard
     if guard and guard.lifecycleFrame then
         if guard.lifecycleFrame.UnregisterAllEvents then
