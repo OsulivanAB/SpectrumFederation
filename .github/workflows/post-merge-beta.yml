@@ -27,8 +27,13 @@ jobs:
     name: Detect Release Scope
     runs-on: ubuntu-latest
     # Update WoW Game Version publishes beta itself. Skip this path for its
-    # Interface-bump commits so PAT-triggered pushes do not double-publish.
-    if: "${{ !startsWith(github.event.head_commit.message, 'chore: bump Interface to') }}"
+    # Interface-bump commits and history-only main→beta sync commits so
+    # PAT-triggered pushes do not double-publish.
+    if: >-
+      ${{
+        !startsWith(github.event.head_commit.message, 'chore: bump Interface to')
+        && !startsWith(github.event.head_commit.message, 'chore: sync main game-version update into beta')
+      }}
     outputs:
       addon_changed: ${{ steps.scope.outputs.addon_changed }}
       release_required: ${{ steps.scope.outputs.release_required }}
