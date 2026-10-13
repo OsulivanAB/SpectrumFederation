@@ -59,6 +59,12 @@ function SF:InitializeLootHelperDatabase()
         SF.LootHelperComm:Init()
     end
 
+    -- Guild Gossip reuses Comm readiness; does not require an active profile,
+    -- Loot Helper UI, or raid session. Synthetic provider stays disabled.
+    if SF.GuildGossip and SF.GuildGossip.Init then
+        SF.GuildGossip.Init()
+    end
+
 	-- Loot Helper Window
 	if SF.LootHelperWindow and SF.LootHelperWindow.Controller and SF.LootHelperWindow.Controller.Init then
 		SF.LootHelperWindow.Controller:Init()

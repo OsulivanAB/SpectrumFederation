@@ -25,13 +25,18 @@ Comm.cfg = Comm.cfg or {
 
 Comm.PREFIX = Comm.PREFIX or {
     CONTROL = "SF_LH",
-    BULK    = "SF_LHB"
+    BULK    = "SF_LHB",
+    GOSSIP  = "SF_GG",
 }
 
 Comm._handlers = Comm._handlers or {
     CONTROL = {},
-    BULK    = {}
+    BULK    = {},
+    GOSSIP  = {},
 }
+
+-- Optional gossip receive sink (Guild Gossip engine). Never routes into LootHelperSync.
+Comm._gossipHandler = Comm._gossipHandler or nil
 
 Comm.state = Comm.state or {
     total       = 0,
@@ -142,7 +147,20 @@ end
 function Comm:_KindFromPrefix(prefix)
     if prefix == self.PREFIX.CONTROL then return "CONTROL" end
     if prefix == self.PREFIX.BULK then return "BULK" end
+    if prefix == self.PREFIX.GOSSIP then return "GOSSIP" end
     return nil
+end
+
+-- Traffic class: FOREGROUND (session CONTROL/BULK) vs BACKGROUND (gossip).
+-- Pump prefers FOREGROUND so gossip cannot bury session work behind a backlog.
+function Comm:_TrafficClassFor(channelKey, opts)
+    if opts and opts.trafficClass then
+        return opts.trafficClass
+    end
+    if channelKey == "GOSSIP" then
+        return "BACKGROUND"
+    end
+    return "FOREGROUND"
 end
 
 -- =====================================================================
@@ -175,27 +193,44 @@ function Comm:Init(opts)
 
     self:_RegisterPrefix(self.PREFIX.CONTROL)
     self:_RegisterPrefix(self.PREFIX.BULK)
+    self:_RegisterPrefix(self.PREFIX.GOSSIP)
 
     self:RegisterComm(self.PREFIX.CONTROL, "OnCommReceived")
     self:RegisterComm(self.PREFIX.BULK, "OnCommReceived")
+    self:RegisterComm(self.PREFIX.GOSSIP, "OnCommReceived")
+
+    -- Bind gossip receive guard to the AceComm instance LibStub actually selected
+    -- (may be a newer copy from another addon).
+    if SF.GuildGossip and SF.GuildGossip.InstallReceiveGuard then
+        SF.GuildGossip.InstallReceiveGuard(AceComm)
+    end
 
     -- Set ready flag after successful registration
     self._ready = true
 
-    DInfo("Comm init complete (CONTROL=%s, BULK=%s)", self.PREFIX.CONTROL, self.PREFIX.BULK)  
+    DInfo("Comm init complete (CONTROL=%s, BULK=%s, GOSSIP=%s)",
+        self.PREFIX.CONTROL, self.PREFIX.BULK, self.PREFIX.GOSSIP)
 end
 
 -- Function Register a message handler for a specific kind + msgType
--- @param kind string - "CONTROL" or "BULK"
+-- @param kind string - "CONTROL", "BULK", or "GOSSIP"
 -- @param msgType string - the message type to handle
 -- @param fn function - the handler function to call when a message of this type is received
 -- @return nil
 function Comm:RegisterHandler(kind, msgType, fn)
-    assert(kind == "CONTROL" or kind == "BULK", "kind must be CONTROL or BULK")
+    assert(kind == "CONTROL" or kind == "BULK" or kind == "GOSSIP", "kind must be CONTROL, BULK, or GOSSIP")
     assert(type(msgType) == "string", "msgType must be a  string")
     assert(type(fn) == "function", "fn must be a function")
-    
+
+    self._handlers[kind] = self._handlers[kind] or {}
     self._handlers[kind][msgType] = fn
+end
+
+-- Function Register the Guild Gossip receive sink (full envelope path).
+-- @param fn function(prefix, text, distribution, sender)
+function Comm:RegisterGossipHandler(fn)
+    assert(type(fn) == "function", "fn must be a function")
+    self._gossipHandler = fn
 end
 
 -- Function Send a protocol-envelope message via AceComm
@@ -209,6 +244,7 @@ end
 -- @return true if sent, false on error
 function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opts)
     if not self._ready then return false end
+    opts = opts or {}
 
     local SP = SF and SF.SyncProtocol
     if not SP then
@@ -216,54 +252,80 @@ function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opt
         return false
     end
 
-    local prefix = (channelKey == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
-    local proto = SP.PROTO_CURRENT
-    local enc = (opts and opts.enc) or SP.ENC_B64CBOR
-
-    local payloadStr = ""
-    -- Guard: only treat payload as empty if it's nil or an empty table
-    if payload == nil then
-        enc = SP.ENC_NONE
-        payloadStr = ""
-    elseif type(payload) == "table" and next(payload) == nil then
-        enc = SP.ENC_NONE
-        payloadStr = ""
-    elseif type(payload) ~= "table" then
-        -- Prevent crash: payload must be nil or table
-        DError("Cannot send: payload must be nil or table, got %s", type(payload))
-        return false
+    local prefix
+    if channelKey == "BULK" then
+        prefix = self.PREFIX.BULK
+    elseif channelKey == "GOSSIP" then
+        prefix = self.PREFIX.GOSSIP
     else
-        local err
-        payloadStr, err = SP.EncodePayloadTable(payload, enc)
-        if not payloadStr then
-            DError("Payload encode failed: %s", tostring(err))
+        prefix = self.PREFIX.CONTROL
+    end
+
+    local msg
+    if opts.gossip and opts.gossipEnvelope then
+        -- Prebuilt gossip envelope (own proto/encoding); do not use raid PROTO_CURRENT.
+        msg = opts.gossipEnvelope
+    elseif opts.gossip and SF.GuildGossip and SF.GuildGossip.BuildWireMessage then
+        local envelope, err = SF.GuildGossip.BuildWireMessage(msgType, payload)
+        if not envelope then
+            DError("Gossip encode failed: %s", tostring(err))
             return false
+        end
+        msg = envelope
+    else
+        local proto = SP.PROTO_CURRENT
+        local enc = opts.enc or SP.ENC_B64CBOR
+
+        local payloadStr = ""
+        -- Guard: only treat payload as empty if it's nil or an empty table
+        if payload == nil then
+            enc = SP.ENC_NONE
+            payloadStr = ""
+        elseif type(payload) == "table" and next(payload) == nil then
+            enc = SP.ENC_NONE
+            payloadStr = ""
+        elseif type(payload) ~= "table" then
+            -- Prevent crash: payload must be nil or table
+            DError("Cannot send: payload must be nil or table, got %s", type(payload))
+            return false
+        else
+            local err
+            payloadStr, err = SP.EncodePayloadTable(payload, enc)
+            if not payloadStr then
+                DError("Payload encode failed: %s", tostring(err))
+                return false
+            end
+        end
+
+        local envelope = SP.PackEnvelope(msgType, proto, enc, payloadStr)
+        if not envelope then
+            DError("PackEnvelope failed")
+            return false
+        end
+        msg = envelope
+    end
+
+    -- Resolve priority: use explicit prio, fall back to config based on channel
+    if not prio then
+        if channelKey == "BULK" or channelKey == "GOSSIP" then
+            prio = self.cfg.bulkPrio
+        else
+            prio = self.cfg.controlPrio
         end
     end
 
-    local envelope = SP.PackEnvelope(msgType, proto, enc, payloadStr)
-    if not envelope then
-        DError("PackEnvelope failed")
-        return false
-    end
+    local trafficClass = self:_TrafficClassFor(channelKey, opts)
 
-    local msg = envelope
-    
-    -- Resolve priority: use explicit prio, fall back to config based on channel
-    if not prio then
-        prio = (channelKey == "BULK") and self.cfg.bulkPrio or self.cfg.controlPrio
-    end
-    
-    DVerbose("Send: channelKey=%s type=%s prio=%s dist=%s target=%s", 
-        tostring(channelKey), tostring(msgType), tostring(prio), 
+    DVerbose("Send: channelKey=%s type=%s prio=%s class=%s dist=%s target=%s",
+        tostring(channelKey), tostring(msgType), tostring(prio), tostring(trafficClass),
         tostring(distribution), tostring(target or "nil"))
-    
-    local callback = opts and opts.callback or nil
 
-    -- By default: queue BULK; CONTROL sends immediately
-    local shouldQueue = (channelKey == "BULK") or (opts and opts.queue == true)
-    if shouldQueue and not (opts and opts.immediate) then
-        return self:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
+    local callback = opts.callback or nil
+
+    -- By default: queue BULK and GOSSIP; CONTROL sends immediately
+    local shouldQueue = (channelKey == "BULK") or (channelKey == "GOSSIP") or (opts.queue == true)
+    if shouldQueue and not opts.immediate then
+        return self:_EnqueueSend(prefix, msg, distribution, target, prio, callback, trafficClass)
     end
 
     self:SendCommMessage(prefix, msg, distribution, target, prio, callback)
@@ -304,15 +366,23 @@ end
 -- @param prio string - the AceComm priority
 -- @param callback function or nil - the callback function for SendCommMessage
 -- @return true if enqueued, false if dropped
-function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
+function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback, trafficClass)
     if not self.cfg.queueEnabled then
         self:SendCommMessage(prefix, msg, distribution, target, prio, callback)
         return true
     end
 
+    trafficClass = trafficClass or "FOREGROUND"
+
     local st = self.state
     local maxQ = tonumber(self.cfg.maxQueue) or 200
     if (st.total or 0) >= maxQ then
+        -- Prefer dropping BACKGROUND (gossip) when the shared queue is exhausted
+        -- so foreground session traffic retains capacity.
+        if trafficClass == "BACKGROUND" then
+            DVerbose("Comm queue full: dropping BACKGROUND gossip message")
+            return false
+        end
         if not st._queueFullWarned then
             st._queueFullWarned = true
             DWarn("Comm queue full (%d/%d): dropping message", st.total, maxQ)
@@ -330,6 +400,10 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
 
     local maxPer = tonumber(self.cfg.maxPerTarget) or 50
     if #q >= maxPer then
+        if trafficClass == "BACKGROUND" then
+            DVerbose("Comm per-target queue full: dropping BACKGROUND gossip for %s", tostring(key))
+            return false
+        end
         st._perTargetWarned = st._perTargetWarned or {}
         if not st._perTargetWarned[key] then
             st._perTargetWarned[key] = true
@@ -338,14 +412,29 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
         return false
     end
 
-    table.insert(q, {
-        prefix      = prefix,
-        msg         = msg,
-        dist        = distribution,
-        target      = target,
-        prio        = prio,
-        callback    = callback,
-    })
+    local item = {
+        prefix       = prefix,
+        msg          = msg,
+        dist         = distribution,
+        target       = target,
+        prio         = prio,
+        callback     = callback,
+        trafficClass = trafficClass,
+    }
+
+    -- Keep BACKGROUND behind any already-queued FOREGROUND items for this target.
+    if trafficClass == "BACKGROUND" then
+        table.insert(q, item)
+    else
+        local insertAt = #q + 1
+        for i = 1, #q do
+            if q[i].trafficClass == "BACKGROUND" then
+                insertAt = i
+                break
+            end
+        end
+        table.insert(q, insertAt, item)
+    end
 
     st.total = (st.total or 0) + 1
 
@@ -378,14 +467,44 @@ function Comm:_PumpQueue()
     local sent = 0
     local tries = 0
 
+    -- Prefer targets whose head-of-line item is FOREGROUND.
+    local function headClass(key)
+        local q = st.byKey[key]
+        if q and q[1] then
+            return q[1].trafficClass or "FOREGROUND"
+        end
+        return nil
+    end
+
     while sent < maxSends and tries < (#st.keys * 2) do
         tries = tries + 1
+
+        local preferFg = false
+        for _, key in ipairs(st.keys) do
+            if headClass(key) == "FOREGROUND" then
+                preferFg = true
+                break
+            end
+        end
+
         st.rr = (st.rr or 0) + 1
         if st.rr > #st.keys then
             st.rr = 1
         end
 
         local key = st.keys[st.rr]
+        if preferFg then
+            local scanned = 0
+            while scanned < #st.keys and headClass(key) ~= "FOREGROUND" do
+                st.rr = st.rr + 1
+                if st.rr > #st.keys then
+                    st.rr = 1
+                end
+                key = st.keys[st.rr]
+                scanned = scanned + 1
+            end
+        end
+
         local q = st.byKey[key]
 
         if not q or #q == 0 then
@@ -416,7 +535,7 @@ function Comm:_PumpQueue()
 
                 self:SendCommMessage(item.prefix, item.msg, item.dist, item.target, item.prio, item.callback)
                 sent = sent + 1
-                
+
                 -- Eagerly clean up if queue is now empty after sending
                 if #q == 0 then
                     st.byKey[key] = nil
@@ -471,6 +590,22 @@ function Comm:OnCommReceived(prefix, text, distribution, sender)
 
 	local kind = self:_KindFromPrefix(prefix)
 	if not kind then
+		return
+	end
+
+	-- Gossip uses an independent receive path (own proto/encoding/NACK policy).
+	if kind == "GOSSIP" then
+		if self._gossipHandler then
+			local ok, err = pcall(self._gossipHandler, prefix, text, distribution, sender)
+			if not ok then
+				DError("Gossip handler error from=%s err=%s", tostring(sender), tostring(err))
+			end
+		elseif SF.GuildGossip and SF.GuildGossip.OnGossipCommReceived then
+			local ok, err = pcall(SF.GuildGossip.OnGossipCommReceived, prefix, text, distribution, sender)
+			if not ok then
+				DError("Gossip engine error from=%s err=%s", tostring(sender), tostring(err))
+			end
+		end
 		return
 	end
 
