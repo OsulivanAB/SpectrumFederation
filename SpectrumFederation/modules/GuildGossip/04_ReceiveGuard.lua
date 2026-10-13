@@ -12,6 +12,7 @@ GG._recvGuard = GG._recvGuard or {
     partialBytes = 0,
     partialCount = 0,
     expiryTimer = nil,
+    lifecycleFrame = nil,
 }
 
 local function partialKey(prefix, distribution, sender)
@@ -152,6 +153,12 @@ function GG.InstallReceiveGuard(aceComm)
         return true
     end
 
+    -- Switching LibStub instances abandons the prior physical spool; reset
+    -- accounting so caps remain meaningful on the active table.
+    if st.aceComm and st.aceComm ~= aceComm then
+        GG.ClearAllPartials()
+    end
+
     local prefix = GG.PREFIX
     local origFirst = aceComm.OnReceiveMultipartFirst
     local origNext = aceComm.OnReceiveMultipartNext
@@ -230,6 +237,40 @@ function GG.InstallReceiveGuard(aceComm)
     st.wrapperNext = wrapperNext
     st.wrapperLast = wrapperLast
     GG._DInfo("Gossip receive guard installed on AceComm instance %s", tostring(aceComm))
+    return true
+end
+
+-- Rebind the LibStub-selected AceComm without forcing callers to know about it.
+function GG.EnsureReceiveGuard()
+    if not LibStub then
+        return false
+    end
+    local AceComm = LibStub("AceComm-3.0", true)
+    if not AceComm then
+        return false
+    end
+    return GG.InstallReceiveGuard(AceComm)
+end
+
+-- Late load-on-demand addons can upgrade AceComm after PLAYER_LOGIN. Re-check
+-- wrappers on ADDON_LOADED; InstallReceiveGuard is idempotent when unchanged.
+function GG.InitReceiveGuardLifecycle()
+    local st = GG._recvGuard
+    if st.lifecycleFrame then
+        return true
+    end
+    if not CreateFrame then
+        return false
+    end
+    local frame = CreateFrame("Frame", "SFGuildGossipReceiveGuard")
+    frame:RegisterEvent("ADDON_LOADED")
+    frame:SetScript("OnEvent", function(_, event)
+        if event ~= "ADDON_LOADED" then
+            return
+        end
+        GG.EnsureReceiveGuard()
+    end)
+    st.lifecycleFrame = frame
     return true
 end
 

@@ -1178,6 +1178,101 @@ do
     assertTrue(e.nextDiscoveryAt == nil, "F22: incomplete identity does not schedule discovery")
 end
 
+---------------------------------------------------------------------------
+-- F23: ADDON_LOADED rebinds AceComm guard after same-table upgrade
+-- (no manual InstallReceiveGuard; production lifecycle event only)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local GG = A.GuildGossip
+    local ace = activeAceComm
+    local frame = GG._recvGuard.lifecycleFrame
+    assertTrue(frame ~= nil, "F23: Init registered receive-guard lifecycle frame")
+    assertTrue(frame.events and frame.events.ADDON_LOADED, "F23: ADDON_LOADED registered")
+    assertTrue(type(frame.OnEvent) == "function", "F23: OnEvent handler installed")
+    assertTrue(ace.OnReceiveMultipartFirst == GG._recvGuard.wrapperFirst,
+        "F23: init installs guard wrappers")
+
+    local otherFirst, otherNext, otherLast = 0, 0, 0
+    local upgradedFirst = function(self, pfx, message, distribution, sender)
+        if pfx == "OTHER" then
+            otherFirst = otherFirst + 1
+            return
+        end
+        -- Bare AceComm FIRST: uncapped spool write (pre-guard behavior).
+        local key = pfx .. "\t" .. distribution .. "\t" .. sender
+        self.multipart_spool[key] = message
+    end
+    local upgradedNext = function(self, pfx, message, distribution, sender)
+        if pfx == "OTHER" then
+            otherNext = otherNext + 1
+            return
+        end
+        local key = pfx .. "\t" .. distribution .. "\t" .. sender
+        local old = self.multipart_spool[key]
+        if not old then return end
+        if type(old) ~= "table" then
+            self.multipart_spool[key] = { old, message }
+        else
+            old[#old + 1] = message
+        end
+    end
+    local upgradedLast = function(self, pfx, message, distribution, sender)
+        if pfx == "OTHER" then
+            otherLast = otherLast + 1
+            return
+        end
+        local key = pfx .. "\t" .. distribution .. "\t" .. sender
+        self.multipart_spool[key] = nil
+    end
+    -- Same shared LibStub table: a later addon upgrades the methods in place.
+    ace.OnReceiveMultipartFirst = upgradedFirst
+    ace.OnReceiveMultipartNext = upgradedNext
+    ace.OnReceiveMultipartLast = upgradedLast
+    ace._SF_GG_RecvGuard = true -- marker alone must not skip rebind
+    assertTrue(ace.OnReceiveMultipartFirst == upgradedFirst, "F23: fixture replaced FIRST hook")
+
+    -- Production path: fire the registered addon-load event only.
+    frame.OnEvent(frame, "ADDON_LOADED", "SomeLateAddon")
+    assertTrue(ace.OnReceiveMultipartFirst ~= upgradedFirst,
+        "F23: ADDON_LOADED rebinds FIRST without manual InstallReceiveGuard")
+    assertTrue(ace.OnReceiveMultipartNext ~= upgradedNext, "F23: ADDON_LOADED rebinds NEXT")
+    assertTrue(ace.OnReceiveMultipartLast ~= upgradedLast, "F23: ADDON_LOADED rebinds LAST")
+    local wrappedFirst = ace.OnReceiveMultipartFirst
+    local wrappedNext = ace.OnReceiveMultipartNext
+    local wrappedLast = ace.OnReceiveMultipartLast
+
+    -- Repeated ADDON_LOADED must not stack wrappers when already bound.
+    frame.OnEvent(frame, "ADDON_LOADED", "AnotherAddon")
+    assertEq(ace.OnReceiveMultipartFirst, wrappedFirst, "F23: repeated ADDON_LOADED does not restack FIRST")
+    assertEq(ace.OnReceiveMultipartNext, wrappedNext, "F23: repeated ADDON_LOADED does not restack NEXT")
+    assertEq(ace.OnReceiveMultipartLast, wrappedLast, "F23: repeated ADDON_LOADED does not restack LAST")
+
+    -- Unrelated prefixes still reach the upgraded AceComm methods.
+    ace:OnReceiveMultipartFirst("OTHER", "x", "WHISPER", "Bob-Garona")
+    ace:OnReceiveMultipartNext("OTHER", "y", "WHISPER", "Bob-Garona")
+    ace:OnReceiveMultipartLast("OTHER", "z", "WHISPER", "Bob-Garona")
+    assertEq(otherFirst, 1, "F23: OTHER prefix FIRST unaffected")
+    assertEq(otherNext, 1, "F23: OTHER prefix NEXT unaffected")
+    assertEq(otherLast, 1, "F23: OTHER prefix LAST unaffected")
+
+    -- Physical SF_GG spool bounds + expiry still enforced after lifecycle rebind.
+    ace:OnReceiveMultipartFirst("SF_GG", "abc", "WHISPER", "Bob-Garona")
+    for i = 1, 50 do
+        ace:OnReceiveMultipartNext("SF_GG", "", "WHISPER", "Bob-Garona")
+    end
+    local spool = ace.multipart_spool["SF_GG\tWHISPER\tBob-Garona"]
+    local fragCount = 0
+    if type(spool) == "table" then fragCount = #spool elseif spool then fragCount = 1 end
+    assertTrue(fragCount <= 32, "F23: empty NEXT fragments bounded after rebind (fragCount=" .. tostring(fragCount) .. ")")
+    world.time = world.time + GG.REASSEMBLY_IDLE_SEC + 1
+    GG.ExpireStalePartials(world.time)
+    assertEq(ace.multipart_spool["SF_GG\tWHISPER\tBob-Garona"], nil, "F23: physical spool cleared on expiry after rebind")
+    local stats = GG.GetReceiveGuardStats()
+    assertEq(stats.partialCount, 0, "F23: accounting cleared with spool after rebind")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")

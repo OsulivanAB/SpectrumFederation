@@ -1893,11 +1893,16 @@ function GG.Init(opts)
     local e = GG._engine
     if e.inited then
         -- Re-bind receive guard to current AceComm.
-        if LibStub then
+        if GG.EnsureReceiveGuard then
+            GG.EnsureReceiveGuard()
+        elseif LibStub then
             local AceComm = LibStub("AceComm-3.0", true)
             if AceComm then
                 GG.InstallReceiveGuard(AceComm)
             end
+        end
+        if GG.InitReceiveGuardLifecycle then
+            GG.InitReceiveGuardLifecycle()
         end
         return
     end
@@ -1909,11 +1914,16 @@ function GG.Init(opts)
 
     GG.InitGuildAdapter()
 
-    if LibStub then
+    if GG.EnsureReceiveGuard then
+        GG.EnsureReceiveGuard()
+    elseif LibStub then
         local AceComm = LibStub("AceComm-3.0", true)
         if AceComm then
             GG.InstallReceiveGuard(AceComm)
         end
+    end
+    if GG.InitReceiveGuardLifecycle then
+        GG.InitReceiveGuardLifecycle()
     end
 
     local Comm = SF.LootHelperComm
@@ -1935,5 +1945,15 @@ function GG.Shutdown()
     GG._StopScheduler()
     GG.InvalidateRuntime("shutdown")
     GG.ShutdownGuildAdapter()
+    local guard = GG._recvGuard
+    if guard and guard.lifecycleFrame then
+        if guard.lifecycleFrame.UnregisterAllEvents then
+            guard.lifecycleFrame:UnregisterAllEvents()
+        end
+        if guard.lifecycleFrame.SetScript then
+            guard.lifecycleFrame:SetScript("OnEvent", nil)
+        end
+        guard.lifecycleFrame = nil
+    end
     GG._engine.inited = false
 end
