@@ -58,7 +58,8 @@ function GG.NotifyMeaningfulChange()
     if GG._engine and GG._engine.outPull then
         st.dirtyFollowUp = true
     end
-    -- Accepted changes invalidate "already covered" peer marks.
+    -- Local accepted changes clear coverage so a follow-up pass can run.
+    -- Remote peers learn via discovery changeGen, not by wiping on receipt alone.
     if GG._engine and GG._engine.peers then
         for _, peer in pairs(GG._engine.peers) do
             peer.covered = {}

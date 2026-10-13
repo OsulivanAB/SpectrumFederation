@@ -903,13 +903,17 @@ local function handleView(sender, payload)
             offerPayload = reply,
         }
         local servedPull = e.inPull
-        GG.SendGossip(GG.MSG.VIEW, reply, "WHISPER", sender, {
+        local ok = GG.SendGossip(GG.MSG.VIEW, reply, "WHISPER", sender, {
             providerId = providerEntry.id,
             scopeId = scopeId,
             onFinalSubmitted = function(success)
                 noteInPullSubmission(servedPull, success)
             end,
         })
+        if not ok then
+            -- Queue admission failure is not a terminal lease; free the slot.
+            closeInPull("offer_admission_failed")
+        end
         return
     end
 

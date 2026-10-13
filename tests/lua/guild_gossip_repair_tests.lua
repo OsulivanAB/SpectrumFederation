@@ -814,6 +814,176 @@ do
         "F15: array index 1 cannot authorize unsolicited BODY id '1'")
 end
 
+---------------------------------------------------------------------------
+-- F16: sender reload mints a new incarnation; receiver bookmarks must not skip
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f16a" })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f16b" })
+    for i = 1, 6 do pB.AppendLocal("old-" .. i, "old-" .. i) end
+    local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local oldEpoch = entryB.index.epoch
+    -- Alice retains a bookmark into Bob's pre-reload source.
+    local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    entryA.bookmarks["bob-garona|sf.synthetic.gossip|" .. tostring(A.GuildGossip.GetGuildScopeId()) .. "|0"] = {
+        epoch = oldEpoch, scopeId = A.GuildGossip.GetGuildScopeId(), afterSeq = 3,
+    }
+    -- Simulate Bob /reload: new incarnation base + rebuilt provider index.
+    B.GuildGossip._epochBase = nil
+    B.GuildGossip._epochSeq = 0
+    B.GuildGossip.InitEpochIncarnation()
+    B.GuildGossip.BumpIndexEpoch(entryB.index)
+    for i = 1, 6 do
+        B.GuildGossip.IndexUpsert(entryB.index, "new-" .. i, "v")
+    end
+    assertTrue(entryB.index.epoch ~= oldEpoch, "F16: reload mints a new source epoch")
+    local bm = entryA.bookmarks["bob-garona|sf.synthetic.gossip|" .. tostring(A.GuildGossip.GetGuildScopeId()) .. "|0"]
+    assertTrue(bm.epoch ~= entryB.index.epoch, "F16: receiver bookmark epoch is foreign after sender reload")
+    -- Engine compare path must ignore foreign bookmarks.
+    world._unitName = "Alice"; world._sendAs = "Alice-Garona"
+    local peer = { name = "Bob-Garona", key = "bob-garona", caps = {
+        proto = 1, enc = { "B64CBOR" },
+        providers = { { id = "sf.synthetic.gossip", schema = 1, changeGen = 1 } },
+    }, covered = {} }
+    A.GuildGossip._engine.peers["bob-garona"] = peer
+    A.GuildGossip._engine.peerOrder = { "bob-garona" }
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    local pull = A.GuildGossip._engine.outPull
+    assertTrue(pull ~= nil, "F16: outPull starts against reloaded sender")
+    if pull then
+        -- Force compare with remote view using Bob's new epoch.
+        pull.remoteView = {
+            epoch = entryB.index.epoch,
+            buckets = B.GuildGossip.CaptureViewSummaries(entryB.index, 1, pull.scopeId,
+                "sf.synthetic.gossip", 1).buckets,
+        }
+        pull.phase = "compare"
+        pull.bucketCursor = 0
+        stepClient(A, A.GuildGossip.GetStepLimits())
+        assertTrue(pull.afterSeq == 0 or (A.GuildGossip._engine.outPull and A.GuildGossip._engine.outPull.afterSeq == 0),
+            "F16: foreign bookmark does not resume afterSeq past new prefix")
+    end
+end
+
+---------------------------------------------------------------------------
+-- F17: discovery coverage preserved unless changeGen differs; omission ok
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f17" })
+    A.GuildGossip.RegisterProvider({
+        id = "other", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return {} end,
+        GetRecordVersionFp = function() return nil end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    local peer = A.GuildGossip._engine.peers
+    -- Seed peer coverage via first announcement with both providers.
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.DISC, {
+        proto = 1, enc = { "B64CBOR" },
+        providers = {
+            { id = "sf.synthetic.gossip", schema = 1, changeGen = 1 },
+            { id = "other", schema = 1, changeGen = 1 },
+        },
+    }), "GUILD", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    local p = A.GuildGossip._engine.peers["bob-garona"]
+    assertTrue(p ~= nil, "F17: peer tracked")
+    p.covered["sf.synthetic.gossip"] = true
+    p.covered["other"] = true
+    local fpBefore = p.capFingerprints["sf.synthetic.gossip"]
+    -- Rotated announcement omits "other" but same changeGen for synthetic.
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.DISC, {
+        proto = 1, enc = { "B64CBOR" },
+        providers = {
+            { id = "sf.synthetic.gossip", schema = 1, changeGen = 1 },
+        },
+    }), "GUILD", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    assertTrue(p.covered["sf.synthetic.gossip"] == true, "F17: unchanged announcement keeps coverage")
+    assertTrue(p.covered["other"] == true, "F17: omitted provider does not clear coverage")
+    -- Meaningful remote change bumps changeGen for synthetic.
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.DISC, {
+        proto = 1, enc = { "B64CBOR" },
+        providers = {
+            { id = "sf.synthetic.gossip", schema = 1, changeGen = 2 },
+        },
+    }), "GUILD", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    assertTrue(p.covered["sf.synthetic.gossip"] == nil, "F17: changeGen bump clears coverage for that provider")
+    assertTrue(p.covered["other"] == true, "F17: other provider coverage retained")
+    assertTrue(p.capFingerprints["sf.synthetic.gossip"] ~= fpBefore, "F17: fingerprint updated")
+end
+
+---------------------------------------------------------------------------
+-- F18: offer admission failure does not strand the served pull slot
+---------------------------------------------------------------------------
+do
+    reset()
+    local B = makeClient("Bob")
+    B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f18" })
+    local e = B.GuildGossip._engine
+    local origSend = B.GuildGossip.SendGossip
+    B.GuildGossip.SendGossip = function()
+        return false, "queue_rejected"
+    end
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v18", providerId = "sf.synthetic.gossip",
+        schema = 1, scopeId = B.GuildGossip.GetGuildScopeId(),
+        eligibilityGen = 1, epoch = 1, packedBuckets = B.GuildGossip.PackBucketSummaries({}),
+        mode = "NORMAL", engineGen = e.generation,
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits())
+    assertTrue(e.inPull == nil, "F18: failed offer admission frees served pull slot")
+    B.GuildGossip.SendGossip = origSend
+end
+
+---------------------------------------------------------------------------
+-- F19: retry backoff waits 5s before resending the outstanding request
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f19" })
+    local e = A.GuildGossip._engine
+    local sends = 0
+    local orig = A.GuildGossip.SendGossip
+    A.GuildGossip.SendGossip = function(...)
+        sends = sends + 1
+        return orig(...)
+    end
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v19",
+        scopeId = A.GuildGossip.GetGuildScopeId(), phase = "wait_view",
+        outstanding = {
+            msgType = A.GuildGossip.MSG.VIEW,
+            payload = {
+                op = "request", viewId = "v19", providerId = "sf.synthetic.gossip",
+                schema = 1, scopeId = A.GuildGossip.GetGuildScopeId(),
+            },
+        },
+        retries = 0, finalSubmitted = false, usableProgressAt = world.time - 6,
+        engineGen = e.generation, localEpoch = 1,
+    }
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    local pull = e.outPull
+    assertTrue(pull and pull.retryAt and pull.retryAt > world.time, "F19: backoff schedules future retryAt")
+    local sendsAfterSchedule = sends
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    assertEq(sends, sendsAfterSchedule, "F19: no immediate resend while retryAt is in the future")
+    world.time = pull.retryAt + 0.01
+    stepClient(A, A.GuildGossip.GetStepLimits())
+    assertTrue(sends > sendsAfterSchedule, "F19: outstanding request resent after backoff")
+    A.GuildGossip.SendGossip = orig
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")

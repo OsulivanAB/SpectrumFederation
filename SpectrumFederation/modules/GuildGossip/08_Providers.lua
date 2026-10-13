@@ -163,6 +163,14 @@ function GG._RecountActiveProviders()
     GG._providers.activeCount = n
 end
 
+function GG.BumpProviderChangeGen(providerId)
+    local entry = GG.GetProvider(providerId)
+    if not entry then
+        return
+    end
+    entry.changeGen = (tonumber(entry.changeGen) or 0) + 1
+end
+
 function GG.NotifyProviderChanged(providerId)
     local entry = GG.GetProvider(providerId)
     if not entry or not entry.enabled then
@@ -173,6 +181,7 @@ function GG.NotifyProviderChanged(providerId)
     entry.index.dirty = true
     entry._buildList = nil
     entry._buildPos = nil
+    GG.BumpProviderChangeGen(providerId)
     if GG.MarkWorkPending then
         GG.MarkWorkPending()
     end
@@ -217,6 +226,10 @@ function GG.BuildDiscoveryCaps()
         local c = {
             id = entry.id,
             schema = entry.schema,
+            -- Bounded change identity for discovery coverage. Ordinary remote
+            -- appends bump changeGen; schema/id alone must not reopen pulls.
+            changeGen = tonumber(entry.changeGen) or 0,
+            eligibilityGen = tonumber(entry.eligibilityGen) or 0,
         }
         if entry.api and type(entry.api.GetCapabilities) == "function" then
             local ok, extra = pcall(entry.api.GetCapabilities)
@@ -326,6 +339,7 @@ function GG.ApplyRecordToProvider(entry, record, ctx)
                 GG.IndexUpsert(entry.index, id, tostring(vfp), record)
             end
         end
+        GG.BumpProviderChangeGen(entry.id)
         GG.NotifyMeaningfulChange()
     end
     return result, detail

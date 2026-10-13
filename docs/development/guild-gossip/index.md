@@ -105,12 +105,13 @@ Locked architecture is unchanged: C1/D1, uncompressed `B64CBOR`, raid independen
 5. **Admit-before-decode** — Encoded envelopes are queued after cheap sender/channel/size/proto checks; decode and schema validation run under the shared step budget.
 6. **Dirty-driven index + idle** — Completed indexes are not re-listed every step; seeks start after the cursor; aggregate index/app budgets are shared; the 0.1s ticker stops when truly idle (discovery keeps its own timer).
 7. **Cancel unsent work** — Provider disable/unregister and runtime invalidation cancel scoped Comm queue items and release admission; eligibility/scope are rechecked before export, send, and apply.
-8. **Fresh source epochs** — `CreateIndex` / rebuild / re-registration mint a new epoch via a process-wide counter; bookmarks require matching epoch+scope.
-9. **Unresolved without false coverage** — PENDING/REJECTED records stay in a bounded unresolved map and block `peer.covered` for that provider until reconciled or expired.
-10. **Byte-aware pages** — Servers pack BODY/MANIFEST pages to the encoded cap and skip oversize records rather than failing the whole response silently.
-11. **Provider scopes** — Both directions use `GetScopeId()` (not only guild identity) and pass peer/scope context into eligibility.
+8. **Fresh source epochs** — Each load mints a high-entropy incarnation base; rebuilds add generations. Bookmarks require matching epoch+scope and cannot resume across a sender reload.
+9. **Unresolved without false coverage** — PENDING/REJECTED/limit obligations stay bounded; bookmarks do not advance past them; expiry invalidates affected coverage/bookmarks.
+10. **Byte-aware pages** — Servers pack BODY/MANIFEST pages to the encoded cap; an unsendable manifest descriptor returns a correlated `limit` outcome without advancing coverage.
+11. **Provider scopes / export context** — Both directions use `GetScopeId()`; optional `IsRecordExportable(peer, id, ctx)` filters summary/manifest/body without per-peer history copies.
 12. **Foreground protection** — BACKGROUND admission leaves reserved FOREGROUND capacity; FOREGROUND may evict BACKGROUND at both global and per-target caps.
-13. **Fair discovery** — When capabilities exceed 240 bytes, announcements rotate which providers fit rather than permanently trimming the same tail.
+13. **Fair discovery** — Rotated announcements preserve coverage for omitted providers; only a changed per-provider `changeGen`/fingerprint reopens reconciliation.
+14. **Transport outcomes** — Queue admission, cancellation/eviction, failed submission, and successful final-fragment submission are distinct; failed/cancelled work cannot strand a pull; retries wait the real 5/15s backoff and replay the outstanding request; identical VIEW requests replay the cached offer.
 
 ## C1 paging (brief)
 

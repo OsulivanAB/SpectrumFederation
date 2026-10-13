@@ -21,9 +21,10 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical provider API and Retail smoke s
 5. Queue acceptance ≠ final-fragment submission ≠ remote receipt ≠ provider acceptance; unsent gossip is cancellable by provider/runtime invalidation.
 6. Independent of raid/session/Loot Helper enablement/UI/profiles/coordinators.
 7. Chat-free: enabled `SF.Debug` only. Synthetic provider disabled by default; no active provider ⇒ no recurring work.
-8. Admit encoded gossip before decode; validate bounded structures before mutation; physical AceComm spool is released with guard accounting.
-9. Index maintenance is dirty/incomplete-driven; idle stops the step ticker; discovery rotates oversized capability announcements.
-10. Provider `GetScopeId` is authoritative on both request and serve paths; unresolved obligations never mark a view covered.
+8. Admit encoded gossip before decode; validate bounded structures + distributions before mutation; physical AceComm spool is released with guard accounting, including during pause via an independent expiry timer.
+9. Index maintenance is dirty/incomplete-driven; incomplete work prevents idle; discovery rotates oversized capability announcements and advertises per-provider `changeGen`.
+10. Provider `GetScopeId` is authoritative on both request and serve paths; optional `IsRecordExportable` supplies peer-specific export filtering; unresolved obligations never mark a view covered.
+11. Transport outcomes are explicit: admission ≠ final submission ≠ acceptance; cancel/fail frees leases; backoff is real; offer replay is idempotent for the same correlated VIEW.
 
 ## Dependencies / invalidation
 
