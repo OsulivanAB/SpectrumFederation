@@ -706,7 +706,7 @@ end
 -- Receive admission + dispatch
 ---------------------------------------------------------------------------
 
-local function enqueueReceive(sender, msgType, payloadStr, enc, bytes)
+local function enqueueReceive(sender, msgType, payloadStr, enc, bytes, distribution)
     local e = GG._engine
     bytes = tonumber(bytes) or 0
     if #(e.recvQueue) >= GG.MAX_RECV_QUEUE_MESSAGES then
@@ -798,7 +798,7 @@ function GG.OnGossipCommReceived(prefix, text, distribution, sender)
     end
 
     -- Payload decoding is intentionally deferred until the bounded dispatcher.
-    enqueueReceive(sender, msgType, payloadStr, enc, #text)
+    enqueueReceive(sender, msgType, payloadStr, enc, #text, distribution)
 end
 
 local function handleDisc(sender, payload)
