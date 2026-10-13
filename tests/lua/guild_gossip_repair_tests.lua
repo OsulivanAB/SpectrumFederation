@@ -367,6 +367,7 @@ do
         bodyOffset = 1, -- waiting for subpage 2 (r2)
         expectedRequestId = "req-b2", expectedSubpage = 2,
         expectedIds = { "r2" }, expectedFingerprints = { r2 = "v2" },
+        localEpoch = A.GuildGossip.GetProvider("sf.synthetic.gossip").index.epoch,
         engineGen = e.generation, usableProgressAt = world.time, finalSubmitted = true,
         remoteView = { epoch = 1 }, activeBucket = 0, afterSeq = 0,
         manifest = { entries = { { seq = 1, id = "r1", versionFp = "v1" }, { seq = 2, id = "r2", versionFp = "v2" } }, done = true },
@@ -442,6 +443,7 @@ do
         phase = "wait_manifest", engineGen = e.generation, expectedRequestId = "m1",
         activeBucket = 0, afterSeq = 0, remoteView = { epoch = 1, buckets = {} },
         scopeId = A.GuildGossip.GetGuildScopeId(), usableProgressAt = world.time, finalSubmitted = true,
+        localEpoch = A.GuildGossip.GetProvider("sf.synthetic.gossip").index.epoch,
     }
     local okCall, err = pcall(function()
         A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.MANIFEST, {
