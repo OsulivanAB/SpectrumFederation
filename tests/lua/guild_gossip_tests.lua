@@ -671,7 +671,8 @@ do
             .. ", phase=" .. tostring(finalPull and finalPull.phase)
             .. ", pullEpoch=" .. tostring(finalPull and finalPull.localEpoch)
             .. ", indexEpoch=" .. tostring(finalIndex and finalIndex.epoch)
-            .. ", sourcePhase=" .. tostring(sourcePull and sourcePull.phase) .. ")")
+            .. ", sourcePhase=" .. tostring(sourcePull and sourcePull.phase)
+            .. ", sourceClose=" .. tostring(A.GuildGossip._engine.lastInPullCloseReason) .. ")")
 end
 
 -- 7) Rejected/pending do not loop forever; duplicates harmless

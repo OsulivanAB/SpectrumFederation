@@ -418,6 +418,7 @@ local function closeInPull(reason)
         e.peers[peerKey(pull.peer)].activeExchange = nil
     end
     e.inPull = nil
+    e.lastInPullCloseReason = reason
     GG._DVerbose("In pull closed (%s)", tostring(reason))
 end
 
