@@ -929,9 +929,9 @@ do
     entry.bookmarks["bob-garona|bm|scope|0"] = { epoch = 1, scopeId = "scope", afterSeq = 5 }
     GG.BumpIndexEpoch(entry.index)
     assertTrue(entry.index.epoch == 2, "epoch bumped")
-    -- Stale bookmark epoch mismatch => resume from 0 (engine logic)
+    -- Epoch invalidation clears the bookmark rather than retaining a stale cursor.
     local bm = entry.bookmarks["bob-garona|bm|scope|0"]
-    assertTrue(bm.epoch ~= entry.index.epoch, "bookmark epoch stale after rebuild")
+    assertTrue(bm == nil, "bookmark cleared after rebuild")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
