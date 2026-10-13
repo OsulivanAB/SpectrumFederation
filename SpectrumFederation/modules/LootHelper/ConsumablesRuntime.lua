@@ -35,13 +35,6 @@ local function Warn(text)
     end
 end
 
-local function Info(text)
-    Debug("Info", "%s", tostring(text))
-    if SF.PrintInfo then
-        SF:PrintInfo(text)
-    end
-end
-
 local function InCombat()
     return InCombatLockdown and InCombatLockdown()
 end
@@ -2100,10 +2093,13 @@ function Runtime:FinishDeposit(fromTimer)
     actual = intent.bestActual or actual
     -- Issue #366 PR2: deposit assistant no longer creates CONSUMABLE_DONATION
     -- events. Guild Bank transaction observation/verification is authoritative.
+    -- Successful deposits stay silent in normal chat (user-visible messaging is
+    -- opt-in). Diagnostics only go through SF.Debug.
     if actual < intent.intended then
-        Info(string.format("Deposited %d. The rest is still in your bags. Contribution credit waits for Guild Bank verification.", actual))
+        Debug("Info", "deposit settled partial actual=%s intended=%s; credit awaits Guild Bank verification",
+            tostring(actual), tostring(intent.intended))
     elseif actual > 0 then
-        Info("Deposit moved to the guild bank. Contribution credit waits for Guild Bank verification.")
+        Debug("Info", "deposit settled actual=%s; credit awaits Guild Bank verification", tostring(actual))
     end
     self:CompleteDeferredProfileDeletes()
 end

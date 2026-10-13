@@ -380,8 +380,12 @@ do
     fh:close()
     assertTrue(body:find("DepositEvents(", 1, true) == nil,
         "runtime FinishDeposit path does not call DepositEvents")
-    assertTrue(body:find("Contribution credit waits for Guild Bank verification", 1, true) ~= nil,
-        "runtime tells the user credit waits for verification")
+    assertTrue(body:find("Contribution credit waits for Guild Bank verification", 1, true) == nil,
+        "runtime does not print credit-waiting status to chat")
+    assertTrue(body:find("PrintInfo", 1, true) == nil,
+        "runtime deposit path does not use PrintInfo for status")
+    assertTrue(body:find("deposit settled", 1, true) ~= nil,
+        "runtime logs deposit settlement through Debug")
 end
 
 -- ---------------------------------------------------------------------------

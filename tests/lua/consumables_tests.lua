@@ -79,6 +79,7 @@ local function resetWorld()
         timers = {},
         warnings = {},
         infos = {},
+        debugs = {},
         activeProfile = nil,
     }
 end
@@ -326,7 +327,7 @@ local function noop() end
 for _, name in ipairs({
     "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
     "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH",
-    "SetAutoFocus", "SetNumeric", "SetScrollChild", "RegisterEvent",
+    "SetAutoFocus", "SetNumeric", "SetScrollChild",
     "SetMinMaxValues", "SetStatusBarTexture", "SetStatusBarColor", "SetWordWrap",
 }) do
     FrameMethods[name] = noop
@@ -379,7 +380,19 @@ function FrameMethods:GetText() return self.text end
 function FrameMethods:Show() self.shown = true end
 function FrameMethods:Hide() self.shown = false end
 function FrameMethods:IsShown() return self.shown == true end
+-- Prefer an explicit visible flag so tests can model a shown child under a
+-- hidden standalone settings parent (IsShown true, IsVisible false).
+function FrameMethods:IsVisible()
+    if self.visible ~= nil then
+        return self.visible == true
+    end
+    return self.shown == true
+end
 function FrameMethods:SetShown(shown) self.shown = shown and true or false end
+function FrameMethods:RegisterEvent(event)
+    self.registeredEvents = self.registeredEvents or {}
+    self.registeredEvents[event] = true
+end
 function FrameMethods:Enable() self.enabled = true end
 function FrameMethods:Disable() self.enabled = false end
 function FrameMethods:IsEnabled() return self.enabled end
@@ -437,9 +450,30 @@ local REVIEW_COMPACT_WIDTH_MAX = 280
 
 local SF = {
     Debug = {
-        Info = function() end,
-        Warn = function() end,
-        Error = function() end,
+        Info = function(_, category, fmt, ...)
+            world.debugs = world.debugs or {}
+            world.debugs[#world.debugs + 1] = {
+                level = "Info",
+                category = category,
+                text = string.format(tostring(fmt), ...),
+            }
+        end,
+        Warn = function(_, category, fmt, ...)
+            world.debugs = world.debugs or {}
+            world.debugs[#world.debugs + 1] = {
+                level = "Warn",
+                category = category,
+                text = string.format(tostring(fmt), ...),
+            }
+        end,
+        Error = function(_, category, fmt, ...)
+            world.debugs = world.debugs or {}
+            world.debugs[#world.debugs + 1] = {
+                level = "Error",
+                category = category,
+                text = string.format(tostring(fmt), ...),
+            }
+        end,
         Verbose = function() end,
     },
 }
@@ -3423,10 +3457,13 @@ local function checkRuntimeDeposit()
     -- Guild Bank transaction observation/verification is the accounting source.
     assertEq(#p._consumableEvents, 0, "a confirmed deposit does not directly record a donation")
     assertEq(C.ContributionTotal(p, donor, aqirite), 0, "deposit assistant does not update contribution totals")
-    assertTrue(#world.infos > 0, "a clean deposit still reports materials were moved")
-    local infoText = table.concat(world.infos, "\n")
-    assertTrue(contains(infoText, "verification") or contains(infoText, "Guild Bank"),
-        "deposit success mentions verification wait")
+    assertEq(#world.infos, 0, "a clean deposit stays silent in normal chat")
+    local debugText = ""
+    for i = 1, #(world.debugs or {}) do
+        debugText = debugText .. tostring(world.debugs[i].text) .. "\n"
+    end
+    assertTrue(contains(debugText, "deposit settled"),
+        "deposit success is logged to Debug only")
     assertEq(#world.warnings, 0, "a clean deposit shows no warnings")
     assertEq(#(p._consumablesUnsent or {}), 0, "no donation is queued from the deposit assistant")
 
@@ -3539,7 +3576,13 @@ local function checkRuntimeDepositPartialAndFailure()
     fireTimers()
     assertEq(RT.depositIntent, nil, "the deadline finishes a partial deposit")
     assertEq(#p._consumableEvents, 0, "the deadline does not create deposit-assistant accounting")
-    assertTrue(contains(world.infos[#world.infos], "The rest is still in your bags"), "a partial deposit explains the remainder")
+    assertEq(#world.infos, 0, "a partial deposit stays silent in normal chat")
+    local partialDebug = ""
+    for i = 1, #(world.debugs or {}) do
+        partialDebug = partialDebug .. tostring(world.debugs[i].text) .. "\n"
+    end
+    assertTrue(contains(partialDebug, "deposit settled partial"),
+        "partial deposit remainder is logged to Debug only")
 
     p = runtimeFixture("rt-bank-only")
     world.bankOpen = true
@@ -4367,6 +4410,249 @@ local function checkSmartDonationHelper()
     unchanged(p, "smart donation helper")
 end
 
+local function checkClassColoredDisplayNames()
+    -- Issue #348: presentation-only class colors for Consumable Logs.
+    SF.WOW_CLASSES = {
+        WARRIOR = { colorCode = { r = 0.78, g = 0.61, b = 0.43 } },
+        MAGE = { colorCode = { r = 0.25, g = 0.78, b = 0.92 } },
+        HUNTER = { colorCode = { r = 0.67, g = 0.83, b = 0.45 } },
+    }
+    local priorNormalize = SF.NameUtil.NormalizeNameRealm
+    local priorSame = SF.NameUtil.SamePlayer
+    SF.NameUtil.NormalizeNameRealm = function(name)
+        if type(name) ~= "string" then return nil end
+        name = name:gsub("^%s+", ""):gsub("%s+$", "")
+        if name == "" then return nil end
+        if not name:find("-", 1, true) then
+            return name .. "-Realm"
+        end
+        return name:gsub("%s+", "")
+    end
+    SF.NameUtil.SamePlayer = function(a, b)
+        local na = SF.NameUtil.NormalizeNameRealm(a)
+        local nb = SF.NameUtil.NormalizeNameRealm(b)
+        return na and nb and na:lower() == nb:lower()
+    end
+
+    local main = "Main-Realm"
+    local alt = "Alt-Realm"
+    local guildOnly = "GuildAlt-Realm"
+    local otherRealm = "Main-OtherRealm"
+    local unknown = "Stranger-Realm"
+
+    local members = {
+        [main:lower()] = {
+            class = "WARRIOR",
+            GetClass = function(self) return self.class end,
+        },
+        [alt:lower()] = {
+            class = "MAGE",
+            GetClass = function(self) return self.class end,
+        },
+    }
+    local profile = {
+        getMemberByID = function(_, id)
+            local key = SF.NameUtil.NormalizeNameRealm(id)
+            return key and members[key:lower()] or nil
+        end,
+    }
+
+    local guildClassByKey = {
+        [guildOnly:lower()] = "HUNTER",
+        [otherRealm:lower()] = "MAGE",
+        -- Ambiguous collision after normalization must stay uncolored.
+        ["collision-realm"] = false,
+    }
+
+    assertEq(C.ResolveCharacterClass(profile, main, guildClassByKey), "WARRIOR",
+        "profile member class is preferred")
+    assertEq(C.ResolveCharacterClass(profile, alt, guildClassByKey), "MAGE",
+        "linked alt keeps its own class, not the main's")
+    assertEq(C.ResolveCharacterClass(profile, guildOnly, guildClassByKey), "HUNTER",
+        "guild-only alt resolves from the roster lookup")
+    assertEq(C.ResolveCharacterClass(profile, otherRealm, guildClassByKey), "MAGE",
+        "same character name on another realm resolves independently")
+    assertEq(C.ResolveCharacterClass(profile, unknown, guildClassByKey), nil,
+        "unknown characters resolve to no class")
+    assertEq(C.ResolveCharacterClass(profile, "Collision-Realm", guildClassByKey), nil,
+        "ambiguous guild roster keys stay unresolved")
+    assertEq(C.ResolveCharacterClass(nil, guildOnly, guildClassByKey), "HUNTER",
+        "guild lookup works without a profile")
+
+    local warriorColor = C.ColorizeCharacterName(main, "WARRIOR")
+    local mageColor = C.ColorizeCharacterName(alt, "MAGE")
+    local hunterColor = C.ColorizeCharacterName(guildOnly, "HUNTER")
+    assertTrue(contains(warriorColor, "|cff"), "warrior names receive a color code")
+    assertTrue(contains(warriorColor, main) and contains(warriorColor, "|r"),
+        "colored names keep the character identity and reset")
+    assertEq(C.ColorizeCharacterName(unknown, nil), unknown,
+        "unknown class leaves the plain name unchanged")
+    assertFalse(warriorColor == mageColor, "different classes produce different colors")
+
+    local formatName = function(name)
+        return C.ColorizeCharacterName(name, C.ResolveCharacterClass(profile, name, guildClassByKey))
+    end
+
+    assertEq(
+        C.FormatEvent({
+            type = C.EVENT.DONATION, actor = main, itemId = aqirite, quantity = 3, source = "guildbank",
+        }, "Aqirite"),
+        "Main-Realm donated 3 Aqirite to the guild bank.",
+        "plain FormatEvent remains compatible without a formatter"
+    )
+    local donationText = C.FormatEvent({
+        type = C.EVENT.DONATION, actor = main, itemId = aqirite, quantity = 3, source = "guildbank",
+    }, "Aqirite", formatName)
+    assertTrue(contains(donationText, warriorColor), "donation history colors the donor")
+    assertTrue(contains(donationText, " donated 3 Aqirite to the guild bank."),
+        "donation history keeps surrounding text")
+
+    local adjustText = C.FormatEvent({
+        type = C.EVENT.ADJUSTMENT, actor = main, attributed = alt, itemId = aqirite, quantity = 2,
+    }, "Aqirite", formatName)
+    assertTrue(contains(adjustText, warriorColor), "adjustment history colors the admin")
+    assertTrue(contains(adjustText, mageColor), "adjustment history colors the credited alt")
+
+    local resetText = C.FormatEvent({
+        type = C.EVENT.RESET, actor = main,
+    }, nil, formatName)
+    assertTrue(contains(resetText, warriorColor), "configuration clear history colors the admin")
+
+    local pendingText = C.FormatObservation({
+        donor = guildOnly, itemId = aqirite, quantity = 4, status = "pending",
+    }, "Aqirite", nil, formatName)
+    assertTrue(contains(pendingText, hunterColor), "pending observations color guild-only donors")
+    assertTrue(contains(pendingText, " — Pending verification"),
+        "pending observation status text stays uncolored")
+
+    local reviewText = C.FormatObservation({
+        donor = unknown, itemId = aqirite, quantity = 1, status = "ambiguous",
+    }, "Aqirite", nil, formatName)
+    assertEq(reviewText, "Stranger-Realm donated 1 Aqirite — Needs review",
+        "unknown donors stay readable without color codes")
+
+    local p = configured("class-colors-history")
+    C.AppendEvent(p, {
+        id = "ce:class-colors-history:Main-Realm:1",
+        type = C.EVENT.DONATION,
+        actor = main,
+        itemId = aqirite,
+        quantity = 1,
+        source = "guildbank",
+        generation = 1,
+        timestamp = 1,
+    }, { silent = true })
+    local rows = C.HistoryRows(p, function() return "Aqirite" end, 10, 0, formatName)
+    assertTrue(#rows >= 1 and contains(rows[1].text, warriorColor),
+        "HistoryRows applies the optional display-name formatter")
+    local plainRows = C.HistoryRows(p, function() return "Aqirite" end, 10, 0)
+    assertTrue(#plainRows >= 1 and not contains(plainRows[1].text, "|cff"),
+        "HistoryRows without a formatter stays plain text")
+
+    local preview = {
+        itemId = aqirite,
+        quantity = 5,
+        attributed = alt,
+        currentItem = 1,
+        nextItem = 6,
+        currentPlayer = 0,
+        nextPlayer = 5,
+    }
+    local confirm = C.ManualAdjustmentConfirmation(preview, "Aqirite", formatName)
+    assertTrue(contains(confirm, mageColor), "manual adjustment preview colors the credited member")
+    assertFalse(contains(confirm, warriorColor),
+        "manual adjustment credit uses the attributed character, not a linked main")
+
+    SF.NameUtil.NormalizeNameRealm = priorNormalize
+    SF.NameUtil.SamePlayer = priorSame
+end
+
+local function checkConsumableLogsHiddenParentRefresh()
+    -- Issue #348 follow-up: GUILD_ROSTER_UPDATE must not refresh history while the
+    -- standalone settings parent is hidden (panel IsShown, not IsVisible).
+    local refreshCount = 0
+    SF.SettingsUI = {
+        pagesById = {},
+        pages = {},
+        DefinitionRenderer = {
+            Build = function() end,
+            Refresh = function()
+                refreshCount = refreshCount + 1
+            end,
+        },
+    }
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+
+    local framesBefore = #createdFrames
+    load("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
+    local page = SF.SettingsUI.pagesById.lootHelperConsumableLogs
+    assertTrue(page ~= nil, "Consumable Logs page registers with SettingsUI")
+
+    local rosterFrame
+    for i = framesBefore + 1, #createdFrames do
+        local frame = createdFrames[i]
+        if frame.registeredEvents and frame.registeredEvents.GUILD_ROSTER_UPDATE and frame.scripts and frame.scripts.OnEvent then
+            rosterFrame = frame
+            break
+        end
+    end
+    assertTrue(rosterFrame ~= nil, "Consumable Logs installs a single GUILD_ROSTER_UPDATE listener")
+
+    local panel = FrameMock("Frame")
+    panel.shown = true
+    panel.visible = false
+    page:Build(panel)
+    assertEq(Page and true or true, true, "page build keeps a panel reference")
+    assertTrue(page.panel == panel, "Build stores the Consumable Logs panel")
+
+    refreshCount = 0
+    world.after = {}
+    rosterFrame.scripts.OnEvent(rosterFrame, "GUILD_ROSTER_UPDATE")
+    assertEq(#world.after, 0, "hidden parent does not queue a roster-driven refresh")
+    assertEq(refreshCount, 0, "hidden parent does not refresh Consumable Logs history")
+
+    -- Queue while visible, then hide before the delayed callback runs.
+    panel.visible = true
+    refreshCount = 0
+    world.after = {}
+    rosterFrame.scripts.OnEvent(rosterFrame, "GUILD_ROSTER_UPDATE")
+    assertEq(#world.after, 1, "visible panel queues one deferred roster refresh")
+    panel.visible = false
+    drainAfter()
+    assertEq(refreshCount, 0, "closing before the deferred callback skips the roster refresh")
+
+    -- Reopening through OnShow still refreshes (initial/subsequent open behavior).
+    panel.visible = true
+    refreshCount = 0
+    local onShowHooks = panel.hooks and panel.hooks.OnShow or {}
+    assertTrue(#onShowHooks >= 1, "Build installs an OnShow refresh hook")
+    for i = 1, #onShowHooks do
+        onShowHooks[i](panel)
+    end
+    assertTrue(refreshCount >= 1, "OnShow refreshes Consumable Logs when the page becomes visible")
+
+    -- A second Build must not accumulate another guild-roster listener.
+    local rosterListeners = 0
+    for i = 1, #createdFrames do
+        local frame = createdFrames[i]
+        if frame.registeredEvents and frame.registeredEvents.GUILD_ROSTER_UPDATE then
+            rosterListeners = rosterListeners + 1
+        end
+    end
+    page:Build(panel)
+    local rosterListenersAfter = 0
+    for i = 1, #createdFrames do
+        local frame = createdFrames[i]
+        if frame.registeredEvents and frame.registeredEvents.GUILD_ROSTER_UPDATE then
+            rosterListenersAfter = rosterListenersAfter + 1
+        end
+    end
+    assertEq(rosterListenersAfter, rosterListeners, "repeated Build does not add GUILD_ROSTER_UPDATE listeners")
+end
+
 checkGuildConfiguration()
 checkRequestedItems()
 checkApplyOpAndSettingsModel()
@@ -4378,6 +4664,8 @@ checkAccounting()
 checkAuthorizeAndConfigSync()
 checkRemoteEvents()
 checkManualAdjustments()
+checkClassColoredDisplayNames()
+checkConsumableLogsHiddenParentRefresh()
 checkCatchUpRules()
 checkSessionTransport()
 checkPeerHistoryRecoveryServePath()

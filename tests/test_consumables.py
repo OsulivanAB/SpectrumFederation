@@ -119,7 +119,10 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "admin_trust" in verification
     assert "goldValueCopper" in verification
     assert "DepositEvents(" not in runtime
-    assert "Contribution credit waits for Guild Bank verification" in runtime
+    assert "Contribution credit waits for Guild Bank verification" not in runtime
+    assert "Deposit moved to the guild bank" not in runtime
+    assert "deposit settled" in runtime
+    assert "PrintInfo" not in runtime
     assert "CONSUMABLES_OBS_REPORT" in SYNC_TRANSPORT.read_text(encoding="utf-8")
     assert "SF.ConsumablesBankLog:Init()" in runtime
     assert "ConsumablesBankLog:OnProfileMaybeChanged" in runtime
@@ -283,6 +286,22 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
     ).read_text(encoding="utf-8")
     assert "getText" in logs_page
+    # Admin review selected-details must be dynamic: DefinitionRenderer:Refresh does
+    # not rebuild the page, and AddHelpText only updates via getText.
+    assert "getText = SelectedReviewHelpText" in logs_page
+    assert "text = selectedHelp" not in logs_page
+    assert "local function SelectedReviewHelpText" in logs_page
+    assert "RAID_CONSUMABLE_REVIEW_SELECTED" in logs_page
+    # Roster-driven refreshes must use effective visibility; index invalidation
+    # still runs while the standalone settings parent is hidden.
+    assert "local function PanelEffectivelyVisible" in logs_page
+    assert "panel.IsVisible" in logs_page
+    assert "if not PanelEffectivelyVisible(panel) then return end" in logs_page
+    assert "if not PanelEffectivelyVisible(Page.panel) then return end" in logs_page
+    roster_handler = logs_page.split("RegisterEvent(\"GUILD_ROSTER_UPDATE\")", 1)[1]
+    invalidate_at = roster_handler.find("InvalidateGuildClassIndex()")
+    queue_at = roster_handler.find("QueueRefresh()")
+    assert 0 <= invalidate_at < queue_at, "roster update invalidates class index before QueueRefresh"
     assert "RAID_CONSUMABLE_ADJUST_HISTORY_ATTRIBUTED" in locale
     assert "RAID_CONSUMABLE_ADJUST_ERR_NOT_MEMBER" in locale
 
