@@ -664,9 +664,12 @@ do
         if recordCount(B, id1) >= 60 then break end
     end
     local finalPull = B.GuildGossip._engine.outPull
+    local finalIndex = B.GuildGossip.GetProvider(id1).index
     assertTrue(recordCount(B, id1) >= 60,
         "receiver eventually gets seed+append via follow-up (count=" .. tostring(recordCount(B, id1))
-            .. ", phase=" .. tostring(finalPull and finalPull.phase) .. ")")
+            .. ", phase=" .. tostring(finalPull and finalPull.phase)
+            .. ", pullEpoch=" .. tostring(finalPull and finalPull.localEpoch)
+            .. ", indexEpoch=" .. tostring(finalIndex and finalIndex.epoch) .. ")")
 end
 
 -- 7) Rejected/pending do not loop forever; duplicates harmless
