@@ -663,8 +663,10 @@ do
         runSteps(5)
         if recordCount(B, id1) >= 60 then break end
     end
+    local finalPull = B.GuildGossip._engine.outPull
     assertTrue(recordCount(B, id1) >= 60,
-        "receiver eventually gets seed+append via follow-up (count=" .. tostring(recordCount(B, id1)) .. ")")
+        "receiver eventually gets seed+append via follow-up (count=" .. tostring(recordCount(B, id1))
+            .. ", phase=" .. tostring(finalPull and finalPull.phase) .. ")")
 end
 
 -- 7) Rejected/pending do not loop forever; duplicates harmless
