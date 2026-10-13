@@ -1295,12 +1295,11 @@ def simulate_channel_integration(
         beta_iface, beta_ver = read_toc_fields_from_git(
             sim_repo, final_sha, "SpectrumFederation/SpectrumFederation.toc"
         )
-        if plan.get("main_update_needed") or plan.get("main_action") in {"update", "publish", "none"}:
-            if main_iface != interface or main_ver != main_target:
-                raise RuntimeError(
-                    f"Simulation main metadata mismatch: expected {interface}/{main_target}, "
-                    f"found {main_iface}/{main_ver}"
-                )
+        if main_iface != interface or main_ver != main_target:
+            raise RuntimeError(
+                f"Simulation main metadata mismatch: expected {interface}/{main_target}, "
+                f"found {main_iface}/{main_ver}"
+            )
         if beta_iface != interface or beta_ver != beta_target:
             raise RuntimeError(
                 f"Simulation beta metadata mismatch: expected {interface}/{beta_target}, "
@@ -1308,9 +1307,8 @@ def simulate_channel_integration(
             )
 
         changelog_text = read_git_blob(sim_repo, final_sha, "CHANGELOG.md") or ""
-        if plan.get("main_update_needed") or sync_needed:
-            if f"## [{main_target}]" not in changelog_text and plan.get("main_update_needed"):
-                raise RuntimeError(f"Simulation changelog missing main section {main_target}")
+        if plan.get("main_update_needed") and f"## [{main_target}]" not in changelog_text:
+            raise RuntimeError(f"Simulation changelog missing main section {main_target}")
         if plan.get("beta_update_needed") and f"## [{beta_target}]" not in changelog_text:
             raise RuntimeError(f"Simulation changelog missing beta section {beta_target}")
 
@@ -1860,8 +1858,10 @@ def write_step_summary(plan, *, dry_run=False, simulation=None):
                 f"- Result: `{'ok' if simulation.get('ok') else 'failed'}`",
                 f"- Simulated main SHA: `{simulation.get('simulated_main_sha', '')}`",
                 f"- Simulated beta SHA: `{simulation.get('simulated_beta_sha', '')}`",
-                f"- Resolved metadata paths: "
-                f"`{', '.join(simulation.get('resolved_paths') or []) or '(none)'}`",
+                (
+                    "- Resolved metadata paths: "
+                    f"`{', '.join(simulation.get('resolved_paths') or []) or '(none)'}`"
+                ),
                 "",
             ]
         )

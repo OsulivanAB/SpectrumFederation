@@ -609,17 +609,17 @@ jobs:
 
           # History-only synchronization must not classify as a beta addon release.
           if [[ "$BETA_UPDATE_NEEDED" != "true" ]]; then
-            PYTHONPATH="$HELPERS_DIR" BEFORE_SHA="$BEFORE_SHA" python3 -c '
-import classify_promotion_scope as scope
-import os
-classified = scope.classify_git_range(os.environ["BEFORE_SHA"], "HEAD")
-if classified.release_required:
-    raise SystemExit(
-        "History-only main→beta sync produced release_required changes; "
-        "refusing to push an unintended Post-Merge Beta release."
-    )
-print("[sync] History-only sync classified as non-release")
-'
+            SCOPE_OUT="$(mktemp)"
+            GITHUB_OUTPUT="$SCOPE_OUT" PYTHONPATH="$HELPERS_DIR" \
+              python3 "$HELPERS_DIR/classify_promotion_scope.py" \
+              --base "$BEFORE_SHA" \
+              --head HEAD \
+              --github-output
+            if grep -q '^release_required=true$' "$SCOPE_OUT"; then
+              echo "::error::History-only main→beta sync produced release_required changes; refusing to push an unintended Post-Merge Beta release."
+              exit 1
+            fi
+            echo "[sync] History-only sync classified as non-release"
           fi
 
           echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
