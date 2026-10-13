@@ -155,10 +155,19 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
     e.admittedOutBytes = (e.admittedOutBytes or 0) + bytes
 
     local submittedFinal = false
+    local releasedEarly = false
+    local function releaseAdmission()
+        if releasedEarly or submittedFinal then
+            return
+        end
+        releasedEarly = true
+        e.streamBusy[sk] = nil
+        onGossipSubmitted(bytes)
+    end
     local callback = function(_, sent, textlen, sendResult)
         -- ChatThrottleLib/AceComm callback: sent reaches textlen on final fragment.
         if type(sent) == "number" and type(textlen) == "number" and sent >= textlen then
-            if not submittedFinal then
+            if not submittedFinal and not releasedEarly then
                 submittedFinal = true
                 e.streamBusy[sk] = nil
                 onGossipSubmitted(bytes)
@@ -169,6 +178,7 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         end
     end
 
+    local providerId = opts.providerId or (type(payload) == "table" and payload.providerId) or nil
     local ok = Comm:Send("GOSSIP", msgType, payload, distribution, target, GG.ACE_PRIO, {
         enc = (payload == nil or (type(payload) == "table" and next(payload) == nil)) and GG.ENC_NONE or GG.ENC_B64CBOR,
         queue = true,
@@ -177,7 +187,9 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         callback = callback,
         proto = GG.PROTO_CURRENT,
         gossip = true,
-        gossipProviderId = opts.providerId or (type(payload) == "table" and payload.providerId),
+        gossipProviderId = providerId,
+        gossipGeneration = e.generation,
+        gossipCancel = releaseAdmission,
     })
     if not ok then
         e.streamBusy[sk] = nil
@@ -424,6 +436,10 @@ function GG.InvalidateRuntime(reason)
     e.recvQueue = {}
     e.recvBytes = 0
     GG.ClearAllPartials()
+    local comm = SF.LootHelperComm
+    if comm and comm.CancelAllQueuedGossip then
+        comm:CancelAllQueuedGossip()
+    end
     GG._DInfo("Gossip runtime invalidated (%s)", tostring(reason))
 end
 
@@ -612,20 +628,31 @@ function GG.OnGossipCommReceived(prefix, text, distribution, sender)
         return
     end
 
+    -- Cheap channel + membership admission before proto feedback or decode.
+    if distribution ~= "GUILD" and distribution ~= "WHISPER" then
+        return
+    end
+    if not GG.IsGuildMember(sender) then
+        GG._DVerbose("Drop gossip from non-member %s", tostring(sender))
+        return
+    end
+
     local protoOk, code = GG.ValidateGossipProto(proto)
     if not protoOk then
         -- Quiet fail; optional throttled gossip NACK (never via raid path).
-        local e = GG._engine
-        local now = GG._Now()
-        local lk = peerKey(sender)
-        if not e.lastNackAt[lk] or (now - e.lastNackAt[lk]) > 60 then
-            e.lastNackAt[lk] = now
-            GG.SendGossip(GG.MSG.NACK, {
-                seenProto = proto,
-                supportedMin = GG.PROTO_MIN,
-                supportedMax = GG.PROTO_MAX,
-                code = code,
-            }, "WHISPER", sender, { allowWithoutProvider = true, ignoreStreamBusy = true })
+        if distribution == "WHISPER" then
+            local e = GG._engine
+            local now = GG._Now()
+            local lk = peerKey(sender)
+            if not e.lastNackAt[lk] or (now - e.lastNackAt[lk]) > 60 then
+                e.lastNackAt[lk] = now
+                GG.SendGossip(GG.MSG.NACK, {
+                    seenProto = proto,
+                    supportedMin = GG.PROTO_MIN,
+                    supportedMax = GG.PROTO_MAX,
+                    code = code,
+                }, "WHISPER", sender, { allowWithoutProvider = true, ignoreStreamBusy = true })
+            end
         end
         GG._DVerbose("Unsupported gossip proto from %s proto=%s", tostring(sender), tostring(proto))
         return
@@ -633,17 +660,6 @@ function GG.OnGossipCommReceived(prefix, text, distribution, sender)
 
     if enc == "B64CBORZ" or (SF.SyncProtocol and enc == SF.SyncProtocol.ENC_B64CBORZ) then
         GG._DVerbose("Rejected compressed gossip from %s", tostring(sender))
-        return
-    end
-
-    -- Guild membership check for all gossip (fail closed).
-    if distribution == "GUILD" or distribution == "WHISPER" then
-        if not GG.IsGuildMember(sender) then
-            GG._DVerbose("Drop gossip from non-member %s", tostring(sender))
-            return
-        end
-    else
-        -- Wrong distribution.
         return
     end
 
@@ -1480,6 +1496,17 @@ function GG.OnSchedulerStep(limits, now)
         -- Keep discovery while providers active; clear continuous work flag.
         if not e.discoveryTimer and not e.nextDiscoveryAt then
             GG.ScheduleDiscovery(false)
+        end
+        if GG.ClearWorkPendingIfIdle then
+            GG.ClearWorkPendingIfIdle()
+        end
+        -- Stop the 0.1s step ticker; discovery uses its own NewTimer.
+        if GG._StopScheduler then
+            local keepDiscovery = e.discoveryTimer
+            local keepNext = e.nextDiscoveryAt
+            GG._StopScheduler()
+            e.discoveryTimer = keepDiscovery
+            e.nextDiscoveryAt = keepNext
         end
     end
 end

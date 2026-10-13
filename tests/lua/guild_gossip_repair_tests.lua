@@ -567,26 +567,34 @@ do
     }
     world._unitName = "Bob"
     world._sendAs = "Bob-Garona"
-    -- Directly invoke body request handler path via OnGossipCommReceived + step
     local ids = { "big-1", "big-2", "big-3" }
     B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
         op = "request", viewId = "vb", providerId = "sf.synthetic.gossip",
         requestId = "br1", ids = ids,
     }), "WHISPER", "Alice-Garona")
-    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
-    -- Must still be serving or have sent a subpage (not silent occupancy with zero wire)
-    local sentBody = false
+    -- Dispatch + pump without deliverWire (which clears the send wire).
+    B.GuildGossip.OnSchedulerStep(B.GuildGossip.GetStepLimits("NORMAL"), world.time)
+    B.LootHelperComm:_PumpQueue()
+    local bodyPages, maxLen, maxRecords = 0, 0, 0
     for _, msg in ipairs(world.wire) do
-        if msg.prefix == "SF_GG" and msg.text:find("GG_BODY", 1, true) then sentBody = true end
+        if msg.prefix == "SF_GG" and msg.text:find("GG_BODY", 1, true) then
+            bodyPages = bodyPages + 1
+            maxLen = math.max(maxLen, #msg.text)
+            local ok, _, _, enc, payloadStr = B.GuildGossip.ParseEnvelope(msg.text)
+            if ok then
+                local payload = select(1, B.GuildGossip.DecodePayload(payloadStr, enc))
+                if type(payload) == "table" and type(payload.records) == "table" then
+                    maxRecords = math.max(maxRecords, #payload.records)
+                end
+            end
+        end
     end
-    -- Also check after pump
-    pump("Bob", B)
-    for _, msg in ipairs(world.wire) do
-        if msg.prefix == "SF_GG" and msg.text:find("GG_BODY", 1, true) then sentBody = true end
-    end
-    assertTrue(sentBody or (e.inPull and e.inPull.phase == "serving"),
-        "F10: oversized body request yields subpage send or retained obligation (not silent drop)")
-    -- Record oversize rejected
+    assertTrue(bodyPages >= 1, "F10: at least one BODY page sent (not silent SendGossip failure)")
+    assertTrue(maxLen <= B.GuildGossip.MAX_ENCODED_ENVELOPE,
+        "F10: BODY page within 4KiB envelope (maxLen=" .. tostring(maxLen) .. ")")
+    assertTrue(maxRecords >= 1 and maxRecords < 3,
+        "F10: byte-limited subpage sends some but not all three ~1.5KiB records (n=" .. tostring(maxRecords) .. ")")
+    -- Record oversize rejected at CBOR bound
     local over = string.rep("Y", 3000)
     local raw = C_EncodingUtil.SerializeCBOR({ id = "over", versionFp = "v", body = over })
     assertTrue(#raw > A.GuildGossip.MAX_RECORD_CBOR, "F10: fixture exceeds 2KiB CBOR")
@@ -631,13 +639,21 @@ do
     stepClient(A, A.GuildGossip.GetStepLimits())
     local pull = A.GuildGossip._engine.outPull
     assertTrue(pull ~= nil, "F11: outPull started for data-scoped provider")
-    assertEq(pull.scopeId, scope, "F11: request uses provider GetScopeId")
+    if pull then
+        assertEq(pull.scopeId, scope, "F11: request uses provider GetScopeId")
+    else
+        fail("F11: request uses provider GetScopeId (no outPull)")
+    end
     -- Deliver VIEW request to Bob
     advance(0.2)
     stepClient(B, B.GuildGossip.GetStepLimits())
     local inPull = B.GuildGossip._engine.inPull
     assertTrue(inPull ~= nil, "F11: Bob accepts view for provider data scope")
-    assertEq(inPull.scopeId, scope, "F11: served view stores provider scope")
+    if inPull then
+        assertEq(inPull.scopeId, scope, "F11: served view stores provider scope")
+    else
+        fail("F11: served view stores provider scope (no inPull)")
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -682,14 +698,17 @@ do
     for round = 1, 8 do
         world._unitName = "Alice"; world._sendAs = "Alice-Garona"
         A.GuildGossip.SendDiscovery()
-        pump("Alice", A)
+        -- Inspect the send wire before deliverWire() clears it.
+        A.LootHelperComm:_PumpQueue()
         for _, msg in ipairs(world.wire) do
             if msg.distribution == "GUILD" then
                 local ok, msgType, proto, enc, payloadStr = A.GuildGossip.ParseEnvelope(msg.text)
-                local payload = select(1, A.GuildGossip.DecodePayload(payloadStr, enc))
-                if type(payload) == "table" and type(payload.providers) == "table" then
-                    for _, p in ipairs(payload.providers) do
-                        seen[p.id] = true
+                if ok then
+                    local payload = select(1, A.GuildGossip.DecodePayload(payloadStr, enc))
+                    if type(payload) == "table" and type(payload.providers) == "table" then
+                        for _, p in ipairs(payload.providers) do
+                            seen[p.id] = true
+                        end
                     end
                 end
             end

@@ -16,11 +16,14 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical provider API and Retail smoke s
 
 1. C1 fixed source-local end markers + seek cursors over a 64-bucket read index; appends dirty a follow-up pass and never move the current finish line.
 2. Read sequences are transport cursors only — never authoritative event order, txn identity, campaign boundaries, or admin revisions.
-3. D1 NORMAL/SLOW thresholds; missing/invalid FPS ⇒ SLOW; steady low FPS still makes bounded progress; combat/loading pauses preserve unfinished needs.
-4. Aggregate work/queue/peer/receive/reassembly limits across providers; one initiated pull and one served pull per client; stop-and-wait paging.
-5. Queue acceptance ≠ final-fragment submission ≠ remote receipt ≠ provider acceptance.
+3. D1 NORMAL/SLOW thresholds; missing/invalid FPS ⇒ SLOW; steady low FPS still makes bounded progress; combat/loading pauses preserve unfinished needs and do not consume view leases.
+4. Aggregate work/queue/peer/receive/reassembly limits across providers; one initiated pull and one served pull per client; stop-and-wait paging with requestId/subpage correlation and byte-aware pages.
+5. Queue acceptance ≠ final-fragment submission ≠ remote receipt ≠ provider acceptance; unsent gossip is cancellable by provider/runtime invalidation.
 6. Independent of raid/session/Loot Helper enablement/UI/profiles/coordinators.
 7. Chat-free: enabled `SF.Debug` only. Synthetic provider disabled by default; no active provider ⇒ no recurring work.
+8. Admit encoded gossip before decode; validate bounded structures before mutation; physical AceComm spool is released with guard accounting.
+9. Index maintenance is dirty/incomplete-driven; idle stops the step ticker; discovery rotates oversized capability announcements.
+10. Provider `GetScopeId` is authoritative on both request and serve paths; unresolved obligations never mark a view covered.
 
 ## Dependencies / invalidation
 
@@ -40,4 +43,7 @@ unregister/shutdown → clear runtime queues/callbacks; leave provider durable d
 
 ## Evidence
 
-Production-Lua multi-peer harness (`tests/lua/guild_gossip_tests.lua`) plus packaging/lint/docs validation. Retail smoke remains human QA.
+- Production-Lua multi-peer harness: `tests/lua/guild_gossip_tests.lua`
+- Owner-review regression probes (fail on reviewed head `aa6fa91`, pass after repair): `tests/lua/guild_gossip_repair_tests.lua`
+- Packaging/lint/docs validation per root `AGENTS.md`
+- Retail smoke remains human QA

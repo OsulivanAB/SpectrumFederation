@@ -85,15 +85,36 @@ Delivery results distinguish **accepted**, **duplicate**, **rejected**, and **pe
 | Concurrent pulls | 1 out + 1 in; stop-and-wait pages |
 | Admitted out bytes | ≤8 KiB unfinished gossip into lower-level send path |
 | Peer working set | ≤64; expire 10 minutes; never evict active exchange |
-| Partial reassembly | ≤4 messages, ≤4 KiB each, ≤16 KiB total; idle expiry 30s |
-| Complete recv queue | ≤4 messages / 16 KiB |
-| Discovery | initial 3–10s jitter; then 120–180s |
-| View idle timeout | 120s usable-work time without page progress |
-| Page retries | 2 resends (5s then 15s); then ≥60s peer cooldown |
+| Partial reassembly | ≤4 messages, ≤4 KiB each, ≤16 KiB total, ≤32 fragments; idle expiry 30s; physical AceComm spool cleared with accounting |
+| Complete recv queue | ≤4 encoded messages / 16 KiB (decode deferred until dispatch) |
+| Discovery | initial 3–10s jitter; then 120–180s; rotated provider subsets when over 240 bytes |
+| View idle timeout | 120s usable-work time (pause excluded) without page progress; served views use the same lease |
+| Page retries | 2 resends of the outstanding correlated request (5s then 15s); then ≥60s peer cooldown |
+| Unresolved obligations | ≤64 entries, 600s TTL; unresolved views are not marked covered |
+| Foreground reservation | Comm reserves queue/per-target capacity for FOREGROUND; BACKGROUND may be evicted |
+| Record CBOR / body pages | ≤2 KiB raw CBOR per record; BODY/MANIFEST pages packed to the 4 KiB encoded envelope |
+
+## Guarantees hardened in the #390 repair batch
+
+Locked architecture is unchanged: C1/D1, uncompressed `B64CBOR`, raid independence, synthetic-only default, and strict no-chat.
+
+1. **Partial body retention** — NORMAL→SLOW keeps the admitted BODY subpage and a per-subpage apply cursor; enumeration advances only after the subpage is settled.
+2. **Request correlation** — MANIFEST/BODY responses must match `requestId` / `subpage` / expected IDs+fingerprints; stale or duplicate pages neither apply nor refresh leases.
+3. **Usable-time leases** — Outgoing and served pulls expire on usable time; retries replay the outstanding phase request; backoff is enforced; combat/loading pauses do not burn the lease.
+4. **Physical reassembly bounds** — ReceiveGuard clears `multipart_spool` on reject/expiry and bounds empty non-progress fragments.
+5. **Admit-before-decode** — Encoded envelopes are queued after cheap sender/channel/size/proto checks; decode and schema validation run under the shared step budget.
+6. **Dirty-driven index + idle** — Completed indexes are not re-listed every step; seeks start after the cursor; aggregate index/app budgets are shared; the 0.1s ticker stops when truly idle (discovery keeps its own timer).
+7. **Cancel unsent work** — Provider disable/unregister and runtime invalidation cancel scoped Comm queue items and release admission; eligibility/scope are rechecked before export, send, and apply.
+8. **Fresh source epochs** — `CreateIndex` / rebuild / re-registration mint a new epoch via a process-wide counter; bookmarks require matching epoch+scope.
+9. **Unresolved without false coverage** — PENDING/REJECTED records stay in a bounded unresolved map and block `peer.covered` for that provider until reconciled or expired.
+10. **Byte-aware pages** — Servers pack BODY/MANIFEST pages to the encoded cap and skip oversize records rather than failing the whole response silently.
+11. **Provider scopes** — Both directions use `GetScopeId()` (not only guild identity) and pass peer/scope context into eligibility.
+12. **Foreground protection** — BACKGROUND admission leaves reserved FOREGROUND capacity; FOREGROUND may evict BACKGROUND at both global and per-target caps.
+13. **Fair discovery** — When capabilities exceed 240 bytes, announcements rotate which providers fit rather than permanently trimming the same tail.
 
 ## C1 paging (brief)
 
-Providers maintain a 64-bucket read index. A pull captures per-bucket end markers (last sequence, count, fingerprint). Manifests seek `afterSeq < seq ≤ endSeq`. Appends assign later sequences and set one follow-up dirty flag; they do not restart the current pass. Bookmarks are scoped by peer/provider/scope/bucket and invalidated on epoch/scope/eligibility changes.
+Providers maintain a 64-bucket read index. A pull captures per-bucket end markers (last sequence, count, fingerprint). Manifests seek `afterSeq < seq ≤ endSeq` with direct position lookup. Appends update the live index and set one follow-up dirty flag; they do not restart the current pass or force a full history re-list. Bookmarks are scoped by peer/provider/scope/bucket and invalidated on epoch/scope/eligibility changes.
 
 ## Retail smoke test (human)
 
@@ -117,6 +138,13 @@ Automated tests do **not** replace Retail QA.
    SF.GuildGossip:DisableSynthetic("sf.synthetic.gossip")
    ```
 9. Cross-realm same-guild members should discover via `GUILD` addon messages. Opposite-faction whispers remain a Blizzard availability constraint; exchanges may time out safely and retry later — do not treat that as engine authority failure.
+
+## Evidence
+
+- Production-Lua multi-peer harness: `tests/lua/guild_gossip_tests.lua`
+- Owner-review repair regressions: `tests/lua/guild_gossip_repair_tests.lua` (fail on reviewed head `aa6fa91`, pass after repair)
+- Packaging/lint/docs validation per root `AGENTS.md`
+- Retail smoke remains human QA
 
 ## Handoff to Phase 2 / 3
 

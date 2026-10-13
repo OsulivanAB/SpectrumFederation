@@ -115,8 +115,11 @@ function GG.IndexUpsert(index, recordId, versionFp, meta)
     bucket.count = (bucket.count or 0) + 1
     bucket.fingerprint = GG.CombineFingerprint(bucket.fingerprint, recordId, versionFp)
     index.byId[recordId] = entry
-    index.buildComplete = false
-    index.dirty = true
+    -- Ordinary appends update the live index in place. Only incomplete cold builds
+    -- remain dirty; completed indexes must not re-list history every step.
+    if not index.buildComplete then
+        index.dirty = true
+    end
     return true, entry
 end
 

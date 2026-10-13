@@ -11,6 +11,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PARENT_TOC = REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc"
 LUA_TESTS = REPO_ROOT / "tests" / "lua" / "guild_gossip_tests.lua"
+LUA_REPAIR_TESTS = REPO_ROOT / "tests" / "lua" / "guild_gossip_repair_tests.lua"
 GOSSIP_DIR = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildGossip"
 COMM = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "Comm.lua"
 DOCS = REPO_ROOT / "docs" / "development" / "guild-gossip" / "index.md"
@@ -42,6 +43,26 @@ def test_guild_gossip_production_lua():
     assert DOCS.exists()
 
 
+def test_guild_gossip_repair_regressions():
+    """Behavioral probes for owner review findings on PR #390 / issue #378."""
+    result = subprocess.run(
+        [_lua51(), str(LUA_REPAIR_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Guild Gossip repair tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "0 failed" in result.stdout
+    assert LUA_REPAIR_TESTS.exists()
+    assert "CancelQueuedGossipForProvider" in COMM.read_text(encoding="utf-8")
+
+
 def test_parent_toc_loads_guild_gossip_after_comm():
     toc = PARENT_TOC.read_text(encoding="utf-8")
     comm = toc.find("modules/LootHelper/Comm.lua")
@@ -58,3 +79,5 @@ def test_comm_registers_gossip_prefix():
     assert "RegisterGossipHandler" in text
     assert "BACKGROUND" in text
     assert "InstallReceiveGuard" in text
+    assert "CancelQueuedGossipForProvider" in text
+    assert "FOREGROUND_RESERVED" in (GOSSIP_DIR / "01_Constants.lua").read_text(encoding="utf-8")

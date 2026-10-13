@@ -325,11 +325,104 @@ function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opt
     -- By default: queue BULK and GOSSIP; CONTROL sends immediately
     local shouldQueue = (channelKey == "BULK") or (channelKey == "GOSSIP") or (opts.queue == true)
     if shouldQueue and not opts.immediate then
-        return self:_EnqueueSend(prefix, msg, distribution, target, prio, callback, trafficClass)
+        return self:_EnqueueSend(prefix, msg, distribution, target, prio, callback, trafficClass, {
+            gossipProviderId = opts.gossipProviderId,
+            gossipGeneration = opts.gossipGeneration,
+            gossipCancel = opts.gossipCancel,
+        })
     end
 
     self:SendCommMessage(prefix, msg, distribution, target, prio, callback)
     return true
+end
+
+local function _foregroundReservedSlots()
+    local GG = SF and SF.GuildGossip
+    return tonumber(GG and GG.FOREGROUND_RESERVED_SLOTS) or 4
+end
+
+local function _foregroundReservedQueue()
+    local GG = SF and SF.GuildGossip
+    return tonumber(GG and GG.FOREGROUND_RESERVED_QUEUE) or 8
+end
+
+local function _releaseQueuedItem(item)
+    if not item then
+        return
+    end
+    if type(item.gossipCancel) == "function" then
+        pcall(item.gossipCancel)
+    elseif type(item.callback) == "function" then
+        -- Treat cancellation as terminal so senders release stream/byte reservations.
+        pcall(item.callback, nil, 1, 1, false)
+    end
+end
+
+local function _evictBackgroundFromQueue(st, q, count)
+    local removed = 0
+    for i = #q, 1, -1 do
+        if removed >= count then
+            break
+        end
+        if q[i].trafficClass == "BACKGROUND" then
+            local item = table.remove(q, i)
+            st.total = math.max(0, (st.total or 0) - 1)
+            _releaseQueuedItem(item)
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+local function _evictBackgroundGlobal(st, count)
+    local removed = 0
+    for _, key in ipairs(st.keys or {}) do
+        if removed >= count then
+            break
+        end
+        local q = st.byKey[key]
+        if q then
+            removed = removed + _evictBackgroundFromQueue(st, q, count - removed)
+        end
+    end
+    return removed
+end
+
+-- Cancel unsent gossip queued for a provider (or all gossip when providerId is nil).
+function Comm:CancelQueuedGossipForProvider(providerId)
+    local st = self.state
+    if not st or not st.byKey then
+        return 0
+    end
+    local matchAll = providerId == nil
+    local want = providerId and tostring(providerId) or nil
+    local removed = 0
+    for _, key in ipairs(st.keys or {}) do
+        local q = st.byKey[key]
+        if q then
+            local i = 1
+            while i <= #q do
+                local item = q[i]
+                local isGossip = item.prefix == self.PREFIX.GOSSIP
+                    or item.trafficClass == "BACKGROUND"
+                local matches = matchAll
+                    or (item.gossipProviderId and tostring(item.gossipProviderId) == want)
+                if isGossip and matches then
+                    table.remove(q, i)
+                    st.total = math.max(0, (st.total or 0) - 1)
+                    _releaseQueuedItem(item)
+                    removed = removed + 1
+                else
+                    i = i + 1
+                end
+            end
+        end
+    end
+    return removed
+end
+
+function Comm:CancelAllQueuedGossip()
+    return self:CancelQueuedGossipForProvider(nil)
 end
 
 -- Function Generate a target key string for tracking
@@ -365,29 +458,41 @@ end
 -- @param target string or nil - the target player (for WHISPER)
 -- @param prio string - the AceComm priority
 -- @param callback function or nil - the callback function for SendCommMessage
+-- @param trafficClass string|nil - FOREGROUND or BACKGROUND
+-- @param meta table|nil - optional gossipProviderId / gossipCancel
 -- @return true if enqueued, false if dropped
-function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback, trafficClass)
+function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback, trafficClass, meta)
     if not self.cfg.queueEnabled then
         self:SendCommMessage(prefix, msg, distribution, target, prio, callback)
         return true
     end
 
     trafficClass = trafficClass or "FOREGROUND"
+    meta = type(meta) == "table" and meta or nil
 
     local st = self.state
     local maxQ = tonumber(self.cfg.maxQueue) or 200
+    local reserveQ = _foregroundReservedQueue()
+    local bgGlobalLimit = math.max(0, maxQ - reserveQ)
+
+    if trafficClass == "BACKGROUND" and (st.total or 0) >= bgGlobalLimit then
+        DVerbose("Comm queue reserving capacity: dropping BACKGROUND gossip message")
+        return false
+    end
+
     if (st.total or 0) >= maxQ then
-        -- Prefer dropping BACKGROUND (gossip) when the shared queue is exhausted
-        -- so foreground session traffic retains capacity.
         if trafficClass == "BACKGROUND" then
             DVerbose("Comm queue full: dropping BACKGROUND gossip message")
             return false
         end
-        if not st._queueFullWarned then
-            st._queueFullWarned = true
-            DWarn("Comm queue full (%d/%d): dropping message", st.total, maxQ)
+        -- FOREGROUND may reclaim BACKGROUND slots at the global cap.
+        if _evictBackgroundGlobal(st, 1) < 1 then
+            if not st._queueFullWarned then
+                st._queueFullWarned = true
+                DWarn("Comm queue full (%d/%d): dropping message", st.total, maxQ)
+            end
+            return false
         end
-        return false
     end
 
     local key = self:_TargetKey(distribution, target)
@@ -399,17 +504,28 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback, tr
     end
 
     local maxPer = tonumber(self.cfg.maxPerTarget) or 50
+    local reserveSlots = _foregroundReservedSlots()
+    local bgPerTargetLimit = math.max(0, maxPer - reserveSlots)
+
+    if trafficClass == "BACKGROUND" and #q >= bgPerTargetLimit then
+        DVerbose("Comm per-target reserving capacity: dropping BACKGROUND gossip for %s", tostring(key))
+        return false
+    end
+
     if #q >= maxPer then
         if trafficClass == "BACKGROUND" then
             DVerbose("Comm per-target queue full: dropping BACKGROUND gossip for %s", tostring(key))
             return false
         end
-        st._perTargetWarned = st._perTargetWarned or {}
-        if not st._perTargetWarned[key] then
-            st._perTargetWarned[key] = true
-            DWarn("Comm per-target queue full for %s (%d/%d): dropping message", tostring(key), #q, maxPer)
+        -- FOREGROUND reclaims a BACKGROUND slot rather than being rejected.
+        if _evictBackgroundFromQueue(st, q, 1) < 1 then
+            st._perTargetWarned = st._perTargetWarned or {}
+            if not st._perTargetWarned[key] then
+                st._perTargetWarned[key] = true
+                DWarn("Comm per-target queue full for %s (%d/%d): dropping message", tostring(key), #q, maxPer)
+            end
+            return false
         end
-        return false
     end
 
     local item = {
@@ -420,6 +536,9 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback, tr
         prio         = prio,
         callback     = callback,
         trafficClass = trafficClass,
+        gossipProviderId = meta and meta.gossipProviderId or nil,
+        gossipGeneration = meta and meta.gossipGeneration or nil,
+        gossipCancel = meta and meta.gossipCancel or nil,
     }
 
     -- Keep BACKGROUND behind any already-queued FOREGROUND items for this target.
