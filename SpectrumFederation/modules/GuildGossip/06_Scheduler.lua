@@ -66,7 +66,10 @@ function GG.NotifyMeaningfulChange()
             peer.covered = {}
         end
     end
-    -- A meaningful provider change reopens suspended unresolved obligations.
+    -- Clear scoped unresolved backoff so suspended peers can be reconsidered.
+    -- Full obligation/bookmark reopen is owned by NotifyProviderChanged, remote
+    -- change-identity updates, TTL expiry, and cap eviction — not every accepted
+    -- apply (which also calls this helper and must not wipe sibling obligations).
     if GG._engine then
         GG._engine.unresolvedBackoffUntil = {}
     end

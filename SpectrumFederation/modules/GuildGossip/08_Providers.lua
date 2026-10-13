@@ -52,11 +52,16 @@ Provider contract (Phase 1):
   ValidateAndApply(record, ctx) -> "accepted"|"duplicate"|"rejected"|"pending", detail
   GetRecordBody(recordId) -> table|nil  opaque body for eligible export
   GetRecordVersionFp(recordId) -> string|nil
-  ListRecordIds(cursor, limit) -> pageIds, nextCursor|nil   bounded cold enumeration
+  ListRecordIds(cursor, limit) -> pageIds, nextCursor|nil
+      Bounded cold enumeration. pageIds MUST contain at most `limit` entries.
+      Oversized pages fail the index attempt; full-history dumps are unsupported.
+      nextCursor nil means no further pages; otherwise resume at that cursor.
   NotifyChange(cb) / optional; engine also exposes GG.NotifyProviderChanged(id)
 
 Registration is idempotent. Unregister clears engine runtime state for that provider.
 Enabled providers must supply EnsureIndex or ListRecordIds+GetRecordVersionFp.
+Callback work (ListRecordIds / EnsureIndex / GetRecordVersionFp) must stay within
+the supplied per-step budget; the engine does not materialize unbounded snapshots.
 ]]
 function GG.RegisterProvider(spec)
     if type(spec) ~= "table" or type(spec.id) ~= "string" or spec.id == "" then
@@ -211,6 +216,11 @@ function GG.NotifyProviderChanged(providerId)
             end
         end
     end
+    -- Reopen enumeration past advanced bookmarks for this provider's unresolved
+    -- obligations so earlier rejected/pending/skipped revisions remain reachable.
+    if type(GG.ReopenUnresolvedEnumeration) == "function" then
+        GG.ReopenUnresolvedEnumeration(providerId)
+    end
     -- Provider-owned storage changed outside the engine's append path. Retain
     -- dirty/changeGen even while disabled so re-enable reconciles durable writes
     -- without starting transport. Enabled providers keep the live index usable
@@ -359,13 +369,13 @@ function GG.EnsureProviderIndex(entry, limits)
     end
 
     -- Bounded cold/dirty enumeration: ListRecordIds(cursor, limit) -> page, nextCursor.
+    -- Full-history dumps are unsupported; pages larger than the budget fail closed.
     if type(api.ListRecordIds) ~= "function" or type(api.GetRecordVersionFp) ~= "function" then
         markIndexFailed(entry, "no_index_api")
         return false
     end
     local index = entry.index
-    if index and index.buildComplete and not index.dirty
-        and not entry._buildList and not entry._listCursor then
+    if index and index.buildComplete and not index.dirty and not entry._listCursor then
         return false
     end
 
@@ -381,37 +391,8 @@ function GG.EnsureProviderIndex(entry, limits)
         local _, detail = GG.IndexUpsert(entry.index, rid, vfp)
         if detail == "replaced" then
             GG.BumpIndexEpoch(entry.index)
-            entry._buildList = nil
-            entry._buildPos = nil
             entry._listCursor = 1
             return "restart"
-        end
-        return true
-    end
-
-    -- Legacy one-shot list retained only while walking under budget after first page.
-    if entry._buildList then
-        local n = 0
-        while entry._buildPos <= #entry._buildList and n < budget do
-            local rid = entry._buildList[entry._buildPos]
-            entry._buildPos = entry._buildPos + 1
-            local status = upsertId(rid)
-            if status == "restart" then
-                entry.lastIndexExamined = n + 1
-                return true
-            end
-            n = n + 1
-        end
-        entry.lastIndexExamined = n
-        if entry._buildPos > #entry._buildList then
-            entry._buildList = nil
-            entry._buildPos = nil
-            if index then
-                index.buildComplete = true
-                index.dirty = false
-            end
-            entry.indexFailCount = 0
-            return false
         end
         return true
     end
@@ -427,22 +408,16 @@ function GG.EnsureProviderIndex(entry, limits)
         noteIndexAttemptFailure(entry, "list_record_ids_invalid")
         return false
     end
-
-    -- Legacy ListRecordIds() ignoring cursor/limit: materializes a full snapshot.
-    -- Walk it under budget and do not call ListRecordIds again until complete.
-    if nextCursor == nil and #page > budget then
-        entry._buildList = page
-        entry._buildPos = 1
+    if #page > budget then
+        GG._DError("ListRecordIds oversize provider=%s page=%s budget=%s",
+            entry.id, tostring(#page), tostring(budget))
+        noteIndexAttemptFailure(entry, "list_record_ids_oversize")
         entry._listCursor = nil
-        entry.lastIndexExamined = 0
-        return true
+        return false
     end
 
     local n = 0
     for i = 1, #page do
-        if n >= budget then
-            break
-        end
         local status = upsertId(page[i])
         if status == "restart" then
             entry.lastIndexExamined = n + 1
@@ -640,7 +615,7 @@ function GG.CreateSyntheticProvider(opts)
             if entry then
             -- Ordinary appends update the live index in place.
                 GG.IndexUpsert(entry.index, rid, vfp, record)
-                if not entry.index.buildComplete and not entry._buildList then
+                if not entry.index.buildComplete and not entry._listCursor then
                     -- Live maintenance before an in-flight cold walk: the upserted
                     -- index is already usable; do not block VIEW publication on a
                     -- deferred SLOW ListRecordIds walk of the same rows.
@@ -658,8 +633,7 @@ function GG.CreateSyntheticProvider(opts)
                         entry.index.dirty = true
                         entry.index.buildComplete = false
                     end
-                    entry._buildList = nil
-                    entry._buildPos = nil
+                    entry._listCursor = nil
                 end
             end
         end

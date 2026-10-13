@@ -4,6 +4,8 @@ local addonName, SF = ...
 SF.GuildGossip = SF.GuildGossip or {}
 local GG = SF.GuildGossip
 local providerScope, providerEligible
+local isKnownUnresolvedRevision, clearUnresolvedRevision, recordUnresolved
+local hasUnresolvedForProvider, reopenUnresolvedEnumeration
 
 GG._engine = GG._engine or {
     inited = false,
@@ -139,6 +141,12 @@ local function touchPeer(name, info)
                     local fingerprint = providerAnnouncementFingerprint(cap)
                     if peer.capFingerprints[id] and peer.capFingerprints[id] ~= fingerprint then
                         peer.covered[id] = nil
+                        -- Remote revision/eligibility change clears scoped VIEW
+                        -- incompatibility so a now-compatible peer can recover.
+                        if peer.scopeIncompat then
+                            peer.scopeIncompat[id] = nil
+                        end
+                        clearPeerProviderState(norm, id, nil)
                     end
                     peer.capFingerprints[id] = fingerprint
                 end
@@ -529,7 +537,7 @@ local function indexReadyForView(entry)
     return index
         and index.buildComplete == true
         and not index.dirty
-        and not entry._buildList
+        and not entry._listCursor
 end
 
 local function providerNeedsIndexWork(entry)
@@ -540,7 +548,7 @@ local function providerNeedsIndexWork(entry)
     if entry.indexFailed then
         return false
     end
-    if entry._buildList or entry._listCursor then
+    if entry._listCursor then
         return true
     end
     return entry.index.dirty == true or entry.index.buildComplete ~= true
@@ -1161,13 +1169,19 @@ local function handleManifest(sender, payload, stepLimits)
             GG.MarkWorkPending()
             return "defer"
         end
+        local metaRemaining = tonumber(e.stepMetaRemaining)
+        if metaRemaining ~= nil and metaRemaining <= 0 then
+            -- Shared examine budget exhausted; do not force another examination.
+            GG.MarkWorkPending()
+            return "defer"
+        end
         local endSeq = 0
         local bucketId = tonumber(payload.bucketId) or 0
         if pull.buckets and pull.buckets[bucketId] then
             endSeq = pull.buckets[bucketId].lastSeq or 0
         end
         -- Capture was fixed at serve time; use captured end marker.
-        local examineBudget = math.max(1, tonumber(e.stepMetaRemaining) or manifestBudget)
+        local examineBudget = math.max(1, metaRemaining or manifestBudget)
         local entries, seekMeta = GG.IndexSeekManifest(
             entry.index,
             bucketId,
@@ -1195,6 +1209,8 @@ local function handleManifest(sender, payload, stepLimits)
             afterSeq = payload.afterSeq or 0,
             endSeq = endSeq,
             entries = entries,
+            -- Scan continuation for empty/filtered budget slices.
+            scanAfter = seekMeta and seekMeta.lastExaminedSeq or nil,
             done = seekMeta and seekMeta.done == true,
             engineGen = e.generation,
         }
@@ -1251,9 +1267,11 @@ local function handleManifest(sender, payload, stepLimits)
         pull.expectedSubpage = nil
         pull.outstanding = nil
         pull.usableProgressAt = GG._Now()
-        for _, ent in ipairs(payload.entries) do
+        for _, ent in ipairs(payload.entries or {}) do
             local have = GG.IndexGetEntry(entry.index, ent.id)
-            if not have or have.versionFp ~= ent.versionFp then
+            if (not have or have.versionFp ~= ent.versionFp)
+                and not isKnownUnresolvedRevision(
+                    pull.providerId, pull.peer, pull.scopeId, ent.id, ent.versionFp) then
                 pull.neededBodies[#pull.neededBodies + 1] = ent
             end
         end
@@ -1445,16 +1463,24 @@ local function handleAck(sender, payload)
         return
     end
     if payload.scopeMismatch and payload.providerId then
+        -- Correlate to the active request/view; stale ACKs must not poison selection.
+        local pull = e.outPull
+        if not pull or pull.peer ~= sender
+            or pull.providerId ~= payload.providerId
+            or pull.viewId ~= payload.viewId then
+            return
+        end
         local peer = e.peers[peerKey(sender)] or touchPeer(sender, {})
         if peer then
+            local pid = tostring(payload.providerId)
             peer.scopeIncompat = peer.scopeIncompat or {}
-            peer.scopeIncompat[tostring(payload.providerId)] = true
+            peer.scopeIncompat[pid] = {
+                fingerprint = peer.capFingerprints and peer.capFingerprints[pid] or nil,
+                at = GG._Now(),
+            }
         end
-        local pull = e.outPull
-        if pull and pull.peer == sender and pull.providerId == payload.providerId then
-            closeOutPull("scope_mismatch")
-            GG.MarkWorkPending()
-        end
+        closeOutPull("scope_mismatch")
+        GG.MarkWorkPending()
         return
     end
     if payload.busy then
@@ -1635,14 +1661,59 @@ local function invalidateUnresolvedCoverage(item)
     end
 end
 
-local function recordUnresolved(providerId, recordId, result, now, peerName, scopeId)
+-- Revision-scoped unresolved obligations (provider|peer|scope|id|versionFp).
+-- Enumeration may advance past these; coverage stays incomplete until recovery.
+local function unresolvedRevisionKey(providerId, peerName, scopeId, recordId, versionFp)
+    return table.concat({
+        tostring(providerId),
+        peerKey(peerName),
+        tostring(scopeId),
+        tostring(recordId),
+        tostring(versionFp or ""),
+    }, "|")
+end
+
+isKnownUnresolvedRevision = function(providerId, peerName, scopeId, recordId, versionFp)
+    if versionFp == nil then
+        return false
+    end
+    local key = unresolvedRevisionKey(providerId, peerName, scopeId, recordId, versionFp)
+    return GG._engine.unresolved[key] ~= nil
+end
+
+clearUnresolvedRevision = function(providerId, peerName, scopeId, recordId, versionFp)
+    if versionFp == nil then
+        return
+    end
+    local key = unresolvedRevisionKey(providerId, peerName, scopeId, recordId, versionFp)
+    GG._engine.unresolved[key] = nil
+end
+
+recordUnresolved = function(providerId, recordId, result, now, peerName, scopeId, versionFp)
     local e = GG._engine
     local peer = peerKey(peerName)
-    local key = table.concat({ tostring(providerId), peer, tostring(scopeId), tostring(recordId) }, "|")
+    versionFp = versionFp ~= nil and tostring(versionFp) or ""
+    local key = unresolvedRevisionKey(providerId, peerName, scopeId, recordId, versionFp)
+    local existing = e.unresolved[key]
+    if existing and existing.result == result and tostring(existing.versionFp or "") == versionFp then
+        -- Identical outcome: preserve original age so TTL/eviction can fire.
+        return
+    end
+    -- A new fingerprint supersedes older revisions of the same record id.
+    for unresolvedKey, item in pairs(e.unresolved) do
+        if item.providerId == providerId
+            and item.peerKey == peer
+            and item.scopeId == scopeId
+            and tostring(item.recordId) == tostring(recordId)
+            and tostring(item.versionFp or "") ~= versionFp then
+            e.unresolved[unresolvedKey] = nil
+        end
+    end
     e.unresolved[key] = {
         at = now,
         providerId = providerId,
         recordId = recordId,
+        versionFp = versionFp,
         result = result,
         peer = peerName,
         peerKey = peer,
@@ -1656,12 +1727,13 @@ local function recordUnresolved(providerId, recordId, result, now, peerName, sco
         end
     end
     if count > GG.MAX_UNRESOLVED and oldestKey then
+        -- Cap eviction reopens bookmarks/coverage; does not accept the obligation.
         invalidateUnresolvedCoverage(e.unresolved[oldestKey])
         e.unresolved[oldestKey] = nil
     end
 end
 
-local function hasUnresolvedForProvider(providerId, peerName, scopeId)
+hasUnresolvedForProvider = function(providerId, peerName, scopeId)
     for _, item in pairs(GG._engine.unresolved) do
         if item.providerId == providerId
             and (not peerName or item.peerKey == peerKey(peerName))
@@ -1671,6 +1743,36 @@ local function hasUnresolvedForProvider(providerId, peerName, scopeId)
     end
     return false
 end
+
+reopenUnresolvedEnumeration = function(providerId)
+    local e = GG._engine
+    local snapshot = {}
+    for key, item in pairs(e.unresolved or {}) do
+        if not providerId or item.providerId == providerId then
+            snapshot[#snapshot + 1] = item
+            e.unresolved[key] = nil
+        end
+    end
+    local touched = {}
+    for _, item in ipairs(snapshot) do
+        local ck = table.concat({
+            tostring(item.peerKey or ""),
+            tostring(item.providerId or ""),
+            tostring(item.scopeId or ""),
+        }, "|")
+        if not touched[ck] then
+            touched[ck] = true
+            -- Clears bookmarks for the scoped peer/provider so earlier
+            -- unresolved records remain reachable on the next pass.
+            clearPeerProviderState(item.peer, item.providerId, item.scopeId)
+            local peer = item.peerKey and e.peers[item.peerKey]
+            if peer and peer.covered then
+                peer.covered[item.providerId] = nil
+            end
+        end
+    end
+end
+GG.ReopenUnresolvedEnumeration = reopenUnresolvedEnumeration
 
 local function advanceOutPull(limits, now)
     local e = GG._engine
@@ -1739,18 +1841,23 @@ local function advanceOutPull(limits, now)
             end
         end
         if pull.phase == "compare" then
-            -- All buckets covered for this finite pass.
+            -- Finite enumeration finished; coverage requires no unresolved obligations.
             GG.SendGossip(GG.MSG.ACK, {
                 viewId = pull.viewId,
                 done = true,
                 providerId = pull.providerId,
             }, "WHISPER", pull.peer)
+            local stillUnresolved = hasUnresolvedForProvider(
+                pull.providerId, pull.peer, pull.scopeId)
             local p = e.peers[peerKey(pull.peer)]
-            if p and not hasUnresolvedForProvider(pull.providerId, pull.peer, pull.scopeId) then
+            if p and not stillUnresolved then
                 p.covered = p.covered or {}
                 p.covered[pull.providerId] = true
+                closeOutPull("complete")
+            else
+                -- Incomplete coverage + bounded backoff; do not hot-loop unchanged obligations.
+                closeOutPull("unresolved")
             end
-            closeOutPull("complete")
             if GG.HasDirtyFollowUp() then
                 GG.ClearDirtyFollowUp()
                 -- Local/remote appends invalidate coverage so a follow-up can run.
@@ -1788,10 +1895,14 @@ local function advanceOutPull(limits, now)
 
     if pull.phase == "need_bodies" then
         if not pull.neededBodies or #pull.neededBodies == 0 then
-            -- Advance enumeration cursor for this manifest page.
+            -- Advance enumeration cursor for this manifest page. Empty filtered
+            -- slices use scanAfter so the requester does not retry the same range.
             local page = pull.manifest
             if page and page.entries and #page.entries > 0 then
                 pull.afterSeq = page.entries[#page.entries].seq or pull.afterSeq
+            elseif page and page.scanAfter
+                and (tonumber(page.scanAfter) or 0) > (tonumber(pull.afterSeq) or 0) then
+                pull.afterSeq = tonumber(page.scanAfter)
             end
             setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
                 epoch = pull.remoteView and pull.remoteView.epoch,
@@ -1876,9 +1987,14 @@ local function advanceOutPull(limits, now)
             -- the epoch produced by this provider-owned side effect.
             if result == GG.DELIVERY.ACCEPTED or result == GG.DELIVERY.DUPLICATE then
                 pull.localEpoch = entry.index and entry.index.epoch or pull.localEpoch
-            end
-            if result == GG.DELIVERY.PENDING or result == GG.DELIVERY.REJECTED then
-                recordUnresolved(pull.providerId, rec.id, result, now, pull.peer, pull.scopeId)
+                local vfp = rec.versionFp
+                    or (pull.expectedFingerprints and pull.expectedFingerprints[tostring(rec.id)])
+                clearUnresolvedRevision(pull.providerId, pull.peer, pull.scopeId, rec.id, vfp)
+            elseif result == GG.DELIVERY.PENDING or result == GG.DELIVERY.REJECTED then
+                local vfp = rec.versionFp
+                    or (pull.expectedFingerprints and pull.expectedFingerprints[tostring(rec.id)])
+                recordUnresolved(
+                    pull.providerId, rec.id, result, now, pull.peer, pull.scopeId, vfp)
             end
             cursor = cursor + 1
             apps = apps + 1
@@ -1891,15 +2007,15 @@ local function advanceOutPull(limits, now)
         end
         local skipped = pull.bodyPage.skippedIds or {}
         for _, recordId in ipairs(skipped) do
-            recordUnresolved(pull.providerId, recordId, GG.DELIVERY.REJECTED, now, pull.peer, pull.scopeId)
+            -- Skipped bodies have no body payload; use correlated manifest fingerprint.
+            local vfp = pull.expectedFingerprints
+                and pull.expectedFingerprints[tostring(recordId)]
+            recordUnresolved(
+                pull.providerId, recordId, GG.DELIVERY.REJECTED, now, pull.peer, pull.scopeId, vfp)
         end
-        if hasUnresolvedForProvider(pull.providerId, pull.peer, pull.scopeId) then
-            -- Do not advance the transport bookmark over a provider obligation
-            -- that has not settled. A meaningful provider change reopens this
-            -- coverage; expiry invalidates it below.
-            closeOutPull("unresolved")
-            return true
-        end
+        -- Enumeration advances past unresolved revisions; obligations remain and
+        -- block peer.covered until recovery. Neither PENDING nor REJECTED may
+        -- indefinitely block unrelated later pages/buckets.
         local appliedCount = pull.pendingBodyCount or (#records + #skipped)
         pull.bodyOffset = (pull.bodyOffset or 0) + appliedCount
         pull.bodyPage = nil
@@ -1916,6 +2032,9 @@ local function advanceOutPull(limits, now)
             local page = pull.manifest
             if page and page.entries and #page.entries > 0 then
                 pull.afterSeq = page.entries[#page.entries].seq or pull.afterSeq
+            elseif page and page.scanAfter
+                and (tonumber(page.scanAfter) or 0) > (tonumber(pull.afterSeq) or 0) then
+                pull.afterSeq = tonumber(page.scanAfter)
             end
             setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
                 epoch = pull.remoteView and pull.remoteView.epoch,

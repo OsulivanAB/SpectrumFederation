@@ -68,8 +68,7 @@ function GG.BumpIndexEpoch(index)
         for _, entry in pairs(GG._providers.byId) do
             if entry and entry.index == index then
                 GG.InvalidateProviderBookmarks(entry)
-                entry._buildList = nil
-                entry._buildPos = nil
+                entry._listCursor = nil
                 break
             end
         end
@@ -317,11 +316,13 @@ end
 -- Seek manifest entries: afterSeq < sequence <= endSeq in increasing order.
 -- Starts at the order position after afterSeq (direct seek). Bounds both returned
 -- entries (limit) and examined order slots / filter callbacks (examineLimit).
+-- When a budget slice yields no exportable entries, lastExaminedSeq is the scan
+-- continuation cursor the requester must advance to (not the original afterSeq).
 function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportable, examineLimit)
     local out = {}
     local examined = 0
     if type(index) ~= "table" then
-        return out, { examined = 0, done = true }
+        return out, { examined = 0, done = true, lastExaminedSeq = nil }
     end
     bucketId = tonumber(bucketId)
     afterSeq = tonumber(afterSeq) or 0
@@ -330,7 +331,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
     examineLimit = math.max(1, tonumber(examineLimit) or limit)
     local bucket = index.buckets[bucketId]
     if not bucket then
-        return out, { examined = 0, done = true }
+        return out, { examined = 0, done = true, lastExaminedSeq = nil }
     end
     local startPos = 1
     if afterSeq > 0 and bucket.posBySeq and bucket.posBySeq[afterSeq] then
@@ -342,7 +343,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
             guess = guess - 1
             examined = examined + 1
             if examined >= examineLimit then
-                return out, { examined = examined, done = false }
+                return out, { examined = examined, done = false, lastExaminedSeq = afterSeq }
             end
         end
         if guess > 0 and bucket.posBySeq and bucket.posBySeq[guess] then
@@ -351,6 +352,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
     end
     examined = 0
     local done = true
+    local lastExaminedSeq = nil
     for i = startPos, #bucket.order do
         if examined >= examineLimit then
             done = false
@@ -359,6 +361,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
         local seq = bucket.order[i]
         examined = examined + 1
         if seq > afterSeq and seq <= endSeq then
+            lastExaminedSeq = seq
             local entry = bucket.bySeq[seq]
             if entry and (not exportable or exportable(entry.id, entry)) then
                 out[#out + 1] = {
@@ -375,7 +378,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
             break
         end
     end
-    return out, { examined = examined, done = done }
+    return out, { examined = examined, done = done, lastExaminedSeq = lastExaminedSeq }
 end
 
 function GG.IndexGetEntry(index, recordId)
