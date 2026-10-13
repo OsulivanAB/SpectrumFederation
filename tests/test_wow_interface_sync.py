@@ -982,6 +982,10 @@ def test_reconcile_changelog_preserves_both_channel_sections():
     assert "## [1.5.11-beta.1]" in merged
     assert "## [1.5.10]" in merged
     assert merged.count("## [1.5.9]") == 1
+    beta_pos = merged.index("## [1.5.11-beta.1]")
+    stable_pos = merged.index("## [1.5.10]")
+    prior_pos = merged.index("## [1.5.9]")
+    assert beta_pos < stable_pos < prior_pos
 
 
 def test_reconcile_changelog_rejects_incompatible_same_version():
@@ -1043,7 +1047,7 @@ def test_unexpected_non_metadata_conflict_fails_safely(tmp_path):
     bad_main = _git(repo, "rev-parse", "HEAD")
 
     _git(repo, "checkout", "beta")
-    with pytest.raises(RuntimeError, match="outside generated game-version metadata"):
+    with pytest.raises(RuntimeError, match="outside generated game-version metadata|files outside generated"):
         wow.integrate_main_into_beta(
             repo,
             main_sha=bad_main,
@@ -1241,10 +1245,178 @@ def test_identify_sync_rejects_unrelated_main_divergence(tmp_path):
     _git(repo, "commit", "-m", "docs on main after bump")
     drifted_main = _git(repo, "rev-parse", "HEAD")
 
-    with pytest.raises(RuntimeError, match="outside generated game-version metadata"):
+    with pytest.raises(RuntimeError, match="outside generated game-version metadata|files outside generated"):
         wow.identify_sync_main_sha(
             repo,
             main_sha=drifted_main,
             beta_sha=state["beta_sha"],
             main_update_needed=False,
         )
+
+
+def test_unrelated_readme_body_edit_on_main_fails_preflight_sync(tmp_path, monkeypatch):
+    """Content-level guard: allowlisted README path with unrelated body edit is rejected."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _write_channel_tree(
+        repo,
+        interface="120100",
+        version="1.5.9",
+        track="main",
+        changelog_versions=[("1.5.9", "### Changed\n- Prior\n")],
+        extra_files={"SpectrumFederation/Core.lua": "print('shared')\n"},
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "checkout", "-b", "beta")
+    (repo / "SpectrumFederation" / "BetaOnly.lua").write_text("return 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "beta-only")
+    beta_sha = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "main")
+    # Unrelated body edit on the allowlisted README path before the Interface bump.
+    readme = (repo / "README.md").read_text(encoding="utf-8")
+    (repo / "README.md").write_text(
+        readme.replace(
+            "Unrelated readme body that must survive sync.",
+            "Main-only marketing blurb that must not sync automatically.",
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "docs: unrelated main README body edit")
+    main_sha = _git(repo, "rev-parse", "HEAD")
+
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_a, **_k: None)
+    requested = wow.parse_human_game_version("12.1.5")
+    plan = wow.build_update_plan(
+        requested=requested,
+        live_game_version="12.1.5.1",
+        live_interface=120105,
+        main_interface="120100",
+        main_version_raw="1.5.9",
+        beta_interface="120100",
+        beta_version_raw="1.5.9",
+        main_sha=main_sha,
+        beta_sha=beta_sha,
+        repo="owner/repo",
+        token="token",
+        repo_path=repo,
+    )
+    assert plan["main_update_needed"] is True
+    assert plan["sync_needed"] is True
+    with pytest.raises(RuntimeError, match="outside generated badges"):
+        wow.simulate_channel_integration(
+            repo,
+            plan,
+            work_dir=tmp_path / "sim",
+            game_version="12.1.5",
+        )
+
+
+def test_history_only_sync_does_not_synthesize_beta_changelog_section(tmp_path):
+    state = _init_divergent_game_version_repo(tmp_path)
+    repo = state["repo"]
+    _git(repo, "checkout", "beta")
+    # Replace the beta compatibility note with a placeholder so a naive rewrite
+    # would replace it; history-only sync must leave it alone.
+    placeholder_changelog = "\n".join(
+        [
+            "# Changelog",
+            "",
+            "## [1.5.11-beta.1] - 2026-10-13",
+            "",
+            "### Changed",
+            "- Infrastructure and tooling updates",
+            "",
+            "## [1.5.9] - 2026-10-13",
+            "",
+            "### Changed",
+            "- Prior stable release note",
+            "",
+        ]
+    )
+    (repo / "CHANGELOG.md").write_text(placeholder_changelog, encoding="utf-8")
+    _git(repo, "add", "CHANGELOG.md")
+    _git(repo, "commit", "-m", "placeholder beta changelog")
+    before = _git(repo, "rev-parse", "HEAD")
+
+    result = wow.integrate_main_into_beta(
+        repo,
+        main_sha=state["main_sha"],
+        beta_interface="120105",
+        beta_version="1.5.11-beta.1",
+        game_version="12.1.5",
+        beta_update_needed=False,
+        commit=True,
+    )
+    assert result["synced"] is True
+    assert wow.git_is_ancestor(repo, state["main_sha"], result["commit_sha"])
+    changelog = wow.read_git_blob(repo, "HEAD", "CHANGELOG.md")
+    assert "## [1.5.10]" in changelog
+    assert "Infrastructure and tooling updates" in changelog
+    assert "Updated Retail game compatibility to Interface 120105 (12.1.5)." in changelog
+    # Placeholder section must not be replaced by a regenerated compatibility note.
+    beta_section = changelog.split("## [1.5.11-beta.1]")[1].split("## [")[0]
+    assert "Infrastructure and tooling updates" in beta_section
+    assert "Updated Retail game compatibility" not in beta_section
+    assert _git(repo, "rev-parse", "HEAD") != before
+
+
+def test_history_sync_plus_missing_release_uses_mutated_publish_source(tmp_path, monkeypatch):
+    """Recovery: sync_needed + beta_action=publish must publish the post-sync tip."""
+    state = _init_divergent_game_version_repo(tmp_path)
+    repo = state["repo"]
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_a, **_k: None)
+    requested = wow.parse_human_game_version("12.1.5")
+    plan = wow.build_update_plan(
+        requested=requested,
+        live_game_version="12.1.5.1",
+        live_interface=120105,
+        main_interface="120105",
+        main_version_raw="1.5.10",
+        beta_interface="120105",
+        beta_version_raw="1.5.11-beta.1",
+        main_sha=state["main_sha"],
+        beta_sha=state["beta_sha"],
+        repo="owner/repo",
+        token="token",
+        repo_path=repo,
+    )
+    assert plan["sync_needed"] is True
+    assert plan["beta_update_needed"] is False
+    assert plan["beta_action"] == "publish"
+    assert plan["beta_branch_mutation"] is True
+    assert plan["main_action"] in {"none", "publish"}
+
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "update-wow-game-version.yml"
+    ).read_text(encoding="utf-8")
+    assert "BETA_MUTATION" in workflow
+    assert 'BETA_ACTION" == "update" || "$BETA_MUTATION" == "true"' in workflow
+    assert "beta_branch_mutation != 'true'" in workflow
+
+    _git(repo, "checkout", "beta")
+    result = wow.integrate_main_into_beta(
+        repo,
+        main_sha=state["main_sha"],
+        beta_interface="120105",
+        beta_version="1.5.11-beta.1",
+        game_version="12.1.5",
+        beta_update_needed=False,
+        commit=True,
+    )
+    synced_sha = result["commit_sha"]
+    assert synced_sha != state["beta_sha"]
+    assert wow.git_is_ancestor(repo, state["main_sha"], synced_sha)
+    # Publish source after mutation is the synced tip, not the pre-sync capture.
+    assert synced_sha == _git(repo, "rev-parse", "HEAD")
+    with pytest.raises(RuntimeError, match="advanced unexpectedly"):
+        wow.verify_git_sha(repo, "HEAD", state["beta_sha"], label="beta")

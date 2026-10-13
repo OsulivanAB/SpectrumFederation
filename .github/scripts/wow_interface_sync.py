@@ -802,12 +802,32 @@ def changelog_sections_compatible(left_section, right_section):
     return left_bullets == right_bullets and bool(left_bullets)
 
 
+def _changelog_section_value(section):
+    """Return a comparable numeric value for changelog section ordering."""
+    try:
+        return version_value(parse_version(section["version"]))
+    except RuntimeError:
+        # Non-semver headings such as Unreleased stay at the top when present.
+        return float("inf")
+
+
+def _insert_changelog_section_by_version(merged, section):
+    """Insert section into merged so newer versions remain ahead of older ones."""
+    new_value = _changelog_section_value(section)
+    for index, existing in enumerate(merged):
+        if new_value > _changelog_section_value(existing):
+            merged.insert(index, section)
+            return
+    merged.append(section)
+
+
 def reconcile_changelog_texts(ours_text, theirs_text):
     """Merge changelog histories section-by-section without losing either channel.
 
     Keeps beta (ours) ordering for shared versions when contents are compatible.
-    Inserts main-only sections without duplicating version headings. Incompatible
-    same-version bodies fail instead of silently discarding either side.
+    Inserts main-only sections at the appropriate version position rather than
+    appending them after all beta history. Incompatible same-version bodies fail
+    instead of silently discarding either side.
     """
     changelog = _update_changelog()
     ours_preface, ours_sections = changelog.parse_changelog_sections(ours_text or "")
@@ -832,7 +852,7 @@ def reconcile_changelog_texts(ours_text, theirs_text):
     for section in theirs_sections:
         if section["version"] in seen:
             continue
-        merged.append(section)
+        _insert_changelog_section_by_version(merged, section)
         seen.add(section["version"])
 
     rebuilt = [preface.rstrip()]
@@ -841,12 +861,98 @@ def reconcile_changelog_texts(ours_text, theirs_text):
     return changelog.normalize_changelog("\n".join(rebuilt))
 
 
-def range_only_touches_generated_metadata(repo_path, base_sha, head_sha):
-    """Return True when base...head only modifies recognized generated metadata."""
+def assert_changelog_delta_is_generated_only(base_text, head_text, *, label):
+    """Fail when a main-range CHANGELOG delta includes non-generated content."""
+    changelog = _update_changelog()
+    _base_preface, base_sections = changelog.parse_changelog_sections(base_text or "")
+    _head_preface, head_sections = changelog.parse_changelog_sections(head_text or "")
+    base_by_version = {section["version"]: section for section in base_sections}
+    head_by_version = {section["version"]: section for section in head_sections}
+
+    for version, section in base_by_version.items():
+        if version not in head_by_version:
+            raise RuntimeError(
+                f"{label} CHANGELOG.md removed section {version}; "
+                "refusing automatic synchronization."
+            )
+        if not changelog_sections_compatible(section, head_by_version[version]):
+            raise RuntimeError(
+                f"{label} CHANGELOG.md modified section {version} with incompatible "
+                "content; refusing automatic synchronization."
+            )
+
+    for version, section in head_by_version.items():
+        if version in base_by_version:
+            continue
+        bullets = changelog.extract_bullets(section.get("text", ""))
+        if not bullets:
+            raise RuntimeError(
+                f"{label} CHANGELOG.md added empty section {version}; "
+                "refusing automatic synchronization."
+            )
+        for _category, text in bullets:
+            if not changelog.is_compatibility_note(text):
+                raise RuntimeError(
+                    f"{label} CHANGELOG.md added non-generated content under {version}; "
+                    "refusing automatic synchronization."
+                )
+
+
+def assert_range_is_generated_metadata_only(repo_path, base_sha, head_sha, *, label):
+    """Fail unless base...head only changes recognized generated metadata content.
+
+    Path allowlisting alone is insufficient: unrelated edits inside README/TOC/
+    CHANGELOG must also be rejected before synchronization.
+    """
     paths = list_changed_paths(repo_path, base_sha, head_sha)
     if not paths:
         return True
-    return all(path in GENERATED_METADATA_PATH_SET for path in paths)
+
+    unexpected = [path for path in paths if path not in GENERATED_METADATA_PATH_SET]
+    if unexpected:
+        raise RuntimeError(
+            f"{label} includes files outside generated game-version metadata: "
+            f"{', '.join(unexpected)}"
+        )
+
+    for path in paths:
+        base_text = read_git_blob(repo_path, base_sha, path) or ""
+        head_text = read_git_blob(repo_path, head_sha, path) or ""
+        if path.endswith(".toc"):
+            if strip_toc_metadata_lines(base_text) != strip_toc_metadata_lines(head_text):
+                raise RuntimeError(
+                    f"{label} changes non-metadata content in {path}; "
+                    "refusing automatic synchronization."
+                )
+        elif path == "README.md":
+            if strip_readme_badge_lines(base_text) != strip_readme_badge_lines(head_text):
+                raise RuntimeError(
+                    f"{label} changes README.md content outside generated badges; "
+                    "refusing automatic synchronization."
+                )
+        elif path == "CHANGELOG.md":
+            assert_changelog_delta_is_generated_only(
+                base_text,
+                head_text,
+                label=label,
+            )
+        else:
+            raise RuntimeError(f"{label} touched unsupported metadata path {path}")
+    return True
+
+
+def range_only_touches_generated_metadata(repo_path, base_sha, head_sha):
+    """Return True when base...head only modifies recognized generated metadata."""
+    try:
+        assert_range_is_generated_metadata_only(
+            repo_path,
+            base_sha,
+            head_sha,
+            label="Divergent main range",
+        )
+    except RuntimeError:
+        return False
+    return True
 
 
 def identify_sync_main_sha(repo_path, *, main_sha, beta_sha, main_update_needed):
@@ -864,13 +970,12 @@ def identify_sync_main_sha(repo_path, *, main_sha, beta_sha, main_update_needed)
         return False, "", "main tip is already an ancestor of beta"
 
     merge_base = git_merge_base(repo_path, main_sha, beta_sha)
-    if not range_only_touches_generated_metadata(repo_path, merge_base, main_sha):
-        changed = ", ".join(list_changed_paths(repo_path, merge_base, main_sha)) or "(none)"
-        raise RuntimeError(
-            "Main tip is not in beta ancestry, but the divergent main range includes "
-            "files outside generated game-version metadata. Refusing automatic sync. "
-            f"Changed paths since merge-base: {changed}"
-        )
+    assert_range_is_generated_metadata_only(
+        repo_path,
+        merge_base,
+        main_sha,
+        label="Main tip is not in beta ancestry, but the divergent main range",
+    )
     return True, main_sha, "main game-version commit is missing from beta ancestry"
 
 
@@ -882,27 +987,29 @@ def apply_channel_metadata(
     version,
     game_version,
     ensure_beta_concurrency=False,
+    update_changelog=True,
 ):
-    """Apply TOC, README, and compatibility changelog updates in repo_path."""
+    """Apply TOC, README, and optional compatibility changelog updates in repo_path."""
     repo_path = Path(repo_path)
     toc_path = repo_path / "SpectrumFederation" / "SpectrumFederation.toc"
     update_packaged_tocs(toc_path, str(interface), version)
     update_readme_badges(repo_path / "README.md", version, interface, channel)
 
-    from datetime import datetime, timezone
+    if update_changelog:
+        from datetime import datetime, timezone
 
-    changelog = _update_changelog()
-    previous_cwd = Path.cwd()
-    try:
-        os.chdir(repo_path)
-        changelog.apply_compatibility_changelog(
-            version,
-            game_version,
-            str(interface),
-            datetime.now(timezone.utc).date().isoformat(),
-        )
-    finally:
-        os.chdir(previous_cwd)
+        changelog = _update_changelog()
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(repo_path)
+            changelog.apply_compatibility_changelog(
+                version,
+                game_version,
+                str(interface),
+                datetime.now(timezone.utc).date().isoformat(),
+            )
+        finally:
+            os.chdir(previous_cwd)
 
     if ensure_beta_concurrency and channel == "beta":
         workflow = repo_path / ".github" / "workflows" / "post-merge-beta.yml"
@@ -1008,6 +1115,7 @@ def integrate_main_into_beta(
                 version=beta_version,
                 game_version=game_version,
                 ensure_beta_concurrency=True,
+                update_changelog=True,
             )
             staged = [*packaged_toc_relpaths(), "README.md", "CHANGELOG.md"]
             workflow = repo_path / ".github" / "workflows" / "post-merge-beta.yml"
@@ -1040,13 +1148,12 @@ def integrate_main_into_beta(
         }
 
     merge_base = git_merge_base(repo_path, main_sha, "HEAD")
-    if not range_only_touches_generated_metadata(repo_path, merge_base, main_sha):
-        changed = ", ".join(list_changed_paths(repo_path, merge_base, main_sha)) or "(none)"
-        raise RuntimeError(
-            "Refusing to synchronize main into beta because the main range includes "
-            "files outside generated game-version metadata. "
-            f"Changed paths since merge-base: {changed}"
-        )
+    assert_range_is_generated_metadata_only(
+        repo_path,
+        merge_base,
+        main_sha,
+        label="Refusing to synchronize main into beta because the main range",
+    )
 
     merge = subprocess.run(
         [
@@ -1082,8 +1189,9 @@ def integrate_main_into_beta(
             beta_version=beta_version,
         )
 
-    # Always stamp planned beta metadata onto the final tree so beta is never
-    # left with stable TOC/README values from main, even when Git auto-merged.
+    # Always stamp planned beta TOC/README onto the final tree so beta is never
+    # left with stable values from main, even when Git auto-merged. Only write a
+    # beta compatibility changelog section when a beta version bump is planned.
     apply_channel_metadata(
         repo_path,
         channel="beta",
@@ -1091,6 +1199,7 @@ def integrate_main_into_beta(
         version=beta_version,
         game_version=game_version,
         ensure_beta_concurrency=beta_update_needed,
+        update_changelog=beta_update_needed,
     )
     staged = [*packaged_toc_relpaths(), "README.md", "CHANGELOG.md"]
     workflow = repo_path / ".github" / "workflows" / "post-merge-beta.yml"

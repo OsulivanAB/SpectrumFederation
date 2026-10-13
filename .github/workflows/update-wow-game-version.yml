@@ -669,14 +669,23 @@ jobs:
         id: source
         env:
           BETA_ACTION: ${{ needs.preflight.outputs.beta_action }}
+          BETA_MUTATION: ${{ needs.preflight.outputs.beta_branch_mutation }}
           CAPTURED_SHA: ${{ needs.preflight.outputs.beta_sha }}
           PUSHED_SHA: ${{ needs.update-beta.outputs.pushed_sha }}
         run: |
           set -euo pipefail
-          if [[ "$BETA_ACTION" == "update" ]]; then
+          # After history-only sync, beta_action may be publish while the tip moved.
+          # Publish from the post-sync commit whenever update-beta mutated the branch.
+          if [[ "$BETA_ACTION" == "update" || "$BETA_MUTATION" == "true" ]]; then
+            if [[ -z "${PUSHED_SHA}" ]]; then
+              echo "::error::Beta publish requires update-beta pushed_sha after beta mutation"
+              exit 1
+            fi
             echo "sha=$PUSHED_SHA" >> "$GITHUB_OUTPUT"
+            echo "mutated=true" >> "$GITHUB_OUTPUT"
           else
             echo "sha=$CAPTURED_SHA" >> "$GITHUB_OUTPUT"
+            echo "mutated=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout publish source
@@ -724,7 +733,9 @@ jobs:
           done
 
       - name: Verify beta tip has not drifted before publish-only
-        if: needs.preflight.outputs.beta_action == 'publish'
+        if: |
+          needs.preflight.outputs.beta_action == 'publish' &&
+          needs.preflight.outputs.beta_branch_mutation != 'true'
         env:
           EXPECTED_SHA: ${{ needs.preflight.outputs.beta_sha }}
         run: |
@@ -735,7 +746,9 @@ jobs:
             --verify-sha "$EXPECTED_SHA"
 
       - name: Overlay live generated notes when publishing a prior tip
-        if: needs.preflight.outputs.beta_action == 'publish'
+        if: |
+          needs.preflight.outputs.beta_action == 'publish' &&
+          needs.preflight.outputs.beta_branch_mutation != 'true'
         run: |
           set -euo pipefail
           git fetch origin beta
