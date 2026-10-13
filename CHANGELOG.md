@@ -2,19 +2,13 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.9-beta.3] - 2026-10-13
-
-### Changed
-- Loot Helper Consumable Logs: character class colors (#348)
-
-## [1.5.9-beta.2] - 2026-10-12
+## [1.5.9] - 2026-10-13
 
 ### Added
 - Silence remaining chat noise and add chat-output regression guards
 
-## [1.5.9-beta.1] - 2026-10-12
-
 ### Changed
+- Loot Helper Consumable Logs: character class colors (#348)
 - Silence unnecessary raid-supply deposit chat messages
 
 ## [1.5.8] - 2026-10-10
