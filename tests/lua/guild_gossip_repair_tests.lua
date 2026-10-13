@@ -576,8 +576,10 @@ do
         op = "request", viewId = "vb", providerId = "sf.synthetic.gossip",
         scopeId = B.GuildGossip.GetGuildScopeId(), requestId = "br1", ids = ids,
     }), "WHISPER", "Alice-Garona")
+    assertEq(#e.recvQueue, 1, "F10: admitted correlated BODY request")
     -- Dispatch + pump without deliverWire (which clears the send wire).
     B.GuildGossip.OnSchedulerStep(B.GuildGossip.GetStepLimits("NORMAL"), world.time)
+    assertTrue((B.LootHelperComm.state.total or 0) >= 1, "F10: BODY response queued after export")
     B.LootHelperComm:_PumpQueue()
     local bodyPages, maxLen, maxRecords = 0, 0, 0
     for _, msg in ipairs(world.wire) do
