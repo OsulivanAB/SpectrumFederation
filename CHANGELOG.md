@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.10] - 2026-10-13
+
+### Changed
+- Updated Retail game compatibility to Interface 120105 (12.1.5).
+
 ## [1.5.9] - 2026-10-13
 
 ### Added

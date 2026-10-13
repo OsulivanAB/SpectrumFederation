@@ -1,8 +1,8 @@
-## Interface: 120100
+## Interface: 120105
 ## Title: Spectrum Federation: RC Loot Council Integration
 ## Notes: Records RC Loot Council awards in Spectrum Loot Logs during an active Loot Helper session.
 ## Author: OsulivanAB
-## Version: 1.5.9
+## Version: 1.5.10
 ## Dependencies: SpectrumFederation
 ## OptionalDeps: RCLootCouncil
 ## Group: SpectrumFederation
