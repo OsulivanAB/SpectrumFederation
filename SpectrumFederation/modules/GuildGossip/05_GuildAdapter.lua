@@ -10,6 +10,7 @@ GG._guild = GG._guild or {
     ready = false,
     inGuild = false,
     scopeId = nil, -- stable guild scope string
+    lastVerifiedScopeId = nil,
     guildName = nil,
     guildRealm = nil,
     clubId = nil,
@@ -110,15 +111,24 @@ function GG.RefreshGuildState()
     local scopeId = computeScopeId(guildName, guildRealm, clubId)
     if not scopeId then
         -- Guild claimed but identity incomplete — wait/fail closed.
+        if g.ready and GG.OnGuildInvalidated then
+            GG.OnGuildInvalidated("identity_incomplete")
+        end
         g.inGuild = true
         g.ready = false
         g.scopeId = nil
+        g.members = {}
         return
     end
 
     if not GetNumGuildMembers or not GetGuildRosterInfo then
+        if g.ready and GG.OnGuildInvalidated then
+            GG.OnGuildInvalidated("roster_unavailable")
+        end
         g.inGuild = true
         g.ready = false
+        g.scopeId = nil
+        g.members = {}
         return
     end
 
@@ -127,8 +137,13 @@ function GG.RefreshGuildState()
     -- An empty total while claiming guild membership is treated as not ready
     -- (roster not yet available). Never treat empty as "zero members authenticated".
     if total <= 0 then
+        if g.ready and GG.OnGuildInvalidated then
+            GG.OnGuildInvalidated("roster_incomplete")
+        end
         g.inGuild = true
         g.ready = false
+        g.scopeId = nil
+        g.members = {}
         requestRoster()
         return
     end
@@ -143,10 +158,11 @@ function GG.RefreshGuildState()
         end
     end
 
-    local scopeChanged = g.scopeId and g.scopeId ~= scopeId
+    local scopeChanged = g.lastVerifiedScopeId and g.lastVerifiedScopeId ~= scopeId
     g.inGuild = true
     g.ready = true
     g.scopeId = scopeId
+    g.lastVerifiedScopeId = scopeId
     g.guildName = guildName
     g.guildRealm = guildRealm
     g.clubId = clubId

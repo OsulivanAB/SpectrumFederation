@@ -11,6 +11,7 @@ GG._recvGuard = GG._recvGuard or {
     partials = {}, -- [key] = { bytes, fragments, lastAt, lastProgressAt }
     partialBytes = 0,
     partialCount = 0,
+    expiryTimer = nil,
 }
 
 local function partialKey(prefix, distribution, sender)
@@ -36,6 +37,24 @@ local function releasePartial(st, key)
     clearPhysicalSpool(st, key)
 end
 
+local function ensurePartialExpiry(st)
+    if not next(st.partials) then
+        if st.expiryTimer and st.expiryTimer.Cancel then
+            pcall(function() st.expiryTimer:Cancel() end)
+        end
+        st.expiryTimer = nil
+        return
+    end
+    if st.expiryTimer or not (C_Timer and C_Timer.NewTimer) then
+        return
+    end
+    st.expiryTimer = C_Timer.NewTimer(GG.REASSEMBLY_IDLE_SEC, function()
+        st.expiryTimer = nil
+        GG.ExpireStalePartials(GG._Now())
+        ensurePartialExpiry(st)
+    end)
+end
+
 function GG.ExpireStalePartials(now)
     local st = GG._recvGuard
     now = now or GG._Now()
@@ -51,6 +70,7 @@ function GG.ExpireStalePartials(now)
         releasePartial(st, keys[i])
         GG._DVerbose("Reassembly expired key=%s", keys[i])
     end
+    ensurePartialExpiry(st)
 end
 
 function GG.ClearAllPartials()
@@ -65,6 +85,7 @@ function GG.ClearAllPartials()
     st.partials = {}
     st.partialBytes = 0
     st.partialCount = 0
+    ensurePartialExpiry(st)
 end
 
 local function admitFragment(st, key, addBytes, now)
@@ -89,6 +110,7 @@ local function admitFragment(st, key, addBytes, now)
         }
         st.partialCount = (st.partialCount or 0) + 1
         st.partialBytes = (st.partialBytes or 0) + addBytes
+        ensurePartialExpiry(st)
         return true, nil
     end
 
@@ -114,6 +136,7 @@ local function admitFragment(st, key, addBytes, now)
     if progress then
         p.lastProgressAt = now
     end
+    ensurePartialExpiry(st)
     return true, nil
 end
 
@@ -122,7 +145,10 @@ function GG.InstallReceiveGuard(aceComm)
     if not aceComm then
         return false
     end
-    if st.installed and st.aceComm == aceComm and aceComm._SF_GG_RecvGuard then
+    if st.installed and st.aceComm == aceComm and aceComm._SF_GG_RecvGuard
+        and aceComm.OnReceiveMultipartFirst == st.wrapperFirst
+        and aceComm.OnReceiveMultipartNext == st.wrapperNext
+        and aceComm.OnReceiveMultipartLast == st.wrapperLast then
         return true
     end
 
@@ -136,7 +162,7 @@ function GG.InstallReceiveGuard(aceComm)
         return false
     end
 
-    aceComm.OnReceiveMultipartFirst = function(self, pfx, message, distribution, sender)
+    local wrapperFirst = function(self, pfx, message, distribution, sender)
         if pfx ~= prefix then
             return origFirst(self, pfx, message, distribution, sender)
         end
@@ -150,7 +176,7 @@ function GG.InstallReceiveGuard(aceComm)
         return origFirst(self, pfx, message, distribution, sender)
     end
 
-    aceComm.OnReceiveMultipartNext = function(self, pfx, message, distribution, sender)
+    local wrapperNext = function(self, pfx, message, distribution, sender)
         if pfx ~= prefix then
             return origNext(self, pfx, message, distribution, sender)
         end
@@ -167,7 +193,7 @@ function GG.InstallReceiveGuard(aceComm)
         return origNext(self, pfx, message, distribution, sender)
     end
 
-    aceComm.OnReceiveMultipartLast = function(self, pfx, message, distribution, sender)
+    local wrapperLast = function(self, pfx, message, distribution, sender)
         if pfx ~= prefix then
             return origLast(self, pfx, message, distribution, sender)
         end
@@ -190,12 +216,19 @@ function GG.InstallReceiveGuard(aceComm)
             st.partialCount = math.max(0, (st.partialCount or 0) - 1)
             st.partials[key] = nil
         end
+        ensurePartialExpiry(st)
         return origLast(self, pfx, message, distribution, sender)
     end
 
+    aceComm.OnReceiveMultipartFirst = wrapperFirst
+    aceComm.OnReceiveMultipartNext = wrapperNext
+    aceComm.OnReceiveMultipartLast = wrapperLast
     aceComm._SF_GG_RecvGuard = true
     st.aceComm = aceComm
     st.installed = true
+    st.wrapperFirst = wrapperFirst
+    st.wrapperNext = wrapperNext
+    st.wrapperLast = wrapperLast
     GG._DInfo("Gossip receive guard installed on AceComm instance %s", tostring(aceComm))
     return true
 end

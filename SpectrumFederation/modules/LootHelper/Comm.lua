@@ -329,6 +329,7 @@ function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opt
             gossipProviderId = opts.gossipProviderId,
             gossipGeneration = opts.gossipGeneration,
             gossipCancel = opts.gossipCancel,
+            gossipValid = opts.gossipValid,
         })
     end
 
@@ -351,7 +352,7 @@ local function _releaseQueuedItem(item)
         return
     end
     if type(item.gossipCancel) == "function" then
-        pcall(item.gossipCancel)
+        pcall(item.gossipCancel, "cancelled")
     elseif type(item.callback) == "function" then
         -- Treat cancellation as terminal so senders release stream/byte reservations.
         pcall(item.callback, nil, 1, 1, false)
@@ -539,6 +540,7 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback, tr
         gossipProviderId = meta and meta.gossipProviderId or nil,
         gossipGeneration = meta and meta.gossipGeneration or nil,
         gossipCancel = meta and meta.gossipCancel or nil,
+        gossipValid = meta and meta.gossipValid or nil,
     }
 
     -- Keep BACKGROUND behind any already-queued FOREGROUND items for this target.
@@ -652,8 +654,12 @@ function Comm:_PumpQueue()
                     st._perTargetWarned[key] = nil
                 end
 
-                self:SendCommMessage(item.prefix, item.msg, item.dist, item.target, item.prio, item.callback)
-                sent = sent + 1
+                if type(item.gossipValid) == "function" and not item.gossipValid() then
+                    _releaseQueuedItem(item)
+                else
+                    self:SendCommMessage(item.prefix, item.msg, item.dist, item.target, item.prio, item.callback)
+                    sent = sent + 1
+                end
 
                 -- Eagerly clean up if queue is now empty after sending
                 if #q == 0 then
@@ -718,11 +724,17 @@ function Comm:OnCommReceived(prefix, text, distribution, sender)
 			local ok, err = pcall(self._gossipHandler, prefix, text, distribution, sender)
 			if not ok then
 				DError("Gossip handler error from=%s err=%s", tostring(sender), tostring(err))
+                if geterrorhandler then
+                    pcall(geterrorhandler(), err)
+                end
 			end
 		elseif SF.GuildGossip and SF.GuildGossip.OnGossipCommReceived then
 			local ok, err = pcall(SF.GuildGossip.OnGossipCommReceived, prefix, text, distribution, sender)
 			if not ok then
 				DError("Gossip engine error from=%s err=%s", tostring(sender), tostring(err))
+                if geterrorhandler then
+                    pcall(geterrorhandler(), err)
+                end
 			end
 		end
 		return

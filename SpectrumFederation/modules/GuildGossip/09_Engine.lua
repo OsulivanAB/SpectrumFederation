@@ -3,6 +3,7 @@ local addonName, SF = ...
 
 SF.GuildGossip = SF.GuildGossip or {}
 local GG = SF.GuildGossip
+local providerScope, providerEligible
 
 GG._engine = GG._engine or {
     inited = false,
@@ -48,6 +49,45 @@ end
 -- Peer working set
 ---------------------------------------------------------------------------
 
+local function providerAnnouncementFingerprint(cap)
+    if type(cap) ~= "table" then
+        return ""
+    end
+    return table.concat({
+        tostring(cap.id or ""),
+        tostring(cap.schema or ""),
+        tostring(cap.revision or cap.changeGen or ""),
+        tostring(cap.dataFingerprint or cap.fingerprint or ""),
+        tostring(cap.eligibilityGen or ""),
+    }, "\0")
+end
+
+local function clearPeerProviderState(peerName, providerId, scopeId)
+    local normalized = peerName and peerKey(peerName) or nil
+    for _, entry in ipairs(GG.ListActiveProviders()) do
+        if not providerId or entry.id == providerId then
+            for key in pairs(entry.bookmarks or {}) do
+                local parts = {}
+                for part in string.gmatch(key, "[^|]+") do
+                    parts[#parts + 1] = part
+                end
+                if (not normalized or parts[1] == normalized)
+                    and (not scopeId or parts[3] == tostring(scopeId)) then
+                    entry.bookmarks[key] = nil
+                end
+            end
+        end
+    end
+    local unresolved = GG._engine.unresolved or {}
+    for key, item in pairs(unresolved) do
+        if (not normalized or item.peerKey == normalized)
+            and (not providerId or item.providerId == providerId)
+            and (not scopeId or item.scopeId == scopeId) then
+            unresolved[key] = nil
+        end
+    end
+end
+
 local function touchPeer(name, info)
     local e = GG._engine
     local norm = GG.NormalizePlayer(name)
@@ -82,8 +122,21 @@ local function touchPeer(name, info)
     peer.lastSeen = now
     if info and info.caps then
         peer.caps = info.caps
-        -- New announcement invalidates prior "already covered" marks.
-        peer.covered = {}
+        peer.capFingerprints = peer.capFingerprints or {}
+        peer.covered = peer.covered or {}
+        -- Discovery is deliberately rotated. Only an advertised provider whose
+        -- bounded change identity differs reopens coverage; omission says
+        -- nothing about providers absent from this packet.
+        for _, cap in ipairs(info.caps.providers or {}) do
+            if type(cap) == "table" and cap.id then
+                local id = tostring(cap.id)
+                local fingerprint = providerAnnouncementFingerprint(cap)
+                if peer.capFingerprints[id] and peer.capFingerprints[id] ~= fingerprint then
+                    peer.covered[id] = nil
+                end
+                peer.capFingerprints[id] = fingerprint
+            end
+        end
     end
     peer.proto = info and info.proto or peer.proto
     peer.covered = peer.covered or {}
@@ -103,6 +156,7 @@ local function expirePeers(now)
                 keep[#keep + 1] = key
             else
                 e.peers[key] = nil
+                clearPeerProviderState(p.name, nil, nil)
             end
         end
     end
@@ -154,31 +208,43 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
     end
     e.admittedOutBytes = (e.admittedOutBytes or 0) + bytes
 
-    local submittedFinal = false
-    local releasedEarly = false
-    local function releaseAdmission()
-        if releasedEarly or submittedFinal then
+    local terminal = false
+    local function finish(success, sendResult)
+        if terminal then
             return
         end
-        releasedEarly = true
+        terminal = true
         e.streamBusy[sk] = nil
         onGossipSubmitted(bytes)
+        if opts.onFinalSubmitted then
+            opts.onFinalSubmitted(success == true, sendResult)
+        end
+    end
+    local function releaseAdmission(reason)
+        finish(false, reason or "cancelled")
     end
     local callback = function(_, sent, textlen, sendResult)
         -- ChatThrottleLib/AceComm callback: sent reaches textlen on final fragment.
         if type(sent) == "number" and type(textlen) == "number" and sent >= textlen then
-            if not submittedFinal and not releasedEarly then
-                submittedFinal = true
-                e.streamBusy[sk] = nil
-                onGossipSubmitted(bytes)
-                if opts.onFinalSubmitted then
-                    opts.onFinalSubmitted(true, sendResult)
-                end
-            end
+            finish(sendResult ~= false, sendResult)
         end
     end
 
     local providerId = opts.providerId or (type(payload) == "table" and payload.providerId) or nil
+    local scopeId = opts.scopeId or (type(payload) == "table" and payload.scopeId) or nil
+    if providerId and not scopeId and providerScope then
+        scopeId = providerScope(GG.GetProvider(providerId))
+    end
+    local sendGeneration = e.generation
+    local gossipValid = opts.gossipValid or function()
+        if sendGeneration ~= GG._engine.generation or not GG.IsGuildReady() then
+            return false
+        end
+        if not providerId then
+            return GG.HasActiveProvider()
+        end
+        return providerEligible and providerEligible(GG.GetProvider(providerId), target, scopeId)
+    end
     local ok = Comm:Send("GOSSIP", msgType, payload, distribution, target, GG.ACE_PRIO, {
         enc = (payload == nil or (type(payload) == "table" and next(payload) == nil)) and GG.ENC_NONE or GG.ENC_B64CBOR,
         queue = true,
@@ -190,10 +256,10 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         gossipProviderId = providerId,
         gossipGeneration = e.generation,
         gossipCancel = releaseAdmission,
+        gossipValid = gossipValid,
     })
     if not ok then
-        e.streamBusy[sk] = nil
-        e.admittedOutBytes = math.max(0, (e.admittedOutBytes or 0) - bytes)
+        finish(false, "queue_rejected")
         return false, "queue_rejected"
     end
     -- Single-part: AceComm still invokes callback; if Comm bypasses callback on
@@ -355,7 +421,39 @@ local function closeInPull(reason)
     GG._DVerbose("In pull closed (%s)", tostring(reason))
 end
 
-local function providerScope(entry)
+local function scheduleOutPullRetry(pull, reason)
+    if GG._engine.outPull ~= pull or not pull.outstanding then
+        return
+    end
+    pull.retries = (pull.retries or 0) + 1
+    if pull.retries > GG.PAGE_RETRY_MAX then
+        closeOutPull("exhausted")
+        return
+    end
+    local backoff = GG.PAGE_RETRY_BACKOFF[pull.retries] or GG.PAGE_RETRY_BACKOFF[#GG.PAGE_RETRY_BACKOFF]
+    pull.finalSubmitted = false
+    pull.awaitingSince = nil
+    pull.retryAt = GG._Now() + backoff
+    pull.usableProgressAt = pull.retryAt
+    GG.MarkWorkPending()
+    GG._DVerbose("Out pull retry scheduled (%s) in %ss", tostring(reason), tostring(backoff))
+end
+
+local function noteOutPullSubmission(pull, success, sendResult)
+    if GG._engine.outPull ~= pull then
+        return
+    end
+    if success then
+        pull.finalSubmitted = true
+        pull.retryAt = nil
+        pull.awaitingSince = GG._Now()
+        pull.usableProgressAt = pull.awaitingSince
+    else
+        scheduleOutPullRetry(pull, sendResult or "final_submission_failed")
+    end
+end
+
+providerScope = function(entry)
     if not entry or not entry.api then
         return nil
     end
@@ -369,13 +467,31 @@ local function providerScope(entry)
     return GG.GetGuildScopeId()
 end
 
-local function providerEligible(entry, peerName, scopeId)
+providerEligible = function(entry, peerName, scopeId)
     return entry
         and entry.enabled
         and entry.ready
         and scopeId ~= nil
         and providerScope(entry) == scopeId
         and GG.ProviderIsPeerEligible(entry, peerName, { scopeId = scopeId })
+end
+
+local function recordExportable(entry, peerName, scopeId, recordId, indexEntry)
+    if not providerEligible(entry, peerName, scopeId) then
+        return false
+    end
+    local api = entry.api
+    if type(api.IsRecordExportable) == "function" then
+        local ctx = {
+            peer = peerName,
+            scopeId = scopeId,
+            eligibilityGen = entry.eligibilityGen,
+            indexEntry = indexEntry,
+        }
+        local ok, allowed = pcall(api.IsRecordExportable, peerName, recordId, ctx)
+        return ok and allowed == true
+    end
+    return true
 end
 
 local function nextRequestId(pull, kind)
@@ -395,6 +511,9 @@ local function noteInPullSubmission(pull, success)
         if pull.finalSubmitted then
             pull.awaitingSince = GG._Now()
             pull.usableProgressAt = pull.awaitingSince
+        else
+            -- An unsent offer/page cannot retain the stop-and-wait lease.
+            closeInPull("submission_failed")
         end
     end
 end
@@ -469,6 +588,12 @@ GG.OnProviderRemoved = function(providerId)
     if GG.CancelQueuedGossipForProvider then
         GG.CancelQueuedGossipForProvider(providerId)
     end
+    clearPeerProviderState(nil, providerId, nil)
+    for key, item in pairs(e.unresolved or {}) do
+        if item.providerId == providerId then
+            e.unresolved[key] = nil
+        end
+    end
 end
 
 local function startOutPull(peer, providerEntry)
@@ -493,7 +618,10 @@ local function startOutPull(peer, providerEntry)
         providerEntry.eligibilityGen,
         scopeId,
         providerEntry.id,
-        providerEntry.schema
+        providerEntry.schema,
+        function(recordId, indexEntry)
+            return recordExportable(providerEntry, peer.name, scopeId, recordId, indexEntry)
+        end
     )
     local payload = {
         op = "request",
@@ -534,11 +662,9 @@ local function startOutPull(peer, providerEntry)
     e.outPull = pull
     local ok = GG.SendGossip(GG.MSG.VIEW, payload, "WHISPER", peer.name, {
         providerId = providerEntry.id,
+        scopeId = scopeId,
         onFinalSubmitted = function(success)
-            if e.outPull == pull then
-                pull.awaitingSince = GG._Now()
-                pull.finalSubmitted = success and true or false
-            end
+            noteOutPullSubmission(pull, success)
         end,
     })
     if not ok then
@@ -565,7 +691,9 @@ local function selectPullPeer()
             local matched = compatibleProviders(peer.caps)
             -- Prefer a provider not already covered for this peer.
             for _, entry in ipairs(matched) do
-                if not (peer.covered and peer.covered[entry.id]) then
+                local scopeId = providerScope(entry)
+                if providerEligible(entry, peer.name, scopeId)
+                    and not (peer.covered and peer.covered[entry.id]) then
                     return peer, entry
                 end
             end
@@ -594,6 +722,7 @@ local function enqueueReceive(sender, msgType, payloadStr, enc, bytes)
         msgType = msgType,
         payloadStr = payloadStr,
         enc = enc,
+        distribution = distribution,
         bytes = bytes,
         at = GG._Now(),
     }
@@ -625,6 +754,11 @@ function GG.OnGossipCommReceived(prefix, text, distribution, sender)
     local ok, msgType, proto, enc, payloadStr, parseErr = GG.ParseEnvelope(text)
     if not ok then
         GG._DVerbose("Bad gossip envelope from %s (%s)", tostring(sender), tostring(parseErr))
+        return
+    end
+
+    if (msgType == GG.MSG.DISC and distribution ~= "GUILD")
+        or (msgType ~= GG.MSG.DISC and distribution ~= "WHISPER") then
         return
     end
 
@@ -704,6 +838,19 @@ local function handleView(sender, payload)
     if payload.op == "request" then
         -- Serve a pull: reply with our view summaries.
         if e.inPull then
+            local existing = e.inPull
+            if existing.peer == sender and existing.viewId == payload.viewId
+                and existing.providerId == payload.providerId and existing.scopeId == scopeId
+                and existing.offerPayload then
+                GG.SendGossip(GG.MSG.VIEW, existing.offerPayload, "WHISPER", sender, {
+                    providerId = existing.providerId,
+                    scopeId = existing.scopeId,
+                    onFinalSubmitted = function(success)
+                        noteInPullSubmission(existing, success)
+                    end,
+                })
+                return
+            end
             -- Stop-and-wait: one served pull at a time. Tell requester to rotate.
             GG.SendGossip(GG.MSG.ACK, {
                 viewId = payload.viewId,
@@ -717,7 +864,10 @@ local function handleView(sender, payload)
             providerEntry.eligibilityGen,
             scopeId,
             providerEntry.id,
-            providerEntry.schema
+            providerEntry.schema,
+            function(recordId, indexEntry)
+                return recordExportable(providerEntry, sender, scopeId, recordId, indexEntry)
+            end
         )
         local reply = {
             op = "offer",
@@ -743,17 +893,21 @@ local function handleView(sender, payload)
             sourceViewId = view.viewId,
             scopeId = scopeId,
             epoch = view.epoch,
+            eligibilityGen = providerEntry.eligibilityGen,
             buckets = view.buckets,
             phase = "serving",
             engineGen = e.generation,
             usableProgressAt = GG._Now(),
             pauseExcluded = 0,
             finalSubmitted = false,
+            offerPayload = reply,
         }
+        local servedPull = e.inPull
         GG.SendGossip(GG.MSG.VIEW, reply, "WHISPER", sender, {
             providerId = providerEntry.id,
+            scopeId = scopeId,
             onFinalSubmitted = function(success)
-                noteInPullSubmission(e.inPull, success)
+                noteInPullSubmission(servedPull, success)
             end,
         })
         return
@@ -788,7 +942,10 @@ local function handleManifest(sender, payload)
             return
         end
         local entry = GG.GetProvider(pull.providerId)
-        if not providerEligible(entry, sender, pull.scopeId) then
+        if not providerEligible(entry, sender, pull.scopeId)
+            or pull.epoch ~= (entry and entry.index and entry.index.epoch)
+            or pull.eligibilityGen ~= (entry and entry.eligibilityGen) then
+            closeInPull("stale_provider_view")
             return
         end
         pull.usableProgressAt = GG._Now()
@@ -799,12 +956,15 @@ local function handleManifest(sender, payload)
             endSeq = pull.buckets[bucketId].lastSeq or 0
         end
         -- Capture was fixed at serve time; use captured end marker.
-        local entries = GG.IndexSeekManifest(
+        local entries, seekMeta = GG.IndexSeekManifest(
             entry.index,
             bucketId,
             payload.afterSeq or 0,
             endSeq,
-            limits.manifestEntries
+            limits.manifestEntries,
+            function(recordId, indexEntry)
+                return recordExportable(entry, sender, pull.scopeId, recordId, indexEntry)
+            end
         )
         local response = {
             op = "page",
@@ -817,7 +977,7 @@ local function handleManifest(sender, payload)
             afterSeq = payload.afterSeq or 0,
             endSeq = endSeq,
             entries = entries,
-            done = (#entries == 0) or ((entries[#entries].seq or 0) >= endSeq),
+            done = seekMeta and seekMeta.done == true,
             engineGen = e.generation,
         }
         -- A manifest must also be sendable as one bounded gossip envelope.
@@ -825,8 +985,17 @@ local function handleManifest(sender, payload)
             table.remove(response.entries)
             response.done = false
         end
+        if #response.entries == 0 and #entries > 0 then
+            -- The descriptor itself cannot fit. Do not advance past it or
+            -- pretend this bucket is covered; give the requester a correlated
+            -- terminal outcome so it can cool down without a tight retry loop.
+            response.limit = true
+            response.error = "manifest_descriptor_too_large"
+            response.done = false
+        end
         GG.SendGossip(GG.MSG.MANIFEST, response, "WHISPER", sender, {
             providerId = pull.providerId,
+            scopeId = pull.scopeId,
             onFinalSubmitted = function(success)
                 noteInPullSubmission(pull, success)
             end,
@@ -848,6 +1017,11 @@ local function handleManifest(sender, payload)
         local entry = GG.GetProvider(pull.providerId)
         if not providerEligible(entry, sender, pull.scopeId) then
             closeOutPull("provider_ineligible")
+            return
+        end
+        if payload.limit then
+            e.peerCooldownUntil[peerKey(sender)] = GG._Now() + GG.POST_EXHAUSTION_COOLDOWN_SEC
+            closeOutPull("provider_limit")
             return
         end
         pull.manifest = payload
@@ -880,15 +1054,31 @@ local function handleBody(sender, payload)
         end
         local entry = GG.GetProvider(pull.providerId)
         if not providerEligible(entry, sender, pull.scopeId)
+            or pull.epoch ~= (entry and entry.index and entry.index.epoch)
+            or pull.eligibilityGen ~= (entry and entry.eligibilityGen)
             or not entry.api or type(entry.api.GetRecordBody) ~= "function" then
+            closeInPull("stale_provider_view")
             return
         end
         pull.usableProgressAt = GG._Now()
         local records = {}
         local skippedIds = {}
-        local more = false
-        for _, rid in ipairs(payload.ids) do
-            local ok, body = pcall(entry.api.GetRecordBody, rid)
+        local limits = GG.GetStepLimits(payload.mode or GG.GetSchedMode())
+        local maxBodies = math.min(#payload.ids, limits.bodies or 1)
+        local more = #payload.ids > maxBodies
+        for requestIndex, rid in ipairs(payload.ids) do
+            if requestIndex > maxBodies then
+                break
+            end
+            local exportCtx = {
+                peer = sender,
+                scopeId = pull.scopeId,
+                eligibilityGen = entry.eligibilityGen,
+            }
+            local ok, body = false, nil
+            if recordExportable(entry, sender, pull.scopeId, rid, GG.IndexGetEntry(entry.index, rid)) then
+                ok, body = pcall(entry.api.GetRecordBody, rid, exportCtx)
+            end
             if ok and type(body) == "table" then
                 local rawOk, raw = false, nil
                 if C_EncodingUtil and C_EncodingUtil.SerializeCBOR then
@@ -934,6 +1124,7 @@ local function handleBody(sender, payload)
             engineGen = e.generation,
         }, "WHISPER", sender, {
             providerId = pull.providerId,
+            scopeId = pull.scopeId,
             onFinalSubmitted = function(success)
                 noteInPullSubmission(pull, success)
             end,
@@ -951,14 +1142,10 @@ local function handleBody(sender, payload)
             return
         end
         local expected = pull.expectedIds or {}
+        local expectedOrder = pull.expectedOrder or {}
         local expectedFp = pull.expectedFingerprints or {}
         local function isExpected(id)
-            for key, value in pairs(expected) do
-                if tostring(key) == tostring(id) or tostring(value) == tostring(id) then
-                    return true
-                end
-            end
-            return false
+            return expected[tostring(id)] == true
         end
         local seen = {}
         for _, record in ipairs(payload.records) do
@@ -978,14 +1165,31 @@ local function handleBody(sender, payload)
             end
             seen[tostring(recordId)] = true
         end
+        local settled = #payload.records + #(payload.skippedIds or {})
+        if settled == 0 then
+            return
+        end
+        -- A partial page may settle only the leading portion of the current
+        -- request. Otherwise a reordered/omitted response could advance the
+        -- cursor over records which were never delivered.
+        for i = 1, settled do
+            local expectedId = expectedOrder[i]
+            if not expectedId or not seen[tostring(expectedId)] then
+                return
+            end
+        end
+        if payload.more ~= true and settled ~= #expectedOrder then
+            return
+        end
         local entry = GG.GetProvider(pull.providerId)
-        if not providerEligible(entry, sender, pull.scopeId) then
+        if not providerEligible(entry, sender, pull.scopeId)
+            or pull.localEpoch ~= (entry and entry.index and entry.index.epoch) then
             closeOutPull("provider_ineligible")
             return
         end
         pull.bodyPage = payload
         pull.bodyApplyCursor = 0
-        pull.pendingBodyCount = #payload.records + #(payload.skippedIds or {})
+        pull.pendingBodyCount = settled
         pull.bodyMore = payload.more == true
         pull.expectedRequestId = nil
         pull.expectedSubpage = nil
@@ -1060,26 +1264,53 @@ local function hasValidRecords(records)
     return true
 end
 
-local function validPayloadForMessage(msgType, payload)
+local function validPayloadForMessage(msgType, payload, distribution)
     if type(payload) ~= "table" then
         return false
     end
     if not boundedValue(payload, 1, { nodes = 1 }, {}) then
         return false
     end
-    if msgType == GG.MSG.MANIFEST and payload.op == "page" then
-        return hasValidEntries(payload.entries)
+    if msgType == GG.MSG.DISC then
+        return distribution == "GUILD" and type(payload.providers) == "table"
+            and #payload.providers <= GG.MAX_PEERS
     end
-    if msgType == GG.MSG.BODY and payload.op == "page" then
+    if msgType == GG.MSG.VIEW then
+        return distribution == "WHISPER"
+            and (payload.op == "request" or payload.op == "offer")
+            and type(payload.viewId) == "string" and type(payload.providerId) == "string"
+            and type(payload.scopeId) == "string"
+    end
+    if msgType == GG.MSG.MANIFEST then
+        if distribution ~= "WHISPER" or (payload.op ~= "request" and payload.op ~= "page") then
+            return false
+        end
+        return type(payload.viewId) == "string" and type(payload.providerId) == "string"
+            and type(payload.scopeId) == "string" and type(payload.requestId) == "string"
+            and (payload.op ~= "page" or hasValidEntries(payload.entries))
+    end
+    if msgType == GG.MSG.BODY then
+        if distribution ~= "WHISPER" or (payload.op ~= "request" and payload.op ~= "page") then
+            return false
+        end
+        if type(payload.viewId) ~= "string" or type(payload.providerId) ~= "string"
+            or type(payload.scopeId) ~= "string" or type(payload.requestId) ~= "string" then
+            return false
+        end
+        if payload.op == "request" then
+            return type(payload.ids) == "table" and #payload.ids <= GG.BODIES_PER_MESSAGE.NORMAL
+        end
         return hasValidRecords(payload.records)
+            and #payload.records <= GG.BODIES_PER_MESSAGE.NORMAL
+            and (payload.skippedIds == nil or type(payload.skippedIds) == "table")
     end
-    return true
+    return distribution == "WHISPER" and (msgType == GG.MSG.ACK or msgType == GG.MSG.NACK)
 end
 
 local function dispatchOne(item, limits)
     local msgType = item.msgType
     local payload, err = GG.DecodePayload(item.payloadStr, item.enc)
-    if err or not validPayloadForMessage(msgType, payload) then
+    if err or not validPayloadForMessage(msgType, payload, item.distribution) then
         GG._DVerbose("Drop malformed gossip %s from %s", tostring(msgType), tostring(item.sender))
         return
     end
@@ -1115,23 +1346,36 @@ local function resendOutstanding(pull)
     pull.finalSubmitted = false
     return GG.SendGossip(outstanding.msgType, outstanding.payload, "WHISPER", pull.peer, {
         providerId = pull.providerId,
-        onFinalSubmitted = function(success)
-            if GG._engine.outPull == pull then
-                pull.finalSubmitted = success and true or false
-                pull.awaitingSince = GG._Now()
-            end
+        scopeId = pull.scopeId,
+        onFinalSubmitted = function(success, sendResult)
+            noteOutPullSubmission(pull, success, sendResult)
         end,
     })
 end
 
-local function recordUnresolved(providerId, recordId, result, now)
+local function invalidateUnresolvedCoverage(item)
+    if not item then
+        return
+    end
+    clearPeerProviderState(item.peer, item.providerId, item.scopeId)
+    local peer = item.peerKey and GG._engine.peers[item.peerKey]
+    if peer and peer.covered then
+        peer.covered[item.providerId] = nil
+    end
+end
+
+local function recordUnresolved(providerId, recordId, result, now, peerName, scopeId)
     local e = GG._engine
-    local key = tostring(providerId) .. "|" .. tostring(recordId)
+    local peer = peerKey(peerName)
+    local key = table.concat({ tostring(providerId), peer, tostring(scopeId), tostring(recordId) }, "|")
     e.unresolved[key] = {
         at = now,
         providerId = providerId,
         recordId = recordId,
         result = result,
+        peer = peerName,
+        peerKey = peer,
+        scopeId = scopeId,
     }
     local oldestKey, oldestAt, count = nil, nil, 0
     for unresolvedKey, item in pairs(e.unresolved) do
@@ -1141,13 +1385,16 @@ local function recordUnresolved(providerId, recordId, result, now)
         end
     end
     if count > GG.MAX_UNRESOLVED and oldestKey then
+        invalidateUnresolvedCoverage(e.unresolved[oldestKey])
         e.unresolved[oldestKey] = nil
     end
 end
 
-local function hasUnresolvedForProvider(providerId)
+local function hasUnresolvedForProvider(providerId, peerName, scopeId)
     for _, item in pairs(GG._engine.unresolved) do
-        if item.providerId == providerId then
+        if item.providerId == providerId
+            and (not peerName or item.peerKey == peerKey(peerName))
+            and (not scopeId or item.scopeId == scopeId) then
             return true
         end
     end
@@ -1165,22 +1412,25 @@ local function advanceOutPull(limits, now)
         return false
     end
 
-    if pull.finalSubmitted and pull.awaitingSince and pull.outstanding
-        and now >= (pull.usableProgressAt or pull.awaitingSince)
-        and (now - (pull.usableProgressAt or pull.awaitingSince)) > GG.VIEW_IDLE_TIMEOUT_SEC then
-        pull.retries = (pull.retries or 0) + 1
-        if pull.retries > GG.PAGE_RETRY_MAX then
-            closeOutPull("exhausted")
+    if pull.retryAt then
+        if now < pull.retryAt then
             return false
         end
-        local backoff = GG.PAGE_RETRY_BACKOFF[pull.retries] or 15
-        pull.usableProgressAt = now + backoff
+        pull.retryAt = nil
         resendOutstanding(pull)
         return true
     end
 
+    if pull.finalSubmitted and pull.awaitingSince and pull.outstanding
+        and now >= (pull.usableProgressAt or pull.awaitingSince)
+        and (now - (pull.usableProgressAt or pull.awaitingSince)) > GG.VIEW_IDLE_TIMEOUT_SEC then
+        scheduleOutPullRetry(pull, "response_timeout")
+        return true
+    end
+
     local entry = GG.GetProvider(pull.providerId)
-    if not providerEligible(entry, pull.peer, pull.scopeId) then
+    if not providerEligible(entry, pull.peer, pull.scopeId)
+        or pull.localEpoch ~= (entry and entry.index and entry.index.epoch) then
         closeOutPull("provider_gone")
         return false
     end
@@ -1213,7 +1463,7 @@ local function advanceOutPull(limits, now)
                 providerId = pull.providerId,
             }, "WHISPER", pull.peer)
             local p = e.peers[peerKey(pull.peer)]
-            if p and not hasUnresolvedForProvider(pull.providerId) then
+            if p and not hasUnresolvedForProvider(pull.providerId, pull.peer, pull.scopeId) then
                 p.covered = p.covered or {}
                 p.covered[pull.providerId] = true
             end
@@ -1248,12 +1498,8 @@ local function advanceOutPull(limits, now)
         pull.expectedSubpage = 1
         pull.expectedIds = nil
         pull.outstanding = { msgType = GG.MSG.MANIFEST, payload = payload }
-        local ok = resendOutstanding(pull)
-        if ok then
-            pull.phase = "wait_manifest"
-        else
-            pull.outstanding = nil
-        end
+        pull.phase = "wait_manifest"
+        resendOutstanding(pull)
         return true
     end
 
@@ -1284,11 +1530,12 @@ local function advanceOutPull(limits, now)
             end
             return true
         end
-        local ids, expectedFingerprints = {}, {}
+        local ids, expectedIds, expectedFingerprints = {}, {}, {}
         local maxBodies = limits.bodies
         for i = (pull.bodyOffset or 0) + 1, math.min(#pull.neededBodies, (pull.bodyOffset or 0) + maxBodies) do
             local needed = pull.neededBodies[i]
             ids[#ids + 1] = needed.id
+            expectedIds[tostring(needed.id)] = true
             expectedFingerprints[tostring(needed.id)] = needed.versionFp
         end
         if #ids == 0 then
@@ -1305,20 +1552,18 @@ local function advanceOutPull(limits, now)
             requestId = requestId,
             subpage = pull.bodySubpage,
             ids = ids,
+            mode = limits.mode,
             engineGen = e.generation,
         }
         pull.pendingBodyCount = #ids
         pull.expectedRequestId = requestId
         pull.expectedSubpage = pull.bodySubpage
-        pull.expectedIds = ids
+        pull.expectedIds = expectedIds
+        pull.expectedOrder = ids
         pull.expectedFingerprints = expectedFingerprints
         pull.outstanding = { msgType = GG.MSG.BODY, payload = payload }
-        local ok = resendOutstanding(pull)
-        if ok then
-            pull.phase = "wait_bodies"
-        else
-            pull.outstanding = nil
-        end
+        pull.phase = "wait_bodies"
+        resendOutstanding(pull)
         return true
     end
 
@@ -1336,13 +1581,14 @@ local function advanceOutPull(limits, now)
         while cursor < #records and apps < limits.apps do
             local rec = records[cursor + 1]
             -- Re-check eligibility immediately before the provider side effect.
-            if not providerEligible(entry, pull.peer, pull.scopeId) then
+            if not providerEligible(entry, pull.peer, pull.scopeId)
+                or pull.localEpoch ~= (entry and entry.index and entry.index.epoch) then
                 closeOutPull("provider_ineligible")
                 return false
             end
             local result = GG.ApplyRecordToProvider(entry, rec, ctx)
             if result == GG.DELIVERY.PENDING or result == GG.DELIVERY.REJECTED then
-                recordUnresolved(pull.providerId, rec.id, result, now)
+                recordUnresolved(pull.providerId, rec.id, result, now, pull.peer, pull.scopeId)
             end
             cursor = cursor + 1
             apps = apps + 1
@@ -1355,7 +1601,14 @@ local function advanceOutPull(limits, now)
         end
         local skipped = pull.bodyPage.skippedIds or {}
         for _, recordId in ipairs(skipped) do
-            recordUnresolved(pull.providerId, recordId, GG.DELIVERY.REJECTED, now)
+            recordUnresolved(pull.providerId, recordId, GG.DELIVERY.REJECTED, now, pull.peer, pull.scopeId)
+        end
+        if hasUnresolvedForProvider(pull.providerId, pull.peer, pull.scopeId) then
+            -- Do not advance the transport bookmark over a provider obligation
+            -- that has not settled. A meaningful provider change reopens this
+            -- coverage; expiry invalidates it below.
+            closeOutPull("unresolved")
+            return true
         end
         local appliedCount = pull.pendingBodyCount or (#records + #skipped)
         pull.bodyOffset = (pull.bodyOffset or 0) + appliedCount
@@ -1424,6 +1677,7 @@ local function expireUnresolved(now)
     local unresolved = GG._engine.unresolved
     for key, item in pairs(unresolved) do
         if not item.at or (now - item.at) > GG.UNRESOLVED_TTL_SEC then
+            invalidateUnresolvedCoverage(item)
             unresolved[key] = nil
         end
     end
@@ -1440,6 +1694,7 @@ function GG.OnSchedulerStep(limits, now)
 
     local stepStartedAt = debugprofilestop and debugprofilestop() or nil
     local indexRemaining = limits.indexEntries or 0
+    e.indexWorkPending = false
     e.stepStats = { indexExamined = 0, receivedApps = 0, cpuMs = 0 }
     -- Index maintenance uses one aggregate entry budget across providers.
     for _, entry in ipairs(GG.ListActiveProviders()) do
@@ -1451,7 +1706,10 @@ function GG.OnSchedulerStep(limits, now)
             indexLimits[key] = value
         end
         indexLimits.indexEntries = indexRemaining
-        GG.EnsureProviderIndex(entry, indexLimits)
+        local moreIndex = GG.EnsureProviderIndex(entry, indexLimits)
+        if moreIndex or (entry.index and (entry.index.dirty or not entry.index.buildComplete)) then
+            e.indexWorkPending = true
+        end
         local examined = math.max(0, tonumber(entry.lastIndexExamined) or 0)
         e.stepStats.indexExamined = e.stepStats.indexExamined + examined
         indexRemaining = math.max(0, indexRemaining - examined)
@@ -1491,6 +1749,7 @@ function GG.OnSchedulerStep(limits, now)
     -- Idle detection: no pulls, empty recv, no debounce, discovery-only.
     local sched = GG._sched
     if not e.outPull and not e.inPull and #(e.recvQueue) == 0
+        and not e.indexWorkPending
         and not (sched and sched.changeDebounceAt)
     then
         -- Keep discovery while providers active; clear continuous work flag.
@@ -1529,6 +1788,9 @@ function GG.Init(opts)
     end
     e.inited = true
     opts = opts or {}
+    if GG.InitEpochIncarnation then
+        GG.InitEpochIncarnation()
+    end
 
     GG.InitGuildAdapter()
 

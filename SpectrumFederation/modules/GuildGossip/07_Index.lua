@@ -22,9 +22,22 @@ local function newBucket()
     }
 end
 
+function GG.InitEpochIncarnation()
+    if GG._epochBase then
+        return GG._epochBase
+    end
+    local now = (GetTime and GetTime()) or 0
+    -- A process-local sequence alone restarts after /reload. Mix a high-resolution
+    -- session value with entropy so a receiver never treats a reloaded source's
+    -- cursors as the same source incarnation.
+    GG._epochBase = math.floor(now * 1000000) * 1000000 + math.random(1, 999999)
+    return GG._epochBase
+end
+
 local function nextEpoch()
+    GG.InitEpochIncarnation()
     GG._epochSeq = (tonumber(GG._epochSeq) or 0) + 1
-    return GG._epochSeq
+    return GG._epochBase + GG._epochSeq
 end
 
 function GG.CreateIndex()
@@ -51,6 +64,8 @@ function GG.BumpIndexEpoch(index)
         for _, entry in pairs(GG._providers.byId) do
             if entry and entry.index == index then
                 GG.InvalidateProviderBookmarks(entry)
+                entry._buildList = nil
+                entry._buildPos = nil
                 break
             end
         end
@@ -176,18 +191,23 @@ function GG.UnpackBucketSummaries(packed)
     return buckets
 end
 
-function GG.CaptureViewSummaries(index, eligibilityGen, scopeId, providerId, schema)
+function GG.CaptureViewSummaries(index, eligibilityGen, scopeId, providerId, schema, exportable)
     if type(index) ~= "table" then
         return nil
     end
     local buckets = {}
     for i = 0, GG.BUCKET_COUNT - 1 do
         local b = index.buckets[i]
-        buckets[i] = {
-            lastSeq = b.lastSeq or 0,
-            count = b.count or 0,
-            fingerprint = b.fingerprint or 0,
-        }
+        local summary = { lastSeq = 0, count = 0, fingerprint = 0 }
+        for _, seq in ipairs(b.order or {}) do
+            local entry = b.bySeq[seq]
+            if entry and (not exportable or exportable(entry.id, entry)) then
+                summary.lastSeq = math.max(summary.lastSeq, entry.seq or 0)
+                summary.count = summary.count + 1
+                summary.fingerprint = GG.CombineFingerprint(summary.fingerprint, entry.id, entry.versionFp)
+            end
+        end
+        buckets[i] = summary
     end
     return {
         providerId = providerId,
@@ -203,11 +223,11 @@ end
 
 -- Seek manifest entries: afterSeq < sequence <= endSeq in increasing order.
 -- Starts at the order position after afterSeq (direct seek); returns examined count.
-function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit)
+function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportable)
     local out = {}
     local examined = 0
     if type(index) ~= "table" then
-        return out, { examined = 0 }
+        return out, { examined = 0, done = true }
     end
     bucketId = tonumber(bucketId)
     afterSeq = tonumber(afterSeq) or 0
@@ -215,7 +235,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit)
     limit = tonumber(limit) or 1
     local bucket = index.buckets[bucketId]
     if not bucket then
-        return out, { examined = 0 }
+        return out, { examined = 0, done = true }
     end
     local startPos = 1
     if afterSeq > 0 and bucket.posBySeq and bucket.posBySeq[afterSeq] then
@@ -236,18 +256,20 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit)
         end
     end
     examined = 0
+    local done = true
     for i = startPos, #bucket.order do
         local seq = bucket.order[i]
         examined = examined + 1
         if seq > afterSeq and seq <= endSeq then
             local entry = bucket.bySeq[seq]
-            if entry then
+            if entry and (not exportable or exportable(entry.id, entry)) then
                 out[#out + 1] = {
                     seq = entry.seq,
                     id = entry.id,
                     versionFp = entry.versionFp,
                 }
                 if #out >= limit then
+                    done = false
                     break
                 end
             end
@@ -255,7 +277,7 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit)
             break
         end
     end
-    return out, { examined = examined }
+    return out, { examined = examined, done = done }
 end
 
 function GG.IndexGetEntry(index, recordId)

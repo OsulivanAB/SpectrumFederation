@@ -231,6 +231,11 @@ function GG._TickScheduler()
         return
     end
     local now = GG._Now()
+    -- Multipart reassembly has its own lifetime and must expire even while
+    -- normal provider work is paused for combat/loading.
+    if GG.ExpireStalePartials then
+        GG.ExpireStalePartials(now)
+    end
     if GG.UpdatePauseState(now) then
         -- Paused: do not consume view idle retry time (engine checks pause).
         return

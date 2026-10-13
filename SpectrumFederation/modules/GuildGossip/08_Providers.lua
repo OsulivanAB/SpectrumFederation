@@ -168,6 +168,14 @@ function GG.NotifyProviderChanged(providerId)
     if not entry or not entry.enabled then
         return
     end
+    -- Provider-owned storage changed outside the engine's append path. Keep the
+    -- existing index usable while scheduling a bounded reconciliation pass.
+    entry.index.dirty = true
+    entry._buildList = nil
+    entry._buildPos = nil
+    if GG.MarkWorkPending then
+        GG.MarkWorkPending()
+    end
     GG.NotifyMeaningfulChange()
 end
 

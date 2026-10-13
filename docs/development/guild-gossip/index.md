@@ -55,7 +55,7 @@ SF.GuildGossip:Register({
  complementary helpers:
 
 - `SF.GuildGossip:Unregister(id)` / `:EnableProvider` / `:DisableProvider`
-- `SF.GuildGossip:NotifyProviderChanged(id)` via `SF.GuildGossip.NotifyProviderChanged`
+- `SF.GuildGossip.NotifyProviderChanged(id)` dirties the provider index for a bounded rebuild and reopens affected discovery coverage
 - `SF.GuildGossip:EnableSynthetic(opts)` / `:DisableSynthetic(id)` — **explicit** test activation; disabled by default; runtime-only store
 - `SF.GuildGossip:GetStats()` — runtime diagnostics
 
