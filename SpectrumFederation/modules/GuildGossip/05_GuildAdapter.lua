@@ -162,6 +162,8 @@ function GG.RefreshGuildState()
     g.inGuild = true
     g.ready = true
     g.scopeId = scopeId
+    -- Preserve lastVerifiedScopeId across leave/incomplete gaps so a later
+    -- verified guild can still detect a true scope transition.
     g.lastVerifiedScopeId = scopeId
     g.guildName = guildName
     g.guildRealm = guildRealm
@@ -171,7 +173,10 @@ function GG.RefreshGuildState()
 
     if scopeChanged and GG.OnGuildInvalidated then
         GG.OnGuildInvalidated("scope_changed")
-    elseif GG.OnGuildReady then
+    end
+    -- Always wake readiness after a verified guild identity is installed,
+    -- including when an old scope was just invalidated.
+    if GG.OnGuildReady then
         GG.OnGuildReady()
     end
 end

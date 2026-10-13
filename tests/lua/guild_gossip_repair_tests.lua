@@ -984,6 +984,200 @@ do
     A.GuildGossip.SendGossip = orig
 end
 
+---------------------------------------------------------------------------
+-- F20: SLOW server uses local body budget (not NORMAL requester mode)
+-- and shares that budget across queued BODY requests.
+---------------------------------------------------------------------------
+do
+    reset()
+    local B = makeClient("Bob")
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f20" })
+    for i = 1, 8 do pB.AppendLocal("payload-" .. i, "f20-" .. i) end
+    local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local lookups = 0
+    local origBody = entryB.api.GetRecordBody
+    entryB.api.GetRecordBody = function(...)
+        lookups = lookups + 1
+        return origBody(...)
+    end
+    local e = B.GuildGossip._engine
+    e.inPull = {
+        peer = "Alice-Garona", providerId = "sf.synthetic.gossip", viewId = "v20",
+        scopeId = B.GuildGossip.GetGuildScopeId(), epoch = entryB.index.epoch,
+        eligibilityGen = entryB.eligibilityGen,
+        buckets = {}, phase = "serving", engineGen = e.generation,
+        usableProgressAt = world.time, finalSubmitted = true,
+    }
+    local ids = {}
+    for i = 1, 8 do ids[i] = "f20-" .. i end
+    local function admitBody(requestId)
+        B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
+            op = "request", viewId = "v20", providerId = "sf.synthetic.gossip",
+            scopeId = B.GuildGossip.GetGuildScopeId(), requestId = requestId,
+            ids = ids, mode = "NORMAL",
+        }), "WHISPER", "Alice-Garona")
+    end
+    admitBody("br20a")
+    admitBody("br20b")
+    assertEq(#e.recvQueue, 2, "F20: two BODY requests admitted")
+    -- Elevate apps so both could dispatch in one step; bodies stay SLOW=1.
+    local slow = B.GuildGossip.GetStepLimits("SLOW")
+    local limits = {
+        mode = "SLOW",
+        bodies = slow.bodies,
+        manifestEntries = slow.manifestEntries,
+        apps = 4,
+        cpuMs = slow.cpuMs,
+        indexEntries = slow.indexEntries,
+    }
+    assertEq(limits.bodies, 1, "F20: fixture SLOW bodies=1")
+    world.wire = {}
+    world._unitName = "Bob"
+    world._sendAs = "Bob-Garona"
+    B.GuildGossip.OnSchedulerStep(limits, world.time)
+    B.LootHelperComm:_PumpQueue()
+    assertEq(lookups, 1, "F20: first step performs only one GetRecordBody under SLOW")
+    assertTrue(#e.recvQueue >= 1, "F20: second request retained after shared budget exhaustion")
+    local pages, moreFlags, recordCounts = 0, 0, 0
+    for _, msg in ipairs(world.wire) do
+        if msg.prefix == "SF_GG" and msg.text:find("GG_BODY", 1, true) then
+            pages = pages + 1
+            local ok, _, _, enc, payloadStr = B.GuildGossip.ParseEnvelope(msg.text)
+            if ok then
+                local payload = select(1, B.GuildGossip.DecodePayload(payloadStr, enc))
+                if type(payload) == "table" and payload.op == "page" then
+                    if payload.more == true then moreFlags = moreFlags + 1 end
+                    recordCounts = recordCounts + #(payload.records or {})
+                end
+            end
+        end
+    end
+    assertEq(pages, 1, "F20: one partial BODY page in the first step")
+    assertEq(moreFlags, 1, "F20: partial page signals more=true for unfinished IDs")
+    assertEq(recordCounts, 1, "F20: first page carries one record")
+    -- Next step drains remaining queued work within the same local aggregate.
+    world.wire = {}
+    B.GuildGossip.OnSchedulerStep(limits, world.time)
+    B.LootHelperComm:_PumpQueue()
+    assertEq(lookups, 2, "F20: second step consumes one more local body slot")
+    local secondPages = 0
+    for _, msg in ipairs(world.wire) do
+        if msg.prefix == "SF_GG" and msg.text:find("GG_BODY", 1, true) then
+            secondPages = secondPages + 1
+        end
+    end
+    assertEq(secondPages, 1, "F20: deferred second request completes on a later step")
+    entryB.api.GetRecordBody = origBody
+end
+
+---------------------------------------------------------------------------
+-- F21: transient VIEW offer stream_busy keeps the served pull and retries
+---------------------------------------------------------------------------
+do
+    reset()
+    local B = makeClient("Bob")
+    B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f21" })
+    local e = B.GuildGossip._engine
+    local sk = "WHISPER|Alice-Garona"
+    e.streamBusy[sk] = true
+    local offerAttempts, usedIgnoreBusy = 0, false
+    local origSend = B.GuildGossip.SendGossip
+    B.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        opts = opts or {}
+        if msgType == B.GuildGossip.MSG.VIEW and type(payload) == "table" and payload.op == "offer" then
+            offerAttempts = offerAttempts + 1
+            if opts.ignoreStreamBusy then
+                usedIgnoreBusy = true
+            end
+        end
+        return origSend(msgType, payload, dist, target, opts)
+    end
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v21", providerId = "sf.synthetic.gossip",
+        schema = 1, scopeId = B.GuildGossip.GetGuildScopeId(),
+        eligibilityGen = 1, epoch = 1, packedBuckets = B.GuildGossip.PackBucketSummaries({}),
+        mode = "NORMAL", engineGen = e.generation,
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull ~= nil, "F21: stream_busy does not close served pull")
+    assertTrue(e.inPull.offerRetryPending == true, "F21: offer retry pending while stream busy")
+    assertTrue(e.inPull.offerPayload ~= nil, "F21: correlated offer payload preserved")
+    assertEq(usedIgnoreBusy, false, "F21: offer path does not set ignoreStreamBusy")
+    -- Simulate delayed final-submission / foreground drain releasing the stream.
+    e.streamBusy[sk] = nil
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull ~= nil, "F21: served pull still present after retry")
+    assertTrue(e.inPull.offerRetryPending ~= true, "F21: offer retry cleared after successful send")
+    assertTrue(offerAttempts >= 2, "F21: offer retried after stream drained (attempts=" .. tostring(offerAttempts) .. ")")
+    assertTrue(e.inPull.finalSubmitted == true, "F21: offer final submission recorded")
+    -- Cancellation / reservation cleanup on invalidation.
+    local genBefore = e.generation
+    B.GuildGossip.InvalidateRuntime("f21_cleanup")
+    assertTrue(e.inPull == nil, "F21: invalidation clears served pull")
+    assertTrue(e.streamBusy[sk] == nil, "F21: no stranded streamBusy reservation")
+    assertTrue(e.generation == genBefore + 1, "F21: generation bumped on cleanup")
+    B.GuildGossip.SendGossip = origSend
+end
+
+---------------------------------------------------------------------------
+-- F22: verified guild A→B and leave→join wake initial discovery jitter
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f22" })
+    local e = A.GuildGossip._engine
+    local g = A.GuildGossip._guild
+    local scopeA = A.GuildGossip.GetGuildScopeId()
+    assertTrue(scopeA ~= nil, "F22: starting verified scope")
+    -- Idle scheduler with a leftover periodic discovery deadline.
+    A.GuildGossip.StopDiscovery()
+    e.nextDiscoveryAt = world.time + 150
+    e.discoveryTimer = nil
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v22",
+        scopeId = scopeA, phase = "wait_view", engineGen = e.generation,
+        usableProgressAt = world.time, finalSubmitted = true,
+    }
+    -- Direct A→B scope change.
+    world.guild.clubId = 99
+    A.GuildGossip.RefreshGuildState()
+    local scopeB = A.GuildGossip.GetGuildScopeId()
+    assertEq(scopeB, "club:99", "F22: new verified scope installed")
+    assertEq(g.lastVerifiedScopeId, "club:99", "F22: lastVerifiedScopeId tracks new scope")
+    assertTrue(e.outPull == nil, "F22: old-scope outPull cancelled on A→B")
+    local delayAB = (e.nextDiscoveryAt or 0) - world.time
+    assertTrue(delayAB >= 3 and delayAB <= 10,
+        "F22: A→B schedules initial 3–10s discovery (delay=" .. tostring(delayAB) .. ")")
+    assertTrue(e.discoveryTimer ~= nil, "F22: A→B arms discovery timer")
+
+    -- Leave (unknown) then join another guild from an idle scheduler.
+    A.GuildGossip.StopDiscovery()
+    e.nextDiscoveryAt = world.time + 160
+    e.discoveryTimer = nil
+    world.guild.inGuild = false
+    A.GuildGossip.RefreshGuildState()
+    assertTrue(not A.GuildGossip.IsGuildReady(), "F22: leave clears readiness")
+    assertEq(g.lastVerifiedScopeId, "club:99", "F22: lastVerifiedScopeId preserved across leave")
+    world.guild.inGuild = true
+    world.guild.clubId = 7
+    world.guild.name = "OtherGuild"
+    A.GuildGossip.RefreshGuildState()
+    assertEq(A.GuildGossip.GetGuildScopeId(), "club:7", "F22: leave→join installs new scope")
+    assertEq(g.lastVerifiedScopeId, "club:7", "F22: lastVerifiedScopeId updated after rejoin")
+    local delayJoin = (e.nextDiscoveryAt or 0) - world.time
+    assertTrue(delayJoin >= 3 and delayJoin <= 10,
+        "F22: leave→join schedules initial 3–10s discovery (delay=" .. tostring(delayJoin) .. ")")
+    -- Fail-closed incomplete identity does not wake discovery as ready.
+    A.GuildGossip.StopDiscovery()
+    e.nextDiscoveryAt = nil
+    world.guild.clubId = nil
+    world.guild.name = nil
+    A.GuildGossip.RefreshGuildState()
+    assertTrue(not A.GuildGossip.IsGuildReady(), "F22: incomplete identity fails closed")
+    assertTrue(e.nextDiscoveryAt == nil, "F22: incomplete identity does not schedule discovery")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")

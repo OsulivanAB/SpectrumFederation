@@ -216,6 +216,11 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         terminal = true
         e.streamBusy[sk] = nil
         onGossipSubmitted(bytes)
+        -- A served VIEW offer may be waiting for this stream to drain.
+        local pull = GG._engine.inPull
+        if pull and pull.offerRetryPending and streamKey("WHISPER", pull.peer) == sk then
+            GG.MarkWorkPending()
+        end
         if opts.onFinalSubmitted then
             opts.onFinalSubmitted(success == true, sendResult)
         end
@@ -509,6 +514,7 @@ local function noteInPullSubmission(pull, success)
     if GG._engine.inPull == pull then
         pull.finalSubmitted = success and true or false
         if pull.finalSubmitted then
+            pull.offerRetryPending = nil
             pull.awaitingSince = GG._Now()
             pull.usableProgressAt = pull.awaitingSince
         else
@@ -516,6 +522,59 @@ local function noteInPullSubmission(pull, success)
             closeInPull("submission_failed")
         end
     end
+end
+
+-- Serving budgets are owned by the local scheduler step. A remote mode may only
+-- reduce throughput; it must never raise the server above its current limits.
+local function resolveServeLimits(stepLimits, remoteMode)
+    local localLimits = stepLimits or GG.GetStepLimits()
+    local remoteLimits = remoteMode and GG.GetStepLimits(remoteMode) or localLimits
+    return {
+        mode = localLimits.mode,
+        bodies = math.min(localLimits.bodies or 1, remoteLimits.bodies or 1),
+        manifestEntries = math.min(localLimits.manifestEntries or 1, remoteLimits.manifestEntries or 1),
+        apps = localLimits.apps,
+        cpuMs = localLimits.cpuMs,
+        indexEntries = localLimits.indexEntries,
+    }
+end
+
+local function consumeStepExportBudget(kind, amount)
+    local budget = GG._engine.stepExportBudget
+    if not budget then
+        return amount
+    end
+    local key = kind == "manifest" and "manifestEntries" or "bodies"
+    local remaining = tonumber(budget[key]) or 0
+    local take = math.max(0, math.min(amount, remaining))
+    budget[key] = math.max(0, remaining - take)
+    return take
+end
+
+local function trySendServedOffer(pull)
+    if not pull or not pull.offerPayload or GG._engine.inPull ~= pull then
+        return false
+    end
+    local ok, err = GG.SendGossip(GG.MSG.VIEW, pull.offerPayload, "WHISPER", pull.peer, {
+        providerId = pull.providerId,
+        scopeId = pull.scopeId,
+        onFinalSubmitted = function(success)
+            noteInPullSubmission(pull, success)
+        end,
+    })
+    if ok then
+        pull.offerRetryPending = nil
+        return true
+    end
+    if err == "stream_busy" then
+        -- Preserve the correlated served view and retry when the stream drains.
+        pull.offerRetryPending = true
+        pull.finalSubmitted = false
+        GG.MarkWorkPending()
+        return false
+    end
+    closeInPull("offer_admission_failed")
+    return false
 end
 
 function GG.OnGossipPauseChanged(paused, now)
@@ -842,13 +901,7 @@ local function handleView(sender, payload)
             if existing.peer == sender and existing.viewId == payload.viewId
                 and existing.providerId == payload.providerId and existing.scopeId == scopeId
                 and existing.offerPayload then
-                GG.SendGossip(GG.MSG.VIEW, existing.offerPayload, "WHISPER", sender, {
-                    providerId = existing.providerId,
-                    scopeId = existing.scopeId,
-                    onFinalSubmitted = function(success)
-                        noteInPullSubmission(existing, success)
-                    end,
-                })
+                trySendServedOffer(existing)
                 return
             end
             -- Stop-and-wait: one served pull at a time. Tell requester to rotate.
@@ -902,18 +955,7 @@ local function handleView(sender, payload)
             finalSubmitted = false,
             offerPayload = reply,
         }
-        local servedPull = e.inPull
-        local ok = GG.SendGossip(GG.MSG.VIEW, reply, "WHISPER", sender, {
-            providerId = providerEntry.id,
-            scopeId = scopeId,
-            onFinalSubmitted = function(success)
-                noteInPullSubmission(servedPull, success)
-            end,
-        })
-        if not ok then
-            -- Queue admission failure is not a terminal lease; free the slot.
-            closeInPull("offer_admission_failed")
-        end
+        trySendServedOffer(e.inPull)
         return
     end
 
@@ -937,7 +979,9 @@ local function handleView(sender, payload)
     end
 end
 
-local function handleManifest(sender, payload)
+-- Returns "defer" when the shared step export budget is exhausted so the
+-- caller can put the admitted request back on the receive queue.
+local function handleManifest(sender, payload, stepLimits)
     local e = GG._engine
     if payload.op == "request" then
         local pull = e.inPull
@@ -953,7 +997,13 @@ local function handleManifest(sender, payload)
             return
         end
         pull.usableProgressAt = GG._Now()
-        local limits = GG.GetStepLimits(payload.mode or GG.GetSchedMode())
+        local limits = resolveServeLimits(stepLimits or e.stepLimits, payload.mode)
+        local manifestBudget = consumeStepExportBudget("manifest", limits.manifestEntries or 1)
+        if manifestBudget <= 0 then
+            -- Shared step export budget exhausted; retain the admitted request.
+            GG.MarkWorkPending()
+            return "defer"
+        end
         local endSeq = 0
         local bucketId = tonumber(payload.bucketId) or 0
         if pull.buckets and pull.buckets[bucketId] then
@@ -965,7 +1015,7 @@ local function handleManifest(sender, payload)
             bucketId,
             payload.afterSeq or 0,
             endSeq,
-            limits.manifestEntries,
+            manifestBudget,
             function(recordId, indexEntry)
                 return recordExportable(entry, sender, pull.scopeId, recordId, indexEntry)
             end
@@ -1047,7 +1097,9 @@ local function handleManifest(sender, payload)
     end
 end
 
-local function handleBody(sender, payload)
+-- Returns "defer" when the shared step export budget is exhausted so the
+-- caller can put the admitted request back on the receive queue.
+local function handleBody(sender, payload, stepLimits)
     local e = GG._engine
     if payload.op == "request" then
         local pull = e.inPull
@@ -1067,11 +1119,25 @@ local function handleBody(sender, payload)
         pull.usableProgressAt = GG._Now()
         local records = {}
         local skippedIds = {}
-        local limits = GG.GetStepLimits(payload.mode or GG.GetSchedMode())
-        local maxBodies = math.min(#payload.ids, limits.bodies or 1)
+        local limits = resolveServeLimits(stepLimits or e.stepLimits, payload.mode)
+        local maxBodies = consumeStepExportBudget("bodies", math.min(#payload.ids, limits.bodies or 1))
+        if maxBodies <= 0 then
+            -- Shared step export budget exhausted; retain the admitted request.
+            GG.MarkWorkPending()
+            return "defer"
+        end
         local more = #payload.ids > maxBodies
+        local lookups = 0
+        local cpuLimit = tonumber(limits.cpuMs)
+        local stepStartedAt = e.stepStartedAt
         for requestIndex, rid in ipairs(payload.ids) do
             if requestIndex > maxBodies then
+                more = true
+                break
+            end
+            if stepStartedAt and debugprofilestop and cpuLimit
+                and (debugprofilestop() - stepStartedAt) >= cpuLimit then
+                more = true
                 break
             end
             local exportCtx = {
@@ -1082,6 +1148,7 @@ local function handleBody(sender, payload)
             local ok, body = false, nil
             if recordExportable(entry, sender, pull.scopeId, rid, GG.IndexGetEntry(entry.index, rid)) then
                 ok, body = pcall(entry.api.GetRecordBody, rid, exportCtx)
+                lookups = lookups + 1
             end
             if ok and type(body) == "table" then
                 local rawOk, raw = false, nil
@@ -1115,6 +1182,10 @@ local function handleBody(sender, payload)
                 skippedIds[#skippedIds + 1] = rid
             end
         end
+        if e.stepStats then
+            e.stepStats.exportLookups = (e.stepStats.exportLookups or 0) + lookups
+        end
+        -- Unprocessed trailing IDs are preserved via more=true; they are not skipped.
         GG.SendGossip(GG.MSG.BODY, {
             op = "page",
             viewId = pull.viewId,
@@ -1311,6 +1382,7 @@ local function validPayloadForMessage(msgType, payload, distribution)
     return distribution == "WHISPER" and (msgType == GG.MSG.ACK or msgType == GG.MSG.NACK)
 end
 
+-- Returns "defer" when export work must wait for a later step budget.
 local function dispatchOne(item, limits)
     local msgType = item.msgType
     local payload, err = GG.DecodePayload(item.payloadStr, item.enc)
@@ -1323,9 +1395,9 @@ local function dispatchOne(item, limits)
     elseif msgType == GG.MSG.VIEW then
         handleView(item.sender, payload)
     elseif msgType == GG.MSG.MANIFEST then
-        handleManifest(item.sender, payload)
+        return handleManifest(item.sender, payload, limits)
     elseif msgType == GG.MSG.BODY then
-        handleBody(item.sender, payload)
+        return handleBody(item.sender, payload, limits)
     elseif msgType == GG.MSG.ACK then
         handleAck(item.sender, payload)
     elseif msgType == GG.MSG.NACK then
@@ -1677,13 +1749,23 @@ local function advanceOutPull(limits, now)
 end
 
 local function advanceInPull(now)
-    local pull = GG._engine.inPull
+    local e = GG._engine
+    local pull = e.inPull
     if not pull then
         return false
     end
-    if pull.engineGen ~= GG._engine.generation then
+    if pull.engineGen ~= e.generation then
         closeInPull("stale_gen")
         return true
+    end
+    if pull.offerRetryPending and pull.offerPayload then
+        local sk = streamKey("WHISPER", pull.peer)
+        if not e.streamBusy[sk] then
+            trySendServedOffer(pull)
+            return true
+        end
+        GG.MarkWorkPending()
+        return false
     end
     if pull.finalSubmitted and now >= (pull.usableProgressAt or now)
         and (now - (pull.usableProgressAt or now)) > GG.SERVED_VIEW_IDLE_TIMEOUT_SEC then
@@ -1713,9 +1795,15 @@ function GG.OnSchedulerStep(limits, now)
     end
 
     local stepStartedAt = debugprofilestop and debugprofilestop() or nil
+    e.stepStartedAt = stepStartedAt
     local indexRemaining = limits.indexEntries or 0
     e.indexWorkPending = false
-    e.stepStats = { indexExamined = 0, receivedApps = 0, cpuMs = 0 }
+    e.stepLimits = limits
+    e.stepExportBudget = {
+        bodies = limits.bodies or 0,
+        manifestEntries = limits.manifestEntries or 0,
+    }
+    e.stepStats = { indexExamined = 0, receivedApps = 0, cpuMs = 0, exportLookups = 0 }
     -- Index maintenance uses one aggregate entry budget across providers.
     for _, entry in ipairs(GG.ListActiveProviders()) do
         if indexRemaining <= 0 then
@@ -1738,12 +1826,19 @@ function GG.OnSchedulerStep(limits, now)
         end
     end
 
-    -- Drain receive queue under app budget.
+    -- Drain receive queue under app + shared export budgets.
     local apps = 0
     while #(e.recvQueue) > 0 and apps < limits.apps do
         local item = table.remove(e.recvQueue, 1)
         e.recvBytes = math.max(0, (e.recvBytes or 0) - (item.bytes or 0))
-        dispatchOne(item, limits)
+        local status = dispatchOne(item, limits)
+        if status == "defer" then
+            -- Put the admitted request back; do not burn further app slots.
+            table.insert(e.recvQueue, 1, item)
+            e.recvBytes = (e.recvBytes or 0) + (item.bytes or 0)
+            GG.MarkWorkPending()
+            break
+        end
         apps = apps + 1
     end
     e.stepStats.receivedApps = apps
