@@ -574,7 +574,7 @@ do
     local ids = { "big-1", "big-2", "big-3" }
     B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
         op = "request", viewId = "vb", providerId = "sf.synthetic.gossip",
-        requestId = "br1", ids = ids,
+        scopeId = B.GuildGossip.GetGuildScopeId(), requestId = "br1", ids = ids,
     }), "WHISPER", "Alice-Garona")
     -- Dispatch + pump without deliverWire (which clears the send wire).
     B.GuildGossip.OnSchedulerStep(B.GuildGossip.GetStepLimits("NORMAL"), world.time)
