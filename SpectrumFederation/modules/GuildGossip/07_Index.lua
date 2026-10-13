@@ -5,7 +5,7 @@ SF.GuildGossip = SF.GuildGossip or {}
 local GG = SF.GuildGossip
 
 -- index = {
---   epoch = n,
+--   epoch = string, -- exactly-representable "incarnation.seq"
 --   buckets = { [0..63] = { lastSeq, count, fingerprint, bySeq = {seq->entry}, order = {seq...} } },
 --   byId = { [id] = entry },
 --   dirty = bool,
@@ -23,21 +23,25 @@ local function newBucket()
 end
 
 function GG.InitEpochIncarnation()
-    if GG._epochBase then
-        return GG._epochBase
+    if GG._epochIncarnation then
+        return GG._epochIncarnation
     end
     local now = (GetTime and GetTime()) or 0
-    -- A process-local sequence alone restarts after /reload. Mix a high-resolution
-    -- session value with entropy so a receiver never treats a reloaded source's
-    -- cursors as the same source incarnation.
-    GG._epochBase = math.floor(now * 1000000) * 1000000 + math.random(1, 999999)
-    return GG._epochBase
+    -- Keep both parts well under 2^53 so consecutive seq increments stay distinct
+    -- even after long sessions. String form avoids double-precision +1 collisions.
+    local seconds = math.floor(tonumber(now) or 0)
+    if seconds < 0 then
+        seconds = 0
+    end
+    GG._epochIncarnation = string.format("%d-%d", seconds, math.random(1, 1000000000))
+    GG._epochSeq = 0
+    return GG._epochIncarnation
 end
 
 local function nextEpoch()
     GG.InitEpochIncarnation()
     GG._epochSeq = (tonumber(GG._epochSeq) or 0) + 1
-    return GG._epochBase + GG._epochSeq
+    return string.format("%s.%d", GG._epochIncarnation, GG._epochSeq)
 end
 
 function GG.CreateIndex()
@@ -191,34 +195,123 @@ function GG.UnpackBucketSummaries(packed)
     return buckets
 end
 
-function GG.CaptureViewSummaries(index, eligibilityGen, scopeId, providerId, schema, exportable)
-    if type(index) ~= "table" then
-        return nil
-    end
-    local buckets = {}
-    for i = 0, GG.BUCKET_COUNT - 1 do
-        local b = index.buckets[i]
-        local summary = { lastSeq = 0, count = 0, fingerprint = 0 }
-        for _, seq in ipairs(b.order or {}) do
-            local entry = b.bySeq[seq]
-            if entry and (not exportable or exportable(entry.id, entry)) then
-                summary.lastSeq = math.max(summary.lastSeq, entry.seq or 0)
-                summary.count = summary.count + 1
-                summary.fingerprint = GG.CombineFingerprint(summary.fingerprint, entry.id, entry.versionFp)
-            end
-        end
-        buckets[i] = summary
-    end
+local function finishViewCapture(state)
+    local buckets = state.buckets
     return {
-        providerId = providerId,
-        schema = schema,
-        scopeId = scopeId,
-        eligibilityGen = eligibilityGen,
-        epoch = index.epoch,
+        providerId = state.providerId,
+        schema = state.schema,
+        scopeId = state.scopeId,
+        eligibilityGen = state.eligibilityGen,
+        epoch = state.epoch,
         buckets = buckets,
         packedBuckets = GG.PackBucketSummaries(buckets),
-        viewId = string.format("%s:%d:%d", tostring(providerId), tonumber(index.epoch) or 0, math.random(1, 1e9)),
+        viewId = string.format("%s:%s:%d", tostring(state.providerId), tostring(state.epoch), math.random(1, 1e9)),
+        examined = state.examinedTotal or 0,
     }
+end
+
+-- Capture fixed-end-marker bucket summaries. Without an export filter this is O(64)
+-- from maintained bucket stats. With a filter, work continues under limits across
+-- calls via the returned resume state (cancellation when epoch/eligibility changes).
+-- Returns: view|nil, resumeState|nil, examinedThisCall
+function GG.CaptureViewSummaries(index, eligibilityGen, scopeId, providerId, schema, exportable, limits, resume)
+    if type(index) ~= "table" then
+        return nil, nil, 0
+    end
+
+    if not exportable then
+        local buckets = {}
+        for i = 0, GG.BUCKET_COUNT - 1 do
+            local b = index.buckets[i] or {}
+            buckets[i] = {
+                lastSeq = tonumber(b.lastSeq) or 0,
+                count = tonumber(b.count) or 0,
+                fingerprint = tonumber(b.fingerprint) or 0,
+            }
+        end
+        local view = {
+            providerId = providerId,
+            schema = schema,
+            scopeId = scopeId,
+            eligibilityGen = eligibilityGen,
+            epoch = index.epoch,
+            buckets = buckets,
+            packedBuckets = GG.PackBucketSummaries(buckets),
+            viewId = string.format("%s:%s:%d", tostring(providerId), tostring(index.epoch), math.random(1, 1e9)),
+            examined = GG.BUCKET_COUNT,
+        }
+        return view, nil, GG.BUCKET_COUNT
+    end
+
+    local state = resume
+    if state then
+        if state.epoch ~= index.epoch
+            or state.eligibilityGen ~= eligibilityGen
+            or state.scopeId ~= scopeId
+            or state.providerId ~= providerId then
+            state = nil
+        end
+    end
+    if not state then
+        local endMarkers = {}
+        local buckets = {}
+        for i = 0, GG.BUCKET_COUNT - 1 do
+            local b = index.buckets[i] or {}
+            endMarkers[i] = tonumber(b.lastSeq) or 0
+            buckets[i] = { lastSeq = 0, count = 0, fingerprint = 0 }
+        end
+        state = {
+            epoch = index.epoch,
+            eligibilityGen = eligibilityGen,
+            scopeId = scopeId,
+            providerId = providerId,
+            schema = schema,
+            endMarkers = endMarkers,
+            buckets = buckets,
+            bucketId = 0,
+            orderPos = 1,
+            examinedTotal = 0,
+        }
+    end
+
+    local budget = math.max(1, tonumber(limits and limits.indexEntries) or GG.INDEX_ENTRIES_PER_STEP.SLOW)
+    local examined = 0
+    while state.bucketId < GG.BUCKET_COUNT and examined < budget do
+        local bucketId = state.bucketId
+        local bucket = index.buckets[bucketId]
+        local endSeq = state.endMarkers[bucketId] or 0
+        local summary = state.buckets[bucketId]
+        local order = bucket and bucket.order or {}
+        local pos = state.orderPos
+        while pos <= #order and examined < budget do
+            local seq = order[pos]
+            pos = pos + 1
+            examined = examined + 1
+            state.examinedTotal = (state.examinedTotal or 0) + 1
+            if type(seq) == "number" and seq > 0 and seq <= endSeq then
+                local entry = bucket.bySeq[seq]
+                if entry and exportable(entry.id, entry) then
+                    summary.lastSeq = math.max(summary.lastSeq, entry.seq or 0)
+                    summary.count = summary.count + 1
+                    summary.fingerprint = GG.CombineFingerprint(summary.fingerprint, entry.id, entry.versionFp)
+                end
+            elseif type(seq) == "number" and seq > endSeq then
+                -- Fixed end marker reached for this bucket.
+                pos = #order + 1
+                break
+            end
+        end
+        state.orderPos = pos
+        if pos > #order then
+            state.bucketId = bucketId + 1
+            state.orderPos = 1
+        end
+    end
+
+    if state.bucketId >= GG.BUCKET_COUNT then
+        return finishViewCapture(state), nil, examined
+    end
+    return nil, state, examined
 end
 
 -- Seek manifest entries: afterSeq < sequence <= endSeq in increasing order.

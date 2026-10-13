@@ -54,8 +54,9 @@ function GG.NotifyMeaningfulChange()
     if not st.changeDebounceAt or due < st.changeDebounceAt then
         st.changeDebounceAt = due
     end
-    -- Active pass keeps a single follow-up dirty flag rather than restarting.
-    if GG._engine and GG._engine.outPull then
+    -- Active exchange keeps a single follow-up dirty flag rather than restarting
+    -- the current pass (initiated or served).
+    if GG._engine and (GG._engine.outPull or GG._engine.inPull) then
         st.dirtyFollowUp = true
     end
     -- Local accepted changes clear coverage so a follow-up pass can run.
@@ -64,6 +65,10 @@ function GG.NotifyMeaningfulChange()
         for _, peer in pairs(GG._engine.peers) do
             peer.covered = {}
         end
+    end
+    -- A meaningful provider change reopens suspended unresolved obligations.
+    if GG._engine then
+        GG._engine.unresolvedBackoffUntil = {}
     end
     GG.MarkWorkPending()
 end

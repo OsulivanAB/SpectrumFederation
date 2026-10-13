@@ -22,6 +22,9 @@ GG._engine = GG._engine or {
     lastNackAt = {},
     peerCooldownUntil = {},
     unresolved = {}, -- bounded unresolved bookkeeping
+    -- [peer|provider|scope] = until: suspend exchanges after pending/rejected
+    unresolvedBackoffUntil = {},
+    pendingOutCapture = nil, -- budgeted local VIEW summary construction
 }
 
 local function peerKey(name)
@@ -397,6 +400,10 @@ local function setBookmark(entry, peerName, scopeId, bucketId, bm)
     entry.bookmarks[key] = bm
 end
 
+local function unresolvedBackoffKey(peerName, providerId, scopeId)
+    return peerKey(peerName) .. "|" .. tostring(providerId or "") .. "|" .. tostring(scopeId or "")
+end
+
 local function closeOutPull(reason)
     local e = GG._engine
     local pull = e.outPull
@@ -410,6 +417,12 @@ local function closeOutPull(reason)
     GG._DVerbose("Out pull closed (%s)", tostring(reason))
     if reason == "exhausted" and pull.peer then
         e.peerCooldownUntil[peerKey(pull.peer)] = GG._Now() + GG.POST_EXHAUSTION_COOLDOWN_SEC
+    elseif reason == "unresolved" and pull.peer and pull.providerId then
+        -- Keep coverage incomplete; suppress this scoped obligation until a
+        -- meaningful notification or the bounded backoff deadline.
+        e.unresolvedBackoffUntil = e.unresolvedBackoffUntil or {}
+        e.unresolvedBackoffUntil[unresolvedBackoffKey(pull.peer, pull.providerId, pull.scopeId)] =
+            GG._Now() + (GG.UNRESOLVED_BACKOFF_SEC or GG.POST_EXHAUSTION_COOLDOWN_SEC)
     end
 end
 
@@ -497,6 +510,33 @@ local function recordExportable(entry, peerName, scopeId, recordId, indexEntry)
         return ok and allowed == true
     end
     return true
+end
+
+local function indexReadyForView(entry)
+    local index = entry and entry.index
+    return index
+        and index.buildComplete == true
+        and not index.dirty
+        and not entry._buildList
+end
+
+local function providerNeedsIndexWork(entry)
+    if not entry or not entry.enabled or not entry.ready or not entry.index then
+        return false
+    end
+    if entry._buildList then
+        return true
+    end
+    return entry.index.dirty == true or entry.index.buildComplete ~= true
+end
+
+local function viewExportFilter(entry, peerName, scopeId)
+    if not entry or not entry.api or type(entry.api.IsRecordExportable) ~= "function" then
+        return nil
+    end
+    return function(recordId, indexEntry)
+        return recordExportable(entry, peerName, scopeId, recordId, indexEntry)
+    end
 end
 
 local function nextRequestId(pull, kind)
@@ -613,6 +653,8 @@ function GG.InvalidateRuntime(reason)
     closeInPull(reason or "invalidated")
     e.recvQueue = {}
     e.recvBytes = 0
+    e.pendingOutCapture = nil
+    e.unresolvedBackoffUntil = {}
     GG.ClearAllPartials()
     local comm = SF.LootHelperComm
     if comm and comm.CancelAllQueuedGossip then
@@ -671,17 +713,57 @@ local function startOutPull(peer, providerEntry)
     if cooldown and GG._Now() < cooldown then
         return false
     end
+    local backoffUntil = e.unresolvedBackoffUntil
+        and e.unresolvedBackoffUntil[unresolvedBackoffKey(peer.name, providerEntry.id, scopeId)]
+    if backoffUntil and GG._Now() < backoffUntil then
+        return false
+    end
+    -- Never publish a cold/dirty partial index as a usable view.
+    if not indexReadyForView(providerEntry) then
+        GG.MarkWorkPending()
+        return false
+    end
 
-    local view = GG.CaptureViewSummaries(
+    local limits = e.stepLimits or GG.GetStepLimits()
+    local filter = viewExportFilter(providerEntry, peer.name, scopeId)
+    local resume = nil
+    if e.pendingOutCapture
+        and e.pendingOutCapture.peerKey == peer.key
+        and e.pendingOutCapture.providerId == providerEntry.id
+        and e.pendingOutCapture.scopeId == scopeId
+        and e.pendingOutCapture.eligibilityGen == providerEntry.eligibilityGen
+        and e.pendingOutCapture.epoch == providerEntry.index.epoch then
+        resume = e.pendingOutCapture.state
+    end
+    local view, pending, examined = GG.CaptureViewSummaries(
         providerEntry.index,
         providerEntry.eligibilityGen,
         scopeId,
         providerEntry.id,
         providerEntry.schema,
-        function(recordId, indexEntry)
-            return recordExportable(providerEntry, peer.name, scopeId, recordId, indexEntry)
-        end
+        filter,
+        limits,
+        resume
     )
+    if e.stepStats then
+        e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + (tonumber(examined) or 0)
+    end
+    if pending then
+        e.pendingOutCapture = {
+            peerKey = peer.key,
+            providerId = providerEntry.id,
+            scopeId = scopeId,
+            eligibilityGen = providerEntry.eligibilityGen,
+            epoch = providerEntry.index.epoch,
+            state = pending,
+        }
+        GG.MarkWorkPending()
+        return false
+    end
+    e.pendingOutCapture = nil
+    if not view then
+        return false
+    end
     local payload = {
         op = "request",
         viewId = view.viewId,
@@ -751,8 +833,12 @@ local function selectPullPeer()
             -- Prefer a provider not already covered for this peer.
             for _, entry in ipairs(matched) do
                 local scopeId = providerScope(entry)
+                local ub = e.unresolvedBackoffUntil
+                    and e.unresolvedBackoffUntil[unresolvedBackoffKey(peer.name, entry.id, scopeId)]
                 if providerEligible(entry, peer.name, scopeId)
-                    and not (peer.covered and peer.covered[entry.id]) then
+                    and not (peer.covered and peer.covered[entry.id])
+                    and not (ub and now < ub)
+                    and indexReadyForView(entry) then
                     return peer, entry
                 end
             end
@@ -912,29 +998,16 @@ local function handleView(sender, payload)
             }, "WHISPER", sender, { ignoreStreamBusy = true })
             return
         end
-        local view = GG.CaptureViewSummaries(
-            providerEntry.index,
-            providerEntry.eligibilityGen,
-            scopeId,
-            providerEntry.id,
-            providerEntry.schema,
-            function(recordId, indexEntry)
-                return recordExportable(providerEntry, sender, scopeId, recordId, indexEntry)
-            end
-        )
-        local reply = {
-            op = "offer",
-            viewId = payload.viewId,
-            sourceViewId = view.viewId,
-            providerId = providerEntry.id,
-            schema = providerEntry.schema,
-            scopeId = scopeId,
-            eligibilityGen = providerEntry.eligibilityGen,
-            epoch = view.epoch,
-            packedBuckets = view.packedBuckets,
-            mode = GG.GetSchedMode(),
-            engineGen = e.generation,
-        }
+        -- Never serve a cold/dirty partial index as a permanently coverable view.
+        if not indexReadyForView(providerEntry) then
+            GG.SendGossip(GG.MSG.ACK, {
+                viewId = payload.viewId,
+                busy = true,
+                providerId = payload.providerId,
+            }, "WHISPER", sender, { ignoreStreamBusy = true })
+            GG.MarkWorkPending()
+            return
+        end
         local peer = touchPeer(sender, {})
         if peer then
             peer.activeExchange = true
@@ -943,19 +1016,17 @@ local function handleView(sender, payload)
             peer = sender,
             providerId = providerEntry.id,
             viewId = payload.viewId,
-            sourceViewId = view.viewId,
             scopeId = scopeId,
-            epoch = view.epoch,
             eligibilityGen = providerEntry.eligibilityGen,
-            buckets = view.buckets,
-            phase = "serving",
+            epoch = providerEntry.index.epoch,
+            phase = "capturing",
+            captureState = nil,
             engineGen = e.generation,
             usableProgressAt = GG._Now(),
             pauseExcluded = 0,
             finalSubmitted = false,
-            offerPayload = reply,
         }
-        trySendServedOffer(e.inPull)
+        GG.MarkWorkPending()
         return
     end
 
@@ -1327,12 +1398,30 @@ local function hasValidEntries(entries)
     return true
 end
 
+local function recordRawWithinCap(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    if not (C_EncodingUtil and C_EncodingUtil.SerializeCBOR) then
+        return false
+    end
+    local ok, raw = pcall(C_EncodingUtil.SerializeCBOR, record)
+    if not ok or type(raw) ~= "string" then
+        return false
+    end
+    return #raw <= GG.MAX_RECORD_CBOR
+end
+
 local function hasValidRecords(records)
     if type(records) ~= "table" then
         return false
     end
     for _, record in ipairs(records) do
         if type(record) ~= "table" or record.id == nil or record.versionFp == nil then
+            return false
+        end
+        -- Enforce the advertised 2 KiB raw record cap before provider mutation.
+        if not recordRawWithinCap(record) then
             return false
         end
     end
@@ -1531,7 +1620,9 @@ local function advanceOutPull(limits, now)
             if GG.BucketsDiffer(lb, rb) and rb and (rb.lastSeq or 0) > 0 then
                 local bm = select(1, getBookmark(entry, pull.peer, pull.scopeId, b))
                 local after = 0
-                if bm and bm.epoch == pull.remoteView.epoch and bm.scopeId == pull.scopeId then
+                local remoteElig = pull.remoteView.eligibilityGen
+                if bm and bm.epoch == pull.remoteView.epoch and bm.scopeId == pull.scopeId
+                    and bm.eligibilityGen ~= nil and bm.eligibilityGen == remoteElig then
                     after = bm.afterSeq or 0
                 end
                 pull.activeBucket = b
@@ -1599,6 +1690,7 @@ local function advanceOutPull(limits, now)
             setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
                 epoch = pull.remoteView and pull.remoteView.epoch,
                 scopeId = pull.scopeId,
+                eligibilityGen = pull.remoteView and pull.remoteView.eligibilityGen,
                 afterSeq = pull.afterSeq,
             })
             GG.SendGossip(GG.MSG.ACK, {
@@ -1722,6 +1814,7 @@ local function advanceOutPull(limits, now)
             setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
                 epoch = pull.remoteView and pull.remoteView.epoch,
                 scopeId = pull.scopeId,
+                eligibilityGen = pull.remoteView and pull.remoteView.eligibilityGen,
                 afterSeq = pull.afterSeq,
             })
             pull.neededBodies = nil
@@ -1756,6 +1849,62 @@ local function advanceInPull(now)
     end
     if pull.engineGen ~= e.generation then
         closeInPull("stale_gen")
+        return true
+    end
+    if pull.phase == "capturing" then
+        local entry = GG.GetProvider(pull.providerId)
+        if not providerEligible(entry, pull.peer, pull.scopeId)
+            or not indexReadyForView(entry)
+            or pull.epoch ~= (entry and entry.index and entry.index.epoch)
+            or pull.eligibilityGen ~= (entry and entry.eligibilityGen) then
+            closeInPull("capture_invalidated")
+            return true
+        end
+        local limits = e.stepLimits or GG.GetStepLimits()
+        local filter = viewExportFilter(entry, pull.peer, pull.scopeId)
+        local view, pending, examined = GG.CaptureViewSummaries(
+            entry.index,
+            entry.eligibilityGen,
+            pull.scopeId,
+            entry.id,
+            entry.schema,
+            filter,
+            limits,
+            pull.captureState
+        )
+        if e.stepStats then
+            e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + (tonumber(examined) or 0)
+        end
+        if pending then
+            pull.captureState = pending
+            pull.usableProgressAt = now
+            GG.MarkWorkPending()
+            return true
+        end
+        if not view then
+            closeInPull("capture_failed")
+            return true
+        end
+        local reply = {
+            op = "offer",
+            viewId = pull.viewId,
+            sourceViewId = view.viewId,
+            providerId = entry.id,
+            schema = entry.schema,
+            scopeId = pull.scopeId,
+            eligibilityGen = entry.eligibilityGen,
+            epoch = view.epoch,
+            packedBuckets = view.packedBuckets,
+            mode = GG.GetSchedMode(),
+            engineGen = e.generation,
+        }
+        pull.sourceViewId = view.viewId
+        pull.epoch = view.epoch
+        pull.buckets = view.buckets
+        pull.offerPayload = reply
+        pull.captureState = nil
+        pull.phase = "serving"
+        trySendServedOffer(pull)
         return true
     end
     if pull.offerRetryPending and pull.offerPayload then
@@ -1805,7 +1954,8 @@ function GG.OnSchedulerStep(limits, now)
     }
     e.stepStats = { indexExamined = 0, receivedApps = 0, cpuMs = 0, exportLookups = 0 }
     -- Index maintenance uses one aggregate entry budget across providers.
-    for _, entry in ipairs(GG.ListActiveProviders()) do
+    local activeProviders = GG.ListActiveProviders()
+    for _, entry in ipairs(activeProviders) do
         if indexRemaining <= 0 then
             break
         end
@@ -1815,7 +1965,7 @@ function GG.OnSchedulerStep(limits, now)
         end
         indexLimits.indexEntries = indexRemaining
         local moreIndex = GG.EnsureProviderIndex(entry, indexLimits)
-        if moreIndex or (entry.index and (entry.index.dirty or not entry.index.buildComplete)) then
+        if moreIndex or providerNeedsIndexWork(entry) then
             e.indexWorkPending = true
         end
         local examined = math.max(0, tonumber(entry.lastIndexExamined) or 0)
@@ -1823,6 +1973,15 @@ function GG.OnSchedulerStep(limits, now)
         indexRemaining = math.max(0, indexRemaining - examined)
         if stepStartedAt and (debugprofilestop() - stepStartedAt) >= (limits.cpuMs or math.huge) then
             break
+        end
+    end
+    -- Providers skipped by exact budget/CPU exhaustion still keep the scheduler awake.
+    if not e.indexWorkPending then
+        for _, entry in ipairs(activeProviders) do
+            if providerNeedsIndexWork(entry) then
+                e.indexWorkPending = true
+                break
+            end
         end
     end
 
@@ -1865,6 +2024,7 @@ function GG.OnSchedulerStep(limits, now)
     local sched = GG._sched
     if not e.outPull and not e.inPull and #(e.recvQueue) == 0
         and not e.indexWorkPending
+        and not e.pendingOutCapture
         and not (sched and sched.changeDebounceAt)
     then
         -- Keep discovery while providers active; clear continuous work flag.

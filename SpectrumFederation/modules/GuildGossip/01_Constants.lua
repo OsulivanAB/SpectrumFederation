@@ -31,6 +31,9 @@ GG.VIEW_IDLE_TIMEOUT_SEC = 120
 GG.PAGE_RETRY_MAX = 2
 GG.PAGE_RETRY_BACKOFF = { 5, 15 }
 GG.POST_EXHAUSTION_COOLDOWN_SEC = 60
+-- Suspend peer/provider exchanges after pending/rejected outcomes until a
+-- meaningful provider change or this deadline (whichever comes first).
+GG.UNRESOLVED_BACKOFF_SEC = 30
 
 -- D1 scheduling / FPS
 GG.FPS_ENTER_SLOW = 30

@@ -133,6 +133,11 @@ function GG.SetProviderEnabled(providerId, enabled)
     GG._RecountActiveProviders()
     if entry.enabled and entry.ready then
         entry.eligibilityGen = (entry.eligibilityGen or 0) + 1
+        -- Durable changes retained while disabled must reconcile before transport.
+        if entry.index and (entry.index.dirty or not entry.index.buildComplete) then
+            entry._buildList = nil
+            entry._buildPos = nil
+        end
         GG.MarkWorkPending()
         GG._EnsureScheduler()
         if GG.ScheduleDiscovery then
@@ -173,15 +178,25 @@ end
 
 function GG.NotifyProviderChanged(providerId)
     local entry = GG.GetProvider(providerId)
-    if not entry or not entry.enabled then
+    if not entry then
         return
     end
-    -- Provider-owned storage changed outside the engine's append path. Keep the
-    -- existing index usable while scheduling a bounded reconciliation pass.
-    entry.index.dirty = true
+    -- Provider-owned storage changed outside the engine's append path. Retain
+    -- dirty/changeGen even while disabled so re-enable reconciles durable writes
+    -- without starting transport. Enabled providers keep the live index usable
+    -- and schedule a bounded reconciliation pass.
+    if entry.index then
+        entry.index.dirty = true
+        if not entry.enabled then
+            entry.index.buildComplete = false
+        end
+    end
     entry._buildList = nil
     entry._buildPos = nil
     GG.BumpProviderChangeGen(providerId)
+    if not entry.enabled then
+        return
+    end
     if GG.MarkWorkPending then
         GG.MarkWorkPending()
     end
@@ -193,12 +208,13 @@ function GG.ProviderIsPeerEligible(entry, peerName, ctx)
         return false
     end
     local api = entry.api
-    if type(api.IsPeerEligible) == "function" then
-        local ok, res = pcall(api.IsPeerEligible, peerName, ctx)
-        return ok and res and true or false
+    -- Fail closed: intentional guild-wide access must supply an explicit callback
+    -- (the synthetic provider does). Omitting the policy never authorizes export.
+    if type(api) ~= "table" or type(api.IsPeerEligible) ~= "function" then
+        return false
     end
-    -- Default: any verified guild member is eligible for the provider's scope.
-    return GG.IsGuildMember(peerName)
+    local ok, res = pcall(api.IsPeerEligible, peerName, ctx)
+    return ok and res and true or false
 end
 
 function GG.InvalidateProviderBookmarks(entry)
@@ -328,7 +344,20 @@ function GG.ApplyRecordToProvider(entry, record, ctx)
         end
         return RESULT.REJECTED, "provider_error"
     end
-    result = tostring(result or RESULT.REJECTED)
+    -- Whitelist the four contract outcomes; anything else is non-success.
+    if result == true then
+        result = RESULT.ACCEPTED
+    elseif result == false or result == nil then
+        result = RESULT.REJECTED
+        detail = detail or "invalid_outcome"
+    else
+        result = tostring(result)
+    end
+    if result ~= RESULT.ACCEPTED and result ~= RESULT.DUPLICATE
+        and result ~= RESULT.REJECTED and result ~= RESULT.PENDING then
+        GG._DVerbose("Invalid delivery outcome provider=%s result=%s", entry.id, tostring(result))
+        return RESULT.REJECTED, "invalid_outcome"
+    end
     if result == RESULT.ACCEPTED then
         local id = record and (record.id or record.recordId)
         local vfp = record and (record.versionFp or record.v)
@@ -439,8 +468,29 @@ function GG.CreateSyntheticProvider(opts)
         if result == RESULT.ACCEPTED then
             local entry = GG.GetProvider(id)
             if entry then
+            -- Ordinary appends update the live index in place.
                 GG.IndexUpsert(entry.index, rid, vfp, record)
-                GG.NotifyProviderChanged(id)
+                if not entry.index.buildComplete and not entry._buildList then
+                    -- Live maintenance before an in-flight cold walk: the upserted
+                    -- index is already usable; do not block VIEW publication on a
+                    -- deferred SLOW ListRecordIds walk of the same rows.
+                    entry.index.buildComplete = true
+                    entry.index.dirty = false
+                end
+                GG.BumpProviderChangeGen(id)
+                if entry.enabled then
+                    if GG.NotifyMeaningfulChange then
+                        GG.NotifyMeaningfulChange()
+                    end
+                else
+                    -- Durable write while disabled: reconcile on re-enable.
+                    if entry.index then
+                        entry.index.dirty = true
+                        entry.index.buildComplete = false
+                    end
+                    entry._buildList = nil
+                    entry._buildPos = nil
+                end
             end
         end
         return result, rid, vfp

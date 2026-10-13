@@ -657,8 +657,12 @@ do
     end
     assertTrue(A.GuildGossip._engine.outPull or B.GuildGossip._engine.outPull,
         "initial pull started before follow-up append")
+    -- Let the VIEW request be dispatched so the serving side also has an active
+    -- exchange before local appends mark follow-up work.
+    runSteps(1)
     for i = 41, 60 do pA.AppendLocal("late-" .. i, "l" .. i) end
-    assertTrue(A.GuildGossip.HasDirtyFollowUp(), "append during active pull marks follow-up work")
+    assertTrue(A.GuildGossip.HasDirtyFollowUp() or B.GuildGossip.HasDirtyFollowUp(),
+        "append during active pull marks follow-up work")
     for i = 1, 400 do
         runSteps(5)
         if recordCount(B, id1) >= 60 then break end

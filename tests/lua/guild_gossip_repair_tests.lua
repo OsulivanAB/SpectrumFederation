@@ -831,8 +831,9 @@ do
     entryA.bookmarks["bob-garona|sf.synthetic.gossip|" .. tostring(A.GuildGossip.GetGuildScopeId()) .. "|0"] = {
         epoch = oldEpoch, scopeId = A.GuildGossip.GetGuildScopeId(), afterSeq = 3,
     }
-    -- Simulate Bob /reload: new incarnation base + rebuilt provider index.
-    B.GuildGossip._epochBase = nil
+    -- Simulate Bob /reload: new incarnation + rebuilt provider index.
+    B.GuildGossip._epochIncarnation = nil
+    B.GuildGossip._epochBase = nil -- legacy field cleared if present
     B.GuildGossip._epochSeq = 0
     B.GuildGossip.InitEpochIncarnation()
     B.GuildGossip.BumpIndexEpoch(entryB.index)
@@ -855,10 +856,12 @@ do
     assertTrue(pull ~= nil, "F16: outPull starts against reloaded sender")
     if pull then
         -- Force compare with remote view using Bob's new epoch.
+        local remoteView = B.GuildGossip.CaptureViewSummaries(entryB.index, 1, pull.scopeId,
+            "sf.synthetic.gossip", 1)
         pull.remoteView = {
             epoch = entryB.index.epoch,
-            buckets = B.GuildGossip.CaptureViewSummaries(entryB.index, 1, pull.scopeId,
-                "sf.synthetic.gossip", 1).buckets,
+            eligibilityGen = entryB.eligibilityGen,
+            buckets = remoteView.buckets,
         }
         pull.phase = "compare"
         pull.bucketCursor = 0
@@ -1271,6 +1274,445 @@ do
     assertEq(ace.multipart_spool["SF_GG\tWHISPER\tBob-Garona"], nil, "F23: physical spool cleared on expiry after rebind")
     local stats = GG.GetReceiveGuardStats()
     assertEq(stats.partialCount, 0, "F23: accounting cleared with spool after rebind")
+end
+
+---------------------------------------------------------------------------
+-- F24: epoch increments stay distinct at large clock values
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local GG = A.GuildGossip
+    local savedGetTime = GetTime
+    GetTime = function() return 100000 end -- ~27h; old 1e12 mix lost +1 precision
+    GG._epochIncarnation = nil
+    GG._epochBase = nil
+    GG._epochSeq = 0
+    GG.InitEpochIncarnation()
+    local e1 = GG.CreateIndex().epoch
+    local e2 = GG.CreateIndex().epoch
+    local e3 = GG.CreateIndex().epoch
+    GetTime = savedGetTime
+    assertTrue(e1 ~= e2 and e2 ~= e3 and e1 ~= e3, "F24: consecutive epochs distinct at large clock")
+    assertTrue(type(e1) == "string", "F24: epoch is exactly-representable string form")
+end
+
+---------------------------------------------------------------------------
+-- F25: filtered view capture examines a bounded number of entries per step
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local GG = A.GuildGossip
+    local exportCalls = 0
+    local ids = {}
+    for i = 1, 200 do ids[i] = "f25-" .. i end
+    A.GuildGossip.RegisterProvider({
+        id = "filt", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function()
+            local c = {}
+            for i = 1, #ids do c[i] = ids[i] end
+            return c
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        IsRecordExportable = function()
+            exportCalls = exportCalls + 1
+            return true
+        end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    local entry = GG.GetProvider("filt")
+    for i = 1, 20 do stepClient(A, GG.GetStepLimits("NORMAL")) end
+    assertTrue(entry.index.buildComplete, "F25: index built")
+    exportCalls = 0
+    local limits = { indexEntries = 8, bodies = 1, apps = 1, cpuMs = 0.25, manifestEntries = 4 }
+    local view, resume, examined = GG.CaptureViewSummaries(
+        entry.index, entry.eligibilityGen, A.GuildGossip.GetGuildScopeId(),
+        "filt", 1, function(id, ent) return entry.api.IsRecordExportable("Alice-Garona", id, {}) end,
+        limits, nil
+    )
+    assertTrue(view == nil and resume ~= nil, "F25: large filtered capture is incremental")
+    assertTrue((tonumber(examined) or 0) <= 8, "F25: examined bounded by step budget")
+    assertTrue(exportCalls <= 8, "F25: export callbacks bounded (calls=" .. tostring(exportCalls) .. ")")
+    -- Resume to completion under the same budgeted API.
+    local steps, final = 0, nil
+    while resume and steps < 40 do
+        steps = steps + 1
+        final, resume = GG.CaptureViewSummaries(
+            entry.index, entry.eligibilityGen, A.GuildGossip.GetGuildScopeId(),
+            "filt", 1, function(id, ent) return entry.api.IsRecordExportable("Alice-Garona", id, {}) end,
+            limits, resume
+        )
+    end
+    assertTrue(final ~= nil and resume == nil, "F25: eventual complete filtered summary")
+    local total = 0
+    for i = 0, 63 do total = total + (final.buckets[i].count or 0) end
+    assertEq(total, 200, "F25: completed summary covers full filtered history")
+end
+
+---------------------------------------------------------------------------
+-- F26: VIEW mid-build does not publish a permanently coverable partial
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local ids = {}
+    for i = 1, 40 do ids[i] = "f26-" .. i end
+    A.GuildGossip.RegisterProvider({
+        id = "slowbuild", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function()
+            local c = {}
+            for i = 1, #ids do c[i] = ids[i] end
+            return c
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    B.GuildGossip.RegisterProvider({
+        id = "slowbuild", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return {} end,
+        GetRecordVersionFp = function() return nil end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function(rec)
+            if type(rec) ~= "table" then return "rejected" end
+            return "accepted"
+        end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return B.GuildGossip.GetGuildScopeId() end,
+    })
+    local entryA = A.GuildGossip.GetProvider("slowbuild")
+    assertTrue(not entryA.index.buildComplete, "F26: cold index incomplete before steps")
+    -- Mid-build VIEW request must busy rather than serve a partial coverable view.
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v26", providerId = "slowbuild",
+        schema = 1, scopeId = A.GuildGossip.GetGuildScopeId(),
+        eligibilityGen = 1, epoch = 1, packedBuckets = A.GuildGossip.PackBucketSummaries({}),
+        mode = "NORMAL", engineGen = A.GuildGossip._engine.generation,
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(A.GuildGossip._engine.inPull == nil, "F26: incomplete index does not open served pull")
+    -- Finish the build, then a subsequent request can capture a complete view.
+    for i = 1, 20 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    assertTrue(entryA.index.buildComplete and not entryA.index.dirty, "F26: index eventually complete")
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v26b", providerId = "slowbuild",
+        schema = 1, scopeId = A.GuildGossip.GetGuildScopeId(),
+        eligibilityGen = entryA.eligibilityGen, epoch = entryA.index.epoch,
+        packedBuckets = A.GuildGossip.PackBucketSummaries({}),
+        mode = "NORMAL", engineGen = A.GuildGossip._engine.generation,
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(A.GuildGossip._engine.inPull ~= nil, "F26: complete index accepts served pull")
+end
+
+---------------------------------------------------------------------------
+-- F27: later providers stay pending when earlier ones exhaust the index budget
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local idsA, idsB = {}, {}
+    for i = 1, 8 do idsA[i] = "a-" .. i; idsB[i] = "b-" .. i end
+    A.GuildGossip.RegisterProvider({
+        id = "provA", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() local c={}; for i=1,#idsA do c[i]=idsA[i] end; return c end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    A.GuildGossip.RegisterProvider({
+        id = "provB", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() local c={}; for i=1,#idsB do c[i]=idsB[i] end; return c end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return nil end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    local limits = {
+        mode = "SLOW", bodies = 1, apps = 1, cpuMs = 10,
+        indexEntries = 8, manifestEntries = 4,
+    }
+    world._unitName = "Alice"; world._sendAs = "Alice-Garona"
+    A.GuildGossip.OnSchedulerStep(limits, world.time)
+    local eA = A.GuildGossip.GetProvider("provA")
+    local eB = A.GuildGossip.GetProvider("provB")
+    assertTrue(eA.index.buildComplete, "F27: first provider completes at exact budget")
+    assertTrue(not eB.index.buildComplete, "F27: second provider still incomplete")
+    assertTrue(A.GuildGossip._engine.indexWorkPending == true,
+        "F27: indexWorkPending kept for unvisited incomplete provider")
+end
+
+---------------------------------------------------------------------------
+-- F28: shutdown invalidates deferred guild-refresh callbacks
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f28" })
+    local g = A.GuildGossip._guild
+    local readyCalls = 0
+    local origReady = A.GuildGossip.OnGuildReady
+    A.GuildGossip.OnGuildReady = function()
+        readyCalls = readyCalls + 1
+        if origReady then origReady() end
+    end
+    -- Schedule a coalesced refresh, then shut down before it fires.
+    g.coalescePending = false
+    world.guild.clubId = 1234
+    if g.frame and g.frame.OnEvent then
+        g.frame.OnEvent(g.frame, "PLAYER_GUILD_UPDATE")
+    end
+    assertTrue(g.coalescePending == true, "F28: coalesce scheduled")
+    local genAtSchedule = g.coalesceGen
+    A.GuildGossip.Shutdown()
+    assertTrue(g.coalesceGen == genAtSchedule + 1, "F28: shutdown bumps coalesceGen")
+    -- Fire due After timers; stale callback must not restore readiness/discovery.
+    world.time = world.time + 1
+    for _, h in ipairs(timers) do
+        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+            h.fired = true
+            h.fn()
+        end
+    end
+    assertTrue(not A.GuildGossip.IsGuildReady(), "F28: stale coalesce does not restore readiness")
+    assertEq(readyCalls, 0, "F28: OnGuildReady not invoked after shutdown")
+end
+
+---------------------------------------------------------------------------
+-- F29: missing IsPeerEligible fails closed (no guild-wide default export)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip.RegisterProvider({
+        id = "noelig", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function() return { "r1" } end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return { id = "r1", versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+        -- intentionally omit IsPeerEligible
+    })
+    local entry = A.GuildGossip.GetProvider("noelig")
+    for i = 1, 5 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    assertTrue(not A.GuildGossip.ProviderIsPeerEligible(entry, "Bob-Garona", {}),
+        "F29: omitted eligibility callback is ineligible")
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v29", providerId = "noelig",
+        schema = 1, scopeId = A.GuildGossip.GetGuildScopeId(),
+        eligibilityGen = 1, epoch = entry.index.epoch,
+        packedBuckets = A.GuildGossip.PackBucketSummaries({}),
+        mode = "NORMAL", engineGen = A.GuildGossip._engine.generation,
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(A.GuildGossip._engine.inPull == nil, "F29: no served pull without eligibility policy")
+end
+
+---------------------------------------------------------------------------
+-- F30: unknown ValidateAndApply outcomes never imply successful coverage
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f30" })
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local result, detail = A.GuildGossip.ApplyRecordToProvider(entry, {
+        id = "x1", versionFp = "v1", body = "x",
+    }, { sender = "Bob-Garona" })
+    -- Force unknown outcome through the adapter.
+    entry.api.ValidateAndApply = function() return "typo_accepted" end
+    result, detail = A.GuildGossip.ApplyRecordToProvider(entry, {
+        id = "x2", versionFp = "v2", body = "y",
+    }, { sender = "Bob-Garona" })
+    assertEq(result, "rejected", "F30: typo outcome mapped to rejected")
+    entry.api.ValidateAndApply = function() return true end
+    result = A.GuildGossip.ApplyRecordToProvider(entry, {
+        id = "x3", versionFp = "v3", body = "z",
+    }, { sender = "Bob-Garona" })
+    assertEq(result, "accepted", "F30: boolean true remains accepted")
+    entry.api.ValidateAndApply = function() return nil end
+    result = A.GuildGossip.ApplyRecordToProvider(entry, {
+        id = "x4", versionFp = "v4", body = "w",
+    }, { sender = "Bob-Garona" })
+    assertEq(result, "rejected", "F30: nil outcome mapped to rejected")
+    -- Pull processor: unknown result becomes unresolved, not covered.
+    entry.api.ValidateAndApply = function() return "weird" end
+    local e = A.GuildGossip._engine
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v30",
+        scopeId = A.GuildGossip.GetGuildScopeId(), phase = "apply_bodies",
+        localEpoch = entry.index.epoch, engineGen = e.generation,
+        usableProgressAt = world.time, finalSubmitted = true,
+        neededBodies = { { id = "n1", versionFp = "v", seq = 1 } },
+        bodyOffset = 0, pendingBodyCount = 1, bodyApplyCursor = 0,
+        bodyPage = { records = { { id = "n1", versionFp = "v", body = 1 } }, skippedIds = {} },
+        remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen },
+        activeBucket = 0, afterSeq = 0,
+        manifest = { entries = { { seq = 1, id = "n1", versionFp = "v" } }, done = true },
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", covered = {} }
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.outPull == nil, "F30: pull closed on invalid delivery outcome")
+    assertTrue(e.peers["bob-garona"].covered["sf.synthetic.gossip"] ~= true,
+        "F30: invalid outcome does not mark coverage")
+end
+
+---------------------------------------------------------------------------
+-- F31: bookmark resume requires matching remote eligibilityGen
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f31" })
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local e = A.GuildGossip._engine
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v31",
+        scopeId = scope, phase = "compare", engineGen = e.generation,
+        localEpoch = entry.index.epoch, usableProgressAt = world.time, finalSubmitted = true,
+        bucketCursor = 0, afterSeq = 0,
+        localBuckets = { [0] = { lastSeq = 0, count = 0, fingerprint = 0 } },
+        remoteView = {
+            epoch = "ep-1", eligibilityGen = 2, buckets = {
+                [0] = { lastSeq = 5, count = 2, fingerprint = 1 },
+            },
+        },
+    }
+    for i = 1, 63 do
+        e.outPull.localBuckets[i] = { lastSeq = 0, count = 0, fingerprint = 0 }
+        e.outPull.remoteView.buckets[i] = { lastSeq = 0, count = 0, fingerprint = 0 }
+    end
+    -- Old bookmark lacks eligibilityGen / mismatches expansion gen.
+    entry.bookmarks["bob-garona|sf.synthetic.gossip|" .. scope .. "|0"] = {
+        epoch = "ep-1", scopeId = scope, afterSeq = 4, eligibilityGen = 1,
+    }
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    local pull = e.outPull
+    assertTrue(pull ~= nil, "F31: pull remains active after compare")
+    assertTrue(pull.phase == "request_manifest" or pull.phase == "wait_manifest",
+        "F31: compare advances to manifest (phase=" .. tostring(pull.phase) .. ")")
+    assertEq(pull.afterSeq, 0, "F31: mismatched eligibilityGen does not resume afterSeq")
+end
+
+---------------------------------------------------------------------------
+-- F32: received records over 2 KiB are rejected before provider apply
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f32" })
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local e = A.GuildGossip._engine
+    local big = string.rep("Z", 2500)
+    local over = { id = "big1", versionFp = "v", body = big }
+    local raw = C_EncodingUtil.SerializeCBOR(over)
+    assertTrue(#raw > A.GuildGossip.MAX_RECORD_CBOR, "F32: fixture exceeds 2KiB raw")
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v32",
+        scopeId = A.GuildGossip.GetGuildScopeId(), phase = "wait_bodies",
+        localEpoch = entry.index.epoch, engineGen = e.generation,
+        usableProgressAt = world.time, finalSubmitted = true,
+        expectedRequestId = "r32", expectedSubpage = 1,
+        expectedIds = { big1 = true }, expectedOrder = { "big1" },
+        expectedFingerprints = { big1 = "v" },
+        remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen },
+    }
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.BODY, {
+        op = "page", viewId = "v32", providerId = "sf.synthetic.gossip",
+        scopeId = A.GuildGossip.GetGuildScopeId(), requestId = "r32", subpage = 1,
+        records = { over }, more = false,
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(entry.api.GetStore().records["big1"] == nil, "F32: oversized record not applied")
+    assertTrue(e.outPull and e.outPull.phase == "wait_bodies", "F32: pull does not advance on oversize page")
+end
+
+---------------------------------------------------------------------------
+-- F33: unresolved pending/rejected backs off the scoped peer/provider
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local pendingIds = { ["p1"] = true }
+    local pA = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f33a", pendingIds = pendingIds })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f33b" })
+    pB.AppendLocal("pending-body", "p1")
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.5)
+    local applies = 0
+    local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local origApply = entryA.api.ValidateAndApply
+    entryA.api.ValidateAndApply = function(rec, ctx)
+        applies = applies + 1
+        return origApply(rec, ctx)
+    end
+    for i = 1, 40 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.1)
+    end
+    local backoff = A.GuildGossip._engine.unresolvedBackoffUntil
+    local hasBackoff = false
+    if type(backoff) == "table" then
+        for _, untilAt in pairs(backoff) do
+            if type(untilAt) == "number" and untilAt > world.time then hasBackoff = true end
+        end
+    end
+    assertTrue(hasBackoff, "F33: unresolved obligation schedules scoped backoff")
+    assertTrue(applies <= 3, "F33: sustained pending does not hot-loop applies (applies=" .. tostring(applies) .. ")")
+    -- Meaningful change clears backoff and allows progress on other work.
+    A.GuildGossip.NotifyMeaningfulChange()
+    assertTrue(next(A.GuildGossip._engine.unresolvedBackoffUntil or {}) == nil,
+        "F33: meaningful notification clears unresolved backoff")
+end
+
+---------------------------------------------------------------------------
+-- F34: durable changes while disabled reconcile on re-enable
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local pA = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f34a" })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f34b" })
+    pA.AppendLocal("before", "b0")
+    for i = 1, 10 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    end
+    A.GuildGossip.SetProviderEnabled("sf.synthetic.gossip", false)
+    assertTrue(not A.GuildGossip.GetProvider("sf.synthetic.gossip").enabled, "F34: disabled")
+    -- Durable append + notification while transport is disabled.
+    pA.AppendLocal("while-disabled", "wd1")
+    local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    assertTrue(entryA.index.dirty == true or entryA.index.buildComplete == false,
+        "F34: disabled change retained as dirty/incomplete")
+    local genBefore = entryA.changeGen
+    A.GuildGossip.SetProviderEnabled("sf.synthetic.gossip", true)
+    assertTrue(entryA.changeGen >= genBefore, "F34: changeGen preserved/bumped across re-enable")
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    for i = 1, 80 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.1)
+        if pB.GetStore().records["wd1"] then break end
+    end
+    assertTrue(pB.GetStore().records["wd1"] ~= nil, "F34: peer receives record written while disabled")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

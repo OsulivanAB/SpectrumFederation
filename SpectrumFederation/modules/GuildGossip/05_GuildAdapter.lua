@@ -17,6 +17,7 @@ GG._guild = GG._guild or {
     members = {}, -- [normalizedName] = { online = bool, lastSeen = t }
     generation = 0,
     coalescePending = false,
+    coalesceGen = 0, -- invalidates deferred RefreshGuildState after shutdown
     frame = nil,
 }
 
@@ -188,8 +189,13 @@ local function coalesceRefresh()
     end
     g.coalescePending = true
     local delay = 0.25
+    local gen = (tonumber(g.coalesceGen) or 0)
     if C_Timer and C_Timer.After then
         C_Timer.After(delay, function()
+            -- Shutdown/reinit bumps coalesceGen; drop stale deferred work.
+            if (tonumber(g.coalesceGen) or 0) ~= gen then
+                return
+            end
             g.coalescePending = false
             GG.RefreshGuildState()
         end)
@@ -233,6 +239,9 @@ function GG.ShutdownGuildAdapter()
         g.frame:SetScript("OnEvent", nil)
         g.frame = nil
     end
+    -- Invalidate any coalesced RefreshGuildState already scheduled via C_Timer.After.
+    g.coalesceGen = (tonumber(g.coalesceGen) or 0) + 1
+    g.coalescePending = false
     g.ready = false
     g.inGuild = false
     g.scopeId = nil
