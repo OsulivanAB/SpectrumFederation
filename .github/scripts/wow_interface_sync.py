@@ -45,6 +45,20 @@ SCORING_CONTEXT_CHARS = 240
 NON_RETAIL_PATTERN = re.compile(
     rf"\b(?:{'|'.join(re.escape(token) for token in NON_RETAIL_TOKENS)})\b"
 )
+# Generated release-metadata paths that game-version sync may reconcile automatically.
+GENERATED_METADATA_PATHS = (
+    "SpectrumFederation/SpectrumFederation.toc",
+    "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc",
+    "SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc",
+    "README.md",
+    "CHANGELOG.md",
+)
+GENERATED_METADATA_PATH_SET = set(GENERATED_METADATA_PATHS)
+README_BADGE_LINE_RE = re.compile(
+    r"^!\[(?:Interface|Track|Addon Version)\]\(https://img\.shields\.io/badge/[^)]+\)\s*$"
+)
+TOC_METADATA_LINE_RE = re.compile(r"^##\s*(?:Interface|Version):\s*.*$")
+HISTORY_SYNC_COMMIT_PREFIX = "chore: sync main game-version update into beta"
 
 
 def _validate_packaging():
@@ -55,6 +69,13 @@ def _validate_packaging():
 
         validate_packaging = _vp
     return validate_packaging
+
+
+def _update_changelog():
+    """Import update_changelog from SCRIPTS_DIR on first use."""
+    import update_changelog as _uc
+
+    return _uc
 
 
 class VersionInfo:
@@ -667,6 +688,655 @@ def verify_git_sha(repo_path, git_ref, expected_sha, *, label):
     return current
 
 
+def git_is_ancestor(repo_path, ancestor_sha, descendant_sha):
+    """Return True when ancestor_sha is an ancestor of descendant_sha."""
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_path),
+            "merge-base",
+            "--is-ancestor",
+            ancestor_sha,
+            descendant_sha,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def git_merge_base(repo_path, left_sha, right_sha):
+    """Return the merge-base SHA for two commits."""
+    return subprocess.run(
+        ["git", "-C", str(repo_path), "merge-base", left_sha, right_sha],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def list_changed_paths(repo_path, base_sha, head_sha):
+    """Return repo-relative paths changed between base and head."""
+    payload = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_path),
+            "diff",
+            "--name-only",
+            "--no-renames",
+            f"{base_sha}...{head_sha}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return [line.strip().replace("\\", "/") for line in payload.splitlines() if line.strip()]
+
+
+def list_unmerged_paths(repo_path):
+    """Return conflicted paths in the current merge state."""
+    payload = subprocess.run(
+        ["git", "-C", str(repo_path), "diff", "--name-only", "--diff-filter=U"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    return [line.strip().replace("\\", "/") for line in payload.splitlines() if line.strip()]
+
+
+def read_git_blob(repo_path, git_ref, rel_path):
+    """Return file contents at git_ref:rel_path, or None when missing."""
+    rel = str(rel_path).replace("\\", "/")
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "show", f"{git_ref}:{rel}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def strip_toc_metadata_lines(text):
+    """Remove Interface/Version TOC lines for non-metadata comparisons."""
+    lines = []
+    for line in (text or "").splitlines():
+        if TOC_METADATA_LINE_RE.match(line.strip()):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def strip_readme_badge_lines(text):
+    """Remove generated Interface/Track/Version badge lines from README text."""
+    lines = []
+    for line in (text or "").splitlines():
+        if README_BADGE_LINE_RE.match(line.strip()):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def changelog_sections_compatible(left_section, right_section):
+    """Return True when two same-version changelog sections are interchangeable."""
+    left_text = (left_section.get("text") or "").strip()
+    right_text = (right_section.get("text") or "").strip()
+    if left_text == right_text:
+        return True
+
+    changelog = _update_changelog()
+    left_bullets = {
+        (category, changelog.normalize_bullet_text(text).lower())
+        for category, text in changelog.extract_bullets(left_text)
+        if changelog.normalize_bullet_text(text)
+    }
+    right_bullets = {
+        (category, changelog.normalize_bullet_text(text).lower())
+        for category, text in changelog.extract_bullets(right_text)
+        if changelog.normalize_bullet_text(text)
+    }
+    return left_bullets == right_bullets and bool(left_bullets)
+
+
+def reconcile_changelog_texts(ours_text, theirs_text):
+    """Merge changelog histories section-by-section without losing either channel.
+
+    Keeps beta (ours) ordering for shared versions when contents are compatible.
+    Inserts main-only sections without duplicating version headings. Incompatible
+    same-version bodies fail instead of silently discarding either side.
+    """
+    changelog = _update_changelog()
+    ours_preface, ours_sections = changelog.parse_changelog_sections(ours_text or "")
+    theirs_preface, theirs_sections = changelog.parse_changelog_sections(theirs_text or "")
+    preface = ours_preface if ours_preface.strip() else theirs_preface
+
+    merged = []
+    seen = set()
+    theirs_by_version = {section["version"]: section for section in theirs_sections}
+
+    for section in ours_sections:
+        version = section["version"]
+        other = theirs_by_version.get(version)
+        if other is not None and not changelog_sections_compatible(section, other):
+            raise RuntimeError(
+                f"Incompatible CHANGELOG.md sections for version {version}; "
+                "manual reconciliation is required."
+            )
+        merged.append(section)
+        seen.add(version)
+
+    for section in theirs_sections:
+        if section["version"] in seen:
+            continue
+        merged.append(section)
+        seen.add(section["version"])
+
+    rebuilt = [preface.rstrip()]
+    for section in merged:
+        rebuilt.extend(["", section["text"]])
+    return changelog.normalize_changelog("\n".join(rebuilt))
+
+
+def range_only_touches_generated_metadata(repo_path, base_sha, head_sha):
+    """Return True when base...head only modifies recognized generated metadata."""
+    paths = list_changed_paths(repo_path, base_sha, head_sha)
+    if not paths:
+        return True
+    return all(path in GENERATED_METADATA_PATH_SET for path in paths)
+
+
+def identify_sync_main_sha(repo_path, *, main_sha, beta_sha, main_update_needed):
+    """Return (sync_needed, sync_main_sha, reason) for main→beta history sync.
+
+    When main still needs an update in this run, sync is required after that push
+    and sync_main_sha is resolved later from the update-main job output.
+    When main is already current, sync the captured main tip only if it is not yet
+    an ancestor of beta and the divergent main range is metadata-only.
+    """
+    if main_update_needed:
+        return True, "", "main update will require synchronizing the new main commit into beta"
+
+    if git_is_ancestor(repo_path, main_sha, beta_sha):
+        return False, "", "main tip is already an ancestor of beta"
+
+    merge_base = git_merge_base(repo_path, main_sha, beta_sha)
+    if not range_only_touches_generated_metadata(repo_path, merge_base, main_sha):
+        changed = ", ".join(list_changed_paths(repo_path, merge_base, main_sha)) or "(none)"
+        raise RuntimeError(
+            "Main tip is not in beta ancestry, but the divergent main range includes "
+            "files outside generated game-version metadata. Refusing automatic sync. "
+            f"Changed paths since merge-base: {changed}"
+        )
+    return True, main_sha, "main game-version commit is missing from beta ancestry"
+
+
+def apply_channel_metadata(
+    repo_path,
+    *,
+    channel,
+    interface,
+    version,
+    game_version,
+    ensure_beta_concurrency=False,
+):
+    """Apply TOC, README, and compatibility changelog updates in repo_path."""
+    repo_path = Path(repo_path)
+    toc_path = repo_path / "SpectrumFederation" / "SpectrumFederation.toc"
+    update_packaged_tocs(toc_path, str(interface), version)
+    update_readme_badges(repo_path / "README.md", version, interface, channel)
+
+    from datetime import datetime, timezone
+
+    changelog = _update_changelog()
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(repo_path)
+        changelog.apply_compatibility_changelog(
+            version,
+            game_version,
+            str(interface),
+            datetime.now(timezone.utc).date().isoformat(),
+        )
+    finally:
+        os.chdir(previous_cwd)
+
+    if ensure_beta_concurrency and channel == "beta":
+        workflow = repo_path / ".github" / "workflows" / "post-merge-beta.yml"
+        if workflow.exists():
+            ensure_release_channels_concurrency(workflow)
+
+
+def _stage_paths(repo_path, paths):
+    if not paths:
+        return
+    subprocess.run(["git", "-C", str(repo_path), "add", "--", *paths], check=True)
+
+
+def resolve_generated_metadata_conflicts(
+    repo_path,
+    *,
+    beta_interface,
+    beta_version,
+):
+    """Resolve merge conflicts only for recognized generated metadata files."""
+    repo_path = Path(repo_path)
+    conflicted = list_unmerged_paths(repo_path)
+    if not conflicted:
+        return []
+
+    unexpected = [path for path in conflicted if path not in GENERATED_METADATA_PATH_SET]
+    if unexpected:
+        details = ", ".join(unexpected)
+        raise RuntimeError(
+            "Merge conflicts outside generated game-version metadata; aborting before push. "
+            f"Unexpected paths: {details}. Manual intervention is required."
+        )
+
+    resolved = []
+    for rel_path in conflicted:
+        ours = read_git_blob(repo_path, ":2", rel_path)
+        theirs = read_git_blob(repo_path, ":3", rel_path)
+        if ours is None or theirs is None:
+            raise RuntimeError(
+                f"Unable to read both merge stages for conflicted file {rel_path}; "
+                "manual intervention is required."
+            )
+
+        target = repo_path / rel_path
+        if rel_path.endswith(".toc"):
+            if strip_toc_metadata_lines(ours) != strip_toc_metadata_lines(theirs):
+                raise RuntimeError(
+                    f"TOC conflict in {rel_path} includes non-metadata edits; "
+                    "refusing automatic resolution."
+                )
+            # Prefer beta stage body, then stamp planned beta Interface/Version.
+            target.write_text(ours, encoding="utf-8")
+            update_toc(target, str(beta_interface), beta_version)
+        elif rel_path == "README.md":
+            if strip_readme_badge_lines(ours) != strip_readme_badge_lines(theirs):
+                raise RuntimeError(
+                    "README.md conflict includes edits outside generated badges; "
+                    "refusing automatic resolution."
+                )
+            target.write_text(ours, encoding="utf-8")
+            update_readme_badges(target, beta_version, beta_interface, "beta")
+        elif rel_path == "CHANGELOG.md":
+            target.write_text(reconcile_changelog_texts(ours, theirs), encoding="utf-8")
+        else:
+            raise RuntimeError(f"Unsupported conflicted metadata path: {rel_path}")
+
+        _stage_paths(repo_path, [rel_path])
+        resolved.append(rel_path)
+
+    remaining = list_unmerged_paths(repo_path)
+    if remaining:
+        raise RuntimeError(
+            "Generated-metadata conflict resolution left unresolved paths: "
+            + ", ".join(remaining)
+        )
+    return resolved
+
+
+def integrate_main_into_beta(
+    repo_path,
+    *,
+    main_sha,
+    beta_interface,
+    beta_version,
+    game_version,
+    beta_update_needed,
+    commit=True,
+    commit_message=None,
+):
+    """Merge main_sha into the current beta checkout and finalize beta metadata.
+
+    Performs one in-progress merge, resolves only generated-metadata conflicts,
+    applies the planned beta metadata when needed, and optionally creates a single
+    merge commit. Does not push.
+    """
+    repo_path = Path(repo_path)
+    if git_is_ancestor(repo_path, main_sha, "HEAD"):
+        if beta_update_needed:
+            apply_channel_metadata(
+                repo_path,
+                channel="beta",
+                interface=beta_interface,
+                version=beta_version,
+                game_version=game_version,
+                ensure_beta_concurrency=True,
+            )
+            staged = [*packaged_toc_relpaths(), "README.md", "CHANGELOG.md"]
+            workflow = repo_path / ".github" / "workflows" / "post-merge-beta.yml"
+            if workflow.exists():
+                staged.append(".github/workflows/post-merge-beta.yml")
+            existing_staged = [path for path in staged if (repo_path / path).exists()]
+            _stage_paths(repo_path, existing_staged)
+            if commit:
+                message = commit_message or (
+                    f"chore: bump Interface to {beta_interface} and version to {beta_version} [skip ci]"
+                )
+                status = subprocess.run(
+                    ["git", "-C", str(repo_path), "status", "--porcelain"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if status:
+                    subprocess.run(
+                        ["git", "-C", str(repo_path), "commit", "-m", message],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+        return {
+            "synced": False,
+            "reason": "main_sha already an ancestor of HEAD",
+            "resolved_paths": [],
+            "commit_sha": resolve_git_sha(repo_path, "HEAD"),
+        }
+
+    merge_base = git_merge_base(repo_path, main_sha, "HEAD")
+    if not range_only_touches_generated_metadata(repo_path, merge_base, main_sha):
+        changed = ", ".join(list_changed_paths(repo_path, merge_base, main_sha)) or "(none)"
+        raise RuntimeError(
+            "Refusing to synchronize main into beta because the main range includes "
+            "files outside generated game-version metadata. "
+            f"Changed paths since merge-base: {changed}"
+        )
+
+    merge = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_path),
+            "merge",
+            "--no-ff",
+            "--no-commit",
+            main_sha,
+            "-m",
+            commit_message
+            or (
+                f"{HISTORY_SYNC_COMMIT_PREFIX} [skip ci]"
+                if not beta_update_needed
+                else f"chore: bump Interface to {beta_interface} and version to {beta_version} [skip ci]"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if merge.returncode not in (0, 1):
+        raise RuntimeError(
+            f"git merge of {main_sha} failed:\n{merge.stdout}\n{merge.stderr}"
+        )
+
+    resolved_paths = []
+    if merge.returncode == 1:
+        resolved_paths = resolve_generated_metadata_conflicts(
+            repo_path,
+            beta_interface=beta_interface,
+            beta_version=beta_version,
+        )
+
+    # Always stamp planned beta metadata onto the final tree so beta is never
+    # left with stable TOC/README values from main, even when Git auto-merged.
+    apply_channel_metadata(
+        repo_path,
+        channel="beta",
+        interface=beta_interface,
+        version=beta_version,
+        game_version=game_version,
+        ensure_beta_concurrency=beta_update_needed,
+    )
+    staged = [*packaged_toc_relpaths(), "README.md", "CHANGELOG.md"]
+    workflow = repo_path / ".github" / "workflows" / "post-merge-beta.yml"
+    if workflow.exists() and beta_update_needed:
+        staged.append(".github/workflows/post-merge-beta.yml")
+    existing_staged = [path for path in staged if (repo_path / path).exists()]
+    _stage_paths(repo_path, existing_staged)
+
+    if not commit:
+        return {
+            "synced": True,
+            "reason": "merge prepared without commit",
+            "resolved_paths": resolved_paths,
+            "commit_sha": "",
+        }
+
+    message = commit_message
+    if not message:
+        if beta_update_needed:
+            message = (
+                f"chore: bump Interface to {beta_interface} and version to {beta_version} [skip ci]"
+            )
+        else:
+            message = f"{HISTORY_SYNC_COMMIT_PREFIX} [skip ci]"
+
+    # Completing an in-progress merge reuses MERGE_HEAD; otherwise create a normal commit.
+    merge_head = repo_path / ".git" / "MERGE_HEAD"
+    if merge_head.exists():
+        subprocess.run(
+            ["git", "-C", str(repo_path), "commit", "-m", message],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        status = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if status:
+            subprocess.run(
+                ["git", "-C", str(repo_path), "commit", "-m", message],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    commit_sha = resolve_git_sha(repo_path, "HEAD")
+    if not git_is_ancestor(repo_path, main_sha, commit_sha):
+        raise RuntimeError(
+            f"Integration commit {commit_sha} does not contain main commit {main_sha}"
+        )
+    return {
+        "synced": True,
+        "reason": "merged main into beta and finalized metadata",
+        "resolved_paths": resolved_paths,
+        "commit_sha": commit_sha,
+    }
+
+
+def simulate_channel_integration(
+    repo_path,
+    plan,
+    *,
+    work_dir,
+    game_version=None,
+):
+    """Simulate main update + main→beta sync + beta finalize without touching remotes.
+
+    Uses a local clone under work_dir. Returns a result dict for Actions summaries.
+    """
+    import shutil
+    import tempfile
+
+    repo_path = Path(repo_path).resolve()
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    sim_repo = Path(tempfile.mkdtemp(prefix="sf-game-version-sim-", dir=str(work_dir)))
+
+    try:
+        subprocess.run(
+            ["git", "clone", "--local", str(repo_path), str(sim_repo)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        git_config(sim_repo)
+
+        main_sha = plan["main_sha"]
+        beta_sha = plan["beta_sha"]
+        interface = str(plan["interface"])
+        game_version = game_version or plan.get("game_version") or plan.get("requested_version")
+        main_target = plan["main_target_version"]
+        beta_target = plan["beta_target_version"]
+
+        subprocess.run(
+            ["git", "-C", str(sim_repo), "checkout", "--force", main_sha],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        simulated_main_sha = main_sha
+        if plan.get("main_update_needed"):
+            apply_channel_metadata(
+                sim_repo,
+                channel="main",
+                interface=interface,
+                version=main_target,
+                game_version=game_version,
+            )
+            _stage_paths(
+                sim_repo,
+                [*packaged_toc_relpaths(), "README.md", "CHANGELOG.md"],
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(sim_repo),
+                    "commit",
+                    "-m",
+                    f"chore: bump Interface to {interface} and version to {main_target} [skip ci]",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            simulated_main_sha = resolve_git_sha(sim_repo, "HEAD")
+
+        sync_needed = bool(plan.get("sync_needed"))
+        if plan.get("main_update_needed"):
+            sync_needed = True
+        elif not sync_needed:
+            sync_needed = not git_is_ancestor(sim_repo, simulated_main_sha, beta_sha)
+
+        subprocess.run(
+            ["git", "-C", str(sim_repo), "checkout", "--force", "-B", "sim-beta", beta_sha],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        # Preserve a beta-only marker path check when present in tests/fixtures.
+        beta_only_probe = None
+        probe_path = sim_repo / "SpectrumFederation" / ".sf-beta-only-probe"
+        if probe_path.exists():
+            beta_only_probe = probe_path.read_text(encoding="utf-8")
+
+        integration = {"synced": False, "resolved_paths": [], "commit_sha": beta_sha}
+        if sync_needed or plan.get("beta_update_needed"):
+            if sync_needed:
+                integration = integrate_main_into_beta(
+                    sim_repo,
+                    main_sha=simulated_main_sha,
+                    beta_interface=interface,
+                    beta_version=beta_target,
+                    game_version=game_version,
+                    beta_update_needed=bool(plan.get("beta_update_needed")),
+                    commit=True,
+                )
+            elif plan.get("beta_update_needed"):
+                apply_channel_metadata(
+                    sim_repo,
+                    channel="beta",
+                    interface=interface,
+                    version=beta_target,
+                    game_version=game_version,
+                    ensure_beta_concurrency=True,
+                )
+                _stage_paths(
+                    sim_repo,
+                    [*packaged_toc_relpaths(), "README.md", "CHANGELOG.md"],
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(sim_repo),
+                        "commit",
+                        "-m",
+                        f"chore: bump Interface to {interface} and version to {beta_target} [skip ci]",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                integration = {
+                    "synced": False,
+                    "resolved_paths": [],
+                    "commit_sha": resolve_git_sha(sim_repo, "HEAD"),
+                }
+
+        final_sha = resolve_git_sha(sim_repo, "HEAD")
+        if sync_needed and not git_is_ancestor(sim_repo, simulated_main_sha, final_sha):
+            raise RuntimeError("Simulation failed: main commit is not an ancestor of beta")
+
+        main_iface, main_ver = read_toc_fields_from_git(
+            sim_repo, simulated_main_sha, "SpectrumFederation/SpectrumFederation.toc"
+        )
+        beta_iface, beta_ver = read_toc_fields_from_git(
+            sim_repo, final_sha, "SpectrumFederation/SpectrumFederation.toc"
+        )
+        if plan.get("main_update_needed") or plan.get("main_action") in {"update", "publish", "none"}:
+            if main_iface != interface or main_ver != main_target:
+                raise RuntimeError(
+                    f"Simulation main metadata mismatch: expected {interface}/{main_target}, "
+                    f"found {main_iface}/{main_ver}"
+                )
+        if beta_iface != interface or beta_ver != beta_target:
+            raise RuntimeError(
+                f"Simulation beta metadata mismatch: expected {interface}/{beta_target}, "
+                f"found {beta_iface}/{beta_ver}"
+            )
+
+        changelog_text = read_git_blob(sim_repo, final_sha, "CHANGELOG.md") or ""
+        if plan.get("main_update_needed") or sync_needed:
+            if f"## [{main_target}]" not in changelog_text and plan.get("main_update_needed"):
+                raise RuntimeError(f"Simulation changelog missing main section {main_target}")
+        if plan.get("beta_update_needed") and f"## [{beta_target}]" not in changelog_text:
+            raise RuntimeError(f"Simulation changelog missing beta section {beta_target}")
+
+        if beta_only_probe is not None:
+            current_probe = read_git_blob(
+                sim_repo, final_sha, "SpectrumFederation/.sf-beta-only-probe"
+            )
+            if current_probe != beta_only_probe:
+                raise RuntimeError("Simulation lost beta-only addon content")
+
+        result = {
+            "ok": True,
+            "sync_needed": sync_needed,
+            "simulated_main_sha": simulated_main_sha,
+            "simulated_beta_sha": final_sha,
+            "resolved_paths": integration.get("resolved_paths") or [],
+            "main_version": main_ver,
+            "beta_version": beta_ver,
+            "main_interface": main_iface,
+            "beta_interface": beta_iface,
+        }
+        return result
+    finally:
+        shutil.rmtree(sim_repo, ignore_errors=True)
+
+
 def is_beta_semver(version_raw):
     """Return True when version is X.Y.Z-beta.N."""
     info = parse_version(version_raw)
@@ -991,6 +1661,7 @@ def build_update_plan(
     token=None,
     occupied_tags=None,
     retry_publication=False,
+    repo_path=None,
 ):
     """Build the immutable plan consumed by the workflow."""
     target_interface = verify_requested_matches_live(
@@ -1062,15 +1733,32 @@ def build_update_plan(
         token=token,
         retry_publication=retry_publication,
     )
-    # An update action always publishes after the branch mutation.
-    if main_action == "update":
-        pass
-    if beta_action == "update":
-        pass
+
+    sync_needed = False
+    sync_main_sha = ""
+    sync_reason = "not evaluated"
+    if repo_path is not None:
+        sync_needed, sync_main_sha, sync_reason = identify_sync_main_sha(
+            repo_path,
+            main_sha=main_sha,
+            beta_sha=beta_sha,
+            main_update_needed=main_update_needed,
+        )
+    elif main_update_needed:
+        sync_needed = True
+        sync_reason = "main update will require synchronizing the new main commit into beta"
+
+    if retry_publication and sync_needed:
+        raise RuntimeError(
+            "retry_publication cannot mutate branches, but main→beta history sync is still "
+            f"required ({sync_reason}). Re-run without retry_publication to complete "
+            "synchronization first, then retry publication."
+        )
 
     any_work = (
         main_action in {"update", "publish"}
         or beta_action in {"update", "publish"}
+        or sync_needed
     )
     return {
         "requested_version": requested["normalized"],
@@ -1091,6 +1779,10 @@ def build_update_plan(
         "beta_action": beta_action,
         "beta_ahead": beta_ahead,
         "any_toc_update": main_update_needed or beta_update_needed,
+        "sync_needed": sync_needed,
+        "sync_main_sha": sync_main_sha,
+        "sync_reason": sync_reason,
+        "beta_branch_mutation": beta_update_needed or sync_needed,
         "any_work": any_work,
     }
 
@@ -1126,7 +1818,7 @@ def update_readme_badges(readme_path, version, interface, track):
     return False
 
 
-def write_step_summary(plan, *, dry_run=False):
+def write_step_summary(plan, *, dry_run=False, simulation=None):
     """Append a human-readable plan summary for GitHub Actions."""
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -1142,6 +1834,9 @@ def write_step_summary(plan, *, dry_run=False):
         f"- Main SHA: `{plan['main_sha']}`",
         f"- Beta SHA: `{plan['beta_sha']}`",
         f"- Retry publication: `{'true' if plan.get('retry_publication') else 'false'}`",
+        f"- Main→beta sync needed: `{'true' if plan.get('sync_needed') else 'false'}`",
+        f"- Sync reason: {plan.get('sync_reason') or 'n/a'}",
+        f"- Sync main SHA: `{plan.get('sync_main_sha') or '(from update-main push)'}`",
         "",
         "| Branch | Interface | Version | Action |",
         "| --- | --- | --- | --- |",
@@ -1157,6 +1852,19 @@ def write_step_summary(plan, *, dry_run=False):
         ),
         "",
     ]
+    if simulation is not None:
+        lines.extend(
+            [
+                "### Integration simulation",
+                "",
+                f"- Result: `{'ok' if simulation.get('ok') else 'failed'}`",
+                f"- Simulated main SHA: `{simulation.get('simulated_main_sha', '')}`",
+                f"- Simulated beta SHA: `{simulation.get('simulated_beta_sha', '')}`",
+                f"- Resolved metadata paths: "
+                f"`{', '.join(simulation.get('resolved_paths') or []) or '(none)'}`",
+                "",
+            ]
+        )
     if dry_run:
         lines.append("Dry run only: no branch mutations or publishing were performed.")
         lines.append("")
@@ -1173,6 +1881,8 @@ def _emit_plan_outputs(plan):
         "any_toc_update",
         "any_work",
         "retry_publication",
+        "sync_needed",
+        "beta_branch_mutation",
     )
     for key, value in plan.items():
         if key in bool_keys:
@@ -1221,13 +1931,26 @@ def run_plan_mode(args):
         token=os.environ.get("GITHUB_TOKEN"),
         occupied_tags=occupied_tags,
         retry_publication=bool(args.retry_publication),
+        repo_path=repo_path,
     )
     plan["resolver_strategy"] = resolver_strategy
     plan["retry_publication"] = bool(args.retry_publication)
 
+    simulation = None
+    if args.simulate_integration or args.dry_run:
+        work_dir = Path(args.simulation_work_dir or "/tmp/sf-game-version-sim")
+        simulation = simulate_channel_integration(
+            repo_path,
+            plan,
+            work_dir=work_dir,
+            game_version=plan["game_version"],
+        )
+        plan["simulation_ok"] = True
+        print(json.dumps({"simulation": simulation}, indent=2, sort_keys=True))
+
     print(json.dumps(plan, indent=2, sort_keys=True))
     _emit_plan_outputs(plan)
-    write_step_summary(plan, dry_run=args.dry_run)
+    write_step_summary(plan, dry_run=args.dry_run, simulation=simulation)
     return 0
 
 
@@ -1315,6 +2038,39 @@ def main():
         metavar="PATH",
         help="Rewrite post-merge-beta concurrency group to release-channels when outdated",
     )
+    parser.add_argument(
+        "--simulate-integration",
+        action="store_true",
+        help="With --plan, simulate main update + main→beta sync + beta finalize locally",
+    )
+    parser.add_argument(
+        "--simulation-work-dir",
+        default="/tmp/sf-game-version-sim",
+        help="Directory for temporary integration simulation clones",
+    )
+    parser.add_argument(
+        "--integrate-main-into-beta",
+        metavar="MAIN_SHA",
+        help="Merge MAIN_SHA into the current checkout and finalize beta metadata",
+    )
+    parser.add_argument(
+        "--beta-target-version",
+        help="Beta TOC version used with --integrate-main-into-beta",
+    )
+    parser.add_argument(
+        "--game-version",
+        help="Human-readable game version for compatibility changelog entries",
+    )
+    parser.add_argument(
+        "--beta-update-needed",
+        action="store_true",
+        help="With --integrate-main-into-beta, also treat this as a beta release bump",
+    )
+    parser.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="With --integrate-main-into-beta, prepare the tree without creating a commit",
+    )
     args = parser.parse_args()
 
     if args.assert_no_conflicts:
@@ -1346,6 +2102,28 @@ def main():
             print(f"[sync] Updated concurrency group in {path} to release-channels")
         else:
             print(f"[sync] No beta-release concurrency group rewrite needed in {path}")
+        return 0
+
+    if args.integrate_main_into_beta:
+        if not args.apply_interface or not args.beta_target_version or not args.game_version:
+            parser.error(
+                "--integrate-main-into-beta requires --apply-interface, "
+                "--beta-target-version, and --game-version"
+            )
+        result = integrate_main_into_beta(
+            Path(args.repo_path or "."),
+            main_sha=args.integrate_main_into_beta,
+            beta_interface=str(_validate_interface(args.apply_interface)),
+            beta_version=parse_version(args.beta_target_version).raw,
+            game_version=args.game_version,
+            beta_update_needed=bool(args.beta_update_needed),
+            commit=not args.no_commit,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if result.get("commit_sha"):
+            write_output("pushed_sha", result["commit_sha"])
+            write_output("completed", "true")
+            write_output("synced", "true" if result.get("synced") else "false")
         return 0
 
     if args.verify_sha:
