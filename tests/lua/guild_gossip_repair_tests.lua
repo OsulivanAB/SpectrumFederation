@@ -767,6 +767,53 @@ do
     Comm.SendCommMessage = orig
 end
 
+---------------------------------------------------------------------------
+-- F14: same-table AceComm upgrades must rebind the physical guard wrappers
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local GG = A.GuildGossip
+    local ace = activeAceComm
+    GG.InstallReceiveGuard(ace)
+    local replacement = function() end
+    ace.OnReceiveMultipartFirst = replacement
+    assertTrue(GG.InstallReceiveGuard(ace), "F14: guard reinstalls on upgraded same AceComm table")
+    assertTrue(ace.OnReceiveMultipartFirst ~= replacement,
+        "F14: same-table marker alone does not leave upgraded first hook unguarded")
+end
+
+---------------------------------------------------------------------------
+-- F15: numeric array keys are never BODY record IDs
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f15" })
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local e = A.GuildGossip._engine
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v15",
+        scopeId = A.GuildGossip.GetGuildScopeId(), phase = "wait_bodies",
+        expectedRequestId = "b15", expectedSubpage = 1,
+        -- Historical array shape demonstrates why the receiver must only
+        -- consult the exact ID-keyed whitelist created by the request path.
+        expectedIds = { "r1" }, expectedOrder = { "r1" },
+        expectedFingerprints = { r1 = "v1" },
+        localEpoch = entry.index.epoch, engineGen = e.generation,
+        usableProgressAt = world.time, finalSubmitted = true,
+        remoteView = { epoch = 1 }, activeBucket = 0, afterSeq = 0,
+    }
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.BODY, {
+        op = "page", viewId = "v15", providerId = "sf.synthetic.gossip",
+        scopeId = A.GuildGossip.GetGuildScopeId(), requestId = "b15", subpage = 1,
+        records = { { id = "1", versionFp = "v1", body = "unsolicited" } },
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.outPull and e.outPull.phase == "wait_bodies",
+        "F15: array index 1 cannot authorize unsolicited BODY id '1'")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")
