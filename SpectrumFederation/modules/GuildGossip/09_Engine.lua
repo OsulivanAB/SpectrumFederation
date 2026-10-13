@@ -407,6 +407,15 @@ function GG.OnGossipPauseChanged(paused, now)
     end
 end
 
+-- Comm owns its shared queue; this indirection keeps engine cancellation scoped.
+GG.CancelQueuedGossipForProvider = GG.CancelQueuedGossipForProvider or function(providerId)
+    local comm = SF.LootHelperComm
+    if comm and comm.CancelQueuedGossipForProvider then
+        return comm:CancelQueuedGossipForProvider(providerId)
+    end
+    return false
+end
+
 function GG.InvalidateRuntime(reason)
     local e = GG._engine
     e.generation = (e.generation or 0) + 1
@@ -849,7 +858,8 @@ local function handleBody(sender, payload)
     if payload.op == "request" then
         local pull = e.inPull
         if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId
-            or type(payload.requestId) ~= "string" or type(payload.ids) ~= "table" then
+            or type(payload.requestId) ~= "string" or type(payload.ids) ~= "table"
+            or #payload.ids > GG.BODIES_PER_MESSAGE.NORMAL then
             return
         end
         local entry = GG.GetProvider(pull.providerId)
