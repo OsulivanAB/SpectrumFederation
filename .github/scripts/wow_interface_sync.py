@@ -861,11 +861,52 @@ def reconcile_changelog_texts(ours_text, theirs_text):
     return changelog.normalize_changelog("\n".join(rebuilt))
 
 
+def _changelog_text_equivalent(left, right):
+    """Compare changelog fragments after the writer's blank-line normalization."""
+    def normalize(text):
+        return re.sub(r"\n{3,}", "\n\n", (text or "").strip())
+
+    return normalize(left) == normalize(right)
+
+
+def _is_wholly_generated_compatibility_section(changelog, section):
+    """Return True when section body is exactly a rendered compatibility note set."""
+    bullets = changelog.extract_bullets(section.get("text", ""))
+    if not bullets:
+        return False
+
+    entries = []
+    for category, text in bullets:
+        cleaned = changelog.normalize_bullet_text(text)
+        if not cleaned or not changelog.is_compatibility_note(cleaned):
+            return False
+        entries.append({"category": category, "text": cleaned})
+
+    rendered = changelog.render_section(
+        section["version"],
+        section.get("date") or "",
+        entries,
+    )
+    return _changelog_text_equivalent(rendered, section.get("text", ""))
+
+
 def assert_changelog_delta_is_generated_only(base_text, head_text, *, label):
-    """Fail when a main-range CHANGELOG delta includes non-generated content."""
+    """Fail when a main-range CHANGELOG delta includes non-generated content.
+
+    Preface and pre-existing release sections must remain unchanged (aside from
+    the changelog writer's blank-line normalization). Newly added sections must
+    be wholly generated compatibility content, not merely bullet-compatible.
+    """
     changelog = _update_changelog()
-    _base_preface, base_sections = changelog.parse_changelog_sections(base_text or "")
-    _head_preface, head_sections = changelog.parse_changelog_sections(head_text or "")
+    base_preface, base_sections = changelog.parse_changelog_sections(base_text or "")
+    head_preface, head_sections = changelog.parse_changelog_sections(head_text or "")
+
+    if not _changelog_text_equivalent(base_preface, head_preface):
+        raise RuntimeError(
+            f"{label} CHANGELOG.md modified the unversioned preface; "
+            "refusing automatic synchronization."
+        )
+
     base_by_version = {section["version"]: section for section in base_sections}
     head_by_version = {section["version"]: section for section in head_sections}
 
@@ -875,27 +916,20 @@ def assert_changelog_delta_is_generated_only(base_text, head_text, *, label):
                 f"{label} CHANGELOG.md removed section {version}; "
                 "refusing automatic synchronization."
             )
-        if not changelog_sections_compatible(section, head_by_version[version]):
+        if not _changelog_text_equivalent(section["text"], head_by_version[version]["text"]):
             raise RuntimeError(
-                f"{label} CHANGELOG.md modified section {version} with incompatible "
-                "content; refusing automatic synchronization."
+                f"{label} CHANGELOG.md modified existing section {version}; "
+                "refusing automatic synchronization."
             )
 
     for version, section in head_by_version.items():
         if version in base_by_version:
             continue
-        bullets = changelog.extract_bullets(section.get("text", ""))
-        if not bullets:
+        if not _is_wholly_generated_compatibility_section(changelog, section):
             raise RuntimeError(
-                f"{label} CHANGELOG.md added empty section {version}; "
+                f"{label} CHANGELOG.md added non-generated content under {version}; "
                 "refusing automatic synchronization."
             )
-        for _category, text in bullets:
-            if not changelog.is_compatibility_note(text):
-                raise RuntimeError(
-                    f"{label} CHANGELOG.md added non-generated content under {version}; "
-                    "refusing automatic synchronization."
-                )
 
 
 def assert_range_is_generated_metadata_only(repo_path, base_sha, head_sha, *, label):

@@ -995,6 +995,86 @@ def test_reconcile_changelog_rejects_incompatible_same_version():
         wow.reconcile_changelog_texts(ours, theirs)
 
 
+def test_assert_changelog_delta_rejects_preface_and_existing_section_edits():
+    base = "\n".join(
+        [
+            "# Changelog",
+            "",
+            "All notable changes to SpectrumFederation will be documented in this file.",
+            "",
+            "## [1.5.9] - 2026-10-13",
+            "",
+            "### Changed",
+            "- Prior stable release note",
+            "",
+            "Historical context paragraph that must stay unchanged.",
+            "",
+        ]
+    )
+    legitimate_head = "\n".join(
+        [
+            "# Changelog",
+            "",
+            "All notable changes to SpectrumFederation will be documented in this file.",
+            "",
+            "## [1.5.10] - 2026-10-13",
+            "",
+            "### Changed",
+            "- Updated Retail game compatibility to Interface 120105 (12.1.5).",
+            "",
+            "## [1.5.9] - 2026-10-13",
+            "",
+            "### Changed",
+            "- Prior stable release note",
+            "",
+            "Historical context paragraph that must stay unchanged.",
+            "",
+        ]
+    )
+    wow.assert_changelog_delta_is_generated_only(base, legitimate_head, label="Test")
+
+    preface_edited = legitimate_head.replace(
+        "All notable changes to SpectrumFederation will be documented in this file.",
+        "Main-only marketing preface that must not sync automatically.",
+    )
+    with pytest.raises(RuntimeError, match="unversioned preface"):
+        wow.assert_changelog_delta_is_generated_only(base, preface_edited, label="Test")
+
+    # Same bullets, different non-bullet prose in a pre-existing section.
+    prose_edited = legitimate_head.replace(
+        "Historical context paragraph that must stay unchanged.",
+        "Rewritten historical blurb that must not sync automatically.",
+    )
+    with pytest.raises(RuntimeError, match="modified existing section 1\\.5\\.9"):
+        wow.assert_changelog_delta_is_generated_only(base, prose_edited, label="Test")
+
+    # New section with compatibility bullet plus unrelated prose.
+    polluted_new = "\n".join(
+        [
+            "# Changelog",
+            "",
+            "All notable changes to SpectrumFederation will be documented in this file.",
+            "",
+            "## [1.5.10] - 2026-10-13",
+            "",
+            "Unrelated paragraph before the generated note.",
+            "",
+            "### Changed",
+            "- Updated Retail game compatibility to Interface 120105 (12.1.5).",
+            "",
+            "## [1.5.9] - 2026-10-13",
+            "",
+            "### Changed",
+            "- Prior stable release note",
+            "",
+            "Historical context paragraph that must stay unchanged.",
+            "",
+        ]
+    )
+    with pytest.raises(RuntimeError, match="non-generated content under 1\\.5\\.10"):
+        wow.assert_changelog_delta_is_generated_only(base, polluted_new, label="Test")
+
+
 def test_original_parallel_bump_sync_preserves_ancestry_and_metadata(tmp_path):
     state = _init_divergent_game_version_repo(tmp_path)
     repo = state["repo"]
@@ -1316,6 +1396,75 @@ def test_unrelated_readme_body_edit_on_main_fails_preflight_sync(tmp_path, monke
             work_dir=tmp_path / "sim",
             game_version="12.1.5",
         )
+
+
+def test_unrelated_changelog_preface_edit_on_main_fails_preflight_sync(tmp_path, monkeypatch):
+    """Content-level guard: main-only CHANGELOG preface edits fail before branch mutation."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _write_channel_tree(
+        repo,
+        interface="120100",
+        version="1.5.9",
+        track="main",
+        changelog_versions=[("1.5.9", "### Changed\n- Prior\n")],
+        extra_files={"SpectrumFederation/Core.lua": "print('shared')\n"},
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    _git(repo, "checkout", "-b", "beta")
+    (repo / "SpectrumFederation" / "BetaOnly.lua").write_text("return 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "beta-only")
+    beta_sha = _git(repo, "rev-parse", "HEAD")
+
+    _git(repo, "checkout", "main")
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    (repo / "CHANGELOG.md").write_text(
+        changelog.replace(
+            "All notable changes to SpectrumFederation will be documented in this file.",
+            "Main-only changelog preface that must not sync automatically.",
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", "CHANGELOG.md")
+    _git(repo, "commit", "-m", "docs: unrelated main CHANGELOG preface edit")
+    main_sha = _git(repo, "rev-parse", "HEAD")
+    main_tip_before_sim = main_sha
+    beta_tip_before_sim = beta_sha
+
+    monkeypatch.setattr(wow, "fetch_github_release", lambda *_a, **_k: None)
+    requested = wow.parse_human_game_version("12.1.5")
+    plan = wow.build_update_plan(
+        requested=requested,
+        live_game_version="12.1.5.1",
+        live_interface=120105,
+        main_interface="120100",
+        main_version_raw="1.5.9",
+        beta_interface="120100",
+        beta_version_raw="1.5.9",
+        main_sha=main_sha,
+        beta_sha=beta_sha,
+        repo="owner/repo",
+        token="token",
+        repo_path=repo,
+    )
+    assert plan["main_update_needed"] is True
+    assert plan["sync_needed"] is True
+    with pytest.raises(RuntimeError, match="unversioned preface"):
+        wow.simulate_channel_integration(
+            repo,
+            plan,
+            work_dir=tmp_path / "sim",
+            game_version="12.1.5",
+        )
+
+    # Preflight must fail before mutating the source repository branches.
+    assert _git(repo, "rev-parse", "main") == main_tip_before_sim
+    assert _git(repo, "rev-parse", "beta") == beta_tip_before_sim
 
 
 def test_history_only_sync_does_not_synthesize_beta_changelog_section(tmp_path):
