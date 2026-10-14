@@ -60,18 +60,34 @@ function GG.CreateIndex()
     return index
 end
 
+local function invalidateProviderBookmarksForIndex(index)
+    if not (GG._providers and GG._providers.byId and GG.InvalidateProviderBookmarks) then
+        return nil
+    end
+    for _, entry in pairs(GG._providers.byId) do
+        if entry and entry.index == index then
+            GG.InvalidateProviderBookmarks(entry)
+            return entry
+        end
+    end
+    return nil
+end
+
+local function notifyIndexEpochChanged(entry)
+    if entry and type(GG.OnProviderIndexEpochChanged) == "function" then
+        pcall(GG.OnProviderIndexEpochChanged, entry.id)
+    end
+end
+
 function GG.BumpIndexEpoch(index)
     if type(index) ~= "table" then
         return
     end
-    if GG._providers and GG._providers.byId and GG.InvalidateProviderBookmarks then
-        for _, entry in pairs(GG._providers.byId) do
-            if entry and entry.index == index then
-                GG.InvalidateProviderBookmarks(entry)
-                entry._listCursor = nil
-                break
-            end
-        end
+    local entry = invalidateProviderBookmarksForIndex(index)
+    if entry then
+        entry._listCursor = nil
+        entry._reconcileSeen = nil
+        entry._reconciling = nil
     end
     index.epoch = nextEpoch()
     index.buckets = {}
@@ -83,6 +99,18 @@ function GG.BumpIndexEpoch(index)
     for i = 0, GG.BUCKET_COUNT - 1 do
         index.buckets[i] = newBucket()
     end
+    notifyIndexEpochChanged(entry)
+end
+
+-- Bump the view epoch and invalidate bookmarks while preserving index rows.
+-- Used after a successful dirty rebuild removes disappeared records.
+function GG.TouchIndexEpoch(index)
+    if type(index) ~= "table" then
+        return
+    end
+    local entry = invalidateProviderBookmarksForIndex(index)
+    index.epoch = nextEpoch()
+    notifyIndexEpochChanged(entry)
 end
 
 local function recomputeBucketFingerprint(bucket)

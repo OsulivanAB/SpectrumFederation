@@ -13,6 +13,13 @@ GG._recvGuard = GG._recvGuard or {
     partialCount = 0,
     expiryTimer = nil,
     lifecycleFrame = nil,
+    -- Unwrapped AceComm originals captured per instance (never our wrappers).
+    origFirst = nil,
+    origNext = nil,
+    origLast = nil,
+    wrapperFirst = nil,
+    wrapperNext = nil,
+    wrapperLast = nil,
 }
 
 local function partialKey(prefix, distribution, sender)
@@ -141,34 +148,8 @@ local function admitFragment(st, key, addBytes, now)
     return true, nil
 end
 
-function GG.InstallReceiveGuard(aceComm)
-    local st = GG._recvGuard
-    if not aceComm then
-        return false
-    end
-    if st.installed and st.aceComm == aceComm and aceComm._SF_GG_RecvGuard
-        and aceComm.OnReceiveMultipartFirst == st.wrapperFirst
-        and aceComm.OnReceiveMultipartNext == st.wrapperNext
-        and aceComm.OnReceiveMultipartLast == st.wrapperLast then
-        return true
-    end
-
-    -- Switching LibStub instances abandons the prior physical spool; reset
-    -- accounting so caps remain meaningful on the active table.
-    if st.aceComm and st.aceComm ~= aceComm then
-        GG.ClearAllPartials()
-    end
-
+local function buildWrappers(st, origFirst, origNext, origLast)
     local prefix = GG.PREFIX
-    local origFirst = aceComm.OnReceiveMultipartFirst
-    local origNext = aceComm.OnReceiveMultipartNext
-    local origLast = aceComm.OnReceiveMultipartLast
-
-    if type(origFirst) ~= "function" or type(origNext) ~= "function" or type(origLast) ~= "function" then
-        GG._DWarn("AceComm multipart hooks unavailable; cannot install receive guard")
-        return false
-    end
-
     local wrapperFirst = function(self, pfx, message, distribution, sender)
         if pfx ~= prefix then
             return origFirst(self, pfx, message, distribution, sender)
@@ -210,7 +191,6 @@ function GG.InstallReceiveGuard(aceComm)
         end
         local ok, err = admitFragment(st, key, #(message or ""), GG._Now())
         -- Always release accounting; LAST either completes or is dropped.
-        local ace = st.aceComm
         if not ok then
             GG._DVerbose("Drop gossip multipart LAST (%s)", tostring(err))
             releasePartial(st, key)
@@ -227,12 +207,65 @@ function GG.InstallReceiveGuard(aceComm)
         return origLast(self, pfx, message, distribution, sender)
     end
 
+    return wrapperFirst, wrapperNext, wrapperLast
+end
+
+function GG.InstallReceiveGuard(aceComm)
+    local st = GG._recvGuard
+    if not aceComm then
+        return false
+    end
+    if st.installed and st.aceComm == aceComm and aceComm._SF_GG_RecvGuard
+        and aceComm.OnReceiveMultipartFirst == st.wrapperFirst
+        and aceComm.OnReceiveMultipartNext == st.wrapperNext
+        and aceComm.OnReceiveMultipartLast == st.wrapperLast then
+        return true
+    end
+
+    -- Switching LibStub instances abandons the prior physical spool; reset
+    -- accounting so caps remain meaningful on the active table.
+    if st.aceComm and st.aceComm ~= aceComm then
+        GG.ClearAllPartials()
+        st.origFirst, st.origNext, st.origLast = nil, nil, nil
+        st.wrapperFirst, st.wrapperNext, st.wrapperLast = nil, nil, nil
+        st.installed = false
+    end
+
+    local curFirst = aceComm.OnReceiveMultipartFirst
+    local curNext = aceComm.OnReceiveMultipartNext
+    local curLast = aceComm.OnReceiveMultipartLast
+    if type(curFirst) ~= "function" or type(curNext) ~= "function" or type(curLast) ~= "function" then
+        GG._DWarn("AceComm multipart hooks unavailable; cannot install receive guard")
+        return false
+    end
+
+    -- When only one AceComm hook changed, unchanged slots are still our wrappers.
+    -- Reuse the stored unwrapped originals for those slots so we never nest.
+    local origFirst, origNext, origLast
+    if st.aceComm == aceComm and st.wrapperFirst then
+        origFirst = (curFirst == st.wrapperFirst) and st.origFirst or curFirst
+        origNext = (curNext == st.wrapperNext) and st.origNext or curNext
+        origLast = (curLast == st.wrapperLast) and st.origLast or curLast
+    else
+        origFirst, origNext, origLast = curFirst, curNext, curLast
+    end
+
+    if type(origFirst) ~= "function" or type(origNext) ~= "function" or type(origLast) ~= "function" then
+        GG._DWarn("AceComm multipart originals unavailable; cannot install receive guard")
+        return false
+    end
+
+    local wrapperFirst, wrapperNext, wrapperLast = buildWrappers(st, origFirst, origNext, origLast)
+
     aceComm.OnReceiveMultipartFirst = wrapperFirst
     aceComm.OnReceiveMultipartNext = wrapperNext
     aceComm.OnReceiveMultipartLast = wrapperLast
     aceComm._SF_GG_RecvGuard = true
     st.aceComm = aceComm
     st.installed = true
+    st.origFirst = origFirst
+    st.origNext = origNext
+    st.origLast = origLast
     st.wrapperFirst = wrapperFirst
     st.wrapperNext = wrapperNext
     st.wrapperLast = wrapperLast

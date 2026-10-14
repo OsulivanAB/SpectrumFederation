@@ -1088,7 +1088,10 @@ do
     reset()
     local B = makeClient("Bob")
     local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f20" })
-    for i = 1, 8 do pB.AppendLocal("payload-" .. i, "f20-" .. i) end
+    for i = 1, 8 do
+        pB.AppendLocal("payload-a-" .. i, "f20a-" .. i)
+        pB.AppendLocal("payload-b-" .. i, "f20b-" .. i)
+    end
     local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
     local lookups = 0
     local origBody = entryB.api.GetRecordBody
@@ -1104,17 +1107,21 @@ do
         buckets = {}, phase = "serving", engineGen = e.generation,
         usableProgressAt = world.time, finalSubmitted = true,
     }
-    local ids = {}
-    for i = 1, 8 do ids[i] = "f20-" .. i end
-    local function admitBody(requestId)
+    -- Distinct ID sets: same-ids duplicates are replayed without export (F67).
+    local idsA, idsB = {}, {}
+    for i = 1, 8 do
+        idsA[i] = "f20a-" .. i
+        idsB[i] = "f20b-" .. i
+    end
+    local function admitBody(requestId, ids)
         B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
             op = "request", viewId = "v20", providerId = "sf.synthetic.gossip",
             scopeId = B.GuildGossip.GetGuildScopeId(), requestId = requestId,
             ids = ids, mode = "NORMAL",
         }), "WHISPER", "Alice-Garona")
     end
-    admitBody("br20a")
-    admitBody("br20b")
+    admitBody("br20a", idsA)
+    admitBody("br20b", idsB)
     assertEq(#e.recvQueue, 2, "F20: two BODY requests admitted")
     -- Elevate apps so both could dispatch in one step; bodies stay SLOW=1.
     local slow = B.GuildGossip.GetStepLimits("SLOW")
@@ -3516,6 +3523,304 @@ do
     local again = e.unresolved[key]
     assertTrue(again ~= nil and again.at == firstAt,
         "F66: identical unresolved outcome preserves original at")
+end
+
+---------------------------------------------------------------------------
+-- F67: served MANIFEST/BODY duplicates replay without lease renew / export work
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local p = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f67" })
+    for i = 1, 6 do p.AppendLocal("b-" .. i, "b-" .. i) end
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local view = select(1, A.GuildGossip.CaptureViewSummaries(
+        entry.index, entry.eligibilityGen, scope, entry.id, entry.schema, nil, nil, nil))
+    local lease = world.time
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v67",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = view and view.buckets or {},
+        usableProgressAt = lease, finalSubmitted = true, engineGen = e.generation,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    local function bodyReq(requestId)
+        A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.BODY, {
+            op = "request", viewId = "v67", providerId = "sf.synthetic.gossip",
+            scopeId = scope, requestId = requestId, subpage = 1,
+            ids = { "b-1" }, mode = "NORMAL",
+        }), "WHISPER", "Bob-Garona")
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    end
+    world.time = lease + 1
+    bodyReq("req67a")
+    assertTrue(e.inPull ~= nil, "F67: served pull retained after first BODY")
+    assertTrue(e.inPull.usableProgressAt > lease, "F67: advancing BODY renews lease")
+    local afterFirst = e.inPull.usableProgressAt
+    world.time = afterFirst + 1
+    bodyReq("req67a") -- identical request
+    assertEq(e.inPull.usableProgressAt, afterFirst, "F67: duplicate BODY does not renew lease")
+    world.time = afterFirst + 2
+    bodyReq("req67-renamed") -- new requestId, same ids
+    assertEq(e.inPull.usableProgressAt, afterFirst,
+        "F67: renamed requestId alone does not renew lease")
+    -- Manifest duplicate path.
+    local mLease = e.inPull.usableProgressAt
+    world.time = mLease + 1
+    local function manifestReq(requestId)
+        A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.MANIFEST, {
+            op = "request", viewId = "v67", providerId = "sf.synthetic.gossip",
+            scopeId = scope, requestId = requestId, subpage = 1,
+            bucketId = 0, afterSeq = 0, mode = "NORMAL",
+        }), "WHISPER", "Bob-Garona")
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    end
+    manifestReq("m67a")
+    assertTrue(e.inPull.usableProgressAt > mLease, "F67: advancing MANIFEST renews lease")
+    local afterManifest = e.inPull.usableProgressAt
+    world.time = afterManifest + 1
+    manifestReq("m67a")
+    assertEq(e.inPull.usableProgressAt, afterManifest, "F67: duplicate MANIFEST does not renew lease")
+    world.time = afterManifest + 2
+    manifestReq("m67-renamed")
+    assertEq(e.inPull.usableProgressAt, afterManifest,
+        "F67: renamed MANIFEST requestId alone does not renew lease")
+    -- Eventual timeout frees the slot for another peer.
+    world.time = afterManifest + A.GuildGossip.SERVED_VIEW_IDLE_TIMEOUT_SEC + 5
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull == nil, "F67: served pull eventually times out without duplicate renewals")
+end
+
+---------------------------------------------------------------------------
+-- F68: queued view-derived responses cancel on provider epoch change
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local p = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f68" })
+    for i = 1, 4 do p.AppendLocal("q-" .. i, "q-" .. i) end
+    for _ = 1, 5 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local view = select(1, A.GuildGossip.CaptureViewSummaries(
+        entry.index, entry.eligibilityGen, scope, entry.id, entry.schema, nil, nil, nil))
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v68",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = view and view.buckets or {},
+        usableProgressAt = world.time, finalSubmitted = true, engineGen = e.generation,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    local admittedBefore = e.admittedOutBytes or 0
+    -- Admit a BODY response into the Comm queue without pumping.
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.BODY, {
+        op = "request", viewId = "v68", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "q68", subpage = 1,
+        ids = { "q-1" }, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    world._unitName = "Alice"
+    A.GuildGossip.OnSchedulerStep(A.GuildGossip.GetStepLimits("NORMAL"), world.time)
+    assertTrue((e.admittedOutBytes or 0) > admittedBefore, "F68: response admitted to out path")
+    local epochBefore = entry.index.epoch
+    -- Ordinary append must not invalidate the fixed-end served view epoch.
+    p.AppendLocal("q-extra", "q-extra")
+    assertEq(entry.index.epoch, epochBefore, "F68: ordinary append preserves fixed-end epoch")
+    assertTrue(e.inPull ~= nil, "F68: ordinary append keeps served pull")
+    -- Epoch-changing invalidation cancels queued pages and releases accounting.
+    local wireBefore = #world.wire
+    A.GuildGossip.BumpIndexEpoch(entry.index)
+    assertTrue(e.inPull == nil, "F68: epoch change closes served pull")
+    pump("Alice", A)
+    local discOrBody = 0
+    for i = wireBefore + 1, #world.wire do
+        if world.wire[i].distribution == "WHISPER" then
+            discOrBody = discOrBody + 1
+        end
+    end
+    assertEq(discOrBody, 0, "F68: stale queued BODY not submitted after epoch change")
+    assertEq(e.admittedOutBytes or 0, 0, "F68: admission bytes released after cancel")
+end
+
+---------------------------------------------------------------------------
+-- F69: FIRST/NEXT/LAST-only AceComm upgrades do not nest wrappers
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local GG = A.GuildGossip
+    local ace = activeAceComm
+    assertTrue(GG.InstallReceiveGuard(ace), "F69: guard installed")
+    local st = GG._recvGuard
+    local baseOrigFirst, baseOrigNext, baseOrigLast = st.origFirst, st.origNext, st.origLast
+    local deliveries = 0
+    local function makeBare(kind)
+        return function(self, pfx, message, distribution, sender)
+            if pfx ~= "SF_GG" then
+                return
+            end
+            local key = pfx .. "\t" .. distribution .. "\t" .. sender
+            if kind == "FIRST" then
+                self.multipart_spool[key] = message
+            elseif kind == "NEXT" then
+                local old = self.multipart_spool[key]
+                if not old then return end
+                if type(old) ~= "table" then
+                    self.multipart_spool[key] = { old, message }
+                else
+                    old[#old + 1] = message
+                end
+            else
+                self.multipart_spool[key] = nil
+                deliveries = deliveries + 1
+            end
+        end
+    end
+    local function installOnly(which)
+        local bare = makeBare(which)
+        if which == "FIRST" then
+            ace.OnReceiveMultipartFirst = bare
+        elseif which == "NEXT" then
+            ace.OnReceiveMultipartNext = bare
+        else
+            ace.OnReceiveMultipartLast = bare
+        end
+        assertTrue(GG.InstallReceiveGuard(ace), "F69: rebind after " .. which .. "-only change")
+        if which == "FIRST" then
+            assertTrue(st.origFirst == bare, "F69: FIRST-only captures new FIRST original")
+            assertTrue(st.origNext == baseOrigNext, "F69: FIRST-only keeps unwrapped NEXT original")
+            assertTrue(st.origLast == baseOrigLast, "F69: FIRST-only keeps unwrapped LAST original")
+        elseif which == "NEXT" then
+            assertTrue(st.origNext == bare, "F69: NEXT-only captures new NEXT original")
+            assertTrue(st.origFirst == baseOrigFirst or st.origFirst ~= st.wrapperFirst,
+                "F69: NEXT-only FIRST original is not our wrapper")
+            assertTrue(st.origLast == baseOrigLast or st.origLast ~= st.wrapperLast,
+                "F69: NEXT-only LAST original is not our wrapper")
+        else
+            assertTrue(st.origLast == bare, "F69: LAST-only captures new LAST original")
+            assertTrue(st.origFirst ~= st.wrapperFirst, "F69: LAST-only FIRST original unwrapped")
+            assertTrue(st.origNext ~= st.wrapperNext, "F69: LAST-only NEXT original unwrapped")
+        end
+        baseOrigFirst, baseOrigNext, baseOrigLast = st.origFirst, st.origNext, st.origLast
+    end
+    installOnly("FIRST")
+    installOnly("NEXT")
+    installOnly("LAST")
+    -- Repeated install is idempotent.
+    local w1, w2, w3 = st.wrapperFirst, st.wrapperNext, st.wrapperLast
+    assertTrue(GG.InstallReceiveGuard(ace), "F69: repeated install ok")
+    assertEq(st.wrapperFirst, w1, "F69: repeated install does not restack FIRST")
+    assertEq(st.wrapperNext, w2, "F69: repeated install does not restack NEXT")
+    assertEq(st.wrapperLast, w3, "F69: repeated install does not restack LAST")
+    -- Exactly-once multipart delivery + clean accounting.
+    deliveries = 0
+    ace:OnReceiveMultipartFirst("SF_GG", "p1", "WHISPER", "Bob-Garona")
+    ace:OnReceiveMultipartNext("SF_GG", "p2", "WHISPER", "Bob-Garona")
+    ace:OnReceiveMultipartLast("SF_GG", "p3", "WHISPER", "Bob-Garona")
+    assertEq(deliveries, 1, "F69: multipart LAST delivered exactly once")
+    local stats = GG.GetReceiveGuardStats()
+    assertEq(stats.partialCount, 0, "F69: accounting cleared after complete multipart")
+    assertEq(ace.multipart_spool["SF_GG\tWHISPER\tBob-Garona"], nil, "F69: physical spool cleared")
+    -- Other-prefix unchanged.
+    local other = 0
+    local prevLast = st.origLast
+    st.origLast = function(self, pfx, ...)
+        if pfx == "OTHER" then other = other + 1; return end
+        return prevLast(self, pfx, ...)
+    end
+    -- Re-install so wrapper closes over updated origLast? Wrappers already close over
+    -- previous origLast. Call through ace LAST for OTHER — wrapper delegates to st.origLast
+    -- captured at build time. Use direct bare path: replace LAST again with counter.
+    local otherLast = 0
+    local otherBare = function(self, pfx, ...)
+        if pfx == "OTHER" then otherLast = otherLast + 1 end
+    end
+    ace.OnReceiveMultipartLast = otherBare
+    -- Keep FIRST/NEXT as our wrappers; only LAST changed.
+    local keepFirst, keepNext = ace.OnReceiveMultipartFirst, ace.OnReceiveMultipartNext
+    GG.InstallReceiveGuard(ace)
+    ace:OnReceiveMultipartLast("OTHER", "z", "WHISPER", "Bob-Garona")
+    assertEq(otherLast, 1, "F69: OTHER prefix LAST still reaches upgraded hook")
+end
+
+---------------------------------------------------------------------------
+-- F70: paged dirty rebuild removes disappeared records; failed walks do not prune
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local ids = { "a", "b", "c", "d", "e", "f", "g", "h", "i", "j" }
+    local bodies = {}
+    for _, id in ipairs(ids) do bodies[id] = { id = id, versionFp = "v", body = 1 } end
+    A.GuildGossip.RegisterProvider({
+        id = "page70", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            cursor = tonumber(cursor) or 1
+            limit = tonumber(limit) or 8
+            local page = {}
+            local i = cursor
+            while i <= #ids and #page < limit do
+                page[#page + 1] = ids[i]
+                i = i + 1
+            end
+            if i <= #ids then return page, i end
+            return page, nil
+        end,
+        GetRecordVersionFp = function(id) return bodies[id] and bodies[id].versionFp or nil end,
+        GetRecordBody = function(id) return bodies[id] end,
+        ValidateAndApply = function() return "accepted" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 8 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    local entry = A.GuildGossip.GetProvider("page70")
+    assertTrue(entry.index.buildComplete, "F70: initial paged build complete")
+    assertTrue(A.GuildGossip.IndexGetEntry(entry.index, "c") ~= nil, "F70: record c indexed")
+    local epoch1 = entry.index.epoch
+    -- Delete a durable record and notify.
+    table.remove(ids, 3) -- remove "c"
+    bodies["c"] = nil
+    A.GuildGossip.NotifyProviderChanged("page70")
+    assertTrue(entry.index.dirty == true, "F70: notify marks dirty")
+    -- Interrupted walk must not prune yet.
+    entry._listCursor = 1
+    entry._reconciling = true
+    entry._reconcileSeen = { a = true, b = true }
+    entry.index.buildComplete = false
+    -- Force an error mid-walk via GetRecordVersionFp throw on next id.
+    local origVfp = entry.api.GetRecordVersionFp
+    entry.api.GetRecordVersionFp = function(id)
+        if id == "d" then error("fail-mid") end
+        return origVfp(id)
+    end
+    for _ = 1, 3 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    assertTrue(A.GuildGossip.IndexGetEntry(entry.index, "c") ~= nil,
+        "F70: failed/incomplete walk does not prune disappeared record yet")
+    entry.api.GetRecordVersionFp = origVfp
+    entry.indexFailed = nil
+    entry.indexFailCount = 0
+    entry._listCursor = nil
+    entry._reconcileSeen = nil
+    entry._reconciling = nil
+    entry.index.dirty = true
+    entry.index.buildComplete = false
+    for _ = 1, 12 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    assertTrue(entry.index.buildComplete, "F70: successful multi-slice rebuild completes")
+    assertTrue(A.GuildGossip.IndexGetEntry(entry.index, "c") == nil,
+        "F70: disappeared record removed from read index")
+    assertTrue(entry.index.epoch ~= epoch1, "F70: removal invalidates index epoch")
+    assertTrue(A.GuildGossip.IndexGetEntry(entry.index, "a") ~= nil, "F70: retained record a still indexed")
+    assertTrue(A.GuildGossip.IndexGetEntry(entry.index, "j") ~= nil, "F70: retained record j still indexed")
+    -- Ordinary append still preserves epoch (no full wipe).
+    local epoch2 = entry.index.epoch
+    -- Simulate append-only upsert path through IndexUpsert (paged providers own storage).
+    A.GuildGossip.IndexUpsert(entry.index, "k", "v")
+    assertEq(entry.index.epoch, epoch2, "F70: ordinary append does not bump epoch")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

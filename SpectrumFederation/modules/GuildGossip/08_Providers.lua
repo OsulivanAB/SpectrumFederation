@@ -234,6 +234,8 @@ function GG.NotifyProviderChanged(providerId)
     entry._buildList = nil
     entry._buildPos = nil
     entry._listCursor = nil
+    entry._reconcileSeen = nil
+    entry._reconciling = nil
     if entry.api and type(entry.api.OnIndexInvalidated) == "function" then
         pcall(entry.api.OnIndexInvalidated)
     end
@@ -259,6 +261,8 @@ local function markIndexFailed(entry, reason)
     entry._buildList = nil
     entry._buildPos = nil
     entry._listCursor = nil
+    entry._reconcileSeen = nil
+    entry._reconciling = nil
     entry.lastIndexExamined = 0
     GG._DError("Index failed provider=%s reason=%s", entry.id, entry.indexFailReason)
 end
@@ -382,6 +386,13 @@ function GG.EnsureProviderIndex(entry, limits)
         return false
     end
 
+    -- Start a dirty reconciliation walk: accumulate seen IDs across budgeted
+    -- slices, and prune disappeared rows only after a successful completion.
+    if index and index.dirty and not entry._listCursor and not entry._reconciling then
+        entry._reconciling = true
+        entry._reconcileSeen = {}
+    end
+
     local function upsertId(rid)
         local ok, res = pcall(api.GetRecordVersionFp, rid)
         if not ok then
@@ -401,6 +412,8 @@ function GG.EnsureProviderIndex(entry, limits)
         if detail == "replaced" then
             GG.BumpIndexEpoch(entry.index)
             entry._listCursor = 1
+            entry._reconcileSeen = {}
+            entry._reconciling = true
             return "restart"
         end
         return true
@@ -427,10 +440,14 @@ function GG.EnsureProviderIndex(entry, limits)
 
     local n = 0
     for i = 1, #page do
-        local status = upsertId(page[i])
+        local rid = page[i]
+        if entry._reconcileSeen and rid ~= nil then
+            entry._reconcileSeen[tostring(rid)] = true
+        end
+        local status = upsertId(rid)
         if status == "error" then
             -- Keep the build incomplete and the cursor on this page so recovery
-            -- can retry. Bounded failure handling (not a hot loop forever).
+            -- can retry. Do not prune on failed/incomplete walks.
             entry.lastIndexExamined = n
             entry._listCursor = cursor
             if index then
@@ -458,6 +475,26 @@ function GG.EnsureProviderIndex(entry, limits)
     -- Empty page or final page with no next cursor completes the build.
     entry._listCursor = nil
     if index then
+        if entry._reconciling and entry._reconcileSeen then
+            local removed = false
+            local toRemove = {}
+            for id in pairs(index.byId or {}) do
+                if not entry._reconcileSeen[id] then
+                    toRemove[#toRemove + 1] = id
+                end
+            end
+            for i = 1, #toRemove do
+                if GG.IndexRemove(index, toRemove[i]) then
+                    removed = true
+                end
+            end
+            if removed and GG.TouchIndexEpoch then
+                -- Invalidate views after established removal; preserve rows.
+                GG.TouchIndexEpoch(index)
+            end
+        end
+        entry._reconcileSeen = nil
+        entry._reconciling = nil
         index.buildComplete = true
         index.dirty = false
     end

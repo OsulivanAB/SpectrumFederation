@@ -574,6 +574,19 @@ local function closeInPull(reason)
     GG._DVerbose("In pull closed (%s)", tostring(reason))
 end
 
+-- Index epoch bumps invalidate captured served views and cancel queued pages
+-- through Comm gossipValid/gossipCancel (admission/stream accounting released).
+GG.OnProviderIndexEpochChanged = function(providerId)
+    local e = GG._engine
+    if e.inPull and e.inPull.providerId == providerId then
+        closeInPull("index_epoch_changed")
+    end
+    if GG.CancelQueuedGossipForProvider then
+        GG.CancelQueuedGossipForProvider(providerId)
+    end
+    GG.MarkWorkPending()
+end
+
 local function scheduleOutPullRetry(pull, reason)
     if GG._engine.outPull ~= pull or not pull.outstanding then
         return
@@ -689,18 +702,84 @@ local function nextRequestId(pull, kind)
     }, ":")
 end
 
-local function noteInPullSubmission(pull, success)
+-- renewLease: renew usableProgressAt only after successful final submission of
+-- genuinely advancing work. closeOnFail: replay/admission-no-progress paths
+-- must not tear down the served pull merely because a duplicate send failed.
+local function noteInPullSubmission(pull, success, opts)
+    opts = opts or {}
+    local renewLease = opts.renewLease
+    local closeOnFail = opts.closeOnFail
+    if closeOnFail == nil then
+        closeOnFail = true
+    end
     if GG._engine.inPull == pull then
         pull.finalSubmitted = success and true or false
         if pull.finalSubmitted then
             pull.offerRetryPending = nil
             pull.awaitingSince = GG._Now()
-            pull.usableProgressAt = pull.awaitingSince
-        else
+            if renewLease then
+                pull.usableProgressAt = pull.awaitingSince
+            end
+        elseif closeOnFail then
             -- An unsent offer/page cannot retain the stop-and-wait lease.
             closeInPull("submission_failed")
         end
     end
+end
+
+-- Bind queued view-derived responses to the captured served-view epoch /
+-- eligibility identity so BumpIndexEpoch / eligibility changes cancel them
+-- through existing Comm gossipValid + gossipCancel accounting release.
+local function makeServedGossipValid(pull)
+    local sendGeneration = GG._engine.generation
+    local providerId = pull.providerId
+    local scopeId = pull.scopeId
+    local epoch = pull.epoch
+    local eligibilityGen = pull.eligibilityGen
+    local viewId = pull.viewId
+    local peer = pull.peer
+    return function()
+        if sendGeneration ~= GG._engine.generation or not GG.IsGuildReady() then
+            return false
+        end
+        local entry = GG.GetProvider(providerId)
+        if not providerEligible(entry, peer, scopeId) then
+            return false
+        end
+        if not entry.index or entry.index.epoch ~= epoch then
+            return false
+        end
+        if entry.eligibilityGen ~= eligibilityGen then
+            return false
+        end
+        local current = GG._engine.inPull
+        if not current or current ~= pull or current.viewId ~= viewId then
+            return false
+        end
+        return true
+    end
+end
+
+local function bodyIdsKey(ids)
+    local parts = {}
+    for i = 1, #ids do
+        parts[i] = tostring(ids[i])
+    end
+    return table.concat(parts, "\0")
+end
+
+local function sendServedResponse(pull, msgType, response, advancing)
+    return GG.SendGossip(msgType, response, "WHISPER", pull.peer, {
+        providerId = pull.providerId,
+        scopeId = pull.scopeId,
+        gossipValid = makeServedGossipValid(pull),
+        onFinalSubmitted = function(success)
+            noteInPullSubmission(pull, success, {
+                renewLease = advancing and true or false,
+                closeOnFail = advancing and true or false,
+            })
+        end,
+    })
 end
 
 -- Serving budgets are owned by the local scheduler step. A remote mode may only
@@ -737,8 +816,9 @@ local function trySendServedOffer(pull)
     local ok, err = GG.SendGossip(GG.MSG.VIEW, pull.offerPayload, "WHISPER", pull.peer, {
         providerId = pull.providerId,
         scopeId = pull.scopeId,
+        gossipValid = makeServedGossipValid(pull),
         onFinalSubmitted = function(success)
-            noteInPullSubmission(pull, success)
+            noteInPullSubmission(pull, success, { renewLease = true, closeOnFail = true })
         end,
     })
     if ok then
@@ -1318,6 +1398,26 @@ local function handleManifest(sender, payload, stepLimits)
             closeInPull("stale_provider_view")
             return
         end
+        local bucketId = tonumber(payload.bucketId) or 0
+        local afterSeq = tonumber(payload.afterSeq) or 0
+        local subpage = tonumber(payload.subpage) or 1
+        local last = pull.servedManifest
+        -- Duplicate / renamed requestId at the same cursor: replay without
+        -- provider export work or lease renewal. requestId alone is not progress.
+        if last and last.response and last.bucketId == bucketId
+            and last.afterSeq == afterSeq and (last.subpage or 1) == subpage then
+            local replay = {}
+            for k, v in pairs(last.response) do
+                replay[k] = v
+            end
+            replay.requestId = payload.requestId
+            sendServedResponse(pull, GG.MSG.MANIFEST, replay, false)
+            return
+        end
+        -- Reject non-monotonic cursor regress on the same bucket.
+        if last and last.bucketId == bucketId and afterSeq < last.afterSeq then
+            return
+        end
         local limits = resolveServeLimits(stepLimits or e.stepLimits, payload.mode)
         local manifestBudget = consumeStepExportBudget("manifest", limits.manifestEntries or 1)
         if manifestBudget <= 0 then
@@ -1334,7 +1434,6 @@ local function handleManifest(sender, payload, stepLimits)
             return "defer"
         end
         local endSeq = 0
-        local bucketId = tonumber(payload.bucketId) or 0
         if pull.buckets and pull.buckets[bucketId] then
             endSeq = pull.buckets[bucketId].lastSeq or 0
         end
@@ -1343,7 +1442,7 @@ local function handleManifest(sender, payload, stepLimits)
         local entries, seekMeta = GG.IndexSeekManifest(
             entry.index,
             bucketId,
-            payload.afterSeq or 0,
+            afterSeq,
             endSeq,
             manifestBudget,
             function(recordId, indexEntry)
@@ -1362,9 +1461,9 @@ local function handleManifest(sender, payload, stepLimits)
             providerId = pull.providerId,
             scopeId = pull.scopeId,
             requestId = payload.requestId,
-            subpage = tonumber(payload.subpage) or 1,
+            subpage = subpage,
             bucketId = bucketId,
-            afterSeq = payload.afterSeq or 0,
+            afterSeq = afterSeq,
             endSeq = endSeq,
             entries = entries,
             -- Scan continuation for empty/filtered budget slices.
@@ -1385,14 +1484,15 @@ local function handleManifest(sender, payload, stepLimits)
             response.error = "manifest_descriptor_too_large"
             response.done = false
         end
-        -- Lease renews only after validated export work is submitted.
-        GG.SendGossip(GG.MSG.MANIFEST, response, "WHISPER", sender, {
-            providerId = pull.providerId,
-            scopeId = pull.scopeId,
-            onFinalSubmitted = function(success)
-                noteInPullSubmission(pull, success)
-            end,
-        })
+        pull.servedManifest = {
+            bucketId = bucketId,
+            afterSeq = afterSeq,
+            subpage = subpage,
+            requestId = payload.requestId,
+            response = response,
+        }
+        -- Lease renews only after successful final submission of this advance.
+        sendServedResponse(pull, GG.MSG.MANIFEST, response, true)
         return
     end
 
@@ -1484,6 +1584,21 @@ local function handleBody(sender, payload, stepLimits)
             closeInPull("stale_provider_view")
             return
         end
+        local subpage = tonumber(payload.subpage) or 1
+        local idsKey = bodyIdsKey(payload.ids)
+        local last = pull.servedBody
+        -- Duplicate / renamed requestId with the same ID set: replay without
+        -- export work or lease renewal. Truncated more=true continuations use
+        -- a different id set and remain advancing work.
+        if last and last.response and last.idsKey == idsKey and (last.subpage or 1) == subpage then
+            local replay = {}
+            for k, v in pairs(last.response) do
+                replay[k] = v
+            end
+            replay.requestId = payload.requestId
+            sendServedResponse(pull, GG.MSG.BODY, replay, false)
+            return
+        end
         local records = {}
         local skippedIds = {}
         local limits = resolveServeLimits(stepLimits or e.stepLimits, payload.mode)
@@ -1541,7 +1656,7 @@ local function handleBody(sender, payload, stepLimits)
                     local candidate = {
                         op = "page", viewId = pull.viewId, providerId = pull.providerId,
                         scopeId = pull.scopeId, requestId = payload.requestId,
-                        subpage = tonumber(payload.subpage) or 1, records = {},
+                        subpage = subpage, records = {},
                         skippedIds = skippedIds, more = false, engineGen = e.generation,
                     }
                     for i, record in ipairs(records) do
@@ -1578,26 +1693,27 @@ local function handleBody(sender, payload, stepLimits)
             closeInPull("body_unsettled")
             return
         end
-        pull.usableProgressAt = GG._Now()
-        -- Unprocessed trailing IDs are preserved via more=true; they are not skipped.
-        GG.SendGossip(GG.MSG.BODY, {
+        local response = {
             op = "page",
             viewId = pull.viewId,
             providerId = pull.providerId,
             scopeId = pull.scopeId,
             requestId = payload.requestId,
-            subpage = tonumber(payload.subpage) or 1,
+            subpage = subpage,
             records = records,
             skippedIds = skippedIds,
             more = more,
             engineGen = e.generation,
-        }, "WHISPER", sender, {
-            providerId = pull.providerId,
-            scopeId = pull.scopeId,
-            onFinalSubmitted = function(success)
-                noteInPullSubmission(pull, success)
-            end,
-        })
+        }
+        pull.servedBody = {
+            idsKey = idsKey,
+            subpage = subpage,
+            requestId = payload.requestId,
+            response = response,
+        }
+        -- Unprocessed trailing IDs are preserved via more=true; they are not skipped.
+        -- Lease renews only after successful final submission of this advance.
+        sendServedResponse(pull, GG.MSG.BODY, response, true)
         return
     end
 
