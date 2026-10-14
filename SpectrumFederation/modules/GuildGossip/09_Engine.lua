@@ -6,6 +6,7 @@ local GG = SF.GuildGossip
 local providerScope, providerEligible
 local isKnownUnresolvedRevision, clearUnresolvedRevision, recordUnresolved
 local hasUnresolvedForProvider, reopenUnresolvedEnumeration
+local hasValidBodyIdArray, transportSenderAuthorized
 
 GG._engine = GG._engine or {
     inited = false,
@@ -67,22 +68,47 @@ local function providerAnnouncementFingerprint(cap)
     }, "\0")
 end
 
-local function clearPeerProviderState(peerName, providerId, scopeId)
+-- Iterate every registered provider (enabled or not) so peer eviction and
+-- scoped invalidation cannot leave bookmarks behind on disabled entries.
+local function eachRegisteredProvider(fn)
+    local reg = GG._providers and GG._providers.byId
+    if not reg then
+        return
+    end
+    for _, entry in pairs(reg) do
+        if entry then
+            fn(entry)
+        end
+    end
+end
+
+-- Clear bookmarks using structured bookmark metadata (never parse composite keys:
+-- supported scopes such as name:<guild>|<realm> contain '|').
+local function clearBookmarksForScope(peerName, providerId, scopeId)
     local normalized = peerName and peerKey(peerName) or nil
-    for _, entry in ipairs(GG.ListActiveProviders()) do
-        if not providerId or entry.id == providerId then
-            for key in pairs(entry.bookmarks or {}) do
-                local parts = {}
-                for part in string.gmatch(key, "[^|]+") do
-                    parts[#parts + 1] = part
-                end
-                if (not normalized or parts[1] == normalized)
-                    and (not scopeId or parts[3] == tostring(scopeId)) then
+    local scopeStr = scopeId ~= nil and tostring(scopeId) or nil
+    eachRegisteredProvider(function(entry)
+        if providerId and entry.id ~= providerId then
+            return
+        end
+        if not normalized and not scopeStr then
+            entry.bookmarks = {}
+            return
+        end
+        for key, bm in pairs(entry.bookmarks or {}) do
+            if type(bm) == "table" and bm.peerKey ~= nil then
+                local bmScope = bm.scopeId ~= nil and tostring(bm.scopeId) or nil
+                if (not normalized or bm.peerKey == normalized)
+                    and (not scopeStr or bmScope == scopeStr) then
                     entry.bookmarks[key] = nil
                 end
             end
         end
-    end
+    end)
+end
+
+local function clearUnresolvedForScope(peerName, providerId, scopeId)
+    local normalized = peerName and peerKey(peerName) or nil
     local unresolved = GG._engine.unresolved or {}
     for key, item in pairs(unresolved) do
         if (not normalized or item.peerKey == normalized)
@@ -91,6 +117,48 @@ local function clearPeerProviderState(peerName, providerId, scopeId)
             unresolved[key] = nil
         end
     end
+end
+
+local function clearPeerOwnedRuntime(peerName)
+    local normalized = peerName and peerKey(peerName) or nil
+    if not normalized then
+        return
+    end
+    local e = GG._engine
+    clearBookmarksForScope(peerName, nil, nil)
+    clearUnresolvedForScope(peerName, nil, nil)
+    if e.peerCooldownUntil then
+        e.peerCooldownUntil[normalized] = nil
+    end
+    if e.unresolvedBackoffUntil then
+        local prefix = normalized .. "|"
+        for key in pairs(e.unresolvedBackoffUntil) do
+            if type(key) == "string" and string.sub(key, 1, #prefix) == prefix then
+                e.unresolvedBackoffUntil[key] = nil
+            end
+        end
+    end
+    if e.lastNackAt then
+        e.lastNackAt[normalized] = nil
+    end
+    if e.pendingOutCapture and e.pendingOutCapture.peer
+        and peerKey(e.pendingOutCapture.peer) == normalized then
+        e.pendingOutCapture = nil
+    end
+    local peer = e.peers[normalized]
+    if peer then
+        peer.covered = {}
+        peer.scopeIncompat = nil
+        peer.capFingerprints = nil
+        peer.caps = nil
+    end
+end
+
+-- Full peer/provider/scope wipe (bookmarks + obligations). Prefer narrower
+-- helpers when only bookmarks or a single revision must change.
+local function clearPeerProviderState(peerName, providerId, scopeId)
+    clearBookmarksForScope(peerName, providerId, scopeId)
+    clearUnresolvedForScope(peerName, providerId, scopeId)
 end
 
 local function touchPeer(name, info)
@@ -117,6 +185,12 @@ local function touchPeer(name, info)
                 return nil
             end
             local ek = e.peerOrder[evictIdx]
+            local evicted = e.peers[ek]
+            if evicted then
+                -- Same scoped cleanup as expirePeers so capacity eviction cannot
+                -- retain bookmarks/unresolved/cooldowns outside the peer bound.
+                clearPeerOwnedRuntime(evicted.name)
+            end
             e.peers[ek] = nil
             table.remove(e.peerOrder, evictIdx)
         end
@@ -178,8 +252,8 @@ local function expirePeers(now)
             if active or fresh then
                 keep[#keep + 1] = key
             else
+                clearPeerOwnedRuntime(p.name)
                 e.peers[key] = nil
-                clearPeerProviderState(p.name, nil, nil)
             end
         end
     end
@@ -203,6 +277,14 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
     end
     if not GG.HasActiveProvider() and not opts.allowWithoutProvider then
         return false, "no_provider"
+    end
+    if not GG.IsGuildReady() and not opts.allowWithoutProvider then
+        return false, "guild_not_ready"
+    end
+    if distribution == "WHISPER" and target and not opts.allowWithoutProvider then
+        if not GG.IsGuildMember(target) then
+            return false, "target_not_member"
+        end
     end
 
     local envelope, err = GG.BuildWireMessage(msgType, payload)
@@ -401,13 +483,19 @@ end
 -- C1 pull state machines
 ---------------------------------------------------------------------------
 
+-- Opaque storage key: length-prefixed fields so '|' inside scope/id cannot
+-- create ambiguous encodings. Matching uses structured bookmark metadata.
+local function lengthPrefixedKey(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        local value = tostring(select(i, ...) or "")
+        parts[#parts + 1] = string.format("%d:%s", #value, value)
+    end
+    return table.concat(parts, "\0")
+end
+
 local function bookmarkKey(peerName, providerId, scopeId, bucketId)
-    return table.concat({
-        peerKey(peerName),
-        tostring(providerId),
-        tostring(scopeId),
-        tostring(bucketId),
-    }, "|")
+    return lengthPrefixedKey(peerKey(peerName), providerId, scopeId, bucketId)
 end
 
 local function getBookmark(entry, peerName, scopeId, bucketId)
@@ -417,11 +505,17 @@ end
 
 local function setBookmark(entry, peerName, scopeId, bucketId, bm)
     local key = bookmarkKey(peerName, entry.id, scopeId, bucketId)
+    bm = bm or {}
+    bm.peerKey = peerKey(peerName)
+    bm.providerId = entry.id
+    bm.scopeId = scopeId
+    bm.bucketId = tonumber(bucketId)
     entry.bookmarks[key] = bm
 end
 
 local function unresolvedBackoffKey(peerName, providerId, scopeId)
-    return peerKey(peerName) .. "|" .. tostring(providerId or "") .. "|" .. tostring(scopeId or "")
+    -- Prefix-matched on eviction via peerKey.."|"; provider/scope may contain '|'.
+    return peerKey(peerName) .. "|" .. tostring(providerId or "") .. "\0" .. tostring(scopeId or "")
 end
 
 local function closeOutPull(reason)
@@ -1079,10 +1173,17 @@ local function handleView(sender, payload)
         if e.inPull then
             local existing = e.inPull
             if existing.peer == sender and existing.viewId == payload.viewId
-                and existing.providerId == payload.providerId and existing.scopeId == scopeId
-                and existing.offerPayload then
-                trySendServedOffer(existing)
-                return
+                and existing.providerId == payload.providerId and existing.scopeId == scopeId then
+                if existing.offerPayload then
+                    trySendServedOffer(existing)
+                    return
+                end
+                if existing.phase == "capturing" then
+                    -- Idempotent duplicate while capture is in progress: stay
+                    -- attached and preserve continuation. Do not treat the
+                    -- retry as usable progress (lease must not renew).
+                    return
+                end
             end
             -- Stop-and-wait: one served pull at a time. Tell requester to rotate.
             GG.SendGossip(GG.MSG.ACK, {
@@ -1286,8 +1387,12 @@ local function handleBody(sender, payload, stepLimits)
     if payload.op == "request" then
         local pull = e.inPull
         if not pull or pull.peer ~= sender or pull.viewId ~= payload.viewId
-            or type(payload.requestId) ~= "string" or type(payload.ids) ~= "table"
-            or #payload.ids > GG.BODIES_PER_MESSAGE.NORMAL then
+            or type(payload.requestId) ~= "string"
+            or not hasValidBodyIdArray(payload.ids) then
+            return
+        end
+        if not transportSenderAuthorized(sender) then
+            closeInPull("sender_unauthorized")
             return
         end
         local entry = GG.GetProvider(pull.providerId)
@@ -1298,10 +1403,18 @@ local function handleBody(sender, payload, stepLimits)
             closeInPull("stale_provider_view")
             return
         end
-        pull.usableProgressAt = GG._Now()
         local records = {}
         local skippedIds = {}
         local limits = resolveServeLimits(stepLimits or e.stepLimits, payload.mode)
+        local cpuLimit = tonumber(limits.cpuMs)
+        local stepStartedAt = e.stepStartedAt
+        -- Pre-exhausted CPU: defer without renewing the lease or sending an
+        -- empty unusable page that would force a response timeout.
+        if stepStartedAt and debugprofilestop and cpuLimit
+            and (debugprofilestop() - stepStartedAt) >= cpuLimit then
+            GG.MarkWorkPending()
+            return "defer"
+        end
         local maxBodies = consumeStepExportBudget("bodies", math.min(#payload.ids, limits.bodies or 1))
         if maxBodies <= 0 then
             -- Shared step export budget exhausted; retain the admitted request.
@@ -1310,8 +1423,7 @@ local function handleBody(sender, payload, stepLimits)
         end
         local more = #payload.ids > maxBodies
         local lookups = 0
-        local cpuLimit = tonumber(limits.cpuMs)
-        local stepStartedAt = e.stepStartedAt
+        local cpuCut = false
         for requestIndex, rid in ipairs(payload.ids) do
             if requestIndex > maxBodies then
                 more = true
@@ -1320,7 +1432,12 @@ local function handleBody(sender, payload, stepLimits)
             if stepStartedAt and debugprofilestop and cpuLimit
                 and (debugprofilestop() - stepStartedAt) >= cpuLimit then
                 more = true
+                cpuCut = true
                 break
+            end
+            if not transportSenderAuthorized(sender) then
+                closeInPull("sender_unauthorized")
+                return
             end
             local exportCtx = {
                 peer = sender,
@@ -1367,6 +1484,20 @@ local function handleBody(sender, payload, stepLimits)
         if e.stepStats then
             e.stepStats.exportLookups = (e.stepStats.exportLookups or 0) + lookups
         end
+        local settled = #records + #skippedIds
+        if settled == 0 then
+            -- No ID settled (CPU cut before first / envelope failure). Defer
+            -- rather than send an empty more=true page the requester rejects.
+            if cpuCut then
+                GG.MarkWorkPending()
+                return "defer"
+            end
+            -- Pathological: cannot settle even one ID; cool down without lease renew.
+            e.peerCooldownUntil[peerKey(sender)] = GG._Now() + GG.POST_EXHAUSTION_COOLDOWN_SEC
+            closeInPull("body_unsettled")
+            return
+        end
+        pull.usableProgressAt = GG._Now()
         -- Unprocessed trailing IDs are preserved via more=true; they are not skipped.
         GG.SendGossip(GG.MSG.BODY, {
             op = "page",
@@ -1560,6 +1691,29 @@ local function hasValidRecords(records)
     return true
 end
 
+-- Non-empty dense BODY id arrays only. Empty/sparse/map-shaped tables are
+-- invalid work (drop), not temporary budget exhaustion (defer).
+hasValidBodyIdArray = function(ids)
+    if type(ids) ~= "table" then
+        return false
+    end
+    local n = #ids
+    if n < 1 or n > GG.BODIES_PER_MESSAGE.NORMAL then
+        return false
+    end
+    local count = 0
+    for key, value in pairs(ids) do
+        count = count + 1
+        if type(key) ~= "number" or key < 1 or key > n or key ~= math.floor(key) then
+            return false
+        end
+        if value == nil or (type(value) ~= "string" and type(value) ~= "number") then
+            return false
+        end
+    end
+    return count == n
+end
+
 local function validPayloadForMessage(msgType, payload, distribution)
     if type(payload) ~= "table" then
         return false
@@ -1594,7 +1748,7 @@ local function validPayloadForMessage(msgType, payload, distribution)
             return false
         end
         if payload.op == "request" then
-            return type(payload.ids) == "table" and #payload.ids <= GG.BODIES_PER_MESSAGE.NORMAL
+            return hasValidBodyIdArray(payload.ids)
         end
         return hasValidRecords(payload.records)
             and #payload.records <= GG.BODIES_PER_MESSAGE.NORMAL
@@ -1603,9 +1757,19 @@ local function validPayloadForMessage(msgType, payload, distribution)
     return distribution == "WHISPER" and (msgType == GG.MSG.ACK or msgType == GG.MSG.NACK)
 end
 
+transportSenderAuthorized = function(sender)
+    return GG.IsGuildReady() and GG.IsGuildMember(sender) == true
+end
+
 -- Returns "defer" when export work must wait for a later step budget.
 local function dispatchOne(item, limits)
     local msgType = item.msgType
+    -- Revalidate guild readiness/membership at dispatch so deferred/queued work
+    -- cannot outlive roster authorization that admitted the encoded envelope.
+    if not transportSenderAuthorized(item.sender) then
+        GG._DVerbose("Drop gossip from unauthorized sender %s", tostring(item.sender))
+        return
+    end
     local payload, err = GG.DecodePayload(item.payloadStr, item.enc)
     if err or not validPayloadForMessage(msgType, payload, item.distribution) then
         GG._DVerbose("Drop malformed gossip %s from %s", tostring(msgType), tostring(item.sender))
@@ -1650,27 +1814,28 @@ local function resendOutstanding(pull)
     })
 end
 
-local function invalidateUnresolvedCoverage(item)
+-- Reopen bookmarks/coverage for a scoped peer/provider without deleting sibling
+-- unresolved revisions. Expiry and cap eviction call this, then remove only the
+-- selected obligation key.
+local function reopenCoverageForUnresolved(item)
     if not item then
         return
     end
-    clearPeerProviderState(item.peer, item.providerId, item.scopeId)
+    clearBookmarksForScope(item.peer, item.providerId, item.scopeId)
     local peer = item.peerKey and GG._engine.peers[item.peerKey]
     if peer and peer.covered then
         peer.covered[item.providerId] = nil
     end
 end
 
--- Revision-scoped unresolved obligations (provider|peer|scope|id|versionFp).
--- Enumeration may advance past these; coverage stays incomplete until recovery.
+local function invalidateUnresolvedCoverage(item)
+    reopenCoverageForUnresolved(item)
+end
+
+-- Revision-scoped unresolved obligations. Keys are length-prefixed so scopes
+-- containing '|' cannot collide; matching always uses item metadata fields.
 local function unresolvedRevisionKey(providerId, peerName, scopeId, recordId, versionFp)
-    return table.concat({
-        tostring(providerId),
-        peerKey(peerName),
-        tostring(scopeId),
-        tostring(recordId),
-        tostring(versionFp or ""),
-    }, "|")
+    return lengthPrefixedKey(providerId, peerKey(peerName), scopeId, recordId, versionFp or "")
 end
 
 isKnownUnresolvedRevision = function(providerId, peerName, scopeId, recordId, versionFp)
@@ -1727,8 +1892,10 @@ recordUnresolved = function(providerId, recordId, result, now, peerName, scopeId
         end
     end
     if count > GG.MAX_UNRESOLVED and oldestKey then
-        -- Cap eviction reopens bookmarks/coverage; does not accept the obligation.
-        invalidateUnresolvedCoverage(e.unresolved[oldestKey])
+        -- Cap eviction reopens bookmarks/coverage for recovery of the selected
+        -- revision only; sibling obligations remain so coverage stays honest.
+        local evicted = e.unresolved[oldestKey]
+        invalidateUnresolvedCoverage(evicted)
         e.unresolved[oldestKey] = nil
     end
 end
@@ -1749,22 +1916,18 @@ reopenUnresolvedEnumeration = function(providerId)
     local snapshot = {}
     for key, item in pairs(e.unresolved or {}) do
         if not providerId or item.providerId == providerId then
-            snapshot[#snapshot + 1] = item
+            snapshot[#snapshot + 1] = { key = key, item = item }
             e.unresolved[key] = nil
         end
     end
     local touched = {}
-    for _, item in ipairs(snapshot) do
-        local ck = table.concat({
-            tostring(item.peerKey or ""),
-            tostring(item.providerId or ""),
-            tostring(item.scopeId or ""),
-        }, "|")
+    for _, row in ipairs(snapshot) do
+        local item = row.item
+        local ck = lengthPrefixedKey(item.peerKey or "", item.providerId or "", item.scopeId or "")
         if not touched[ck] then
             touched[ck] = true
-            -- Clears bookmarks for the scoped peer/provider so earlier
-            -- unresolved records remain reachable on the next pass.
-            clearPeerProviderState(item.peer, item.providerId, item.scopeId)
+            -- Bookmarks only: obligations for this provider were already removed.
+            clearBookmarksForScope(item.peer, item.providerId, item.scopeId)
             local peer = item.peerKey and e.peers[item.peerKey]
             if peer and peer.covered then
                 peer.covered[item.providerId] = nil
@@ -1975,6 +2138,12 @@ local function advanceOutPull(limits, now)
         local cursor = tonumber(pull.bodyApplyCursor) or 0
         while cursor < #records and apps < limits.apps do
             local rec = records[cursor + 1]
+            -- Guild transport boundary must still hold before delayed application;
+            -- provider eligibility is an additional restriction, never a substitute.
+            if not transportSenderAuthorized(pull.peer) then
+                closeOutPull("peer_unauthorized")
+                return false
+            end
             -- Re-check eligibility immediately before the provider side effect.
             if not providerEligible(entry, pull.peer, pull.scopeId)
                 or pull.localEpoch ~= (entry and entry.index and entry.index.epoch) then

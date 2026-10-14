@@ -35,8 +35,22 @@ SF.GuildGossip:Register({
   GetCapabilities = function()
     return { feature = true }
   end,
-  ListRecordIds = function()
-    return { "r1", "r2" }
+  -- Bounded cold enumeration. page MUST contain at most `limit` ids.
+  -- nextCursor nil ends the walk; otherwise resume at that cursor next step.
+  -- Prefer EnsureIndex(index, limits) when the provider owns its own budgeted build.
+  ListRecordIds = function(cursor, limit)
+    cursor = tonumber(cursor) or 1
+    limit = math.max(1, tonumber(limit) or 8)
+    local page = {}
+    local i = cursor
+    while i <= #myOrder and #page < limit do
+      page[#page + 1] = myOrder[i]
+      i = i + 1
+    end
+    if i <= #myOrder then
+      return page, i
+    end
+    return page, nil
   end,
   GetRecordVersionFp = function(recordId)
     return "v1"
@@ -51,6 +65,8 @@ SF.GuildGossip:Register({
   end,
 })
 ```
+
+Callback work for `ListRecordIds` / `EnsureIndex` / `GetRecordVersionFp` must stay within the supplied per-step budget. Oversized pages (more than `limit` ids) fail the index attempt; full-history dumps are unsupported.
 
  complementary helpers:
 
@@ -106,7 +122,7 @@ Locked architecture is unchanged: C1/D1, uncompressed `B64CBOR`, raid independen
 6. **Dirty-driven index + idle** — Completed indexes are not re-listed every step; seeks start after the cursor; aggregate index/app budgets are shared; the 0.1s ticker stops when truly idle (discovery keeps its own timer).
 7. **Cancel unsent work** — Provider disable/unregister and runtime invalidation cancel scoped Comm queue items and release admission; eligibility/scope are rechecked before export, send, and apply.
 8. **Fresh source epochs** — Each load mints a high-entropy incarnation base; rebuilds add generations. Bookmarks require matching epoch+scope and cannot resume across a sender reload.
-9. **Unresolved without false coverage** — PENDING/REJECTED/limit obligations stay bounded; bookmarks do not advance past them; expiry invalidates affected coverage/bookmarks.
+9. **Unresolved without false coverage** — PENDING/REJECTED/skipped obligations stay revision-scoped and bounded; enumeration may advance past them while `peer.covered` stays unset; expiry/eviction reopen bookmarks for the selected revision only and preserve sibling obligations.
 10. **Byte-aware pages** — Servers pack BODY/MANIFEST pages to the encoded cap; an unsendable manifest descriptor returns a correlated `limit` outcome without advancing coverage.
 11. **Provider scopes / export context** — Both directions use `GetScopeId()`; optional `IsRecordExportable(peer, id, ctx)` filters summary/manifest/body without per-peer history copies.
 12. **Foreground protection** — BACKGROUND admission leaves reserved FOREGROUND capacity; FOREGROUND may evict BACKGROUND at both global and per-target caps.

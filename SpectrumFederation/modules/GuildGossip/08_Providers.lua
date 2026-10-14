@@ -234,6 +234,9 @@ function GG.NotifyProviderChanged(providerId)
     entry._buildList = nil
     entry._buildPos = nil
     entry._listCursor = nil
+    if entry.api and type(entry.api.OnIndexInvalidated) == "function" then
+        pcall(entry.api.OnIndexInvalidated)
+    end
     GG.BumpProviderChangeGen(providerId)
     if not entry.enabled then
         return
@@ -517,13 +520,19 @@ function GG.CreateSyntheticProvider(opts)
         GetCapabilities = function()
             return { synthetic = true, appendOnly = true }
         end,
+        OnIndexInvalidated = function()
+            store._enumPos = nil
+        end,
         -- Budget-aware index path: never materializes the full order in one step.
         EnsureIndex = function(index, limits)
             local budget = math.max(1, tonumber(limits and limits.indexEntries) or GG.INDEX_ENTRIES_PER_STEP.SLOW)
             if index.buildComplete and not index.dirty then
                 return false, 0
             end
-            if index.dirty or not store._enumPos then
+            -- Preserve continuation across ordinary dirty steps. Reset only when
+            -- starting a new build (nil cursor) or after a genuine invalidation
+            -- that cleared _enumPos (BumpIndexEpoch / ClearStore / Notify).
+            if not store._enumPos then
                 store._enumPos = 1
             end
             local n = 0
