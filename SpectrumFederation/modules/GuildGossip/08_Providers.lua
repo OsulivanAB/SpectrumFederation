@@ -55,7 +55,10 @@ Provider contract (Phase 1):
   ListRecordIds(cursor, limit) -> pageIds, nextCursor|nil
       Bounded cold enumeration. pageIds MUST contain at most `limit` entries.
       Oversized pages fail the index attempt; full-history dumps are unsupported.
-      nextCursor nil means no further pages; otherwise resume at that cursor.
+      Phase 1 cursors are finite increasing integers: nextCursor nil ends the walk;
+      otherwise nextCursor must be a finite integer strictly greater than `cursor`.
+      Opaque or non-progress tokens are rejected as an incomplete/failed build
+      (no prune of already-indexed rows).
 
 After durable storage changes outside the engine append path, call
 GG.NotifyProviderChanged(id) (also SF.GuildGossip.NotifyProviderChanged(id)).
@@ -303,10 +306,18 @@ function GG.BuildDiscoveryCaps()
     local caps = {}
     local active = GG.ListActiveProviders()
     local count = #active
-    -- Compact 8-bit incarnation token: enough to distinguish reloads in
-    -- discovery fingerprints while keeping long rotated caps ≤240 bytes.
-    local srcToken = GG.Hash32(GG.InitEpochIncarnation and GG.InitEpochIncarnation()
-        or tostring(GG._epochIncarnation or "")) % 256
+    -- Compact 32-bit incarnation token from the existing per-load epoch
+    -- machinery: full Hash32 packed as 4 bytes (not %256). Retains reload
+    -- collision resistance while staying inside the 240-byte discovery envelope
+    -- under rotation (far denser on-wire than a decimal integer encoding).
+    local h = GG.Hash32(GG.InitEpochIncarnation and GG.InitEpochIncarnation()
+        or tostring(GG._epochIncarnation or ""))
+    local srcToken = string.char(
+        math.floor(h / 16777216) % 256,
+        math.floor(h / 65536) % 256,
+        math.floor(h / 256) % 256,
+        h % 256
+    )
     if count == 0 then
         return {
             proto = GG.PROTO_CURRENT,
@@ -372,6 +383,9 @@ function GG.EnsureProviderIndex(entry, limits)
         local ok, more, examined = pcall(api.EnsureIndex, entry.index, limits)
         if not ok then
             GG._DError("EnsureIndex failed provider=%s err=%s", entry.id, tostring(more))
+            if geterrorhandler then
+                pcall(geterrorhandler(), more)
+            end
             noteIndexAttemptFailure(entry, "ensure_index_error")
             return false
         end
@@ -437,6 +451,9 @@ function GG.EnsureProviderIndex(entry, limits)
     local ok, page, nextCursor = pcall(api.ListRecordIds, cursor, budget)
     if not ok then
         GG._DError("ListRecordIds failed provider=%s err=%s", entry.id, tostring(page))
+        if geterrorhandler then
+            pcall(geterrorhandler(), page)
+        end
         noteIndexAttemptFailure(entry, "list_record_ids_error")
         return false
     end
@@ -482,37 +499,64 @@ function GG.EnsureProviderIndex(entry, limits)
     entry.lastIndexExamined = n
     entry.indexFailCount = 0
 
-    if type(nextCursor) == "number" and nextCursor > cursor then
-        entry._listCursor = nextCursor
+    -- Phase 1: only nil (EOF) or a finite integer strictly greater than the
+    -- request cursor may continue. Opaque / backward / non-numeric tokens must
+    -- never be treated as successful completion (that would prune valid rows).
+    if nextCursor == nil then
+        -- Empty page or final page with no next cursor completes the build.
+        entry._listCursor = nil
+        if index then
+            if entry._reconciling and entry._reconcileSeen then
+                local removed = false
+                local toRemove = {}
+                for id in pairs(index.byId or {}) do
+                    if not entry._reconcileSeen[id] then
+                        toRemove[#toRemove + 1] = id
+                    end
+                end
+                for i = 1, #toRemove do
+                    if GG.IndexRemove(index, toRemove[i]) then
+                        removed = true
+                    end
+                end
+                if removed and GG.TouchIndexEpoch then
+                    -- Invalidate views after established removal; preserve rows.
+                    GG.TouchIndexEpoch(index)
+                end
+            end
+            entry._reconcileSeen = nil
+            entry._reconciling = nil
+            index.buildComplete = true
+            index.dirty = false
+        end
+        return false
+    end
+
+    local nextNum = tonumber(nextCursor)
+    local cursorOk = type(nextCursor) == "number"
+        and nextNum == nextCursor
+        and nextNum == nextNum
+        and nextNum ~= math.huge
+        and nextNum ~= -math.huge
+        and nextNum == math.floor(nextNum)
+        and nextNum > cursor
+    if cursorOk then
+        entry._listCursor = nextNum
         return true
     end
-    -- Empty page or final page with no next cursor completes the build.
-    entry._listCursor = nil
+
+    GG._DError("ListRecordIds bad cursor provider=%s cursor=%s next=%s",
+        entry.id, tostring(cursor), tostring(nextCursor))
+    entry._listCursor = cursor
     if index then
-        if entry._reconciling and entry._reconcileSeen then
-            local removed = false
-            local toRemove = {}
-            for id in pairs(index.byId or {}) do
-                if not entry._reconcileSeen[id] then
-                    toRemove[#toRemove + 1] = id
-                end
-            end
-            for i = 1, #toRemove do
-                if GG.IndexRemove(index, toRemove[i]) then
-                    removed = true
-                end
-            end
-            if removed and GG.TouchIndexEpoch then
-                -- Invalidate views after established removal; preserve rows.
-                GG.TouchIndexEpoch(index)
-            end
-        end
-        entry._reconcileSeen = nil
-        entry._reconciling = nil
-        index.buildComplete = true
-        index.dirty = false
+        index.buildComplete = false
+        index.dirty = true
     end
-    return false
+    -- Keep reconcile state; do not prune on a failed/incomplete walk.
+    if noteIndexAttemptFailure(entry, "list_record_ids_bad_cursor") then
+        return false
+    end
+    return true
 end
 
 function GG.ApplyRecordToProvider(entry, record, ctx)

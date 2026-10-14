@@ -758,7 +758,9 @@ do
             IsPeerEligible = function() return true end,
             GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
             GetCapabilities = function()
-                return { tag = string.rep("Z", 40) }
+                -- Keep single-provider discovery ≤240 with the 4-byte source
+                -- incarnation token under the bulky test serializer.
+                return { tag = string.rep("Z", 36) }
             end,
         })
     end
@@ -4444,8 +4446,9 @@ do
     local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
     local caps1 = B.GuildGossip.BuildDiscoveryCaps()
     local prov1 = caps1.providers[1]
-    assertTrue(tonumber(caps1.s) ~= nil,
-        "F78: discovery advertises compact packet-level source incarnation")
+    local s1 = caps1.s
+    assertTrue(type(s1) == "string" and #s1 == 4,
+        "F78: discovery advertises compact 4-byte source incarnation")
     assertTrue(prov1 and prov1.s == nil and prov1.src == nil,
         "F78: incarnation is not duplicated on each provider cap")
     local env1 = B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.DISC, caps1)
@@ -4461,27 +4464,50 @@ do
     peer.covered["sf.synthetic.gossip"] = true
     local changeGen = tonumber(prov1.changeGen) or 0
     local elig = tonumber(prov1.eligibilityGen) or 0
+    -- Unchanged announcement (same incarnation/counters) must stay idle.
+    A.GuildGossip.OnGossipCommReceived("SF_GG", env1, "GUILD", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(peer.covered["sf.synthetic.gossip"] == true,
+        "F78: unchanged announcement retains coverage")
+    assertEq(peer.capFingerprints["sf.synthetic.gossip"], fp1,
+        "F78: unchanged announcement keeps fingerprint")
     -- Simulate Bob /reload: new incarnation, matching counters, new durable record.
+    -- Deliberately choose an incarnation that collides under the old %256 width
+    -- (same low byte) but differs in the full 32-bit token.
     local oldSrc = B.GuildGossip._epochIncarnation
-    local oldSrcHash = tonumber(caps1.s)
+    local oldLow = s1:byte(4)
     pB.AppendLocal("new-1", "new-1")
     entryB.changeGen = changeGen
     entryB.eligibilityGen = elig
-    -- Choose an incarnation whose compact token differs (8-bit wire token).
-    local caps2, prov2
-    for attempt = 1, 64 do
-        B.GuildGossip._epochIncarnation = string.format("reload-%d-%d", world.time, attempt)
-        B.GuildGossip._epochSeq = 0
-        caps2 = B.GuildGossip.BuildDiscoveryCaps()
-        if tonumber(caps2.s) ~= oldSrcHash then
-            break
+    local caps2, prov2, collideInc
+    for attempt = 1, 8192 do
+        local cand = string.format("reload-%d-%d", world.time, attempt)
+        local h = B.GuildGossip.Hash32(cand)
+        if (h % 256) == oldLow then
+            local tok = string.char(
+                math.floor(h / 16777216) % 256,
+                math.floor(h / 65536) % 256,
+                math.floor(h / 256) % 256,
+                h % 256
+            )
+            if tok ~= s1 then
+                B.GuildGossip._epochIncarnation = cand
+                B.GuildGossip._epochSeq = 0
+                caps2 = B.GuildGossip.BuildDiscoveryCaps()
+                if caps2.s == tok then
+                    collideInc = cand
+                    break
+                end
+            end
         end
     end
+    assertTrue(collideInc ~= nil, "F78: found distinct incarnation colliding under old %256")
     assertTrue(B.GuildGossip._epochIncarnation ~= oldSrc, "F78: reload mints new incarnation")
     prov2 = caps2.providers[1]
     assertEq(tonumber(prov2.changeGen), changeGen, "F78: changeGen matches across reload")
     assertEq(tonumber(prov2.eligibilityGen), elig, "F78: eligibilityGen matches across reload")
-    assertTrue(tonumber(caps2.s) ~= oldSrcHash, "F78: src incarnation changed after reload")
+    assertTrue(caps2.s ~= s1, "F78: full 32-bit src token differs despite %256 collision")
+    assertEq(caps2.s:byte(4), oldLow, "F78: fixture collides under old 8-bit truncation")
     -- Re-assert coverage after AppendLocal (which clears covered via NotifyMeaningfulChange).
     peer.covered["sf.synthetic.gossip"] = true
     peer.capFingerprints["sf.synthetic.gossip"] = fp1
@@ -4508,6 +4534,431 @@ do
         end
     end
     assertTrue(got, "F78: reload with matching counters still converges new records")
+end
+
+---------------------------------------------------------------------------
+-- F79: MANIFEST byte trimming rewinds scanAfter; oversized descriptor limits
+---------------------------------------------------------------------------
+do
+    reset()
+    local B = makeClient("Bob")
+    -- Force several records into one bucket so a single seek page must trim.
+    local ids = { "m79-1", "m79-98", "m79-1079", "m79-1097", "m79-1178", "m79-1196" }
+    local bodies = {}
+    for i, id in ipairs(ids) do
+        bodies[id] = { id = id, versionFp = "v" .. i, body = string.rep("x", 40) }
+    end
+    B.GuildGossip.RegisterProvider({
+        id = "man79", schema = 1, enabled = true, ready = true,
+        ListRecordIds = pagedIds(ids),
+        GetRecordVersionFp = function(id) return bodies[id] and bodies[id].versionFp end,
+        GetRecordBody = function(id) return bodies[id] end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return B.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 10 do stepClient(B, B.GuildGossip.GetStepLimits("NORMAL")) end
+    local entry = B.GuildGossip.GetProvider("man79")
+    assertTrue(entry.index.buildComplete, "F79: index ready")
+    local e = B.GuildGossip._engine
+    local scope = B.GuildGossip.GetGuildScopeId()
+    local endMarkers = {}
+    for b = 0, B.GuildGossip.BUCKET_COUNT - 1 do
+        endMarkers[b] = (entry.index.buckets[b] and entry.index.buckets[b].lastSeq) or 0
+    end
+    -- Force a served pull; intercept MANIFEST pages with a tight encoded budget.
+    local maxEntries = 2
+    local origBuild = B.GuildGossip.BuildWireMessage
+    B.GuildGossip.BuildWireMessage = function(msgType, payload)
+        if msgType == B.GuildGossip.MSG.MANIFEST and type(payload) == "table"
+            and payload.op == "page" and not payload.limit then
+            if #(payload.entries or {}) > maxEntries then
+                return nil, "discovery_too_large"
+            end
+        end
+        return origBuild(msgType, payload)
+    end
+    local pages = {}
+    local origSend = B.GuildGossip.SendGossip
+    B.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        if msgType == B.GuildGossip.MSG.MANIFEST and type(payload) == "table" and payload.op == "page" then
+            pages[#pages + 1] = {
+                n = #(payload.entries or {}),
+                done = payload.done,
+                scanAfter = payload.scanAfter,
+                limit = payload.limit,
+                error = payload.error,
+                ids = {},
+            }
+            for i, ent in ipairs(payload.entries or {}) do
+                pages[#pages].ids[i] = ent.id
+            end
+        end
+        return origSend(msgType, payload, dist, target, opts)
+    end
+    local buckets = {}
+    for b = 0, B.GuildGossip.BUCKET_COUNT - 1 do
+        local bb = entry.index.buckets[b] or {}
+        buckets[b] = {
+            lastSeq = tonumber(bb.lastSeq) or 0,
+            count = tonumber(bb.count) or 0,
+            fingerprint = tonumber(bb.fingerprint) or 0,
+        }
+    end
+    e.inPull = {
+        peer = "Alice-Garona", providerId = "man79", viewId = "v79",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = buckets,
+        usableProgressAt = world.time, finalSubmitted = true,
+        offerProgressArmed = true, engineGen = e.generation,
+    }
+    e.peers["alice-garona"] = { name = "Alice-Garona", key = "alice-garona", activeExchange = true }
+    local bucketId = B.GuildGossip.BucketForId(ids[1])
+    local endSeq = buckets[bucketId].lastSeq or 0
+    assertTrue(endSeq >= 3, "F79: bucket with >=3 descriptors available (end=" .. tostring(endSeq) .. ")")
+    B.GuildGossip.OnGossipCommReceived("SF_GG", origBuild(B.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v79", providerId = "man79", scopeId = scope,
+        requestId = "r79a", subpage = 1, bucketId = bucketId, afterSeq = 0, endSeq = endSeq,
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(#pages >= 1, "F79: trimmed MANIFEST page emitted")
+    local p1 = pages[1]
+    assertTrue(p1.n > 0 and p1.n <= maxEntries,
+        "F79: page respects encoded entry budget (n=" .. tostring(p1.n) .. ")")
+    assertTrue(p1.done ~= true, "F79: trimmed page is not terminal")
+    assertTrue(tonumber(p1.scanAfter) ~= nil, "F79: trimmed page has scanAfter")
+    -- scanAfter must be the last retained descriptor seq (not past omitted ones).
+    local retainedLast = nil
+    for _, ent in ipairs(e.inPull.servedManifest.response.entries or {}) do
+        retainedLast = tonumber(ent.seq)
+    end
+    assertEq(tonumber(p1.scanAfter), retainedLast, "F79: scanAfter rewound to retained boundary")
+    -- Continue until every individually sendable id is delivered.
+    local seen = {}
+    for _, id in ipairs(p1.ids) do seen[id] = true end
+    local after = tonumber(p1.scanAfter) or 0
+    for step = 1, 12 do
+        if after >= endSeq then break end
+        pages = {}
+        B.GuildGossip.OnGossipCommReceived("SF_GG", origBuild(B.GuildGossip.MSG.MANIFEST, {
+            op = "request", viewId = "v79", providerId = "man79", scopeId = scope,
+            requestId = "r79-" .. step, subpage = 1, bucketId = bucketId,
+            afterSeq = after, endSeq = endSeq,
+        }), "WHISPER", "Alice-Garona")
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        assertTrue(#pages >= 1, "F79: continuation page emitted")
+        local p = pages[1]
+        for _, id in ipairs(p.ids) do seen[id] = true end
+        after = tonumber(p.scanAfter) or after
+        if p.done then break end
+    end
+    local expected = 0
+    for bseq = 1, endSeq do
+        local row = entry.index.buckets[bucketId].bySeq[bseq]
+        if row then expected = expected + 1; assertTrue(seen[row.id], "F79: delivered " .. tostring(row.id)) end
+    end
+    assertTrue(expected >= 3, "F79: expected multiple sendable descriptors")
+    -- Individually oversized descriptor => correlated limit (alias-safe).
+    maxEntries = 0
+    pages = {}
+    -- Fresh served pull so the prior servedManifest cursor does not replay.
+    e.inPull = {
+        peer = "Alice-Garona", providerId = "man79", viewId = "v79b",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = buckets,
+        usableProgressAt = world.time, finalSubmitted = true,
+        offerProgressArmed = true, engineGen = e.generation,
+    }
+    B.GuildGossip.OnGossipCommReceived("SF_GG", origBuild(B.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v79b", providerId = "man79", scopeId = scope,
+        requestId = "r79lim", subpage = 1, bucketId = bucketId, afterSeq = 0, endSeq = endSeq,
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(#pages >= 1 and pages[1].limit == true,
+        "F79: individually oversized descriptor yields limit outcome")
+    assertEq(pages[1].error, "manifest_descriptor_too_large", "F79: limit error correlated")
+    assertTrue(pages[1].done ~= true, "F79: limit page is not done")
+    B.GuildGossip.BuildWireMessage = origBuild
+    B.GuildGossip.SendGossip = origSend
+end
+
+---------------------------------------------------------------------------
+-- F80: ListRecordIds cursors — nil EOF, numeric continue, invalid/backward fail
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local mode = "ok" -- ok | opaque | backward
+    local ids = { "c1", "c2", "c3", "c4" }
+    A.GuildGossip.RegisterProvider({
+        id = "cur80", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            cursor = tonumber(cursor) or 1
+            limit = math.max(1, tonumber(limit) or 2)
+            local page = {}
+            local i = cursor
+            while i <= #ids and #page < limit do
+                page[#page + 1] = ids[i]
+                i = i + 1
+            end
+            if mode == "opaque" then
+                return page, "page-2"
+            end
+            if mode == "backward" then
+                return page, cursor
+            end
+            if i <= #ids then return page, i end
+            return page, nil
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 12 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local entry = A.GuildGossip.GetProvider("cur80")
+    assertTrue(entry.index.buildComplete == true, "F80: nil cursor completes build")
+    assertEq(entry.index.byId["c1"] ~= nil and entry.index.byId["c4"] ~= nil, true,
+        "F80: numeric continuation indexed all rows")
+    -- Seed rows, then opaque cursor must not complete/prune.
+    mode = "opaque"
+    A.GuildGossip.NotifyProviderChanged("cur80")
+    for _ = 1, 8 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    entry = A.GuildGossip.GetProvider("cur80")
+    assertTrue(entry.index.buildComplete ~= true, "F80: opaque cursor leaves build incomplete")
+    assertTrue(entry.index.byId["c1"] ~= nil, "F80: opaque cursor does not prune existing rows")
+    -- Recovery with valid cursors.
+    mode = "ok"
+    A.GuildGossip.NotifyProviderChanged("cur80")
+    for _ = 1, 12 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    assertTrue(A.GuildGossip.GetProvider("cur80").index.buildComplete == true,
+        "F80: recovery after opaque cursor")
+    -- Backward cursor fails without prune.
+    mode = "backward"
+    A.GuildGossip.NotifyProviderChanged("cur80")
+    for _ = 1, 8 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    entry = A.GuildGossip.GetProvider("cur80")
+    assertTrue(entry.index.buildComplete ~= true or entry.indexFailed == true,
+        "F80: backward cursor incomplete/failed")
+    assertTrue(entry.index.byId["c1"] ~= nil, "F80: backward cursor retains rows")
+end
+
+---------------------------------------------------------------------------
+-- F81: EnsureIndex/ListRecordIds exceptions reach geterrorhandler (Debug off)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.debugEnabled = false
+    world.errors = {}
+    local throws = true
+    A.GuildGossip.RegisterProvider({
+        id = "ens81", schema = 1, enabled = true, ready = true,
+        EnsureIndex = function()
+            if throws then error("ensure-boom") end
+            local entry = A.GuildGossip.GetProvider("ens81")
+            entry.index.buildComplete = true
+            entry.index.dirty = false
+            return false, 0
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return { id = "x", versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    local entry = A.GuildGossip.GetProvider("ens81")
+    assertTrue(#world.errors >= 1, "F81: EnsureIndex error reaches geterrorhandler with Debug off")
+    assertTrue(entry.indexFailed == true, "F81: EnsureIndex bounded retries reach indexFailed")
+    throws = false
+    world.errors = {}
+    A.GuildGossip.NotifyProviderChanged("ens81")
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    assertTrue(A.GuildGossip.GetProvider("ens81").indexFailed ~= true, "F81: Notify recovers EnsureIndex")
+    assertTrue(A.GuildGossip.GetProvider("ens81").index.buildComplete == true, "F81: EnsureIndex recovered")
+
+    reset()
+    A = makeClient("Alice")
+    A.debugEnabled = false
+    world.errors = {}
+    throws = true
+    A.GuildGossip.RegisterProvider({
+        id = "list81", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function()
+            if throws then error("list-boom") end
+            return {}, nil
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function() return { id = "x", versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    entry = A.GuildGossip.GetProvider("list81")
+    assertTrue(#world.errors >= 1, "F81: ListRecordIds error reaches geterrorhandler with Debug off")
+    assertTrue(entry.indexFailed == true, "F81: ListRecordIds bounded retries reach indexFailed")
+    throws = false
+    A.GuildGossip.NotifyProviderChanged("list81")
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    assertTrue(A.GuildGossip.GetProvider("list81").indexFailed ~= true, "F81: Notify recovers ListRecordIds")
+end
+
+---------------------------------------------------------------------------
+-- F82: served-pull usable-time lease during capture / queued offer
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f82" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local timeout = A.GuildGossip.SERVED_VIEW_IDLE_TIMEOUT_SEC
+    -- Capturing with no progress must expire without finalSubmitted.
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v82c",
+        scopeId = scope, phase = "capturing", captureState = { bucketId = 0 },
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        usableProgressAt = world.time - (timeout + 1),
+        finalSubmitted = false, engineGen = e.generation,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    -- Starve metadata budget so capture cannot make progress / renew.
+    e.stepMetaRemaining = 0
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull == nil, "F82: starved capture expires on usable-time lease")
+    -- Queued/stream-blocked offer expires; delayed callback must not revive it.
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v82o",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        offerPayload = { op = "offer", viewId = "v82o", providerId = "sf.synthetic.gossip" },
+        offerRetryPending = true, offerProgressArmed = false,
+        usableProgressAt = world.time - (timeout + 1),
+        finalSubmitted = false, engineGen = e.generation,
+    }
+    e.streamBusy["WHISPER|Bob-Garona"] = true
+    local expired = e.inPull
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull == nil, "F82: stream-blocked offer expires on usable-time lease")
+    -- Simulate a late final-submission callback for the expired pull.
+    if expired then
+        expired.finalSubmitted = true
+        expired.offerRetryPending = nil
+    end
+    assertTrue(e.inPull == nil, "F82: delayed callback cannot revive expired served pull")
+    -- Progressing capture renews the lease and survives past the old deadline.
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v82p",
+        scopeId = scope, phase = "capturing",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        usableProgressAt = world.time - (timeout - 5),
+        finalSubmitted = false, engineGen = e.generation,
+    }
+    -- Give budget and a filter so capture walks buckets (examined > 0).
+    entry.api.IsRecordExportable = function() return true end
+    e.stepMetaRemaining = 64
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull ~= nil, "F82: progressing capture retained")
+    assertTrue((e.inPull.usableProgressAt or 0) >= world.time - 1,
+        "F82: capture progress renews usableProgressAt")
+end
+
+---------------------------------------------------------------------------
+-- F83: unresolved TTL during active pull cannot restore false coverage
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f83" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local ttl = A.GuildGossip.UNRESOLVED_TTL_SEC
+    e.peers["bob-garona"] = {
+        name = "Bob-Garona", key = "bob-garona", covered = { ["sf.synthetic.gossip"] = true },
+    }
+    e.peerOrder = { "bob-garona" }
+    local function urKey(recordId, vfp)
+        local parts = {}
+        local values = { "sf.synthetic.gossip", "bob-garona", tostring(scope), tostring(recordId), tostring(vfp) }
+        for i = 1, #values do
+            parts[#parts + 1] = string.format("%d:%s", #values[i], values[i])
+        end
+        return table.concat(parts, "\0")
+    end
+    -- Sole expired obligation while an advanced pull is in compare: must not
+    -- restore coverage after expiry clears the only unresolved item.
+    e.unresolved[urKey("skip-1", "v1")] = {
+        at = world.time - (ttl + 1),
+        providerId = "sf.synthetic.gossip",
+        recordId = "skip-1", versionFp = "v1", result = "rejected",
+        peer = "Bob-Garona", peerKey = "bob-garona", scopeId = scope,
+    }
+    e.unresolved[urKey("sib-1", "v1")] = {
+        at = world.time,
+        providerId = "sf.synthetic.gossip",
+        recordId = "sib-1", versionFp = "v1", result = "rejected",
+        peer = "Bob-Garona", peerKey = "bob-garona", scopeId = scope,
+    }
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout83",
+        scopeId = scope, phase = "compare",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time, finalSubmitted = true,
+        bucketCursor = A.GuildGossip.BUCKET_COUNT,
+        remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen, buckets = {} },
+        remoteAnnouncementFp = "fp83",
+        localBuckets = {},
+        afterSeq = 10,
+    }
+    setTestBookmark(entry, "Bob-Garona", scope, 0, {
+        epoch = entry.index.epoch, afterSeq = 10, eligibilityGen = entry.eligibilityGen,
+    })
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    local skipGone, sibKept = true, false
+    for _, item in pairs(e.unresolved or {}) do
+        if item.recordId == "skip-1" then skipGone = false end
+        if item.recordId == "sib-1" then sibKept = true end
+    end
+    assertTrue(skipGone, "F83: expired unresolved obligation removed")
+    assertTrue(sibKept, "F83: sibling unresolved obligation retained")
+    assertTrue(e.peers["bob-garona"].covered["sf.synthetic.gossip"] ~= true,
+        "F83: coverage not restored while sibling unresolved remains")
+    -- Sole-expired case: only the advanced pull's skipped revision expires.
+    e.unresolved = {
+        [urKey("skip-2", "v2")] = {
+            at = world.time - (ttl + 1),
+            providerId = "sf.synthetic.gossip",
+            recordId = "skip-2", versionFp = "v2", result = "rejected",
+            peer = "Bob-Garona", peerKey = "bob-garona", scopeId = scope,
+        },
+    }
+    e.peers["bob-garona"].covered["sf.synthetic.gossip"] = true
+    A.GuildGossip._sched.dirtyFollowUp = false
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout83b",
+        scopeId = scope, phase = "compare",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time, finalSubmitted = true,
+        bucketCursor = A.GuildGossip.BUCKET_COUNT,
+        remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen, buckets = {} },
+        remoteAnnouncementFp = "fp83",
+        localBuckets = {},
+        afterSeq = 10,
+    }
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(next(e.unresolved or {}) == nil, "F83: sole expired obligation removed")
+    assertTrue(e.outPull == nil, "F83: advanced pull closed without claiming coverage")
+    assertTrue(e.peers["bob-garona"].covered["sf.synthetic.gossip"] ~= true,
+        "F83: active pull completion does not restore false coverage after expiry")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

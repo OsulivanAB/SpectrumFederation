@@ -1562,11 +1562,13 @@ local function handleManifest(sender, payload, stepLimits)
         e.stepMetaRemaining = math.max(0, (tonumber(e.stepMetaRemaining) or examineBudget) - examined)
         local done = seekMeta and seekMeta.done == true
         local scanAfter = seekMeta and seekMeta.lastExaminedSeq or nil
-        -- Terminal pages must carry a continuation marker that reaches the
-        -- captured end so filtered tails still prove exhaustion of the offer.
-        if done and endSeq > afterSeq and (not scanAfter or scanAfter < endSeq) then
-            scanAfter = endSeq
+        -- Copy descriptors so envelope trimming cannot alias-mutate the seek
+        -- result used for the oversized-descriptor limit check.
+        local pageEntries = {}
+        for i = 1, #(entries or {}) do
+            pageEntries[i] = entries[i]
         end
+        local originalCount = #pageEntries
         local response = {
             op = "page",
             viewId = pull.viewId,
@@ -1577,7 +1579,7 @@ local function handleManifest(sender, payload, stepLimits)
             bucketId = bucketId,
             afterSeq = afterSeq,
             endSeq = endSeq,
-            entries = entries,
+            entries = pageEntries,
             -- Scan continuation for empty/filtered budget slices.
             scanAfter = scanAfter,
             done = done,
@@ -1586,15 +1588,25 @@ local function handleManifest(sender, payload, stepLimits)
         -- A manifest must also be sendable as one bounded gossip envelope.
         while #response.entries > 0 and not GG.BuildWireMessage(GG.MSG.MANIFEST, response) do
             table.remove(response.entries)
-            response.done = false
         end
-        if #response.entries == 0 and #entries > 0 then
+        if #response.entries == 0 and originalCount > 0 then
             -- The descriptor itself cannot fit. Do not advance past it or
             -- pretend this bucket is covered; give the requester a correlated
             -- terminal outcome so it can cool down without a tight retry loop.
             response.limit = true
             response.error = "manifest_descriptor_too_large"
             response.done = false
+            response.scanAfter = afterSeq
+        elseif #response.entries < originalCount then
+            -- Trimmed tail descriptors must remain reachable: rewind scanAfter
+            -- to the last retained sequence and clear premature completion.
+            response.done = false
+            local last = response.entries[#response.entries]
+            response.scanAfter = last and tonumber(last.seq) or afterSeq
+        elseif done and endSeq > afterSeq
+            and (not response.scanAfter or response.scanAfter < endSeq) then
+            -- Untrimmed terminal page: prove exhaustion of the offered end.
+            response.scanAfter = endSeq
         end
         pull.servedManifest = {
             bucketId = bucketId,
@@ -2154,15 +2166,27 @@ end
 
 -- Reopen bookmarks/coverage for a scoped peer/provider without deleting sibling
 -- unresolved revisions. Expiry and cap eviction call this, then remove only the
--- selected obligation key.
+-- selected obligation key. A matching in-flight outPull must not later restore
+-- false coverage after skipping the expired revision.
 local function reopenCoverageForUnresolved(item)
     if not item then
         return
     end
     clearBookmarksForScope(item.peer, item.providerId, item.scopeId)
-    local peer = item.peerKey and GG._engine.peers[item.peerKey]
+    local e = GG._engine
+    local peer = item.peerKey and e.peers[item.peerKey]
     if peer and peer.covered then
         peer.covered[item.providerId] = nil
+    end
+    local out = e.outPull
+    if out and item.providerId and out.providerId == item.providerId
+        and out.peer and peerKey(out.peer) == item.peerKey
+        and (not item.scopeId or out.scopeId == item.scopeId) then
+        out.needsFollowUp = true
+        if GG._sched then
+            GG._sched.dirtyFollowUp = true
+        end
+        GG.MarkWorkPending()
     end
 end
 
@@ -2607,6 +2631,11 @@ local function advanceOutPull(limits, now)
     return false
 end
 
+local function servedUsableIdleExpired(pull, now)
+    local at = pull.usableProgressAt or now
+    return now >= at and (now - at) > GG.SERVED_VIEW_IDLE_TIMEOUT_SEC
+end
+
 local function advanceInPull(now)
     local e = GG._engine
     local pull = e.inPull
@@ -2615,6 +2644,13 @@ local function advanceInPull(now)
     end
     if pull.engineGen ~= e.generation then
         closeInPull("stale_gen")
+        return true
+    end
+    -- Pause-adjusted usable-time lease applies in capturing / queued-offer /
+    -- serving states. Delayed SendGossip callbacks cannot revive a closed pull
+    -- (noteInPullSubmission / trySendServedOffer / gossipValid check identity).
+    if servedUsableIdleExpired(pull, now) then
+        closeInPull("served_view_idle")
         return true
     end
     if pull.phase == "capturing" then
@@ -2629,6 +2665,8 @@ local function advanceInPull(now)
         local limits = e.stepLimits or GG.GetStepLimits()
         local metaBudget = math.max(0, tonumber(e.stepMetaRemaining) or tonumber(limits.indexEntries) or 0)
         if metaBudget <= 0 and viewExportFilter(entry, pull.peer, pull.scopeId) then
+            -- Starved of shared metadata budget: keep the slot, but do not
+            -- renew the lease — usable-time expiry above still applies.
             GG.MarkWorkPending()
             return true
         end
@@ -2658,7 +2696,10 @@ local function advanceInPull(now)
         end
         if pending then
             pull.captureState = pending
-            pull.usableProgressAt = now
+            -- Renew only for actual capture progress (examined order slots).
+            if examined > 0 then
+                pull.usableProgressAt = now
+            end
             GG.MarkWorkPending()
             return true
         end
@@ -2687,6 +2728,8 @@ local function advanceInPull(now)
         pull.offerPayload = reply
         pull.captureState = nil
         pull.phase = "serving"
+        -- Completing capture is usable progress before the offer submits.
+        pull.usableProgressAt = now
         trySendServedOffer(pull)
         return true
     end
@@ -2696,13 +2739,9 @@ local function advanceInPull(now)
             trySendServedOffer(pull)
             return true
         end
+        -- Stream still busy: no lease renew; expiry is handled above.
         GG.MarkWorkPending()
         return false
-    end
-    if pull.finalSubmitted and now >= (pull.usableProgressAt or now)
-        and (now - (pull.usableProgressAt or now)) > GG.SERVED_VIEW_IDLE_TIMEOUT_SEC then
-        closeInPull("served_view_idle")
-        return true
     end
     return false
 end

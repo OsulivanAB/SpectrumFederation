@@ -36,7 +36,9 @@ SF.GuildGossip:Register({
     return { feature = true }
   end,
   -- Bounded cold enumeration. page MUST contain at most `limit` ids.
-  -- nextCursor nil ends the walk; otherwise resume at that cursor next step.
+  -- Phase 1: nextCursor nil ends the walk; otherwise nextCursor must be a
+  -- finite integer strictly greater than `cursor`. Opaque/backward tokens fail
+  -- the index attempt without pruning already-indexed rows.
   -- Prefer EnsureIndex(index, limits) when the provider owns its own budgeted build.
   ListRecordIds = function(cursor, limit)
     cursor = tonumber(cursor) or 1
@@ -66,7 +68,7 @@ SF.GuildGossip:Register({
 })
 ```
 
-Callback work for `ListRecordIds` / `EnsureIndex` / `GetRecordVersionFp` must stay within the supplied per-step budget. Oversized pages (more than `limit` ids) fail the index attempt; full-history dumps are unsupported.
+Callback work for `ListRecordIds` / `EnsureIndex` / `GetRecordVersionFp` must stay within the supplied per-step budget. Oversized pages (more than `limit` ids) fail the index attempt; full-history dumps are unsupported. Phase 1 `ListRecordIds` continuations are finite increasing integers only; unsupported cursors leave the build incomplete/failed without pruning.
 
  complementary helpers:
 
