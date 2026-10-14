@@ -209,7 +209,28 @@ end
 
 function GG.InitGuildAdapter()
     local g = GG._guild
+    local function onEvent(_, event)
+        if event == "PLAYER_GUILD_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+            requestRoster()
+            coalesceRefresh()
+        elseif event == "GUILD_ROSTER_UPDATE" then
+            coalesceRefresh()
+        end
+    end
     if g.frame then
+        -- Reactivate a retained frame after Shutdown (named frames persist).
+        if g.frame.UnregisterAllEvents then
+            g.frame:UnregisterAllEvents()
+        end
+        if g.frame.RegisterEvent then
+            g.frame:RegisterEvent("PLAYER_GUILD_UPDATE")
+            g.frame:RegisterEvent("GUILD_ROSTER_UPDATE")
+            g.frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+        end
+        if g.frame.SetScript then
+            g.frame:SetScript("OnEvent", onEvent)
+        end
+        requestRoster()
         GG.RefreshGuildState()
         return
     end
@@ -221,14 +242,7 @@ function GG.InitGuildAdapter()
     frame:RegisterEvent("PLAYER_GUILD_UPDATE")
     frame:RegisterEvent("GUILD_ROSTER_UPDATE")
     frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-    frame:SetScript("OnEvent", function(_, event)
-        if event == "PLAYER_GUILD_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
-            requestRoster()
-            coalesceRefresh()
-        elseif event == "GUILD_ROSTER_UPDATE" then
-            coalesceRefresh()
-        end
-    end)
+    frame:SetScript("OnEvent", onEvent)
     g.frame = frame
     requestRoster()
     GG.RefreshGuildState()
@@ -239,7 +253,7 @@ function GG.ShutdownGuildAdapter()
     if g.frame then
         g.frame:UnregisterAllEvents()
         g.frame:SetScript("OnEvent", nil)
-        g.frame = nil
+        -- Keep the named frame reference for Initialize reuse.
     end
     -- Invalidate any coalesced RefreshGuildState already scheduled via C_Timer.After.
     g.coalesceGen = (tonumber(g.coalesceGen) or 0) + 1

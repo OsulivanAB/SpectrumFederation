@@ -59,10 +59,13 @@ local function providerAnnouncementFingerprint(cap)
     if type(cap) ~= "table" then
         return ""
     end
+    -- revision (provider-owned) and changeGen (engine-owned) are independent
+    -- identity fields; neither may suppress the other.
     return table.concat({
         tostring(cap.id or ""),
         tostring(cap.schema or ""),
-        tostring(cap.revision or cap.changeGen or ""),
+        tostring(cap.revision or ""),
+        tostring(cap.changeGen or ""),
         tostring(cap.dataFingerprint or cap.fingerprint or ""),
         tostring(cap.eligibilityGen or ""),
     }, "\0")
@@ -221,6 +224,18 @@ local function touchPeer(name, info)
                             peer.scopeIncompat[id] = nil
                         end
                         clearPeerProviderState(norm, id, nil)
+                        -- Active fixed-end pulls keep their captured view; mark
+                        -- follow-up so completion cannot claim coverage on the
+                        -- stale announcement identity.
+                        local out = e.outPull
+                        if out and out.providerId == id
+                            and out.peer and peerKey(out.peer) == key then
+                            out.needsFollowUp = true
+                            if GG._sched then
+                                GG._sched.dirtyFollowUp = true
+                            end
+                            GG.MarkWorkPending()
+                        end
                     end
                     peer.capFingerprints[id] = fingerprint
                 end
@@ -426,6 +441,12 @@ function GG.SendDiscovery()
     end
     if not GG.IsGuildReady() then
         return false
+    end
+    -- Discovery uses an independent timer; when the work ticker is idle,
+    -- _sched.paused may be stale. Refresh live combat/loading inputs and
+    -- preserve resume jitter / pause-clock accounting before broadcasting.
+    if GG.UpdatePauseState then
+        GG.UpdatePauseState(GG._Now())
     end
     if GG.IsSchedPaused() then
         return false
@@ -806,6 +827,29 @@ end
 GG.OnGuildInvalidated = function(reason)
     GG.StopDiscovery()
     GG.InvalidateRuntime(reason)
+    -- Verified guild-scope change invalidates scope-dependent peer coverage
+    -- and announcement identity. Transient readiness loss (roster/identity
+    -- gaps, leave) must not erase useful progress or durable provider storage.
+    if reason == "scope_changed" then
+        local e = GG._engine
+        for _, key in ipairs(e.peerOrder or {}) do
+            local p = e.peers[key]
+            if p then
+                clearPeerOwnedRuntime(p.name)
+            end
+        end
+        -- Bookmarks/unresolved already cleared per-peer; drop leftover peer
+        -- announcement maps so a same-fingerprint peer in the new guild is
+        -- not treated as already covered.
+        for _, p in pairs(e.peers or {}) do
+            if p then
+                p.covered = {}
+                p.scopeIncompat = nil
+                p.capFingerprints = nil
+                p.caps = nil
+            end
+        end
+    end
     -- Suspend the work ticker until readiness returns; preserve unfinished
     -- obligations via generation bump / closed pulls above.
     if GG._StopScheduler then
@@ -958,6 +1002,9 @@ local function startOutPull(peer, providerEntry)
         localEpoch = view.epoch,
         localBuckets = view.buckets,
         localPacked = view.packedBuckets,
+        -- Announcement identity observed when this fixed-end pull started.
+        -- Coverage completion requires the peer still advertise the same fp.
+        remoteAnnouncementFp = peer.capFingerprints and peer.capFingerprints[providerEntry.id] or nil,
         remoteView = nil,
         bucketCursor = 0,
         afterSeq = 0,
@@ -1009,6 +1056,15 @@ local function selectPullPeer()
                 local ub = e.unresolvedBackoffUntil
                     and e.unresolvedBackoffUntil[unresolvedBackoffKey(peer.name, entry.id, scopeId)]
                 local scopeBlocked = peer.scopeIncompat and peer.scopeIncompat[entry.id]
+                -- Cached mismatch records the request's local scope. When the
+                -- authoritative GetScopeId changes, drop the block without a
+                -- periodic retry (NotifyProviderChanged / remote fingerprint
+                -- recovery remain the other clear paths).
+                if scopeBlocked and scopeBlocked.localScope ~= nil
+                    and tostring(scopeBlocked.localScope) ~= tostring(scopeId) then
+                    peer.scopeIncompat[entry.id] = nil
+                    scopeBlocked = nil
+                end
                 if providerEligible(entry, peer.name, scopeId)
                     and not (peer.covered and peer.covered[entry.id])
                     and not scopeBlocked
@@ -1262,17 +1318,18 @@ local function handleManifest(sender, payload, stepLimits)
             closeInPull("stale_provider_view")
             return
         end
-        pull.usableProgressAt = GG._Now()
         local limits = resolveServeLimits(stepLimits or e.stepLimits, payload.mode)
         local manifestBudget = consumeStepExportBudget("manifest", limits.manifestEntries or 1)
         if manifestBudget <= 0 then
-            -- Shared step export budget exhausted; retain the admitted request.
+            -- Shared step export budget exhausted; retain the admitted request
+            -- without renewing the served-view lease.
             GG.MarkWorkPending()
             return "defer"
         end
         local metaRemaining = tonumber(e.stepMetaRemaining)
         if metaRemaining ~= nil and metaRemaining <= 0 then
-            -- Shared examine budget exhausted; do not force another examination.
+            -- Shared examine budget exhausted; do not force another examination
+            -- or renew the lease merely because the request was requeued.
             GG.MarkWorkPending()
             return "defer"
         end
@@ -1328,6 +1385,7 @@ local function handleManifest(sender, payload, stepLimits)
             response.error = "manifest_descriptor_too_large"
             response.done = false
         end
+        -- Lease renews only after validated export work is submitted.
         GG.SendGossip(GG.MSG.MANIFEST, response, "WHISPER", sender, {
             providerId = pull.providerId,
             scopeId = pull.scopeId,
@@ -1359,6 +1417,29 @@ local function handleManifest(sender, payload, stepLimits)
             closeOutPull("provider_limit")
             return
         end
+        -- Nonterminal pages must prove monotonic bounded progress before any
+        -- request/lease mutation. Empty filtered pages may advance via scanAfter.
+        local entries = type(payload.entries) == "table" and payload.entries or {}
+        local entryCount = #entries
+        local pullAfter = tonumber(pull.afterSeq) or 0
+        local endSeq = tonumber(payload.endSeq)
+        if endSeq == nil then
+            endSeq = tonumber(pull.remoteEndSeq) or 0
+        end
+        local scanAfter = tonumber(payload.scanAfter)
+        local terminal = payload.done == true
+        local hasEntries = entryCount > 0
+        local scanProgress = scanAfter ~= nil and scanAfter > pullAfter
+        if scanAfter ~= nil then
+            if scanAfter < pullAfter or (endSeq > 0 and scanAfter > endSeq) then
+                -- Backward or out-of-range scan: drop without renewing the lease.
+                return
+            end
+        end
+        if not terminal and not hasEntries and not scanProgress then
+            -- Unchanged/absent progress on a nonterminal page: ignore.
+            return
+        end
         pull.manifest = payload
         pull.phase = "need_bodies"
         pull.neededBodies = {}
@@ -1368,7 +1449,7 @@ local function handleManifest(sender, payload, stepLimits)
         pull.expectedSubpage = nil
         pull.outstanding = nil
         pull.usableProgressAt = GG._Now()
-        for _, ent in ipairs(payload.entries or {}) do
+        for _, ent in ipairs(entries) do
             local have = GG.IndexGetEntry(entry.index, ent.id)
             if (not have or have.versionFp ~= ent.versionFp)
                 and not isKnownUnresolvedRevision(
@@ -1607,6 +1688,7 @@ local function handleAck(sender, payload)
             peer.scopeIncompat = peer.scopeIncompat or {}
             peer.scopeIncompat[pid] = {
                 fingerprint = peer.capFingerprints and peer.capFingerprints[pid] or nil,
+                localScope = pull.scopeId,
                 at = GG._Now(),
             }
         end
@@ -2004,7 +2086,8 @@ local function advanceOutPull(limits, now)
             end
         end
         if pull.phase == "compare" then
-            -- Finite enumeration finished; coverage requires no unresolved obligations.
+            -- Finite enumeration finished; coverage requires no unresolved obligations
+            -- and an unchanged remote announcement identity for this pull.
             GG.SendGossip(GG.MSG.ACK, {
                 viewId = pull.viewId,
                 done = true,
@@ -2013,13 +2096,25 @@ local function advanceOutPull(limits, now)
             local stillUnresolved = hasUnresolvedForProvider(
                 pull.providerId, pull.peer, pull.scopeId)
             local p = e.peers[peerKey(pull.peer)]
-            if p and not stillUnresolved then
+            local currentFp = p and p.capFingerprints and p.capFingerprints[pull.providerId]
+            local announcementStale = pull.remoteAnnouncementFp
+                and currentFp
+                and currentFp ~= pull.remoteAnnouncementFp
+            if announcementStale or pull.needsFollowUp then
+                if GG._sched then
+                    GG._sched.dirtyFollowUp = true
+                end
+            end
+            if p and not stillUnresolved and not announcementStale and not pull.needsFollowUp then
                 p.covered = p.covered or {}
                 p.covered[pull.providerId] = true
                 closeOutPull("complete")
-            else
+            elseif stillUnresolved then
                 -- Incomplete coverage + bounded backoff; do not hot-loop unchanged obligations.
                 closeOutPull("unresolved")
+            else
+                -- Stale announcement mid-pull: release without claiming coverage.
+                closeOutPull("stale_announcement")
             end
             if GG.HasDirtyFollowUp() then
                 GG.ClearDirtyFollowUp()
@@ -2560,13 +2655,13 @@ function GG.Shutdown()
     end
     local guard = GG._recvGuard
     if guard and guard.lifecycleFrame then
+        -- Retain the named frame for reuse; only deactivate events/scripts.
         if guard.lifecycleFrame.UnregisterAllEvents then
             guard.lifecycleFrame:UnregisterAllEvents()
         end
         if guard.lifecycleFrame.SetScript then
             guard.lifecycleFrame:SetScript("OnEvent", nil)
         end
-        guard.lifecycleFrame = nil
     end
     GG._engine.inited = false
 end

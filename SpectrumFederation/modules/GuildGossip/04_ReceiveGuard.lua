@@ -254,9 +254,29 @@ end
 
 -- Late load-on-demand addons can upgrade AceComm after PLAYER_LOGIN. Re-check
 -- wrappers on ADDON_LOADED; InstallReceiveGuard is idempotent when unchanged.
+-- Named WoW frames cannot be destroyed; reuse the retained lifecycle frame
+-- across Shutdown/Initialize and reject callbacks after shutdown.
 function GG.InitReceiveGuardLifecycle()
     local st = GG._recvGuard
+    local function onEvent(_, event)
+        if event ~= "ADDON_LOADED" then
+            return
+        end
+        if not GG._engine or not GG._engine.inited then
+            return
+        end
+        GG.EnsureReceiveGuard()
+    end
     if st.lifecycleFrame then
+        if st.lifecycleFrame.UnregisterAllEvents then
+            st.lifecycleFrame:UnregisterAllEvents()
+        end
+        if st.lifecycleFrame.RegisterEvent then
+            st.lifecycleFrame:RegisterEvent("ADDON_LOADED")
+        end
+        if st.lifecycleFrame.SetScript then
+            st.lifecycleFrame:SetScript("OnEvent", onEvent)
+        end
         return true
     end
     if not CreateFrame then
@@ -264,12 +284,7 @@ function GG.InitReceiveGuardLifecycle()
     end
     local frame = CreateFrame("Frame", "SFGuildGossipReceiveGuard")
     frame:RegisterEvent("ADDON_LOADED")
-    frame:SetScript("OnEvent", function(_, event)
-        if event ~= "ADDON_LOADED" then
-            return
-        end
-        GG.EnsureReceiveGuard()
-    end)
+    frame:SetScript("OnEvent", onEvent)
     st.lifecycleFrame = frame
     return true
 end

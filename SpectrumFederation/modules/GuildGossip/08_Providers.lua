@@ -383,14 +383,20 @@ function GG.EnsureProviderIndex(entry, limits)
     end
 
     local function upsertId(rid)
-        local vfp = nil
         local ok, res = pcall(api.GetRecordVersionFp, rid)
-        if ok then
-            vfp = res
+        if not ok then
+            -- Callback failure is distinct from legitimate absence (nil).
+            GG._DError("GetRecordVersionFp failed provider=%s id=%s err=%s",
+                entry.id, tostring(rid), tostring(res))
+            if geterrorhandler then
+                pcall(geterrorhandler(), res)
+            end
+            return "error"
         end
-        if not vfp then
+        if res == nil or res == false then
             return false
         end
+        local vfp = res
         local _, detail = GG.IndexUpsert(entry.index, rid, vfp)
         if detail == "replaced" then
             GG.BumpIndexEpoch(entry.index)
@@ -422,6 +428,20 @@ function GG.EnsureProviderIndex(entry, limits)
     local n = 0
     for i = 1, #page do
         local status = upsertId(page[i])
+        if status == "error" then
+            -- Keep the build incomplete and the cursor on this page so recovery
+            -- can retry. Bounded failure handling (not a hot loop forever).
+            entry.lastIndexExamined = n
+            entry._listCursor = cursor
+            if index then
+                index.buildComplete = false
+                index.dirty = true
+            end
+            if noteIndexAttemptFailure(entry, "get_record_version_fp_error") then
+                return false
+            end
+            return true
+        end
         if status == "restart" then
             entry.lastIndexExamined = n + 1
             return true
@@ -624,12 +644,15 @@ function GG.CreateSyntheticProvider(opts)
             if entry then
             -- Ordinary appends update the live index in place.
                 GG.IndexUpsert(entry.index, rid, vfp, record)
-                if not entry.index.buildComplete and not entry._listCursor then
-                    -- Live maintenance before an in-flight cold walk: the upserted
-                    -- index is already usable; do not block VIEW publication on a
-                    -- deferred SLOW ListRecordIds walk of the same rows.
+                -- Synthetic EnsureIndex tracks cold enumeration with store._enumPos
+                -- (not entry._listCursor). Do not declare the build complete while
+                -- that walk — or a ListRecordIds cursor — is still in progress.
+                local coldWalkPending = entry._listCursor ~= nil or store._enumPos ~= nil
+                if not entry.index.buildComplete and not coldWalkPending then
                     entry.index.buildComplete = true
                     entry.index.dirty = false
+                elseif not entry.index.buildComplete then
+                    entry.index.dirty = true
                 end
                 GG.BumpProviderChangeGen(id)
                 if entry.enabled then
@@ -643,6 +666,7 @@ function GG.CreateSyntheticProvider(opts)
                         entry.index.buildComplete = false
                     end
                     entry._listCursor = nil
+                    store._enumPos = nil
                 end
             end
         end
