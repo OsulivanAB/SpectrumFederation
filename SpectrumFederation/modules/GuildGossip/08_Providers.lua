@@ -497,13 +497,15 @@ function GG.EnsureProviderIndex(entry, limits)
         n = n + 1
     end
     entry.lastIndexExamined = n
-    entry.indexFailCount = 0
 
     -- Phase 1: only nil (EOF) or a finite integer strictly greater than the
     -- request cursor may continue. Opaque / backward / non-numeric tokens must
     -- never be treated as successful completion (that would prune valid rows).
+    -- Reset failure counting only after a genuinely valid page/continuation —
+    -- never before cursor validation (that would prevent terminal indexFailed).
     if nextCursor == nil then
         -- Empty page or final page with no next cursor completes the build.
+        entry.indexFailCount = 0
         entry._listCursor = nil
         if index then
             if entry._reconciling and entry._reconcileSeen then
@@ -541,6 +543,7 @@ function GG.EnsureProviderIndex(entry, limits)
         and nextNum == math.floor(nextNum)
         and nextNum > cursor
     if cursorOk then
+        entry.indexFailCount = 0
         entry._listCursor = nextNum
         return true
     end

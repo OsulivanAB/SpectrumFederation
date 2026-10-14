@@ -7,6 +7,7 @@ local providerScope, providerEligible
 local isKnownUnresolvedRevision, clearUnresolvedRevision, recordUnresolved
 local hasUnresolvedForProvider, reopenUnresolvedEnumeration
 local hasValidBodyIdArray, transportSenderAuthorized
+local makeOutPullGossipValid, outPullSubmissionMatches
 
 GG._engine = GG._engine or {
     inited = false,
@@ -336,7 +337,7 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
     if isMulti then
         e.streamBusy[sk] = true
     end
-    e.admittedOutBytes = (e.admittedOutBytes or 0) + bytes
+        e.admittedOutBytes = (e.admittedOutBytes or 0) + bytes
 
     local terminal = false
     local function finish(success, sendResult)
@@ -346,9 +347,11 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         terminal = true
         e.streamBusy[sk] = nil
         onGossipSubmitted(bytes)
-        -- A served VIEW offer may be waiting for this stream to drain.
+        -- A served VIEW offer or cached MANIFEST/BODY page may be waiting
+        -- for this stream to drain (stream_busy admission rejection).
         local pull = GG._engine.inPull
-        if pull and pull.offerRetryPending and streamKey("WHISPER", pull.peer) == sk then
+        if pull and streamKey("WHISPER", pull.peer) == sk
+            and (pull.offerRetryPending or pull.pageRetryPending) then
             GG.MarkWorkPending()
         end
         if opts.onFinalSubmitted then
@@ -786,6 +789,8 @@ end
 -- Bind queued view-derived responses to the captured served-view epoch /
 -- eligibility identity so BumpIndexEpoch / eligibility changes cancel them
 -- through existing Comm gossipValid + gossipCancel accounting release.
+-- Transport membership/readiness is required independently; provider
+-- eligibility supplements it and never substitutes for roster checks.
 local function makeServedGossipValid(pull)
     local sendGeneration = GG._engine.generation
     local providerId = pull.providerId
@@ -795,7 +800,9 @@ local function makeServedGossipValid(pull)
     local viewId = pull.viewId
     local peer = pull.peer
     return function()
-        if sendGeneration ~= GG._engine.generation or not GG.IsGuildReady() then
+        if sendGeneration ~= GG._engine.generation
+            or not GG.IsGuildReady()
+            or not GG.IsGuildMember(peer) then
             return false
         end
         local entry = GG.GetProvider(providerId)
@@ -825,17 +832,40 @@ local function bodyIdsKey(ids)
 end
 
 local function sendServedResponse(pull, msgType, response, advancing)
-    return GG.SendGossip(msgType, response, "WHISPER", pull.peer, {
+    local ok, err = GG.SendGossip(msgType, response, "WHISPER", pull.peer, {
         providerId = pull.providerId,
         scopeId = pull.scopeId,
         gossipValid = makeServedGossipValid(pull),
         onFinalSubmitted = function(success)
+            if GG._engine.inPull == pull then
+                pull.pageRetryPending = nil
+            end
             noteInPullSubmission(pull, success, {
                 renewLease = advancing and true or false,
                 closeOnFail = advancing and true or false,
             })
         end,
     })
+    if ok then
+        pull.pageRetryPending = nil
+        return true
+    end
+    if err == "stream_busy" then
+        -- Reuse the already-cached served page when the stream drains; do not
+        -- re-export or renew leases on failed admission.
+        pull.pageRetryPending = true
+        pull.pageRetryMsgType = msgType
+        pull.pageRetryAdvancing = advancing and true or false
+        GG.MarkWorkPending()
+        return false
+    end
+    if advancing then
+        -- An unsent advancing page cannot retain the stop-and-wait lease.
+        noteInPullSubmission(pull, false, { renewLease = false, closeOnFail = true })
+    else
+        GG.MarkWorkPending()
+    end
+    return false
 end
 
 -- Serving budgets are owned by the local scheduler step. A remote mode may only
@@ -1190,8 +1220,12 @@ local function startOutPull(peer, providerEntry)
     local ok = GG.SendGossip(GG.MSG.VIEW, payload, "WHISPER", peer.name, {
         providerId = providerEntry.id,
         scopeId = scopeId,
-        onFinalSubmitted = function(success)
-            noteOutPullSubmission(pull, success)
+        gossipValid = makeOutPullGossipValid(pull, GG.MSG.VIEW, nil),
+        onFinalSubmitted = function(success, sendResult)
+            if not outPullSubmissionMatches(pull, GG.MSG.VIEW, nil) then
+                return
+            end
+            noteOutPullSubmission(pull, success, sendResult)
         end,
     })
     if not ok then
@@ -2144,6 +2178,57 @@ end
 -- Processor step
 ---------------------------------------------------------------------------
 
+makeOutPullGossipValid = function(pull, msgType, requestId)
+    local sendGeneration = GG._engine.generation
+    local providerId = pull.providerId
+    local scopeId = pull.scopeId
+    local viewId = pull.viewId
+    local peer = pull.peer
+    return function()
+        if sendGeneration ~= GG._engine.generation
+            or not GG.IsGuildReady()
+            or not GG.IsGuildMember(peer) then
+            return false
+        end
+        local entry = GG.GetProvider(providerId)
+        if not providerEligible(entry, peer, scopeId) then
+            return false
+        end
+        local current = GG._engine.outPull
+        if not current or current ~= pull or current.viewId ~= viewId then
+            return false
+        end
+        local outstanding = current.outstanding
+        if not outstanding or outstanding.msgType ~= msgType then
+            return false
+        end
+        if requestId ~= nil then
+            local payload = outstanding.payload
+            if type(payload) ~= "table" or payload.requestId ~= requestId then
+                return false
+            end
+        end
+        return true
+    end
+end
+
+outPullSubmissionMatches = function(pull, msgType, requestId)
+    if GG._engine.outPull ~= pull then
+        return false
+    end
+    local outstanding = pull.outstanding
+    if not outstanding or outstanding.msgType ~= msgType then
+        return false
+    end
+    if requestId ~= nil then
+        local payload = outstanding.payload
+        if type(payload) ~= "table" or payload.requestId ~= requestId then
+            return false
+        end
+    end
+    return true
+end
+
 local function resendOutstanding(pull)
     local outstanding = pull and pull.outstanding
     if not outstanding then
@@ -2154,11 +2239,18 @@ local function resendOutstanding(pull)
         closeOutPull("provider_ineligible")
         return false
     end
+    local msgType = outstanding.msgType
+    local requestId = type(outstanding.payload) == "table" and outstanding.payload.requestId or nil
     pull.finalSubmitted = false
-    return GG.SendGossip(outstanding.msgType, outstanding.payload, "WHISPER", pull.peer, {
+    return GG.SendGossip(msgType, outstanding.payload, "WHISPER", pull.peer, {
         providerId = pull.providerId,
         scopeId = pull.scopeId,
+        gossipValid = makeOutPullGossipValid(pull, msgType, requestId),
         onFinalSubmitted = function(success, sendResult)
+            -- Late callbacks must not modify a newer correlated request.
+            if not outPullSubmissionMatches(pull, msgType, requestId) then
+                return
+            end
             noteOutPullSubmission(pull, success, sendResult)
         end,
     })
@@ -2167,7 +2259,9 @@ end
 -- Reopen bookmarks/coverage for a scoped peer/provider without deleting sibling
 -- unresolved revisions. Expiry and cap eviction call this, then remove only the
 -- selected obligation key. A matching in-flight outPull must not later restore
--- false coverage after skipping the expired revision.
+-- false coverage after skipping the expired revision: needsFollowUp blocks
+-- bookmark rewrites for the remainder of that pull so a follow-up cannot reuse
+-- an advanced cursor past the expired revision.
 local function reopenCoverageForUnresolved(item)
     if not item then
         return
@@ -2455,12 +2549,16 @@ local function advanceOutPull(limits, now)
                 end
             end
             pull.afterSeq = after
-            setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
-                epoch = pull.remoteView and pull.remoteView.epoch,
-                scopeId = pull.scopeId,
-                eligibilityGen = pull.remoteView and pull.remoteView.eligibilityGen,
-                afterSeq = pull.afterSeq,
-            })
+            -- Expiry-driven needsFollowUp cleared bookmarks; do not recreate an
+            -- advanced cursor that would skip the expired revision on follow-up.
+            if not pull.needsFollowUp then
+                setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
+                    epoch = pull.remoteView and pull.remoteView.epoch,
+                    scopeId = pull.scopeId,
+                    eligibilityGen = pull.remoteView and pull.remoteView.eligibilityGen,
+                    afterSeq = pull.afterSeq,
+                })
+            end
             GG.SendGossip(GG.MSG.ACK, {
                 viewId = pull.viewId,
                 providerId = pull.providerId,
@@ -2601,12 +2699,16 @@ local function advanceOutPull(limits, now)
                 end
             end
             pull.afterSeq = after
-            setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
-                epoch = pull.remoteView and pull.remoteView.epoch,
-                scopeId = pull.scopeId,
-                eligibilityGen = pull.remoteView and pull.remoteView.eligibilityGen,
-                afterSeq = pull.afterSeq,
-            })
+            -- Expiry-driven needsFollowUp cleared bookmarks; do not recreate an
+            -- advanced cursor that would skip the expired revision on follow-up.
+            if not pull.needsFollowUp then
+                setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
+                    epoch = pull.remoteView and pull.remoteView.epoch,
+                    scopeId = pull.scopeId,
+                    eligibilityGen = pull.remoteView and pull.remoteView.eligibilityGen,
+                    afterSeq = pull.afterSeq,
+                })
+            end
             pull.neededBodies = nil
             pull.bodyOffset = 0
             if page and page.done then
@@ -2737,6 +2839,32 @@ local function advanceInPull(now)
         local sk = streamKey("WHISPER", pull.peer)
         if not e.streamBusy[sk] then
             trySendServedOffer(pull)
+            return true
+        end
+        -- Stream still busy: no lease renew; expiry is handled above.
+        GG.MarkWorkPending()
+        return false
+    end
+    if pull.pageRetryPending then
+        local sk = streamKey("WHISPER", pull.peer)
+        if not e.streamBusy[sk] then
+            local msgType = pull.pageRetryMsgType
+            local advancing = pull.pageRetryAdvancing and true or false
+            local cached
+            if msgType == GG.MSG.MANIFEST and pull.servedManifest and pull.servedManifest.response then
+                cached = pull.servedManifest.response
+            elseif msgType == GG.MSG.BODY and pull.servedBody and pull.servedBody.response then
+                cached = pull.servedBody.response
+            end
+            if cached then
+                local replay = {}
+                for k, v in pairs(cached) do
+                    replay[k] = v
+                end
+                sendServedResponse(pull, msgType, replay, advancing)
+            else
+                pull.pageRetryPending = nil
+            end
             return true
         end
         -- Stream still busy: no lease renew; expiry is handled above.

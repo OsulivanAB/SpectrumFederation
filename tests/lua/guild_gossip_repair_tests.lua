@@ -4744,6 +4744,37 @@ do
     assertTrue(entry.index.buildComplete ~= true or entry.indexFailed == true,
         "F80: backward cursor incomplete/failed")
     assertTrue(entry.index.byId["c1"] ~= nil, "F80: backward cursor retains rows")
+
+    -- Isolated invalid-cursor terminal stop: failCount must not reset each step.
+    reset()
+    A = makeClient("Alice")
+    local listCalls = 0
+    A.GuildGossip.RegisterProvider({
+        id = "cur80fail", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            listCalls = listCalls + 1
+            cursor = tonumber(cursor) or 1
+            return { "r1" }, "opaque-token"
+        end,
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 8 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    entry = A.GuildGossip.GetProvider("cur80fail")
+    assertTrue(entry.indexFailed == true, "F80: eight invalid-cursor steps reach indexFailed")
+    assertTrue(listCalls <= 4, "F80: invalid-cursor callbacks stay bounded (calls="
+        .. tostring(listCalls) .. ")")
+    assertTrue(entry.index.byId["r1"] ~= nil, "F80: invalid-cursor retains indexed rows")
+    local callsAtFail = listCalls
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("SLOW")) end
+    assertEq(listCalls, callsAtFail, "F80: indexFailed stops further ListRecordIds callbacks")
+    A.GuildGossip.NotifyProviderChanged("cur80fail")
+    entry = A.GuildGossip.GetProvider("cur80fail")
+    -- Recovery requires a valid cursor path; keep opaque to prove Notify clears failure.
+    assertTrue(entry.indexFailed ~= true, "F80: NotifyProviderChanged clears indexFailed")
 end
 
 ---------------------------------------------------------------------------
@@ -4959,6 +4990,415 @@ do
     assertTrue(e.outPull == nil, "F83: advanced pull closed without claiming coverage")
     assertTrue(e.peers["bob-garona"].covered["sf.synthetic.gossip"] ~= true,
         "F83: active pull completion does not restore false coverage after expiry")
+
+    -- need_bodies expiry must not recreate an advanced bookmark that skips the
+    -- expired revision on a later follow-up pass.
+    reset()
+    A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f83nb" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    e = A.GuildGossip._engine
+    entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    scope = A.GuildGossip.GetGuildScopeId()
+    ttl = A.GuildGossip.UNRESOLVED_TTL_SEC
+    e.peers["bob-garona"] = {
+        name = "Bob-Garona", key = "bob-garona", covered = { ["sf.synthetic.gossip"] = true },
+    }
+    e.peerOrder = { "bob-garona" }
+    local expiredId, expiredVfp = "skip-nb", "v-nb"
+    e.unresolved[urKey(expiredId, expiredVfp)] = {
+        at = world.time - (ttl + 1),
+        providerId = "sf.synthetic.gossip",
+        recordId = expiredId, versionFp = expiredVfp, result = "rejected",
+        peer = "Bob-Garona", peerKey = "bob-garona", scopeId = scope,
+    }
+    setTestBookmark(entry, "Bob-Garona", scope, 0, {
+        epoch = 7, afterSeq = 11, eligibilityGen = entry.eligibilityGen,
+    })
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout83nb",
+        scopeId = scope, phase = "need_bodies",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time, finalSubmitted = true,
+        activeBucket = 0, afterSeq = 5, bucketCursor = 1,
+        neededBodies = {}, bodyOffset = 0,
+        remoteView = {
+            epoch = 7, eligibilityGen = entry.eligibilityGen,
+            buckets = { [0] = { lastSeq = 20, count = 2, fingerprint = "fp" } },
+        },
+        remoteAnnouncementFp = "fp83nb",
+        localBuckets = {},
+        manifest = {
+            entries = { { seq = 10, id = "later", versionFp = "vL" } },
+            scanAfter = 11, done = true,
+        },
+    }
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.outPull == nil or e.outPull.needsFollowUp == true
+        or e.peers["bob-garona"].covered["sf.synthetic.gossip"] ~= true,
+        "F83: need_bodies expiry keeps coverage incomplete / follow-up armed")
+    local bmAfter
+    for _, bm in pairs(entry.bookmarks or {}) do
+        if tonumber(bm.bucketId) == 0 then bmAfter = bm break end
+    end
+    assertTrue(bmAfter == nil or (tonumber(bmAfter.afterSeq) or 0) < 11,
+        "F83: need_bodies expiry does not recreate advanced bookmark (afterSeq="
+        .. tostring(bmAfter and bmAfter.afterSeq) .. ")")
+    -- Later pass with cleared bookmarks must request from afterSeq 0 (not 11).
+    e.peers["bob-garona"].covered["sf.synthetic.gossip"] = nil
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout83nb2",
+        scopeId = scope, phase = "compare",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time, finalSubmitted = true,
+        bucketCursor = 0, afterSeq = 0,
+        remoteView = {
+            epoch = 7, eligibilityGen = entry.eligibilityGen,
+            buckets = { [0] = { lastSeq = 20, count = 2, fingerprint = "fp" } },
+        },
+        remoteAnnouncementFp = "fp83nb",
+        localBuckets = { [0] = { lastSeq = 0, count = 0, fingerprint = "" } },
+    }
+    local manifestAfter = nil
+    local origSend = A.GuildGossip.SendGossip
+    A.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        if msgType == A.GuildGossip.MSG.MANIFEST and type(payload) == "table"
+            and payload.op == "request" then
+            manifestAfter = tonumber(payload.afterSeq)
+        end
+        return origSend(msgType, payload, dist, target, opts)
+    end
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    A.GuildGossip.SendGossip = origSend
+    assertTrue(manifestAfter ~= nil, "F83: follow-up pass issues MANIFEST request")
+    assertTrue(manifestAfter < 11,
+        "F83: follow-up fetches behind expired cursor (afterSeq=" .. tostring(manifestAfter) .. ")")
+end
+
+---------------------------------------------------------------------------
+-- F84: delayed served send rechecks guild membership (permissive provider)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip.RegisterProvider({
+        id = "perm84", schema = 1, enabled = true, ready = true,
+        ListRecordIds = pagedIds({ "m1" }),
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("perm84")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "perm84", viewId = "v84",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = { [0] = { lastSeq = 1, count = 1, fingerprint = "fp" } },
+        usableProgressAt = world.time, finalSubmitted = true, engineGen = e.generation,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    local admittedBefore = e.admittedOutBytes or 0
+    -- Admit MANIFEST into Comm queue without pumping.
+    world._unitName = "Alice"
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v84", providerId = "perm84",
+        scopeId = scope, requestId = "r84", subpage = 1,
+        bucketId = 0, afterSeq = 0, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    A.GuildGossip.OnSchedulerStep(A.GuildGossip.GetStepLimits("NORMAL"), world.time)
+    assertTrue((e.admittedOutBytes or 0) > admittedBefore, "F84: MANIFEST admitted before revoke")
+    -- Revoke membership before the real Comm pump.
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "Carol-Garona", online = true },
+    }
+    A.GuildGossip.RefreshGuildState()
+    local wireBefore = #world.wire
+    pump("Alice", A)
+    local whispers = 0
+    for i = wireBefore + 1, #world.wire do
+        if world.wire[i].distribution == "WHISPER" then whispers = whispers + 1 end
+    end
+    assertEq(whispers, 0, "F84: revoked member does not receive queued MANIFEST")
+    assertEq(e.admittedOutBytes or 0, 0, "F84: admission bytes released after cancel")
+    assertTrue(e.streamBusy["WHISPER|Bob-Garona"] == nil, "F84: streamBusy released after cancel")
+
+    -- BODY path: same membership revoke before pump.
+    reset()
+    A = makeClient("Alice")
+    A.GuildGossip.RegisterProvider({
+        id = "perm84b", schema = 1, enabled = true, ready = true,
+        ListRecordIds = pagedIds({ "b1" }),
+        GetRecordVersionFp = function() return "v" end,
+        GetRecordBody = function(id) return { id = id, versionFp = "v", body = 1 } end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    e = A.GuildGossip._engine
+    entry = A.GuildGossip.GetProvider("perm84b")
+    scope = A.GuildGossip.GetGuildScopeId()
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "perm84b", viewId = "v84b",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = { [0] = { lastSeq = 1, count = 1, fingerprint = "fp" } },
+        usableProgressAt = world.time, finalSubmitted = true, engineGen = e.generation,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    admittedBefore = e.admittedOutBytes or 0
+    world._unitName = "Alice"
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.BODY, {
+        op = "request", viewId = "v84b", providerId = "perm84b",
+        scopeId = scope, requestId = "r84b", subpage = 1,
+        ids = { "b1" }, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    A.GuildGossip.OnSchedulerStep(A.GuildGossip.GetStepLimits("NORMAL"), world.time)
+    assertTrue((e.admittedOutBytes or 0) > admittedBefore, "F84: BODY admitted before revoke")
+    world.guild.members = { { name = "Alice-Garona", online = true } }
+    A.GuildGossip.RefreshGuildState()
+    wireBefore = #world.wire
+    pump("Alice", A)
+    whispers = 0
+    for i = wireBefore + 1, #world.wire do
+        if world.wire[i].distribution == "WHISPER" then whispers = whispers + 1 end
+    end
+    assertEq(whispers, 0, "F84: revoked member does not receive queued BODY")
+    assertEq(e.admittedOutBytes or 0, 0, "F84: BODY admission bytes released")
+end
+
+---------------------------------------------------------------------------
+-- F85: MANIFEST/BODY stream_busy retries cached page without re-export
+---------------------------------------------------------------------------
+do
+    reset()
+    local B = makeClient("Bob")
+    local p = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f85" })
+    for i = 1, 3 do p.AppendLocal("p85-" .. i, "body-" .. i) end
+    for _ = 1, 6 do stepClient(B, B.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = B.GuildGossip._engine
+    local entry = B.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = B.GuildGossip.GetGuildScopeId()
+    local sk = "WHISPER|Alice-Garona"
+    local view = select(1, B.GuildGossip.CaptureViewSummaries(
+        entry.index, entry.eligibilityGen, scope, entry.id, entry.schema, nil, nil, nil))
+    e.inPull = {
+        peer = "Alice-Garona", providerId = "sf.synthetic.gossip", viewId = "v85",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = view and view.buckets or {},
+        usableProgressAt = world.time, finalSubmitted = true, engineGen = e.generation,
+    }
+    e.peers["alice-garona"] = { name = "Alice-Garona", key = "alice-garona", activeExchange = true }
+    local bucketId = 0
+    if view and view.buckets then
+        for b, meta in pairs(view.buckets) do
+            if meta and (tonumber(meta.lastSeq) or 0) > 0 then
+                bucketId = tonumber(b) or b
+                break
+            end
+        end
+    end
+    e.streamBusy[sk] = true
+    local manifestSends, bodySends, usedIgnore = 0, 0, false
+    local bodyExports = 0
+    local origBody = entry.api.GetRecordBody
+    entry.api.GetRecordBody = function(...)
+        bodyExports = bodyExports + 1
+        return origBody(...)
+    end
+    local origSend = B.GuildGossip.SendGossip
+    B.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        opts = opts or {}
+        if opts.ignoreStreamBusy then usedIgnore = true end
+        local ok, err = origSend(msgType, payload, dist, target, opts)
+        if ok then
+            if msgType == B.GuildGossip.MSG.MANIFEST and type(payload) == "table" and payload.op == "page" then
+                manifestSends = manifestSends + 1
+            end
+            if msgType == B.GuildGossip.MSG.BODY and type(payload) == "table" and payload.op == "page" then
+                bodySends = bodySends + 1
+            end
+        end
+        return ok, err
+    end
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v85", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "m85", subpage = 1,
+        bucketId = bucketId, afterSeq = 0, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull ~= nil, "F85: stream_busy keeps served pull for MANIFEST")
+    assertTrue(e.inPull.pageRetryPending == true, "F85: MANIFEST pageRetryPending while busy")
+    assertTrue(e.inPull.servedManifest ~= nil, "F85: MANIFEST response cached for retry")
+    assertEq(manifestSends, 0, "F85: no MANIFEST admission while stream busy")
+    assertEq(usedIgnore, false, "F85: page path does not set ignoreStreamBusy")
+    e.streamBusy[sk] = nil
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull ~= nil, "F85: served pull retained after MANIFEST retry")
+    assertTrue(e.inPull.pageRetryPending ~= true, "F85: MANIFEST pageRetry cleared after send")
+    assertTrue(manifestSends >= 1, "F85: MANIFEST retried after stream drained")
+
+    -- BODY stream_busy path.
+    e.streamBusy[sk] = true
+    bodySends = 0
+    bodyExports = 0
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
+        op = "request", viewId = "v85", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "b85", subpage = 1,
+        ids = { "p85-1" }, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull.pageRetryPending == true, "F85: BODY pageRetryPending while busy")
+    assertTrue(e.inPull.servedBody ~= nil, "F85: BODY response cached for retry")
+    assertEq(bodySends, 0, "F85: no BODY admission while stream busy")
+    local exportsAtBusy = bodyExports
+    assertTrue(exportsAtBusy >= 1, "F85: BODY export ran once before stream_busy")
+    e.streamBusy[sk] = nil
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull.pageRetryPending ~= true, "F85: BODY pageRetry cleared after send")
+    assertTrue(bodySends >= 1, "F85: BODY retried after stream drained")
+    assertEq(bodyExports, exportsAtBusy, "F85: BODY retry does not re-export")
+    B.GuildGossip.SendGossip = origSend
+    entry.api.GetRecordBody = origBody
+end
+
+---------------------------------------------------------------------------
+-- F86: queued outPull requests cancel when pull advances / closes
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f86" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local Comm = A.LootHelperComm
+    -- Hold the Comm pump so retries accumulate in the queue.
+    local origPump = Comm._PumpQueue
+    Comm._PumpQueue = function() end
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout86",
+        scopeId = scope, phase = "wait_manifest",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time - 6, finalSubmitted = false,
+        activeBucket = 0, afterSeq = 0,
+        outstanding = {
+            msgType = A.GuildGossip.MSG.MANIFEST,
+            payload = {
+                op = "request", viewId = "vout86", providerId = "sf.synthetic.gossip",
+                scopeId = scope, requestId = "req-old", subpage = 1,
+                bucketId = 0, afterSeq = 0, mode = "NORMAL", engineGen = e.generation,
+            },
+        },
+        retries = 0,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    -- Unconfirmed backoff schedules retryAt; advance time so resend enqueues.
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.outPull ~= nil and e.outPull.retryAt ~= nil, "F86: unconfirmed path schedules retry")
+    world.time = (e.outPull.retryAt or world.time) + 0.1
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.outPull ~= nil, "F86: pull retained while retries queue")
+    local queuedAfterFirst = Comm.state.total or 0
+    assertTrue(queuedAfterFirst >= 1, "F86: first request copy queued (n="
+        .. tostring(queuedAfterFirst) .. ")")
+    -- Advance outstanding to a new requestId while old copies remain queued.
+    e.outPull.outstanding = {
+        msgType = A.GuildGossip.MSG.MANIFEST,
+        payload = {
+            op = "request", viewId = "vout86", providerId = "sf.synthetic.gossip",
+            scopeId = scope, requestId = "req-new", subpage = 1,
+            bucketId = 0, afterSeq = 3, mode = "NORMAL", engineGen = e.generation,
+        },
+    }
+    e.outPull.expectedRequestId = "req-new"
+    e.outPull.finalSubmitted = false
+    e.outPull.usableProgressAt = world.time - 6
+    e.outPull.retryAt = nil
+    e.outPull.retries = 0
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    world.time = (e.outPull.retryAt or world.time) + 0.1
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    local totalQueued = Comm.state.total or 0
+    assertTrue(totalQueued >= 2, "F86: obsolete and current requests queued (n="
+        .. tostring(totalQueued) .. ")")
+    -- Close the pull: every queued copy must cancel via gossipValid.
+    e.outPull = nil
+    e.peers["bob-garona"].activeExchange = false
+    Comm._PumpQueue = origPump
+    local wireBefore = #world.wire
+    for _ = 1, 8 do
+        if (Comm.state.total or 0) == 0 then break end
+        world.time = world.time + 0.1
+        pump("Alice", A)
+    end
+    local whispers = 0
+    for i = wireBefore + 1, #world.wire do
+        if world.wire[i].distribution == "WHISPER" then whispers = whispers + 1 end
+    end
+    assertEq(whispers, 0, "F86: closed pull cancels all queued request copies")
+    assertEq(Comm.state.total or 0, 0, "F86: Comm queue empty after cancel")
+    assertEq(e.admittedOutBytes or 0, 0, "F86: admission accounting released")
+
+    -- Current-request recovery: queued valid request still sends.
+    reset()
+    A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f86b" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    e = A.GuildGossip._engine
+    entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    scope = A.GuildGossip.GetGuildScopeId()
+    Comm = A.LootHelperComm
+    origPump = Comm._PumpQueue
+    Comm._PumpQueue = function() end
+    local payload = {
+        op = "request", viewId = "vout86b", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "req-live", subpage = 1,
+        bucketId = 0, afterSeq = 0, mode = "NORMAL", engineGen = e.generation,
+    }
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout86b",
+        scopeId = scope, phase = "wait_manifest",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time - 6, finalSubmitted = false,
+        activeBucket = 0, afterSeq = 0, expectedRequestId = "req-live",
+        outstanding = { msgType = A.GuildGossip.MSG.MANIFEST, payload = payload },
+        retries = 0,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    world.time = (e.outPull.retryAt or world.time) + 0.1
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue((Comm.state.total or 0) >= 1, "F86: live request queued before drain")
+    local key = Comm.state.keys[1]
+    local item = Comm.state.byKey[key][1]
+    assertTrue(item.gossipValid and item.gossipValid() == true,
+        "F86: live queued request gossipValid before drain")
+    Comm._PumpQueue = origPump
+    wireBefore = #world.wire
+    -- Drain past per-target min-gap; count wire before deliverWire clears it.
+    world.time = world.time + 0.1
+    world._unitName = "Alice"
+    world._sendAs = "Alice-Garona"
+    Comm:_PumpQueue()
+    world._sendAs = nil
+    whispers = 0
+    for i = wireBefore + 1, #world.wire do
+        if world.wire[i].distribution == "WHISPER" then whispers = whispers + 1 end
+    end
+    deliverWire()
+    assertTrue(whispers >= 1, "F86: current correlated request still sends after drain (whispers="
+        .. tostring(whispers) .. ")")
+    assertTrue(e.outPull ~= nil, "F86: live pull retained after successful send")
+    assertEq(Comm.state.total or 0, 0, "F86: live drain empties Comm queue")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
