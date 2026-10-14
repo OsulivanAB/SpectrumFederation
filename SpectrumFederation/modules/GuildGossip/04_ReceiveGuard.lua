@@ -155,6 +155,12 @@ local function buildWrappers(st, origFirst, origNext, origLast)
             return origFirst(self, pfx, message, distribution, sender)
         end
         local key = partialKey(pfx, distribution, sender)
+        -- AceComm FIRST replaces the physical spool for this stream. Release any
+        -- abandoned partial so replacement accounting starts clean (matches the
+        -- physical overwrite) instead of charging the new message to the old one.
+        if st.partials[key] then
+            releasePartial(st, key)
+        end
         local ok, err = admitFragment(st, key, #(message or ""), GG._Now())
         if not ok then
             GG._DVerbose("Drop gossip multipart FIRST (%s)", tostring(err))

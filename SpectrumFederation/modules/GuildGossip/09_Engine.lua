@@ -813,12 +813,31 @@ local function trySendServedOffer(pull)
     if not pull or not pull.offerPayload or GG._engine.inPull ~= pull then
         return false
     end
+    -- First successful offer arms the progress clock; later identical VIEW
+    -- replays / lost-offer retries must not renew the sole served-pull lease.
+    local replay = pull.offerProgressArmed == true
     local ok, err = GG.SendGossip(GG.MSG.VIEW, pull.offerPayload, "WHISPER", pull.peer, {
         providerId = pull.providerId,
         scopeId = pull.scopeId,
         gossipValid = makeServedGossipValid(pull),
         onFinalSubmitted = function(success)
+            if GG._engine.inPull ~= pull then
+                return
+            end
+            if replay then
+                if success then
+                    -- Keep timeout armed without extending usableProgressAt.
+                    pull.finalSubmitted = true
+                    pull.offerRetryPending = nil
+                    pull.awaitingSince = GG._Now()
+                end
+                -- Replay failure must not clear finalSubmitted or close the pull.
+                return
+            end
             noteInPullSubmission(pull, success, { renewLease = true, closeOnFail = true })
+            if success and GG._engine.inPull == pull then
+                pull.offerProgressArmed = true
+            end
         end,
     })
     if ok then
@@ -828,7 +847,14 @@ local function trySendServedOffer(pull)
     if err == "stream_busy" then
         -- Preserve the correlated served view and retry when the stream drains.
         pull.offerRetryPending = true
-        pull.finalSubmitted = false
+        if not replay then
+            pull.finalSubmitted = false
+        end
+        GG.MarkWorkPending()
+        return false
+    end
+    if replay then
+        -- Admission failure on a replay must not disable the idle timeout.
         GG.MarkWorkPending()
         return false
     end
@@ -1455,6 +1481,13 @@ local function handleManifest(sender, payload, stepLimits)
             e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + examined
         end
         e.stepMetaRemaining = math.max(0, (tonumber(e.stepMetaRemaining) or examineBudget) - examined)
+        local done = seekMeta and seekMeta.done == true
+        local scanAfter = seekMeta and seekMeta.lastExaminedSeq or nil
+        -- Terminal pages must carry a continuation marker that reaches the
+        -- captured end so filtered tails still prove exhaustion of the offer.
+        if done and endSeq > afterSeq and (not scanAfter or scanAfter < endSeq) then
+            scanAfter = endSeq
+        end
         local response = {
             op = "page",
             viewId = pull.viewId,
@@ -1467,8 +1500,8 @@ local function handleManifest(sender, payload, stepLimits)
             endSeq = endSeq,
             entries = entries,
             -- Scan continuation for empty/filtered budget slices.
-            scanAfter = seekMeta and seekMeta.lastExaminedSeq or nil,
-            done = seekMeta and seekMeta.done == true,
+            scanAfter = scanAfter,
+            done = done,
             engineGen = e.generation,
         }
         -- A manifest must also be sendable as one bounded gossip envelope.
@@ -1517,26 +1550,47 @@ local function handleManifest(sender, payload, stepLimits)
             closeOutPull("provider_limit")
             return
         end
-        -- Nonterminal pages must prove monotonic bounded progress before any
-        -- request/lease mutation. Empty filtered pages may advance via scanAfter.
+        -- Bind progress to the offered view's fixed end marker. Validate
+        -- descriptor sequences and terminal exhaustion before any mutation.
         local entries = type(payload.entries) == "table" and payload.entries or {}
         local entryCount = #entries
         local pullAfter = tonumber(pull.afterSeq) or 0
-        local endSeq = tonumber(payload.endSeq)
-        if endSeq == nil then
-            endSeq = tonumber(pull.remoteEndSeq) or 0
-        end
+        local endSeq = tonumber(pull.remoteEndSeq) or 0
         local scanAfter = tonumber(payload.scanAfter)
         local terminal = payload.done == true
-        local hasEntries = entryCount > 0
-        local scanProgress = scanAfter ~= nil and scanAfter > pullAfter
         if scanAfter ~= nil then
-            if scanAfter < pullAfter or (endSeq > 0 and scanAfter > endSeq) then
+            if scanAfter < pullAfter or scanAfter > endSeq then
                 -- Backward or out-of-range scan: drop without renewing the lease.
                 return
             end
         end
-        if not terminal and not hasEntries and not scanProgress then
+        local prevSeq = pullAfter
+        local lastEntrySeq = nil
+        for i = 1, entryCount do
+            local raw = entries[i] and entries[i].seq
+            local seq = tonumber(raw)
+            if seq == nil or seq ~= seq or seq == math.huge or seq == -math.huge
+                or seq ~= math.floor(seq) then
+                return
+            end
+            if seq <= prevSeq or seq > endSeq then
+                -- Missing/duplicate/backward/out-of-range: ignore before mutation.
+                return
+            end
+            prevSeq = seq
+            lastEntrySeq = seq
+        end
+        local hasEntries = entryCount > 0
+        local scanProgress = scanAfter ~= nil and scanAfter > pullAfter
+        local reachedEnd = pullAfter >= endSeq
+            or (lastEntrySeq ~= nil and lastEntrySeq >= endSeq)
+            or (scanAfter ~= nil and scanAfter >= endSeq)
+        if terminal then
+            if not reachedEnd then
+                -- Premature done must not advance coverage or renew the lease.
+                return
+            end
+        elseif not hasEntries and not scanProgress then
             -- Unchanged/absent progress on a nonterminal page: ignore.
             return
         end
@@ -2270,14 +2324,23 @@ local function advanceOutPull(limits, now)
     if pull.phase == "need_bodies" then
         if not pull.neededBodies or #pull.neededBodies == 0 then
             -- Advance enumeration cursor for this manifest page. Empty filtered
-            -- slices use scanAfter so the requester does not retry the same range.
+            -- slices use scanAfter; terminal pages may also raise scanAfter past
+            -- the last exportable entry to the fixed end marker.
             local page = pull.manifest
+            local after = tonumber(pull.afterSeq) or 0
             if page and page.entries and #page.entries > 0 then
-                pull.afterSeq = page.entries[#page.entries].seq or pull.afterSeq
-            elseif page and page.scanAfter
-                and (tonumber(page.scanAfter) or 0) > (tonumber(pull.afterSeq) or 0) then
-                pull.afterSeq = tonumber(page.scanAfter)
+                local seq = tonumber(page.entries[#page.entries].seq)
+                if seq and seq > after then
+                    after = seq
+                end
             end
+            if page and page.scanAfter then
+                local scan = tonumber(page.scanAfter) or 0
+                if scan > after then
+                    after = scan
+                end
+            end
+            pull.afterSeq = after
             setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
                 epoch = pull.remoteView and pull.remoteView.epoch,
                 scopeId = pull.scopeId,
@@ -2410,12 +2473,20 @@ local function advanceOutPull(limits, now)
         if pull.bodyOffset >= #(pull.neededBodies or {}) then
             -- Finished body subpages for this manifest.
             local page = pull.manifest
+            local after = tonumber(pull.afterSeq) or 0
             if page and page.entries and #page.entries > 0 then
-                pull.afterSeq = page.entries[#page.entries].seq or pull.afterSeq
-            elseif page and page.scanAfter
-                and (tonumber(page.scanAfter) or 0) > (tonumber(pull.afterSeq) or 0) then
-                pull.afterSeq = tonumber(page.scanAfter)
+                local seq = tonumber(page.entries[#page.entries].seq)
+                if seq and seq > after then
+                    after = seq
+                end
             end
+            if page and page.scanAfter then
+                local scan = tonumber(page.scanAfter) or 0
+                if scan > after then
+                    after = scan
+                end
+            end
+            pull.afterSeq = after
             setBookmark(entry, pull.peer, pull.scopeId, pull.activeBucket, {
                 epoch = pull.remoteView and pull.remoteView.epoch,
                 scopeId = pull.scopeId,

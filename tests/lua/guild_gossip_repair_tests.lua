@@ -3823,6 +3823,301 @@ do
     assertEq(entry.index.epoch, epoch2, "F70: ordinary append does not bump epoch")
 end
 
+---------------------------------------------------------------------------
+-- F71: MANIFEST entry seq + terminal exhaustion before lease/coverage mutation
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f71" })
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    entry.index.buildComplete = true
+    entry.index.dirty = false
+    local lease = world.time
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local function resetPull()
+        e.outPull = {
+            peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v71",
+            scopeId = scope, phase = "wait_manifest",
+            engineGen = e.generation, localEpoch = entry.index.epoch,
+            usableProgressAt = lease, afterSeq = 5, activeBucket = 0, remoteEndSeq = 20,
+            expectedRequestId = "req71", expectedSubpage = 1,
+            remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen, buckets = {} },
+        }
+        e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", covered = {} }
+    end
+    local function sendPage(page)
+        A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.MANIFEST, page),
+            "WHISPER", "Bob-Garona")
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    end
+    local base = {
+        op = "page", viewId = "v71", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "req71", subpage = 1,
+        bucketId = 0, afterSeq = 5, endSeq = 20, done = false,
+    }
+    resetPull()
+    -- Missing seq: nonempty entries must not count as progress.
+    sendPage({
+        op = base.op, viewId = base.viewId, providerId = base.providerId, scopeId = base.scopeId,
+        requestId = base.requestId, subpage = base.subpage, bucketId = base.bucketId,
+        afterSeq = base.afterSeq, endSeq = base.endSeq, done = false,
+        entries = { { id = "x", versionFp = "v" } },
+    })
+    assertTrue(e.outPull ~= nil and e.outPull.phase == "wait_manifest",
+        "F71: missing seq rejected before mutation")
+    assertEq(e.outPull.usableProgressAt, lease, "F71: missing seq does not renew lease")
+    -- Duplicate / non-increasing seq.
+    sendPage({
+        op = base.op, viewId = base.viewId, providerId = base.providerId, scopeId = base.scopeId,
+        requestId = base.requestId, subpage = base.subpage, bucketId = base.bucketId,
+        afterSeq = base.afterSeq, endSeq = base.endSeq, done = false,
+        entries = {
+            { seq = 8, id = "a", versionFp = "v" },
+            { seq = 8, id = "b", versionFp = "v" },
+        },
+    })
+    assertEq(e.outPull.usableProgressAt, lease, "F71: duplicate seq does not renew lease")
+    assertTrue(e.outPull.phase == "wait_manifest", "F71: duplicate seq keeps wait_manifest")
+    -- Backward seq relative to cursor.
+    sendPage({
+        op = base.op, viewId = base.viewId, providerId = base.providerId, scopeId = base.scopeId,
+        requestId = base.requestId, subpage = base.subpage, bucketId = base.bucketId,
+        afterSeq = base.afterSeq, endSeq = base.endSeq, done = false,
+        entries = { { seq = 3, id = "a", versionFp = "v" } },
+    })
+    assertEq(e.outPull.usableProgressAt, lease, "F71: backward seq does not renew lease")
+    -- Out-of-range seq past captured end.
+    sendPage({
+        op = base.op, viewId = base.viewId, providerId = base.providerId, scopeId = base.scopeId,
+        requestId = base.requestId, subpage = base.subpage, bucketId = base.bucketId,
+        afterSeq = base.afterSeq, endSeq = 999, done = false,
+        entries = { { seq = 25, id = "a", versionFp = "v" } },
+    })
+    assertEq(e.outPull.usableProgressAt, lease, "F71: out-of-range seq does not renew lease")
+    -- Premature terminal page before fixed end.
+    sendPage({
+        op = base.op, viewId = base.viewId, providerId = base.providerId, scopeId = base.scopeId,
+        requestId = base.requestId, subpage = base.subpage, bucketId = base.bucketId,
+        afterSeq = base.afterSeq, endSeq = base.endSeq, done = true,
+        entries = {},
+    })
+    assertEq(e.outPull.usableProgressAt, lease, "F71: premature done does not renew lease")
+    assertTrue(e.outPull.phase == "wait_manifest", "F71: premature done ignored")
+    -- Valid filtered empty terminal that proves exhaustion via scanAfter.
+    world.time = lease + 1
+    sendPage({
+        op = base.op, viewId = base.viewId, providerId = base.providerId, scopeId = base.scopeId,
+        requestId = base.requestId, subpage = base.subpage, bucketId = base.bucketId,
+        afterSeq = base.afterSeq, endSeq = base.endSeq, done = true,
+        entries = {}, scanAfter = 20,
+    })
+    assertTrue(e.outPull ~= nil and e.outPull.phase ~= "wait_manifest",
+        "F71: filtered terminal completion accepted")
+    assertTrue(e.outPull.usableProgressAt > lease, "F71: valid terminal renews lease")
+    assertTrue((tonumber(e.outPull.afterSeq) or 0) >= 20,
+        "F71: terminal scanAfter advances to fixed end")
+    -- Already-at-end request: pullAfter == remoteEndSeq, empty done.
+    lease = world.time
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v71b",
+        scopeId = scope, phase = "wait_manifest",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = lease, afterSeq = 20, activeBucket = 0, remoteEndSeq = 20,
+        expectedRequestId = "req71b", expectedSubpage = 1,
+        remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen, buckets = {} },
+    }
+    world.time = lease + 1
+    sendPage({
+        op = "page", viewId = "v71b", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "req71b", subpage = 1,
+        bucketId = 0, afterSeq = 20, endSeq = 20, done = true, entries = {},
+    })
+    assertTrue(e.outPull ~= nil and e.outPull.phase ~= "wait_manifest",
+        "F71: already-at-end terminal page accepted")
+    assertTrue(e.outPull.usableProgressAt > lease, "F71: already-at-end renews lease")
+    -- Sender emits scanAfter=endSeq on filtered terminal serve path.
+    reset()
+    local B = makeClient("Bob")
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f71s" })
+    for i = 1, 4 do pB.AppendLocal("deny-" .. i, "deny-" .. i) end
+    for _ = 1, 6 do stepClient(B, B.GuildGossip.GetStepLimits("NORMAL")) end
+    local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
+    entryB.api.IsRecordExportable = function() return false end
+    local eB = B.GuildGossip._engine
+    local scopeB = B.GuildGossip.GetGuildScopeId()
+    local viewB = select(1, B.GuildGossip.CaptureViewSummaries(
+        entryB.index, entryB.eligibilityGen, scopeB, entryB.id, entryB.schema, nil, nil, nil))
+    local endMarker = 0
+    for bid = 0, 63 do
+        local b = viewB.buckets and viewB.buckets[bid]
+        if b and (b.lastSeq or 0) > endMarker then
+            endMarker = b.lastSeq
+        end
+    end
+    assertTrue(endMarker > 0, "F71: captured end marker present")
+    local bucketId = nil
+    for bid = 0, 63 do
+        local b = viewB.buckets and viewB.buckets[bid]
+        if b and (b.lastSeq or 0) == endMarker then
+            bucketId = bid
+            break
+        end
+    end
+    eB.inPull = {
+        peer = "Alice-Garona", providerId = "sf.synthetic.gossip", viewId = "v71s",
+        scopeId = scopeB, phase = "serving",
+        epoch = entryB.index.epoch, eligibilityGen = entryB.eligibilityGen,
+        buckets = viewB.buckets, usableProgressAt = world.time,
+        finalSubmitted = true, engineGen = eB.generation,
+    }
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v71s", providerId = "sf.synthetic.gossip",
+        scopeId = scopeB, requestId = "ms71", subpage = 1,
+        bucketId = bucketId, afterSeq = 0, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    local page = eB.inPull and eB.inPull.servedManifest and eB.inPull.servedManifest.response
+    assertTrue(page ~= nil, "F71: sender emitted MANIFEST page")
+    assertTrue(page.done == true, "F71: filtered bucket page is terminal")
+    assertEq(tonumber(page.scanAfter), endMarker,
+        "F71: sender terminal scanAfter bound to captured end")
+    assertEq(tonumber(page.endSeq), endMarker, "F71: sender endSeq bound to captured marker")
+end
+
+---------------------------------------------------------------------------
+-- F72: cached VIEW offer replay preserves lease; eventual release
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f72" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    assertTrue(entry.index.buildComplete, "F72: index ready")
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v72", providerId = "sf.synthetic.gossip",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    for _ = 1, 8 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        if e.inPull and e.inPull.offerProgressArmed then break end
+    end
+    assertTrue(e.inPull ~= nil and e.inPull.offerPayload ~= nil, "F72: offer captured")
+    assertTrue(e.inPull.offerProgressArmed == true, "F72: first successful offer arms progress")
+    assertTrue(e.inPull.finalSubmitted == true, "F72: first offer finalSubmitted")
+    local lease = e.inPull.usableProgressAt
+    assertTrue(e.inPull.offerProgressArmed == true, "F72: offer progress armed after first send")
+    -- Lost-offer recovery / repeated VIEW: replay without renewing lease.
+    world.time = lease + 10
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v72", providerId = "sf.synthetic.gossip",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull ~= nil, "F72: replay keeps served pull")
+    assertEq(e.inPull.usableProgressAt, lease, "F72: replay does not renew progress clock")
+    assertTrue(e.inPull.finalSubmitted == true, "F72: replay success keeps timeout armed")
+    -- Replay admission/final failure must not clear finalSubmitted.
+    local origSend = A.GuildGossip.SendGossip
+    A.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        opts = opts or {}
+        if msgType == A.GuildGossip.MSG.VIEW and type(payload) == "table" and payload.op == "offer"
+            and opts.onFinalSubmitted then
+            -- Admit ok but report final submission failure (lost last fragment).
+            local ok, err = origSend(msgType, payload, dist, target, {
+                providerId = opts.providerId,
+                scopeId = opts.scopeId,
+                gossipValid = opts.gossipValid,
+                onFinalSubmitted = function() end,
+            })
+            if ok then
+                opts.onFinalSubmitted(false, "simulated_fail")
+            end
+            return ok, err
+        end
+        return origSend(msgType, payload, dist, target, opts)
+    end
+    world.time = lease + 20
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v72", providerId = "sf.synthetic.gossip",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    A.GuildGossip.SendGossip = origSend
+    assertTrue(e.inPull ~= nil, "F72: replay failure retains serving slot")
+    assertTrue(e.inPull.finalSubmitted == true, "F72: replay failure does not disarm timeout")
+    assertEq(e.inPull.usableProgressAt, lease, "F72: replay failure preserves original lease")
+    -- Eventual idle release frees the sole served slot.
+    world.time = lease + A.GuildGossip.SERVED_VIEW_IDLE_TIMEOUT_SEC + 5
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull == nil, "F72: served pull eventually releases after idle timeout")
+end
+
+---------------------------------------------------------------------------
+-- F73: replacement FIRST resets multipart accounting (AceComm overwrite)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local GG = A.GuildGossip
+    local ace = activeAceComm
+    GG.InstallReceiveGuard(ace)
+    local key = "SF_GG\tWHISPER\tBob-Garona"
+    local near = GG.MAX_PARTIAL_BYTES_EACH - 50
+    local abandoned = string.rep("A", near)
+    ace:OnReceiveMultipartFirst("SF_GG", abandoned, "WHISPER", "Bob-Garona")
+    -- Push fragment count near the cap without completing LAST.
+    for i = 1, 28 do
+        ace:OnReceiveMultipartNext("SF_GG", "n", "WHISPER", "Bob-Garona")
+    end
+    local before = GG.GetReceiveGuardStats()
+    assertTrue(before.partialBytes >= near, "F73: abandoned stream near byte cap")
+    assertTrue((before.partialCount or 0) >= 1, "F73: abandoned partial accounted")
+    -- AceComm FIRST replaces the physical spool; guard must release old bytes.
+    local replacement = string.rep("B", 100)
+    ace:OnReceiveMultipartFirst("SF_GG", replacement, "WHISPER", "Bob-Garona")
+    local mid = GG.GetReceiveGuardStats()
+    assertEq(mid.partialCount, 1, "F73: replacement keeps one partial")
+    assertEq(mid.partialBytes, #replacement,
+        "F73: replacement accounting matches new FIRST only")
+    assertTrue(type(ace.multipart_spool[key]) == "string"
+        and ace.multipart_spool[key] == replacement,
+        "F73: physical spool is the replacement FIRST")
+    -- Complete a valid replacement message under caps.
+    ace:OnReceiveMultipartNext("SF_GG", "more", "WHISPER", "Bob-Garona")
+    local delivered = 0
+    local origCallbacks = ace.callbacks_by_prefix["SF_GG"] or {}
+    ace.callbacks_by_prefix["SF_GG"] = {
+        {
+            owner = {},
+            fn = function(_, prefix, full, distribution, sender)
+                delivered = delivered + 1
+                assertEq(prefix, "SF_GG", "F73: delivered prefix")
+                assertEq(full, replacement .. "more" .. "LAST", "F73: replacement body assembled")
+                assertEq(sender, "Bob-Garona", "F73: replacement sender")
+            end,
+        },
+    }
+    ace:OnReceiveMultipartLast("SF_GG", "LAST", "WHISPER", "Bob-Garona")
+    ace.callbacks_by_prefix["SF_GG"] = origCallbacks
+    assertEq(delivered, 1, "F73: replacement stream delivered successfully")
+    local after = GG.GetReceiveGuardStats()
+    assertEq(after.partialCount, 0, "F73: accounting cleared after LAST")
+    assertEq(after.partialBytes, 0, "F73: accounted bytes cleared after LAST")
+    assertEq(ace.multipart_spool[key], nil, "F73: physical spool cleared after LAST")
+    -- Other prefixes still pass through without SF_GG accounting.
+    local otherBefore = GG.GetReceiveGuardStats().partialBytes
+    ace:OnReceiveMultipartFirst("OTHER", string.rep("z", 200), "WHISPER", "Carol-Garona")
+    assertEq(GG.GetReceiveGuardStats().partialBytes, otherBefore,
+        "F73: OTHER prefix does not affect SF_GG accounting")
+    assertEq(GG.GetReceiveGuardStats().partialCount, 0,
+        "F73: OTHER prefix does not create SF_GG partials")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")
