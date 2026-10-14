@@ -71,7 +71,7 @@ Callback work for `ListRecordIds` / `EnsureIndex` / `GetRecordVersionFp` must st
  complementary helpers:
 
 - `SF.GuildGossip:Unregister(id)` / `:EnableProvider` / `:DisableProvider`
-- `SF.GuildGossip.NotifyProviderChanged(id)` dirties the provider index for a bounded rebuild and reopens affected discovery coverage
+- `SF.GuildGossip.NotifyProviderChanged(id)` — **required** explicit notification when provider-owned durable storage changes outside the engine append path. Dirties the provider index for a bounded rebuild and reopens affected discovery coverage. There is no `NotifyChange(cb)` subscription API in Phase 1.
 - `SF.GuildGossip:EnableSynthetic(opts)` / `:DisableSynthetic(id)` — **explicit** test activation; disabled by default; runtime-only store
 - `SF.GuildGossip:GetStats()` — runtime diagnostics
 
@@ -126,7 +126,7 @@ Locked architecture is unchanged: C1/D1, uncompressed `B64CBOR`, raid independen
 10. **Byte-aware pages** — Servers pack BODY/MANIFEST pages to the encoded cap; an unsendable manifest descriptor returns a correlated `limit` outcome without advancing coverage.
 11. **Provider scopes / export context** — Both directions use `GetScopeId()`; optional `IsRecordExportable(peer, id, ctx)` filters summary/manifest/body without per-peer history copies.
 12. **Foreground protection** — BACKGROUND admission leaves reserved FOREGROUND capacity; FOREGROUND may evict BACKGROUND at both global and per-target caps.
-13. **Fair discovery** — Rotated announcements preserve coverage for omitted providers; only a changed per-provider `changeGen`/fingerprint reopens reconciliation.
+13. **Fair discovery** — Rotated announcements preserve coverage for omitted providers; a changed per-provider announcement fingerprint (`changeGen`, eligibility, and per-load source incarnation) reopens reconciliation.
 14. **Transport outcomes** — Queue admission, cancellation/eviction, failed submission, and successful final-fragment submission are distinct; failed/cancelled work cannot strand a pull; retries wait the real 5/15s backoff and replay the outstanding request; identical VIEW requests replay the cached offer.
 
 ## C1 paging (brief)

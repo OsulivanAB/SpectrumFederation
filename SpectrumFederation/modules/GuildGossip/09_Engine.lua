@@ -24,6 +24,9 @@ GG._engine = GG._engine or {
     requestSeq = 0,
     lastNackAt = {},
     peerCooldownUntil = {},
+    -- Serve-side rejection after export-filter failure (not shared with the
+    -- short initiate backoff applied when a peer replies busy).
+    peerServeCooldownUntil = {},
     unresolved = {}, -- bounded unresolved bookkeeping
     -- [peer|provider|scope] = until: suspend exchanges after pending/rejected
     unresolvedBackoffUntil = {},
@@ -55,12 +58,14 @@ end
 -- Peer working set
 ---------------------------------------------------------------------------
 
-local function providerAnnouncementFingerprint(cap)
+local function providerAnnouncementFingerprint(cap, packetSrc)
     if type(cap) ~= "table" then
         return ""
     end
     -- revision (provider-owned) and changeGen (engine-owned) are independent
-    -- identity fields; neither may suppress the other.
+    -- identity fields; neither may suppress the other. Per-load source
+    -- incarnation (discovery packet `src`) prevents counter collisions after
+    -- /reload from preserving stale coverage.
     return table.concat({
         tostring(cap.id or ""),
         tostring(cap.schema or ""),
@@ -68,6 +73,7 @@ local function providerAnnouncementFingerprint(cap)
         tostring(cap.changeGen or ""),
         tostring(cap.dataFingerprint or cap.fingerprint or ""),
         tostring(cap.eligibilityGen or ""),
+        tostring(packetSrc or cap.s or cap.src or ""),
     }, "\0")
 end
 
@@ -132,6 +138,9 @@ local function clearPeerOwnedRuntime(peerName)
     clearUnresolvedForScope(peerName, nil, nil)
     if e.peerCooldownUntil then
         e.peerCooldownUntil[normalized] = nil
+    end
+    if e.peerServeCooldownUntil then
+        e.peerServeCooldownUntil[normalized] = nil
     end
     if e.unresolvedBackoffUntil then
         local prefix = normalized .. "|"
@@ -211,11 +220,12 @@ local function touchPeer(name, info)
         -- nothing about providers absent from this packet. Retain fingerprints
         -- only for locally registered providers so cumulative bogus IDs cannot
         -- grow the map without bound.
+        local packetSrc = info.caps.s or info.caps.src
         for _, cap in ipairs(info.caps.providers or {}) do
             if type(cap) == "table" and cap.id then
                 local id = tostring(cap.id)
                 if GG.GetProvider(id) then
-                    local fingerprint = providerAnnouncementFingerprint(cap)
+                    local fingerprint = providerAnnouncementFingerprint(cap, packetSrc)
                     if peer.capFingerprints[id] and peer.capFingerprints[id] ~= fingerprint then
                         peer.covered[id] = nil
                         -- Remote revision/eligibility change clears scoped VIEW
@@ -539,16 +549,37 @@ local function unresolvedBackoffKey(peerName, providerId, scopeId)
     return peerKey(peerName) .. "|" .. tostring(providerId or "") .. "\0" .. tostring(scopeId or "")
 end
 
+-- Shared peer activity is derived from remaining pulls (normalized identity),
+-- not a sticky boolean cleared by the first direction to close.
+local function refreshPeerActiveExchange(peerName)
+    local e = GG._engine
+    if not peerName then
+        return
+    end
+    local key = peerKey(peerName)
+    local peer = e.peers[key]
+    if not peer then
+        return
+    end
+    local active = false
+    if e.outPull and e.outPull.peer and peerKey(e.outPull.peer) == key then
+        active = true
+    end
+    if e.inPull and e.inPull.peer and peerKey(e.inPull.peer) == key then
+        active = true
+    end
+    peer.activeExchange = active and true or nil
+end
+
 local function closeOutPull(reason)
     local e = GG._engine
     local pull = e.outPull
     if not pull then
         return
     end
-    if pull.peer and e.peers[peerKey(pull.peer)] then
-        e.peers[peerKey(pull.peer)].activeExchange = nil
-    end
+    local closedPeer = pull.peer
     e.outPull = nil
+    refreshPeerActiveExchange(closedPeer)
     GG._DVerbose("Out pull closed (%s)", tostring(reason))
     if reason == "exhausted" and pull.peer then
         e.peerCooldownUntil[peerKey(pull.peer)] = GG._Now() + GG.POST_EXHAUSTION_COOLDOWN_SEC
@@ -567,10 +598,9 @@ local function closeInPull(reason)
     if not pull then
         return
     end
-    if pull.peer and e.peers[peerKey(pull.peer)] then
-        e.peers[peerKey(pull.peer)].activeExchange = nil
-    end
+    local closedPeer = pull.peer
     e.inPull = nil
+    refreshPeerActiveExchange(closedPeer)
     GG._DVerbose("In pull closed (%s)", tostring(reason))
 end
 
@@ -642,6 +672,9 @@ providerEligible = function(entry, peerName, scopeId)
         and GG.ProviderIsPeerEligible(entry, peerName, { scopeId = scopeId })
 end
 
+-- true = exportable, false = ordinary denial, nil = unexpected callback error
+-- (already reported via _DError / geterrorhandler). Callers must abort the
+-- attempt on nil rather than treating it as a successful filter deny.
 local function recordExportable(entry, peerName, scopeId, recordId, indexEntry)
     if not providerEligible(entry, peerName, scopeId) then
         return false
@@ -655,9 +688,32 @@ local function recordExportable(entry, peerName, scopeId, recordId, indexEntry)
             indexEntry = indexEntry,
         }
         local ok, allowed = pcall(api.IsRecordExportable, peerName, recordId, ctx)
-        return ok and allowed == true
+        if not ok then
+            GG._DError("IsRecordExportable failed provider=%s id=%s err=%s",
+                entry.id, tostring(recordId), tostring(allowed))
+            if geterrorhandler then
+                pcall(geterrorhandler(), allowed)
+            end
+            return nil
+        end
+        return allowed == true
     end
     return true
+end
+
+local function coolDownPeer(peerName)
+    local e = GG._engine
+    if not peerName then
+        return
+    end
+    local key = peerKey(peerName)
+    local untilTime = GG._Now() + GG.POST_EXHAUSTION_COOLDOWN_SEC
+    -- Initiate backoff (selectPullPeer / startOutPull) and serve rejection
+    -- share the long export-filter cooldown, but busy-ACK initiate backoff
+    -- must not block reverse-direction serving.
+    e.peerCooldownUntil[key] = untilTime
+    e.peerServeCooldownUntil = e.peerServeCooldownUntil or {}
+    e.peerServeCooldownUntil[key] = untilTime
 end
 
 local function indexReadyForView(entry)
@@ -914,6 +970,7 @@ local function clearEngineOwnedRuntimeState()
     e.peerOrder = {}
     e.unresolved = {}
     e.peerCooldownUntil = {}
+    e.peerServeCooldownUntil = {}
     e.lastNackAt = {}
     e.unresolvedBackoffUntil = {}
     e.pendingOutCapture = nil
@@ -1085,6 +1142,9 @@ local function startOutPull(peer, providerEntry)
     end
     e.pendingOutCapture = nil
     if not view then
+        -- Export-filter failure (or other capture abort): cool down instead of
+        -- hot-looping incomplete summaries into a false covered state.
+        coolDownPeer(peer.name)
         return false
     end
     local payload = {
@@ -1355,6 +1415,20 @@ local function handleView(sender, payload)
             }, "WHISPER", sender, { ignoreStreamBusy = true })
             return
         end
+        -- Export-filter (and similar) serve cooldown: reject without starting a
+        -- new capture. Do not use peerCooldownUntil here — the short busy-ACK
+        -- initiate backoff lives on that map and must not deadlock the reverse
+        -- pull direction.
+        local serveCoolUntil = e.peerServeCooldownUntil
+            and e.peerServeCooldownUntil[peerKey(sender)]
+        if serveCoolUntil and GG._Now() < serveCoolUntil then
+            GG.SendGossip(GG.MSG.ACK, {
+                viewId = payload.viewId,
+                busy = true,
+                providerId = payload.providerId,
+            }, "WHISPER", sender, { ignoreStreamBusy = true })
+            return
+        end
         -- Never serve a cold/dirty partial index as a permanently coverable view.
         if not indexReadyForView(providerEntry) then
             GG.SendGossip(GG.MSG.ACK, {
@@ -1476,6 +1550,11 @@ local function handleManifest(sender, payload, stepLimits)
             end,
             examineBudget
         )
+        if seekMeta and seekMeta.error then
+            coolDownPeer(sender)
+            closeInPull("export_filter_failed")
+            return
+        end
         local examined = math.max(0, tonumber(seekMeta and seekMeta.examined) or 0)
         if e.stepStats then
             e.stepStats.indexExamined = (e.stepStats.indexExamined or 0) + examined
@@ -1695,7 +1774,14 @@ local function handleBody(sender, payload, stepLimits)
                 eligibilityGen = entry.eligibilityGen,
             }
             local ok, body = false, nil
-            if recordExportable(entry, sender, pull.scopeId, rid, GG.IndexGetEntry(entry.index, rid)) then
+            local exportOk = recordExportable(
+                entry, sender, pull.scopeId, rid, GG.IndexGetEntry(entry.index, rid))
+            if exportOk == nil then
+                coolDownPeer(sender)
+                closeInPull("export_filter_failed")
+                return
+            end
+            if exportOk then
                 ok, body = pcall(entry.api.GetRecordBody, rid, exportCtx)
                 lookups = lookups + 1
             end
@@ -2292,7 +2378,11 @@ local function advanceOutPull(limits, now)
                 for _, peer in pairs(e.peers) do
                     peer.covered = {}
                 end
-                GG.NotifyMeaningfulChange()
+                -- Consume the pending follow-up via ordinary work scheduling.
+                -- Do not call NotifyMeaningfulChange here: an independent inPull
+                -- would re-set dirtyFollowUp and wipe coverage again every time
+                -- an outgoing pull completes.
+                GG.MarkWorkPending()
             end
             return true
         end
@@ -2573,7 +2663,9 @@ local function advanceInPull(now)
             return true
         end
         if not view then
-            closeInPull("capture_failed")
+            -- Incomplete/failed filtered capture must not publish a successful view.
+            coolDownPeer(pull.peer)
+            closeInPull("export_filter_failed")
             return true
         end
         local reply = {

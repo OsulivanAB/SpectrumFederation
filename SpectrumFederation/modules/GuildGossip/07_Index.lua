@@ -317,10 +317,22 @@ function GG.CaptureViewSummaries(index, eligibilityGen, scopeId, providerId, sch
             state.examinedTotal = (state.examinedTotal or 0) + 1
             if type(seq) == "number" and seq > 0 and seq <= endSeq then
                 local entry = bucket.bySeq[seq]
-                if entry and exportable(entry.id, entry) then
-                    summary.lastSeq = math.max(summary.lastSeq, entry.seq or 0)
-                    summary.count = summary.count + 1
-                    summary.fingerprint = GG.CombineFingerprint(summary.fingerprint, entry.id, entry.versionFp)
+                if entry then
+                    local allowed = true
+                    if exportable then
+                        allowed = exportable(entry.id, entry)
+                        -- nil means unexpected filter failure: abort without a
+                        -- successful incomplete view the peer could cover.
+                        if allowed == nil then
+                            return nil, nil, examined
+                        end
+                    end
+                    if allowed then
+                        summary.lastSeq = math.max(summary.lastSeq, entry.seq or 0)
+                        summary.count = summary.count + 1
+                        summary.fingerprint = GG.CombineFingerprint(
+                            summary.fingerprint, entry.id, entry.versionFp)
+                    end
                 end
             elseif type(seq) == "number" and seq > endSeq then
                 -- Fixed end marker reached for this bucket.
@@ -391,15 +403,29 @@ function GG.IndexSeekManifest(index, bucketId, afterSeq, endSeq, limit, exportab
         if seq > afterSeq and seq <= endSeq then
             lastExaminedSeq = seq
             local entry = bucket.bySeq[seq]
-            if entry and (not exportable or exportable(entry.id, entry)) then
-                out[#out + 1] = {
-                    seq = entry.seq,
-                    id = entry.id,
-                    versionFp = entry.versionFp,
-                }
-                if #out >= limit then
-                    done = false
-                    break
+            if entry then
+                local allowed = true
+                if exportable then
+                    allowed = exportable(entry.id, entry)
+                    if allowed == nil then
+                        return out, {
+                            examined = examined,
+                            done = false,
+                            lastExaminedSeq = lastExaminedSeq,
+                            error = "export_filter",
+                        }
+                    end
+                end
+                if allowed then
+                    out[#out + 1] = {
+                        seq = entry.seq,
+                        id = entry.id,
+                        versionFp = entry.versionFp,
+                    }
+                    if #out >= limit then
+                        done = false
+                        break
+                    end
                 end
             end
         elseif seq > endSeq then

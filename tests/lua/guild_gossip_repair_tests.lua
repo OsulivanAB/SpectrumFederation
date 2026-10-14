@@ -150,6 +150,13 @@ C_EncodingUtil = {
 }
 C_ChatInfo = { RegisterAddonMessagePrefix = function() return true end }
 DEFAULT_CHAT_FRAME = { AddMessage = function() end }
+world.errors = {}
+function geterrorhandler()
+    return function(err)
+        world.errors[#world.errors + 1] = err
+    end
+end
+_G.geterrorhandler = geterrorhandler
 
 local function makeAceComm()
     local AceComm = { embeds = {}, multipart_spool = {}, callbacks_by_prefix = {} }
@@ -301,6 +308,7 @@ end
 local function reset()
     world.time = 1000; world.fps = 60; world.combat = false; world.loading = false
     world.wire = {}; world.clients = {}; world.decodeCount = 0; world.listCalls = {}
+    world.errors = {}
     world._sendAs = nil
     timers = {}
     namedFrames = {}
@@ -4116,6 +4124,390 @@ do
         "F73: OTHER prefix does not affect SF_GG accounting")
     assertEq(GG.GetReceiveGuardStats().partialCount, 0,
         "F73: OTHER prefix does not create SF_GG partials")
+end
+
+---------------------------------------------------------------------------
+-- F74: IsRecordExportable exceptions abort capture (no false coverage)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local ids = { "ok-1", "boom-1", "ok-2" }
+    local bodies = {
+        ["ok-1"] = { id = "ok-1", versionFp = "v", body = 1 },
+        ["boom-1"] = { id = "boom-1", versionFp = "v", body = 1 },
+        ["ok-2"] = { id = "ok-2", versionFp = "v", body = 1 },
+    }
+    local throwFilter = true
+    A.GuildGossip.RegisterProvider({
+        id = "filt74", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            cursor = tonumber(cursor) or 1
+            limit = math.max(1, tonumber(limit) or 8)
+            local page = {}
+            local i = cursor
+            while i <= #ids and #page < limit do
+                page[#page + 1] = ids[i]
+                i = i + 1
+            end
+            if i <= #ids then return page, i end
+            return page, nil
+        end,
+        GetRecordVersionFp = function(id) return bodies[id] and bodies[id].versionFp end,
+        GetRecordBody = function(id) return bodies[id] end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        IsRecordExportable = function(peer, id)
+            if throwFilter and id == "boom-1" then
+                error("filter-boom")
+            end
+            return true
+        end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    for _ = 1, 8 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local entry = A.GuildGossip.GetProvider("filt74")
+    assertTrue(entry.index.buildComplete, "F74: index ready")
+    local e = A.GuildGossip._engine
+    local scope = A.GuildGossip.GetGuildScopeId()
+    world.errors = {}
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v74", providerId = "filt74",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    -- Recv is queued; the first scheduler step admits + captures (and should abort).
+    local sawInPull = false
+    for _ = 1, 12 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        if e.inPull then
+            sawInPull = true
+        elseif sawInPull or #world.errors > 0 or e.peerCooldownUntil["bob-garona"] then
+            break
+        end
+    end
+    assertTrue(e.inPull == nil, "F74: failed export filter aborts served pull")
+    assertTrue(#world.errors >= 1,
+        "F74: unexpected filter error reaches geterrorhandler (n=" .. tostring(#world.errors) .. ")")
+    local cool = e.peerCooldownUntil["bob-garona"]
+    assertTrue(cool ~= nil and cool > world.time,
+        "F74: persistent failure applies peer cooldown (cool=" .. tostring(cool) .. ")")
+    -- During cooldown, new VIEW is busy (no uncontrolled re-capture loop).
+    local busy = 0
+    local origSend = A.GuildGossip.SendGossip
+    A.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        if msgType == A.GuildGossip.MSG.ACK and type(payload) == "table" and payload.busy then
+            busy = busy + 1
+        end
+        return origSend(msgType, payload, dist, target, opts)
+    end
+    local captures = 0
+    for i = 1, 5 do
+        local beforePull = e.inPull
+        A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+            op = "request", viewId = "v74r" .. i, providerId = "filt74",
+            scopeId = scope, schema = 1, mode = "NORMAL",
+        }), "WHISPER", "Bob-Garona")
+        if e.inPull and e.inPull ~= beforePull then
+            captures = captures + 1
+        end
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        assertTrue(e.inPull == nil, "F74: cooldown prevents new served capture")
+    end
+    A.GuildGossip.SendGossip = origSend
+    assertEq(captures, 0, "F74: cooldown admits no new capture attempts")
+    assertTrue(busy >= 1, "F74: cooldown replies busy rather than hot-looping capture")
+    -- Transient recovery after cooldown: filter stops throwing; offer succeeds.
+    throwFilter = false
+    world.time = (cool or world.time) + 1
+    world.errors = {}
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v74ok", providerId = "filt74",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    for _ = 1, 10 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        if e.inPull and e.inPull.offerPayload then break end
+    end
+    assertTrue(e.inPull and e.inPull.offerPayload ~= nil, "F74: recovered filter produces offer")
+    assertTrue(e.inPull.phase == "serving", "F74: recovered capture reaches serving")
+    assertEq(#world.errors, 0, "F74: recovery path has no filter errors")
+end
+
+---------------------------------------------------------------------------
+-- F75: consuming dirtyFollowUp must not re-dirty via active inPull
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f75" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    -- Independent served pull remains open while outgoing completes.
+    e.inPull = {
+        peer = "Carol-Garona", providerId = "sf.synthetic.gossip", viewId = "vin75",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = {}, usableProgressAt = world.time,
+        finalSubmitted = true, engineGen = e.generation,
+        offerProgressArmed = true,
+    }
+    e.peers["carol-garona"] = {
+        name = "Carol-Garona", key = "carol-garona", activeExchange = true, covered = {},
+    }
+    e.peers["bob-garona"] = {
+        name = "Bob-Garona", key = "bob-garona", activeExchange = true, covered = {
+            ["sf.synthetic.gossip"] = true,
+        },
+        capFingerprints = { ["sf.synthetic.gossip"] = "fp75" },
+    }
+    e.peerOrder = { "bob-garona", "carol-garona" }
+    A.GuildGossip._sched.dirtyFollowUp = true
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout75",
+        scopeId = scope, phase = "compare",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time, finalSubmitted = true,
+        bucketCursor = A.GuildGossip.BUCKET_COUNT,
+        remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen, buckets = {} },
+        remoteAnnouncementFp = "fp75",
+        localBuckets = {},
+    }
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(not A.GuildGossip.HasDirtyFollowUp(),
+        "F75: follow-up consumed without regenerating dirtyFollowUp")
+    assertTrue(e.inPull ~= nil and e.inPull.peer == "Carol-Garona",
+        "F75: independent served pull retained")
+    -- Coverage was cleared once for the follow-up; completing again must not
+    -- keep re-arming dirtyFollowUp while inPull stays open.
+    e.peers["bob-garona"].covered["sf.synthetic.gossip"] = true
+    e.peers["bob-garona"].capFingerprints["sf.synthetic.gossip"] = "fp75"
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "vout75b",
+        scopeId = scope, phase = "compare",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = world.time, finalSubmitted = true,
+        bucketCursor = A.GuildGossip.BUCKET_COUNT,
+        remoteView = { epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen, buckets = {} },
+        remoteAnnouncementFp = "fp75",
+        localBuckets = {},
+    }
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(not A.GuildGossip.HasDirtyFollowUp(),
+        "F75: second completion does not regenerate follow-up from inPull")
+    assertTrue(e.peers["bob-garona"].covered["sf.synthetic.gossip"] == true,
+        "F75: clean completion can retain coverage while serving another peer")
+end
+
+---------------------------------------------------------------------------
+-- F76: NotifyChange(cb) is not advertised; NotifyProviderChanged is the path
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local src = io.open("SpectrumFederation/modules/GuildGossip/08_Providers.lua", "r")
+    assertTrue(src ~= nil, "F76: provider module readable")
+    local text = src:read("*a")
+    src:close()
+    assertTrue(not text:find("NotifyChange%(cb%)", 1, false),
+        "F76: contract no longer advertises NotifyChange(cb)")
+    assertTrue(text:find("NotifyProviderChanged", 1, true),
+        "F76: contract documents NotifyProviderChanged")
+    assertTrue(type(A.GuildGossip.NotifyProviderChanged) == "function",
+        "F76: NotifyProviderChanged helper exists")
+    assertTrue(A.GuildGossip.NotifyChange == nil,
+        "F76: no NotifyChange subscription API on engine")
+end
+
+---------------------------------------------------------------------------
+-- F77: activeExchange derived from remaining in/out pulls
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f77" })
+    local e = A.GuildGossip._engine
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local function armBoth(outPeer, inPeer)
+        e.peers["bob-garona"] = e.peers["bob-garona"]
+            or { name = "Bob-Garona", key = "bob-garona" }
+        e.peers["carol-garona"] = e.peers["carol-garona"]
+            or { name = "Carol-Garona", key = "carol-garona" }
+        e.outPull = {
+            peer = outPeer, providerId = "sf.synthetic.gossip", viewId = "out77",
+            scopeId = scope, phase = "wait_view", engineGen = e.generation,
+            localEpoch = entry.index.epoch,
+            usableProgressAt = world.time, finalSubmitted = true,
+            outstanding = { msgType = A.GuildGossip.MSG.VIEW, payload = { op = "request" } },
+            awaitingSince = world.time,
+        }
+        e.inPull = {
+            peer = inPeer, providerId = "sf.synthetic.gossip", viewId = "in77",
+            scopeId = scope, phase = "serving", engineGen = e.generation,
+            epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+            usableProgressAt = world.time, finalSubmitted = true,
+            offerProgressArmed = true,
+        }
+        e.peers[string.lower(outPeer)].activeExchange = true
+        e.peers[string.lower(inPeer)].activeExchange = true
+    end
+    -- Close out first (stale gen); same peer inPull remains active.
+    armBoth("Bob-Garona", "Bob-Garona")
+    e.outPull.engineGen = e.generation - 1
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.outPull == nil, "F77: outPull closed first")
+    assertTrue(e.inPull ~= nil, "F77: inPull retained when out closes first")
+    assertTrue(e.peers["bob-garona"].activeExchange == true,
+        "F77: activeExchange true while inPull remains (out closed first)")
+    e.inPull.engineGen = e.generation - 1
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull == nil, "F77: inPull closed after out")
+    assertTrue(e.peers["bob-garona"].activeExchange == nil,
+        "F77: activeExchange cleared when both directions closed")
+    -- Reverse order: close in first (served idle) while out remains fresh.
+    armBoth("Bob-Garona", "Bob-Garona")
+    e.inPull.usableProgressAt = world.time - (A.GuildGossip.SERVED_VIEW_IDLE_TIMEOUT_SEC + 5)
+    e.outPull.usableProgressAt = world.time
+    e.outPull.awaitingSince = world.time
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull == nil, "F77: inPull closed first")
+    assertTrue(e.outPull ~= nil, "F77: outPull retained")
+    assertTrue(e.peers["bob-garona"].activeExchange == true,
+        "F77: activeExchange true while outPull remains (in closed first)")
+    -- Different peers: closing Bob's out must not clear Carol's in activity.
+    armBoth("Bob-Garona", "Carol-Garona")
+    e.outPull.engineGen = e.generation - 1
+    e.inPull.usableProgressAt = world.time
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.outPull == nil, "F77: Bob outPull closed")
+    assertTrue(e.peers["bob-garona"].activeExchange == nil,
+        "F77: Bob inactive after his only pull closes")
+    assertTrue(e.inPull ~= nil and e.peers["carol-garona"].activeExchange == true,
+        "F77: Carol remains active (different peer)")
+    -- Eviction protection while either direction is active.
+    e.inPull.engineGen = e.generation
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "out77e",
+        scopeId = scope, phase = "wait_view", engineGen = e.generation,
+        localEpoch = entry.index.epoch,
+        usableProgressAt = world.time, finalSubmitted = true,
+        outstanding = { msgType = A.GuildGossip.MSG.VIEW, payload = { op = "request" } },
+        awaitingSince = world.time,
+    }
+    e.inPull = nil
+    e.peers["bob-garona"].activeExchange = true
+    e.peerOrder = { "bob-garona" }
+    local maxPeers = A.GuildGossip.MAX_PEERS
+    for i = 1, maxPeers do
+        local name = "P" .. i .. "-Garona"
+        local key = string.lower(name)
+        if not e.peers[key] then
+            e.peers[key] = { name = name, key = key, lastSeen = world.time }
+            e.peerOrder[#e.peerOrder + 1] = key
+        end
+    end
+    -- Direct touchPeer-style admission via discovery from a new member.
+    world.guild.members[#world.guild.members + 1] = { name = "Zed-Garona", online = true }
+    local beforeBob = e.peers["bob-garona"]
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.DISC, {
+        proto = 1, enc = { "B64CBOR" },
+        s = A.GuildGossip.Hash32(A.GuildGossip.InitEpochIncarnation()) % 256,
+        providers = { {
+            id = "sf.synthetic.gossip", schema = 1, changeGen = 1,
+            eligibilityGen = entry.eligibilityGen,
+        } },
+    }), "GUILD", "Zed-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.peers["bob-garona"] == beforeBob,
+        "F77: active Bob peer object retained under peer-cap pressure")
+    assertTrue(e.outPull ~= nil and e.peers["bob-garona"].activeExchange == true,
+        "F77: activeExchange protects Bob under peer-cap pressure")
+end
+
+---------------------------------------------------------------------------
+-- F78: discovery includes source incarnation; reload reopens coverage
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f78a" })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f78b" })
+    pB.AppendLocal("old-1", "old-1")
+    for _ = 1, 6 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    end
+    local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local caps1 = B.GuildGossip.BuildDiscoveryCaps()
+    local prov1 = caps1.providers[1]
+    assertTrue(tonumber(caps1.s) ~= nil,
+        "F78: discovery advertises compact packet-level source incarnation")
+    assertTrue(prov1 and prov1.s == nil and prov1.src == nil,
+        "F78: incarnation is not duplicated on each provider cap")
+    local env1 = B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.DISC, caps1)
+    assertTrue(type(env1) == "string" and #env1 <= B.GuildGossip.MAX_DISCOVERY_BYTES,
+        "F78: discovery with incarnation stays within byte limit")
+    world._unitName = "Alice"
+    A.GuildGossip.OnGossipCommReceived("SF_GG", env1, "GUILD", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    local peer = A.GuildGossip._engine.peers["bob-garona"]
+    assertTrue(peer ~= nil, "F78: Bob peer tracked")
+    local fp1 = peer.capFingerprints and peer.capFingerprints["sf.synthetic.gossip"]
+    assertTrue(fp1 ~= nil and fp1 ~= "", "F78: announcement fingerprint stored")
+    peer.covered["sf.synthetic.gossip"] = true
+    local changeGen = tonumber(prov1.changeGen) or 0
+    local elig = tonumber(prov1.eligibilityGen) or 0
+    -- Simulate Bob /reload: new incarnation, matching counters, new durable record.
+    local oldSrc = B.GuildGossip._epochIncarnation
+    local oldSrcHash = tonumber(caps1.s)
+    pB.AppendLocal("new-1", "new-1")
+    entryB.changeGen = changeGen
+    entryB.eligibilityGen = elig
+    -- Choose an incarnation whose compact token differs (8-bit wire token).
+    local caps2, prov2
+    for attempt = 1, 64 do
+        B.GuildGossip._epochIncarnation = string.format("reload-%d-%d", world.time, attempt)
+        B.GuildGossip._epochSeq = 0
+        caps2 = B.GuildGossip.BuildDiscoveryCaps()
+        if tonumber(caps2.s) ~= oldSrcHash then
+            break
+        end
+    end
+    assertTrue(B.GuildGossip._epochIncarnation ~= oldSrc, "F78: reload mints new incarnation")
+    prov2 = caps2.providers[1]
+    assertEq(tonumber(prov2.changeGen), changeGen, "F78: changeGen matches across reload")
+    assertEq(tonumber(prov2.eligibilityGen), elig, "F78: eligibilityGen matches across reload")
+    assertTrue(tonumber(caps2.s) ~= oldSrcHash, "F78: src incarnation changed after reload")
+    -- Re-assert coverage after AppendLocal (which clears covered via NotifyMeaningfulChange).
+    peer.covered["sf.synthetic.gossip"] = true
+    peer.capFingerprints["sf.synthetic.gossip"] = fp1
+    local env2 = B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.DISC, caps2)
+    assertTrue(#env2 <= B.GuildGossip.MAX_DISCOVERY_BYTES, "F78: post-reload discovery within limit")
+    -- Harness SelfId follows world._unitName; receive as Alice after Bob's reload work.
+    world._unitName = "Alice"
+    A.GuildGossip.OnGossipCommReceived("SF_GG", env2, "GUILD", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    peer = A.GuildGossip._engine.peers["bob-garona"]
+    local fp2 = peer.capFingerprints and peer.capFingerprints["sf.synthetic.gossip"]
+    assertTrue(fp2 ~= fp1, "F78: fingerprint changes when only src incarnation changes")
+    assertTrue(peer.covered["sf.synthetic.gossip"] ~= true,
+        "F78: stale coverage cleared after reload discovery")
+    local got = false
+    for _ = 1, 50 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        deliverWire()
+        local storeA = A.GuildGossip.GetProvider("sf.synthetic.gossip").api.GetStore()
+        if storeA.records["new-1"] then
+            got = true
+            break
+        end
+    end
+    assertTrue(got, "F78: reload with matching counters still converges new records")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

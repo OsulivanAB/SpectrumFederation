@@ -56,7 +56,10 @@ Provider contract (Phase 1):
       Bounded cold enumeration. pageIds MUST contain at most `limit` entries.
       Oversized pages fail the index attempt; full-history dumps are unsupported.
       nextCursor nil means no further pages; otherwise resume at that cursor.
-  NotifyChange(cb) / optional; engine also exposes GG.NotifyProviderChanged(id)
+
+After durable storage changes outside the engine append path, call
+GG.NotifyProviderChanged(id) (also SF.GuildGossip.NotifyProviderChanged(id)).
+There is no subscription/callback registration API in Phase 1.
 
 Registration is idempotent. Unregister clears engine runtime state for that provider.
 Enabled providers must supply EnsureIndex or ListRecordIds+GetRecordVersionFp.
@@ -300,10 +303,15 @@ function GG.BuildDiscoveryCaps()
     local caps = {}
     local active = GG.ListActiveProviders()
     local count = #active
+    -- Compact 8-bit incarnation token: enough to distinguish reloads in
+    -- discovery fingerprints while keeping long rotated caps ≤240 bytes.
+    local srcToken = GG.Hash32(GG.InitEpochIncarnation and GG.InitEpochIncarnation()
+        or tostring(GG._epochIncarnation or "")) % 256
     if count == 0 then
         return {
             proto = GG.PROTO_CURRENT,
             enc = { GG.ENC_B64CBOR },
+            s = srcToken,
             providers = caps,
         }
     end
@@ -317,8 +325,10 @@ function GG.BuildDiscoveryCaps()
             schema = entry.schema,
             -- Bounded change identity for discovery coverage. Ordinary remote
             -- appends bump changeGen; schema/id alone must not reopen pulls.
-            -- Scope is matched on the VIEW path (not advertised) to preserve
-            -- the 240-byte discovery envelope under rotation.
+            -- Per-load source incarnation distinguishes reloads whose counters
+            -- restart at the same values. Scope is matched on the VIEW path
+            -- (not advertised) to preserve the 240-byte discovery envelope
+            -- under rotation.
             changeGen = tonumber(entry.changeGen) or 0,
             eligibilityGen = tonumber(entry.eligibilityGen) or 0,
         }
@@ -334,9 +344,13 @@ function GG.BuildDiscoveryCaps()
         end
         caps[#caps + 1] = c
     end
+    -- Per-load source incarnation once per discovery packet (not per provider)
+    -- so reload counter collisions reopen coverage while preserving the
+    -- 240-byte envelope / rotation budget.
     return {
         proto = GG.PROTO_CURRENT,
         enc = { GG.ENC_B64CBOR },
+        s = srcToken,
         providers = caps,
     }
 end
