@@ -89,6 +89,7 @@ function GG.BumpIndexEpoch(index)
         entry._reconcileSeen = nil
         entry._reconciling = nil
         entry._reconcileFollowUp = nil
+        entry._indexUsable = nil
     end
     index.epoch = nextEpoch()
     index.buckets = {}

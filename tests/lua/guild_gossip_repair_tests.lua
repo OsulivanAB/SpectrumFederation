@@ -6007,6 +6007,226 @@ do
         "F90: EnsureIndex mid-walk append converges via follow-up")
 end
 
+---------------------------------------------------------------------------
+-- F91: continuous Notify keeps index view-usable; exchange while producing
+-- (4279189517 residual at cd19f3b)
+---------------------------------------------------------------------------
+do
+    -- Paged: interleaved append+Notify every step must admit views mid-stream.
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local orderA, versionsA, bodiesA = {}, {}, {}
+    local orderB, versionsB, bodiesB = {}, {}, {}
+    local function seed(n)
+        for i = 1, n do
+            local id = "seed-" .. i
+            orderA[#orderA + 1] = id
+            versionsA[id] = "v1"
+            bodiesA[id] = i
+        end
+    end
+    seed(24)
+    local function listFn(order)
+        return function(cursor, limit)
+            cursor = math.max(1, tonumber(cursor) or 1)
+            limit = math.max(1, tonumber(limit) or 8)
+            local page = {}
+            local i = cursor
+            while i <= #order and #page < limit do
+                page[#page + 1] = order[i]
+                i = i + 1
+            end
+            if i <= #order then return page, i end
+            return page, nil
+        end
+    end
+    local function registerPaged(SF, storeOrder, storeVersions, storeBodies, instance)
+        SF.GuildGossip.RegisterProvider({
+            id = "page91", schema = 1, enabled = true, ready = true,
+            ListRecordIds = listFn(storeOrder),
+            GetRecordVersionFp = function(id) return storeVersions[tostring(id)] end,
+            GetRecordBody = function(id)
+                local v = storeVersions[tostring(id)]
+                if not v then return nil end
+                return { id = id, versionFp = v, body = storeBodies[tostring(id)] }
+            end,
+            ValidateAndApply = function(record)
+                if type(record) ~= "table" or record.id == nil then
+                    return "rejected", "malformed"
+                end
+                local rid = tostring(record.id)
+                local vfp = tostring(record.versionFp or "")
+                if storeVersions[rid] == vfp then
+                    return "duplicate"
+                end
+                if not storeVersions[rid] then
+                    storeOrder[#storeOrder + 1] = rid
+                end
+                storeVersions[rid] = vfp
+                storeBodies[rid] = record.body
+                return "accepted"
+            end,
+            IsPeerEligible = function() return true end,
+            GetScopeId = function() return SF.GuildGossip.GetGuildScopeId() end,
+        })
+    end
+    registerPaged(A, orderA, versionsA, bodiesA, "a")
+    registerPaged(B, orderB, versionsB, bodiesB, "b")
+    local entryA = A.GuildGossip.GetProvider("page91")
+    local limits = A.GuildGossip.GetStepLimits("NORMAL")
+    local producing = true
+    local liveN = 0
+    local sawUsableWhileProducing = false
+    local sawExchangeWhileProducing = false
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    for step = 1, 100 do
+        if producing then
+            liveN = liveN + 1
+            local id = "live-" .. liveN
+            orderA[#orderA + 1] = id
+            versionsA[id] = "v1"
+            bodiesA[id] = liveN
+            A.GuildGossip.NotifyProviderChanged("page91")
+        end
+        if step % 8 == 0 then
+            if A.GuildGossip._sched.changeDebounceAt then
+                world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
+            end
+            world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+            world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+            advance(0.2)
+        end
+        stepClient(A, limits)
+        stepClient(B, limits)
+        advance(0.05)
+        if producing and entryA._indexUsable == true then
+            sawUsableWhileProducing = true
+        end
+        if producing and versionsB["seed-1"] ~= nil then
+            sawExchangeWhileProducing = true
+        end
+        -- Keep producing after first usable+exchange proof.
+        if sawUsableWhileProducing and sawExchangeWhileProducing and step >= 50 then
+            producing = false
+        end
+    end
+    assertTrue(sawUsableWhileProducing,
+        "F91: paged index becomes view-usable while Notify continues")
+    assertTrue(sawExchangeWhileProducing,
+        "F91: paged peer exchange occurs while producer still running")
+    assertTrue(entryA._indexUsable == true, "F91: paged remains usable after producer stops")
+    -- Drain follow-up maintenance to idle and full convergence.
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    for _ = 1, 120 do
+        if A.GuildGossip._sched.changeDebounceAt then
+            world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
+        end
+        stepClient(A, limits)
+        stepClient(B, limits)
+        advance(0.05)
+        if entryA.index.buildComplete and not entryA.index.dirty
+            and not entryA._listCursor and not entryA._reconcileFollowUp
+            and versionsB["live-" .. tostring(liveN)] ~= nil then
+            break
+        end
+    end
+    assertTrue(versionsB["seed-1"] ~= nil, "F91: paged Bob has seed")
+    assertTrue(versionsB["live-" .. tostring(liveN)] ~= nil,
+        "F91: paged Bob converges final live row")
+    assertTrue(entryA.index.buildComplete and not entryA.index.dirty
+        and not entryA._listCursor and not entryA._reconcileFollowUp,
+        "F91: paged Alice idles after producer stops")
+    -- Genuine invalidation still clears usability.
+    A.GuildGossip.BumpIndexEpoch(entryA.index)
+    assertTrue(entryA._indexUsable ~= true, "F91: paged BumpIndexEpoch clears usability")
+end
+
+do
+    -- EnsureIndex / synthetic: continuous AppendLocal+Notify while peer exchanges.
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local pA = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f91a" })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f91b" })
+    for i = 1, 24 do
+        pA.AppendLocal("seed-" .. i, "f91-seed-" .. i)
+    end
+    local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    -- Force a multi-slice cold walk so Notify coalescing matters.
+    entryA.index.buildComplete = false
+    entryA.index.dirty = true
+    entryA._indexUsable = nil
+    pA.GetStore()._enumPos = nil
+    local limits = A.GuildGossip.GetStepLimits("NORMAL")
+    local producing = true
+    local liveN = 0
+    local sawUsableWhileProducing = false
+    local sawExchangeWhileProducing = false
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    for step = 1, 100 do
+        if producing then
+            liveN = liveN + 1
+            pA.AppendLocal("live-" .. liveN, "f91-live-" .. liveN)
+            A.GuildGossip.NotifyProviderChanged("sf.synthetic.gossip")
+        end
+        if step % 8 == 0 then
+            if A.GuildGossip._sched.changeDebounceAt then
+                world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
+            end
+            world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+            world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+            advance(0.2)
+        end
+        stepClient(A, limits)
+        stepClient(B, limits)
+        advance(0.05)
+        if producing and entryA._indexUsable == true then
+            sawUsableWhileProducing = true
+        end
+        if producing and pB.GetStore().records["f91-seed-1"] ~= nil then
+            sawExchangeWhileProducing = true
+        end
+        if sawUsableWhileProducing and sawExchangeWhileProducing and step >= 50 then
+            producing = false
+        end
+    end
+    assertTrue(sawUsableWhileProducing,
+        "F91: EnsureIndex becomes view-usable while Notify continues")
+    assertTrue(sawExchangeWhileProducing,
+        "F91: EnsureIndex peer exchange occurs while producer still running")
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    for _ = 1, 120 do
+        if A.GuildGossip._sched.changeDebounceAt then
+            world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
+        end
+        stepClient(A, limits)
+        stepClient(B, limits)
+        advance(0.05)
+        if entryA.index.buildComplete and not entryA.index.dirty
+            and not entryA._reconcileFollowUp and not pA.GetStore()._enumPos
+            and pB.GetStore().records["f91-live-" .. tostring(liveN)] ~= nil then
+            break
+        end
+    end
+    assertTrue(pB.GetStore().records["f91-seed-1"] ~= nil, "F91: EnsureIndex Bob has seed")
+    assertTrue(pB.GetStore().records["f91-live-" .. tostring(liveN)] ~= nil,
+        "F91: EnsureIndex Bob converges final live row")
+    assertTrue(entryA.index.buildComplete and not entryA.index.dirty
+        and not entryA._reconcileFollowUp and not pA.GetStore()._enumPos,
+        "F91: EnsureIndex Alice idles after producer stops")
+    A.GuildGossip.BumpIndexEpoch(entryA.index)
+    assertTrue(entryA._indexUsable ~= true, "F91: EnsureIndex BumpIndexEpoch clears usability")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")

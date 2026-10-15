@@ -310,6 +310,7 @@ local function markIndexFailed(entry, reason)
     entry._reconcileSeen = nil
     entry._reconciling = nil
     entry._reconcileFollowUp = nil
+    entry._indexUsable = nil
     entry.lastIndexExamined = 0
     GG._DError("Index failed provider=%s reason=%s", entry.id, entry.indexFailReason)
 end
@@ -440,7 +441,9 @@ function GG.EnsureProviderIndex(entry, limits)
             markIndexFailed(entry, "ensure_index_incomplete")
             return false
         end
-        -- Notifications during the walk coalesced into one follow-up dirty pass.
+        -- A completed finite EnsureIndex pass is view-usable even when ordinary
+        -- notifications coalesced a follow-up dirty maintenance walk.
+        entry._indexUsable = true
         if entry._reconcileFollowUp then
             entry._reconcileFollowUp = nil
             entry.index.dirty = true
@@ -556,10 +559,13 @@ function GG.EnsureProviderIndex(entry, limits)
         entry.indexFailCount = 0
         entry._listCursor = nil
         if index then
+            -- Mark usable before any follow-up dirty arming so continuous Notify
+            -- cannot indefinitely block view admission.
+            entry._indexUsable = true
             if entry._reconcileFollowUp then
                 -- Changes arrived during this walk: do not prune from a possibly
                 -- stale seen set. Keep indexed rows, mark dirty, and run one
-                -- fresh reconcile on the next steps.
+                -- fresh reconcile on the next steps while remaining view-usable.
                 entry._reconcileFollowUp = nil
                 entry._reconcileSeen = nil
                 entry._reconciling = nil

@@ -726,8 +726,17 @@ end
 
 local function indexReadyForView(entry)
     local index = entry and entry.index
-    return index
-        and index.buildComplete == true
+    if not index or entry.indexFailed then
+        return false
+    end
+    -- A successfully completed finite walk remains view-admissible while ordinary
+    -- follow-up / dirty maintenance continues. Continuous NotifyProviderChanged
+    -- must not starve sync by keeping dirty/_listCursor forever. Genuine
+    -- BumpIndexEpoch / indexFailed clears _indexUsable.
+    if entry._indexUsable == true then
+        return true
+    end
+    return index.buildComplete == true
         and not index.dirty
         and not entry._listCursor
 end
@@ -740,7 +749,7 @@ local function providerNeedsIndexWork(entry)
     if entry.indexFailed then
         return false
     end
-    if entry._listCursor then
+    if entry._listCursor or entry._reconcileFollowUp then
         return true
     end
     return entry.index.dirty == true or entry.index.buildComplete ~= true
@@ -2934,6 +2943,8 @@ function GG.OnSchedulerStep(limits, now)
     }
     e.stepStats = { indexExamined = 0, receivedApps = 0, cpuMs = 0, exportLookups = 0 }
     -- Index maintenance uses one aggregate entry budget across providers.
+    -- Once a provider is view-usable, reserve half the step metadata budget for
+    -- capture/manifest so continuous Notify follow-up walks cannot starve sync.
     local activeProviders = GG.ListActiveProviders()
     for _, entry in ipairs(activeProviders) do
         if indexRemaining <= 0 then
@@ -2943,7 +2954,11 @@ function GG.OnSchedulerStep(limits, now)
         for key, value in pairs(limits) do
             indexLimits[key] = value
         end
-        indexLimits.indexEntries = indexRemaining
+        local slice = indexRemaining
+        if entry._indexUsable and indexRemaining > 1 then
+            slice = math.max(1, math.floor(indexRemaining / 2))
+        end
+        indexLimits.indexEntries = slice
         local moreIndex = GG.EnsureProviderIndex(entry, indexLimits)
         if moreIndex or providerNeedsIndexWork(entry) then
             e.indexWorkPending = true
