@@ -35,6 +35,8 @@ local CONFIRM_SNAPSHOT_FIELDS = {
 local CANDIDATE_REF_FIELDS = {
     "recordId", "records", "contentFingerprint", "originalIds", "campaignId",
 }
+-- Documented confirmation manifest row fields only (no nested extras).
+local MANIFEST_ROW_FIELDS = { "id", "contentFingerprint" }
 
 local function ServerTime()
     if GetServerTime then
@@ -171,6 +173,63 @@ local function DeepSnapshot(value, depth, seen, budget)
     return copy
 end
 
+--- Canonical confirmation manifest row: only id + contentFingerprint.
+local function SnapshotCanonicalRecords(records, budget)
+    if type(records) ~= "table" then
+        return nil, "invalid_candidate_batch"
+    end
+    local n = #records
+    if n < 1 or n > GS.MAX_CONFIRMATION_BATCH then
+        return nil, "invalid_candidate_batch"
+    end
+    local ok, err = ChargeSnapshot(budget, 1)
+    if not ok then
+        return nil, err
+    end
+    local copy = {}
+    local counted = 0
+    for k, row in pairs(records) do
+        counted = counted + 1
+        if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+            return nil, "invalid_candidate_batch"
+        end
+        ok, err = ChargeSnapshot(budget, 1) -- numeric key
+        if not ok then
+            return nil, err
+        end
+        if type(row) ~= "table" then
+            return nil, "invalid_candidate_batch"
+        end
+        ok, err = ChargeSnapshot(budget, 1) -- row table
+        if not ok then
+            return nil, err
+        end
+        local rowCopy = {}
+        for i = 1, #MANIFEST_ROW_FIELDS do
+            local rf = MANIFEST_ROW_FIELDS[i]
+            local value = row[rf]
+            if value == nil then
+                return nil, "invalid_candidate_batch"
+            end
+            ok, err = ChargeSnapshotString(budget, rf)
+            if not ok then
+                return nil, err
+            end
+            local child
+            child, err = DeepSnapshot(value, 1, {}, budget)
+            if err then
+                return nil, err
+            end
+            rowCopy[rf] = child
+        end
+        copy[k] = rowCopy
+    end
+    if counted ~= n then
+        return nil, "invalid_candidate_batch"
+    end
+    return copy
+end
+
 local function SnapshotWhitelisted(source, fields)
     if type(source) ~= "table" then
         return nil, "invalid_operation"
@@ -203,7 +262,11 @@ local function SnapshotWhitelisted(source, fields)
                             return nil, err
                         end
                         local child
-                        child, err = DeepSnapshot(value[rf], 1, {}, budget)
+                        if rf == "records" then
+                            child, err = SnapshotCanonicalRecords(value[rf], budget)
+                        else
+                            child, err = DeepSnapshot(value[rf], 1, {}, budget)
+                        end
                         if err then
                             return nil, err
                         end

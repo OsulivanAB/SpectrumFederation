@@ -23,8 +23,15 @@ GG._guild = GG._guild or {
 }
 
 -- Demand-driven roster nudge for zero-provider authority (no listeners/polling).
+-- boundClubId: club whose native roster/rank reads are currently trusted.
+-- pendingClubId + staleFingerprint: fail closed across club transitions until
+-- roster contents differ from the pre-transition snapshot (request/timeout
+-- alone is not proof of freshness).
 GG._demandRoster = GG._demandRoster or {
     lastRequestAt = nil,
+    boundClubId = nil,
+    pendingClubId = nil,
+    staleFingerprint = nil,
 }
 local DEMAND_ROSTER_MIN_INTERVAL = 2.0
 
@@ -46,6 +53,87 @@ local function requestRosterDemandDriven()
     end
     GG._demandRoster.lastRequestAt = now
     requestRoster()
+    return true
+end
+
+--- Bounded fingerprint of the current native guild roster for scope binding.
+-- Retail assumption: after a club change, GetGuildRosterInfo may still return
+-- the previous guild's rows until a roster refresh lands; content change is
+-- the demand-driven freshness signal without permanent listeners.
+local function demandRosterFingerprint()
+    if not GetNumGuildMembers or not GetGuildRosterInfo then
+        return "unavailable"
+    end
+    local total = tonumber((GetNumGuildMembers())) or 0
+    if total <= 0 then
+        return "empty"
+    end
+    local parts = {}
+    for i = 1, total do
+        local name, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, guid = GetGuildRosterInfo(i)
+        parts[#parts + 1] = tostring(name or "") .. ":" .. tostring(guid or "")
+    end
+    table.sort(parts)
+    return tostring(total) .. "|" .. table.concat(parts, ";")
+end
+
+--- Fail closed when club identity and native roster may disagree.
+-- @return boolean trusted
+local function ensureDemandRosterScope(clubId)
+    local dr = GG._demandRoster
+    if type(clubId) ~= "string" or clubId == "" then
+        return false
+    end
+    if dr.boundClubId == clubId then
+        return true
+    end
+
+    -- First observation this session: bind immediately when roster is nonempty.
+    if dr.boundClubId == nil and dr.pendingClubId == nil then
+        -- Capture only the first GetNumGuildMembers return (avoid tonumber(n, base)).
+        local total = 0
+        if GetNumGuildMembers then
+            total = tonumber((GetNumGuildMembers())) or 0
+        end
+        if total <= 0 then
+            dr.pendingClubId = clubId
+            dr.staleFingerprint = "empty"
+            requestRosterDemandDriven()
+            return false
+        end
+        dr.boundClubId = clubId
+        dr.pendingClubId = nil
+        dr.staleFingerprint = nil
+        return true
+    end
+
+    -- Club identity changed (or first pending target changed): capture stale snapshot.
+    if dr.pendingClubId ~= clubId then
+        dr.boundClubId = nil
+        dr.pendingClubId = clubId
+        dr.staleFingerprint = demandRosterFingerprint()
+        requestRosterDemandDriven()
+        return false
+    end
+
+    -- Pending this club: empty stays incomplete; identical content stays stale.
+    local total = 0
+    if GetNumGuildMembers then
+        total = tonumber((GetNumGuildMembers())) or 0
+    end
+    if total <= 0 then
+        requestRosterDemandDriven()
+        return false
+    end
+    local fp = demandRosterFingerprint()
+    if fp == dr.staleFingerprint then
+        requestRosterDemandDriven()
+        return false
+    end
+
+    dr.boundClubId = clubId
+    dr.pendingClubId = nil
+    dr.staleFingerprint = nil
     return true
 end
 
@@ -400,6 +488,10 @@ function GG.GetGuildMember(name)
     if not GetNumGuildMembers or not GetGuildRosterInfo then
         return nil, "roster_unavailable"
     end
+    -- Do not label a newly observed club with a prior guild's nonempty roster.
+    if not ensureDemandRosterScope(identity.clubId) then
+        return nil, "roster_incomplete"
+    end
     local total = GetNumGuildMembers()
     total = tonumber(total) or 0
     if total <= 0 then
@@ -436,6 +528,10 @@ function GG.GetGuildRanks()
     local identity, reason = GG.GetGuildIdentity()
     if not identity then
         return nil, reason or "not_ready"
+    end
+    -- Rank names are also guild-scoped; fail closed during roster/club transitions.
+    if not ensureDemandRosterScope(identity.clubId) then
+        return nil, "roster_incomplete"
     end
     if type(GuildControlGetNumRanks) ~= "function" or type(GuildControlGetRankName) ~= "function" then
         return nil, "ranks_unavailable"

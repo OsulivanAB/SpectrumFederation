@@ -639,8 +639,10 @@ function GS:GetCurrentRecord()
     return record, nil, identity
 end
 
---- Explicit local staged creation. Requires verified current guild + default rank authority.
-function GS:CreateStagedRecord()
+--- Explicit local staged creation. Requires verified current guild + authority.
+-- @param editorRankPosition number|nil GM-selected threshold when fewer than 3 ranks exist.
+--   Ordinary guilds (≥3 ranks) ignore this and use default position 3.
+function GS:CreateStagedRecord(editorRankPosition)
     if not GS:IsRootReady() then
         return nil, "rejected", GS:GetRootReason() or "not_ready"
     end
@@ -668,18 +670,37 @@ function GS:CreateStagedRecord()
     local ranks = ctx.ranks
     local rankCount = ranks and tonumber(ranks.count) or 0
     local initialPosition = GS.DEFAULT_EDITOR_RANK_POSITION
+    local caps = GS:GetCapabilities()
+    if not caps then
+        return nil, "rejected", "unauthorized"
+    end
+
     if rankCount > 0 and rankCount < GS.DEFAULT_EDITOR_RANK_POSITION then
-        -- Fresh guild with fewer than three ranks requires GM selection later;
-        -- do not invent a default position that does not exist.
+        -- Fewer than three ranks: verified GM must select an existing threshold.
+        -- Do not invent/widen a default position that does not exist.
+        if ctx.previewNonAdmin then
+            return nil, "rejected", "preview_non_admin"
+        end
         if ctx.rankOrder ~= 1 then
             return nil, "rejected", "policy_requires_gm"
         end
-        return nil, "rejected", "threshold_unselected"
-    end
-
-    local caps = GS:GetCapabilities()
-    if not caps or not caps.canEdit then
-        return nil, "rejected", (caps and caps.reason) or "unauthorized"
+        if editorRankPosition == nil then
+            return nil, "rejected", "threshold_unselected"
+        end
+        local selected = tonumber(editorRankPosition)
+        if not selected or selected ~= math.floor(selected) or selected < 1
+            or selected > rankCount then
+            return nil, "rejected", "invalid_editor_rank_position"
+        end
+        if not caps.canRecoverPolicy then
+            return nil, "rejected", caps.reason or "policy_requires_gm"
+        end
+        initialPosition = selected
+    else
+        if not caps.canEdit then
+            return nil, "rejected", caps.reason or "unauthorized"
+        end
+        -- Ordinary path keeps default rank 3; caller selection is not applied.
     end
 
     local datasetId, idErr = GS:_NewDatasetId(ctx.actorGuid)
@@ -711,7 +732,8 @@ function GS:CreateStagedRecord()
     end
 
     GS._root.guilds[ctx.guildKey] = record
-    DebugInfo("created staged guild record key=%s dataset=%s", ctx.guildKey, datasetId)
+    DebugInfo("created staged guild record key=%s dataset=%s threshold=%s",
+        ctx.guildKey, datasetId, tostring(initialPosition))
     return record, "accepted", nil
 end
 
@@ -790,8 +812,7 @@ function GS.ValidateCampaignBoundary(header, record, expectedGuildKey)
         if header.resetOperationId ~= header.campaignId then
             return false, "campaign_id_mismatch"
         end
-        local startedAt = tonumber(header.startedAt)
-        if not startedAt or startedAt ~= math.floor(startedAt) or startedAt < 0 then
+        if not IsFiniteNonnegInt(header.startedAt) then
             return false, "invalid_started_at"
         end
     elseif header.resetOperationId ~= nil then
@@ -818,11 +839,9 @@ function GS.ValidateCampaignBoundary(header, record, expectedGuildKey)
         if header.createdByName ~= nil and not IsBoundedActorString(header.createdByName) then
             return false, "invalid_attribution"
         end
-        if header.startedAt ~= nil then
-            local startedAt = tonumber(header.startedAt)
-            if not startedAt or startedAt ~= math.floor(startedAt) or startedAt < 0 then
-                return false, "invalid_started_at"
-            end
+        -- Absent legacy startedAt is honest; present values must be finite.
+        if header.startedAt ~= nil and not IsFiniteNonnegInt(header.startedAt) then
+            return false, "invalid_started_at"
         end
     end
 

@@ -224,6 +224,9 @@ local function resetDb()
     world.rosterRequests = 0
     if GG._demandRoster then
         GG._demandRoster.lastRequestAt = nil
+        GG._demandRoster.boundClubId = nil
+        GG._demandRoster.pendingClubId = nil
+        GG._demandRoster.staleFingerprint = nil
     end
 end
 
@@ -331,18 +334,35 @@ do
     world.guild.clubId = 99
     world.guild.name = "OtherGuild"
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Club changed first while native roster still shows prior guild rows.
+    local ctxB = GS:GetCurrentContext()
+    assertEq(ctxB.ready, false, "stale roster keeps new club unready")
+    assertEq(ctxB.reason, "roster_incomplete", "roster_incomplete until new roster lands")
+    -- Roster refresh for the new club (content differs from the captured stale snapshot).
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Zoe-Garona", guid = "Player-1-Zoe", rankOrder = 2, online = true },
+    }
     -- Same character, different guild — no leak of A
     local b, reason = GS:GetCurrentRecord()
     assertNil(b, "guild B not configured")
     assertEq(reason, "not_configured", "guild B not_configured")
     local recB, st = GS:CreateStagedRecord()
-    assertEq(st, "accepted", "create guild B")
+    assertEq(st, "accepted", "create guild B after roster refresh")
     assertTrue(recB.datasetId ~= datasetA, "distinct dataset IDs")
     assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"] ~= nil, true, "guild A retained")
     assertEq(SpectrumFederationDB.guildSupplies.guilds["club:99"] ~= nil, true, "guild B present")
 
     world.guild.clubId = 42
     world.guild.name = "Spectrum"
+    -- Again: identity flips before roster contents do.
+    assertEq(GS:GetCurrentContext().ready, false, "return to A unready on stale B roster")
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
     local again = GS:GetCurrentRecord()
     assertEq(again.datasetId, datasetA, "return to guild A restores record")
 end
@@ -422,6 +442,7 @@ end
 do
     resetDb()
     GS:Initialize(SpectrumFederationDB)
+    world.guild.clubId = 42
     world.guild.ranks = { "Guild Master", "Member" }
     world.guild.members = {
         { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
@@ -430,10 +451,20 @@ do
     setPlayer("Bob-Garona", "Player-1-Bob", 2)
     local _, st, err = GS:CreateStagedRecord()
     assertEq(st, "rejected", "non-GM cannot init short rank list")
+    assertEq(err, "policy_requires_gm", "non-GM policy_requires_gm")
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     _, st, err = GS:CreateStagedRecord()
     assertEq(st, "rejected", "GM cannot invent missing default position 3")
-    assertEq(err, "threshold_unselected", "threshold_unselected")
+    assertEq(err, "threshold_unselected", "threshold_unselected without selection")
+    _, st, err = GS:CreateStagedRecord(3)
+    assertEq(st, "rejected", "GM cannot select missing rank 3")
+    assertEq(err, "invalid_editor_rank_position", "invalid_editor_rank_position for missing rank")
+    _, st, err = GS:CreateStagedRecord(0)
+    assertEq(st, "rejected", "GM cannot select rank 0")
+    local rec
+    rec, st, err = GS:CreateStagedRecord(2)
+    assertEq(st, "accepted", "GM selects existing threshold 2: " .. tostring(err))
+    assertEq(rec.permission.editorRankPosition, 2, "selected threshold stored")
     -- restore default roster
     world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
     world.guild.members = {
@@ -551,9 +582,17 @@ do
     world.guild.clubId = 77
     status, reason = GS:ApplyStagedConfigOperation(op)
     assertEq(status, "rejected", "guild change rejects commit")
-    assertTrue(reason == "wrong_guild" or reason == "stale_handle" or reason == "not_configured" or reason == "not_ready",
+    assertTrue(reason == "wrong_guild" or reason == "stale_handle" or reason == "not_configured"
+            or reason == "not_ready" or reason == "roster_incomplete",
         "guild-change reason=" .. tostring(reason))
     world.guild.clubId = 42
+    -- Restore roster trust for later tests after the club flip above.
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
 end
 
 -- 13) ID conflict retained; live profile ledger untouched
@@ -1858,6 +1897,245 @@ do
     local bound = GS:GetCurrentCampaignBoundary()
     assertEq(bound.contextRecordCount, 4, "captured count roundtrip")
     assertEq(bound.createdByName, "Alice-Garona", "captured author roundtrip")
+end
+
+-- R18) Canonical confirmation manifest rows + exact replay after reload
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    local conf, st, err = GS:NewConfirmationOperation({
+        records = {
+            {
+                id = "r-extra",
+                contentFingerprint = "fp-extra",
+                extra = { a = { b = true } },
+            },
+        },
+        contentFingerprint = "fp-extra",
+        originalIds = { "txn-extra-1" },
+    })
+    assertEq(st, "accepted", "nested-extra prepare accepted after canonicalize: " .. tostring(err))
+    assertNil(conf.candidateRef.records[1].extra, "prepared row strips nested extras")
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "nested-extra admits as canonical")
+    local stored = GS:GetCurrentRecord().operations.records[conf.id]
+    assertNil(stored.candidateRef.records[1].extra, "durable row has no nested extras")
+
+    -- Exact replay after reload
+    local saved = SpectrumFederationDB
+    GS._db = nil
+    GS._root = nil
+    GS._rootValid = false
+    SpectrumFederationDB = saved
+    assertEq(GS:Initialize(SpectrumFederationDB), true, "reload after confirm")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local status, reason = GS:ApplyStagedConfirmationOperation(conf)
+    assertEq(status, "duplicate", "exact replay after reload is duplicate")
+    assertEq(reason, "duplicate", "duplicate reason after reload")
+
+    -- Genuinely changed body still conflicts
+    local clash = {}
+    for k, v in pairs(conf) do clash[k] = v end
+    clash.timestamp = (tonumber(conf.timestamp) or 1) + 1
+    status, reason = GS:ApplyStagedConfirmationOperation(clash)
+    assertEq(status, "rejected", "changed-body confirmation rejected")
+    assertEq(reason, "id_conflict", "id_conflict for changed body")
+
+    -- Max batch still supported
+    local rows, oids = {}, {}
+    local fp = "fp-r18-" .. string.rep("d", 32)
+    for i = 1, GS.MAX_CONFIRMATION_BATCH do
+        rows[i] = {
+            id = string.format("gs1:Player-1-Alice:%s:%d", string.rep("e", 24), i),
+            contentFingerprint = fp,
+            noise = { nested = true },
+        }
+        oids[i] = "oid-" .. i
+    end
+    conf, st, err = GS:NewConfirmationOperation({
+        records = rows,
+        contentFingerprint = fp,
+        originalIds = oids,
+    })
+    assertEq(st, "accepted", "max batch with row noise still prepares: " .. tostring(err))
+    assertNil(conf.candidateRef.records[1].noise, "max-batch rows canonicalized")
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "max batch with noise admits")
+end
+
+-- R19) Finite campaign startedAt (reject inf/nan/negative; valid round-trip)
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+
+    local function tryStart(startedAt)
+        return GS:_StoreCampaignBoundaryForTests({
+            schemaVersion = 1,
+            campaignId = "camp-start-" .. tostring(startedAt),
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            resetOperationId = "camp-start-" .. tostring(startedAt),
+            createdByGuid = "Player-1-Alice",
+            createdByName = "Alice-Garona",
+            startedAt = startedAt,
+            bankTabAtStart = 1,
+            boundaryVersion = 1,
+            boundaryKind = "new-goal",
+            contextStatus = "unavailable",
+        })
+    end
+
+    local ok, err = tryStart(math.huge)
+    assertEq(ok, false, "math.huge startedAt rejected")
+    assertEq(err, "invalid_started_at", "invalid_started_at for infinity")
+    ok, err = tryStart(0 / 0)
+    assertEq(ok, false, "NaN startedAt rejected")
+    assertEq(err, "invalid_started_at", "invalid_started_at for NaN")
+    ok, err = tryStart(-1)
+    assertEq(ok, false, "negative startedAt rejected")
+    assertEq(err, "invalid_started_at", "invalid_started_at for negative")
+    ok, err = tryStart(123456)
+    assertEq(ok, true, "finite startedAt accepted: " .. tostring(err))
+    assertEq(GS:GetCurrentCampaignBoundary().startedAt, 123456, "finite startedAt roundtrip")
+
+    ok, err = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "legacy-inf",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        boundaryKind = "legacy-preserved",
+        boundaryVersion = 1,
+        contextStatus = "unavailable",
+        startedAt = math.huge,
+    })
+    assertEq(ok, false, "legacy math.huge startedAt rejected")
+    assertEq(err, "invalid_started_at", "legacy invalid_started_at for infinity")
+    ok, err = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "legacy-absent-start",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        boundaryKind = "legacy-preserved",
+        boundaryVersion = 1,
+        contextStatus = "unavailable",
+        startedAt = nil,
+    })
+    assertEq(ok, true, "legacy absent startedAt preserved: " .. tostring(err))
+end
+
+-- R20) Small-guild GM threshold selection + denials
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = true
+    local _, st, err = GS:CreateStagedRecord(1)
+    assertEq(st, "rejected", "preview denies small-guild create")
+    assertEq(err, "preview_non_admin", "preview_non_admin for small guild")
+    world.impersonationActive = false
+
+    GS._db = nil
+    GS._root = nil
+    GS._rootValid = false
+    -- unreadiness: clear club
+    local savedClub = world.guild.clubId
+    world.guild.clubId = nil
+    _, st, err = GS:CreateStagedRecord(1)
+    assertEq(st, "rejected", "missing club readiness denies create")
+    assertTrue(err == "club_id_unavailable" or err == "not_ready", "readiness reason")
+    world.guild.clubId = savedClub
+    GS:Initialize(SpectrumFederationDB)
+
+    local rec
+    rec, st, err = GS:CreateStagedRecord(1)
+    assertEq(st, "accepted", "GM selects threshold 1: " .. tostring(err))
+    assertEq(rec.permission.editorRankPosition, 1, "threshold 1 stored")
+    assertNil(GS:CreateStagedRecord(1), "no allocate on second create / already configured")
+
+    -- Ordinary ≥3 ranks still defaults to 3 and ignores selection
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    rec, st = GS:CreateStagedRecord(1)
+    assertEq(st, "accepted", "ordinary create ignores explicit selection")
+    assertEq(rec.permission.editorRankPosition, 3, "ordinary default remains 3")
+end
+
+-- R21) Demand-driven roster scope after club identity change
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    local member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "initial roster trusted for club 42")
+    assertEq(member.clubId, "42", "member labeled with club 42")
+    GS:CreateStagedRecord()
+    local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "writes work when roster scoped")
+
+    -- New club identity, same stale nonempty roster rows.
+    world.guild.clubId = 99
+    world.guild.name = "OtherGuild"
+    world.rosterRequests = 0
+    if GG._demandRoster then GG._demandRoster.lastRequestAt = nil end
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "stale roster not trusted for new club")
+    assertEq(reason, "roster_incomplete", "roster_incomplete during scope transition")
+    assertTrue(world.rosterRequests >= 1, "demand roster request on scope change")
+    local ctx = GS:GetCurrentContext()
+    assertEq(ctx.ready, false, "context not ready during roster uncertainty")
+    local newOp, newSt, newErr = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertNil(newOp, "no op prepared during uncertainty")
+    assertEq(newSt, "rejected", "rejected prepare during uncertainty")
+    assertTrue(newErr == "roster_incomplete" or newErr == "not_ready" or newErr == "rank_unavailable",
+        "uncertainty reason on prepare: " .. tostring(newErr))
+
+    -- Recovery: roster contents change for the new guild.
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Eve-Garona", guid = "Player-1-Eve", rankOrder = 2, online = true },
+    }
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "roster trusted after content change: " .. tostring(reason))
+    assertEq(member.clubId, "99", "member labeled with new club 99")
+    ctx = GS:GetCurrentContext()
+    assertEq(ctx.ready, true, "context ready after scoped roster recovery")
+    -- Guild 99 is not configured — create is allowed for editor; writes to 42 denied via key.
+    local rec99, st99 = GS:CreateStagedRecord()
+    assertEq(st99, "accepted", "can create staged record after roster recovery")
+    assertEq(rec99.accounting._consumables.guild.guid, "99", "new guild accounting guid")
+
+    -- restore default world guild for later isolation
+    world.guild.clubId = 42
+    world.guild.name = "Spectrum"
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

@@ -57,7 +57,7 @@ SpectrumFederationDB.guildSupplies = {
 | `:Initialize(db)` | Idempotent root load/validate; no network or guild bootstrap |
 | `:GetCurrentContext()` | Native guildKey, actor, rank readiness, handle generation, or waiting reason |
 | `:GetCurrentRecord()` | Validated current-guild staged record or nil + reason (no allocate-on-read) |
-| `:CreateStagedRecord()` | Explicit create with default editor rank 3 when ≥3 ranks exist |
+| `:CreateStagedRecord(editorRankPosition?)` | Explicit create with default editor rank 3 when ≥3 ranks exist; when fewer than 3 ranks, verified GM must pass an existing threshold position |
 | `:GetCapabilities()` | `canRead` / `canEdit` / `canRecoverPolicy`, resolved rank name label; Preview as Non-Admin |
 | `:NewConfigOperation(kind, target, value)` | Build IDs/actor/timestamp/base revisions from local context |
 | `:ValidateConfigOperation(op, context)` | Shape/scope/authority/base checks; no side effects |
@@ -82,11 +82,12 @@ Caps: **4,096** accepted operations / guild; **128** combined pending+conflict a
 - Player-facing labels use `GuildControlGetRankName(position)` (for example `"%s and higher"`).
 - Invalid/out-of-range policy → verified Guild Master recovery only.
 - Preview as Non-Admin denies privileged actions locally.
-- Zero active gossip providers: authority uses a **demand-driven** native snapshot. A cold empty roster triggers a throttled native `GuildRoster` request without listeners, discovery, or a dummy provider. Missing data fails closed. Commit rechecks guild/rank/policy.
+- Zero active gossip providers: authority uses a **demand-driven** native snapshot. A cold empty roster triggers a throttled native `GuildRoster` request without listeners, discovery, or a dummy provider. After a club-identity change, stale nonempty roster/rank data is not trusted until roster contents differ from the pre-transition snapshot; missing/uncertain data fails closed. Commit rechecks guild/rank/policy.
+- Fresh guilds with fewer than three ranks: `CreateStagedRecord` does not invent a default threshold; verified GM passes an existing 1-based position. Preview as Non-Admin and non-GM callers remain denied.
 
 ### Confirmation envelope
 
-`confirm-candidate` carries `schemaVersion, id, guildKey, datasetId, candidateRef, contentFingerprint, campaignId, basePolicyRevision, actorGuid, actorName, timestamp`. `candidateRef` must use exactly one reference form: a single `recordId` **or** a dense `records` manifest (1–64), never both/neither. When `candidateRef.campaignId` is present it must match the envelope `campaignId`. Candidate policy cannot self-authorize. Original IDs are preserved; endorsement is not a live donation credit. Network confirmation exchange is #387/#388.
+`confirm-candidate` carries `schemaVersion, id, guildKey, datasetId, candidateRef, contentFingerprint, campaignId, basePolicyRevision, actorGuid, actorName, timestamp`. `candidateRef` must use exactly one reference form: a single `recordId` **or** a dense `records` manifest (1–64), never both/neither. Manifest rows are canonicalized to `{ id, contentFingerprint }` only at prepare/admission so nested extras cannot poison durable snapshots or exact-duplicate comparison. When `candidateRef.campaignId` is present it must match the envelope `campaignId`. Candidate policy cannot self-authorize. Original IDs are preserved; endorsement is not a live donation credit. Network confirmation exchange is #387/#388.
 
 ### Campaign boundary header
 
