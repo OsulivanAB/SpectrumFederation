@@ -298,3 +298,139 @@ function GG.SyncGuildAdapterLifecycle()
         GG.ShutdownGuildAdapter()
     end
 end
+
+---------------------------------------------------------------------------
+-- Demand-driven native identity/rank snapshot (no provider / no listeners).
+-- Used by Guild Supplies (#385) and other dormant domain checks. Must never
+-- mark transport ready, start discovery, or leave a permanent roster loop.
+---------------------------------------------------------------------------
+
+local function readActualClubId()
+    if not (C_Club and C_Club.GetGuildClubId) then
+        return nil
+    end
+    local clubId = C_Club.GetGuildClubId()
+    if clubId == nil or clubId == 0 or clubId == "0" or clubId == "" then
+        return nil
+    end
+    return tostring(clubId)
+end
+
+local function readGuildDisplay()
+    local guildName, guildRealm = nil, nil
+    if GetGuildInfo then
+        local name, _, _, realm = GetGuildInfo("player")
+        guildName, guildRealm = name, realm
+    end
+    return guildName, guildRealm
+end
+
+-- Normalize a native rank position to the locked 1-based guildRankOrder
+-- convention (Guild Master = 1). Prefer C_GuildInfo.GetGuildRankOrder.
+-- Zero-based legacy GetGuildRosterInfo rankIndex is converted exactly once.
+local function normalizeRankOrder(guid, legacyRankIndex)
+    if guid and C_GuildInfo and type(C_GuildInfo.GetGuildRankOrder) == "function" then
+        local order = C_GuildInfo.GetGuildRankOrder(guid)
+        order = tonumber(order)
+        if order and order == math.floor(order) and order >= 1 then
+            return order
+        end
+    end
+    local idx = tonumber(legacyRankIndex)
+    if idx and idx == math.floor(idx) and idx >= 0 then
+        return idx + 1
+    end
+    return nil
+end
+
+--- Actual club-backed guild identity. Never persists or returns name: scopes.
+-- @return table|nil identity, string|nil reason
+function GG.GetGuildIdentity()
+    local inGuild = (IsInGuild and IsInGuild()) and true or false
+    if not inGuild then
+        return nil, "not_in_guild"
+    end
+    local clubId = readActualClubId()
+    if not clubId then
+        return nil, "club_id_unavailable"
+    end
+    local guildName, guildRealm = readGuildDisplay()
+    return {
+        clubId = clubId,
+        guildKey = "club:" .. clubId,
+        guildName = type(guildName) == "string" and guildName or "",
+        guildRealm = type(guildRealm) == "string" and guildRealm or "",
+        -- Transport scope for comparison only; Guild Supplies rejects non-club scopes.
+        transportScopeId = "club:" .. clubId,
+    }
+end
+
+--- Demand-driven member snapshot (name/GUID/1-based rank order).
+-- Does not consult or populate the idle gossip membership cache.
+-- @param name string
+-- @return table|nil member, string|nil reason
+function GG.GetGuildMember(name)
+    local identity, reason = GG.GetGuildIdentity()
+    if not identity then
+        return nil, reason or "not_ready"
+    end
+    local want = GG.NormalizePlayer(name)
+    if not want then
+        return nil, "invalid_name"
+    end
+    if not GetNumGuildMembers or not GetGuildRosterInfo then
+        return nil, "roster_unavailable"
+    end
+    local total = GetNumGuildMembers()
+    total = tonumber(total) or 0
+    if total <= 0 then
+        return nil, "roster_incomplete"
+    end
+    local wantLower = string.lower(want)
+    for i = 1, total do
+        local rosterName, _, rankIndex, _, _, _, _, _, isOnline, _, _, _, _, _, _, _, guid =
+            GetGuildRosterInfo(i)
+        local norm = GG.NormalizePlayer(rosterName)
+        if norm and string.lower(norm) == wantLower then
+            local rankOrder = normalizeRankOrder(guid, rankIndex)
+            if not rankOrder then
+                return nil, "rank_unavailable"
+            end
+            return {
+                name = norm,
+                guid = (type(guid) == "string" and guid ~= "") and guid or nil,
+                rankOrder = rankOrder,
+                online = isOnline and true or false,
+                guildKey = identity.guildKey,
+                clubId = identity.clubId,
+            }
+        end
+    end
+    return nil, "not_a_member"
+end
+
+--- Current 1-based rank-name list from GuildControl APIs.
+-- @return table|nil ranks ({[position]=name, count=n}), string|nil reason
+function GG.GetGuildRanks()
+    local identity, reason = GG.GetGuildIdentity()
+    if not identity then
+        return nil, reason or "not_ready"
+    end
+    if type(GuildControlGetNumRanks) ~= "function" or type(GuildControlGetRankName) ~= "function" then
+        return nil, "ranks_unavailable"
+    end
+    local count = tonumber(GuildControlGetNumRanks()) or 0
+    if count < 1 then
+        return nil, "ranks_unavailable"
+    end
+    local ranks = { count = count }
+    for i = 1, count do
+        local rankName = GuildControlGetRankName(i)
+        if type(rankName) ~= "string" or rankName == "" then
+            return nil, "rank_name_unavailable"
+        end
+        ranks[i] = rankName
+    end
+    ranks.guildKey = identity.guildKey
+    return ranks
+end

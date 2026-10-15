@@ -79,6 +79,10 @@ L["RAID_CONSUMABLE_ADJUST_ERR_NO_PROFILE"] = "No active profile."
 L["RAID_CONSUMABLE_ADJUST_ERR_PROFILE_CHANGED"] = "The active profile changed, so the adjustment was not applied."
 L["RAID_CONSUMABLE_ADJUST_ERR_COMMIT"] = "Could not record that adjustment."
 
+-- Guild Supplies staged foundation (#385) — rank labels / waiting states
+L["GUILD_SUPPLIES_EDITOR_RANK_LABEL"] = "%s and higher"
+L["GUILD_SUPPLIES_RANK_WAITING"] = "Guild rank information is unavailable."
+
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)
 	local value = L[key]
