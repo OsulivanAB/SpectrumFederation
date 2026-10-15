@@ -6,10 +6,11 @@ local GS = SF.GuildSupplies
 
 GS.OP_SCHEMA_VERSION = 1
 GS.MAX_BANK_TAB = 8
--- Entry/leaf budget must fit a max confirmation batch (64) plus envelope fields.
+-- Node/string budgets sized for MAX_CONFIRMATION_BATCH (64) records + originalIds
+-- plus the confirmation envelope. Do not raise the 2 KiB transport export cap.
 GS.MAX_SNAPSHOT_DEPTH = 6
-GS.MAX_SNAPSHOT_NODES = 256
-GS.MAX_SNAPSHOT_STRING_BYTES = 8192
+GS.MAX_SNAPSHOT_NODES = 1024
+GS.MAX_SNAPSHOT_STRING_BYTES = 49152
 
 local KIND = {
     SET_EDITOR_RANK = "set-editor-rank",
@@ -268,6 +269,11 @@ local function TargetKey(kind, target)
         return "confirm"
     end
     return nil
+end
+
+--- Shared target-key helper for durable head validation (State load order is earlier).
+function GS.ComputeTargetKey(kind, target)
+    return TargetKey(kind, target)
 end
 
 local function CountMap(t)
@@ -961,7 +967,18 @@ local function ValidateCandidateRef(ref)
         or #ref.contentFingerprint > GS.MAX_OPERATION_ID then
         return false, "invalid_fingerprint"
     end
-    if ref.recordId ~= nil then
+    -- Exactly one reference form: single recordId XOR bounded records manifest.
+    local hasRecordId = ref.recordId ~= nil
+    local hasRecords = ref.records ~= nil
+    if hasRecordId == hasRecords then
+        return false, "invalid_candidate_ref"
+    end
+    if ref.campaignId ~= nil then
+        if type(ref.campaignId) ~= "string" or ref.campaignId == "" then
+            return false, "invalid_candidate_ref"
+        end
+    end
+    if hasRecordId then
         if type(ref.recordId) ~= "string" or ref.recordId == ""
             or #ref.recordId > GS.MAX_OPERATION_ID then
             return false, "invalid_candidate_ref"
@@ -972,34 +989,34 @@ local function ValidateCandidateRef(ref)
         end
         return true
     end
-    if type(ref.records) == "table" then
-        local n = #ref.records
-        if n < 1 or n > GS.MAX_CONFIRMATION_BATCH then
-            return false, "invalid_candidate_batch"
-        end
-        local counted = 0
-        for k, row in pairs(ref.records) do
-            counted = counted + 1
-            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
-                return false, "invalid_candidate_batch"
-            end
-            if type(row) ~= "table" or type(row.id) ~= "string" or row.id == ""
-                or #row.id > GS.MAX_OPERATION_ID
-                or type(row.contentFingerprint) ~= "string" or row.contentFingerprint == ""
-                or #row.contentFingerprint > GS.MAX_OPERATION_ID then
-                return false, "invalid_candidate_batch"
-            end
-        end
-        if counted ~= n then
-            return false, "invalid_candidate_batch"
-        end
-        local idsOk, idsErr = ValidateOriginalIds(ref.originalIds)
-        if not idsOk then
-            return false, idsErr
-        end
-        return true
+    if type(ref.records) ~= "table" then
+        return false, "invalid_candidate_ref"
     end
-    return false, "invalid_candidate_ref"
+    local n = #ref.records
+    if n < 1 or n > GS.MAX_CONFIRMATION_BATCH then
+        return false, "invalid_candidate_batch"
+    end
+    local counted = 0
+    for k, row in pairs(ref.records) do
+        counted = counted + 1
+        if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+            return false, "invalid_candidate_batch"
+        end
+        if type(row) ~= "table" or type(row.id) ~= "string" or row.id == ""
+            or #row.id > GS.MAX_OPERATION_ID
+            or type(row.contentFingerprint) ~= "string" or row.contentFingerprint == ""
+            or #row.contentFingerprint > GS.MAX_OPERATION_ID then
+            return false, "invalid_candidate_batch"
+        end
+    end
+    if counted ~= n then
+        return false, "invalid_candidate_batch"
+    end
+    local idsOk, idsErr = ValidateOriginalIds(ref.originalIds)
+    if not idsOk then
+        return false, idsErr
+    end
+    return true
 end
 
 local function ValidateConfirmationShape(op)
@@ -1047,6 +1064,10 @@ local function ValidateConfirmationShape(op)
     end
     if op.candidateRef.contentFingerprint ~= op.contentFingerprint then
         return false, "fingerprint_mismatch"
+    end
+    -- Nested candidate campaign ID, when present, must match the envelope.
+    if op.candidateRef.campaignId ~= nil and op.candidateRef.campaignId ~= op.campaignId then
+        return false, "invalid_campaign"
     end
     return true
 end
@@ -1114,6 +1135,15 @@ function GS:NewConfirmationOperation(candidateRef)
         timestamp = ts,
         _preparedHandleGeneration = ctx.handleGeneration,
     }
+    -- Complete-envelope check at prepare (same whitelist/budgets as admission).
+    local shapeOk, shapeErr = ValidateConfirmationShape(op)
+    if not shapeOk then
+        return nil, "rejected", shapeErr
+    end
+    local stored, snapErr = SnapshotPublicOp(op)
+    if not stored then
+        return nil, "rejected", snapErr or "invalid_operation"
+    end
     return op, "accepted", nil
 end
 

@@ -49,6 +49,28 @@ local function NewWriterState()
     }
 end
 
+--- Persisted writer nonce: exactly 24 lowercase/uppercase hex digits.
+local function IsValidWriterNonce(nonce)
+    return type(nonce) == "string" and #nonce == 24 and nonce:match("^[0-9a-fA-F]+$") ~= nil
+end
+
+local function IsValidWriterState(writer)
+    if type(writer) ~= "table" or not IsValidWriterNonce(writer.nonce) then
+        return false
+    end
+    local seq = tonumber(writer.nextSeq)
+    return seq and seq == math.floor(seq) and seq >= 1 and seq <= GS.MAX_EVENT_SEQ
+end
+
+local function IsBoundedActorString(value)
+    return type(value) == "string" and value ~= "" and #value <= GS.MAX_OPERATION_ID
+end
+
+local function IsFiniteNonnegInt(value)
+    local n = tonumber(value)
+    return n and n == math.floor(n) and n >= 0 and n == n and n ~= math.huge
+end
+
 local function EmptyAccounting(clubId, guildName, guildRealm)
     return {
         _consumables = {
@@ -147,8 +169,36 @@ local function ValidateRetainedAdmissionEntry(id, entry)
     if type(entry.body) ~= "table" then
         return false, "invalid_operations"
     end
-    if entry.body.id ~= nil and entry.body.id ~= id then
+    if type(entry.body.id) ~= "string" or entry.body.id ~= id then
         return false, "invalid_operations"
+    end
+    return true
+end
+
+local function ValidateOperationsHeads(ops)
+    local headCount = 0
+    for targetKey, headId in pairs(ops.heads) do
+        headCount = headCount + 1
+        if headCount > GS.MAX_ACCEPTED_OPERATIONS then
+            return false, "invalid_operations"
+        end
+        if type(targetKey) ~= "string" or targetKey == "" or #targetKey > GS.MAX_OPERATION_ID then
+            return false, "invalid_operations"
+        end
+        if type(headId) ~= "string" or headId == "" or #headId > GS.MAX_OPERATION_ID then
+            return false, "invalid_operations"
+        end
+        local body = ops.records[headId]
+        if type(body) ~= "table" then
+            return false, "invalid_operations"
+        end
+        if type(GS.ComputeTargetKey) ~= "function" then
+            return false, "invalid_operations"
+        end
+        local expectedKey = GS.ComputeTargetKey(body.kind, body.target)
+        if expectedKey == nil or expectedKey ~= targetKey then
+            return false, "invalid_operations"
+        end
     end
     return true
 end
@@ -181,7 +231,7 @@ local function ValidateOperationsStore(ops)
         if type(body) ~= "table" then
             return false, "invalid_operations"
         end
-        if body.id ~= nil and body.id ~= id then
+        if type(body.id) ~= "string" or body.id ~= id then
             return false, "invalid_operations"
         end
     end
@@ -227,6 +277,48 @@ local function ValidateOperationsStore(ops)
         return false, "invalid_operations"
     end
 
+    local headsOk, headsErr = ValidateOperationsHeads(ops)
+    if not headsOk then
+        return false, headsErr
+    end
+
+    return true
+end
+
+--- confirmationRefs: dense unique IDs of accepted confirm-candidate bodies.
+local function ValidateConfirmationRefs(refs, ops)
+    if type(refs) ~= "table" then
+        return false, "invalid_record_shape"
+    end
+    local n = #refs
+    if n > GS.MAX_ACCEPTED_OPERATIONS then
+        return false, "invalid_confirmation_refs"
+    end
+    local counted = 0
+    local seen = {}
+    for k, id in pairs(refs) do
+        counted = counted + 1
+        if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+            return false, "invalid_confirmation_refs"
+        end
+        if type(id) ~= "string" or id == "" or #id > GS.MAX_OPERATION_ID then
+            return false, "invalid_confirmation_refs"
+        end
+        if seen[id] then
+            return false, "invalid_confirmation_refs"
+        end
+        seen[id] = true
+        local body = ops and ops.records and ops.records[id]
+        if type(body) ~= "table" or body.kind ~= "confirm-candidate" then
+            return false, "invalid_confirmation_refs"
+        end
+        if type(body.id) ~= "string" or body.id ~= id then
+            return false, "invalid_confirmation_refs"
+        end
+    end
+    if counted ~= n then
+        return false, "invalid_confirmation_refs"
+    end
     return true
 end
 
@@ -299,6 +391,10 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if not ok then
         return false, err
     end
+    ok, err = ValidateConfirmationRefs(record.confirmationRefs, record.operations)
+    if not ok then
+        return false, err
+    end
     return true
 end
 
@@ -345,7 +441,8 @@ function GS:_GetPolicyRecoveryRecord(guildKey)
     return record, permErr or "invalid_permission", clubId
 end
 
-local function ValidateRoot(root)
+--- Schema/guilds only; writer recovery is handled separately under #385.
+local function ValidateRootBase(root)
     if type(root) ~= "table" then
         return false, "invalid_root"
     end
@@ -356,12 +453,15 @@ local function ValidateRoot(root)
     if type(root.guilds) ~= "table" then
         return false, "invalid_guilds"
     end
-    local writer = root.localWriter
-    if type(writer) ~= "table" or type(writer.nonce) ~= "string" or writer.nonce == "" then
-        return false, "invalid_local_writer"
+    return true
+end
+
+local function ValidateRoot(root)
+    local ok, reason = ValidateRootBase(root)
+    if not ok then
+        return false, reason
     end
-    local seq = tonumber(writer.nextSeq)
-    if not seq or seq ~= math.floor(seq) or seq < 1 or seq > GS.MAX_EVENT_SEQ then
+    if not IsValidWriterState(root.localWriter) then
         return false, "invalid_local_writer"
     end
     return true
@@ -401,7 +501,20 @@ function GS:Initialize(db)
 
     local ok, reason = ValidateRoot(existing)
     if not ok then
-        -- Preserve unsupported/malformed saved data; do not normalize.
+        -- #385: malformed writer on an otherwise supported root gets a fresh
+        -- nonce before new IDs; preserve all guild records unchanged.
+        if reason == "invalid_local_writer" then
+            local baseOk = ValidateRootBase(existing)
+            if baseOk then
+                existing.localWriter = NewWriterState()
+                GS._root = existing
+                GS._rootValid = true
+                GS._rootReason = nil
+                DebugWarn("reestablished localWriter nonce on initialize")
+                return true
+            end
+        end
+        -- Preserve unsupported/malformed saved data; do not normalize domain.
         GS._root = existing
         GS._rootValid = false
         GS._rootReason = reason or "unsupported_schema"
@@ -438,15 +551,10 @@ function GS:_GetWriter()
     if not root then
         return nil, reason
     end
-    local writer = root.localWriter
-    if type(writer) ~= "table" or type(writer.nonce) ~= "string" or writer.nonce == "" then
+    if not IsValidWriterState(root.localWriter) then
         return nil, "invalid_local_writer"
     end
-    local seq = tonumber(writer.nextSeq)
-    if not seq or seq ~= math.floor(seq) or seq < 1 then
-        return nil, "invalid_local_writer"
-    end
-    return writer
+    return root.localWriter
 end
 
 --- Rotate writer nonce when sequence is exhausted or writer state is unusable.
@@ -456,10 +564,9 @@ function GS:_EnsureWritableWriter()
         return nil, reason
     end
     local writer = root.localWriter
-    local seq = writer and tonumber(writer.nextSeq)
-    local nonceOk = type(writer) == "table" and type(writer.nonce) == "string" and writer.nonce ~= ""
-    if not nonceOk or not seq or seq ~= math.floor(seq) or seq < 1 or seq > GS.MAX_EVENT_SEQ then
+    if not IsValidWriterState(writer) then
         -- Preserve old records; establish a fresh nonce before new IDs.
+        -- Never reuse or continue the malformed nonce/counter.
         root.localWriter = NewWriterState()
         DebugWarn("reestablished localWriter nonce")
         return root.localWriter
@@ -697,6 +804,48 @@ function GS.ValidateCampaignBoundary(header, record, expectedGuildKey)
         and header.contextStatus ~= "unavailable" then
         return false, "invalid_context_status"
     end
+
+    -- Attribution: new-goal requires bounded authors; legacy must not invent them.
+    if header.boundaryKind == "new-goal" then
+        if not IsBoundedActorString(header.createdByGuid)
+            or not IsBoundedActorString(header.createdByName) then
+            return false, "invalid_attribution"
+        end
+    else
+        if header.createdByGuid ~= nil and not IsBoundedActorString(header.createdByGuid) then
+            return false, "invalid_attribution"
+        end
+        if header.createdByName ~= nil and not IsBoundedActorString(header.createdByName) then
+            return false, "invalid_attribution"
+        end
+        if header.startedAt ~= nil then
+            local startedAt = tonumber(header.startedAt)
+            if not startedAt or startedAt ~= math.floor(startedAt) or startedAt < 0 then
+                return false, "invalid_started_at"
+            end
+        end
+    end
+
+    -- Capture metadata is status-dependent; unavailable may honestly omit evidence.
+    if header.contextStatus == "captured" or header.contextStatus == "empty" then
+        if not IsFiniteNonnegInt(header.contextObservedAt) then
+            return false, "invalid_context_observed_at"
+        end
+        if not IsFiniteNonnegInt(header.contextRecordCount) then
+            return false, "invalid_context_record_count"
+        end
+        if header.contextStatus == "empty" and tonumber(header.contextRecordCount) ~= 0 then
+            return false, "invalid_context_record_count"
+        end
+    else
+        if header.contextObservedAt ~= nil and not IsFiniteNonnegInt(header.contextObservedAt) then
+            return false, "invalid_context_observed_at"
+        end
+        if header.contextRecordCount ~= nil and not IsFiniteNonnegInt(header.contextRecordCount) then
+            return false, "invalid_context_record_count"
+        end
+    end
+
     if tonumber(header.boundaryVersion) ~= 1 then
         return false, "unsupported_boundary_version"
     end

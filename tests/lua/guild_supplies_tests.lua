@@ -1376,13 +1376,9 @@ do
     assertEq(st, "accepted", "supported confirmation batch prepares")
     assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "supported batch admits")
 
-    -- Wide scalar map rejected without durable mutation
+    -- Oversized string rejected without durable mutation (budget is 49,152 bytes).
     local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
-    local wide = {}
-    for i = 1, 200 do wide["k" .. i] = i end
-    -- Inject oversized nested value through a crafted confirm-sized payload on config:
-    -- snapshot whitelist only copies known fields; craft via candidate-like oversize string.
-    op.actorName = string.rep("n", 9000)
+    op.actorName = string.rep("n", GS.MAX_SNAPSHOT_STRING_BYTES + 1)
     local beforeTab = GS:GetCurrentRecord().accounting._consumables.bankTab
     status, reason = GS:ApplyStagedConfigOperation(op)
     assertEq(status, "rejected", "oversized string snapshot rejected")
@@ -1462,6 +1458,406 @@ do
     member, reason = GG.GetGuildMember("Alice-Garona")
     assertTrue(member ~= nil, "later native readiness resolves")
     assertEq(member.guid, "Player-1-Alice", "member guid after roster present")
+end
+
+-- R15) Max confirmation batch + over-limit + XOR candidateRef + nested campaign
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    -- Both recordId and records rejected (exactly one form).
+    local conf, st, err = GS:NewConfirmationOperation({
+        recordId = "single",
+        records = { { id = "r1", contentFingerprint = "fp-xor" } },
+        contentFingerprint = "fp-xor",
+    })
+    assertEq(st, "rejected", "both candidate forms rejected at prepare")
+    assertEq(err, "invalid_candidate_ref", "invalid_candidate_ref for both forms")
+
+    conf, st, err = GS:NewConfirmationOperation({
+        contentFingerprint = "fp-neither",
+    })
+    assertEq(st, "rejected", "neither candidate form rejected")
+    assertEq(err, "invalid_candidate_ref", "invalid_candidate_ref for neither form")
+
+    -- Nested campaign mismatch vs envelope (crafted after prepare).
+    conf, st = GS:NewConfirmationOperation({
+        recordId = "camp-bind",
+        contentFingerprint = "fp-camp",
+        campaignId = "camp-A",
+    })
+    assertEq(st, "accepted", "nested campaign prepare when matching envelope source")
+    conf.campaignId = "camp-B"
+    local ok, verr = GS:ValidateConfirmationOperation(conf)
+    assertEq(ok, false, "nested/envelope campaign mismatch rejected")
+    assertEq(verr, "invalid_campaign", "invalid_campaign for nested mismatch")
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "rejected", "mismatch not admitted")
+    assertNil(GS:GetCurrentRecord().operations.records[conf.id], "no retention on campaign mismatch")
+
+    -- Malformed nested campaignId type
+    conf, st, err = GS:NewConfirmationOperation({
+        recordId = "camp-bad",
+        contentFingerprint = "fp-camp-bad",
+        campaignId = false,
+    })
+    assertEq(st, "rejected", "non-string nested campaignId rejected")
+    assertEq(err, "invalid_candidate_ref", "invalid_candidate_ref for bad campaignId")
+
+    -- Maximum supported batch with realistic IDs/fingerprints/originalIds.
+    local rows, oids = {}, {}
+    local fp = "fp-" .. string.rep("a", 40)
+    for i = 1, GS.MAX_CONFIRMATION_BATCH do
+        local id = string.format("gs1:Player-1-Alice:%s:%d", string.rep("b", 24), i)
+        rows[i] = { id = id, contentFingerprint = fp }
+        oids[i] = string.format("txn:%s:%d", string.rep("c", 32), i)
+    end
+    conf, st, err = GS:NewConfirmationOperation({
+        records = rows,
+        contentFingerprint = fp,
+        originalIds = oids,
+    })
+    assertEq(st, "accepted", "max confirmation batch prepares: " .. tostring(err))
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "max confirmation batch admits")
+    assertEq(GS:GetCurrentRecord().confirmationRefs[1], conf.id, "max batch confirmationRefs id")
+
+    -- Just over limit rejected at prepare; no durable mutation.
+    local overRows = {}
+    for i = 1, GS.MAX_CONFIRMATION_BATCH + 1 do
+        overRows[i] = { id = "over-" .. i, contentFingerprint = "fp-over" }
+    end
+    local beforeRefs = #GS:GetCurrentRecord().confirmationRefs
+    conf, st, err = GS:NewConfirmationOperation({
+        records = overRows,
+        contentFingerprint = "fp-over",
+    })
+    assertEq(st, "rejected", "over-limit batch rejected at prepare")
+    assertEq(err, "invalid_candidate_batch", "invalid_candidate_batch for 65 records")
+    assertEq(#GS:GetCurrentRecord().confirmationRefs, beforeRefs, "no refs growth on over-limit")
+end
+
+-- R16) Heads, confirmationRefs, required body.id
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+
+    -- Ghost head
+    raw.operations.heads["item:1"] = "ghost"
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "ghost head keeps record unavailable")
+    assertEq(reason, "invalid_operations", "invalid_operations for ghost head")
+    assertEq(raw.operations.heads["item:1"], "ghost", "ghost head preserved")
+
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "bank tab for wrong-target head fixture")
+    raw.operations.heads["item:99"] = op.id
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "wrong-target head unavailable")
+    assertEq(reason, "invalid_operations", "invalid_operations for wrong-target head")
+
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.operations.heads["config:bankTab"] = true
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "non-string head unavailable")
+    assertEq(reason, "invalid_operations", "invalid_operations for non-string head")
+
+    -- Missing body.id on accepted
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.operations.records["acc-1"] = { kind = "set-bank-tab", target = "bankTab", value = 1 }
+    raw.operations.order[1] = "acc-1"
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "missing accepted body.id unavailable")
+    assertEq(reason, "invalid_operations", "invalid_operations for missing body.id")
+    assertEq(raw.operations.records["acc-1"].id, nil, "missing body.id preserved")
+
+    -- Mismatched pending body.id
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.operations.pending["p1"] = {
+        id = "p1",
+        reason = "stale_base",
+        body = { id = "other", kind = "set-bank-tab" },
+        at = 1,
+    }
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "mismatched pending body.id unavailable")
+    assertEq(reason, "invalid_operations", "invalid_operations for pending body.id")
+    assertEq(raw.operations.pending["p1"].body.id, "other", "mismatched pending preserved")
+
+    -- confirmationRefs: dangling / wrong kind / sparse / duplicate
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.confirmationRefs = { "missing-confirm" }
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "dangling confirmationRefs unavailable")
+    assertEq(reason, "invalid_confirmation_refs", "invalid_confirmation_refs dangling")
+
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local bankOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertEq(GS:ApplyStagedConfigOperation(bankOp), "accepted", "config for wrong-kind refs")
+    raw.confirmationRefs = { bankOp.id }
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "wrong-kind confirmationRefs unavailable")
+    assertEq(reason, "invalid_confirmation_refs", "invalid_confirmation_refs wrong kind")
+
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local conf = GS:NewConfirmationOperation({ recordId = "ref-ok", contentFingerprint = "fp-ref" })
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "confirm for refs fixture")
+    raw.confirmationRefs[2] = conf.id
+    raw.confirmationRefs[1] = nil
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "sparse confirmationRefs unavailable")
+    assertEq(reason, "invalid_confirmation_refs", "invalid_confirmation_refs sparse")
+
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    conf = GS:NewConfirmationOperation({ recordId = "ref-dup", contentFingerprint = "fp-dup-ref" })
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "confirm for dup refs")
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.confirmationRefs = { conf.id, conf.id }
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "duplicate confirmationRefs unavailable")
+    assertEq(reason, "invalid_confirmation_refs", "invalid_confirmation_refs duplicate")
+end
+
+-- R17) Writer nonce recovery + boundary attribution/capture metadata
+do
+    resetDb()
+    SpectrumFederationDB = {
+        guildSupplies = {
+            schemaVersion = 1,
+            localWriter = { nonce = string.rep("z", 500), nextSeq = 1 },
+            guilds = {
+                ["club:42"] = {
+                    schemaVersion = 1,
+                    activation = "staged",
+                    datasetId = "gs1:Player-1-Alice:aaaaaaaaaaaaaaaaaaaaaaaa:1",
+                    permission = { editorRankPosition = 3, revisionId = "gs1:Player-1-Alice:aaaaaaaaaaaaaaaaaaaaaaaa:1" },
+                    currentCampaignId = nil,
+                    campaigns = {},
+                    accounting = {
+                        _consumables = {
+                            guild = { guid = "42", name = "Spectrum", realm = "Garona" },
+                            bankTab = nil,
+                            requestedItems = {},
+                            generation = 0,
+                            configSeq = 0,
+                            eventSeq = 0,
+                            eligibility = {},
+                            txnRegistry = {},
+                        },
+                        _consumableEvents = {},
+                        _consumableEventArchive = {},
+                    },
+                    observations = { byCampaign = {} },
+                    operations = { records = {}, order = {}, heads = {}, pending = {}, conflicts = {} },
+                    confirmationRefs = {},
+                    migration = nil,
+                },
+            },
+        },
+    }
+    local oldDataset = SpectrumFederationDB.guildSupplies.guilds["club:42"].datasetId
+    local ok = GS:Initialize(SpectrumFederationDB)
+    assertEq(ok, true, "malformed writer recovers on otherwise valid root")
+    local nonce = SpectrumFederationDB.guildSupplies.localWriter.nonce
+    assertEq(#nonce, 24, "recovered nonce is 24 hex")
+    assertTrue(nonce:match("^[0-9a-fA-F]+$") ~= nil, "recovered nonce hex")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].datasetId, oldDataset,
+        "old dataset/record preserved across writer recovery")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    local rec = GS:GetCurrentRecord()
+    assertTrue(rec ~= nil, "recovered root exposes preserved guild record")
+    local newId = GS:_AllocateOperationId("Player-1-Alice")
+    assertTrue(newId ~= nil and newId:find(nonce, 1, true) ~= nil, "new IDs use fresh nonce")
+
+    -- Valid reload keeps nonce
+    local kept = SpectrumFederationDB.guildSupplies.localWriter.nonce
+    local seq = SpectrumFederationDB.guildSupplies.localWriter.nextSeq
+    GS:Initialize(SpectrumFederationDB)
+    assertEq(SpectrumFederationDB.guildSupplies.localWriter.nonce, kept, "valid nonce survives reload")
+    assertEq(SpectrumFederationDB.guildSupplies.localWriter.nextSeq, seq, "valid nextSeq survives reload")
+
+    -- Exhaustion rotates to a fresh nonce without rewriting old records
+    SpectrumFederationDB.guildSupplies.localWriter.nextSeq = GS.MAX_EVENT_SEQ + 1
+    local rotated = GS:_EnsureWritableWriter()
+    assertTrue(rotated.nonce ~= kept, "exhaustion rotates nonce")
+    assertEq(rotated.nextSeq, 1, "fresh writer starts at 1")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].datasetId, oldDataset,
+        "exhaustion preserves guild records")
+
+    -- Unsupported schema still unavailable (no writer/domain normalize)
+    resetDb()
+    SpectrumFederationDB = {
+        guildSupplies = {
+            schemaVersion = 99,
+            localWriter = { nonce = string.rep("f", 500), nextSeq = 1 },
+            guilds = { ["club:1"] = { schemaVersion = 99 } },
+        },
+    }
+    ok = GS:Initialize(SpectrumFederationDB)
+    assertEq(ok, false, "unsupported schema remains unavailable")
+    assertEq(SpectrumFederationDB.guildSupplies.localWriter.nonce, string.rep("f", 500),
+        "unsupported root writer not rewritten")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:1"].schemaVersion, 99,
+        "unsupported guild preserved")
+
+    -- Boundary attribution / capture metadata
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+
+    local okStore, storeErr = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-no-author",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "camp-no-author",
+        createdByGuid = nil,
+        createdByName = nil,
+        startedAt = 10,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    })
+    assertEq(okStore, false, "new-goal missing authors rejected")
+    assertEq(storeErr, "invalid_attribution", "invalid_attribution for missing authors")
+
+    okStore, storeErr = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-captured-bad",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "camp-captured-bad",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 10,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "captured",
+        contextObservedAt = nil,
+        contextRecordCount = 2,
+    })
+    assertEq(okStore, false, "captured without observedAt rejected")
+    assertEq(storeErr, "invalid_context_observed_at", "invalid_context_observed_at")
+
+    okStore, storeErr = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-empty-nonzero",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "camp-empty-nonzero",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 10,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "empty",
+        contextObservedAt = 11,
+        contextRecordCount = 3,
+    })
+    assertEq(okStore, false, "empty with nonzero count rejected")
+    assertEq(storeErr, "invalid_context_record_count", "invalid_context_record_count for empty")
+
+    okStore, storeErr = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-unavail-ok",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "camp-unavail-ok",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 10,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextObservedAt = nil,
+        contextRecordCount = nil,
+    })
+    assertEq(okStore, true, "unavailable may omit observation evidence: " .. tostring(storeErr))
+
+    okStore, storeErr = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "legacy-no-fabricate",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = nil,
+        createdByGuid = nil,
+        createdByName = nil,
+        startedAt = nil,
+        bankTabAtStart = nil,
+        boundaryVersion = 1,
+        boundaryKind = "legacy-preserved",
+        contextStatus = "unavailable",
+        contextObservedAt = nil,
+        contextRecordCount = nil,
+    })
+    assertEq(okStore, true, "legacy-preserved without fabricated authors/timestamps: " .. tostring(storeErr))
+
+    okStore, storeErr = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-captured-ok",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "camp-captured-ok",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 12,
+        bankTabAtStart = 2,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "captured",
+        contextObservedAt = 12,
+        contextRecordCount = 4,
+    })
+    assertEq(okStore, true, "captured with evidence metadata accepted: " .. tostring(storeErr))
+    local bound = GS:GetCurrentCampaignBoundary()
+    assertEq(bound.contextRecordCount, 4, "captured count roundtrip")
+    assertEq(bound.createdByName, "Alice-Garona", "captured author roundtrip")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

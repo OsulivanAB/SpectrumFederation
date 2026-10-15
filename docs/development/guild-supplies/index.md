@@ -74,7 +74,7 @@ Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected` with stable re
 - `set-requested-item` → target `{ itemId = N }` (add/update/remove share one revision chain)
 - `confirm-candidate` → confirmation envelope (see below)
 
-Caps: **4,096** accepted operations / guild; **128** combined pending+conflict admission bodies / guild (shared budget). Existing-ID retries reuse a slot and do not consume another. Overfull admissions return `full` without partial mutation or eviction. Durable operation snapshots are whitelisted and bounded (entry/leaf count and string bytes); malformed or oversized input is rejected without partial retention. Retained `records`/`order`/`pending`/`conflicts` entries must be shape- and ID-consistent before a guild record is usable; inconsistent saved stores stay unavailable without repair-on-read.
+Caps: **4,096** accepted operations / guild; **128** combined pending+conflict admission bodies / guild (shared budget). Existing-ID retries reuse a slot and do not consume another. Overfull admissions return `full` without partial mutation or eviction. Durable operation snapshots are whitelisted and bounded (depth 6, **1,024** nodes, **49,152** string bytes) so a full confirmation batch of **64** records plus `originalIds` fits; the separate **2 KiB** transport export cap is unchanged. Malformed or oversized input is rejected without partial retention. Retained `records`/`order`/`pending`/`conflicts` entries require map-key/`body.id` identity; `operations.heads` must name accepted bodies for the corresponding target; `confirmationRefs` is a dense unique array of accepted `confirm-candidate` IDs (≤ accepted cap). Inconsistent saved stores stay unavailable without repair-on-read. A malformed `localWriter` nonce on an otherwise supported root is replaced with a fresh 24-hex nonce before new IDs; guild records are preserved and unsupported domain data is never normalized.
 
 ### Rank authority (locked)
 
@@ -86,11 +86,11 @@ Caps: **4,096** accepted operations / guild; **128** combined pending+conflict a
 
 ### Confirmation envelope
 
-`confirm-candidate` carries `schemaVersion, id, guildKey, datasetId, candidateRef, contentFingerprint, campaignId, basePolicyRevision, actorGuid, actorName, timestamp`. Candidate policy cannot self-authorize. Original IDs are preserved; endorsement is not a live donation credit. Network confirmation exchange is #387/#388.
+`confirm-candidate` carries `schemaVersion, id, guildKey, datasetId, candidateRef, contentFingerprint, campaignId, basePolicyRevision, actorGuid, actorName, timestamp`. `candidateRef` must use exactly one reference form: a single `recordId` **or** a dense `records` manifest (1–64), never both/neither. When `candidateRef.campaignId` is present it must match the envelope `campaignId`. Candidate policy cannot self-authorize. Original IDs are preserved; endorsement is not a live donation credit. Network confirmation exchange is #387/#388.
 
 ### Campaign boundary header
 
-Fields: `schemaVersion, campaignId, datasetId, guildKey, parentCampaignId, resetOperationId, createdByGuid, createdByName, startedAt, bankTabAtStart, boundaryVersion=1, boundaryKind ("new-goal"|"legacy-preserved"), contextStatus ("captured"|"empty"|"unavailable"), contextObservedAt, contextRecordCount`. `currentCampaignId` must be nil or a nonempty key whose embedded `campaignId` matches. `new-goal` requires nonempty `resetOperationId == campaignId`. `bankTabAtStart` is nil or integral tabs 1–8. `#385` validates/accesses only; bank capture and reset lifecycle are #386.
+Fields: `schemaVersion, campaignId, datasetId, guildKey, parentCampaignId, resetOperationId, createdByGuid, createdByName, startedAt, bankTabAtStart, boundaryVersion=1, boundaryKind ("new-goal"|"legacy-preserved"), contextStatus ("captured"|"empty"|"unavailable"), contextObservedAt, contextRecordCount`. `currentCampaignId` must be nil or a nonempty key whose embedded `campaignId` matches. `new-goal` requires nonempty `resetOperationId == campaignId`, bounded `createdByGuid`/`createdByName`, and finite `startedAt`. `legacy-preserved` may omit historical authors/`startedAt` (do not fabricate them); present values stay type-safe. `contextStatus` `captured`/`empty` require finite `contextObservedAt` and `contextRecordCount` (`empty` ⇒ count 0); `unavailable` may honestly omit observation evidence. `bankTabAtStart` is nil or integral tabs 1–8. `#385` validates/accesses only; bank capture and reset lifecycle are #386.
 
 ## Downstream ownership
 
