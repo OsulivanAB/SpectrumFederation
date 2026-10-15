@@ -18,7 +18,7 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 3. Default editor threshold is logical rank position 3; labels use actual rank names.
 4. Invalid/out-of-range policy permits verified Guild Master recovery only.
 5. Staged compare-and-apply statuses: accepted / duplicate / pending / rejected.
-6. Zero active gossip providers still support demand-driven authority (throttled cold-roster nudge only); missing data fails closed; commit rechecks guild/rank/policy.
+6. Zero active gossip providers still support demand-driven authority (throttled cold-roster nudge + temporary `GUILD_ROSTER_UPDATE` wait across club changes; no permanent listeners/discovery); missing data fails closed; commit rechecks guild/rank/policy.
 7. Chat-free: enabled `SF.Debug` only. No Guild Supplies provider registration in 2A.
 
 ## Dependencies / invalidation

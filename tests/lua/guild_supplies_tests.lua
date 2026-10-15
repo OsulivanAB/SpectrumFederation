@@ -60,6 +60,8 @@ local world = {
     gossipReady = false,
     wireSends = 0,
     rosterRequests = 0,
+    frames = {},
+    framesByName = {},
 }
 
 function GetTime() return world.time end
@@ -121,14 +123,45 @@ C_Timer = {
     end,
 }
 
-function CreateFrame()
+local function flushTimers()
+    local progressed = true
+    while progressed do
+        progressed = false
+        local i = 1
+        while i <= #timers do
+            local t = timers[i]
+            if t.at <= world.time then
+                table.remove(timers, i)
+                t.fn()
+                progressed = true
+            else
+                i = i + 1
+            end
+        end
+    end
+end
+
+function CreateFrame(_, name)
     local f = {
+        name = name,
         events = {},
         RegisterEvent = function(self, e) self.events[e] = true end,
         UnregisterAllEvents = function(self) self.events = {} end,
         SetScript = function(self, _, fn) self._onEvent = fn end,
     }
+    world.frames[#world.frames + 1] = f
+    if type(name) == "string" and name ~= "" then
+        world.framesByName[name] = f
+    end
     return f
+end
+
+local function fireEvent(event)
+    for _, f in ipairs(world.frames) do
+        if f.events[event] and f._onEvent then
+            f._onEvent(f, event)
+        end
+    end
 end
 
 -- Chat / print traps
@@ -222,10 +255,18 @@ local function resetDb()
     GS._handleGeneration = 0
     GS._lastGuildKey = nil
     world.rosterRequests = 0
+    timers = {}
     if GG._demandRoster then
         GG._demandRoster.lastRequestAt = nil
         GG._demandRoster.boundClubId = nil
         GG._demandRoster.pendingClubId = nil
+        GG._demandRoster.waitGeneration = (tonumber(GG._demandRoster.waitGeneration) or 0) + 1
+        GG._demandRoster.waitActive = false
+        local wf = GG._demandRoster.waitFrame
+        if wf then
+            if wf.UnregisterAllEvents then wf:UnregisterAllEvents() end
+            if wf.SetScript then wf:SetScript("OnEvent", nil) end
+        end
         GG._demandRoster.staleFingerprint = nil
     end
 end
@@ -337,32 +378,35 @@ do
     -- Club changed first while native roster still shows prior guild rows.
     local ctxB = GS:GetCurrentContext()
     assertEq(ctxB.ready, false, "stale roster keeps new club unready")
-    assertEq(ctxB.reason, "roster_incomplete", "roster_incomplete until new roster lands")
-    -- Roster refresh for the new club (content differs from the captured stale snapshot).
+    assertEq(ctxB.reason, "roster_incomplete", "roster_incomplete until roster update event")
+    -- Content alone must not authenticate; GUILD_ROSTER_UPDATE completes the wait.
     world.guild.members = {
         { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
         { name = "Zoe-Garona", guid = "Player-1-Zoe", rankOrder = 2, online = true },
     }
+    assertEq(GS:GetCurrentContext().ready, false, "content change alone stays unready")
+    fireEvent("GUILD_ROSTER_UPDATE")
     -- Same character, different guild — no leak of A
     local b, reason = GS:GetCurrentRecord()
     assertNil(b, "guild B not configured")
     assertEq(reason, "not_configured", "guild B not_configured")
     local recB, st = GS:CreateStagedRecord()
-    assertEq(st, "accepted", "create guild B after roster refresh")
+    assertEq(st, "accepted", "create guild B after roster update event")
     assertTrue(recB.datasetId ~= datasetA, "distinct dataset IDs")
     assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"] ~= nil, true, "guild A retained")
     assertEq(SpectrumFederationDB.guildSupplies.guilds["club:99"] ~= nil, true, "guild B present")
 
     world.guild.clubId = 42
     world.guild.name = "Spectrum"
-    -- Again: identity flips before roster contents do.
-    assertEq(GS:GetCurrentContext().ready, false, "return to A unready on stale B roster")
+    -- Again: identity flips before a roster update event for A.
+    assertEq(GS:GetCurrentContext().ready, false, "return to A unready before roster event")
     world.guild.members = {
         { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
         { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
         { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
         { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
     }
+    fireEvent("GUILD_ROSTER_UPDATE")
     local again = GS:GetCurrentRecord()
     assertEq(again.datasetId, datasetA, "return to guild A restores record")
 end
@@ -1494,9 +1538,14 @@ do
     assertEq(GG._guild.listening, false, "no permanent listeners")
     assertEq(GG._guild.ready, false, "transport not marked ready")
     world.guild.members = savedMembers
+    -- Population alone is not freshness after a cold wait; the update event binds.
     member, reason = GG.GetGuildMember("Alice-Garona")
-    assertTrue(member ~= nil, "later native readiness resolves")
+    assertNil(member, "still incomplete until roster update event")
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "later native readiness resolves after event")
     assertEq(member.guid, "Player-1-Alice", "member guid after roster present")
+    assertEq(GG._demandRoster.waitActive, false, "cold wait cleaned up after event")
 end
 
 -- R15) Max confirmation batch + over-limit + XOR candidateRef + nested campaign
@@ -2103,6 +2152,7 @@ do
     assertNil(member, "stale roster not trusted for new club")
     assertEq(reason, "roster_incomplete", "roster_incomplete during scope transition")
     assertTrue(world.rosterRequests >= 1, "demand roster request on scope change")
+    assertEq(GG._demandRoster.waitActive, true, "temporary GUILD_ROSTER_UPDATE wait active")
     local ctx = GS:GetCurrentContext()
     assertEq(ctx.ready, false, "context not ready during roster uncertainty")
     local newOp, newSt, newErr = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
@@ -2111,18 +2161,23 @@ do
     assertTrue(newErr == "roster_incomplete" or newErr == "not_ready" or newErr == "rank_unavailable",
         "uncertainty reason on prepare: " .. tostring(newErr))
 
-    -- Recovery: roster contents change for the new guild.
+    -- Content change alone must not authenticate stale rank data.
     world.guild.members = {
         { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
         { name = "Eve-Garona", guid = "Player-1-Eve", rankOrder = 2, online = true },
     }
-    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
     member, reason = GG.GetGuildMember("Alice-Garona")
-    assertTrue(member ~= nil, "roster trusted after content change: " .. tostring(reason))
+    assertNil(member, "content change alone does not bind new club")
+    assertEq(reason, "roster_incomplete", "still incomplete without roster event")
+
+    -- Recovery: GUILD_ROSTER_UPDATE completes the bounded wait.
+    fireEvent("GUILD_ROSTER_UPDATE")
+    assertEq(GG._demandRoster.waitActive, false, "wait cleaned up after event")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "roster trusted after update event: " .. tostring(reason))
     assertEq(member.clubId, "99", "member labeled with new club 99")
     ctx = GS:GetCurrentContext()
     assertEq(ctx.ready, true, "context ready after scoped roster recovery")
-    -- Guild 99 is not configured — create is allowed for editor; writes to 42 denied via key.
     local rec99, st99 = GS:CreateStagedRecord()
     assertEq(st99, "accepted", "can create staged record after roster recovery")
     assertEq(rec99.accounting._consumables.guild.guid, "99", "new guild accounting guid")
@@ -2136,6 +2191,238 @@ do
         { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
         { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
     }
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+end
+
+-- R22) Requested-item value canonicalization at admission (nested extras / remove / replay)
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    local op = GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
+        itemId = 501, goal = 7, extra = { a = { b = { c = { d = true } } } },
+    })
+    assertTrue(op ~= nil, "prepare strips nested extras from constructor value")
+    assertNil(op.value.extra, "constructor value has no nested extras")
+    assertEq(op.value.itemId, 501, "canonical itemId")
+    assertEq(op.value.goal, 7, "canonical goal")
+    assertEq(op.value.removed, false, "canonical removed=false")
+
+    -- Caller re-poisons the draft between prepare and apply.
+    op.value.extra = { a = { b = { c = { d = true } } } }
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "admit re-canonicalizes poisoned draft")
+    local stored = GS:GetCurrentRecord().operations.records[op.id]
+    assertNil(stored.value.extra, "durable body has no nested extras")
+    assertEq(stored.value.goal, 7, "durable goal preserved")
+
+    -- Exact replay after "reload" (re-read durable body shape) → duplicate.
+    local replay = {
+        schemaVersion = stored.schemaVersion,
+        id = stored.id,
+        guildKey = stored.guildKey,
+        datasetId = stored.datasetId,
+        kind = stored.kind,
+        target = { itemId = stored.target.itemId },
+        value = {
+            itemId = stored.value.itemId,
+            goal = stored.value.goal,
+            removed = false,
+            extra = { a = { b = { c = { d = true } } } },
+        },
+        baseTargetRevision = stored.baseTargetRevision,
+        basePolicyRevision = stored.basePolicyRevision,
+        baseCampaignId = stored.baseCampaignId,
+        campaignId = stored.campaignId,
+        actorGuid = stored.actorGuid,
+        actorName = stored.actorName,
+        timestamp = stored.timestamp,
+    }
+    local stReplay, reasonReplay = GS:ApplyStagedConfigOperation(replay)
+    assertEq(stReplay, "duplicate", "exact replay with nested extras is duplicate: " .. tostring(reasonReplay))
+
+    -- Genuine semantic change with same id → id_conflict (before removal).
+    local conflict = {
+        schemaVersion = stored.schemaVersion,
+        id = stored.id,
+        guildKey = stored.guildKey,
+        datasetId = stored.datasetId,
+        kind = "set-requested-item",
+        target = { itemId = 501 },
+        value = { itemId = 501, goal = 99, removed = false },
+        baseTargetRevision = stored.baseTargetRevision,
+        basePolicyRevision = stored.basePolicyRevision,
+        baseCampaignId = stored.baseCampaignId,
+        campaignId = stored.campaignId,
+        actorGuid = stored.actorGuid,
+        actorName = stored.actorName,
+        timestamp = stored.timestamp + 1,
+    }
+    local stConflict, reasonConflict = GS:ApplyStagedConfigOperation(conflict)
+    assertEq(stConflict, "rejected", "semantic change rejected")
+    assertEq(reasonConflict, "id_conflict", "id_conflict for changed goal")
+
+    -- Removal values also drop extras.
+    local opRm = GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
+        removed = true, noise = { x = { y = true } },
+    })
+    assertEq(opRm.value.removed, true, "removal canonical removed")
+    assertNil(opRm.value.noise, "removal drops extras at prepare")
+    opRm.value.noise = { x = { y = true } }
+    assertEq(GS:ApplyStagedConfigOperation(opRm), "accepted", "removal admits after re-canonicalize")
+    local storedRm = GS:GetCurrentRecord().operations.records[opRm.id]
+    assertEq(storedRm.value.removed, true, "durable removal")
+    assertNil(storedRm.value.noise, "durable removal has no extras")
+    assertNil(storedRm.value.itemId, "removal omits itemId")
+end
+
+-- R23) Roster readiness: identical refresh, first read, retarget, timeout cleanup
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+
+    -- Already-refreshed first read binds immediately (no wait).
+    local member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "first nonempty observation binds: " .. tostring(reason))
+    assertEq(GG._demandRoster.waitActive, false, "no wait on already-refreshed first read")
+    assertEq(GG._demandRoster.boundClubId, "42", "bound to first club")
+
+    -- Stale nonempty after club change stays incomplete.
+    local staleMembers = world.guild.members
+    world.guild.clubId = 55
+    world.rosterRequests = 0
+    GG._demandRoster.lastRequestAt = nil
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "stale nonempty denied")
+    assertEq(reason, "roster_incomplete", "incomplete while waiting")
+    assertEq(GG._demandRoster.waitActive, true, "wait started for club 55")
+    local waitFrame = world.framesByName["SFGuildGossipDemandRosterWait"]
+    assertTrue(waitFrame ~= nil, "temporary wait frame created")
+    assertEq(waitFrame.events["GUILD_ROSTER_UPDATE"], true, "wait registers GUILD_ROSTER_UPDATE")
+
+    -- Identical refreshed roster must recover via event (no content change).
+    world.guild.members = staleMembers
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "identical content alone still incomplete")
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "identical roster recovers after event: " .. tostring(reason))
+    assertEq(member.clubId, "55", "bound to club 55")
+    assertEq(GG._demandRoster.waitActive, false, "wait stopped after identical recovery")
+    assertEq(waitFrame.events["GUILD_ROSTER_UPDATE"], nil, "event unregistered after completion")
+
+    -- Another guild change while waiting retargets; stale event for old club must not bind.
+    world.guild.clubId = 66
+    GG._demandRoster.lastRequestAt = nil
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "club 66 incomplete while waiting")
+    local genAt66 = GG._demandRoster.waitGeneration
+    assertEq(GG._demandRoster.pendingClubId, "66", "pending retargeted to 66")
+    world.guild.clubId = 77
+    GG._demandRoster.lastRequestAt = nil
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "club 77 incomplete while waiting")
+    assertEq(GG._demandRoster.pendingClubId, "77", "pending retargeted to 77")
+    assertTrue(GG._demandRoster.waitGeneration ~= genAt66, "retarget bumps wait generation")
+    -- Fire event while still on 77 with nonempty data → bind 77.
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "retargeted wait completes for current club")
+    assertEq(member.clubId, "77", "bound to retargeted club 77")
+
+    -- Unavailable/failed refresh cleanup: timeout terminates wait without binding.
+    world.guild.clubId = 88
+    GG._demandRoster.lastRequestAt = nil
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "club 88 incomplete")
+    assertEq(GG._demandRoster.waitActive, true, "wait active before timeout")
+    world.time = world.time + 11
+    flushTimers()
+    assertEq(GG._demandRoster.waitActive, false, "timeout clears waitActive")
+    assertEq(GG._demandRoster.boundClubId, nil, "timeout does not bind")
+    assertEq(GG._demandRoster.pendingClubId, "88", "pending retained fail-closed")
+    waitFrame = world.framesByName["SFGuildGossipDemandRosterWait"]
+    assertEq(waitFrame.events["GUILD_ROSTER_UPDATE"], nil, "timeout unregisters event")
+    -- Privileged writes stay denied until a later completed wait.
+    local ctx = GS:GetCurrentContext()
+    assertEq(ctx.ready, false, "not ready after timed-out wait")
+    local op, st, err = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertNil(op, "no prepare after timeout without refresh")
+    assertEq(st, "rejected", "prepare rejected after timeout")
+    assertTrue(err == "roster_incomplete" or err == "not_ready" or err == "rank_unavailable",
+        "timeout deny reason: " .. tostring(err))
+    -- A subsequent demand read may start another bounded wait and complete.
+    GG._demandRoster.lastRequestAt = nil
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "still incomplete until new event")
+    assertEq(GG._demandRoster.waitActive, true, "new wait after timeout")
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "recovers after post-timeout event")
+    assertEq(member.clubId, "88", "bound to 88 after recovery")
+
+    -- Idle gossip preserved throughout.
+    ensureIdleGossip()
+
+    -- restore defaults
+    world.guild.clubId = 42
+    world.guild.name = "Spectrum"
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+end
+
+-- R24) Bank-tab constructor: nil-only clear; reject failed conversions
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    local op, st = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertEq(st, "accepted", "valid tab 3 prepares")
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "valid tab 3 applies")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "tab 3 stored")
+
+    local badStr, stBad, errBad = GS:NewConfigOperation("set-bank-tab", "bankTab", "oops")
+    assertNil(badStr, "malformed string rejected at prepare")
+    assertEq(stBad, "rejected", "malformed string status")
+    assertEq(errBad, "invalid_bank_tab", "malformed string reason")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "tab unchanged after bad string")
+
+    local badBool, stBool, errBool = GS:NewConfigOperation("set-bank-tab", "bankTab", false)
+    assertNil(badBool, "false rejected at prepare")
+    assertEq(stBool, "rejected", "false status")
+    assertEq(errBool, "invalid_bank_tab", "false reason")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "tab unchanged after false")
+
+    -- Apply-path rejection also preserves the existing setting.
+    local poison = GS:NewConfigOperation("set-bank-tab", "bankTab", 4)
+    poison.value = "oops"
+    local stPoison, errPoison = GS:ApplyStagedConfigOperation(poison)
+    assertEq(stPoison, "rejected", "apply rejects poisoned bank tab")
+    assertEq(errPoison, "invalid_bank_tab", "apply invalid_bank_tab")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "tab unchanged after apply reject")
+
+    local opStr, stStr = GS:NewConfigOperation("set-bank-tab", "bankTab", "5")
+    assertEq(stStr, "accepted", "numeric string coerces")
+    assertEq(opStr.value, 5, "coerced to number 5")
+    assertEq(GS:ApplyStagedConfigOperation(opStr), "accepted", "coerced string applies")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 5, "tab 5 stored")
+
+    local opClear, stClear = GS:NewConfigOperation("set-bank-tab", "bankTab", nil)
+    assertEq(stClear, "accepted", "explicit nil prepares clear")
+    assertNil(opClear.value, "clear sentinel is nil")
+    assertEq(GS:ApplyStagedConfigOperation(opClear), "accepted", "explicit nil clears")
+    assertNil(GS:GetCurrentRecord().accounting._consumables.bankTab, "tab cleared")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

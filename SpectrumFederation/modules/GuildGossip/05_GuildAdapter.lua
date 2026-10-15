@@ -22,18 +22,22 @@ GG._guild = GG._guild or {
     frame = nil,
 }
 
--- Demand-driven roster nudge for zero-provider authority (no listeners/polling).
--- boundClubId: club whose native roster/rank reads are currently trusted.
--- pendingClubId + staleFingerprint: fail closed across club transitions until
--- roster contents differ from the pre-transition snapshot (request/timeout
--- alone is not proof of freshness).
+-- Demand-driven roster nudge for zero-provider authority (no permanent listeners
+-- /polling/discovery). boundClubId is the club whose native roster/rank reads
+-- are trusted. Across club transitions, fail closed until a temporary
+-- GUILD_ROSTER_UPDATE wait completes for the pending club (content fingerprint
+-- inequality is not proof of freshness — identical valid rosters must recover).
 GG._demandRoster = GG._demandRoster or {
     lastRequestAt = nil,
     boundClubId = nil,
     pendingClubId = nil,
-    staleFingerprint = nil,
+    waitActive = false,
+    waitGeneration = 0,
+    waitFrame = nil,
 }
 local DEMAND_ROSTER_MIN_INTERVAL = 2.0
+-- Bounded one-shot wait; must terminate even when Retail never fires the event.
+local DEMAND_ROSTER_WAIT_TIMEOUT = 10.0
 
 local function requestRoster()
     if C_GuildInfo and C_GuildInfo.GuildRoster then
@@ -44,7 +48,7 @@ local function requestRoster()
 end
 
 --- Throttled native roster request for cold demand-driven reads.
--- Does not register listeners, mark transport ready, or start discovery.
+-- Does not mark transport ready or start discovery.
 local function requestRosterDemandDriven()
     local now = (GetTime and GetTime()) or 0
     local last = GG._demandRoster.lastRequestAt
@@ -56,28 +60,141 @@ local function requestRosterDemandDriven()
     return true
 end
 
---- Bounded fingerprint of the current native guild roster for scope binding.
--- Retail assumption: after a club change, GetGuildRosterInfo may still return
--- the previous guild's rows until a roster refresh lands; content change is
--- the demand-driven freshness signal without permanent listeners.
-local function demandRosterFingerprint()
-    if not GetNumGuildMembers or not GetGuildRosterInfo then
-        return "unavailable"
+local function readDemandClubId()
+    if not (C_Club and C_Club.GetGuildClubId) then
+        return nil
     end
-    local total = tonumber((GetNumGuildMembers())) or 0
-    if total <= 0 then
-        return "empty"
+    local clubId = C_Club.GetGuildClubId()
+    if clubId == nil or clubId == 0 or clubId == "0" or clubId == "" then
+        return nil
     end
-    local parts = {}
-    for i = 1, total do
-        local name, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, guid = GetGuildRosterInfo(i)
-        parts[#parts + 1] = tostring(name or "") .. ":" .. tostring(guid or "")
+    return tostring(clubId)
+end
+
+local function demandRosterNonempty()
+    if not GetNumGuildMembers then
+        return false
     end
-    table.sort(parts)
-    return tostring(total) .. "|" .. table.concat(parts, ";")
+    return (tonumber((GetNumGuildMembers())) or 0) > 0
+end
+
+--- Tear down the temporary demand wait frame/timer without binding.
+local function stopDemandRosterWait()
+    local dr = GG._demandRoster
+    dr.waitGeneration = (tonumber(dr.waitGeneration) or 0) + 1
+    dr.waitActive = false
+    local frame = dr.waitFrame
+    if frame then
+        if frame.UnregisterAllEvents then
+            frame:UnregisterAllEvents()
+        end
+        if frame.SetScript then
+            frame:SetScript("OnEvent", nil)
+        end
+    end
+end
+
+--- Bind pending club after a completed refresh signal; always stops the wait.
+local function completeDemandRosterWait(expectedClubId)
+    local dr = GG._demandRoster
+    stopDemandRosterWait()
+    if type(expectedClubId) ~= "string" or expectedClubId == "" then
+        return false
+    end
+    if dr.pendingClubId ~= expectedClubId then
+        return false
+    end
+    local current = readDemandClubId()
+    if current ~= expectedClubId then
+        return false
+    end
+    if not demandRosterNonempty() then
+        -- Event/timeout observed but still empty: stay unbound; next demand
+        -- read may start another bounded wait.
+        return false
+    end
+    dr.boundClubId = expectedClubId
+    dr.pendingClubId = nil
+    return true
+end
+
+--- Start or retarget a temporary GUILD_ROSTER_UPDATE wait for clubId.
+-- Unregisters on completion, club retarget, or timeout. Never leaves a
+-- permanent listener and never activates the provider guild adapter.
+local function startDemandRosterWait(clubId)
+    local dr = GG._demandRoster
+    if type(clubId) ~= "string" or clubId == "" then
+        return
+    end
+
+    -- Already waiting for this club: only nudge the native request.
+    if dr.waitActive and dr.pendingClubId == clubId then
+        requestRosterDemandDriven()
+        return
+    end
+
+    stopDemandRosterWait()
+    dr.boundClubId = nil
+    dr.pendingClubId = clubId
+    requestRosterDemandDriven()
+
+    if not CreateFrame then
+        -- Cannot observe GUILD_ROSTER_UPDATE; stay fail-closed without listeners.
+        return
+    end
+
+    local frame = dr.waitFrame
+    if not frame then
+        frame = CreateFrame("Frame", "SFGuildGossipDemandRosterWait")
+        dr.waitFrame = frame
+    elseif frame.UnregisterAllEvents then
+        frame:UnregisterAllEvents()
+    end
+
+    local gen = (tonumber(dr.waitGeneration) or 0)
+    local pending = clubId
+    dr.waitActive = true
+
+    local function onWaitEvent(_, event)
+        if event ~= "GUILD_ROSTER_UPDATE" then
+            return
+        end
+        local cur = GG._demandRoster
+        if not cur.waitActive or (tonumber(cur.waitGeneration) or 0) ~= gen then
+            return
+        end
+        if cur.pendingClubId ~= pending then
+            return
+        end
+        completeDemandRosterWait(pending)
+    end
+
+    if frame.RegisterEvent then
+        frame:RegisterEvent("GUILD_ROSTER_UPDATE")
+    end
+    if frame.SetScript then
+        frame:SetScript("OnEvent", onWaitEvent)
+    end
+
+    if C_Timer and C_Timer.After then
+        C_Timer.After(DEMAND_ROSTER_WAIT_TIMEOUT, function()
+            local cur = GG._demandRoster
+            if not cur.waitActive or (tonumber(cur.waitGeneration) or 0) ~= gen then
+                return
+            end
+            if cur.pendingClubId ~= pending then
+                return
+            end
+            -- Timeout: terminate the temporary wait; do not invent freshness.
+            stopDemandRosterWait()
+        end)
+    end
 end
 
 --- Fail closed when club identity and native roster may disagree.
+-- Freshness after a club change requires a completed GUILD_ROSTER_UPDATE for
+-- the pending club (or a first-session nonempty observation). Roster content
+-- inequality alone must not authenticate a transition.
 -- @return boolean trusted
 local function ensureDemandRosterScope(clubId)
     local dr = GG._demandRoster
@@ -88,53 +205,31 @@ local function ensureDemandRosterScope(clubId)
         return true
     end
 
-    -- First observation this session: bind immediately when roster is nonempty.
+    -- First observation this session: bind immediately when roster is nonempty
+    -- (already-refreshed first read). Cold empty starts a bounded wait.
     if dr.boundClubId == nil and dr.pendingClubId == nil then
-        -- Capture only the first GetNumGuildMembers return (avoid tonumber(n, base)).
-        local total = 0
-        if GetNumGuildMembers then
-            total = tonumber((GetNumGuildMembers())) or 0
+        if demandRosterNonempty() then
+            dr.boundClubId = clubId
+            dr.pendingClubId = nil
+            return true
         end
-        if total <= 0 then
-            dr.pendingClubId = clubId
-            dr.staleFingerprint = "empty"
-            requestRosterDemandDriven()
-            return false
-        end
-        dr.boundClubId = clubId
-        dr.pendingClubId = nil
-        dr.staleFingerprint = nil
-        return true
+        startDemandRosterWait(clubId)
+        return false
     end
 
-    -- Club identity changed (or first pending target changed): capture stale snapshot.
+    -- Club identity changed (or pending target retargeted): new bounded wait.
     if dr.pendingClubId ~= clubId then
-        dr.boundClubId = nil
-        dr.pendingClubId = clubId
-        dr.staleFingerprint = demandRosterFingerprint()
-        requestRosterDemandDriven()
+        startDemandRosterWait(clubId)
         return false
     end
 
-    -- Pending this club: empty stays incomplete; identical content stays stale.
-    local total = 0
-    if GetNumGuildMembers then
-        total = tonumber((GetNumGuildMembers())) or 0
-    end
-    if total <= 0 then
-        requestRosterDemandDriven()
+    -- Pending this club: wait for GUILD_ROSTER_UPDATE (or restart after timeout).
+    if not dr.waitActive then
+        startDemandRosterWait(clubId)
         return false
     end
-    local fp = demandRosterFingerprint()
-    if fp == dr.staleFingerprint then
-        requestRosterDemandDriven()
-        return false
-    end
-
-    dr.boundClubId = clubId
-    dr.pendingClubId = nil
-    dr.staleFingerprint = nil
-    return true
+    requestRosterDemandDriven()
+    return false
 end
 
 local function computeScopeId(guildName, guildRealm, clubId)

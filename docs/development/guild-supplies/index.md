@@ -70,8 +70,8 @@ Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected` with stable re
 ### Config operation kinds / targets
 
 - `set-editor-rank` → target `editorRankPosition`
-- `set-bank-tab` → target `bankTab`
-- `set-requested-item` → target `{ itemId = N }` (add/update/remove share one revision chain)
+- `set-bank-tab` → target `bankTab` (explicit `nil` clears; non-nil values must coerce to integral tabs 1–8 — failed conversions reject without clearing)
+- `set-requested-item` → target `{ itemId = N }` (add/update/remove share one revision chain; values are canonicalized to `{ itemId, goal, removed=false }` or `{ removed=true }` at prepare/admission so nested extras cannot poison snapshots or exact-duplicate comparison)
 - `confirm-candidate` → confirmation envelope (see below)
 
 Caps: **4,096** accepted operations / guild; **128** combined pending+conflict admission bodies / guild (shared budget). Existing-ID retries reuse a slot and do not consume another. Overfull admissions return `full` without partial mutation or eviction. Durable operation snapshots are whitelisted and bounded (depth 6, **1,024** nodes, **49,152** string bytes) so a full confirmation batch of **64** records plus `originalIds` fits; the separate **2 KiB** transport export cap is unchanged. Malformed or oversized input is rejected without partial retention. Retained `records`/`order`/`pending`/`conflicts` entries require map-key/`body.id` identity; `operations.heads` must name accepted bodies for the corresponding target; `confirmationRefs` is a dense unique array of accepted `confirm-candidate` IDs (≤ accepted cap). Inconsistent saved stores stay unavailable without repair-on-read. A malformed `localWriter` nonce on an otherwise supported root is replaced with a fresh 24-hex nonce before new IDs; guild records are preserved and unsupported domain data is never normalized.
@@ -82,7 +82,7 @@ Caps: **4,096** accepted operations / guild; **128** combined pending+conflict a
 - Player-facing labels use `GuildControlGetRankName(position)` (for example `"%s and higher"`).
 - Invalid/out-of-range policy → verified Guild Master recovery only.
 - Preview as Non-Admin denies privileged actions locally.
-- Zero active gossip providers: authority uses a **demand-driven** native snapshot. A cold empty roster triggers a throttled native `GuildRoster` request without listeners, discovery, or a dummy provider. After a club-identity change, stale nonempty roster/rank data is not trusted until roster contents differ from the pre-transition snapshot; missing/uncertain data fails closed. Commit rechecks guild/rank/policy.
+- Zero active gossip providers: authority uses a **demand-driven** native snapshot. A cold empty roster triggers a throttled native `GuildRoster` request without permanent listeners, discovery, or a dummy provider. After a club-identity change, stale nonempty roster/rank data stays untrusted until a temporary `GUILD_ROSTER_UPDATE` wait completes for the new club (identical refreshed rosters may recover; content inequality alone is not freshness). The wait always terminates on event, retarget, or timeout. Missing/uncertain data fails closed. Commit rechecks guild/rank/policy.
 - Fresh guilds with fewer than three ranks: `CreateStagedRecord` does not invent a default threshold; verified GM passes an existing 1-based position. Preview as Non-Admin and non-GM callers remain denied.
 
 ### Confirmation envelope

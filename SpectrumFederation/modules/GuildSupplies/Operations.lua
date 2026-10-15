@@ -443,12 +443,54 @@ local function ValidateOriginalIds(originalIds)
     return true
 end
 
+--- Explicit nil clears; only finite integral tabs 1..MAX are otherwise valid.
+-- Does not coerce non-numeric values to the clear sentinel.
 local function IsValidBankTab(tab)
     if tab == nil then
         return true
     end
-    tab = tonumber(tab)
-    return tab and tab == math.floor(tab) and tab >= 1 and tab <= GS.MAX_BANK_TAB
+    if type(tab) ~= "number" then
+        return false
+    end
+    return tab == math.floor(tab) and tab >= 1 and tab <= GS.MAX_BANK_TAB
+        and tab == tab and tab ~= math.huge
+end
+
+--- Convert constructor bank-tab input. Explicit nil clears; failed conversions reject.
+local function CoerceBankTabValue(value)
+    if value == nil then
+        return nil
+    end
+    local converted
+    if type(value) == "number" then
+        converted = value
+    elseif type(value) == "string" then
+        converted = tonumber(value)
+        if converted == nil then
+            return nil, "invalid_bank_tab"
+        end
+    else
+        return nil, "invalid_bank_tab"
+    end
+    if not IsValidBankTab(converted) then
+        return nil, "invalid_bank_tab"
+    end
+    return converted
+end
+
+local function CanonicalRequestedItemValue(value)
+    local normalized, err = NormalizeRequestedItemValue(value)
+    if not normalized then
+        return nil, err
+    end
+    if normalized.removed then
+        return { removed = true }
+    end
+    return {
+        itemId = normalized.itemId,
+        goal = normalized.goal,
+        removed = false,
+    }
 end
 
 local function ValidateConfigShape(op)
@@ -600,26 +642,21 @@ function GS:NewConfigOperation(kind, target, value)
             return nil, "rejected", "invalid_target"
         end
         target = canon
-        local normalized, err = NormalizeRequestedItemValue(value)
+        local normalized, err = CanonicalRequestedItemValue(value)
         if not normalized then
             return nil, "rejected", err
         end
-        if normalized.removed then
-            value = { removed = true }
-        else
-            value = normalized
-        end
+        value = normalized
     elseif kind == KIND.SET_EDITOR_RANK then
         target = "editorRankPosition"
         value = tonumber(value)
     elseif kind == KIND.SET_BANK_TAB then
         target = "bankTab"
-        if value ~= nil then
-            value = tonumber(value)
+        local coerced, coerceErr = CoerceBankTabValue(value)
+        if coerceErr then
+            return nil, "rejected", coerceErr
         end
-        if not IsValidBankTab(value) then
-            return nil, "rejected", "invalid_bank_tab"
-        end
+        value = coerced
     end
 
     local tKey = TargetKey(kind, target)
@@ -909,6 +946,19 @@ function GS:ApplyStagedConfigOperation(op, context)
             return "rejected", "invalid_target"
         end
         op.target = canon
+        -- Canonicalize value before snapshot/projection/duplicate comparison so
+        -- caller-added nested extras cannot poison DeepEqual vs durable bodies.
+        local normalized, normErr = CanonicalRequestedItemValue(op.value)
+        if not normalized then
+            return "rejected", normErr or "invalid_item_value"
+        end
+        op.value = normalized
+    elseif op.kind == KIND.SET_BANK_TAB then
+        local coerced, coerceErr = CoerceBankTabValue(op.value)
+        if coerceErr then
+            return "rejected", coerceErr
+        end
+        op.value = coerced
     end
 
     local kindOk, kindErr = ValidateKindValue(op)
