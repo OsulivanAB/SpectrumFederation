@@ -3118,7 +3118,12 @@ function GG.Init(opts)
         GG.InitEpochIncarnation()
     end
 
-    GG.InitGuildAdapter()
+    -- Guild roster event work follows active providers (idle when none).
+    if GG.SyncGuildAdapterLifecycle then
+        GG.SyncGuildAdapterLifecycle()
+    elseif GG.HasActiveProvider and GG.HasActiveProvider() then
+        GG.InitGuildAdapter()
+    end
 
     if GG.EnsureReceiveGuard then
         GG.EnsureReceiveGuard()

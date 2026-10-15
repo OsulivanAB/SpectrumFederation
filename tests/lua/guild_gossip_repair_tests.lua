@@ -89,10 +89,15 @@ function IsInGuild() return world.guild.inGuild end
 function GetGuildInfo() return world.guild.name, "R", 0, world.guild.realm end
 function GetNumGuildMembers() return #world.guild.members end
 function GetGuildRosterInfo(i)
+    world.rosterWalks = (world.rosterWalks or 0) + 1
     local m = world.guild.members[i]
     if m then return m.name, "R", 0, 80, "W", "Z", "", "", true, 0, "WARRIOR", 0, 0, false, false, 0 end
 end
-C_GuildInfo = { GuildRoster = function() end }
+C_GuildInfo = {
+    GuildRoster = function()
+        world.rosterRequests = (world.rosterRequests or 0) + 1
+    end,
+}
 C_Club = { GetGuildClubId = function() return world.guild.clubId end }
 function GetRealmName() return "Garona" end
 function strtrim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
@@ -309,6 +314,8 @@ local function reset()
     world.time = 1000; world.fps = 60; world.combat = false; world.loading = false
     world.wire = {}; world.clients = {}; world.decodeCount = 0; world.listCalls = {}
     world.errors = {}
+    world.rosterWalks = 0
+    world.rosterRequests = 0
     world._sendAs = nil
     timers = {}
     namedFrames = {}
@@ -5725,6 +5732,117 @@ do
     assertEq(e.inPull.usableProgressAt, 40, "F88: first resume shifts once")
     A.GuildGossip.OnGossipPauseChanged(false, 70)
     assertEq(e.inPull.usableProgressAt, 40, "F88: second resume without pause is idempotent")
+end
+
+---------------------------------------------------------------------------
+-- F89: guild roster work stays idle without active providers (4278969515)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    -- makeClient forces RefreshGuildState for harness readiness; clear counters and
+    -- drop that cache so idle lifecycle matches production (no stale auth).
+    A.GuildGossip.ShutdownGuildAdapter()
+    world.rosterWalks = 0
+    world.rosterRequests = 0
+
+    local g = A.GuildGossip._guild
+    assertTrue(g.listening ~= true, "F89: adapter not listening after init without providers")
+    assertTrue(g.frame == nil or not (g.frame.events and g.frame.events.GUILD_ROSTER_UPDATE),
+        "F89: GUILD_ROSTER_UPDATE not registered while idle")
+    assertEq(world.rosterRequests, 0, "F89: no GuildRoster requests while idle after clear")
+    assertEq(world.rosterWalks, 0, "F89: no roster walks while idle after clear")
+    assertTrue(not A.GuildGossip.IsGuildReady(), "F89: not guild-ready while idle")
+    assertTrue(not A.GuildGossip.IsGuildMember("Bob-Garona"),
+        "F89: idle does not authorize from cached membership")
+
+    -- Activation: fresh verified roster before discovery/auth.
+    local scopeBefore = g.lastVerifiedScopeId
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f89" })
+    assertTrue(g.listening == true, "F89: listening after provider activation")
+    assertTrue(g.frame and g.frame.events and g.frame.events.GUILD_ROSTER_UPDATE,
+        "F89: GUILD_ROSTER_UPDATE registered on activation")
+    assertTrue(world.rosterRequests >= 1, "F89: activation requests roster")
+    assertTrue(world.rosterWalks >= 1, "F89: activation walks roster")
+    assertTrue(A.GuildGossip.IsGuildReady(), "F89: fresh readiness on activation")
+    assertTrue(A.GuildGossip.IsGuildMember("Bob-Garona"), "F89: membership verified on activation")
+    assertTrue(g.lastVerifiedScopeId ~= nil, "F89: lastVerifiedScopeId set on activation")
+    if scopeBefore then
+        assertEq(g.lastVerifiedScopeId, scopeBefore, "F89: scope preserved when unchanged")
+    end
+
+    -- Active roster events still refresh (revocation observed).
+    world.rosterWalks = 0
+    world.rosterRequests = 0
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "Carol-Garona", online = true },
+    }
+    g.frame.OnEvent(g.frame, "GUILD_ROSTER_UPDATE")
+    assertTrue(g.coalescePending == true, "F89: active coalesces roster update")
+    world.time = world.time + 1
+    for _, h in ipairs(timers) do
+        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+            h.fired = true
+            h.fn()
+        end
+    end
+    assertTrue(world.rosterWalks >= 1, "F89: active roster update walks members")
+    assertTrue(not A.GuildGossip.IsGuildMember("Bob-Garona"),
+        "F89: active membership revocation still observed")
+    assertTrue(A.GuildGossip.IsGuildMember("Carol-Garona"),
+        "F89: remaining members still authorized while active")
+
+    -- Pending coalesce after disable must not restore readiness or walk roster.
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "Bob-Garona", online = true },
+        { name = "Carol-Garona", online = true },
+    }
+    g.coalescePending = false
+    g.frame.OnEvent(g.frame, "PLAYER_GUILD_UPDATE")
+    assertTrue(g.coalescePending == true, "F89: coalesce scheduled before disable")
+    local genAtSchedule = g.coalesceGen
+    local walksAtDisable = world.rosterWalks
+    A.GuildGossip:DisableProvider("sf.synthetic.gossip")
+    assertTrue(g.listening ~= true, "F89: not listening after last provider disabled")
+    assertTrue(not (g.frame.events and g.frame.events.GUILD_ROSTER_UPDATE),
+        "F89: roster events unregistered when idle")
+    assertTrue(g.coalesceGen == genAtSchedule + 1, "F89: disable bumps coalesceGen")
+    assertTrue(not A.GuildGossip.IsGuildReady(), "F89: readiness cleared on idle")
+    assertTrue(not A.GuildGossip.IsGuildMember("Bob-Garona"),
+        "F89: membership cache cleared on idle (no stale auth)")
+    world.time = world.time + 1
+    for _, h in ipairs(timers) do
+        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+            h.fired = true
+            h.fn()
+        end
+    end
+    assertEq(world.rosterWalks, walksAtDisable,
+        "F89: pending coalesce after disable does not walk roster")
+    assertTrue(not A.GuildGossip.IsGuildReady(),
+        "F89: pending callback after disable does not restore readiness")
+
+    -- Idle guild change then re-enable: fresh verify; preserve lastVerifiedScopeId gap.
+    local preservedScope = g.lastVerifiedScopeId
+    assertTrue(preservedScope ~= nil, "F89: lastVerifiedScopeId retained across idle")
+    world.guild.clubId = 777
+    world.rosterWalks = 0
+    world.rosterRequests = 0
+    -- No registered handler while idle; zero work.
+    assertTrue(g.frame.OnEvent == nil, "F89: OnEvent cleared while idle")
+    assertEq(world.rosterWalks, 0, "F89: zero walks during idle guild change")
+    assertEq(world.rosterRequests, 0, "F89: zero roster requests during idle guild change")
+
+    A.GuildGossip:EnableProvider("sf.synthetic.gossip")
+    assertTrue(g.listening == true, "F89: re-enable restores listening")
+    assertTrue(A.GuildGossip.IsGuildReady(), "F89: fresh readiness after idle guild change")
+    assertEq(g.lastVerifiedScopeId, "club:777", "F89: re-enable verifies new scope")
+    assertTrue(preservedScope ~= g.lastVerifiedScopeId,
+        "F89: idle guild change detected on re-enable via preserved lastVerifiedScopeId")
+    assertTrue(A.GuildGossip.IsGuildMember("Bob-Garona"),
+        "F89: re-enable authorizes from fresh roster not idle cache")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

@@ -20,7 +20,7 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical provider API and Retail smoke s
 4. Aggregate work/queue/peer/receive/reassembly limits across providers; one initiated pull and one served pull per client; stop-and-wait paging with requestId/subpage correlation and byte-aware pages.
 5. Queue acceptance ≠ final-fragment submission ≠ remote receipt ≠ provider acceptance; unsent gossip is cancellable by provider/runtime invalidation.
 6. Independent of raid/session/Loot Helper enablement/UI/profiles/coordinators.
-7. Chat-free: enabled `SF.Debug` only. Synthetic provider disabled by default; no active provider ⇒ no recurring work.
+7. Chat-free: enabled `SF.Debug` only. Synthetic provider disabled by default; no active provider ⇒ no recurring work (including guild roster request/refresh). Activation re-verifies roster before auth/discovery; idle clears membership cache and preserves `lastVerifiedScopeId`.
 8. Admit encoded gossip before decode; validate bounded structures + distributions before mutation; physical AceComm spool is released with guard accounting, including during pause via an independent expiry timer.
 9. Index maintenance is dirty/incomplete-driven; incomplete work prevents idle; discovery rotates oversized capability announcements and advertises per-provider `changeGen` plus a compact 4-byte Hash32 of the per-load source incarnation so reload counter collisions cannot preserve stale coverage.
 10. Provider `GetScopeId` is authoritative on both request and serve paths; optional `IsRecordExportable` supplies peer-specific export filtering (callback errors abort the attempt; they are not successful denies); unresolved obligations never mark a view covered. Durable storage changes notify through `GG.NotifyProviderChanged(id)` — there is no Phase 1 change-subscription API.
@@ -35,8 +35,8 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical provider API and Retail smoke s
 ## Lifecycle
 
 ```
-no provider → idle
-provider ready → discovery (jittered) + opportunistic pulls
+no provider → idle (guild adapter not listening; no roster walks)
+provider ready → fresh roster verify → discovery (jittered) + opportunistic pulls
 combat/loading → pause expensive work; retain unfinished needs
 recovery → 3–10s jitter then NORMAL/SLOW pacing
 unregister/shutdown → clear runtime queues/callbacks; leave provider durable data alone
@@ -45,6 +45,6 @@ unregister/shutdown → clear runtime queues/callbacks; leave provider durable d
 ## Evidence
 
 - Production-Lua multi-peer harness: `tests/lua/guild_gossip_tests.lua`
-- Owner-review regression probes (fail on reviewed head `aa6fa91`, pass after repair): `tests/lua/guild_gossip_repair_tests.lua`
+- Owner-review regression probes (fail on reviewed head `aa6fa91`, pass after repair): `tests/lua/guild_gossip_repair_tests.lua` (through F89)
 - Packaging/lint/docs validation per root `AGENTS.md`
 - Retail smoke remains human QA

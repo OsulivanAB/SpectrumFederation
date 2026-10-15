@@ -18,6 +18,7 @@ GG._guild = GG._guild or {
     generation = 0,
     coalescePending = false,
     coalesceGen = 0, -- invalidates deferred RefreshGuildState after shutdown
+    listening = false, -- event/roster work only while an active provider needs it
     frame = nil,
 }
 
@@ -186,6 +187,10 @@ end
 
 local function coalesceRefresh()
     local g = GG._guild
+    -- Idle contract: no coalesced roster walks without an active provider.
+    if not g.listening then
+        return
+    end
     if g.coalescePending then
         return
     end
@@ -196,6 +201,10 @@ local function coalesceRefresh()
         C_Timer.After(delay, function()
             -- Shutdown/reinit bumps coalesceGen; drop stale deferred work.
             if (tonumber(g.coalesceGen) or 0) ~= gen then
+                return
+            end
+            if not g.listening then
+                g.coalescePending = false
                 return
             end
             g.coalescePending = false
@@ -209,7 +218,12 @@ end
 
 function GG.InitGuildAdapter()
     local g = GG._guild
+    -- Mark listening before roster request/refresh so activation is a fresh verify.
+    g.listening = true
     local function onEvent(_, event)
+        if not GG._guild.listening then
+            return
+        end
         if event == "PLAYER_GUILD_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
             requestRoster()
             coalesceRefresh()
@@ -250,6 +264,7 @@ end
 
 function GG.ShutdownGuildAdapter()
     local g = GG._guild
+    g.listening = false
     if g.frame then
         g.frame:UnregisterAllEvents()
         g.frame:SetScript("OnEvent", nil)
@@ -263,4 +278,23 @@ function GG.ShutdownGuildAdapter()
     g.scopeId = nil
     g.members = {}
     g.generation = (g.generation or 0) + 1
+    -- Preserve lastVerifiedScopeId across idle gaps so a later activation can
+    -- still detect a true scope transition after guild changes while inactive.
+end
+
+-- Bind guild roster event work to the active-provider idle contract. Activation
+-- always runs InitGuildAdapter for a fresh verified roster before auth/discovery;
+-- idle clears cached membership so peers are not authorized from stale data.
+function GG.SyncGuildAdapterLifecycle()
+    local g = GG._guild
+    if GG.HasActiveProvider and GG.HasActiveProvider() then
+        if not g.listening then
+            GG.InitGuildAdapter()
+        end
+        return
+    end
+    if g.listening or g.ready or g.inGuild or g.coalescePending
+        or (g.members and next(g.members) ~= nil) then
+        GG.ShutdownGuildAdapter()
+    end
 end

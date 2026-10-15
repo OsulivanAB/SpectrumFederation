@@ -101,6 +101,10 @@ function GG.RegisterProvider(spec)
         reg.order[#reg.order + 1] = id
     end
     GG._RecountActiveProviders()
+    -- Activate/idle guild roster work with provider lifecycle (fresh verify on arm).
+    if GG.SyncGuildAdapterLifecycle then
+        GG.SyncGuildAdapterLifecycle()
+    end
     if entry.enabled and entry.ready then
         GG.MarkWorkPending()
         -- Do not start the work ticker or discovery while guild readiness is absent.
@@ -136,6 +140,9 @@ function GG.UnregisterProvider(providerId)
         GG.OnProviderRemoved(id)
     end
     GG._RecountActiveProviders()
+    if GG.SyncGuildAdapterLifecycle then
+        GG.SyncGuildAdapterLifecycle()
+    end
     if not GG.HasActiveProvider() then
         GG._StopScheduler()
         if GG.StopDiscovery then
@@ -155,6 +162,9 @@ function GG.SetProviderEnabled(providerId, enabled)
         entry.api.enabled = entry.enabled
     end
     GG._RecountActiveProviders()
+    if GG.SyncGuildAdapterLifecycle then
+        GG.SyncGuildAdapterLifecycle()
+    end
     if entry.enabled and entry.ready then
         entry.eligibilityGen = (entry.eligibilityGen or 0) + 1
         entry.indexFailed = nil
