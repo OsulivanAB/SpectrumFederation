@@ -20,7 +20,8 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 5. Staged compare-and-apply statuses: accepted / duplicate / pending / rejected.
 6. Zero active gossip providers still support demand-driven authority (throttled cold-roster nudge + temporary `GUILD_ROSTER_UPDATE` wait for unbound first observations and club changes; no permanent listeners/discovery); missing data fails closed; commit rechecks guild/rank/policy.
 7. Accepted SavedVariables operation bodies must pass kind-specific historical shape validation before a guild record is exposed as usable; malformed bodies stay preserved but unavailable (no repair-on-read).
-8. Chat-free: enabled `SF.Debug` only. No Guild Supplies provider registration in 2A.
+8. Current `permission.revisionId` / `editorRankPosition` must match the bootstrap `datasetId` (no policy head) or the accepted `set-editor-rank` head body value; inconsistency is permission-only (verified GM recovery). Stored data cannot prove the original rank count at bootstrap — today's roster is not used to invent that history.
+9. Chat-free: enabled `SF.Debug` only. No Guild Supplies provider registration in 2A.
 
 ## Dependencies / invalidation
 

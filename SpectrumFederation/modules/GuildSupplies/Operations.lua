@@ -519,8 +519,7 @@ local function ValidateConfigShape(op)
     if type(op.actorName) ~= "string" or op.actorName == "" then
         return false, "invalid_actor"
     end
-    local ts = tonumber(op.timestamp)
-    if not ts or ts ~= math.floor(ts) or ts < 0 then
+    if not GS.IsFiniteNonnegInt(op.timestamp) then
         return false, "invalid_timestamp"
     end
     if type(op.baseTargetRevision) ~= "string" or op.baseTargetRevision == "" then
@@ -1168,8 +1167,7 @@ local function ValidateConfirmationShape(op)
     if type(op.actorName) ~= "string" or op.actorName == "" then
         return false, "invalid_actor"
     end
-    local ts = tonumber(op.timestamp)
-    if not ts or ts ~= math.floor(ts) or ts < 0 then
+    if not GS.IsFiniteNonnegInt(op.timestamp) then
         return false, "invalid_timestamp"
     end
     if type(op.basePolicyRevision) ~= "string" or op.basePolicyRevision == "" then

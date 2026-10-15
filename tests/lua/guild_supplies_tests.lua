@@ -2745,6 +2745,258 @@ do
         "pending original still unchanged after B")
 end
 
+-- R27) Demand-roster trust invalidated on observed identity loss
+do
+    resetDb()
+    initGS({ settle = false })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.inGuild = true
+    settleRoster()
+    local member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "bound after refresh for club A")
+    assertEq(GG._demandRoster.boundClubId, "42", "boundClubId is 42")
+
+    -- Observed guild loss clears trust and terminates any wait.
+    world.guild.inGuild = false
+    local id, idReason = GG.GetGuildIdentity()
+    assertNil(id, "identity nil when not in guild")
+    assertEq(idReason, "not_in_guild", "not_in_guild reason")
+    assertNil(GG._demandRoster.boundClubId, "bound cleared on guild loss")
+    assertNil(GG._demandRoster.pendingClubId, "pending cleared on guild loss")
+    assertEq(GG._demandRoster.waitActive, false, "wait inactive after guild loss")
+
+    -- Rejoin same club with stale nonempty rows: must wait again.
+    world.guild.inGuild = true
+    world.guild.clubId = 42
+    -- Rank change while away (stale authority risk if trust were kept).
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Alice" then m.rankOrder = 4 end
+    end
+    world.rosterRequests = 0
+    GG._demandRoster.lastRequestAt = nil
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "rejoin A incomplete until refresh")
+    assertEq(reason, "roster_incomplete", "roster_incomplete after rejoin")
+    assertEq(GG._demandRoster.waitActive, true, "wait restarted for rejoin A")
+    assertNil(GG._demandRoster.boundClubId, "not bound before rejoin refresh")
+    local ctx = GS:GetCurrentContext()
+    assertEq(ctx.ready, false, "privileged context unavailable after rejoin before refresh")
+    local op, st = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertNil(op, "no prepare after rejoin before refresh")
+    assertEq(st, "rejected", "prepare rejected after rejoin before refresh")
+
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "recovers after rejoin refresh")
+    assertEq(member.rankOrder, 4, "post-refresh rank reflects change while away")
+    assertEq(GG._demandRoster.boundClubId, "42", "rebound to A after refresh")
+
+    -- Identity loss while a wait is active: invalidate; old event must not bind.
+    world.guild.clubId = 55
+    GG._demandRoster.lastRequestAt = nil
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "club 55 wait started")
+    assertEq(GG._demandRoster.waitActive, true, "wait active for 55")
+    local genBeforeLoss = GG._demandRoster.waitGeneration
+    world.guild.clubId = nil
+    id, idReason = GG.GetGuildIdentity()
+    assertNil(id, "club unavailable")
+    assertEq(idReason, "club_id_unavailable", "club_id_unavailable")
+    assertNil(GG._demandRoster.boundClubId, "bound cleared on club loss")
+    assertNil(GG._demandRoster.pendingClubId, "pending cleared on club loss")
+    assertEq(GG._demandRoster.waitActive, false, "wait terminated on club loss")
+    assertTrue(GG._demandRoster.waitGeneration ~= genBeforeLoss, "generation bumped on club loss")
+    -- Stale GUILD_ROSTER_UPDATE must not restore trust.
+    world.guild.clubId = 55
+    fireEvent("GUILD_ROSTER_UPDATE")
+    assertNil(GG._demandRoster.boundClubId, "stale event after loss does not bind")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "still incomplete; needs a fresh wait after loss")
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "fresh wait after loss completes")
+    ensureIdleGossip()
+
+    -- restore defaults
+    world.guild.inGuild = true
+    world.guild.clubId = 42
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Alice" then m.rankOrder = 1 end
+    end
+end
+
+-- R28) Finite nonnegative operation timestamps (config + confirmation + historical)
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertTrue(op ~= nil, "valid timestamp prepares")
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "valid timestamp admits")
+
+    local function assertBadTs(label, ts)
+        local bad = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+        bad.timestamp = ts
+        local st, err = GS:ApplyStagedConfigOperation(bad)
+        assertEq(st, "rejected", label .. " rejected at admission")
+        assertEq(err, "invalid_timestamp", label .. " invalid_timestamp")
+    end
+    assertBadTs("math.huge", math.huge)
+    assertBadTs("-math.huge", -math.huge)
+    assertBadTs("nan", 0/0)
+    assertBadTs("fractional", 1.5)
+    assertBadTs("negative", -1)
+
+    -- Historical accepted body with non-finite timestamp: preserved, unavailable.
+    local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local storedId = op.id
+    local savedTs = raw.operations.records[storedId].timestamp
+    raw.operations.records[storedId].timestamp = math.huge
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "huge historical timestamp unavailable")
+    assertEq(reason, "invalid_timestamp", "historical invalid_timestamp")
+    assertEq(raw.operations.records[storedId].timestamp, math.huge, "malformed timestamp preserved")
+    raw.operations.records[storedId].timestamp = savedTs
+    assertTrue(GS:GetCurrentRecord() ~= nil, "restored finite timestamp usable")
+
+    -- Confirmation shape rejects non-finite timestamps at prepare/admission.
+    local conf, confSt, confErr = GS:NewConfirmationOperation({
+        recordId = "ts-cand",
+        contentFingerprint = "fp-ts",
+    })
+    assertEq(confSt, "accepted", "confirm with valid timestamp prepares")
+    conf.timestamp = math.huge
+    local cst, cerr = GS:ApplyStagedConfirmationOperation(conf)
+    assertEq(cst, "rejected", "confirm huge timestamp rejected")
+    assertEq(cerr, "invalid_timestamp", "confirm invalid_timestamp")
+end
+
+-- R29) Permission revision consistency with policy head / bootstrap
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+    local datasetId = record.datasetId
+    assertEq(record.permission.revisionId, datasetId, "bootstrap revision is datasetId")
+    assertEq(record.permission.editorRankPosition, 3, "default bootstrap threshold 3")
+    assertNil(record.operations.heads["permission:editorRankPosition"], "no policy head at bootstrap")
+
+    -- Valid edited policy: head + revision + value agree.
+    local rankOp = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
+    assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted", "edited policy accepted")
+    record = GS:GetCurrentRecord()
+    assertEq(record.permission.revisionId, rankOp.id, "revision follows accepted op")
+    assertEq(record.permission.editorRankPosition, 2, "threshold projected to 2")
+    assertEq(record.operations.heads["permission:editorRankPosition"], rankOp.id, "policy head set")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "rank 3 cannot edit under threshold 2")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, true, "rank 2 can edit under valid edited policy")
+
+    -- Mismatched projected value vs head body.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.permission.editorRankPosition = 5
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "value mismatch unavailable")
+    assertEq(reason, "invalid_permission_revision", "value mismatch reason")
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "ordinary edit denied on value mismatch")
+    assertEq(caps.canRecoverPolicy, true, "GM recovery on value mismatch")
+    raw.permission.editorRankPosition = 2
+
+    -- Nonexistent / stale policy revision vs head.
+    raw.permission.revisionId = "does-not-exist"
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "nonexistent revision unavailable")
+    assertEq(reason, "invalid_permission_revision", "nonexistent revision reason")
+    caps = GS:GetCapabilities()
+    assertEq(caps.canRecoverPolicy, true, "GM recovery on nonexistent revision")
+    assertEq(caps.canEdit, false, "no ordinary edit on nonexistent revision")
+    raw.permission.revisionId = rankOp.id
+
+    -- Stale revision (bootstrap id) while head points at edited op.
+    raw.permission.revisionId = datasetId
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "stale bootstrap revision vs head unavailable")
+    assertEq(reason, "invalid_permission_revision", "stale revision reason")
+    raw.permission.revisionId = rankOp.id
+
+    -- Wrong operation kind under the policy head key is structural (not waived).
+    local headKey = "permission:editorRankPosition"
+    local savedBody = raw.operations.records[rankOp.id]
+    raw.operations.records[rankOp.id] = minimalValidBankTabBody(rankOp.id, datasetId, 1)
+    raw.operations.heads[headKey] = rankOp.id
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "wrong-kind head body unavailable")
+    assertEq(reason, "invalid_operations", "wrong-kind is structural invalid_operations")
+    caps = GS:GetCapabilities()
+    assertEq(caps.canRecoverPolicy, false, "structural corruption not GM policy recovery")
+    assertEq(caps.canEdit, false, "no edit on structural corruption")
+    raw.operations.records[rankOp.id] = savedBody
+
+    -- Explicit GM recovery after permission-only mismatch.
+    raw.permission.editorRankPosition = 5
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    caps = GS:GetCapabilities()
+    assertEq(caps.canRecoverPolicy, true, "GM can recover after mismatch")
+    local recoverOp, recoverSt = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 3)
+    assertEq(recoverSt, "accepted", "GM recovery prepare accepted: " .. tostring(recoverOp and recoverOp.id))
+    assertEq(GS:ApplyStagedConfigOperation(recoverOp), "accepted", "GM recovery apply accepted")
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "record usable after GM recovery")
+    assertEq(record.permission.editorRankPosition, 3, "recovered threshold 3")
+    assertEq(record.permission.revisionId, recoverOp.id, "recovered revision is new op")
+
+    -- Valid small-guild GM-selected threshold remains bootstrap (no policy head).
+    resetDb()
+    initGS()
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    local small, smallSt = GS:CreateStagedRecord(2)
+    assertEq(smallSt, "accepted", "small-guild GM selection accepted")
+    assertEq(small.permission.editorRankPosition, 2, "small-guild selected threshold")
+    assertEq(small.permission.revisionId, small.datasetId, "small-guild bootstrap revision")
+    assertNil(small.operations.heads["permission:editorRankPosition"], "small-guild has no policy head")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "small-guild bootstrap record usable")
+
+    -- Preview restriction still applies (not waived by recovery path).
+    resetDb()
+    initGS()
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.permission.revisionId = "bogus-rev"
+    world.impersonationActive = true
+    caps = GS:GetCapabilities()
+    assertEq(caps.canRecoverPolicy, false, "Preview as Non-Admin blocks GM recovery")
+    assertEq(caps.canEdit, false, "Preview blocks edit")
+    world.impersonationActive = false
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

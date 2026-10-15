@@ -71,6 +71,11 @@ local function IsFiniteNonnegInt(value)
     return n and n == math.floor(n) and n >= 0 and n == n and n ~= math.huge
 end
 
+--- Shared finite nonnegative-integer check (operation timestamps, campaign fields).
+function GS.IsFiniteNonnegInt(value)
+    return IsFiniteNonnegInt(value)
+end
+
 local function EmptyAccounting(clubId, guildName, guildRealm)
     return {
         _consumables = {
@@ -136,6 +141,67 @@ local function ValidatePermission(permission)
         return false, "invalid_editor_rank_position"
     end
     if type(permission.revisionId) ~= "string" or permission.revisionId == "" then
+        return false, "invalid_permission_revision"
+    end
+    return true
+end
+
+--- Bind current permission to bootstrap datasetId or the accepted policy head.
+-- Bootstrap (no permission head): revisionId must equal datasetId.
+-- Edited policy: revisionId must be the permission head, naming an accepted
+-- set-editor-rank body whose value equals editorRankPosition.
+-- Does not infer original rank count from today's roster and does not walk
+-- full operation history. Wrong-kind heads that fail ComputeTargetKey remain
+-- structural (invalid_operations), not permission-only recovery.
+-- @return boolean ok, string|nil reason
+local function ValidatePermissionPolicyConsistency(record)
+    if type(record) ~= "table" then
+        return false, "invalid_permission"
+    end
+    local permission = record.permission
+    local basicOk, basicErr = ValidatePermission(permission)
+    if not basicOk then
+        return false, basicErr
+    end
+    local pos = tonumber(permission.editorRankPosition)
+    local rev = permission.revisionId
+    local datasetId = record.datasetId
+    if type(datasetId) ~= "string" or datasetId == "" then
+        return false, "invalid_dataset_id"
+    end
+    local ops = record.operations
+    if type(ops) ~= "table" or type(ops.heads) ~= "table" or type(ops.records) ~= "table" then
+        return false, "invalid_operations"
+    end
+
+    local headKey = "permission:editorRankPosition"
+    if type(GS.ComputeTargetKey) == "function" then
+        headKey = GS.ComputeTargetKey("set-editor-rank", "editorRankPosition") or headKey
+    end
+    local headId = ops.heads[headKey]
+
+    if headId == nil then
+        -- Untouched bootstrap revision: datasetId is the only valid provenance.
+        if rev ~= datasetId then
+            return false, "invalid_permission_revision"
+        end
+        return true
+    end
+
+    if type(headId) ~= "string" or headId == "" then
+        return false, "invalid_permission_revision"
+    end
+    if rev ~= headId then
+        return false, "invalid_permission_revision"
+    end
+    local body = ops.records[headId]
+    if type(body) ~= "table" then
+        return false, "invalid_permission_revision"
+    end
+    if body.kind ~= "set-editor-rank" then
+        return false, "invalid_permission_revision"
+    end
+    if tonumber(body.value) ~= pos then
         return false, "invalid_permission_revision"
     end
     return true
@@ -415,7 +481,7 @@ local function ValidateGuildRecord(guildKey, record)
     if not ok then
         return false, err
     end
-    return ValidatePermission(record.permission)
+    return ValidatePermissionPolicyConsistency(record)
 end
 
 function GS._ValidateGuildRecordStructure(guildKey, record)
@@ -445,9 +511,13 @@ function GS:_GetPolicyRecoveryRecord(guildKey)
     if not ok then
         return nil, err or "invalid_record"
     end
-    local permOk, permErr = ValidatePermission(record.permission)
+    -- Permission shape or policy-revision consistency may be the sole failure.
+    local permOk, permErr = ValidatePermissionPolicyConsistency(record)
     if permOk then
         return nil, "policy_valid"
+    end
+    if not GS._IsPermissionOnlyFailure(permErr) then
+        return nil, permErr or "invalid_record"
     end
     return record, permErr or "invalid_permission", clubId
 end

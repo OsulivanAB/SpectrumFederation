@@ -94,6 +94,16 @@ local function stopDemandRosterWait()
     end
 end
 
+--- Clear bound/pending trust and invalidate any temporary wait.
+-- Used when demand-driven identity observes not_in_guild / unavailable club.
+-- Old wait callbacks must not restore trust after generation bump.
+local function invalidateDemandRosterTrust()
+    local dr = GG._demandRoster
+    stopDemandRosterWait()
+    dr.boundClubId = nil
+    dr.pendingClubId = nil
+end
+
 --- Bind pending club after a completed refresh signal; always stops the wait.
 local function completeDemandRosterWait(expectedClubId)
     local dr = GG._demandRoster
@@ -536,14 +546,19 @@ local function normalizeRankOrder(guid, legacyRankIndex)
 end
 
 --- Actual club-backed guild identity. Never persists or returns name: scopes.
+-- Observing membership/club loss clears demand-roster trust so rejoining the
+-- same club requires a completed refresh wait. Does not detect transitions
+-- never observed by this demand-driven API.
 -- @return table|nil identity, string|nil reason
 function GG.GetGuildIdentity()
     local inGuild = (IsInGuild and IsInGuild()) and true or false
     if not inGuild then
+        invalidateDemandRosterTrust()
         return nil, "not_in_guild"
     end
     local clubId = readActualClubId()
     if not clubId then
+        invalidateDemandRosterTrust()
         return nil, "club_id_unavailable"
     end
     local guildName, guildRealm = readGuildDisplay()
