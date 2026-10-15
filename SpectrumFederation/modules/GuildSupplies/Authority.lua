@@ -196,20 +196,31 @@ function GS:GetCapabilities()
             policyValid = false
             result.editorRankPosition = nil
         end
-    elseif recordReason == "invalid_editor_rank_position" or recordReason == "invalid_permission" then
+    elseif GS._IsPermissionOnlyFailure and GS._IsPermissionOnlyFailure(recordReason) then
+        -- Permission-only failure: structure must still be recoverable.
+        local raw = GS:_GetPolicyRecoveryRecord(ctx.guildKey)
+        if not raw then
+            result.canRead = false
+            result.reason = recordReason
+            return result
+        end
         policyValid = false
         result.reason = recordReason
     elseif recordReason and recordReason ~= "not_configured" then
         -- Malformed/unsupported record: fail closed for edits; reads of accepted
         -- public history remain available only when record validates. Here record
         -- failed validation, so do not expose it as readable domain data.
+        -- Unrelated corruption is not GM policy recovery.
         result.canRead = false
+        result.canRecoverPolicy = false
         result.reason = recordReason
         return result
     end
 
     if ctx.ready and type(ctx.rankOrder) == "number" then
         local isGM = (ctx.rankOrder == 1)
+        -- Verified Guild Master recovery capability is retained under the accepted
+        -- policy contract; Preview as Non-Admin still hides/denies it.
         result.canRecoverPolicy = isGM and true or false
 
         if PreviewNonAdminActive() then
@@ -221,6 +232,7 @@ function GS:GetCapabilities()
             result.reason = nil
         elseif (not policyValid or not policyInRange) and isGM then
             -- Invalid/missing/out-of-range policy: GM recovery only.
+            -- For permission-only failures, structure was verified above.
             result.canEdit = false
             result.canRecoverPolicy = true
             result.reason = "policy_requires_gm"

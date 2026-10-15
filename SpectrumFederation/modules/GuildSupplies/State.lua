@@ -119,6 +119,20 @@ local function ValidatePermission(permission)
     return true
 end
 
+GS.PERMISSION_ONLY_REASONS = {
+    invalid_permission = true,
+    invalid_editor_rank_position = true,
+    invalid_permission_revision = true,
+}
+
+local function IsValidBankTabValue(tab)
+    if tab == nil then
+        return true
+    end
+    tab = tonumber(tab)
+    return tab and tab == math.floor(tab) and tab >= 1 and tab <= 8
+end
+
 local function ValidateOperationsStore(ops)
     if type(ops) ~= "table" then
         return false, "invalid_operations"
@@ -131,7 +145,8 @@ local function ValidateOperationsStore(ops)
     return true
 end
 
-local function ValidateGuildRecord(guildKey, record)
+--- Non-policy structure/scope validation. Does not rewrite SavedVariables.
+local function ValidateGuildRecordStructure(guildKey, record)
     if type(record) ~= "table" then
         return false, "invalid_record"
     end
@@ -146,10 +161,6 @@ local function ValidateGuildRecord(guildKey, record)
     if type(record.datasetId) ~= "string" or record.datasetId == "" then
         return false, "invalid_dataset_id"
     end
-    local ok, err = ValidatePermission(record.permission)
-    if not ok then
-        return false, err
-    end
     local _, clubId = GS.ParseGuildKey(guildKey)
     if not clubId then
         return false, "invalid_guild_key"
@@ -158,20 +169,75 @@ local function ValidateGuildRecord(guildKey, record)
     if type(accounting) ~= "table" or type(accounting._consumables) ~= "table" then
         return false, "invalid_accounting"
     end
-    local guildMeta = accounting._consumables.guild
+    local cfg = accounting._consumables
+    local guildMeta = cfg.guild
     if type(guildMeta) ~= "table" or tostring(guildMeta.guid or "") ~= clubId then
         return false, "guild_identity_mismatch"
+    end
+    -- Fail closed on malformed accounting fields consumed by staged APIs.
+    if type(cfg.requestedItems) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    if type(accounting._consumableEvents) ~= "table"
+        or type(accounting._consumableEventArchive) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    if not IsValidBankTabValue(cfg.bankTab) then
+        return false, "invalid_accounting"
     end
     if type(record.campaigns) ~= "table" or type(record.observations) ~= "table"
         or type(record.observations.byCampaign) ~= "table"
         or type(record.confirmationRefs) ~= "table" then
         return false, "invalid_record_shape"
     end
-    ok, err = ValidateOperationsStore(record.operations)
+    local ok, err = ValidateOperationsStore(record.operations)
     if not ok then
         return false, err
     end
     return true
+end
+
+local function ValidateGuildRecord(guildKey, record)
+    -- Structure/scope first so permission-only recovery cannot mask corruption.
+    local ok, err = ValidateGuildRecordStructure(guildKey, record)
+    if not ok then
+        return false, err
+    end
+    return ValidatePermission(record.permission)
+end
+
+function GS._ValidateGuildRecordStructure(guildKey, record)
+    return ValidateGuildRecordStructure(guildKey, record)
+end
+
+function GS._IsPermissionOnlyFailure(reason)
+    return type(reason) == "string" and GS.PERMISSION_ONLY_REASONS[reason] == true
+end
+
+--- Raw retained record usable only for explicit GM policy recovery.
+-- Structure/scope must validate; permission must be the sole failure.
+-- Never exposed by ordinary GetCurrentRecord reads.
+function GS:_GetPolicyRecoveryRecord(guildKey)
+    if not GS:IsRootReady() then
+        return nil, GS:GetRootReason()
+    end
+    local key, clubId = GS.ParseGuildKey(guildKey)
+    if not key then
+        return nil, "invalid_guild_key"
+    end
+    local record = GS._root.guilds[key]
+    if record == nil then
+        return nil, "not_configured"
+    end
+    local ok, err = ValidateGuildRecordStructure(key, record)
+    if not ok then
+        return nil, err or "invalid_record"
+    end
+    local permOk, permErr = ValidatePermission(record.permission)
+    if permOk then
+        return nil, "policy_valid"
+    end
+    return record, permErr or "invalid_permission", clubId
 end
 
 local function ValidateRoot(root)
@@ -439,7 +505,7 @@ end
 
 --- Campaign boundary accessor: schema/validation only (#386 creates real boundaries).
 function GS:GetCurrentCampaignBoundary()
-    local record, reason = GS:GetCurrentRecord()
+    local record, reason, identity = GS:GetCurrentRecord()
     if not record then
         return nil, reason or "not_ready"
     end
@@ -454,14 +520,15 @@ function GS:GetCurrentCampaignBoundary()
     if type(header) ~= "table" then
         return nil, "missing_campaign"
     end
-    local ok, err = GS.ValidateCampaignBoundary(header, record)
+    local expectedKey = identity and identity.guildKey or nil
+    local ok, err = GS.ValidateCampaignBoundary(header, record, expectedKey)
     if not ok then
         return nil, err or "invalid_campaign"
     end
     return header
 end
 
-function GS.ValidateCampaignBoundary(header, record)
+function GS.ValidateCampaignBoundary(header, record, expectedGuildKey)
     if type(header) ~= "table" then
         return false, "invalid_campaign"
     end
@@ -483,6 +550,19 @@ function GS.ValidateCampaignBoundary(header, record)
     local keyOk = GS.ParseGuildKey(header.guildKey)
     if not keyOk then
         return false, "unsupported_guild_key"
+    end
+    -- Campaign headers must match the owning guild record / verified accessor context.
+    local ownerKey = expectedGuildKey
+    if ownerKey == nil and record ~= nil then
+        -- Infer from accounting guild guid when the caller supplies the record.
+        local cfg = record.accounting and record.accounting._consumables
+        local guid = cfg and cfg.guild and cfg.guild.guid
+        if guid ~= nil then
+            ownerKey = "club:" .. tostring(guid)
+        end
+    end
+    if ownerKey ~= nil and header.guildKey ~= ownerKey then
+        return false, "wrong_guild"
     end
     if header.resetOperationId ~= nil and header.resetOperationId ~= header.campaignId then
         -- For new-goal campaigns, campaignId = resetOperationId.
@@ -521,11 +601,20 @@ function GS:_StoreCampaignBoundaryForTests(header)
     if type(header) ~= "table" then
         return false, "invalid_campaign"
     end
-    header.datasetId = header.datasetId or record.datasetId
-    header.guildKey = header.guildKey or identity.guildKey
-    header.schemaVersion = header.schemaVersion or GS.SCHEMA_VERSION
-    header.boundaryVersion = header.boundaryVersion or 1
-    local ok, err = GS.ValidateCampaignBoundary(header, record)
+    -- Fill missing identity fields only; never rewrite a foreign guildKey.
+    if header.datasetId == nil then
+        header.datasetId = record.datasetId
+    end
+    if header.guildKey == nil then
+        header.guildKey = identity.guildKey
+    end
+    if header.schemaVersion == nil then
+        header.schemaVersion = GS.SCHEMA_VERSION
+    end
+    if header.boundaryVersion == nil then
+        header.boundaryVersion = 1
+    end
+    local ok, err = GS.ValidateCampaignBoundary(header, record, identity.guildKey)
     if not ok then
         return false, err
     end

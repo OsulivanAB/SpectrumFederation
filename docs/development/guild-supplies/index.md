@@ -74,7 +74,7 @@ Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected` with stable re
 - `set-requested-item` → target `{ itemId = N }` (add/update/remove share one revision chain)
 - `confirm-candidate` → confirmation envelope (see below)
 
-Caps: **4,096** accepted operations / guild; **128** pending/conflict admission bodies / guild. Overfull admissions return `full` without evicting ancestry.
+Caps: **4,096** accepted operations / guild; **128** combined pending+conflict admission bodies / guild (shared budget). Existing-ID retries reuse a slot and do not consume another. Overfull admissions return `full` without partial mutation or eviction.
 
 ### Rank authority (locked)
 
