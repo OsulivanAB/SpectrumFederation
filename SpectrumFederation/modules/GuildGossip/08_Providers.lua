@@ -216,6 +216,26 @@ function GG.BumpProviderChangeGen(providerId)
     entry.changeGen = (tonumber(entry.changeGen) or 0) + 1
 end
 
+-- True while a finite budgeted index walk is in progress. Ordinary durable
+-- NotifyProviderChanged calls must not discard that continuation.
+local function indexWalkInProgress(entry)
+    if not entry or entry.indexFailed then
+        return false
+    end
+    if entry._listCursor ~= nil or entry._reconciling then
+        return true
+    end
+    -- Custom EnsureIndex owns its continuation (e.g. synthetic _enumPos). An
+    -- incomplete or dirty build means that walk is still live.
+    if entry.api and type(entry.api.EnsureIndex) == "function" then
+        local index = entry.index
+        if index and (index.buildComplete ~= true or index.dirty) then
+            return true
+        end
+    end
+    return false
+end
+
 function GG.NotifyProviderChanged(providerId)
     local entry = GG.GetProvider(providerId)
     if not entry then
@@ -247,13 +267,23 @@ function GG.NotifyProviderChanged(providerId)
             entry.index.buildComplete = false
         end
     end
-    entry._buildList = nil
-    entry._buildPos = nil
-    entry._listCursor = nil
-    entry._reconcileSeen = nil
-    entry._reconciling = nil
-    if entry.api and type(entry.api.OnIndexInvalidated) == "function" then
-        pcall(entry.api.OnIndexInvalidated)
+    -- Ordinary durable updates during an active finite walk must not restart
+    -- that walk (recurring Notify would starve completion). Coalesce into one
+    -- follow-up reconcile after the current cursor/enum finishes. Genuine
+    -- epoch/replacement invalidation still goes through BumpIndexEpoch, which
+    -- clears continuation state itself.
+    if indexWalkInProgress(entry) then
+        entry._reconcileFollowUp = true
+    else
+        entry._buildList = nil
+        entry._buildPos = nil
+        entry._listCursor = nil
+        entry._reconcileSeen = nil
+        entry._reconciling = nil
+        entry._reconcileFollowUp = nil
+        if entry.api and type(entry.api.OnIndexInvalidated) == "function" then
+            pcall(entry.api.OnIndexInvalidated)
+        end
     end
     GG.BumpProviderChangeGen(providerId)
     if not entry.enabled then
@@ -279,6 +309,7 @@ local function markIndexFailed(entry, reason)
     entry._listCursor = nil
     entry._reconcileSeen = nil
     entry._reconciling = nil
+    entry._reconcileFollowUp = nil
     entry.lastIndexExamined = 0
     GG._DError("Index failed provider=%s reason=%s", entry.id, entry.indexFailReason)
 end
@@ -409,6 +440,13 @@ function GG.EnsureProviderIndex(entry, limits)
             markIndexFailed(entry, "ensure_index_incomplete")
             return false
         end
+        -- Notifications during the walk coalesced into one follow-up dirty pass.
+        if entry._reconcileFollowUp then
+            entry._reconcileFollowUp = nil
+            entry.index.dirty = true
+            entry.indexFailCount = 0
+            return true
+        end
         entry.indexFailCount = 0
         return false
     end
@@ -518,6 +556,17 @@ function GG.EnsureProviderIndex(entry, limits)
         entry.indexFailCount = 0
         entry._listCursor = nil
         if index then
+            if entry._reconcileFollowUp then
+                -- Changes arrived during this walk: do not prune from a possibly
+                -- stale seen set. Keep indexed rows, mark dirty, and run one
+                -- fresh reconcile on the next steps.
+                entry._reconcileFollowUp = nil
+                entry._reconcileSeen = nil
+                entry._reconciling = nil
+                index.buildComplete = true
+                index.dirty = true
+                return true
+            end
             if entry._reconciling and entry._reconcileSeen then
                 local removed = false
                 local toRemove = {}
@@ -659,7 +708,9 @@ function GG.CreateSyntheticProvider(opts)
             end
             -- Preserve continuation across ordinary dirty steps. Reset only when
             -- starting a new build (nil cursor) or after a genuine invalidation
-            -- that cleared _enumPos (BumpIndexEpoch / ClearStore / Notify).
+            -- that cleared _enumPos (BumpIndexEpoch / ClearStore / idle Notify).
+            -- NotifyProviderChanged during an active walk coalesces a follow-up
+            -- instead of clearing _enumPos via OnIndexInvalidated.
             if not store._enumPos then
                 store._enumPos = 1
             end

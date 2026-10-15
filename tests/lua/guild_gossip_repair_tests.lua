@@ -5845,6 +5845,168 @@ do
         "F89: re-enable authorizes from fresh roster not idle cache")
 end
 
+---------------------------------------------------------------------------
+-- F90: NotifyProviderChanged during active walk coalesces follow-up (4279189517)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local order = {}
+    for i = 1, 40 do
+        order[i] = "r" .. i
+    end
+    local versions = {}
+    for i = 1, 40 do
+        versions[order[i]] = "v1"
+    end
+    local listCalls = 0
+    local cursorHist = {}
+    A.GuildGossip.RegisterProvider({
+        id = "page90", schema = 1, enabled = true, ready = true,
+        ListRecordIds = function(cursor, limit)
+            listCalls = listCalls + 1
+            cursor = math.max(1, tonumber(cursor) or 1)
+            cursorHist[#cursorHist + 1] = cursor
+            limit = math.max(1, tonumber(limit) or 8)
+            local page = {}
+            local i = cursor
+            while i <= #order and #page < limit do
+                page[#page + 1] = order[i]
+                i = i + 1
+            end
+            if i <= #order then
+                return page, i
+            end
+            return page, nil
+        end,
+        GetRecordVersionFp = function(id) return versions[tostring(id)] end,
+        GetRecordBody = function(id)
+            return { id = id, versionFp = versions[tostring(id)], body = 1 }
+        end,
+        ValidateAndApply = function() return "duplicate" end,
+        IsPeerEligible = function() return true end,
+        GetScopeId = function() return A.GuildGossip.GetGuildScopeId() end,
+    })
+    local entry = A.GuildGossip.GetProvider("page90")
+    local limits = {
+        mode = "SLOW", bodies = 1, apps = 1, cpuMs = 10,
+        indexEntries = 8, manifestEntries = 4,
+    }
+
+    -- Multi-step build with repeated Notify: cursor must keep advancing.
+    stepClient(A, limits)
+    assertTrue(entry._listCursor ~= nil or not entry.index.buildComplete,
+        "F90: paged walk started")
+    local cursorAfterFirst = entry._listCursor
+    assertTrue(cursorAfterFirst ~= nil and cursorAfterFirst > 1,
+        "F90: first slice advanced cursor")
+    for i = 1, 12 do
+        versions["late-" .. i] = "v1"
+        order[#order + 1] = "late-" .. i
+        A.GuildGossip.NotifyProviderChanged("page90")
+        assertTrue(entry._reconcileFollowUp == true,
+            "F90: Notify during walk arms follow-up (i=" .. i .. ")")
+        assertEq(entry._listCursor, cursorAfterFirst,
+            "F90: Notify does not restart cursor (i=" .. i .. ")")
+    end
+    local callsMid = listCalls
+    stepClient(A, limits)
+    assertTrue(entry._listCursor == nil or entry._listCursor > cursorAfterFirst,
+        "F90: walk continues past coalesced Notify")
+    assertTrue(listCalls - callsMid <= 2,
+        "F90: per-step ListRecordIds stays bounded (delta=" .. tostring(listCalls - callsMid) .. ")")
+
+    local steps = 0
+    while (not entry.index.buildComplete or entry.index.dirty or entry._reconcileFollowUp
+        or entry._listCursor or entry._reconciling) and steps < 40 do
+        steps = steps + 1
+        stepClient(A, limits)
+    end
+    assertTrue(entry.index.buildComplete == true and entry.index.dirty ~= true,
+        "F90: eventual usable completion after repeated Notify")
+    assertTrue(entry._reconcileFollowUp ~= true, "F90: follow-up drained")
+    assertTrue(entry.index.byId["r1"] ~= nil, "F90: early rows indexed")
+    assertTrue(entry.index.byId["late-1"] ~= nil,
+        "F90: rows added during walk converge via follow-up")
+    assertTrue(entry.index.byId["late-12"] ~= nil,
+        "F90: last coalesced update not lost")
+
+    -- Idle Notify still performs soft invalidate (OnIndexInvalidated path).
+    local invalidated = 0
+    entry.api.OnIndexInvalidated = function()
+        invalidated = invalidated + 1
+    end
+    A.GuildGossip.NotifyProviderChanged("page90")
+    assertEq(invalidated, 1, "F90: idle Notify still invokes OnIndexInvalidated")
+    assertTrue(entry.index.dirty == true, "F90: idle Notify marks dirty")
+    assertTrue(entry._listCursor == nil, "F90: idle Notify clears cursor")
+    for _ = 1, 20 do
+        stepClient(A, limits)
+        if entry.index.buildComplete and not entry.index.dirty then break end
+    end
+    assertTrue(entry.index.buildComplete and not entry.index.dirty,
+        "F90: idle Notify rebuild converges")
+
+    -- Genuine epoch invalidation still restarts (BumpIndexEpoch clears walk).
+    stepClient(A, limits) -- ensure idle complete
+    -- Force a mid-walk then bump epoch.
+    entry.index.buildComplete = false
+    entry.index.dirty = true
+    stepClient(A, limits)
+    assertTrue(entry._listCursor ~= nil, "F90: mid-walk before epoch bump")
+    local epochBefore = entry.index.epoch
+    A.GuildGossip.BumpIndexEpoch(entry.index)
+    assertTrue(entry._listCursor == nil, "F90: BumpIndexEpoch clears cursor")
+    assertTrue(entry._reconcileFollowUp ~= true, "F90: BumpIndexEpoch clears follow-up")
+    assertTrue(entry.index.epoch ~= epochBefore, "F90: epoch changed")
+    for _ = 1, 30 do
+        stepClient(A, limits)
+        if entry.index.buildComplete and not entry.index.dirty then break end
+    end
+    assertTrue(entry.index.buildComplete and not entry.index.dirty,
+        "F90: rebuild after genuine invalidation converges")
+end
+
+do
+    -- EnsureIndex / synthetic path: repeated Notify during multi-slice build.
+    reset()
+    local A = makeClient("Alice")
+    local p = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f90e" })
+    for i = 1, 40 do
+        p.AppendLocal("row-" .. i, "f90e-" .. i)
+    end
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    entry.index.buildComplete = false
+    entry.index.dirty = true
+    p.GetStore()._enumPos = nil
+    local limits = {
+        mode = "SLOW", bodies = 1, apps = 1, cpuMs = 10,
+        indexEntries = 8, manifestEntries = 4,
+    }
+    stepClient(A, limits)
+    local posAfterFirst = p.GetStore()._enumPos
+    assertTrue(posAfterFirst ~= nil and posAfterFirst > 1,
+        "F90: EnsureIndex walk advanced")
+    for i = 1, 10 do
+        p.AppendLocal("mid-" .. i, "f90e-mid-" .. i)
+        A.GuildGossip.NotifyProviderChanged("sf.synthetic.gossip")
+        assertTrue(entry._reconcileFollowUp == true, "F90: EnsureIndex Notify arms follow-up")
+        assertEq(p.GetStore()._enumPos, posAfterFirst,
+            "F90: EnsureIndex Notify does not clear _enumPos")
+    end
+    local steps = 0
+    while (not entry.index.buildComplete or entry.index.dirty or entry._reconcileFollowUp
+        or p.GetStore()._enumPos) and steps < 40 do
+        steps = steps + 1
+        stepClient(A, limits)
+    end
+    assertTrue(entry.index.buildComplete == true and entry.index.dirty ~= true,
+        "F90: EnsureIndex eventual completion after repeated Notify")
+    assertTrue(entry.index.byId["f90e-1"] ~= nil, "F90: EnsureIndex early row present")
+    assertTrue(entry.index.byId["f90e-mid-1"] ~= nil,
+        "F90: EnsureIndex mid-walk append converges via follow-up")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")
