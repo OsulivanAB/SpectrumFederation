@@ -59,6 +59,7 @@ local world = {
     gossipListening = false,
     gossipReady = false,
     wireSends = 0,
+    rosterRequests = 0,
 }
 
 function GetTime() return world.time end
@@ -88,7 +89,9 @@ function GuildControlGetRankName(i)
     return world.guild.ranks[i]
 end
 C_GuildInfo = {
-    GuildRoster = function() end,
+    GuildRoster = function()
+        world.rosterRequests = (world.rosterRequests or 0) + 1
+    end,
     GetGuildRankOrder = function(guid)
         for _, m in ipairs(world.guild.members) do
             if m.guid == guid then
@@ -218,6 +221,10 @@ local function resetDb()
     GS._rootReason = "not_initialized"
     GS._handleGeneration = 0
     GS._lastGuildKey = nil
+    world.rosterRequests = 0
+    if GG._demandRoster then
+        GG._demandRoster.lastRequestAt = nil
+    end
 end
 
 local function setPlayer(name, guid, rankOrder)
@@ -1081,6 +1088,380 @@ do
     status, reason = GS:ApplyStagedConfigOperation(op)
     assertEq(status, "pending", "exact pending retry idempotent")
     assertEq(reason, "stale_base", "still stale_base")
+end
+
+---------------------------------------------------------------------------
+-- Repair regressions (PR #392 second batch)
+---------------------------------------------------------------------------
+
+-- R9) Canonical item targets: scalar/string/table + invalid removals
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    -- Scalar/string apply inputs normalize to { itemId = N }; no crash / nil key.
+    local op = GS:NewConfigOperation("set-requested-item", { itemId = 10 }, { itemId = 10, goal = 1 })
+    op.target = 10
+    local status, reason = GS:ApplyStagedConfigOperation(op)
+    assertEq(status, "accepted", "numeric target normalizes without crash")
+    assertEq(GS:GetCurrentRecord().operations.heads["item:10"], op.id, "canonical item head")
+    assertEq(GS:GetCurrentRecord().operations.records[op.id].target.itemId, 10,
+        "durable target is canonical table")
+    assertNil(GS:GetCurrentRecord().accounting._consumables.requestedItems["nil"], "no nil item key")
+
+    op = GS:NewConfigOperation("set-requested-item", { itemId = 11 }, { itemId = 11, goal = 2 })
+    op.target = "11"
+    status, reason = GS:ApplyStagedConfigOperation(op)
+    assertEq(status, "accepted", "string target normalizes without crash")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["11"].goal, 2,
+        "string target projects correctly")
+
+    -- Validate-only still requires canonical table shape (no silent scalar validate).
+    op = GS:NewConfigOperation("set-requested-item", { itemId = 12 }, { itemId = 12, goal = 1 })
+    op.target = 12
+    local ok, err = GS:ValidateConfigOperation(op)
+    assertEq(ok, false, "validate rejects bare numeric target shape")
+    assertEq(err, "invalid_target", "invalid_target from validate on scalar")
+
+    local st
+    op, st = GS:NewConfigOperation("set-requested-item", { itemId = -1 }, { removed = true })
+    assertEq(st, "rejected", "negative removal rejected at prepare")
+    op, st = GS:NewConfigOperation("set-requested-item", { itemId = 1.5 }, { removed = true })
+    assertEq(st, "rejected", "fractional removal rejected at prepare")
+    op = GS:NewConfigOperation("set-requested-item", { itemId = 13 }, { itemId = 13, goal = 1 })
+    op.target = -5
+    status, reason = GS:ApplyStagedConfigOperation(op)
+    assertEq(status, "rejected", "negative scalar apply rejected")
+    assertEq(reason, "invalid_target", "invalid_target for negative scalar")
+    op, st = GS:NewConfigOperation("set-requested-item", 42, { itemId = 42, goal = 3 })
+    assertEq(st, "accepted", "scalar prepare normalizes to table")
+    assertEq(op.target.itemId, 42, "canonical target shape from scalar prepare")
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "canonical table apply accepts")
+end
+
+-- R10) Campaign schema: reset ID, bank tab, key/header match, dangling current
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local rec = GS:GetCurrentRecord()
+
+    local ok, err = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-nil-reset",
+        datasetId = rec.datasetId,
+        guildKey = "club:42",
+        resetOperationId = nil,
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 1,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    })
+    assertEq(ok, false, "new-goal nil reset rejected")
+    assertEq(err, "invalid_reset_operation", "invalid_reset_operation")
+
+    ok, err = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-empty-reset",
+        datasetId = rec.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 1,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    })
+    assertEq(ok, false, "new-goal empty reset rejected")
+    assertEq(err, "invalid_reset_operation", "empty reset invalid_reset_operation")
+
+    ok, err = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-mismatch-reset",
+        datasetId = rec.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "other-id",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 1,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    })
+    assertEq(ok, false, "new-goal mismatched reset rejected")
+    assertEq(err, "campaign_id_mismatch", "campaign_id_mismatch for reset")
+
+    ok, err = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-tab9",
+        datasetId = rec.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "camp-tab9",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 1,
+        bankTabAtStart = 9,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    })
+    assertEq(ok, false, "bankTabAtStart 9 rejected")
+    assertEq(err, "invalid_bank_tab", "invalid_bank_tab for tab 9")
+
+    -- legacy-preserved may omit resetOperationId and bankTabAtStart
+    ok, err = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "legacy-1",
+        datasetId = rec.datasetId,
+        guildKey = "club:42",
+        resetOperationId = nil,
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = nil,
+        bankTabAtStart = nil,
+        boundaryVersion = 1,
+        boundaryKind = "legacy-preserved",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    })
+    assertEq(ok, true, "legacy-preserved without reset preserved")
+
+    -- Mismatched embedded campaignId under map key
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    rec = GS:GetCurrentRecord()
+    rec.campaigns["A"] = {
+        schemaVersion = 1,
+        campaignId = "B",
+        datasetId = rec.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "B",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 1,
+        bankTabAtStart = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    }
+    rec.currentCampaignId = "A"
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "key/header mismatch keeps record unavailable")
+    assertEq(reason, "campaign_id_mismatch", "campaign_id_mismatch for embedded id")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].currentCampaignId, "A",
+        "malformed campaign pointer preserved")
+
+    -- Dangling currentCampaignId
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    SpectrumFederationDB.guildSupplies.guilds["club:42"].currentCampaignId = "missing"
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "dangling currentCampaignId unavailable")
+    assertEq(reason, "dangling_campaign", "dangling_campaign reason")
+end
+
+-- R11) Attribution bind + exact duplicate after self-lockout / demotion
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local op = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
+    assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "restrictive threshold accepted")
+    local status, reason = GS:ApplyStagedConfigOperation(op)
+    assertEq(status, "duplicate", "exact retry after self-lockout is duplicate")
+    assertEq(reason, "duplicate", "duplicate reason after self-lockout")
+
+    -- Tampered actorName with correct GUID rejected before retention
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    op = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    op.actorName = "Eve-Garona"
+    status, reason = GS:ApplyStagedConfigOperation(op)
+    assertEq(status, "rejected", "tampered actorName rejected")
+    assertEq(reason, "unauthorized", "unauthorized for tampered name")
+    assertNil(GS:GetCurrentRecord().operations.pending[op.id], "no pending retention for bad name")
+    assertNil(GS:GetCurrentRecord().operations.records[op.id], "no accepted retention for bad name")
+
+    -- Confirmation demotion: exact accepted retry without edit rank
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    GS:CreateStagedRecord()
+    local conf = GS:NewConfirmationOperation({ recordId = "cand-dup2", contentFingerprint = "fp-dup2" })
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "confirm accepted")
+    -- Demote Carol below threshold
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local demote = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
+    assertEq(GS:ApplyStagedConfigOperation(demote), "accepted", "GM demotes threshold")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    status, reason = GS:ApplyStagedConfirmationOperation(conf)
+    assertEq(status, "duplicate", "demoted confirm exact retry is duplicate")
+    assertEq(reason, "duplicate", "duplicate after demotion")
+
+    -- Changed-body negative still requires authority
+    local clash = {}
+    for k, v in pairs(conf) do clash[k] = v end
+    clash.timestamp = (tonumber(conf.timestamp) or 1) + 5
+    status, reason = GS:ApplyStagedConfirmationOperation(clash)
+    assertEq(status, "rejected", "changed-body confirm rejected without edit")
+    assertEq(reason, "unauthorized", "unauthorized for changed body after demotion")
+end
+
+-- R12) Snapshot bounds + batched originalIds validation
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    local conf, st, err = GS:NewConfirmationOperation({
+        records = { { id = "a", contentFingerprint = "fp" } },
+        contentFingerprint = "fp",
+        originalIds = { false },
+    })
+    assertEq(st, "rejected", "false originalId rejected at prepare")
+    assertTrue(err == "invalid_candidate_ref" or err == "invalid_candidate_batch",
+        "invalid candidate reason for false originalId")
+
+    conf, st, err = GS:NewConfirmationOperation({
+        recordId = "single",
+        contentFingerprint = "fp2",
+        originalIds = { "" },
+    })
+    assertEq(st, "rejected", "empty originalId rejected")
+
+    conf, st, err = GS:NewConfirmationOperation({
+        records = { { id = "a", contentFingerprint = "fp3" } },
+        contentFingerprint = "fp3",
+        originalIds = { string.rep("z", GS.MAX_OPERATION_ID + 1) },
+    })
+    assertEq(st, "rejected", "oversized originalId rejected")
+
+    -- Supported batch still works
+    local ids = {}
+    for i = 1, 16 do ids[i] = "txn-" .. i end
+    conf, st = GS:NewConfirmationOperation({
+        records = {
+            { id = "r1", contentFingerprint = "fp-batch" },
+            { id = "r2", contentFingerprint = "fp-batch" },
+        },
+        contentFingerprint = "fp-batch",
+        originalIds = ids,
+    })
+    assertEq(st, "accepted", "supported confirmation batch prepares")
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "supported batch admits")
+
+    -- Wide scalar map rejected without durable mutation
+    local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    local wide = {}
+    for i = 1, 200 do wide["k" .. i] = i end
+    -- Inject oversized nested value through a crafted confirm-sized payload on config:
+    -- snapshot whitelist only copies known fields; craft via candidate-like oversize string.
+    op.actorName = string.rep("n", 9000)
+    local beforeTab = GS:GetCurrentRecord().accounting._consumables.bankTab
+    status, reason = GS:ApplyStagedConfigOperation(op)
+    assertEq(status, "rejected", "oversized string snapshot rejected")
+    assertTrue(reason == "snapshot_string_too_large" or reason == "invalid_actor",
+        "bounded rejection reason for long string")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, beforeTab, "no durable mutation")
+end
+
+-- R13) Retained ops store shape + accepted cap without trusting #order alone
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    raw.operations.pending["bad"] = true
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "pending=true keeps record unavailable")
+    assertEq(reason, "invalid_operations", "invalid_operations for pending=true")
+    assertEq(raw.operations.pending["bad"], true, "corrupt pending preserved")
+
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    -- Short order + large records map: structurally inconsistent
+    raw.operations.records["only"] = { id = "only", kind = "set-bank-tab" }
+    raw.operations.order = {}
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "records/order mismatch unavailable")
+    assertEq(reason, "invalid_operations", "invalid_operations for order mismatch")
+
+    -- Cap fixture: structurally valid full accepted store rejects another admit
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+    local ops = record.operations
+    for i = 1, GS.MAX_ACCEPTED_OPERATIONS do
+        local id = "acc-" .. i
+        ops.records[id] = { id = id, kind = "set-bank-tab", target = "bankTab", value = 1 }
+        ops.order[i] = id
+    end
+    assertEq(GS:GetCurrentRecord() ~= nil, true, "full structurally valid store readable")
+    local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 4)
+    status, reason = GS:ApplyStagedConfigOperation(op)
+    assertEq(status, "rejected", "accepted cap rejects new admit")
+    assertEq(reason, "full", "full reason at accepted cap")
+    assertNil(ops.records[op.id], "no partial accepted mutation at cap")
+end
+
+-- R14) Cold roster demand nudge (throttled) + idle transport
+do
+    resetDb()
+    GS:Initialize(SpectrumFederationDB)
+    local savedMembers = world.guild.members
+    world.guild.members = {}
+    world.rosterRequests = 0
+    if GG._demandRoster then GG._demandRoster.lastRequestAt = nil end
+    local member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "cold roster returns nil")
+    assertEq(reason, "roster_incomplete", "roster_incomplete on cold cache")
+    assertEq(world.rosterRequests, 1, "demand-driven roster request once")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertEq(reason, "roster_incomplete", "still incomplete")
+    assertEq(world.rosterRequests, 1, "throttled; no spam on nested reads")
+    world.time = world.time + 3
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertEq(world.rosterRequests, 2, "request allowed after throttle interval")
+    assertEq(GG.HasActiveProvider(), false, "still zero providers")
+    assertEq(GG._guild.listening, false, "no permanent listeners")
+    assertEq(GG._guild.ready, false, "transport not marked ready")
+    world.guild.members = savedMembers
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "later native readiness resolves")
+    assertEq(member.guid, "Player-1-Alice", "member guid after roster present")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

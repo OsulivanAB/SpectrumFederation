@@ -22,12 +22,31 @@ GG._guild = GG._guild or {
     frame = nil,
 }
 
+-- Demand-driven roster nudge for zero-provider authority (no listeners/polling).
+GG._demandRoster = GG._demandRoster or {
+    lastRequestAt = nil,
+}
+local DEMAND_ROSTER_MIN_INTERVAL = 2.0
+
 local function requestRoster()
     if C_GuildInfo and C_GuildInfo.GuildRoster then
         C_GuildInfo.GuildRoster()
     elseif GuildRoster then
         GuildRoster()
     end
+end
+
+--- Throttled native roster request for cold demand-driven reads.
+-- Does not register listeners, mark transport ready, or start discovery.
+local function requestRosterDemandDriven()
+    local now = (GetTime and GetTime()) or 0
+    local last = GG._demandRoster.lastRequestAt
+    if type(last) == "number" and (now - last) < DEMAND_ROSTER_MIN_INTERVAL then
+        return false
+    end
+    GG._demandRoster.lastRequestAt = now
+    requestRoster()
+    return true
 end
 
 local function computeScopeId(guildName, guildRealm, clubId)
@@ -384,6 +403,8 @@ function GG.GetGuildMember(name)
     local total = GetNumGuildMembers()
     total = tonumber(total) or 0
     if total <= 0 then
+        -- Cold native roster: request once (throttled); stay fail-closed until data arrives.
+        requestRosterDemandDriven()
         return nil, "roster_incomplete"
     end
     local wantLower = string.lower(want)

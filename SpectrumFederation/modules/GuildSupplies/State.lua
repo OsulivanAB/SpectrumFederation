@@ -133,6 +133,26 @@ local function IsValidBankTabValue(tab)
     return tab and tab == math.floor(tab) and tab >= 1 and tab <= 8
 end
 
+--- Bounded shape/ID consistency for retained ops. Does not deep-walk bodies.
+local function ValidateRetainedAdmissionEntry(id, entry)
+    if type(id) ~= "string" or id == "" or #id > GS.MAX_OPERATION_ID then
+        return false, "invalid_operations"
+    end
+    if type(entry) ~= "table" then
+        return false, "invalid_operations"
+    end
+    if entry.id ~= id then
+        return false, "invalid_operations"
+    end
+    if type(entry.body) ~= "table" then
+        return false, "invalid_operations"
+    end
+    if entry.body.id ~= nil and entry.body.id ~= id then
+        return false, "invalid_operations"
+    end
+    return true
+end
+
 local function ValidateOperationsStore(ops)
     if type(ops) ~= "table" then
         return false, "invalid_operations"
@@ -142,6 +162,71 @@ local function ValidateOperationsStore(ops)
         or type(ops.conflicts) ~= "table" then
         return false, "invalid_operations"
     end
+
+    local orderCount = #ops.order
+    if orderCount > GS.MAX_ACCEPTED_OPERATIONS then
+        return false, "invalid_operations"
+    end
+    local seenOrder = {}
+    for i = 1, orderCount do
+        local id = ops.order[i]
+        if type(id) ~= "string" or id == "" or #id > GS.MAX_OPERATION_ID then
+            return false, "invalid_operations"
+        end
+        if seenOrder[id] then
+            return false, "invalid_operations"
+        end
+        seenOrder[id] = true
+        local body = ops.records[id]
+        if type(body) ~= "table" then
+            return false, "invalid_operations"
+        end
+        if body.id ~= nil and body.id ~= id then
+            return false, "invalid_operations"
+        end
+    end
+
+    local recordCount = 0
+    for id, body in pairs(ops.records) do
+        recordCount = recordCount + 1
+        if recordCount > GS.MAX_ACCEPTED_OPERATIONS then
+            return false, "invalid_operations"
+        end
+        if type(id) ~= "string" or not seenOrder[id] or type(body) ~= "table" then
+            return false, "invalid_operations"
+        end
+    end
+    if recordCount ~= orderCount then
+        return false, "invalid_operations"
+    end
+
+    local pendingCount = 0
+    for id, entry in pairs(ops.pending) do
+        pendingCount = pendingCount + 1
+        if pendingCount > GS.MAX_PENDING_OPERATIONS then
+            return false, "invalid_operations"
+        end
+        local ok, err = ValidateRetainedAdmissionEntry(id, entry)
+        if not ok then
+            return false, err
+        end
+    end
+
+    local conflictCount = 0
+    for id, entry in pairs(ops.conflicts) do
+        conflictCount = conflictCount + 1
+        if conflictCount > GS.MAX_PENDING_OPERATIONS then
+            return false, "invalid_operations"
+        end
+        local ok, err = ValidateRetainedAdmissionEntry(id, entry)
+        if not ok then
+            return false, err
+        end
+    end
+    if pendingCount + conflictCount > GS.MAX_PENDING_OPERATIONS then
+        return false, "invalid_operations"
+    end
+
     return true
 end
 
@@ -190,6 +275,26 @@ local function ValidateGuildRecordStructure(guildKey, record)
         or type(record.confirmationRefs) ~= "table" then
         return false, "invalid_record_shape"
     end
+
+    -- currentCampaignId: nil (no campaign) or nonempty key matching embedded header.
+    local currentCampaignId = record.currentCampaignId
+    if currentCampaignId ~= nil then
+        if type(currentCampaignId) ~= "string" or currentCampaignId == "" then
+            return false, "invalid_campaign"
+        end
+        local header = record.campaigns[currentCampaignId]
+        if type(header) ~= "table" then
+            return false, "dangling_campaign"
+        end
+        if header.campaignId ~= currentCampaignId then
+            return false, "campaign_id_mismatch"
+        end
+        local campOk, campErr = GS.ValidateCampaignBoundary(header, record, guildKey)
+        if not campOk then
+            return false, campErr or "invalid_campaign"
+        end
+    end
+
     local ok, err = ValidateOperationsStore(record.operations)
     if not ok then
         return false, err
@@ -520,6 +625,9 @@ function GS:GetCurrentCampaignBoundary()
     if type(header) ~= "table" then
         return nil, "missing_campaign"
     end
+    if header.campaignId ~= campaignId then
+        return nil, "campaign_id_mismatch"
+    end
     local expectedKey = identity and identity.guildKey or nil
     local ok, err = GS.ValidateCampaignBoundary(header, record, expectedKey)
     if not ok then
@@ -564,14 +672,26 @@ function GS.ValidateCampaignBoundary(header, record, expectedGuildKey)
     if ownerKey ~= nil and header.guildKey ~= ownerKey then
         return false, "wrong_guild"
     end
-    if header.resetOperationId ~= nil and header.resetOperationId ~= header.campaignId then
-        -- For new-goal campaigns, campaignId = resetOperationId.
-        if header.boundaryKind == "new-goal" then
-            return false, "campaign_id_mismatch"
-        end
-    end
     if header.boundaryKind ~= "new-goal" and header.boundaryKind ~= "legacy-preserved" then
         return false, "invalid_boundary_kind"
+    end
+    if header.boundaryKind == "new-goal" then
+        -- campaignId = resetOperationId for new-goal boundaries.
+        if type(header.resetOperationId) ~= "string" or header.resetOperationId == "" then
+            return false, "invalid_reset_operation"
+        end
+        if header.resetOperationId ~= header.campaignId then
+            return false, "campaign_id_mismatch"
+        end
+        local startedAt = tonumber(header.startedAt)
+        if not startedAt or startedAt ~= math.floor(startedAt) or startedAt < 0 then
+            return false, "invalid_started_at"
+        end
+    elseif header.resetOperationId ~= nil then
+        -- legacy-preserved may omit reset IDs; if present, keep type-safe.
+        if type(header.resetOperationId) ~= "string" or header.resetOperationId == "" then
+            return false, "invalid_reset_operation"
+        end
     end
     if header.contextStatus ~= "captured" and header.contextStatus ~= "empty"
         and header.contextStatus ~= "unavailable" then
@@ -580,11 +700,8 @@ function GS.ValidateCampaignBoundary(header, record, expectedGuildKey)
     if tonumber(header.boundaryVersion) ~= 1 then
         return false, "unsupported_boundary_version"
     end
-    if header.boundaryKind == "new-goal" then
-        local startedAt = tonumber(header.startedAt)
-        if not startedAt or startedAt ~= math.floor(startedAt) or startedAt < 0 then
-            return false, "invalid_started_at"
-        end
+    if not IsValidBankTabValue(header.bankTabAtStart) then
+        return false, "invalid_bank_tab"
     end
     if header.parentCampaignId ~= nil and type(header.parentCampaignId) ~= "string" then
         return false, "invalid_parent_campaign"

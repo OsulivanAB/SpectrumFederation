@@ -6,8 +6,10 @@ local GS = SF.GuildSupplies
 
 GS.OP_SCHEMA_VERSION = 1
 GS.MAX_BANK_TAB = 8
+-- Entry/leaf budget must fit a max confirmation batch (64) plus envelope fields.
 GS.MAX_SNAPSHOT_DEPTH = 6
-GS.MAX_SNAPSHOT_NODES = 64
+GS.MAX_SNAPSHOT_NODES = 256
+GS.MAX_SNAPSHOT_STRING_BYTES = 8192
 
 local KIND = {
     SET_EDITOR_RANK = "set-editor-rank",
@@ -17,6 +19,21 @@ local KIND = {
 }
 
 GS.KIND = KIND
+
+-- Public durable fields only; private "_" prepare metadata is never retained.
+local CONFIG_SNAPSHOT_FIELDS = {
+    "schemaVersion", "id", "guildKey", "datasetId", "campaignId", "kind",
+    "target", "value", "actorGuid", "actorName", "timestamp",
+    "baseTargetRevision", "basePolicyRevision", "baseCampaignId",
+}
+local CONFIRM_SNAPSHOT_FIELDS = {
+    "schemaVersion", "id", "guildKey", "datasetId", "kind", "candidateRef",
+    "contentFingerprint", "campaignId", "basePolicyRevision",
+    "actorGuid", "actorName", "timestamp",
+}
+local CANDIDATE_REF_FIELDS = {
+    "recordId", "records", "contentFingerprint", "originalIds", "campaignId",
+}
 
 local function ServerTime()
     if GetServerTime then
@@ -55,14 +72,56 @@ local function DeepEqual(a, b, depth)
     return true
 end
 
---- Bounded deep snapshot of public operation fields. Rejects cycles / oversize.
+local function ChargeSnapshot(budget, amount)
+    budget.n = budget.n + (amount or 1)
+    if budget.n > GS.MAX_SNAPSHOT_NODES then
+        return false, "snapshot_too_large"
+    end
+    return true
+end
+
+local function ChargeSnapshotString(budget, s)
+    local ok, err = ChargeSnapshot(budget, 1)
+    if not ok then
+        return false, err
+    end
+    budget.stringBytes = budget.stringBytes + #s
+    if budget.stringBytes > GS.MAX_SNAPSHOT_STRING_BYTES then
+        return false, "snapshot_string_too_large"
+    end
+    return true
+end
+
+--- Bounded deep snapshot. Counts tables and scalar leaves; bounds string bytes.
+-- Private "_" keys are skipped. Rejects cycles / oversize without partial return.
 -- @return copy|nil, err|nil
-local function DeepSnapshot(value, depth, seen, nodeCountRef)
+local function DeepSnapshot(value, depth, seen, budget)
     depth = depth or 0
     seen = seen or {}
-    nodeCountRef = nodeCountRef or { n = 0 }
+    budget = budget or { n = 0, stringBytes = 0 }
     local t = type(value)
-    if t == "nil" or t == "boolean" or t == "number" or t == "string" then
+    if t == "nil" or t == "boolean" then
+        local ok, err = ChargeSnapshot(budget, 1)
+        if not ok then
+            return nil, err
+        end
+        return value
+    end
+    if t == "number" then
+        if value ~= value or value == math.huge or value == -math.huge then
+            return nil, "invalid_snapshot_number"
+        end
+        local ok, err = ChargeSnapshot(budget, 1)
+        if not ok then
+            return nil, err
+        end
+        return value
+    end
+    if t == "string" then
+        local ok, err = ChargeSnapshotString(budget, value)
+        if not ok then
+            return nil, err
+        end
         return value
     end
     if t ~= "table" then
@@ -74,20 +133,34 @@ local function DeepSnapshot(value, depth, seen, nodeCountRef)
     if seen[value] then
         return nil, "snapshot_cycle"
     end
-    nodeCountRef.n = nodeCountRef.n + 1
-    if nodeCountRef.n > GS.MAX_SNAPSHOT_NODES then
-        return nil, "snapshot_too_large"
+    local ok, err = ChargeSnapshot(budget, 1)
+    if not ok then
+        return nil, err
     end
     seen[value] = true
     local copy = {}
     for k, v in pairs(value) do
         local kt = type(k)
         if kt ~= "string" and kt ~= "number" then
+            seen[value] = nil
             return nil, "invalid_snapshot_key"
         end
-        if kt ~= "string" or k:sub(1, 1) ~= "_" then
-            local child, err = DeepSnapshot(v, depth + 1, seen, nodeCountRef)
+        if kt == "string" and k:sub(1, 1) == "_" then
+            -- Prepare-only metadata; never durable.
+        else
+            if kt == "string" then
+                ok, err = ChargeSnapshotString(budget, k)
+            else
+                ok, err = ChargeSnapshot(budget, 1)
+            end
+            if not ok then
+                seen[value] = nil
+                return nil, err
+            end
+            local child
+            child, err = DeepSnapshot(v, depth + 1, seen, budget)
             if err then
+                seen[value] = nil
                 return nil, err
             end
             copy[k] = child
@@ -97,11 +170,87 @@ local function DeepSnapshot(value, depth, seen, nodeCountRef)
     return copy
 end
 
+local function SnapshotWhitelisted(source, fields)
+    if type(source) ~= "table" then
+        return nil, "invalid_operation"
+    end
+    local budget = { n = 0, stringBytes = 0 }
+    local copy = {}
+    local ok, err = ChargeSnapshot(budget, 1)
+    if not ok then
+        return nil, err
+    end
+    for i = 1, #fields do
+        local field = fields[i]
+        local value = source[field]
+        if value ~= nil then
+            ok, err = ChargeSnapshotString(budget, field)
+            if not ok then
+                return nil, err
+            end
+            if field == "candidateRef" and type(value) == "table" then
+                local refCopy = {}
+                ok, err = ChargeSnapshot(budget, 1)
+                if not ok then
+                    return nil, err
+                end
+                for j = 1, #CANDIDATE_REF_FIELDS do
+                    local rf = CANDIDATE_REF_FIELDS[j]
+                    if value[rf] ~= nil then
+                        ok, err = ChargeSnapshotString(budget, rf)
+                        if not ok then
+                            return nil, err
+                        end
+                        local child
+                        child, err = DeepSnapshot(value[rf], 1, {}, budget)
+                        if err then
+                            return nil, err
+                        end
+                        refCopy[rf] = child
+                    end
+                end
+                copy[field] = refCopy
+            else
+                local child
+                child, err = DeepSnapshot(value, 1, {}, budget)
+                if err then
+                    return nil, err
+                end
+                copy[field] = child
+            end
+        end
+    end
+    return copy
+end
+
 local function SnapshotPublicOp(op)
     if type(op) ~= "table" then
         return nil, "invalid_operation"
     end
-    return DeepSnapshot(op, 0, {}, { n = 0 })
+    if op.kind == KIND.CONFIRM_CANDIDATE then
+        return SnapshotWhitelisted(op, CONFIRM_SNAPSHOT_FIELDS)
+    end
+    return SnapshotWhitelisted(op, CONFIG_SNAPSHOT_FIELDS)
+end
+
+--- Canonical requested-item target: { itemId = finite positive integer }.
+local function CanonicalItemTarget(target)
+    local raw
+    if type(target) == "table" then
+        raw = target.itemId
+    elseif type(target) == "number" or type(target) == "string" then
+        raw = target
+    else
+        return nil
+    end
+    local itemId = tonumber(raw)
+    if not itemId or itemId ~= itemId or itemId == math.huge or itemId == -math.huge then
+        return nil
+    end
+    if itemId ~= math.floor(itemId) or itemId < 1 then
+        return nil
+    end
+    return { itemId = itemId }
 end
 
 local function TargetKey(kind, target)
@@ -110,11 +259,11 @@ local function TargetKey(kind, target)
     elseif kind == KIND.SET_BANK_TAB then
         return "config:bankTab"
     elseif kind == KIND.SET_REQUESTED_ITEM then
-        local itemId = type(target) == "table" and tonumber(target.itemId) or tonumber(target)
-        if not itemId then
+        local canon = CanonicalItemTarget(target)
+        if not canon then
             return nil
         end
-        return "item:" .. tostring(itemId)
+        return "item:" .. tostring(canon.itemId)
     elseif kind == KIND.CONFIRM_CANDIDATE then
         return "confirm"
     end
@@ -132,8 +281,9 @@ local function CountMap(t)
     return n
 end
 
+--- Prefer records map size; structure validation keeps it consistent with order.
 local function AcceptedCount(ops)
-    return #(ops.order or {})
+    return CountMap(ops.records)
 end
 
 local function RetentionBodyCount(ops)
@@ -178,22 +328,50 @@ local function NormalizeRequestedItemValue(value)
     if value.removed == true then
         return { removed = true }
     end
-    local itemId = tonumber(value.itemId)
-    local goal = tonumber(value.goal)
-    if not itemId or itemId ~= math.floor(itemId) or itemId < 1 then
+    local canon = CanonicalItemTarget(value)
+    if not canon then
         return nil, "invalid_item_id"
     end
+    local goal = tonumber(value.goal)
     local C = SF.Consumables
     local maxGoal = (C and C.MAX_GOAL) or 100000
     local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
-    if not goal or goal ~= math.floor(goal) or goal < 0 or goal > maxGoal then
+    if not goal or goal ~= goal or goal ~= math.floor(goal) or goal < 0 or goal > maxGoal then
         return nil, "invalid_goal"
     end
     return {
-        itemId = itemId,
+        itemId = canon.itemId,
         goal = goal,
         removed = false,
     }, nil, maxItems
+end
+
+--- Dense-array originalIds: every entry must be a nonempty bounded string.
+local function ValidateOriginalIds(originalIds)
+    if originalIds == nil then
+        return true
+    end
+    if type(originalIds) ~= "table" then
+        return false, "invalid_candidate_ref"
+    end
+    local n = #originalIds
+    if n > GS.MAX_CONFIRMATION_BATCH then
+        return false, "invalid_candidate_batch"
+    end
+    local counted = 0
+    for k, v in pairs(originalIds) do
+        counted = counted + 1
+        if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+            return false, "invalid_candidate_ref"
+        end
+        if type(v) ~= "string" or v == "" or #v > GS.MAX_OPERATION_ID then
+            return false, "invalid_candidate_ref"
+        end
+    end
+    if counted ~= n then
+        return false, "invalid_candidate_ref"
+    end
+    return true
 end
 
 local function IsValidBankTab(tab)
@@ -269,15 +447,19 @@ local function ValidateKindValue(op)
         end
         return true
     elseif kind == KIND.SET_REQUESTED_ITEM then
-        local itemId = type(op.target) == "table" and tonumber(op.target.itemId) or tonumber(op.target)
-        if not itemId then
+        local canon = CanonicalItemTarget(op.target)
+        if not canon then
+            return false, "invalid_target"
+        end
+        -- Require canonical table shape so validate/apply agree.
+        if type(op.target) ~= "table" or tonumber(op.target.itemId) ~= canon.itemId then
             return false, "invalid_target"
         end
         local normalized, err = NormalizeRequestedItemValue(op.value)
         if not normalized then
             return false, err
         end
-        if normalized.removed ~= true and normalized.itemId ~= itemId then
+        if normalized.removed ~= true and normalized.itemId ~= canon.itemId then
             return false, "item_id_mismatch"
         end
         return true
@@ -344,11 +526,11 @@ function GS:NewConfigOperation(kind, target, value)
     end
 
     if kind == KIND.SET_REQUESTED_ITEM then
-        local itemId = type(target) == "table" and tonumber(target.itemId) or tonumber(target)
-        if not itemId then
+        local canon = CanonicalItemTarget(target)
+        if not canon then
             return nil, "rejected", "invalid_target"
         end
-        target = { itemId = itemId }
+        target = canon
         local normalized, err = NormalizeRequestedItemValue(value)
         if not normalized then
             return nil, "rejected", err
@@ -420,6 +602,10 @@ function GS:ValidateConfigOperation(op, context)
         return false, "wrong_guild"
     end
     if op.actorGuid ~= context.actorGuid then
+        return false, "unauthorized"
+    end
+    -- Bind attribution to verified native context before any retention.
+    if op.actorName ~= context.actorName then
         return false, "unauthorized"
     end
 
@@ -574,7 +760,11 @@ local function ApplyMutations(record, op)
         if type(cfg.requestedItems) ~= "table" then
             return false, "invalid_accounting"
         end
-        local itemId = tonumber(op.target.itemId)
+        local canon = CanonicalItemTarget(op.target)
+        if not canon then
+            return false, "invalid_target"
+        end
+        local itemId = canon.itemId
         local key = tostring(itemId)
         if type(op.value) == "table" and op.value.removed == true then
             cfg.requestedItems[key] = nil
@@ -600,9 +790,71 @@ local function ApplyMutations(record, op)
     return false, "unsupported_kind"
 end
 
+--- Exact accepted duplicate within verified current guild/dataset (no edit rank).
+-- Changed bodies and pending promotion still require fresh authority.
+local function RecognizeExactAcceptedDuplicate(op, stored)
+    local ctx = GS:GetCurrentContext()
+    if not ctx or not ctx.guildKey or not ctx.membershipReady then
+        return nil
+    end
+    if type(op) ~= "table" or type(stored) ~= "table" or type(op.id) ~= "string" then
+        return nil
+    end
+    if op.guildKey ~= ctx.guildKey then
+        return "rejected", "wrong_guild"
+    end
+    if not GS:IsRootReady() then
+        return nil
+    end
+    local record, reason = GS:GetCurrentRecord()
+    if type(record) ~= "table" then
+        if reason == "not_configured" then
+            return nil
+        end
+        -- Permission-only recovery records are not exposed here; fall through.
+        return nil
+    end
+    if op.datasetId ~= record.datasetId then
+        return "rejected", "dataset_mismatch"
+    end
+    local existing = record.operations.records[op.id]
+    if existing and DeepEqual(existing, stored) then
+        return "duplicate", "duplicate"
+    end
+    return nil
+end
+
 function GS:ApplyStagedConfigOperation(op, context)
     if type(op) ~= "table" then
         return "rejected", "invalid_operation"
+    end
+
+    local shapeOk, shapeErr = ValidateConfigShape(op)
+    if not shapeOk then
+        return "rejected", shapeErr
+    end
+
+    if op.kind == KIND.SET_REQUESTED_ITEM then
+        local canon = CanonicalItemTarget(op.target)
+        if not canon then
+            return "rejected", "invalid_target"
+        end
+        op.target = canon
+    end
+
+    local kindOk, kindErr = ValidateKindValue(op)
+    if not kindOk then
+        return "rejected", kindErr
+    end
+
+    local stored, snapErr = SnapshotPublicOp(op)
+    if not stored then
+        return "rejected", snapErr or "invalid_operation"
+    end
+
+    local dupStatus, dupReason = RecognizeExactAcceptedDuplicate(op, stored)
+    if dupStatus then
+        return dupStatus, dupReason
     end
 
     local prepared = {
@@ -618,19 +870,8 @@ function GS:ApplyStagedConfigOperation(op, context)
         return "rejected", authReason or "unauthorized"
     end
     context = fresh or context or GS:GetCurrentContext()
-
-    local shapeOk, shapeErr = ValidateConfigShape(op)
-    if not shapeOk then
-        return "rejected", shapeErr
-    end
-    local kindOk, kindErr = ValidateKindValue(op)
-    if not kindOk then
-        return "rejected", kindErr
-    end
-
-    local stored, snapErr = SnapshotPublicOp(op)
-    if not stored then
-        return "rejected", snapErr or "invalid_operation"
+    if op.actorName ~= context.actorName then
+        return "rejected", "unauthorized"
     end
 
     if not GS:IsRootReady() then
@@ -699,8 +940,8 @@ function GS:ApplyStagedConfigOperation(op, context)
         return "rejected", verr or "unauthorized"
     end
 
-    local tKey = TargetKey(op.kind, op.target)
-    local applied, applyErr = ApplyMutations(record, op)
+    local tKey = TargetKey(op.kind, stored.target)
+    local applied, applyErr = ApplyMutations(record, stored)
     if not applied then
         return "rejected", applyErr or "apply_failed"
     end
@@ -725,20 +966,9 @@ local function ValidateCandidateRef(ref)
             or #ref.recordId > GS.MAX_OPERATION_ID then
             return false, "invalid_candidate_ref"
         end
-        if ref.originalIds ~= nil then
-            if type(ref.originalIds) ~= "table" then
-                return false, "invalid_candidate_ref"
-            end
-            local n = #ref.originalIds
-            if n > GS.MAX_CONFIRMATION_BATCH then
-                return false, "invalid_candidate_batch"
-            end
-            for i = 1, n do
-                if type(ref.originalIds[i]) ~= "string" or ref.originalIds[i] == ""
-                    or #ref.originalIds[i] > GS.MAX_OPERATION_ID then
-                    return false, "invalid_candidate_ref"
-                end
-            end
+        local idsOk, idsErr = ValidateOriginalIds(ref.originalIds)
+        if not idsOk then
+            return false, idsErr
         end
         return true
     end
@@ -747,8 +977,12 @@ local function ValidateCandidateRef(ref)
         if n < 1 or n > GS.MAX_CONFIRMATION_BATCH then
             return false, "invalid_candidate_batch"
         end
-        for i = 1, n do
-            local row = ref.records[i]
+        local counted = 0
+        for k, row in pairs(ref.records) do
+            counted = counted + 1
+            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+                return false, "invalid_candidate_batch"
+            end
             if type(row) ~= "table" or type(row.id) ~= "string" or row.id == ""
                 or #row.id > GS.MAX_OPERATION_ID
                 or type(row.contentFingerprint) ~= "string" or row.contentFingerprint == ""
@@ -756,10 +990,12 @@ local function ValidateCandidateRef(ref)
                 return false, "invalid_candidate_batch"
             end
         end
-        if ref.originalIds ~= nil then
-            if type(ref.originalIds) ~= "table" or #ref.originalIds > GS.MAX_CONFIRMATION_BATCH then
-                return false, "invalid_candidate_batch"
-            end
+        if counted ~= n then
+            return false, "invalid_candidate_batch"
+        end
+        local idsOk, idsErr = ValidateOriginalIds(ref.originalIds)
+        if not idsOk then
+            return false, idsErr
         end
         return true
     end
@@ -848,15 +1084,20 @@ function GS:NewConfirmationOperation(candidateRef)
         campaignId = record.currentCampaignId
     end
 
-    local snapRef, snapErr = DeepSnapshot({
-        recordId = candidateRef.recordId,
-        records = candidateRef.records,
-        contentFingerprint = candidateRef.contentFingerprint,
-        originalIds = candidateRef.originalIds,
-    }, 0, {}, { n = 0 })
-    if not snapRef then
+    local snapShell, snapErr = SnapshotWhitelisted({
+        kind = KIND.CONFIRM_CANDIDATE,
+        candidateRef = {
+            recordId = candidateRef.recordId,
+            records = candidateRef.records,
+            contentFingerprint = candidateRef.contentFingerprint,
+            originalIds = candidateRef.originalIds,
+            campaignId = candidateRef.campaignId,
+        },
+    }, { "candidateRef" })
+    if not snapShell or type(snapShell.candidateRef) ~= "table" then
         return nil, "rejected", snapErr or "invalid_candidate_ref"
     end
+    local snapRef = snapShell.candidateRef
 
     local op = {
         schemaVersion = GS.OP_SCHEMA_VERSION,
@@ -921,20 +1162,37 @@ end
 
 --- Staged admission for a confirmation op (does not credit donations).
 function GS:ApplyStagedConfirmationOperation(op, context)
+    if type(op) ~= "table" then
+        return "rejected", "invalid_operation"
+    end
+
+    local shapeOk, shapeErr = ValidateConfirmationShape(op)
+    if not shapeOk then
+        return "rejected", shapeErr
+    end
+
+    local stored, snapErr = SnapshotPublicOp(op)
+    if not stored then
+        return "rejected", snapErr or "invalid_operation"
+    end
+
+    local dupStatus, dupReason = RecognizeExactAcceptedDuplicate(op, stored)
+    if dupStatus then
+        return dupStatus, dupReason
+    end
+
     local prepared = {
-        guildKey = op and op.guildKey,
-        actorGuid = op and op.actorGuid,
-        handleGeneration = op and op._preparedHandleGeneration,
+        guildKey = op.guildKey,
+        actorGuid = op.actorGuid,
+        handleGeneration = op._preparedHandleGeneration,
     }
     local authOk, authReason, fresh = GS:_AuthorizeCommit(prepared)
     if not authOk then
         return "rejected", authReason or "unauthorized"
     end
     context = fresh or context
-
-    local stored, snapErr = SnapshotPublicOp(op)
-    if not stored then
-        return "rejected", snapErr or "invalid_operation"
+    if op.actorName ~= (context and context.actorName) then
+        return "rejected", "unauthorized"
     end
 
     local valid, verr = GS:ValidateConfirmationOperation(op, context)

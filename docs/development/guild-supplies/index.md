@@ -74,7 +74,7 @@ Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected` with stable re
 - `set-requested-item` → target `{ itemId = N }` (add/update/remove share one revision chain)
 - `confirm-candidate` → confirmation envelope (see below)
 
-Caps: **4,096** accepted operations / guild; **128** combined pending+conflict admission bodies / guild (shared budget). Existing-ID retries reuse a slot and do not consume another. Overfull admissions return `full` without partial mutation or eviction.
+Caps: **4,096** accepted operations / guild; **128** combined pending+conflict admission bodies / guild (shared budget). Existing-ID retries reuse a slot and do not consume another. Overfull admissions return `full` without partial mutation or eviction. Durable operation snapshots are whitelisted and bounded (entry/leaf count and string bytes); malformed or oversized input is rejected without partial retention. Retained `records`/`order`/`pending`/`conflicts` entries must be shape- and ID-consistent before a guild record is usable; inconsistent saved stores stay unavailable without repair-on-read.
 
 ### Rank authority (locked)
 
@@ -82,7 +82,7 @@ Caps: **4,096** accepted operations / guild; **128** combined pending+conflict a
 - Player-facing labels use `GuildControlGetRankName(position)` (for example `"%s and higher"`).
 - Invalid/out-of-range policy → verified Guild Master recovery only.
 - Preview as Non-Admin denies privileged actions locally.
-- Zero active gossip providers: authority uses a **demand-driven** native snapshot. Missing data fails closed. Commit rechecks guild/rank/policy.
+- Zero active gossip providers: authority uses a **demand-driven** native snapshot. A cold empty roster triggers a throttled native `GuildRoster` request without listeners, discovery, or a dummy provider. Missing data fails closed. Commit rechecks guild/rank/policy.
 
 ### Confirmation envelope
 
@@ -90,7 +90,7 @@ Caps: **4,096** accepted operations / guild; **128** combined pending+conflict a
 
 ### Campaign boundary header
 
-Fields: `schemaVersion, campaignId, datasetId, guildKey, parentCampaignId, resetOperationId, createdByGuid, createdByName, startedAt, bankTabAtStart, boundaryVersion=1, boundaryKind ("new-goal"|"legacy-preserved"), contextStatus ("captured"|"empty"|"unavailable"), contextObservedAt, contextRecordCount`. `#385` validates/accesses only; bank capture and reset lifecycle are #386.
+Fields: `schemaVersion, campaignId, datasetId, guildKey, parentCampaignId, resetOperationId, createdByGuid, createdByName, startedAt, bankTabAtStart, boundaryVersion=1, boundaryKind ("new-goal"|"legacy-preserved"), contextStatus ("captured"|"empty"|"unavailable"), contextObservedAt, contextRecordCount`. `currentCampaignId` must be nil or a nonempty key whose embedded `campaignId` matches. `new-goal` requires nonempty `resetOperationId == campaignId`. `bankTabAtStart` is nil or integral tabs 1–8. `#385` validates/accesses only; bank capture and reset lifecycle are #386.
 
 ## Downstream ownership
 
