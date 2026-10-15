@@ -2997,6 +2997,67 @@ do
     world.impersonationActive = false
 end
 
+-- R30) operations.order must be a bounded dense 1..n array (all keys inspected)
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "empty dense order readable at bootstrap")
+    assertEq(next(record.operations.order), nil, "bootstrap order empty")
+
+    local op1 = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertEq(GS:ApplyStagedConfigOperation(op1), "accepted", "first append accepted")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "dense order after first append readable")
+    local op2 = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(op2), "accepted", "second append accepted")
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "valid dense append remains readable")
+    assertEq(record.operations.order[1], op1.id, "dense order[1]")
+    assertEq(record.operations.order[2], op2.id, "dense order[2]")
+
+    local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local datasetId = raw.datasetId
+    local ghostId = "ghost-order-id"
+    raw.operations.records[ghostId] = minimalValidBankTabBody(ghostId, datasetId, 7)
+
+    -- Hole with an entry beyond the contiguous prefix (do not assert #order).
+    raw.operations.order = { [1] = op1.id, [3] = ghostId }
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "hole beyond contiguous prefix unavailable")
+    assertEq(reason, "invalid_operations", "hole invalid_operations")
+    assertEq(raw.operations.order[1], op1.id, "hole order[1] preserved")
+    assertEq(raw.operations.order[3], ghostId, "hole order[3] preserved")
+    assertNil(raw.operations.order[2], "hole at 2 unchanged (still absent)")
+
+    local function assertBadOrderKeys(label, orderTable)
+        raw.operations.order = orderTable
+        local ex, rs = GS:GetCurrentRecord()
+        assertNil(ex, label .. " unavailable")
+        assertEq(rs, "invalid_operations", label .. " invalid_operations")
+        -- Malformed saved order remains unchanged (no rewrite/delete).
+        for k, v in pairs(orderTable) do
+            assertEq(raw.operations.order[k], v, label .. " key preserved: " .. tostring(k))
+        end
+    end
+
+    assertBadOrderKeys("string key", { [1] = op1.id, ["2"] = op2.id })
+    assertBadOrderKeys("zero key", { [0] = op1.id, [1] = op2.id })
+    assertBadOrderKeys("negative key", { [-1] = op1.id, [1] = op2.id })
+    assertBadOrderKeys("fractional key", { [1] = op1.id, [1.5] = op2.id })
+
+    -- Restore a valid dense order; record becomes usable again.
+    raw.operations.order = { op1.id, op2.id }
+    raw.operations.records[ghostId] = nil
+    exposed, reason = GS:GetCurrentRecord()
+    assertTrue(exposed ~= nil, "restored dense order readable: " .. tostring(reason))
+    local op3 = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertEq(GS:ApplyStagedConfigOperation(op3), "accepted", "append after restore accepted")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "readable after valid append on restored dense order")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

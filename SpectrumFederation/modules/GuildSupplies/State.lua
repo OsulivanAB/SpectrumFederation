@@ -269,6 +269,36 @@ local function ValidateOperationsHeads(ops)
     return true
 end
 
+--- Require ops.order to be a bounded dense array with keys exactly 1..n.
+-- Inspects every key (not only 1..#order) so holes / non-integral keys cannot
+-- hide ghost entries that later appends would expose. Does not rewrite SV.
+-- @return boolean ok, number|nil orderCount, string|nil reason
+local function ValidateOperationsOrderDense(order)
+    if type(order) ~= "table" then
+        return false, nil, "invalid_operations"
+    end
+    local counted = 0
+    local maxKey = 0
+    for k, _ in pairs(order) do
+        counted = counted + 1
+        if counted > GS.MAX_ACCEPTED_OPERATIONS then
+            return false, nil, "invalid_operations"
+        end
+        if type(k) ~= "number" or k ~= math.floor(k) or k < 1
+            or k ~= k or k == math.huge then
+            return false, nil, "invalid_operations"
+        end
+        if k > maxKey then
+            maxKey = k
+        end
+    end
+    -- Distinct positive integral keys form exactly {1..n} iff maxKey == counted.
+    if maxKey ~= counted then
+        return false, nil, "invalid_operations"
+    end
+    return true, counted, nil
+end
+
 --- @param ops table
 -- @param guildKey string|nil owning guild key for body consistency
 -- @param datasetId string|nil owning dataset id for body consistency
@@ -282,9 +312,9 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
         return false, "invalid_operations"
     end
 
-    local orderCount = #ops.order
-    if orderCount > GS.MAX_ACCEPTED_OPERATIONS then
-        return false, "invalid_operations"
+    local denseOk, orderCount, denseErr = ValidateOperationsOrderDense(ops.order)
+    if not denseOk then
+        return false, denseErr or "invalid_operations"
     end
     local seenOrder = {}
     for i = 1, orderCount do
