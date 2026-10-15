@@ -246,14 +246,7 @@ loadModule("SpectrumFederation/modules/GuildSupplies/Operations.lua")
 local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
 
-local function resetDb()
-    SpectrumFederationDB = {}
-    GS._db = nil
-    GS._root = nil
-    GS._rootValid = false
-    GS._rootReason = "not_initialized"
-    GS._handleGeneration = 0
-    GS._lastGuildKey = nil
+local function resetDemandRoster()
     world.rosterRequests = 0
     timers = {}
     if GG._demandRoster then
@@ -269,6 +262,84 @@ local function resetDb()
         end
         GG._demandRoster.staleFingerprint = nil
     end
+end
+
+--- Complete the temporary demand roster wait for the current club (test helper).
+local function settleRoster()
+    if not world.guild.inGuild or world.guild.clubId == nil or world.guild.clubId == 0 then
+        return
+    end
+    if #(world.guild.members or {}) <= 0 then
+        return
+    end
+    local clubId = tostring(world.guild.clubId)
+    if GG._demandRoster and GG._demandRoster.boundClubId == clubId then
+        return
+    end
+    GG.GetGuildRanks()
+    fireEvent("GUILD_ROSTER_UPDATE")
+end
+
+--- Simulate /reload clearing runtime demand-roster state while SV/world persist.
+local function simulateRuntimeReload()
+    resetDemandRoster()
+end
+
+local function resetDb()
+    SpectrumFederationDB = {}
+    GS._db = nil
+    GS._root = nil
+    GS._rootValid = false
+    GS._rootReason = "not_initialized"
+    GS._handleGeneration = 0
+    GS._lastGuildKey = nil
+    resetDemandRoster()
+end
+
+local function initGS(opts)
+    opts = opts or {}
+    local ok, reason = GS:Initialize(SpectrumFederationDB)
+    if opts.settle ~= false then
+        settleRoster()
+    end
+    return ok, reason
+end
+
+local function minimalValidBankTabBody(id, datasetId, value)
+    return {
+        schemaVersion = 1,
+        id = id,
+        guildKey = "club:42",
+        datasetId = datasetId,
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = value or 1,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 1,
+        baseTargetRevision = datasetId,
+        basePolicyRevision = datasetId,
+    }
+end
+
+local function minimalValidConfirmBody(id, datasetId)
+    return {
+        schemaVersion = 1,
+        id = id,
+        guildKey = "club:42",
+        datasetId = datasetId,
+        kind = "confirm-candidate",
+        candidateRef = {
+            recordId = "cand-1",
+            contentFingerprint = "fp-1",
+        },
+        contentFingerprint = "fp-1",
+        campaignId = nil,
+        basePolicyRevision = datasetId,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 1,
+    }
 end
 
 local function setPlayer(name, guid, rankOrder)
@@ -308,7 +379,7 @@ end
 do
     resetDb()
     world.wireSends = 0
-    local ok = GS:Initialize(SpectrumFederationDB)
+    local ok = initGS()
     assertTrue(ok, "Initialize creates empty root")
     assertTrue(type(SpectrumFederationDB.guildSupplies) == "table", "root present")
     assertEq(next(SpectrumFederationDB.guildSupplies.guilds), nil, "no guild auto-created")
@@ -321,7 +392,7 @@ end
 -- 2) Missing club readiness
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     local saved = world.guild.clubId
     world.guild.clubId = nil
     local ctx = GS:GetCurrentContext()
@@ -338,7 +409,7 @@ end
 -- 3) Explicit staged create + default rank 3; ranks 1-3 edit, 4 denied
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local rec, status = GS:CreateStagedRecord()
     assertEq(status, "accepted", "GM creates staged record")
@@ -364,7 +435,7 @@ end
 -- 4) Guild isolation across characters / club change
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -421,13 +492,13 @@ do
             guilds = {},
         },
     }
-    local ok, reason = GS:Initialize(SpectrumFederationDB)
+    local ok, reason = initGS()
     assertEq(ok, false, "future schema not accepted")
     assertEq(reason, "unsupported_schema", "unsupported_schema reason")
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, 99, "future root preserved")
 
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -444,7 +515,7 @@ end
 -- 6) Rename refreshes names; reorder keeps numeric threshold
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -466,7 +537,7 @@ end
 -- 7) Invalid/out-of-range policy → GM recovery only
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -485,7 +556,7 @@ end
 -- 8) Guild with fewer than three ranks
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     world.guild.clubId = 42
     world.guild.ranks = { "Guild Master", "Member" }
     world.guild.members = {
@@ -522,7 +593,7 @@ end
 -- 9) Preview as Non-Admin
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -537,7 +608,7 @@ end
 -- 10) Staged operations: accept, duplicate, independent targets, remove ancestry
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -586,7 +657,7 @@ end
 -- 11) Threshold change under old policy; restrictive self-lockout
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Carol-Garona", "Player-1-Carol", 3)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -601,7 +672,7 @@ end
 -- 12) Prepare then rank revocation / guild change at commit
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -650,7 +721,7 @@ do
             activeProfileId = "p1",
         },
     }
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -670,7 +741,7 @@ end
 -- 14) Confirmation contract
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -714,7 +785,7 @@ end
 -- 15) Campaign boundary schema
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -793,7 +864,7 @@ end
 -- 16) Zero-provider native authority + gossip remains idle
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     ensureIdleGossip()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
@@ -816,7 +887,7 @@ end
 -- 17) Reload persistence
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -828,7 +899,7 @@ do
     GS._root = nil
     GS._rootValid = false
     SpectrumFederationDB = saved
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     local record = GS:GetCurrentRecord()
     assertEq(record.accounting._consumables.requestedItems["7"].goal, 3, "survives reload")
     local status = GS:ApplyStagedConfigOperation(op)
@@ -848,7 +919,7 @@ end
 -- 19) Profile switch does not change guild key / create records
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     SpectrumFederationDB.lootHelper = { activeProfileId = "a" }
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
@@ -866,7 +937,7 @@ end
 -- R1) Malformed-policy GM recovery vs unrelated corruption
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -886,7 +957,7 @@ do
 
     -- Missing revision metadata
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -899,7 +970,7 @@ do
 
     -- Unrelated corruption: malformed requestedItems — no recovery write path
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -918,7 +989,7 @@ do
 
     -- Preview as Non-Admin still denies recovery
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     SpectrumFederationDB.guildSupplies.guilds["club:42"].permission.editorRankPosition = 0
@@ -933,7 +1004,7 @@ end
 -- R2) Shared pending/conflict capacity (128) + confirmation path
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1010,7 +1081,7 @@ end
 -- R3) Confirmation campaign bind (incl. nil→campaign)
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1049,7 +1120,7 @@ end
 -- R4) Nested caller mutation after admission does not alter durable body
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1067,7 +1138,7 @@ end
 -- R5) Malformed saved requestedItems unavailable
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1080,7 +1151,7 @@ end
 -- R6) Bank tab 1–8 domain + invalid confirmation fields
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1116,7 +1187,7 @@ end
 -- R7) Foreign-guild campaign headers fail without mutation
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1145,7 +1216,7 @@ end
 -- R8) Changed-body pending replay → id_conflict; unchanged retry idempotent
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1180,7 +1251,7 @@ end
 -- R9) Canonical item targets: scalar/string/table + invalid removals
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1228,7 +1299,7 @@ end
 -- R10) Campaign schema: reset ID, bank tab, key/header match, dangling current
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1326,7 +1397,7 @@ do
 
     -- Mismatched embedded campaignId under map key
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     rec = GS:GetCurrentRecord()
@@ -1354,7 +1425,7 @@ do
 
     -- Dangling currentCampaignId
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     SpectrumFederationDB.guildSupplies.guilds["club:42"].currentCampaignId = "missing"
@@ -1366,7 +1437,7 @@ end
 -- R11) Attribution bind + exact duplicate after self-lockout / demotion
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Carol-Garona", "Player-1-Carol", 3)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1378,7 +1449,7 @@ do
 
     -- Tampered actorName with correct GUID rejected before retention
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     op = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
@@ -1391,7 +1462,7 @@ do
 
     -- Confirmation demotion: exact accepted retry without edit rank
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Carol-Garona", "Player-1-Carol", 3)
     GS:CreateStagedRecord()
     local conf = GS:NewConfirmationOperation({ recordId = "cand-dup2", contentFingerprint = "fp-dup2" })
@@ -1417,7 +1488,7 @@ end
 -- R12) Snapshot bounds + batched originalIds validation
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1473,7 +1544,7 @@ end
 -- R13) Retained ops store shape + accepted cap without trusting #order alone
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1485,7 +1556,7 @@ do
     assertEq(raw.operations.pending["bad"], true, "corrupt pending preserved")
 
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1498,16 +1569,19 @@ do
 
     -- Cap fixture: structurally valid full accepted store rejects another admit
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     local record = GS:GetCurrentRecord()
     local ops = record.operations
+    local datasetId = record.datasetId
     for i = 1, GS.MAX_ACCEPTED_OPERATIONS do
         local id = "acc-" .. i
-        ops.records[id] = { id = id, kind = "set-bank-tab", target = "bankTab", value = 1 }
+        ops.records[id] = minimalValidBankTabBody(id, datasetId, 1)
         ops.order[i] = id
     end
+    -- Clear heads so historical bank-tab bodies do not need matching head keys.
+    ops.heads = {}
     assertEq(GS:GetCurrentRecord() ~= nil, true, "full structurally valid store readable")
     local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 4)
     status, reason = GS:ApplyStagedConfigOperation(op)
@@ -1519,7 +1593,7 @@ end
 -- R14) Cold roster demand nudge (throttled) + idle transport
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS({ settle = false })
     local savedMembers = world.guild.members
     world.guild.members = {}
     world.rosterRequests = 0
@@ -1551,7 +1625,7 @@ end
 -- R15) Max confirmation batch + over-limit + XOR candidateRef + nested campaign
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1629,7 +1703,7 @@ end
 -- R16) Heads, confirmationRefs, required body.id
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1643,7 +1717,7 @@ do
     assertEq(raw.operations.heads["item:1"], "ghost", "ghost head preserved")
 
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1655,7 +1729,7 @@ do
     assertEq(reason, "invalid_operations", "invalid_operations for wrong-target head")
 
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1666,7 +1740,7 @@ do
 
     -- Missing body.id on accepted
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1679,7 +1753,7 @@ do
 
     -- Mismatched pending body.id
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1696,7 +1770,7 @@ do
 
     -- confirmationRefs: dangling / wrong kind / sparse / duplicate
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1706,7 +1780,7 @@ do
     assertEq(reason, "invalid_confirmation_refs", "invalid_confirmation_refs dangling")
 
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1718,7 +1792,7 @@ do
     assertEq(reason, "invalid_confirmation_refs", "invalid_confirmation_refs wrong kind")
 
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
@@ -1731,7 +1805,7 @@ do
     assertEq(reason, "invalid_confirmation_refs", "invalid_confirmation_refs sparse")
 
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     GS:CreateStagedRecord()
     conf = GS:NewConfirmationOperation({ recordId = "ref-dup", contentFingerprint = "fp-dup-ref" })
@@ -1781,7 +1855,7 @@ do
         },
     }
     local oldDataset = SpectrumFederationDB.guildSupplies.guilds["club:42"].datasetId
-    local ok = GS:Initialize(SpectrumFederationDB)
+    local ok = initGS()
     assertEq(ok, true, "malformed writer recovers on otherwise valid root")
     local nonce = SpectrumFederationDB.guildSupplies.localWriter.nonce
     assertEq(#nonce, 24, "recovered nonce is 24 hex")
@@ -1798,7 +1872,7 @@ do
     -- Valid reload keeps nonce
     local kept = SpectrumFederationDB.guildSupplies.localWriter.nonce
     local seq = SpectrumFederationDB.guildSupplies.localWriter.nextSeq
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     assertEq(SpectrumFederationDB.guildSupplies.localWriter.nonce, kept, "valid nonce survives reload")
     assertEq(SpectrumFederationDB.guildSupplies.localWriter.nextSeq, seq, "valid nextSeq survives reload")
 
@@ -1819,7 +1893,7 @@ do
             guilds = { ["club:1"] = { schemaVersion = 99 } },
         },
     }
-    ok = GS:Initialize(SpectrumFederationDB)
+    ok = initGS()
     assertEq(ok, false, "unsupported schema remains unavailable")
     assertEq(SpectrumFederationDB.guildSupplies.localWriter.nonce, string.rep("f", 500),
         "unsupported root writer not rewritten")
@@ -1828,7 +1902,7 @@ do
 
     -- Boundary attribution / capture metadata
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1951,7 +2025,7 @@ end
 -- R18) Canonical confirmation manifest rows + exact replay after reload
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -1979,7 +2053,7 @@ do
     GS._root = nil
     GS._rootValid = false
     SpectrumFederationDB = saved
-    assertEq(GS:Initialize(SpectrumFederationDB), true, "reload after confirm")
+    assertEq(initGS(), true, "reload after confirm")
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local status, reason = GS:ApplyStagedConfirmationOperation(conf)
     assertEq(status, "duplicate", "exact replay after reload is duplicate")
@@ -2017,7 +2091,7 @@ end
 -- R19) Finite campaign startedAt (reject inf/nan/negative; valid round-trip)
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -2081,7 +2155,7 @@ end
 -- R20) Small-guild GM threshold selection + denials
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     world.guild.clubId = 42
     world.guild.ranks = { "Guild Master", "Member" }
     world.guild.members = {
@@ -2105,7 +2179,7 @@ do
     assertEq(st, "rejected", "missing club readiness denies create")
     assertTrue(err == "club_id_unavailable" or err == "not_ready", "readiness reason")
     world.guild.clubId = savedClub
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
 
     local rec
     rec, st, err = GS:CreateStagedRecord(1)
@@ -2115,7 +2189,7 @@ do
 
     -- Ordinary ≥3 ranks still defaults to 3 and ignores selection
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
     world.guild.members = {
         { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
@@ -2133,7 +2207,7 @@ end
 -- R21) Demand-driven roster scope after club identity change
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     local member, reason = GG.GetGuildMember("Alice-Garona")
@@ -2197,7 +2271,7 @@ end
 -- R22) Requested-item value canonicalization at admission (nested extras / remove / replay)
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -2278,18 +2352,40 @@ do
     assertNil(storedRm.value.itemId, "removal omits itemId")
 end
 
--- R23) Roster readiness: identical refresh, first read, retarget, timeout cleanup
+-- R23) Roster readiness: unbound first wait, identical refresh, retarget, timeout
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS({ settle = false })
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
 
-    -- Already-refreshed first read binds immediately (no wait).
+    -- Unbound first observation with nonempty stale-capable data starts a wait.
     local member, reason = GG.GetGuildMember("Alice-Garona")
-    assertTrue(member ~= nil, "first nonempty observation binds: " .. tostring(reason))
-    assertEq(GG._demandRoster.waitActive, false, "no wait on already-refreshed first read")
-    assertEq(GG._demandRoster.boundClubId, "42", "bound to first club")
+    assertNil(member, "first nonempty observation does not bind without refresh")
+    assertEq(reason, "roster_incomplete", "incomplete until refresh event")
+    assertEq(GG._demandRoster.waitActive, true, "wait started on unbound first observation")
+    assertNil(GG._demandRoster.boundClubId, "not bound before event")
+    local ctx = GS:GetCurrentContext()
+    assertEq(ctx.ready, false, "privileged context unavailable before first refresh")
+    local deniedOp, deniedSt = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertNil(deniedOp, "no prepare before first refresh")
+    assertEq(deniedSt, "rejected", "prepare rejected before first refresh")
+
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "first observation recovers after refresh event")
+    assertEq(GG._demandRoster.boundClubId, "42", "bound to first club after event")
+    assertEq(GG._demandRoster.waitActive, false, "wait cleaned after first refresh")
+
+    -- Simulated /reload: runtime demand state clears; nonempty rows still need wait.
+    simulateRuntimeReload()
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertNil(member, "reload leaves initial nonempty roster unbound")
+    assertEq(reason, "roster_incomplete", "reload requires a new refresh wait")
+    assertEq(GG._demandRoster.waitActive, true, "wait restarted after reload")
+    fireEvent("GUILD_ROSTER_UPDATE")
+    member, reason = GG.GetGuildMember("Alice-Garona")
+    assertTrue(member ~= nil, "recovers after post-reload refresh")
 
     -- Stale nonempty after club change stays incomplete.
     local staleMembers = world.guild.members
@@ -2328,7 +2424,6 @@ do
     assertNil(member, "club 77 incomplete while waiting")
     assertEq(GG._demandRoster.pendingClubId, "77", "pending retargeted to 77")
     assertTrue(GG._demandRoster.waitGeneration ~= genAt66, "retarget bumps wait generation")
-    -- Fire event while still on 77 with nonempty data → bind 77.
     fireEvent("GUILD_ROSTER_UPDATE")
     member, reason = GG.GetGuildMember("Alice-Garona")
     assertTrue(member ~= nil, "retargeted wait completes for current club")
@@ -2347,15 +2442,13 @@ do
     assertEq(GG._demandRoster.pendingClubId, "88", "pending retained fail-closed")
     waitFrame = world.framesByName["SFGuildGossipDemandRosterWait"]
     assertEq(waitFrame.events["GUILD_ROSTER_UPDATE"], nil, "timeout unregisters event")
-    -- Privileged writes stay denied until a later completed wait.
-    local ctx = GS:GetCurrentContext()
+    ctx = GS:GetCurrentContext()
     assertEq(ctx.ready, false, "not ready after timed-out wait")
     local op, st, err = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
     assertNil(op, "no prepare after timeout without refresh")
     assertEq(st, "rejected", "prepare rejected after timeout")
     assertTrue(err == "roster_incomplete" or err == "not_ready" or err == "rank_unavailable",
         "timeout deny reason: " .. tostring(err))
-    -- A subsequent demand read may start another bounded wait and complete.
     GG._demandRoster.lastRequestAt = nil
     member, reason = GG.GetGuildMember("Alice-Garona")
     assertNil(member, "still incomplete until new event")
@@ -2365,10 +2458,8 @@ do
     assertTrue(member ~= nil, "recovers after post-timeout event")
     assertEq(member.clubId, "88", "bound to 88 after recovery")
 
-    -- Idle gossip preserved throughout.
     ensureIdleGossip()
 
-    -- restore defaults
     world.guild.clubId = 42
     world.guild.name = "Spectrum"
     world.guild.members = {
@@ -2382,7 +2473,7 @@ end
 -- R24) Bank-tab constructor: nil-only clear; reject failed conversions
 do
     resetDb()
-    GS:Initialize(SpectrumFederationDB)
+    initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
@@ -2423,6 +2514,235 @@ do
     assertNil(opClear.value, "clear sentinel is nil")
     assertEq(GS:ApplyStagedConfigOperation(opClear), "accepted", "explicit nil clears")
     assertNil(GS:GetCurrentRecord().accounting._consumables.bankTab, "tab cleared")
+end
+
+-- R25) Historical accepted body shape validation (no current-authority checks)
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+    local datasetId = record.datasetId
+    local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+
+    -- Malformed confirmation body (kind only) stays preserved but unavailable.
+    raw.operations.records["bad-conf"] = { id = "bad-conf", kind = "confirm-candidate" }
+    raw.operations.order = { "bad-conf" }
+    raw.operations.heads = {}
+    raw.confirmationRefs = { "bad-conf" }
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "malformed confirmation body unavailable")
+    assertTrue(reason == "invalid_operations" or reason == "invalid_fingerprint"
+        or reason == "invalid_candidate_ref" or reason == "invalid_actor"
+        or reason == "invalid_base_policy" or reason == "invalid_timestamp"
+        or reason == "invalid_guild_key" or reason == "invalid_dataset_id"
+        or reason == "unsupported_schema" or reason == "invalid_kind",
+        "malformed confirm reason: " .. tostring(reason))
+    assertEq(raw.operations.records["bad-conf"].kind, "confirm-candidate", "malformed confirm preserved")
+
+    -- Malformed config body unavailable; SV preserved.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    datasetId = raw.datasetId
+    raw.operations.records["bad-cfg"] = {
+        id = "bad-cfg",
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = 2,
+        -- missing required envelope fields
+    }
+    raw.operations.order = { "bad-cfg" }
+    raw.operations.heads = {}
+    raw.confirmationRefs = {}
+    exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "malformed config body unavailable")
+    assertTrue(reason == "invalid_operations" or reason == "unsupported_schema"
+        or reason == "invalid_guild_key" or reason == "invalid_dataset_id"
+        or reason == "invalid_actor" or reason == "invalid_timestamp"
+        or reason == "invalid_base_target" or reason == "invalid_base_policy",
+        "malformed config reason: " .. tostring(reason))
+    assertEq(raw.operations.records["bad-cfg"].value, 2, "malformed config preserved")
+
+    -- Valid historical bodies remain usable after policy/campaign change.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    local bankOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(bankOp), "accepted", "historical bank op accepted")
+    local conf, confSt = GS:NewConfirmationOperation({
+        recordId = "hist-cand",
+        contentFingerprint = "fp-hist",
+    })
+    assertEq(confSt, "accepted", "historical confirm prepares")
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "historical confirm admits")
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "record usable with valid historical bodies")
+    -- Policy revision changes (editor rank op) — old bodies keep stale basePolicyRevision.
+    local rankOp = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
+    assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted", "policy revision advances")
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "record usable after policy change")
+    assertTrue(record.operations.records[bankOp.id] ~= nil, "old bank body still present")
+    assertTrue(record.operations.records[conf.id] ~= nil, "old confirm body still present")
+    assertTrue(record.operations.records[bankOp.id].basePolicyRevision ~= record.permission.revisionId,
+        "historical basePolicyRevision differs from current policy")
+    -- Campaign pointer change must not invalidate historical accepted bodies.
+    local okCamp, campErr = GS:_StoreCampaignBoundaryForTests({
+        schemaVersion = 1,
+        campaignId = "camp-hist",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "camp-hist",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 50,
+        bankTabAtStart = 2,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+        contextRecordCount = 0,
+    })
+    assertEq(okCamp, true, "campaign stored: " .. tostring(campErr))
+    record.currentCampaignId = "camp-hist"
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "record usable after campaign change with historical ops")
+    assertEq(record.operations.records[bankOp.id].value, 2, "historical bank value intact")
+end
+
+-- R26) Immutable retained conflicts: first body preserved (config + confirmation + pending)
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    -- Config: original accepted -> divergent A -> divergent B -> retry A
+    local orig = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertEq(GS:ApplyStagedConfigOperation(orig), "accepted", "original config accepted")
+    local storedOrig = GS:GetCurrentRecord().operations.records[orig.id]
+    local function cloneConfig(base, value, ts)
+        return {
+            schemaVersion = base.schemaVersion,
+            id = base.id,
+            guildKey = base.guildKey,
+            datasetId = base.datasetId,
+            kind = base.kind,
+            target = base.target,
+            value = value,
+            actorGuid = base.actorGuid,
+            actorName = base.actorName,
+            timestamp = ts,
+            baseTargetRevision = base.baseTargetRevision,
+            basePolicyRevision = base.basePolicyRevision,
+            baseCampaignId = base.baseCampaignId,
+            campaignId = base.campaignId,
+        }
+    end
+    local divA = cloneConfig(storedOrig, 2, storedOrig.timestamp + 1)
+    local stA, reasonA = GS:ApplyStagedConfigOperation(divA)
+    assertEq(stA, "rejected", "divergent A rejected")
+    assertEq(reasonA, "id_conflict", "divergent A id_conflict")
+    local conflictA = GS:GetCurrentRecord().operations.conflicts[orig.id]
+    assertTrue(conflictA ~= nil, "conflict A retained")
+    assertEq(conflictA.body.value, 2, "conflict A body value 2")
+    local slotCountAfterA = 0
+    for _ in pairs(GS:GetCurrentRecord().operations.conflicts) do slotCountAfterA = slotCountAfterA + 1 end
+    for _ in pairs(GS:GetCurrentRecord().operations.pending) do slotCountAfterA = slotCountAfterA + 1 end
+
+    local divB = cloneConfig(storedOrig, 3, storedOrig.timestamp + 2)
+    local stB, reasonB = GS:ApplyStagedConfigOperation(divB)
+    assertEq(stB, "rejected", "divergent B rejected")
+    assertEq(reasonB, "id_conflict", "divergent B id_conflict")
+    local conflictAfterB = GS:GetCurrentRecord().operations.conflicts[orig.id]
+    assertEq(conflictAfterB.body.value, 2, "first conflict body preserved (not replaced by B)")
+    assertEq(GS:GetCurrentRecord().operations.records[orig.id].value, 1, "accepted original unchanged")
+    local slotCountAfterB = 0
+    for _ in pairs(GS:GetCurrentRecord().operations.conflicts) do slotCountAfterB = slotCountAfterB + 1 end
+    for _ in pairs(GS:GetCurrentRecord().operations.pending) do slotCountAfterB = slotCountAfterB + 1 end
+    assertEq(slotCountAfterB, slotCountAfterA, "divergent B does not consume another retention slot")
+
+    local retryA = cloneConfig(storedOrig, 2, storedOrig.timestamp + 3)
+    local stRetry, reasonRetry = GS:ApplyStagedConfigOperation(retryA)
+    assertEq(stRetry, "rejected", "retry A rejected")
+    assertEq(reasonRetry, "id_conflict", "retry A id_conflict")
+    assertEq(GS:GetCurrentRecord().operations.conflicts[orig.id].body.value, 2, "retry A still preserves first conflict")
+
+    -- Confirmation family: original -> A -> B -> retry A
+    local conf, confSt = GS:NewConfirmationOperation({
+        recordId = "c-imm",
+        contentFingerprint = "fp-imm",
+    })
+    assertEq(confSt, "accepted", "confirm original prepares")
+    assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "confirm original accepted")
+    local confStored = GS:GetCurrentRecord().operations.records[conf.id]
+    local function cloneConfirm(base, fp, ts)
+        return {
+            schemaVersion = base.schemaVersion,
+            id = base.id,
+            guildKey = base.guildKey,
+            datasetId = base.datasetId,
+            kind = base.kind,
+            candidateRef = { recordId = "c-imm", contentFingerprint = fp },
+            contentFingerprint = fp,
+            campaignId = base.campaignId,
+            basePolicyRevision = base.basePolicyRevision,
+            actorGuid = base.actorGuid,
+            actorName = base.actorName,
+            timestamp = ts,
+        }
+    end
+    local confA = cloneConfirm(confStored, "fp-A", confStored.timestamp + 1)
+    assertEq(GS:ApplyStagedConfirmationOperation(confA), "rejected", "confirm divergent A rejected")
+    assertEq(GS:GetCurrentRecord().operations.conflicts[conf.id].body.contentFingerprint, "fp-A",
+        "confirm conflict A retained")
+    local confB = cloneConfirm(confStored, "fp-B", confStored.timestamp + 2)
+    assertEq(GS:ApplyStagedConfirmationOperation(confB), "rejected", "confirm divergent B rejected")
+    assertEq(GS:GetCurrentRecord().operations.conflicts[conf.id].body.contentFingerprint, "fp-A",
+        "confirm first conflict preserved against B")
+    assertEq(GS:GetCurrentRecord().operations.records[conf.id].contentFingerprint, "fp-imm",
+        "accepted confirm body unchanged")
+    local confRetryA = cloneConfirm(confStored, "fp-A", confStored.timestamp + 3)
+    assertEq(GS:ApplyStagedConfirmationOperation(confRetryA), "rejected", "confirm retry A rejected")
+    assertEq(GS:GetCurrentRecord().operations.conflicts[conf.id].body.contentFingerprint, "fp-A",
+        "confirm retry A keeps first conflict")
+
+    -- Pending path: pending original -> divergent A conflict -> divergent B preserves A
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:CreateStagedRecord()
+    local headOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 4)
+    assertEq(GS:ApplyStagedConfigOperation(headOp), "accepted", "head bank accepted")
+    -- Build a stale-base pending by using an outdated baseTargetRevision.
+    local pendingOrig = GS:NewConfigOperation("set-bank-tab", "bankTab", 5)
+    pendingOrig.baseTargetRevision = "stale-base-rev"
+    local pst, preason = GS:ApplyStagedConfigOperation(pendingOrig)
+    assertEq(pst, "pending", "stale-base becomes pending: " .. tostring(preason))
+    local pendingBody = GS:GetCurrentRecord().operations.pending[pendingOrig.id].body
+    assertEq(pendingBody.value, 5, "pending original value 5")
+    local pendA = cloneConfig(pendingBody, 6, pendingBody.timestamp + 1)
+    local pstA, preasonA = GS:ApplyStagedConfigOperation(pendA)
+    assertEq(pstA, "rejected", "pending divergent A rejected")
+    assertEq(preasonA, "id_conflict", "pending divergent A id_conflict")
+    assertEq(GS:GetCurrentRecord().operations.conflicts[pendingOrig.id].body.value, 6,
+        "pending-path conflict A retained")
+    assertEq(GS:GetCurrentRecord().operations.pending[pendingOrig.id].body.value, 5,
+        "original pending body unchanged")
+    local pendB = cloneConfig(pendingBody, 7, pendingBody.timestamp + 2)
+    local pstB, preasonB = GS:ApplyStagedConfigOperation(pendB)
+    assertEq(pstB, "rejected", "pending divergent B rejected")
+    assertEq(preasonB, "id_conflict", "pending divergent B id_conflict")
+    assertEq(GS:GetCurrentRecord().operations.conflicts[pendingOrig.id].body.value, 6,
+        "pending-path first conflict preserved against B")
+    assertEq(GS:GetCurrentRecord().operations.pending[pendingOrig.id].body.value, 5,
+        "pending original still unchanged after B")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

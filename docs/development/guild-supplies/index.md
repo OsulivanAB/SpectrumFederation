@@ -82,7 +82,7 @@ Caps: **4,096** accepted operations / guild; **128** combined pending+conflict a
 - Player-facing labels use `GuildControlGetRankName(position)` (for example `"%s and higher"`).
 - Invalid/out-of-range policy → verified Guild Master recovery only.
 - Preview as Non-Admin denies privileged actions locally.
-- Zero active gossip providers: authority uses a **demand-driven** native snapshot. A cold empty roster triggers a throttled native `GuildRoster` request without permanent listeners, discovery, or a dummy provider. After a club-identity change, stale nonempty roster/rank data stays untrusted until a temporary `GUILD_ROSTER_UPDATE` wait completes for the new club (identical refreshed rosters may recover; content inequality alone is not freshness). The wait always terminates on event, retarget, or timeout. Missing/uncertain data fails closed. Commit rechecks guild/rank/policy.
+- Zero active gossip providers: authority uses a **demand-driven** native snapshot. An unbound observation (including the first after login/reload) starts a temporary `GUILD_ROSTER_UPDATE` wait with a throttled native `GuildRoster` request — nonempty cached rows alone are not freshness. No permanent listeners, discovery, or dummy provider. Identical refreshed rosters may recover; content inequality alone is not freshness. The wait always terminates on event, retarget, or timeout. Missing/uncertain data fails closed. Commit rechecks guild/rank/policy.
 - Fresh guilds with fewer than three ranks: `CreateStagedRecord` does not invent a default threshold; verified GM passes an existing 1-based position. Preview as Non-Admin and non-GM callers remain denied.
 
 ### Confirmation envelope

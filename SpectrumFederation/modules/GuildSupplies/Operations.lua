@@ -777,8 +777,19 @@ function GS:ValidateConfigOperation(op, context)
     return true
 end
 
+--- Retain the first conflict body for an ID as immutable evidence.
+-- An existing slot is never replaced by a later divergent body and does not
+-- consume another retention slot. Returns false only when capacity is exhausted
+-- for a new ID.
 local function RetainConflict(ops, op)
-    if not CanRetainBody(ops, ops.conflicts, op.id) then
+    if type(ops) ~= "table" or type(op) ~= "table" or type(op.id) ~= "string" then
+        return false
+    end
+    local existing = ops.conflicts and ops.conflicts[op.id]
+    if type(existing) == "table" then
+        return true
+    end
+    if RetentionBodyCount(ops) >= GS.MAX_PENDING_OPERATIONS then
         return false
     end
     ops.conflicts[op.id] = {
@@ -1258,6 +1269,51 @@ function GS:NewConfirmationOperation(candidateRef)
         return nil, "rejected", snapErr or "invalid_operation"
     end
     return op, "accepted", nil
+end
+
+--- Pure historical shape validation for accepted SavedVariables bodies.
+-- Reuses config/confirmation shape + kind-value checks without current-authority
+-- or current-revision admission. Safe for ValidateGuildRecord (no GetCurrentRecord).
+-- @param body table
+-- @param guildKey string|nil owning guild key when known
+-- @param datasetId string|nil owning dataset id when known
+-- @return boolean ok, string|nil reason
+function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
+    if type(body) ~= "table" then
+        return false, "invalid_operations"
+    end
+    if type(body.id) ~= "string" or body.id == "" or #body.id > GS.MAX_OPERATION_ID then
+        return false, "invalid_operations"
+    end
+    local kind = body.kind
+    if kind == KIND.CONFIRM_CANDIDATE then
+        local ok, err = ValidateConfirmationShape(body)
+        if not ok then
+            return false, err or "invalid_operations"
+        end
+    elseif kind == KIND.SET_EDITOR_RANK or kind == KIND.SET_BANK_TAB or kind == KIND.SET_REQUESTED_ITEM then
+        local ok, err = ValidateConfigShape(body)
+        if not ok then
+            return false, err or "invalid_operations"
+        end
+        ok, err = ValidateKindValue(body)
+        if not ok then
+            return false, err or "invalid_operations"
+        end
+    else
+        return false, "unsupported_kind"
+    end
+    if guildKey ~= nil then
+        if type(body.guildKey) ~= "string" or body.guildKey ~= guildKey then
+            return false, "wrong_guild"
+        end
+    end
+    if datasetId ~= nil then
+        if type(body.datasetId) ~= "string" or body.datasetId ~= datasetId then
+            return false, "dataset_mismatch"
+        end
+    end
+    return true
 end
 
 function GS:ValidateConfirmationOperation(op, context)

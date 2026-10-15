@@ -192,9 +192,11 @@ local function startDemandRosterWait(clubId)
 end
 
 --- Fail closed when club identity and native roster may disagree.
--- Freshness after a club change requires a completed GUILD_ROSTER_UPDATE for
--- the pending club (or a first-session nonempty observation). Roster content
--- inequality alone must not authenticate a transition.
+-- An unbound observation (including the first after login/reload) always
+-- requires a completed temporary GUILD_ROSTER_UPDATE wait for the pending club.
+-- Nonempty native rows alone are not proof of freshness — roster caches can
+-- lag club identity across reload/transition. Roster content inequality alone
+-- must not authenticate a transition either.
 -- @return boolean trusted
 local function ensureDemandRosterScope(clubId)
     local dr = GG._demandRoster
@@ -205,19 +207,7 @@ local function ensureDemandRosterScope(clubId)
         return true
     end
 
-    -- First observation this session: bind immediately when roster is nonempty
-    -- (already-refreshed first read). Cold empty starts a bounded wait.
-    if dr.boundClubId == nil and dr.pendingClubId == nil then
-        if demandRosterNonempty() then
-            dr.boundClubId = clubId
-            dr.pendingClubId = nil
-            return true
-        end
-        startDemandRosterWait(clubId)
-        return false
-    end
-
-    -- Club identity changed (or pending target retargeted): new bounded wait.
+    -- Unbound, retargeted, or pending a different club: start/retarget wait.
     if dr.pendingClubId ~= clubId then
         startDemandRosterWait(clubId)
         return false

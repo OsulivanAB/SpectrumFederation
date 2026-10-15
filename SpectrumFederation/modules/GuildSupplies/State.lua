@@ -203,7 +203,10 @@ local function ValidateOperationsHeads(ops)
     return true
 end
 
-local function ValidateOperationsStore(ops)
+--- @param ops table
+-- @param guildKey string|nil owning guild key for body consistency
+-- @param datasetId string|nil owning dataset id for body consistency
+local function ValidateOperationsStore(ops, guildKey, datasetId)
     if type(ops) ~= "table" then
         return false, "invalid_operations"
     end
@@ -233,6 +236,14 @@ local function ValidateOperationsStore(ops)
         end
         if type(body.id) ~= "string" or body.id ~= id then
             return false, "invalid_operations"
+        end
+        -- Kind-specific historical shape (Operations registers the pure validator).
+        -- Avoids current-authority / current-revision admission and GetCurrentRecord.
+        if type(GS.ValidateAcceptedOperationBody) == "function" then
+            local bodyOk, bodyErr = GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
+            if not bodyOk then
+                return false, bodyErr or "invalid_operations"
+            end
         end
     end
 
@@ -387,7 +398,7 @@ local function ValidateGuildRecordStructure(guildKey, record)
         end
     end
 
-    local ok, err = ValidateOperationsStore(record.operations)
+    local ok, err = ValidateOperationsStore(record.operations, guildKey, record.datasetId)
     if not ok then
         return false, err
     end
