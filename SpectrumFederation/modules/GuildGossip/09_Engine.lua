@@ -337,7 +337,12 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
     if isMulti then
         e.streamBusy[sk] = true
     end
-        e.admittedOutBytes = (e.admittedOutBytes or 0) + bytes
+    e.admittedOutBytes = (e.admittedOutBytes or 0) + bytes
+    -- Track same-step whisper admission so coalesced GUILD discovery yields the
+    -- Comm pump (round-robin across target keys) to lease-renewing pages.
+    if distribution == "WHISPER" then
+        e.stepWhisperAdmitted = true
+    end
 
     local terminal = false
     local function finish(success, sendResult)
@@ -839,6 +844,7 @@ local function sendServedResponse(pull, msgType, response, advancing)
         onFinalSubmitted = function(success)
             if GG._engine.inPull == pull then
                 pull.pageRetryPending = nil
+                pull.pageRetryAdvancing = nil
             end
             noteInPullSubmission(pull, success, {
                 renewLease = advancing and true or false,
@@ -848,14 +854,21 @@ local function sendServedResponse(pull, msgType, response, advancing)
     })
     if ok then
         pull.pageRetryPending = nil
+        pull.pageRetryAdvancing = nil
         return true
     end
     if err == "stream_busy" then
         -- Reuse the already-cached served page when the stream drains; do not
-        -- re-export or renew leases on failed admission.
+        -- re-export or renew leases on failed admission. Duplicate correlated
+        -- replays (advancing=false) must not downgrade an already-armed
+        -- advancing retry for this same cached page.
         pull.pageRetryPending = true
         pull.pageRetryMsgType = msgType
-        pull.pageRetryAdvancing = advancing and true or false
+        if advancing or pull.pageRetryAdvancing then
+            pull.pageRetryAdvancing = true
+        else
+            pull.pageRetryAdvancing = false
+        end
         GG.MarkWorkPending()
         return false
     end
@@ -951,21 +964,27 @@ end
 function GG.OnGossipPauseChanged(paused, now)
     now = now or GG._Now()
     local e = GG._engine
-    for _, pull in ipairs({ e.outPull, e.inPull }) do
-        if pull then
-            if paused then
-                pull.pauseStartedAt = pull.pauseStartedAt or now
-            elseif pull.pauseStartedAt then
-                local elapsed = math.max(0, now - pull.pauseStartedAt)
-                pull.pauseExcluded = (pull.pauseExcluded or 0) + elapsed
-                pull.usableProgressAt = (pull.usableProgressAt or now) + elapsed
-                if pull.awaitingSince then
-                    pull.awaitingSince = pull.awaitingSince + elapsed
-                end
-                pull.pauseStartedAt = nil
+    -- Process optional pull slots independently. ipairs({nil, inPull}) stops at
+    -- the first nil, which would skip serving-only clients and fail to shift
+    -- usableProgressAt across combat/loading pauses longer than the lease.
+    local function adjustPull(pull)
+        if not pull then
+            return
+        end
+        if paused then
+            pull.pauseStartedAt = pull.pauseStartedAt or now
+        elseif pull.pauseStartedAt then
+            local elapsed = math.max(0, now - pull.pauseStartedAt)
+            pull.pauseExcluded = (pull.pauseExcluded or 0) + elapsed
+            pull.usableProgressAt = (pull.usableProgressAt or now) + elapsed
+            if pull.awaitingSince then
+                pull.awaitingSince = pull.awaitingSince + elapsed
             end
+            pull.pauseStartedAt = nil
         end
     end
+    adjustPull(e.outPull)
+    adjustPull(e.inPull)
 end
 
 -- Comm owns its shared queue; this indirection keeps engine cancellation scoped.
@@ -2864,6 +2883,7 @@ local function advanceInPull(now)
                 sendServedResponse(pull, msgType, replay, advancing)
             else
                 pull.pageRetryPending = nil
+                pull.pageRetryAdvancing = nil
             end
             return true
         end
@@ -2903,6 +2923,7 @@ function GG.OnSchedulerStep(limits, now)
 
     local stepStartedAt = debugprofilestop and debugprofilestop() or nil
     e.stepStartedAt = stepStartedAt
+    e.stepWhisperAdmitted = nil
     local indexRemaining = limits.indexEntries or 0
     e.indexWorkPending = false
     e.stepLimits = limits
@@ -2968,7 +2989,25 @@ function GG.OnSchedulerStep(limits, now)
     end
     e.stepStats.receivedApps = apps
 
-    GG.ConsumeChangeDebounce(now)
+    -- Coalesced local accepted/appended changes: arm a deferred discovery so
+    -- same-step served MANIFEST/BODY responses can drain first (one Comm pump
+    -- per test step / ticker tick). Send on the next step under readiness/pause
+    -- gates. SendDiscovery does not reschedule the periodic timer. DUPLICATE
+    -- applies do not notify, so peer acceptance cannot form a continuous echo.
+    local schedNow = GG._sched
+    if schedNow and schedNow.changeDebounceAt and now >= schedNow.changeDebounceAt then
+        if GG.UpdatePauseState then
+            GG.UpdatePauseState(now)
+        end
+        if GG.IsGuildReady() and not GG.IsSchedPaused() then
+            if GG.ConsumeChangeDebounce(now) then
+                e.changeDiscoveryPending = true
+                GG.MarkWorkPending()
+            end
+        else
+            GG.MarkWorkPending()
+        end
+    end
     expirePeers(now)
     expireUnresolved(now)
     GG.ExpireStalePartials(now)
@@ -3007,11 +3046,31 @@ function GG.OnSchedulerStep(limits, now)
         e.stepStats.cpuMs = debugprofilestop() - stepStartedAt
     end
 
+    -- Flush coalesced change discovery after step work. Yield while a served
+    -- offer/page retry is stream-blocked, or when this step already admitted a
+    -- whisper (Comm RR across GUILD vs WHISPER keys could otherwise starve the
+    -- lease-renewing page for a whole step).
+    if e.changeDiscoveryPending then
+        if GG.UpdatePauseState then
+            GG.UpdatePauseState(now)
+        end
+        local inPull = e.inPull
+        local deferForServed = inPull
+            and (inPull.pageRetryPending or inPull.offerRetryPending)
+        if GG.IsSchedPaused() or deferForServed or e.stepWhisperAdmitted then
+            GG.MarkWorkPending()
+        else
+            e.changeDiscoveryPending = nil
+            GG.SendDiscovery()
+        end
+    end
+
     -- Idle detection: no pulls, empty recv, no debounce, discovery-only.
     local sched = GG._sched
     if not e.outPull and not e.inPull and #(e.recvQueue) == 0
         and not e.indexWorkPending
         and not e.pendingOutCapture
+        and not e.changeDiscoveryPending
         and not (sched and sched.changeDebounceAt)
     then
         -- Keep discovery while providers active; clear continuous work flag.

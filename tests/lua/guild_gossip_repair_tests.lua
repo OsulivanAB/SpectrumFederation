@@ -5267,6 +5267,108 @@ do
     assertEq(bodyExports, exportsAtBusy, "F85: BODY retry does not re-export")
     B.GuildGossip.SendGossip = origSend
     entry.api.GetRecordBody = origBody
+
+    -- Duplicate correlated MANIFEST while first response is stream_busy must not
+    -- downgrade pageRetryAdvancing; first success renews once, later replay does not.
+    reset()
+    B = makeClient("Bob")
+    p = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f85dup" })
+    for i = 1, 3 do p.AppendLocal("d85-" .. i, "body-" .. i) end
+    for _ = 1, 6 do stepClient(B, B.GuildGossip.GetStepLimits("NORMAL")) end
+    e = B.GuildGossip._engine
+    entry = B.GuildGossip.GetProvider("sf.synthetic.gossip")
+    scope = B.GuildGossip.GetGuildScopeId()
+    sk = "WHISPER|Alice-Garona"
+    view = select(1, B.GuildGossip.CaptureViewSummaries(
+        entry.index, entry.eligibilityGen, scope, entry.id, entry.schema, nil, nil, nil))
+    bucketId = 0
+    if view and view.buckets then
+        for b, meta in pairs(view.buckets) do
+            if meta and (tonumber(meta.lastSeq) or 0) > 0 then
+                bucketId = tonumber(b) or b
+                break
+            end
+        end
+    end
+    local timeout = B.GuildGossip.SERVED_VIEW_IDLE_TIMEOUT_SEC
+    e.inPull = {
+        peer = "Alice-Garona", providerId = "sf.synthetic.gossip", viewId = "v85d",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        buckets = view and view.buckets or {},
+        usableProgressAt = world.time - (timeout - 5),
+        finalSubmitted = true, engineGen = e.generation,
+    }
+    e.peers["alice-garona"] = { name = "Alice-Garona", key = "alice-garona", activeExchange = true }
+    e.streamBusy[sk] = true
+    local leaseBefore = e.inPull.usableProgressAt
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v85d", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "m85a", subpage = 1,
+        bucketId = bucketId, afterSeq = 0, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull.pageRetryPending == true, "F85: advancing MANIFEST armed pageRetry")
+    assertTrue(e.inPull.pageRetryAdvancing == true, "F85: first busy page is advancing")
+    -- Duplicate correlated request (replay path, advancing=false) before drain.
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v85d", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "m85b", subpage = 1,
+        bucketId = bucketId, afterSeq = 0, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull.pageRetryAdvancing == true,
+        "F85: duplicate replay does not downgrade pageRetryAdvancing")
+    e.streamBusy[sk] = nil
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull ~= nil, "F85: near-expiry pull continues after advancing retry")
+    assertTrue((e.inPull.usableProgressAt or 0) > leaseBefore,
+        "F85: first advancing success renews usableProgressAt")
+    local leaseAfterFirst = e.inPull.usableProgressAt
+    -- Subsequent identical replay must not renew again.
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.MANIFEST, {
+        op = "request", viewId = "v85d", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "m85c", subpage = 1,
+        bucketId = bucketId, afterSeq = 0, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertEq(e.inPull.usableProgressAt, leaseAfterFirst,
+        "F85: subsequent MANIFEST replay does not renew lease")
+
+    -- BODY duplicate-before-drain preserves advancing.
+    e.streamBusy[sk] = true
+    world.time = world.time + 1
+    leaseBefore = e.inPull.usableProgressAt
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
+        op = "request", viewId = "v85d", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "b85a", subpage = 1,
+        ids = { "d85-1" }, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull.pageRetryAdvancing == true, "F85: BODY busy page is advancing")
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
+        op = "request", viewId = "v85d", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "b85b", subpage = 1,
+        ids = { "d85-1" }, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull.pageRetryAdvancing == true,
+        "F85: BODY duplicate replay preserves pageRetryAdvancing")
+    e.streamBusy[sk] = nil
+    world.time = world.time + 1
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue((e.inPull.usableProgressAt or 0) > leaseBefore,
+        "F85: BODY advancing success renews usableProgressAt")
+    leaseAfterFirst = e.inPull.usableProgressAt
+    world.time = world.time + 1
+    B.GuildGossip.OnGossipCommReceived("SF_GG", B.GuildGossip.BuildWireMessage(B.GuildGossip.MSG.BODY, {
+        op = "request", viewId = "v85d", providerId = "sf.synthetic.gossip",
+        scopeId = scope, requestId = "b85c", subpage = 1,
+        ids = { "d85-1" }, mode = "NORMAL",
+    }), "WHISPER", "Alice-Garona")
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    assertEq(e.inPull.usableProgressAt, leaseAfterFirst,
+        "F85: subsequent BODY replay does not renew lease")
 end
 
 ---------------------------------------------------------------------------
@@ -5399,6 +5501,230 @@ do
         .. tostring(whispers) .. ")")
     assertTrue(e.outPull ~= nil, "F86: live pull retained after successful send")
     assertEq(Comm.state.total or 0, 0, "F86: live drain empties Comm queue")
+end
+
+---------------------------------------------------------------------------
+-- F87: mature change debounce announces discovery (not only periodic timer)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local pA = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f87a" })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f87b" })
+    -- Index empty seeds first so discovery/fingerprints are stable.
+    for _ = 1, 6 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    end
+    pA.AppendLocal("body-seed-87", "seed-87")
+    for _ = 1, 6 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.5)
+    for _ = 1, 120 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.05)
+        if pB.GetStore().records["seed-87"] then break end
+    end
+    assertTrue(pB.GetStore().records["seed-87"] ~= nil, "F87: initial convergence")
+    -- Install current announcement fingerprints, then mark both sides covered.
+    local eA = A.GuildGossip._engine
+    local eB = B.GuildGossip._engine
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+    eA.peers["bob-garona"] = eA.peers["bob-garona"] or { name = "Bob-Garona", key = "bob-garona" }
+    eB.peers["alice-garona"] = eB.peers["alice-garona"] or { name = "Alice-Garona", key = "alice-garona" }
+    assertTrue(eB.peers["alice-garona"].capFingerprints
+        and eB.peers["alice-garona"].capFingerprints["sf.synthetic.gossip"] ~= nil,
+        "F87: Bob holds Alice announcement fingerprint before cover")
+    eA.peers["bob-garona"].covered = { ["sf.synthetic.gossip"] = true }
+    eB.peers["alice-garona"].covered = { ["sf.synthetic.gossip"] = true }
+    A.GuildGossip.StopDiscovery()
+    B.GuildGossip.StopDiscovery()
+    eA.nextDiscoveryAt = world.time + 1000
+    eB.nextDiscoveryAt = world.time + 1000
+    eA.changeDiscoveryPending = nil
+    eB.changeDiscoveryPending = nil
+    eA.outPull = nil
+    eA.inPull = nil
+    eB.outPull = nil
+    eB.inPull = nil
+    A.GuildGossip._sched.changeDebounceAt = nil
+    B.GuildGossip._sched.changeDebounceAt = nil
+    local genBefore = A.GuildGossip.GetProvider("sf.synthetic.gossip").changeGen
+    pA.AppendLocal("body-late-87", "late-87")
+    assertTrue((A.GuildGossip._sched.changeDebounceAt or 0) > world.time,
+        "F87: append arms change debounce")
+    assertTrue(A.GuildGossip.GetProvider("sf.synthetic.gossip").changeGen > genBefore,
+        "F87: append bumps changeGen")
+    -- Mature coalesced window (2–5s) well before the 120s periodic timer.
+    world.time = (A.GuildGossip._sched.changeDebounceAt or world.time) + 0.05
+    local discSends = 0
+    local origSendA = A.GuildGossip.SendGossip
+    A.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        local ok, err = origSendA(msgType, payload, dist, target, opts)
+        if ok and msgType == A.GuildGossip.MSG.DISC and dist == "GUILD" then
+            discSends = discSends + 1
+        end
+        return ok, err
+    end
+    -- Close pulls so change discovery is not deferred behind whisper traffic.
+    eA.outPull = nil
+    eA.inPull = nil
+    eA.stepWhisperAdmitted = nil
+    for _ = 1, 4 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        if discSends >= 1 then break end
+        advance(0.05)
+    end
+    A.GuildGossip.SendGossip = origSendA
+    assertTrue(A.GuildGossip._sched.changeDebounceAt == nil, "F87: debounce consumed after mature")
+    assertTrue(discSends >= 1, "F87: mature debounce sends discovery (n=" .. tostring(discSends) .. ")")
+    assertTrue(A.GuildGossip._engine.changeDiscoveryPending ~= true,
+        "F87: deferred change discovery cleared after flush")
+    assertTrue(pA.GetStore().records["late-87"] ~= nil, "F87: Alice retained late-87")
+    for _ = 1, 8 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    -- Bob receives announcement and converges before any periodic discovery.
+    for _ = 1, 200 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.1)
+        if pB.GetStore().records["late-87"] then break end
+    end
+    assertTrue(pB.GetStore().records["late-87"] ~= nil,
+        "F87: covered peer converges from coalesced discovery")
+    assertTrue(world.time < (eA.nextDiscoveryAt or 0),
+        "F87: convergence completed before deferred periodic discovery")
+    -- Idle unchanged clients: no continuous discovery echo once settled.
+    eA.outPull = nil
+    eA.inPull = nil
+    eB.outPull = nil
+    eB.inPull = nil
+    eA.changeDiscoveryPending = nil
+    eB.changeDiscoveryPending = nil
+    eA.peers["bob-garona"].covered = { ["sf.synthetic.gossip"] = true }
+    eB.peers["alice-garona"].covered = { ["sf.synthetic.gossip"] = true }
+    A.GuildGossip._sched.changeDebounceAt = nil
+    B.GuildGossip._sched.changeDebounceAt = nil
+    local discSendsIdle = 0
+    local restoreA = A.GuildGossip.SendGossip
+    local restoreB = B.GuildGossip.SendGossip
+    local function wrapDisc(SF)
+        local orig = SF.GuildGossip.SendGossip
+        SF.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+            local ok, err = orig(msgType, payload, dist, target, opts)
+            if ok and msgType == SF.GuildGossip.MSG.DISC and dist == "GUILD" then
+                discSendsIdle = discSendsIdle + 1
+            end
+            return ok, err
+        end
+    end
+    wrapDisc(A)
+    wrapDisc(B)
+    for _ = 1, 10 do
+        stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+        stepClient(B, B.GuildGossip.GetStepLimits("SLOW"))
+        advance(0.05)
+    end
+    A.GuildGossip.SendGossip = restoreA
+    B.GuildGossip.SendGossip = restoreB
+    assertEq(discSendsIdle, 0, "F87: idle covered clients do not echo discovery")
+end
+
+---------------------------------------------------------------------------
+-- F88: serving-only pause shifts inPull lease (ipairs nil hole)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f88" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    local timeout = A.GuildGossip.SERVED_VIEW_IDLE_TIMEOUT_SEC
+    -- in-only: no outPull (the ipairs nil-hole case).
+    e.outPull = nil
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v88in",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        usableProgressAt = 100, awaitingSince = 100, finalSubmitted = true,
+        engineGen = e.generation,
+        offerPayload = { op = "offer", viewId = "v88in", providerId = "sf.synthetic.gossip" },
+        offerProgressArmed = true,
+    }
+    e.peers["bob-garona"] = { name = "Bob-Garona", key = "bob-garona", activeExchange = true }
+    world.time = 100
+    A.GuildGossip.OnGossipPauseChanged(true, world.time)
+    assertTrue(e.inPull.pauseStartedAt == 100, "F88: in-only pauseStartedAt armed")
+    world.time = 300 -- 200s pause > 120s lease
+    A.GuildGossip.OnGossipPauseChanged(false, world.time)
+    assertEq(e.inPull.usableProgressAt, 300, "F88: in-only usableProgressAt shifted by pause")
+    assertEq(e.inPull.awaitingSince, 300, "F88: in-only awaitingSince shifted by pause")
+    assertTrue(e.inPull.pauseStartedAt == nil, "F88: in-only pauseStartedAt cleared")
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull ~= nil, "F88: in-only pull survives pause longer than lease")
+
+    -- out-only
+    e.inPull = nil
+    e.outPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v88out",
+        scopeId = scope, phase = "wait_view",
+        engineGen = e.generation, localEpoch = entry.index.epoch,
+        usableProgressAt = 100, awaitingSince = 100, finalSubmitted = true,
+        outstanding = { msgType = A.GuildGossip.MSG.VIEW, payload = { op = "request" } },
+    }
+    world.time = 100
+    A.GuildGossip.OnGossipPauseChanged(true, 100)
+    world.time = 300
+    A.GuildGossip.OnGossipPauseChanged(false, 300)
+    assertEq(e.outPull.usableProgressAt, 300, "F88: out-only usableProgressAt shifted")
+
+    -- both
+    e.inPull = {
+        peer = "Carol-Garona", providerId = "sf.synthetic.gossip", viewId = "v88both",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        usableProgressAt = 50, awaitingSince = 50, finalSubmitted = true,
+        engineGen = e.generation,
+    }
+    e.outPull.usableProgressAt = 60
+    e.outPull.awaitingSince = 60
+    e.outPull.pauseStartedAt = nil
+    world.time = 60
+    A.GuildGossip.OnGossipPauseChanged(true, 60)
+    world.time = 90
+    A.GuildGossip.OnGossipPauseChanged(false, 90)
+    assertEq(e.outPull.usableProgressAt, 90, "F88: both — outPull shifted")
+    assertEq(e.inPull.usableProgressAt, 80, "F88: both — inPull shifted")
+
+    -- neither: no error
+    e.outPull = nil
+    e.inPull = nil
+    A.GuildGossip.OnGossipPauseChanged(true, world.time)
+    A.GuildGossip.OnGossipPauseChanged(false, world.time + 10)
+    assertTrue(true, "F88: neither pull is a no-op")
+
+    -- Idempotent double-resume does not double-shift.
+    e.inPull = {
+        peer = "Bob-Garona", providerId = "sf.synthetic.gossip", viewId = "v88id",
+        scopeId = scope, phase = "serving",
+        epoch = entry.index.epoch, eligibilityGen = entry.eligibilityGen,
+        usableProgressAt = 10, finalSubmitted = true, engineGen = e.generation,
+    }
+    world.time = 10
+    A.GuildGossip.OnGossipPauseChanged(true, 10)
+    world.time = 40
+    A.GuildGossip.OnGossipPauseChanged(false, 40)
+    assertEq(e.inPull.usableProgressAt, 40, "F88: first resume shifts once")
+    A.GuildGossip.OnGossipPauseChanged(false, 70)
+    assertEq(e.inPull.usableProgressAt, 40, "F88: second resume without pause is idempotent")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
