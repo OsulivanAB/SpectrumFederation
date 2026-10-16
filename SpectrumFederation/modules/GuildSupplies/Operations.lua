@@ -1043,9 +1043,9 @@ function GS:ApplyStagedConfigOperation(op, context)
         return "rejected", GS:GetRootReason() or "not_ready"
     end
 
-    local record, _, recovery = ResolveStagedRecord(op.guildKey, op.kind)
+    local record, resolveReason, recovery = ResolveStagedRecord(op.guildKey, op.kind)
     if type(record) ~= "table" then
-        return "rejected", "not_configured"
+        return "rejected", resolveReason or "not_configured"
     end
     if record.activation ~= GS.ACTIVATION_STAGED then
         return "rejected", "unsupported_activation"

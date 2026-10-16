@@ -474,6 +474,13 @@ local function ValidateGuildRecordStructure(guildKey, record)
             return false, itemsErr or "invalid_accounting"
         end
     end
+    -- Eligibility container shape: allow absent/2A {} ; reject present non-tables.
+    if GS.ValidateEligibilityContainer then
+        local eligOk, eligErr = GS.ValidateEligibilityContainer(cfg.eligibility)
+        if not eligOk then
+            return false, eligErr or "invalid_eligibility"
+        end
+    end
     if type(accounting._consumableEvents) ~= "table"
         or type(accounting._consumableEventArchive) ~= "table" then
         return false, "invalid_accounting"

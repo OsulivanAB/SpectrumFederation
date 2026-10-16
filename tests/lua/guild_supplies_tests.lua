@@ -3406,6 +3406,200 @@ do
     assertEq(afterRaw, rawCount, "over-cap campaigns SV retained unchanged")
 end
 
+-- 2B7b) Archive capacity bound + preexisting current-campaign archive reject
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local record = GS:GetCurrentRecord()
+    record.accounting._consumables.requestedItems["10"] = { itemId = 10, goal = 7 }
+    -- Fill archives to capacity with unrelated campaign ids (not the current one).
+    record.campaignArchives = record.campaignArchives or {}
+    local fill = 0
+    while true do
+        local n = 0
+        for _ in pairs(record.campaignArchives) do n = n + 1 end
+        if n >= GS.MAX_CAMPAIGNS then break end
+        fill = fill + 1
+        local id = "arch-fill-" .. fill
+        if record.campaignArchives[id] == nil then
+            record.campaignArchives[id] = {
+                schemaVersion = GS.SCHEMA_VERSION,
+                campaignId = id,
+                datasetId = record.datasetId,
+                requestedItems = {},
+                generation = 1,
+                archivedAt = fill,
+            }
+        end
+    end
+    local atCap = 0
+    for _ in pairs(record.campaignArchives) do atCap = atCap + 1 end
+    assertEq(atCap, GS.MAX_CAMPAIGNS, "archives at capacity")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "usable current with full archives")
+    local beforeItems = record.accounting._consumables.requestedItems
+    local beforeGoal = beforeItems["10"].goal
+    local beforeCamp = record.currentCampaignId
+    local beforeOps = 0
+    for _ in pairs(record.operations.records or {}) do beforeOps = beforeOps + 1 end
+    local opFull = GS:NewCampaignOperation()
+    assertTrue(opFull ~= nil, "prepare at archive capacity")
+    local stFull, reasonFull = GS:ApplyStagedCampaignOperation(opFull)
+    assertEq(stFull, "rejected", "archive capacity rejects New Campaign")
+    assertEq(reasonFull, "full", "archive capacity reason full")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeCamp, "current campaign intact at archive cap")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["10"].goal, beforeGoal,
+        "live goals intact at archive cap")
+    local afterArch = 0
+    for _ in pairs(GS:GetCurrentRecord().campaignArchives) do afterArch = afterArch + 1 end
+    assertEq(afterArch, atCap, "archive map unchanged at capacity reject")
+
+    -- Oversized archive map: bounded reject without clearing live config.
+    for i = 1, 40 do
+        local id = "arch-over-" .. i
+        record.campaignArchives[id] = {
+            schemaVersion = GS.SCHEMA_VERSION,
+            campaignId = id,
+            datasetId = record.datasetId,
+            requestedItems = {},
+            generation = 1,
+            archivedAt = 1000 + i,
+        }
+    end
+    local overRaw = 0
+    for _ in pairs(record.campaignArchives) do overRaw = overRaw + 1 end
+    assertTrue(overRaw > GS.MAX_CAMPAIGNS + 1, "archive fixture exceeds cap")
+    assertTrue(GS:GetCurrentRecord() ~= nil,
+        "oversized archives do not disable usable current campaign")
+    local opOver = GS:NewCampaignOperation()
+    assertTrue(opOver ~= nil, "prepare with oversized archives")
+    local stOver, reasonOver = GS:ApplyStagedCampaignOperation(opOver)
+    assertEq(stOver, "rejected", "oversized archives reject New Campaign")
+    assertEq(reasonOver, "full", "oversized archives reason full")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["10"].goal, beforeGoal,
+        "live goals intact after oversized archive reject")
+    local afterOver = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaignArchives) do
+        afterOver = afterOver + 1
+    end
+    assertEq(afterOver, overRaw, "oversized archives SV retained unchanged")
+
+    -- Preexisting archive for the ending current campaign: reject before clear.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local cur = startCampaign()
+    record = GS:GetCurrentRecord()
+    record.accounting._consumables.requestedItems["55"] = { itemId = 55, goal = 12 }
+    record.campaignArchives = record.campaignArchives or {}
+    record.campaignArchives[cur.id] = {
+        schemaVersion = GS.SCHEMA_VERSION,
+        campaignId = cur.id,
+        datasetId = record.datasetId,
+        requestedItems = { ["55"] = { itemId = 55, goal = 1 } }, -- divergent
+        generation = 99,
+        archivedAt = 1,
+    }
+    local opPrep = GS:NewCampaignOperation()
+    assertTrue(opPrep ~= nil, "prepare with preexisting current archive")
+    -- Also cover prepare-then-corrupt-archive-slot path.
+    local stExist, reasonExist = GS:ApplyStagedCampaignOperation(opPrep)
+    assertEq(stExist, "rejected", "preexisting current archive rejects reset")
+    assertEq(reasonExist, "campaign_archive_exists", "preexisting archive reason")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, cur.id, "campaign identity preserved")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["55"].goal, 12,
+        "live goals preserved with preexisting archive")
+    assertEq(GS:GetCurrentRecord().campaignArchives[cur.id].requestedItems["55"].goal, 1,
+        "divergent archive retained unchanged")
+    local opsExist = 0
+    for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do opsExist = opsExist + 1 end
+    -- Malformed preexisting archive for current campaign.
+    record.campaignArchives[cur.id] = "not-an-archive"
+    local opMal = GS:NewCampaignOperation()
+    assertTrue(opMal ~= nil, "prepare with malformed preexisting archive")
+    local stMal, reasonMal = GS:ApplyStagedCampaignOperation(opMal)
+    assertEq(stMal, "rejected", "malformed preexisting archive rejects reset")
+    assertEq(reasonMal, "campaign_archive_exists", "malformed preexisting archive reason")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["55"].goal, 12,
+        "live goals preserved with malformed preexisting archive")
+    assertEq(GS:GetCurrentRecord().campaignArchives[cur.id], "not-an-archive",
+        "malformed preexisting archive SV unchanged")
+end
+
+-- 2B7c) Eligibility container shape guard
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    -- Supported 2A empty eligibility form remains usable.
+    record.accounting._consumables.eligibility = {}
+    assertTrue(GS:GetCurrentRecord() ~= nil, "2A eligibility={} remains available")
+    assertEq(GS.ValidateEligibilityContainer({}), true, "empty eligibility container ok")
+    assertEq(GS.ValidateEligibilityContainer(nil), true, "absent eligibility ok")
+    -- Ordinary tab/item cutoff behavior with valid eligibility.
+    record.accounting._consumables.eligibility = {
+        items = {},
+        baselineEstablished = true,
+        baselineAt = world.time,
+        tabEligibleFrom = world.time,
+    }
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "valid tab cutoff accepted")
+    assertTrue(GS:GetCurrentRecord().accounting._consumables.eligibility.tabEligibleFrom ~= nil,
+        "tab cutoff written")
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 77 }, { itemId = 77, goal = 4 })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "valid item cutoff accepted")
+    assertTrue(GS:GetCurrentRecord().accounting._consumables.eligibility.items["77"] ~= nil,
+        "item cutoff written")
+
+    -- Non-table eligibility: unavailable; prepare then corrupt then apply.
+    record = GS:GetCurrentRecord()
+    local snapCamp = record.currentCampaignId
+    local snapOps = 0
+    for _ in pairs(record.operations.records or {}) do snapOps = snapOps + 1 end
+    local prepTab = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertTrue(prepTab ~= nil, "prepare before eligibility corruption")
+    record.accounting._consumables.eligibility = "bad-eligibility"
+    assertEq(select(1, GS:GetCurrentRecord()), nil, "non-table eligibility unavailable")
+    assertEq(select(2, GS:GetCurrentRecord()), "invalid_eligibility", "non-table eligibility reason")
+    local stBad, reasonBad = GS:ApplyStagedConfigOperation(prepTab)
+    assertEq(stBad, "rejected", "commit rejects after eligibility corruption")
+    assertEq(reasonBad, "invalid_eligibility", "commit surfaces invalid_eligibility")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.eligibility,
+        "bad-eligibility", "malformed eligibility SV preserved on reject")
+    local opsAfterCorrupt = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].operations.records or {}) do
+        opsAfterCorrupt = opsAfterCorrupt + 1
+    end
+    assertEq(opsAfterCorrupt, snapOps, "operations unchanged after eligibility reject")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].currentCampaignId, snapCamp,
+        "campaign unchanged after eligibility reject")
+
+    -- Present non-table items container.
+    SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.eligibility = {
+        items = "bad-items",
+        baselineEstablished = true,
+    }
+    assertEq(select(2, GS:GetCurrentRecord()), "invalid_eligibility",
+        "non-table eligibility.items unavailable")
+    local prepItem, prepItemSt, prepItemReason = GS:NewConfigOperation(
+        "set-requested-item", { itemId = 88 }, { itemId = 88, goal = 1 })
+    assertEq(prepItem, nil, "prepare blocked by non-table eligibility.items")
+    assertEq(prepItemSt, "rejected", "prepare status rejected")
+    assertEq(prepItemReason, "invalid_eligibility", "prepare reason invalid_eligibility")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.eligibility.items,
+        "bad-items", "non-table items container SV preserved")
+end
+
 -- 2B8) Status feedback never reports Saved for rejection; bank context unavailable
 do
     local msg, sev = GS.FormatMutationFeedback("rejected", "unauthorized")
@@ -5262,6 +5456,56 @@ do
     assertMalformedReject("over-max goal", function(items)
         items["42"] = { itemId = 42, goal = maxGoal + 1 }
     end)
+
+    -- Canonical string keys only: numeric / mixed aliases fail closed (no collapse).
+    boundItems["42"] = nil
+    boundItems[42] = { itemId = 42, goal = 5 }
+    assertEq(GS.ValidateRequestedItemsMap(boundItems), false,
+        "numeric-only requested-item key rejected")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_malformed",
+        "numeric-only key makes record unavailable")
+    boundItems[42] = nil
+    boundItems["42"] = { itemId = 42, goal = 5 }
+    boundItems[42] = { itemId = 42, goal = 9 }
+    assertEq(GS.ValidateRequestedItemsMap(boundItems), false,
+        "mixed numeric/string requested-item keys rejected")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_malformed",
+        "mixed-key map makes record unavailable")
+    -- Prepare New Campaign on a clean canonical map, then corrupt keys before commit.
+    boundItems[42] = nil
+    boundItems["42"] = { itemId = 42, goal = 5 }
+    local keyRec = GS:GetCurrentRecord()
+    assertTrue(keyRec ~= nil, "canonical string key usable before corruption")
+    local keyCamp = keyRec.currentCampaignId
+    local keyOps = 0
+    for _ in pairs(keyRec.operations.records or {}) do keyOps = keyOps + 1 end
+    local keyArch = 0
+    for _ in pairs(keyRec.campaignArchives or {}) do keyArch = keyArch + 1 end
+    local keyOp = GS:NewCampaignOperation()
+    assertTrue(keyOp ~= nil, "prepare New Campaign before key corruption")
+    boundItems[42] = { itemId = 42, goal = 11 }
+    local keySt, keyReason = GS:ApplyStagedCampaignOperation(keyOp)
+    assertEq(keySt, "rejected", "commit rejects after mixed-key corruption")
+    assertEq(keyReason, "requested_items_malformed",
+        "commit revalidation surfaces requested_items_malformed")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.requestedItems[42].goal,
+        11, "numeric alias row preserved on reject")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.requestedItems["42"].goal,
+        5, "string key row preserved on reject")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].currentCampaignId, keyCamp,
+        "campaign unchanged after key-collision reject")
+    local keyOpsAfter = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].operations.records or {}) do
+        keyOpsAfter = keyOpsAfter + 1
+    end
+    assertEq(keyOpsAfter, keyOps, "operations unchanged after key-collision reject")
+    local keyArchAfter = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaignArchives or {}) do
+        keyArchAfter = keyArchAfter + 1
+    end
+    assertEq(keyArchAfter, keyArch, "archives unchanged after key-collision reject")
+    boundItems[42] = nil
+    boundItems["42"] = { itemId = 42, goal = 3 }
 
     -- Malformed archive must not disable a usable current campaign.
     boundItems["42"] = { itemId = 42, goal = 3 }

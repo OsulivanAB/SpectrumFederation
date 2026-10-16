@@ -63,9 +63,10 @@ local function ValidateRequestedItemEntry(key, row)
         or itemId ~= math.floor(itemId) or itemId < 1 then
         return false, "requested_items_malformed"
     end
-    -- Preserve supported key representation: key must be the canonical id string.
-    -- Do not fall back to the key as identity or collapse mismatched rows.
-    if tostring(key) ~= tostring(itemId) then
+    -- Canonical production keys are tostring(itemId). Reject numeric aliases
+    -- (e.g. 42 vs "42") so distinct raw rows cannot collapse during archive copy.
+    local canonicalKey = tostring(itemId)
+    if type(key) ~= "string" or key ~= canonicalKey then
         return false, "requested_items_malformed"
     end
     local C = SF.Consumables
@@ -134,13 +135,19 @@ function GS.ValidateRequestedItemsMap(items)
     return true
 end
 
---- Ensure eligibility table shape without repairing unrelated corruption.
+--- Ensure eligibility table shape for genuinely new/empty state only.
+-- Does not replace a present non-table eligibility or items container.
 local function EnsureEligibility(cfg)
-    if type(cfg.eligibility) ~= "table" then
+    if cfg.eligibility == nil then
         cfg.eligibility = { items = {}, tabEligibleFrom = nil }
+    elseif type(cfg.eligibility) ~= "table" then
+        return nil
     end
-    if type(cfg.eligibility.items) ~= "table" then
+    -- Supported 2A form eligibility={} may omit items; initialize that field only.
+    if cfg.eligibility.items == nil then
         cfg.eligibility.items = {}
+    elseif type(cfg.eligibility.items) ~= "table" then
+        return nil
     end
     return cfg.eligibility
 end
@@ -152,12 +159,31 @@ function GS.EnsureEligibility(cfg)
     return EnsureEligibility(cfg)
 end
 
+--- Supported shapes: absent/nil, 2A eligibility={}, or table with table/nil items.
+-- Present non-table eligibility or items fails closed. Does not rewrite SV.
+-- @return boolean ok, string|nil err
+function GS.ValidateEligibilityContainer(eligibility)
+    if eligibility == nil then
+        return true
+    end
+    if type(eligibility) ~= "table" then
+        return false, "invalid_eligibility"
+    end
+    if eligibility.items ~= nil and type(eligibility.items) ~= "table" then
+        return false, "invalid_eligibility"
+    end
+    return true
+end
+
 --- Tab change establishes a campaign-local cutoff when a baseline exists.
 function GS.NoteTabEligibilityCutoff(cfg, timestamp)
     if type(cfg) ~= "table" then
         return false
     end
     local eligibility = EnsureEligibility(cfg)
+    if not eligibility then
+        return false
+    end
     local ts = tonumber(timestamp)
     if not ts or ts ~= math.floor(ts) or ts < 0 or ts ~= ts then
         return false
@@ -180,6 +206,9 @@ function GS.NoteItemEligibilityCutoff(cfg, itemId, timestamp)
         return false
     end
     local eligibility = EnsureEligibility(cfg)
+    if not eligibility then
+        return false
+    end
     local ts = tonumber(timestamp)
     if not ts or ts ~= math.floor(ts) or ts < 0 or ts ~= ts then
         return false
@@ -198,6 +227,9 @@ function GS.EstablishCampaignBaseline(cfg, timestamp)
         return false
     end
     local eligibility = EnsureEligibility(cfg)
+    if not eligibility then
+        return false
+    end
     local ts = tonumber(timestamp)
     if not ts or ts ~= math.floor(ts) or ts < 0 or ts ~= ts then
         return false
@@ -466,13 +498,18 @@ end
 
 --- Count campaign headers with an early stop at MAX_CAMPAIGNS+1 so oversized
 -- retained maps cannot force an unbounded UI-thread scan during validation.
-function GS.CountCampaignHeaders(record)
-    if type(record) ~= "table" or type(record.campaigns) ~= "table" then
+--- Count map entries with an early stop so oversized retained maps cannot force
+-- unbounded UI-thread scans during capacity checks.
+local function CountMapBounded(t, limit)
+    local n = 0
+    if type(t) ~= "table" then
         return 0
     end
-    local limit = (GS.MAX_CAMPAIGNS or 64) + 1
-    local n = 0
-    for _ in pairs(record.campaigns) do
+    limit = tonumber(limit) or 0
+    if limit < 1 then
+        return CountMap(t)
+    end
+    for _ in pairs(t) do
         n = n + 1
         if n >= limit then
             return n
@@ -481,19 +518,29 @@ function GS.CountCampaignHeaders(record)
     return n
 end
 
+function GS.CountCampaignHeaders(record)
+    if type(record) ~= "table" or type(record.campaigns) ~= "table" then
+        return 0
+    end
+    return CountMapBounded(record.campaigns, (GS.MAX_CAMPAIGNS or 64) + 1)
+end
+
 --- Snapshot current requested items into an archive for an ending campaign.
--- Leaves prior state untouched on capacity failure (caller must check first).
+-- Leaves prior state untouched on capacity / conflict failure.
 local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
     local cfg = record.accounting and record.accounting._consumables
     if type(cfg) ~= "table" then
         return false, "invalid_accounting"
     end
     local archives = EnsureCampaignArchives(record)
+    -- A preexisting archive for the still-current campaign is not safe to treat
+    -- as idempotent: it may be stale/divergent. Exact accepted retries never reach
+    -- archival. Reject before clearing live configuration.
     if archives[campaignId] ~= nil then
-        -- Idempotent: archive already retained for this campaign.
-        return true
+        return false, "campaign_archive_exists"
     end
-    if CountMap(archives) >= GS.MAX_CAMPAIGNS then
+    local archiveCount = CountMapBounded(archives, (GS.MAX_CAMPAIGNS or 64) + 1)
+    if archiveCount >= GS.MAX_CAMPAIGNS then
         return false, "full"
     end
     local generation = tonumber(cfg.generation) or 0
@@ -915,6 +962,10 @@ function GS.FormatReasonText(reason)
             "requested-item configuration exceeds the supported limit"),
         requested_items_malformed = Loc("GUILD_SUPPLIES_REASON_REQUESTED_ITEMS_MALFORMED",
             "requested-item configuration is malformed"),
+        invalid_eligibility = Loc("GUILD_SUPPLIES_REASON_INVALID_ELIGIBILITY",
+            "eligibility configuration is malformed"),
+        campaign_archive_exists = Loc("GUILD_SUPPLIES_REASON_CAMPAIGN_ARCHIVE_EXISTS",
+            "this campaign already has a retained archive"),
         invalid_editor_rank_position = Loc("GUILD_SUPPLIES_REASON_INVALID_RANK",
             "choose an existing guild rank"),
         rank_unavailable = Loc("GUILD_SUPPLIES_REASON_RANK_UNAVAILABLE",
@@ -1247,9 +1298,9 @@ function GS:ApplyStagedCampaignOperation(op, context)
     if not GS:IsRootReady() then
         return "rejected", GS:GetRootReason() or "not_ready"
     end
-    local record = GS:GetCurrentRecord()
+    local record, recordReason = GS:GetCurrentRecord()
     if type(record) ~= "table" then
-        return "rejected", "not_configured"
+        return "rejected", recordReason or "not_configured"
     end
     if record.activation ~= GS.ACTIVATION_STAGED then
         return "rejected", "unsupported_activation"
