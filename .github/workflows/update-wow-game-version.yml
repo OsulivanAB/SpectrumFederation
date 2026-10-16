@@ -55,6 +55,10 @@ jobs:
       beta_current_version: ${{ steps.plan.outputs.beta_current_version }}
       main_target_version: ${{ steps.plan.outputs.main_target_version }}
       beta_target_version: ${{ steps.plan.outputs.beta_target_version }}
+      sync_needed: ${{ steps.plan.outputs.sync_needed }}
+      sync_main_sha: ${{ steps.plan.outputs.sync_main_sha }}
+      sync_reason: ${{ steps.plan.outputs.sync_reason }}
+      beta_branch_mutation: ${{ steps.plan.outputs.beta_branch_mutation }}
       any_work: ${{ steps.plan.outputs.any_work }}
       helpers_dir: ${{ env.HELPERS_DIR }}
 
@@ -405,13 +409,24 @@ jobs:
   update-beta:
     name: Update Beta Branch
     runs-on: ubuntu-latest
-    needs: preflight
+    # Coordinate after main so beta incorporates the completed main update (or a
+    # recovered main tip) before any beta push. Skipped update-main is allowed when
+    # main did not need a TOC mutation.
+    # History-only commits use: chore: sync main game-version update into beta [skip ci]
+    needs: [preflight, update-main]
     if: |
+      always() &&
+      needs.preflight.result == 'success' &&
       needs.preflight.outputs.dry_run != 'true' &&
-      needs.preflight.outputs.beta_action == 'update'
+      needs.preflight.outputs.beta_branch_mutation == 'true' &&
+      (
+        needs.preflight.outputs.main_action != 'update' ||
+        needs.update-main.result == 'success'
+      )
     outputs:
       pushed_sha: ${{ steps.push.outputs.pushed_sha }}
       completed: ${{ steps.push.outputs.completed }}
+      synced: ${{ steps.push.outputs.synced }}
 
     steps:
       - name: Require PAT_TOKEN for protected branch push
@@ -430,8 +445,8 @@ jobs:
           ref: beta
           fetch-depth: 0
           # Admin PAT is required for ruleset bypass. Post-Merge Beta is skipped for
-          # Interface-bump commits once beta has that workflow guard; until then the
-          # preflight conflicting-run check plus duplicate-release safeguards apply.
+          # Interface-bump and history-sync commits; classify_promotion_scope also
+          # guards against unintended release_required pushes.
           token: ${{ secrets.PAT_TOKEN }}
 
       - name: Set up Python
@@ -466,7 +481,8 @@ jobs:
             update_changelog.py \
             publish_release.py \
             validate_packaging.py \
-            blizzard_api.py
+            blizzard_api.py \
+            classify_promotion_scope.py
           do
             if [[ ! -f "$HELPERS_DIR/$required" ]]; then
               echo "::error::Missing required helper $required from $WORKFLOW_SHA"
@@ -485,60 +501,148 @@ jobs:
             --verify-sha "$EXPECTED_SHA"
           git reset --hard "$EXPECTED_SHA"
 
-      - name: Apply TOC, changelog, README, and concurrency guard updates
+      - name: Resolve main commit to synchronize
+        id: sync_source
         env:
+          MAIN_ACTION: ${{ needs.preflight.outputs.main_action }}
+          SYNC_NEEDED: ${{ needs.preflight.outputs.sync_needed }}
+          PLAN_SYNC_SHA: ${{ needs.preflight.outputs.sync_main_sha }}
+          PUSHED_MAIN_SHA: ${{ needs.update-main.outputs.pushed_sha }}
+          CAPTURED_MAIN_SHA: ${{ needs.preflight.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$MAIN_ACTION" == "update" ]]; then
+            if [[ -z "${PUSHED_MAIN_SHA}" ]]; then
+              echo "::error::update-main did not produce pushed_sha for synchronization"
+              exit 1
+            fi
+            echo "sha=$PUSHED_MAIN_SHA" >> "$GITHUB_OUTPUT"
+          elif [[ "$SYNC_NEEDED" == "true" ]]; then
+            if [[ -z "${PLAN_SYNC_SHA}" ]]; then
+              echo "::error::sync_needed but preflight did not capture sync_main_sha"
+              exit 1
+            fi
+            echo "sha=$PLAN_SYNC_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=" >> "$GITHUB_OUTPUT"
+          fi
+          # Refuse drifting main tips when recovering a previously completed main update.
+          if [[ "$MAIN_ACTION" != "update" && "$SYNC_NEEDED" == "true" ]]; then
+            git fetch origin main
+            python3 "$HELPERS_DIR/wow_interface_sync.py" \
+              --verify-ref origin/main \
+              --verify-sha "$CAPTURED_MAIN_SHA"
+          fi
+
+      - name: Synchronize main into beta and finalize metadata
+        id: integrate
+        env:
+          MAIN_SHA: ${{ steps.sync_source.outputs.sha }}
+          SYNC_NEEDED: ${{ needs.preflight.outputs.sync_needed }}
+          BETA_UPDATE_NEEDED: ${{ needs.preflight.outputs.beta_update_needed }}
           TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
           TARGET_VERSION: ${{ needs.preflight.outputs.beta_target_version }}
           GAME_VERSION: ${{ needs.preflight.outputs.game_version }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          python3 "$HELPERS_DIR/wow_interface_sync.py" \
-            --apply-interface "$TARGET_INTERFACE" \
-            --apply-toc-version "$TARGET_VERSION" \
-            --update-readme beta
-          BRANCH_NAME=beta \
-          CHANGELOG_MODE=compatibility \
-          CHANGELOG_VERSION="$TARGET_VERSION" \
-          CHANGELOG_INTERFACE="$TARGET_INTERFACE" \
-          CHANGELOG_GAME_VERSION="$GAME_VERSION" \
-            python3 "$HELPERS_DIR/update_changelog.py"
-          # Close the live-beta concurrency gap without promoting unfinished beta code.
-          if [[ -f .github/workflows/post-merge-beta.yml ]]; then
-            python3 "$HELPERS_DIR/wow_interface_sync.py" \
-              --ensure-beta-release-concurrency .github/workflows/post-merge-beta.yml
-          fi
-          python3 "$HELPERS_DIR/validate_packaging.py"
-
-      - name: Commit and push beta
-        id: push
-        env:
-          TARGET_INTERFACE: ${{ needs.preflight.outputs.interface }}
-          TARGET_VERSION: ${{ needs.preflight.outputs.beta_target_version }}
+          BEFORE_SHA: ${{ needs.preflight.outputs.beta_sha }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add \
-            SpectrumFederation/SpectrumFederation.toc \
-            SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc \
-            SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc \
-            CHANGELOG.md \
-            README.md
-          if [[ -f .github/workflows/post-merge-beta.yml ]]; then
-            git add .github/workflows/post-merge-beta.yml
-          fi
-          if git diff --cached --quiet; then
-            echo "::error::Beta update produced no staged changes"
+          git fetch origin main beta
+
+          SYNCED=false
+          if [[ -n "${MAIN_SHA}" && ( "$SYNC_NEEDED" == "true" || "$BETA_UPDATE_NEEDED" == "true" ) ]]; then
+            # Merge + finalize into one local commit before any beta push.
+            INTEGRATE_ARGS=(
+              --integrate-main-into-beta "$MAIN_SHA"
+              --apply-interface "$TARGET_INTERFACE"
+              --beta-target-version "$TARGET_VERSION"
+              --game-version "$GAME_VERSION"
+            )
+            if [[ "$BETA_UPDATE_NEEDED" == "true" ]]; then
+              INTEGRATE_ARGS+=(--beta-update-needed)
+            fi
+            python3 "$HELPERS_DIR/wow_interface_sync.py" "${INTEGRATE_ARGS[@]}"
+            SYNCED=true
+          elif [[ "$BETA_UPDATE_NEEDED" == "true" ]]; then
+            python3 "$HELPERS_DIR/wow_interface_sync.py" \
+              --apply-interface "$TARGET_INTERFACE" \
+              --apply-toc-version "$TARGET_VERSION" \
+              --update-readme beta
+            BRANCH_NAME=beta \
+            CHANGELOG_MODE=compatibility \
+            CHANGELOG_VERSION="$TARGET_VERSION" \
+            CHANGELOG_INTERFACE="$TARGET_INTERFACE" \
+            CHANGELOG_GAME_VERSION="$GAME_VERSION" \
+              python3 "$HELPERS_DIR/update_changelog.py"
+            if [[ -f .github/workflows/post-merge-beta.yml ]]; then
+              python3 "$HELPERS_DIR/wow_interface_sync.py" \
+                --ensure-beta-release-concurrency .github/workflows/post-merge-beta.yml
+            fi
+            git add \
+              SpectrumFederation/SpectrumFederation.toc \
+              SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc \
+              SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc \
+              CHANGELOG.md \
+              README.md
+            if [[ -f .github/workflows/post-merge-beta.yml ]]; then
+              git add .github/workflows/post-merge-beta.yml
+            fi
+            if git diff --cached --quiet; then
+              echo "::error::Beta update produced no staged changes"
+              exit 1
+            fi
+            git commit -m "chore: bump Interface to ${TARGET_INTERFACE} and version to ${TARGET_VERSION} [skip ci]"
+          else
+            echo "::error::Beta mutation requested without sync source or beta update"
             exit 1
           fi
-          git commit -m "chore: bump Interface to ${TARGET_INTERFACE} and version to ${TARGET_VERSION} [skip ci]"
+
+          python3 "$HELPERS_DIR/validate_packaging.py"
+
+          if [[ -n "${MAIN_SHA}" ]]; then
+            if ! git merge-base --is-ancestor "$MAIN_SHA" HEAD; then
+              echo "::error::Beta tip does not contain synchronized main commit $MAIN_SHA"
+              exit 1
+            fi
+          fi
+
+          # History-only synchronization must not classify as a beta addon release.
+          if [[ "$BETA_UPDATE_NEEDED" != "true" ]]; then
+            SCOPE_OUT="$(mktemp)"
+            GITHUB_OUTPUT="$SCOPE_OUT" PYTHONPATH="$HELPERS_DIR" \
+              python3 "$HELPERS_DIR/classify_promotion_scope.py" \
+              --base "$BEFORE_SHA" \
+              --head HEAD \
+              --github-output
+            if grep -q '^release_required=true$' "$SCOPE_OUT"; then
+              echo "::error::History-only main→beta sync produced release_required changes; refusing to push an unintended Post-Merge Beta release."
+              exit 1
+            fi
+            echo "[sync] History-only sync classified as non-release"
+          fi
+
+          echo "synced=$SYNCED" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push beta
+        id: push
+        env:
+          SYNCED: ${{ steps.integrate.outputs.synced }}
+          COMMIT_SHA: ${{ steps.integrate.outputs.commit_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$COMMIT_SHA" ]]; then
+            echo "::error::Beta HEAD drifted after local integration commit"
+            exit 1
+          fi
           if ! git push origin HEAD:beta; then
             echo "::error::Failed to push beta with PAT_TOKEN. Confirm PAT_TOKEN belongs to a repository Admin (ruleset bypass). Do not force-push or weaken protection."
             exit 1
           fi
           echo "pushed_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "completed=true" >> "$GITHUB_OUTPUT"
+          echo "synced=${SYNCED:-false}" >> "$GITHUB_OUTPUT"
 
   publish-beta:
     name: Publish Beta Release
@@ -546,8 +650,13 @@ jobs:
     needs: [preflight, update-beta]
     if: |
       always() &&
+      needs.preflight.result == 'success' &&
       needs.preflight.outputs.dry_run != 'true' &&
       (needs.preflight.outputs.beta_action == 'update' || needs.preflight.outputs.beta_action == 'publish') &&
+      (
+        needs.preflight.outputs.beta_branch_mutation != 'true' ||
+        needs.update-beta.result == 'success'
+      ) &&
       (
         needs.preflight.outputs.beta_action != 'update' ||
         needs.update-beta.result == 'success'
@@ -560,14 +669,23 @@ jobs:
         id: source
         env:
           BETA_ACTION: ${{ needs.preflight.outputs.beta_action }}
+          BETA_MUTATION: ${{ needs.preflight.outputs.beta_branch_mutation }}
           CAPTURED_SHA: ${{ needs.preflight.outputs.beta_sha }}
           PUSHED_SHA: ${{ needs.update-beta.outputs.pushed_sha }}
         run: |
           set -euo pipefail
-          if [[ "$BETA_ACTION" == "update" ]]; then
+          # After history-only sync, beta_action may be publish while the tip moved.
+          # Publish from the post-sync commit whenever update-beta mutated the branch.
+          if [[ "$BETA_ACTION" == "update" || "$BETA_MUTATION" == "true" ]]; then
+            if [[ -z "${PUSHED_SHA}" ]]; then
+              echo "::error::Beta publish requires update-beta pushed_sha after beta mutation"
+              exit 1
+            fi
             echo "sha=$PUSHED_SHA" >> "$GITHUB_OUTPUT"
+            echo "mutated=true" >> "$GITHUB_OUTPUT"
           else
             echo "sha=$CAPTURED_SHA" >> "$GITHUB_OUTPUT"
+            echo "mutated=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout publish source
@@ -615,7 +733,9 @@ jobs:
           done
 
       - name: Verify beta tip has not drifted before publish-only
-        if: needs.preflight.outputs.beta_action == 'publish'
+        if: |
+          needs.preflight.outputs.beta_action == 'publish' &&
+          needs.preflight.outputs.beta_branch_mutation != 'true'
         env:
           EXPECTED_SHA: ${{ needs.preflight.outputs.beta_sha }}
         run: |
@@ -626,7 +746,9 @@ jobs:
             --verify-sha "$EXPECTED_SHA"
 
       - name: Overlay live generated notes when publishing a prior tip
-        if: needs.preflight.outputs.beta_action == 'publish'
+        if: |
+          needs.preflight.outputs.beta_action == 'publish' &&
+          needs.preflight.outputs.beta_branch_mutation != 'true'
         run: |
           set -euo pipefail
           git fetch origin beta
@@ -672,6 +794,9 @@ jobs:
           BETA_ACTION: ${{ needs.preflight.outputs.beta_action }}
           MAIN_VERSION: ${{ needs.preflight.outputs.main_target_version }}
           BETA_VERSION: ${{ needs.preflight.outputs.beta_target_version }}
+          SYNC_NEEDED: ${{ needs.preflight.outputs.sync_needed }}
+          SYNC_REASON: ${{ needs.preflight.outputs.sync_reason }}
+          BETA_MUTATION: ${{ needs.preflight.outputs.beta_branch_mutation }}
           ANY_WORK: ${{ needs.preflight.outputs.any_work }}
           PREFLIGHT_RESULT: ${{ needs.preflight.result }}
           UPDATE_MAIN_RESULT: ${{ needs.update-main.result }}
@@ -699,8 +824,8 @@ jobs:
           if [[ "$DRY_RUN" != "true" && ( "$MAIN_ACTION" == "update" || "$MAIN_ACTION" == "publish" ) && "$PUBLISH_MAIN_RESULT" != "success" ]]; then
             ERRORS+=("Main publish failed ($PUBLISH_MAIN_RESULT). If GitHub succeeded but CurseForge/Wago failed, rerun with retry_publication=true (no TOC bump). If the GitHub release is missing, a normal rerun recovers publish without a bump when Interface is already current.")
           fi
-          if [[ "$DRY_RUN" != "true" && "$BETA_ACTION" == "update" && "$UPDATE_BETA_RESULT" != "success" ]]; then
-            ERRORS+=("Beta branch update failed ($UPDATE_BETA_RESULT)")
+          if [[ "$DRY_RUN" != "true" && "$BETA_MUTATION" == "true" && "$UPDATE_BETA_RESULT" != "success" ]]; then
+            ERRORS+=("Beta branch update/sync failed ($UPDATE_BETA_RESULT). If main already updated, a normal rerun can complete history sync without another version bump when Interfaces are current.")
           fi
           if [[ "$DRY_RUN" != "true" && ( "$BETA_ACTION" == "update" || "$BETA_ACTION" == "publish" ) && "$PUBLISH_BETA_RESULT" != "success" ]]; then
             ERRORS+=("Beta publish failed ($PUBLISH_BETA_RESULT). If GitHub succeeded but CurseForge/Wago failed, rerun with retry_publication=true (no TOC bump). If the GitHub release is missing, a normal rerun recovers publish without a bump when Interface is already current.")
@@ -728,17 +853,20 @@ jobs:
             echo "| Beta version | $BETA_VERSION |"
             echo "| Main action | $MAIN_ACTION |"
             echo "| Beta action | $BETA_ACTION |"
+            echo "| Main→beta sync needed | $SYNC_NEEDED |"
+            echo "| Sync reason | $SYNC_REASON |"
             echo ""
             echo "| Job | Result |"
             echo "| --- | --- |"
             echo "| $(icon "$PREFLIGHT_RESULT") Preflight | $PREFLIGHT_RESULT |"
             echo "| $(icon "$UPDATE_MAIN_RESULT") Update main | $UPDATE_MAIN_RESULT |"
             echo "| $(icon "$PUBLISH_MAIN_RESULT") Publish main | $PUBLISH_MAIN_RESULT |"
-            echo "| $(icon "$UPDATE_BETA_RESULT") Update beta | $UPDATE_BETA_RESULT |"
+            echo "| $(icon "$UPDATE_BETA_RESULT") Update/sync beta | $UPDATE_BETA_RESULT |"
             echo "| $(icon "$PUBLISH_BETA_RESULT") Publish beta | $PUBLISH_BETA_RESULT |"
             echo ""
             echo "Helpers always run from the dispatched workflow commit, even when the working tree is an older beta tip."
             echo "Protected pushes require PAT_TOKEN from a repository Admin (ruleset bypass)."
+            echo "Beta incorporates the completed main game-version commit before a single validated push."
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
