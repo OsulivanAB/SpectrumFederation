@@ -6,11 +6,11 @@ Only the profile owner can switch a profile between Point Based and Reward Pot. 
 
 ## Attendance
 
-The Loot Helper window title shows **Attendance**. The Points column is hidden so the remaining glance columns can use the space. Each profile member's row still shows raid-check presence as a percentage, BiS usage, and an equipment-readiness warning only when something is known to be missing. Reward Pot Attendance points are not shown as a roster column; admins change them under **Loot Helper → Character**. Loot Logs still record those adjustments.
+The Loot Helper window title shows **Attendance**. The Points column is hidden so the remaining glance columns can use the space. Each profile member's row still shows BiS usage and an equipment-readiness warning only when something is known to be missing. The roster Att.% and Prep.% columns are temporarily hidden. Reward Pot Attendance points are not shown as a roster column; admins change them under **Loot Helper → Character**. Loot Logs still record those adjustments.
 
-Profile admins can raise or lower Attendance points one at a time from that Character page. Decreasing Attendance points at zero does nothing. Attendance points never go below zero. They are not the roster Att.% column.
+Profile admins can raise or lower Attendance points one at a time from that Character page. Decreasing Attendance points at zero does nothing. Attendance points never go below zero. They are not the (currently hidden) roster Att.% glance metric.
 
-**Raid Check** awards `1` Attendance to each prepared profile member who is in the raid. A player below an enabled minimum item level is Unprepared and does not receive that award. Presence (Att.%) still credits them for being in the raid. **Pre-Raid Check** never changes Attendance.
+**Raid Check** awards `1` Attendance to each prepared profile member who is in the raid. A player below an enabled minimum item level is Unprepared and does not receive that award. Presence history still credits them for being in the raid even while the Att.% column is hidden. **Pre-Raid Check** never changes Attendance.
 
 ## The pot
 
