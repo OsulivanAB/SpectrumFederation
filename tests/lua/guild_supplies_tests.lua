@@ -67,6 +67,10 @@ local world = {
 function GetTime() return world.time end
 function time() return math.floor(world.time) end
 function GetServerTime() return math.floor(world.time) end
+-- WoW provides date(); Lua 5.1 tests map it to os.date.
+function date(fmt, ts)
+    return os.date(fmt, ts)
+end
 function IsInGuild() return world.guild.inGuild end
 function GetGuildInfo(unit)
     if unit == "player" and world.guild.inGuild then
@@ -213,6 +217,25 @@ SF.Debug = {
 SF.Consumables = {
     MAX_REQUESTED_ITEMS = 256,
     MAX_GOAL = 100000,
+    ValidGoal = function(value)
+        local goal = tonumber(value)
+        if not goal or goal ~= goal or goal == math.huge or goal == -math.huge then
+            return nil
+        end
+        if goal ~= math.floor(goal) or goal < 0 or goal > 100000 then
+            return nil
+        end
+        return goal
+    end,
+    ItemIdFromText = function(text)
+        local n = tonumber(text)
+        if n and n == math.floor(n) and n > 0 then return n end
+        if type(text) == "string" then
+            local id = text:match("item:(%d+)")
+            if id then return tonumber(id) end
+        end
+        return nil
+    end,
 }
 
 SF.LootHelperImpersonation = {
@@ -242,6 +265,7 @@ SF.GuildGossip.Init = function() end
 loadModule("SpectrumFederation/modules/GuildSupplies/State.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Authority.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Operations.lua")
+loadModule("SpectrumFederation/modules/GuildSupplies/Campaigns.lua")
 
 local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
@@ -303,6 +327,16 @@ local function initGS(opts)
         settleRoster()
     end
     return ok, reason
+end
+
+--- #386: campaign-owned items require an active campaign.
+local function startCampaign()
+    local op, st, err = GS:NewCampaignOperation()
+    assertEq(st, "accepted", "campaign op prepared: " .. tostring(err))
+    assertTrue(op ~= nil, "campaign op present")
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "accepted", "campaign started: " .. tostring(reason))
+    return op
 end
 
 local function minimalValidBankTabBody(id, datasetId, value)
@@ -612,6 +646,17 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    -- Bank tab remains shared without a campaign.
+    local opTabEarly, stTabEarly = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertEq(stTabEarly, "accepted", "bank tab before campaign prepared")
+    assertEq(GS:ApplyStagedConfigOperation(opTabEarly), "accepted", "bank tab before campaign applied")
+    -- Items require a campaign (#386).
+    local noCamp, noCampSt, noCampReason = GS:NewConfigOperation(
+        "set-requested-item", { itemId = 1 }, { itemId = 1, goal = 1 })
+    assertNil(noCamp, "item prepare blocked without campaign")
+    assertEq(noCampSt, "rejected", "item prepare rejected")
+    assertEq(noCampReason, "no_campaign", "no_campaign reason")
+    startCampaign()
 
     local op, st = GS:NewConfigOperation("set-requested-item", { itemId = 12345 }, { itemId = 12345, goal = 20 })
     assertEq(st, "accepted", "new item op built")
@@ -725,6 +770,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 1 }, { itemId = 1, goal = 1 })
     GS:ApplyStagedConfigOperation(op)
     local clash = {}
@@ -891,6 +937,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 7 }, { itemId = 7, goal = 3 })
     GS:ApplyStagedConfigOperation(op)
     local saved = SpectrumFederationDB
@@ -1017,6 +1064,7 @@ do
     end
     -- One conflict fills the shared budget to 128
     ops.conflicts["conf-1"] = { id = "conf-1", body = { id = "conf-1" }, at = 1 }
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 50 }, { itemId = 50, goal = 1 })
     -- Force stale base
     op.baseTargetRevision = "missing-base"
@@ -1124,6 +1172,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 77 }, { itemId = 77, goal = 5 })
     assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "admit item op")
     op.value.goal = 999
@@ -1220,6 +1269,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 88 }, { itemId = 88, goal = 1 })
     op.baseTargetRevision = "not-yet"
     local status, reason = GS:ApplyStagedConfigOperation(op)
@@ -1255,6 +1305,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
 
     -- Scalar/string apply inputs normalize to { itemId = N }; no crash / nil key.
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 10 }, { itemId = 10, goal = 1 })
@@ -2275,6 +2326,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
 
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
         itemId = 501, goal = 7, extra = { a = { b = { c = { d = true } } } },
@@ -3056,6 +3108,2660 @@ do
     local op3 = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
     assertEq(GS:ApplyStagedConfigOperation(op3), "accepted", "append after restore accepted")
     assertTrue(GS:GetCurrentRecord() ~= nil, "readable after valid append on restored dense order")
+end
+
+---------------------------------------------------------------------------
+-- Part 2B (#386): fresh start, campaigns, eligibility, UI statuses
+---------------------------------------------------------------------------
+
+-- 2B1) Fresh setup imports nothing from legacy Consumables / unrelated profiles
+do
+    resetDb()
+    SpectrumFederationDB = {
+        lootHelper = {
+            profiles = {
+                legacy = {
+                    _consumables = {
+                        bankTab = 4,
+                        requestedItems = { ["999"] = { itemId = 999, goal = 50 } },
+                        txnRegistry = { ["txn-old"] = { id = "txn-old" } },
+                    },
+                    _consumableEvents = { { id = "ev-legacy", type = "donation", itemId = 999, quantity = 3 } },
+                },
+            },
+            activeProfileId = "legacy",
+            showRaidSupplyReminders = false,
+        },
+        otherFeature = { keep = true },
+    }
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    assertNil(select(1, GS:GetCurrentRecord()), "no auto-bootstrap on read")
+    local rec, st = GS:CreateStagedRecord()
+    assertEq(st, "accepted", "explicit create")
+    assertTrue(rec ~= nil, "record created")
+    local nItems = 0
+    for _ in pairs(rec.accounting._consumables.requestedItems) do nItems = nItems + 1 end
+    assertEq(nItems, 0, "fresh requested items empty")
+    assertNil(rec.accounting._consumables.bankTab, "bank tab unset until configured")
+    assertEq(rec.currentCampaignId, nil, "no campaign until New Campaign")
+    local nTxn = 0
+    for _ in pairs(rec.accounting._consumables.txnRegistry) do nTxn = nTxn + 1 end
+    assertEq(nTxn, 0, "no legacy txn import")
+    assertEq(#rec.accounting._consumableEvents, 0, "no legacy event import")
+    assertEq(SpectrumFederationDB.lootHelper.profiles.legacy._consumables.requestedItems["999"].goal, 50,
+        "legacy profile untouched")
+    assertEq(SpectrumFederationDB.otherFeature.keep, true, "unrelated account data untouched")
+    assertEq(SpectrumFederationDB.lootHelper.showRaidSupplyReminders, false,
+        "personal preference untouched by setup")
+end
+
+-- 2B2) New Campaign empty; archives prior config; guild/tab/rank preserved
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "set shared bank tab")
+    local camp1 = startCampaign()
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 42 }, { itemId = 42, goal = 10 })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "add campaign item")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["42"].goal, 10, "item present")
+    local eligBefore = GS:GetCurrentRecord().accounting._consumables.eligibility.items["42"]
+    assertTrue(type(eligBefore) == "number", "item cutoff after baseline")
+
+    local camp2 = startCampaign()
+    assertTrue(camp1.id ~= camp2.id, "distinct campaign identities")
+    local record = GS:GetCurrentRecord()
+    assertEq(record.currentCampaignId, camp2.id, "current is second campaign")
+    local nItems = 0
+    for _ in pairs(record.accounting._consumables.requestedItems) do nItems = nItems + 1 end
+    assertEq(nItems, 0, "new campaign starts empty")
+    assertEq(record.accounting._consumables.bankTab, 3, "bank tab preserved")
+    assertEq(record.permission.editorRankPosition, 3, "editor rank preserved")
+    local archive = record.campaignArchives[camp1.id]
+    assertTrue(archive ~= nil, "prior campaign archived")
+    assertEq(archive.requestedItems["42"].goal, 10, "archived goals preserved")
+    local progress = GS:ProjectCampaignProgress(camp2.id)
+    assertEq(progress.itemTotals[42], nil, "new campaign zero progress")
+    local archivedItems = GS:GetCampaignRequestedItems(camp1.id)
+    assertEq(archivedItems["42"].goal, 10, "inspect archived items")
+end
+
+-- 2B3) Reset retry/reload idempotent; distinct confirmed reset gets new id
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local campOp = GS:NewCampaignOperation()
+    assertEq(GS:ApplyStagedCampaignOperation(campOp), "accepted", "first campaign")
+    local status = GS:ApplyStagedCampaignOperation(campOp)
+    assertEq(status, "duplicate", "retry same op is duplicate")
+    local record = GS:GetCurrentRecord()
+    local nCamps = 0
+    for _ in pairs(record.campaigns) do nCamps = nCamps + 1 end
+    assertEq(nCamps, 1, "single campaign after retry")
+
+    -- Reload persistence of campaign op
+    local saved = SpectrumFederationDB
+    GS._db = nil
+    GS._root = nil
+    GS._rootValid = false
+    SpectrumFederationDB = saved
+    initGS()
+    assertEq(GS:ApplyStagedCampaignOperation(campOp), "duplicate", "duplicate after reload")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, campOp.id, "same current after reload")
+
+    local campOp2 = GS:NewCampaignOperation()
+    assertEq(GS:ApplyStagedCampaignOperation(campOp2), "accepted", "distinct subsequent reset")
+    assertTrue(campOp2.id ~= campOp.id, "new reset identity")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, campOp2.id, "second current")
+end
+
+-- 2B4) Stale authority / campaign base leaves prior intact
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local before = GS:GetCurrentRecord().currentCampaignId
+    local op = GS:NewCampaignOperation()
+    op.baseCampaignId = "not-current"
+    op.campaignId = "not-current"
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "pending", "stale campaign base pending")
+    assertEq(reason, "stale_base", "stale_base reason")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, before, "current unchanged on stale")
+    assertNil(GS:GetCurrentRecord().campaigns[op.id], "no partial campaign header")
+
+    -- Rank revocation at commit
+    op = GS:NewCampaignOperation()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    settleRoster()
+    status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "rejected", "unauthorized after demotion")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, first.id, "campaign intact after auth failure")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+end
+
+-- 2B5) Eligibility: tab change + item add/re-add cutoffs; goal edit preserves
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local add = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { itemId = 100, goal = 1 })
+    assertEq(GS:ApplyStagedConfigOperation(add), "accepted", "add item")
+    local cutoff1 = GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"]
+    assertTrue(type(cutoff1) == "number", "add establishes cutoff")
+
+    world.time = world.time + 50
+    local goal = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { itemId = 100, goal = 9 })
+    assertEq(GS:ApplyStagedConfigOperation(goal), "accepted", "goal edit")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"], cutoff1,
+        "goal edit preserves cutoff")
+
+    local rem = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { removed = true })
+    assertEq(GS:ApplyStagedConfigOperation(rem), "accepted", "remove item")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"], cutoff1,
+        "remove preserves cutoff history")
+
+    world.time = world.time + 50
+    local readd = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { itemId = 100, goal = 2 })
+    assertEq(GS:ApplyStagedConfigOperation(readd), "accepted", "re-add item")
+    local cutoff2 = GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"]
+    assertTrue(cutoff2 > cutoff1, "re-add establishes newer cutoff")
+
+    local beforeTab = GS:GetCurrentRecord().accounting._consumables.eligibility.tabEligibleFrom
+    world.time = world.time + 50
+    local tab = GS:NewConfigOperation("set-bank-tab", "bankTab", 5)
+    assertEq(GS:ApplyStagedConfigOperation(tab), "accepted", "tab change")
+    local afterTab = GS:GetCurrentRecord().accounting._consumables.eligibility.tabEligibleFrom
+    assertTrue(afterTab ~= nil and (beforeTab == nil or afterTab >= beforeTab),
+        "tab change updates tabEligibleFrom")
+end
+
+-- 2B6) Malformed archived headers retained but not exposed
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local good = startCampaign()
+    local record = GS:GetCurrentRecord()
+    record.campaigns["bad-camp"] = {
+        schemaVersion = 1,
+        campaignId = "wrong-id",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "bad-camp",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+    }
+    local list = GS:ListInspectableCampaigns()
+    local seenBad = false
+    local seenGood = false
+    for i = 1, #list do
+        if list[i].campaignId == "bad-camp" then seenBad = true end
+        if list[i].campaignId == good.id then seenGood = true end
+    end
+    assertEq(seenBad, false, "malformed header not exposed")
+    assertEq(seenGood, true, "valid campaign still listed")
+    assertTrue(GS:GetCurrentRecord().campaigns["bad-camp"] ~= nil, "malformed retained in SV")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "guild record still usable")
+end
+
+-- 2B7) Capacity failure leaves prior campaign intact
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local record = GS:GetCurrentRecord()
+    local fill = 0
+    while GS.CountCampaignHeaders(record) < GS.MAX_CAMPAIGNS do
+        fill = fill + 1
+        local id = "fill-camp-" .. fill
+        if record.campaigns[id] == nil then
+            record.campaigns[id] = {
+                schemaVersion = 1,
+                campaignId = id,
+                datasetId = record.datasetId,
+                guildKey = "club:42",
+                resetOperationId = id,
+                createdByGuid = "Player-1-Alice",
+                createdByName = "Alice-Garona",
+                startedAt = fill,
+                boundaryVersion = 1,
+                boundaryKind = "new-goal",
+                contextStatus = "unavailable",
+            }
+        end
+    end
+    assertEq(GS.CountCampaignHeaders(record), GS.MAX_CAMPAIGNS, "at campaign capacity")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "record still usable at capacity")
+    local before = record.currentCampaignId
+    local beforeItems = record.accounting._consumables.requestedItems
+    local op, pst, perr = GS:NewCampaignOperation()
+    assertTrue(op ~= nil, "prepare still works at capacity: " .. tostring(perr))
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "rejected", "full capacity rejects")
+    assertEq(reason, "full", "full reason")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, before, "current intact")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems, beforeItems,
+        "items table intact")
+    assertNil(GS:GetCurrentRecord().campaigns[op.id], "no partial new campaign")
+    assertEq(before, first.id, "first campaign still current")
+
+    -- Oversized retained campaigns map: early-stop count, unavailable, SV unchanged.
+    local overCap = GS.MAX_CAMPAIGNS + 40
+    for i = 1, overCap do
+        local id = "over-camp-" .. i
+        if record.campaigns[id] == nil then
+            record.campaigns[id] = {
+                schemaVersion = 1,
+                campaignId = id,
+                datasetId = record.datasetId,
+                guildKey = "club:42",
+                resetOperationId = id,
+                createdByGuid = "Player-1-Alice",
+                createdByName = "Alice-Garona",
+                startedAt = i,
+                boundaryVersion = 1,
+                boundaryKind = "new-goal",
+                contextStatus = "unavailable",
+            }
+        end
+    end
+    local rawCount = 0
+    for _ in pairs(record.campaigns) do rawCount = rawCount + 1 end
+    assertTrue(rawCount > GS.MAX_CAMPAIGNS + 1, "fixture exceeds campaign header cap")
+    local boundedCount = GS.CountCampaignHeaders(record)
+    assertEq(boundedCount, GS.MAX_CAMPAIGNS + 1,
+        "CountCampaignHeaders stops at MAX_CAMPAIGNS+1")
+    assertTrue(boundedCount < rawCount, "bounded count is below full retained size")
+    assertEq(select(1, GS:GetCurrentRecord()), nil, "over-cap campaigns make record unavailable")
+    assertEq(select(2, GS:GetCurrentRecord()), "full", "over-cap campaigns reason is full")
+    local afterRaw = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaigns) do
+        afterRaw = afterRaw + 1
+    end
+    assertEq(afterRaw, rawCount, "over-cap campaigns SV retained unchanged")
+end
+
+-- 2B7b) Archive capacity bound + preexisting current-campaign archive reject
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local record = GS:GetCurrentRecord()
+    record.accounting._consumables.requestedItems["10"] = { itemId = 10, goal = 7 }
+    -- Fill archives to capacity with unrelated campaign ids (not the current one).
+    record.campaignArchives = record.campaignArchives or {}
+    local fill = 0
+    while true do
+        local n = 0
+        for _ in pairs(record.campaignArchives) do n = n + 1 end
+        if n >= GS.MAX_CAMPAIGNS then break end
+        fill = fill + 1
+        local id = "arch-fill-" .. fill
+        if record.campaignArchives[id] == nil then
+            record.campaignArchives[id] = {
+                schemaVersion = GS.SCHEMA_VERSION,
+                campaignId = id,
+                datasetId = record.datasetId,
+                requestedItems = {},
+                generation = 1,
+                archivedAt = fill,
+            }
+        end
+    end
+    local atCap = 0
+    for _ in pairs(record.campaignArchives) do atCap = atCap + 1 end
+    assertEq(atCap, GS.MAX_CAMPAIGNS, "archives at capacity")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "usable current with full archives")
+    local beforeItems = record.accounting._consumables.requestedItems
+    local beforeGoal = beforeItems["10"].goal
+    local beforeCamp = record.currentCampaignId
+    local beforeOps = 0
+    for _ in pairs(record.operations.records or {}) do beforeOps = beforeOps + 1 end
+    local opFull = GS:NewCampaignOperation()
+    assertTrue(opFull ~= nil, "prepare at archive capacity")
+    local stFull, reasonFull = GS:ApplyStagedCampaignOperation(opFull)
+    assertEq(stFull, "rejected", "archive capacity rejects New Campaign")
+    assertEq(reasonFull, "full", "archive capacity reason full")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeCamp, "current campaign intact at archive cap")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["10"].goal, beforeGoal,
+        "live goals intact at archive cap")
+    local afterArch = 0
+    for _ in pairs(GS:GetCurrentRecord().campaignArchives) do afterArch = afterArch + 1 end
+    assertEq(afterArch, atCap, "archive map unchanged at capacity reject")
+
+    -- Oversized archive map: bounded reject without clearing live config.
+    for i = 1, 40 do
+        local id = "arch-over-" .. i
+        record.campaignArchives[id] = {
+            schemaVersion = GS.SCHEMA_VERSION,
+            campaignId = id,
+            datasetId = record.datasetId,
+            requestedItems = {},
+            generation = 1,
+            archivedAt = 1000 + i,
+        }
+    end
+    local overRaw = 0
+    for _ in pairs(record.campaignArchives) do overRaw = overRaw + 1 end
+    assertTrue(overRaw > GS.MAX_CAMPAIGNS + 1, "archive fixture exceeds cap")
+    assertTrue(GS:GetCurrentRecord() ~= nil,
+        "oversized archives do not disable usable current campaign")
+    local opOver = GS:NewCampaignOperation()
+    assertTrue(opOver ~= nil, "prepare with oversized archives")
+    local stOver, reasonOver = GS:ApplyStagedCampaignOperation(opOver)
+    assertEq(stOver, "rejected", "oversized archives reject New Campaign")
+    assertEq(reasonOver, "full", "oversized archives reason full")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["10"].goal, beforeGoal,
+        "live goals intact after oversized archive reject")
+    local afterOver = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaignArchives) do
+        afterOver = afterOver + 1
+    end
+    assertEq(afterOver, overRaw, "oversized archives SV retained unchanged")
+
+    -- Preexisting archive for the ending current campaign: reject before clear.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local cur = startCampaign()
+    record = GS:GetCurrentRecord()
+    record.accounting._consumables.requestedItems["55"] = { itemId = 55, goal = 12 }
+    record.campaignArchives = record.campaignArchives or {}
+    record.campaignArchives[cur.id] = {
+        schemaVersion = GS.SCHEMA_VERSION,
+        campaignId = cur.id,
+        datasetId = record.datasetId,
+        requestedItems = { ["55"] = { itemId = 55, goal = 1 } }, -- divergent
+        generation = 99,
+        archivedAt = 1,
+    }
+    local opPrep = GS:NewCampaignOperation()
+    assertTrue(opPrep ~= nil, "prepare with preexisting current archive")
+    -- Also cover prepare-then-corrupt-archive-slot path.
+    local stExist, reasonExist = GS:ApplyStagedCampaignOperation(opPrep)
+    assertEq(stExist, "rejected", "preexisting current archive rejects reset")
+    assertEq(reasonExist, "campaign_archive_exists", "preexisting archive reason")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, cur.id, "campaign identity preserved")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["55"].goal, 12,
+        "live goals preserved with preexisting archive")
+    assertEq(GS:GetCurrentRecord().campaignArchives[cur.id].requestedItems["55"].goal, 1,
+        "divergent archive retained unchanged")
+    local opsExist = 0
+    for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do opsExist = opsExist + 1 end
+    -- Malformed preexisting archive for current campaign.
+    record.campaignArchives[cur.id] = "not-an-archive"
+    local opMal = GS:NewCampaignOperation()
+    assertTrue(opMal ~= nil, "prepare with malformed preexisting archive")
+    local stMal, reasonMal = GS:ApplyStagedCampaignOperation(opMal)
+    assertEq(stMal, "rejected", "malformed preexisting archive rejects reset")
+    assertEq(reasonMal, "campaign_archive_exists", "malformed preexisting archive reason")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["55"].goal, 12,
+        "live goals preserved with malformed preexisting archive")
+    assertEq(GS:GetCurrentRecord().campaignArchives[cur.id], "not-an-archive",
+        "malformed preexisting archive SV unchanged")
+end
+
+-- 2B7c) Eligibility container shape guard
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    -- Supported 2A empty eligibility form remains usable.
+    record.accounting._consumables.eligibility = {}
+    assertTrue(GS:GetCurrentRecord() ~= nil, "2A eligibility={} remains available")
+    assertEq(GS.ValidateEligibilityContainer({}), true, "empty eligibility container ok")
+    assertEq(GS.ValidateEligibilityContainer(nil), true, "absent eligibility ok")
+    -- Ordinary tab/item cutoff behavior with valid eligibility.
+    record.accounting._consumables.eligibility = {
+        items = {},
+        baselineEstablished = true,
+        baselineAt = world.time,
+        tabEligibleFrom = world.time,
+    }
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "valid tab cutoff accepted")
+    assertTrue(GS:GetCurrentRecord().accounting._consumables.eligibility.tabEligibleFrom ~= nil,
+        "tab cutoff written")
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 77 }, { itemId = 77, goal = 4 })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "valid item cutoff accepted")
+    assertTrue(GS:GetCurrentRecord().accounting._consumables.eligibility.items["77"] ~= nil,
+        "item cutoff written")
+
+    -- Non-table eligibility: unavailable; prepare then corrupt then apply.
+    record = GS:GetCurrentRecord()
+    local snapCamp = record.currentCampaignId
+    local snapOps = 0
+    for _ in pairs(record.operations.records or {}) do snapOps = snapOps + 1 end
+    local prepTab = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertTrue(prepTab ~= nil, "prepare before eligibility corruption")
+    record.accounting._consumables.eligibility = "bad-eligibility"
+    assertEq(select(1, GS:GetCurrentRecord()), nil, "non-table eligibility unavailable")
+    assertEq(select(2, GS:GetCurrentRecord()), "invalid_eligibility", "non-table eligibility reason")
+    local stBad, reasonBad = GS:ApplyStagedConfigOperation(prepTab)
+    assertEq(stBad, "rejected", "commit rejects after eligibility corruption")
+    assertEq(reasonBad, "invalid_eligibility", "commit surfaces invalid_eligibility")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.eligibility,
+        "bad-eligibility", "malformed eligibility SV preserved on reject")
+    local opsAfterCorrupt = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].operations.records or {}) do
+        opsAfterCorrupt = opsAfterCorrupt + 1
+    end
+    assertEq(opsAfterCorrupt, snapOps, "operations unchanged after eligibility reject")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].currentCampaignId, snapCamp,
+        "campaign unchanged after eligibility reject")
+
+    -- Present non-table items container.
+    SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.eligibility = {
+        items = "bad-items",
+        baselineEstablished = true,
+    }
+    assertEq(select(2, GS:GetCurrentRecord()), "invalid_eligibility",
+        "non-table eligibility.items unavailable")
+    local prepItem, prepItemSt, prepItemReason = GS:NewConfigOperation(
+        "set-requested-item", { itemId = 88 }, { itemId = 88, goal = 1 })
+    assertEq(prepItem, nil, "prepare blocked by non-table eligibility.items")
+    assertEq(prepItemSt, "rejected", "prepare status rejected")
+    assertEq(prepItemReason, "invalid_eligibility", "prepare reason invalid_eligibility")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.eligibility.items,
+        "bad-items", "non-table items container SV preserved")
+end
+
+-- 2B8) Status feedback never reports Saved for rejection; bank context unavailable
+do
+    local msg, sev = GS.FormatMutationFeedback("rejected", "unauthorized")
+    assertTrue(type(msg) == "string" and msg:find("not authorized", 1, true),
+        "rejected message uses localized reason")
+    assertEq(sev, "error", "rejected severity")
+    assertEq(msg:find("Saved", 1, true), nil, "no Saved for rejection")
+    msg, sev = GS.FormatMutationFeedback("accepted", nil)
+    assertEq(sev, "success", "accepted severity")
+    assertTrue(msg:find("Staged", 1, true) or msg:find("admitted", 1, true), "accepted staged wording")
+    msg, sev = GS.FormatMutationFeedback("duplicate", "duplicate")
+    assertEq(sev, "info", "duplicate severity")
+    msg, sev = GS.FormatMutationFeedback("pending", "stale_base")
+    assertEq(sev, "warn", "pending severity")
+    assertTrue(msg:find("out of date", 1, true), "pending reason localized")
+    assertTrue(GS.FormatReasonText("not_ready"):find("not ready", 1, true),
+        "FormatReasonText maps known codes")
+
+    local ctx = GS.CaptureBankContext(nil)
+    assertEq(ctx.status, "unavailable", "unset tab is unavailable not empty")
+    ctx = GS.CaptureBankContext(1)
+    -- Without bank APIs / readiness in the harness, capture is unavailable (not empty).
+    assertEq(ctx.status, "unavailable", "missing APIs unavailable")
+    assertTrue(ctx.reason ~= nil, "unavailable reason present")
+end
+
+-- 2B9) Cross-campaign txn registry preserved; historical start-campaign body validates
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    record.accounting._consumables.txnRegistry["txn-keep"] = {
+        id = "txn-keep",
+        generation = 1,
+    }
+    startCampaign()
+    assertTrue(GS:GetCurrentRecord().accounting._consumables.txnRegistry["txn-keep"] ~= nil,
+        "txn registry survives campaign reset")
+
+    local campOp = GS:NewCampaignOperation()
+    local ok, err = GS.ValidateAcceptedOperationBody(campOp, "club:42", record.datasetId)
+    -- campOp is prepared against current dataset; body shape must validate historically.
+    assertEq(ok, true, "start-campaign historical body ok: " .. tostring(err))
+end
+
+-- 2B10) Inspectable campaign accessors remain stable (UI lifecycle covered in 2B16)
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local list1 = GS:ListInspectableCampaigns()
+    local list2 = GS:ListInspectableCampaigns()
+    assertEq(#list1, #list2, "list size stable across repeated reads")
+    local items1 = GS:GetCampaignRequestedItems(list1[1].campaignId)
+    local items2 = GS:GetCampaignRequestedItems(list1[1].campaignId)
+    assertTrue(items1 ~= items2, "accessors return copies, not live tables")
+end
+
+-- 2B11) Exact canonical-body equality for campaign retries / ID conflicts
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local op = startCampaign()
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "duplicate", "exact replay after accept is duplicate: " .. tostring(reason))
+
+    local divergent = {}
+    for k, v in pairs(op) do divergent[k] = v end
+    divergent.baseTargetRevision = "gs1:other:base:1"
+    status, reason = GS:ApplyStagedCampaignOperation(divergent)
+    assertEq(status, "rejected", "divergent accepted body is id_conflict")
+    assertEq(reason, "id_conflict", "id_conflict reason for changed baseTargetRevision")
+    assertTrue(GS:GetCurrentRecord().operations.records[op.id] ~= nil, "original accepted body retained")
+    assertEq(GS:GetCurrentRecord().operations.records[op.id].baseTargetRevision, op.baseTargetRevision,
+        "accepted body baseTargetRevision unchanged")
+
+    -- Pending path: stale pending with exact body may stay pending; changed body conflicts.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local pendingOp = GS:NewCampaignOperation()
+    local record = GS:GetCurrentRecord()
+    record.operations.pending[pendingOp.id] = {
+        id = pendingOp.id,
+        reason = "stale_base",
+        body = pendingOp,
+        at = world.time,
+    }
+    local changedPending = {}
+    for k, v in pairs(pendingOp) do changedPending[k] = v end
+    changedPending.value = { extra = true }
+    status, reason = GS:ApplyStagedCampaignOperation(changedPending)
+    assertEq(status, "rejected", "changed pending body rejected")
+    assertEq(reason, "id_conflict", "pending id_conflict")
+    assertTrue(record.operations.pending[pendingOp.id] ~= nil, "original pending retained")
+    local pendingValue = record.operations.pending[pendingOp.id].body.value
+    assertTrue(type(pendingValue) == "table", "original pending value remains a table")
+    assertNil(pendingValue.extra, "original pending body not replaced by divergent value")
+end
+
+-- 2B12) Bank context requires readiness; empty only when fresh; creation still works
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    world.bankTxnCounts = world.bankTxnCounts or {}
+    function GetNumGuildBankTransactions(tab)
+        return world.bankTxnCounts[tab] or 0
+    end
+    function GetGuildBankTransaction()
+        return "deposit", "Alice-Garona", nil, 1, nil, nil, 0, 1, 1, 1
+    end
+
+    GS._BankContextReadinessProbe = function()
+        return false, "bank_closed"
+    end
+    local ctx = GS.CaptureBankContext(1)
+    assertEq(ctx.status, "unavailable", "closed bank is unavailable even with zero count")
+    assertEq(ctx.reason, "bank_closed", "bank_closed reason")
+
+    world.bankTxnCounts[2] = 0
+    GS._BankContextReadinessProbe = function(tab)
+        if tab == 2 then return true end
+        return false, "tab_not_ready"
+    end
+    ctx = GS.CaptureBankContext(2)
+    assertEq(ctx.status, "empty", "fresh ready zero count is empty")
+    assertEq(ctx.recordCount, 0, "empty recordCount 0")
+
+    world.bankTxnCounts[3] = 2
+    GS._BankContextReadinessProbe = function() return false, "log_not_updated" end
+    ctx = GS.CaptureBankContext(3)
+    assertEq(ctx.status, "unavailable", "positive count without readiness is unavailable")
+
+    GS._BankContextReadinessProbe = nil
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+
+    -- New Campaign still accepts with unavailable context.
+    local op = GS:NewCampaignOperation()
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "accepted", "campaign without bank context: " .. tostring(reason))
+    local header = GS:GetCurrentRecord().campaigns[op.id]
+    assertEq(header.contextStatus, "unavailable", "contextStatus unavailable when unreadiness")
+end
+
+-- 2B13) Complete bounded rollback on post-validation rejection
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local record = GS:GetCurrentRecord()
+    local cfg = record.accounting._consumables
+    cfg.requestedItems["100"] = { itemId = 100, goal = 5 }
+    -- Populated/oversized prior eligibility.items: rollback must restore the
+    -- original object/map without copying or mutating those entries.
+    cfg.eligibility = cfg.eligibility or {}
+    cfg.eligibility.items = cfg.eligibility.items or {}
+    local priorElig = cfg.eligibility
+    local priorEligItems = priorElig.items
+    for i = 1, 512 do
+        priorEligItems["cut-" .. i] = world.time + i
+    end
+    local before = {
+        current = record.currentCampaignId,
+        generation = cfg.generation,
+        configSeq = cfg.configSeq,
+        items = cfg.requestedItems,
+        eligibility = priorElig,
+        eligibilityItems = priorEligItems,
+        eligibilityBaseline = cfg.eligibility and cfg.eligibility.baselineAt,
+        eligibilityTab = cfg.eligibility and cfg.eligibility.tabEligibleFrom,
+        head = record.operations.heads[GS.CAMPAIGN_TARGET_KEY],
+        archiveCount = 0,
+        eligItemCount = 0,
+    }
+    for _ in pairs(priorEligItems) do
+        before.eligItemCount = before.eligItemCount + 1
+    end
+    for _ in pairs(record.campaignArchives or {}) do
+        before.archiveCount = before.archiveCount + 1
+    end
+
+    local realValidate = GS._ValidateGuildRecordStructure
+    GS._ValidateGuildRecordStructure = function()
+        return false, "injected_post_failure"
+    end
+    local op = GS:NewCampaignOperation()
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    GS._ValidateGuildRecordStructure = realValidate
+
+    assertEq(status, "rejected", "post-validation rejection status")
+    assertEq(reason, "injected_post_failure", "post-validation rejection reason")
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    assertEq(record.currentCampaignId, before.current, "rollback restores current campaign")
+    assertEq(cfg.generation, before.generation, "rollback restores generation")
+    assertEq(cfg.configSeq, before.configSeq, "rollback restores configSeq")
+    assertTrue(cfg.requestedItems == before.items, "rollback restores requestedItems ref")
+    assertTrue(cfg.eligibility == before.eligibility, "rollback restores original eligibility object")
+    assertTrue(cfg.eligibility.items == before.eligibilityItems,
+        "rollback restores original eligibility.items map")
+    local eligCountAfter = 0
+    for _ in pairs(cfg.eligibility.items) do
+        eligCountAfter = eligCountAfter + 1
+    end
+    assertEq(eligCountAfter, before.eligItemCount, "rollback leaves prior eligibility items untouched")
+    assertEq(cfg.eligibility and cfg.eligibility.baselineAt, before.eligibilityBaseline,
+        "rollback restores eligibility baselineAt")
+    assertEq(cfg.eligibility and cfg.eligibility.tabEligibleFrom, before.eligibilityTab,
+        "rollback restores eligibility tabEligibleFrom")
+    assertEq(record.operations.heads[GS.CAMPAIGN_TARGET_KEY], before.head, "rollback restores campaign head")
+    assertNil(record.operations.records[op.id], "rejected op not accepted")
+    assertNil(record.campaigns[op.id], "rejected campaign header removed")
+    local archiveCount = 0
+    for _ in pairs(record.campaignArchives or {}) do
+        archiveCount = archiveCount + 1
+    end
+    assertEq(archiveCount, before.archiveCount, "rollback removes newly inserted archive only")
+    assertTrue(record.campaigns[first.id] ~= nil, "prior campaign retained")
+
+    -- Successful reset installs fresh empty eligibility and leaves the old map intact.
+    local oldElig = cfg.eligibility
+    local oldItems = cfg.eligibility.items
+    local oldCount = before.eligItemCount
+    local okOp = startCampaign()
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    assertTrue(cfg.eligibility ~= oldElig, "success installs fresh eligibility object")
+    assertTrue(cfg.eligibility.items ~= oldItems, "success installs fresh eligibility.items")
+    local freshCount = 0
+    for _ in pairs(cfg.eligibility.items) do
+        freshCount = freshCount + 1
+    end
+    assertEq(freshCount, 0, "success uses empty eligibility.items baseline")
+    local retainedCount = 0
+    for _ in pairs(oldItems) do
+        retainedCount = retainedCount + 1
+    end
+    assertEq(retainedCount, oldCount, "old eligibility.items map not traversed/cleared on success")
+    assertTrue(record.campaigns[okOp.id] ~= nil, "successful campaign present")
+end
+
+-- 2B14) Archive ledger + adjustment attribution in projections and history
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local camp1 = startCampaign()
+    local record = GS:GetCurrentRecord()
+    local gen1 = record.accounting._consumables.generation
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        id = "ev-don-1",
+        type = "donation",
+        itemId = 200,
+        quantity = 4,
+        actor = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        id = "ev-adj-1",
+        type = "adjustment",
+        itemId = 200,
+        quantity = -1,
+        actor = "Alice-Garona",
+        attributed = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time + 1,
+    }
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        id = "ev-adj-2",
+        type = "adjustment",
+        itemId = 200,
+        quantity = 2,
+        actor = "Alice-Garona",
+        attributed = nil,
+        generation = gen1,
+        timestamp = world.time + 2,
+    }
+
+    local progress = GS:ProjectCampaignProgress(camp1.id)
+    assertEq(progress.itemTotals[200], 5, "live donation+adjustments item total")
+    assertEq(progress.contributions["Bob-Garona"][200], 3, "attributed adjustment credits contributor")
+
+    local camp2 = startCampaign()
+    -- Move gen1 events into archive after reset (simulates retention).
+    record = GS:GetCurrentRecord()
+    local archive = record.accounting._consumableEventArchive
+    if type(archive) ~= "table" then
+        record.accounting._consumableEventArchive = {}
+        archive = record.accounting._consumableEventArchive
+    end
+    local live = record.accounting._consumableEvents
+    local kept = {}
+    for i = 1, #live do
+        if tonumber(live[i].generation) == gen1 then
+            archive[#archive + 1] = live[i]
+        else
+            kept[#kept + 1] = live[i]
+        end
+    end
+    record.accounting._consumableEvents = kept
+
+    progress = GS:ProjectCampaignProgress(camp1.id)
+    assertEq(progress.itemTotals[200], 5, "archived campaign totals include archive ledger")
+    assertEq(progress.contributions["Bob-Garona"][200], 3, "archived attribution preserved")
+
+    local currentProgress = GS:ProjectCampaignProgress(camp2.id)
+    assertEq(currentProgress.itemTotals[200] or 0, 0, "new campaign isolated from prior totals")
+
+    local rows, total = GS:ListCampaignHistory(camp1.id, 10, 0)
+    assertEq(total, 3, "history total for archived campaign")
+    assertEq(#rows, 3, "history rows returned")
+    assertTrue(rows[1].text:find("adjusted", 1, true) or rows[1].text:find("donated", 1, true),
+        "history text formatted")
+
+    -- Overlapping accepted IDs across live+archive must count once in totals/history.
+    -- Distinct IDs with identical payloads still count separately.
+    record = GS:GetCurrentRecord()
+    local liveList = record.accounting._consumableEvents
+    local archList = record.accounting._consumableEventArchive
+    local overlapDon = {
+        id = "ev-don-1",
+        type = "donation",
+        itemId = 200,
+        quantity = 4,
+        actor = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    local overlapAdj = {
+        id = "ev-adj-1",
+        type = "adjustment",
+        itemId = 200,
+        quantity = -1,
+        actor = "Alice-Garona",
+        attributed = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time + 1,
+    }
+    liveList[#liveList + 1] = overlapDon
+    liveList[#liveList + 1] = overlapAdj
+    archList[#archList + 1] = {
+        id = "ev-don-dup-payload",
+        type = "donation",
+        itemId = 200,
+        quantity = 4,
+        actor = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time + 3,
+        source = "guildbank",
+    }
+    progress = GS:ProjectCampaignProgress(camp1.id)
+    -- Original 5 + distinct-id duplicate donation 4 = 9; overlapping IDs not double-counted.
+    assertEq(progress.itemTotals[200], 9, "overlapping event IDs deduped in item totals")
+    assertEq(progress.contributions["Bob-Garona"][200], 7,
+        "overlapping IDs deduped in contributor totals")
+    rows, total = GS:ListCampaignHistory(camp1.id, 20, 0)
+    assertEq(total, 4, "history dedupes overlapping IDs; distinct IDs remain")
+    local currentProgress2 = GS:ProjectCampaignProgress(camp2.id)
+    assertEq(currentProgress2.itemTotals[200] or 0, 0, "new campaign still isolated after overlap fixture")
+end
+
+-- 2B14b) Missing vs empty new-goal archives; invalid current generations
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    -- Pre-campaign generation 0 remains usable for first New Campaign.
+    assertEq(GS:GetCurrentRecord().accounting._consumables.generation, 0,
+        "fresh setup generation 0")
+    local campEmpty = startCampaign()
+    local record = GS:GetCurrentRecord()
+    assertEq(record.accounting._consumables.generation, 1, "first campaign generation 1")
+    -- Valid empty archived snapshot (requestedItems={}) is inspectable/readable.
+    local campAfterEmpty = startCampaign()
+    record = GS:GetCurrentRecord()
+    local emptyArchive = record.campaignArchives[campEmpty.id]
+    assertTrue(type(emptyArchive) == "table", "empty campaign has archive snapshot")
+    emptyArchive.requestedItems = {}
+    assertEq(GS.ValidateCampaignArchive(emptyArchive, campEmpty.id, record), true,
+        "validated empty archive remains valid")
+    local emptyItems, emptyErr = GS:GetCampaignRequestedItems(campEmpty.id)
+    assertEq(emptyErr, nil, "valid empty archive has no error")
+    assertTrue(type(emptyItems) == "table", "valid empty archive returns table")
+    local emptyCount = 0
+    for _ in pairs(emptyItems) do emptyCount = emptyCount + 1 end
+    assertEq(emptyCount, 0, "valid empty archive returns empty map")
+    local listEmpty = GS:ListInspectableCampaigns()
+    local sawEmpty = false
+    for i = 1, #listEmpty do
+        if listEmpty[i].campaignId == campEmpty.id then sawEmpty = true end
+    end
+    assertEq(sawEmpty, true, "valid empty archive remains inspectable")
+
+    -- Missing required new-goal archive is unavailable (not successful empty).
+    record.campaignArchives[campEmpty.id] = nil
+    local missingItems, missingErr = GS:GetCampaignRequestedItems(campEmpty.id)
+    assertEq(missingItems, nil, "missing archive items unavailable")
+    assertEq(missingErr, "missing_campaign_archive", "missing archive reason")
+    local missProgress, missProgErr = GS:ProjectCampaignProgress(campEmpty.id)
+    assertEq(missProgress, nil, "missing archive progress unavailable")
+    assertEq(missProgErr, "missing_campaign_archive", "progress missing archive reason")
+    local listMissing = GS:ListInspectableCampaigns()
+    local sawMissing = false
+    for i = 1, #listMissing do
+        if listMissing[i].campaignId == campEmpty.id then sawMissing = true end
+    end
+    assertEq(sawMissing, false, "missing archive excluded from inspectable selector")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "current record usable with missing historical archive")
+    local curItems = GS:GetCampaignRequestedItems(campAfterEmpty.id)
+    assertTrue(type(curItems) == "table", "current campaign reads remain independent")
+
+    -- Non-table retained archive is also unavailable / excluded.
+    record.campaignArchives[campEmpty.id] = "not-a-table"
+    local badItems, badErr = GS:GetCampaignRequestedItems(campEmpty.id)
+    assertEq(badItems, nil, "non-table archive unavailable")
+    assertEq(badErr, "missing_campaign_archive", "non-table archive treated as missing snapshot")
+    local listBad = GS:ListInspectableCampaigns()
+    local sawBad = false
+    for i = 1, #listBad do
+        if listBad[i].campaignId == campEmpty.id then sawBad = true end
+    end
+    assertEq(sawBad, false, "non-table archive excluded from inspectable")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaignArchives[campEmpty.id],
+        "not-a-table", "malformed archive retained in SV")
+    record.campaignArchives[campEmpty.id] = nil
+
+    -- Invalid current generations reject archival/reset; state unchanged.
+    local function assertGenReject(mutate, label)
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        GS:CreateStagedRecord()
+        local camp = startCampaign()
+        local rec = GS:GetCurrentRecord()
+        rec.accounting._consumables.requestedItems["77"] = { itemId = 77, goal = 3 }
+        local genBefore = rec.accounting._consumables.generation
+        local events = rec.accounting._consumableEvents
+        events[#events + 1] = {
+            id = "ev-gen-" .. label,
+            type = "donation",
+            itemId = 77,
+            quantity = 2,
+            actor = "Bob-Garona",
+            generation = genBefore,
+            timestamp = world.time,
+            source = "guildbank",
+        }
+        local op = GS:NewCampaignOperation()
+        assertTrue(op ~= nil, label .. " prepare while generation valid")
+        mutate(rec.accounting._consumables)
+        local corruptedGen = rec.accounting._consumables.generation
+        local st, reason = GS:ApplyStagedCampaignOperation(op)
+        assertEq(st, "rejected", label .. " apply rejected")
+        assertEq(reason, "invalid_generation", label .. " reason invalid_generation")
+        local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+        assertEq(raw.currentCampaignId, camp.id, label .. " campaign unchanged")
+        assertEq(raw.accounting._consumables.requestedItems["77"].goal, 3,
+            label .. " live goals unchanged")
+        assertEq(raw.accounting._consumables.generation, corruptedGen,
+            label .. " stored generation retained")
+        -- Restore for isolation proof after a valid subsequent reset.
+        raw.accounting._consumables.generation = genBefore
+        assertTrue(GS:GetCurrentRecord() ~= nil, label .. " restored usable")
+        local nextCamp = startCampaign()
+        local progOld = GS:ProjectCampaignProgress(camp.id)
+        assertEq(progOld.itemTotals[77], 2, label .. " prior donation stays on archived campaign")
+        local progNew = GS:ProjectCampaignProgress(nextCamp.id)
+        assertEq(progNew.itemTotals[77] or 0, 0, label .. " new campaign isolated from prior donation")
+        assertTrue(raw.accounting._consumables.generation ~= genBefore,
+            label .. " valid reset advances generation")
+    end
+
+    assertGenReject(function(cfg)
+        cfg.generation = nil
+    end, "missing")
+    assertGenReject(function(cfg)
+        cfg.generation = 0
+    end, "zero")
+    assertGenReject(function(cfg)
+        cfg.generation = "nope"
+    end, "nonnumeric")
+    assertGenReject(function(cfg)
+        cfg.generation = 1.5
+    end, "fractional")
+    assertGenReject(function(cfg)
+        cfg.generation = math.huge
+    end, "infinite")
+end
+
+-- 2B15–2B16) Production DefinitionRenderer page contracts (Build/Refresh/mutations)
+do
+    local created = {}
+    local function fire(region, event, ...)
+        local script = region.scripts and region.scripts[event]
+        if script then script(region, ...) end
+        for _, hook in ipairs((region.hooks and region.hooks[event]) or {}) do
+            hook(region, ...)
+        end
+    end
+    local function makeRegion(kind, name, parent, template)
+        local region = {
+            kind = kind,
+            name = name,
+            parent = parent,
+            shown = true,
+            height = 40,
+            width = 400,
+            points = {},
+            scripts = {},
+            hooks = {},
+            children = {},
+            text = "",
+            enabled = true,
+            focused = false,
+            registeredEvents = {},
+        }
+        created[#created + 1] = region
+        if parent and parent.children then
+            parent.children[#parent.children + 1] = region
+        end
+        function region:GetObjectType() return self.kind or "Frame" end
+        function region:SetPoint(point, relativeTo, relativePoint, x, y)
+            if type(relativeTo) == "number" then
+                x, y = relativeTo, relativePoint
+                relativeTo, relativePoint = nil, point
+            elseif type(relativePoint) == "number" then
+                x, y = relativePoint, x
+                relativePoint = point
+            end
+            self.points[#self.points + 1] = {
+                point = point, relativeTo = relativeTo, relativePoint = relativePoint, x = x or 0, y = y or 0,
+            }
+        end
+        function region:ClearAllPoints() self.points = {} end
+        function region:SetAllPoints(target) self.allPoints = target or self.parent end
+        function region:SetHeight(h) self.height = tonumber(h) or 0 end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = tonumber(w) or 0 end
+        function region:GetWidth() return self.width end
+        function region:SetSize(w, h) self:SetWidth(w); self:SetHeight(h) end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown and true or false end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:SetAlpha() end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetNonSpaceWrap() end
+        function region:SetMaxLines() end
+        function region:SetAutoFocus() end
+        function region:SetNumeric() end
+        function region:SetMaxLetters() end
+        function region:SetHighlightColor() end
+        function region:SetCursorPosition() end
+        function region:HasFocus() return self.focused end
+        function region:ClearFocus()
+            self.focused = false
+            fire(self, "OnEditFocusLost")
+        end
+        function region:SetFocus() self.focused = true end
+        function region:GetStringWidth() return math.max(1, #(self.text or "") * 7) end
+        function region:GetStringHeight() return 12 end
+        function region:SetColorTexture() end
+        function region:SetTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetVertexColor() end
+        function region:SetBlendMode() end
+        function region:SetVerticalScroll() end
+        function region:SetScrollChild(child) self.scrollChild = child end
+        function region:CreateTexture() return makeRegion("Texture", nil, self) end
+        function region:CreateFontString() return makeRegion("FontString", nil, self) end
+        function region:CreateFrame() return makeRegion("Frame", nil, self) end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:SetDefaultText(t) self.defaultText = t end
+        function region:SetupMenu(gen)
+            self.menuGenerator = gen
+            self.menuOptions = {}
+            local root = {
+                CreateRadio = function(_, label, isSelected, setSelected, value)
+                    self.menuOptions[#self.menuOptions + 1] = {
+                        label = label, value = value, isSelected = isSelected, setSelected = setSelected,
+                    }
+                end,
+            }
+            if type(gen) == "function" then
+                gen(self, root)
+            end
+        end
+        function region:GenerateMenu()
+            if self.menuGenerator then self:SetupMenu(self.menuGenerator) end
+        end
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeRegion("Slider", nil, region)
+            region.ScrollBar:SetWidth(20)
+            region.ScrollBar.shown = false
+        end
+        function region:SetChecked(v) self.checked = v and true or false end
+        function region:GetChecked() return self.checked and true or false end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:SetCheckedTexture() end
+        function region:SetDisabledCheckedTexture() end
+        function region:RegisterForClicks() end
+        function region:Click()
+            fire(self, "OnClick")
+        end
+        function region:SetFontObject() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:SetClipsChildren() end
+        function region:EnableDrawLayer() end
+        function region:DisableDrawLayer() end
+        function region:SetPropagateKeyboardInput() end
+        function region:SetObeyStepOnDrag() end
+        function region:SetMinMaxValues() end
+        function region:SetValueStep() end
+        function region:SetValue() end
+        function region:GetValue() return self.value or 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:GetName() return self.name end
+        return region
+    end
+
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        return makeRegion(frameType or "Frame", name, parent, template)
+    end
+
+    -- Minimal Settings chrome dependencies.
+    GameTooltip = GameTooltip or {
+        Hide = function() end, SetOwner = function() end, SetText = function() end,
+        AddLine = function() end, Show = function() end,
+    }
+    OKAY = OKAY or "OK"
+    CANCEL = CANCEL or "Cancel"
+    if type(CopyTable) ~= "function" then
+        function CopyTable(t)
+            if type(t) ~= "table" then return t end
+            local out = {}
+            for k, v in pairs(t) do
+                if type(v) == "table" then
+                    out[k] = CopyTable(v)
+                else
+                    out[k] = v
+                end
+            end
+            return out
+        end
+    end
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    local pendingConfirm
+    function StaticPopup_Show(key, message, _, data)
+        pendingConfirm = { key = key, message = message, data = data }
+        return { key = key }
+    end
+
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = {}
+    SF.SettingsUI.pages = {}
+    SF.SettingsUI.categories = {}
+    function SF.SettingsUI:RegisterCategory(cat)
+        self.categories[cat.id] = cat
+    end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    SF.SettingsStore = {
+        Get = function(_, _) return true end,
+        Set = function() end,
+    }
+
+    loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+
+    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(configPage ~= nil, "Configuration page registered")
+    assertTrue(logsPage ~= nil, "Logs page registered")
+    assertTrue(type(configPage.Build) == "function" and type(configPage.Refresh) == "function",
+        "Configuration exposes Build/Refresh")
+    assertTrue(type(logsPage.Build) == "function" and type(logsPage.Refresh) == "function",
+        "Logs exposes Build/Refresh")
+    assertEq(SF.SettingsUI.categories.guildSupplies.name, "Guild Supplies",
+        "category name localized through Loc default")
+
+    local function findEditBoxes(node, out)
+        out = out or {}
+        if node.kind == "EditBox" then
+            out[#out + 1] = node
+        end
+        for _, child in ipairs(node.children or {}) do
+            findEditBoxes(child, out)
+        end
+        return out
+    end
+    local function findButtons(node, out)
+        out = out or {}
+        if node.kind == "Button" and node.text then
+            out[#out + 1] = node
+        end
+        for _, child in ipairs(node.children or {}) do
+            findButtons(child, out)
+        end
+        return out
+    end
+    local function findDropdowns(node, out)
+        out = out or {}
+        if node.kind == "DropdownButton" then
+            out[#out + 1] = node
+        end
+        for _, child in ipairs(node.children or {}) do
+            findDropdowns(child, out)
+        end
+        return out
+    end
+
+    -- Configuration: Build renders; bank-tab onCommit; New Campaign confirmation binding.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+
+    local configPanel = makeRegion("Frame", "GSConfigPanel", nil)
+    configPanel:SetSize(600, 800)
+    local beforeBuild = #created
+    configPage:Build(configPanel)
+    assertTrue(#created > beforeBuild, "Configuration Build creates controls")
+    assertTrue(configPanel.__sfPageBuilder ~= nil, "Configuration uses DefinitionRenderer:Build")
+    local pageDef = configPanel.__sfPageDef
+    assertTrue(type(pageDef) == "table", "Build stores page definition")
+    local foundBankCommit, foundGoalCommit, foundHelpGetText = false, false, false
+    for _, sec in ipairs(pageDef.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "editbox" and type(item.onCommit) == "function" then
+                foundBankCommit = true
+            end
+            if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
+                foundGoalCommit = true
+            end
+            if item.type == "help" and type(item.getText) == "function" then
+                foundHelpGetText = true
+            end
+        end
+    end
+    assertTrue(foundBankCommit, "bank tab uses onCommit")
+    assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
+    assertTrue(foundHelpGetText, "status help uses getText")
+
+    local edits = findEditBoxes(configPanel)
+    assertTrue(#edits >= 1, "bank tab editbox present")
+    local bankEdit = edits[1]
+    bankEdit:SetText("2")
+    fire(bankEdit, "OnEnterPressed")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 2, "onCommit sets bank tab")
+
+    bankEdit:SetText("")
+    fire(bankEdit, "OnEditFocusLost")
+    assertNil(GS:GetCurrentRecord().accounting._consumables.bankTab, "onCommit clear removes bank tab")
+
+    -- Rejected invalid tab leaves state unchanged.
+    local opSet = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    GS:ApplyStagedConfigOperation(opSet)
+    bankEdit:SetText("9")
+    local messages = {}
+    local section = configPanel.__sfSections and configPanel.__sfSections.gsStatus
+    if section then
+        local priorSet = section.SetMessage
+        section.SetMessage = function(self, msg, sev)
+            messages[#messages + 1] = { msg = msg, sev = sev }
+            if priorSet then priorSet(self, msg, sev) end
+        end
+    end
+    fire(bankEdit, "OnEnterPressed")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "invalid tab leaves state")
+
+    -- New Campaign: bind before confirm; cancel leaves state; accept applies bound op.
+    local buttons = findButtons(configPanel)
+    local newCampaignBtn
+    for i = 1, #buttons do
+        if buttons[i].text == "New Campaign" then
+            newCampaignBtn = buttons[i]
+            break
+        end
+    end
+    assertTrue(newCampaignBtn ~= nil, "New Campaign button present")
+    local beforeCampaign = GS:GetCurrentRecord().currentCampaignId
+    pendingConfirm = nil
+    newCampaignBtn:Click()
+    assertTrue(pendingConfirm ~= nil, "New Campaign shows confirmation")
+    -- Cancel: do not invoke accept.
+    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeCampaign, "cancel leaves campaign")
+    -- Accept bound op.
+    local acceptFn = pendingConfirm.data
+    assertTrue(type(acceptFn) == "function", "confirm binds accept function")
+    acceptFn()
+    assertTrue(GS:GetCurrentRecord().currentCampaignId ~= beforeCampaign, "accept starts new campaign")
+
+    -- Concurrent campaign change while the dialog is open keeps the bound op from applying.
+    pendingConfirm = nil
+    newCampaignBtn:Click()
+    local boundAccept = pendingConfirm.data
+    assertTrue(type(boundAccept) == "function", "stale-case confirm binds accept")
+    local concurrent = GS:NewCampaignOperation()
+    local concStatus = GS:ApplyStagedCampaignOperation(concurrent)
+    assertEq(concStatus, "accepted", "concurrent campaign applies while dialog open")
+    local midCampaign = GS:GetCurrentRecord().currentCampaignId
+    local okCall = pcall(boundAccept)
+    assertTrue(okCall, "bound accept does not error")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, midCampaign,
+        "stale bound campaign op does not overwrite newer campaign")
+    assertTrue(GS:GetCurrentRecord().operations.records[concurrent.id] ~= nil,
+        "concurrent accepted op retained")
+
+    -- Cached Refresh after setup/campaign changes (no rebuild).
+    local refreshCalls = 0
+    local realRefresh = SF.SettingsUI.DefinitionRenderer.Refresh
+    SF.SettingsUI.DefinitionRenderer.Refresh = function(self, panel)
+        refreshCalls = refreshCalls + 1
+        return realRefresh(self, panel)
+    end
+    configPage:Refresh(configPanel)
+    assertEq(refreshCalls, 1, "Configuration Refresh uses renderer:Refresh")
+    configPanel.shown = false
+    configPage:Refresh(configPanel)
+    assertEq(refreshCalls, 1, "hidden Configuration skips Refresh")
+    configPanel.shown = true
+    SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
+
+    -- Logs: Build/reopen without openCount crash; dropdown labels; history rows.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local c1 = startCampaign()
+    local r = GS:GetCurrentRecord()
+    local gen = r.accounting._consumables.generation
+    r.accounting._consumableEvents[#r.accounting._consumableEvents + 1] = {
+        id = "ui-don",
+        type = "donation",
+        itemId = 50,
+        quantity = 3,
+        actor = "Carol-Garona",
+        generation = gen,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    startCampaign()
+
+    local logsPanel = makeRegion("Frame", "GSLogsPanel", nil)
+    logsPanel:SetSize(600, 800)
+    logsPage:Build(logsPanel)
+    assertTrue(logsPanel.__sfPageBuilder ~= nil, "Logs uses DefinitionRenderer:Build")
+    logsPage:Build(logsPanel) -- reopen / rebuild
+    assertTrue(logsPanel.__sfPageBuilder ~= nil, "Logs rebuild succeeds (no openCount crash)")
+
+    local drops = findDropdowns(logsPanel)
+    assertTrue(#drops >= 1, "campaign dropdown present")
+    local drop = drops[1]
+    assertTrue(type(drop.menuOptions) == "table" and #drop.menuOptions >= 1, "dropdown options built")
+    local labeled = false
+    for i = 1, #drop.menuOptions do
+        local lab = tostring(drop.menuOptions[i].label or "")
+        if lab:find("Current", 1, true) or lab:find("Archived", 1, true) then
+            labeled = true
+            break
+        end
+    end
+    assertTrue(labeled, "dropdown options use readable labels not raw ids only")
+
+    logsPage:Refresh(logsPanel)
+    -- Select archived campaign via set path and refresh history.
+    if drop.menuOptions[1] and drop.menuOptions[1].setSelected then
+        drop.menuOptions[1].setSelected(drop.menuOptions[1].value)
+    end
+    logsPage:Refresh(logsPanel)
+    local histRows, histTotal = GS:ListCampaignHistory(c1.id, 25, 0)
+    assertTrue((histTotal or 0) >= 1, "history projection available for UI")
+
+    -- Small-guild explicit threshold through CreateStagedRecord path used by UI.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    local _, stInit, errInit = GS:CreateStagedRecord()
+    assertEq(stInit, "rejected", "small guild without threshold rejected")
+    assertEq(errInit, "threshold_unselected", "threshold_unselected")
+    local recInit, stOk = GS:CreateStagedRecord(2)
+    assertEq(stOk, "accepted", "small guild with explicit threshold accepted")
+    assertEq(recInit.permission.editorRankPosition, 2, "selected threshold stored")
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    settleRoster()
+
+    CreateFrame = priorCreateFrame
+end
+
+-- 2B17) Confirmation start-time finalization, reason fallback, BankLog freshness lifecycle
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local op = GS:NewCampaignOperation()
+    local preparedTs = op.timestamp
+    local preparedBase = op.baseTargetRevision
+    local preparedPolicy = op.basePolicyRevision
+    local preparedGuild = op.guildKey
+    world.time = world.time + 120
+    local okFinal, finalErr = GS:FinalizeCampaignStartTime(op)
+    assertEq(okFinal, true, "finalize start time ok: " .. tostring(finalErr))
+    assertTrue(op.timestamp ~= preparedTs, "timestamp finalized at accept time")
+    assertEq(op.timestamp, math.floor(world.time), "final timestamp uses accept-time server time")
+    assertEq(op.baseTargetRevision, preparedBase, "base target preserved")
+    assertEq(op.basePolicyRevision, preparedPolicy, "base policy preserved")
+    assertEq(op.guildKey, preparedGuild, "guild scope preserved")
+    local status = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "accepted", "delayed finalize then apply accepted")
+    assertEq(GS:GetCurrentRecord().campaigns[op.id].startedAt, op.timestamp,
+        "campaign startedAt uses finalized timestamp")
+    -- Exact retry must not restamp.
+    local priorTs = op.timestamp
+    world.time = world.time + 50
+    assertEq(GS:FinalizeCampaignStartTime(op), true, "finalize no-op after accept")
+    assertEq(op.timestamp, priorTs, "accepted body timestamp not restamped")
+    assertEq(GS:ApplyStagedCampaignOperation(op), "duplicate", "exact replay remains duplicate")
+
+    local generic = GS.FormatReasonText("totally_unknown_code_xyz")
+    assertTrue(generic:find("could not be applied", 1, true), "generic reason localized")
+    assertEq(generic:find("totally_unknown_code_xyz", 1, true), nil, "generic reason hides raw code")
+    assertTrue(GS.FormatReasonText("no_campaign"):find("New Campaign", 1, true),
+        "mapped no_campaign wording")
+    assertTrue(GS.FormatReasonText("stale_handle"):find("out of date", 1, true),
+        "mapped stale_handle wording")
+
+    -- Production BankLog → adapter lifecycle (RequestLog / CancelTimers / ProcessLogUpdate).
+    GS._BankContextReadinessProbe = nil
+    world.bankTxnCounts = { [1] = 0 }
+    world.bankTabInfo = {
+        [1] = { name = "Supplies", isViewable = true },
+    }
+    world.logQueries = {}
+    world.afterFns = {}
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction()
+        return "deposit", "Alice-Garona", nil, 1, nil, nil, 0, 1, 1, 1
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    function QueryGuildBankLog(tab)
+        world.logQueries[#world.logQueries + 1] = tab
+    end
+    local priorAfter = C_Timer and C_Timer.After
+    C_Timer = C_Timer or {}
+    C_Timer.After = function(_, fn)
+        world.afterFns[#world.afterFns + 1] = fn
+    end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    BankLog.active = true
+    BankLog.bankOpen = true
+    BankLog.awaitingLogUpdate = false
+    BankLog.queryRetries = 0
+    BankLog.queryToken = 0
+    BankLog.activeContext = {
+        bankTab = 1, guildGuid = "42", profileId = "p-gs",
+        generation = 1, requestedSet = { [10] = true }, observedBy = "Alice-Garona",
+    }
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog.lastFreshLogAt = world.time
+    local priorEligible = BankLog.EligibleContext
+    function BankLog:EligibleContext()
+        return self.activeContext
+    end
+
+    assertEq(GS.IsBankContextSampleReady(1), true, "viewable stamped tab is ready")
+    local ctx = GS.CaptureBankContext(1)
+    assertEq(ctx.status, "empty", "ready viewable tab may be empty")
+
+    -- New query invalidates prior stamp via production RequestLog.
+    BankLog:RequestLog("test")
+    assertEq(BankLog.lastFreshLogTab, nil, "RequestLog clears freshness stamp")
+    assertEq(BankLog.awaitingLogUpdate, true, "RequestLog awaits update")
+    assertEq(GS.CaptureBankContext(1).status, "unavailable", "awaiting query is unavailable")
+    assertEq(GS.CaptureBankContext(1).reason, "log_pending", "log_pending while awaiting")
+
+    -- Failed ProcessLogUpdate clears stamp and awaiting.
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    local priorCount = GetNumGuildBankTransactions
+    GetNumGuildBankTransactions = function() return "bad" end
+    BankLog:ProcessLogUpdate("failed")
+    assertEq(BankLog.lastFreshLogTab, nil, "failed ProcessLogUpdate clears stamp")
+    assertEq(BankLog.awaitingLogUpdate, false, "failed ProcessLogUpdate clears awaiting")
+    GetNumGuildBankTransactions = priorCount
+
+    -- Exhaustion path clears stamp.
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog.awaitingLogUpdate = true
+    BankLog.queryRetries = 5
+    BankLog:RequestLog("retry")
+    assertEq(BankLog.lastFreshLogTab, nil, "exhausted RequestLog clears stamp before terminal wait")
+    local terminal = world.afterFns[#world.afterFns]
+    assertTrue(type(terminal) == "function", "exhaustion schedules terminal callback")
+    terminal()
+    assertEq(BankLog.awaitingLogUpdate, false, "exhaustion clears awaiting")
+    assertEq(BankLog.lastFreshLogTab, nil, "exhaustion keeps stamp cleared")
+
+    -- Successful update restores stamp.
+    BankLog.awaitingLogUpdate = true
+    GetNumGuildBankTransactions = function() return 0 end
+    BankLog:ProcessLogUpdate("success")
+    assertEq(BankLog.lastFreshLogTab, 1, "successful update restores stamp")
+    assertEq(GS.CaptureBankContext(1).status, "empty", "restored stamp allows empty")
+
+    -- Slot-change inside throttle: invalidate stamp without issuing another query.
+    world.logQueries = {}
+    BankLog.awaitingLogUpdate = false
+    BankLog.lastQueryAt = world.time
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog.lastFreshLogAt = world.time
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(#world.logQueries, 0, "throttled slots_changed does not query")
+    assertEq(BankLog.lastFreshLogTab, nil, "slots_changed clears stamp inside throttle")
+    assertEq(GS.IsBankContextSampleReady(1), false, "readiness unavailable after throttled slot change")
+    assertEq(select(2, GS.IsBankContextSampleReady(1)), "log_not_updated",
+        "throttled slot change reason is log_not_updated")
+    assertEq(GS.CaptureBankContext(1).status, "unavailable",
+        "CaptureBankContext unavailable after throttled slot change")
+    -- Genuine successful update restores readiness without requiring a new query first.
+    BankLog.awaitingLogUpdate = true
+    BankLog:ProcessLogUpdate("slot_restore")
+    assertEq(BankLog.lastFreshLogTab, 1, "successful update restores stamp after slot invalidate")
+    assertEq(GS.IsBankContextSampleReady(1), true, "readiness restored after successful update")
+
+    -- Slot change while a query is already outstanding: clear stamp, coalesce query.
+    world.logQueries = {}
+    BankLog.awaitingLogUpdate = true
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(#world.logQueries, 0, "outstanding slots_changed does not start a second query")
+    assertEq(BankLog.lastFreshLogTab, nil, "outstanding slots_changed clears stamp")
+    assertEq(BankLog.awaitingLogUpdate, true, "outstanding query remains awaiting")
+    assertEq(select(2, GS.IsBankContextSampleReady(1)), "log_pending",
+        "outstanding slots_changed stays log_pending")
+
+    -- Production CancelTimers clears stamp and awaiting.
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog.awaitingLogUpdate = true
+    BankLog:CancelTimers("test_cancel")
+    assertEq(BankLog.lastFreshLogTab, nil, "CancelTimers clears freshness stamp")
+    assertEq(BankLog.awaitingLogUpdate, false, "CancelTimers clears awaiting")
+    assertEq(GS.IsBankContextSampleReady(1), false, "CancelTimers leaves readiness unavailable")
+
+    -- Denied / unknown tab access.
+    BankLog.awaitingLogUpdate = false
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    world.bankTabInfo[1].isViewable = false
+    local deniedReady, deniedReason = GS.IsBankContextSampleReady(1)
+    assertEq(deniedReady, false, "denied tab access not ready")
+    assertEq(deniedReason, "tab_access_denied", "denied reason")
+    assertEq(GS.CaptureBankContext(1).status, "unavailable", "denied access is unavailable")
+    world.bankTabInfo[1].isViewable = true
+    world.bankTabInfo[1].name = nil
+    assertEq(select(2, GS.IsBankContextSampleReady(1)), "tab_access_unknown", "unknown access")
+    -- New Campaign still succeeds when context unavailable.
+    world.bankTabInfo[1] = { name = "Supplies", isViewable = true }
+    BankLog.lastFreshLogTab = nil
+    local campOp = GS:NewCampaignOperation()
+    assertTrue(campOp ~= nil, "New Campaign prepared while bank unavailable")
+    assertEq(GS:ApplyStagedCampaignOperation(campOp), "accepted", "New Campaign accepted without bank context")
+
+    BankLog.EligibleContext = priorEligible
+    C_Timer.After = priorAfter
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+    GetGuildBankTabInfo = nil
+    QueryGuildBankLog = nil
+end
+
+-- 2B18) Extended production UI: bank double-commit, duplicate Add, history pager, recovery, roster
+do
+    local created = {}
+    local function fire(region, event, ...)
+        local script = region.scripts and region.scripts[event]
+        if script then script(region, ...) end
+        for _, hook in ipairs((region.hooks and region.hooks[event]) or {}) do
+            hook(region, ...)
+        end
+    end
+    local function makeRegion(kind, name, parent, template)
+        local region = {
+            kind = kind, name = name, parent = parent, shown = true,
+            height = 40, width = 400, points = {}, scripts = {}, hooks = {},
+            children = {}, text = "", enabled = true, focused = false,
+            registeredEvents = {},
+        }
+        created[#created + 1] = region
+        if parent and parent.children then parent.children[#parent.children + 1] = region end
+        function region:GetObjectType() return self.kind or "Frame" end
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetAllPoints() end
+        function region:SetHeight(h) self.height = tonumber(h) or 0 end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = tonumber(w) or 0 end
+        function region:GetWidth() return self.width end
+        function region:SetSize(w, h) self:SetWidth(w); self:SetHeight(h) end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown and true or false end
+        -- Model StandaloneWindow: child may stay IsShown while parent is hidden.
+        function region:IsVisible()
+            if self.visible ~= nil then return self.visible == true end
+            local p = self.parent
+            while p do
+                if p.visible == false or p.shown == false then return false end
+                p = p.parent
+            end
+            return self.shown and true or false
+        end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:SetAlpha() end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetNonSpaceWrap() end
+        function region:SetMaxLines() end
+        function region:SetAutoFocus() end
+        function region:SetNumeric() end
+        function region:SetMaxLetters() end
+        function region:SetHighlightColor() end
+        function region:SetCursorPosition() end
+        function region:HasFocus() return self.focused end
+        function region:ClearFocus()
+            self.focused = false
+            fire(self, "OnEditFocusLost")
+        end
+        function region:SetFocus() self.focused = true end
+        function region:GetStringWidth() return 40 end
+        function region:GetStringHeight() return 12 end
+        function region:SetColorTexture() end
+        function region:SetTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetVertexColor() end
+        function region:SetBlendMode() end
+        function region:SetVerticalScroll() end
+        function region:SetScrollChild(child) self.scrollChild = child end
+        function region:CreateTexture() return makeRegion("Texture", nil, self) end
+        function region:CreateFontString() return makeRegion("FontString", nil, self) end
+        function region:CreateFrame() return makeRegion("Frame", nil, self) end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:SetDefaultText(t) self.defaultText = t end
+        function region:SetupMenu(gen)
+            self.menuGenerator = gen
+            self.menuOptions = {}
+            local root = {
+                CreateRadio = function(_, label, isSelected, setSelected, value)
+                    self.menuOptions[#self.menuOptions + 1] = {
+                        label = label, value = value, isSelected = isSelected, setSelected = setSelected,
+                    }
+                end,
+            }
+            if type(gen) == "function" then gen(self, root) end
+        end
+        function region:GenerateMenu()
+            if self.menuGenerator then self:SetupMenu(self.menuGenerator) end
+        end
+        function region:SetChecked(v) self.checked = v and true or false end
+        function region:GetChecked() return self.checked and true or false end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:SetCheckedTexture() end
+        function region:SetDisabledCheckedTexture() end
+        function region:RegisterForClicks() end
+        function region:Click() fire(self, "OnClick") end
+        function region:SetFontObject() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:SetClipsChildren() end
+        function region:EnableDrawLayer() end
+        function region:DisableDrawLayer() end
+        function region:SetPropagateKeyboardInput() end
+        function region:SetObeyStepOnDrag() end
+        function region:SetMinMaxValues() end
+        function region:SetValueStep() end
+        function region:SetValue() end
+        function region:GetValue() return self.value or 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:GetName() return self.name end
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeRegion("Slider", nil, region)
+            region.ScrollBar:SetWidth(20)
+            region.ScrollBar.shown = false
+        end
+        return region
+    end
+
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        return makeRegion(frameType or "Frame", name, parent, template)
+    end
+    if type(CopyTable) ~= "function" then
+        function CopyTable(t)
+            if type(t) ~= "table" then return t end
+            local out = {}
+            for k, v in pairs(t) do
+                out[k] = type(v) == "table" and CopyTable(v) or v
+            end
+            return out
+        end
+    end
+    GameTooltip = GameTooltip or {
+        Hide = function() end, SetOwner = function() end, SetText = function() end,
+        AddLine = function() end, Show = function() end,
+    }
+    OKAY = OKAY or "OK"
+    CANCEL = CANCEL or "Cancel"
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    local pendingConfirm
+    function StaticPopup_Show(key, message, _, data)
+        pendingConfirm = { key = key, message = message, data = data }
+        return { key = key }
+    end
+
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    SF.SettingsUI.categories = SF.SettingsUI.categories or {}
+    function SF.SettingsUI:RegisterCategory(cat) self.categories[cat.id] = cat end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    SF.SettingsStore = SF.SettingsStore or {
+        Get = function() return true end,
+        Set = function() end,
+    }
+    -- Reload page modules under this CreateFrame so roster listeners join this harness.
+    if not SF.SettingsUI.DefinitionRenderer then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    end
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+
+    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(configPage ~= nil and logsPage ~= nil, "pages available for 2B18")
+
+    local function findEditBoxes(node, out)
+        out = out or {}
+        if node.kind == "EditBox" then out[#out + 1] = node end
+        for _, child in ipairs(node.children or {}) do findEditBoxes(child, out) end
+        return out
+    end
+    local function countOps(record)
+        local n = 0
+        for _ in pairs(record.operations.records or {}) do n = n + 1 end
+        return n
+    end
+
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+
+    local configPanel = makeRegion("Frame", "GSConfigPanel2", nil)
+    configPanel:SetSize(600, 800)
+    configPage:Build(configPanel)
+    local edits = findEditBoxes(configPanel)
+    assertTrue(#edits >= 1, "bank edit present in 2B18")
+    local bankEdit = edits[1]
+    local beforeOps = countOps(GS:GetCurrentRecord())
+    bankEdit:SetText("4")
+    fire(bankEdit, "OnEnterPressed")
+    -- AddEditBox ClearFocus after Enter.
+    bankEdit:ClearFocus()
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 4, "bank tab set once")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps + 1,
+        "Enter+focus-loss admits exactly one bank-tab operation")
+    -- Unchanged focus loss admits none.
+    beforeOps = countOps(GS:GetCurrentRecord())
+    fire(bankEdit, "OnEditFocusLost")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "unchanged focus loss allocates no op")
+
+    -- Add + goal edit through production control callbacks (not domain-only).
+    local def = configPanel.__sfPageDef
+    local addHandler, goalHandler
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "editboxButton" and type(item.onSubmit) == "function" then
+                addHandler = item.onSubmit
+            end
+            if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
+                goalHandler = item.onGoalCommit
+            end
+        end
+    end
+    assertTrue(addHandler ~= nil, "Add onSubmit present")
+    assertTrue(goalHandler ~= nil, "onGoalCommit present")
+    local messages = {}
+    local refreshViaPass = 0
+    local ctx = {
+        section = {
+            SetMessage = function(_, msg, sev) messages[#messages + 1] = { msg = msg, sev = sev } end,
+            ClearMessage = function() end,
+        },
+        pageBuilder = {
+            Refresh = function()
+                -- Legacy path should not be required; Page:Refresh owns pass cache.
+                refreshViaPass = refreshViaPass + 1
+            end,
+        },
+    }
+    beforeOps = countOps(GS:GetCurrentRecord())
+    addHandler(ctx, "777")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps + 1, "Add admits one operation")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 0, "Add starts goal 0")
+    beforeOps = countOps(GS:GetCurrentRecord())
+    goalHandler(ctx, { itemId = 777 }, "12")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 12,
+        "goal commit via onGoalCommit")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps + 1, "goal commit admits one operation")
+    -- Range feedback for MAX_GOAL+1.
+    messages = {}
+    beforeOps = countOps(GS:GetCurrentRecord())
+    goalHandler(ctx, { itemId = 777 }, "100001")
+    assertTrue(#messages >= 1, "over-max goal shows feedback")
+    assertTrue((messages[#messages].msg or ""):find("0 to 100000", 1, true)
+        or (messages[#messages].msg or ""):find("100000", 1, true),
+        "over-max goal localized range: " .. tostring(messages[#messages] and messages[#messages].msg))
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "over-max goal allocates no op")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 12,
+        "over-max preserves prior goal")
+    goalHandler(ctx, { itemId = 777 }, "0")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 0, "goal 0 accepted")
+    goalHandler(ctx, { itemId = 777 }, "100000")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 100000,
+        "MAX_GOAL accepted")
+    goalHandler(ctx, { itemId = 777 }, "12")
+    local cutoff = GS:GetCurrentRecord().accounting._consumables.eligibility.items["777"]
+    beforeOps = countOps(GS:GetCurrentRecord())
+    messages = {}
+    addHandler(ctx, "777")
+    assertTrue(#messages >= 1, "duplicate Add shows feedback")
+    assertTrue((messages[1].msg or ""):find("already", 1, true), "duplicate Add localized")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "duplicate Add allocates no operation")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 12,
+        "duplicate Add preserves goal")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["777"], cutoff,
+        "duplicate Add preserves eligibility cutoff")
+
+    -- Delayed confirmation finalizes timestamp through UI accept path.
+    pendingConfirm = nil
+    local newCampaignBtn
+    local function findButtons(node, out)
+        out = out or {}
+        if node.kind == "Button" and node.text then out[#out + 1] = node end
+        for _, child in ipairs(node.children or {}) do findButtons(child, out) end
+        return out
+    end
+    for _, btn in ipairs(findButtons(configPanel)) do
+        if btn.text == "New Campaign" then newCampaignBtn = btn break end
+    end
+    assertTrue(newCampaignBtn ~= nil, "New Campaign button in 2B18")
+    newCampaignBtn:Click()
+    assertTrue(pendingConfirm ~= nil, "confirm shown")
+    local acceptFn = pendingConfirm.data
+    local prepareTime = world.time
+    world.time = world.time + 90
+    acceptFn()
+    local curId = GS:GetCurrentRecord().currentCampaignId
+    local startedAt = GS:GetCurrentRecord().campaigns[curId].startedAt
+    assertTrue(startedAt >= prepareTime + 90 or startedAt == math.floor(world.time),
+        "UI accept finalizes start timestamp")
+
+    -- Cached open/hide/reopen: Settings parent hide (panel stays IsShown).
+    local settingsParent = makeRegion("Frame", "GSSettingsParent", nil)
+    configPanel.parent = settingsParent
+    settingsParent.shown = true
+    local refreshCount = 0
+    local realRefresh = SF.SettingsUI.DefinitionRenderer.Refresh
+    SF.SettingsUI.DefinitionRenderer.Refresh = function(self, panel)
+        refreshCount = refreshCount + 1
+        return realRefresh(self, panel)
+    end
+    local function fireRosterEvents()
+        for i = 1, #created do
+            local f = created[i]
+            if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE
+                and f.scripts and f.scripts.OnEvent then
+                f.scripts.OnEvent(f, "GUILD_ROSTER_UPDATE")
+            end
+        end
+    end
+    local priorAfter = C_Timer.After
+    local deferredFns = {}
+    C_Timer.After = function(_, fn)
+        deferredFns[#deferredFns + 1] = fn
+    end
+    settingsParent.shown = false
+    configPanel.shown = true -- child remains locally shown under hidden parent
+    refreshCount = 0
+    deferredFns = {}
+    fireRosterEvents()
+    assertEq(#deferredFns, 0, "hidden Settings parent does not queue roster refresh")
+    assertEq(refreshCount, 0, "hidden Settings parent skips roster refresh")
+    settingsParent.shown = true
+    configPage:Refresh(configPanel)
+    assertTrue(refreshCount >= 1, "cached reopen uses Refresh when parent visible")
+    local rosterListeners = 0
+    for i = 1, #created do
+        local f = created[i]
+        if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE then
+            rosterListeners = rosterListeners + 1
+        end
+    end
+    assertTrue(rosterListeners >= 1 and rosterListeners <= 4,
+        "bounded guild roster listeners: " .. tostring(rosterListeners))
+    refreshCount = 0
+    deferredFns = {}
+    fireRosterEvents()
+    fireRosterEvents()
+    fireRosterEvents()
+    assertEq(#deferredFns, 1, "roster burst queues a single coalesced callback")
+    deferredFns[1]()
+    assertEq(refreshCount, 1, "deferred roster burst coalesces to one refresh")
+    C_Timer.After = priorAfter
+    SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
+
+    -- Membership/readiness restoration through deferred roster event (no manual Refresh).
+    local priorMembers = world.guild.members
+    local function statusAndItemCount()
+        local status, itemCount
+        for _, sec in ipairs((configPanel.__sfPageDef and configPanel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
+                    status = item.getText()
+                end
+                if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
+                    itemCount = #item.getItems()
+                end
+            end
+        end
+        return status, itemCount
+    end
+    world.guild.members = {} -- demand roster no longer verifies local membership
+    deferredFns = {}
+    C_Timer.After = function(_, fn)
+        deferredFns[#deferredFns + 1] = fn
+    end
+    fireRosterEvents()
+    assertEq(#deferredFns, 1, "membership loss queues deferred page refresh")
+    deferredFns[1]()
+    assertEq(GS:GetCapabilities().canRead, false, "unverified membership canRead false")
+    local statusText, itemCount = statusAndItemCount()
+    assertEq(itemCount, 0, "items redacted without canRead via deferred event")
+    assertTrue(type(statusText) == "string" and statusText:find("membership", 1, true),
+        "status redacts shared data pending membership: " .. tostring(statusText))
+    world.guild.members = priorMembers
+    settleRoster()
+    deferredFns = {}
+    fireRosterEvents()
+    assertEq(#deferredFns, 1, "membership restore queues deferred page refresh")
+    deferredFns[1]()
+    assertEq(GS:GetCapabilities().canRead, true, "membership ready restores canRead via deferred event")
+    statusText, itemCount = statusAndItemCount()
+    assertTrue(type(statusText) == "string" and not statusText:find("membership is still", 1, true),
+        "status leaves membership-pending wording after restore")
+    C_Timer.After = priorAfter
+    SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
+
+    -- History pager: drive Older/Newer and assert displayed ranges + pager state.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local archiveCamp = startCampaign()
+    local rec = GS:GetCurrentRecord()
+    local gen = rec.accounting._consumables.generation
+    for i = 1, 30 do
+        rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+            id = "hist-" .. i,
+            type = "donation",
+            itemId = 10,
+            quantity = 1,
+            actor = "Bob-Garona",
+            generation = gen,
+            timestamp = world.time + i,
+            source = "guildbank",
+        }
+    end
+    startCampaign() -- current empty
+    local rows, total = GS:ListCampaignHistory(archiveCamp.id, 25, 0)
+    assertEq(total, 30, "archived history total 30")
+    assertTrue((rows[1].text or ""):find("donated", 1, true), "history text includes donation")
+    assertTrue((rows[1].text or ""):find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
+        "history text includes recognizable timestamp: " .. tostring(rows[1].text))
+
+    local logsParent = makeRegion("Frame", "GSLogsParent", nil)
+    local logsPanel = makeRegion("Frame", "GSLogsPanel2", logsParent)
+    logsPanel:SetSize(600, 800)
+    logsPage:Build(logsPanel)
+    local drops = {}
+    local function findDropdowns(node)
+        if node.kind == "DropdownButton" then drops[#drops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findDropdowns(child) end
+    end
+    findDropdowns(logsPanel)
+    assertTrue(#drops >= 1, "logs dropdown present")
+    local archivedValue
+    for i = 1, #(drops[1].menuOptions or {}) do
+        local opt = drops[1].menuOptions[i]
+        if tostring(opt.label or ""):find("Archived", 1, true) then
+            archivedValue = opt.value
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    assertTrue(archivedValue ~= nil, "archived campaign option present")
+    logsPage:Refresh(logsPanel)
+    assertTrue((logsPage.historyTotal or 0) > 25, "historyTotal synced before pager")
+    assertEq(logsPage.historyOffset or 0, 0, "pager starts at offset 0")
+    local function historyItemsFromDef()
+        for _, sec in ipairs((logsPanel.__sfPageDef and logsPanel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "scrollList" and type(item.getItems) == "function" then
+                    local got = item.getItems()
+                    if type(got) == "table" and got[1] and type(got[1].id) == "string"
+                        and tostring(got[1].id):find("^hist%-") then
+                        return got
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    local page0 = historyItemsFromDef()
+    assertTrue(type(page0) == "table" and #page0 == 25, "first history page has 25 rows")
+    assertEq(page0[1].id, "hist-30", "newest event first on page 0")
+    assertEq(page0[25].id, "hist-6", "oldest-on-page event at end of page 0")
+    local olderBtn, newerBtn
+    local function findNamedButtons(node)
+        olderBtn, newerBtn = nil, nil
+        local function walk(n)
+            if n.kind == "Button" then
+                if n.text == "Older" then olderBtn = n end
+                if n.text == "Newer" then newerBtn = n end
+            end
+            for _, child in ipairs(n.children or {}) do walk(child) end
+        end
+        walk(node)
+    end
+    findNamedButtons(logsPanel)
+    assertTrue(olderBtn ~= nil, "Older button present")
+    assertTrue(newerBtn ~= nil, "Newer button present")
+    assertTrue(olderBtn.enabled ~= false, "Older enabled for >25 archive rows")
+    local totalBefore = logsPage.historyTotal
+    local recordCalls = 0
+    local realGetCurrentRecord = GS.GetCurrentRecord
+    GS.GetCurrentRecord = function(self, ...)
+        recordCalls = recordCalls + 1
+        return realGetCurrentRecord(self, ...)
+    end
+    olderBtn:Click()
+    assertEq(logsPage.historyTotal, totalBefore, "pager keeps total after Older")
+    assertEq(logsPage.historyOffset, 25, "Older advances historyOffset to 25")
+    local page1 = historyItemsFromDef()
+    assertTrue(type(page1) == "table" and #page1 == 5, "second history page has remaining 5 rows")
+    assertEq(page1[1].id, "hist-5", "Older page starts at hist-5")
+    assertEq(page1[5].id, "hist-1", "Older page ends at hist-1")
+    -- Bound is control/render-pass scale, not one call per retained history event.
+    assertTrue(recordCalls > 0 and recordCalls <= 40 and recordCalls < total,
+        "populated-history validation work stays bounded on Older render: " .. tostring(recordCalls))
+    findNamedButtons(logsPanel)
+    assertTrue(newerBtn ~= nil and newerBtn.enabled ~= false, "Newer enabled after Older")
+    newerBtn:Click()
+    assertEq(logsPage.historyOffset, 0, "Newer returns historyOffset to 0")
+    local pageBack = historyItemsFromDef()
+    assertEq(pageBack[1].id, "hist-30", "Newer restores newest page")
+    assertEq(pageBack[25].id, "hist-6", "Newer restores first-page tail")
+    GS.GetCurrentRecord = realGetCurrentRecord
+
+    -- Ordinary-guild GM recovery through dropdown + confirmation (not domain-only).
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+    record.permission.revisionId = "gs1:broken-policy-rev:1"
+    assertEq(GS:GetCapabilities().canRecoverPolicy, true, "GM canRecoverPolicy under permission-only failure")
+    assertNil(select(1, GS:GetCurrentRecord()), "GetCurrentRecord nil for permission-only failure")
+    local recoverPanel = makeRegion("Frame", "GSRecoverPanel", nil)
+    recoverPanel:SetSize(600, 800)
+    pendingConfirm = nil
+    configPage:Build(recoverPanel)
+    local recoverDrops = {}
+    local function findDrops(node)
+        if node.kind == "DropdownButton" then recoverDrops[#recoverDrops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findDrops(child) end
+    end
+    findDrops(recoverPanel)
+    assertTrue(#recoverDrops >= 1, "recovery rank dropdown present")
+    recoverDrops[1]:GenerateMenu()
+    local picked
+    for i = 1, #(recoverDrops[1].menuOptions or {}) do
+        local opt = recoverDrops[1].menuOptions[i]
+        if opt.value == 2 then
+            picked = opt
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    assertTrue(picked ~= nil, "recovery selected rank 2")
+    assertTrue(pendingConfirm ~= nil, "recovery confirmation shown")
+    pendingConfirm.data()
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2,
+        "UI recovery admits editor rank")
+
+    -- Small-guild permission-only recovery must not take the Initialize branch.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    local smallRec, smallSt = GS:CreateStagedRecord(2)
+    assertEq(smallSt, "accepted", "small guild configured with explicit threshold")
+    assertTrue(smallRec ~= nil, "small guild record created")
+    smallRec.permission.revisionId = "gs1:broken-small:1"
+    assertNil(select(1, GS:GetCurrentRecord()), "small guild GetCurrentRecord nil")
+    assertEq(GS:GetCapabilities().canRecoverPolicy, true, "small guild GM canRecoverPolicy")
+    pendingConfirm = nil
+    local smallPanel = makeRegion("Frame", "GSSmallRecover", nil)
+    smallPanel:SetSize(600, 800)
+    configPage:Build(smallPanel)
+    local initEnabled = false
+    for _, sec in ipairs((smallPanel.__sfPageDef and smallPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText and item.buttonText:find("Initialize", 1, true) then
+                initEnabled = item.enabled and item.enabled() or false
+            end
+        end
+    end
+    assertEq(initEnabled, false, "Initialize disabled for existing unusable record")
+    local smallDrops = {}
+    local function findSmallDrops(node)
+        if node.kind == "DropdownButton" then smallDrops[#smallDrops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findSmallDrops(child) end
+    end
+    findSmallDrops(smallPanel)
+    assertTrue(#smallDrops >= 1, "small-guild recovery dropdown present")
+    smallDrops[1]:GenerateMenu()
+    for i = 1, #(smallDrops[1].menuOptions or {}) do
+        local opt = smallDrops[1].menuOptions[i]
+        if opt.value == 1 then
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    assertTrue(pendingConfirm ~= nil, "small-guild recovery opens confirmation not init")
+    pendingConfirm.data()
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
+        "small-guild UI recovery admits rank")
+
+    -- Ordinary (>=3 ranks) not_configured: rank edits disabled until Initialize.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    settleRoster()
+    pendingConfirm = nil
+    local ordinaryInitPanel = makeRegion("Frame", "GSOrdinaryInit", nil)
+    ordinaryInitPanel:SetSize(600, 800)
+    configPage:Build(ordinaryInitPanel)
+    local function rankDropdownEnabled(panel)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "dropdown" and item.label
+                    and tostring(item.label):find("Editor", 1, true)
+                    and type(item.enabled) == "function" then
+                    return item.enabled() and true or false
+                end
+            end
+        end
+        return nil
+    end
+    assertEq(rankDropdownEnabled(ordinaryInitPanel), false,
+        "ordinary not_configured disables editor-rank edits")
+    assertEq(select(2, GS:GetCurrentRecord()), "not_configured", "ordinary guild not_configured")
+    local ordinaryInitBtn
+    local function findOrdinaryInit(node)
+        if node.kind == "Button" and node.text and node.text:find("Initialize", 1, true) then
+            ordinaryInitBtn = node
+        end
+        for _, child in ipairs(node.children or {}) do findOrdinaryInit(child) end
+    end
+    findOrdinaryInit(ordinaryInitPanel)
+    configPage:Refresh(ordinaryInitPanel)
+    findOrdinaryInit(ordinaryInitPanel)
+    assertTrue(ordinaryInitBtn ~= nil and ordinaryInitBtn.enabled ~= false,
+        "ordinary Initialize enabled without explicit threshold")
+    ordinaryInitBtn:Click()
+    local ordinaryRec = GS:GetCurrentRecord()
+    assertTrue(ordinaryRec ~= nil, "ordinary Initialize creates dataset")
+    assertEq(ordinaryRec.permission.editorRankPosition, GS.DEFAULT_EDITOR_RANK_POSITION or 3,
+        "ordinary Initialize admits default editor rank policy")
+    configPage:Refresh(ordinaryInitPanel)
+    assertEq(rankDropdownEnabled(ordinaryInitPanel), true,
+        "editor-rank edits enabled after ordinary Initialize")
+
+    -- Pending init rank bound to guild context; click Initialize and assert dataset/policy.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    pendingConfirm = nil
+    local initPanel = makeRegion("Frame", "GSInitPanel", nil)
+    initPanel:SetSize(600, 800)
+    configPage:Build(initPanel)
+    local initDrops = {}
+    local function findInitDrops(node)
+        if node.kind == "DropdownButton" then initDrops[#initDrops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findInitDrops(child) end
+    end
+    findInitDrops(initPanel)
+    initDrops[1]:GenerateMenu()
+    for i = 1, #(initDrops[1].menuOptions or {}) do
+        local opt = initDrops[1].menuOptions[i]
+        if opt.value == 2 then
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    local initBtn
+    local function findInitBtn(node)
+        if node.kind == "Button" and node.text and node.text:find("Initialize", 1, true) then
+            initBtn = node
+        end
+        for _, child in ipairs(node.children or {}) do findInitBtn(child) end
+    end
+    findInitBtn(initPanel)
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    assertTrue(initBtn ~= nil and initBtn.enabled ~= false, "Initialize enabled after pending rank")
+    assertNil(select(1, GS:GetCurrentRecord()), "no dataset before Initialize click")
+    initBtn:Click()
+    local createdRec, createdReason = GS:GetCurrentRecord()
+    assertTrue(createdRec ~= nil, "Initialize click creates dataset: " .. tostring(createdReason))
+    assertEq(createdRec.permission.editorRankPosition, 2,
+        "Initialize click admits selected editor rank policy")
+    assertEq(createdRec.activation, GS.ACTIVATION_STAGED, "Initialize creates staged activation")
+    assertTrue(type(createdRec.datasetId) == "string" and createdRec.datasetId ~= "",
+        "Initialize creates datasetId")
+
+    -- Fresh not-configured guild: unchanged roster keeps pending rank; guild change clears it.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    pendingConfirm = nil
+    initPanel = makeRegion("Frame", "GSInitPanel2", nil)
+    initPanel:SetSize(600, 800)
+    configPage:Build(initPanel)
+    initDrops = {}
+    findInitDrops(initPanel)
+    assertTrue(#initDrops >= 1, "init rank dropdown present for reselect")
+    initDrops[1]:GenerateMenu()
+    local selectedPending = false
+    for i = 1, #(initDrops[1].menuOptions or {}) do
+        local opt = initDrops[1].menuOptions[i]
+        if opt.value == 2 then
+            opt.setSelected(opt.value)
+            selectedPending = true
+            break
+        end
+    end
+    assertEq(selectedPending, true, "pending init rank 2 selected")
+    initBtn = nil
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    assertTrue(initBtn ~= nil and initBtn.enabled ~= false, "Initialize enabled after reselect")
+    C_Timer.After = function(_, fn) fn() end
+    for i = 1, #created do
+        local f = created[i]
+        if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE
+            and f.scripts and f.scripts.OnEvent then
+            f.scripts.OnEvent(f, "GUILD_ROSTER_UPDATE")
+        end
+    end
+    initBtn = nil
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    assertTrue(initBtn ~= nil and initBtn.enabled ~= false, "unchanged roster keeps pending init rank")
+    -- Restore deferred timers before further settleRoster calls; an immediate
+    -- C_Timer.After would fire the demand-roster wait timeout before the update.
+    C_Timer.After = priorAfter
+    -- Guild change clears pending selection.
+    world.guild.clubId = 99
+    settleRoster()
+    initBtn = nil
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    local stillEnabled = initBtn and initBtn.enabled
+    -- After guild change, needs reselection (Initialize disabled until new pending).
+    assertTrue(stillEnabled == false or stillEnabled == nil,
+        "guild change requires init rank reselection")
+
+    -- Requested-item bounds: over-cap/invalid fixtures stay unavailable; valid max renders.
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    local createdBound, createdBoundStatus, createdBoundReason = GS:CreateStagedRecord()
+    assertEq(createdBoundStatus, "accepted",
+        "bounds fixture CreateStagedRecord: " .. tostring(createdBoundReason))
+    assertTrue(createdBound ~= nil, "bounds fixture record created")
+    startCampaign()
+    local boundRec = GS:GetCurrentRecord()
+    assertTrue(boundRec ~= nil, "bounds fixture current record available")
+    local boundItems = boundRec.accounting._consumables.requestedItems
+    local maxItems = (SF.Consumables and SF.Consumables.MAX_REQUESTED_ITEMS) or 256
+    for i = 1, maxItems do
+        boundItems[tostring(1000 + i)] = { itemId = 1000 + i, goal = i }
+    end
+    local okMax, errMax = GS.ValidateRequestedItemsMap(boundItems)
+    assertEq(okMax, true, "valid maximum-sized map accepted")
+    local copiedMax = GS:GetCampaignRequestedItems(boundRec.currentCampaignId)
+    local copiedCount = 0
+    for _ in pairs(copiedMax or {}) do copiedCount = copiedCount + 1 end
+    assertEq(copiedCount, maxItems, "GetCampaignRequestedItems returns full max-sized map")
+    local boundsPanel = makeRegion("Frame", "GSBoundsPanel", nil)
+    boundsPanel:SetSize(600, 800)
+    configPage:Build(boundsPanel)
+    local maxRowCount
+    for _, sec in ipairs((boundsPanel.__sfPageDef and boundsPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
+                maxRowCount = #item.getItems()
+            end
+        end
+    end
+    assertEq(maxRowCount, maxItems, "UI constructs bounded rows for valid max-sized map")
+    -- Over-cap: preserve SV unchanged and make record unavailable.
+    boundItems[tostring(1000 + maxItems + 1)] = { itemId = 1000 + maxItems + 1, goal = 1 }
+    local overflowSnapshot = {}
+    for k, v in pairs(boundItems) do
+        overflowSnapshot[k] = v
+    end
+    local overflowCount = 0
+    for _ in pairs(boundItems) do overflowCount = overflowCount + 1 end
+    assertTrue(overflowCount > maxItems, "fixture exceeds requested-item cap")
+    assertEq(select(1, GS:GetCurrentRecord()), nil, "over-cap current map makes record unavailable")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_overflow",
+        "over-cap reason is requested_items_overflow")
+    local afterCount = 0
+    local preserved = true
+    for k, v in pairs(overflowSnapshot) do
+        afterCount = afterCount + 1
+        if boundItems[k] ~= v then
+            preserved = false
+        end
+    end
+    assertEq(afterCount, overflowCount, "over-cap SV entry count preserved")
+    assertEq(preserved, true, "over-cap SV entries preserved unchanged")
+    configPage:Refresh(boundsPanel)
+    local overflowRows = 0
+    local overflowStatus
+    for _, sec in ipairs((boundsPanel.__sfPageDef and boundsPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
+                overflowRows = #item.getItems()
+            end
+            if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
+                overflowStatus = item.getText()
+            end
+        end
+    end
+    assertEq(overflowRows, 0, "over-cap UI constructs no requested-item rows")
+    assertTrue(type(overflowStatus) == "string" and overflowStatus ~= "",
+        "over-cap presents unavailable status text")
+    -- Invalid-heavy map: non-table rows fail closed (malformed, not truncated).
+    boundItems[tostring(1000 + maxItems + 1)] = nil
+    for i = 1, maxItems do
+        boundItems[tostring(1000 + i)] = nil
+    end
+    for i = 1, maxItems + 5 do
+        boundItems["bad-" .. i] = "not-a-row"
+    end
+    local badOk, badErr = GS.ValidateRequestedItemsMap(boundItems)
+    assertEq(badOk, false, "invalid raw entries fail closed")
+    assertEq(badErr, "requested_items_malformed", "non-table rows are malformed")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_malformed",
+        "invalid raw entries make record unavailable")
+    for i = 1, maxItems + 5 do
+        boundItems["bad-" .. i] = nil
+    end
+
+    -- In-cap malformed rows: reject/unavailable; preserve original retained state.
+    local function assertMalformedReject(label, mutator)
+        boundItems["42"] = { itemId = 42, goal = 3 }
+        local baseline = GS:GetCurrentRecord()
+        assertTrue(baseline ~= nil, label .. " baseline usable")
+        local snapCampaign = baseline.currentCampaignId
+        local snapOps = 0
+        for _ in pairs(baseline.operations.records or {}) do snapOps = snapOps + 1 end
+        local archiveCount = 0
+        for _ in pairs(baseline.campaignArchives or {}) do
+            archiveCount = archiveCount + 1
+        end
+        local snapRow = boundItems["42"]
+        mutator(boundItems)
+        local vok, verr = GS.ValidateRequestedItemsMap(boundItems)
+        assertEq(vok, false, label .. " validation rejects")
+        assertEq(verr, "requested_items_malformed", label .. " reason malformed")
+        assertEq(select(1, GS:GetCurrentRecord()), nil, label .. " record unavailable")
+        local opBad, prepSt = GS:NewCampaignOperation()
+        assertEq(opBad, nil, label .. " New Campaign prepare blocked")
+        assertEq(prepSt, "rejected", label .. " New Campaign prepare rejected")
+        -- Restore original row; SV must still hold the mutated raw entry until we clear it.
+        boundItems["42"] = snapRow
+        local restored = GS:GetCurrentRecord()
+        assertTrue(restored ~= nil, label .. " restored after clearing malformation")
+        assertEq(restored.currentCampaignId, snapCampaign, label .. " current campaign unchanged")
+        local opsAfter = 0
+        for _ in pairs(restored.operations.records or {}) do opsAfter = opsAfter + 1 end
+        assertEq(opsAfter, snapOps, label .. " operations unchanged")
+        local archivesAfter = 0
+        for _ in pairs(restored.campaignArchives or {}) do archivesAfter = archivesAfter + 1 end
+        assertEq(archivesAfter, archiveCount, label .. " archives unchanged")
+        assertEq(restored.accounting._consumables.requestedItems["42"].goal, 3,
+            label .. " retained goal preserved")
+    end
+    assertMalformedReject("non-table", function(items)
+        items["42"] = "not-a-row"
+    end)
+    assertMalformedReject("missing itemId", function(items)
+        items["42"] = { goal = 3 }
+    end)
+    assertMalformedReject("invalid itemId", function(items)
+        items["42"] = { itemId = 0, goal = 3 }
+    end)
+    assertMalformedReject("key/item mismatch", function(items)
+        items["42"] = { itemId = 99, goal = 3 }
+    end)
+    assertMalformedReject("missing goal", function(items)
+        items["42"] = { itemId = 42 }
+    end)
+    assertMalformedReject("negative goal", function(items)
+        items["42"] = { itemId = 42, goal = -1 }
+    end)
+    assertMalformedReject("fractional goal", function(items)
+        items["42"] = { itemId = 42, goal = 1.5 }
+    end)
+    local maxGoal = (SF.Consumables and SF.Consumables.MAX_GOAL) or 100000
+    assertMalformedReject("over-max goal", function(items)
+        items["42"] = { itemId = 42, goal = maxGoal + 1 }
+    end)
+
+    -- Canonical string keys only: numeric / mixed aliases fail closed (no collapse).
+    boundItems["42"] = nil
+    boundItems[42] = { itemId = 42, goal = 5 }
+    assertEq(GS.ValidateRequestedItemsMap(boundItems), false,
+        "numeric-only requested-item key rejected")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_malformed",
+        "numeric-only key makes record unavailable")
+    boundItems[42] = nil
+    boundItems["42"] = { itemId = 42, goal = 5 }
+    boundItems[42] = { itemId = 42, goal = 9 }
+    assertEq(GS.ValidateRequestedItemsMap(boundItems), false,
+        "mixed numeric/string requested-item keys rejected")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_malformed",
+        "mixed-key map makes record unavailable")
+    -- Prepare New Campaign on a clean canonical map, then corrupt keys before commit.
+    boundItems[42] = nil
+    boundItems["42"] = { itemId = 42, goal = 5 }
+    local keyRec = GS:GetCurrentRecord()
+    assertTrue(keyRec ~= nil, "canonical string key usable before corruption")
+    local keyCamp = keyRec.currentCampaignId
+    local keyOps = 0
+    for _ in pairs(keyRec.operations.records or {}) do keyOps = keyOps + 1 end
+    local keyArch = 0
+    for _ in pairs(keyRec.campaignArchives or {}) do keyArch = keyArch + 1 end
+    local keyOp = GS:NewCampaignOperation()
+    assertTrue(keyOp ~= nil, "prepare New Campaign before key corruption")
+    boundItems[42] = { itemId = 42, goal = 11 }
+    local keySt, keyReason = GS:ApplyStagedCampaignOperation(keyOp)
+    assertEq(keySt, "rejected", "commit rejects after mixed-key corruption")
+    assertEq(keyReason, "requested_items_malformed",
+        "commit revalidation surfaces requested_items_malformed")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.requestedItems[42].goal,
+        11, "numeric alias row preserved on reject")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].accounting._consumables.requestedItems["42"].goal,
+        5, "string key row preserved on reject")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].currentCampaignId, keyCamp,
+        "campaign unchanged after key-collision reject")
+    local keyOpsAfter = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].operations.records or {}) do
+        keyOpsAfter = keyOpsAfter + 1
+    end
+    assertEq(keyOpsAfter, keyOps, "operations unchanged after key-collision reject")
+    local keyArchAfter = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaignArchives or {}) do
+        keyArchAfter = keyArchAfter + 1
+    end
+    assertEq(keyArchAfter, keyArch, "archives unchanged after key-collision reject")
+    boundItems[42] = nil
+    boundItems["42"] = { itemId = 42, goal = 3 }
+
+    -- Malformed archive must not disable a usable current campaign.
+    boundItems["42"] = { itemId = 42, goal = 3 }
+    local usable = GS:GetCurrentRecord()
+    assertTrue(usable ~= nil, "usable current restored after clearing overflow")
+    local priorCampaignId = usable.currentCampaignId
+    startCampaign() -- archives prior campaign with item 42
+    usable = GS:GetCurrentRecord()
+    assertTrue(usable.campaignArchives and usable.campaignArchives[priorCampaignId],
+        "prior campaign archived on New Campaign")
+    local archiveItems = usable.campaignArchives[priorCampaignId].requestedItems
+    archiveItems["42"] = { itemId = 42, goal = -5 }
+    local archivedItems, archiveErr = GS:GetCampaignRequestedItems(priorCampaignId)
+    assertEq(archivedItems, nil, "malformed archive items unavailable")
+    assertEq(archiveErr, "requested_items_malformed", "malformed archive reason")
+    -- Also cover over-cap archive isolation.
+    archiveItems["42"] = { itemId = 42, goal = 3 }
+    for i = 1, maxItems + 2 do
+        archiveItems[tostring(2000 + i)] = { itemId = 2000 + i, goal = 1 }
+    end
+    archivedItems, archiveErr = GS:GetCampaignRequestedItems(priorCampaignId)
+    assertEq(archivedItems, nil, "over-cap archive items unavailable")
+    assertEq(archiveErr, "requested_items_overflow", "over-cap archive reason")
+    -- Current campaign remains readable after the bad archive mutation.
+    usable.accounting._consumables.requestedItems["99"] = { itemId = 99, goal = 5 }
+    local currentItems = GS:GetCampaignRequestedItems(usable.currentCampaignId)
+    assertTrue(type(currentItems) == "table" and currentItems["99"] ~= nil,
+        "usable current items survive bad archive")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "guild record still usable with bad archive")
+
+    CreateFrame = priorCreateFrame
+    C_Timer.After = priorAfter
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    world.guild.clubId = 42
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

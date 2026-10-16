@@ -113,10 +113,18 @@ function BankLog:EligibleContext()
     }
 end
 
+local function ClearFreshLogStamp(self)
+    self.lastFreshLogAt = nil
+    self.lastFreshLogTab = nil
+    self.lastFreshLogGuild = nil
+end
+
 function BankLog:CancelTimers(reason)
     self.queryToken = (self.queryToken or 0) + 1
     self.queryRetries = 0
     self.awaitingLogUpdate = false
+    -- A cancelled/invalidated query cycle must not keep an older successful stamp.
+    ClearFreshLogStamp(self)
     if reason then
         Debug("Verbose", "cancelled bank-log timers reason=%s", tostring(reason))
     end
@@ -141,8 +149,11 @@ function BankLog:RequestLog(reason)
     end
     local now = WallNow()
     -- Slot churn can be frequent; coalesce while a query is already outstanding
-    -- or a recent query just completed successfully.
+    -- or a recent query just completed successfully. Invalidate the prior
+    -- successful stamp immediately so readiness cannot reuse a pre-change
+    -- sample while the replacement query is throttled or already in flight.
     if reason == "slots_changed" then
+        ClearFreshLogStamp(self)
         if self.awaitingLogUpdate then return end
         if self.lastQueryAt and (now - self.lastQueryAt) < SLOTS_THROTTLE_SECONDS then
             return
@@ -151,6 +162,8 @@ function BankLog:RequestLog(reason)
     if reason ~= "retry" then
         self.queryRetries = 0
     end
+    -- Starting a new sample invalidates any prior successful freshness stamp.
+    ClearFreshLogStamp(self)
     self.awaitingLogUpdate = true
     self.lastQueryAt = now
     self.lastQueryReason = reason
@@ -175,6 +188,7 @@ function BankLog:RequestLog(reason)
             if not self.awaitingLogUpdate then return end
             self.awaitingLogUpdate = false
             self.queryRetries = 0
+            ClearFreshLogStamp(self)
             Debug("Warn", "guild bank log query retries exhausted; idle until next event")
         end)
     end
@@ -236,16 +250,25 @@ function BankLog:ProcessLogUpdate(reason)
         return
     end
     self.activeContext = ctx
-    self.awaitingLogUpdate = false
     self.queryRetries = 0
-    -- Successful update cancels outstanding retry callbacks.
+    -- Cancel outstanding retry callbacks for this update attempt.
     self.queryToken = (self.queryToken or 0) + 1
 
     local snapshot = self:ReadSnapshot(ctx)
     if not snapshot then
+        -- Failed refresh must not keep awaiting=false with an older successful stamp.
+        self.awaitingLogUpdate = false
+        ClearFreshLogStamp(self)
         Debug("Warn", "log update skipped: incomplete snapshot reason=%s", tostring(reason))
         return
     end
+    self.awaitingLogUpdate = false
+    -- Freshness stamp for read-only bank-context adapters (Guild Supplies #386).
+    -- Restored only after a complete successful update.
+    self.lastFreshLogAt = WallNow()
+    self.lastFreshLogTab = ctx.bankTab
+    self.lastFreshLogGuild = ctx.guildGuid
+
     local C = SF.Consumables
     if C and C.EligibilitySnapshot then
         snapshot.eligibility = C.EligibilitySnapshot(ctx.profile)
@@ -344,6 +367,7 @@ function BankLog:OnBankClosed()
     self.bankOpen = false
     self.active = false
     self.activeContext = nil
+    ClearFreshLogStamp(self)
     self:CancelTimers("bank_closed")
     Debug("Info", "bank closed: observation idle")
 end

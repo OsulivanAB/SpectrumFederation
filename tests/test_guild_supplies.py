@@ -1,4 +1,4 @@
-"""Run production Lua Guild Supplies Part 2A tests (#385)."""
+"""Run production Lua Guild Supplies Part 2A/2B tests (#385 / #386)."""
 
 from __future__ import annotations
 
@@ -48,7 +48,11 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     state = toc.find("modules/GuildSupplies/State.lua")
     authority = toc.find("modules/GuildSupplies/Authority.lua")
     operations = toc.find("modules/GuildSupplies/Operations.lua")
-    assert 0 <= gossip < state < authority < operations
+    campaigns = toc.find("modules/GuildSupplies/Campaigns.lua")
+    config_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    logs_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    assert 0 <= gossip < state < authority < operations < campaigns
+    assert 0 <= config_page < logs_page
 
 
 def test_demand_driven_guild_apis_exist():

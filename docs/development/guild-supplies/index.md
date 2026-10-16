@@ -1,8 +1,8 @@
-# Guild Supplies Foundation (Phase 2A)
+# Guild Supplies Foundation (Phase 2A + 2B)
 
-Part 2A delivers a **dormant, guild-keyed staged foundation** for Guild Supplies. It does **not** migrate SavedVariables, register a gossip provider, capture bank context, reset campaigns, add Settings pages, or activate live guild-wide writes.
+Part **2A** (#385) delivers a **dormant, guild-keyed staged foundation**. Part **2B** (#386) adds **fresh-start campaigns**, local eligibility cutoffs, and **visible standalone Settings** on the integration branch. Neither phase migrates legacy Consumables data, registers a gossip provider, or activates live guild-wide bank writes.
 
-Issue contract: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/385). Parent roadmap: [#384](https://github.com/OsulivanAB/SpectrumFederation/issues/384). Transport dependency: [#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378).
+Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/385), [#386](https://github.com/OsulivanAB/SpectrumFederation/issues/386). Parent roadmap: [#384](https://github.com/OsulivanAB/SpectrumFederation/issues/384). Transport dependency: [#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378).
 
 **Hard release invariant:** Legacy profile-scoped Consumables remains the only live authoritative writer until [#389](https://github.com/OsulivanAB/SpectrumFederation/issues/389).
 
@@ -13,8 +13,17 @@ Issue contract: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/3
 | Durable staged guild record / schema validation | `SF.GuildSupplies` (`State`) |
 | Verified current guild/rank capabilities | `Authority` via demand-driven `GG.GetGuildIdentity` / `GetGuildMember` / `GetGuildRanks` |
 | Operation IDs, typed validation, staged admission | `Operations` |
+| Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
+| Configuration / Logs Settings pages | `UI/Settings/Pages/GuildSupplies*.lua` |
 | Live donation ledger / bank verification | Legacy Consumables (unchanged) |
-| Gossip transport / discovery | Guild Gossip (no Guild Supplies provider in 2A) |
+| Gossip transport / discovery | Guild Gossip (no Guild Supplies provider yet) |
+
+## Fresh start (no legacy migration)
+
+- Opening Settings, reading state, or finding an empty local cache **never** auto-creates an authoritative guild dataset. Use explicit `CreateStagedRecord`.
+- Fresh staged setup starts with empty campaign/accounting data. Legacy Consumables profiles, totals, history, observations, queues, and transaction registries are **not** imported.
+- Unrelated Loot Helper / account data is left alone. Unused `migration` fields stay unused; there is no migration preview or source-selection UI.
+- **#389 live-cutover handoff:** activation must publish a guild-agreed initial eligibility/cutover context so pre-activation bank-log rows, legacy queues, or deposits observed before activation cannot backfill the hard-reset system. Client receipt time or a development-preview timestamp must not substitute for that agreed cutover. Canonical bootstrap/adoption between independently prepared fresh roots also remains #389.
 
 ## Saved schema
 
@@ -27,28 +36,40 @@ SpectrumFederationDB.guildSupplies = {
   guilds = {
     ["club:<actual club id>"] = {
       schemaVersion = 1,
-      activation = "staged", -- #385 never sets active
+      activation = "staged", -- never "active" until #389
       datasetId = "gs1:<guid>:<nonce>:<seq>",
       permission = { editorRankPosition = 3, revisionId = "<datasetId or op id>" },
-      currentCampaignId = nil,
+      currentCampaignId = "<campaignId or nil>",
       campaigns = { -- [campaignId] = immutable boundary header },
+      campaignArchives = { -- [campaignId] = frozen requestedItems + generation },
+      campaignContext = { -- [campaignId] = bounded bank anchors (not gossip envelopes) },
       accounting = {
-        _consumables = { guild = { guid, name, realm }, bankTab, requestedItems, ... },
+        _consumables = { guild = { guid, name, realm }, bankTab, requestedItems, eligibility, txnRegistry, ... },
         _consumableEvents = {},
         _consumableEventArchive = {},
       },
       observations = { byCampaign = {} },
       operations = { records = {}, order = {}, heads = {}, pending = {}, conflicts = {} },
-      confirmationRefs = {}, -- operation IDs only
-      migration = nil, -- #386
+      confirmationRefs = {},
+      migration = nil, -- unused; hard reset replaces import workflows
     },
   },
 }
 ```
 
 - Durable key is only `club:<nonzero club id>`. Transport `name:` scopes are never persisted.
-- Absent root → empty defaults. Unsupported/malformed root or guild records are retained read-only; they are not wiped into a fresh authorized default.
-- Reads/startup never create per-guild records. `CreateStagedRecord()` is an explicit admitted action.
+- Absent root → empty defaults. Unsupported/malformed root or guild records are retained read-only.
+- Campaign headers beyond `MAX_CAMPAIGNS` (64) fail closed. Malformed **archived** headers are retained but omitted from inspectable lists.
+
+## Ownership within a guild record
+
+| Shared across campaigns | Campaign-owned |
+| --- | --- |
+| Guild identity (`club:` key / accounting guild guid) | Requested items / goals |
+| Configured bank tab | Immutable boundary header + context status |
+| Editor-rank policy | Progress projections for that generation |
+| Personal reminder prefs (account-local Settings) | Archived configuration snapshots |
+| Cross-campaign `txnRegistry` deduplication | Observation scopes under `byCampaign` |
 
 ## Public API (`SF.GuildSupplies`)
 
@@ -57,59 +78,86 @@ SpectrumFederationDB.guildSupplies = {
 | `:Initialize(db)` | Idempotent root load/validate; no network or guild bootstrap |
 | `:GetCurrentContext()` | Native guildKey, actor, rank readiness, handle generation, or waiting reason |
 | `:GetCurrentRecord()` | Validated current-guild staged record or nil + reason (no allocate-on-read) |
-| `:CreateStagedRecord(editorRankPosition?)` | Explicit create with default editor rank 3 when ≥3 ranks exist; when fewer than 3 ranks, verified GM must pass an existing threshold position |
-| `:GetCapabilities()` | `canRead` / `canEdit` / `canRecoverPolicy`, resolved rank name label; Preview as Non-Admin |
-| `:NewConfigOperation(kind, target, value)` | Build IDs/actor/timestamp/base revisions from local context |
-| `:ValidateConfigOperation(op, context)` | Shape/scope/authority/base checks; no side effects |
-| `:ApplyStagedConfigOperation(op, context)` | Staged compare-and-apply; rechecks guild/rank at commit |
-| `:NewConfirmationOperation(candidateRef)` / `:ValidateConfirmationOperation` | Local confirmation envelope; no live credit |
-| `:GetCurrentCampaignBoundary()` | Validated immutable header or nil + reason |
+| `:CreateStagedRecord(editorRankPosition?)` | Explicit create with default editor rank 3 when ≥3 ranks exist |
+| `:GetCapabilities()` | `canRead` / `canEdit` / `canRecoverPolicy`; Preview as Non-Admin |
+| `:NewConfigOperation` / `:ValidateConfigOperation` / `:ApplyStagedConfigOperation` | Config kinds below |
+| `:NewCampaignOperation` / `:ValidateCampaignOperation` / `:ApplyStagedCampaignOperation` | Confirmed New Campaign lifecycle |
+| `:GetCurrentCampaignBoundary()` | Validated immutable current header or nil + reason |
+| `:ListInspectableCampaigns()` | Validated current/archived headers only (copies/metadata) |
+| `:GetCampaignRequestedItems(campaignId)` | Defensive copy of live or archived items |
+| `:ProjectCampaignProgress(campaignId)` | Bounded generation-scoped totals (current + archive ledger; attributed adjustments) |
+| `:ListCampaignHistory(campaignId, limit, offset)` | Bounded read-only donation/adjustment history for Logs |
+| `IsBankContextSampleReady(bankTab)` | Read-only readiness via existing bank-log evidence / test probe |
+| `CaptureBankContext(bankTab)` | Non-crediting context: `captured` / `empty` only when ready; otherwise `unavailable` |
+| `FormatMutationFeedback(status, reason)` / `FormatReasonText(reason)` | Localized Settings banner text + severity |
 
-Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected` with stable reasons (`not_ready`, `wrong_guild`, `unauthorized`, `unsupported_schema`, `stale_base`, `conflict` / `id_conflict`, `full`, …). `accepted` means staged only.
+Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected`. `accepted` means **staged admission only**. UI must not treat a nonempty reason string as success or show “Saved” for rejection.
 
 ### Config operation kinds / targets
 
 - `set-editor-rank` → target `editorRankPosition`
-- `set-bank-tab` → target `bankTab` (explicit `nil` clears; non-nil values must coerce to integral tabs 1–8 — failed conversions reject without clearing)
-- `set-requested-item` → target `{ itemId = N }` (add/update/remove share one revision chain; values are canonicalized to `{ itemId, goal, removed=false }` or `{ removed=true }` at prepare/admission so nested extras cannot poison snapshots or exact-duplicate comparison)
-- `confirm-candidate` → confirmation envelope (see below)
+- `set-bank-tab` → target `bankTab` (shared; tab changes establish eligibility cutoffs after baseline)
+- `set-requested-item` → target `{ itemId = N }` (**requires current campaign**; add/re-add sets item cutoffs; goal edits preserve them)
+- `confirm-candidate` → confirmation envelope (unchanged from 2A)
+- `start-campaign` → target `campaign` (campaign id == operation id == `resetOperationId`)
 
-Caps: **4,096** accepted operations / guild; **128** combined pending+conflict admission bodies / guild (shared budget). Existing-ID retries reuse a slot and do not consume another. Overfull admissions return `full` without partial mutation or eviction. Durable operation snapshots are whitelisted and bounded (depth 6, **1,024** nodes, **49,152** string bytes) so a full confirmation batch of **64** records plus `originalIds` fits; the separate **2 KiB** transport export cap is unchanged. Malformed or oversized input is rejected without partial retention. Retained `records`/`order`/`pending`/`conflicts` entries require map-key/`body.id` identity; `operations.heads` must name accepted bodies for the corresponding target; `confirmationRefs` is a dense unique array of accepted `confirm-candidate` IDs (≤ accepted cap). Inconsistent saved stores stay unavailable without repair-on-read. A malformed `localWriter` nonce on an otherwise supported root is replaced with a fresh 24-hex nonce before new IDs; guild records are preserved and unsupported domain data is never normalized.
+Caps: **4,096** accepted operations / guild; **128** pending+conflict bodies; **64** campaigns; **16** bank-context anchors / campaign. Capacity exhaustion returns `full` without partial mutation. Durable snapshots stay whitelisted/bounded; the **2 KiB** transport export cap is unchanged.
 
-### Rank authority (locked)
+### Campaign lifecycle
 
-- 1-based `guildRankOrder` (Guild Master = 1). Default editor threshold = **3**.
-- Player-facing labels use `GuildControlGetRankName(position)` (for example `"%s and higher"`).
-- Invalid/out-of-range policy → verified Guild Master recovery only.
-- Preview as Non-Admin denies privileged actions locally.
-- Zero active gossip providers: authority uses a **demand-driven** native snapshot. An unbound observation (including the first after login/reload) starts a temporary `GUILD_ROSTER_UPDATE` wait with a throttled native `GuildRoster` request — nonempty cached rows alone are not freshness. Observed `not_in_guild` / unavailable club identity clears bound/pending trust so rejoining the same club requires refresh completion (does not detect unobserved transitions). No permanent listeners, discovery, or dummy provider. Identical refreshed rosters may recover; content inequality alone is not freshness. The wait always terminates on event, retarget, or timeout. Missing/uncertain data fails closed. Commit rechecks guild/rank/policy.
-- Current editor policy must bind to bootstrap `datasetId` or the accepted `set-editor-rank` head (revision + projected threshold). Mismatch is GM-recoverable permission failure, not silent authorization for ordinary editors.
-- Fresh guilds with fewer than three ranks: `CreateStagedRecord` does not invent a default threshold; verified GM passes an existing 1-based position. Preview as Non-Admin and non-GM callers remain denied.
-
-### Confirmation envelope
-
-`confirm-candidate` carries `schemaVersion, id, guildKey, datasetId, candidateRef, contentFingerprint, campaignId, basePolicyRevision, actorGuid, actorName, timestamp`. `candidateRef` must use exactly one reference form: a single `recordId` **or** a dense `records` manifest (1–64), never both/neither. Manifest rows are canonicalized to `{ id, contentFingerprint }` only at prepare/admission so nested extras cannot poison durable snapshots or exact-duplicate comparison. When `candidateRef.campaignId` is present it must match the envelope `campaignId`. Candidate policy cannot self-authorize. Original IDs are preserved; endorsement is not a live donation credit. Network confirmation exchange is #387/#388.
+1. Editors confirm **New Campaign**.
+2. Admission reallocates an operation id, rechecks guild/rank/policy/base campaign/revisions after the dialog, and captures bank context without verification.
+3. On success (atomic): archive prior campaign’s requested items (if any), clear the live item list, bump generation, establish eligibility baseline, install the immutable `new-goal` boundary, select `currentCampaignId`, retain the operation under `campaign:lifecycle`.
+4. Failure, stale context, or capacity exhaustion leaves the previous campaign/configuration/accounting intact.
+5. Exact retry/reload of the same operation id is `duplicate`. A distinct subsequent confirmed reset receives a new id.
+6. Logs can inspect archived configuration/history; viewing never mutates a historical campaign.
 
 ### Campaign boundary header
 
-Fields: `schemaVersion, campaignId, datasetId, guildKey, parentCampaignId, resetOperationId, createdByGuid, createdByName, startedAt, bankTabAtStart, boundaryVersion=1, boundaryKind ("new-goal"|"legacy-preserved"), contextStatus ("captured"|"empty"|"unavailable"), contextObservedAt, contextRecordCount`. `currentCampaignId` must be nil or a nonempty key whose embedded `campaignId` matches. `new-goal` requires nonempty `resetOperationId == campaignId`, bounded `createdByGuid`/`createdByName`, and finite `startedAt`. `legacy-preserved` may omit historical authors/`startedAt` (do not fabricate them); present values stay type-safe. `contextStatus` `captured`/`empty` require finite `contextObservedAt` and `contextRecordCount` (`empty` ⇒ count 0); `unavailable` may honestly omit observation evidence. `bankTabAtStart` is nil or integral tabs 1–8. `#385` validates/accesses only; bank capture and reset lifecycle are #386.
+Fields: `schemaVersion, campaignId, datasetId, guildKey, parentCampaignId, resetOperationId, createdByGuid, createdByName, startedAt, bankTabAtStart, boundaryVersion=1, boundaryKind ("new-goal"|"legacy-preserved"), contextStatus ("captured"|"empty"|"unavailable"), contextObservedAt, contextRecordCount`.
+
+- `new-goal` requires nonempty `resetOperationId == campaignId`, bounded authors, and finite `startedAt`.
+- `contextStatus` `captured`/`empty` require finite observation metadata (`empty` ⇒ count 0); `unavailable` may honestly omit evidence (including closed bank / missing APIs).
+- Delayed clients must use the original shared boundary, never local receipt time, as the campaign start.
+
+### Local eligibility
+
+- After a campaign baseline exists, **tab changes** set `eligibility.tabEligibleFrom`.
+- **Item add/re-add** sets `eligibility.items[itemId]`.
+- **Ordinary goal edits** and removals preserve existing cutoffs/history.
+- Cross-campaign `txnRegistry` identities are retained so empty progress does not forget prior canonical transactions.
+- Uncertain / overlapping bank evidence stays pending for #388; time eligibility alone never proves uniqueness.
+
+### Rank authority (locked)
+
+Unchanged from 2A: default editor threshold 3; actual rank-name labels; GM recovery for invalid policy; Preview as Non-Admin denies privileged actions; demand-driven roster authority with no Guild Supplies provider.
+
+## Settings UI (visible on the integration branch)
+
+| Area | Access |
+| --- | --- |
+| **Guild Supplies → Configuration** | Eligible editors / GM recovery: initialize (explicit threshold for small guilds), editor rank, bank tab, New Campaign, items/goals, staged status |
+| **Guild Supplies → Logs** | Verified same-guild members: inspect current/archived campaigns, goals, progress, and bounded donation/adjustment history |
+| **Personal preferences** | Account-local reminder checkbox; available to ordinary members |
+
+Pages must show staged/inactive wording. They do not claim live bank-helper or gossip sync has switched. Guild Supplies access does not depend on Loot Helper profile/admin/session.
 
 ## Downstream ownership
 
 | Ticket | Owns |
 | --- | --- |
-| #386 | Migration preview, real campaign reset, Configuration/Logs UI |
 | #387 | Decentralized config exchange/merge, conflict UX |
-| #388 | Gossip accounting/verification |
-| #389 | Live activation, canonical adoption, writer retirement |
+| #388 | Gossip accounting/verification / historical reconciliation |
+| #389 | Live activation, agreed cutover eligibility, canonical adoption, legacy-writer retirement |
 
 ## Chat-free policy
 
-No normal game Chat from Guild Supplies. Diagnostics only through enabled `SF.Debug` (`GUILD_SUPPLIES`). Settings status/banner feedback belongs to later UI tickets.
+No normal game Chat from Guild Supplies. Diagnostics only through enabled `SF.Debug` (`GUILD_SUPPLIES`). User action feedback uses contextual Settings banners via `FormatMutationFeedback`.
 
 ## Evidence
 
 - Production-Lua suite: `tests/lua/guild_supplies_tests.lua` via `tests/test_guild_supplies.py`
-- Gossip idle/repair regressions remain required: `tests/test_guild_gossip.py`
+- Gossip idle/repair regressions: `tests/test_guild_gossip.py`
 - Consumables regressions: `tests/test_consumables.py`
-- Retail rank/readiness/API checks remain human QA
+- Settings navigation/layout when pages change: `tests/test_settings_navigation.py`, `tests/test_settings_window_layout.py`
+- Retail rank/readiness/bank-context checks remain human QA

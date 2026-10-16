@@ -17,6 +17,7 @@ local KIND = {
     SET_BANK_TAB = "set-bank-tab",
     SET_REQUESTED_ITEM = "set-requested-item",
     CONFIRM_CANDIDATE = "confirm-candidate",
+    START_CAMPAIGN = "start-campaign",
 }
 
 GS.KIND = KIND
@@ -328,6 +329,8 @@ local function TargetKey(kind, target)
             return nil
         end
         return "item:" .. tostring(canon.itemId)
+    elseif kind == KIND.START_CAMPAIGN then
+        return GS.CAMPAIGN_TARGET_KEY or "campaign:lifecycle"
     elseif kind == KIND.CONFIRM_CANDIDATE then
         return "confirm"
     end
@@ -573,6 +576,8 @@ local function ValidateKindValue(op)
             return false, "item_id_mismatch"
         end
         return true
+    elseif kind == KIND.START_CAMPAIGN then
+        return false, "use_campaign_api"
     elseif kind == KIND.CONFIRM_CANDIDATE then
         return false, "use_confirmation_api"
     end
@@ -636,6 +641,10 @@ function GS:NewConfigOperation(kind, target, value)
     end
 
     if kind == KIND.SET_REQUESTED_ITEM then
+        -- Campaign-owned items require an active current campaign (#386).
+        if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+            return nil, "rejected", "no_campaign"
+        end
         local canon = CanonicalItemTarget(target)
         if not canon then
             return nil, "rejected", "invalid_target"
@@ -771,6 +780,11 @@ function GS:ValidateConfigOperation(op, context)
         if not caps.canEdit then
             return false, caps.reason or "unauthorized"
         end
+        if op.kind == KIND.SET_REQUESTED_ITEM then
+            if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+                return false, "no_campaign"
+            end
+        end
     end
 
     return true
@@ -869,12 +883,21 @@ local function ApplyMutations(record, op)
         if type(cfg.requestedItems) ~= "table" then
             return false, "invalid_accounting"
         end
+        local previous = cfg.bankTab
         cfg.bankTab = op.value
+        -- Tab change (including clear↔set) establishes cutoff after baseline.
+        if previous ~= op.value and GS.NoteTabEligibilityCutoff then
+            GS.NoteTabEligibilityCutoff(cfg, op.timestamp)
+        end
         return true
     elseif op.kind == KIND.SET_REQUESTED_ITEM then
         local cfg = record.accounting._consumables
         if type(cfg.requestedItems) ~= "table" then
             return false, "invalid_accounting"
+        end
+        -- Campaign-owned items require an active current campaign (#386).
+        if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+            return false, "no_campaign"
         end
         local canon = CanonicalItemTarget(op.target)
         if not canon then
@@ -884,10 +907,12 @@ local function ApplyMutations(record, op)
         local key = tostring(itemId)
         if type(op.value) == "table" and op.value.removed == true then
             cfg.requestedItems[key] = nil
+            -- Removal preserves prior eligibility/history; no cutoff rewrite.
         else
             local C = SF.Consumables
             local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
-            if cfg.requestedItems[key] == nil then
+            local isAddOrReadd = cfg.requestedItems[key] == nil
+            if isAddOrReadd then
                 local count = 0
                 for _ in pairs(cfg.requestedItems) do
                     count = count + 1
@@ -896,10 +921,21 @@ local function ApplyMutations(record, op)
                     end
                 end
             end
+            local previousGoal = nil
+            if not isAddOrReadd and type(cfg.requestedItems[key]) == "table" then
+                previousGoal = tonumber(cfg.requestedItems[key].goal)
+            end
+            local newGoal = tonumber(op.value.goal) or 0
             cfg.requestedItems[key] = {
                 itemId = itemId,
-                goal = tonumber(op.value.goal) or 0,
+                goal = newGoal,
             }
+            -- Add/re-add establishes cutoff; ordinary goal-only edits preserve it.
+            if isAddOrReadd and GS.NoteItemEligibilityCutoff then
+                GS.NoteItemEligibilityCutoff(cfg, itemId, op.timestamp)
+            elseif not isAddOrReadd and previousGoal == newGoal then
+                -- Exact same goal: no eligibility change (idempotent field write).
+            end
         end
         return true
     end
@@ -1007,9 +1043,9 @@ function GS:ApplyStagedConfigOperation(op, context)
         return "rejected", GS:GetRootReason() or "not_ready"
     end
 
-    local record, _, recovery = ResolveStagedRecord(op.guildKey, op.kind)
+    local record, resolveReason, recovery = ResolveStagedRecord(op.guildKey, op.kind)
     if type(record) ~= "table" then
-        return "rejected", "not_configured"
+        return "rejected", resolveReason or "not_configured"
     end
     if record.activation ~= GS.ACTIVATION_STAGED then
         return "rejected", "unsupported_activation"
@@ -1289,6 +1325,16 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         if not ok then
             return false, err or "invalid_operations"
         end
+    elseif kind == KIND.START_CAMPAIGN then
+        if GS.ValidateCampaignOperationBody then
+            local ok, err = GS.ValidateCampaignOperationBody(body, guildKey, datasetId)
+            if not ok then
+                return false, err or "invalid_operations"
+            end
+        else
+            return false, "unsupported_kind"
+        end
+        return true
     elseif kind == KIND.SET_EDITOR_RANK or kind == KIND.SET_BANK_TAB or kind == KIND.SET_REQUESTED_ITEM then
         local ok, err = ValidateConfigShape(body)
         if not ok then
@@ -1461,4 +1507,32 @@ function GS:ApplyStagedConfirmationOperation(op, context)
         refs[#refs + 1] = stored.id
     end
     return "accepted", nil
+end
+
+---------------------------------------------------------------------------
+-- Cross-module helpers for Campaigns.lua (same GS table; no globals)
+---------------------------------------------------------------------------
+
+function GS._SnapshotPublicOp(op)
+    return SnapshotPublicOp(op)
+end
+
+function GS._DeepEqualOps(a, b)
+    return DeepEqual(a, b)
+end
+
+function GS._RetainConflict(ops, op)
+    return RetainConflict(ops, op)
+end
+
+function GS._AdmitPendingOrConflict(ops, stored, reason)
+    return AdmitPendingOrConflict(ops, stored, reason)
+end
+
+function GS._StoreAccepted(ops, stored, targetKey)
+    return StoreAccepted(ops, stored, targetKey)
+end
+
+function GS._RecognizeExactAcceptedDuplicate(op, stored)
+    return RecognizeExactAcceptedDuplicate(op, stored)
 end

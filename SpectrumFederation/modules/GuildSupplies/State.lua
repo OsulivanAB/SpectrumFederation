@@ -89,7 +89,11 @@ local function EmptyAccounting(clubId, guildName, guildRealm)
             generation = 0,
             configSeq = 0,
             eventSeq = 0,
-            eligibility = {},
+            eligibility = {
+                items = {},
+                tabEligibleFrom = nil,
+                baselineEstablished = false,
+            },
             txnRegistry = {},
         },
         _consumableEvents = {},
@@ -462,6 +466,21 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if type(cfg.requestedItems) ~= "table" then
         return false, "invalid_accounting"
     end
+    -- Bound every raw requestedItems entry (including invalid ones). Preserve
+    -- oversized retained maps unchanged/unavailable — do not silently truncate.
+    if GS.ValidateRequestedItemsMap then
+        local itemsOk, itemsErr = GS.ValidateRequestedItemsMap(cfg.requestedItems)
+        if not itemsOk then
+            return false, itemsErr or "invalid_accounting"
+        end
+    end
+    -- Eligibility container shape: allow absent/2A {} ; reject present non-tables.
+    if GS.ValidateEligibilityContainer then
+        local eligOk, eligErr = GS.ValidateEligibilityContainer(cfg.eligibility)
+        if not eligOk then
+            return false, eligErr or "invalid_eligibility"
+        end
+    end
     if type(accounting._consumableEvents) ~= "table"
         or type(accounting._consumableEventArchive) ~= "table" then
         return false, "invalid_accounting"
@@ -473,6 +492,16 @@ local function ValidateGuildRecordStructure(guildKey, record)
         or type(record.observations.byCampaign) ~= "table"
         or type(record.confirmationRefs) ~= "table" then
         return false, "invalid_record_shape"
+    end
+    -- Optional #386 maps: absent is fine for 2A-era records; wrong types fail closed.
+    if record.campaignArchives ~= nil and type(record.campaignArchives) ~= "table" then
+        return false, "invalid_record_shape"
+    end
+    if record.campaignContext ~= nil and type(record.campaignContext) ~= "table" then
+        return false, "invalid_record_shape"
+    end
+    if GS.CountCampaignHeaders and GS.CountCampaignHeaders(record) > (GS.MAX_CAMPAIGNS or 64) then
+        return false, "full"
     end
 
     -- currentCampaignId: nil (no campaign) or nonempty key matching embedded header.
@@ -492,7 +521,21 @@ local function ValidateGuildRecordStructure(guildKey, record)
         if not campOk then
             return false, campErr or "invalid_campaign"
         end
+        -- Active campaign generations must be finite positive integers. Do not
+        -- normalize missing/zero/nonnumeric values into generation 1 on reset.
+        local gen = tonumber(cfg.generation)
+        if not gen or gen ~= math.floor(gen) or gen < 1
+            or gen ~= gen or gen == math.huge then
+            return false, "invalid_generation"
+        end
+    elseif cfg.generation ~= nil then
+        -- Pre-campaign setup uses generation 0; other non-finite values fail closed.
+        if not IsFiniteNonnegInt(cfg.generation) then
+            return false, "invalid_generation"
+        end
     end
+    -- Archived/other headers are retained even when malformed; ListInspectableCampaigns
+    -- validates each before exposure. Do not fail the whole guild record for them.
 
     local ok, err = ValidateOperationsStore(record.operations, guildKey, record.datasetId)
     if not ok then
@@ -830,10 +873,13 @@ function GS:CreateStagedRecord(editorRankPosition)
         },
         currentCampaignId = nil,
         campaigns = {},
+        campaignArchives = {}, -- frozen per-campaign requested-item snapshots (#386)
+        campaignContext = {}, -- bounded bank-context anchors (#386); not gossip envelopes
         accounting = EmptyAccounting(clubId, ctx.guildName, ctx.guildRealm),
         observations = { byCampaign = {} },
         operations = EmptyOperations(),
         confirmationRefs = {},
+        -- Explicitly unused: hard reset replaces legacy migration (#386).
         migration = nil,
     }
 
@@ -1016,6 +1062,16 @@ function GS:_StoreCampaignBoundaryForTests(header)
     end
     record.campaigns[header.campaignId] = header
     record.currentCampaignId = header.campaignId
+    -- Keep test helper coherent with the production invariant: a current
+    -- campaign requires a finite positive generation (fresh setup is 0).
+    local cfg = record.accounting and record.accounting._consumables
+    if type(cfg) == "table" then
+        local gen = tonumber(cfg.generation)
+        if not gen or gen ~= math.floor(gen) or gen < 1
+            or gen ~= gen or gen == math.huge then
+            cfg.generation = 1
+        end
+    end
     if record.observations.byCampaign[header.campaignId] == nil then
         record.observations.byCampaign[header.campaignId] = {
             schemaVersion = 1,
