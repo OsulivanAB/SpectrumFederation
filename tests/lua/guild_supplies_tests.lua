@@ -217,6 +217,25 @@ SF.Debug = {
 SF.Consumables = {
     MAX_REQUESTED_ITEMS = 256,
     MAX_GOAL = 100000,
+    ValidGoal = function(value)
+        local goal = tonumber(value)
+        if not goal or goal ~= goal or goal == math.huge or goal == -math.huge then
+            return nil
+        end
+        if goal ~= math.floor(goal) or goal < 0 or goal > 100000 then
+            return nil
+        end
+        return goal
+    end,
+    ItemIdFromText = function(text)
+        local n = tonumber(text)
+        if n and n == math.floor(n) and n > 0 then return n end
+        if type(text) == "string" then
+            local id = text:match("item:(%d+)")
+            if id then return tonumber(id) end
+        end
+        return nil
+    end,
 }
 
 SF.LootHelperImpersonation = {
@@ -4132,46 +4151,113 @@ do
     assertTrue(GS.FormatReasonText("stale_handle"):find("out of date", 1, true),
         "mapped stale_handle wording")
 
-    -- Real BankLog → adapter lifecycle without probe.
+    -- Production BankLog → adapter lifecycle (RequestLog / CancelTimers / ProcessLogUpdate).
     GS._BankContextReadinessProbe = nil
     world.bankTxnCounts = { [1] = 0 }
+    world.bankTabInfo = {
+        [1] = { name = "Supplies", isViewable = true },
+    }
+    world.logQueries = {}
+    world.afterFns = {}
     function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
     function GetGuildBankTransaction()
         return "deposit", "Alice-Garona", nil, 1, nil, nil, 0, 1, 1, 1
     end
-    SF.ConsumablesBankLog = {
-        bankOpen = true,
-        active = true,
-        awaitingLogUpdate = false,
-        activeContext = { bankTab = 1, guildGuid = "42" },
-        lastFreshLogTab = 1,
-        lastFreshLogGuild = "42",
-        lastFreshLogAt = world.time,
-    }
-    -- Load production BankLog helpers by exercising Invalidate via mirrored logic:
-    -- after a new query starts, stamp must be cleared before success.
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    function QueryGuildBankLog(tab)
+        world.logQueries[#world.logQueries + 1] = tab
+    end
+    local priorAfter = C_Timer and C_Timer.After
+    C_Timer = C_Timer or {}
+    C_Timer.After = function(_, fn)
+        world.afterFns[#world.afterFns + 1] = fn
+    end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
     local BankLog = SF.ConsumablesBankLog
-    BankLog.awaitingLogUpdate = true
-    BankLog.lastFreshLogTab = nil
-    BankLog.lastFreshLogGuild = nil
-    local ctx = GS.CaptureBankContext(1)
-    assertEq(ctx.status, "unavailable", "awaiting query is unavailable")
-    assertEq(ctx.reason, "log_pending", "log_pending while awaiting")
-
+    BankLog.active = true
+    BankLog.bankOpen = true
     BankLog.awaitingLogUpdate = false
+    BankLog.queryRetries = 0
+    BankLog.queryToken = 0
+    BankLog.activeContext = {
+        bankTab = 1, guildGuid = "42", profileId = "p-gs",
+        generation = 1, requestedSet = { [10] = true }, observedBy = "Alice-Garona",
+    }
     BankLog.lastFreshLogTab = 1
     BankLog.lastFreshLogGuild = "42"
-    ctx = GS.CaptureBankContext(1)
-    assertEq(ctx.status, "empty", "successful stamp allows empty")
+    BankLog.lastFreshLogAt = world.time
+    local priorEligible = BankLog.EligibleContext
+    function BankLog:EligibleContext()
+        return self.activeContext
+    end
 
-    -- Failed refresh retains no stamp.
+    assertEq(GS.IsBankContextSampleReady(1), true, "viewable stamped tab is ready")
+    local ctx = GS.CaptureBankContext(1)
+    assertEq(ctx.status, "empty", "ready viewable tab may be empty")
+
+    -- New query invalidates prior stamp via production RequestLog.
+    BankLog:RequestLog("test")
+    assertEq(BankLog.lastFreshLogTab, nil, "RequestLog clears freshness stamp")
+    assertEq(BankLog.awaitingLogUpdate, true, "RequestLog awaits update")
+    assertEq(GS.CaptureBankContext(1).status, "unavailable", "awaiting query is unavailable")
+    assertEq(GS.CaptureBankContext(1).reason, "log_pending", "log_pending while awaiting")
+
+    -- Failed ProcessLogUpdate clears stamp and awaiting.
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    local priorCount = GetNumGuildBankTransactions
+    GetNumGuildBankTransactions = function() return "bad" end
+    BankLog:ProcessLogUpdate("failed")
+    assertEq(BankLog.lastFreshLogTab, nil, "failed ProcessLogUpdate clears stamp")
+    assertEq(BankLog.awaitingLogUpdate, false, "failed ProcessLogUpdate clears awaiting")
+    GetNumGuildBankTransactions = priorCount
+
+    -- Exhaustion path clears stamp.
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog.awaitingLogUpdate = true
+    BankLog.queryRetries = 5
+    BankLog:RequestLog("retry")
+    assertEq(BankLog.lastFreshLogTab, nil, "exhausted RequestLog clears stamp before terminal wait")
+    local terminal = world.afterFns[#world.afterFns]
+    assertTrue(type(terminal) == "function", "exhaustion schedules terminal callback")
+    terminal()
+    assertEq(BankLog.awaitingLogUpdate, false, "exhaustion clears awaiting")
+    assertEq(BankLog.lastFreshLogTab, nil, "exhaustion keeps stamp cleared")
+
+    -- Successful update restores stamp.
+    BankLog.awaitingLogUpdate = true
+    GetNumGuildBankTransactions = function() return 0 end
+    BankLog:ProcessLogUpdate("success")
+    assertEq(BankLog.lastFreshLogTab, 1, "successful update restores stamp")
+    assertEq(GS.CaptureBankContext(1).status, "empty", "restored stamp allows empty")
+
+    -- Denied / unknown tab access.
+    world.bankTabInfo[1].isViewable = false
+    local deniedReady, deniedReason = GS.IsBankContextSampleReady(1)
+    assertEq(deniedReady, false, "denied tab access not ready")
+    assertEq(deniedReason, "tab_access_denied", "denied reason")
+    assertEq(GS.CaptureBankContext(1).status, "unavailable", "denied access is unavailable")
+    world.bankTabInfo[1].isViewable = true
+    world.bankTabInfo[1].name = nil
+    assertEq(select(2, GS.IsBankContextSampleReady(1)), "tab_access_unknown", "unknown access")
+    -- New Campaign still succeeds when context unavailable.
+    world.bankTabInfo[1] = { name = "Supplies", isViewable = true }
     BankLog.lastFreshLogTab = nil
-    BankLog.lastFreshLogGuild = nil
-    ctx = GS.CaptureBankContext(1)
-    assertEq(ctx.status, "unavailable", "missing stamp after failed refresh")
-    SF.ConsumablesBankLog = nil
+    local campOp = GS:NewCampaignOperation()
+    assertTrue(campOp ~= nil, "New Campaign prepared while bank unavailable")
+    assertEq(GS:ApplyStagedCampaignOperation(campOp), "accepted", "New Campaign accepted without bank context")
+
+    BankLog.EligibleContext = priorEligible
+    C_Timer.After = priorAfter
     GetNumGuildBankTransactions = nil
     GetGuildBankTransaction = nil
+    GetGuildBankTabInfo = nil
+    QueryGuildBankLog = nil
 end
 
 -- 2B18) Extended production UI: bank double-commit, duplicate Add, history pager, recovery, roster
@@ -4205,6 +4291,16 @@ do
         function region:Show() self.shown = true end
         function region:Hide() self.shown = false end
         function region:IsShown() return self.shown and true or false end
+        -- Model StandaloneWindow: child may stay IsShown while parent is hidden.
+        function region:IsVisible()
+            if self.visible ~= nil then return self.visible == true end
+            local p = self.parent
+            while p do
+                if p.visible == false or p.shown == false then return false end
+                p = p.parent
+            end
+            return self.shown and true or false
+        end
         function region:SetShown(v) self.shown = v and true or false end
         function region:SetAlpha() end
         function region:SetScript(event, fn) self.scripts[event] = fn end
@@ -4403,37 +4499,64 @@ do
     fire(bankEdit, "OnEditFocusLost")
     assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "unchanged focus loss allocates no op")
 
-    -- Duplicate Add preserves goal/cutoff/op count.
-    local addItem = GS:NewConfigOperation("set-requested-item", { itemId = 777 }, {
-        itemId = 777, goal = 0, removed = false,
-    })
-    assertEq(GS:ApplyStagedConfigOperation(addItem), "accepted", "add item 777")
-    local goalOp = GS:NewConfigOperation("set-requested-item", { itemId = 777 }, {
-        itemId = 777, goal = 12, removed = false,
-    })
-    assertEq(GS:ApplyStagedConfigOperation(goalOp), "accepted", "set goal 12")
-    local cutoff = GS:GetCurrentRecord().accounting._consumables.eligibility.items["777"]
-    beforeOps = countOps(GS:GetCurrentRecord())
-    -- Invoke Add path via definition onSubmit through a rebuilt page message surface.
-    local section = configPanel.__sfSections and configPanel.__sfSections.gsItems
+    -- Add + goal edit through production control callbacks (not domain-only).
     local def = configPanel.__sfPageDef
-    local addHandler
+    local addHandler, goalHandler
     for _, sec in ipairs(def.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
             if item.type == "editboxButton" and type(item.onSubmit) == "function" then
                 addHandler = item.onSubmit
             end
+            if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
+                goalHandler = item.onGoalCommit
+            end
         end
     end
     assertTrue(addHandler ~= nil, "Add onSubmit present")
+    assertTrue(goalHandler ~= nil, "onGoalCommit present")
     local messages = {}
+    local refreshViaPass = 0
     local ctx = {
         section = {
             SetMessage = function(_, msg, sev) messages[#messages + 1] = { msg = msg, sev = sev } end,
             ClearMessage = function() end,
         },
-        pageBuilder = { Refresh = function() end },
+        pageBuilder = {
+            Refresh = function()
+                -- Legacy path should not be required; Page:Refresh owns pass cache.
+                refreshViaPass = refreshViaPass + 1
+            end,
+        },
     }
+    beforeOps = countOps(GS:GetCurrentRecord())
+    addHandler(ctx, "777")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps + 1, "Add admits one operation")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 0, "Add starts goal 0")
+    beforeOps = countOps(GS:GetCurrentRecord())
+    goalHandler(ctx, { itemId = 777 }, "12")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 12,
+        "goal commit via onGoalCommit")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps + 1, "goal commit admits one operation")
+    -- Range feedback for MAX_GOAL+1.
+    messages = {}
+    beforeOps = countOps(GS:GetCurrentRecord())
+    goalHandler(ctx, { itemId = 777 }, "100001")
+    assertTrue(#messages >= 1, "over-max goal shows feedback")
+    assertTrue((messages[#messages].msg or ""):find("0 to 100000", 1, true)
+        or (messages[#messages].msg or ""):find("100000", 1, true),
+        "over-max goal localized range: " .. tostring(messages[#messages] and messages[#messages].msg))
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "over-max goal allocates no op")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 12,
+        "over-max preserves prior goal")
+    goalHandler(ctx, { itemId = 777 }, "0")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 0, "goal 0 accepted")
+    goalHandler(ctx, { itemId = 777 }, "100000")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 100000,
+        "MAX_GOAL accepted")
+    goalHandler(ctx, { itemId = 777 }, "12")
+    local cutoff = GS:GetCurrentRecord().accounting._consumables.eligibility.items["777"]
+    beforeOps = countOps(GS:GetCurrentRecord())
+    messages = {}
     addHandler(ctx, "777")
     assertTrue(#messages >= 1, "duplicate Add shows feedback")
     assertTrue((messages[1].msg or ""):find("already", 1, true), "duplicate Add localized")
@@ -4467,20 +4590,40 @@ do
     assertTrue(startedAt >= prepareTime + 90 or startedAt == math.floor(world.time),
         "UI accept finalizes start timestamp")
 
-    -- Cached open/hide/reopen via Refresh (StandaloneWindow pattern), not second Build.
+    -- Cached open/hide/reopen: Settings parent hide (panel stays IsShown).
+    local settingsParent = makeRegion("Frame", "GSSettingsParent", nil)
+    configPanel.parent = settingsParent
+    settingsParent.shown = true
     local refreshCount = 0
     local realRefresh = SF.SettingsUI.DefinitionRenderer.Refresh
     SF.SettingsUI.DefinitionRenderer.Refresh = function(self, panel)
         refreshCount = refreshCount + 1
         return realRefresh(self, panel)
     end
-    configPanel.shown = false
+    local function fireRosterEvents()
+        for i = 1, #created do
+            local f = created[i]
+            if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE
+                and f.scripts and f.scripts.OnEvent then
+                f.scripts.OnEvent(f, "GUILD_ROSTER_UPDATE")
+            end
+        end
+    end
+    local priorAfter = C_Timer.After
+    local deferredFns = {}
+    C_Timer.After = function(_, fn)
+        deferredFns[#deferredFns + 1] = fn
+    end
+    settingsParent.shown = false
+    configPanel.shown = true -- child remains locally shown under hidden parent
+    refreshCount = 0
+    deferredFns = {}
+    fireRosterEvents()
+    assertEq(#deferredFns, 0, "hidden Settings parent does not queue roster refresh")
+    assertEq(refreshCount, 0, "hidden Settings parent skips roster refresh")
+    settingsParent.shown = true
     configPage:Refresh(configPanel)
-    assertEq(refreshCount, 0, "hidden panel skips refresh")
-    configPanel.shown = true
-    configPage:Refresh(configPanel)
-    assertTrue(refreshCount >= 1, "cached reopen uses Refresh")
-    -- Roster readiness event refreshes visible page.
+    assertTrue(refreshCount >= 1, "cached reopen uses Refresh when parent visible")
     local rosterListeners = 0
     for i = 1, #created do
         local f = created[i]
@@ -4488,22 +4631,44 @@ do
             rosterListeners = rosterListeners + 1
         end
     end
-    assertTrue(rosterListeners >= 1, "guild roster listener installed")
+    assertTrue(rosterListeners >= 1 and rosterListeners <= 4,
+        "bounded guild roster listeners: " .. tostring(rosterListeners))
     refreshCount = 0
-    local priorAfter = C_Timer.After
-    C_Timer.After = function(_, fn) fn() end -- coalesce immediately in this harness
-    for i = 1, #created do
-        local f = created[i]
-        if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE
-            and f.scripts and f.scripts.OnEvent then
-            f.scripts.OnEvent(f, "GUILD_ROSTER_UPDATE")
-        end
-    end
+    deferredFns = {}
+    fireRosterEvents()
+    fireRosterEvents()
+    fireRosterEvents()
+    assertEq(#deferredFns, 1, "roster burst queues a single coalesced callback")
+    deferredFns[1]()
+    assertEq(refreshCount, 1, "deferred roster burst coalesces to one refresh")
     C_Timer.After = priorAfter
-    assertTrue(refreshCount >= 1, "roster event refreshes visible configuration page")
     SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
 
-    -- History pager: empty current then archived with >25 rows enables Older after Refresh.
+    -- Membership redaction: known guild dataset, unverified local membership.
+    local priorMembers = world.guild.members
+    world.guild.members = {} -- demand roster no longer verifies local membership
+    configPage:Refresh(configPanel)
+    local capsNoRead = GS:GetCapabilities()
+    assertEq(capsNoRead.canRead, false, "unverified membership canRead false")
+    local statusText
+    for _, sec in ipairs((configPanel.__sfPageDef and configPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
+                statusText = item.getText()
+            end
+            if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
+                assertEq(#item.getItems(), 0, "items redacted without canRead")
+            end
+        end
+    end
+    assertTrue(type(statusText) == "string" and statusText:find("membership", 1, true),
+        "status redacts shared data pending membership: " .. tostring(statusText))
+    world.guild.members = priorMembers
+    settleRoster()
+    configPage:Refresh(configPanel)
+    assertEq(GS:GetCapabilities().canRead, true, "membership ready restores canRead")
+
+    -- History pager: drive Older/Newer controls after selecting archived campaign.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -4531,11 +4696,10 @@ do
     assertTrue((rows[1].text or ""):find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
         "history text includes recognizable timestamp: " .. tostring(rows[1].text))
 
-    local logsPanel = makeRegion("Frame", "GSLogsPanel2", nil)
+    local logsParent = makeRegion("Frame", "GSLogsParent", nil)
+    local logsPanel = makeRegion("Frame", "GSLogsPanel2", logsParent)
     logsPanel:SetSize(600, 800)
     logsPage:Build(logsPanel)
-    -- Simulate selecting archived campaign and refreshing (cached reopen path).
-    selectedCampaignId = nil -- page-local; drive through dropdown setSelected
     local drops = {}
     local function findDropdowns(node)
         if node.kind == "DropdownButton" then drops[#drops + 1] = node end
@@ -4554,29 +4718,174 @@ do
     end
     assertTrue(archivedValue ~= nil, "archived campaign option present")
     logsPage:Refresh(logsPanel)
-    assertTrue((logsPage.historyTotal or 0) >= 25, "historyTotal synced before pager")
-    assertTrue(logsPage.historyTotal > 25, "Older should be enableable for >25 rows")
+    assertTrue((logsPage.historyTotal or 0) > 25, "historyTotal synced before pager")
+    local olderBtn, newerBtn
+    local function findNamedButtons(node)
+        if node.kind == "Button" then
+            if node.text == "Older" then olderBtn = node end
+            if node.text == "Newer" then newerBtn = node end
+        end
+        for _, child in ipairs(node.children or {}) do findNamedButtons(child) end
+    end
+    findNamedButtons(logsPanel)
+    assertTrue(olderBtn ~= nil, "Older button present")
+    assertTrue(newerBtn ~= nil, "Newer button present")
+    assertTrue(olderBtn.enabled ~= false, "Older enabled for >25 archive rows")
+    local offsetBefore = logsPage.historyTotal
+    olderBtn:Click()
+    assertTrue((logsPage.historyTotal or 0) == offsetBefore, "pager keeps total after Older")
+    -- After Older, Newer should become meaningful (offset > 0).
+    logsPage:Refresh(logsPanel)
+    findNamedButtons(logsPanel)
+    newerBtn:Click()
+    logsPage:Refresh(logsPanel)
 
-    -- GM policy recovery: permission-only failure still enables rank control path.
+    -- Ordinary-guild GM recovery through dropdown + confirmation (not domain-only).
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
     GS:CreateStagedRecord()
     local record = GS:GetCurrentRecord()
-    -- Break permission revision consistency (permission-only).
     record.permission.revisionId = "gs1:broken-policy-rev:1"
-    local caps = GS:GetCapabilities()
-    assertEq(caps.canRecoverPolicy, true, "GM canRecoverPolicy under permission-only failure")
+    assertEq(GS:GetCapabilities().canRecoverPolicy, true, "GM canRecoverPolicy under permission-only failure")
     assertNil(select(1, GS:GetCurrentRecord()), "GetCurrentRecord nil for permission-only failure")
-    local recoverOp, prepSt, prepReason = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
-    assertTrue(recoverOp ~= nil, "recovery NewConfigOperation works: " .. tostring(prepReason))
-    assertEq(prepSt, "accepted", "recovery op prepared")
-    local applySt, applyReason = GS:ApplyStagedConfigOperation(recoverOp)
-    assertEq(applySt, "accepted", "recovery apply accepted: " .. tostring(applyReason))
-    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2, "recovered editor rank")
+    local recoverPanel = makeRegion("Frame", "GSRecoverPanel", nil)
+    recoverPanel:SetSize(600, 800)
+    pendingConfirm = nil
+    configPage:Build(recoverPanel)
+    local recoverDrops = {}
+    local function findDrops(node)
+        if node.kind == "DropdownButton" then recoverDrops[#recoverDrops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findDrops(child) end
+    end
+    findDrops(recoverPanel)
+    assertTrue(#recoverDrops >= 1, "recovery rank dropdown present")
+    recoverDrops[1]:GenerateMenu()
+    local picked
+    for i = 1, #(recoverDrops[1].menuOptions or {}) do
+        local opt = recoverDrops[1].menuOptions[i]
+        if opt.value == 2 then
+            picked = opt
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    assertTrue(picked ~= nil, "recovery selected rank 2")
+    assertTrue(pendingConfirm ~= nil, "recovery confirmation shown")
+    pendingConfirm.data()
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2,
+        "UI recovery admits editor rank")
+
+    -- Small-guild permission-only recovery must not take the Initialize branch.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    local smallRec, smallSt = GS:CreateStagedRecord(2)
+    assertEq(smallSt, "accepted", "small guild configured with explicit threshold")
+    assertTrue(smallRec ~= nil, "small guild record created")
+    smallRec.permission.revisionId = "gs1:broken-small:1"
+    assertNil(select(1, GS:GetCurrentRecord()), "small guild GetCurrentRecord nil")
+    assertEq(GS:GetCapabilities().canRecoverPolicy, true, "small guild GM canRecoverPolicy")
+    pendingConfirm = nil
+    local smallPanel = makeRegion("Frame", "GSSmallRecover", nil)
+    smallPanel:SetSize(600, 800)
+    configPage:Build(smallPanel)
+    local initEnabled = false
+    for _, sec in ipairs((smallPanel.__sfPageDef and smallPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText and item.buttonText:find("Initialize", 1, true) then
+                initEnabled = item.enabled and item.enabled() or false
+            end
+        end
+    end
+    assertEq(initEnabled, false, "Initialize disabled for existing unusable record")
+    local smallDrops = {}
+    local function findSmallDrops(node)
+        if node.kind == "DropdownButton" then smallDrops[#smallDrops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findSmallDrops(child) end
+    end
+    findSmallDrops(smallPanel)
+    assertTrue(#smallDrops >= 1, "small-guild recovery dropdown present")
+    smallDrops[1]:GenerateMenu()
+    for i = 1, #(smallDrops[1].menuOptions or {}) do
+        local opt = smallDrops[1].menuOptions[i]
+        if opt.value == 1 then
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    assertTrue(pendingConfirm ~= nil, "small-guild recovery opens confirmation not init")
+    pendingConfirm.data()
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
+        "small-guild UI recovery admits rank")
+
+    -- Pending init rank bound to guild context; ordinary roster does not clear.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    pendingConfirm = nil
+    local initPanel = makeRegion("Frame", "GSInitPanel", nil)
+    initPanel:SetSize(600, 800)
+    configPage:Build(initPanel)
+    local initDrops = {}
+    local function findInitDrops(node)
+        if node.kind == "DropdownButton" then initDrops[#initDrops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findInitDrops(child) end
+    end
+    findInitDrops(initPanel)
+    initDrops[1]:GenerateMenu()
+    for i = 1, #(initDrops[1].menuOptions or {}) do
+        local opt = initDrops[1].menuOptions[i]
+        if opt.value == 2 then
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    local initBtn
+    local function findInitBtn(node)
+        if node.kind == "Button" and node.text and node.text:find("Initialize", 1, true) then
+            initBtn = node
+        end
+        for _, child in ipairs(node.children or {}) do findInitBtn(child) end
+    end
+    findInitBtn(initPanel)
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    assertTrue(initBtn ~= nil and initBtn.enabled ~= false, "Initialize enabled after pending rank")
+    -- Ordinary unchanged roster event keeps pending selection.
+    C_Timer.After = function(_, fn) fn() end
+    for i = 1, #created do
+        local f = created[i]
+        if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE
+            and f.scripts and f.scripts.OnEvent then
+            f.scripts.OnEvent(f, "GUILD_ROSTER_UPDATE")
+        end
+    end
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    assertTrue(initBtn.enabled ~= false, "unchanged roster keeps pending init rank")
+    -- Guild change clears pending selection.
+    world.guild.clubId = 99
+    settleRoster()
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    local stillEnabled = initBtn and initBtn.enabled
+    -- After guild change, needs reselection (Initialize disabled until new pending).
+    assertTrue(stillEnabled == false or stillEnabled == nil,
+        "guild change requires init rank reselection")
 
     CreateFrame = priorCreateFrame
+    C_Timer.After = priorAfter
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    world.guild.clubId = 42
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

@@ -84,9 +84,55 @@ local function Caps()
 end
 
 -- Ephemeral small-guild threshold choice for Initialize; never persisted.
+-- Bound to the originating guild/rank-count context (not a bare scalar).
 local pendingInitRank = nil
+local pendingInitGuildKey = nil
+local pendingInitRankCount = nil
 local refreshQueued = false
 local rosterFrame = nil
+
+--- Refresh controls through Page:Refresh so passCache bounds the render.
+local function RefreshPageControls()
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
+local function ClearPendingInitRank()
+	pendingInitRank = nil
+	pendingInitGuildKey = nil
+	pendingInitRankCount = nil
+end
+
+--- Drop a stale initialization choice only when guild/rank context actually changes.
+local function SyncPendingInitContext()
+	if pendingInitRank == nil then
+		return
+	end
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	if not ctx or type(ctx.guildKey) ~= "string" or ctx.guildKey == "" then
+		ClearPendingInitRank()
+		return
+	end
+	local count = tonumber(ctx.rankCount) or 0
+	if ctx.guildKey ~= pendingInitGuildKey or count ~= pendingInitRankCount then
+		ClearPendingInitRank()
+	end
+end
+
+local function SetPendingInitRank(value)
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local pos = tonumber(value)
+	if not pos or not ctx or type(ctx.guildKey) ~= "string" then
+		ClearPendingInitRank()
+		return
+	end
+	pendingInitRank = pos
+	pendingInitGuildKey = ctx.guildKey
+	pendingInitRankCount = tonumber(ctx.rankCount) or 0
+end
 
 local function ReportStatus(ctx, status, reason)
 	local g = GS()
@@ -101,9 +147,7 @@ local function ReportStatus(ctx, status, reason)
 			or "error"
 	end
 	ctx.section:SetMessage(message, severity)
-	if ctx.pageBuilder and ctx.pageBuilder.Refresh then
-		ctx.pageBuilder:Refresh()
-	end
+	RefreshPageControls()
 end
 
 local function ItemLabel(itemId)
@@ -137,7 +181,14 @@ local function RankOptions()
 	return opts
 end
 
+--- True only for first-time setup (no dataset). Permission-only nil records are recovery.
+local function IsNotConfigured()
+	local _, reason = CurrentRecord()
+	return reason == "not_configured"
+end
+
 local function NeedsExplicitInitThreshold()
+	SyncPendingInitContext()
 	local g = GS()
 	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
 	if not ctx or not ctx.ready then
@@ -148,11 +199,13 @@ local function NeedsExplicitInitThreshold()
 	if count <= 0 or count >= defaultPos then
 		return false
 	end
-	local rec = CurrentRecord()
-	return rec == nil
+	return IsNotConfigured()
 end
 
 local function CurrentBankTab()
+	if not Caps().canRead then
+		return nil
+	end
 	local rec = CurrentRecord()
 	local tab = rec and rec.accounting and rec.accounting._consumables
 		and rec.accounting._consumables.bankTab
@@ -160,8 +213,12 @@ local function CurrentBankTab()
 end
 
 local function RequestedItemRows()
-	local record = CurrentRecord()
 	local rows = {}
+	-- Shared campaign/item data stays redacted until membership canRead is verified.
+	if not Caps().canRead then
+		return rows
+	end
+	local record = CurrentRecord()
 	if not record or type(record.currentCampaignId) ~= "string" then
 		return rows
 	end
@@ -189,13 +246,17 @@ local function RequestedItemRows()
 end
 
 local function StagedStatusText()
+	local caps = Caps()
+	if not caps.canRead then
+		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
+			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
+	end
 	local g = GS()
 	local record, recReason = CurrentRecord()
 	local formatReason = g and g.FormatReasonText or function(r)
 		return tostring(r or "unknown")
 	end
 	if not record then
-		local caps = Caps()
 		if caps.reason == "not_configured" or recReason == "not_configured" then
 			return Loc("GUILD_SUPPLIES_STATUS_NOT_CONFIGURED",
 				"No staged Guild Supplies dataset for this guild yet. Use Initialize Guild Supplies.")
@@ -215,6 +276,10 @@ local function StagedStatusText()
 end
 
 local function ItemsHelpText()
+	if not Caps().canRead then
+		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
+			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
+	end
 	local record = CurrentRecord()
 	local hasCampaign = record and type(record.currentCampaignId) == "string" and record.currentCampaignId ~= ""
 	if hasCampaign then
@@ -359,14 +424,20 @@ local function Definition()
 						defaultText = Loc("GUILD_SUPPLIES_EDITOR_RANK_UNKNOWN", "Unavailable"),
 						options = RankOptions,
 						get = function()
+							SyncPendingInitContext()
 							if NeedsExplicitInitThreshold() then
 								return pendingInitRank
+							end
+							-- Redact shared policy display until membership canRead; recovery
+							-- enablement still uses Caps().canRecoverPolicy below.
+							if not Caps().canRead and not Caps().canRecoverPolicy then
+								return nil
 							end
 							return Caps().editorRankPosition
 						end,
 						set = function(value)
 							if NeedsExplicitInitThreshold() then
-								pendingInitRank = tonumber(value)
+								SetPendingInitRank(value)
 							end
 						end,
 						enabled = function()
@@ -384,10 +455,8 @@ local function Definition()
 						end,
 						onValueChanged = function(ctx, value)
 							if NeedsExplicitInitThreshold() then
-								pendingInitRank = tonumber(value)
-								if ctx.pageBuilder and ctx.pageBuilder.Refresh then
-									ctx.pageBuilder:Refresh()
-								end
+								SetPendingInitRank(value)
+								RefreshPageControls()
 								return
 							end
 							CommitEditorRank(ctx, value)
@@ -404,10 +473,11 @@ local function Definition()
 							if not c.canEdit and not c.canRecoverPolicy then
 								return false
 							end
-							local rec = CurrentRecord()
-							if rec ~= nil then
+							-- Only true first-time setup; existing unusable records use recovery.
+							if not IsNotConfigured() then
 								return false
 							end
+							SyncPendingInitContext()
 							if NeedsExplicitInitThreshold() then
 								return pendingInitRank ~= nil
 							end
@@ -422,7 +492,12 @@ local function Definition()
 									"error")
 								return
 							end
+							if not IsNotConfigured() then
+								ReportStatus(ctx, "rejected", "already_configured")
+								return
+							end
 							local threshold = nil
+							SyncPendingInitContext()
 							if NeedsExplicitInitThreshold() then
 								threshold = pendingInitRank
 								if threshold == nil then
@@ -432,7 +507,7 @@ local function Definition()
 							end
 							local _, status, reason = mod:CreateStagedRecord(threshold)
 							if status == "accepted" then
-								pendingInitRank = nil
+								ClearPendingInitRank()
 							end
 							ReportStatus(ctx, status or "rejected", reason)
 						end,
@@ -558,11 +633,21 @@ local function Definition()
 						end,
 						onGoalCommit = function(ctx, item, goal)
 							if not item or not item.itemId then return end
-							local gnum = tonumber(goal)
-							if not gnum or gnum < 0 or gnum ~= math.floor(gnum) then
-								ctx.section:SetMessage(
-									Loc("GUILD_SUPPLIES_ERR_GOAL", "Enter a non-negative whole-number goal."),
-									"error")
+							local C = SF.Consumables
+							local gnum = C and C.ValidGoal and C.ValidGoal(goal) or nil
+							if gnum == nil then
+								local maxGoal = (C and tonumber(C.MAX_GOAL)) or 100000
+								local raw = tonumber(goal)
+								if raw and raw == math.floor(raw) and raw >= 0 and raw > maxGoal then
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_ERR_GOAL_RANGE",
+											"Enter a whole-number goal from 0 to %d."):format(maxGoal),
+										"error")
+								else
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_ERR_GOAL", "Enter a non-negative whole-number goal."),
+										"error")
+								end
 								return
 							end
 							CommitConfig(ctx, "set-requested-item", { itemId = item.itemId }, {
@@ -603,10 +688,17 @@ local function Definition()
 	}
 end
 
+-- Standalone Settings can hide the parent while the page panel stays IsShown.
+-- Prefer IsVisible so roster-driven work does not run against a closed window.
 local function PanelVisible(panel)
 	if not panel then return false end
-	if panel.IsShown and not panel:IsShown() then return false end
-	return true
+	if panel.IsVisible then
+		return panel:IsVisible() and true or false
+	end
+	if panel.IsShown then
+		return panel:IsShown() and true or false
+	end
+	return false
 end
 
 local function QueueRefresh()
@@ -619,6 +711,7 @@ local function QueueRefresh()
 		refreshQueued = false
 		if not Page.panel or not Page.Refresh then return end
 		if not PanelVisible(Page.panel) then return end
+		SyncPendingInitContext()
 		Page:Refresh(Page.panel)
 	end
 	if C_Timer and C_Timer.After then
@@ -639,6 +732,7 @@ local function EnsureRosterListener()
 		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
 	end
 	frame:SetScript("OnEvent", function()
+		SyncPendingInitContext()
 		QueueRefresh()
 	end)
 end
@@ -676,6 +770,7 @@ end
 
 function Page:OnHide()
 	refreshQueued = false
+	-- Do not rely on OnHide for visibility gating; PanelVisible uses IsVisible.
 end
 
 EnsureRosterListener()

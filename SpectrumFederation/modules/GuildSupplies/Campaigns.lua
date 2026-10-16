@@ -222,6 +222,21 @@ function GS.IsBankContextSampleReady(bankTab)
             end
         end
     end
+    -- Require current view access to the configured tab before claiming a fresh sample.
+    -- Unknown or denied access is unavailable; New Campaign still proceeds.
+    if type(GetGuildBankTabInfo) ~= "function" then
+        return false, "tab_access_unknown"
+    end
+    local okTab, name, _, isViewable = pcall(GetGuildBankTabInfo, tab)
+    if not okTab or type(name) ~= "string" or name == "" then
+        return false, "tab_access_unknown"
+    end
+    if isViewable ~= true then
+        if isViewable == false then
+            return false, "tab_access_denied"
+        end
+        return false, "tab_access_unknown"
+    end
     return true
 end
 
@@ -802,6 +817,10 @@ function GS.FormatReasonText(reason)
             "the Guild Bank log is not ready yet"),
         tab_not_ready = Loc("GUILD_SUPPLIES_REASON_TAB_NOT_READY",
             "the configured bank tab is not ready to read"),
+        tab_access_denied = Loc("GUILD_SUPPLIES_REASON_TAB_ACCESS_DENIED",
+            "this character cannot view the configured bank tab"),
+        tab_access_unknown = Loc("GUILD_SUPPLIES_REASON_TAB_ACCESS_UNKNOWN",
+            "bank tab access could not be verified"),
         bank_tab_unset = Loc("GUILD_SUPPLIES_REASON_BANK_TAB_UNSET",
             "no bank tab is configured"),
         api_unavailable = Loc("GUILD_SUPPLIES_REASON_API_UNAVAILABLE",

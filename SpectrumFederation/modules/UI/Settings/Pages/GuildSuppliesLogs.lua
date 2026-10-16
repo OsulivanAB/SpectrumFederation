@@ -118,6 +118,9 @@ end
 
 local function CampaignOptions()
 	local opts = {}
+	if not Caps().canRead then
+		return opts
+	end
 	local list = InspectableCampaigns()
 	for i = 1, #list do
 		local entry = list[i]
@@ -130,6 +133,10 @@ local function CampaignOptions()
 end
 
 local function ResolveSelectedCampaign()
+	if not Caps().canRead then
+		selectedCampaignId = nil
+		return nil
+	end
 	local record = CurrentRecord()
 	if not record then
 		selectedCampaignId = nil
@@ -172,9 +179,12 @@ local function MembershipHelpText()
 end
 
 local function ItemRowsForSelected()
+	local rows = {}
+	if not Caps().canRead then
+		return rows
+	end
 	local g = GS()
 	local campaignId = ResolveSelectedCampaign()
-	local rows = {}
 	if not g or not campaignId then
 		return rows
 	end
@@ -330,6 +340,10 @@ local function Definition()
 						type = "display",
 						label = Loc("GUILD_SUPPLIES_CAMPAIGN_DETAIL", "Selection"),
 						get = function()
+							if not Caps().canRead then
+								return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
+									"Join a guild with a verified membership to inspect Guild Supplies logs.")
+							end
 							local id = ResolveSelectedCampaign()
 							if not id then
 								return Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns")
@@ -437,10 +451,17 @@ local function Definition()
 	}
 end
 
+-- Standalone Settings can hide the parent while the page panel stays IsShown.
+-- Prefer IsVisible so roster-driven work does not run against a closed window.
 local function PanelVisible(panel)
 	if not panel then return false end
-	if panel.IsShown and not panel:IsShown() then return false end
-	return true
+	if panel.IsVisible then
+		return panel:IsVisible() and true or false
+	end
+	if panel.IsShown then
+		return panel:IsShown() and true or false
+	end
+	return false
 end
 
 local function QueueRefresh()
