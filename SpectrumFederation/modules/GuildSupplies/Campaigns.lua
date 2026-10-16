@@ -51,17 +51,21 @@ local function CountMap(t)
     return n
 end
 
+--- Bound every raw map entry (including invalid ones). Over-cap fails closed
+-- without returning a truncated valid-looking partial list.
+-- @return table|nil copy, string|nil err
 local function CopyRequestedItems(items)
-    local out = {}
     if type(items) ~= "table" then
-        return out
+        return {}
     end
     local C = SF.Consumables
     local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
+    local out = {}
     local n = 0
     for key, row in pairs(items) do
-        if n >= maxItems then
-            break
+        n = n + 1
+        if n > maxItems then
+            return nil, "requested_items_overflow"
         end
         if type(row) == "table" then
             local itemId = tonumber(row.itemId) or tonumber(key)
@@ -69,11 +73,29 @@ local function CopyRequestedItems(items)
             if itemId and itemId == math.floor(itemId) and itemId >= 1
                 and goal == math.floor(goal) and goal >= 0 then
                 out[tostring(itemId)] = { itemId = itemId, goal = goal }
-                n = n + 1
             end
         end
     end
     return out
+end
+
+--- Fail closed when a retained requestedItems map exceeds the supported cap.
+-- Counts every raw entry, including invalid ones. Does not rewrite SavedVariables.
+-- @return boolean ok, string|nil err
+function GS.ValidateRequestedItemsMap(items)
+    if type(items) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    local C = SF.Consumables
+    local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
+    local n = 0
+    for _ in pairs(items) do
+        n = n + 1
+        if n > maxItems then
+            return false, "requested_items_overflow"
+        end
+    end
+    return true
 end
 
 --- Ensure eligibility table shape without repairing unrelated corruption.
@@ -378,6 +400,10 @@ function GS.ValidateCampaignArchive(archive, campaignId, record)
     if type(archive.requestedItems) ~= "table" then
         return false, "invalid_campaign_archive"
     end
+    local itemsOk, itemsErr = GS.ValidateRequestedItemsMap(archive.requestedItems)
+    if not itemsOk then
+        return false, itemsErr or "invalid_campaign_archive"
+    end
     local gen = tonumber(archive.generation)
     if not gen or gen ~= math.floor(gen) or gen < 1 then
         return false, "invalid_generation"
@@ -428,11 +454,15 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
     if generation < 1 then
         generation = 1
     end
+    local copiedItems, copyErr = CopyRequestedItems(cfg.requestedItems)
+    if type(copiedItems) ~= "table" then
+        return false, copyErr or "invalid_accounting"
+    end
     archives[campaignId] = {
         schemaVersion = GS.SCHEMA_VERSION,
         campaignId = campaignId,
         datasetId = record.datasetId,
-        requestedItems = CopyRequestedItems(cfg.requestedItems),
+        requestedItems = copiedItems,
         generation = generation,
         archivedAt = timestamp,
     }
@@ -525,18 +555,26 @@ function GS:GetCampaignRequestedItems(campaignId)
 
     if record.currentCampaignId == campaignId then
         local cfg = record.accounting._consumables
-        return CopyRequestedItems(cfg and cfg.requestedItems), nil, true
+        local copied, copyErr = CopyRequestedItems(cfg and cfg.requestedItems)
+        if type(copied) ~= "table" then
+            return nil, copyErr or "requested_items_overflow"
+        end
+        return copied, nil, true
     end
 
     local archive = record.campaignArchives and record.campaignArchives[campaignId]
     if type(archive) ~= "table" then
-        return CopyRequestedItems(nil), nil, false
+        return {}, nil, false
     end
     local aok, aerr = GS.ValidateCampaignArchive(archive, campaignId, record)
     if not aok then
         return nil, aerr or "invalid_campaign_archive"
     end
-    return CopyRequestedItems(archive.requestedItems), nil, false
+    local copied, copyErr = CopyRequestedItems(archive.requestedItems)
+    if type(copied) ~= "table" then
+        return nil, copyErr or "requested_items_overflow"
+    end
+    return copied, nil, false
 end
 
 local function IsDonationEvent(event)
@@ -827,6 +865,8 @@ function GS.FormatReasonText(reason)
             "Guild Bank APIs are unavailable"),
         readiness_unavailable = Loc("GUILD_SUPPLIES_REASON_READINESS_UNAVAILABLE",
             "bank readiness evidence is unavailable"),
+        requested_items_overflow = Loc("GUILD_SUPPLIES_REASON_REQUESTED_ITEMS_OVERFLOW",
+            "requested-item configuration exceeds the supported limit"),
         invalid_editor_rank_position = Loc("GUILD_SUPPLIES_REASON_INVALID_RANK",
             "choose an existing guild rank"),
         rank_unavailable = Loc("GUILD_SUPPLIES_REASON_RANK_UNAVAILABLE",

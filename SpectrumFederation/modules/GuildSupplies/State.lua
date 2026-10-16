@@ -466,6 +466,14 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if type(cfg.requestedItems) ~= "table" then
         return false, "invalid_accounting"
     end
+    -- Bound every raw requestedItems entry (including invalid ones). Preserve
+    -- oversized retained maps unchanged/unavailable — do not silently truncate.
+    if GS.ValidateRequestedItemsMap then
+        local itemsOk, itemsErr = GS.ValidateRequestedItemsMap(cfg.requestedItems)
+        if not itemsOk then
+            return false, itemsErr or "invalid_accounting"
+        end
+    end
     if type(accounting._consumableEvents) ~= "table"
         or type(accounting._consumableEventArchive) ~= "table" then
         return false, "invalid_accounting"

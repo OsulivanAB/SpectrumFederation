@@ -227,8 +227,17 @@ local function RequestedItemRows()
 	if type(items) ~= "table" then
 		return rows
 	end
+	-- Cap before constructing controls. Count every raw entry, including invalid;
+	-- over-cap maps stay unavailable rather than becoming a truncated UI list.
+	local C = SF.Consumables
+	local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
+	local inspected = 0
 	local canEdit = Caps().canEdit
 	for _, row in pairs(items) do
+		inspected = inspected + 1
+		if inspected > maxItems then
+			return {}
+		end
 		if type(row) == "table" and tonumber(row.itemId) then
 			rows[#rows + 1] = {
 				text = ItemLabel(row.itemId),

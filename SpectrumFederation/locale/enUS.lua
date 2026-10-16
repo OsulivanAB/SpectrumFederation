@@ -137,6 +137,7 @@ L["GUILD_SUPPLIES_REASON_TAB_ACCESS_UNKNOWN"] = "bank tab access could not be ve
 L["GUILD_SUPPLIES_REASON_BANK_TAB_UNSET"] = "no bank tab is configured"
 L["GUILD_SUPPLIES_REASON_API_UNAVAILABLE"] = "Guild Bank APIs are unavailable"
 L["GUILD_SUPPLIES_REASON_READINESS_UNAVAILABLE"] = "bank readiness evidence is unavailable"
+L["GUILD_SUPPLIES_REASON_REQUESTED_ITEMS_OVERFLOW"] = "requested-item configuration exceeds the supported limit"
 L["GUILD_SUPPLIES_REASON_INVALID_RANK"] = "choose an existing guild rank"
 L["GUILD_SUPPLIES_REASON_RANK_UNAVAILABLE"] = "guild rank information is unavailable"
 L["GUILD_SUPPLIES_REASON_DATASET_MISMATCH"] = "the guild dataset changed"

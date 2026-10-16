@@ -244,6 +244,7 @@ local function EnsureHistoryState()
 		historyOffset = 0
 		historyCampaignId = campaignId
 		Page.historyTotal = 0
+		Page.historyOffset = 0
 		cachedHistoryItems = {}
 		return cachedHistoryItems
 	end
@@ -259,10 +260,15 @@ local function EnsureHistoryState()
 		total = tonumber(total) or (rows and #rows) or 0
 	end
 	Page.historyTotal = total
+	Page.historyOffset = historyOffset
 	local items = {}
 	if type(rows) == "table" then
 		for i = 1, #rows do
-			items[#items + 1] = { text = rows[i].text, canRemove = false }
+			items[#items + 1] = {
+				text = rows[i].text,
+				id = rows[i].id,
+				canRemove = false,
+			}
 		end
 	end
 	cachedHistoryItems = items

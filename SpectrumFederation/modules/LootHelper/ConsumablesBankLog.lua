@@ -149,8 +149,11 @@ function BankLog:RequestLog(reason)
     end
     local now = WallNow()
     -- Slot churn can be frequent; coalesce while a query is already outstanding
-    -- or a recent query just completed successfully.
+    -- or a recent query just completed successfully. Invalidate the prior
+    -- successful stamp immediately so readiness cannot reuse a pre-change
+    -- sample while the replacement query is throttled or already in flight.
     if reason == "slots_changed" then
+        ClearFreshLogStamp(self)
         if self.awaitingLogUpdate then return end
         if self.lastQueryAt and (now - self.lastQueryAt) < SLOTS_THROTTLE_SECONDS then
             return

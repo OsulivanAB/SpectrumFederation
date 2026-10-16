@@ -4236,7 +4236,52 @@ do
     assertEq(BankLog.lastFreshLogTab, 1, "successful update restores stamp")
     assertEq(GS.CaptureBankContext(1).status, "empty", "restored stamp allows empty")
 
+    -- Slot-change inside throttle: invalidate stamp without issuing another query.
+    world.logQueries = {}
+    BankLog.awaitingLogUpdate = false
+    BankLog.lastQueryAt = world.time
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog.lastFreshLogAt = world.time
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(#world.logQueries, 0, "throttled slots_changed does not query")
+    assertEq(BankLog.lastFreshLogTab, nil, "slots_changed clears stamp inside throttle")
+    assertEq(GS.IsBankContextSampleReady(1), false, "readiness unavailable after throttled slot change")
+    assertEq(select(2, GS.IsBankContextSampleReady(1)), "log_not_updated",
+        "throttled slot change reason is log_not_updated")
+    assertEq(GS.CaptureBankContext(1).status, "unavailable",
+        "CaptureBankContext unavailable after throttled slot change")
+    -- Genuine successful update restores readiness without requiring a new query first.
+    BankLog.awaitingLogUpdate = true
+    BankLog:ProcessLogUpdate("slot_restore")
+    assertEq(BankLog.lastFreshLogTab, 1, "successful update restores stamp after slot invalidate")
+    assertEq(GS.IsBankContextSampleReady(1), true, "readiness restored after successful update")
+
+    -- Slot change while a query is already outstanding: clear stamp, coalesce query.
+    world.logQueries = {}
+    BankLog.awaitingLogUpdate = true
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(#world.logQueries, 0, "outstanding slots_changed does not start a second query")
+    assertEq(BankLog.lastFreshLogTab, nil, "outstanding slots_changed clears stamp")
+    assertEq(BankLog.awaitingLogUpdate, true, "outstanding query remains awaiting")
+    assertEq(select(2, GS.IsBankContextSampleReady(1)), "log_pending",
+        "outstanding slots_changed stays log_pending")
+
+    -- Production CancelTimers clears stamp and awaiting.
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    BankLog.awaitingLogUpdate = true
+    BankLog:CancelTimers("test_cancel")
+    assertEq(BankLog.lastFreshLogTab, nil, "CancelTimers clears freshness stamp")
+    assertEq(BankLog.awaitingLogUpdate, false, "CancelTimers clears awaiting")
+    assertEq(GS.IsBankContextSampleReady(1), false, "CancelTimers leaves readiness unavailable")
+
     -- Denied / unknown tab access.
+    BankLog.awaitingLogUpdate = false
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
     world.bankTabInfo[1].isViewable = false
     local deniedReady, deniedReason = GS.IsBankContextSampleReady(1)
     assertEq(deniedReady, false, "denied tab access not ready")
@@ -4644,31 +4689,49 @@ do
     C_Timer.After = priorAfter
     SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
 
-    -- Membership redaction: known guild dataset, unverified local membership.
+    -- Membership/readiness restoration through deferred roster event (no manual Refresh).
     local priorMembers = world.guild.members
-    world.guild.members = {} -- demand roster no longer verifies local membership
-    configPage:Refresh(configPanel)
-    local capsNoRead = GS:GetCapabilities()
-    assertEq(capsNoRead.canRead, false, "unverified membership canRead false")
-    local statusText
-    for _, sec in ipairs((configPanel.__sfPageDef and configPanel.__sfPageDef.sections) or {}) do
-        for _, item in ipairs(sec.items or {}) do
-            if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
-                statusText = item.getText()
-            end
-            if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
-                assertEq(#item.getItems(), 0, "items redacted without canRead")
+    local function statusAndItemCount()
+        local status, itemCount
+        for _, sec in ipairs((configPanel.__sfPageDef and configPanel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
+                    status = item.getText()
+                end
+                if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
+                    itemCount = #item.getItems()
+                end
             end
         end
+        return status, itemCount
     end
+    world.guild.members = {} -- demand roster no longer verifies local membership
+    deferredFns = {}
+    C_Timer.After = function(_, fn)
+        deferredFns[#deferredFns + 1] = fn
+    end
+    fireRosterEvents()
+    assertEq(#deferredFns, 1, "membership loss queues deferred page refresh")
+    deferredFns[1]()
+    assertEq(GS:GetCapabilities().canRead, false, "unverified membership canRead false")
+    local statusText, itemCount = statusAndItemCount()
+    assertEq(itemCount, 0, "items redacted without canRead via deferred event")
     assertTrue(type(statusText) == "string" and statusText:find("membership", 1, true),
         "status redacts shared data pending membership: " .. tostring(statusText))
     world.guild.members = priorMembers
     settleRoster()
-    configPage:Refresh(configPanel)
-    assertEq(GS:GetCapabilities().canRead, true, "membership ready restores canRead")
+    deferredFns = {}
+    fireRosterEvents()
+    assertEq(#deferredFns, 1, "membership restore queues deferred page refresh")
+    deferredFns[1]()
+    assertEq(GS:GetCapabilities().canRead, true, "membership ready restores canRead via deferred event")
+    statusText, itemCount = statusAndItemCount()
+    assertTrue(type(statusText) == "string" and not statusText:find("membership is still", 1, true),
+        "status leaves membership-pending wording after restore")
+    C_Timer.After = priorAfter
+    SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
 
-    -- History pager: drive Older/Newer controls after selecting archived campaign.
+    -- History pager: drive Older/Newer and assert displayed ranges + pager state.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -4719,26 +4782,66 @@ do
     assertTrue(archivedValue ~= nil, "archived campaign option present")
     logsPage:Refresh(logsPanel)
     assertTrue((logsPage.historyTotal or 0) > 25, "historyTotal synced before pager")
+    assertEq(logsPage.historyOffset or 0, 0, "pager starts at offset 0")
+    local function historyItemsFromDef()
+        for _, sec in ipairs((logsPanel.__sfPageDef and logsPanel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "scrollList" and type(item.getItems) == "function" then
+                    local got = item.getItems()
+                    if type(got) == "table" and got[1] and type(got[1].id) == "string"
+                        and tostring(got[1].id):find("^hist%-") then
+                        return got
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    local page0 = historyItemsFromDef()
+    assertTrue(type(page0) == "table" and #page0 == 25, "first history page has 25 rows")
+    assertEq(page0[1].id, "hist-30", "newest event first on page 0")
+    assertEq(page0[25].id, "hist-6", "oldest-on-page event at end of page 0")
     local olderBtn, newerBtn
     local function findNamedButtons(node)
-        if node.kind == "Button" then
-            if node.text == "Older" then olderBtn = node end
-            if node.text == "Newer" then newerBtn = node end
+        olderBtn, newerBtn = nil, nil
+        local function walk(n)
+            if n.kind == "Button" then
+                if n.text == "Older" then olderBtn = n end
+                if n.text == "Newer" then newerBtn = n end
+            end
+            for _, child in ipairs(n.children or {}) do walk(child) end
         end
-        for _, child in ipairs(node.children or {}) do findNamedButtons(child) end
+        walk(node)
     end
     findNamedButtons(logsPanel)
     assertTrue(olderBtn ~= nil, "Older button present")
     assertTrue(newerBtn ~= nil, "Newer button present")
     assertTrue(olderBtn.enabled ~= false, "Older enabled for >25 archive rows")
-    local offsetBefore = logsPage.historyTotal
+    local totalBefore = logsPage.historyTotal
+    local recordCalls = 0
+    local realGetCurrentRecord = GS.GetCurrentRecord
+    GS.GetCurrentRecord = function(self, ...)
+        recordCalls = recordCalls + 1
+        return realGetCurrentRecord(self, ...)
+    end
     olderBtn:Click()
-    assertTrue((logsPage.historyTotal or 0) == offsetBefore, "pager keeps total after Older")
-    -- After Older, Newer should become meaningful (offset > 0).
-    logsPage:Refresh(logsPanel)
+    assertEq(logsPage.historyTotal, totalBefore, "pager keeps total after Older")
+    assertEq(logsPage.historyOffset, 25, "Older advances historyOffset to 25")
+    local page1 = historyItemsFromDef()
+    assertTrue(type(page1) == "table" and #page1 == 5, "second history page has remaining 5 rows")
+    assertEq(page1[1].id, "hist-5", "Older page starts at hist-5")
+    assertEq(page1[5].id, "hist-1", "Older page ends at hist-1")
+    -- Bound is control/render-pass scale, not one call per retained history event.
+    assertTrue(recordCalls > 0 and recordCalls <= 40 and recordCalls < total,
+        "populated-history validation work stays bounded on Older render: " .. tostring(recordCalls))
     findNamedButtons(logsPanel)
+    assertTrue(newerBtn ~= nil and newerBtn.enabled ~= false, "Newer enabled after Older")
     newerBtn:Click()
-    logsPage:Refresh(logsPanel)
+    assertEq(logsPage.historyOffset, 0, "Newer returns historyOffset to 0")
+    local pageBack = historyItemsFromDef()
+    assertEq(pageBack[1].id, "hist-30", "Newer restores newest page")
+    assertEq(pageBack[25].id, "hist-6", "Newer restores first-page tail")
+    GS.GetCurrentRecord = realGetCurrentRecord
 
     -- Ordinary-guild GM recovery through dropdown + confirmation (not domain-only).
     resetDb()
@@ -4824,7 +4927,7 @@ do
     assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
         "small-guild UI recovery admits rank")
 
-    -- Pending init rank bound to guild context; ordinary roster does not clear.
+    -- Pending init rank bound to guild context; click Initialize and assert dataset/policy.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -4860,7 +4963,45 @@ do
     configPage:Refresh(initPanel)
     findInitBtn(initPanel)
     assertTrue(initBtn ~= nil and initBtn.enabled ~= false, "Initialize enabled after pending rank")
-    -- Ordinary unchanged roster event keeps pending selection.
+    assertNil(select(1, GS:GetCurrentRecord()), "no dataset before Initialize click")
+    initBtn:Click()
+    local createdRec, createdReason = GS:GetCurrentRecord()
+    assertTrue(createdRec ~= nil, "Initialize click creates dataset: " .. tostring(createdReason))
+    assertEq(createdRec.permission.editorRankPosition, 2,
+        "Initialize click admits selected editor rank policy")
+    assertEq(createdRec.activation, GS.ACTIVATION_STAGED, "Initialize creates staged activation")
+    assertTrue(type(createdRec.datasetId) == "string" and createdRec.datasetId ~= "",
+        "Initialize creates datasetId")
+
+    -- Fresh not-configured guild: unchanged roster keeps pending rank; guild change clears it.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    pendingConfirm = nil
+    initPanel = makeRegion("Frame", "GSInitPanel2", nil)
+    initPanel:SetSize(600, 800)
+    configPage:Build(initPanel)
+    initDrops = {}
+    findInitDrops(initPanel)
+    assertTrue(#initDrops >= 1, "init rank dropdown present for reselect")
+    initDrops[1]:GenerateMenu()
+    local selectedPending = false
+    for i = 1, #(initDrops[1].menuOptions or {}) do
+        local opt = initDrops[1].menuOptions[i]
+        if opt.value == 2 then
+            opt.setSelected(opt.value)
+            selectedPending = true
+            break
+        end
+    end
+    assertEq(selectedPending, true, "pending init rank 2 selected")
+    initBtn = nil
+    configPage:Refresh(initPanel)
+    findInitBtn(initPanel)
+    assertTrue(initBtn ~= nil and initBtn.enabled ~= false, "Initialize enabled after reselect")
     C_Timer.After = function(_, fn) fn() end
     for i = 1, #created do
         local f = created[i]
@@ -4869,18 +5010,136 @@ do
             f.scripts.OnEvent(f, "GUILD_ROSTER_UPDATE")
         end
     end
+    initBtn = nil
     configPage:Refresh(initPanel)
     findInitBtn(initPanel)
-    assertTrue(initBtn.enabled ~= false, "unchanged roster keeps pending init rank")
+    assertTrue(initBtn ~= nil and initBtn.enabled ~= false, "unchanged roster keeps pending init rank")
+    -- Restore deferred timers before further settleRoster calls; an immediate
+    -- C_Timer.After would fire the demand-roster wait timeout before the update.
+    C_Timer.After = priorAfter
     -- Guild change clears pending selection.
     world.guild.clubId = 99
     settleRoster()
+    initBtn = nil
     configPage:Refresh(initPanel)
     findInitBtn(initPanel)
     local stillEnabled = initBtn and initBtn.enabled
     -- After guild change, needs reselection (Initialize disabled until new pending).
     assertTrue(stillEnabled == false or stillEnabled == nil,
         "guild change requires init rank reselection")
+
+    -- Requested-item bounds: over-cap/invalid fixtures stay unavailable; valid max renders.
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    local createdBound, createdBoundStatus, createdBoundReason = GS:CreateStagedRecord()
+    assertEq(createdBoundStatus, "accepted",
+        "bounds fixture CreateStagedRecord: " .. tostring(createdBoundReason))
+    assertTrue(createdBound ~= nil, "bounds fixture record created")
+    startCampaign()
+    local boundRec = GS:GetCurrentRecord()
+    assertTrue(boundRec ~= nil, "bounds fixture current record available")
+    local boundItems = boundRec.accounting._consumables.requestedItems
+    local maxItems = (SF.Consumables and SF.Consumables.MAX_REQUESTED_ITEMS) or 256
+    for i = 1, maxItems do
+        boundItems[tostring(1000 + i)] = { itemId = 1000 + i, goal = i }
+    end
+    local okMax, errMax = GS.ValidateRequestedItemsMap(boundItems)
+    assertEq(okMax, true, "valid maximum-sized map accepted")
+    local copiedMax = GS:GetCampaignRequestedItems(boundRec.currentCampaignId)
+    local copiedCount = 0
+    for _ in pairs(copiedMax or {}) do copiedCount = copiedCount + 1 end
+    assertEq(copiedCount, maxItems, "GetCampaignRequestedItems returns full max-sized map")
+    local boundsPanel = makeRegion("Frame", "GSBoundsPanel", nil)
+    boundsPanel:SetSize(600, 800)
+    configPage:Build(boundsPanel)
+    local maxRowCount
+    for _, sec in ipairs((boundsPanel.__sfPageDef and boundsPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
+                maxRowCount = #item.getItems()
+            end
+        end
+    end
+    assertEq(maxRowCount, maxItems, "UI constructs bounded rows for valid max-sized map")
+    -- Over-cap: preserve SV unchanged and make record unavailable.
+    boundItems[tostring(1000 + maxItems + 1)] = { itemId = 1000 + maxItems + 1, goal = 1 }
+    local overflowSnapshot = {}
+    for k, v in pairs(boundItems) do
+        overflowSnapshot[k] = v
+    end
+    local overflowCount = 0
+    for _ in pairs(boundItems) do overflowCount = overflowCount + 1 end
+    assertTrue(overflowCount > maxItems, "fixture exceeds requested-item cap")
+    assertEq(select(1, GS:GetCurrentRecord()), nil, "over-cap current map makes record unavailable")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_overflow",
+        "over-cap reason is requested_items_overflow")
+    local afterCount = 0
+    local preserved = true
+    for k, v in pairs(overflowSnapshot) do
+        afterCount = afterCount + 1
+        if boundItems[k] ~= v then
+            preserved = false
+        end
+    end
+    assertEq(afterCount, overflowCount, "over-cap SV entry count preserved")
+    assertEq(preserved, true, "over-cap SV entries preserved unchanged")
+    configPage:Refresh(boundsPanel)
+    local overflowRows = 0
+    local overflowStatus
+    for _, sec in ipairs((boundsPanel.__sfPageDef and boundsPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
+                overflowRows = #item.getItems()
+            end
+            if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
+                overflowStatus = item.getText()
+            end
+        end
+    end
+    assertEq(overflowRows, 0, "over-cap UI constructs no requested-item rows")
+    assertTrue(type(overflowStatus) == "string" and overflowStatus ~= "",
+        "over-cap presents unavailable status text")
+    -- Invalid-heavy map that previously skipped the CopyRequestedItems bound.
+    boundItems[tostring(1000 + maxItems + 1)] = nil
+    for i = 1, maxItems do
+        boundItems[tostring(1000 + i)] = nil
+    end
+    for i = 1, maxItems + 5 do
+        boundItems["bad-" .. i] = "not-a-row"
+    end
+    assertEq(GS.ValidateRequestedItemsMap(boundItems), false,
+        "invalid over-cap raw entries fail closed")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_overflow",
+        "invalid over-cap raw entries make record unavailable")
+    -- Archive overflow must not erase a usable current campaign.
+    for i = 1, maxItems + 5 do
+        boundItems["bad-" .. i] = nil
+    end
+    boundItems["42"] = { itemId = 42, goal = 3 }
+    local usable = GS:GetCurrentRecord()
+    assertTrue(usable ~= nil, "usable current restored after clearing overflow")
+    local priorCampaignId = usable.currentCampaignId
+    startCampaign() -- archives prior campaign with item 42
+    usable = GS:GetCurrentRecord()
+    assertTrue(usable.campaignArchives and usable.campaignArchives[priorCampaignId],
+        "prior campaign archived on New Campaign")
+    local archiveItems = usable.campaignArchives[priorCampaignId].requestedItems
+    for i = 1, maxItems + 2 do
+        archiveItems[tostring(2000 + i)] = { itemId = 2000 + i, goal = 1 }
+    end
+    local archivedItems, archiveErr = GS:GetCampaignRequestedItems(priorCampaignId)
+    assertEq(archivedItems, nil, "over-cap archive items unavailable")
+    assertEq(archiveErr, "requested_items_overflow", "over-cap archive reason")
+    -- Current campaign remains readable after the bad archive mutation.
+    usable.accounting._consumables.requestedItems["99"] = { itemId = 99, goal = 5 }
+    local currentItems = GS:GetCampaignRequestedItems(usable.currentCampaignId)
+    assertTrue(type(currentItems) == "table" and currentItems["99"] ~= nil,
+        "usable current items survive bad archive")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "guild record still usable with bad archive")
 
     CreateFrame = priorCreateFrame
     C_Timer.After = priorAfter
