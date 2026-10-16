@@ -451,8 +451,14 @@ local function Definition()
 						end,
 						enabled = function()
 							local c = Caps()
+							-- Small-guild first setup: select an explicit init threshold.
 							if NeedsExplicitInitThreshold() then
 								return c.canRecoverPolicy == true
+							end
+							-- Ordinary not_configured: Initialize uses the default rank.
+							-- Do not enable CommitEditorRank before a dataset exists.
+							if IsNotConfigured() then
+								return false
 							end
 							-- Permission-only recovery: GetCurrentRecord may be nil while
 							-- canRecoverPolicy is true; NewConfigOperation still resolves it.

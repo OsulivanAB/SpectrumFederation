@@ -51,8 +51,43 @@ local function CountMap(t)
     return n
 end
 
---- Bound every raw map entry (including invalid ones). Over-cap fails closed
--- without returning a truncated valid-looking partial list.
+--- Canonical requested-item row: table with finite item id, matching map key,
+-- and an explicit ValidGoal (including MAX_GOAL). No defaults or silent skips.
+-- @return boolean ok, string|nil err, number|nil itemId, number|nil goal
+local function ValidateRequestedItemEntry(key, row)
+    if type(row) ~= "table" then
+        return false, "requested_items_malformed"
+    end
+    local itemId = tonumber(row.itemId)
+    if not itemId or itemId ~= itemId or itemId == math.huge or itemId == -math.huge
+        or itemId ~= math.floor(itemId) or itemId < 1 then
+        return false, "requested_items_malformed"
+    end
+    -- Preserve supported key representation: key must be the canonical id string.
+    -- Do not fall back to the key as identity or collapse mismatched rows.
+    if tostring(key) ~= tostring(itemId) then
+        return false, "requested_items_malformed"
+    end
+    local C = SF.Consumables
+    local goal
+    if C and type(C.ValidGoal) == "function" then
+        goal = C.ValidGoal(row.goal)
+    else
+        goal = tonumber(row.goal)
+        local maxGoal = (C and C.MAX_GOAL) or 100000
+        if not goal or goal ~= goal or goal == math.huge or goal == -math.huge
+            or goal ~= math.floor(goal) or goal < 0 or goal > maxGoal then
+            goal = nil
+        end
+    end
+    if goal == nil then
+        return false, "requested_items_malformed"
+    end
+    return true, nil, itemId, goal
+end
+
+--- Bound every raw map entry (including invalid ones). Over-cap and malformed
+-- rows fail closed without returning a truncated valid-looking partial list.
 -- @return table|nil copy, string|nil err
 local function CopyRequestedItems(items)
     if type(items) ~= "table" then
@@ -67,20 +102,17 @@ local function CopyRequestedItems(items)
         if n > maxItems then
             return nil, "requested_items_overflow"
         end
-        if type(row) == "table" then
-            local itemId = tonumber(row.itemId) or tonumber(key)
-            local goal = tonumber(row.goal) or 0
-            if itemId and itemId == math.floor(itemId) and itemId >= 1
-                and goal == math.floor(goal) and goal >= 0 then
-                out[tostring(itemId)] = { itemId = itemId, goal = goal }
-            end
+        local ok, err, itemId, goal = ValidateRequestedItemEntry(key, row)
+        if not ok then
+            return nil, err or "requested_items_malformed"
         end
+        out[tostring(itemId)] = { itemId = itemId, goal = goal }
     end
     return out
 end
 
---- Fail closed when a retained requestedItems map exceeds the supported cap.
--- Counts every raw entry, including invalid ones. Does not rewrite SavedVariables.
+--- Fail closed when a retained requestedItems map exceeds the supported cap or
+-- contains malformed rows. Counts/inspects every raw entry. Does not rewrite SV.
 -- @return boolean ok, string|nil err
 function GS.ValidateRequestedItemsMap(items)
     if type(items) ~= "table" then
@@ -89,10 +121,14 @@ function GS.ValidateRequestedItemsMap(items)
     local C = SF.Consumables
     local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
     local n = 0
-    for _ in pairs(items) do
+    for key, row in pairs(items) do
         n = n + 1
         if n > maxItems then
             return false, "requested_items_overflow"
+        end
+        local ok, err = ValidateRequestedItemEntry(key, row)
+        if not ok then
+            return false, err or "requested_items_malformed"
         end
     end
     return true
@@ -428,11 +464,21 @@ local function EnsureContextRecords(record)
     return record.campaignContext
 end
 
+--- Count campaign headers with an early stop at MAX_CAMPAIGNS+1 so oversized
+-- retained maps cannot force an unbounded UI-thread scan during validation.
 function GS.CountCampaignHeaders(record)
     if type(record) ~= "table" or type(record.campaigns) ~= "table" then
         return 0
     end
-    return CountMap(record.campaigns)
+    local limit = (GS.MAX_CAMPAIGNS or 64) + 1
+    local n = 0
+    for _ in pairs(record.campaigns) do
+        n = n + 1
+        if n >= limit then
+            return n
+        end
+    end
+    return n
 end
 
 --- Snapshot current requested items into an archive for an ending campaign.
@@ -867,6 +913,8 @@ function GS.FormatReasonText(reason)
             "bank readiness evidence is unavailable"),
         requested_items_overflow = Loc("GUILD_SUPPLIES_REASON_REQUESTED_ITEMS_OVERFLOW",
             "requested-item configuration exceeds the supported limit"),
+        requested_items_malformed = Loc("GUILD_SUPPLIES_REASON_REQUESTED_ITEMS_MALFORMED",
+            "requested-item configuration is malformed"),
         invalid_editor_rank_position = Loc("GUILD_SUPPLIES_REASON_INVALID_RANK",
             "choose an existing guild rank"),
         rank_unavailable = Loc("GUILD_SUPPLIES_REASON_RANK_UNAVAILABLE",

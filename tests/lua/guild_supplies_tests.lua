@@ -3369,6 +3369,41 @@ do
         "items table intact")
     assertNil(GS:GetCurrentRecord().campaigns[op.id], "no partial new campaign")
     assertEq(before, first.id, "first campaign still current")
+
+    -- Oversized retained campaigns map: early-stop count, unavailable, SV unchanged.
+    local overCap = GS.MAX_CAMPAIGNS + 40
+    for i = 1, overCap do
+        local id = "over-camp-" .. i
+        if record.campaigns[id] == nil then
+            record.campaigns[id] = {
+                schemaVersion = 1,
+                campaignId = id,
+                datasetId = record.datasetId,
+                guildKey = "club:42",
+                resetOperationId = id,
+                createdByGuid = "Player-1-Alice",
+                createdByName = "Alice-Garona",
+                startedAt = i,
+                boundaryVersion = 1,
+                boundaryKind = "new-goal",
+                contextStatus = "unavailable",
+            }
+        end
+    end
+    local rawCount = 0
+    for _ in pairs(record.campaigns) do rawCount = rawCount + 1 end
+    assertTrue(rawCount > GS.MAX_CAMPAIGNS + 1, "fixture exceeds campaign header cap")
+    local boundedCount = GS.CountCampaignHeaders(record)
+    assertEq(boundedCount, GS.MAX_CAMPAIGNS + 1,
+        "CountCampaignHeaders stops at MAX_CAMPAIGNS+1")
+    assertTrue(boundedCount < rawCount, "bounded count is below full retained size")
+    assertEq(select(1, GS:GetCurrentRecord()), nil, "over-cap campaigns make record unavailable")
+    assertEq(select(2, GS:GetCurrentRecord()), "full", "over-cap campaigns reason is full")
+    local afterRaw = 0
+    for _ in pairs(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaigns) do
+        afterRaw = afterRaw + 1
+    end
+    assertEq(afterRaw, rawCount, "over-cap campaigns SV retained unchanged")
 end
 
 -- 2B8) Status feedback never reports Saved for rejection; bank context unavailable
@@ -4927,6 +4962,53 @@ do
     assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
         "small-guild UI recovery admits rank")
 
+    -- Ordinary (>=3 ranks) not_configured: rank edits disabled until Initialize.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    settleRoster()
+    pendingConfirm = nil
+    local ordinaryInitPanel = makeRegion("Frame", "GSOrdinaryInit", nil)
+    ordinaryInitPanel:SetSize(600, 800)
+    configPage:Build(ordinaryInitPanel)
+    local function rankDropdownEnabled(panel)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "dropdown" and item.label
+                    and tostring(item.label):find("Editor", 1, true)
+                    and type(item.enabled) == "function" then
+                    return item.enabled() and true or false
+                end
+            end
+        end
+        return nil
+    end
+    assertEq(rankDropdownEnabled(ordinaryInitPanel), false,
+        "ordinary not_configured disables editor-rank edits")
+    assertEq(select(2, GS:GetCurrentRecord()), "not_configured", "ordinary guild not_configured")
+    local ordinaryInitBtn
+    local function findOrdinaryInit(node)
+        if node.kind == "Button" and node.text and node.text:find("Initialize", 1, true) then
+            ordinaryInitBtn = node
+        end
+        for _, child in ipairs(node.children or {}) do findOrdinaryInit(child) end
+    end
+    findOrdinaryInit(ordinaryInitPanel)
+    configPage:Refresh(ordinaryInitPanel)
+    findOrdinaryInit(ordinaryInitPanel)
+    assertTrue(ordinaryInitBtn ~= nil and ordinaryInitBtn.enabled ~= false,
+        "ordinary Initialize enabled without explicit threshold")
+    ordinaryInitBtn:Click()
+    local ordinaryRec = GS:GetCurrentRecord()
+    assertTrue(ordinaryRec ~= nil, "ordinary Initialize creates dataset")
+    assertEq(ordinaryRec.permission.editorRankPosition, GS.DEFAULT_EDITOR_RANK_POSITION or 3,
+        "ordinary Initialize admits default editor rank policy")
+    configPage:Refresh(ordinaryInitPanel)
+    assertEq(rankDropdownEnabled(ordinaryInitPanel), true,
+        "editor-rank edits enabled after ordinary Initialize")
+
     -- Pending init rank bound to guild context; click Initialize and assert dataset/policy.
     resetDb()
     initGS()
@@ -5103,7 +5185,7 @@ do
     assertEq(overflowRows, 0, "over-cap UI constructs no requested-item rows")
     assertTrue(type(overflowStatus) == "string" and overflowStatus ~= "",
         "over-cap presents unavailable status text")
-    -- Invalid-heavy map that previously skipped the CopyRequestedItems bound.
+    -- Invalid-heavy map: non-table rows fail closed (malformed, not truncated).
     boundItems[tostring(1000 + maxItems + 1)] = nil
     for i = 1, maxItems do
         boundItems[tostring(1000 + i)] = nil
@@ -5111,14 +5193,77 @@ do
     for i = 1, maxItems + 5 do
         boundItems["bad-" .. i] = "not-a-row"
     end
-    assertEq(GS.ValidateRequestedItemsMap(boundItems), false,
-        "invalid over-cap raw entries fail closed")
-    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_overflow",
-        "invalid over-cap raw entries make record unavailable")
-    -- Archive overflow must not erase a usable current campaign.
+    local badOk, badErr = GS.ValidateRequestedItemsMap(boundItems)
+    assertEq(badOk, false, "invalid raw entries fail closed")
+    assertEq(badErr, "requested_items_malformed", "non-table rows are malformed")
+    assertEq(select(2, GS:GetCurrentRecord()), "requested_items_malformed",
+        "invalid raw entries make record unavailable")
     for i = 1, maxItems + 5 do
         boundItems["bad-" .. i] = nil
     end
+
+    -- In-cap malformed rows: reject/unavailable; preserve original retained state.
+    local function assertMalformedReject(label, mutator)
+        boundItems["42"] = { itemId = 42, goal = 3 }
+        local baseline = GS:GetCurrentRecord()
+        assertTrue(baseline ~= nil, label .. " baseline usable")
+        local snapCampaign = baseline.currentCampaignId
+        local snapOps = 0
+        for _ in pairs(baseline.operations.records or {}) do snapOps = snapOps + 1 end
+        local archiveCount = 0
+        for _ in pairs(baseline.campaignArchives or {}) do
+            archiveCount = archiveCount + 1
+        end
+        local snapRow = boundItems["42"]
+        mutator(boundItems)
+        local vok, verr = GS.ValidateRequestedItemsMap(boundItems)
+        assertEq(vok, false, label .. " validation rejects")
+        assertEq(verr, "requested_items_malformed", label .. " reason malformed")
+        assertEq(select(1, GS:GetCurrentRecord()), nil, label .. " record unavailable")
+        local opBad, prepSt = GS:NewCampaignOperation()
+        assertEq(opBad, nil, label .. " New Campaign prepare blocked")
+        assertEq(prepSt, "rejected", label .. " New Campaign prepare rejected")
+        -- Restore original row; SV must still hold the mutated raw entry until we clear it.
+        boundItems["42"] = snapRow
+        local restored = GS:GetCurrentRecord()
+        assertTrue(restored ~= nil, label .. " restored after clearing malformation")
+        assertEq(restored.currentCampaignId, snapCampaign, label .. " current campaign unchanged")
+        local opsAfter = 0
+        for _ in pairs(restored.operations.records or {}) do opsAfter = opsAfter + 1 end
+        assertEq(opsAfter, snapOps, label .. " operations unchanged")
+        local archivesAfter = 0
+        for _ in pairs(restored.campaignArchives or {}) do archivesAfter = archivesAfter + 1 end
+        assertEq(archivesAfter, archiveCount, label .. " archives unchanged")
+        assertEq(restored.accounting._consumables.requestedItems["42"].goal, 3,
+            label .. " retained goal preserved")
+    end
+    assertMalformedReject("non-table", function(items)
+        items["42"] = "not-a-row"
+    end)
+    assertMalformedReject("missing itemId", function(items)
+        items["42"] = { goal = 3 }
+    end)
+    assertMalformedReject("invalid itemId", function(items)
+        items["42"] = { itemId = 0, goal = 3 }
+    end)
+    assertMalformedReject("key/item mismatch", function(items)
+        items["42"] = { itemId = 99, goal = 3 }
+    end)
+    assertMalformedReject("missing goal", function(items)
+        items["42"] = { itemId = 42 }
+    end)
+    assertMalformedReject("negative goal", function(items)
+        items["42"] = { itemId = 42, goal = -1 }
+    end)
+    assertMalformedReject("fractional goal", function(items)
+        items["42"] = { itemId = 42, goal = 1.5 }
+    end)
+    local maxGoal = (SF.Consumables and SF.Consumables.MAX_GOAL) or 100000
+    assertMalformedReject("over-max goal", function(items)
+        items["42"] = { itemId = 42, goal = maxGoal + 1 }
+    end)
+
+    -- Malformed archive must not disable a usable current campaign.
     boundItems["42"] = { itemId = 42, goal = 3 }
     local usable = GS:GetCurrentRecord()
     assertTrue(usable ~= nil, "usable current restored after clearing overflow")
@@ -5128,10 +5273,16 @@ do
     assertTrue(usable.campaignArchives and usable.campaignArchives[priorCampaignId],
         "prior campaign archived on New Campaign")
     local archiveItems = usable.campaignArchives[priorCampaignId].requestedItems
+    archiveItems["42"] = { itemId = 42, goal = -5 }
+    local archivedItems, archiveErr = GS:GetCampaignRequestedItems(priorCampaignId)
+    assertEq(archivedItems, nil, "malformed archive items unavailable")
+    assertEq(archiveErr, "requested_items_malformed", "malformed archive reason")
+    -- Also cover over-cap archive isolation.
+    archiveItems["42"] = { itemId = 42, goal = 3 }
     for i = 1, maxItems + 2 do
         archiveItems[tostring(2000 + i)] = { itemId = 2000 + i, goal = 1 }
     end
-    local archivedItems, archiveErr = GS:GetCampaignRequestedItems(priorCampaignId)
+    archivedItems, archiveErr = GS:GetCampaignRequestedItems(priorCampaignId)
     assertEq(archivedItems, nil, "over-cap archive items unavailable")
     assertEq(archiveErr, "requested_items_overflow", "over-cap archive reason")
     -- Current campaign remains readable after the bad archive mutation.
