@@ -270,16 +270,26 @@ local function measure(text)
     return string.len(tostring(text or "")) * 8
 end
 
+-- Production roster temporarily omits Att./Prep. from the layout request.
 local pointRequest = {
     points = true,
-    attendance = true,
-    preparedness = true,
+    attendance = false,
+    preparedness = false,
     bis = true,
     readiness = true,
     hasAction = true,
 }
 local potRequest = {
     points = false,
+    attendance = false,
+    preparedness = false,
+    bis = true,
+    readiness = true,
+    hasAction = true,
+}
+-- Legacy request still supported by ResolveResponsiveLayout for a later re-enable.
+local legacyRequest = {
+    points = true,
     attendance = true,
     preparedness = true,
     bis = true,
@@ -294,6 +304,10 @@ assertEq(C.DEFAULT_WIDTH, 620, "default width is unchanged")
 assertEq(C.DEFAULT_HEIGHT, 520, "default height is unchanged")
 assertTrue(C.DEFAULT_WIDTH > C.MIN_WIDTH, "default width remains above the new minimum")
 assertTrue(View.MIN_WIDTH_COMFORT < 48 + 8, "comfort padding cannot resurrect a hidden glance column")
+
+local productionCols = View.GlanceColumns({ type = "PROFILE_MEMBER", showPoints = true })
+assertTrue(not productionCols.attendance and not productionCols.preparedness, "production glance selection omits Att. and Prep.")
+assertTrue(productionCols.bis and productionCols.readiness and productionCols.points, "production glance selection keeps Points, BiS, and readiness")
 
 local metrics = Window.TitleMetrics
 local expectedTitle = (metrics.frameInset + C.TITLE_PADDING_X + C.LOGO_SIZE + metrics.leftPad)
@@ -327,36 +341,36 @@ local function firstWidth(pred)
 end
 
 local allWidth, allDecision = firstWidth(function(decision)
-    return decision.bis and decision.preparedness and decision.attendance and decision.points and decision.readiness
+    return decision.bis and decision.points and decision.readiness
+        and (not decision.attendance) and (not decision.preparedness)
 end)
-assertTrue(allWidth ~= nil, "a wide roster still fits every glance column")
+assertTrue(allWidth ~= nil, "a wide roster still fits the active glance columns")
 assertAlmost(allDecision.nameWidth, nameMin, 1.01, "columns stay until the name reaches its protected minimum")
 local beforeBisDrop = View.ResolveResponsiveLayout(allWidth - 1, pointRequest, nameMin)
-assertTrue(not beforeBisDrop.bis, "BiS is the first glance column to hide")
-assertTrue(beforeBisDrop.preparedness and beforeBisDrop.attendance, "Prep. and Att. remain when BiS first hides")
+assertTrue(not beforeBisDrop.bis, "BiS is the optional glance column that hides when width is tight")
+assertTrue(not beforeBisDrop.attendance and not beforeBisDrop.preparedness, "Att. and Prep. stay unrequested when BiS hides")
 assertTrue(beforeBisDrop.points and beforeBisDrop.readiness, "Points and readiness remain when BiS hides")
 assertTrue(beforeBisDrop.nameWidth >= nameMin - 0.01, "name stays at the floor when BiS hides")
 
-local prepWidth = firstWidth(function(decision)
-    return (not decision.bis) and decision.preparedness and decision.attendance
+-- Exercise the reversible hide order while Att./Prep. remain supported by the helper.
+local function firstLegacyWidth(pred)
+    for width = 1, 900 do
+        local decision = View.ResolveResponsiveLayout(width, legacyRequest, nameMin)
+        if pred(decision) then
+            return width, decision
+        end
+    end
+    return nil
+end
+local legacyWide = firstLegacyWidth(function(decision)
+    return decision.bis and decision.preparedness and decision.attendance
 end)
-assertTrue(prepWidth ~= nil, "Prep. remains after BiS hides")
-local beforePrepDrop = View.ResolveResponsiveLayout(prepWidth - 1, pointRequest, nameMin)
-assertTrue(not beforePrepDrop.bis and not beforePrepDrop.preparedness, "Prep. hides only after BiS")
-assertTrue(beforePrepDrop.attendance, "Att. remains when Prep. first hides")
-assertTrue(beforePrepDrop.points and beforePrepDrop.readiness, "Points and readiness remain when Prep. hides")
-
-local attWidth = firstWidth(function(decision)
-    return (not decision.bis) and (not decision.preparedness) and decision.attendance
-end)
-assertTrue(attWidth ~= nil, "Att. remains after Prep. hides")
-local beforeAttDrop = View.ResolveResponsiveLayout(attWidth - 1, pointRequest, nameMin)
-assertTrue(not beforeAttDrop.attendance and not beforeAttDrop.preparedness and not beforeAttDrop.bis, "Att. hides last")
-assertTrue(beforeAttDrop.points and beforeAttDrop.readiness, "Points and readiness remain after Att. hides")
-assertTrue(beforeAttDrop.nameWidth >= nameMin - 0.01, "name floor holds after every optional column is hidden")
+assertTrue(legacyWide ~= nil, "legacy request can still show Att./Prep./BiS together")
+local legacyBeforeBis = View.ResolveResponsiveLayout(legacyWide - 1, legacyRequest, nameMin)
+assertTrue(not legacyBeforeBis.bis and legacyBeforeBis.preparedness and legacyBeforeBis.attendance, "legacy hide order still drops BiS before Prep./Att.")
 
 local hidden = {}
-local seen = { bis = true, preparedness = true, attendance = true }
+local seen = { bis = true }
 local narrowingOk = true
 for width = 900, 1, -1 do
     local decision = View.ResolveResponsiveLayout(width, pointRequest, nameMin)
@@ -365,59 +379,47 @@ for width = 900, 1, -1 do
         fail("narrowing dropped the name floor, Points, or readiness at width " .. tostring(width))
         break
     end
-    for _, key in ipairs({ "bis", "preparedness", "attendance" }) do
-        if seen[key] and not decision[key] then
-            hidden[#hidden + 1] = key
-        end
-        if not seen[key] and decision[key] then
-            narrowingOk = false
-            fail(key .. " returned while the width was still decreasing")
-            break
-        end
+    if decision.attendance or decision.preparedness then
+        narrowingOk = false
+        fail("narrowing resurrected Att. or Prep. at width " .. tostring(width))
+        break
     end
-    seen = {
-        bis = decision.bis,
-        preparedness = decision.preparedness,
-        attendance = decision.attendance,
-    }
+    if seen.bis and not decision.bis then
+        hidden[#hidden + 1] = "bis"
+    end
+    if (not seen.bis) and decision.bis then
+        narrowingOk = false
+        fail("bis returned while the width was still decreasing")
+        break
+    end
+    seen = { bis = decision.bis }
 end
 assertTrue(narrowingOk, "narrowing keeps the name floor, Points, and readiness, and does not restore hidden columns")
-assertEq(hidden[1], "bis", "narrowing hides BiS first")
-assertEq(hidden[2], "preparedness", "narrowing hides Prep. second")
-assertEq(hidden[3], "attendance", "narrowing hides Att. third")
-assertEq(#hidden, 3, "each optional column hides once")
+assertEq(hidden[1], "bis", "narrowing hides BiS when space runs out")
+assertEq(#hidden, 1, "only BiS is an optional production column")
 
 local restored = {}
-seen = { bis = false, preparedness = false, attendance = false }
+seen = { bis = false }
 for width = 1, 900 do
     local decision = View.ResolveResponsiveLayout(width, pointRequest, nameMin)
-    for _, key in ipairs({ "attendance", "preparedness", "bis" }) do
-        if (not seen[key]) and decision[key] then
-            restored[#restored + 1] = key
-        end
+    if (not seen.bis) and decision.bis then
+        restored[#restored + 1] = "bis"
     end
     if seen.bis and not decision.bis then
         fail("BiS hid again while widening")
     end
-    if seen.preparedness and not decision.preparedness then
-        fail("Prep. hid again while widening")
+    if decision.attendance or decision.preparedness then
+        fail("widening resurrected Att. or Prep.")
     end
-    if seen.attendance and not decision.attendance then
-        fail("Att. hid again while widening")
-    end
-    seen = {
-        bis = decision.bis,
-        preparedness = decision.preparedness,
-        attendance = decision.attendance,
-    }
+    seen = { bis = decision.bis }
 end
-assertEq(restored[1], "attendance", "widening restores Att. first")
-assertEq(restored[2], "preparedness", "widening restores Prep. second")
-assertEq(restored[3], "bis", "widening restores BiS last")
+assertEq(restored[1], "bis", "widening restores BiS")
+assertEq(#restored, 1, "widening only restores BiS among optional production columns")
 
 local longName = "Osulivan-Stormrage"
 local truncateAt = View.ResolveResponsiveLayout(allWidth + 40, pointRequest, nameMin)
-assertTrue(truncateAt.bis and truncateAt.preparedness and truncateAt.attendance, "name truncates while every column is still visible")
+assertTrue(truncateAt.bis and truncateAt.points and truncateAt.readiness, "name truncates while active columns are still visible")
+assertTrue(not truncateAt.attendance and not truncateAt.preparedness, "name truncation does not bring Att./Prep. back")
 assertTrue(truncateAt.nameWidth < measure(longName), "the sample name does not fit in the shrunk name column")
 local truncated = View.TruncateToWidth(longName, truncateAt.nameWidth, measure)
 assertTrue(truncated ~= longName, "long raider names gain an ellipsis before columns drop")
@@ -460,17 +462,19 @@ assertEq(string.byte(utfTruncated, 1), string.byte(utfName, 1), "truncation keep
 local contentAtMin = View.ContentWidthForWindow(C.MIN_WIDTH, true)
 local atMin = View.ResolveResponsiveLayout(contentAtMin, pointRequest, nameMin)
 assertTrue(atMin.points and atMin.readiness, "point-based minimum keeps Points and readiness")
-assertTrue(not atMin.bis and not atMin.preparedness and not atMin.attendance, "optional columns are hidden at the minimum")
+assertTrue(not atMin.bis and not atMin.preparedness and not atMin.attendance, "optional BiS is hidden at the minimum and Att./Prep. stay off")
 assertTrue(atMin.nameWidth >= nameMin - 0.01, "minimum width still honors the name floor")
 
 local potAtMin = View.ResolveResponsiveLayout(contentAtMin, potRequest, nameMin)
 assertTrue(not potAtMin.points, "reward pot does not show Points")
 assertTrue(potAtMin.readiness, "reward pot keeps readiness at the minimum")
+assertTrue(not potAtMin.attendance and not potAtMin.preparedness, "reward pot also keeps Att./Prep. hidden")
 assertTrue(potAtMin.nameWidth >= nameMin - 0.01, "reward pot keeps the name floor")
 
 local defaultContent = View.ContentWidthForWindow(C.DEFAULT_WIDTH, true)
 local atDefault = View.ResolveResponsiveLayout(defaultContent, pointRequest, nameMin)
-assertTrue(atDefault.bis and atDefault.preparedness and atDefault.attendance and atDefault.points and atDefault.readiness, "default width shows every column")
+assertTrue(atDefault.bis and atDefault.points and atDefault.readiness, "default width shows Points, BiS, and readiness")
+assertTrue(not atDefault.attendance and not atDefault.preparedness, "default width keeps Att. and Prep. hidden")
 
 local previousMinimumContent = View.ContentWidthForWindow(480, true)
 local atPreviousMinimum = View.ResolveResponsiveLayout(previousMinimumContent, pointRequest, nameMin)
@@ -531,17 +535,27 @@ view:Render({ rowModel }, {})
 assertEq(insetUpdates, 1, "render requests one scroll-inset update")
 assertEq(view._layoutApplyCount, 1, "render applies responsive layout once")
 assertTrue(view.header.Bis:IsShown(), "wide render shows the BiS header")
-assertTrue(view.header.Preparedness:IsShown(), "wide render shows the Prep. header")
-assertTrue(view.header.Attendance:IsShown(), "wide render shows the Att. header")
+assertTrue(not view.header.Preparedness:IsShown(), "wide render keeps the Prep. header hidden")
+assertTrue(not view.header.Attendance:IsShown(), "wide render keeps the Att. header hidden")
 assertTrue(view.header.Points:IsShown(), "wide render shows the Points header")
 assertEq(view.header.Points:GetText(), "DKP", "points header uses the profile point name")
+assertTrue(
+    view._layoutRequest
+        and view._layoutRequest.attendance == false
+        and view._layoutRequest.preparedness == false,
+    "render layout request does not reserve Att. or Prep."
+)
 
 local row = view.rows[1]
 assertTrue(row.BtnHelmet:IsShown(), "equipment button is available when the roster is wide")
 assertTrue(row.Readiness:IsShown(), "readiness column is available when the roster is wide")
 assertTrue(row.Readiness.Icon:IsShown(), "not-ready rows still draw the readiness icon")
 assertEq(row.Points:GetText(), "12", "points value is shown")
-assertTrue(row.Bis:IsShown() and row.Attendance:IsShown() and row.Preparedness:IsShown(), "wide row shows every glance column")
+assertTrue(row.Bis:IsShown(), "wide row shows BiS")
+assertTrue(not row.Attendance:IsShown() and not row.Preparedness:IsShown(), "wide row keeps Att. and Prep. hidden")
+assertEq(row.Attendance:GetText(), "", "hidden Att. cell does not show a value")
+assertEq(row.Preparedness:GetText(), "", "hidden Prep. cell does not show a value")
+assertEq(row.Bis:GetText(), "5/16", "BiS still renders while Att. is hidden")
 assertTrue(row.Name:GetText() ~= longName, "wide-but-finite row truncates the long raider name")
 assertEq(string.sub(row.Name:GetText(), -3), "...", "rendered truncation uses an ellipsis")
 assertTrue(string.len(row.Name:GetText()) >= 6, "rendered name keeps at least three characters")
@@ -554,9 +568,7 @@ local function rightInset(widget)
     return -(point[4] or 0)
 end
 
-assertTrue(rightInset(view.header.Points) > rightInset(view.header.Attendance), "Points header sits left of Att.")
-assertTrue(rightInset(view.header.Attendance) > rightInset(view.header.Preparedness), "Att. header sits left of Prep.")
-assertTrue(rightInset(view.header.Preparedness) > rightInset(view.header.Bis), "Prep. header sits left of BiS")
+assertTrue(rightInset(view.header.Points) > rightInset(view.header.Bis), "Points header sits left of BiS when Att./Prep. are hidden")
 
 local sizeHook = content.Scroll.hooks["OnSizeChanged"]
 local appliesAfterRender = view._layoutApplyCount
@@ -566,13 +578,14 @@ end
 assertEq(view._layoutApplyCount, appliesAfterRender, "same-width resize does no further layout work")
 assertEq(insetUpdates, 1, "same-width resize does not request another scroll-inset update")
 assertEq(businessCalls, 0, "resize does not run roster business callbacks")
+assertTrue(not view.header.Attendance:IsShown() and not view.header.Preparedness:IsShown(), "same-width resize does not resurrect Att./Prep.")
 
 content.Scroll.width = contentAtMin
 sizeHook()
 assertEq(view._layoutApplyCount, appliesAfterRender + 1, "a real width change applies layout once")
 assertTrue(not view.header.Bis:IsShown(), "minimum width hides the BiS header")
-assertTrue(not view.header.Preparedness:IsShown(), "minimum width hides the Prep. header")
-assertTrue(not view.header.Attendance:IsShown(), "minimum width hides the Att. header")
+assertTrue(not view.header.Preparedness:IsShown(), "minimum width keeps the Prep. header hidden")
+assertTrue(not view.header.Attendance:IsShown(), "minimum width keeps the Att. header hidden")
 assertTrue(view.header.Points:IsShown(), "minimum width keeps the Points header")
 assertTrue(row.BtnHelmet:IsShown(), "equipment button remains at the minimum width")
 assertTrue(row.Readiness:IsShown(), "readiness remains at the minimum width")
@@ -594,11 +607,22 @@ assertEq(view._layoutApplyCount, appliesAtMin, "holding the minimum width does n
 
 content.Scroll.width = allWidth + 80
 sizeHook()
-assertTrue(view.header.Bis:IsShown() and view.header.Preparedness:IsShown() and view.header.Attendance:IsShown(), "widening brings the glance headers back")
-assertTrue(row.Bis:IsShown() and row.Preparedness:IsShown() and row.Attendance:IsShown(), "widening brings the glance columns back")
+assertTrue(view.header.Bis:IsShown(), "widening brings the BiS header back")
+assertTrue(not view.header.Preparedness:IsShown() and not view.header.Attendance:IsShown(), "widening does not resurrect Att./Prep. headers")
+assertTrue(row.Bis:IsShown(), "widening brings the BiS column back")
+assertTrue(not row.Preparedness:IsShown() and not row.Attendance:IsShown(), "widening does not resurrect Att./Prep. cells")
 assertEq(row.Bis:GetText(), "5/16", "restored BiS column keeps its value without a model rebuild")
 assertEq(row.Points:GetText(), "12", "restored layout keeps Points")
 assertTrue(row.BtnHelmet:IsShown() and row.Readiness:IsShown(), "restored layout keeps equipment and readiness")
+
+-- Re-render / reopen must keep Att./Prep. hidden while BiS and readiness stay live.
+local appliesBeforeRerender = view._layoutApplyCount
+view:Render({ rowModel }, {})
+assertTrue(view._layoutApplyCount > appliesBeforeRerender, "re-render reapplies responsive layout")
+assertTrue(not view.header.Attendance:IsShown() and not view.header.Preparedness:IsShown(), "re-render keeps Att./Prep. headers hidden")
+assertTrue(row.Bis:IsShown() and row.Readiness:IsShown() and row.Points:IsShown(), "re-render keeps Points, BiS, and readiness")
+assertEq(row.Bis:GetText(), "5/16", "re-render still paints BiS while Att. is hidden")
+assertTrue(row.Readiness.Icon:IsShown(), "re-render still paints the not-ready icon")
 
 -- A nested size event during layout must not recurse.
 local nested = 0
@@ -618,7 +642,7 @@ assertTrue(view._layoutApplyCount >= beforeNested + 1, "nested resize still appl
 assertEq(businessCalls, 0, "nested resize still does not run business callbacks")
 
 -- Reward pot hides Points and still keeps the equipment button and readiness.
-content.Scroll.width = contentAtMin
+content.Scroll.width = allWidth + 80
 local potModel = {
     type = "PROFILE_MEMBER",
     displayName = "Osulivan",
@@ -633,8 +657,20 @@ local potModel = {
 view:Render({ potModel }, {})
 assertTrue(not row.Points:IsShown(), "reward pot row hides Points")
 assertTrue(not view.header.Points:IsShown(), "reward pot header hides Points")
+assertTrue(not row.Attendance:IsShown() and not row.Preparedness:IsShown(), "reward pot keeps Att./Prep. hidden")
+assertTrue(not view.header.Attendance:IsShown() and not view.header.Preparedness:IsShown(), "reward pot keeps Att./Prep. headers hidden")
+assertTrue(row.Bis:IsShown(), "reward pot still shows BiS on a wide roster")
+assertEq(row.Bis:GetText(), "5/16", "reward pot still paints BiS while Att. is hidden")
 assertTrue(row.BtnHelmet:IsShown(), "reward pot keeps the equipment button")
 assertTrue(row.Readiness:IsShown(), "reward pot keeps readiness")
+assertTrue(row.Readiness.Icon:IsShown(), "reward pot still paints the not-ready icon")
+assertEq(row.Name:GetText(), "Osulivan", "short reward pot names are not ellipsized when width allows")
+
+content.Scroll.width = contentAtMin
+sizeHook()
+assertTrue(not row.Points:IsShown(), "reward pot still hides Points at the minimum")
+assertTrue(not row.Attendance:IsShown() and not row.Preparedness:IsShown(), "reward pot keeps Att./Prep. hidden at the minimum")
+assertTrue(row.BtnHelmet:IsShown() and row.Readiness:IsShown(), "reward pot keeps equipment and readiness at the minimum")
 assertEq(string.sub(row.Name:GetText(), 1, 3), "Osu", "reward pot name keeps a three-character prefix")
 
 local beforeStyle = view._layoutApplyCount
