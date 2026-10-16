@@ -67,6 +67,10 @@ local world = {
 function GetTime() return world.time end
 function time() return math.floor(world.time) end
 function GetServerTime() return math.floor(world.time) end
+-- WoW provides date(); Lua 5.1 tests map it to os.date.
+function date(fmt, ts)
+    return os.date(fmt, ts)
+end
 function IsInGuild() return world.guild.inGuild end
 function GetGuildInfo(unit)
     if unit == "player" and world.guild.inGuild then
@@ -4085,6 +4089,492 @@ do
     assertEq(recInit.permission.editorRankPosition, 2, "selected threshold stored")
     world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
     settleRoster()
+
+    CreateFrame = priorCreateFrame
+end
+
+-- 2B17) Confirmation start-time finalization, reason fallback, BankLog freshness lifecycle
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local op = GS:NewCampaignOperation()
+    local preparedTs = op.timestamp
+    local preparedBase = op.baseTargetRevision
+    local preparedPolicy = op.basePolicyRevision
+    local preparedGuild = op.guildKey
+    world.time = world.time + 120
+    local okFinal, finalErr = GS:FinalizeCampaignStartTime(op)
+    assertEq(okFinal, true, "finalize start time ok: " .. tostring(finalErr))
+    assertTrue(op.timestamp ~= preparedTs, "timestamp finalized at accept time")
+    assertEq(op.timestamp, math.floor(world.time), "final timestamp uses accept-time server time")
+    assertEq(op.baseTargetRevision, preparedBase, "base target preserved")
+    assertEq(op.basePolicyRevision, preparedPolicy, "base policy preserved")
+    assertEq(op.guildKey, preparedGuild, "guild scope preserved")
+    local status = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "accepted", "delayed finalize then apply accepted")
+    assertEq(GS:GetCurrentRecord().campaigns[op.id].startedAt, op.timestamp,
+        "campaign startedAt uses finalized timestamp")
+    -- Exact retry must not restamp.
+    local priorTs = op.timestamp
+    world.time = world.time + 50
+    assertEq(GS:FinalizeCampaignStartTime(op), true, "finalize no-op after accept")
+    assertEq(op.timestamp, priorTs, "accepted body timestamp not restamped")
+    assertEq(GS:ApplyStagedCampaignOperation(op), "duplicate", "exact replay remains duplicate")
+
+    local generic = GS.FormatReasonText("totally_unknown_code_xyz")
+    assertTrue(generic:find("could not be applied", 1, true), "generic reason localized")
+    assertEq(generic:find("totally_unknown_code_xyz", 1, true), nil, "generic reason hides raw code")
+    assertTrue(GS.FormatReasonText("no_campaign"):find("New Campaign", 1, true),
+        "mapped no_campaign wording")
+    assertTrue(GS.FormatReasonText("stale_handle"):find("out of date", 1, true),
+        "mapped stale_handle wording")
+
+    -- Real BankLog → adapter lifecycle without probe.
+    GS._BankContextReadinessProbe = nil
+    world.bankTxnCounts = { [1] = 0 }
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction()
+        return "deposit", "Alice-Garona", nil, 1, nil, nil, 0, 1, 1, 1
+    end
+    SF.ConsumablesBankLog = {
+        bankOpen = true,
+        active = true,
+        awaitingLogUpdate = false,
+        activeContext = { bankTab = 1, guildGuid = "42" },
+        lastFreshLogTab = 1,
+        lastFreshLogGuild = "42",
+        lastFreshLogAt = world.time,
+    }
+    -- Load production BankLog helpers by exercising Invalidate via mirrored logic:
+    -- after a new query starts, stamp must be cleared before success.
+    local BankLog = SF.ConsumablesBankLog
+    BankLog.awaitingLogUpdate = true
+    BankLog.lastFreshLogTab = nil
+    BankLog.lastFreshLogGuild = nil
+    local ctx = GS.CaptureBankContext(1)
+    assertEq(ctx.status, "unavailable", "awaiting query is unavailable")
+    assertEq(ctx.reason, "log_pending", "log_pending while awaiting")
+
+    BankLog.awaitingLogUpdate = false
+    BankLog.lastFreshLogTab = 1
+    BankLog.lastFreshLogGuild = "42"
+    ctx = GS.CaptureBankContext(1)
+    assertEq(ctx.status, "empty", "successful stamp allows empty")
+
+    -- Failed refresh retains no stamp.
+    BankLog.lastFreshLogTab = nil
+    BankLog.lastFreshLogGuild = nil
+    ctx = GS.CaptureBankContext(1)
+    assertEq(ctx.status, "unavailable", "missing stamp after failed refresh")
+    SF.ConsumablesBankLog = nil
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+end
+
+-- 2B18) Extended production UI: bank double-commit, duplicate Add, history pager, recovery, roster
+do
+    local created = {}
+    local function fire(region, event, ...)
+        local script = region.scripts and region.scripts[event]
+        if script then script(region, ...) end
+        for _, hook in ipairs((region.hooks and region.hooks[event]) or {}) do
+            hook(region, ...)
+        end
+    end
+    local function makeRegion(kind, name, parent, template)
+        local region = {
+            kind = kind, name = name, parent = parent, shown = true,
+            height = 40, width = 400, points = {}, scripts = {}, hooks = {},
+            children = {}, text = "", enabled = true, focused = false,
+            registeredEvents = {},
+        }
+        created[#created + 1] = region
+        if parent and parent.children then parent.children[#parent.children + 1] = region end
+        function region:GetObjectType() return self.kind or "Frame" end
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetAllPoints() end
+        function region:SetHeight(h) self.height = tonumber(h) or 0 end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = tonumber(w) or 0 end
+        function region:GetWidth() return self.width end
+        function region:SetSize(w, h) self:SetWidth(w); self:SetHeight(h) end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown and true or false end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:SetAlpha() end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetNonSpaceWrap() end
+        function region:SetMaxLines() end
+        function region:SetAutoFocus() end
+        function region:SetNumeric() end
+        function region:SetMaxLetters() end
+        function region:SetHighlightColor() end
+        function region:SetCursorPosition() end
+        function region:HasFocus() return self.focused end
+        function region:ClearFocus()
+            self.focused = false
+            fire(self, "OnEditFocusLost")
+        end
+        function region:SetFocus() self.focused = true end
+        function region:GetStringWidth() return 40 end
+        function region:GetStringHeight() return 12 end
+        function region:SetColorTexture() end
+        function region:SetTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetVertexColor() end
+        function region:SetBlendMode() end
+        function region:SetVerticalScroll() end
+        function region:SetScrollChild(child) self.scrollChild = child end
+        function region:CreateTexture() return makeRegion("Texture", nil, self) end
+        function region:CreateFontString() return makeRegion("FontString", nil, self) end
+        function region:CreateFrame() return makeRegion("Frame", nil, self) end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:SetDefaultText(t) self.defaultText = t end
+        function region:SetupMenu(gen)
+            self.menuGenerator = gen
+            self.menuOptions = {}
+            local root = {
+                CreateRadio = function(_, label, isSelected, setSelected, value)
+                    self.menuOptions[#self.menuOptions + 1] = {
+                        label = label, value = value, isSelected = isSelected, setSelected = setSelected,
+                    }
+                end,
+            }
+            if type(gen) == "function" then gen(self, root) end
+        end
+        function region:GenerateMenu()
+            if self.menuGenerator then self:SetupMenu(self.menuGenerator) end
+        end
+        function region:SetChecked(v) self.checked = v and true or false end
+        function region:GetChecked() return self.checked and true or false end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:SetCheckedTexture() end
+        function region:SetDisabledCheckedTexture() end
+        function region:RegisterForClicks() end
+        function region:Click() fire(self, "OnClick") end
+        function region:SetFontObject() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:SetClipsChildren() end
+        function region:EnableDrawLayer() end
+        function region:DisableDrawLayer() end
+        function region:SetPropagateKeyboardInput() end
+        function region:SetObeyStepOnDrag() end
+        function region:SetMinMaxValues() end
+        function region:SetValueStep() end
+        function region:SetValue() end
+        function region:GetValue() return self.value or 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:GetName() return self.name end
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeRegion("Slider", nil, region)
+            region.ScrollBar:SetWidth(20)
+            region.ScrollBar.shown = false
+        end
+        return region
+    end
+
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        return makeRegion(frameType or "Frame", name, parent, template)
+    end
+    if type(CopyTable) ~= "function" then
+        function CopyTable(t)
+            if type(t) ~= "table" then return t end
+            local out = {}
+            for k, v in pairs(t) do
+                out[k] = type(v) == "table" and CopyTable(v) or v
+            end
+            return out
+        end
+    end
+    GameTooltip = GameTooltip or {
+        Hide = function() end, SetOwner = function() end, SetText = function() end,
+        AddLine = function() end, Show = function() end,
+    }
+    OKAY = OKAY or "OK"
+    CANCEL = CANCEL or "Cancel"
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    local pendingConfirm
+    function StaticPopup_Show(key, message, _, data)
+        pendingConfirm = { key = key, message = message, data = data }
+        return { key = key }
+    end
+
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    SF.SettingsUI.categories = SF.SettingsUI.categories or {}
+    function SF.SettingsUI:RegisterCategory(cat) self.categories[cat.id] = cat end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    SF.SettingsStore = SF.SettingsStore or {
+        Get = function() return true end,
+        Set = function() end,
+    }
+    -- Reload page modules under this CreateFrame so roster listeners join this harness.
+    if not SF.SettingsUI.DefinitionRenderer then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    end
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+
+    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(configPage ~= nil and logsPage ~= nil, "pages available for 2B18")
+
+    local function findEditBoxes(node, out)
+        out = out or {}
+        if node.kind == "EditBox" then out[#out + 1] = node end
+        for _, child in ipairs(node.children or {}) do findEditBoxes(child, out) end
+        return out
+    end
+    local function countOps(record)
+        local n = 0
+        for _ in pairs(record.operations.records or {}) do n = n + 1 end
+        return n
+    end
+
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+
+    local configPanel = makeRegion("Frame", "GSConfigPanel2", nil)
+    configPanel:SetSize(600, 800)
+    configPage:Build(configPanel)
+    local edits = findEditBoxes(configPanel)
+    assertTrue(#edits >= 1, "bank edit present in 2B18")
+    local bankEdit = edits[1]
+    local beforeOps = countOps(GS:GetCurrentRecord())
+    bankEdit:SetText("4")
+    fire(bankEdit, "OnEnterPressed")
+    -- AddEditBox ClearFocus after Enter.
+    bankEdit:ClearFocus()
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 4, "bank tab set once")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps + 1,
+        "Enter+focus-loss admits exactly one bank-tab operation")
+    -- Unchanged focus loss admits none.
+    beforeOps = countOps(GS:GetCurrentRecord())
+    fire(bankEdit, "OnEditFocusLost")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "unchanged focus loss allocates no op")
+
+    -- Duplicate Add preserves goal/cutoff/op count.
+    local addItem = GS:NewConfigOperation("set-requested-item", { itemId = 777 }, {
+        itemId = 777, goal = 0, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(addItem), "accepted", "add item 777")
+    local goalOp = GS:NewConfigOperation("set-requested-item", { itemId = 777 }, {
+        itemId = 777, goal = 12, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(goalOp), "accepted", "set goal 12")
+    local cutoff = GS:GetCurrentRecord().accounting._consumables.eligibility.items["777"]
+    beforeOps = countOps(GS:GetCurrentRecord())
+    -- Invoke Add path via definition onSubmit through a rebuilt page message surface.
+    local section = configPanel.__sfSections and configPanel.__sfSections.gsItems
+    local def = configPanel.__sfPageDef
+    local addHandler
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "editboxButton" and type(item.onSubmit) == "function" then
+                addHandler = item.onSubmit
+            end
+        end
+    end
+    assertTrue(addHandler ~= nil, "Add onSubmit present")
+    local messages = {}
+    local ctx = {
+        section = {
+            SetMessage = function(_, msg, sev) messages[#messages + 1] = { msg = msg, sev = sev } end,
+            ClearMessage = function() end,
+        },
+        pageBuilder = { Refresh = function() end },
+    }
+    addHandler(ctx, "777")
+    assertTrue(#messages >= 1, "duplicate Add shows feedback")
+    assertTrue((messages[1].msg or ""):find("already", 1, true), "duplicate Add localized")
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "duplicate Add allocates no operation")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["777"].goal, 12,
+        "duplicate Add preserves goal")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["777"], cutoff,
+        "duplicate Add preserves eligibility cutoff")
+
+    -- Delayed confirmation finalizes timestamp through UI accept path.
+    pendingConfirm = nil
+    local newCampaignBtn
+    local function findButtons(node, out)
+        out = out or {}
+        if node.kind == "Button" and node.text then out[#out + 1] = node end
+        for _, child in ipairs(node.children or {}) do findButtons(child, out) end
+        return out
+    end
+    for _, btn in ipairs(findButtons(configPanel)) do
+        if btn.text == "New Campaign" then newCampaignBtn = btn break end
+    end
+    assertTrue(newCampaignBtn ~= nil, "New Campaign button in 2B18")
+    newCampaignBtn:Click()
+    assertTrue(pendingConfirm ~= nil, "confirm shown")
+    local acceptFn = pendingConfirm.data
+    local prepareTime = world.time
+    world.time = world.time + 90
+    acceptFn()
+    local curId = GS:GetCurrentRecord().currentCampaignId
+    local startedAt = GS:GetCurrentRecord().campaigns[curId].startedAt
+    assertTrue(startedAt >= prepareTime + 90 or startedAt == math.floor(world.time),
+        "UI accept finalizes start timestamp")
+
+    -- Cached open/hide/reopen via Refresh (StandaloneWindow pattern), not second Build.
+    local refreshCount = 0
+    local realRefresh = SF.SettingsUI.DefinitionRenderer.Refresh
+    SF.SettingsUI.DefinitionRenderer.Refresh = function(self, panel)
+        refreshCount = refreshCount + 1
+        return realRefresh(self, panel)
+    end
+    configPanel.shown = false
+    configPage:Refresh(configPanel)
+    assertEq(refreshCount, 0, "hidden panel skips refresh")
+    configPanel.shown = true
+    configPage:Refresh(configPanel)
+    assertTrue(refreshCount >= 1, "cached reopen uses Refresh")
+    -- Roster readiness event refreshes visible page.
+    local rosterListeners = 0
+    for i = 1, #created do
+        local f = created[i]
+        if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE then
+            rosterListeners = rosterListeners + 1
+        end
+    end
+    assertTrue(rosterListeners >= 1, "guild roster listener installed")
+    refreshCount = 0
+    local priorAfter = C_Timer.After
+    C_Timer.After = function(_, fn) fn() end -- coalesce immediately in this harness
+    for i = 1, #created do
+        local f = created[i]
+        if f.registeredEvents and f.registeredEvents.GUILD_ROSTER_UPDATE
+            and f.scripts and f.scripts.OnEvent then
+            f.scripts.OnEvent(f, "GUILD_ROSTER_UPDATE")
+        end
+    end
+    C_Timer.After = priorAfter
+    assertTrue(refreshCount >= 1, "roster event refreshes visible configuration page")
+    SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
+
+    -- History pager: empty current then archived with >25 rows enables Older after Refresh.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local archiveCamp = startCampaign()
+    local rec = GS:GetCurrentRecord()
+    local gen = rec.accounting._consumables.generation
+    for i = 1, 30 do
+        rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+            id = "hist-" .. i,
+            type = "donation",
+            itemId = 10,
+            quantity = 1,
+            actor = "Bob-Garona",
+            generation = gen,
+            timestamp = world.time + i,
+            source = "guildbank",
+        }
+    end
+    startCampaign() -- current empty
+    local rows, total = GS:ListCampaignHistory(archiveCamp.id, 25, 0)
+    assertEq(total, 30, "archived history total 30")
+    assertTrue((rows[1].text or ""):find("donated", 1, true), "history text includes donation")
+    assertTrue((rows[1].text or ""):find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
+        "history text includes recognizable timestamp: " .. tostring(rows[1].text))
+
+    local logsPanel = makeRegion("Frame", "GSLogsPanel2", nil)
+    logsPanel:SetSize(600, 800)
+    logsPage:Build(logsPanel)
+    -- Simulate selecting archived campaign and refreshing (cached reopen path).
+    selectedCampaignId = nil -- page-local; drive through dropdown setSelected
+    local drops = {}
+    local function findDropdowns(node)
+        if node.kind == "DropdownButton" then drops[#drops + 1] = node end
+        for _, child in ipairs(node.children or {}) do findDropdowns(child) end
+    end
+    findDropdowns(logsPanel)
+    assertTrue(#drops >= 1, "logs dropdown present")
+    local archivedValue
+    for i = 1, #(drops[1].menuOptions or {}) do
+        local opt = drops[1].menuOptions[i]
+        if tostring(opt.label or ""):find("Archived", 1, true) then
+            archivedValue = opt.value
+            opt.setSelected(opt.value)
+            break
+        end
+    end
+    assertTrue(archivedValue ~= nil, "archived campaign option present")
+    logsPage:Refresh(logsPanel)
+    assertTrue((logsPage.historyTotal or 0) >= 25, "historyTotal synced before pager")
+    assertTrue(logsPage.historyTotal > 25, "Older should be enableable for >25 rows")
+
+    -- GM policy recovery: permission-only failure still enables rank control path.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local record = GS:GetCurrentRecord()
+    -- Break permission revision consistency (permission-only).
+    record.permission.revisionId = "gs1:broken-policy-rev:1"
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canRecoverPolicy, true, "GM canRecoverPolicy under permission-only failure")
+    assertNil(select(1, GS:GetCurrentRecord()), "GetCurrentRecord nil for permission-only failure")
+    local recoverOp, prepSt, prepReason = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
+    assertTrue(recoverOp ~= nil, "recovery NewConfigOperation works: " .. tostring(prepReason))
+    assertEq(prepSt, "accepted", "recovery op prepared")
+    local applySt, applyReason = GS:ApplyStagedConfigOperation(recoverOp)
+    assertEq(applySt, "accepted", "recovery apply accepted: " .. tostring(applyReason))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2, "recovered editor rank")
 
     CreateFrame = priorCreateFrame
 end

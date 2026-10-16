@@ -633,6 +633,20 @@ function GS:ProjectCampaignProgress(campaignId)
     }
 end
 
+local function FormatHistoryTimestamp(event)
+    local ts = tonumber(event and event.timestamp)
+    if not ts or ts ~= ts or ts < 0 then
+        return nil
+    end
+    if date then
+        local ok, formatted = pcall(date, "%Y-%m-%d %H:%M", ts)
+        if ok and type(formatted) == "string" and formatted ~= "" then
+            return formatted
+        end
+    end
+    return tostring(math.floor(ts))
+end
+
 local function FormatCampaignHistoryText(event, itemName)
     local itemId = tonumber(event.itemId)
     local qty = tonumber(event.quantity) or 0
@@ -640,25 +654,32 @@ local function FormatCampaignHistoryText(event, itemName)
     if type(name) ~= "string" or name == "" then
         name = Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId or "?"))
     end
+    local body
     if IsDonationEvent(event) then
         local who = BoundedActorName(event.actor) or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
-        return Loc("GUILD_SUPPLIES_HISTORY_DONATION", "%s donated %d %s.")
+        body = Loc("GUILD_SUPPLIES_HISTORY_DONATION", "%s donated %d %s.")
             :format(who, qty, name)
-    end
-    if IsAdjustmentEvent(event) then
+    elseif IsAdjustmentEvent(event) then
         local who = BoundedActorName(event.actor)
             or Loc("GUILD_SUPPLIES_HISTORY_ADMIN", "An admin")
         local credit = BoundedActorName(event.attributed)
         if credit then
-            return Loc("GUILD_SUPPLIES_HISTORY_ADJUST_ATTRIBUTED",
+            body = Loc("GUILD_SUPPLIES_HISTORY_ADJUST_ATTRIBUTED",
                 "%s adjusted %s by %+d (credited to %s).")
                 :format(who, name, qty, credit)
+        else
+            body = Loc("GUILD_SUPPLIES_HISTORY_ADJUST_UNATTRIBUTED",
+                "%s adjusted %s by %+d (unattributed / miscellaneous).")
+                :format(who, name, qty)
         end
-        return Loc("GUILD_SUPPLIES_HISTORY_ADJUST_UNATTRIBUTED",
-            "%s adjusted %s by %+d (unattributed / miscellaneous).")
-            :format(who, name, qty)
+    else
+        return nil
     end
-    return nil
+    local when = FormatHistoryTimestamp(event)
+    if when then
+        return Loc("GUILD_SUPPLIES_HISTORY_WITH_TIME", "%s — %s"):format(when, body)
+    end
+    return body
 end
 
 --- Bounded read-only donation/adjustment history for one campaign.
@@ -797,11 +818,38 @@ function GS.FormatReasonText(reason)
             "the active guild changed"),
         unsupported_activation = Loc("GUILD_SUPPLIES_REASON_UNSUPPORTED_ACTIVATION",
             "this dataset is not on the staged activation path"),
+        stale_handle = Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+            "the page is out of date — refresh and try again"),
+        actor_changed = Loc("GUILD_SUPPLIES_REASON_ACTOR_CHANGED",
+            "the active character changed"),
+        no_campaign = Loc("GUILD_SUPPLIES_REASON_NO_CAMPAIGN",
+            "start a New Campaign before changing requested items"),
+        already_requested = Loc("GUILD_SUPPLIES_REASON_ALREADY_REQUESTED",
+            "that item is already on the current campaign"),
+        server_time_unavailable = Loc("GUILD_SUPPLIES_REASON_SERVER_TIME",
+            "server time is unavailable right now"),
+        log_pending = Loc("GUILD_SUPPLIES_REASON_LOG_PENDING",
+            "the Guild Bank log is still updating"),
+        not_observing = Loc("GUILD_SUPPLIES_REASON_NOT_OBSERVING",
+            "the Guild Bank is not being observed yet"),
+        guild_mismatch = Loc("GUILD_SUPPLIES_REASON_GUILD_MISMATCH",
+            "the active guild does not match the bank sample"),
+        partial_read = Loc("GUILD_SUPPLIES_REASON_PARTIAL_READ",
+            "the Guild Bank log could not be read completely"),
+        read_failed = Loc("GUILD_SUPPLIES_REASON_READ_FAILED",
+            "the Guild Bank log could not be read"),
+        invalid_bank_tab = Loc("GUILD_SUPPLIES_REASON_INVALID_BANK_TAB",
+            "enter a bank tab from 1 to 8"),
     }
     if known[code] then
         return known[code]
     end
-    return Loc("GUILD_SUPPLIES_REASON_GENERIC", "reason: %s"):format(code)
+    -- Useful localized fallback; do not expose internal tokens to players.
+    if SF.Debug and SF.Debug.IsEnabled and SF.Debug:IsEnabled() and SF.Debug.Verbose then
+        SF.Debug:Verbose("GUILD_SUPPLIES", "unmapped mutation reason code=%s", code)
+    end
+    return Loc("GUILD_SUPPLIES_REASON_GENERIC",
+        "the change could not be applied right now")
 end
 
 --- Translate staged mutation statuses for Settings banners.
@@ -919,6 +967,8 @@ function GS:NewCampaignOperation()
     if not record then
         return nil, "rejected", recordReason or "not_configured"
     end
+    -- Placeholder timestamp; FinalizeCampaignStartTime sets the real start once
+    -- confirmation is accepted, before first admission.
     local ts = ServerTime()
     if not ts then
         return nil, "rejected", "server_time_unavailable"
@@ -947,12 +997,44 @@ function GS:NewCampaignOperation()
         basePolicyRevision = policyRev,
         baseCampaignId = record.currentCampaignId,
         _preparedHandleGeneration = ctx.handleGeneration,
+        _startTimeFinalized = false,
     }
     local shapeOk, shapeErr = ValidateCampaignOpShape(op)
     if not shapeOk then
         return nil, "rejected", shapeErr
     end
     return op, "accepted", nil
+end
+
+--- Finalize startedAt/timestamp once when confirmation is accepted.
+-- Preserves guild/dataset/actor/handle/campaign/policy/target bases.
+-- Does not restamp an already accepted or pending body (exact retry/reload).
+function GS:FinalizeCampaignStartTime(op)
+    if type(op) ~= "table" or op.kind ~= GS.KIND.START_CAMPAIGN then
+        return false, "invalid_operation"
+    end
+    if type(op.id) ~= "string" or op.id == "" then
+        return false, "invalid_id"
+    end
+    local record = GS:GetCurrentRecord()
+    if type(record) == "table" and type(record.operations) == "table" then
+        if record.operations.records and record.operations.records[op.id] then
+            return true
+        end
+        if record.operations.pending and record.operations.pending[op.id] then
+            return true
+        end
+    end
+    if op._startTimeFinalized == true then
+        return true
+    end
+    local ts = ServerTime()
+    if not ts then
+        return false, "server_time_unavailable"
+    end
+    op.timestamp = ts
+    op._startTimeFinalized = true
+    return true
 end
 
 function GS:ValidateCampaignOperation(op, context)

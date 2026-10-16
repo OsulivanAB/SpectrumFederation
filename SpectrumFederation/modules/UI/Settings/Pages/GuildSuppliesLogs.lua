@@ -30,13 +30,74 @@ local selectedCampaignId = nil
 local historyOffset = 0
 local historyCampaignId = nil
 local HISTORY_PAGE_SIZE = 25
+local cachedHistoryItems = nil
+local refreshQueued = false
+local rosterFrame = nil
+
+-- Per build/refresh pass only: reuse validated read context across controls.
+local passCache = nil
+
+local function BeginRenderPass()
+	passCache = {}
+end
+
+local function EndRenderPass()
+	passCache = nil
+end
 
 local function Caps()
-	local g = GS()
-	if not g or not g.GetCapabilities then
-		return { canRead = false, reason = "not_ready" }
+	if passCache and passCache.caps then
+		return passCache.caps
 	end
-	return g:GetCapabilities()
+	local g = GS()
+	local caps
+	if not g or not g.GetCapabilities then
+		caps = { canRead = false, reason = "not_ready" }
+	else
+		caps = g:GetCapabilities()
+	end
+	if passCache then
+		passCache.caps = caps
+	end
+	return caps
+end
+
+local function CurrentRecord()
+	if passCache and passCache.recordChecked then
+		return passCache.record, passCache.recordReason
+	end
+	local g = GS()
+	local record, reason
+	if g and g.GetCurrentRecord then
+		record, reason = g:GetCurrentRecord()
+	else
+		reason = "not_ready"
+	end
+	if passCache then
+		passCache.recordChecked = true
+		passCache.record = record
+		passCache.recordReason = reason
+	end
+	return record, reason
+end
+
+local function InspectableCampaigns()
+	if passCache and passCache.campaignsChecked then
+		return passCache.campaigns
+	end
+	local g = GS()
+	local list
+	if g and g.ListInspectableCampaigns then
+		list = g:ListInspectableCampaigns()
+	end
+	if type(list) ~= "table" then
+		list = {}
+	end
+	if passCache then
+		passCache.campaignsChecked = true
+		passCache.campaigns = list
+	end
+	return list
 end
 
 local function FormatCampaignLabel(entry)
@@ -56,15 +117,8 @@ local function FormatCampaignLabel(entry)
 end
 
 local function CampaignOptions()
-	local g = GS()
 	local opts = {}
-	if not g or not g.ListInspectableCampaigns then
-		return opts
-	end
-	local list = g:ListInspectableCampaigns()
-	if type(list) ~= "table" then
-		return opts
-	end
+	local list = InspectableCampaigns()
 	for i = 1, #list do
 		local entry = list[i]
 		opts[#opts + 1] = {
@@ -76,14 +130,13 @@ local function CampaignOptions()
 end
 
 local function ResolveSelectedCampaign()
-	local g = GS()
-	local record = g and select(1, g:GetCurrentRecord()) or nil
+	local record = CurrentRecord()
 	if not record then
 		selectedCampaignId = nil
 		return nil
 	end
-	local list = g:ListInspectableCampaigns()
-	if type(list) ~= "table" or #list == 0 then
+	local list = InspectableCampaigns()
+	if #list == 0 then
 		selectedCampaignId = nil
 		return nil
 	end
@@ -173,12 +226,16 @@ local function ItemNameForHistory(itemId)
 	return nil
 end
 
-local function HistoryRowsForSelected()
+--- Sync selected-campaign history total/offset before pager enablement runs.
+local function EnsureHistoryState()
 	local g = GS()
 	local campaignId = ResolveSelectedCampaign()
-	if not g or not campaignId or not g.ListCampaignHistory then
+	if not Caps().canRead or not g or not campaignId or not g.ListCampaignHistory then
+		historyOffset = 0
+		historyCampaignId = campaignId
 		Page.historyTotal = 0
-		return {}
+		cachedHistoryItems = {}
+		return cachedHistoryItems
 	end
 	if campaignId ~= historyCampaignId then
 		historyCampaignId = campaignId
@@ -198,15 +255,25 @@ local function HistoryRowsForSelected()
 			items[#items + 1] = { text = rows[i].text, canRemove = false }
 		end
 	end
+	cachedHistoryItems = items
 	return items
 end
 
+local function HistoryRowsForSelected()
+	if cachedHistoryItems then
+		return cachedHistoryItems
+	end
+	return EnsureHistoryState()
+end
+
 local function ShiftHistory(delta)
+	EnsureHistoryState()
 	local total = Page.historyTotal or 0
 	local nextOffset = historyOffset + (delta * HISTORY_PAGE_SIZE)
 	if nextOffset < 0 then nextOffset = 0 end
 	if nextOffset > 0 and nextOffset >= total then return end
 	historyOffset = nextOffset
+	cachedHistoryItems = nil
 	if Page.Refresh and Page.panel then
 		Page:Refresh(Page.panel)
 	end
@@ -244,13 +311,17 @@ local function Definition()
 							selectedCampaignId = value
 							historyOffset = 0
 							historyCampaignId = value
+							cachedHistoryItems = nil
 						end,
 						enabled = function()
 							return Caps().canRead and #CampaignOptions() > 0
 						end,
 						onValueChanged = function(ctx)
 							historyOffset = 0
-							if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+							cachedHistoryItems = nil
+							if Page.Refresh and Page.panel then
+								Page:Refresh(Page.panel)
+							elseif ctx.pageBuilder and ctx.pageBuilder.Refresh then
 								ctx.pageBuilder:Refresh()
 							end
 						end,
@@ -263,8 +334,7 @@ local function Definition()
 							if not id then
 								return Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns")
 							end
-							local g = GS()
-							local list = g and g:ListInspectableCampaigns() or {}
+							local list = InspectableCampaigns()
 							for i = 1, #list do
 								if list[i].campaignId == id then
 									return FormatCampaignLabel(list[i])
@@ -294,11 +364,27 @@ local function Definition()
 						getText = HistoryHelpText,
 					},
 					{
+						type = "scrollList",
+						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY", "Campaign history"),
+						height = 180,
+						rowHeight = 20,
+						getItems = function()
+							if not Caps().canRead then
+								return {}
+							end
+							return HistoryRowsForSelected()
+						end,
+						enabled = function()
+							return Caps().canRead
+						end,
+					},
+					{
 						type = "button",
 						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY_PREV", "Newer"),
 						buttonText = Loc("GUILD_SUPPLIES_LOGS_HISTORY_PREV", "Newer"),
 						width = 90,
 						enabled = function()
+							-- Page.historyTotal is synced in Page:Refresh before control refresh.
 							return Caps().canRead and historyOffset > 0
 						end,
 						onClick = function()
@@ -316,21 +402,6 @@ local function Definition()
 						end,
 						onClick = function()
 							ShiftHistory(1)
-						end,
-					},
-					{
-						type = "scrollList",
-						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY", "Campaign history"),
-						height = 180,
-						rowHeight = 20,
-						getItems = function()
-							if not Caps().canRead then
-								return {}
-							end
-							return HistoryRowsForSelected()
-						end,
-						enabled = function()
-							return Caps().canRead
 						end,
 					},
 					{
@@ -366,30 +437,86 @@ local function Definition()
 	}
 end
 
+local function PanelVisible(panel)
+	if not panel then return false end
+	if panel.IsShown and not panel:IsShown() then return false end
+	return true
+end
+
+local function QueueRefresh()
+	local panel = Page.panel
+	if not panel or not Page.Refresh then return end
+	if not PanelVisible(panel) then return end
+	if refreshQueued then return end
+	refreshQueued = true
+	local function run()
+		refreshQueued = false
+		if not Page.panel or not Page.Refresh then return end
+		if not PanelVisible(Page.panel) then return end
+		Page:Refresh(Page.panel)
+	end
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, run)
+	else
+		run()
+	end
+end
+
+local function EnsureRosterListener()
+	if rosterFrame or type(CreateFrame) ~= "function" then
+		return
+	end
+	local frame = CreateFrame("Frame")
+	rosterFrame = frame
+	frame:RegisterEvent("GUILD_ROSTER_UPDATE")
+	if frame.RegisterEvent then
+		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
+	end
+	frame:SetScript("OnEvent", function()
+		QueueRefresh()
+	end)
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
 		return
 	end
+	EnsureRosterListener()
+	BeginRenderPass()
+	EnsureHistoryState()
 	renderer:Build(panel, Definition())
+	EndRenderPass()
 	self.panel = panel
+	if panel.HookScript and not panel.__sfGuildSuppliesLogsHook then
+		panel.__sfGuildSuppliesLogsHook = true
+		panel:HookScript("OnShow", function()
+			QueueRefresh()
+		end)
+	end
 end
 
 function Page:Refresh(panel)
 	panel = panel or self.panel
-	if panel and panel.IsShown and not panel:IsShown() then
+	if not PanelVisible(panel) then
 		return
 	end
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if renderer and renderer.Refresh then
+		BeginRenderPass()
+		-- Derive history total/offset before pager enablement callbacks run.
+		cachedHistoryItems = nil
+		EnsureHistoryState()
 		renderer:Refresh(panel)
+		EndRenderPass()
 	end
 end
 
--- Lifecycle: selection is ephemeral; repeated open must not accumulate listeners.
--- PageBuilder owns refresh; this module registers no permanent frames/timers.
 function Page:OnHide()
-	-- Keep selectedCampaignId for the session; do not grow resources.
+	refreshQueued = false
+	cachedHistoryItems = nil
 end
+
+EnsureRosterListener()
 
 SF.SettingsUI:RegisterPage(Page)

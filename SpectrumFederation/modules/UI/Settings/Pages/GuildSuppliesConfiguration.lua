@@ -35,16 +35,58 @@ local function GS()
 	return SF.GuildSupplies
 end
 
-local function Caps()
-	local g = GS()
-	if not g or not g.GetCapabilities then
-		return { canEdit = false, canRead = false, canRecoverPolicy = false, reason = "not_ready" }
+-- Per build/refresh pass only: reuse validated read context across controls.
+-- Cleared after the pass so mutations always recheck authority/base freshly.
+local passCache = nil
+
+local function BeginRenderPass()
+	passCache = {}
+end
+
+local function EndRenderPass()
+	passCache = nil
+end
+
+local function CurrentRecord()
+	if passCache and passCache.recordChecked then
+		return passCache.record, passCache.recordReason
 	end
-	return g:GetCapabilities()
+	local g = GS()
+	local record, reason
+	if g and g.GetCurrentRecord then
+		record, reason = g:GetCurrentRecord()
+	else
+		reason = "not_ready"
+	end
+	if passCache then
+		passCache.recordChecked = true
+		passCache.record = record
+		passCache.recordReason = reason
+	end
+	return record, reason
+end
+
+local function Caps()
+	if passCache and passCache.caps then
+		return passCache.caps
+	end
+	local g = GS()
+	local caps
+	if not g or not g.GetCapabilities then
+		caps = { canEdit = false, canRead = false, canRecoverPolicy = false, reason = "not_ready" }
+	else
+		caps = g:GetCapabilities()
+	end
+	if passCache then
+		passCache.caps = caps
+	end
+	return caps
 end
 
 -- Ephemeral small-guild threshold choice for Initialize; never persisted.
 local pendingInitRank = nil
+local refreshQueued = false
+local rosterFrame = nil
 
 local function ReportStatus(ctx, status, reason)
 	local g = GS()
@@ -106,13 +148,19 @@ local function NeedsExplicitInitThreshold()
 	if count <= 0 or count >= defaultPos then
 		return false
 	end
-	local rec = g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	local rec = CurrentRecord()
 	return rec == nil
 end
 
+local function CurrentBankTab()
+	local rec = CurrentRecord()
+	local tab = rec and rec.accounting and rec.accounting._consumables
+		and rec.accounting._consumables.bankTab
+	return tab ~= nil and tonumber(tab) or nil
+end
+
 local function RequestedItemRows()
-	local g = GS()
-	local record = g and g.GetCurrentRecord and g:GetCurrentRecord() or nil
+	local record = CurrentRecord()
 	local rows = {}
 	if not record or type(record.currentCampaignId) ~= "string" then
 		return rows
@@ -142,19 +190,18 @@ end
 
 local function StagedStatusText()
 	local g = GS()
-	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	local record, recReason = CurrentRecord()
 	local formatReason = g and g.FormatReasonText or function(r)
 		return tostring(r or "unknown")
 	end
 	if not record then
 		local caps = Caps()
-		local recReason = g and g.GetCurrentRecord and select(2, g:GetCurrentRecord()) or nil
 		if caps.reason == "not_configured" or recReason == "not_configured" then
 			return Loc("GUILD_SUPPLIES_STATUS_NOT_CONFIGURED",
 				"No staged Guild Supplies dataset for this guild yet. Use Initialize Guild Supplies.")
 		end
 		return Loc("GUILD_SUPPLIES_STATUS_UNAVAILABLE",
-			"Guild Supplies data is unavailable (%s)."):format(formatReason(caps.reason or "unknown"))
+			"Guild Supplies data is unavailable (%s)."):format(formatReason(caps.reason or recReason or "unknown"))
 	end
 	local campaign = record.currentCampaignId
 	local activation = Loc("GUILD_SUPPLIES_STATUS_STAGED",
@@ -168,8 +215,7 @@ local function StagedStatusText()
 end
 
 local function ItemsHelpText()
-	local g = GS()
-	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	local record = CurrentRecord()
 	local hasCampaign = record and type(record.currentCampaignId) == "string" and record.currentCampaignId ~= ""
 	if hasCampaign then
 		return Loc("GUILD_SUPPLIES_ITEMS_HELP",
@@ -261,6 +307,14 @@ local function CommitNewCampaign(ctx)
 	local boundOp = op
 	local accept = function()
 		ctx.section:ClearMessage()
+		-- Finalize startedAt once at confirmation accept; keep bound scope/bases.
+		if g.FinalizeCampaignStartTime then
+			local okFinal, finalReason = g:FinalizeCampaignStartTime(boundOp)
+			if not okFinal then
+				ReportStatus(ctx, "rejected", finalReason or "server_time_unavailable")
+				return
+			end
+		end
 		local status, reason = g:ApplyStagedCampaignOperation(boundOp)
 		ReportStatus(ctx, status, reason)
 	end
@@ -320,9 +374,13 @@ local function Definition()
 							if NeedsExplicitInitThreshold() then
 								return c.canRecoverPolicy == true
 							end
-							local mod = GS()
-							local rec = mod and select(1, mod:GetCurrentRecord())
-							return rec ~= nil and (c.canEdit or c.canRecoverPolicy)
+							-- Permission-only recovery: GetCurrentRecord may be nil while
+							-- canRecoverPolicy is true; NewConfigOperation still resolves it.
+							if c.canRecoverPolicy then
+								return true
+							end
+							local rec = CurrentRecord()
+							return rec ~= nil and c.canEdit == true
 						end,
 						onValueChanged = function(ctx, value)
 							if NeedsExplicitInitThreshold() then
@@ -346,9 +404,7 @@ local function Definition()
 							if not c.canEdit and not c.canRecoverPolicy then
 								return false
 							end
-							local mod = GS()
-							if not mod then return false end
-							local rec = select(1, mod:GetCurrentRecord())
+							local rec = CurrentRecord()
 							if rec ~= nil then
 								return false
 							end
@@ -389,27 +445,32 @@ local function Definition()
 						tooltip = Loc("GUILD_SUPPLIES_BANK_TAB_TIP",
 							"Shared across campaigns. Changing the tab establishes a new eligibility cutoff."),
 						get = function()
-							local mod = GS()
-							local rec = mod and select(1, mod:GetCurrentRecord())
-							local tab = rec and rec.accounting and rec.accounting._consumables
-								and rec.accounting._consumables.bankTab
+							local tab = CurrentBankTab()
 							return tab ~= nil and tostring(tab) or ""
 						end,
 						set = function() end,
 						enabled = function()
-							local mod = GS()
-							return Caps().canEdit and mod and select(1, mod:GetCurrentRecord()) ~= nil
+							return Caps().canEdit and CurrentRecord() ~= nil
 						end,
 						onCommit = function(ctx, text)
-							local tab = tonumber(text)
+							-- Enter then ClearFocus both fire Commit; skip unchanged values
+							-- so one Enter admits one operation and idle focus loss admits none.
+							local current = CurrentBankTab()
 							if text == nil or text == "" then
+								if current == nil then
+									return
+								end
 								CommitConfig(ctx, "set-bank-tab", "bankTab", nil)
 								return
 							end
-							if not tab or tab < 1 or tab > 8 then
+							local tab = tonumber(text)
+							if not tab or tab < 1 or tab > 8 or tab ~= math.floor(tab) then
 								ctx.section:SetMessage(
 									Loc("GUILD_SUPPLIES_ERR_BANK_TAB", "Enter a bank tab from 1 to 8, or clear the field."),
 									"error")
+								return
+							end
+							if current == tab then
 								return
 							end
 							CommitConfig(ctx, "set-bank-tab", "bankTab", tab)
@@ -422,8 +483,7 @@ local function Definition()
 						buttonText = Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_BUTTON", "New Campaign"),
 						width = 160,
 						enabled = function()
-							local mod = GS()
-							return Caps().canEdit and mod and select(1, mod:GetCurrentRecord()) ~= nil
+							return Caps().canEdit and CurrentRecord() ~= nil
 						end,
 						onClick = function(ctx)
 							CommitNewCampaign(ctx)
@@ -451,8 +511,7 @@ local function Definition()
 						buttonWidth = 90,
 						editWidth = 170,
 						enabled = function()
-							local mod = GS()
-							local rec = mod and select(1, mod:GetCurrentRecord())
+							local rec = CurrentRecord()
 							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
 						end,
 						onSubmit = function(ctx, text)
@@ -462,6 +521,18 @@ local function Definition()
 								ctx.section:SetMessage(
 									Loc("GUILD_SUPPLIES_ERR_ITEM", "Enter an item ID or paste an item link."),
 									"error")
+								return
+							end
+							-- Fresh mutation-time read (not the render pass cache).
+							local g = GS()
+							local live = g and select(1, g:GetCurrentRecord())
+							local items = live and live.accounting and live.accounting._consumables
+								and live.accounting._consumables.requestedItems
+							if type(items) == "table" and type(items[tostring(itemId)]) == "table" then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ITEM_EXISTS",
+										"That item is already requested. Change its goal in the list instead of adding it again."),
+									"warn")
 								return
 							end
 							CommitConfig(ctx, "set-requested-item", { itemId = itemId }, {
@@ -478,8 +549,7 @@ local function Definition()
 						height = 180,
 						getItems = RequestedItemRows,
 						enabled = function()
-							local mod = GS()
-							local rec = mod and select(1, mod:GetCurrentRecord())
+							local rec = CurrentRecord()
 							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
 						end,
 						onRemove = function(ctx, item)
@@ -533,28 +603,81 @@ local function Definition()
 	}
 end
 
+local function PanelVisible(panel)
+	if not panel then return false end
+	if panel.IsShown and not panel:IsShown() then return false end
+	return true
+end
+
+local function QueueRefresh()
+	local panel = Page.panel
+	if not panel or not Page.Refresh then return end
+	if not PanelVisible(panel) then return end
+	if refreshQueued then return end
+	refreshQueued = true
+	local function run()
+		refreshQueued = false
+		if not Page.panel or not Page.Refresh then return end
+		if not PanelVisible(Page.panel) then return end
+		Page:Refresh(Page.panel)
+	end
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, run)
+	else
+		run()
+	end
+end
+
+local function EnsureRosterListener()
+	if rosterFrame or type(CreateFrame) ~= "function" then
+		return
+	end
+	local frame = CreateFrame("Frame")
+	rosterFrame = frame
+	frame:RegisterEvent("GUILD_ROSTER_UPDATE")
+	if frame.RegisterEvent then
+		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
+	end
+	frame:SetScript("OnEvent", function()
+		QueueRefresh()
+	end)
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
 		return
 	end
+	EnsureRosterListener()
+	BeginRenderPass()
 	renderer:Build(panel, Definition())
+	EndRenderPass()
 	self.panel = panel
+	if panel.HookScript and not panel.__sfGuildSuppliesConfigHook then
+		panel.__sfGuildSuppliesConfigHook = true
+		panel:HookScript("OnShow", function()
+			QueueRefresh()
+		end)
+	end
 end
 
 function Page:Refresh(panel)
 	panel = panel or self.panel
-	if panel and panel.IsShown and not panel:IsShown() then
+	if not PanelVisible(panel) then
 		return
 	end
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if renderer and renderer.Refresh then
+		BeginRenderPass()
 		renderer:Refresh(panel)
+		EndRenderPass()
 	end
 end
 
--- Lifecycle: no permanent frames/timers; PageBuilder owns refresh registration.
 function Page:OnHide()
+	refreshQueued = false
 end
+
+EnsureRosterListener()
 
 SF.SettingsUI:RegisterPage(Page)
