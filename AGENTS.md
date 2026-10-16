@@ -274,7 +274,12 @@ Distinguish authorization carefully:
   continuation authority. After delivering the currently requested work, report
   and stop.
 - Reply to or resolve review threads only when the owner's current request
-  reasonably includes that action.
+  reasonably includes that action. An authorized **repair batch** includes
+  posting disposition replies on the addressed threads after delivery by
+  default unless the owner opts out; thread resolution still needs separate
+  authorization. Details:
+  `.cursor/skills/ai-review-loop/SKILL.md` and
+  `.cursor/skills/pr-review-comments/SKILL.md`.
 - **Human QA handoff:** use "Implementation and automated validation complete;
   awaiting human Retail QA" only when implementation and applicable automated
   validation are actually complete and human Retail QA is the remaining gate.
