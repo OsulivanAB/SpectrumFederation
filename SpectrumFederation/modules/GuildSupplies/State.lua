@@ -521,6 +521,18 @@ local function ValidateGuildRecordStructure(guildKey, record)
         if not campOk then
             return false, campErr or "invalid_campaign"
         end
+        -- Active campaign generations must be finite positive integers. Do not
+        -- normalize missing/zero/nonnumeric values into generation 1 on reset.
+        local gen = tonumber(cfg.generation)
+        if not gen or gen ~= math.floor(gen) or gen < 1
+            or gen ~= gen or gen == math.huge then
+            return false, "invalid_generation"
+        end
+    elseif cfg.generation ~= nil then
+        -- Pre-campaign setup uses generation 0; other non-finite values fail closed.
+        if not IsFiniteNonnegInt(cfg.generation) then
+            return false, "invalid_generation"
+        end
     end
     -- Archived/other headers are retained even when malformed; ListInspectableCampaigns
     -- validates each before exposure. Do not fail the whole guild record for them.
@@ -1050,6 +1062,16 @@ function GS:_StoreCampaignBoundaryForTests(header)
     end
     record.campaigns[header.campaignId] = header
     record.currentCampaignId = header.campaignId
+    -- Keep test helper coherent with the production invariant: a current
+    -- campaign requires a finite positive generation (fresh setup is 0).
+    local cfg = record.accounting and record.accounting._consumables
+    if type(cfg) == "table" then
+        local gen = tonumber(cfg.generation)
+        if not gen or gen ~= math.floor(gen) or gen < 1
+            or gen ~= gen or gen == math.huge then
+            cfg.generation = 1
+        end
+    end
     if record.observations.byCampaign[header.campaignId] == nil then
         record.observations.byCampaign[header.campaignId] = {
             schemaVersion = 1,

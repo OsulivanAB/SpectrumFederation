@@ -543,9 +543,12 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
     if archiveCount >= GS.MAX_CAMPAIGNS then
         return false, "full"
     end
-    local generation = tonumber(cfg.generation) or 0
-    if generation < 1 then
-        generation = 1
+    -- Never manufacture generation 1 from missing/invalid current state: that
+    -- collapses distinct campaign generations and mixes ledger attribution.
+    local generation = tonumber(cfg.generation)
+    if not generation or generation ~= math.floor(generation) or generation < 1
+        or generation ~= generation or generation == math.huge then
+        return false, "invalid_generation"
     end
     local copiedItems, copyErr = CopyRequestedItems(cfg.requestedItems)
     if type(copiedItems) ~= "table" then
@@ -585,6 +588,28 @@ end
 -- Listing / inspection (validated views; malformed retained but not exposed)
 ---------------------------------------------------------------------------
 
+--- True when a non-current campaign may be listed/read without an archive.
+-- #386 new-goal campaigns always create an archive when superseded; missing
+-- snapshots are unavailable (distinct from a validated empty requestedItems={}).
+local function CampaignArchiveOptional(header)
+    return type(header) ~= "table" or header.boundaryKind ~= "new-goal"
+end
+
+local function CampaignArchiveInspectable(record, campaignId, header)
+    if record.currentCampaignId == campaignId then
+        return true
+    end
+    local archived = record.campaignArchives and record.campaignArchives[campaignId]
+    if CampaignArchiveOptional(header) then
+        -- Explicit legacy/other formats only: absent remains allowed; present must validate.
+        return archived == nil or GS.ValidateCampaignArchive(archived, campaignId, record)
+    end
+    if type(archived) ~= "table" then
+        return false
+    end
+    return GS.ValidateCampaignArchive(archived, campaignId, record)
+end
+
 --- Build a sorted list of inspectable campaigns without mutating storage.
 -- Malformed/foreign headers stay in SavedVariables but are omitted here.
 function GS:ListInspectableCampaigns()
@@ -597,21 +622,17 @@ function GS:ListInspectableCampaigns()
     for campaignId, header in pairs(record.campaigns) do
         if type(campaignId) == "string" and type(header) == "table" then
             local ok = GS.ValidateCampaignBoundary(header, record, guildKey)
-            if ok and header.campaignId == campaignId then
-                local archived = record.campaignArchives and record.campaignArchives[campaignId]
-                local archiveOk = archived == nil
-                    or GS.ValidateCampaignArchive(archived, campaignId, record)
-                if archiveOk then
-                    list[#list + 1] = {
-                        campaignId = campaignId,
-                        startedAt = header.startedAt,
-                        boundaryKind = header.boundaryKind,
-                        contextStatus = header.contextStatus,
-                        parentCampaignId = header.parentCampaignId,
-                        isCurrent = (record.currentCampaignId == campaignId),
-                        bankTabAtStart = header.bankTabAtStart,
-                    }
-                end
+            if ok and header.campaignId == campaignId
+                and CampaignArchiveInspectable(record, campaignId, header) then
+                list[#list + 1] = {
+                    campaignId = campaignId,
+                    startedAt = header.startedAt,
+                    boundaryKind = header.boundaryKind,
+                    contextStatus = header.contextStatus,
+                    parentCampaignId = header.parentCampaignId,
+                    isCurrent = (record.currentCampaignId == campaignId),
+                    bankTabAtStart = header.bankTabAtStart,
+                }
             end
         end
     end
@@ -656,12 +677,23 @@ function GS:GetCampaignRequestedItems(campaignId)
     end
 
     local archive = record.campaignArchives and record.campaignArchives[campaignId]
-    if type(archive) ~= "table" then
-        return {}, nil, false
-    end
-    local aok, aerr = GS.ValidateCampaignArchive(archive, campaignId, record)
-    if not aok then
-        return nil, aerr or "invalid_campaign_archive"
+    if not CampaignArchiveOptional(header) then
+        -- Required new-goal snapshot: missing/non-table is unavailable, not empty.
+        if type(archive) ~= "table" then
+            return nil, "missing_campaign_archive"
+        end
+        local aok, aerr = GS.ValidateCampaignArchive(archive, campaignId, record)
+        if not aok then
+            return nil, aerr or "invalid_campaign_archive"
+        end
+    else
+        if type(archive) ~= "table" then
+            return {}, nil, false
+        end
+        local aok, aerr = GS.ValidateCampaignArchive(archive, campaignId, record)
+        if not aok then
+            return nil, aerr or "invalid_campaign_archive"
+        end
     end
     local copied, copyErr = CopyRequestedItems(archive.requestedItems)
     if type(copied) ~= "table" then
@@ -690,11 +722,13 @@ local function BoundedActorName(name)
 end
 
 --- Walk current + archived ledger inputs for one campaign generation.
--- Preserves original event identities; callers must not double-count.
+-- Deduplicates nonempty accepted event IDs across archive+live inputs so
+-- progress totals and history stay consistent. Distinct IDs still count separately.
 local function ForEachCampaignLedgerEvent(record, generation, visitor)
     if type(visitor) ~= "function" or not generation or generation < 1 then
         return
     end
+    local seen = {}
     local function walk(list, maxN)
         if type(list) ~= "table" then
             return
@@ -706,11 +740,21 @@ local function ForEachCampaignLedgerEvent(record, generation, visitor)
         for i = 1, limit do
             local event = list[i]
             if type(event) == "table" and tonumber(event.generation) == generation then
-                visitor(event)
+                local id = event.id
+                if type(id) == "string" and id ~= "" then
+                    if seen[id] then
+                        -- Overlapping retained identity; already projected.
+                    else
+                        seen[id] = true
+                        visitor(event)
+                    end
+                else
+                    visitor(event)
+                end
             end
         end
     end
-    -- Archive first, then live list — same accepted identities must not appear in both.
+    -- Archive first, then live list — shared identities count once.
     walk(record.accounting and record.accounting._consumableEventArchive, 4096)
     walk(record.accounting and record.accounting._consumableEvents, 4096)
 end
@@ -966,6 +1010,10 @@ function GS.FormatReasonText(reason)
             "eligibility configuration is malformed"),
         campaign_archive_exists = Loc("GUILD_SUPPLIES_REASON_CAMPAIGN_ARCHIVE_EXISTS",
             "this campaign already has a retained archive"),
+        missing_campaign_archive = Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN_ARCHIVE",
+            "archived campaign goals are unavailable"),
+        invalid_generation = Loc("GUILD_SUPPLIES_REASON_INVALID_GENERATION",
+            "campaign generation data is malformed"),
         invalid_editor_rank_position = Loc("GUILD_SUPPLIES_REASON_INVALID_RANK",
             "choose an existing guild rank"),
         rank_unavailable = Loc("GUILD_SUPPLIES_REASON_RANK_UNAVAILABLE",
@@ -1418,28 +1466,11 @@ function GS:ApplyStagedCampaignOperation(op, context)
         return "rejected", headerErr or "invalid_campaign"
     end
 
-    -- Snapshot only fields this transaction mutates (no whole-guild deep copy).
-    local function CopyEligibilitySnapshot(elig)
-        if type(elig) ~= "table" then
-            return elig
-        end
-        local items = {}
-        if type(elig.items) == "table" then
-            for k, v in pairs(elig.items) do
-                items[k] = v
-            end
-        end
-        return {
-            items = items,
-            tabEligibleFrom = elig.tabEligibleFrom,
-            baselineEstablished = elig.baselineEstablished,
-            baselineAt = elig.baselineAt,
-        }
-    end
-
+    -- Retain the original eligibility object for rollback. Do not walk/copy
+    -- eligibility.items: install a fresh container for the new campaign instead.
     local previousItems = cfg.requestedItems
     local previousGeneration = cfg.generation
-    local previousEligibility = CopyEligibilitySnapshot(cfg.eligibility)
+    local previousEligibility = cfg.eligibility
     local previousConfigSeq = cfg.configSeq
     local previousCurrent = record.currentCampaignId
     local previousHead = ops.heads and ops.heads[GS.CAMPAIGN_TARGET_KEY]
@@ -1450,11 +1481,30 @@ function GS:ApplyStagedCampaignOperation(op, context)
     local contextExisted = record.campaignContext and record.campaignContext[op.id] ~= nil
 
     cfg.requestedItems = {}
-    local nextGen = (tonumber(cfg.generation) or 0) + 1
-    if nextGen < 1 then
-        nextGen = 1
+    local currentGen = tonumber(cfg.generation)
+    if parentId then
+        -- Current campaign generation already validated by archive/admission.
+        if not currentGen or currentGen ~= math.floor(currentGen) or currentGen < 1
+            or currentGen ~= currentGen or currentGen == math.huge then
+            if archiveInserted and record.campaignArchives then
+                record.campaignArchives[parentId] = nil
+            end
+            return "rejected", "invalid_generation"
+        end
+    else
+        -- Pre-campaign setup uses generation 0; reject other malformed values.
+        if currentGen == nil then
+            currentGen = 0
+        end
+        if currentGen ~= math.floor(currentGen) or currentGen < 0
+            or currentGen ~= currentGen or currentGen == math.huge then
+            return "rejected", "invalid_generation"
+        end
     end
+    local nextGen = currentGen + 1
     cfg.generation = nextGen
+    -- Fresh eligibility object so EstablishCampaignBaseline never mutates the prior map.
+    cfg.eligibility = {}
     GS.EstablishCampaignBaseline(cfg, op.timestamp)
     -- configSeq bump for projection invalidation without gossip.
     cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1

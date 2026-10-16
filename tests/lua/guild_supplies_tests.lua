@@ -3772,16 +3772,31 @@ do
     local record = GS:GetCurrentRecord()
     local cfg = record.accounting._consumables
     cfg.requestedItems["100"] = { itemId = 100, goal = 5 }
+    -- Populated/oversized prior eligibility.items: rollback must restore the
+    -- original object/map without copying or mutating those entries.
+    cfg.eligibility = cfg.eligibility or {}
+    cfg.eligibility.items = cfg.eligibility.items or {}
+    local priorElig = cfg.eligibility
+    local priorEligItems = priorElig.items
+    for i = 1, 512 do
+        priorEligItems["cut-" .. i] = world.time + i
+    end
     local before = {
         current = record.currentCampaignId,
         generation = cfg.generation,
         configSeq = cfg.configSeq,
         items = cfg.requestedItems,
+        eligibility = priorElig,
+        eligibilityItems = priorEligItems,
         eligibilityBaseline = cfg.eligibility and cfg.eligibility.baselineAt,
         eligibilityTab = cfg.eligibility and cfg.eligibility.tabEligibleFrom,
         head = record.operations.heads[GS.CAMPAIGN_TARGET_KEY],
         archiveCount = 0,
+        eligItemCount = 0,
     }
+    for _ in pairs(priorEligItems) do
+        before.eligItemCount = before.eligItemCount + 1
+    end
     for _ in pairs(record.campaignArchives or {}) do
         before.archiveCount = before.archiveCount + 1
     end
@@ -3802,6 +3817,14 @@ do
     assertEq(cfg.generation, before.generation, "rollback restores generation")
     assertEq(cfg.configSeq, before.configSeq, "rollback restores configSeq")
     assertTrue(cfg.requestedItems == before.items, "rollback restores requestedItems ref")
+    assertTrue(cfg.eligibility == before.eligibility, "rollback restores original eligibility object")
+    assertTrue(cfg.eligibility.items == before.eligibilityItems,
+        "rollback restores original eligibility.items map")
+    local eligCountAfter = 0
+    for _ in pairs(cfg.eligibility.items) do
+        eligCountAfter = eligCountAfter + 1
+    end
+    assertEq(eligCountAfter, before.eligItemCount, "rollback leaves prior eligibility items untouched")
     assertEq(cfg.eligibility and cfg.eligibility.baselineAt, before.eligibilityBaseline,
         "rollback restores eligibility baselineAt")
     assertEq(cfg.eligibility and cfg.eligibility.tabEligibleFrom, before.eligibilityTab,
@@ -3815,6 +3838,27 @@ do
     end
     assertEq(archiveCount, before.archiveCount, "rollback removes newly inserted archive only")
     assertTrue(record.campaigns[first.id] ~= nil, "prior campaign retained")
+
+    -- Successful reset installs fresh empty eligibility and leaves the old map intact.
+    local oldElig = cfg.eligibility
+    local oldItems = cfg.eligibility.items
+    local oldCount = before.eligItemCount
+    local okOp = startCampaign()
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    assertTrue(cfg.eligibility ~= oldElig, "success installs fresh eligibility object")
+    assertTrue(cfg.eligibility.items ~= oldItems, "success installs fresh eligibility.items")
+    local freshCount = 0
+    for _ in pairs(cfg.eligibility.items) do
+        freshCount = freshCount + 1
+    end
+    assertEq(freshCount, 0, "success uses empty eligibility.items baseline")
+    local retainedCount = 0
+    for _ in pairs(oldItems) do
+        retainedCount = retainedCount + 1
+    end
+    assertEq(retainedCount, oldCount, "old eligibility.items map not traversed/cleared on success")
+    assertTrue(record.campaigns[okOp.id] ~= nil, "successful campaign present")
 end
 
 -- 2B14) Archive ledger + adjustment attribution in projections and history
@@ -3893,6 +3937,184 @@ do
     assertEq(#rows, 3, "history rows returned")
     assertTrue(rows[1].text:find("adjusted", 1, true) or rows[1].text:find("donated", 1, true),
         "history text formatted")
+
+    -- Overlapping accepted IDs across live+archive must count once in totals/history.
+    -- Distinct IDs with identical payloads still count separately.
+    record = GS:GetCurrentRecord()
+    local liveList = record.accounting._consumableEvents
+    local archList = record.accounting._consumableEventArchive
+    local overlapDon = {
+        id = "ev-don-1",
+        type = "donation",
+        itemId = 200,
+        quantity = 4,
+        actor = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    local overlapAdj = {
+        id = "ev-adj-1",
+        type = "adjustment",
+        itemId = 200,
+        quantity = -1,
+        actor = "Alice-Garona",
+        attributed = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time + 1,
+    }
+    liveList[#liveList + 1] = overlapDon
+    liveList[#liveList + 1] = overlapAdj
+    archList[#archList + 1] = {
+        id = "ev-don-dup-payload",
+        type = "donation",
+        itemId = 200,
+        quantity = 4,
+        actor = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time + 3,
+        source = "guildbank",
+    }
+    progress = GS:ProjectCampaignProgress(camp1.id)
+    -- Original 5 + distinct-id duplicate donation 4 = 9; overlapping IDs not double-counted.
+    assertEq(progress.itemTotals[200], 9, "overlapping event IDs deduped in item totals")
+    assertEq(progress.contributions["Bob-Garona"][200], 7,
+        "overlapping IDs deduped in contributor totals")
+    rows, total = GS:ListCampaignHistory(camp1.id, 20, 0)
+    assertEq(total, 4, "history dedupes overlapping IDs; distinct IDs remain")
+    local currentProgress2 = GS:ProjectCampaignProgress(camp2.id)
+    assertEq(currentProgress2.itemTotals[200] or 0, 0, "new campaign still isolated after overlap fixture")
+end
+
+-- 2B14b) Missing vs empty new-goal archives; invalid current generations
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    -- Pre-campaign generation 0 remains usable for first New Campaign.
+    assertEq(GS:GetCurrentRecord().accounting._consumables.generation, 0,
+        "fresh setup generation 0")
+    local campEmpty = startCampaign()
+    local record = GS:GetCurrentRecord()
+    assertEq(record.accounting._consumables.generation, 1, "first campaign generation 1")
+    -- Valid empty archived snapshot (requestedItems={}) is inspectable/readable.
+    local campAfterEmpty = startCampaign()
+    record = GS:GetCurrentRecord()
+    local emptyArchive = record.campaignArchives[campEmpty.id]
+    assertTrue(type(emptyArchive) == "table", "empty campaign has archive snapshot")
+    emptyArchive.requestedItems = {}
+    assertEq(GS.ValidateCampaignArchive(emptyArchive, campEmpty.id, record), true,
+        "validated empty archive remains valid")
+    local emptyItems, emptyErr = GS:GetCampaignRequestedItems(campEmpty.id)
+    assertEq(emptyErr, nil, "valid empty archive has no error")
+    assertTrue(type(emptyItems) == "table", "valid empty archive returns table")
+    local emptyCount = 0
+    for _ in pairs(emptyItems) do emptyCount = emptyCount + 1 end
+    assertEq(emptyCount, 0, "valid empty archive returns empty map")
+    local listEmpty = GS:ListInspectableCampaigns()
+    local sawEmpty = false
+    for i = 1, #listEmpty do
+        if listEmpty[i].campaignId == campEmpty.id then sawEmpty = true end
+    end
+    assertEq(sawEmpty, true, "valid empty archive remains inspectable")
+
+    -- Missing required new-goal archive is unavailable (not successful empty).
+    record.campaignArchives[campEmpty.id] = nil
+    local missingItems, missingErr = GS:GetCampaignRequestedItems(campEmpty.id)
+    assertEq(missingItems, nil, "missing archive items unavailable")
+    assertEq(missingErr, "missing_campaign_archive", "missing archive reason")
+    local missProgress, missProgErr = GS:ProjectCampaignProgress(campEmpty.id)
+    assertEq(missProgress, nil, "missing archive progress unavailable")
+    assertEq(missProgErr, "missing_campaign_archive", "progress missing archive reason")
+    local listMissing = GS:ListInspectableCampaigns()
+    local sawMissing = false
+    for i = 1, #listMissing do
+        if listMissing[i].campaignId == campEmpty.id then sawMissing = true end
+    end
+    assertEq(sawMissing, false, "missing archive excluded from inspectable selector")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "current record usable with missing historical archive")
+    local curItems = GS:GetCampaignRequestedItems(campAfterEmpty.id)
+    assertTrue(type(curItems) == "table", "current campaign reads remain independent")
+
+    -- Non-table retained archive is also unavailable / excluded.
+    record.campaignArchives[campEmpty.id] = "not-a-table"
+    local badItems, badErr = GS:GetCampaignRequestedItems(campEmpty.id)
+    assertEq(badItems, nil, "non-table archive unavailable")
+    assertEq(badErr, "missing_campaign_archive", "non-table archive treated as missing snapshot")
+    local listBad = GS:ListInspectableCampaigns()
+    local sawBad = false
+    for i = 1, #listBad do
+        if listBad[i].campaignId == campEmpty.id then sawBad = true end
+    end
+    assertEq(sawBad, false, "non-table archive excluded from inspectable")
+    assertEq(SpectrumFederationDB.guildSupplies.guilds["club:42"].campaignArchives[campEmpty.id],
+        "not-a-table", "malformed archive retained in SV")
+    record.campaignArchives[campEmpty.id] = nil
+
+    -- Invalid current generations reject archival/reset; state unchanged.
+    local function assertGenReject(mutate, label)
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        GS:CreateStagedRecord()
+        local camp = startCampaign()
+        local rec = GS:GetCurrentRecord()
+        rec.accounting._consumables.requestedItems["77"] = { itemId = 77, goal = 3 }
+        local genBefore = rec.accounting._consumables.generation
+        local events = rec.accounting._consumableEvents
+        events[#events + 1] = {
+            id = "ev-gen-" .. label,
+            type = "donation",
+            itemId = 77,
+            quantity = 2,
+            actor = "Bob-Garona",
+            generation = genBefore,
+            timestamp = world.time,
+            source = "guildbank",
+        }
+        local op = GS:NewCampaignOperation()
+        assertTrue(op ~= nil, label .. " prepare while generation valid")
+        mutate(rec.accounting._consumables)
+        local corruptedGen = rec.accounting._consumables.generation
+        local st, reason = GS:ApplyStagedCampaignOperation(op)
+        assertEq(st, "rejected", label .. " apply rejected")
+        assertEq(reason, "invalid_generation", label .. " reason invalid_generation")
+        local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+        assertEq(raw.currentCampaignId, camp.id, label .. " campaign unchanged")
+        assertEq(raw.accounting._consumables.requestedItems["77"].goal, 3,
+            label .. " live goals unchanged")
+        assertEq(raw.accounting._consumables.generation, corruptedGen,
+            label .. " stored generation retained")
+        -- Restore for isolation proof after a valid subsequent reset.
+        raw.accounting._consumables.generation = genBefore
+        assertTrue(GS:GetCurrentRecord() ~= nil, label .. " restored usable")
+        local nextCamp = startCampaign()
+        local progOld = GS:ProjectCampaignProgress(camp.id)
+        assertEq(progOld.itemTotals[77], 2, label .. " prior donation stays on archived campaign")
+        local progNew = GS:ProjectCampaignProgress(nextCamp.id)
+        assertEq(progNew.itemTotals[77] or 0, 0, label .. " new campaign isolated from prior donation")
+        assertTrue(raw.accounting._consumables.generation ~= genBefore,
+            label .. " valid reset advances generation")
+    end
+
+    assertGenReject(function(cfg)
+        cfg.generation = nil
+    end, "missing")
+    assertGenReject(function(cfg)
+        cfg.generation = 0
+    end, "zero")
+    assertGenReject(function(cfg)
+        cfg.generation = "nope"
+    end, "nonnumeric")
+    assertGenReject(function(cfg)
+        cfg.generation = 1.5
+    end, "fractional")
+    assertGenReject(function(cfg)
+        cfg.generation = math.huge
+    end, "infinite")
 end
 
 -- 2B15–2B16) Production DefinitionRenderer page contracts (Build/Refresh/mutations)
