@@ -3351,7 +3351,8 @@ end
 -- 2B8) Status feedback never reports Saved for rejection; bank context unavailable
 do
     local msg, sev = GS.FormatMutationFeedback("rejected", "unauthorized")
-    assertTrue(type(msg) == "string" and msg:find("unauthorized", 1, true), "rejected message")
+    assertTrue(type(msg) == "string" and msg:find("not authorized", 1, true),
+        "rejected message uses localized reason")
     assertEq(sev, "error", "rejected severity")
     assertEq(msg:find("Saved", 1, true), nil, "no Saved for rejection")
     msg, sev = GS.FormatMutationFeedback("accepted", nil)
@@ -3361,11 +3362,14 @@ do
     assertEq(sev, "info", "duplicate severity")
     msg, sev = GS.FormatMutationFeedback("pending", "stale_base")
     assertEq(sev, "warn", "pending severity")
+    assertTrue(msg:find("out of date", 1, true), "pending reason localized")
+    assertTrue(GS.FormatReasonText("not_ready"):find("not ready", 1, true),
+        "FormatReasonText maps known codes")
 
     local ctx = GS.CaptureBankContext(nil)
     assertEq(ctx.status, "unavailable", "unset tab is unavailable not empty")
     ctx = GS.CaptureBankContext(1)
-    -- Without bank APIs in the harness, capture is unavailable (not empty).
+    -- Without bank APIs / readiness in the harness, capture is unavailable (not empty).
     assertEq(ctx.status, "unavailable", "missing APIs unavailable")
     assertTrue(ctx.reason ~= nil, "unavailable reason present")
 end
@@ -3393,7 +3397,7 @@ do
     assertEq(ok, true, "start-campaign historical body ok: " .. tostring(err))
 end
 
--- 2B10) UI open/close selection converges (no listener growth in module state)
+-- 2B10) Inspectable campaign accessors remain stable (UI lifecycle covered in 2B16)
 do
     resetDb()
     initGS()
@@ -3407,6 +3411,682 @@ do
     local items1 = GS:GetCampaignRequestedItems(list1[1].campaignId)
     local items2 = GS:GetCampaignRequestedItems(list1[1].campaignId)
     assertTrue(items1 ~= items2, "accessors return copies, not live tables")
+end
+
+-- 2B11) Exact canonical-body equality for campaign retries / ID conflicts
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local op = startCampaign()
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "duplicate", "exact replay after accept is duplicate: " .. tostring(reason))
+
+    local divergent = {}
+    for k, v in pairs(op) do divergent[k] = v end
+    divergent.baseTargetRevision = "gs1:other:base:1"
+    status, reason = GS:ApplyStagedCampaignOperation(divergent)
+    assertEq(status, "rejected", "divergent accepted body is id_conflict")
+    assertEq(reason, "id_conflict", "id_conflict reason for changed baseTargetRevision")
+    assertTrue(GS:GetCurrentRecord().operations.records[op.id] ~= nil, "original accepted body retained")
+    assertEq(GS:GetCurrentRecord().operations.records[op.id].baseTargetRevision, op.baseTargetRevision,
+        "accepted body baseTargetRevision unchanged")
+
+    -- Pending path: stale pending with exact body may stay pending; changed body conflicts.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local pendingOp = GS:NewCampaignOperation()
+    local record = GS:GetCurrentRecord()
+    record.operations.pending[pendingOp.id] = {
+        id = pendingOp.id,
+        reason = "stale_base",
+        body = pendingOp,
+        at = world.time,
+    }
+    local changedPending = {}
+    for k, v in pairs(pendingOp) do changedPending[k] = v end
+    changedPending.value = { extra = true }
+    status, reason = GS:ApplyStagedCampaignOperation(changedPending)
+    assertEq(status, "rejected", "changed pending body rejected")
+    assertEq(reason, "id_conflict", "pending id_conflict")
+    assertTrue(record.operations.pending[pendingOp.id] ~= nil, "original pending retained")
+    local pendingValue = record.operations.pending[pendingOp.id].body.value
+    assertTrue(type(pendingValue) == "table", "original pending value remains a table")
+    assertNil(pendingValue.extra, "original pending body not replaced by divergent value")
+end
+
+-- 2B12) Bank context requires readiness; empty only when fresh; creation still works
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+
+    world.bankTxnCounts = world.bankTxnCounts or {}
+    function GetNumGuildBankTransactions(tab)
+        return world.bankTxnCounts[tab] or 0
+    end
+    function GetGuildBankTransaction()
+        return "deposit", "Alice-Garona", nil, 1, nil, nil, 0, 1, 1, 1
+    end
+
+    GS._BankContextReadinessProbe = function()
+        return false, "bank_closed"
+    end
+    local ctx = GS.CaptureBankContext(1)
+    assertEq(ctx.status, "unavailable", "closed bank is unavailable even with zero count")
+    assertEq(ctx.reason, "bank_closed", "bank_closed reason")
+
+    world.bankTxnCounts[2] = 0
+    GS._BankContextReadinessProbe = function(tab)
+        if tab == 2 then return true end
+        return false, "tab_not_ready"
+    end
+    ctx = GS.CaptureBankContext(2)
+    assertEq(ctx.status, "empty", "fresh ready zero count is empty")
+    assertEq(ctx.recordCount, 0, "empty recordCount 0")
+
+    world.bankTxnCounts[3] = 2
+    GS._BankContextReadinessProbe = function() return false, "log_not_updated" end
+    ctx = GS.CaptureBankContext(3)
+    assertEq(ctx.status, "unavailable", "positive count without readiness is unavailable")
+
+    GS._BankContextReadinessProbe = nil
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+
+    -- New Campaign still accepts with unavailable context.
+    local op = GS:NewCampaignOperation()
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "accepted", "campaign without bank context: " .. tostring(reason))
+    local header = GS:GetCurrentRecord().campaigns[op.id]
+    assertEq(header.contextStatus, "unavailable", "contextStatus unavailable when unreadiness")
+end
+
+-- 2B13) Complete bounded rollback on post-validation rejection
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local record = GS:GetCurrentRecord()
+    local cfg = record.accounting._consumables
+    cfg.requestedItems["100"] = { itemId = 100, goal = 5 }
+    local before = {
+        current = record.currentCampaignId,
+        generation = cfg.generation,
+        configSeq = cfg.configSeq,
+        items = cfg.requestedItems,
+        eligibilityBaseline = cfg.eligibility and cfg.eligibility.baselineAt,
+        eligibilityTab = cfg.eligibility and cfg.eligibility.tabEligibleFrom,
+        head = record.operations.heads[GS.CAMPAIGN_TARGET_KEY],
+        archiveCount = 0,
+    }
+    for _ in pairs(record.campaignArchives or {}) do
+        before.archiveCount = before.archiveCount + 1
+    end
+
+    local realValidate = GS._ValidateGuildRecordStructure
+    GS._ValidateGuildRecordStructure = function()
+        return false, "injected_post_failure"
+    end
+    local op = GS:NewCampaignOperation()
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    GS._ValidateGuildRecordStructure = realValidate
+
+    assertEq(status, "rejected", "post-validation rejection status")
+    assertEq(reason, "injected_post_failure", "post-validation rejection reason")
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    assertEq(record.currentCampaignId, before.current, "rollback restores current campaign")
+    assertEq(cfg.generation, before.generation, "rollback restores generation")
+    assertEq(cfg.configSeq, before.configSeq, "rollback restores configSeq")
+    assertTrue(cfg.requestedItems == before.items, "rollback restores requestedItems ref")
+    assertEq(cfg.eligibility and cfg.eligibility.baselineAt, before.eligibilityBaseline,
+        "rollback restores eligibility baselineAt")
+    assertEq(cfg.eligibility and cfg.eligibility.tabEligibleFrom, before.eligibilityTab,
+        "rollback restores eligibility tabEligibleFrom")
+    assertEq(record.operations.heads[GS.CAMPAIGN_TARGET_KEY], before.head, "rollback restores campaign head")
+    assertNil(record.operations.records[op.id], "rejected op not accepted")
+    assertNil(record.campaigns[op.id], "rejected campaign header removed")
+    local archiveCount = 0
+    for _ in pairs(record.campaignArchives or {}) do
+        archiveCount = archiveCount + 1
+    end
+    assertEq(archiveCount, before.archiveCount, "rollback removes newly inserted archive only")
+    assertTrue(record.campaigns[first.id] ~= nil, "prior campaign retained")
+end
+
+-- 2B14) Archive ledger + adjustment attribution in projections and history
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local camp1 = startCampaign()
+    local record = GS:GetCurrentRecord()
+    local gen1 = record.accounting._consumables.generation
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        id = "ev-don-1",
+        type = "donation",
+        itemId = 200,
+        quantity = 4,
+        actor = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        id = "ev-adj-1",
+        type = "adjustment",
+        itemId = 200,
+        quantity = -1,
+        actor = "Alice-Garona",
+        attributed = "Bob-Garona",
+        generation = gen1,
+        timestamp = world.time + 1,
+    }
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        id = "ev-adj-2",
+        type = "adjustment",
+        itemId = 200,
+        quantity = 2,
+        actor = "Alice-Garona",
+        attributed = nil,
+        generation = gen1,
+        timestamp = world.time + 2,
+    }
+
+    local progress = GS:ProjectCampaignProgress(camp1.id)
+    assertEq(progress.itemTotals[200], 5, "live donation+adjustments item total")
+    assertEq(progress.contributions["Bob-Garona"][200], 3, "attributed adjustment credits contributor")
+
+    local camp2 = startCampaign()
+    -- Move gen1 events into archive after reset (simulates retention).
+    record = GS:GetCurrentRecord()
+    local archive = record.accounting._consumableEventArchive
+    if type(archive) ~= "table" then
+        record.accounting._consumableEventArchive = {}
+        archive = record.accounting._consumableEventArchive
+    end
+    local live = record.accounting._consumableEvents
+    local kept = {}
+    for i = 1, #live do
+        if tonumber(live[i].generation) == gen1 then
+            archive[#archive + 1] = live[i]
+        else
+            kept[#kept + 1] = live[i]
+        end
+    end
+    record.accounting._consumableEvents = kept
+
+    progress = GS:ProjectCampaignProgress(camp1.id)
+    assertEq(progress.itemTotals[200], 5, "archived campaign totals include archive ledger")
+    assertEq(progress.contributions["Bob-Garona"][200], 3, "archived attribution preserved")
+
+    local currentProgress = GS:ProjectCampaignProgress(camp2.id)
+    assertEq(currentProgress.itemTotals[200] or 0, 0, "new campaign isolated from prior totals")
+
+    local rows, total = GS:ListCampaignHistory(camp1.id, 10, 0)
+    assertEq(total, 3, "history total for archived campaign")
+    assertEq(#rows, 3, "history rows returned")
+    assertTrue(rows[1].text:find("adjusted", 1, true) or rows[1].text:find("donated", 1, true),
+        "history text formatted")
+end
+
+-- 2B15–2B16) Production DefinitionRenderer page contracts (Build/Refresh/mutations)
+do
+    local created = {}
+    local function fire(region, event, ...)
+        local script = region.scripts and region.scripts[event]
+        if script then script(region, ...) end
+        for _, hook in ipairs((region.hooks and region.hooks[event]) or {}) do
+            hook(region, ...)
+        end
+    end
+    local function makeRegion(kind, name, parent, template)
+        local region = {
+            kind = kind,
+            name = name,
+            parent = parent,
+            shown = true,
+            height = 40,
+            width = 400,
+            points = {},
+            scripts = {},
+            hooks = {},
+            children = {},
+            text = "",
+            enabled = true,
+            focused = false,
+            registeredEvents = {},
+        }
+        created[#created + 1] = region
+        if parent and parent.children then
+            parent.children[#parent.children + 1] = region
+        end
+        function region:GetObjectType() return self.kind or "Frame" end
+        function region:SetPoint(point, relativeTo, relativePoint, x, y)
+            if type(relativeTo) == "number" then
+                x, y = relativeTo, relativePoint
+                relativeTo, relativePoint = nil, point
+            elseif type(relativePoint) == "number" then
+                x, y = relativePoint, x
+                relativePoint = point
+            end
+            self.points[#self.points + 1] = {
+                point = point, relativeTo = relativeTo, relativePoint = relativePoint, x = x or 0, y = y or 0,
+            }
+        end
+        function region:ClearAllPoints() self.points = {} end
+        function region:SetAllPoints(target) self.allPoints = target or self.parent end
+        function region:SetHeight(h) self.height = tonumber(h) or 0 end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = tonumber(w) or 0 end
+        function region:GetWidth() return self.width end
+        function region:SetSize(w, h) self:SetWidth(w); self:SetHeight(h) end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown and true or false end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:SetAlpha() end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetNonSpaceWrap() end
+        function region:SetMaxLines() end
+        function region:SetAutoFocus() end
+        function region:SetNumeric() end
+        function region:SetMaxLetters() end
+        function region:SetHighlightColor() end
+        function region:SetCursorPosition() end
+        function region:HasFocus() return self.focused end
+        function region:ClearFocus()
+            self.focused = false
+            fire(self, "OnEditFocusLost")
+        end
+        function region:SetFocus() self.focused = true end
+        function region:GetStringWidth() return math.max(1, #(self.text or "") * 7) end
+        function region:GetStringHeight() return 12 end
+        function region:SetColorTexture() end
+        function region:SetTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetVertexColor() end
+        function region:SetBlendMode() end
+        function region:SetVerticalScroll() end
+        function region:SetScrollChild(child) self.scrollChild = child end
+        function region:CreateTexture() return makeRegion("Texture", nil, self) end
+        function region:CreateFontString() return makeRegion("FontString", nil, self) end
+        function region:CreateFrame() return makeRegion("Frame", nil, self) end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:SetDefaultText(t) self.defaultText = t end
+        function region:SetupMenu(gen)
+            self.menuGenerator = gen
+            self.menuOptions = {}
+            local root = {
+                CreateRadio = function(_, label, isSelected, setSelected, value)
+                    self.menuOptions[#self.menuOptions + 1] = {
+                        label = label, value = value, isSelected = isSelected, setSelected = setSelected,
+                    }
+                end,
+            }
+            if type(gen) == "function" then
+                gen(self, root)
+            end
+        end
+        function region:GenerateMenu()
+            if self.menuGenerator then self:SetupMenu(self.menuGenerator) end
+        end
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeRegion("Slider", nil, region)
+            region.ScrollBar:SetWidth(20)
+            region.ScrollBar.shown = false
+        end
+        function region:SetChecked(v) self.checked = v and true or false end
+        function region:GetChecked() return self.checked and true or false end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:SetCheckedTexture() end
+        function region:SetDisabledCheckedTexture() end
+        function region:RegisterForClicks() end
+        function region:Click()
+            fire(self, "OnClick")
+        end
+        function region:SetFontObject() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:SetClipsChildren() end
+        function region:EnableDrawLayer() end
+        function region:DisableDrawLayer() end
+        function region:SetPropagateKeyboardInput() end
+        function region:SetObeyStepOnDrag() end
+        function region:SetMinMaxValues() end
+        function region:SetValueStep() end
+        function region:SetValue() end
+        function region:GetValue() return self.value or 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:GetName() return self.name end
+        return region
+    end
+
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        return makeRegion(frameType or "Frame", name, parent, template)
+    end
+
+    -- Minimal Settings chrome dependencies.
+    GameTooltip = GameTooltip or {
+        Hide = function() end, SetOwner = function() end, SetText = function() end,
+        AddLine = function() end, Show = function() end,
+    }
+    OKAY = OKAY or "OK"
+    CANCEL = CANCEL or "Cancel"
+    if type(CopyTable) ~= "function" then
+        function CopyTable(t)
+            if type(t) ~= "table" then return t end
+            local out = {}
+            for k, v in pairs(t) do
+                if type(v) == "table" then
+                    out[k] = CopyTable(v)
+                else
+                    out[k] = v
+                end
+            end
+            return out
+        end
+    end
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    local pendingConfirm
+    function StaticPopup_Show(key, message, _, data)
+        pendingConfirm = { key = key, message = message, data = data }
+        return { key = key }
+    end
+
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = {}
+    SF.SettingsUI.pages = {}
+    SF.SettingsUI.categories = {}
+    function SF.SettingsUI:RegisterCategory(cat)
+        self.categories[cat.id] = cat
+    end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    SF.SettingsStore = {
+        Get = function(_, _) return true end,
+        Set = function() end,
+    }
+
+    loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+
+    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+    local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(configPage ~= nil, "Configuration page registered")
+    assertTrue(logsPage ~= nil, "Logs page registered")
+    assertTrue(type(configPage.Build) == "function" and type(configPage.Refresh) == "function",
+        "Configuration exposes Build/Refresh")
+    assertTrue(type(logsPage.Build) == "function" and type(logsPage.Refresh) == "function",
+        "Logs exposes Build/Refresh")
+    assertEq(SF.SettingsUI.categories.guildSupplies.name, "Guild Supplies",
+        "category name localized through Loc default")
+
+    local function findEditBoxes(node, out)
+        out = out or {}
+        if node.kind == "EditBox" then
+            out[#out + 1] = node
+        end
+        for _, child in ipairs(node.children or {}) do
+            findEditBoxes(child, out)
+        end
+        return out
+    end
+    local function findButtons(node, out)
+        out = out or {}
+        if node.kind == "Button" and node.text then
+            out[#out + 1] = node
+        end
+        for _, child in ipairs(node.children or {}) do
+            findButtons(child, out)
+        end
+        return out
+    end
+    local function findDropdowns(node, out)
+        out = out or {}
+        if node.kind == "DropdownButton" then
+            out[#out + 1] = node
+        end
+        for _, child in ipairs(node.children or {}) do
+            findDropdowns(child, out)
+        end
+        return out
+    end
+
+    -- Configuration: Build renders; bank-tab onCommit; New Campaign confirmation binding.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+
+    local configPanel = makeRegion("Frame", "GSConfigPanel", nil)
+    configPanel:SetSize(600, 800)
+    local beforeBuild = #created
+    configPage:Build(configPanel)
+    assertTrue(#created > beforeBuild, "Configuration Build creates controls")
+    assertTrue(configPanel.__sfPageBuilder ~= nil, "Configuration uses DefinitionRenderer:Build")
+    local pageDef = configPanel.__sfPageDef
+    assertTrue(type(pageDef) == "table", "Build stores page definition")
+    local foundBankCommit, foundGoalCommit, foundHelpGetText = false, false, false
+    for _, sec in ipairs(pageDef.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "editbox" and type(item.onCommit) == "function" then
+                foundBankCommit = true
+            end
+            if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
+                foundGoalCommit = true
+            end
+            if item.type == "help" and type(item.getText) == "function" then
+                foundHelpGetText = true
+            end
+        end
+    end
+    assertTrue(foundBankCommit, "bank tab uses onCommit")
+    assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
+    assertTrue(foundHelpGetText, "status help uses getText")
+
+    local edits = findEditBoxes(configPanel)
+    assertTrue(#edits >= 1, "bank tab editbox present")
+    local bankEdit = edits[1]
+    bankEdit:SetText("2")
+    fire(bankEdit, "OnEnterPressed")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 2, "onCommit sets bank tab")
+
+    bankEdit:SetText("")
+    fire(bankEdit, "OnEditFocusLost")
+    assertNil(GS:GetCurrentRecord().accounting._consumables.bankTab, "onCommit clear removes bank tab")
+
+    -- Rejected invalid tab leaves state unchanged.
+    local opSet = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    GS:ApplyStagedConfigOperation(opSet)
+    bankEdit:SetText("9")
+    local messages = {}
+    local section = configPanel.__sfSections and configPanel.__sfSections.gsStatus
+    if section then
+        local priorSet = section.SetMessage
+        section.SetMessage = function(self, msg, sev)
+            messages[#messages + 1] = { msg = msg, sev = sev }
+            if priorSet then priorSet(self, msg, sev) end
+        end
+    end
+    fire(bankEdit, "OnEnterPressed")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "invalid tab leaves state")
+
+    -- New Campaign: bind before confirm; cancel leaves state; accept applies bound op.
+    local buttons = findButtons(configPanel)
+    local newCampaignBtn
+    for i = 1, #buttons do
+        if buttons[i].text == "New Campaign" then
+            newCampaignBtn = buttons[i]
+            break
+        end
+    end
+    assertTrue(newCampaignBtn ~= nil, "New Campaign button present")
+    local beforeCampaign = GS:GetCurrentRecord().currentCampaignId
+    pendingConfirm = nil
+    newCampaignBtn:Click()
+    assertTrue(pendingConfirm ~= nil, "New Campaign shows confirmation")
+    -- Cancel: do not invoke accept.
+    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeCampaign, "cancel leaves campaign")
+    -- Accept bound op.
+    local acceptFn = pendingConfirm.data
+    assertTrue(type(acceptFn) == "function", "confirm binds accept function")
+    acceptFn()
+    assertTrue(GS:GetCurrentRecord().currentCampaignId ~= beforeCampaign, "accept starts new campaign")
+
+    -- Concurrent campaign change while the dialog is open keeps the bound op from applying.
+    pendingConfirm = nil
+    newCampaignBtn:Click()
+    local boundAccept = pendingConfirm.data
+    assertTrue(type(boundAccept) == "function", "stale-case confirm binds accept")
+    local concurrent = GS:NewCampaignOperation()
+    local concStatus = GS:ApplyStagedCampaignOperation(concurrent)
+    assertEq(concStatus, "accepted", "concurrent campaign applies while dialog open")
+    local midCampaign = GS:GetCurrentRecord().currentCampaignId
+    local okCall = pcall(boundAccept)
+    assertTrue(okCall, "bound accept does not error")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, midCampaign,
+        "stale bound campaign op does not overwrite newer campaign")
+    assertTrue(GS:GetCurrentRecord().operations.records[concurrent.id] ~= nil,
+        "concurrent accepted op retained")
+
+    -- Cached Refresh after setup/campaign changes (no rebuild).
+    local refreshCalls = 0
+    local realRefresh = SF.SettingsUI.DefinitionRenderer.Refresh
+    SF.SettingsUI.DefinitionRenderer.Refresh = function(self, panel)
+        refreshCalls = refreshCalls + 1
+        return realRefresh(self, panel)
+    end
+    configPage:Refresh(configPanel)
+    assertEq(refreshCalls, 1, "Configuration Refresh uses renderer:Refresh")
+    configPanel.shown = false
+    configPage:Refresh(configPanel)
+    assertEq(refreshCalls, 1, "hidden Configuration skips Refresh")
+    configPanel.shown = true
+    SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
+
+    -- Logs: Build/reopen without openCount crash; dropdown labels; history rows.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local c1 = startCampaign()
+    local r = GS:GetCurrentRecord()
+    local gen = r.accounting._consumables.generation
+    r.accounting._consumableEvents[#r.accounting._consumableEvents + 1] = {
+        id = "ui-don",
+        type = "donation",
+        itemId = 50,
+        quantity = 3,
+        actor = "Carol-Garona",
+        generation = gen,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    startCampaign()
+
+    local logsPanel = makeRegion("Frame", "GSLogsPanel", nil)
+    logsPanel:SetSize(600, 800)
+    logsPage:Build(logsPanel)
+    assertTrue(logsPanel.__sfPageBuilder ~= nil, "Logs uses DefinitionRenderer:Build")
+    logsPage:Build(logsPanel) -- reopen / rebuild
+    assertTrue(logsPanel.__sfPageBuilder ~= nil, "Logs rebuild succeeds (no openCount crash)")
+
+    local drops = findDropdowns(logsPanel)
+    assertTrue(#drops >= 1, "campaign dropdown present")
+    local drop = drops[1]
+    assertTrue(type(drop.menuOptions) == "table" and #drop.menuOptions >= 1, "dropdown options built")
+    local labeled = false
+    for i = 1, #drop.menuOptions do
+        local lab = tostring(drop.menuOptions[i].label or "")
+        if lab:find("Current", 1, true) or lab:find("Archived", 1, true) then
+            labeled = true
+            break
+        end
+    end
+    assertTrue(labeled, "dropdown options use readable labels not raw ids only")
+
+    logsPage:Refresh(logsPanel)
+    -- Select archived campaign via set path and refresh history.
+    if drop.menuOptions[1] and drop.menuOptions[1].setSelected then
+        drop.menuOptions[1].setSelected(drop.menuOptions[1].value)
+    end
+    logsPage:Refresh(logsPanel)
+    local histRows, histTotal = GS:ListCampaignHistory(c1.id, 25, 0)
+    assertTrue((histTotal or 0) >= 1, "history projection available for UI")
+
+    -- Small-guild explicit threshold through CreateStagedRecord path used by UI.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    local _, stInit, errInit = GS:CreateStagedRecord()
+    assertEq(stInit, "rejected", "small guild without threshold rejected")
+    assertEq(errInit, "threshold_unselected", "threshold_unselected")
+    local recInit, stOk = GS:CreateStagedRecord(2)
+    assertEq(stOk, "accepted", "small guild with explicit threshold accepted")
+    assertEq(recInit.permission.editorRankPosition, 2, "selected threshold stored")
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    settleRoster()
+
+    CreateFrame = priorCreateFrame
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

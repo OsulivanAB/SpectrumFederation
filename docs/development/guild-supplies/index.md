@@ -85,9 +85,11 @@ SpectrumFederationDB.guildSupplies = {
 | `:GetCurrentCampaignBoundary()` | Validated immutable current header or nil + reason |
 | `:ListInspectableCampaigns()` | Validated current/archived headers only (copies/metadata) |
 | `:GetCampaignRequestedItems(campaignId)` | Defensive copy of live or archived items |
-| `:ProjectCampaignProgress(campaignId)` | Bounded generation-scoped totals |
-| `CaptureBankContext(bankTab)` | Non-crediting context: `captured` / `empty` / `unavailable` |
-| `FormatMutationFeedback(status, reason)` | Settings banner text + severity for accepted/duplicate/pending/rejected |
+| `:ProjectCampaignProgress(campaignId)` | Bounded generation-scoped totals (current + archive ledger; attributed adjustments) |
+| `:ListCampaignHistory(campaignId, limit, offset)` | Bounded read-only donation/adjustment history for Logs |
+| `IsBankContextSampleReady(bankTab)` | Read-only readiness via existing bank-log evidence / test probe |
+| `CaptureBankContext(bankTab)` | Non-crediting context: `captured` / `empty` only when ready; otherwise `unavailable` |
+| `FormatMutationFeedback(status, reason)` / `FormatReasonText(reason)` | Localized Settings banner text + severity |
 
 Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected`. `accepted` means **staged admission only**. UI must not treat a nonempty reason string as success or show “Saved” for rejection.
 
@@ -134,8 +136,8 @@ Unchanged from 2A: default editor threshold 3; actual rank-name labels; GM recov
 
 | Area | Access |
 | --- | --- |
-| **Guild Supplies → Configuration** | Eligible editors / GM recovery: initialize, bank tab, New Campaign, items/goals, staged status |
-| **Guild Supplies → Logs** | Verified same-guild members: inspect current/archived campaigns, goals, progress |
+| **Guild Supplies → Configuration** | Eligible editors / GM recovery: initialize (explicit threshold for small guilds), editor rank, bank tab, New Campaign, items/goals, staged status |
+| **Guild Supplies → Logs** | Verified same-guild members: inspect current/archived campaigns, goals, progress, and bounded donation/adjustment history |
 | **Personal preferences** | Account-local reminder checkbox; available to ordinary members |
 
 Pages must show staged/inactive wording. They do not claim live bank-helper or gossip sync has switched. Guild Supplies access does not depend on Loot Helper profile/admin/session.

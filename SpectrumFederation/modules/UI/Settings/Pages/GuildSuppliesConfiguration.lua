@@ -2,32 +2,34 @@
 -- Live bank helper / donation writer remains legacy Consumables until #389.
 local _, SF = ...
 
-SF.SettingsUI:RegisterCategory({
-	id = "guildSupplies",
-	name = "Guild Supplies",
-	navLabel = "Guild Supplies",
-	group = "Loot Tools",
-	description = "Guild-owned raid supply campaigns, configuration, and logs.",
-	order = 19,
-})
-
-local Page = {
-	id = "guildSuppliesConfiguration",
-	categoryId = "guildSupplies",
-	name = "Configuration",
-	navLabel = "Configuration",
-	contentHeading = "Guild Supplies Configuration",
-	group = "Loot Tools",
-	description = "Fresh guild setup, bank tab, editor ranks, requested items, and New Campaign.",
-	order = 19.1,
-}
-
 local function Loc(key, default)
 	if SF.LocaleText then
 		return SF.LocaleText(key, default)
 	end
 	return default or key
 end
+
+SF.SettingsUI:RegisterCategory({
+	id = "guildSupplies",
+	name = Loc("GUILD_SUPPLIES_CATEGORY_NAME", "Guild Supplies"),
+	navLabel = Loc("GUILD_SUPPLIES_CATEGORY_NAV", "Guild Supplies"),
+	group = "Loot Tools", -- stable navigation group id (display owned by chrome)
+	description = Loc("GUILD_SUPPLIES_CATEGORY_DESC",
+		"Guild-owned raid supply campaigns, configuration, and logs."),
+	order = 19,
+})
+
+local Page = {
+	id = "guildSuppliesConfiguration",
+	categoryId = "guildSupplies",
+	name = Loc("GUILD_SUPPLIES_CONFIG_NAME", "Configuration"),
+	navLabel = Loc("GUILD_SUPPLIES_CONFIG_NAV", "Configuration"),
+	contentHeading = Loc("GUILD_SUPPLIES_CONFIG_HEADING", "Guild Supplies Configuration"),
+	group = "Loot Tools",
+	description = Loc("GUILD_SUPPLIES_CONFIG_DESC",
+		"Fresh guild setup, bank tab, editor ranks, requested items, and New Campaign."),
+	order = 19.1,
+}
 
 local function GS()
 	return SF.GuildSupplies
@@ -40,6 +42,9 @@ local function Caps()
 	end
 	return g:GetCapabilities()
 end
+
+-- Ephemeral small-guild threshold choice for Initialize; never persisted.
+local pendingInitRank = nil
 
 local function ReportStatus(ctx, status, reason)
 	local g = GS()
@@ -70,7 +75,39 @@ local function ItemLabel(itemId)
 	if type(name) == "string" and name ~= "" then
 		return string.format("%s (%d)", name, itemId)
 	end
-	return "item " .. tostring(itemId)
+	return Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId))
+end
+
+local function RankOptions()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local opts = {}
+	if not ctx or type(ctx.ranks) ~= "table" then
+		return opts
+	end
+	local count = tonumber(ctx.rankCount) or 0
+	for i = 1, count do
+		local name = ctx.ranks[i]
+		if type(name) == "string" and name ~= "" then
+			opts[#opts + 1] = { value = i, label = name }
+		end
+	end
+	return opts
+end
+
+local function NeedsExplicitInitThreshold()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	if not ctx or not ctx.ready then
+		return false
+	end
+	local count = tonumber(ctx.rankCount) or 0
+	local defaultPos = (g and g.DEFAULT_EDITOR_RANK_POSITION) or 3
+	if count <= 0 or count >= defaultPos then
+		return false
+	end
+	local rec = g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	return rec == nil
 end
 
 local function RequestedItemRows()
@@ -106,14 +143,18 @@ end
 local function StagedStatusText()
 	local g = GS()
 	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	local formatReason = g and g.FormatReasonText or function(r)
+		return tostring(r or "unknown")
+	end
 	if not record then
 		local caps = Caps()
-		if caps.reason == "not_configured" or (g and g.GetCurrentRecord and select(2, g:GetCurrentRecord()) == "not_configured") then
+		local recReason = g and g.GetCurrentRecord and select(2, g:GetCurrentRecord()) or nil
+		if caps.reason == "not_configured" or recReason == "not_configured" then
 			return Loc("GUILD_SUPPLIES_STATUS_NOT_CONFIGURED",
 				"No staged Guild Supplies dataset for this guild yet. Use Initialize Guild Supplies.")
 		end
 		return Loc("GUILD_SUPPLIES_STATUS_UNAVAILABLE",
-			"Guild Supplies data is unavailable (%s)."):format(tostring(caps.reason or "unknown"))
+			"Guild Supplies data is unavailable (%s)."):format(formatReason(caps.reason or "unknown"))
 	end
 	local campaign = record.currentCampaignId
 	local activation = Loc("GUILD_SUPPLIES_STATUS_STAGED",
@@ -124,6 +165,18 @@ local function StagedStatusText()
 	end
 	return activation .. " "
 		.. Loc("GUILD_SUPPLIES_STATUS_CURRENT_CAMPAIGN", "Current campaign: %s"):format(campaign)
+end
+
+local function ItemsHelpText()
+	local g = GS()
+	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	local hasCampaign = record and type(record.currentCampaignId) == "string" and record.currentCampaignId ~= ""
+	if hasCampaign then
+		return Loc("GUILD_SUPPLIES_ITEMS_HELP",
+			"Add exact item IDs for the current campaign. Goal edits keep contribution history.")
+	end
+	return Loc("GUILD_SUPPLIES_ITEMS_NEED_CAMPAIGN",
+		"Start a New Campaign before adding requested items.")
 end
 
 local function CommitConfig(ctx, kind, target, value)
@@ -142,6 +195,55 @@ local function CommitConfig(ctx, kind, target, value)
 	ReportStatus(ctx, status, reason)
 end
 
+local function CommitEditorRank(ctx, position)
+	local g = GS()
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local caps = Caps()
+	local pos = tonumber(position)
+	if not g or not pos then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	if not caps.canEdit and not caps.canRecoverPolicy then
+		ReportStatus(ctx, "rejected", caps.reason or "unauthorized")
+		return
+	end
+	if caps.editorRankPosition and tonumber(caps.editorRankPosition) == pos then
+		return
+	end
+
+	local ctxNow = g.GetCurrentContext and g:GetCurrentContext() or nil
+	local selfRestricts = ctxNow and type(ctxNow.rankOrder) == "number" and ctxNow.rankOrder > pos
+	local confirmMsg = Loc("GUILD_SUPPLIES_EDITOR_RANK_CONFIRM",
+		"Change the editor rank threshold to this rank and higher?")
+	if selfRestricts then
+		confirmMsg = Loc("GUILD_SUPPLIES_EDITOR_RANK_CONFIRM_SELF",
+			"Change the editor rank threshold? Your character would no longer meet it and would lose edit rights.")
+	end
+
+	-- Bind the intended operation before confirmation so guild/policy churn cannot
+	-- silently rebuild against a different context on accept.
+	local op, prepStatus, prepReason = g:NewConfigOperation("set-editor-rank", "editorRankPosition", pos)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local boundOp = op
+	local accept = function()
+		ctx.section:ClearMessage()
+		local status, reason = g:ApplyStagedConfigOperation(boundOp)
+		ReportStatus(ctx, status, reason)
+	end
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(confirmMsg, Loc("GUILD_SUPPLIES_EDITOR_RANK_APPLY", "Change rank"), accept)
+	else
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
+	end
+end
+
 local function CommitNewCampaign(ctx)
 	local g = GS()
 	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
@@ -149,15 +251,17 @@ local function CommitNewCampaign(ctx)
 		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
 		return
 	end
-	local confirm = function()
+	-- Bind the intended operation to the original guild/campaign/policy context
+	-- before showing confirmation. Do not rebuild on accept.
+	local op, prepStatus, prepReason = g:NewCampaignOperation()
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local boundOp = op
+	local accept = function()
 		ctx.section:ClearMessage()
-		-- Recheck authority after the confirmation dialog.
-		local op, prepStatus, prepReason = g:NewCampaignOperation()
-		if not op then
-			ReportStatus(ctx, prepStatus or "rejected", prepReason)
-			return
-		end
-		local status, reason = g:ApplyStagedCampaignOperation(op)
+		local status, reason = g:ApplyStagedCampaignOperation(boundOp)
 		ReportStatus(ctx, status, reason)
 	end
 	if dialogs and dialogs.Confirm then
@@ -165,21 +269,18 @@ local function CommitNewCampaign(ctx)
 			Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_CONFIRM",
 				"Start a New Campaign? The current campaign keeps its items, goals, and history for Logs inspection. The new campaign starts empty."),
 			Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_BUTTON", "New Campaign"),
-			confirm
+			accept
 		)
 	else
-		confirm()
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
 	end
 end
 
-function Page:Build(panel)
-	local renderer = SF.SettingsUI.DefinitionRenderer
-	local caps = Caps()
-	local g = GS()
-	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
-	local hasCampaign = record and type(record.currentCampaignId) == "string" and record.currentCampaignId ~= ""
-
-	local def = {
+local function Definition()
+	return {
 		isAdmin = function()
 			return Caps().canEdit or Caps().canRecoverPolicy
 		end,
@@ -193,21 +294,45 @@ function Page:Build(panel)
 					{
 						type = "help",
 						indent = "label",
-						text = StagedStatusText(),
+						getText = StagedStatusText,
 					},
 					{
-						type = "display",
+						type = "dropdown",
 						label = Loc("GUILD_SUPPLIES_EDITOR_RANK", "Editor ranks"),
+						tooltip = Loc("GUILD_SUPPLIES_EDITOR_RANK_TIP",
+							"Native guild ranks at or above this threshold may edit. Guild Masters can recover an invalid policy."),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_EDITOR_RANK_UNKNOWN", "Unavailable"),
+						options = RankOptions,
 						get = function()
+							if NeedsExplicitInitThreshold() then
+								return pendingInitRank
+							end
+							return Caps().editorRankPosition
+						end,
+						set = function(value)
+							if NeedsExplicitInitThreshold() then
+								pendingInitRank = tonumber(value)
+							end
+						end,
+						enabled = function()
 							local c = Caps()
-							if c.editorRankLabel then
-								return c.editorRankLabel
+							if NeedsExplicitInitThreshold() then
+								return c.canRecoverPolicy == true
 							end
-							if c.editorRankName then
-								return Loc("GUILD_SUPPLIES_EDITOR_RANK_FMT", "%s and higher")
-									:format(c.editorRankName)
+							local mod = GS()
+							local rec = mod and select(1, mod:GetCurrentRecord())
+							return rec ~= nil and (c.canEdit or c.canRecoverPolicy)
+						end,
+						onValueChanged = function(ctx, value)
+							if NeedsExplicitInitThreshold() then
+								pendingInitRank = tonumber(value)
+								if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+									ctx.pageBuilder:Refresh()
+								end
+								return
 							end
-							return Loc("GUILD_SUPPLIES_EDITOR_RANK_UNKNOWN", "Unavailable")
+							CommitEditorRank(ctx, value)
 						end,
 					},
 					{
@@ -224,7 +349,13 @@ function Page:Build(panel)
 							local mod = GS()
 							if not mod then return false end
 							local rec = select(1, mod:GetCurrentRecord())
-							return rec == nil
+							if rec ~= nil then
+								return false
+							end
+							if NeedsExplicitInitThreshold() then
+								return pendingInitRank ~= nil
+							end
+							return true
 						end,
 						onClick = function(ctx)
 							local mod = GS()
@@ -235,7 +366,18 @@ function Page:Build(panel)
 									"error")
 								return
 							end
-							local _, status, reason = mod:CreateStagedRecord()
+							local threshold = nil
+							if NeedsExplicitInitThreshold() then
+								threshold = pendingInitRank
+								if threshold == nil then
+									ReportStatus(ctx, "rejected", "threshold_unselected")
+									return
+								end
+							end
+							local _, status, reason = mod:CreateStagedRecord(threshold)
+							if status == "accepted" then
+								pendingInitRank = nil
+							end
 							ReportStatus(ctx, status or "rejected", reason)
 						end,
 					},
@@ -258,7 +400,7 @@ function Page:Build(panel)
 							local mod = GS()
 							return Caps().canEdit and mod and select(1, mod:GetCurrentRecord()) ~= nil
 						end,
-						onEnterPressed = function(ctx, text)
+						onCommit = function(ctx, text)
 							local tab = tonumber(text)
 							if text == nil or text == "" then
 								CommitConfig(ctx, "set-bank-tab", "bankTab", nil)
@@ -298,11 +440,7 @@ function Page:Build(panel)
 					{
 						type = "help",
 						indent = "label",
-						text = hasCampaign
-							and Loc("GUILD_SUPPLIES_ITEMS_HELP",
-								"Add exact item IDs for the current campaign. Goal edits keep contribution history.")
-							or Loc("GUILD_SUPPLIES_ITEMS_NEED_CAMPAIGN",
-								"Start a New Campaign before adding requested items."),
+						getText = ItemsHelpText,
 					},
 					{
 						type = "editboxButton",
@@ -348,7 +486,7 @@ function Page:Build(panel)
 							if not item or not item.itemId then return end
 							CommitConfig(ctx, "set-requested-item", { itemId = item.itemId }, { removed = true })
 						end,
-						onGoalChanged = function(ctx, item, goal)
+						onGoalCommit = function(ctx, item, goal)
 							if not item or not item.itemId then return end
 							local gnum = tonumber(goal)
 							if not gnum or gnum < 0 or gnum ~= math.floor(gnum) then
@@ -393,10 +531,30 @@ function Page:Build(panel)
 			},
 		},
 	}
+end
 
-	if renderer and renderer.Render then
-		renderer:Render(panel, def)
+function Page:Build(panel)
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if not renderer or not renderer.Build then
+		return
 	end
+	renderer:Build(panel, Definition())
+	self.panel = panel
+end
+
+function Page:Refresh(panel)
+	panel = panel or self.panel
+	if panel and panel.IsShown and not panel:IsShown() then
+		return
+	end
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if renderer and renderer.Refresh then
+		renderer:Refresh(panel)
+	end
+end
+
+-- Lifecycle: no permanent frames/timers; PageBuilder owns refresh registration.
+function Page:OnHide()
 end
 
 SF.SettingsUI:RegisterPage(Page)

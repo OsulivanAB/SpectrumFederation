@@ -246,6 +246,12 @@ function BankLog:ProcessLogUpdate(reason)
         Debug("Warn", "log update skipped: incomplete snapshot reason=%s", tostring(reason))
         return
     end
+    -- Freshness stamp for read-only bank-context adapters (Guild Supplies #386).
+    -- Cleared on bank close; never invents readiness without a successful update.
+    self.lastFreshLogAt = WallNow()
+    self.lastFreshLogTab = ctx.bankTab
+    self.lastFreshLogGuild = ctx.guildGuid
+
     local C = SF.Consumables
     if C and C.EligibilitySnapshot then
         snapshot.eligibility = C.EligibilitySnapshot(ctx.profile)
@@ -344,6 +350,9 @@ function BankLog:OnBankClosed()
     self.bankOpen = false
     self.active = false
     self.activeContext = nil
+    self.lastFreshLogAt = nil
+    self.lastFreshLogTab = nil
+    self.lastFreshLogGuild = nil
     self:CancelTimers("bank_closed")
     Debug("Info", "bank closed: observation idle")
 end

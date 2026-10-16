@@ -2,17 +2,6 @@
 -- No privileged mutation controls. Live verification remains #388/#389.
 local _, SF = ...
 
-local Page = {
-	id = "guildSuppliesLogs",
-	categoryId = "guildSupplies",
-	name = "Logs",
-	navLabel = "Logs",
-	contentHeading = "Guild Supplies Logs",
-	group = "Loot Tools",
-	description = "Inspect current and archived campaign goals, progress, and history.",
-	order = 19.2,
-}
-
 local function Loc(key, default)
 	if SF.LocaleText then
 		return SF.LocaleText(key, default)
@@ -20,12 +9,27 @@ local function Loc(key, default)
 	return default or key
 end
 
+local Page = {
+	id = "guildSuppliesLogs",
+	categoryId = "guildSupplies",
+	name = Loc("GUILD_SUPPLIES_LOGS_NAME", "Logs"),
+	navLabel = Loc("GUILD_SUPPLIES_LOGS_NAV", "Logs"),
+	contentHeading = Loc("GUILD_SUPPLIES_LOGS_HEADING", "Guild Supplies Logs"),
+	group = "Loot Tools",
+	description = Loc("GUILD_SUPPLIES_LOGS_DESC",
+		"Inspect current and archived campaign goals, progress, and history."),
+	order = 19.2,
+}
+
 local function GS()
 	return SF.GuildSupplies
 end
 
--- Ephemeral UI selection only; never persisted.
+-- Ephemeral UI selection / history pagination only; never persisted.
 local selectedCampaignId = nil
+local historyOffset = 0
+local historyCampaignId = nil
+local HISTORY_PAGE_SIZE = 25
 
 local function Caps()
 	local g = GS()
@@ -65,7 +69,7 @@ local function CampaignOptions()
 		local entry = list[i]
 		opts[#opts + 1] = {
 			value = entry.campaignId,
-			text = FormatCampaignLabel(entry),
+			label = FormatCampaignLabel(entry),
 		}
 	end
 	return opts
@@ -99,6 +103,21 @@ local function ResolveSelectedCampaign()
 	return selectedCampaignId
 end
 
+local function MembershipHelpText()
+	local caps = Caps()
+	local g = GS()
+	local formatReason = g and g.FormatReasonText or function(r)
+		return tostring(r or "unknown")
+	end
+	if caps.canRead then
+		return Loc("GUILD_SUPPLIES_LOGS_HELP",
+			"Members can inspect current and archived campaign goals and progress. Privileged edits live on Configuration. Live donation verification is not active on this staged branch.")
+	end
+	return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
+		"Join a guild with a verified membership to inspect Guild Supplies logs.")
+		.. " (" .. formatReason(caps.reason or "not_ready") .. ")"
+end
+
 local function ItemRowsForSelected()
 	local g = GS()
 	local campaignId = ResolveSelectedCampaign()
@@ -124,7 +143,8 @@ local function ItemRowsForSelected()
 			if type(name) ~= "string" and GetItemInfo then
 				name = GetItemInfo(itemId)
 			end
-			local label = (type(name) == "string" and name ~= "" and name) or ("item " .. tostring(itemId))
+			local label = (type(name) == "string" and name ~= "" and name)
+				or Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId))
 			rows[#rows + 1] = {
 				text = string.format("%s — %d / %s", label, got, goal > 0 and tostring(goal) or "—"),
 				itemId = itemId,
@@ -139,12 +159,67 @@ local function ItemRowsForSelected()
 	return rows
 end
 
-function Page:Build(panel)
-	openCount = openCount + 1
-	local renderer = SF.SettingsUI.DefinitionRenderer
-	local canRead = Caps().canRead
+local function ItemNameForHistory(itemId)
+	local name = nil
+	if C_Item and C_Item.GetItemInfo then
+		name = C_Item.GetItemInfo(itemId)
+	end
+	if type(name) ~= "string" and GetItemInfo then
+		name = GetItemInfo(itemId)
+	end
+	if type(name) == "string" and name ~= "" then
+		return name
+	end
+	return nil
+end
 
-	local def = {
+local function HistoryRowsForSelected()
+	local g = GS()
+	local campaignId = ResolveSelectedCampaign()
+	if not g or not campaignId or not g.ListCampaignHistory then
+		Page.historyTotal = 0
+		return {}
+	end
+	if campaignId ~= historyCampaignId then
+		historyCampaignId = campaignId
+		historyOffset = 0
+	end
+	local rows, total = g:ListCampaignHistory(campaignId, HISTORY_PAGE_SIZE, historyOffset, ItemNameForHistory)
+	total = tonumber(total) or (rows and #rows) or 0
+	if historyOffset > 0 and historyOffset >= total then
+		historyOffset = 0
+		rows, total = g:ListCampaignHistory(campaignId, HISTORY_PAGE_SIZE, 0, ItemNameForHistory)
+		total = tonumber(total) or (rows and #rows) or 0
+	end
+	Page.historyTotal = total
+	local items = {}
+	if type(rows) == "table" then
+		for i = 1, #rows do
+			items[#items + 1] = { text = rows[i].text, canRemove = false }
+		end
+	end
+	return items
+end
+
+local function ShiftHistory(delta)
+	local total = Page.historyTotal or 0
+	local nextOffset = historyOffset + (delta * HISTORY_PAGE_SIZE)
+	if nextOffset < 0 then nextOffset = 0 end
+	if nextOffset > 0 and nextOffset >= total then return end
+	historyOffset = nextOffset
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
+local function HistoryHelpText()
+	return Loc("GUILD_SUPPLIES_LOGS_HISTORY_HELP",
+		"Newest donation and adjustment entries for the selected campaign are first. Each page shows up to %d entries. Live bank verification is not active on this staged branch.")
+		:format(HISTORY_PAGE_SIZE)
+end
+
+local function Definition()
+	return {
 		sections = {
 			{
 				id = "gsLogsStatus",
@@ -153,11 +228,7 @@ function Page:Build(panel)
 					{
 						type = "help",
 						indent = "label",
-						text = canRead
-							and Loc("GUILD_SUPPLIES_LOGS_HELP",
-								"Members can inspect current and archived campaign goals and progress. Privileged edits live on Configuration. Live donation verification is not active on this staged branch.")
-							or Loc("GUILD_SUPPLIES_LOGS_NO_READ",
-								"Join a guild with a verified membership to inspect Guild Supplies logs."),
+						getText = MembershipHelpText,
 					},
 					{
 						type = "dropdown",
@@ -171,11 +242,14 @@ function Page:Build(panel)
 						end,
 						set = function(value)
 							selectedCampaignId = value
+							historyOffset = 0
+							historyCampaignId = value
 						end,
 						enabled = function()
 							return Caps().canRead and #CampaignOptions() > 0
 						end,
 						onValueChanged = function(ctx)
+							historyOffset = 0
 							if ctx.pageBuilder and ctx.pageBuilder.Refresh then
 								ctx.pageBuilder:Refresh()
 							end
@@ -202,13 +276,58 @@ function Page:Build(panel)
 					{
 						type = "scrollList",
 						label = Loc("GUILD_SUPPLIES_LOGS_ITEMS", "Goals and progress"),
-						height = 220,
+						height = 160,
 						rowHeight = 20,
 						getItems = function()
 							if not Caps().canRead then
 								return {}
 							end
 							return ItemRowsForSelected()
+						end,
+						enabled = function()
+							return Caps().canRead
+						end,
+					},
+					{
+						type = "help",
+						indent = "label",
+						getText = HistoryHelpText,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY_PREV", "Newer"),
+						buttonText = Loc("GUILD_SUPPLIES_LOGS_HISTORY_PREV", "Newer"),
+						width = 90,
+						enabled = function()
+							return Caps().canRead and historyOffset > 0
+						end,
+						onClick = function()
+							ShiftHistory(-1)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY_NEXT", "Older"),
+						buttonText = Loc("GUILD_SUPPLIES_LOGS_HISTORY_NEXT", "Older"),
+						width = 90,
+						enabled = function()
+							return Caps().canRead
+								and historyOffset + HISTORY_PAGE_SIZE < (Page.historyTotal or 0)
+						end,
+						onClick = function()
+							ShiftHistory(1)
+						end,
+					},
+					{
+						type = "scrollList",
+						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY", "Campaign history"),
+						height = 180,
+						rowHeight = 20,
+						getItems = function()
+							if not Caps().canRead then
+								return {}
+							end
+							return HistoryRowsForSelected()
 						end,
 						enabled = function()
 							return Caps().canRead
@@ -245,9 +364,25 @@ function Page:Build(panel)
 			},
 		},
 	}
+end
 
-	if renderer and renderer.Render then
-		renderer:Render(panel, def)
+function Page:Build(panel)
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if not renderer or not renderer.Build then
+		return
+	end
+	renderer:Build(panel, Definition())
+	self.panel = panel
+end
+
+function Page:Refresh(panel)
+	panel = panel or self.panel
+	if panel and panel.IsShown and not panel:IsShown() then
+		return
+	end
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if renderer and renderer.Refresh then
+		renderer:Refresh(panel)
 	end
 end
 

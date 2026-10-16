@@ -175,8 +175,59 @@ local function CaptureAnchorFromRow(row, index)
     }
 end
 
+--- Narrow read-only readiness for a trustworthy bank-log sample on this tab.
+-- Adapts existing ConsumablesBankLog evidence; never queries, polls, or starts
+-- a second observer. Tests may inject GS._BankContextReadinessProbe(tab).
+-- @return boolean ready, string|nil reason
+function GS.IsBankContextSampleReady(bankTab)
+    local tab = tonumber(bankTab)
+    if tab == nil or tab ~= math.floor(tab) or tab < 1 or tab > GS.MAX_BANK_TAB then
+        return false, "invalid_bank_tab"
+    end
+    if type(GS._BankContextReadinessProbe) == "function" then
+        return GS._BankContextReadinessProbe(tab)
+    end
+    local BankLog = SF.ConsumablesBankLog
+    if type(BankLog) ~= "table" then
+        return false, "readiness_unavailable"
+    end
+    if BankLog.bankOpen ~= true then
+        return false, "bank_closed"
+    end
+    local ctx = BankLog.activeContext
+    if type(ctx) ~= "table" then
+        return false, "not_observing"
+    end
+    if tonumber(ctx.bankTab) ~= tab then
+        return false, "tab_not_ready"
+    end
+    if BankLog.awaitingLogUpdate then
+        return false, "log_pending"
+    end
+    -- Require a processed GUILDBANKLOG_UPDATE stamp bound to this guild/tab.
+    if tonumber(BankLog.lastFreshLogTab) ~= tab then
+        return false, "log_not_updated"
+    end
+    if type(BankLog.lastFreshLogGuild) == "string" and BankLog.lastFreshLogGuild ~= ""
+        and type(ctx.guildGuid) == "string" and ctx.guildGuid ~= ""
+        and BankLog.lastFreshLogGuild ~= ctx.guildGuid then
+        return false, "guild_mismatch"
+    end
+    if type(ctx.guildGuid) == "string" and ctx.guildGuid ~= "" then
+        local gsCtx = GS.GetCurrentContext and GS:GetCurrentContext()
+        if gsCtx and type(gsCtx.guildKey) == "string" then
+            local _, clubId = GS.ParseGuildKey(gsCtx.guildKey)
+            if clubId and tostring(clubId) ~= tostring(ctx.guildGuid) then
+                return false, "guild_mismatch"
+            end
+        end
+    end
+    return true
+end
+
 --- Read bounded bank context without verification/crediting.
--- Distinguishes unavailable (API/open/tab failure) from genuinely empty.
+-- Distinguishes unavailable (API/open/tab/log unreadiness) from genuinely empty.
+-- Campaign creation still proceeds when status is unavailable.
 -- @return context table { status, observedAt, recordCount, anchors?, bankTab?, reason? }
 function GS.CaptureBankContext(bankTab)
     local observedAt = ServerTime()
@@ -206,6 +257,17 @@ function GS.CaptureBankContext(bankTab)
             recordCount = nil,
             bankTab = tab,
             reason = "api_unavailable",
+        }
+    end
+
+    local ready, readyReason = GS.IsBankContextSampleReady(tab)
+    if not ready then
+        return {
+            status = "unavailable",
+            observedAt = observedAt,
+            recordCount = nil,
+            bankTab = tab,
+            reason = readyReason or "not_ready",
         }
     end
 
@@ -462,7 +524,65 @@ function GS:GetCampaignRequestedItems(campaignId)
     return CopyRequestedItems(archive.requestedItems), nil, false
 end
 
+local function IsDonationEvent(event)
+    return event.type == "donation" or event.type == "CONSUMABLE_DONATION"
+end
+
+local function IsAdjustmentEvent(event)
+    return event.type == "adjustment" or event.type == "CONSUMABLE_ADJUSTMENT"
+end
+
+local function BoundedActorName(name)
+    if type(name) ~= "string" then
+        return nil
+    end
+    local trimmed = name:match("^%s*(.-)%s*$")
+    if not trimmed or trimmed == "" or #trimmed > 64 then
+        return nil
+    end
+    return trimmed
+end
+
+--- Walk current + archived ledger inputs for one campaign generation.
+-- Preserves original event identities; callers must not double-count.
+local function ForEachCampaignLedgerEvent(record, generation, visitor)
+    if type(visitor) ~= "function" or not generation or generation < 1 then
+        return
+    end
+    local function walk(list, maxN)
+        if type(list) ~= "table" then
+            return
+        end
+        local limit = #list
+        if limit > maxN then
+            limit = maxN
+        end
+        for i = 1, limit do
+            local event = list[i]
+            if type(event) == "table" and tonumber(event.generation) == generation then
+                visitor(event)
+            end
+        end
+    end
+    -- Archive first, then live list — same accepted identities must not appear in both.
+    walk(record.accounting and record.accounting._consumableEventArchive, 4096)
+    walk(record.accounting and record.accounting._consumableEvents, 4096)
+end
+
+local function ResolveCampaignGeneration(record, campaignId)
+    if record.currentCampaignId == campaignId then
+        local cfg = record.accounting and record.accounting._consumables
+        return tonumber(cfg and cfg.generation) or 0, nil
+    end
+    local archive = record.campaignArchives and record.campaignArchives[campaignId]
+    if type(archive) == "table" and GS.ValidateCampaignArchive(archive, campaignId, record) then
+        return tonumber(archive.generation), nil
+    end
+    return nil, "missing_campaign_archive"
+end
+
 --- Bounded progress projection for a campaign generation (read-only copies).
+-- Includes archived ledger records and signed attributed/unattributed adjustments.
 function GS:ProjectCampaignProgress(campaignId)
     local record, reason = GS:GetCurrentRecord()
     if not record then
@@ -472,17 +592,9 @@ function GS:ProjectCampaignProgress(campaignId)
         return nil, "invalid_campaign"
     end
 
-    local generation
-    if record.currentCampaignId == campaignId then
-        local cfg = record.accounting._consumables
-        generation = tonumber(cfg and cfg.generation) or 0
-    else
-        local archive = record.campaignArchives and record.campaignArchives[campaignId]
-        if type(archive) == "table" and GS.ValidateCampaignArchive(archive, campaignId, record) then
-            generation = tonumber(archive.generation)
-        else
-            return nil, "missing_campaign_archive"
-        end
+    local generation, genErr = ResolveCampaignGeneration(record, campaignId)
+    if genErr then
+        return nil, genErr
     end
     if not generation or generation < 1 then
         return { itemTotals = {}, contributions = {}, generation = generation or 0 }
@@ -490,34 +602,30 @@ function GS:ProjectCampaignProgress(campaignId)
 
     local itemTotals = {}
     local contributions = {}
-    local events = record.accounting._consumableEvents
-    if type(events) == "table" then
-        local limit = #events
-        if limit > 4096 then
-            limit = 4096
+    ForEachCampaignLedgerEvent(record, generation, function(event)
+        local itemId = tonumber(event.itemId)
+        local qty = tonumber(event.quantity) or 0
+        if not itemId or qty == 0 then
+            return
         end
-        for i = 1, limit do
-            local event = events[i]
-            if type(event) == "table" and tonumber(event.generation) == generation then
-                local itemId = tonumber(event.itemId)
-                local qty = tonumber(event.quantity) or 0
-                if itemId and qty ~= 0 then
-                    if event.type == "donation" or event.type == "CONSUMABLE_DONATION" then
-                        if qty > 0 then
-                            itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
-                            if type(event.actor) == "string" and event.actor ~= "" then
-                                contributions[event.actor] = contributions[event.actor] or {}
-                                contributions[event.actor][itemId] =
-                                    (contributions[event.actor][itemId] or 0) + qty
-                            end
-                        end
-                    elseif event.type == "adjustment" or event.type == "CONSUMABLE_ADJUSTMENT" then
-                        itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
-                    end
+        if IsDonationEvent(event) then
+            if qty > 0 then
+                itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
+                local actor = BoundedActorName(event.actor)
+                if actor then
+                    contributions[actor] = contributions[actor] or {}
+                    contributions[actor][itemId] = (contributions[actor][itemId] or 0) + qty
                 end
             end
+        elseif IsAdjustmentEvent(event) then
+            itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
+            local credit = BoundedActorName(event.attributed)
+            if credit then
+                contributions[credit] = contributions[credit] or {}
+                contributions[credit][itemId] = (contributions[credit][itemId] or 0) + qty
+            end
         end
-    end
+    end)
     return {
         itemTotals = itemTotals,
         contributions = contributions,
@@ -525,9 +633,176 @@ function GS:ProjectCampaignProgress(campaignId)
     }
 end
 
+local function FormatCampaignHistoryText(event, itemName)
+    local itemId = tonumber(event.itemId)
+    local qty = tonumber(event.quantity) or 0
+    local name = itemName
+    if type(name) ~= "string" or name == "" then
+        name = Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId or "?"))
+    end
+    if IsDonationEvent(event) then
+        local who = BoundedActorName(event.actor) or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
+        return Loc("GUILD_SUPPLIES_HISTORY_DONATION", "%s donated %d %s.")
+            :format(who, qty, name)
+    end
+    if IsAdjustmentEvent(event) then
+        local who = BoundedActorName(event.actor)
+            or Loc("GUILD_SUPPLIES_HISTORY_ADMIN", "An admin")
+        local credit = BoundedActorName(event.attributed)
+        if credit then
+            return Loc("GUILD_SUPPLIES_HISTORY_ADJUST_ATTRIBUTED",
+                "%s adjusted %s by %+d (credited to %s).")
+                :format(who, name, qty, credit)
+        end
+        return Loc("GUILD_SUPPLIES_HISTORY_ADJUST_UNATTRIBUTED",
+            "%s adjusted %s by %+d (unattributed / miscellaneous).")
+            :format(who, name, qty)
+    end
+    return nil
+end
+
+--- Bounded read-only donation/adjustment history for one campaign.
+-- Newest first. Does not mutate state or invent live verification.
+-- @return rows table, total number|nil, err string|nil
+function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
+    local record, reason = GS:GetCurrentRecord()
+    if not record then
+        return nil, nil, reason or "not_ready"
+    end
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return nil, nil, "invalid_campaign"
+    end
+    local generation, genErr = ResolveCampaignGeneration(record, campaignId)
+    if genErr then
+        return nil, nil, genErr
+    end
+    if not generation or generation < 1 then
+        return {}, 0, nil
+    end
+
+    local ordered = {}
+    local seen = {}
+    ForEachCampaignLedgerEvent(record, generation, function(event)
+        local id = event.id
+        if type(id) == "string" and id ~= "" then
+            if seen[id] then
+                return
+            end
+            seen[id] = true
+        end
+        if IsDonationEvent(event) or IsAdjustmentEvent(event) then
+            ordered[#ordered + 1] = event
+        end
+    end)
+    table.sort(ordered, function(a, b)
+        local ta = tonumber(a.timestamp) or 0
+        local tb = tonumber(b.timestamp) or 0
+        if ta ~= tb then
+            return ta > tb
+        end
+        return tostring(a.id or "") > tostring(b.id or "")
+    end)
+
+    local total = #ordered
+    offset = math.floor(tonumber(offset) or 0)
+    if offset < 0 then offset = 0 end
+    if offset > total then offset = total end
+    limit = tonumber(limit)
+    local last = total
+    if limit and limit >= 0 then
+        last = offset + math.floor(limit)
+        if last > total then last = total end
+    end
+    local rows = {}
+    for i = offset + 1, last do
+        local event = ordered[i]
+        local itemName = nil
+        if type(itemNameFn) == "function" and tonumber(event.itemId) then
+            local ok, value = pcall(itemNameFn, event.itemId)
+            if ok and type(value) == "string" then
+                itemName = value
+            end
+        end
+        local text = FormatCampaignHistoryText(event, itemName)
+        if text and text ~= "" then
+            rows[#rows + 1] = {
+                text = text,
+                id = event.id,
+                type = event.type,
+                itemId = event.itemId,
+                quantity = event.quantity,
+                actor = event.actor,
+                attributed = event.attributed,
+                timestamp = event.timestamp,
+                generation = event.generation,
+            }
+        end
+    end
+    return rows, total, nil
+end
+
 ---------------------------------------------------------------------------
 -- Mutation status feedback (never treat rejection as Saved)
 ---------------------------------------------------------------------------
+
+--- Map machine-readable reason codes to localized player wording.
+-- Keeps the status/reason API unchanged; diagnostics stay Debug-only.
+function GS.FormatReasonText(reason)
+    if reason == nil or reason == "" then
+        return Loc("GUILD_SUPPLIES_REASON_UNKNOWN", "unknown reason")
+    end
+    local code = tostring(reason)
+    local known = {
+        stale_base = Loc("GUILD_SUPPLIES_REASON_STALE_BASE",
+            "the page is out of date — refresh and try again"),
+        not_ready = Loc("GUILD_SUPPLIES_REASON_NOT_READY",
+            "guild membership or rank data is not ready yet"),
+        unauthorized = Loc("GUILD_SUPPLIES_REASON_UNAUTHORIZED",
+            "you are not authorized for that change"),
+        not_configured = Loc("GUILD_SUPPLIES_REASON_NOT_CONFIGURED",
+            "Guild Supplies is not initialized for this guild"),
+        already_configured = Loc("GUILD_SUPPLIES_REASON_ALREADY_CONFIGURED",
+            "this guild is already initialized"),
+        threshold_unselected = Loc("GUILD_SUPPLIES_REASON_THRESHOLD_UNSELECTED",
+            "choose an editor rank threshold first"),
+        policy_requires_gm = Loc("GUILD_SUPPLIES_REASON_POLICY_REQUIRES_GM",
+            "only the Guild Master can recover this policy"),
+        preview_non_admin = Loc("GUILD_SUPPLIES_REASON_PREVIEW_NON_ADMIN",
+            "Preview as Non-Admin blocks privileged changes"),
+        id_conflict = Loc("GUILD_SUPPLIES_REASON_ID_CONFLICT",
+            "that operation id already has a different body"),
+        duplicate = Loc("GUILD_SUPPLIES_REASON_DUPLICATE",
+            "that change was already admitted"),
+        full = Loc("GUILD_SUPPLIES_REASON_FULL",
+            "storage capacity for this guild is full"),
+        bank_closed = Loc("GUILD_SUPPLIES_REASON_BANK_CLOSED",
+            "the Guild Bank is closed"),
+        log_not_updated = Loc("GUILD_SUPPLIES_REASON_LOG_NOT_UPDATED",
+            "the Guild Bank log is not ready yet"),
+        tab_not_ready = Loc("GUILD_SUPPLIES_REASON_TAB_NOT_READY",
+            "the configured bank tab is not ready to read"),
+        bank_tab_unset = Loc("GUILD_SUPPLIES_REASON_BANK_TAB_UNSET",
+            "no bank tab is configured"),
+        api_unavailable = Loc("GUILD_SUPPLIES_REASON_API_UNAVAILABLE",
+            "Guild Bank APIs are unavailable"),
+        readiness_unavailable = Loc("GUILD_SUPPLIES_REASON_READINESS_UNAVAILABLE",
+            "bank readiness evidence is unavailable"),
+        invalid_editor_rank_position = Loc("GUILD_SUPPLIES_REASON_INVALID_RANK",
+            "choose an existing guild rank"),
+        rank_unavailable = Loc("GUILD_SUPPLIES_REASON_RANK_UNAVAILABLE",
+            "guild rank information is unavailable"),
+        dataset_mismatch = Loc("GUILD_SUPPLIES_REASON_DATASET_MISMATCH",
+            "the guild dataset changed"),
+        wrong_guild = Loc("GUILD_SUPPLIES_REASON_WRONG_GUILD",
+            "the active guild changed"),
+        unsupported_activation = Loc("GUILD_SUPPLIES_REASON_UNSUPPORTED_ACTIVATION",
+            "this dataset is not on the staged activation path"),
+    }
+    if known[code] then
+        return known[code]
+    end
+    return Loc("GUILD_SUPPLIES_REASON_GENERIC", "reason: %s"):format(code)
+end
 
 --- Translate staged mutation statuses for Settings banners.
 -- @return message string, severity ("success"|"info"|"warn"|"error")
@@ -542,14 +817,13 @@ function GS.FormatMutationFeedback(status, reason)
             "No new effect — that change was already admitted."),
             "info"
     end
+    local detail = GS.FormatReasonText(reason or (status == "pending" and "stale_base") or "rejected")
     if status == "pending" then
-        local detail = reason and tostring(reason) or "stale_base"
         return Loc("GUILD_SUPPLIES_STATUS_PENDING",
             "Change is pending and was not applied yet (%s)."):format(detail),
             "warn"
     end
     -- rejected or unknown
-    local detail = reason and tostring(reason) or "rejected"
     return Loc("GUILD_SUPPLIES_STATUS_REJECTED",
         "Change was not applied (%s)."):format(detail),
         "error"
@@ -795,13 +1069,8 @@ function GS:ApplyStagedCampaignOperation(op, context)
     local ops = record.operations
     local existing = ops.records[op.id]
     if existing then
-        -- Deep equal via Operations helper when available.
+        -- Exact canonical-body equality only; abbreviated field matches are conflicts.
         if GS._DeepEqualOps and GS._DeepEqualOps(existing, stored) then
-            return "duplicate", "duplicate"
-        end
-        if existing.id == stored.id and existing.kind == stored.kind
-            and existing.timestamp == stored.timestamp
-            and existing.baseCampaignId == stored.baseCampaignId then
             return "duplicate", "duplicate"
         end
         if GS._RetainConflict and not GS._RetainConflict(ops, stored) then
@@ -812,9 +1081,7 @@ function GS:ApplyStagedCampaignOperation(op, context)
 
     if ops.pending and ops.pending[op.id] then
         local pendingBody = ops.pending[op.id].body
-        local same = (GS._DeepEqualOps and GS._DeepEqualOps(pendingBody, stored))
-            or (pendingBody and pendingBody.id == stored.id and pendingBody.kind == stored.kind)
-        if same then
+        if GS._DeepEqualOps and GS._DeepEqualOps(pendingBody, stored) then
             local validRetry, verrRetry = GS:ValidateCampaignOperation(op, context)
             if not validRetry then
                 if verrRetry == "stale_base" then
@@ -822,7 +1089,7 @@ function GS:ApplyStagedCampaignOperation(op, context)
                 end
                 return "rejected", verrRetry or "unauthorized"
             end
-            -- Fall through to accept.
+            -- Exact pending retry: fall through to accept.
         else
             if GS._RetainConflict and not GS._RetainConflict(ops, stored) then
                 return "rejected", "full"
@@ -861,12 +1128,19 @@ function GS:ApplyStagedCampaignOperation(op, context)
     end
 
     local parentId = record.currentCampaignId
+    local archiveExisted = parentId
+        and record.campaignArchives
+        and record.campaignArchives[parentId] ~= nil
     if parentId then
         local archiveOk, archiveErr = ArchiveCurrentCampaignConfig(record, parentId, op.timestamp)
         if not archiveOk then
             return "rejected", archiveErr or "full"
         end
     end
+    local archiveInserted = parentId
+        and not archiveExisted
+        and record.campaignArchives
+        and record.campaignArchives[parentId] ~= nil
 
     -- Capture bank context without verification (may be unavailable).
     local contextCapture = GS.CaptureBankContext(cfg.bankTab)
@@ -898,27 +1172,42 @@ function GS:ApplyStagedCampaignOperation(op, context)
     }
     local headerOk, headerErr = GS.ValidateCampaignBoundary(header, record, op.guildKey)
     if not headerOk then
-        -- Roll back archive insert if we just created it for a failed header.
-        if parentId and record.campaignArchives and record.campaignArchives[parentId]
-            and record.campaignArchives[parentId].archivedAt == op.timestamp
-            and record.currentCampaignId == parentId then
-            -- Only remove if this apply created it in this attempt and parent is still current.
-            -- Safer: leave archive — but then retry would see existing archive (idempotent).
-            -- Header failure before pointer swap: remove the just-written archive for this parent
-            -- only when it matches this timestamp and campaigns[parent] still current.
-            local justArchived = record.campaignArchives[parentId]
-            if justArchived and justArchived.archivedAt == op.timestamp then
-                record.campaignArchives[parentId] = nil
-            end
+        if archiveInserted and record.campaignArchives then
+            record.campaignArchives[parentId] = nil
         end
         return "rejected", headerErr or "invalid_campaign"
     end
 
-    -- Mutate: empty items, bump generation, install header, select current.
+    -- Snapshot only fields this transaction mutates (no whole-guild deep copy).
+    local function CopyEligibilitySnapshot(elig)
+        if type(elig) ~= "table" then
+            return elig
+        end
+        local items = {}
+        if type(elig.items) == "table" then
+            for k, v in pairs(elig.items) do
+                items[k] = v
+            end
+        end
+        return {
+            items = items,
+            tabEligibleFrom = elig.tabEligibleFrom,
+            baselineEstablished = elig.baselineEstablished,
+            baselineAt = elig.baselineAt,
+        }
+    end
+
     local previousItems = cfg.requestedItems
     local previousGeneration = cfg.generation
-    local previousEligibility = cfg.eligibility
+    local previousEligibility = CopyEligibilitySnapshot(cfg.eligibility)
+    local previousConfigSeq = cfg.configSeq
     local previousCurrent = record.currentCampaignId
+    local previousHead = ops.heads and ops.heads[GS.CAMPAIGN_TARGET_KEY]
+    local previousPending = ops.pending and ops.pending[stored.id] or nil
+    local observationExisted = record.observations
+        and record.observations.byCampaign
+        and record.observations.byCampaign[op.id] ~= nil
+    local contextExisted = record.campaignContext and record.campaignContext[op.id] ~= nil
 
     cfg.requestedItems = {}
     local nextGen = (tonumber(cfg.generation) or 0) + 1
@@ -932,14 +1221,19 @@ function GS:ApplyStagedCampaignOperation(op, context)
 
     record.campaigns[op.id] = header
     record.currentCampaignId = op.id
+    local observationInserted = false
     if record.observations.byCampaign[op.id] == nil then
         record.observations.byCampaign[op.id] = {
             schemaVersion = 1,
             seq = 0,
             scopes = {},
         }
+        observationInserted = not observationExisted
     end
     StoreContextRecords(record, op.id, contextCapture)
+    local contextInserted = not contextExisted
+        and record.campaignContext
+        and record.campaignContext[op.id] ~= nil
 
     if GS._StoreAccepted then
         GS._StoreAccepted(ops, stored, GS.CAMPAIGN_TARGET_KEY)
@@ -958,25 +1252,30 @@ function GS:ApplyStagedCampaignOperation(op, context)
         cfg.requestedItems = previousItems
         cfg.generation = previousGeneration
         cfg.eligibility = previousEligibility
+        cfg.configSeq = previousConfigSeq
         record.currentCampaignId = previousCurrent
         record.campaigns[op.id] = nil
-        record.observations.byCampaign[op.id] = nil
-        if record.campaignContext then
+        if observationInserted and record.observations and record.observations.byCampaign then
+            record.observations.byCampaign[op.id] = nil
+        end
+        if contextInserted and record.campaignContext then
             record.campaignContext[op.id] = nil
         end
+        if archiveInserted and record.campaignArchives then
+            record.campaignArchives[parentId] = nil
+        end
         ops.records[stored.id] = nil
-        -- Remove trailing order entry if we appended it.
         if ops.order[#ops.order] == stored.id then
             ops.order[#ops.order] = nil
         end
-        if ops.heads[GS.CAMPAIGN_TARGET_KEY] == stored.id then
-            ops.heads[GS.CAMPAIGN_TARGET_KEY] = nil
+        if ops.heads then
+            ops.heads[GS.CAMPAIGN_TARGET_KEY] = previousHead
         end
-        if parentId and record.campaignArchives then
-            local justArchived = record.campaignArchives[parentId]
-            if justArchived and justArchived.archivedAt == op.timestamp then
-                record.campaignArchives[parentId] = nil
-            end
+        if previousPending then
+            ops.pending = ops.pending or {}
+            ops.pending[stored.id] = previousPending
+        elseif ops.pending then
+            ops.pending[stored.id] = nil
         end
         DebugWarn("campaign apply rolled back: %s", tostring(postErr))
         return "rejected", postErr or "invalid_record"
