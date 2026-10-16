@@ -89,7 +89,11 @@ local function EmptyAccounting(clubId, guildName, guildRealm)
             generation = 0,
             configSeq = 0,
             eventSeq = 0,
-            eligibility = {},
+            eligibility = {
+                items = {},
+                tabEligibleFrom = nil,
+                baselineEstablished = false,
+            },
             txnRegistry = {},
         },
         _consumableEvents = {},
@@ -474,6 +478,16 @@ local function ValidateGuildRecordStructure(guildKey, record)
         or type(record.confirmationRefs) ~= "table" then
         return false, "invalid_record_shape"
     end
+    -- Optional #386 maps: absent is fine for 2A-era records; wrong types fail closed.
+    if record.campaignArchives ~= nil and type(record.campaignArchives) ~= "table" then
+        return false, "invalid_record_shape"
+    end
+    if record.campaignContext ~= nil and type(record.campaignContext) ~= "table" then
+        return false, "invalid_record_shape"
+    end
+    if GS.CountCampaignHeaders and GS.CountCampaignHeaders(record) > (GS.MAX_CAMPAIGNS or 64) then
+        return false, "full"
+    end
 
     -- currentCampaignId: nil (no campaign) or nonempty key matching embedded header.
     local currentCampaignId = record.currentCampaignId
@@ -493,6 +507,8 @@ local function ValidateGuildRecordStructure(guildKey, record)
             return false, campErr or "invalid_campaign"
         end
     end
+    -- Archived/other headers are retained even when malformed; ListInspectableCampaigns
+    -- validates each before exposure. Do not fail the whole guild record for them.
 
     local ok, err = ValidateOperationsStore(record.operations, guildKey, record.datasetId)
     if not ok then
@@ -830,10 +846,13 @@ function GS:CreateStagedRecord(editorRankPosition)
         },
         currentCampaignId = nil,
         campaigns = {},
+        campaignArchives = {}, -- frozen per-campaign requested-item snapshots (#386)
+        campaignContext = {}, -- bounded bank-context anchors (#386); not gossip envelopes
         accounting = EmptyAccounting(clubId, ctx.guildName, ctx.guildRealm),
         observations = { byCampaign = {} },
         operations = EmptyOperations(),
         confirmationRefs = {},
+        -- Explicitly unused: hard reset replaces legacy migration (#386).
         migration = nil,
     }
 

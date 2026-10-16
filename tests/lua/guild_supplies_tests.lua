@@ -242,6 +242,7 @@ SF.GuildGossip.Init = function() end
 loadModule("SpectrumFederation/modules/GuildSupplies/State.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Authority.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Operations.lua")
+loadModule("SpectrumFederation/modules/GuildSupplies/Campaigns.lua")
 
 local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
@@ -303,6 +304,16 @@ local function initGS(opts)
         settleRoster()
     end
     return ok, reason
+end
+
+--- #386: campaign-owned items require an active campaign.
+local function startCampaign()
+    local op, st, err = GS:NewCampaignOperation()
+    assertEq(st, "accepted", "campaign op prepared: " .. tostring(err))
+    assertTrue(op ~= nil, "campaign op present")
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "accepted", "campaign started: " .. tostring(reason))
+    return op
 end
 
 local function minimalValidBankTabBody(id, datasetId, value)
@@ -612,6 +623,17 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    -- Bank tab remains shared without a campaign.
+    local opTabEarly, stTabEarly = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertEq(stTabEarly, "accepted", "bank tab before campaign prepared")
+    assertEq(GS:ApplyStagedConfigOperation(opTabEarly), "accepted", "bank tab before campaign applied")
+    -- Items require a campaign (#386).
+    local noCamp, noCampSt, noCampReason = GS:NewConfigOperation(
+        "set-requested-item", { itemId = 1 }, { itemId = 1, goal = 1 })
+    assertNil(noCamp, "item prepare blocked without campaign")
+    assertEq(noCampSt, "rejected", "item prepare rejected")
+    assertEq(noCampReason, "no_campaign", "no_campaign reason")
+    startCampaign()
 
     local op, st = GS:NewConfigOperation("set-requested-item", { itemId = 12345 }, { itemId = 12345, goal = 20 })
     assertEq(st, "accepted", "new item op built")
@@ -725,6 +747,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 1 }, { itemId = 1, goal = 1 })
     GS:ApplyStagedConfigOperation(op)
     local clash = {}
@@ -891,6 +914,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 7 }, { itemId = 7, goal = 3 })
     GS:ApplyStagedConfigOperation(op)
     local saved = SpectrumFederationDB
@@ -1017,6 +1041,7 @@ do
     end
     -- One conflict fills the shared budget to 128
     ops.conflicts["conf-1"] = { id = "conf-1", body = { id = "conf-1" }, at = 1 }
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 50 }, { itemId = 50, goal = 1 })
     -- Force stale base
     op.baseTargetRevision = "missing-base"
@@ -1124,6 +1149,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 77 }, { itemId = 77, goal = 5 })
     assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "admit item op")
     op.value.goal = 999
@@ -1220,6 +1246,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 88 }, { itemId = 88, goal = 1 })
     op.baseTargetRevision = "not-yet"
     local status, reason = GS:ApplyStagedConfigOperation(op)
@@ -1255,6 +1282,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
 
     -- Scalar/string apply inputs normalize to { itemId = N }; no crash / nil key.
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 10 }, { itemId = 10, goal = 1 })
@@ -2275,6 +2303,7 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     GS:CreateStagedRecord()
+    startCampaign()
 
     local op = GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
         itemId = 501, goal = 7, extra = { a = { b = { c = { d = true } } } },
@@ -3056,6 +3085,328 @@ do
     local op3 = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
     assertEq(GS:ApplyStagedConfigOperation(op3), "accepted", "append after restore accepted")
     assertTrue(GS:GetCurrentRecord() ~= nil, "readable after valid append on restored dense order")
+end
+
+---------------------------------------------------------------------------
+-- Part 2B (#386): fresh start, campaigns, eligibility, UI statuses
+---------------------------------------------------------------------------
+
+-- 2B1) Fresh setup imports nothing from legacy Consumables / unrelated profiles
+do
+    resetDb()
+    SpectrumFederationDB = {
+        lootHelper = {
+            profiles = {
+                legacy = {
+                    _consumables = {
+                        bankTab = 4,
+                        requestedItems = { ["999"] = { itemId = 999, goal = 50 } },
+                        txnRegistry = { ["txn-old"] = { id = "txn-old" } },
+                    },
+                    _consumableEvents = { { id = "ev-legacy", type = "donation", itemId = 999, quantity = 3 } },
+                },
+            },
+            activeProfileId = "legacy",
+            showRaidSupplyReminders = false,
+        },
+        otherFeature = { keep = true },
+    }
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    assertNil(select(1, GS:GetCurrentRecord()), "no auto-bootstrap on read")
+    local rec, st = GS:CreateStagedRecord()
+    assertEq(st, "accepted", "explicit create")
+    assertTrue(rec ~= nil, "record created")
+    local nItems = 0
+    for _ in pairs(rec.accounting._consumables.requestedItems) do nItems = nItems + 1 end
+    assertEq(nItems, 0, "fresh requested items empty")
+    assertNil(rec.accounting._consumables.bankTab, "bank tab unset until configured")
+    assertEq(rec.currentCampaignId, nil, "no campaign until New Campaign")
+    local nTxn = 0
+    for _ in pairs(rec.accounting._consumables.txnRegistry) do nTxn = nTxn + 1 end
+    assertEq(nTxn, 0, "no legacy txn import")
+    assertEq(#rec.accounting._consumableEvents, 0, "no legacy event import")
+    assertEq(SpectrumFederationDB.lootHelper.profiles.legacy._consumables.requestedItems["999"].goal, 50,
+        "legacy profile untouched")
+    assertEq(SpectrumFederationDB.otherFeature.keep, true, "unrelated account data untouched")
+    assertEq(SpectrumFederationDB.lootHelper.showRaidSupplyReminders, false,
+        "personal preference untouched by setup")
+end
+
+-- 2B2) New Campaign empty; archives prior config; guild/tab/rank preserved
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "set shared bank tab")
+    local camp1 = startCampaign()
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 42 }, { itemId = 42, goal = 10 })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "add campaign item")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["42"].goal, 10, "item present")
+    local eligBefore = GS:GetCurrentRecord().accounting._consumables.eligibility.items["42"]
+    assertTrue(type(eligBefore) == "number", "item cutoff after baseline")
+
+    local camp2 = startCampaign()
+    assertTrue(camp1.id ~= camp2.id, "distinct campaign identities")
+    local record = GS:GetCurrentRecord()
+    assertEq(record.currentCampaignId, camp2.id, "current is second campaign")
+    local nItems = 0
+    for _ in pairs(record.accounting._consumables.requestedItems) do nItems = nItems + 1 end
+    assertEq(nItems, 0, "new campaign starts empty")
+    assertEq(record.accounting._consumables.bankTab, 3, "bank tab preserved")
+    assertEq(record.permission.editorRankPosition, 3, "editor rank preserved")
+    local archive = record.campaignArchives[camp1.id]
+    assertTrue(archive ~= nil, "prior campaign archived")
+    assertEq(archive.requestedItems["42"].goal, 10, "archived goals preserved")
+    local progress = GS:ProjectCampaignProgress(camp2.id)
+    assertEq(progress.itemTotals[42], nil, "new campaign zero progress")
+    local archivedItems = GS:GetCampaignRequestedItems(camp1.id)
+    assertEq(archivedItems["42"].goal, 10, "inspect archived items")
+end
+
+-- 2B3) Reset retry/reload idempotent; distinct confirmed reset gets new id
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local campOp = GS:NewCampaignOperation()
+    assertEq(GS:ApplyStagedCampaignOperation(campOp), "accepted", "first campaign")
+    local status = GS:ApplyStagedCampaignOperation(campOp)
+    assertEq(status, "duplicate", "retry same op is duplicate")
+    local record = GS:GetCurrentRecord()
+    local nCamps = 0
+    for _ in pairs(record.campaigns) do nCamps = nCamps + 1 end
+    assertEq(nCamps, 1, "single campaign after retry")
+
+    -- Reload persistence of campaign op
+    local saved = SpectrumFederationDB
+    GS._db = nil
+    GS._root = nil
+    GS._rootValid = false
+    SpectrumFederationDB = saved
+    initGS()
+    assertEq(GS:ApplyStagedCampaignOperation(campOp), "duplicate", "duplicate after reload")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, campOp.id, "same current after reload")
+
+    local campOp2 = GS:NewCampaignOperation()
+    assertEq(GS:ApplyStagedCampaignOperation(campOp2), "accepted", "distinct subsequent reset")
+    assertTrue(campOp2.id ~= campOp.id, "new reset identity")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, campOp2.id, "second current")
+end
+
+-- 2B4) Stale authority / campaign base leaves prior intact
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local before = GS:GetCurrentRecord().currentCampaignId
+    local op = GS:NewCampaignOperation()
+    op.baseCampaignId = "not-current"
+    op.campaignId = "not-current"
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "pending", "stale campaign base pending")
+    assertEq(reason, "stale_base", "stale_base reason")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, before, "current unchanged on stale")
+    assertNil(GS:GetCurrentRecord().campaigns[op.id], "no partial campaign header")
+
+    -- Rank revocation at commit
+    op = GS:NewCampaignOperation()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    settleRoster()
+    status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "rejected", "unauthorized after demotion")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, first.id, "campaign intact after auth failure")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+end
+
+-- 2B5) Eligibility: tab change + item add/re-add cutoffs; goal edit preserves
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local add = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { itemId = 100, goal = 1 })
+    assertEq(GS:ApplyStagedConfigOperation(add), "accepted", "add item")
+    local cutoff1 = GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"]
+    assertTrue(type(cutoff1) == "number", "add establishes cutoff")
+
+    world.time = world.time + 50
+    local goal = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { itemId = 100, goal = 9 })
+    assertEq(GS:ApplyStagedConfigOperation(goal), "accepted", "goal edit")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"], cutoff1,
+        "goal edit preserves cutoff")
+
+    local rem = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { removed = true })
+    assertEq(GS:ApplyStagedConfigOperation(rem), "accepted", "remove item")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"], cutoff1,
+        "remove preserves cutoff history")
+
+    world.time = world.time + 50
+    local readd = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, { itemId = 100, goal = 2 })
+    assertEq(GS:ApplyStagedConfigOperation(readd), "accepted", "re-add item")
+    local cutoff2 = GS:GetCurrentRecord().accounting._consumables.eligibility.items["100"]
+    assertTrue(cutoff2 > cutoff1, "re-add establishes newer cutoff")
+
+    local beforeTab = GS:GetCurrentRecord().accounting._consumables.eligibility.tabEligibleFrom
+    world.time = world.time + 50
+    local tab = GS:NewConfigOperation("set-bank-tab", "bankTab", 5)
+    assertEq(GS:ApplyStagedConfigOperation(tab), "accepted", "tab change")
+    local afterTab = GS:GetCurrentRecord().accounting._consumables.eligibility.tabEligibleFrom
+    assertTrue(afterTab ~= nil and (beforeTab == nil or afterTab >= beforeTab),
+        "tab change updates tabEligibleFrom")
+end
+
+-- 2B6) Malformed archived headers retained but not exposed
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local good = startCampaign()
+    local record = GS:GetCurrentRecord()
+    record.campaigns["bad-camp"] = {
+        schemaVersion = 1,
+        campaignId = "wrong-id",
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        resetOperationId = "bad-camp",
+        createdByGuid = "Player-1-Alice",
+        createdByName = "Alice-Garona",
+        startedAt = 1,
+        boundaryVersion = 1,
+        boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+    }
+    local list = GS:ListInspectableCampaigns()
+    local seenBad = false
+    local seenGood = false
+    for i = 1, #list do
+        if list[i].campaignId == "bad-camp" then seenBad = true end
+        if list[i].campaignId == good.id then seenGood = true end
+    end
+    assertEq(seenBad, false, "malformed header not exposed")
+    assertEq(seenGood, true, "valid campaign still listed")
+    assertTrue(GS:GetCurrentRecord().campaigns["bad-camp"] ~= nil, "malformed retained in SV")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "guild record still usable")
+end
+
+-- 2B7) Capacity failure leaves prior campaign intact
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    local first = startCampaign()
+    local record = GS:GetCurrentRecord()
+    local fill = 0
+    while GS.CountCampaignHeaders(record) < GS.MAX_CAMPAIGNS do
+        fill = fill + 1
+        local id = "fill-camp-" .. fill
+        if record.campaigns[id] == nil then
+            record.campaigns[id] = {
+                schemaVersion = 1,
+                campaignId = id,
+                datasetId = record.datasetId,
+                guildKey = "club:42",
+                resetOperationId = id,
+                createdByGuid = "Player-1-Alice",
+                createdByName = "Alice-Garona",
+                startedAt = fill,
+                boundaryVersion = 1,
+                boundaryKind = "new-goal",
+                contextStatus = "unavailable",
+            }
+        end
+    end
+    assertEq(GS.CountCampaignHeaders(record), GS.MAX_CAMPAIGNS, "at campaign capacity")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "record still usable at capacity")
+    local before = record.currentCampaignId
+    local beforeItems = record.accounting._consumables.requestedItems
+    local op, pst, perr = GS:NewCampaignOperation()
+    assertTrue(op ~= nil, "prepare still works at capacity: " .. tostring(perr))
+    local status, reason = GS:ApplyStagedCampaignOperation(op)
+    assertEq(status, "rejected", "full capacity rejects")
+    assertEq(reason, "full", "full reason")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, before, "current intact")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems, beforeItems,
+        "items table intact")
+    assertNil(GS:GetCurrentRecord().campaigns[op.id], "no partial new campaign")
+    assertEq(before, first.id, "first campaign still current")
+end
+
+-- 2B8) Status feedback never reports Saved for rejection; bank context unavailable
+do
+    local msg, sev = GS.FormatMutationFeedback("rejected", "unauthorized")
+    assertTrue(type(msg) == "string" and msg:find("unauthorized", 1, true), "rejected message")
+    assertEq(sev, "error", "rejected severity")
+    assertEq(msg:find("Saved", 1, true), nil, "no Saved for rejection")
+    msg, sev = GS.FormatMutationFeedback("accepted", nil)
+    assertEq(sev, "success", "accepted severity")
+    assertTrue(msg:find("Staged", 1, true) or msg:find("admitted", 1, true), "accepted staged wording")
+    msg, sev = GS.FormatMutationFeedback("duplicate", "duplicate")
+    assertEq(sev, "info", "duplicate severity")
+    msg, sev = GS.FormatMutationFeedback("pending", "stale_base")
+    assertEq(sev, "warn", "pending severity")
+
+    local ctx = GS.CaptureBankContext(nil)
+    assertEq(ctx.status, "unavailable", "unset tab is unavailable not empty")
+    ctx = GS.CaptureBankContext(1)
+    -- Without bank APIs in the harness, capture is unavailable (not empty).
+    assertEq(ctx.status, "unavailable", "missing APIs unavailable")
+    assertTrue(ctx.reason ~= nil, "unavailable reason present")
+end
+
+-- 2B9) Cross-campaign txn registry preserved; historical start-campaign body validates
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    record.accounting._consumables.txnRegistry["txn-keep"] = {
+        id = "txn-keep",
+        generation = 1,
+    }
+    startCampaign()
+    assertTrue(GS:GetCurrentRecord().accounting._consumables.txnRegistry["txn-keep"] ~= nil,
+        "txn registry survives campaign reset")
+
+    local campOp = GS:NewCampaignOperation()
+    local ok, err = GS.ValidateAcceptedOperationBody(campOp, "club:42", record.datasetId)
+    -- campOp is prepared against current dataset; body shape must validate historically.
+    assertEq(ok, true, "start-campaign historical body ok: " .. tostring(err))
+end
+
+-- 2B10) UI open/close selection converges (no listener growth in module state)
+do
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    GS:CreateStagedRecord()
+    startCampaign()
+    local list1 = GS:ListInspectableCampaigns()
+    local list2 = GS:ListInspectableCampaigns()
+    assertEq(#list1, #list2, "list size stable across repeated reads")
+    local items1 = GS:GetCampaignRequestedItems(list1[1].campaignId)
+    local items2 = GS:GetCampaignRequestedItems(list1[1].campaignId)
+    assertTrue(items1 ~= items2, "accessors return copies, not live tables")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
