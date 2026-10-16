@@ -2,14 +2,10 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.11-beta.2] - 2026-10-16
+## [1.5.11] - 2026-10-16
 
 ### Changed
 - Temporarily hide Loot Helper Att./Prep. roster columns
-
-## [1.5.11-beta.1] - 2026-10-13
-
-### Changed
 - Updated Retail game compatibility to Interface 120105 (12.1.5).
 
 ## [1.5.10] - 2026-10-13
