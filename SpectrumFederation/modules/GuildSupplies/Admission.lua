@@ -11,11 +11,6 @@ GS.PROVIDER_SCHEMA = 1
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
--- Must fit a full legal accepted export: ops + headers + archive meta/pages +
--- conflict evidence + descriptor. Archive paging multiplies bodies per campaign.
-GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
-    + ((GS.MAX_CAMPAIGNS or 64) * 24)
-    + 512
 -- Abandoned adoption sessions expire so they cannot suppress peer traffic forever.
 GS.MAX_ADOPTION_SECONDS = 600
 -- Bounded untrusted historical relay retention (runtime-only).
@@ -37,6 +32,13 @@ GS.MAX_ARCHIVE_PAGE_COUNT = 22
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
 -- case, capped by confirmation batch / conflict candidate maxima.
 GS.MAX_MANIFEST_PAGES = math.max(GS.MAX_CONFIRMATION_BATCH or 64, GS.MAX_CONFLICT_CANDIDATES or 16)
+-- Must fit a full legal accepted export: ops + headers + archive meta/pages +
+-- conflict evidence + operation-manifest pages + descriptor. Archive and
+-- confirm/resolve paging multiply bodies beyond logical operation counts.
+GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+    + ((GS.MAX_CAMPAIGNS or 64) * 24)
+    + ((GS.MAX_MANIFEST_PAGES or 64) * 24)
+    + 512
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
@@ -1350,6 +1352,9 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         localAcceptedCount = #localRecord.operations.order
     end
     local previous = GS._adoption
+        if type(previous) == "table" then
+        AbortAdoptionReplay(previous, "replaced")
+    end
     GS._adoption = {
         epoch = (tonumber(GS._adoptionEpoch) or 0) + 1,
         sourcePeer = member.name,
@@ -1384,9 +1389,24 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
     return GS._adoption, "accepted", nil
 end
 
+--- Abort in-progress replay session caches without touching live globals.
+local function AbortAdoptionReplay(adop, reason)
+    if type(adop) ~= "table" then
+        return
+    end
+    adop.replayTemp = nil
+    adop.replayState = nil
+    adop.replayMember = nil
+    adop._replaySessionRelay = nil
+    adop._replaySessionBoundaries = nil
+    adop._replayScheduled = false
+    DebugWarn("adoption replay aborted: %s", tostring(reason))
+end
+
 function GS:CancelDatasetAdoption()
     if GS._adoption then
         DebugInfo("cancelled dataset adoption dataset=%s", tostring(GS._adoption.sourceDatasetId))
+        AbortAdoptionReplay(GS._adoption, "cancel")
         GS._adoption = nil
         NotifyAdoptionStateChanged("cancel")
     end
@@ -1404,6 +1424,7 @@ local function ExpireStaleAdoption()
     if now and started and maxAge > 0 and (now - started) > maxAge then
         DebugInfo("expired dataset adoption dataset=%s age=%s",
             tostring(adop.sourceDatasetId), tostring(now - started))
+        AbortAdoptionReplay(adop, "expire")
         GS._adoption = nil
         NotifyAdoptionStateChanged("expire")
     end
@@ -1678,8 +1699,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
     local sliceUsed = 0
     local progress = false
-    local maxAdmissions = GS.MAX_ADOPTION_AGGREGATE_ADMISSIONS or (#adop.order * 4 + 64)
-    local admissions = tonumber(state.admissions) or 0
+    -- Per-slice work only. A cumulative admission counter must not reject a
+    -- legal reverse-order history that retries dependents before predecessors.
+    local admissions = 0
 
     local function HasUnsettledAcceptableNonRankOnCurrentPolicy()
         local policyNow = temp.permission and temp.permission.revisionId or temp.datasetId
@@ -1714,7 +1736,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     end
     local i = start
     local scanned = 0
-    while scanned < #adop.order and sliceUsed < sliceBudget and admissions < maxAdmissions do
+    local unsettledSeen = false
+    while scanned < #adop.order and sliceUsed < sliceBudget do
         scanned = scanned + 1
         local body = adop.records[adop.order[i]]
         i = i + 1
@@ -1729,6 +1752,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             local opBody = body
             local pageCount = tonumber(body.pageCount) or tonumber(body.op.pageCount)
             if pageCount and pageCount >= 1 and GS.AssembleOpFromPages then
+                -- Assembly/compare work counts toward the slice.
+                sliceUsed = sliceUsed + 1
                 local pages = {}
                 for j = 1, #adop.order do
                     local pb = adop.records[adop.order[j]]
@@ -1744,6 +1769,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         return false, aerr or "invalid_operation", progress
                     end
                     -- wait for pages
+                    unsettledSeen = true
                     opBody = nil
                 else
                     opBody = assembled
@@ -1759,8 +1785,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             if alreadyAccepted or alreadyConflict then
                 -- settled: free
             elseif deferRank and op.kind == GS.KIND.SET_EDITOR_RANK then
-                -- deferred: free scan
+                -- deferred: free scan, but still unfinished work
+                unsettledSeen = true
             else
+                unsettledSeen = true
                 local sourceAuthored = ActorMatchesMember(op, member)
                 local confirmed = AdoptionHasConfirmationFor(
                     adop, op.id, op, member, temp.operations)
@@ -1909,7 +1937,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             end
         end
         for ri = 1, #retryIds do
-            if sliceUsed >= sliceBudget or admissions >= maxAdmissions then
+            if sliceUsed >= sliceBudget then
                 break
             end
             local pid = retryIds[ri]
@@ -1954,91 +1982,45 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
         admissions = admissions + 1
     end
 
-    state.admissions = admissions
+    state.admissions = (tonumber(state.admissions) or 0) + admissions
     state.sliceUsed = sliceUsed
-    local budgetHit = sliceUsed >= sliceBudget or admissions >= maxAdmissions
-    -- moreWork when progress made (need another wave) or budget hit mid-buffer.
-    local moreWork = progress or (budgetHit and scanned < #adop.order)
-    if not progress and not budgetHit then
+    state.cursor = i
+    local budgetHit = sliceUsed >= sliceBudget
+    -- Continue while progress remains, or budget stopped us with unsettled work.
+    -- A no-progress full scan with no unsettled rows means idle (completeness next).
+    local moreWork = progress or (budgetHit and unsettledSeen)
+    if not progress and not budgetHit and not unsettledSeen then
         moreWork = false
-    end
-    if admissions >= maxAdmissions and progress then
-        -- Legal transfers must drain; aggregate is a soft pacing bound, not a reject.
-        -- Continue while progress remains; only stall without progress is fatal later.
-        moreWork = true
+    elseif not progress and not budgetHit and unsettledSeen then
+        -- Full scan found dependents waiting on predecessors: another wave needed
+        -- only when something can still change (progress this wave). Otherwise stall.
+        moreWork = false
     end
     return moreWork, nil, progress
 end
 
-local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
-    opts = opts or {}
-    -- Isolate runtime pending caches so failed adoption cannot leak into live state.
+--- Run fn with adoption session relay/boundary caches swapped in.
+-- Live globals stay untouched across timer yields; cancel/expire discard the session.
+local function WithAdoptionSessionCaches(adop, fn)
     local savedRelay = GS._pendingRelay
     local savedBoundaries = GS._pendingCampaignBoundaries
-    if not opts.resume then
-        GS._pendingRelay = {}
-        GS._pendingCampaignBoundaries = {}
+    adop._replaySessionRelay = adop._replaySessionRelay or {}
+    adop._replaySessionBoundaries = adop._replaySessionBoundaries or {}
+    GS._pendingRelay = adop._replaySessionRelay
+    GS._pendingCampaignBoundaries = adop._replaySessionBoundaries
+    local ok, a, b, c = pcall(fn)
+    adop._replaySessionRelay = GS._pendingRelay
+    adop._replaySessionBoundaries = GS._pendingCampaignBoundaries
+    GS._pendingRelay = savedRelay
+    GS._pendingCampaignBoundaries = savedBoundaries
+    if not ok then
+        error(a)
     end
+    return a, b, c
+end
 
-    local function restoreCaches(ok)
-        if not ok then
-            GS._pendingRelay = savedRelay
-            GS._pendingCampaignBoundaries = savedBoundaries
-        else
-            GS._pendingRelay = {}
-            GS._pendingCampaignBoundaries = {}
-        end
-    end
-
-    local state = opts.state or { cursor = 1, admissions = 0 }
-    local maxWaves = math.max(8, #adop.order + 8)
-    local wave = tonumber(state.wave) or 0
-    local syncDrain = opts.syncDrain == true
-        or not (C_Timer and C_Timer.After)
-        or opts.adoptionReplaySync == true
-
-    local function runOne()
-        wave = wave + 1
-        state.wave = wave
-        if wave > maxWaves then
-            return false, "incomplete_transfer"
-        end
-        local moreWork, err, progress = ReplayAdoptionSlice(temp, adop, member, state)
-        if err then
-            return false, err
-        end
-        if moreWork then
-            return "continue", nil, progress
-        end
-        return "done", nil, progress
-    end
-
-    if not syncDrain then
-        -- Single slice; caller schedules continuation.
-        local status, err = runOne()
-        if status == false then
-            restoreCaches(false)
-            return false, err or "incomplete_transfer", state
-        end
-        if status == "continue" then
-            return "continue", nil, state
-        end
-        -- fall through to completeness check
-    else
-        local status, err
-        repeat
-            status, err = runOne()
-            if status == false then
-                restoreCaches(false)
-                return false, err or "incomplete_transfer", state
-            end
-        until status == "done"
-    end
-
-    -- Completeness: source-authored / confirmed bodies must be accepted (or
-    -- retained as conflict evidence after a resolution). Unconfirmed foreign /
-    -- evidenceOnly may settle as durable pending/conflicts. Session-only
-    -- _pendingRelay is never settlement.
+--- Shared completeness: operations settled AND advertised headers/archives present.
+local function ValidateAdoptionCompleteness(temp, adop, member)
     for i = 1, #adop.order do
         local body = adop.records[adop.order[i]]
         if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
@@ -2053,72 +2035,184 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
             if sourceAuthored or confirmed then
                 local isEnvelope = body.op.kind == GS.KIND.CONFIRM_CANDIDATE
                     or body.op.kind == GS.KIND.RESOLVE_CONFLICT
-                if inRecords then
-                    settled = true
-                elseif inConflicts and not isEnvelope then
-                    -- Losing evidence retained after resolution is settled.
-                    settled = true
-                else
-                    settled = false
-                end
+                settled = inRecords or (inConflicts and not isEnvelope)
             else
                 settled = inRecords or inConflicts or inPending
             end
             if not settled then
-                restoreCaches(false)
                 return false, "incomplete_transfer"
             end
         elseif type(body) == "table" and body.kind == "campaign-header" then
             local h = body.header
             if type(h) == "table" and type(h.campaignId) == "string" then
                 if temp.campaigns[h.campaignId] == nil then
-                    -- Required buffered header must settle whenever the campaign
-                    -- start exists or the header itself was advertised.
-                    restoreCaches(false)
                     return false, "missing_campaign_header"
                 end
             end
         elseif type(body) == "table" and body.kind == "campaign-archive" then
             if body.campaignId and temp.currentCampaignId == body.campaignId then
-                restoreCaches(false)
                 return false, "invalid_campaign_archive"
             end
             if body.campaignId and temp.campaignArchives[body.campaignId] == nil then
-                -- Advertised archive must settle before swap (including when the
-                -- campaign header/start never arrived — fail closed).
-                restoreCaches(false)
                 return false, "invalid_campaign_archive"
             end
         end
     end
-    restoreCaches(true)
-    return true, nil, state
+    return true, nil
 end
 
---- Abort an in-progress adoption replay and restore pre-replay relay caches.
-local function AbortAdoptionReplay(adop, reason)
-    if type(adop) ~= "table" then
-        return
-    end
-    if adop._replaySavedRelay then
-        GS._pendingRelay = adop._replaySavedRelay
-        GS._pendingCampaignBoundaries = adop._replaySavedBoundaries or {}
-    end
-    adop.replayTemp = nil
-    adop.replayState = nil
-    adop.replayMember = nil
-    adop._replaySavedRelay = nil
-    adop._replaySavedBoundaries = nil
-    adop._replayScheduled = false
-    DebugWarn("adoption replay aborted: %s", tostring(reason))
-end
-
-local function PublishAdoptionTemp(adop, temp)
+--- Selected-source effective state: accepted membership + descriptor heads/config.
+local function ValidateAdoptionEffectiveState(temp, adop, desc)
     for i = 1, #(adop.sourceAcceptedIds or {}) do
         local oid = adop.sourceAcceptedIds[i]
         if not (temp.operations.records and temp.operations.records[oid]) then
             return false, "incomplete_transfer"
         end
+    end
+    if type(desc) == "table" then
+        if type(desc.permissionRevisionId) == "string" and desc.permissionRevisionId ~= "" then
+            local livePol = temp.permission and temp.permission.revisionId
+            if livePol ~= desc.permissionRevisionId then
+                return false, "incomplete_transfer"
+            end
+        end
+        if desc.currentCampaignId ~= nil then
+            if (temp.currentCampaignId or nil) ~= (desc.currentCampaignId or nil) then
+                return false, "incomplete_transfer"
+            end
+        end
+        local acceptedCount = 0
+        if temp.operations and type(temp.operations.order) == "table" then
+            acceptedCount = #temp.operations.order
+        end
+        local wantAccepted = tonumber(desc.acceptedOpCount)
+        if wantAccepted and acceptedCount ~= wantAccepted then
+            return false, "incomplete_transfer"
+        end
+    end
+    return true, nil
+end
+
+--- Revalidate local authority, source identity, and pinned transfer before publish/resume.
+local function ValidateAdoptionCommitContext(adop)
+    if type(adop) ~= "table" or adop.committed then
+        return false, "no_adoption"
+    end
+    local prepared = {
+        guildKey = adop.guildKey,
+        actorGuid = adop.actorGuid,
+        handleGeneration = adop.handleGeneration,
+    }
+    local authOk, authReason = GS:_AuthorizeCommit(prepared, { allowRecoverPolicy = true })
+    if not authOk then
+        return false, authReason or "unauthorized"
+    end
+    local member, mReason = GS.AuthenticateTransportSender(adop.sourcePeer)
+    if not member or member.guid ~= adop.sourceGuid then
+        return false, mReason or "source_changed"
+    end
+    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, { allowBootstrapInstall = true })
+    if not editorOk then
+        return false, editorReason or "unauthorized"
+    end
+    if member.guildKey ~= adop.guildKey then
+        return false, "wrong_guild"
+    end
+    local live = GS._root.guilds[adop.guildKey]
+    if type(live) == "table" then
+        if adop.localDatasetId and live.datasetId ~= adop.localDatasetId then
+            return false, "source_changed"
+        end
+        local livePolicy = live.permission and live.permission.revisionId
+        if adop.localPolicyRevision and livePolicy ~= adop.localPolicyRevision then
+            return false, "stale_base"
+        end
+        if (adop.localCampaignId or nil) ~= (live.currentCampaignId or nil) then
+            return false, "stale_base"
+        end
+        local liveSeq = live.accounting and live.accounting._consumables
+            and tonumber(live.accounting._consumables.configSeq)
+        if adop.localConfigSeq ~= nil and liveSeq ~= adop.localConfigSeq then
+            return false, "stale_base"
+        end
+        local liveAccepted = 0
+        if live.operations and type(live.operations.order) == "table" then
+            liveAccepted = #live.operations.order
+        end
+        if adop.localAcceptedCount ~= nil and liveAccepted ~= adop.localAcceptedCount then
+            return false, "stale_base"
+        end
+    end
+    if type(adop.pinnedPermissionRevisionId) == "string" then
+        local peer = GS._peerDatasets[adop.sourcePeer]
+        if type(peer) ~= "table" or peer.datasetId ~= adop.sourceDatasetId then
+            return false, "source_changed"
+        end
+        if type(peer.permissionRevisionId) == "string"
+            and peer.permissionRevisionId ~= ""
+            and peer.permissionRevisionId ~= adop.pinnedPermissionRevisionId then
+            return false, "source_changed"
+        end
+    end
+    return true, nil, member
+end
+
+local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
+    opts = opts or {}
+    local state = opts.state or { cursor = 1, admissions = 0 }
+    local maxWaves = math.max(8, #adop.order + 8)
+    local wave = tonumber(state.wave) or 0
+    local syncDrain = opts.syncDrain == true
+        or not (C_Timer and C_Timer.After)
+        or opts.adoptionReplaySync == true
+
+    local function runOne()
+        wave = wave + 1
+        state.wave = wave
+        if wave > maxWaves then
+            return false, "incomplete_transfer"
+        end
+        local moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
+            return ReplayAdoptionSlice(temp, adop, member, state)
+        end)
+        if err then
+            return false, err
+        end
+        if moreWork then
+            return "continue", nil, progress
+        end
+        return "done", nil, progress
+    end
+
+    if not syncDrain then
+        local status, err = runOne()
+        if status == false then
+            return false, err or "incomplete_transfer", state
+        end
+        if status == "continue" then
+            return "continue", nil, state
+        end
+    else
+        local status, err
+        repeat
+            status, err = runOne()
+            if status == false then
+                return false, err or "incomplete_transfer", state
+            end
+        until status == "done"
+    end
+
+    local okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member)
+    if not okComp then
+        return false, compErr or "incomplete_transfer"
+    end
+    return true, nil, state
+end
+
+local function PublishAdoptionTemp(adop, temp, desc)
+    local okEff, effErr = ValidateAdoptionEffectiveState(temp, adop, desc)
+    if not okEff then
+        return false, effErr or "incomplete_transfer"
     end
     if GS._ValidateGuildRecordStructure then
         local ok, err = GS._ValidateGuildRecordStructure(adop.guildKey, temp)
@@ -2129,9 +2223,13 @@ local function PublishAdoptionTemp(adop, temp)
     GS._root.guilds[adop.guildKey] = temp
     GS._adoptionEpoch = (tonumber(GS._adoptionEpoch) or 0) + 1
     adop.committed = true
+    -- Discard session caches only; live globals were never replaced.
+    adop._replaySessionRelay = nil
+    adop._replaySessionBoundaries = nil
+    adop.replayTemp = nil
+    adop.replayState = nil
+    adop.replayMember = nil
     GS._adoption = nil
-    GS._pendingRelay = {}
-    GS._pendingCampaignBoundaries = {}
     DebugInfo("committed dataset adoption dataset=%s epoch=%s",
         adop.sourceDatasetId, tostring(GS._adoptionEpoch))
     if GS._NotifyLocalDurableChange then
@@ -2146,8 +2244,17 @@ local function ContinueAdoptionReplay(adop)
     if type(adop) ~= "table" or type(adop.replayTemp) ~= "table" then
         return "rejected", "no_adoption"
     end
+    -- Revalidate authority/baseline/source before each resume and before publish.
+    local ctxOk, ctxErr, member = ValidateAdoptionCommitContext(adop)
+    if not ctxOk then
+        AbortAdoptionReplay(adop, ctxErr)
+        GS._adoption = nil
+        NotifyAdoptionStateChanged("failed")
+        return "rejected", ctxErr or "unauthorized"
+    end
     local temp = adop.replayTemp
-    local member = adop.replayMember
+    member = member or adop.replayMember
+    adop.replayMember = member
     local state = adop.replayState or { cursor = 1, admissions = 0, wave = 0 }
     adop.replayState = state
     adop._replayScheduled = false
@@ -2160,7 +2267,9 @@ local function ContinueAdoptionReplay(adop)
         return "rejected", "incomplete_transfer"
     end
 
-    local moreWork, err = ReplayAdoptionSlice(temp, adop, member, state)
+    local moreWork, err = WithAdoptionSessionCaches(adop, function()
+        return ReplayAdoptionSlice(temp, adop, member, state)
+    end)
     if err then
         AbortAdoptionReplay(adop, err)
         GS._adoption = nil
@@ -2168,7 +2277,6 @@ local function ContinueAdoptionReplay(adop)
         return "rejected", err
     end
     if moreWork then
-        -- Test harnesses may set _adoptionReplaySyncDrain to finish in-process.
         if GS._adoptionReplaySyncDrain then
             return ContinueAdoptionReplay(adop)
         end
@@ -2190,34 +2298,15 @@ local function ContinueAdoptionReplay(adop)
         return "pending", "replay_in_progress"
     end
 
-    -- Completeness is validated here directly (slice already drained).
-    for i = 1, #adop.order do
-        local body = adop.records[adop.order[i]]
-        if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
-            local oid = body.op.id
-            local sourceAuthored = ActorMatchesMember(body.op, member)
-            local confirmed = AdoptionHasConfirmationFor(
-                adop, oid, body.op, member, temp.operations)
-            local inRecords = temp.operations.records and temp.operations.records[oid]
-            local inConflicts = temp.operations.conflicts and temp.operations.conflicts[oid]
-            local inPending = temp.operations.pending and temp.operations.pending[oid]
-            local settled = false
-            if sourceAuthored or confirmed then
-                local isEnvelope = body.op.kind == GS.KIND.CONFIRM_CANDIDATE
-                    or body.op.kind == GS.KIND.RESOLVE_CONFLICT
-                settled = inRecords or (inConflicts and not isEnvelope)
-            else
-                settled = inRecords or inConflicts or inPending
-            end
-            if not settled then
-                AbortAdoptionReplay(adop, "incomplete_transfer")
-                GS._adoption = nil
-                NotifyAdoptionStateChanged("failed")
-                return "rejected", "incomplete_transfer"
-            end
-        end
+    local okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member)
+    if not okComp then
+        AbortAdoptionReplay(adop, compErr)
+        GS._adoption = nil
+        NotifyAdoptionStateChanged("failed")
+        return "rejected", compErr or "incomplete_transfer"
     end
-    local okPub, pubErr = PublishAdoptionTemp(adop, temp)
+    local _, _, desc = GS:IsAdoptionTransferComplete()
+    local okPub, pubErr = PublishAdoptionTemp(adop, temp, desc)
     if not okPub then
         AbortAdoptionReplay(adop, pubErr)
         GS._adoption = nil
@@ -2245,58 +2334,14 @@ function GS:CommitDatasetAdoption()
         return ContinueAdoptionReplay(adop)
     end
 
-    local prepared = {
-        guildKey = adop.guildKey,
-        actorGuid = adop.actorGuid,
-        handleGeneration = adop.handleGeneration,
-    }
-    local authOk, authReason = GS:_AuthorizeCommit(prepared, { allowRecoverPolicy = true })
-    if not authOk then
-        return "rejected", authReason or "unauthorized"
-    end
-    local member, mReason = GS.AuthenticateTransportSender(adop.sourcePeer)
-    if not member or member.guid ~= adop.sourceGuid then
-        return "rejected", mReason or "source_changed"
-    end
-    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, { allowBootstrapInstall = true })
-    if not editorOk then
-        return "rejected", editorReason or "unauthorized"
-    end
-    if member.guildKey ~= adop.guildKey then
-        return "rejected", "wrong_guild"
+    local ctxOk, ctxErr, member = ValidateAdoptionCommitContext(adop)
+    if not ctxOk then
+        return "rejected", ctxErr or "unauthorized"
     end
 
     local complete, completeReason, desc = GS:IsAdoptionTransferComplete()
     if not complete then
         return "rejected", completeReason or "incomplete_transfer"
-    end
-
-    -- Local confirmation freshness: local dataset/policy/campaign/config must
-    -- still match the Begin snapshot. Divergence cancels silent replacement.
-    local live = GS._root.guilds[adop.guildKey]
-    if type(live) == "table" then
-        if adop.localDatasetId and live.datasetId ~= adop.localDatasetId then
-            return "rejected", "source_changed"
-        end
-        local livePolicy = live.permission and live.permission.revisionId
-        if adop.localPolicyRevision and livePolicy ~= adop.localPolicyRevision then
-            return "rejected", "stale_base"
-        end
-        if (adop.localCampaignId or nil) ~= (live.currentCampaignId or nil) then
-            return "rejected", "stale_base"
-        end
-        local liveSeq = live.accounting and live.accounting._consumables
-            and tonumber(live.accounting._consumables.configSeq)
-        if adop.localConfigSeq ~= nil and liveSeq ~= adop.localConfigSeq then
-            return "rejected", "stale_base"
-        end
-        local liveAccepted = 0
-        if live.operations and type(live.operations.order) == "table" then
-            liveAccepted = #live.operations.order
-        end
-        if adop.localAcceptedCount ~= nil and liveAccepted ~= adop.localAcceptedCount then
-            return "rejected", "stale_base"
-        end
     end
 
     local identity = GG().GetGuildIdentity()
@@ -2326,24 +2371,9 @@ function GS:CommitDatasetAdoption()
     local temp = NewBootstrapRecord(adop.sourceDatasetId, adop.guildKey, identity, bootstrapPos)
     -- Offline replay: never publish temp until fully validated. Live guild slot
     -- stays untouched; AdmitRemoteOperation uses offlineRecord=temp only.
-    -- Re-check transfer context still matches pinned selection before replay.
-    if type(adop.pinnedPermissionRevisionId) == "string" then
-        local peer = GS._peerDatasets[adop.sourcePeer]
-        if type(peer) ~= "table" or peer.datasetId ~= adop.sourceDatasetId then
-            return "rejected", "source_changed"
-        end
-        if type(peer.permissionRevisionId) == "string"
-            and peer.permissionRevisionId ~= ""
-            and peer.permissionRevisionId ~= adop.pinnedPermissionRevisionId then
-            return "rejected", "source_changed"
-        end
-    end
-
-    -- Prefer yieldable sliced replay when a timer facility exists.
-    adop._replaySavedRelay = GS._pendingRelay
-    adop._replaySavedBoundaries = GS._pendingCampaignBoundaries
-    GS._pendingRelay = {}
-    GS._pendingCampaignBoundaries = {}
+    -- Session-local relay/boundary caches; live globals stay in place across yields.
+    adop._replaySessionRelay = {}
+    adop._replaySessionBoundaries = {}
     adop.replayTemp = temp
     adop.replayMember = member
     adop.replayState = { cursor = 1, admissions = 0, wave = 0 }
@@ -2503,8 +2533,24 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
     end
 
     -- Off-record shadow record: mutations apply only to projected cfg tables.
+    -- Seed bank tab from the CHOSEN immutable boundary (explicit nil clears the
+    -- provisional sibling's live tab).
     local projItems = {}
     local projElig = {}
+    local shadowHeads = {}
+    if type(ops.heads) == "table" then
+        for k, v in pairs(ops.heads) do
+            shadowHeads[k] = v
+        end
+    end
+    local shadowOps = {
+        records = ops.records,
+        pending = ops.pending,
+        conflicts = ops.conflicts,
+        openConflicts = {},
+        heads = shadowHeads,
+        order = ops.order,
+    }
     local shadow = {
         datasetId = record.datasetId,
         currentCampaignId = chosenId,
@@ -2513,20 +2559,31 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             _consumables = {
                 requestedItems = projItems,
                 eligibility = projElig,
-                bankTab = cfg.bankTab,
+                bankTab = header and header.bankTabAtStart,
                 configSeq = tonumber(cfg.configSeq) or 0,
             },
         },
-        operations = ops,
+        operations = shadowOps,
         campaigns = record.campaigns,
     }
     if GS.EstablishCampaignBaseline then
         GS.EstablishCampaignBaseline(shadow.accounting._consumables, header and header.startedAt or nil)
     end
+    local function targetKeyOf(op)
+        if GS._TargetKey then
+            return GS._TargetKey(op.kind, op.target)
+        end
+        return tostring(op.kind) .. ":" .. tostring(op.target)
+    end
     local function applyMut(op)
         if GS._ApplyMutations then
-            return GS._ApplyMutations(shadow, op)
+            local ok = GS._ApplyMutations(shadow, op)
+            if ok then
+                shadowHeads[targetKeyOf(op)] = op.id
+            end
+            return ok
         end
+        shadowHeads[targetKeyOf(op)] = op.id
         return true
     end
     -- Accepted history in durable order (already causal).
@@ -2541,7 +2598,8 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             end
         end
     end
-    -- Confirmed promotions: dependency-frontier waves (not lexicographic ID sort).
+    -- Confirmed promotions: dependency-frontier waves with shared causal rules.
+    -- Confirmation authorizes content; same-base siblings remain conflicts.
     local remaining = {}
     for i = 1, #promoteOps do
         remaining[i] = promoteOps[i]
@@ -2558,31 +2616,76 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         guard = guard - 1
         local progressed = false
         local nextRound = {}
+        -- Group by target so same-base siblings can be detected before apply.
+        local byTarget = {}
         for i = 1, #remaining do
             local op = remaining[i]
-            local base = op.baseTargetRevision
-            local ready = (base == nil) or (base == record.datasetId) or settled[base] == true
-                or (type(ops.heads) == "table" and ops.heads[GS._TargetKey and GS._TargetKey(op.kind, op.target) or ""] == base)
-            -- Same-target head may be the campaign start or prior accepted op.
-            if not ready and type(base) == "string" then
-                if ops.records and ops.records[base] then
-                    ready = true
+            local tk = targetKeyOf(op)
+            byTarget[tk] = byTarget[tk] or {}
+            byTarget[tk][#byTarget[tk] + 1] = op
+        end
+        local deferred = {}
+        for tk, group in pairs(byTarget) do
+            -- Same-base siblings among confirmed promotions stay conflicts.
+            local byBase = {}
+            for i = 1, #group do
+                local op = group[i]
+                local base = op.baseTargetRevision or ""
+                byBase[base] = byBase[base] or {}
+                byBase[base][#byBase[base] + 1] = op
+            end
+            for base, siblings in pairs(byBase) do
+                if #siblings > 1 and base ~= "" then
+                    for i = 1, #siblings do
+                        deferred[siblings[i].id] = true
+                    end
                 end
             end
-            if ready then
-                local okMut = applyMut(op)
-                if not okMut then
-                    return false, "projection_failed"
-                end
-                orderedPromote[#orderedPromote + 1] = op
-                settled[op.id] = true
-                progressed = true
-            else
+        end
+        for i = 1, #remaining do
+            local op = remaining[i]
+            if deferred[op.id] then
                 nextRound[#nextRound + 1] = op
+            else
+                local base = op.baseTargetRevision
+                local tk = targetKeyOf(op)
+                local head = shadowHeads[tk]
+                local ready = (base == nil) or (base == record.datasetId)
+                    or settled[base] == true
+                    or head == base
+                if ready then
+                    -- Shared causal classification against the shadow projection.
+                    local class = "apply"
+                    if ClassifyStaleBase then
+                        class = select(1, ClassifyStaleBase(shadow, op, tk))
+                    end
+                    if class == "apply" or class == nil then
+                        -- Head must still match the declared base (no silent sibling apply).
+                        if base ~= nil and base ~= record.datasetId and head ~= base
+                            and settled[base] ~= true then
+                            nextRound[#nextRound + 1] = op
+                        else
+                            local okMut = applyMut(op)
+                            if not okMut then
+                                return false, "projection_failed"
+                            end
+                            orderedPromote[#orderedPromote + 1] = op
+                            settled[op.id] = true
+                            progressed = true
+                        end
+                    elseif class == "pending" then
+                        nextRound[#nextRound + 1] = op
+                    else
+                        -- conflict / obsolete: leave as pending evidence
+                        nextRound[#nextRound + 1] = op
+                    end
+                else
+                    nextRound[#nextRound + 1] = op
+                end
             end
         end
         if not progressed then
-            -- Missing predecessors among confirmed set: keep as pending evidence.
+            -- Missing predecessors or preserved conflicts among confirmed set.
             break
         end
         remaining = nextRound
@@ -2594,6 +2697,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
         projectedItems = projItems,
         projectedEligibility = projElig,
         projectedBankTab = shadow.accounting._consumables.bankTab,
+        hasProjectedBankTab = true,
     }
 end
 
@@ -2776,7 +2880,11 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
 
     cfg.requestedItems = plan.projectedItems or {}
     cfg.eligibility = plan.projectedEligibility or {}
-    if plan.projectedBankTab ~= nil then
+    -- Always publish the projected tab, including an explicitly captured nil
+    -- from the chosen campaign's bankTabAtStart.
+    if plan.hasProjectedBankTab then
+        cfg.bankTab = plan.projectedBankTab
+    elseif plan.projectedBankTab ~= nil then
         cfg.bankTab = plan.projectedBankTab
     end
     if GS.EstablishCampaignBaseline and (not cfg.eligibility or cfg.eligibility.baselineEstablished ~= true) then
@@ -3653,6 +3761,27 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             and GS._AcceptedCount(ops) + slotsNeeded > GS.MAX_ACCEPTED_OPERATIONS then
             return "rejected", "full"
         end
+        -- Preflight loser evidence retention before any projection/head mutation.
+        -- Pending→conflict relocate is free; reject before apply when a new slot
+        -- would be required and the store is full.
+        if type(value.competingOpIds) == "table" then
+            for i = 1, #value.competingOpIds do
+                local cid = value.competingOpIds[i]
+                if cid ~= value.chosenOpId then
+                    if ops.conflicts and ops.conflicts[cid] then
+                        -- already retained
+                    elseif ops.pending and ops.pending[cid] and ops.pending[cid].body then
+                        -- atomic relocate will succeed without a second slot
+                    elseif type(value.contentBodies) == "table"
+                        and type(value.contentBodies[cid]) == "table" then
+                        if GS._RetentionBodyCount and GS.MAX_PENDING_OPERATIONS
+                            and GS._RetentionBodyCount(ops) >= GS.MAX_PENDING_OPERATIONS then
+                            return "rejected", "full"
+                        end
+                    end
+                end
+            end
+        end
         if chosen.kind == GS.KIND.START_CAMPAIGN then
             local boundary = (open.boundaries and open.boundaries[applyId])
                 or (open.boundaries and open.boundaries[value.chosenOpId])
@@ -3717,12 +3846,17 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             for i = 1, #value.competingOpIds do
                 local cid = value.competingOpIds[i]
                 if cid ~= value.chosenOpId then
-                    if ops.pending and ops.pending[cid] then
-                        -- Keep losing evidence in conflicts; drop pending apply slot.
-                        if GS._RetainConflict and ops.pending[cid].body then
+                    if ops.pending and ops.pending[cid] and ops.pending[cid].body then
+                        -- Atomic pending→conflict relocate (no second slot charge).
+                        if GS._RetainConflict then
                             GS._RetainConflict(ops, ops.pending[cid].body)
                         end
-                        ops.pending[cid] = nil
+                    elseif type(value.contentBodies) == "table"
+                        and type(value.contentBodies[cid]) == "table"
+                        and not (ops.conflicts and ops.conflicts[cid]) then
+                        if GS._RetainConflict then
+                            GS._RetainConflict(ops, value.contentBodies[cid])
+                        end
                     end
                     if GS._pendingCampaignBoundaries then
                         GS._pendingCampaignBoundaries[cid] = nil
@@ -3751,10 +3885,20 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if stored.kind == GS.KIND.START_CAMPAIGN and type(admissionCtx.boundary) == "table" then
             GS._pendingCampaignBoundaries[stored.id] = admissionCtx.boundary
         end
+        local stPend, reasonPend = "pending", classReason or "stale_base"
         if GS._AdmitPendingOrConflict then
-            return GS._AdmitPendingOrConflict(ops, stored, classReason or "stale_base")
+            stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, classReason or "stale_base")
         end
-        return "pending", classReason or "stale_base"
+        -- Successful durable missing-predecessor / pending evidence must notify
+        -- provider maintenance so peers can discover it without a later edit.
+        if (stPend == "pending" or stPend == "duplicate")
+            and not admissionCtx.adoptionReplay
+            and GS._NotifyLocalDurableChange then
+            if ops.pending and ops.pending[stored.id] then
+                GS._NotifyLocalDurableChange("remote-evidence")
+            end
+        end
+        return stPend, reasonPend
     end
     if class == "obsolete" then
         return "rejected", classReason or "stale_base"
@@ -3880,13 +4024,20 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             local rid = relayIds[i]
             local entry = GS._pendingRelay[rid]
             if type(entry) == "table" and type(entry.body) == "table" then
-                GS._pendingRelay[rid] = nil
-                GS:AdmitRemoteOperation(entry.body, {
-                    sender = entry.sender or admissionCtx.sender,
-                    member = member,
-                    boundary = entry.boundary,
-                    localWrite = false,
-                })
+                -- Re-authenticate the retained successor's actual sender. Never
+                -- inherit the predecessor admitter's member/credentials, and do
+                -- not fall back to the predecessor's transport sender.
+                local successorSender = entry.sender
+                if type(successorSender) ~= "string" or successorSender == "" then
+                    -- Keep the entry for a later authenticated redelivery.
+                else
+                    GS._pendingRelay[rid] = nil
+                    GS:AdmitRemoteOperation(entry.body, {
+                        sender = successorSender,
+                        boundary = entry.boundary,
+                        localWrite = false,
+                    })
+                end
             end
         end
     end

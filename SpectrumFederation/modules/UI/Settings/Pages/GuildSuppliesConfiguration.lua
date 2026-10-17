@@ -502,7 +502,17 @@ local function CommitAdoptionTransfer(ctx)
 	end
 	ctx.section:ClearMessage()
 	local adop = g:GetPendingAdoption()
-	if type(adop) ~= "table" or not adop.ready then
+	if type(adop) ~= "table" then
+		ReportStatus(ctx, "rejected", "no_adoption")
+		return
+	end
+	-- Overlapping commits while replay is already running are rejected.
+	if type(adop.replayTemp) == "table" then
+		ReportStatus(ctx, "pending", "replay_in_progress")
+		RefreshPageControls()
+		return
+	end
+	if not adop.ready then
 		ReportStatus(ctx, "pending", "incomplete_transfer")
 		return
 	end
@@ -901,6 +911,7 @@ local function Definition()
 							return (c.canEdit or c.canRecoverPolicy)
 								and type(adop) == "table"
 								and adop.ready == true
+								and type(adop.replayTemp) ~= "table"
 						end,
 						onClick = function(ctx)
 							CommitAdoptionTransfer(ctx)
@@ -924,7 +935,11 @@ local function Definition()
 								g:CancelDatasetAdoption()
 							end
 							ClearPendingAdoptionChoice()
-							ReportStatus(ctx, "accepted", nil)
+							ctx.section:SetMessage(
+								Loc("GUILD_SUPPLIES_STATUS_ADOPTION_CANCELLED",
+									"Dataset adoption cancelled. Local staged configuration was left unchanged."),
+								"info")
+							RefreshPageControls()
 						end,
 					},
 				},

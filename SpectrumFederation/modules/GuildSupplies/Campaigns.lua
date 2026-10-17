@@ -1026,6 +1026,12 @@ function GS.FormatReasonText(reason)
             "this dataset is not on the staged activation path"),
         incomplete_transfer = Loc("GUILD_SUPPLIES_REASON_INCOMPLETE_TRANSFER",
             "the selected dataset transfer is incomplete — local state was left unchanged"),
+        replay_in_progress = Loc("GUILD_SUPPLIES_REASON_REPLAY_IN_PROGRESS",
+            "dataset adoption is still applying — wait for it to finish"),
+        missing_campaign_header = Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN_HEADER",
+            "a required campaign header is missing from the transfer"),
+        invalid_campaign_archive = Loc("GUILD_SUPPLIES_REASON_INVALID_CAMPAIGN_ARCHIVE",
+            "a required campaign archive is missing or malformed"),
         no_adoption = Loc("GUILD_SUPPLIES_REASON_NO_ADOPTION",
             "no dataset adoption is in progress"),
         same_dataset = Loc("GUILD_SUPPLIES_REASON_SAME_DATASET",
@@ -1094,6 +1100,11 @@ function GS.FormatMutationFeedback(status, reason)
         return Loc("GUILD_SUPPLIES_STATUS_DUPLICATE",
             "No new effect — that change was already admitted."),
             "info"
+    end
+    if status == "pending" and reason == "replay_in_progress" then
+        return Loc("GUILD_SUPPLIES_STATUS_ADOPTION_REPLAY",
+            "Adopting the selected dataset — this page will update when the transfer finishes."),
+            "warn"
     end
     local detail = GS.FormatReasonText(reason or (status == "pending" and "stale_base") or "rejected")
     if status == "pending" then

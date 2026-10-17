@@ -812,8 +812,10 @@ end
 
 --- Retain the first conflict body for an ID as immutable evidence.
 -- An existing slot is never replaced by a later divergent body and does not
--- consume another retention slot. Returns false only when capacity is exhausted
--- for a new ID.
+-- consume another retention slot. Relocating the *same* pending body into
+-- conflicts is atomic and does not charge a second slot. Retaining a different
+-- body while pending still holds another body still requires a free slot.
+-- Returns false only when capacity is exhausted for a new ID.
 local function RetainConflict(ops, op)
     if type(ops) ~= "table" or type(op) ~= "table" or type(op.id) ~= "string" then
         return false
@@ -821,6 +823,23 @@ local function RetainConflict(ops, op)
     local existing = ops.conflicts and ops.conflicts[op.id]
     if type(existing) == "table" then
         return true
+    end
+    local pendingEntry = ops.pending and ops.pending[op.id]
+    if type(pendingEntry) == "table" and type(pendingEntry.body) == "table" then
+        -- Atomic relocate only when preserving the pending body itself (resolution
+        -- loser move). A divergent same-ID body still needs its own conflict slot.
+        if pendingEntry.body == op or DeepEqual(pendingEntry.body, op) then
+            ops.conflicts = ops.conflicts or {}
+            ops.conflicts[op.id] = {
+                id = op.id,
+                kind = op.kind,
+                targetKey = TargetKey(op.kind, op.target),
+                body = pendingEntry.body,
+                at = pendingEntry.at or ServerTime() or op.timestamp,
+            }
+            ops.pending[op.id] = nil
+            return true
+        end
     end
     if RetentionBodyCount(ops) >= GS.MAX_PENDING_OPERATIONS then
         return false
@@ -1729,6 +1748,10 @@ end
 
 function GS._RetainConflict(ops, op)
     return RetainConflict(ops, op)
+end
+
+function GS._RetentionBodyCount(ops)
+    return RetentionBodyCount(ops)
 end
 
 function GS._AdmitPendingOrConflict(ops, stored, reason)

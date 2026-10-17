@@ -129,11 +129,30 @@ local function ResetArchivePageBuffers()
     opManifestBufferPages = 0
 end
 
+--- Worst-case versionFp length used when sizing pages (ContentFingerprint ≤ MAX_OPERATION_ID).
+local function EstimateVersionFp()
+    local maxLen = GS.MAX_OPERATION_ID or 192
+    if GS.ContentFingerprint then
+        local fp = GS.ContentFingerprint({ kind = "gs-size", id = "size", pad = "x" })
+        if type(fp) == "string" and #fp > 0 then
+            if #fp > maxLen then
+                return fp:sub(1, maxLen)
+            end
+            if #fp < maxLen then
+                return fp .. string.rep("f", maxLen - #fp)
+            end
+            return fp
+        end
+    end
+    return string.rep("f", maxLen)
+end
+
 --- Wrapper-inclusive wire size estimate (prefer real CBOR when available).
+-- Uses a worst-case versionFp so packing decisions match final ID/versionFp wrappers.
 local function EstimateWireRecordBytes(recordId, body)
     local envelope = {
         id = tostring(recordId or "x"),
-        versionFp = "v",
+        versionFp = EstimateVersionFp(),
         body = body,
     }
     if C_EncodingUtil and C_EncodingUtil.SerializeCBOR then
@@ -259,6 +278,9 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
 end
 
 --- Split oversized confirm/resolve envelopes into shell + pages under wire budget.
+-- Returns a complete fragment set where every ID/versionFp wrapper fits the budget,
+-- or falls back to the inline body only when that itself fits. Never silently
+-- truncates supported rows or emits known-oversized fragments.
 local function BuildOpExportBodies(op, evidenceOnly, boundary)
     local fullBody = {
         kind = "gs-op",
@@ -273,9 +295,10 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
     end
     -- Only confirm/resolve carry embedded authoritative bodies large enough to page.
     if op.kind ~= GS.KIND.CONFIRM_CANDIDATE and op.kind ~= GS.KIND.RESOLVE_CONFLICT then
-        -- Ordinary ops that somehow exceed budget: still emit (engine may skip);
-        -- do not invent a paging scheme for non-manifest kinds.
-        return { { id = exportId, body = fullBody } }
+        -- Ordinary ops that somehow exceed budget cannot be paged; omit rather
+        -- than advertise a known-oversized record as complete.
+        DebugWarn("omitting oversized non-paged op export %s", tostring(op.id))
+        return {}
     end
 
     local rows = {}
@@ -308,7 +331,10 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         end
     end
     if #rows < 1 then
-        return { { id = exportId, body = fullBody } }
+        if EstimateWireRecordBytes(exportId, fullBody) <= budget then
+            return { { id = exportId, body = fullBody } }
+        end
+        return {}
     end
 
     -- Pack rows into pages that each fit the wire budget (worst case 1/row).
@@ -322,63 +348,71 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         end
     end
     for i = 1, #rows do
-        cur.records[#cur.records + 1] = rows[i]
+        local trialRecords = {}
+        for j = 1, #(cur.records) do
+            trialRecords[j] = cur.records[j]
+        end
+        trialRecords[#trialRecords + 1] = rows[i]
         local trialPage = {
             kind = "gs-op-page",
             opId = op.id,
             datasetId = op.datasetId,
             page = #pages + 1,
             pageCount = 1, -- provisional
-            records = cur.records,
+            records = trialRecords,
         }
         if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), trialPage) > budget then
-            -- Undo last add and flush previous pack (keep at least one row/page).
-            cur.records[#cur.records] = nil
             if #(cur.records) == 0 then
-                -- Single row exceeds budget: emit alone (engine may skip oversized).
-                pages[#pages + 1] = { records = { rows[i] } }
-                cur = { records = {} }
-            else
-                flush()
-                cur.records[1] = rows[i]
+                -- Single row exceeds budget even alone: cannot export this op.
+                DebugWarn("omitting op export %s: row exceeds wire budget", tostring(op.id))
+                return {}
             end
+            flush()
+            if #pages >= maxPages then
+                DebugWarn("omitting op export %s: exceeds max manifest pages", tostring(op.id))
+                return {}
+            end
+            cur.records[1] = rows[i]
+            local alone = {
+                kind = "gs-op-page",
+                opId = op.id,
+                datasetId = op.datasetId,
+                page = #pages + 1,
+                pageCount = 1,
+                records = cur.records,
+            }
+            if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), alone) > budget then
+                DebugWarn("omitting op export %s: row exceeds wire budget", tostring(op.id))
+                return {}
+            end
+        else
+            cur.records[#cur.records + 1] = rows[i]
         end
-        if #pages >= maxPages then
-            break
-        end
+    end
+    if #(cur.records) > 0 and #pages >= maxPages then
+        DebugWarn("omitting op export %s: exceeds max manifest pages", tostring(op.id))
+        return {}
     end
     flush()
-    if #pages < 1 then
-        return { { id = exportId, body = fullBody } }
+    if #pages < 1 or #pages > maxPages then
+        return {}
     end
     local pageCount = #pages
-    if pageCount > maxPages then
-        pageCount = maxPages
-    end
 
-    -- Shell: strip embedded bodies; keep ids / metadata.
+    -- Shell: strip embedded bodies. Page rows carry authoritative {id,body};
+    -- keep only compact metadata so identifier lists cannot blow the shell budget.
     local shellOp = {}
     for k, v in pairs(op) do
         shellOp[k] = v
     end
     if op.kind == GS.KIND.CONFIRM_CANDIDATE and type(op.candidateRef) == "table" then
         local ref = op.candidateRef
-        local shellRef = {
+        shellOp.candidateRef = {
             recordId = ref.recordId,
             originalIds = ref.originalIds,
             campaignId = ref.campaignId,
+            -- Membership is declared via recordCount + page row ids.
         }
-        if type(ref.records) == "table" then
-            local idRows = {}
-            for i = 1, #ref.records do
-                local row = ref.records[i]
-                if type(row) == "table" and type(row.id) == "string" then
-                    idRows[#idRows + 1] = { id = row.id }
-                end
-            end
-            shellRef.records = idRows
-        end
-        shellOp.candidateRef = shellRef
     elseif op.kind == GS.KIND.RESOLVE_CONFLICT and type(op.value) == "table" then
         shellOp.value = {
             chosenOpId = op.value.chosenOpId,
@@ -388,30 +422,42 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
     shellOp.pageCount = pageCount
     shellOp.recordCount = #rows
 
+    local shellBody = {
+        kind = "gs-op",
+        op = shellOp,
+        pageCount = pageCount,
+        recordCount = #rows,
+        evidenceOnly = evidenceOnly and true or nil,
+        boundary = boundary,
+    }
+    if EstimateWireRecordBytes(exportId, shellBody) > budget then
+        -- Shell metadata alone still oversized (e.g. huge competingOpIds): omit.
+        DebugWarn("omitting op export %s: shell exceeds wire budget", tostring(op.id))
+        return {}
+    end
+
     local out = {
         {
             id = exportId,
-            body = {
-                kind = "gs-op",
-                op = shellOp,
-                pageCount = pageCount,
-                recordCount = #rows,
-                evidenceOnly = evidenceOnly and true or nil,
-                boundary = boundary,
-            },
+            body = shellBody,
         },
     }
     for p = 1, pageCount do
+        local pageBody = {
+            kind = "gs-op-page",
+            opId = op.id,
+            datasetId = op.datasetId,
+            page = p,
+            pageCount = pageCount,
+            records = pages[p].records,
+        }
+        local pageId = exportId .. ":p" .. tostring(p)
+        if EstimateWireRecordBytes(pageId, pageBody) > budget then
+            return {}
+        end
         out[#out + 1] = {
-            id = exportId .. ":p" .. tostring(p),
-            body = {
-                kind = "gs-op-page",
-                opId = op.id,
-                datasetId = op.datasetId,
-                page = p,
-                pageCount = pageCount,
-                records = pages[p].records,
-            },
+            id = pageId,
+            body = pageBody,
         }
     end
     return out
@@ -422,18 +468,102 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
         return nil, "invalid_operation"
     end
     local pageCount = tonumber(shellBody.pageCount) or tonumber(shellBody.op.pageCount)
-    if not pageCount or pageCount < 1 then
+    if not pageCount then
         -- Inline (non-paged) body.
         return shellBody, nil
     end
+    local maxPages = GS.MAX_MANIFEST_PAGES or 64
+    if pageCount ~= math.floor(pageCount) or pageCount < 1 or pageCount > maxPages then
+        return nil, "invalid_operation"
+    end
+    local declaredCount = tonumber(shellBody.recordCount) or tonumber(shellBody.op.recordCount)
+    if declaredCount ~= nil then
+        if declaredCount ~= math.floor(declaredCount) or declaredCount < 1 then
+            return nil, "invalid_operation"
+        end
+    end
     local rows = {}
+    local seenIds = {}
+    local totalBytes = 0
+    local maxBytes = GS.MAX_FRAGMENT_ASSEMBLY_BYTES or 49152
     for page = 1, pageCount do
         local p = pagesByIndex and pagesByIndex[page]
         if type(p) ~= "table" or type(p.records) ~= "table" then
             return nil, "incomplete_manifest_pages"
         end
+        local declaredPageCount = tonumber(p.pageCount)
+        if declaredPageCount and declaredPageCount ~= pageCount then
+            return nil, "invalid_operation"
+        end
+        if type(p.opId) == "string" and type(shellBody.op.id) == "string"
+            and p.opId ~= shellBody.op.id then
+            return nil, "invalid_operation"
+        end
+        if type(p.datasetId) == "string" and type(shellBody.op.datasetId) == "string"
+            and p.datasetId ~= shellBody.op.datasetId then
+            return nil, "dataset_mismatch"
+        end
         for i = 1, #p.records do
-            rows[#rows + 1] = p.records[i]
+            local row = p.records[i]
+            if type(row) ~= "table" or type(row.id) ~= "string" or row.id == ""
+                or type(row.body) ~= "table" then
+                return nil, "invalid_operation"
+            end
+            if seenIds[row.id] then
+                return nil, "invalid_operation"
+            end
+            seenIds[row.id] = true
+            rows[#rows + 1] = row
+            -- Bound assembled payload size (IDs + approximate body walk).
+            totalBytes = totalBytes + #row.id + 64
+            if totalBytes > maxBytes then
+                return nil, "invalid_operation"
+            end
+        end
+    end
+    if declaredCount ~= nil and #rows ~= declaredCount then
+        return nil, "incomplete_manifest_pages"
+    end
+    if #rows < 1 then
+        return nil, "incomplete_manifest_pages"
+    end
+    -- When the shell still lists expected ids, require exact membership.
+    local expectedIds = nil
+    if shellBody.op.kind == GS.KIND.CONFIRM_CANDIDATE
+        and type(shellBody.op.candidateRef) == "table"
+        and type(shellBody.op.candidateRef.records) == "table"
+        and #shellBody.op.candidateRef.records > 0 then
+        expectedIds = {}
+        for i = 1, #shellBody.op.candidateRef.records do
+            local row = shellBody.op.candidateRef.records[i]
+            if type(row) == "table" and type(row.id) == "string" then
+                expectedIds[#expectedIds + 1] = row.id
+            end
+        end
+    elseif shellBody.op.kind == GS.KIND.RESOLVE_CONFLICT
+        and type(shellBody.op.value) == "table"
+        and type(shellBody.op.value.competingOpIds) == "table"
+        and #shellBody.op.value.competingOpIds > 0 then
+        expectedIds = {}
+        for i = 1, #shellBody.op.value.competingOpIds do
+            local id = shellBody.op.value.competingOpIds[i]
+            if type(id) == "string" then
+                expectedIds[#expectedIds + 1] = id
+            end
+        end
+    end
+    if expectedIds and #expectedIds > 0 then
+        if #expectedIds ~= #rows then
+            return nil, "incomplete_manifest_pages"
+        end
+        local want = {}
+        for i = 1, #expectedIds do
+            want[expectedIds[i]] = true
+        end
+        for i = 1, #rows do
+            if not want[rows[i].id] then
+                return nil, "invalid_operation"
+            end
         end
     end
     local op = {}
@@ -498,6 +628,9 @@ local function CurrentGuildRecord()
     end
     return raw, ctx.guildKey
 end
+
+-- Forward-declared: cold registration and Notify both schedule archive drain.
+local ScheduleExportMaintContinuation
 
 local function RebuildExportIndex()
     exportState.order = {}
@@ -734,6 +867,11 @@ local function RebuildExportIndex()
     exportState.pendingCursor = nil
     exportState.conflictCursor = nil
     exportState.maintScheduled = false
+    -- Cold registration /reload must drain deferred archives without requiring
+    -- an unrelated durable write (NotifyLocalDurableChange also schedules).
+    if exportState.archiveBuildNeeded and ScheduleExportMaintContinuation then
+        ScheduleExportMaintContinuation()
+    end
 end
 
 local function EnsureExportFresh()
@@ -1255,11 +1393,14 @@ local function ValidateAndApply(record, ctx)
             opManifestBuffer[opId] = buf
             opManifestBufferCount = (opManifestBufferCount or 0) + 1
         elseif buf.datasetId and buf.datasetId ~= body.datasetId then
-            ClearOpManifestBuffer(opId)
+            -- Foreign/mismatched fragment: reject without clearing a legitimate assembly.
             return "rejected", "dataset_mismatch"
         elseif buf.sourcePeer and buf.sourcePeer ~= sender then
-            ClearOpManifestBuffer(opId)
+            -- Foreign fragment: reject without clearing the original sender's buffer.
             return "rejected", "id_conflict"
+        end
+        if buf.pageCount and buf.pageCount ~= pageCount then
+            return "rejected", "invalid_operation"
         end
         if buf.pages[page] then
             if GS._DeepEqualOps and not GS._DeepEqualOps(buf.pages[page], body) then
@@ -1310,6 +1451,13 @@ local function ValidateAndApply(record, ctx)
             if not localRecord then
                 return "pending", "awaiting_dataset"
             end
+            local maxPages = GS.MAX_MANIFEST_PAGES or 64
+            if pageCount ~= math.floor(pageCount) or pageCount < 1 or pageCount > maxPages then
+                return "rejected", "invalid_operation"
+            end
+            if op.datasetId ~= localRecord.datasetId then
+                return "rejected", "dataset_mismatch"
+            end
             ReclaimExpiredFragmentBuffers({
                 datasetId = op.datasetId or body.datasetId,
                 guildKey = localRecord._guildKey,
@@ -1330,6 +1478,15 @@ local function ValidateAndApply(record, ctx)
                 }
                 opManifestBuffer[op.id] = buf
                 opManifestBufferCount = (opManifestBufferCount or 0) + 1
+            elseif buf.datasetId and buf.datasetId ~= op.datasetId then
+                -- Reject foreign/mismatched shell without clearing another peer's pages.
+                return "rejected", "dataset_mismatch"
+            elseif buf.sourcePeer and buf.sourcePeer ~= sender then
+                -- Pages-first from peer A must not combine with peer B's shell.
+                return "rejected", "id_conflict"
+            end
+            if buf.pageCount and buf.pageCount ~= pageCount then
+                return "rejected", "invalid_operation"
             end
             if buf.shell and GS._DeepEqualOps and not GS._DeepEqualOps(buf.shell, body) then
                 ClearOpManifestBuffer(op.id)
@@ -1338,9 +1495,16 @@ local function ValidateAndApply(record, ctx)
             buf.shell = body
             buf.pageCount = pageCount
             buf.at = now
+            if not buf.sourcePeer then
+                buf.sourcePeer = sender
+            end
             local assembled, aerr = AssembleOpFromPages(buf.shell, buf.pages)
             if not assembled then
-                return "pending", "missing_predecessor"
+                if aerr == "incomplete_manifest_pages" then
+                    return "pending", "missing_predecessor"
+                end
+                ClearOpManifestBuffer(op.id)
+                return "rejected", aerr or "invalid_operation"
             end
             ClearOpManifestBuffer(op.id)
             body = assembled
@@ -1476,7 +1640,7 @@ function GS:DisableGossipProvider()
     ResetArchivePageBuffers()
 end
 
-local function ScheduleExportMaintContinuation()
+ScheduleExportMaintContinuation = function()
     if exportState.maintScheduled or exportState.maintIdle then
         return
     end

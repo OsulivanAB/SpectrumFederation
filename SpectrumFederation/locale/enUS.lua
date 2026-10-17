@@ -98,6 +98,8 @@ L["GUILD_SUPPLIES_LOGS_DESC"] = "Inspect current and archived campaign goals, pr
 L["GUILD_SUPPLIES_STATUS_ACCEPTED"] = "Staged change admitted. Live bank accounting still uses Raid Consumables until activation."
 L["GUILD_SUPPLIES_STATUS_DUPLICATE"] = "No new effect — that change was already admitted."
 L["GUILD_SUPPLIES_STATUS_PENDING"] = "Change is pending and was not applied yet (%s)."
+L["GUILD_SUPPLIES_STATUS_ADOPTION_REPLAY"] = "Adopting the selected dataset — this page will update when the transfer finishes."
+L["GUILD_SUPPLIES_STATUS_ADOPTION_CANCELLED"] = "Dataset adoption cancelled. Local staged configuration was left unchanged."
 L["GUILD_SUPPLIES_STATUS_REJECTED"] = "Change was not applied (%s)."
 L["GUILD_SUPPLIES_STATUS_NOT_CONFIGURED"] = "No staged Guild Supplies dataset for this guild yet. Use Initialize Guild Supplies."
 L["GUILD_SUPPLIES_STATUS_UNAVAILABLE"] = "Guild Supplies data is unavailable (%s)."
@@ -207,6 +209,9 @@ L["GUILD_SUPPLIES_HISTORY_ADJUST_UNATTRIBUTED"] = "%s adjusted %s by %+d (unattr
 
 -- Staged configuration gossip / adoption / conflicts (#387)
 L["GUILD_SUPPLIES_REASON_INCOMPLETE_TRANSFER"] = "the selected dataset transfer is incomplete — local state was left unchanged"
+L["GUILD_SUPPLIES_REASON_REPLAY_IN_PROGRESS"] = "dataset adoption is still applying — wait for it to finish"
+L["GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN_HEADER"] = "a required campaign header is missing from the transfer"
+L["GUILD_SUPPLIES_REASON_INVALID_CAMPAIGN_ARCHIVE"] = "a required campaign archive is missing or malformed"
 L["GUILD_SUPPLIES_REASON_NO_ADOPTION"] = "no dataset adoption is in progress"
 L["GUILD_SUPPLIES_REASON_SAME_DATASET"] = "that peer already shares this client's staged dataset"
 L["GUILD_SUPPLIES_REASON_DIVERGENT_EDIT"] = "conflicting edits need an explicit choice in Configuration"
