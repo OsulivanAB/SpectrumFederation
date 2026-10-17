@@ -1,4 +1,4 @@
-"""Run production Lua Guild Supplies Part 2A/2B tests (#385 / #386)."""
+"""Run production Lua Guild Supplies Part 2A/2B/3A tests (#385 / #386 / #387)."""
 
 from __future__ import annotations
 
@@ -49,9 +49,11 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     authority = toc.find("modules/GuildSupplies/Authority.lua")
     operations = toc.find("modules/GuildSupplies/Operations.lua")
     campaigns = toc.find("modules/GuildSupplies/Campaigns.lua")
+    admission = toc.find("modules/GuildSupplies/Admission.lua")
+    gs_gossip = toc.find("modules/GuildSupplies/Gossip.lua")
     config_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     logs_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
-    assert 0 <= gossip < state < authority < operations < campaigns
+    assert 0 <= gossip < state < authority < operations < campaigns < admission < gs_gossip
     assert 0 <= config_page < logs_page
 
 
@@ -63,9 +65,14 @@ def test_demand_driven_guild_apis_exist():
     assert "demand-driven" in text.lower() or "Demand-driven" in text
 
 
-def test_no_provider_registration_in_guild_supplies():
+def test_provider_registration_only_in_gossip_module():
+    """#387: staged config provider lives in Gossip.lua; other GS modules stay transport-free."""
     for path in GS_DIR.glob("*.lua"):
         text = path.read_text(encoding="utf-8")
-        assert "RegisterProvider" not in text
         assert "EnableSynthetic" not in text
         assert "SendAddonMessage" not in text
+        if path.name == "Gossip.lua":
+            assert "RegisterProvider" in text or "GG.RegisterProvider" in text or ":Register(" in text
+            assert "sf.guildsupplies.config" in text
+        else:
+            assert "RegisterProvider" not in text
