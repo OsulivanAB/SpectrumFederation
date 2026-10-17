@@ -256,10 +256,17 @@ end
 
 local pendingAdoptionPeer = nil
 local pendingAdoptionDataset = nil
+local pendingConflictTarget = nil
+local pendingConflictChosen = nil
 
 local function ClearPendingAdoptionChoice()
 	pendingAdoptionPeer = nil
 	pendingAdoptionDataset = nil
+end
+
+local function ClearPendingConflictChoice()
+	pendingConflictTarget = nil
+	pendingConflictChosen = nil
 end
 
 local function StagedStatusText()
@@ -344,6 +351,63 @@ local function ConflictHelpText()
 		"Both candidates are preserved. Choosing one creates a new authenticated resolution without rewriting the original operations.")
 end
 
+local function ConflictTargetOptions()
+	local opts = {}
+	local g = GS()
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	for i = 1, #conflicts do
+		local entry = conflicts[i]
+		if entry and type(entry.targetKey) == "string" then
+			opts[#opts + 1] = {
+				value = entry.targetKey,
+				label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_FMT", "Conflict: %s (%d candidates)")
+					:format(entry.targetKey, entry.candidates and #entry.candidates or 0),
+			}
+		end
+	end
+	return opts
+end
+
+local function ConflictCandidateOptions()
+	local opts = {}
+	local g = GS()
+	if not pendingConflictTarget then
+		return opts
+	end
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	local entry = nil
+	for i = 1, #conflicts do
+		if conflicts[i].targetKey == pendingConflictTarget then
+			entry = conflicts[i]
+			break
+		end
+	end
+	if not entry or type(entry.candidates) ~= "table" then
+		return opts
+	end
+	for i = 1, #entry.candidates do
+		local c = entry.candidates[i]
+		if c and type(c.id) == "string" then
+			local body = c.body
+			local summary = tostring(c.id)
+			if type(body) == "table" then
+				local author = body.actorName or "?"
+				local value = body.value
+				if type(value) == "table" then
+					value = value.goal or value.itemId or "?"
+				end
+				summary = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_FMT", "%s — %s (by %s)")
+					:format(tostring(c.id), tostring(value), tostring(author))
+			end
+			opts[#opts + 1] = {
+				value = c.id,
+				label = summary,
+			}
+		end
+	end
+	return opts
+end
+
 local function CommitConflictChoice(ctx, targetKey, chosenOpId, competingOpIds)
 	local g = GS()
 	if not g or not g.NewConflictResolutionOperation then
@@ -351,16 +415,52 @@ local function CommitConflictChoice(ctx, targetKey, chosenOpId, competingOpIds)
 		return
 	end
 	ctx.section:ClearMessage()
-	local op, prepStatus, prepReason = g:NewConflictResolutionOperation(targetKey, chosenOpId, competingOpIds)
+	-- Revalidate the open conflict and chosen id before preparing resolution.
+	local conflicts = g:ListOpenConflicts() or {}
+	local entry = nil
+	for i = 1, #conflicts do
+		if conflicts[i].targetKey == targetKey then
+			entry = conflicts[i]
+			break
+		end
+	end
+	if not entry or type(entry.candidates) ~= "table" then
+		ReportStatus(ctx, "rejected", "no_open_conflict")
+		ClearPendingConflictChoice()
+		return
+	end
+	local ids = competingOpIds
+	if type(ids) ~= "table" then
+		ids = {}
+		for i = 1, #entry.candidates do
+			ids[#ids + 1] = entry.candidates[i].id
+		end
+	end
+	local found = false
+	for i = 1, #ids do
+		if ids[i] == chosenOpId then
+			found = true
+			break
+		end
+	end
+	if not found then
+		ReportStatus(ctx, "rejected", "invalid_resolution")
+		return
+	end
+	local op, prepStatus, prepReason = g:NewConflictResolutionOperation(targetKey, chosenOpId, ids)
 	if not op then
 		ReportStatus(ctx, prepStatus or "rejected", prepReason)
 		return
 	end
 	local status, reason = g:ApplyStagedConflictResolution(op)
+	if status == "accepted" then
+		ClearPendingConflictChoice()
+	end
 	ReportStatus(ctx, status, reason)
 end
 
-local function CommitAdoption(ctx)
+--- Begin adoption transfer (does not commit). Commit is a separate control once ready.
+local function BeginAdoptionTransfer(ctx)
 	local g = GS()
 	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 	if not g or not pendingAdoptionPeer or not pendingAdoptionDataset then
@@ -376,20 +476,8 @@ local function CommitAdoption(ctx)
 			ReportStatus(ctx, status or "rejected", reason)
 			return
 		end
-		-- Buffer locally available export from the selected peer when tests/providers
-		-- already delivered bodies; otherwise wait for gossip ValidateAndApply.
-		-- Commit only when a complete transfer is buffered.
-		local commitStatus, commitReason = g:CommitDatasetAdoption()
-		if commitStatus == "accepted" then
-			ClearPendingAdoptionChoice()
-		elseif commitStatus == "rejected" and commitReason == "incomplete_transfer" then
-			-- Leave the adoption session open for continued gossip buffering.
-			ReportStatus(ctx, "pending", commitReason)
-			return
-		else
-			g:CancelDatasetAdoption()
-		end
-		ReportStatus(ctx, commitStatus or "rejected", commitReason)
+		ReportStatus(ctx, "pending", "incomplete_transfer")
+		RefreshPageControls()
 	end
 	if dialogs and dialogs.Confirm then
 		dialogs:Confirm(
@@ -404,6 +492,26 @@ local function CommitAdoption(ctx)
 				"Confirmation is required and is unavailable right now."),
 			"error")
 	end
+end
+
+local function CommitAdoptionTransfer(ctx)
+	local g = GS()
+	if not g or not g.CommitDatasetAdoption then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local adop = g:GetPendingAdoption()
+	if type(adop) ~= "table" or not adop.ready then
+		ReportStatus(ctx, "pending", "incomplete_transfer")
+		return
+	end
+	local commitStatus, commitReason = g:CommitDatasetAdoption()
+	if commitStatus == "accepted" then
+		ClearPendingAdoptionChoice()
+	end
+	ReportStatus(ctx, commitStatus or "rejected", commitReason)
+	RefreshPageControls()
 end
 
 local function ItemsHelpText()
@@ -765,16 +873,37 @@ local function Definition()
 						type = "button",
 						label = Loc("GUILD_SUPPLIES_ADOPTION_TITLE", "Staged dataset adoption"),
 						adminOnly = true,
-						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_BUTTON", "Adopt selected dataset"),
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_BEGIN", "Start adoption transfer"),
 						width = 220,
 						enabled = function()
 							local c = Caps()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
 							return (c.canEdit or c.canRecoverPolicy)
 								and pendingAdoptionPeer ~= nil
 								and pendingAdoptionDataset ~= nil
+								and type(adop) ~= "table"
 						end,
 						onClick = function(ctx)
-							CommitAdoption(ctx)
+							BeginAdoptionTransfer(ctx)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
+						width = 180,
+						enabled = function()
+							local c = Caps()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+							return (c.canEdit or c.canRecoverPolicy)
+								and type(adop) == "table"
+								and adop.ready == true
+						end,
+						onClick = function(ctx)
+							CommitAdoptionTransfer(ctx)
 						end,
 					},
 					{
@@ -812,35 +941,66 @@ local function Definition()
 						getText = ConflictHelpText,
 					},
 					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET", "Open conflict"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_NONE", "Select a conflict"),
+						options = ConflictTargetOptions,
+						get = function()
+							return pendingConflictTarget
+						end,
+						set = function() end,
+						enabled = function()
+							return Caps().canEdit and #ConflictTargetOptions() > 0
+						end,
+						onValueChanged = function(ctx, value)
+							if type(value) == "string" and value ~= "" then
+								pendingConflictTarget = value
+								pendingConflictChosen = nil
+							else
+								ClearPendingConflictChoice()
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE", "Candidate"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_NONE", "Select a candidate"),
+						options = ConflictCandidateOptions,
+						get = function()
+							return pendingConflictChosen
+						end,
+						set = function() end,
+						enabled = function()
+							return Caps().canEdit
+								and pendingConflictTarget ~= nil
+								and #ConflictCandidateOptions() >= 2
+						end,
+						onValueChanged = function(ctx, value)
+							if type(value) == "string" and value ~= "" then
+								pendingConflictChosen = value
+							else
+								pendingConflictChosen = nil
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
 						type = "button",
 						label = Loc("GUILD_SUPPLIES_CONFLICT_TITLE", "Configuration conflicts"),
 						adminOnly = true,
 						buttonText = Loc("GUILD_SUPPLIES_CONFLICT_CHOOSE", "Use this value"),
 						width = 160,
-						-- First open conflict's first candidate — full multi-candidate UI
-						-- uses the help text + repeated refreshes; editors resolve via this
-						-- when a single clear candidate pair exists.
 						enabled = function()
-							local g = GS()
-							local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
-							return Caps().canEdit and #conflicts > 0
-								and conflicts[1].candidates and #conflicts[1].candidates >= 2
+							return Caps().canEdit
+								and pendingConflictTarget ~= nil
+								and pendingConflictChosen ~= nil
+								and #ConflictCandidateOptions() >= 2
 						end,
 						onClick = function(ctx)
-							local g = GS()
-							local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
-							local entry = conflicts[1]
-							if not entry or not entry.candidates or not entry.candidates[1] then
-								ReportStatus(ctx, "rejected", "no_open_conflict")
-								return
-							end
-							local ids = {}
-							for i = 1, #entry.candidates do
-								ids[#ids + 1] = entry.candidates[i].id
-							end
-							-- Prefer the first candidate (head lineage) as the default choice
-							-- control; a second click path can be added per-candidate later.
-							CommitConflictChoice(ctx, entry.targetKey, entry.candidates[1].id, ids)
+							CommitConflictChoice(ctx, pendingConflictTarget, pendingConflictChosen, nil)
 						end,
 					},
 				},

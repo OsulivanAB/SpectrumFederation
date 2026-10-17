@@ -1529,6 +1529,20 @@ function GS:ApplyStagedConfirmationOperation(op, context)
     if not already then
         refs[#refs + 1] = stored.id
     end
+    -- Exact-content confirmation itself applies eligible retained candidates
+    -- without restamping attribution (Admission.ApplyExactContentConfirmation).
+    if GS.ApplyExactContentConfirmation then
+        GS.ApplyExactContentConfirmation(record, stored, {
+            sender = context and context.actorName,
+            member = context and {
+                name = context.actorName,
+                guid = context.actorGuid,
+                rankOrder = context.rankOrder,
+                guildKey = context.guildKey,
+            } or nil,
+            localWrite = true,
+        })
+    end
     GS._NotifyLocalDurableChange("confirm")
     return "accepted", nil
 end

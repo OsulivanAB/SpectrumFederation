@@ -84,6 +84,23 @@ local function RebuildExportIndex()
     end
 
     -- Compact dataset descriptor (also used for adoption assembly).
+    local acceptedOpCount = 0
+    local opsCountSource = record.operations
+    if type(opsCountSource) == "table" and type(opsCountSource.order) == "table" then
+        acceptedOpCount = #opsCountSource.order
+    end
+    local campaignCount = 0
+    if type(record.campaigns) == "table" then
+        for _ in pairs(record.campaigns) do
+            campaignCount = campaignCount + 1
+        end
+    end
+    local archiveCount = 0
+    if type(record.campaignArchives) == "table" then
+        for _ in pairs(record.campaignArchives) do
+            archiveCount = archiveCount + 1
+        end
+    end
     local desc = {
         kind = "dataset-desc",
         schemaVersion = GS.PROVIDER_SCHEMA,
@@ -91,8 +108,13 @@ local function RebuildExportIndex()
         datasetId = record.datasetId,
         editorRankPosition = record.permission and record.permission.editorRankPosition or nil,
         permissionRevisionId = record.permission and record.permission.revisionId or nil,
+        bootstrapEditorRankPosition = record.permission
+            and record.permission.editorRankPosition or nil,
         currentCampaignId = record.currentCampaignId,
         activation = record.activation,
+        acceptedOpCount = acceptedOpCount,
+        campaignCount = campaignCount,
+        archiveCount = archiveCount,
     }
     add("gs:desc:" .. record.datasetId, FingerprintBody(desc), desc)
 
@@ -156,9 +178,33 @@ local function EnsureExportFresh()
     if exportState.guildKey ~= guildKey
         or exportState.datasetId ~= datasetId
         or exportState.epoch ~= epoch
-        or #exportState.order == 0 and record ~= nil then
+        or (#exportState.order == 0 and record ~= nil) then
         RebuildExportIndex()
+        return true -- callers may bump gossip index epoch after dataset swap
     end
+    return false
+end
+
+--- Upsert one export body without rescanning the whole accepted history.
+local function UpsertExportBody(id, body)
+    if type(id) ~= "string" or id == "" or type(body) ~= "table" then
+        return
+    end
+    local fp = FingerprintBody(body)
+    local existing = exportState.byId[id]
+    if existing and existing.versionFp == fp then
+        existing.body = body
+        return
+    end
+    if not existing then
+        exportState.order[#exportState.order + 1] = id
+    end
+    exportState.byId[id] = {
+        id = id,
+        versionFp = fp,
+        body = body,
+    }
+    exportState.enumPos = 1
 end
 
 ---------------------------------------------------------------------------
@@ -364,19 +410,43 @@ local function ValidateAndApply(record, ctx)
         if type(body.campaignId) ~= "string" then
             return "rejected", "invalid_campaign"
         end
-        if localRecord.campaignArchives[body.campaignId] then
-            return "duplicate", "duplicate"
+        -- Membership alone is not archive authority; require a verified editor.
+        local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {
+            allowBootstrapInstall = false,
+        })
+        if not editorOk then
+            return "rejected", editorReason or "unauthorized"
         end
-        -- Archives apply only after the campaign exists locally.
+        -- Never archive the still-current campaign via gossip.
+        if localRecord.currentCampaignId == body.campaignId then
+            return "rejected", "current_campaign"
+        end
         if not localRecord.campaigns[body.campaignId] then
             return "pending", "missing_predecessor"
         end
-        localRecord.campaignArchives[body.campaignId] = {
+        local archive = {
+            schemaVersion = body.schemaVersion or GS.SCHEMA_VERSION,
+            campaignId = body.campaignId,
             datasetId = body.datasetId,
             requestedItems = body.requestedItems or {},
             generation = body.generation,
             archivedAt = body.archivedAt,
         }
+        if not GS.ValidateCampaignArchive
+            or not GS.ValidateCampaignArchive(archive, body.campaignId, localRecord) then
+            return "rejected", "invalid_campaign_archive"
+        end
+        local existing = localRecord.campaignArchives[body.campaignId]
+        if existing then
+            if GS._DeepEqualOps and GS._DeepEqualOps(existing, archive) then
+                return "duplicate", "duplicate"
+            end
+            return "rejected", "id_conflict"
+        end
+        localRecord.campaignArchives[body.campaignId] = archive
+        if GS.NotifyLocalDurableChange then
+            GS.NotifyLocalDurableChange("remote-archive")
+        end
         return "accepted", nil
     end
 
@@ -386,14 +456,26 @@ local function ValidateAndApply(record, ctx)
             return "rejected", "invalid_operation"
         end
         -- Ordinary members may carry historical candidates; only authenticated
-        -- editors authorize application. Relayed author fields are not proof.
+        -- editors authorize application. Relayed author fields are not proof —
+        -- even when the claimed original author currently has editor rank.
+        local requireRecover = false
+        if op.kind == GS.KIND.SET_EDITOR_RANK and localRecord then
+            local perm = localRecord.permission
+            local policyPos = type(perm) == "table" and tonumber(perm.editorRankPosition) or nil
+            local ranks = GG and GG.GetGuildRanks and GG.GetGuildRanks()
+            local rankCount = type(ranks) == "table" and tonumber(ranks.count) or nil
+            local policyOk = policyPos and policyPos >= 1
+                and (not rankCount or policyPos <= rankCount)
+                and type(perm) == "table"
+                and type(perm.revisionId) == "string" and perm.revisionId ~= ""
+            requireRecover = not policyOk
+        end
         local relay = false
         local editorOk = select(1, GS.SenderHasEditorAuthority(member, {
-            requireRecoverPolicy = (op.kind == GS.KIND.SET_EDITOR_RANK) or false,
+            requireRecoverPolicy = requireRecover,
             allowBootstrapInstall = false,
         }))
         if not editorOk then
-            -- Non-editor sender: treat as untrusted relay of historical candidates.
             relay = true
         end
         return GS:AdmitRemoteOperation(op, {
@@ -472,12 +554,134 @@ function GS:DisableGossipProvider()
 end
 
 --- Required after provider-owned durable storage changes outside engine append.
+-- Adoption / dataset replacement rebuilds the full export index and drops stale
+-- IDs. Ordinary accepted ops upsert incrementally so catch-up stays bounded.
 function GS.NotifyLocalDurableChange(reason)
-    RebuildExportIndex()
+    reason = tostring(reason or "local")
+    local record, guildKey = CurrentGuildRecord()
+    local fullRebuild = reason == "adoption"
+        or reason == "install"
+        or reason == "dataset"
+        or not record
+        or exportState.guildKey ~= guildKey
+        or exportState.datasetId ~= (record and record.datasetId)
+        or exportState.epoch ~= (tonumber(GS._adoptionEpoch) or 0)
+
+    if fullRebuild then
+        local prevOrder = exportState.order
+        RebuildExportIndex()
+        -- After dataset replacement, bump the gossip index epoch so peers drop
+        -- stale record IDs that no longer exist in the rebuilt export.
+        if GG and GG.GetProvider and providerRegistered then
+            local prov = GG.GetProvider(GS.PROVIDER_ID)
+            local index = prov and prov.index
+            if index and GG.BumpIndexEpoch then
+                local stale = false
+                for i = 1, #prevOrder do
+                    local id = prevOrder[i]
+                    if not exportState.byId[id] then
+                        stale = true
+                        break
+                    end
+                end
+                if stale or reason == "adoption" or reason == "install" then
+                    GG.BumpIndexEpoch(index)
+                    index.buildComplete = false
+                    index.dirty = true
+                end
+            end
+        end
+    elseif record then
+        -- Incremental: fingerprint only missing export ids (immutable accepted
+        -- bodies keep their cached versionFp). Always refresh the descriptor.
+        local ops = record.operations
+        if type(ops) == "table" and type(ops.order) == "table" then
+            for i = 1, #ops.order do
+                local oid = ops.order[i]
+                local exportId = "gs:op:" .. oid
+                if not exportState.byId[exportId] then
+                    local op = ops.records and ops.records[oid]
+                    if type(op) == "table" then
+                        local body = { kind = "gs-op", op = op }
+                        if op.kind == GS.KIND.START_CAMPAIGN then
+                            local header = record.campaigns and record.campaigns[op.id]
+                            if type(header) == "table" then
+                                body.boundary = header
+                            end
+                        end
+                        UpsertExportBody(exportId, body)
+                    end
+                end
+            end
+        end
+        if type(record.campaigns) == "table" then
+            for campaignId, header in pairs(record.campaigns) do
+                if type(campaignId) == "string" and type(header) == "table" then
+                    local exportId = "gs:ch:" .. campaignId
+                    if not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "campaign-header",
+                            header = header,
+                        })
+                    end
+                end
+            end
+        end
+        if type(record.campaignArchives) == "table" then
+            for campaignId, archive in pairs(record.campaignArchives) do
+                if type(campaignId) == "string" and type(archive) == "table" then
+                    local exportId = "gs:ca:" .. campaignId
+                    if not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "campaign-archive",
+                            campaignId = campaignId,
+                            datasetId = archive.datasetId or record.datasetId,
+                            requestedItems = archive.requestedItems,
+                            generation = archive.generation,
+                            archivedAt = archive.archivedAt,
+                            schemaVersion = archive.schemaVersion,
+                        })
+                    end
+                end
+            end
+        end
+        local acceptedOpCount = 0
+        if type(ops) == "table" and type(ops.order) == "table" then
+            acceptedOpCount = #ops.order
+        end
+        local campaignCount, archiveCount = 0, 0
+        if type(record.campaigns) == "table" then
+            for _ in pairs(record.campaigns) do
+                campaignCount = campaignCount + 1
+            end
+        end
+        if type(record.campaignArchives) == "table" then
+            for _ in pairs(record.campaignArchives) do
+                archiveCount = archiveCount + 1
+            end
+        end
+        local desc = {
+            kind = "dataset-desc",
+            schemaVersion = GS.PROVIDER_SCHEMA,
+            guildKey = guildKey,
+            datasetId = record.datasetId,
+            editorRankPosition = record.permission and record.permission.editorRankPosition or nil,
+            permissionRevisionId = record.permission and record.permission.revisionId or nil,
+            bootstrapEditorRankPosition = record.permission
+                and record.permission.editorRankPosition or nil,
+            currentCampaignId = record.currentCampaignId,
+            activation = record.activation,
+            acceptedOpCount = acceptedOpCount,
+            campaignCount = campaignCount,
+            archiveCount = archiveCount,
+        }
+        UpsertExportBody("gs:desc:" .. record.datasetId, desc)
+    end
+
     if GG and GG.NotifyProviderChanged and providerRegistered then
         GG.NotifyProviderChanged(GS.PROVIDER_ID)
     end
-    DebugInfo("provider changed reason=%s", tostring(reason or "local"))
+    DebugInfo("provider changed reason=%s", reason)
 end
 
 -- Hook Initialize to register the provider after the durable root is ready.

@@ -6125,7 +6125,8 @@ do
     assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["55"], nil,
         "3A4: not applied from relay")
 
-    -- Alice confirms exact candidate.
+    -- Alice confirms exact candidate — confirmation itself applies the body
+    -- with original attribution (no manual resend / restamp).
     local fp = GS.ContentFingerprint(itemOp)
     local confOp = select(1, GS:NewConfirmationOperation({
         recordId = itemOp.id,
@@ -6135,13 +6136,42 @@ do
     }))
     assertTrue(confOp ~= nil, "3A4: confirmation prepared")
     assertEq(GS:ApplyStagedConfirmationOperation(confOp), "accepted", "3A4: confirmation accepted")
+    local applied = GS:GetCurrentRecord().accounting._consumables.requestedItems["55"]
+    assertTrue(type(applied) == "table", "3A4: confirmation applied retained candidate")
+    assertEq(applied.goal, 3, "3A4: confirmed goal applied")
+    local acceptedHist = GS:GetCurrentRecord().operations.records[itemOp.id]
+    assertTrue(type(acceptedHist) == "table", "3A4: historical op accepted under original id")
+    assertEq(acceptedHist.actorGuid, "Player-1-Alice", "3A4: original attribution preserved")
+    assertEq(acceptedHist.actorName, "Alice-Garona", "3A4: original actor name preserved")
+    assertEq(acceptedHist.timestamp, originalTs, "3A4: original timestamp preserved")
+    local eligAfterConfirm = GS:GetCurrentRecord().accounting._consumables.eligibility
+    assertEq(eligAfterConfirm.items["55"], originalTs, "3A4: eligibility uses original timestamp")
+    assertEq(GS._pendingRelay[itemOp.id], nil, "3A4: applied candidate cleared from pending relay")
 
-    -- Authenticated Alice admission of the historical op with original timestamp.
-    itemOp.baseTargetRevision = GS:GetCurrentRecord().operations.heads["item:55"] or datasetId
-    -- After confirmation, Alice can still admit the op if bases allow; set bases fresh.
-    itemOp.baseTargetRevision = datasetId
-    itemOp.basePolicyRevision = GS:GetCurrentRecord().permission.revisionId
-    -- Rank revocation: demote Alice below threshold then reject remote from her.
+    -- Claimed-author current editor rank must NOT auto-authorize a forged relay.
+    local forged = {
+        schemaVersion = 1,
+        id = "forged-by-alice-claim",
+        guildKey = "club:42",
+        datasetId = datasetId,
+        campaignId = campId,
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = 4,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 8888,
+        baseTargetRevision = datasetId,
+        basePolicyRevision = datasetId,
+        baseCampaignId = campId,
+    }
+    local stForge, reasonForge = providerApply({ kind = "gs-op", op = forged }, "Dave-Garona")
+    assertEq(stForge, "pending", "3A4: forged author claim stays pending")
+    assertEq(reasonForge, "untrusted_relay", "3A4: untrusted despite claimed editor author")
+    assertTrue(GS:GetCurrentRecord().accounting._consumables.bankTab ~= 4,
+        "3A4: forged claim did not mutate bank tab")
+
+    -- Rank revocation: demote below threshold then reject remote from Bob.
     local rankOp = select(1, GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 1))
     assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted", "3A4: tighten rank to GM only")
     switchPlayer("Bob", "Player-1-Bob", 2)
@@ -6162,26 +6192,34 @@ do
         baseCampaignId = campId,
     }
     local stRev, reasonRev = GS:AdmitRemoteOperation(bobOp, { sender = "Bob-Garona" })
-    -- Rank-revoked senders cannot mutate accepted state; their bodies stay
-    -- untrusted historical pending (not applied).
     assertEq(stRev, "pending", "3A4: revoked editor not applied")
     assertEq(reasonRev, "untrusted_relay", "3A4: untrusted after revoke")
     assertTrue(GS:GetCurrentRecord().accounting._consumables.bankTab ~= 8,
         "3A4: revoked sender did not mutate bank tab")
 
-    -- Eligibility: admit item from Alice (GM) with original timestamp preserved.
+    -- Eligibility: GM admits a second item with original timestamp preserved.
     switchPlayer("Alice", "Player-1-Alice", 1)
     settleRoster()
-    itemOp.id = "hist-item-2"
-    itemOp.timestamp = originalTs
-    itemOp.basePolicyRevision = rankOp.id
-    itemOp.baseTargetRevision = datasetId
-    itemOp.actorGuid = "Player-1-Alice"
-    itemOp.actorName = "Alice-Garona"
-    local stItem, reasonItem = GS:AdmitRemoteOperation(itemOp, { sender = "Alice-Garona" })
+    local itemOp2 = {
+        schemaVersion = 1,
+        id = "hist-item-2",
+        guildKey = "club:42",
+        datasetId = datasetId,
+        campaignId = campId,
+        kind = "set-requested-item",
+        target = { itemId = 66 },
+        value = { itemId = 66, goal = 2, removed = false },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = originalTs,
+        baseTargetRevision = datasetId,
+        basePolicyRevision = rankOp.id,
+        baseCampaignId = campId,
+    }
+    local stItem, reasonItem = GS:AdmitRemoteOperation(itemOp2, { sender = "Alice-Garona" })
     assertEq(stItem, "accepted", "3A4: GM admits item: " .. tostring(reasonItem))
     local elig = GS:GetCurrentRecord().accounting._consumables.eligibility
-    assertEq(elig.items["55"], originalTs, "3A4: original eligibility timestamp preserved")
+    assertEq(elig.items["66"], originalTs, "3A4: original eligibility timestamp preserved")
 end
 
 -- 3A5) Missing predecessor pending; duplicates; bounded idle; concurrent campaigns
@@ -6278,6 +6316,233 @@ do
     assertTrue(#page >= 2, "3A6: export has desc + ops")
     assertEq(#world.debugLogs, 0, "3A6: debug-off silent")
     assertEq(#world.chat, 0, "3A6: no chat")
+end
+
+-- 3A7) Valid-policy editor rank replicates without GM recovery; opposite-order
+-- conflicts converge; late peer reconstructs; unauthorized archive rejected;
+-- pending-relay / conflict capacity bounds; adoption expiry; export prune.
+do
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local datasetId = GS:GetCurrentRecord().datasetId
+    local campId = GS:GetCurrentRecord().currentCampaignId
+    local policy = GS:GetCurrentRecord().permission.revisionId
+
+    -- Valid policy: Bob (rank 2, threshold 3) admits a set-editor-rank change.
+    local rankOp = {
+        schemaVersion = 1,
+        id = "rank-from-bob",
+        guildKey = "club:42",
+        datasetId = datasetId,
+        campaignId = campId,
+        kind = "set-editor-rank",
+        target = "editorRankPosition",
+        value = 2,
+        actorGuid = "Player-1-Bob",
+        actorName = "Bob-Garona",
+        timestamp = 12000,
+        baseTargetRevision = policy,
+        basePolicyRevision = policy,
+        baseCampaignId = campId,
+    }
+    local stRank, reasonRank = GS:AdmitRemoteOperation(rankOp, { sender = "Bob-Garona" })
+    assertEq(stRank, "accepted", "3A7: valid-policy rank from editor: " .. tostring(reasonRank))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2, "3A7: rank applied")
+    assertEq(GS:GetCurrentRecord().permission.revisionId, "rank-from-bob", "3A7: policy revision advanced")
+
+    -- Unauthorized archive (non-editor) rejected; forged current-campaign archive rejected.
+    local stArch, reasonArch = providerApply({
+        kind = "campaign-archive",
+        schemaVersion = GS.SCHEMA_VERSION,
+        campaignId = campId,
+        datasetId = datasetId,
+        requestedItems = {},
+        generation = 1,
+        archivedAt = 1,
+    }, "Dave-Garona")
+    assertEq(stArch, "rejected", "3A7: non-editor archive rejected")
+    assertTrue(reasonArch == "unauthorized" or reasonArch == "current_campaign",
+        "3A7: archive auth/current reason: " .. tostring(reasonArch))
+
+    -- Opposite-order same-field conflict then resolve to Bob's value.
+    local aliceTab = {
+        schemaVersion = 1,
+        id = "alice-tab-a",
+        guildKey = "club:42",
+        datasetId = datasetId,
+        campaignId = campId,
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = 1,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 13000,
+        baseTargetRevision = datasetId,
+        basePolicyRevision = "rank-from-bob",
+        baseCampaignId = campId,
+    }
+    local bobTab = {
+        schemaVersion = 1,
+        id = "bob-tab-b",
+        guildKey = "club:42",
+        datasetId = datasetId,
+        campaignId = campId,
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = 5,
+        actorGuid = "Player-1-Bob",
+        actorName = "Bob-Garona",
+        timestamp = 13001,
+        baseTargetRevision = datasetId,
+        basePolicyRevision = "rank-from-bob",
+        baseCampaignId = campId,
+    }
+    assertEq(GS:AdmitRemoteOperation(aliceTab, { sender = "Alice-Garona" }), "accepted", "3A7: alice tab")
+    local stB, reasonB = GS:AdmitRemoteOperation(bobTab, { sender = "Bob-Garona" })
+    assertTrue(stB == "pending" or stB == "rejected", "3A7: bob divergent retained")
+    local conflicts = GS:ListOpenConflicts()
+    assertTrue(#conflicts >= 1, "3A7: open conflict")
+    local entry = conflicts[1]
+    local ids = {}
+    for i = 1, #entry.candidates do
+        ids[#ids + 1] = entry.candidates[i].id
+    end
+    -- Choose non-first candidate (Bob) explicitly.
+    local chosen = "bob-tab-b"
+    local resOp = select(1, GS:NewConflictResolutionOperation(entry.targetKey, chosen, ids))
+    assertTrue(resOp ~= nil, "3A7: resolution prepared")
+    assertEq(GS:ApplyStagedConflictResolution(resOp), "accepted", "3A7: resolve to Bob")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 5, "3A7: Bob value wins")
+    assertEq(#GS:ListOpenConflicts(), 0, "3A7: conflicts cleared")
+
+    -- Pending relay capacity bound does not corrupt accepted state.
+    local tabBefore = GS:GetCurrentRecord().accounting._consumables.bankTab
+    GS._pendingRelay = {}
+    local full = 0
+    for i = 1, (GS.MAX_PENDING_RELAY or 64) + 4 do
+        local junk = {
+            schemaVersion = 1,
+            id = "relay-cap-" .. i,
+            guildKey = "club:42",
+            datasetId = GS:GetCurrentRecord().datasetId,
+            campaignId = GS:GetCurrentRecord().currentCampaignId,
+            kind = "set-bank-tab",
+            target = "bankTab",
+            value = 9,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            timestamp = 14000 + i,
+            baseTargetRevision = datasetId,
+            basePolicyRevision = GS:GetCurrentRecord().permission.revisionId,
+            baseCampaignId = GS:GetCurrentRecord().currentCampaignId,
+        }
+        local st = select(1, providerApply({ kind = "gs-op", op = junk }, "Dave-Garona"))
+        if st == "rejected" then
+            full = full + 1
+        end
+    end
+    assertTrue(full >= 1, "3A7: pending relay capacity rejects overflow")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, tabBefore,
+        "3A7: capacity reject left accepted state intact")
+    GS._pendingRelay = {}
+
+    -- Adoption expiry clears abandoned session.
+    GS.NotePeerDataset("Bob-Garona", "foreign-ds-expiry", { editorRankPosition = 2 })
+    GS:BeginDatasetAdoption("Bob-Garona", "foreign-ds-expiry")
+    assertTrue(GS:GetPendingAdoption() ~= nil, "3A7: adoption pending")
+    GS._adoption.startedAt = (GetServerTime() or 0) - ((GS.MAX_ADOPTION_SECONDS or 600) + 5)
+    assertEq(GS:GetPendingAdoption(), nil, "3A7: expired adoption cleared")
+
+    -- Snapshot export for late-peer adoption BEFORE prune replaces the dataset.
+    GS.NotifyLocalDurableChange("dataset")
+    local exportBodies = {}
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local page = prov.api.ListRecordIds(1, 128)
+    for i = 1, #page do
+        local rec = prov.api.GetRecordBody(page[i])
+        if rec and rec.body then
+            exportBodies[#exportBodies + 1] = {
+                id = page[i],
+                body = rec.body,
+            }
+        end
+    end
+    assertTrue(#exportBodies >= 2, "3A7: export snapshot non-empty")
+    local sourceDataset = GS:GetCurrentRecord().datasetId
+    local aliceRoot = SpectrumFederationDB.guildSupplies
+
+    -- Late third client reconstructs via out-of-order adoption replay.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 2 })
+    local _, stBeginLate = GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)
+    assertEq(stBeginLate, "accepted", "3A7: late begin adoption")
+    for i = #exportBodies, 1, -1 do
+        local row = exportBodies[i]
+        GS:BufferAdoptionRecord(row.id, row.body)
+    end
+    local adopLate = GS:GetPendingAdoption()
+    assertTrue(adopLate and adopLate.ready, "3A7: late adoption transfer ready")
+    local stLate, reasonLate = GS:CommitDatasetAdoption()
+    assertEq(stLate, "accepted", "3A7: late adoption commit: " .. tostring(reasonLate))
+    assertEq(GS:GetCurrentRecord().datasetId, sourceDataset, "3A7: late peer on source dataset")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 5,
+        "3A7: late peer converges to resolved tab")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2,
+        "3A7: late peer has rank policy")
+
+    -- Export index prune after adoption on Alice's root.
+    SpectrumFederationDB.guildSupplies = aliceRoot
+    GS._db = SpectrumFederationDB
+    GS._root = aliceRoot
+    GS._rootValid = true
+    GS._rootReason = nil
+    GS._adoption = nil
+    GS._pendingRelay = {}
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    settleRoster()
+    GS:EnsureGossipProvider()
+    local oldDataset = GS:GetCurrentRecord().datasetId
+    GS.NotePeerDataset("Bob-Garona", "adopt-prune-ds", { editorRankPosition = 2 })
+    GS:BeginDatasetAdoption("Bob-Garona", "adopt-prune-ds")
+    GS:BufferAdoptionRecord("gs:desc:adopt-prune-ds", {
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = "adopt-prune-ds",
+        editorRankPosition = 2,
+        permissionRevisionId = "adopt-prune-ds",
+        bootstrapEditorRankPosition = 2,
+        activation = "staged",
+        acceptedOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
+    })
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "3A7: adoption for prune: " .. tostring(reasonAdopt))
+    assertEq(GS:GetCurrentRecord().datasetId, "adopt-prune-ds", "3A7: adopted new dataset")
+    local page3 = GG.GetProvider(GS.PROVIDER_ID).api.ListRecordIds(1, 128)
+    local stillOld = false
+    for i = 1, #page3 do
+        if tostring(page3[i]):find(oldDataset, 1, true) then
+            stillOld = true
+        end
+    end
+    assertEq(stillOld, false, "3A7: stale export ids pruned after adoption")
+    assertEq(#world.chat, 0, "3A7: no chat")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
