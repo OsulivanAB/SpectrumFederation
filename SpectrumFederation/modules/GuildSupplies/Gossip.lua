@@ -30,6 +30,8 @@ local exportState = {
     guildKey = nil,
     datasetId = nil,
     epoch = 0,
+    appendPos = 0,
+    dirtyRebuild = false,
 }
 
 local function FingerprintBody(body)
@@ -66,6 +68,15 @@ local function RebuildExportIndex()
         exportState.guildKey = nil
         exportState.datasetId = nil
         return
+    end
+    -- Never index/export raw invalid SavedVariables guild records.
+    if GS._ValidateGuildRecordStructure then
+        local ok = GS._ValidateGuildRecordStructure(guildKey, record)
+        if not ok then
+            exportState.guildKey = nil
+            exportState.datasetId = nil
+            return
+        end
     end
     exportState.guildKey = guildKey
     exportState.datasetId = record.datasetId
@@ -108,8 +119,10 @@ local function RebuildExportIndex()
         datasetId = record.datasetId,
         editorRankPosition = record.permission and record.permission.editorRankPosition or nil,
         permissionRevisionId = record.permission and record.permission.revisionId or nil,
-        bootstrapEditorRankPosition = record.permission
-            and record.permission.editorRankPosition or nil,
+        bootstrapEditorRankPosition = (record.permission
+            and record.permission.bootstrapEditorRankPosition)
+            or (record.permission and record.permission.editorRankPosition)
+            or nil,
         currentCampaignId = record.currentCampaignId,
         activation = record.activation,
         acceptedOpCount = acceptedOpCount,
@@ -136,6 +149,76 @@ local function RebuildExportIndex()
                     end
                 end
                 add("gs:op:" .. op.id, FingerprintBody(body), body)
+            end
+        end
+    end
+
+    -- Conflict / resolution dependency bodies so late peers can reconstruct
+    -- resolutions that reference non-head or losing candidates.
+    do
+        local exported = 0
+        local maxExport = (GS.MAX_OPEN_CONFLICTS or 32) * (GS.MAX_CONFLICT_CANDIDATES or 16)
+        local function exportCandidate(cid, boundaryHint)
+            if exported >= maxExport then
+                return
+            end
+            if type(cid) ~= "string" or exportState.byId["gs:op:" .. cid] then
+                return
+            end
+            local cand = ops.records and ops.records[cid]
+                or (ops.pending and ops.pending[cid] and ops.pending[cid].body)
+                or (ops.conflicts and ops.conflicts[cid] and ops.conflicts[cid].body)
+            if type(cand) ~= "table" then
+                return
+            end
+            local body = { kind = "gs-op", op = cand, evidenceOnly = true }
+            if cand.kind == GS.KIND.START_CAMPAIGN then
+                local header = boundaryHint
+                    or (record.campaigns and record.campaigns[cid])
+                    or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
+                if type(header) == "table" then
+                    body.boundary = header
+                end
+            end
+            add("gs:op:" .. cid, FingerprintBody(body), body)
+            exported = exported + 1
+        end
+        if type(ops) == "table" and type(ops.openConflicts) == "table" then
+            for _, entry in pairs(ops.openConflicts) do
+                if type(entry) == "table" and type(entry.candidateIds) == "table" then
+                    for i = 1, #entry.candidateIds do
+                        local cid = entry.candidateIds[i]
+                        local hint = entry.boundaries and entry.boundaries[cid]
+                        exportCandidate(cid, hint)
+                    end
+                end
+            end
+        end
+        -- Losing evidence retained under conflicts (post-resolution).
+        if type(ops) == "table" and type(ops.conflicts) == "table" then
+            for cid, entry in pairs(ops.conflicts) do
+                if type(entry) == "table" then
+                    exportCandidate(cid, nil)
+                end
+            end
+        end
+        -- Accepted resolutions: export every competing id referenced by value.
+        if type(ops) == "table" and type(ops.order) == "table" then
+            for i = 1, #ops.order do
+                local op = ops.records and ops.records[ops.order[i]]
+                if type(op) == "table" and op.kind == GS.KIND.RESOLVE_CONFLICT then
+                    local value = op.value
+                    if type(value) == "table" then
+                        if type(value.chosenOpId) == "string" then
+                            exportCandidate(value.chosenOpId, nil)
+                        end
+                        if type(value.competingOpIds) == "table" then
+                            for j = 1, #value.competingOpIds do
+                                exportCandidate(value.competingOpIds[j], nil)
+                            end
+                        end
+                    end
+                end
             end
         end
     end
@@ -169,6 +252,28 @@ local function RebuildExportIndex()
             end
         end
     end
+
+    -- Descriptor counts must match exported bodies exactly (including conflict deps).
+    local opExportCount, headerExportCount, archiveExportCount = 0, 0, 0
+    for id, entry in pairs(exportState.byId) do
+        if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
+            if entry.body.kind == "gs-op" then
+                opExportCount = opExportCount + 1
+            elseif entry.body.kind == "campaign-header" then
+                headerExportCount = headerExportCount + 1
+            elseif entry.body.kind == "campaign-archive" then
+                archiveExportCount = archiveExportCount + 1
+            end
+        end
+    end
+    local descId = "gs:desc:" .. record.datasetId
+    local descEntry = exportState.byId[descId]
+    if type(descEntry) == "table" and type(descEntry.body) == "table" then
+        descEntry.body.acceptedOpCount = opExportCount
+        descEntry.body.campaignCount = headerExportCount
+        descEntry.body.archiveCount = archiveExportCount
+        descEntry.versionFp = FingerprintBody(descEntry.body)
+    end
 end
 
 local function EnsureExportFresh()
@@ -178,9 +283,15 @@ local function EnsureExportFresh()
     if exportState.guildKey ~= guildKey
         or exportState.datasetId ~= datasetId
         or exportState.epoch ~= epoch
-        or (#exportState.order == 0 and record ~= nil) then
+        or (#exportState.order == 0 and record ~= nil)
+        or exportState.dirtyRebuild then
+        -- Full rebuild remains required on dataset/epoch change; mark dirty so
+        -- EnsureIndex can budget enumeration after an immediate structural rebuild.
         RebuildExportIndex()
-        return true -- callers may bump gossip index epoch after dataset swap
+        exportState.dirtyRebuild = false
+        exportState.appendPos = (record and record.operations and record.operations.order
+            and #record.operations.order) or 0
+        return true
     end
     return false
 end
@@ -333,6 +444,10 @@ local function ValidateAndApply(record, ctx)
     end
 
     -- Pending adoption buffers all bodies for the selected source dataset.
+    -- Expire abandoned sessions on the gossip path so they cannot suppress forever.
+    if GS.GetPendingAdoption then
+        GS:GetPendingAdoption()
+    end
     local adop = GS._adoption
     if type(adop) == "table" and not adop.committed then
         local member = GS.AuthenticateTransportSender(sender)
@@ -476,7 +591,21 @@ local function ValidateAndApply(record, ctx)
             allowBootstrapInstall = false,
         }))
         if not editorOk then
+            -- Non-editor carrier: untrusted historical relay.
             relay = true
+        else
+            -- Editor carrier with mismatched claimed author is still a relay.
+            -- Do not apply or hard-reject; retain for exact-content confirmation.
+            if type(op.actorGuid) == "string" and op.actorGuid ~= ""
+                and op.actorGuid ~= member.guid then
+                relay = true
+            elseif type(op.actorName) == "string" and op.actorName ~= "" then
+                local want = GG.NormalizePlayer and GG.NormalizePlayer(op.actorName)
+                local have = GG.NormalizePlayer and GG.NormalizePlayer(member.name)
+                if want and have and want ~= have then
+                    relay = true
+                end
+            end
         end
         return GS:AdmitRemoteOperation(op, {
             sender = sender,
@@ -592,11 +721,12 @@ function GS.NotifyLocalDurableChange(reason)
             end
         end
     elseif record then
-        -- Incremental: fingerprint only missing export ids (immutable accepted
-        -- bodies keep their cached versionFp). Always refresh the descriptor.
+        -- Incremental: fingerprint only new/missing export ids from appendPos.
+        -- Immutable accepted bodies keep their cached versionFp.
         local ops = record.operations
+        local start = math.max(1, (tonumber(exportState.appendPos) or 0) + 1)
         if type(ops) == "table" and type(ops.order) == "table" then
-            for i = 1, #ops.order do
+            for i = start, #ops.order do
                 local oid = ops.order[i]
                 local exportId = "gs:op:" .. oid
                 if not exportState.byId[exportId] then
@@ -610,6 +740,28 @@ function GS.NotifyLocalDurableChange(reason)
                             end
                         end
                         UpsertExportBody(exportId, body)
+                    end
+                end
+            end
+            exportState.appendPos = #ops.order
+            -- Bounded export of conflict evidence referenced by resolutions.
+            if type(ops.conflicts) == "table" then
+                local n = 0
+                for cid, entry in pairs(ops.conflicts) do
+                    if n >= 64 then
+                        break
+                    end
+                    if type(cid) == "string" and type(entry) == "table"
+                        and not exportState.byId["gs:op:" .. cid] then
+                        local cand = entry.body or entry
+                        if type(cand) == "table" and cand.id then
+                            UpsertExportBody("gs:op:" .. cid, {
+                                kind = "gs-op",
+                                op = cand,
+                                evidenceOnly = true,
+                            })
+                            n = n + 1
+                        end
                     end
                 end
             end
@@ -645,19 +797,16 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
         end
-        local acceptedOpCount = 0
-        if type(ops) == "table" and type(ops.order) == "table" then
-            acceptedOpCount = #ops.order
-        end
-        local campaignCount, archiveCount = 0, 0
-        if type(record.campaigns) == "table" then
-            for _ in pairs(record.campaigns) do
-                campaignCount = campaignCount + 1
-            end
-        end
-        if type(record.campaignArchives) == "table" then
-            for _ in pairs(record.campaignArchives) do
-                archiveCount = archiveCount + 1
+        local acceptedOpCount, campaignCount, archiveCount = 0, 0, 0
+        for id, entry in pairs(exportState.byId) do
+            if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
+                if entry.body.kind == "gs-op" then
+                    acceptedOpCount = acceptedOpCount + 1
+                elseif entry.body.kind == "campaign-header" then
+                    campaignCount = campaignCount + 1
+                elseif entry.body.kind == "campaign-archive" then
+                    archiveCount = archiveCount + 1
+                end
             end
         end
         local desc = {
@@ -667,8 +816,10 @@ function GS.NotifyLocalDurableChange(reason)
             datasetId = record.datasetId,
             editorRankPosition = record.permission and record.permission.editorRankPosition or nil,
             permissionRevisionId = record.permission and record.permission.revisionId or nil,
-            bootstrapEditorRankPosition = record.permission
-                and record.permission.editorRankPosition or nil,
+            bootstrapEditorRankPosition = (record.permission
+                and record.permission.bootstrapEditorRankPosition)
+                or (record.permission and record.permission.editorRankPosition)
+                or nil,
             currentCampaignId = record.currentCampaignId,
             activation = record.activation,
             acceptedOpCount = acceptedOpCount,

@@ -1176,12 +1176,33 @@ local function EnsureRosterListener()
 	end)
 end
 
+--- Coalesced refresh when adoption ready/expiry flips asynchronously (Settings open).
+local adoptionHooked = false
+local function EnsureAdoptionListener()
+	if adoptionHooked then
+		return
+	end
+	local g = GS()
+	if not g then
+		return
+	end
+	adoptionHooked = true
+	local previous = g.OnAdoptionStateChanged
+	g.OnAdoptionStateChanged = function(reason)
+		if previous then
+			pcall(previous, reason)
+		end
+		QueueRefresh()
+	end
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
 		return
 	end
 	EnsureRosterListener()
+	EnsureAdoptionListener()
 	BeginRenderPass()
 	renderer:Build(panel, Definition())
 	EndRenderPass()
@@ -1213,5 +1234,6 @@ function Page:OnHide()
 end
 
 EnsureRosterListener()
+EnsureAdoptionListener()
 
 SF.SettingsUI:RegisterPage(Page)

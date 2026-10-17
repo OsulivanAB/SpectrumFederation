@@ -885,6 +885,11 @@ local function ApplyMutations(record, op)
         if type(record.permission) ~= "table" then
             record.permission = {}
         end
+        -- Preserve original bootstrap threshold; never overwrite with later policy.
+        if record.permission.bootstrapEditorRankPosition == nil then
+            record.permission.bootstrapEditorRankPosition =
+                tonumber(record.permission.editorRankPosition) or tonumber(op.value)
+        end
         record.permission.editorRankPosition = tonumber(op.value)
         record.permission.revisionId = op.id
         return true

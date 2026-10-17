@@ -413,7 +413,8 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
                 return false, "invalid_operations"
             end
             local n = #entry.candidateIds
-            if n < 2 or n > 16 then
+            local maxCand = GS.MAX_CONFLICT_CANDIDATES or 16
+            if n < 2 or n > maxCand then
                 return false, "invalid_operations"
             end
             for i = 1, n do
@@ -900,6 +901,8 @@ function GS:CreateStagedRecord(editorRankPosition)
         datasetId = datasetId,
         permission = {
             editorRankPosition = initialPosition,
+            -- Immutable bootstrap threshold (small-guild / history reconstruction).
+            bootstrapEditorRankPosition = initialPosition,
             revisionId = datasetId,
         },
         currentCampaignId = nil,
