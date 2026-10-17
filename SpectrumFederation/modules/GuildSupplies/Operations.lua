@@ -6,10 +6,16 @@ local GS = SF.GuildSupplies
 
 GS.OP_SCHEMA_VERSION = 1
 GS.MAX_BANK_TAB = 8
--- Node/string budgets sized for MAX_CONFIRMATION_BATCH (64) records + originalIds
--- plus the confirmation envelope. Do not raise the 2 KiB transport export cap.
+-- Node/string budgets sized for MAX_CONFIRMATION_BATCH (64) authoritative
+-- candidate bodies + originalIds + the confirmation envelope. Exact-content
+-- binding embeds full public ops (not fingerprints). Do not raise the 2 KiB
+-- transport export cap — large envelopes use FragmentBuffer paging on the wire.
 GS.MAX_SNAPSHOT_DEPTH = 6
-GS.MAX_SNAPSHOT_NODES = 1024
+-- Equality depth for composed confirm/resolve envelopes: candidateRef.records[i].body.value
+-- nests past snapshot construction depth. Derived from supported composed shapes + margin.
+GS.MAX_EQUALITY_DEPTH = (GS.MAX_SNAPSHOT_DEPTH or 6) + 6
+-- ~40 nodes per candidate body * 64 + envelope/refs headroom.
+GS.MAX_SNAPSHOT_NODES = 4096
 GS.MAX_SNAPSHOT_STRING_BYTES = 49152
 
 local KIND = {
@@ -18,6 +24,7 @@ local KIND = {
     SET_REQUESTED_ITEM = "set-requested-item",
     CONFIRM_CANDIDATE = "confirm-candidate",
     START_CAMPAIGN = "start-campaign",
+    RESOLVE_CONFLICT = "resolve-conflict",
 }
 
 GS.KIND = KIND
@@ -28,16 +35,19 @@ local CONFIG_SNAPSHOT_FIELDS = {
     "target", "value", "actorGuid", "actorName", "timestamp",
     "baseTargetRevision", "basePolicyRevision", "baseCampaignId",
 }
+-- resolve-conflict reuses CONFIG_SNAPSHOT_FIELDS; value carries competing IDs,
+-- choice, and authoritative contentBodies (exact-content binding; no Hash32).
 local CONFIRM_SNAPSHOT_FIELDS = {
     "schemaVersion", "id", "guildKey", "datasetId", "kind", "candidateRef",
-    "contentFingerprint", "campaignId", "basePolicyRevision",
+    "campaignId", "basePolicyRevision",
     "actorGuid", "actorName", "timestamp",
 }
 local CANDIDATE_REF_FIELDS = {
-    "recordId", "records", "contentFingerprint", "originalIds", "campaignId",
+    "recordId", "records", "body", "originalIds", "campaignId",
 }
--- Documented confirmation manifest row fields only (no nested extras).
-local MANIFEST_ROW_FIELDS = { "id", "contentFingerprint" }
+-- Authoritative confirmation manifest row: id + complete candidate body.
+-- contentFingerprint is non-authoritative transport metadata and is excluded.
+local MANIFEST_ROW_FIELDS = { "id", "body" }
 
 local function ServerTime()
     if GetServerTime then
@@ -50,10 +60,7 @@ local function ServerTime()
 end
 
 local function DeepEqual(a, b, depth)
-    depth = (depth or 0) + 1
-    if depth > GS.MAX_SNAPSHOT_DEPTH then
-        return false
-    end
+    -- Identity / scalar checks before depth so equal leaves never fail closed early.
     if a == b then
         return true
     end
@@ -61,6 +68,11 @@ local function DeepEqual(a, b, depth)
         return false
     end
     if type(a) ~= "table" then
+        return false
+    end
+    depth = (depth or 0) + 1
+    local maxDepth = GS.MAX_EQUALITY_DEPTH or ((GS.MAX_SNAPSHOT_DEPTH or 6) + 6)
+    if depth > maxDepth then
         return false
     end
     for k, v in pairs(a) do
@@ -174,7 +186,7 @@ local function DeepSnapshot(value, depth, seen, budget)
     return copy
 end
 
---- Canonical confirmation manifest row: only id + contentFingerprint.
+--- Canonical confirmation manifest row: id + authoritative body.
 local function SnapshotCanonicalRecords(records, budget)
     if type(records) ~= "table" then
         return nil, "invalid_candidate_batch"
@@ -333,6 +345,14 @@ local function TargetKey(kind, target)
         return GS.CAMPAIGN_TARGET_KEY or "campaign:lifecycle"
     elseif kind == KIND.CONFIRM_CANDIDATE then
         return "confirm"
+    elseif kind == KIND.RESOLVE_CONFLICT then
+        if type(target) == "string" and target ~= "" then
+            return target
+        end
+        if type(target) == "table" and type(target.targetKey) == "string" then
+            return target.targetKey
+        end
+        return nil
     end
     return nil
 end
@@ -792,8 +812,10 @@ end
 
 --- Retain the first conflict body for an ID as immutable evidence.
 -- An existing slot is never replaced by a later divergent body and does not
--- consume another retention slot. Returns false only when capacity is exhausted
--- for a new ID.
+-- consume another retention slot. Relocating the *same* pending body into
+-- conflicts is atomic and does not charge a second slot. Retaining a different
+-- body while pending still holds another body still requires a free slot.
+-- Returns false only when capacity is exhausted for a new ID.
 local function RetainConflict(ops, op)
     if type(ops) ~= "table" or type(op) ~= "table" or type(op.id) ~= "string" then
         return false
@@ -801,6 +823,23 @@ local function RetainConflict(ops, op)
     local existing = ops.conflicts and ops.conflicts[op.id]
     if type(existing) == "table" then
         return true
+    end
+    local pendingEntry = ops.pending and ops.pending[op.id]
+    if type(pendingEntry) == "table" and type(pendingEntry.body) == "table" then
+        -- Atomic relocate only when preserving the pending body itself (resolution
+        -- loser move). A divergent same-ID body still needs its own conflict slot.
+        if pendingEntry.body == op or DeepEqual(pendingEntry.body, op) then
+            ops.conflicts = ops.conflicts or {}
+            ops.conflicts[op.id] = {
+                id = op.id,
+                kind = op.kind,
+                targetKey = TargetKey(op.kind, op.target),
+                body = pendingEntry.body,
+                at = pendingEntry.at or ServerTime() or op.timestamp,
+            }
+            ops.pending[op.id] = nil
+            return true
+        end
     end
     if RetentionBodyCount(ops) >= GS.MAX_PENDING_OPERATIONS then
         return false
@@ -874,6 +913,11 @@ local function ApplyMutations(record, op)
         -- Create permission table only on explicit GM-authorized recovery apply.
         if type(record.permission) ~= "table" then
             record.permission = {}
+        end
+        -- Preserve original bootstrap threshold; never overwrite with later policy.
+        if record.permission.bootstrapEditorRankPosition == nil then
+            record.permission.bootstrapEditorRankPosition =
+                tonumber(record.permission.editorRankPosition) or tonumber(op.value)
         end
         record.permission.editorRankPosition = tonumber(op.value)
         record.permission.revisionId = op.id
@@ -1111,6 +1155,7 @@ function GS:ApplyStagedConfigOperation(op, context)
         return "rejected", applyErr or "apply_failed"
     end
     StoreAccepted(ops, stored, tKey)
+    GS._NotifyLocalDurableChange("config")
     return "accepted", nil
 end
 
@@ -1118,13 +1163,15 @@ end
 -- Confirmation operations (local validation / staged storage only)
 ---------------------------------------------------------------------------
 
+--- True when `body` is a table carrying a complete authoritative candidate.
+local function HasAuthoritativeBody(body)
+    return type(body) == "table" and type(body.id) == "string" and body.id ~= ""
+        and type(body.kind) == "string" and body.kind ~= ""
+end
+
 local function ValidateCandidateRef(ref)
     if type(ref) ~= "table" then
         return false, "invalid_candidate_ref"
-    end
-    if type(ref.contentFingerprint) ~= "string" or ref.contentFingerprint == ""
-        or #ref.contentFingerprint > GS.MAX_OPERATION_ID then
-        return false, "invalid_fingerprint"
     end
     -- Exactly one reference form: single recordId XOR bounded records manifest.
     local hasRecordId = ref.recordId ~= nil
@@ -1140,6 +1187,12 @@ local function ValidateCandidateRef(ref)
     if hasRecordId then
         if type(ref.recordId) ~= "string" or ref.recordId == ""
             or #ref.recordId > GS.MAX_OPERATION_ID then
+            return false, "invalid_candidate_ref"
+        end
+        if not HasAuthoritativeBody(ref.body) then
+            return false, "missing_authoritative_body"
+        end
+        if ref.body.id ~= ref.recordId then
             return false, "invalid_candidate_ref"
         end
         local idsOk, idsErr = ValidateOriginalIds(ref.originalIds)
@@ -1163,8 +1216,8 @@ local function ValidateCandidateRef(ref)
         end
         if type(row) ~= "table" or type(row.id) ~= "string" or row.id == ""
             or #row.id > GS.MAX_OPERATION_ID
-            or type(row.contentFingerprint) ~= "string" or row.contentFingerprint == ""
-            or #row.contentFingerprint > GS.MAX_OPERATION_ID then
+            or not HasAuthoritativeBody(row.body)
+            or row.body.id ~= row.id then
             return false, "invalid_candidate_batch"
         end
     end
@@ -1212,22 +1265,41 @@ local function ValidateConfirmationShape(op)
     if op.campaignId ~= nil and type(op.campaignId) ~= "string" then
         return false, "invalid_campaign"
     end
-    if type(op.contentFingerprint) ~= "string" or op.contentFingerprint == ""
-        or #op.contentFingerprint > GS.MAX_OPERATION_ID then
-        return false, "invalid_fingerprint"
-    end
+    -- contentFingerprint is non-authoritative; ignore if present.
     local ok, err = ValidateCandidateRef(op.candidateRef)
     if not ok then
         return false, err
-    end
-    if op.candidateRef.contentFingerprint ~= op.contentFingerprint then
-        return false, "fingerprint_mismatch"
     end
     -- Nested candidate campaign ID, when present, must match the envelope.
     if op.candidateRef.campaignId ~= nil and op.candidateRef.campaignId ~= op.campaignId then
         return false, "invalid_campaign"
     end
     return true
+end
+
+--- Resolve a local retained/accepted body for confirmation embedding.
+local function LookupLocalCandidateBody(record, rid)
+    if type(record) ~= "table" or type(rid) ~= "string" then
+        return nil
+    end
+    local ops = record.operations
+    if type(ops) == "table" then
+        if ops.records and type(ops.records[rid]) == "table" then
+            return ops.records[rid]
+        end
+        if ops.pending and ops.pending[rid] and type(ops.pending[rid].body) == "table" then
+            return ops.pending[rid].body
+        end
+        if ops.conflicts and ops.conflicts[rid] and type(ops.conflicts[rid].body) == "table" then
+            return ops.conflicts[rid].body
+        end
+    end
+    -- Runtime untrusted-relay retention (Admission) also holds confirmable bodies.
+    local relay = GS._pendingRelay and GS._pendingRelay[rid]
+    if type(relay) == "table" and type(relay.body) == "table" then
+        return relay.body
+    end
+    return nil
 end
 
 function GS:NewConfirmationOperation(candidateRef)
@@ -1239,15 +1311,99 @@ function GS:NewConfirmationOperation(candidateRef)
     if not caps.canEdit then
         return nil, "rejected", caps.reason or "unauthorized"
     end
-    local ok, err = ValidateCandidateRef(candidateRef)
-    if not ok then
-        return nil, "rejected", err
-    end
 
     local record, recordReason = GS:GetCurrentRecord()
     if not record then
         return nil, "rejected", recordReason or "not_configured"
     end
+
+    -- Embed complete authoritative candidate content. Fingerprints are never authority.
+    -- When a local retained/accepted body exists for recordId, it is the source of
+    -- truth: caller-supplied bodies must match exactly or preparation fails closed.
+    candidateRef = type(candidateRef) == "table" and candidateRef or {}
+    -- Shape XOR (recordId vs records) before enrichment so malformed forms fail closed
+    -- with invalid_candidate_ref rather than missing_authoritative_body.
+    local hasRecordId = candidateRef.recordId ~= nil
+    local hasRecords = candidateRef.records ~= nil
+    if hasRecordId == hasRecords then
+        return nil, "rejected", "invalid_candidate_ref"
+    end
+    local enriched = {
+        recordId = candidateRef.recordId,
+        records = candidateRef.records,
+        body = candidateRef.body,
+        originalIds = candidateRef.originalIds,
+        campaignId = candidateRef.campaignId,
+    }
+    if enriched.recordId ~= nil then
+        local localBody = LookupLocalCandidateBody(record, enriched.recordId)
+        if type(localBody) == "table" then
+            local snapBody, snapBodyErr = SnapshotPublicOp(localBody)
+            if not snapBody then
+                return nil, "rejected", snapBodyErr or "missing_authoritative_body"
+            end
+            if type(enriched.body) == "table" then
+                local callerSnap = select(1, SnapshotPublicOp(enriched.body))
+                if type(callerSnap) ~= "table" or not DeepEqual(snapBody, callerSnap) then
+                    return nil, "rejected", "content_mismatch"
+                end
+            end
+            enriched.body = snapBody
+        else
+            if type(enriched.body) ~= "table" then
+                return nil, "rejected", "missing_authoritative_body"
+            end
+            local snapBody, snapBodyErr = SnapshotPublicOp(enriched.body)
+            if not snapBody then
+                return nil, "rejected", snapBodyErr or "missing_authoritative_body"
+            end
+            enriched.body = snapBody
+        end
+    end
+    if type(enriched.records) == "table" then
+        local rows = {}
+        for i = 1, #enriched.records do
+            local row = enriched.records[i]
+            if type(row) ~= "table" then
+                return nil, "rejected", "invalid_candidate_batch"
+            end
+            local body = row.body
+            local localBody = nil
+            if type(row.id) == "string" then
+                localBody = LookupLocalCandidateBody(record, row.id)
+            end
+            if type(localBody) == "table" then
+                local snapLocal, snapLocalErr = SnapshotPublicOp(localBody)
+                if not snapLocal then
+                    return nil, "rejected", snapLocalErr or "missing_authoritative_body"
+                end
+                if type(body) == "table" then
+                    local callerSnap = select(1, SnapshotPublicOp(body))
+                    if type(callerSnap) ~= "table" or not DeepEqual(snapLocal, callerSnap) then
+                        return nil, "rejected", "content_mismatch"
+                    end
+                end
+                body = snapLocal
+            else
+                if type(body) ~= "table" then
+                    return nil, "rejected", "missing_authoritative_body"
+                end
+                local snapBody, snapBodyErr = SnapshotPublicOp(body)
+                if not snapBody then
+                    return nil, "rejected", snapBodyErr or "missing_authoritative_body"
+                end
+                body = snapBody
+            end
+            rows[i] = { id = row.id or body.id, body = body }
+        end
+        enriched.records = rows
+    end
+
+    local ok, err = ValidateCandidateRef(enriched)
+    if not ok then
+        return nil, "rejected", err
+    end
+
     local ts = ServerTime()
     if not ts then
         return nil, "rejected", "server_time_unavailable"
@@ -1258,7 +1414,7 @@ function GS:NewConfirmationOperation(candidateRef)
     end
 
     -- Preserve candidate campaign identity; do not blanket-assign current.
-    local campaignId = candidateRef.campaignId
+    local campaignId = enriched.campaignId
     if campaignId == nil then
         campaignId = record.currentCampaignId
     end
@@ -1266,11 +1422,11 @@ function GS:NewConfirmationOperation(candidateRef)
     local snapShell, snapErr = SnapshotWhitelisted({
         kind = KIND.CONFIRM_CANDIDATE,
         candidateRef = {
-            recordId = candidateRef.recordId,
-            records = candidateRef.records,
-            contentFingerprint = candidateRef.contentFingerprint,
-            originalIds = candidateRef.originalIds,
-            campaignId = candidateRef.campaignId,
+            recordId = enriched.recordId,
+            records = enriched.records,
+            body = enriched.body,
+            originalIds = enriched.originalIds,
+            campaignId = enriched.campaignId,
         },
     }, { "candidateRef" })
     if not snapShell or type(snapShell.candidateRef) ~= "table" then
@@ -1285,7 +1441,6 @@ function GS:NewConfirmationOperation(candidateRef)
         datasetId = record.datasetId,
         kind = KIND.CONFIRM_CANDIDATE,
         candidateRef = snapRef,
-        contentFingerprint = candidateRef.contentFingerprint,
         campaignId = campaignId,
         basePolicyRevision = CurrentPolicyRevision(record),
         actorGuid = ctx.actorGuid,
@@ -1298,9 +1453,9 @@ function GS:NewConfirmationOperation(candidateRef)
     if not shapeOk then
         return nil, "rejected", shapeErr
     end
-    local stored, snapErr = SnapshotPublicOp(op)
+    local stored, storedErr = SnapshotPublicOp(op)
     if not stored then
-        return nil, "rejected", snapErr or "invalid_operation"
+        return nil, "rejected", storedErr or "invalid_operation"
     end
     return op, "accepted", nil
 end
@@ -1343,6 +1498,61 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         ok, err = ValidateKindValue(body)
         if not ok then
             return false, err or "invalid_operations"
+        end
+    elseif kind == KIND.RESOLVE_CONFLICT then
+        local ok, err = ValidateConfigShape(body)
+        if not ok then
+            return false, err or "invalid_operations"
+        end
+        if type(body.target) ~= "string" or body.target == "" then
+            return false, "invalid_target"
+        end
+        local value = body.value
+        if type(value) ~= "table" or type(value.chosenOpId) ~= "string"
+            or value.chosenOpId == "" then
+            return false, "invalid_resolution"
+        end
+        -- Shared with remote admission: dense unique bounded competing IDs,
+        -- chosen membership, and authoritative contentBodies (not fingerprints).
+        if type(value.competingOpIds) ~= "table" then
+            return false, "invalid_resolution"
+        end
+        local n = #value.competingOpIds
+        local maxCand = GS.MAX_CONFLICT_CANDIDATES or 16
+        if n < 1 or n > maxCand then
+            return false, "invalid_resolution"
+        end
+        local seen = {}
+        local chosenListed = false
+        local counted = 0
+        for k, cid in pairs(value.competingOpIds) do
+            counted = counted + 1
+            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+                return false, "invalid_resolution"
+            end
+            if type(cid) ~= "string" or cid == "" or #cid > GS.MAX_OPERATION_ID then
+                return false, "invalid_resolution"
+            end
+            if seen[cid] then
+                return false, "invalid_resolution"
+            end
+            seen[cid] = true
+            if cid == value.chosenOpId then
+                chosenListed = true
+            end
+        end
+        if counted ~= n or not chosenListed then
+            return false, "invalid_resolution"
+        end
+        if type(value.contentBodies) ~= "table" then
+            return false, "invalid_resolution"
+        end
+        for i = 1, n do
+            local cid = value.competingOpIds[i]
+            local cbody = value.contentBodies[cid]
+            if type(cbody) ~= "table" or cbody.id ~= cid then
+                return false, "invalid_resolution"
+            end
         end
     else
         return false, "unsupported_kind"
@@ -1506,6 +1716,21 @@ function GS:ApplyStagedConfirmationOperation(op, context)
     if not already then
         refs[#refs + 1] = stored.id
     end
+    -- Exact-content confirmation itself applies eligible retained candidates
+    -- without restamping attribution (Admission.ApplyExactContentConfirmation).
+    if GS.ApplyExactContentConfirmation then
+        GS.ApplyExactContentConfirmation(record, stored, {
+            sender = context and context.actorName,
+            member = context and {
+                name = context.actorName,
+                guid = context.actorGuid,
+                rankOrder = context.rankOrder,
+                guildKey = context.guildKey,
+            } or nil,
+            localWrite = true,
+        })
+    end
+    GS._NotifyLocalDurableChange("confirm")
     return "accepted", nil
 end
 
@@ -1525,6 +1750,10 @@ function GS._RetainConflict(ops, op)
     return RetainConflict(ops, op)
 end
 
+function GS._RetentionBodyCount(ops)
+    return RetentionBodyCount(ops)
+end
+
 function GS._AdmitPendingOrConflict(ops, stored, reason)
     return AdmitPendingOrConflict(ops, stored, reason)
 end
@@ -1535,4 +1764,27 @@ end
 
 function GS._RecognizeExactAcceptedDuplicate(op, stored)
     return RecognizeExactAcceptedDuplicate(op, stored)
+end
+
+function GS._ApplyMutations(record, op)
+    return ApplyMutations(record, op)
+end
+
+function GS._RetainPending(ops, op, reason)
+    return RetainPending(ops, op, reason)
+end
+
+function GS._AcceptedCount(ops)
+    return AcceptedCount(ops)
+end
+
+function GS._TargetKey(kind, target)
+    return TargetKey(kind, target)
+end
+
+--- Notify gossip after a durable local staged write (no-op until provider registers).
+function GS._NotifyLocalDurableChange(reason)
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange(reason)
+    end
 end

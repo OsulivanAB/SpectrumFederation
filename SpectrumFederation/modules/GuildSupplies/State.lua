@@ -108,6 +108,7 @@ local function EmptyOperations()
         heads = {},
         pending = {},
         conflicts = {},
+        openConflicts = {}, -- target-key → candidate op ids (#387)
     }
 end
 
@@ -391,6 +392,54 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
     local headsOk, headsErr = ValidateOperationsHeads(ops)
     if not headsOk then
         return false, headsErr
+    end
+
+    -- openConflicts is optional (#387); when present it must be a bounded map of
+    -- dense unique refs to retained/accepted bodies (no invented candidates).
+    if ops.openConflicts ~= nil then
+        if type(ops.openConflicts) ~= "table" then
+            return false, "invalid_operations"
+        end
+        local openCount = 0
+        local maxOpen = (GS.MAX_OPEN_CONFLICTS or 32)
+        for targetKey, entry in pairs(ops.openConflicts) do
+            openCount = openCount + 1
+            if openCount > maxOpen then
+                return false, "invalid_operations"
+            end
+            if type(targetKey) ~= "string" or targetKey == "" or type(entry) ~= "table" then
+                return false, "invalid_operations"
+            end
+            if type(entry.candidateIds) ~= "table" then
+                return false, "invalid_operations"
+            end
+            local n = #entry.candidateIds
+            local maxCand = GS.MAX_CONFLICT_CANDIDATES or 16
+            if n < 2 or n > maxCand then
+                return false, "invalid_operations"
+            end
+            local seen = {}
+            local dense = 0
+            for k, id in pairs(entry.candidateIds) do
+                dense = dense + 1
+                if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+                    return false, "invalid_operations"
+                end
+                if type(id) ~= "string" or id == "" or seen[id] then
+                    return false, "invalid_operations"
+                end
+                seen[id] = true
+                local body = ops.records and ops.records[id]
+                    or (ops.pending and ops.pending[id] and ops.pending[id].body)
+                    or (ops.conflicts and ops.conflicts[id] and ops.conflicts[id].body)
+                if type(body) ~= "table" then
+                    return false, "invalid_operations"
+                end
+            end
+            if dense ~= n then
+                return false, "invalid_operations"
+            end
+        end
     end
 
     return true
@@ -869,6 +918,8 @@ function GS:CreateStagedRecord(editorRankPosition)
         datasetId = datasetId,
         permission = {
             editorRankPosition = initialPosition,
+            -- Immutable bootstrap threshold (small-guild / history reconstruction).
+            bootstrapEditorRankPosition = initialPosition,
             revisionId = datasetId,
         },
         currentCampaignId = nil,
@@ -891,6 +942,9 @@ function GS:CreateStagedRecord(editorRankPosition)
     GS._root.guilds[ctx.guildKey] = record
     DebugInfo("created staged guild record key=%s dataset=%s threshold=%s",
         ctx.guildKey, datasetId, tostring(initialPosition))
+    if GS._NotifyLocalDurableChange then
+        GS._NotifyLocalDurableChange("create")
+    end
     return record, "accepted", nil
 end
 

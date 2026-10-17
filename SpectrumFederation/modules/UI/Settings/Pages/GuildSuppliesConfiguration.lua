@@ -254,6 +254,21 @@ local function RequestedItemRows()
 	return rows
 end
 
+local pendingAdoptionPeer = nil
+local pendingAdoptionDataset = nil
+local pendingConflictTarget = nil
+local pendingConflictChosen = nil
+
+local function ClearPendingAdoptionChoice()
+	pendingAdoptionPeer = nil
+	pendingAdoptionDataset = nil
+end
+
+local function ClearPendingConflictChoice()
+	pendingConflictTarget = nil
+	pendingConflictChosen = nil
+end
+
 local function StagedStatusText()
 	local caps = Caps()
 	if not caps.canRead then
@@ -265,10 +280,13 @@ local function StagedStatusText()
 	local formatReason = g and g.FormatReasonText or function(r)
 		return tostring(r or "unknown")
 	end
+	local gossipNote = Loc("GUILD_SUPPLIES_STATUS_GOSSIP",
+		"Staged configuration gossip is active for development on this branch. Live bank helper authority remains Raid Consumables until activation (#389).")
 	if not record then
 		if caps.reason == "not_configured" or recReason == "not_configured" then
 			return Loc("GUILD_SUPPLIES_STATUS_NOT_CONFIGURED",
 				"No staged Guild Supplies dataset for this guild yet. Use Initialize Guild Supplies.")
+				.. " " .. gossipNote
 		end
 		return Loc("GUILD_SUPPLIES_STATUS_UNAVAILABLE",
 			"Guild Supplies data is unavailable (%s)."):format(formatReason(caps.reason or recReason or "unknown"))
@@ -276,12 +294,234 @@ local function StagedStatusText()
 	local campaign = record.currentCampaignId
 	local activation = Loc("GUILD_SUPPLIES_STATUS_STAGED",
 		"Staged only — live Guild Bank accounting still uses Raid Consumables until activation (#389).")
+	local mismatch = g and g.GetDatasetMismatchState and g:GetDatasetMismatchState() or nil
+	local mismatchNote = ""
+	if mismatch and mismatch.blocked and mismatch.peers and mismatch.peers[1] then
+		local p = mismatch.peers[1]
+		mismatchNote = " " .. Loc("GUILD_SUPPLIES_ADOPTION_BLOCKED",
+			"A different staged dataset was advertised by %s (%s). Choose a source below to replace this client's local staged dataset, or cancel to keep the current one.")
+			:format(tostring(p.peerName), tostring(p.datasetId))
+	end
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption() or nil
+	local adopNote = ""
+	if type(adop) == "table" then
+		adopNote = " " .. Loc("GUILD_SUPPLIES_ADOPTION_PENDING",
+			"Adoption in progress for dataset %s from %s. Waiting for a complete validated transfer before switching.")
+			:format(tostring(adop.sourceDatasetId), tostring(adop.sourcePeer))
+	end
 	if type(campaign) ~= "string" or campaign == "" then
 		return activation .. " "
 			.. Loc("GUILD_SUPPLIES_STATUS_NO_CAMPAIGN", "No campaign yet. Start a New Campaign before adding items.")
+			.. mismatchNote .. adopNote
 	end
 	return activation .. " "
 		.. Loc("GUILD_SUPPLIES_STATUS_CURRENT_CAMPAIGN", "Current campaign: %s"):format(campaign)
+		.. mismatchNote .. adopNote
+end
+
+local function AdoptionSourceOptions()
+	local opts = {}
+	local g = GS()
+	if not g or not g.ListPeerDatasets then
+		return opts
+	end
+	local peers = g:ListPeerDatasets()
+	for i = 1, #peers do
+		local p = peers[i]
+		if p and not p.sameAsLocal then
+			opts[#opts + 1] = {
+				value = tostring(p.peerName) .. "\0" .. tostring(p.datasetId),
+				label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE_FMT", "%s — %s")
+					:format(tostring(p.peerName), tostring(p.datasetId)),
+				peerName = p.peerName,
+				datasetId = p.datasetId,
+			}
+		end
+	end
+	return opts
+end
+
+local function ConflictHelpText()
+	local g = GS()
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	if #conflicts == 0 then
+		return Loc("GUILD_SUPPLIES_CONFLICT_NONE", "No open configuration conflicts.")
+	end
+	return Loc("GUILD_SUPPLIES_CONFLICT_HELP",
+		"Both candidates are preserved. Choosing one creates a new authenticated resolution without rewriting the original operations.")
+end
+
+local function ConflictTargetOptions()
+	local opts = {}
+	local g = GS()
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	for i = 1, #conflicts do
+		local entry = conflicts[i]
+		if entry and type(entry.targetKey) == "string" then
+			opts[#opts + 1] = {
+				value = entry.targetKey,
+				label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_FMT", "Conflict: %s (%d candidates)")
+					:format(entry.targetKey, entry.candidates and #entry.candidates or 0),
+			}
+		end
+	end
+	return opts
+end
+
+local function ConflictCandidateOptions()
+	local opts = {}
+	local g = GS()
+	if not pendingConflictTarget then
+		return opts
+	end
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	local entry = nil
+	for i = 1, #conflicts do
+		if conflicts[i].targetKey == pendingConflictTarget then
+			entry = conflicts[i]
+			break
+		end
+	end
+	if not entry or type(entry.candidates) ~= "table" then
+		return opts
+	end
+	for i = 1, #entry.candidates do
+		local c = entry.candidates[i]
+		if c and type(c.id) == "string" then
+			local body = c.body
+			local summary = tostring(c.id)
+			if type(body) == "table" then
+				local author = body.actorName or "?"
+				local value = body.value
+				if type(value) == "table" then
+					value = value.goal or value.itemId or "?"
+				end
+				summary = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_FMT", "%s — %s (by %s)")
+					:format(tostring(c.id), tostring(value), tostring(author))
+			end
+			opts[#opts + 1] = {
+				value = c.id,
+				label = summary,
+			}
+		end
+	end
+	return opts
+end
+
+local function CommitConflictChoice(ctx, targetKey, chosenOpId, competingOpIds)
+	local g = GS()
+	if not g or not g.NewConflictResolutionOperation then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	-- Revalidate the open conflict and chosen id before preparing resolution.
+	local conflicts = g:ListOpenConflicts() or {}
+	local entry = nil
+	for i = 1, #conflicts do
+		if conflicts[i].targetKey == targetKey then
+			entry = conflicts[i]
+			break
+		end
+	end
+	if not entry or type(entry.candidates) ~= "table" then
+		ReportStatus(ctx, "rejected", "no_open_conflict")
+		ClearPendingConflictChoice()
+		return
+	end
+	local ids = competingOpIds
+	if type(ids) ~= "table" then
+		ids = {}
+		for i = 1, #entry.candidates do
+			ids[#ids + 1] = entry.candidates[i].id
+		end
+	end
+	local found = false
+	for i = 1, #ids do
+		if ids[i] == chosenOpId then
+			found = true
+			break
+		end
+	end
+	if not found then
+		ReportStatus(ctx, "rejected", "invalid_resolution")
+		return
+	end
+	local op, prepStatus, prepReason = g:NewConflictResolutionOperation(targetKey, chosenOpId, ids)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local status, reason = g:ApplyStagedConflictResolution(op)
+	if status == "accepted" then
+		ClearPendingConflictChoice()
+	end
+	ReportStatus(ctx, status, reason)
+end
+
+--- Begin adoption transfer (does not commit). Commit is a separate control once ready.
+local function BeginAdoptionTransfer(ctx)
+	local g = GS()
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not g or not pendingAdoptionPeer or not pendingAdoptionDataset then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	local peer = pendingAdoptionPeer
+	local datasetId = pendingAdoptionDataset
+	local accept = function()
+		ctx.section:ClearMessage()
+		local session, status, reason = g:BeginDatasetAdoption(peer, datasetId)
+		if status ~= "accepted" then
+			ReportStatus(ctx, status or "rejected", reason)
+			return
+		end
+		ReportStatus(ctx, "pending", "incomplete_transfer")
+		RefreshPageControls()
+	end
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(
+			Loc("GUILD_SUPPLIES_ADOPTION_CONFIRM",
+				"Replace this client's local staged Guild Supplies configuration/dataset with the selected source dataset? The two datasets are not merged. Cancel leaves local state unchanged. This does not activate live bank accounting."),
+			Loc("GUILD_SUPPLIES_ADOPTION_BUTTON", "Adopt selected dataset"),
+			accept
+		)
+	else
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
+	end
+end
+
+local function CommitAdoptionTransfer(ctx)
+	local g = GS()
+	if not g or not g.CommitDatasetAdoption then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local adop = g:GetPendingAdoption()
+	if type(adop) ~= "table" then
+		ReportStatus(ctx, "rejected", "no_adoption")
+		return
+	end
+	-- Overlapping commits while replay is already running are rejected.
+	if type(adop.replayTemp) == "table" then
+		ReportStatus(ctx, "pending", "replay_in_progress")
+		RefreshPageControls()
+		return
+	end
+	if not adop.ready then
+		ReportStatus(ctx, "pending", "incomplete_transfer")
+		return
+	end
+	local commitStatus, commitReason = g:CommitDatasetAdoption()
+	if commitStatus == "accepted" then
+		ClearPendingAdoptionChoice()
+	end
+	ReportStatus(ctx, commitStatus or "rejected", commitReason)
+	RefreshPageControls()
 end
 
 local function ItemsHelpText()
@@ -582,6 +822,205 @@ local function Definition()
 				},
 			},
 			{
+				id = "gsAdoption",
+				title = Loc("GUILD_SUPPLIES_ADOPTION_TITLE", "Staged dataset adoption"),
+				tooltip = Loc("GUILD_SUPPLIES_ADOPTION_TIP",
+					"When another authorized editor has a different staged dataset, choose one source. Adoption replaces this client's local staged Guild Supplies configuration; datasets are never merged."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = function()
+							local opts = AdoptionSourceOptions()
+							if #opts == 0 then
+								local g = GS()
+								local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+								if type(adop) == "table" then
+									return Loc("GUILD_SUPPLIES_ADOPTION_PENDING",
+										"Adoption in progress for dataset %s from %s. Waiting for a complete validated transfer before switching.")
+										:format(tostring(adop.sourceDatasetId), tostring(adop.sourcePeer))
+								end
+								return Loc("GUILD_SUPPLIES_ADOPTION_EMPTY",
+									"No conflicting peer datasets are available right now. Empty clients wait for an authenticated editor source.")
+							end
+							return Loc("GUILD_SUPPLIES_ADOPTION_HELP",
+								"Adoption is a local staged-development action. It does not activate live bank accounting or establish guild-wide production authority.")
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE", "Source dataset"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_ADOPTION_NONE", "Select a source"),
+						options = AdoptionSourceOptions,
+						get = function()
+							if pendingAdoptionPeer and pendingAdoptionDataset then
+								return tostring(pendingAdoptionPeer) .. "\0" .. tostring(pendingAdoptionDataset)
+							end
+							return nil
+						end,
+						set = function() end,
+						enabled = function()
+							local c = Caps()
+							return (c.canEdit or c.canRecoverPolicy) and #AdoptionSourceOptions() > 0
+						end,
+						onValueChanged = function(ctx, value)
+							if type(value) ~= "string" then
+								ClearPendingAdoptionChoice()
+								return
+							end
+							local peer, datasetId = value:match("^(.-)\0(.+)$")
+							if peer and datasetId then
+								pendingAdoptionPeer = peer
+								pendingAdoptionDataset = datasetId
+							else
+								ClearPendingAdoptionChoice()
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_TITLE", "Staged dataset adoption"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_BEGIN", "Start adoption transfer"),
+						width = 220,
+						enabled = function()
+							local c = Caps()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+							return (c.canEdit or c.canRecoverPolicy)
+								and pendingAdoptionPeer ~= nil
+								and pendingAdoptionDataset ~= nil
+								and type(adop) ~= "table"
+						end,
+						onClick = function(ctx)
+							BeginAdoptionTransfer(ctx)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
+						width = 180,
+						enabled = function()
+							local c = Caps()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+							return (c.canEdit or c.canRecoverPolicy)
+								and type(adop) == "table"
+								and adop.ready == true
+								and type(adop.replayTemp) ~= "table"
+						end,
+						onClick = function(ctx)
+							CommitAdoptionTransfer(ctx)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_CANCEL", "Cancel adoption"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_CANCEL", "Cancel adoption"),
+						width = 160,
+						enabled = function()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+							return type(adop) == "table"
+						end,
+						onClick = function(ctx)
+							local g = GS()
+							ctx.section:ClearMessage()
+							if g and g.CancelDatasetAdoption then
+								g:CancelDatasetAdoption()
+							end
+							ClearPendingAdoptionChoice()
+							ctx.section:SetMessage(
+								Loc("GUILD_SUPPLIES_STATUS_ADOPTION_CANCELLED",
+									"Dataset adoption cancelled. Local staged configuration was left unchanged."),
+								"info")
+							RefreshPageControls()
+						end,
+					},
+				},
+			},
+			{
+				id = "gsConflicts",
+				title = Loc("GUILD_SUPPLIES_CONFLICT_TITLE", "Configuration conflicts"),
+				tooltip = Loc("GUILD_SUPPLIES_CONFLICT_TIP",
+					"Same-field or concurrent campaign edits stay unresolved until an authorized editor chooses a result."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = ConflictHelpText,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET", "Open conflict"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_NONE", "Select a conflict"),
+						options = ConflictTargetOptions,
+						get = function()
+							return pendingConflictTarget
+						end,
+						set = function() end,
+						enabled = function()
+							return Caps().canEdit and #ConflictTargetOptions() > 0
+						end,
+						onValueChanged = function(ctx, value)
+							if type(value) == "string" and value ~= "" then
+								pendingConflictTarget = value
+								pendingConflictChosen = nil
+							else
+								ClearPendingConflictChoice()
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE", "Candidate"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_NONE", "Select a candidate"),
+						options = ConflictCandidateOptions,
+						get = function()
+							return pendingConflictChosen
+						end,
+						set = function() end,
+						enabled = function()
+							return Caps().canEdit
+								and pendingConflictTarget ~= nil
+								and #ConflictCandidateOptions() >= 2
+						end,
+						onValueChanged = function(ctx, value)
+							if type(value) == "string" and value ~= "" then
+								pendingConflictChosen = value
+							else
+								pendingConflictChosen = nil
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_TITLE", "Configuration conflicts"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_CONFLICT_CHOOSE", "Use this value"),
+						width = 160,
+						enabled = function()
+							return Caps().canEdit
+								and pendingConflictTarget ~= nil
+								and pendingConflictChosen ~= nil
+								and #ConflictCandidateOptions() >= 2
+						end,
+						onClick = function(ctx)
+							CommitConflictChoice(ctx, pendingConflictTarget, pendingConflictChosen, nil)
+						end,
+					},
+				},
+			},
+			{
 				id = "gsItems",
 				title = Loc("GUILD_SUPPLIES_ITEMS_TITLE", "Requested items"),
 				tooltip = Loc("GUILD_SUPPLIES_ITEMS_TIP",
@@ -752,12 +1191,33 @@ local function EnsureRosterListener()
 	end)
 end
 
+--- Coalesced refresh when adoption ready/expiry flips asynchronously (Settings open).
+local adoptionHooked = false
+local function EnsureAdoptionListener()
+	if adoptionHooked then
+		return
+	end
+	local g = GS()
+	if not g then
+		return
+	end
+	adoptionHooked = true
+	local previous = g.OnAdoptionStateChanged
+	g.OnAdoptionStateChanged = function(reason)
+		if previous then
+			pcall(previous, reason)
+		end
+		QueueRefresh()
+	end
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
 		return
 	end
 	EnsureRosterListener()
+	EnsureAdoptionListener()
 	BeginRenderPass()
 	renderer:Build(panel, Definition())
 	EndRenderPass()
@@ -789,5 +1249,6 @@ function Page:OnHide()
 end
 
 EnsureRosterListener()
+EnsureAdoptionListener()
 
 SF.SettingsUI:RegisterPage(Page)

@@ -1024,6 +1024,36 @@ function GS.FormatReasonText(reason)
             "the active guild changed"),
         unsupported_activation = Loc("GUILD_SUPPLIES_REASON_UNSUPPORTED_ACTIVATION",
             "this dataset is not on the staged activation path"),
+        incomplete_transfer = Loc("GUILD_SUPPLIES_REASON_INCOMPLETE_TRANSFER",
+            "the selected dataset transfer is incomplete — local state was left unchanged"),
+        replay_in_progress = Loc("GUILD_SUPPLIES_REASON_REPLAY_IN_PROGRESS",
+            "dataset adoption is still applying — wait for it to finish"),
+        missing_campaign_header = Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN_HEADER",
+            "a required campaign header is missing from the transfer"),
+        invalid_campaign_archive = Loc("GUILD_SUPPLIES_REASON_INVALID_CAMPAIGN_ARCHIVE",
+            "a required campaign archive is missing or malformed"),
+        no_adoption = Loc("GUILD_SUPPLIES_REASON_NO_ADOPTION",
+            "no dataset adoption is in progress"),
+        same_dataset = Loc("GUILD_SUPPLIES_REASON_SAME_DATASET",
+            "that peer already shares this client's staged dataset"),
+        divergent_edit = Loc("GUILD_SUPPLIES_REASON_DIVERGENT_EDIT",
+            "conflicting edits need an explicit choice in Configuration"),
+        campaign_conflict = Loc("GUILD_SUPPLIES_REASON_CAMPAIGN_CONFLICT",
+            "concurrent New Campaign operations need an explicit choice"),
+        untrusted_relay = Loc("GUILD_SUPPLIES_REASON_UNTRUSTED_RELAY",
+            "historical candidate is pending until an authorized editor confirms it"),
+        missing_predecessor = Loc("GUILD_SUPPLIES_REASON_MISSING_PREDECESSOR",
+            "waiting for a missing predecessor before this change can apply"),
+        actor_mismatch = Loc("GUILD_SUPPLIES_REASON_ACTOR_MISMATCH",
+            "the claimed author does not match the authenticated sender"),
+        no_open_conflict = Loc("GUILD_SUPPLIES_REASON_NO_OPEN_CONFLICT",
+            "there is no open conflict for that setting"),
+        fingerprint_mismatch = Loc("GUILD_SUPPLIES_REASON_FINGERPRINT_MISMATCH",
+            "the confirmed content no longer matches the retained candidate"),
+        awaiting_dataset = Loc("GUILD_SUPPLIES_REASON_AWAITING_DATASET",
+            "waiting for an authenticated editor's staged dataset"),
+        source_changed = Loc("GUILD_SUPPLIES_REASON_SOURCE_CHANGED",
+            "the selected source peer or authority changed before adoption committed"),
         stale_handle = Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
             "the page is out of date — refresh and try again"),
         actor_changed = Loc("GUILD_SUPPLIES_REASON_ACTOR_CHANGED",
@@ -1070,6 +1100,11 @@ function GS.FormatMutationFeedback(status, reason)
         return Loc("GUILD_SUPPLIES_STATUS_DUPLICATE",
             "No new effect — that change was already admitted."),
             "info"
+    end
+    if status == "pending" and reason == "replay_in_progress" then
+        return Loc("GUILD_SUPPLIES_STATUS_ADOPTION_REPLAY",
+            "Adopting the selected dataset — this page will update when the transfer finishes."),
+            "warn"
     end
     local detail = GS.FormatReasonText(reason or (status == "pending" and "stale_base") or "rejected")
     if status == "pending" then
@@ -1573,5 +1608,8 @@ function GS:ApplyStagedCampaignOperation(op, context)
 
     DebugInfo("started campaign id=%s parent=%s context=%s",
         tostring(op.id), tostring(parentId), tostring(contextStatus))
+    if GS._NotifyLocalDurableChange then
+        GS._NotifyLocalDurableChange("campaign")
+    end
     return "accepted", nil
 end
