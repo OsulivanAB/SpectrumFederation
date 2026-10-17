@@ -36,15 +36,25 @@ local exportState = {
     maintIdle = true,
     countsDirty = true,
     cachedOpCount = 0,
+    cachedTransferOpCount = 0,
     cachedCampaignCount = 0,
     cachedArchiveCount = 0,
+    pendingCursor = nil,
+    conflictCursor = nil,
+    openConflictCursor = nil,
+    maintScheduled = false,
+    archiveBuildCursor = nil,
 }
 
--- Runtime reassembly buffer for paged campaign archives (not SavedVariables).
--- Scoped by datasetId; aggregate campaign/page caps prevent unbounded growth.
-local archivePageBuffer = {} -- [campaignId] = { meta, pages, datasetId, pageCount }
+-- Runtime reassembly buffer for paged campaign archives and operation manifests
+-- (not SavedVariables). Scoped by datasetId; aggregate caps + TTL reclaim.
+local archivePageBuffer = {} -- [campaignId] = { meta, pages, datasetId, pageCount, at, sourcePeer }
 local archivePageBufferCount = 0
 local archivePageBufferPages = 0
+-- Operation-manifest FragmentBuffer: [opId] = { shell, pages, datasetId, pageCount, at, sourcePeer }
+local opManifestBuffer = {}
+local opManifestBufferCount = 0
+local opManifestBufferPages = 0
 
 local function ClearArchivePageBuffer(campaignId)
     local buf = archivePageBuffer[campaignId]
@@ -62,10 +72,108 @@ local function ClearArchivePageBuffer(campaignId)
     archivePageBufferPages = math.max(0, (archivePageBufferPages or 0) - pages)
 end
 
+local function ClearOpManifestBuffer(opId)
+    local buf = opManifestBuffer[opId]
+    if not buf then
+        return
+    end
+    local pages = 0
+    if type(buf.pages) == "table" then
+        for _ in pairs(buf.pages) do
+            pages = pages + 1
+        end
+    end
+    opManifestBuffer[opId] = nil
+    opManifestBufferCount = math.max(0, (opManifestBufferCount or 0) - 1)
+    opManifestBufferPages = math.max(0, (opManifestBufferPages or 0) - pages)
+end
+
+local function ReclaimExpiredFragmentBuffers(opts)
+    opts = opts or {}
+    local now = GetServerTime and GetServerTime() or 0
+    local ttl = GS.FRAGMENT_BUFFER_TTL_SECONDS or 600
+    local wantGuild = opts.guildKey
+    local wantDataset = opts.datasetId
+    local removed = 0
+    if now > 0 and ttl > 0 then
+        for cid, buf in pairs(archivePageBuffer) do
+            local stale = type(buf) ~= "table"
+                or (buf.at and (now - (tonumber(buf.at) or 0)) > ttl)
+                or (wantDataset and buf.datasetId and buf.datasetId ~= wantDataset)
+                or (wantGuild and buf.guildKey and buf.guildKey ~= wantGuild)
+            if stale then
+                ClearArchivePageBuffer(cid)
+                removed = removed + 1
+            end
+        end
+        for oid, buf in pairs(opManifestBuffer) do
+            local stale = type(buf) ~= "table"
+                or (buf.at and (now - (tonumber(buf.at) or 0)) > ttl)
+                or (wantDataset and buf.datasetId and buf.datasetId ~= wantDataset)
+                or (wantGuild and buf.guildKey and buf.guildKey ~= wantGuild)
+            if stale then
+                ClearOpManifestBuffer(oid)
+                removed = removed + 1
+            end
+        end
+    end
+    return removed
+end
+
 local function ResetArchivePageBuffers()
     archivePageBuffer = {}
     archivePageBufferCount = 0
     archivePageBufferPages = 0
+    opManifestBuffer = {}
+    opManifestBufferCount = 0
+    opManifestBufferPages = 0
+end
+
+--- Wrapper-inclusive wire size estimate (prefer real CBOR when available).
+local function EstimateWireRecordBytes(recordId, body)
+    local envelope = {
+        id = tostring(recordId or "x"),
+        versionFp = "v",
+        body = body,
+    }
+    if C_EncodingUtil and C_EncodingUtil.SerializeCBOR then
+        local ok, raw = pcall(C_EncodingUtil.SerializeCBOR, envelope)
+        if ok and type(raw) == "string" then
+            return #raw
+        end
+    end
+    -- Fallback: recursive approximate UTF-8 length of a stable dump.
+    local parts = {}
+    local function walk(v, depth)
+        depth = (depth or 0) + 1
+        if depth > 16 then
+            parts[#parts + 1] = "?"
+            return
+        end
+        local t = type(v)
+        if t == "nil" then
+            parts[#parts + 1] = "N"
+        elseif t == "boolean" then
+            parts[#parts + 1] = v and "T" or "F"
+        elseif t == "number" then
+            parts[#parts + 1] = tostring(v)
+        elseif t == "string" then
+            parts[#parts + 1] = v
+        elseif t == "table" then
+            for k, child in pairs(v) do
+                parts[#parts + 1] = tostring(k)
+                walk(child, depth)
+            end
+        end
+    end
+    walk(envelope, 0)
+    return #table.concat(parts)
+end
+
+local function WireBudget()
+    return GS.MAX_WIRE_RECORD_BYTES
+        or (GG and GG.MAX_RECORD_CBOR)
+        or 2048
 end
 
 local function FingerprintBody(body)
@@ -150,6 +258,232 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
     return out
 end
 
+--- Split oversized confirm/resolve envelopes into shell + pages under wire budget.
+local function BuildOpExportBodies(op, evidenceOnly, boundary)
+    local fullBody = {
+        kind = "gs-op",
+        op = op,
+        evidenceOnly = evidenceOnly and true or nil,
+        boundary = boundary,
+    }
+    local exportId = "gs:op:" .. op.id
+    local budget = WireBudget()
+    if EstimateWireRecordBytes(exportId, fullBody) <= budget then
+        return { { id = exportId, body = fullBody } }
+    end
+    -- Only confirm/resolve carry embedded authoritative bodies large enough to page.
+    if op.kind ~= GS.KIND.CONFIRM_CANDIDATE and op.kind ~= GS.KIND.RESOLVE_CONFLICT then
+        -- Ordinary ops that somehow exceed budget: still emit (engine may skip);
+        -- do not invent a paging scheme for non-manifest kinds.
+        return { { id = exportId, body = fullBody } }
+    end
+
+    local rows = {}
+    if op.kind == GS.KIND.CONFIRM_CANDIDATE then
+        local ref = op.candidateRef
+        if type(ref) == "table" then
+            if type(ref.body) == "table" and type(ref.recordId) == "string" then
+                rows[#rows + 1] = { id = ref.recordId, body = ref.body }
+            end
+            if type(ref.records) == "table" then
+                for i = 1, #ref.records do
+                    local row = ref.records[i]
+                    if type(row) == "table" and type(row.id) == "string" and type(row.body) == "table" then
+                        rows[#rows + 1] = { id = row.id, body = row.body }
+                    end
+                end
+            end
+        end
+    elseif op.kind == GS.KIND.RESOLVE_CONFLICT then
+        local bodies = op.value and op.value.contentBodies
+        if type(bodies) == "table" then
+            local ids = {}
+            for id in pairs(bodies) do
+                ids[#ids + 1] = id
+            end
+            table.sort(ids)
+            for i = 1, #ids do
+                rows[#rows + 1] = { id = ids[i], body = bodies[ids[i]] }
+            end
+        end
+    end
+    if #rows < 1 then
+        return { { id = exportId, body = fullBody } }
+    end
+
+    -- Pack rows into pages that each fit the wire budget (worst case 1/row).
+    local maxPages = GS.MAX_MANIFEST_PAGES or 64
+    local pages = {}
+    local cur = { records = {} }
+    local function flush()
+        if #(cur.records) > 0 then
+            pages[#pages + 1] = cur
+            cur = { records = {} }
+        end
+    end
+    for i = 1, #rows do
+        cur.records[#cur.records + 1] = rows[i]
+        local trialPage = {
+            kind = "gs-op-page",
+            opId = op.id,
+            datasetId = op.datasetId,
+            page = #pages + 1,
+            pageCount = 1, -- provisional
+            records = cur.records,
+        }
+        if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), trialPage) > budget then
+            -- Undo last add and flush previous pack (keep at least one row/page).
+            cur.records[#cur.records] = nil
+            if #(cur.records) == 0 then
+                -- Single row exceeds budget: emit alone (engine may skip oversized).
+                pages[#pages + 1] = { records = { rows[i] } }
+                cur = { records = {} }
+            else
+                flush()
+                cur.records[1] = rows[i]
+            end
+        end
+        if #pages >= maxPages then
+            break
+        end
+    end
+    flush()
+    if #pages < 1 then
+        return { { id = exportId, body = fullBody } }
+    end
+    local pageCount = #pages
+    if pageCount > maxPages then
+        pageCount = maxPages
+    end
+
+    -- Shell: strip embedded bodies; keep ids / metadata.
+    local shellOp = {}
+    for k, v in pairs(op) do
+        shellOp[k] = v
+    end
+    if op.kind == GS.KIND.CONFIRM_CANDIDATE and type(op.candidateRef) == "table" then
+        local ref = op.candidateRef
+        local shellRef = {
+            recordId = ref.recordId,
+            originalIds = ref.originalIds,
+            campaignId = ref.campaignId,
+        }
+        if type(ref.records) == "table" then
+            local idRows = {}
+            for i = 1, #ref.records do
+                local row = ref.records[i]
+                if type(row) == "table" and type(row.id) == "string" then
+                    idRows[#idRows + 1] = { id = row.id }
+                end
+            end
+            shellRef.records = idRows
+        end
+        shellOp.candidateRef = shellRef
+    elseif op.kind == GS.KIND.RESOLVE_CONFLICT and type(op.value) == "table" then
+        shellOp.value = {
+            chosenOpId = op.value.chosenOpId,
+            competingOpIds = op.value.competingOpIds,
+        }
+    end
+    shellOp.pageCount = pageCount
+    shellOp.recordCount = #rows
+
+    local out = {
+        {
+            id = exportId,
+            body = {
+                kind = "gs-op",
+                op = shellOp,
+                pageCount = pageCount,
+                recordCount = #rows,
+                evidenceOnly = evidenceOnly and true or nil,
+                boundary = boundary,
+            },
+        },
+    }
+    for p = 1, pageCount do
+        out[#out + 1] = {
+            id = exportId .. ":p" .. tostring(p),
+            body = {
+                kind = "gs-op-page",
+                opId = op.id,
+                datasetId = op.datasetId,
+                page = p,
+                pageCount = pageCount,
+                records = pages[p].records,
+            },
+        }
+    end
+    return out
+end
+
+local function AssembleOpFromPages(shellBody, pagesByIndex)
+    if type(shellBody) ~= "table" or type(shellBody.op) ~= "table" then
+        return nil, "invalid_operation"
+    end
+    local pageCount = tonumber(shellBody.pageCount) or tonumber(shellBody.op.pageCount)
+    if not pageCount or pageCount < 1 then
+        -- Inline (non-paged) body.
+        return shellBody, nil
+    end
+    local rows = {}
+    for page = 1, pageCount do
+        local p = pagesByIndex and pagesByIndex[page]
+        if type(p) ~= "table" or type(p.records) ~= "table" then
+            return nil, "incomplete_manifest_pages"
+        end
+        for i = 1, #p.records do
+            rows[#rows + 1] = p.records[i]
+        end
+    end
+    local op = {}
+    for k, v in pairs(shellBody.op) do
+        op[k] = v
+    end
+    op.pageCount = nil
+    op.recordCount = nil
+    if op.kind == GS.KIND.CONFIRM_CANDIDATE then
+        local ref = op.candidateRef or {}
+        if #rows == 1 and type(ref.recordId) == "string" then
+            op.candidateRef = {
+                recordId = ref.recordId or rows[1].id,
+                body = rows[1].body,
+                originalIds = ref.originalIds,
+                campaignId = ref.campaignId,
+            }
+        else
+            local recs = {}
+            for i = 1, #rows do
+                recs[i] = { id = rows[i].id, body = rows[i].body }
+            end
+            op.candidateRef = {
+                records = recs,
+                originalIds = ref.originalIds,
+                campaignId = ref.campaignId,
+            }
+        end
+    elseif op.kind == GS.KIND.RESOLVE_CONFLICT then
+        local contentBodies = {}
+        for i = 1, #rows do
+            contentBodies[rows[i].id] = rows[i].body
+        end
+        local value = op.value or {}
+        op.value = {
+            chosenOpId = value.chosenOpId,
+            competingOpIds = value.competingOpIds,
+            contentBodies = contentBodies,
+        }
+    end
+    return {
+        kind = "gs-op",
+        op = op,
+        evidenceOnly = shellBody.evidenceOnly,
+        boundary = shellBody.boundary,
+    }, nil
+end
+
+GS.AssembleOpFromPages = AssembleOpFromPages
+
 local function CurrentGuildRecord()
     if not GS:IsRootReady() then
         return nil
@@ -225,29 +559,28 @@ local function RebuildExportIndex()
         currentCampaignId = record.currentCampaignId,
         activation = record.activation,
         acceptedOpCount = 0,
+        transferOpCount = 0,
         campaignCount = 0,
         archiveCount = 0,
     }
     add("gs:desc:" .. record.datasetId, desc)
 
     -- Accepted operations (config / campaign / confirm / resolve).
+    -- Oversized confirm/resolve envelopes emit shell + gs-op-page fragments.
     local ops = record.operations
     if type(ops) == "table" and type(ops.order) == "table" then
         for i = 1, #ops.order do
             local oid = ops.order[i]
             local op = ops.records and ops.records[oid]
             if type(op) == "table" then
-                local body = {
-                    kind = "gs-op",
-                    op = op,
-                }
+                local boundary = nil
                 if op.kind == GS.KIND.START_CAMPAIGN then
-                    local header = record.campaigns and record.campaigns[op.id]
-                    if type(header) == "table" then
-                        body.boundary = header
-                    end
+                    boundary = record.campaigns and record.campaigns[op.id]
                 end
-                add("gs:op:" .. op.id, body)
+                local parts = BuildOpExportBodies(op, false, boundary)
+                for pi = 1, #parts do
+                    add(parts[pi].id, parts[pi].body)
+                end
             end
         end
     end
@@ -277,16 +610,16 @@ local function RebuildExportIndex()
             if ops.records and ops.records[cid] then
                 return -- accepted path already exported above
             end
-            local body = { kind = "gs-op", op = cand, evidenceOnly = true }
+            local header = nil
             if cand.kind == GS.KIND.START_CAMPAIGN then
-                local header = boundaryHint
+                header = boundaryHint
                     or (record.campaigns and record.campaigns[cid])
                     or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
-                if type(header) == "table" then
-                    body.boundary = header
-                end
             end
-            add(exportId, body)
+            local parts = BuildOpExportBodies(cand, true, header)
+            for pi = 1, #parts do
+                add(parts[pi].id, parts[pi].body)
+            end
         end
         if type(ops) == "table" and type(ops.openConflicts) == "table" then
             for _, entry in pairs(ops.openConflicts) do
@@ -348,49 +681,59 @@ local function RebuildExportIndex()
         end
     end
 
-    -- Archived campaign item snapshots (paged to fit MAX_RECORD_CBOR).
+    -- Archives are constructed under export maintenance budget (not cold-path).
+    -- Count logical archives for the descriptor; pages fill asynchronously.
+    local archiveExportCount = 0
     if type(record.campaignArchives) == "table" then
         for campaignId, archive in pairs(record.campaignArchives) do
             if type(archive) == "table" and type(campaignId) == "string" then
-                local parts = BuildArchiveExportBodies(campaignId, archive, record)
-                for i = 1, #parts do
-                    add(parts[i].id, parts[i].body)
-                end
-            end
-        end
-    end
-
-    -- Descriptor counts must match exported bodies exactly (including conflict deps).
-    -- archiveCount counts logical archives (meta bodies), not page fragments.
-    local opExportCount, headerExportCount, archiveExportCount = 0, 0, 0
-    for id, entry in pairs(exportState.byId) do
-        if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
-            if entry.body.kind == "gs-op" then
-                opExportCount = opExportCount + 1
-            elseif entry.body.kind == "campaign-header" then
-                headerExportCount = headerExportCount + 1
-            elseif entry.body.kind == "campaign-archive" then
                 archiveExportCount = archiveExportCount + 1
             end
         end
     end
+    exportState.archiveBuildNeeded = archiveExportCount > 0
+    exportState.archiveBuildCursor = nil
+
+    -- Descriptor counts: acceptedOpCount excludes evidenceOnly; transferOpCount
+    -- includes all gs-op metas (pages are fragments, like archive pages).
+    local acceptedOpCount, transferOpCount, headerExportCount = 0, 0, 0
+    for id, entry in pairs(exportState.byId) do
+        if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
+            if entry.body.kind == "gs-op" then
+                transferOpCount = transferOpCount + 1
+                if entry.body.evidenceOnly ~= true then
+                    acceptedOpCount = acceptedOpCount + 1
+                end
+            elseif entry.body.kind == "campaign-header" then
+                headerExportCount = headerExportCount + 1
+            elseif entry.body.kind == "campaign-archive" then
+                -- pages filled by paced maint; recount below after maint
+            end
+        end
+    end
+    -- Logical archive count from durable store (pages may still be building).
     local descId = "gs:desc:" .. record.datasetId
     local descEntry = exportState.byId[descId]
     if type(descEntry) == "table" and type(descEntry.body) == "table" then
-        descEntry.body.acceptedOpCount = opExportCount
+        descEntry.body.acceptedOpCount = acceptedOpCount
+        descEntry.body.transferOpCount = transferOpCount
         descEntry.body.campaignCount = headerExportCount
         descEntry.body.archiveCount = archiveExportCount
         descEntry.needsFp = true
         descEntry.versionFp = nil
     end
-    exportState.cachedOpCount = opExportCount
+    exportState.cachedOpCount = acceptedOpCount
+    exportState.cachedTransferOpCount = transferOpCount
     exportState.cachedCampaignCount = headerExportCount
     exportState.cachedArchiveCount = archiveExportCount
     exportState.countsDirty = false
     exportState.appendPos = (record.operations and record.operations.order
         and #record.operations.order) or 0
     exportState.resolveScanPos = exportState.appendPos
-    exportState.maintIdle = true
+    exportState.maintIdle = not exportState.archiveBuildNeeded
+    exportState.pendingCursor = nil
+    exportState.conflictCursor = nil
+    exportState.maintScheduled = false
 end
 
 local function EnsureExportFresh()
@@ -742,13 +1085,13 @@ local function ValidateAndApply(record, ctx)
             or GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
         local maxPages = GS.MAX_FRAGMENT_BUFFER_PAGES
             or GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64
-        local ttl = GS.FRAGMENT_BUFFER_TTL_SECONDS or 600
         local now = GetServerTime and GetServerTime() or 0
+        -- Reclaim expired assemblies across the whole pool before capacity checks.
+        ReclaimExpiredFragmentBuffers({
+            datasetId = body.datasetId,
+            guildKey = localRecord and localRecord._guildKey,
+        })
         local buf = archivePageBuffer[body.campaignId]
-        if buf and buf.at and now > 0 and (now - (tonumber(buf.at) or 0)) > ttl then
-            ClearArchivePageBuffer(body.campaignId)
-            buf = nil
-        end
         if not buf then
             if (archivePageBufferCount or 0) >= maxCamps then
                 return "rejected", "full"
@@ -758,6 +1101,7 @@ local function ValidateAndApply(record, ctx)
                 datasetId = body.datasetId,
                 sourcePeer = sender,
                 at = now,
+                guildKey = localRecord and localRecord._guildKey,
             }
             archivePageBuffer[body.campaignId] = buf
             archivePageBufferCount = (archivePageBufferCount or 0) + 1
@@ -773,7 +1117,12 @@ local function ValidateAndApply(record, ctx)
                 ClearArchivePageBuffer(body.campaignId)
                 return "rejected", "id_conflict"
             end
-            buf.meta = body
+            -- Exact meta redelivery: compare without rebuilding pending state.
+            if buf.meta and GS._DeepEqualOps and GS._DeepEqualOps(buf.meta, body) then
+                -- fall through to assembly
+            else
+                buf.meta = body
+            end
             buf.at = now
             if tonumber(body.pageCount) then
                 buf.pageCount = tonumber(body.pageCount)
@@ -785,13 +1134,14 @@ local function ValidateAndApply(record, ctx)
                     ClearArchivePageBuffer(body.campaignId)
                     return "rejected", "id_conflict"
                 end
+                -- Exact page duplicate: do not recreate buffer / recount pages.
             else
                 if (archivePageBufferPages or 0) >= maxPages then
                     return "rejected", "full"
                 end
                 archivePageBufferPages = (archivePageBufferPages or 0) + 1
+                buf.pages[page] = body
             end
-            buf.pages[page] = body
             buf.at = now
             if tonumber(body.pageCount) then
                 buf.pageCount = tonumber(body.pageCount)
@@ -862,10 +1212,139 @@ local function ValidateAndApply(record, ctx)
         return "accepted", nil
     end
 
+    if body.kind == "gs-op-page" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        local opId = body.opId
+        if type(opId) ~= "string" or opId == "" then
+            return "rejected", "invalid_operation"
+        end
+        local page = tonumber(body.page)
+        local pageCount = tonumber(body.pageCount)
+        local maxPages = GS.MAX_MANIFEST_PAGES or 64
+        if not page or page ~= math.floor(page) or page < 1 then
+            return "rejected", "invalid_operation"
+        end
+        if not pageCount or pageCount ~= math.floor(pageCount)
+            or pageCount < 1 or pageCount > maxPages or page > pageCount then
+            return "rejected", "invalid_operation"
+        end
+        ReclaimExpiredFragmentBuffers({
+            datasetId = body.datasetId,
+            guildKey = localRecord._guildKey,
+        })
+        local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES or 16
+        local maxPagesBuf = GS.MAX_FRAGMENT_BUFFER_PAGES or 64
+        local now = GetServerTime and GetServerTime() or 0
+        local buf = opManifestBuffer[opId]
+        if not buf then
+            if (opManifestBufferCount or 0) >= maxCamps then
+                return "rejected", "full"
+            end
+            buf = {
+                pages = {},
+                datasetId = body.datasetId,
+                sourcePeer = sender,
+                at = now,
+                guildKey = localRecord._guildKey,
+            }
+            opManifestBuffer[opId] = buf
+            opManifestBufferCount = (opManifestBufferCount or 0) + 1
+        elseif buf.datasetId and buf.datasetId ~= body.datasetId then
+            ClearOpManifestBuffer(opId)
+            return "rejected", "dataset_mismatch"
+        elseif buf.sourcePeer and buf.sourcePeer ~= sender then
+            ClearOpManifestBuffer(opId)
+            return "rejected", "id_conflict"
+        end
+        if buf.pages[page] then
+            if GS._DeepEqualOps and not GS._DeepEqualOps(buf.pages[page], body) then
+                ClearOpManifestBuffer(opId)
+                return "rejected", "id_conflict"
+            end
+        else
+            if (opManifestBufferPages or 0) >= maxPagesBuf then
+                return "rejected", "full"
+            end
+            opManifestBufferPages = (opManifestBufferPages or 0) + 1
+            buf.pages[page] = body
+        end
+        buf.at = now
+        buf.pageCount = pageCount
+        if type(buf.shell) ~= "table" then
+            return "pending", "missing_predecessor"
+        end
+        local assembled, aerr = AssembleOpFromPages(buf.shell, buf.pages)
+        if not assembled then
+            if aerr == "incomplete_manifest_pages" then
+                return "pending", "missing_predecessor"
+            end
+            ClearOpManifestBuffer(opId)
+            return "rejected", aerr or "invalid_operation"
+        end
+        ClearOpManifestBuffer(opId)
+        -- Re-enter with assembled body.
+        body = assembled
+        -- fall through to gs-op handling below
+    end
+
     if body.kind == "gs-op" then
         local op = body.op
         if type(op) ~= "table" then
             return "rejected", "invalid_operation"
+        end
+        -- Paged shell: retain fragment buffer until pages arrive.
+        local pageCount = tonumber(body.pageCount) or tonumber(op.pageCount)
+        if pageCount and pageCount >= 1 and (
+            (op.kind == GS.KIND.CONFIRM_CANDIDATE
+                and (not op.candidateRef or not op.candidateRef.body)
+                and not (op.candidateRef and op.candidateRef.records
+                    and op.candidateRef.records[1] and op.candidateRef.records[1].body))
+            or (op.kind == GS.KIND.RESOLVE_CONFLICT
+                and (not op.value or type(op.value.contentBodies) ~= "table"))
+        ) then
+            if not localRecord then
+                return "pending", "awaiting_dataset"
+            end
+            ReclaimExpiredFragmentBuffers({
+                datasetId = op.datasetId or body.datasetId,
+                guildKey = localRecord._guildKey,
+            })
+            local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES or 16
+            local now = GetServerTime and GetServerTime() or 0
+            local buf = opManifestBuffer[op.id]
+            if not buf then
+                if (opManifestBufferCount or 0) >= maxCamps then
+                    return "rejected", "full"
+                end
+                buf = {
+                    pages = {},
+                    datasetId = op.datasetId,
+                    sourcePeer = sender,
+                    at = now,
+                    guildKey = localRecord._guildKey,
+                }
+                opManifestBuffer[op.id] = buf
+                opManifestBufferCount = (opManifestBufferCount or 0) + 1
+            end
+            if buf.shell and GS._DeepEqualOps and not GS._DeepEqualOps(buf.shell, body) then
+                ClearOpManifestBuffer(op.id)
+                return "rejected", "id_conflict"
+            end
+            buf.shell = body
+            buf.pageCount = pageCount
+            buf.at = now
+            local assembled, aerr = AssembleOpFromPages(buf.shell, buf.pages)
+            if not assembled then
+                return "pending", "missing_predecessor"
+            end
+            ClearOpManifestBuffer(op.id)
+            body = assembled
+            op = body.op
         end
         -- Ordinary members may carry historical candidates; only authenticated
         -- editors authorize application. Relayed author fields are not proof —
@@ -873,13 +1352,14 @@ local function ValidateAndApply(record, ctx)
         local requireRecover = false
         if op.kind == GS.KIND.SET_EDITOR_RANK and localRecord then
             local perm = localRecord.permission
-            local policyPos = type(perm) == "table" and tonumber(perm.editorRankPosition) or nil
+            local rawPos = type(perm) == "table" and tonumber(perm.editorRankPosition) or nil
+            local integralPos = rawPos and rawPos == math.floor(rawPos) and rawPos >= 1
             local ranks = GG and GG.GetGuildRanks and GG.GetGuildRanks()
             local rankCount = type(ranks) == "table" and tonumber(ranks.count) or nil
-            local policyOk = policyPos and policyPos >= 1
-                and (not rankCount or policyPos <= rankCount)
-                and type(perm) == "table"
+            local policyOk = type(perm) == "table"
                 and type(perm.revisionId) == "string" and perm.revisionId ~= ""
+                and integralPos
+                and (not rankCount or rawPos <= rankCount)
             requireRecover = not policyOk
         end
         -- Policy catch-up: while bootstrap-locked, evaluate authority with
@@ -996,6 +1476,25 @@ function GS:DisableGossipProvider()
     ResetArchivePageBuffers()
 end
 
+local function ScheduleExportMaintContinuation()
+    if exportState.maintScheduled or exportState.maintIdle then
+        return
+    end
+    exportState.maintScheduled = true
+    local function cont()
+        exportState.maintScheduled = false
+        if exportState.maintIdle then
+            return
+        end
+        GS.NotifyLocalDurableChange("export-maint")
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, cont)
+    else
+        cont()
+    end
+end
+
 --- Required after provider-owned durable storage changes outside engine append.
 -- Adoption / dataset replacement rebuilds the full export index and drops stale
 -- IDs. Ordinary accepted ops upsert incrementally so catch-up stays bounded.
@@ -1034,6 +1533,11 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
         end
+        -- Pace deferred archive construction after cold rebuild.
+        if exportState.archiveBuildNeeded then
+            exportState.maintIdle = false
+            ScheduleExportMaintContinuation()
+        end
     elseif record then
         -- Incremental: fingerprint only new/missing export ids from appendPos.
         -- Immutable accepted bodies keep their cached versionFp.
@@ -1046,74 +1550,96 @@ function GS.NotifyLocalDurableChange(reason)
                 local op = ops.records and ops.records[oid]
                 if type(op) == "table" then
                     local existing = exportState.byId[exportId]
-                    -- Replace a previously exported evidenceOnly body after promotion
-                    -- so the accepted form (with campaign boundary) is what peers get.
                     local mustReplace = existing
                         and existing.body
                         and existing.body.evidenceOnly == true
                     if not existing or mustReplace then
-                        local body = { kind = "gs-op", op = op }
+                        local boundary = nil
                         if op.kind == GS.KIND.START_CAMPAIGN then
-                            local header = record.campaigns and record.campaigns[op.id]
-                            if type(header) == "table" then
-                                body.boundary = header
-                            end
+                            boundary = record.campaigns and record.campaigns[op.id]
                         end
-                        UpsertExportBody(exportId, body)
+                        local parts = BuildOpExportBodies(op, false, boundary)
+                        for pi = 1, #parts do
+                            UpsertExportBody(parts[pi].id, parts[pi].body)
+                        end
                     end
                 end
             end
             exportState.appendPos = #ops.order
-            -- Incremental conflict/pending/resolution dependency export.
-            -- Bound per-notify work; resume via maintPos across notifications.
             local function upsertEvidence(cid, boundaryHint)
                 if type(cid) ~= "string" then
-                    return
+                    return false
                 end
                 local exportId = "gs:op:" .. cid
                 local existing = exportState.byId[exportId]
                 if existing and existing.body and existing.body.evidenceOnly ~= true then
-                    return -- accepted export wins
+                    return false -- accepted export wins; still counts as scanned work
                 end
                 if ops.records and ops.records[cid] then
-                    return -- accepted handled above
+                    return false
                 end
                 local cand = (ops.pending and ops.pending[cid] and ops.pending[cid].body)
                     or (ops.conflicts and ops.conflicts[cid] and ops.conflicts[cid].body)
                 if type(cand) ~= "table" then
-                    return
+                    return false
                 end
-                local body = { kind = "gs-op", op = cand, evidenceOnly = true }
+                local header = nil
                 if cand.kind == GS.KIND.START_CAMPAIGN then
-                    local header = boundaryHint
+                    header = boundaryHint
                         or (record.campaigns and record.campaigns[cid])
                         or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
-                    if type(header) == "table" then
-                        body.boundary = header
-                    end
                 end
-                UpsertExportBody(exportId, body)
+                local parts = BuildOpExportBodies(cand, true, header)
+                for pi = 1, #parts do
+                    UpsertExportBody(parts[pi].id, parts[pi].body)
+                end
+                return true
             end
             local slice = GS.MAX_EXPORT_MAINT_PER_SLICE or 32
             local used = 0
+            -- Sorted resume cursors so later evidence is not starved.
+            local function sortedKeys(map)
+                local keys = {}
+                if type(map) == "table" then
+                    for k in pairs(map) do
+                        keys[#keys + 1] = k
+                    end
+                    table.sort(keys, function(a, b)
+                        return tostring(a) < tostring(b)
+                    end)
+                end
+                return keys
+            end
             if type(ops.openConflicts) == "table" then
-                for _, entry in pairs(ops.openConflicts) do
+                local ocKeys = sortedKeys(ops.openConflicts)
+                local ocStart = tonumber(exportState.openConflictCursor) or 1
+                for ki = ocStart, #ocKeys do
                     if used >= slice then
+                        exportState.openConflictCursor = ki
                         break
                     end
+                    local entry = ops.openConflicts[ocKeys[ki]]
                     if type(entry) == "table" and type(entry.candidateIds) == "table" then
                         for i = 1, #entry.candidateIds do
                             if used >= slice then
+                                exportState.openConflictCursor = ki
                                 break
                             end
-                            local cid = entry.candidateIds[i]
-                            upsertEvidence(cid, entry.boundaries and entry.boundaries[cid])
-                            used = used + 1
+                            upsertEvidence(entry.candidateIds[i],
+                                entry.boundaries and entry.boundaries[entry.candidateIds[i]])
+                            used = used + 1 -- budget scanned work, not only writes
                         end
+                    else
+                        used = used + 1
+                    end
+                    if used < slice then
+                        exportState.openConflictCursor = ki + 1
                     end
                 end
+                if used < slice then
+                    exportState.openConflictCursor = nil
+                end
             end
-            -- Only newly appended accepted resolves need competing-id export.
             if used < slice and type(ops.order) == "table" then
                 local resStart = math.max(1, (tonumber(exportState.resolveScanPos) or 0) + 1)
                 for i = resStart, #ops.order do
@@ -1122,11 +1648,11 @@ function GS.NotifyLocalDurableChange(reason)
                     end
                     local op = ops.records and ops.records[ops.order[i]]
                     exportState.resolveScanPos = i
+                    used = used + 1
                     if type(op) == "table" and op.kind == GS.KIND.RESOLVE_CONFLICT
                         and type(op.value) == "table" then
                         if type(op.value.chosenOpId) == "string" then
                             upsertEvidence(op.value.chosenOpId, nil)
-                            used = used + 1
                         end
                         if type(op.value.competingOpIds) == "table" then
                             for j = 1, #op.value.competingOpIds do
@@ -1140,26 +1666,42 @@ function GS.NotifyLocalDurableChange(reason)
                     end
                 end
             end
-            -- Pending/conflict maps: paced walk with resume cursor.
             if used < slice and type(ops.pending) == "table" then
-                for cid in pairs(ops.pending) do
+                local keys = sortedKeys(ops.pending)
+                local startK = tonumber(exportState.pendingCursor) or 1
+                for ki = startK, #keys do
                     if used >= slice then
+                        exportState.pendingCursor = ki
                         break
                     end
-                    upsertEvidence(cid, nil)
+                    upsertEvidence(keys[ki], nil)
                     used = used + 1
+                    exportState.pendingCursor = ki + 1
+                end
+                if used < slice then
+                    exportState.pendingCursor = nil
                 end
             end
             if used < slice and type(ops.conflicts) == "table" then
-                for cid in pairs(ops.conflicts) do
+                local keys = sortedKeys(ops.conflicts)
+                local startK = tonumber(exportState.conflictCursor) or 1
+                for ki = startK, #keys do
                     if used >= slice then
+                        exportState.conflictCursor = ki
                         break
                     end
-                    upsertEvidence(cid, nil)
+                    upsertEvidence(keys[ki], nil)
                     used = used + 1
+                    exportState.conflictCursor = ki + 1
+                end
+                if used < slice then
+                    exportState.conflictCursor = nil
                 end
             end
             exportState.maintIdle = used < slice
+                and exportState.pendingCursor == nil
+                and exportState.conflictCursor == nil
+                and exportState.openConflictCursor == nil
         end
         if type(record.campaigns) == "table" then
             for campaignId, header in pairs(record.campaigns) do
@@ -1174,39 +1716,59 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
         end
-        -- Archives: only construct pages for campaigns not yet exported.
+        -- Archives: paced construction (also drains cold-rebuild backlog).
         if type(record.campaignArchives) == "table" then
             local slice = GS.MAX_EXPORT_MAINT_PER_SLICE or 32
             local used = 0
+            local keys = {}
             for campaignId, archive in pairs(record.campaignArchives) do
+                if type(campaignId) == "string" and type(archive) == "table" then
+                    keys[#keys + 1] = campaignId
+                end
+            end
+            table.sort(keys)
+            local startK = tonumber(exportState.archiveBuildCursor) or 1
+            for ki = startK, #keys do
                 if used >= slice then
+                    exportState.archiveBuildCursor = ki
                     exportState.maintIdle = false
                     break
                 end
-                if type(campaignId) == "string" and type(archive) == "table" then
-                    local metaId = "gs:ca:" .. campaignId
-                    if not exportState.byId[metaId] then
-                        local parts = BuildArchiveExportBodies(campaignId, archive, record)
-                        for i = 1, #parts do
-                            if not exportState.byId[parts[i].id] then
-                                UpsertExportBody(parts[i].id, parts[i].body)
-                            end
+                local campaignId = keys[ki]
+                local archive = record.campaignArchives[campaignId]
+                local metaId = "gs:ca:" .. campaignId
+                used = used + 1
+                if not exportState.byId[metaId] then
+                    local parts = BuildArchiveExportBodies(campaignId, archive, record)
+                    for i = 1, #parts do
+                        if not exportState.byId[parts[i].id] then
+                            UpsertExportBody(parts[i].id, parts[i].body)
                         end
-                        used = used + 1
                     end
                 end
+                exportState.archiveBuildCursor = ki + 1
+            end
+            if used < slice then
+                exportState.archiveBuildCursor = nil
+                exportState.archiveBuildNeeded = false
+            else
+                exportState.maintIdle = false
             end
         end
-        -- Recount descriptor only from cached export map (no archive rebuild).
+        -- Recount descriptor from cached export map (dual accepted/transfer).
         local acceptedOpCount = tonumber(exportState.cachedOpCount) or 0
+        local transferOpCount = tonumber(exportState.cachedTransferOpCount) or 0
         local campaignCount = tonumber(exportState.cachedCampaignCount) or 0
         local archiveCount = tonumber(exportState.cachedArchiveCount) or 0
         if exportState.countsDirty ~= false then
-            acceptedOpCount, campaignCount, archiveCount = 0, 0, 0
+            acceptedOpCount, transferOpCount, campaignCount, archiveCount = 0, 0, 0, 0
             for id, entry in pairs(exportState.byId) do
                 if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
                     if entry.body.kind == "gs-op" then
-                        acceptedOpCount = acceptedOpCount + 1
+                        transferOpCount = transferOpCount + 1
+                        if entry.body.evidenceOnly ~= true then
+                            acceptedOpCount = acceptedOpCount + 1
+                        end
                     elseif entry.body.kind == "campaign-header" then
                         campaignCount = campaignCount + 1
                     elseif entry.body.kind == "campaign-archive" then
@@ -1214,7 +1776,18 @@ function GS.NotifyLocalDurableChange(reason)
                     end
                 end
             end
+            -- Logical archive count from durable store while pages are still building.
+            if type(record.campaignArchives) == "table" then
+                local logical = 0
+                for _ in pairs(record.campaignArchives) do
+                    logical = logical + 1
+                end
+                if logical > archiveCount then
+                    archiveCount = logical
+                end
+            end
             exportState.cachedOpCount = acceptedOpCount
+            exportState.cachedTransferOpCount = transferOpCount
             exportState.cachedCampaignCount = campaignCount
             exportState.cachedArchiveCount = archiveCount
             exportState.countsDirty = false
@@ -1233,11 +1806,15 @@ function GS.NotifyLocalDurableChange(reason)
             currentCampaignId = record.currentCampaignId,
             activation = record.activation,
             acceptedOpCount = acceptedOpCount,
+            transferOpCount = transferOpCount,
             campaignCount = campaignCount,
             archiveCount = archiveCount,
         }
         UpsertExportBody("gs:desc:" .. record.datasetId, desc)
         exportState.countsDirty = true -- next notify reconciles after upserts
+        if not exportState.maintIdle then
+            ScheduleExportMaintContinuation()
+        end
     end
 
     if GG and GG.NotifyProviderChanged and providerRegistered then
