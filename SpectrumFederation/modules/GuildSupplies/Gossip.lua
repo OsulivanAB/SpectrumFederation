@@ -321,13 +321,60 @@ local function EstimateBodyBytes(body)
     return #table.concat(parts)
 end
 
+--- Pack optional identifier lists onto already-built page bodies under budget.
+-- Preserves public snapshot fields (originalIds / competingOpIds) that shells strip.
+local function AttachIdListToPages(pages, fieldName, ids, exportId, opId, datasetId, budget)
+    if type(ids) ~= "table" or #ids < 1 or type(pages) ~= "table" or #pages < 1 then
+        return true
+    end
+    local maxPages = GS.MAX_MANIFEST_PAGES or 64
+    local cursor = 1
+    local pageIdx = 1
+    while cursor <= #ids do
+        while pageIdx > #pages do
+            if #pages >= maxPages then
+                return false
+            end
+            pages[#pages + 1] = { records = {} }
+        end
+        local page = pages[pageIdx]
+        local existing = page[fieldName] or {}
+        local trial = {}
+        for j = 1, #existing do
+            trial[j] = existing[j]
+        end
+        trial[#trial + 1] = ids[cursor]
+        local trialPage = {
+            kind = "gs-op-page",
+            opId = opId,
+            datasetId = datasetId,
+            page = pageIdx,
+            -- Reserve wire space for the final pageCount field (not provisional 1).
+            pageCount = maxPages,
+            records = page.records or {},
+        }
+        trialPage[fieldName] = trial
+        if EstimateWireRecordBytes(exportId .. ":p" .. tostring(pageIdx), trialPage) <= budget then
+            page[fieldName] = trial
+            cursor = cursor + 1
+        else
+            -- Advance to a fresh page; a single id must fit alone.
+            if #existing > 0 or #(page.records or {}) > 0 then
+                pageIdx = pageIdx + 1
+            else
+                return false
+            end
+        end
+    end
+    return true
+end
+
 --- Split oversized envelopes into shell + pages under wire budget.
--- Pages carry authoritative bodies and identifier membership. Shells never retain
--- originalIds / competingOpIds (those lists blow the shell budget). Ordinary
--- oversized ops page the complete op body as a single row. Returns a complete
--- fragment set where every ID/versionFp wrapper fits, or {} only when a single
--- supported row cannot fit the transport budget alone (caller must not advertise
--- that omission as a complete accepted set — use logical descriptor counts).
+-- Pages carry authoritative bodies, identifier membership, and stripped public
+-- lists (originalIds / competingOpIds). Ordinary oversized ops page only the
+-- mutable payload (value/target); the shell keeps identity/causality. Returns a
+-- complete fragment set where every ID/versionFp wrapper fits, or {} only when a
+-- single supported fragment cannot fit the transport budget alone.
 local function BuildOpExportBodies(op, evidenceOnly, boundary)
     local fullBody = {
         kind = "gs-op",
@@ -342,9 +389,14 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
     end
 
     local rows = {}
+    local originalIds = nil
+    local competingOpIds = nil
     if op.kind == GS.KIND.CONFIRM_CANDIDATE then
         local ref = op.candidateRef
         if type(ref) == "table" then
+            if type(ref.originalIds) == "table" then
+                originalIds = ref.originalIds
+            end
             if type(ref.body) == "table" and type(ref.recordId) == "string" then
                 rows[#rows + 1] = { id = ref.recordId, body = ref.body }
             end
@@ -359,19 +411,39 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         end
     elseif op.kind == GS.KIND.RESOLVE_CONFLICT then
         local bodies = op.value and op.value.contentBodies
+        if type(op.value) == "table" and type(op.value.competingOpIds) == "table" then
+            competingOpIds = op.value.competingOpIds
+        end
         if type(bodies) == "table" then
             local ids = {}
-            for id in pairs(bodies) do
-                ids[#ids + 1] = id
+            if type(competingOpIds) == "table" and #competingOpIds > 0 then
+                for i = 1, #competingOpIds do
+                    local id = competingOpIds[i]
+                    if type(id) == "string" and type(bodies[id]) == "table" then
+                        ids[#ids + 1] = id
+                    end
+                end
             end
-            table.sort(ids)
+            if #ids < 1 then
+                for id in pairs(bodies) do
+                    ids[#ids + 1] = id
+                end
+                table.sort(ids)
+            end
             for i = 1, #ids do
                 rows[#rows + 1] = { id = ids[i], body = bodies[ids[i]] }
             end
         end
     else
-        -- Ordinary oversized op: page the complete public body.
-        rows[1] = { id = op.id, body = op }
+        -- Ordinary oversized op: page only the large mutable payload.
+        rows[1] = {
+            id = op.id,
+            body = {
+                id = op.id,
+                value = op.value,
+                target = op.target,
+            },
+        }
     end
     if #rows < 1 then
         if EstimateWireRecordBytes(exportId, fullBody) <= budget then
@@ -381,7 +453,6 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         return {}
     end
 
-    -- Pack rows into pages that each fit the wire budget (worst case 1/row).
     local maxPages = GS.MAX_MANIFEST_PAGES or 64
     local pages = {}
     local cur = { records = {} }
@@ -402,12 +473,11 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
             opId = op.id,
             datasetId = op.datasetId,
             page = #pages + 1,
-            pageCount = 1, -- provisional
+            pageCount = maxPages, -- reserve final pageCount wire space
             records = trialRecords,
         }
         if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), trialPage) > budget then
             if #(cur.records) == 0 then
-                -- Single row exceeds budget even alone: beyond transport support.
                 DebugWarn("op export %s: row exceeds wire budget alone", tostring(op.id))
                 return {}
             end
@@ -422,7 +492,7 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
                 opId = op.id,
                 datasetId = op.datasetId,
                 page = #pages + 1,
-                pageCount = 1,
+                pageCount = maxPages,
                 records = cur.records,
             }
             if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), alone) > budget then
@@ -441,10 +511,22 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
     if #pages < 1 or #pages > maxPages then
         return {}
     end
+
+    if originalIds and not AttachIdListToPages(
+        pages, "originalIds", originalIds, exportId, op.id, op.datasetId, budget) then
+        DebugWarn("op export %s: originalIds exceed page budget", tostring(op.id))
+        return {}
+    end
+    if competingOpIds and not AttachIdListToPages(
+        pages, "competingOpIds", competingOpIds, exportId, op.id, op.datasetId, budget) then
+        DebugWarn("op export %s: competingOpIds exceed page budget", tostring(op.id))
+        return {}
+    end
+    if #pages > maxPages then
+        return {}
+    end
     local pageCount = #pages
 
-    -- Shell: strip embedded bodies and large identifier lists. Membership is
-    -- declared via recordCount + page row ids (and chosenOpId for resolve).
     local shellOp = {}
     for k, v in pairs(op) do
         shellOp[k] = v
@@ -454,15 +536,12 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         shellOp.candidateRef = {
             recordId = ref.recordId,
             campaignId = ref.campaignId,
-            -- originalIds live on pages / reassembled membership, not the shell.
         }
     elseif op.kind == GS.KIND.RESOLVE_CONFLICT and type(op.value) == "table" then
         shellOp.value = {
             chosenOpId = op.value.chosenOpId,
-            -- competingOpIds reconstructed from page row ids on assemble.
         }
     else
-        -- Ordinary: shell keeps identity/causality metadata; page has full body.
         shellOp.value = nil
         shellOp.target = nil
     end
@@ -497,6 +576,12 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
             pageCount = pageCount,
             records = pages[p].records,
         }
+        if type(pages[p].originalIds) == "table" then
+            pageBody.originalIds = pages[p].originalIds
+        end
+        if type(pages[p].competingOpIds) == "table" then
+            pageBody.competingOpIds = pages[p].competingOpIds
+        end
         local pageId = exportId .. ":p" .. tostring(p)
         if EstimateWireRecordBytes(pageId, pageBody) > budget then
             return {}
@@ -530,6 +615,8 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
     end
     local rows = {}
     local seenIds = {}
+    local pageOriginalIds = {}
+    local pageCompetingOpIds = {}
     local totalBytes = 0
     local maxBytes = GS.MAX_FRAGMENT_ASSEMBLY_BYTES or 49152
     for page = 1, pageCount do
@@ -548,6 +635,30 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
         if type(p.datasetId) == "string" and type(shellBody.op.datasetId) == "string"
             and p.datasetId ~= shellBody.op.datasetId then
             return nil, "dataset_mismatch"
+        end
+        if type(p.originalIds) == "table" then
+            for i = 1, #p.originalIds do
+                local oid = p.originalIds[i]
+                if type(oid) == "string" then
+                    pageOriginalIds[#pageOriginalIds + 1] = oid
+                    totalBytes = totalBytes + #oid
+                    if totalBytes > maxBytes then
+                        return nil, "invalid_operation"
+                    end
+                end
+            end
+        end
+        if type(p.competingOpIds) == "table" then
+            for i = 1, #p.competingOpIds do
+                local cid = p.competingOpIds[i]
+                if type(cid) == "string" then
+                    pageCompetingOpIds[#pageCompetingOpIds + 1] = cid
+                    totalBytes = totalBytes + #cid
+                    if totalBytes > maxBytes then
+                        return nil, "invalid_operation"
+                    end
+                end
+            end
         end
         for i = 1, #p.records do
             local row = p.records[i]
@@ -620,11 +731,17 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
     op.recordCount = nil
     if op.kind == GS.KIND.CONFIRM_CANDIDATE then
         local ref = op.candidateRef or {}
+        local originalIds = ref.originalIds
+        if type(originalIds) ~= "table" or #originalIds < 1 then
+            if #pageOriginalIds > 0 then
+                originalIds = pageOriginalIds
+            end
+        end
         if #rows == 1 and type(ref.recordId) == "string" then
             op.candidateRef = {
                 recordId = ref.recordId or rows[1].id,
                 body = rows[1].body,
-                originalIds = ref.originalIds,
+                originalIds = originalIds,
                 campaignId = ref.campaignId,
             }
         else
@@ -634,7 +751,7 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
             end
             op.candidateRef = {
                 records = recs,
-                originalIds = ref.originalIds,
+                originalIds = originalIds,
                 campaignId = ref.campaignId,
             }
         end
@@ -646,8 +763,10 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
             competingOpIds[i] = rows[i].id
         end
         local value = op.value or {}
-        -- Prefer shell-declared order when present; otherwise page membership.
-        if type(value.competingOpIds) == "table" and #value.competingOpIds > 0 then
+        -- Prefer page-carried order, then shell, then page row membership.
+        if #pageCompetingOpIds > 0 then
+            competingOpIds = pageCompetingOpIds
+        elseif type(value.competingOpIds) == "table" and #value.competingOpIds > 0 then
             competingOpIds = value.competingOpIds
         end
         op.value = {
@@ -656,13 +775,24 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
             contentBodies = contentBodies,
         }
     else
-        -- Ordinary paged op: authoritative body is the single page row.
+        -- Ordinary paged op: merge payload into shell identity, or accept a
+        -- complete body when the page still carries one (compat).
         if #rows ~= 1 or type(rows[1].body) ~= "table" then
             return nil, "invalid_operation"
         end
-        op = {}
-        for k, v in pairs(rows[1].body) do
-            op[k] = v
+        local payload = rows[1].body
+        if type(payload.schemaVersion) == "number" and type(payload.actorGuid) == "string" then
+            op = {}
+            for k, v in pairs(payload) do
+                op[k] = v
+            end
+        else
+            if payload.value ~= nil then
+                op.value = payload.value
+            end
+            if payload.target ~= nil then
+                op.target = payload.target
+            end
         end
     end
     return {
@@ -756,6 +886,10 @@ local function RebuildExportIndex()
         transferOpCount = 0,
         campaignCount = 0,
         archiveCount = 0,
+        -- Pin effective config head for adoption binding (nil is meaningful).
+        bankTab = record.accounting and record.accounting._consumables
+            and record.accounting._consumables.bankTab or nil,
+        hasBankTab = true,
     }
     add("gs:desc:" .. record.datasetId, desc)
 
@@ -831,6 +965,9 @@ local function RebuildExportIndex()
         descEntry.body.transferOpCount = transferOpCount
         descEntry.body.campaignCount = headerExportCount
         descEntry.body.archiveCount = archiveExportCount
+        descEntry.body.bankTab = record.accounting and record.accounting._consumables
+            and record.accounting._consumables.bankTab or nil
+        descEntry.body.hasBankTab = true
         descEntry.needsFp = true
         descEntry.versionFp = nil
     end
@@ -1683,6 +1820,11 @@ end
 -- IDs. Ordinary accepted ops upsert incrementally so catch-up stays bounded.
 function GS.NotifyLocalDurableChange(reason)
     reason = tostring(reason or "local")
+    -- Disabled / unregistered providers must not rebuild export state from
+    -- stale Notify calls (queued maint is invalidated via maintGeneration).
+    if not providerRegistered then
+        return
+    end
     local record, guildKey = CurrentGuildRecord()
     local fullRebuild = reason == "adoption"
         or reason == "install"
@@ -1753,6 +1895,7 @@ function GS.NotifyLocalDurableChange(reason)
                     or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
             end
             local parts = BuildOpExportBodies(cand, true, header)
+            used = used + math.max(0, #parts - 1)
             for pi = 1, #parts do
                 UpsertExportBody(parts[pi].id, parts[pi].body)
             end
@@ -1794,6 +1937,8 @@ function GS.NotifyLocalDurableChange(reason)
                             boundary = record.campaigns and record.campaigns[op.id]
                         end
                         local parts = BuildOpExportBodies(op, false, boundary)
+                        -- Charge fragment construction work, not one unit per op.
+                        used = used + math.max(0, #parts - 1)
                         for pi = 1, #parts do
                             UpsertExportBody(parts[pi].id, parts[pi].body)
                         end
@@ -1831,6 +1976,8 @@ function GS.NotifyLocalDurableChange(reason)
                             boundary = record.campaigns and record.campaigns[op.id]
                         end
                         local parts = BuildOpExportBodies(op, false, boundary)
+                        -- Charge fragment construction work, not one unit per op.
+                        used = used + math.max(0, #parts - 1)
                         for pi = 1, #parts do
                             UpsertExportBody(parts[pi].id, parts[pi].body)
                         end
@@ -2065,6 +2212,9 @@ function GS.NotifyLocalDurableChange(reason)
             transferOpCount = transferOpCount,
             campaignCount = campaignCount,
             archiveCount = archiveCount,
+            bankTab = record.accounting and record.accounting._consumables
+                and record.accounting._consumables.bankTab or nil,
+            hasBankTab = true,
         }
         UpsertExportBody("gs:desc:" .. record.datasetId, desc)
         if not exportState.maintIdle then

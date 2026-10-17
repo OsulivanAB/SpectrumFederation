@@ -30,8 +30,12 @@ GS.MAX_WIRE_RECORD_BYTES = 2048
 -- MAX_REQUESTED_ITEMS defaults to 256; ARCHIVE_PAGE_ITEMS is 12 in Gossip.lua.
 GS.MAX_ARCHIVE_PAGE_COUNT = 22
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
--- case, capped by confirmation batch / conflict candidate maxima.
-GS.MAX_MANIFEST_PAGES = math.max(GS.MAX_CONFIRMATION_BATCH or 64, GS.MAX_CONFLICT_CANDIDATES or 16)
+-- case, plus headroom for page-carried originalIds / competingOpIds lists that
+-- shells strip (those lists may need additional pages when record pages are full).
+GS.MAX_MANIFEST_PAGES = math.max(
+    ((GS.MAX_CONFIRMATION_BATCH or 64) * 2),
+    ((GS.MAX_CONFLICT_CANDIDATES or 16) * 2)
+)
 -- Must fit a full legal accepted export: ops + headers + archive meta/pages +
 -- conflict evidence + operation-manifest pages + descriptor. Archive and
 -- confirm/resolve paging multiply bodies beyond logical operation counts.
@@ -42,7 +46,11 @@ GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-GS.MAX_FRAGMENT_BUFFER_PAGES = GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64
+-- Buffer must retain a full paged confirm/resolve (body pages + id-list pages).
+GS.MAX_FRAGMENT_BUFFER_PAGES = math.max(
+    GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64,
+    GS.MAX_MANIFEST_PAGES or 64
+)
 GS.FRAGMENT_BUFFER_TTL_SECONDS = GS.MAX_ADOPTION_SECONDS or 600
 -- Per-slice admission / export maintenance (same order as confirmation redrive).
 GS.MAX_ADMISSION_WORK_PER_SLICE = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
@@ -218,7 +226,6 @@ local function AuthoritativeBodyFromEnvelope(envelope, opId)
     return nil
 end
 
-
 local function ValidateEditorRankValue(pos)
     local ranks = GG() and GG().GetGuildRanks and GG().GetGuildRanks()
     local rankCount = type(ranks) == "table" and tonumber(ranks.count) or nil
@@ -231,7 +238,6 @@ local function ValidateEditorRankValue(pos)
     end
     return true, nil, pos
 end
-
 
 ---------------------------------------------------------------------------
 -- Sender authentication (transport name → verified roster member + rank)
@@ -564,6 +570,9 @@ local ActorMatchesMember -- forward decl; defined below
 -- embeds authoritative content that exactly matches `candidateBody` for `opId`.
 -- Buffered-only envelopes are not authority. Fingerprints are never used.
 -- Selecting an adoption source alone does not confirm unknown authors.
+--- Search buffered confirm/resolve envelopes for exact-content auth of opId.
+-- opts.budget / opts.visited charge each visited buffer record; resumes via
+-- opts.cursor so a single callback cannot scan the whole transfer unboundedly.
 local function AdoptionHasConfirmationFor(adop, opId, candidateBody, member, acceptedOps)
     if type(adop) ~= "table" or type(opId) ~= "string" or type(candidateBody) ~= "table" then
         return false
@@ -2383,7 +2392,13 @@ local function ContinueAdoptionReplay(adop)
             -- Iterate rather than recurse; charge-heavy reverse histories can
             -- need many budget slices. Finite idlePasses still terminate stalls.
             local guard = 0
-            local maxGuard = math.max(256, (#(adop.order or {}) * ((GS.MAX_ADMISSION_WORK_PER_SLICE or 32) + 2)) + 64)
+            -- Retention-capacity reverse histories can require many more slices than
+            -- buffer length (dependency retries + confirmation searches). Idle/stall
+            -- detectors in ReplayAdoptionSlice still terminate non-progressing work.
+            local maxGuard = math.max(
+                256,
+                (#(adop.order or {}) * ((GS.MAX_ADMISSION_WORK_PER_SLICE or 32) + 2) * 8) + 128
+            )
             while moreWork and guard < maxGuard do
                 guard = guard + 1
                 moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
@@ -2519,7 +2534,6 @@ function GS:CommitDatasetAdoption()
     adop.replayState = { cursor = 1, admissions = 0, wave = 0 }
     return ContinueAdoptionReplay(adop)
 end
-
 
 local function ResolutionBodiesMatch(value, ops, ids)
     if type(value.contentBodies) ~= "table" then
