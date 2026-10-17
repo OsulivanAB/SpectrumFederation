@@ -369,9 +369,17 @@ local function settleRoster()
     fireEvent("GUILD_ROSTER_UPDATE")
 end
 
---- Simulate /reload clearing runtime demand-roster state while SV/world persist.
+--- Simulate /reload clearing runtime demand-roster / session caches while SV persist.
 local function simulateRuntimeReload()
     resetDemandRoster()
+    -- Runtime-only caches drop; durable SavedVariables (_root via _db) remain.
+    GS._bootstrapEditLock = {}
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    GS._confirmationRedrivePos = 1
+    GS._confirmationRedriveRemaining = nil
+    GS._confirmationRedriveScheduled = false
+    timers = {}
 end
 
 local function resetDb()
@@ -389,7 +397,10 @@ local function resetDb()
     GS._pendingCampaignBoundaries = {}
     GS._bootstrapEditLock = {}
     GS._confirmationRedrivePos = 1
+    GS._confirmationRedriveRemaining = nil
+    GS._confirmationRedriveScheduled = false
     world.notifyChanged = 0
+    timers = {}
     world.chat = {}
     world.prints = {}
     world.debugLogs = {}
@@ -7112,7 +7123,8 @@ do
         assertEq(GS:GetCapabilities().canEdit, true, "3A8: canEdit after policy catch-up")
     end
 
-    -- Predecessor-late confirmation redrive scans beyond the first 32 refs.
+    -- Predecessor-late confirmation redrive: only ref 33 binds the candidate;
+    -- production continuation (C_Timer) must apply it without a manual second call.
     do
         resetDb()
         switchPlayer("Alice", "Player-1-Alice", 1)
@@ -7123,9 +7135,18 @@ do
         local camp = GS:GetCurrentRecord().currentCampaignId
         local pol = GS:GetCurrentRecord().permission.revisionId
         local record = GS:GetCurrentRecord()
-        -- Synthesize 33 accepted confirmation refs pointing at a late candidate.
+        local lateBody = {
+            schemaVersion = 1, id = "late-cand-33", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 7,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 20100,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        local lateFp = GS.ContentFingerprint(lateBody)
+        assertTrue(type(lateFp) == "string" and lateFp ~= "", "3A8: late fingerprint")
+        -- Refs 1..32 bind a different decoy id; only ref 33 binds late-cand-33.
         for i = 1, 33 do
             local cid = "seed-conf-" .. i
+            local targetId = (i == 33) and "late-cand-33" or ("decoy-cand-" .. i)
             local confBody = {
                 schemaVersion = 1,
                 id = cid,
@@ -7133,10 +7154,10 @@ do
                 datasetId = ds,
                 kind = "confirm-candidate",
                 candidateRef = {
-                    recordId = "late-cand-33",
-                    contentFingerprint = "pending-fp",
+                    recordId = targetId,
+                    contentFingerprint = lateFp,
                 },
-                contentFingerprint = "pending-fp",
+                contentFingerprint = lateFp,
                 campaignId = camp,
                 basePolicyRevision = pol,
                 actorGuid = "Player-1-Alice",
@@ -7148,38 +7169,178 @@ do
             record.confirmationRefs[#record.confirmationRefs + 1] = cid
         end
         assertEq(#record.confirmationRefs, 33, "3A8: 33 confirmationRefs seeded")
-        local lateBody = {
-            schemaVersion = 1, id = "late-cand-33", guildKey = "club:42", datasetId = ds,
-            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 7,
-            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 20100,
-            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
-        }
-        local lateFp = GS.ContentFingerprint(lateBody)
-        for i = 1, 33 do
-            local confBody = record.operations.records["seed-conf-" .. i]
-            confBody.candidateRef.contentFingerprint = lateFp
-            confBody.contentFingerprint = lateFp
-        end
         assertEq(select(1, GS:AdmitRemoteOperation(lateBody, {
             sender = "Dave-Garona", relay = true,
         })), "pending", "3A8: late candidate retained for redrive")
-        -- Ordinary Alice accept on a non-conflicting target must invoke redrive.
-        local aliceRank = {
-            schemaVersion = 1, id = "alice-redrive-rank", guildKey = "club:42", datasetId = ds,
-            campaignId = camp, kind = "set-editor-rank", target = "editorRankPosition", value = 2,
-            actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 20101,
-            baseTargetRevision = pol, basePolicyRevision = pol, baseCampaignId = camp,
+        assertEq(GS:GetCurrentRecord().operations.records["late-cand-33"], nil,
+            "3A8: candidate not applied before continuation")
+        -- A second foreign retain triggers RedriveExactContentConfirmations on the
+        -- production untrusted-relay path without advancing policy or the tab head.
+        local spur = {
+            schemaVersion = 1, id = "spur-relay", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 3,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 20101,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
         }
-        assertEq(GS:AdmitRemoteOperation(aliceRank, { sender = "Alice-Garona" }), "accepted",
-            "3A8: alice accept triggers redrive")
-        -- Drain remaining confirmationRefs slices (budget 32 ⇒ needs 2nd pass).
+        -- Reset cursor so the spur-triggered slice starts at ref 1 and must
+        -- schedule continuation to reach the only matching ref (33).
         GS._confirmationRedrivePos = 1
-        GS.RedriveExactContentConfirmations(GS:GetCurrentRecord(), {})
-        GS.RedriveExactContentConfirmations(GS:GetCurrentRecord(), {})
+        GS._confirmationRedriveRemaining = nil
+        GS._confirmationRedriveScheduled = false
+        timers = {}
+        assertEq(select(1, GS:AdmitRemoteOperation(spur, {
+            sender = "Dave-Garona", relay = true,
+        })), "pending", "3A8: spur retain triggers redrive slice")
+        assertEq(GS:GetCurrentRecord().operations.records["late-cand-33"], nil,
+            "3A8: first slice does not reach ref 33")
+        assertTrue(GS._confirmationRedriveScheduled == true
+            or (tonumber(GS._confirmationRedriveRemaining) or 0) > 0
+            or #timers > 0,
+            "3A8: continuation scheduled after first slice")
+        -- Production continuation path (no manual RedriveExactContentConfirmations).
+        world.time = world.time + 1
+        flushTimers()
         local after = GS:GetCurrentRecord()
-        assertTrue(after.operations.records["late-cand-33"] ~= nil
-            or after.accounting._consumables.bankTab == 7,
-            "3A8: confirmation beyond index 32 redriven onto retained candidate")
+        assertTrue(after.operations.records["late-cand-33"] ~= nil,
+            "3A8: confirmation beyond index 32 applied via scheduled continuation")
+        assertEq(after.accounting._consumables.bankTab, 7,
+            "3A8: late confirmed tab value applied")
+    end
+
+    -- Bootstrap edit lock persists across reload via pendingPolicyRevisionId.
+    do
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        local member = GS.AuthenticateTransportSender("Alice-Garona")
+        assertEq(GS:InstallStagedDatasetFromRemote({
+            kind = "dataset-desc",
+            schemaVersion = 1,
+            guildKey = "club:42",
+            datasetId = "boot-persist-ds",
+            editorRankPosition = 3,
+            permissionRevisionId = "policy-persist",
+            bootstrapEditorRankPosition = 3,
+            activation = "staged",
+            acceptedOpCount = 0,
+            campaignCount = 0,
+            archiveCount = 0,
+        }, member), "accepted", "3A8: persist-lock install")
+        assertEq(GS:GetCurrentRecord().permission.pendingPolicyRevisionId, "policy-persist",
+            "3A8: durable pendingPolicyRevisionId set")
+        assertEq(GS.IsBootstrapEditLocked("club:42"), true, "3A8: lock armed pre-reload")
+        -- Remote config mutation while locked must not apply as ordinary editor.
+        local lockedTab = {
+            schemaVersion = 1, id = "locked-tab", guildKey = "club:42",
+            datasetId = "boot-persist-ds", campaignId = nil,
+            kind = "set-bank-tab", target = "bankTab", value = 4,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 21000,
+            baseTargetRevision = "boot-persist-ds", basePolicyRevision = "boot-persist-ds",
+            baseCampaignId = nil,
+        }
+        local stLock, reasonLock = GS:AdmitRemoteOperation(lockedTab, { sender = "Bob-Garona" })
+        assertTrue(stLock == "pending" or stLock == "rejected",
+            "3A8: locked remote config not accepted")
+        assertTrue(reasonLock == "untrusted_relay" or reasonLock == "awaiting_policy"
+            or reasonLock == "unauthorized" or reasonLock == "missing_campaign"
+            or reasonLock == "stale_base",
+            "3A8: locked remote reason: " .. tostring(reasonLock))
+        assertEq(GS:GetCurrentRecord().operations.records["locked-tab"], nil,
+            "3A8: locked tab not in accepted records")
+        simulateRuntimeReload()
+        -- Re-bind root from SavedVariables the way Initialize would.
+        assertEq(GS:Initialize(SpectrumFederationDB), true, "3A8: re-init after reload")
+        settleRoster()
+        assertEq(GS.IsBootstrapEditLocked("club:42"), true,
+            "3A8: lock reconstructed after reload")
+        assertEq(GS:GetCapabilities().canEdit, false, "3A8: canEdit false after reload lock")
+        local catch = {
+            schemaVersion = 1, id = "policy-persist", guildKey = "club:42",
+            datasetId = "boot-persist-ds", campaignId = nil,
+            kind = "set-editor-rank", target = "editorRankPosition", value = 2,
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 21001,
+            baseTargetRevision = "boot-persist-ds", basePolicyRevision = "boot-persist-ds",
+            baseCampaignId = nil,
+        }
+        assertEq(GS:AdmitRemoteOperation(catch, { sender = "Alice-Garona" }), "accepted",
+            "3A8: catch-up policy admits while locked")
+        assertEq(GS.IsBootstrapEditLocked("club:42"), false, "3A8: lock cleared after catch-up")
+        assertEq(GS:GetCurrentRecord().permission.pendingPolicyRevisionId, nil,
+            "3A8: durable pending cleared")
+    end
+
+    -- Shared-ancestry resolution: bases from candidates, not provisional head.
+    do
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        startCampaign()
+        local ds = GS:GetCurrentRecord().datasetId
+        local camp = GS:GetCurrentRecord().currentCampaignId
+        local pol = GS:GetCurrentRecord().permission.revisionId
+        local tabA = {
+            schemaVersion = 1, id = "anc-tab-a", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 22000,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        local tabB = {
+            schemaVersion = 1, id = "anc-tab-b", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 2,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 22001,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        assertEq(GS:AdmitRemoteOperation(tabA, { sender = "Alice-Garona" }), "accepted", "3A8: anc A")
+        assertEq(select(1, GS:AdmitRemoteOperation(tabB, { sender = "Bob-Garona" })), "pending", "3A8: anc B")
+        local open = GS:ListOpenConflicts()[1]
+        assertTrue(open ~= nil, "3A8: ancestry conflict open")
+        local ids = {}
+        for i = 1, #open.candidates do ids[#ids + 1] = open.candidates[i].id end
+        local resOp, resSt = GS:NewConflictResolutionOperation(open.targetKey, "anc-tab-b", ids)
+        assertEq(resSt, "accepted", "3A8: shared-ancestry resolution prepared")
+        assertEq(resOp.baseTargetRevision, ds, "3A8: resolution baseTarget is shared ancestry")
+        assertEq(resOp.basePolicyRevision, pol, "3A8: resolution basePolicy is shared ancestry")
+        assertEq(resOp.baseCampaignId, camp, "3A8: resolution baseCampaign is shared ancestry")
+        -- Incomplete competingOpIds rejected on admit.
+        local badRes = {
+            schemaVersion = 1, id = "bad-res-omit", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "resolve-conflict", target = open.targetKey,
+            value = { chosenOpId = "anc-tab-a" }, -- missing competingOpIds
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 22002,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        assertEq(select(1, GS:AdmitRemoteOperation(badRes, { sender = "Alice-Garona" })), "rejected",
+            "3A8: resolution without competingOpIds rejected")
+        assertEq(GS:ApplyStagedConflictResolution(resOp), "accepted", "3A8: ancestry resolve applies")
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 2, "3A8: B wins via ancestry")
+    end
+
+    -- Fractional/negative bootstrap threshold rejected on commit.
+    do
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        GS.NotePeerDataset("Bob-Garona", "bad-boot-ds", { editorRankPosition = 2 })
+        GS:BeginDatasetAdoption("Bob-Garona", "bad-boot-ds")
+        GS:BufferAdoptionRecord("gs:desc:bad-boot-ds", {
+            kind = "dataset-desc",
+            schemaVersion = 1,
+            guildKey = "club:42",
+            datasetId = "bad-boot-ds",
+            editorRankPosition = 2.5,
+            permissionRevisionId = "bad-boot-ds",
+            bootstrapEditorRankPosition = 2.5,
+            activation = "staged",
+            acceptedOpCount = 0,
+            campaignCount = 0,
+            archiveCount = 0,
+        })
+        local stBadBoot, reasonBadBoot = GS:CommitDatasetAdoption()
+        assertEq(stBadBoot, "rejected", "3A8: fractional bootstrap rejected")
+        assertEq(reasonBadBoot, "invalid_editor_rank_position",
+            "3A8: fractional bootstrap reason: " .. tostring(reasonBadBoot))
     end
 
     assertEq(#world.chat, 0, "3A8: no chat")

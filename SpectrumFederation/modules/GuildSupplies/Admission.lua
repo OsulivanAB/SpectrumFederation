@@ -11,8 +11,11 @@ GS.PROVIDER_SCHEMA = 1
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
--- Must fit a full legal accepted export (ops) plus descriptor/headers/archives.
-GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096) + 256
+-- Must fit a full legal accepted export: ops + headers + archive meta/pages +
+-- conflict evidence + descriptor. Archive paging multiplies bodies per campaign.
+GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+    + ((GS.MAX_CAMPAIGNS or 64) * 24)
+    + 512
 -- Abandoned adoption sessions expire so they cannot suppress peer traffic forever.
 GS.MAX_ADOPTION_SECONDS = 600
 -- Adoption replay wave bound is derived from buffered body count (dependency
@@ -22,6 +25,9 @@ GS.MAX_ADOPTION_REPLAY_PASSES = nil -- unused; see ReplayAdoptionIntoTemp
 GS.MAX_PENDING_RELAY = 64
 -- Per-commit confirmation redrive slice (full refs scanned across slices).
 GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE = 32
+-- Aggregate archive reassembly buffer (campaigns + pages) for gossip receive.
+GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = 16
+GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 64
 
 -- Runtime-only: adoption / peer discovery / epoch. Not SavedVariables.
 GS._adoptionEpoch = 0
@@ -31,9 +37,11 @@ GS._pendingRelay = {} -- [recordId] = { body, sender, at, fingerprint, boundary?
 -- Pending campaign boundaries retained with conflicting start-campaign candidates.
 GS._pendingCampaignBoundaries = {} -- [opId] = header
 -- After descriptor-first install: block local edits until advertised policy lands.
+-- Durable mirror: permission.pendingPolicyRevisionId (survives /reload).
 GS._bootstrapEditLock = {} -- [guildKey] = advertisedPermissionRevisionId
 -- Confirmation redrive cursor across scheduled slices.
 GS._confirmationRedrivePos = 1
+GS._confirmationRedriveScheduled = false
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -99,36 +107,40 @@ local function CanonicalContentParts(body)
     return parts
 end
 
---- Authority-binding content digest. Uses existing Hash32 over the full
--- canonical serialization in fixed-size windows so distinct bodies do not
--- share a single 32-bit advisory collision as approval authority. Index/advisory
--- hashes elsewhere remain separate. Folded to fit MAX_OPERATION_ID.
+--- Authority-binding content digest over the canonical serialization.
+-- Uses existing Hash32 with position-tagged windows and a rolling mix so
+-- equal-length window collisions cannot share a digest. Fail closed without
+-- Hash32 (never id-only). Folded to fit MAX_OPERATION_ID. Advisory transport
+-- hashes elsewhere remain separate and are not approval authority.
 local function ContentFingerprint(body)
     local gossip = GG()
     if not (gossip and gossip.Hash32) then
-        -- Fail closed for authority binding: never fall back to id-only.
         return nil
     end
     local canon = table.concat(CanonicalContentParts(body))
+    local mix = gossip.Hash32("gs-fp-v2:len:" .. tostring(#canon))
     local digests = {}
-    digests[#digests + 1] = string.format("%08x", gossip.Hash32("len:" .. tostring(#canon)))
+    digests[#digests + 1] = string.format("%08x", mix)
     local win = 256
     if #canon == 0 then
-        digests[#digests + 1] = string.format("%08x", gossip.Hash32(""))
+        mix = gossip.Hash32(string.format("%08x|empty", mix))
+        digests[#digests + 1] = string.format("%08x", mix)
     else
+        local idx = 0
         for i = 1, #canon, win do
+            idx = idx + 1
             local chunk = canon:sub(i, i + win - 1)
-            digests[#digests + 1] = string.format("%08x", gossip.Hash32(chunk))
+            mix = gossip.Hash32(string.format("%08x|%d|%d|", mix, idx, #chunk) .. chunk)
+            digests[#digests + 1] = string.format("%08x", mix)
         end
     end
-    -- Mix full-string hash last so prefix-identical bodies still diverge.
-    digests[#digests + 1] = string.format("%08x", gossip.Hash32(canon))
-    -- Fold until the fingerprint fits confirmation/id field budgets.
+    mix = gossip.Hash32(string.format("%08x|full|", mix) .. canon)
+    digests[#digests + 1] = string.format("%08x", mix)
     local maxLen = GS.MAX_OPERATION_ID or 192
     while #digests > 1 and (#digests * 8) > maxLen do
         local a = table.remove(digests, 1)
         local b = table.remove(digests, 1)
-        table.insert(digests, 1, string.format("%08x", gossip.Hash32(a .. b)))
+        table.insert(digests, 1, string.format("%08x", gossip.Hash32(a .. "|" .. b)))
     end
     return table.concat(digests, "")
 end
@@ -234,6 +246,13 @@ function GS.SenderHasEditorAuthority(member, opts)
     local policyOk = policyPos and policyPos >= 1
         and (not rankCount or policyPos <= rankCount)
         and type(perm.revisionId) == "string" and perm.revisionId ~= ""
+
+    -- Incomplete descriptor-first catch-up: provisional bootstrap threshold is not
+    -- ordinary edit authority (local or remote) until advertised policy lands.
+    if not opts.allowPolicyCatchUp and GS.IsBootstrapEditLocked
+        and GS.IsBootstrapEditLocked(member.guildKey, record) then
+        return false, "awaiting_policy"
+    end
 
     if opts.requireRecoverPolicy or (not policyOk) then
         if member.rankOrder == 1 then
@@ -404,23 +423,38 @@ local function RetainPendingRelay(recordId, entry)
     return true
 end
 
---- True when buffered adoption transfer includes source-authenticated exact-content
--- confirmation or a source-authored resolution that chooses this operation id.
--- Selecting an adoption source alone does not confirm unknown authors.
-local function AdoptionHasConfirmationFor(adop, opId, fingerprint)
+local ActorMatchesMember -- forward decl; defined below
+
+--- True when an *accepted* source-authored exact-content confirmation/resolution
+-- binds `opId` to `fingerprint`. Buffered-only envelopes are not authority —
+-- the envelope must already be in `acceptedOps.records`. Missing fingerprints
+-- fail closed. Selecting an adoption source alone does not confirm unknown authors.
+-- @param acceptedOps table|nil operations map with .records (optional during scan)
+local function AdoptionHasConfirmationFor(adop, opId, fingerprint, member, acceptedOps)
     if type(adop) ~= "table" or type(opId) ~= "string" then
         return false
     end
+    if type(fingerprint) ~= "string" or fingerprint == "" then
+        return false
+    end
+    local accepted = acceptedOps and acceptedOps.records
     for i = 1, #adop.order do
         local body = adop.records[adop.order[i]]
         if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
             local op = body.op
-            if op.kind == GS.KIND.CONFIRM_CANDIDATE then
+            -- Envelope must be accepted and authored by the authenticated source.
+            if type(accepted) == "table" and type(accepted[op.id]) ~= "table" then
+                -- skip not-yet-accepted envelopes
+            elseif not ActorMatchesMember(op, member) then
+                -- skip unauthenticated envelopes
+            elseif op.kind == GS.KIND.CONFIRM_CANDIDATE then
                 local ref = op.candidateRef
                 if type(ref) == "table" then
                     local matchId = false
+                    local rowFp = nil
                     if ref.recordId == opId then
                         matchId = true
+                        rowFp = ref.contentFingerprint
                     elseif type(ref.originalIds) == "table" then
                         for j = 1, #ref.originalIds do
                             if ref.originalIds[j] == opId then
@@ -433,28 +467,27 @@ local function AdoptionHasConfirmationFor(adop, opId, fingerprint)
                             local row = ref.records[j]
                             if type(row) == "table" and row.id == opId then
                                 matchId = true
+                                rowFp = row.contentFingerprint
                                 break
                             end
                         end
                     end
                     if matchId then
-                        local want = ref.contentFingerprint or op.contentFingerprint
-                        if not want or not fingerprint or want == fingerprint then
+                        local want = rowFp or ref.contentFingerprint or op.contentFingerprint
+                        if type(want) == "string" and want ~= "" and want == fingerprint then
                             return true
                         end
                     end
                 end
             elseif op.kind == GS.KIND.RESOLVE_CONFLICT then
                 local value = op.value
-                if type(value) == "table" and value.chosenOpId == opId then
-                    if type(value.contentFingerprints) == "table"
-                        and type(value.contentFingerprints[opId]) == "string"
-                        and fingerprint
-                        and value.contentFingerprints[opId] ~= fingerprint then
-                        -- fingerprint disagreement: not a confirmation of this body
-                    else
-                        return true
-                    end
+                if type(value) == "table" and value.chosenOpId == opId
+                    and type(value.contentFingerprints) == "table"
+                    and type(value.contentFingerprints[opId]) == "string"
+                    and value.contentFingerprints[opId] == fingerprint
+                    and type(value.competingOpIds) == "table"
+                    and #value.competingOpIds >= 1 then
+                    return true
                 end
             end
         end
@@ -462,7 +495,7 @@ local function AdoptionHasConfirmationFor(adop, opId, fingerprint)
     return false
 end
 
-local function ActorMatchesMember(op, member)
+ActorMatchesMember = function(op, member)
     if type(op) ~= "table" or type(member) ~= "table" then
         return false
     end
@@ -864,12 +897,15 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
     GS._root.guilds[guildKey] = record
     GS._adoptionEpoch = (tonumber(GS._adoptionEpoch) or 0) + 1
     -- Descriptor-first install: keep revisionId == datasetId (empty store). When
-    -- the source advertises a different current policy, lock local edits until
-    -- that authenticated policy revision is reconstructed via replication.
+    -- the source advertises a different current policy, lock edits until that
+    -- authenticated policy revision is reconstructed. Persist on the record so
+    -- /reload cannot drop the incomplete-catch-up restriction.
     local advertised = descriptor.permissionRevisionId
     if type(advertised) == "string" and advertised ~= "" and advertised ~= descriptor.datasetId then
+        record.permission.pendingPolicyRevisionId = advertised
         GS._bootstrapEditLock[guildKey] = advertised
     else
+        record.permission.pendingPolicyRevisionId = nil
         GS._bootstrapEditLock[guildKey] = nil
     end
     DebugInfo("installed remote staged dataset key=%s dataset=%s from=%s",
@@ -886,20 +922,45 @@ function GS.ClearBootstrapEditLockIfCaughtUp(record, guildKey)
         return
     end
     local want = GS._bootstrapEditLock[guildKey]
+    if type(want) ~= "string" and type(record.permission) == "table" then
+        want = record.permission.pendingPolicyRevisionId
+    end
     if type(want) ~= "string" then
         return
     end
     local have = record.permission and record.permission.revisionId
     if have == want then
         GS._bootstrapEditLock[guildKey] = nil
+        if type(record.permission) == "table" then
+            record.permission.pendingPolicyRevisionId = nil
+        end
     end
 end
 
-function GS.IsBootstrapEditLocked(guildKey)
+--- True when descriptor-first catch-up is incomplete. Reconstructs from durable
+-- permission.pendingPolicyRevisionId after reload when the runtime cache is empty.
+-- @param guildKey string
+-- @param record table|nil optional record (avoids re-lookup)
+function GS.IsBootstrapEditLocked(guildKey, record)
     if type(guildKey) ~= "string" then
         return false
     end
-    return type(GS._bootstrapEditLock[guildKey]) == "string"
+    local want = GS._bootstrapEditLock[guildKey]
+    if type(want) == "string" and want ~= "" then
+        return true
+    end
+    if type(record) ~= "table" then
+        record = GS._root and GS._root.guilds and GS._root.guilds[guildKey]
+    end
+    if type(record) == "table" and type(record.permission) == "table" then
+        local pending = record.permission.pendingPolicyRevisionId
+        if type(pending) == "string" and pending ~= ""
+            and pending ~= record.permission.revisionId then
+            GS._bootstrapEditLock[guildKey] = pending
+            return true
+        end
+    end
+    return false
 end
 
 local function CountBufferedKinds(adop)
@@ -1234,6 +1295,8 @@ end
 
 --- Persist untrusted/evidence bodies into the offline record so Commit's
 -- restoreCaches(true) cannot wipe unresolved conflict evidence.
+-- Reclassifies against the current head even when the body was retained earlier
+-- as non-conflicting pending (arrival-independent open-conflict reconstruction).
 local function DurableRetainOnRecord(record, op, reason, boundary)
     if type(record) ~= "table" or type(op) ~= "table" or type(record.operations) ~= "table" then
         return "rejected", "invalid_record"
@@ -1242,42 +1305,49 @@ local function DurableRetainOnRecord(record, op, reason, boundary)
     if type(boundary) == "table" and op.kind == GS.KIND.START_CAMPAIGN then
         GS._pendingCampaignBoundaries[op.id] = boundary
     end
+    local st, rsn = "pending", reason or "untrusted_relay"
     if GS._AdmitPendingOrConflict then
-        local st, rsn = GS._AdmitPendingOrConflict(ops, op, reason or "untrusted_relay")
-        -- Always classify: foreign evidence that shares ancestry with the current
-        -- head must open an explicit conflict, even when the retain reason is
-        -- untrusted_relay rather than divergent_edit.
-        local targetKey = GS._TargetKey and GS._TargetKey(op.kind, op.target)
-        if op.kind == GS.KIND.START_CAMPAIGN then
-            targetKey = GS.CAMPAIGN_TARGET_KEY
+        -- Idempotent retain when already pending/conflict with equal body.
+        local already = (ops.pending and ops.pending[op.id])
+            or (ops.conflicts and ops.conflicts[op.id])
+        if not already then
+            st, rsn = GS._AdmitPendingOrConflict(ops, op, reason or "untrusted_relay")
+        elseif already.body and not DeepEqual(already.body, op) then
+            return "rejected", "id_conflict"
         end
-        if targetKey then
-            local class, classReason = ClassifyStaleBase(record, op, targetKey)
-            if class == "conflict" or (ops.openConflicts and ops.openConflicts[targetKey]) then
-                local headId = ops.heads and ops.heads[targetKey]
-                if type(headId) == "string" then
-                    headId = UnderlyingConflictValueId(ops, headId) or headId
-                end
-                local candidates = {}
-                if type(headId) == "string" then
-                    candidates[#candidates + 1] = headId
-                end
-                candidates[#candidates + 1] = op.id
-                local meta = nil
-                if op.kind == GS.KIND.START_CAMPAIGN and type(boundary) == "table" then
-                    meta = { boundaries = { [op.id] = boundary } }
-                end
-                local mok, merr = GS._MarkTargetConflict(
-                    ops, targetKey, candidates, op.timestamp, meta)
-                if not mok and merr == "full" then
-                    return "rejected", "full"
-                end
-                rsn = classReason or rsn
-            end
-        end
-        return st, rsn
     end
-    return "pending", reason or "untrusted_relay"
+    -- Always classify: foreign evidence that shares ancestry with the current
+    -- head must open an explicit conflict, including when it arrived before the
+    -- accepted sibling and was initially stored as plain pending.
+    local targetKey = GS._TargetKey and GS._TargetKey(op.kind, op.target)
+    if op.kind == GS.KIND.START_CAMPAIGN then
+        targetKey = GS.CAMPAIGN_TARGET_KEY
+    end
+    if targetKey then
+        local class, classReason = ClassifyStaleBase(record, op, targetKey)
+        if class == "conflict" or (ops.openConflicts and ops.openConflicts[targetKey]) then
+            local headId = ops.heads and ops.heads[targetKey]
+            if type(headId) == "string" then
+                headId = UnderlyingConflictValueId(ops, headId) or headId
+            end
+            local candidates = {}
+            if type(headId) == "string" then
+                candidates[#candidates + 1] = headId
+            end
+            candidates[#candidates + 1] = op.id
+            local meta = nil
+            if op.kind == GS.KIND.START_CAMPAIGN and type(boundary) == "table" then
+                meta = { boundaries = { [op.id] = boundary } }
+            end
+            local mok, merr = GS._MarkTargetConflict(
+                ops, targetKey, candidates, op.timestamp, meta)
+            if not mok and merr == "full" then
+                return "rejected", "full"
+            end
+            rsn = classReason or rsn
+        end
+    end
+    return st, rsn
 end
 
 --- Replay buffered bodies into an offline temp record (dependency-frontier waves).
@@ -1302,15 +1372,45 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
         end
     end
 
-    -- Dependency-frontier waves: each wave admits ops whose bases match current
-    -- authority. Bound by buffered body count so legal history depth is covered
-    -- without a fixed 64-pass truncation or rank-type priority phases.
+    -- Dependency-frontier waves with policy-successor deferral: do not apply
+    -- set-editor-rank while same-base non-rank history remains unsettled, so
+    -- buffer order cannot obsolete valid bootstrap-base ops as stale_policy.
     local maxPasses = math.max(8, #adop.order + 8)
     local progress = true
     local pass = 0
     while progress and pass < maxPasses do
         progress = false
         pass = pass + 1
+        -- Defer ranks only while a same-base non-rank body that *will be accepted*
+        -- (source-authored or already-confirmed) is not yet in records/conflicts.
+        -- Unconfirmed foreign evidence in pending must not block ranks forever.
+        local function HasUnsettledAcceptableNonRankOnCurrentPolicy()
+            local policyNow = temp.permission and temp.permission.revisionId or temp.datasetId
+            for j = 1, #adop.order do
+                local b = adop.records[adop.order[j]]
+                if type(b) == "table" and b.kind == "gs-op" and type(b.op) == "table" then
+                    local o = b.op
+                    if o.kind ~= GS.KIND.SET_EDITOR_RANK
+                        and o.kind ~= GS.KIND.CONFIRM_CANDIDATE
+                        and o.kind ~= GS.KIND.RESOLVE_CONFLICT
+                        and not (temp.operations.records and temp.operations.records[o.id])
+                        and not (temp.operations.conflicts and temp.operations.conflicts[o.id]) then
+                        if o.basePolicyRevision == policyNow
+                            or o.basePolicyRevision == temp.datasetId then
+                            local src = ActorMatchesMember(o, member)
+                            local fp = ContentFingerprint(o)
+                            local conf = AdoptionHasConfirmationFor(
+                                adop, o.id, fp, member, temp.operations)
+                            if src or conf then
+                                return true
+                            end
+                        end
+                    end
+                end
+            end
+            return false
+        end
+        local deferRank = HasUnsettledAcceptableNonRankOnCurrentPolicy()
         for i = 1, #adop.order do
             local body = adop.records[adop.order[i]]
             if type(body) ~= "table" then
@@ -1321,9 +1421,14 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                 local alreadyConflict = temp.operations.conflicts and temp.operations.conflicts[op.id]
                 local alreadyPending = temp.operations.pending and temp.operations.pending[op.id]
                 if not alreadyAccepted then
+                    if deferRank and op.kind == GS.KIND.SET_EDITOR_RANK then
+                        -- Defer policy successors until same-base non-rank history drains.
+                    else
                     local sourceAuthored = ActorMatchesMember(op, member)
                     local fp = ContentFingerprint(op)
-                    local confirmed = AdoptionHasConfirmationFor(adop, op.id, fp)
+                    -- Confirmation authority requires an already-accepted source envelope.
+                    local confirmed = AdoptionHasConfirmationFor(
+                        adop, op.id, fp, member, temp.operations)
                     local isAuthEnvelope = op.kind == GS.KIND.CONFIRM_CANDIDATE
                         or op.kind == GS.KIND.RESOLVE_CONFLICT
                     local hadPending = alreadyPending ~= nil
@@ -1341,10 +1446,7 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                             preserveAttribution = true,
                         })
                     elseif confirmed and not isAuthEnvelope then
-                        -- Exact-content confirmation is present in the transfer.
-                        -- Promote under the adopting source's confirmer authority
-                        -- without waiting for the confirm envelope itself (which may
-                        -- pin basePolicyRevision to this candidate).
+                        -- Accepted source confirmation binds this exact body.
                         status, reason = GS:AdmitRemoteOperation(op, {
                             sender = adop.sourcePeer,
                             member = member,
@@ -1359,7 +1461,6 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                         end
                     elseif isAuthEnvelope then
                         -- Foreign confirm/resolve envelopes are not actor-proof.
-                        -- Retain durably until a source-authored confirmation arrives.
                         status, reason = DurableRetainOnRecord(
                             temp, op, "untrusted_relay", body.boundary)
                         RetainPendingRelay(op.id, {
@@ -1380,11 +1481,10 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                             offlineRecord = temp,
                             relay = true,
                         })
-                        if status == "pending" then
-                            if not (temp.operations.pending and temp.operations.pending[op.id])
-                                and not (temp.operations.conflicts and temp.operations.conflicts[op.id]) then
-                                DurableRetainOnRecord(temp, op, reason or "untrusted_relay", body.boundary)
-                            end
+                        -- Always reclassify: early foreign evidence may become a
+                        -- conflict once the accepted sibling is present.
+                        if status == "pending" or status == "duplicate" then
+                            DurableRetainOnRecord(temp, op, reason or "untrusted_relay", body.boundary)
                         end
                     end
                     if status == "accepted" or status == "duplicate" then
@@ -1398,15 +1498,23 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                             progress = true
                         end
                     end
+                    end -- deferRank else
                 end
             elseif body.kind == "campaign-header" and type(body.header) == "table" then
                 local h = body.header
                 if type(h.campaignId) == "string" and temp.campaigns[h.campaignId] == nil then
-                    if GS.ValidateCampaignBoundary and GS.ValidateCampaignBoundary(h, temp, adop.guildKey) then
-                        if temp.operations.records[h.campaignId] then
-                            temp.campaigns[h.campaignId] = h
-                            progress = true
+                    local startPresent = (temp.operations.records and temp.operations.records[h.campaignId])
+                        or (temp.operations.pending and temp.operations.pending[h.campaignId])
+                        or (temp.operations.conflicts and temp.operations.conflicts[h.campaignId])
+                    if startPresent
+                        and GS.ValidateCampaignBoundary
+                        and GS.ValidateCampaignBoundary(h, temp, adop.guildKey) then
+                        temp.campaigns[h.campaignId] = h
+                        -- Retain boundary for pending campaign candidates.
+                        if type(body.header) == "table" then
+                            GS._pendingCampaignBoundaries[h.campaignId] = h
                         end
+                        progress = true
                     end
                 end
             elseif body.kind == "campaign-archive" and type(body.campaignId) == "string" then
@@ -1434,8 +1542,11 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                                 restoreCaches(false)
                                 return false, aerr or "invalid_campaign_archive"
                             end
-                        elseif GS.ValidateCampaignArchive
-                            and GS.ValidateCampaignArchive(archive, body.campaignId, temp) then
+                        elseif not (GS.ValidateCampaignArchive
+                            and GS.ValidateCampaignArchive(archive, body.campaignId, temp)) then
+                            restoreCaches(false)
+                            return false, "invalid_campaign_archive"
+                        else
                             local existing = temp.campaignArchives[body.campaignId]
                             if existing then
                                 if not DeepEqual(existing, archive) then
@@ -1459,8 +1570,13 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                             end
                         end
                     end
-                    local archive = select(1, AssemblePagedArchive(body, pages))
-                    if archive and not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
+                    local archive, aerr = AssemblePagedArchive(body, pages)
+                    if not archive then
+                        if aerr ~= "incomplete_archive_pages" then
+                            restoreCaches(false)
+                            return false, aerr or "invalid_campaign_archive"
+                        end
+                    elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
                         restoreCaches(false)
                         return false, "archive_conflict"
                     end
@@ -1469,13 +1585,34 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                 -- Pages alone do not settle; meta assembly above consumes them.
             end
         end
-        -- Retry pending source-authored resolutions after candidates may have opened.
+        -- Retry pending source-authored (or newly confirmed) bodies once
+        -- policy/campaign/target catch up. Reverse-order transfers park them
+        -- as stale_base/missing_predecessor before their dependencies land.
         if temp.operations.pending then
+            local retryIds = {}
             for pid, pend in pairs(temp.operations.pending) do
                 local pob = pend and pend.body
-                if type(pob) == "table" and pob.kind == GS.KIND.RESOLVE_CONFLICT
-                    and ActorMatchesMember(pob, member)
+                if type(pob) == "table"
                     and not (temp.operations.records and temp.operations.records[pid]) then
+                    local src = ActorMatchesMember(pob, member)
+                    local fp = ContentFingerprint(pob)
+                    local conf = AdoptionHasConfirmationFor(
+                        adop, pob.id, fp, member, temp.operations)
+                    local isEnv = pob.kind == GS.KIND.RESOLVE_CONFLICT
+                        or pob.kind == GS.KIND.CONFIRM_CANDIDATE
+                    if src or (conf and not isEnv) or isEnv and src then
+                        retryIds[#retryIds + 1] = pid
+                    end
+                end
+            end
+            for ri = 1, #retryIds do
+                local pid = retryIds[ri]
+                local pend = temp.operations.pending[pid]
+                local pob = pend and pend.body
+                if type(pob) == "table" then
+                    -- Drop stale pending slot so Admit can re-evaluate against
+                    -- the current temp policy/campaign heads.
+                    temp.operations.pending[pid] = nil
                     local st2 = select(1, GS:AdmitRemoteOperation(pob, {
                         sender = adop.sourcePeer,
                         member = member,
@@ -1486,6 +1623,11 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                     }))
                     if st2 == "accepted" or st2 == "duplicate" then
                         progress = true
+                    elseif st2 == "pending" then
+                        DurableRetainOnRecord(temp, pob, "stale_base", nil)
+                        if temp.operations.records and temp.operations.records[pid] then
+                            progress = true
+                        end
                     end
                 end
             end
@@ -1499,33 +1641,35 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
         })
     end
 
-    -- Completeness: every buffered gs-op must be settled on the durable temp
-    -- record (accepted, conflict evidence, or pending). Session-only _pendingRelay
-    -- is not durable settlement.
+    -- Completeness: source-authored / confirmed bodies must be accepted (or
+    -- retained as conflict evidence after a resolution). Unconfirmed foreign /
+    -- evidenceOnly may settle as durable pending/conflicts. Session-only
+    -- _pendingRelay is never settlement.
     for i = 1, #adop.order do
         local body = adop.records[adop.order[i]]
         if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
             local oid = body.op.id
-            local settled = temp.operations.records and temp.operations.records[oid]
-            if not settled and temp.operations.conflicts and temp.operations.conflicts[oid] then
-                settled = true
-            end
-            if not settled and temp.operations.pending and temp.operations.pending[oid] then
-                settled = true
-            end
-            if not settled then
-                local fp = ContentFingerprint(body.op)
-                local sourceAuthored = ActorMatchesMember(body.op, member)
-                local confirmed = AdoptionHasConfirmationFor(adop, oid, fp)
-                if body.evidenceOnly and not sourceAuthored and not confirmed then
-                    -- Unretained evidence-only body is incomplete.
-                    settled = false
-                elseif sourceAuthored or confirmed then
-                    -- Source-authored / confirmed bodies must fully apply or retain.
-                    settled = false
+            local fp = ContentFingerprint(body.op)
+            local sourceAuthored = ActorMatchesMember(body.op, member)
+            local confirmed = AdoptionHasConfirmationFor(
+                adop, oid, fp, member, temp.operations)
+            local inRecords = temp.operations.records and temp.operations.records[oid]
+            local inConflicts = temp.operations.conflicts and temp.operations.conflicts[oid]
+            local inPending = temp.operations.pending and temp.operations.pending[oid]
+            local settled = false
+            if sourceAuthored or confirmed then
+                local isEnvelope = body.op.kind == GS.KIND.CONFIRM_CANDIDATE
+                    or body.op.kind == GS.KIND.RESOLVE_CONFLICT
+                if inRecords then
+                    settled = true
+                elseif inConflicts and not isEnvelope then
+                    -- Losing evidence retained after resolution is settled.
+                    settled = true
                 else
                     settled = false
                 end
+            else
+                settled = inRecords or inConflicts or inPending
             end
             if not settled then
                 restoreCaches(false)
@@ -1535,11 +1679,10 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
             local h = body.header
             if type(h) == "table" and type(h.campaignId) == "string" then
                 if temp.campaigns[h.campaignId] == nil then
-                    -- Required header missing after replay.
-                    if temp.operations.records and temp.operations.records[h.campaignId] then
-                        restoreCaches(false)
-                        return false, "missing_campaign_header"
-                    end
+                    -- Required buffered header must settle whenever the campaign
+                    -- start exists or the header itself was advertised.
+                    restoreCaches(false)
+                    return false, "missing_campaign_header"
                 end
             end
         elseif type(body) == "table" and body.kind == "campaign-archive" then
@@ -1547,8 +1690,9 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                 restoreCaches(false)
                 return false, "invalid_campaign_archive"
             end
-            if body.campaignId and temp.campaignArchives[body.campaignId] == nil
-                and temp.campaigns[body.campaignId] ~= nil then
+            if body.campaignId and temp.campaignArchives[body.campaignId] == nil then
+                -- Advertised archive must settle before swap (including when the
+                -- campaign header/start never arrived — fail closed).
                 restoreCaches(false)
                 return false, "invalid_campaign_archive"
             end
@@ -1628,15 +1772,23 @@ function GS:CommitDatasetAdoption()
     local rankCount = type(ranks) == "table" and tonumber(ranks.count) or 0
     local defaultPos = GS.DEFAULT_EDITOR_RANK_POSITION or 3
     -- Prefer immutable bootstrap threshold from the source descriptor.
+    -- Validate positive integrality for ordinary guilds (not only small-guild
+    -- upper-bound checks) so -1 / 2.5 cannot become live policy.
     local bootstrapPos = tonumber(desc.bootstrapEditorRankPosition)
         or tonumber(desc.editorRankPosition)
         or defaultPos
-    if rankCount > 0 and rankCount < defaultPos then
-        if not bootstrapPos or bootstrapPos < 1 or bootstrapPos > rankCount then
+    local bootOk, bootErr, bootNorm = ValidateEditorRankValue(bootstrapPos)
+    if not bootOk then
+        -- When guild ranks are unavailable, still reject non-integral/non-positive.
+        bootstrapPos = tonumber(bootstrapPos)
+        if not bootstrapPos or bootstrapPos ~= math.floor(bootstrapPos) or bootstrapPos < 1 then
+            return "rejected", bootErr or "invalid_editor_rank_position"
+        end
+        if rankCount and rankCount > 0 and bootstrapPos > rankCount then
             return "rejected", "invalid_editor_rank_position"
         end
-    elseif rankCount and bootstrapPos and bootstrapPos > rankCount then
-        return "rejected", "invalid_editor_rank_position"
+    else
+        bootstrapPos = bootNorm
     end
 
     local temp = NewBootstrapRecord(adop.sourceDatasetId, adop.guildKey, identity, bootstrapPos)
@@ -1742,8 +1894,8 @@ local function StageParentArchive(record, parentId, timestamp)
 end
 
 --- Reconstruct live campaign projection for a chosen sibling from shared history.
--- Replays accepted (and chosen-lineage) config mutations under the chosen campaign
--- without archiving the provisional current sibling or bumping generation.
+-- Replays accepted and newly-satisfiable pending/conflict config mutations under
+-- the chosen campaign without archiving the provisional sibling or bumping generation.
 local function ReconstructChosenCampaignProjection(record, chosenId, header)
     local cfg = record.accounting and record.accounting._consumables
     local ops = record.operations
@@ -1755,27 +1907,46 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header)
     if GS.EstablishCampaignBaseline then
         GS.EstablishCampaignBaseline(cfg, header and (header.startedAt) or nil)
     end
+    local function IsChosenConfigMutation(op)
+        return type(op) == "table"
+            and op.campaignId == chosenId
+            and op.kind ~= GS.KIND.START_CAMPAIGN
+            and op.kind ~= GS.KIND.RESOLVE_CONFLICT
+            and op.kind ~= GS.KIND.CONFIRM_CANDIDATE
+            and op.kind ~= GS.KIND.SET_EDITOR_RANK
+    end
     -- Walk accepted history in order; apply config mutations belonging to chosen.
     if type(ops.order) == "table" and type(ops.records) == "table" then
         for i = 1, #ops.order do
             local op = ops.records[ops.order[i]]
-            if type(op) == "table"
-                and op.campaignId == chosenId
-                and op.kind ~= GS.KIND.START_CAMPAIGN
-                and op.kind ~= GS.KIND.RESOLVE_CONFLICT
-                and op.kind ~= GS.KIND.CONFIRM_CANDIDATE
-                and op.kind ~= GS.KIND.SET_EDITOR_RANK then
-                if GS._ApplyMutations then
-                    local ok = GS._ApplyMutations(record, op)
-                    if not ok then
-                        -- Skip mutations that cannot apply against reconstructed state.
+            if IsChosenConfigMutation(op) and GS._ApplyMutations then
+                GS._ApplyMutations(record, op)
+            end
+        end
+    end
+    -- Apply pending bodies on the chosen lineage (edits under provisional Y before
+    -- Y was chosen). Conflict-map bodies stay as durable evidence and are only
+    -- mutation-applied when already accepted above.
+    if type(ops.pending) == "table" then
+        local pendingIds = {}
+        for id in pairs(ops.pending) do
+            pendingIds[#pendingIds + 1] = id
+        end
+        for i = 1, #pendingIds do
+            local id = pendingIds[i]
+            local entry = ops.pending[id]
+            local op = entry and entry.body
+            if IsChosenConfigMutation(op) and not (ops.records and ops.records[op.id]) then
+                if GS._ApplyMutations and GS._ApplyMutations(record, op) then
+                    local targetKey = GS._TargetKey and GS._TargetKey(op.kind, op.target)
+                    if GS._StoreAccepted then
+                        GS._StoreAccepted(ops, op, targetKey)
                     end
+                    ops.pending[id] = nil
                 end
             end
         end
     end
-    -- Also apply pending/conflict bodies that belong to the chosen campaign and
-    -- are listed as the chosen lineage (already promoted separately).
     return true
 end
 
@@ -1788,6 +1959,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
     end
     local ops = record.operations
     local header = record.campaigns and record.campaigns[chosen.id]
+    local insertingHeader = false
     if type(header) ~= "table" then
         if type(boundary) ~= "table" then
             return false, "missing_campaign"
@@ -1802,7 +1974,7 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
         if not headerOk then
             return false, headerErr or "invalid_campaign"
         end
-        record.campaigns[chosen.id] = boundary
+        insertingHeader = true
         header = boundary
     end
 
@@ -1821,17 +1993,44 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
         return true
     end
 
+    -- Preflight capacity before any durable writes so a rejected 65th sibling
+    -- cannot leave a partially mutated unusable record.
+    if insertingHeader and GS.CountCampaignHeaders
+        and GS.CountCampaignHeaders(record) >= (GS.MAX_CAMPAIGNS or 64) then
+        return false, "full"
+    end
+    local slotsNeeded = 0
+    if not (ops.records and ops.records[chosen.id]) then
+        slotsNeeded = slotsNeeded + 1
+    end
+    if slotsNeeded > 0 and GS._AcceptedCount
+        and GS._AcceptedCount(ops) + slotsNeeded > (GS.MAX_ACCEPTED_OPERATIONS or 4096) then
+        return false, "full"
+    end
+
     -- Sibling switch: keep generation; reconstruct items/eligibility from history.
     local previousItems = cfg.requestedItems
     local previousEligibility = cfg.eligibility
     local previousConfigSeq = cfg.configSeq
     local previousCurrent = record.currentCampaignId
+    local previousObs = nil
+    local insertedObs = false
+    local insertedHeader = false
+    local insertedAccepted = false
+
+    if insertingHeader then
+        record.campaigns[chosen.id] = header
+        insertedHeader = true
+    end
 
     local okRecon, reconErr = ReconstructChosenCampaignProjection(
         record, chosen.id, header)
     if not okRecon then
         cfg.requestedItems = previousItems
         cfg.eligibility = previousEligibility
+        if insertedHeader then
+            record.campaigns[chosen.id] = nil
+        end
         return false, reconErr or "projection_failed"
     end
     -- Ensure baseline timestamp from chosen boundary when reconstruction left empty eligibility.
@@ -1842,15 +2041,18 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
     record.currentCampaignId = chosen.id
     if record.observations and record.observations.byCampaign
         and record.observations.byCampaign[chosen.id] == nil then
+        previousObs = true
         record.observations.byCampaign[chosen.id] = {
             schemaVersion = 1,
             seq = 0,
             scopes = {},
         }
+        insertedObs = true
     end
     if not (ops.records and ops.records[chosen.id]) then
         if GS._StoreAccepted then
             GS._StoreAccepted(ops, chosen, GS.CAMPAIGN_TARGET_KEY)
+            insertedAccepted = true
         end
     elseif ops.heads then
         ops.heads[GS.CAMPAIGN_TARGET_KEY] = chosen.id
@@ -1864,6 +2066,26 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
             cfg.eligibility = previousEligibility
             cfg.configSeq = previousConfigSeq
             record.currentCampaignId = previousCurrent
+            if insertedHeader then
+                record.campaigns[chosen.id] = nil
+            end
+            if insertedObs and record.observations and record.observations.byCampaign then
+                record.observations.byCampaign[chosen.id] = nil
+            end
+            if insertedAccepted and ops.records then
+                ops.records[chosen.id] = nil
+                if type(ops.order) == "table" then
+                    for i = #ops.order, 1, -1 do
+                        if ops.order[i] == chosen.id then
+                            table.remove(ops.order, i)
+                            break
+                        end
+                    end
+                end
+                if ops.heads then
+                    ops.heads[GS.CAMPAIGN_TARGET_KEY] = previousCurrent
+                end
+            end
             return false, postErr or "invalid_record"
         end
     end
@@ -2216,6 +2438,8 @@ end
 --- Re-apply accepted confirmation envelopes against newly retained candidates
 -- (confirm-first / predecessor-late). Scans the full confirmationRefs list using
 -- a bounded per-call slice so correctness is not truncated at index 32.
+-- When more refs remain after a live slice, schedules a continuation so a
+-- relevant confirmation beyond the first slice still applies without traffic.
 function GS.RedriveExactContentConfirmations(record, admissionCtx)
     if type(record) ~= "table" or type(record.confirmationRefs) ~= "table" then
         return
@@ -2252,6 +2476,38 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
         end
     end
     GS._confirmationRedrivePos = i
+    -- Live path: guarantee continuation until one full pass over confirmationRefs
+    -- completes. Do not reschedule forever — drain remaining then clear.
+    if not (admissionCtx and admissionCtx.adoptionReplay) and total > slice then
+        local remaining = tonumber(GS._confirmationRedriveRemaining)
+        if remaining == nil then
+            remaining = total
+        end
+        remaining = math.max(0, remaining - processed)
+        GS._confirmationRedriveRemaining = remaining
+        if remaining > 0 and not GS._confirmationRedriveScheduled then
+            GS._confirmationRedriveScheduled = true
+            local function continueRedrive()
+                GS._confirmationRedriveScheduled = false
+                if type(record) == "table" and type(record.confirmationRefs) == "table"
+                    and #record.confirmationRefs > 0
+                    and (tonumber(GS._confirmationRedriveRemaining) or 0) > 0 then
+                    GS.RedriveExactContentConfirmations(record, admissionCtx or {})
+                else
+                    GS._confirmationRedriveRemaining = nil
+                end
+            end
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0, continueRedrive)
+            else
+                -- Harness without C_Timer: continue synchronously so correctness
+                -- does not depend on manually invoking redrive.
+                continueRedrive()
+            end
+        elseif remaining <= 0 then
+            GS._confirmationRedriveRemaining = nil
+        end
+    end
 end
 
 --- Authenticated remote admission for a durable operation body.
@@ -2302,8 +2558,15 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         requireRecover = not policyOk
     end
 
+    -- Descriptor-first catch-up: the advertised policy revision itself may admit
+    -- under allowPolicyCatchUp; ordinary config mutations stay locked.
+    local pendingPolicy = record.permission and record.permission.pendingPolicyRevisionId
+    local isPolicyCatchUp = op.kind == GS.KIND.SET_EDITOR_RANK
+        and type(pendingPolicy) == "string"
+        and op.id == pendingPolicy
     local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {
         requireRecoverPolicy = requireRecover,
+        allowPolicyCatchUp = isPolicyCatchUp,
     })
 
     -- Untrusted relay: retain historical candidates without rebinding attribution.
@@ -2418,7 +2681,42 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
 
     -- Confirmations: authenticated editor confirming exact historical candidates.
     if stored.kind == GS.KIND.CONFIRM_CANDIDATE then
-        if stored.basePolicyRevision ~= CurrentPolicyRevision(record) then
+        local policyNow = CurrentPolicyRevision(record)
+        local policyOk = stored.basePolicyRevision == policyNow
+        -- Adoption chicken-egg: a confirm prepared after a rank change pins
+        -- basePolicyRevision to that rank id. Allow the envelope when it binds
+        -- that same rank (or any listed) so reverse-order peers can promote it.
+        if not policyOk and admissionCtx.adoptionReplay then
+            local ref = stored.candidateRef
+            local function bindsId(id)
+                if type(ref) ~= "table" or type(id) ~= "string" then
+                    return false
+                end
+                if ref.recordId == id then
+                    return true
+                end
+                if type(ref.originalIds) == "table" then
+                    for j = 1, #ref.originalIds do
+                        if ref.originalIds[j] == id then
+                            return true
+                        end
+                    end
+                end
+                if type(ref.records) == "table" then
+                    for j = 1, #ref.records do
+                        local row = ref.records[j]
+                        if type(row) == "table" and row.id == id then
+                            return true
+                        end
+                    end
+                end
+                return false
+            end
+            if bindsId(stored.basePolicyRevision) then
+                policyOk = true
+            end
+        end
+        if not policyOk then
             if GS._AdmitPendingOrConflict then
                 return GS._AdmitPendingOrConflict(ops, stored, "stale_base")
             end
@@ -2479,9 +2777,13 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
             return "rejected", "stale_base"
         end
+        -- Resolutions always require a non-empty competingOpIds dependency set.
+        if type(value.competingOpIds) ~= "table" or #value.competingOpIds < 1 then
+            return "rejected", "invalid_resolution"
+        end
         if type(open) ~= "table" then
             -- Fast path: chosen already current head — still require complete
-            -- dependency fingerprints for every competing id when provided.
+            -- dependency fingerprints for every competing id (no chosen-only fallback).
             local headNow = ops.heads and ops.heads[targetKey]
             if type(headNow) == "string" then
                 headNow = UnderlyingConflictValueId(ops, headNow) or headNow
@@ -2492,11 +2794,13 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     return "rejected", "fingerprint_mismatch"
                 end
                 local depIds = value.competingOpIds
-                if type(depIds) ~= "table" then
-                    depIds = { value.chosenOpId }
-                end
+                local seenDep = {}
                 for i = 1, #depIds do
                     local id = depIds[i]
+                    if type(id) ~= "string" or id == "" or seenDep[id] then
+                        return "rejected", "invalid_resolution"
+                    end
+                    seenDep[id] = true
                     local fp = value.contentFingerprints[id]
                     local body = ops.records[id]
                         or (ops.pending[id] and ops.pending[id].body)
@@ -2510,6 +2814,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         end
                         return "rejected", "fingerprint_mismatch"
                     end
+                end
+                if not seenDep[value.chosenOpId] then
+                    return "rejected", "invalid_resolution"
                 end
                 -- Atomic capacity: resolution envelope slot.
                 if not ops.records[stored.id] then
@@ -2547,11 +2854,12 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if not chosenInOpen then
             return "rejected", "invalid_resolution"
         end
-        -- Exact competing set: every open candidate must be listed when provided.
-        if type(value.competingOpIds) == "table" and type(open.candidateIds) == "table" then
-            if #value.competingOpIds ~= #open.candidateIds then
-                return "rejected", "invalid_resolution"
-            end
+        -- Exact competing set: every open candidate must be listed (required).
+        if type(open.candidateIds) ~= "table"
+            or #value.competingOpIds ~= #open.candidateIds then
+            return "rejected", "invalid_resolution"
+        end
+        do
             local openSeen, listed = {}, {}
             for i = 1, #open.candidateIds do
                 openSeen[open.candidateIds[i]] = true
@@ -2822,15 +3130,47 @@ function GS:NewConflictResolutionOperation(targetKey, chosenOpId, competingOpIds
         return nil, "rejected", "no_open_conflict"
     end
     competingOpIds = competingOpIds or open.candidateIds
+    if type(competingOpIds) ~= "table" or #competingOpIds < 1 then
+        return nil, "rejected", "invalid_resolution"
+    end
+    -- Stamp shared candidate ancestry (not provisional local heads) so a
+    -- resolution prepared on peer A admits on peer B whose head is the sibling.
+    local sharedPolicy, sharedCampaign, sharedTarget
     local fingerprints = {}
+    local ops = record.operations
     for i = 1, #competingOpIds do
-        local id = competingOpIds[i]
-        local body = record.operations.records[id]
-            or (record.operations.pending[id] and record.operations.pending[id].body)
-            or (record.operations.conflicts[id] and record.operations.conflicts[id].body)
-        if type(body) == "table" then
-            fingerprints[id] = ContentFingerprint(body)
+        local cid = competingOpIds[i]
+        local body = ops.records[cid]
+            or (ops.pending[cid] and ops.pending[cid].body)
+            or (ops.conflicts[cid] and ops.conflicts[cid].body)
+        if type(body) ~= "table" then
+            return nil, "rejected", "missing_predecessor"
         end
+        fingerprints[cid] = ContentFingerprint(body)
+        if type(fingerprints[cid]) ~= "string" or fingerprints[cid] == "" then
+            return nil, "rejected", "fingerprint_mismatch"
+        end
+        if i == 1 then
+            sharedPolicy = body.basePolicyRevision
+            sharedCampaign = body.baseCampaignId
+            sharedTarget = body.baseTargetRevision
+        else
+            if body.basePolicyRevision ~= sharedPolicy
+                or (body.baseCampaignId or nil) ~= (sharedCampaign or nil)
+                or body.baseTargetRevision ~= sharedTarget then
+                return nil, "rejected", "ancestry_mismatch"
+            end
+        end
+    end
+    local chosenListed = false
+    for i = 1, #competingOpIds do
+        if competingOpIds[i] == chosenOpId then
+            chosenListed = true
+            break
+        end
+    end
+    if not chosenListed then
+        return nil, "rejected", "invalid_resolution"
     end
     local ts = GetServerTime and GetServerTime() or nil
     if not ts then
@@ -2845,7 +3185,7 @@ function GS:NewConflictResolutionOperation(targetKey, chosenOpId, competingOpIds
         id = id,
         guildKey = ctx.guildKey,
         datasetId = record.datasetId,
-        campaignId = record.currentCampaignId,
+        campaignId = sharedCampaign,
         kind = GS.KIND.RESOLVE_CONFLICT,
         target = targetKey,
         value = {
@@ -2856,9 +3196,9 @@ function GS:NewConflictResolutionOperation(targetKey, chosenOpId, competingOpIds
         actorGuid = ctx.actorGuid,
         actorName = ctx.actorName,
         timestamp = ts,
-        baseTargetRevision = CurrentTargetRevision(record, targetKey),
-        basePolicyRevision = CurrentPolicyRevision(record),
-        baseCampaignId = record.currentCampaignId,
+        baseTargetRevision = sharedTarget,
+        basePolicyRevision = sharedPolicy,
+        baseCampaignId = sharedCampaign,
         _preparedHandleGeneration = ctx.handleGeneration,
     }
     return op, "accepted", nil
