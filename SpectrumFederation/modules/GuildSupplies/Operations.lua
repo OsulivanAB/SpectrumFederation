@@ -11,6 +11,9 @@ GS.MAX_BANK_TAB = 8
 -- binding embeds full public ops (not fingerprints). Do not raise the 2 KiB
 -- transport export cap — large envelopes use FragmentBuffer paging on the wire.
 GS.MAX_SNAPSHOT_DEPTH = 6
+-- Equality depth for composed confirm/resolve envelopes: candidateRef.records[i].body.value
+-- nests past snapshot construction depth. Derived from supported composed shapes + margin.
+GS.MAX_EQUALITY_DEPTH = (GS.MAX_SNAPSHOT_DEPTH or 6) + 6
 -- ~40 nodes per candidate body * 64 + envelope/refs headroom.
 GS.MAX_SNAPSHOT_NODES = 4096
 GS.MAX_SNAPSHOT_STRING_BYTES = 49152
@@ -57,10 +60,7 @@ local function ServerTime()
 end
 
 local function DeepEqual(a, b, depth)
-    depth = (depth or 0) + 1
-    if depth > GS.MAX_SNAPSHOT_DEPTH then
-        return false
-    end
+    -- Identity / scalar checks before depth so equal leaves never fail closed early.
     if a == b then
         return true
     end
@@ -68,6 +68,11 @@ local function DeepEqual(a, b, depth)
         return false
     end
     if type(a) ~= "table" then
+        return false
+    end
+    depth = (depth or 0) + 1
+    local maxDepth = GS.MAX_EQUALITY_DEPTH or ((GS.MAX_SNAPSHOT_DEPTH or 6) + 6)
+    if depth > maxDepth then
         return false
     end
     for k, v in pairs(a) do
