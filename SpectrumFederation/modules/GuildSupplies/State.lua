@@ -108,6 +108,7 @@ local function EmptyOperations()
         heads = {},
         pending = {},
         conflicts = {},
+        openConflicts = {}, -- target-key → candidate op ids (#387)
     }
 end
 
@@ -391,6 +392,36 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
     local headsOk, headsErr = ValidateOperationsHeads(ops)
     if not headsOk then
         return false, headsErr
+    end
+
+    -- openConflicts is optional (#387); when present it must be a bounded map.
+    if ops.openConflicts ~= nil then
+        if type(ops.openConflicts) ~= "table" then
+            return false, "invalid_operations"
+        end
+        local openCount = 0
+        local maxOpen = (GS.MAX_OPEN_CONFLICTS or 32)
+        for targetKey, entry in pairs(ops.openConflicts) do
+            openCount = openCount + 1
+            if openCount > maxOpen then
+                return false, "invalid_operations"
+            end
+            if type(targetKey) ~= "string" or targetKey == "" or type(entry) ~= "table" then
+                return false, "invalid_operations"
+            end
+            if type(entry.candidateIds) ~= "table" then
+                return false, "invalid_operations"
+            end
+            local n = #entry.candidateIds
+            if n < 2 or n > 16 then
+                return false, "invalid_operations"
+            end
+            for i = 1, n do
+                if type(entry.candidateIds[i]) ~= "string" then
+                    return false, "invalid_operations"
+                end
+            end
+        end
     end
 
     return true
@@ -891,6 +922,9 @@ function GS:CreateStagedRecord(editorRankPosition)
     GS._root.guilds[ctx.guildKey] = record
     DebugInfo("created staged guild record key=%s dataset=%s threshold=%s",
         ctx.guildKey, datasetId, tostring(initialPosition))
+    if GS._NotifyLocalDurableChange then
+        GS._NotifyLocalDurableChange("create")
+    end
     return record, "accepted", nil
 end
 

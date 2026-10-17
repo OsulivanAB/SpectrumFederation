@@ -18,6 +18,7 @@ local KIND = {
     SET_REQUESTED_ITEM = "set-requested-item",
     CONFIRM_CANDIDATE = "confirm-candidate",
     START_CAMPAIGN = "start-campaign",
+    RESOLVE_CONFLICT = "resolve-conflict",
 }
 
 GS.KIND = KIND
@@ -28,6 +29,7 @@ local CONFIG_SNAPSHOT_FIELDS = {
     "target", "value", "actorGuid", "actorName", "timestamp",
     "baseTargetRevision", "basePolicyRevision", "baseCampaignId",
 }
+-- resolve-conflict reuses CONFIG_SNAPSHOT_FIELDS; value carries competing IDs + choice.
 local CONFIRM_SNAPSHOT_FIELDS = {
     "schemaVersion", "id", "guildKey", "datasetId", "kind", "candidateRef",
     "contentFingerprint", "campaignId", "basePolicyRevision",
@@ -333,6 +335,14 @@ local function TargetKey(kind, target)
         return GS.CAMPAIGN_TARGET_KEY or "campaign:lifecycle"
     elseif kind == KIND.CONFIRM_CANDIDATE then
         return "confirm"
+    elseif kind == KIND.RESOLVE_CONFLICT then
+        if type(target) == "string" and target ~= "" then
+            return target
+        end
+        if type(target) == "table" and type(target.targetKey) == "string" then
+            return target.targetKey
+        end
+        return nil
     end
     return nil
 end
@@ -1111,6 +1121,7 @@ function GS:ApplyStagedConfigOperation(op, context)
         return "rejected", applyErr or "apply_failed"
     end
     StoreAccepted(ops, stored, tKey)
+    GS._NotifyLocalDurableChange("config")
     return "accepted", nil
 end
 
@@ -1344,6 +1355,18 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         if not ok then
             return false, err or "invalid_operations"
         end
+    elseif kind == KIND.RESOLVE_CONFLICT then
+        local ok, err = ValidateConfigShape(body)
+        if not ok then
+            return false, err or "invalid_operations"
+        end
+        if type(body.target) ~= "string" or body.target == "" then
+            return false, "invalid_target"
+        end
+        if type(body.value) ~= "table" or type(body.value.chosenOpId) ~= "string"
+            or body.value.chosenOpId == "" then
+            return false, "invalid_resolution"
+        end
     else
         return false, "unsupported_kind"
     end
@@ -1506,6 +1529,7 @@ function GS:ApplyStagedConfirmationOperation(op, context)
     if not already then
         refs[#refs + 1] = stored.id
     end
+    GS._NotifyLocalDurableChange("confirm")
     return "accepted", nil
 end
 
@@ -1535,4 +1559,27 @@ end
 
 function GS._RecognizeExactAcceptedDuplicate(op, stored)
     return RecognizeExactAcceptedDuplicate(op, stored)
+end
+
+function GS._ApplyMutations(record, op)
+    return ApplyMutations(record, op)
+end
+
+function GS._RetainPending(ops, op, reason)
+    return RetainPending(ops, op, reason)
+end
+
+function GS._AcceptedCount(ops)
+    return AcceptedCount(ops)
+end
+
+function GS._TargetKey(kind, target)
+    return TargetKey(kind, target)
+end
+
+--- Notify gossip after a durable local staged write (no-op until provider registers).
+function GS._NotifyLocalDurableChange(reason)
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange(reason)
+    end
 end
