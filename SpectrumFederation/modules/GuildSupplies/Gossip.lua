@@ -34,14 +34,89 @@ local exportState = {
     dirtyRebuild = false,
 }
 
+-- Runtime reassembly buffer for paged campaign archives (not SavedVariables).
+local archivePageBuffer = {} -- [campaignId] = { meta = body?, pages = { [n] = body } }
+
 local function FingerprintBody(body)
     if GS.ContentFingerprint then
-        return GS.ContentFingerprint(body)
+        local fp = GS.ContentFingerprint(body)
+        if type(fp) == "string" and fp ~= "" then
+            return fp
+        end
     end
+    -- Advisory export version only — never used as approval authority.
     if GG and GG.Hash32 then
         return string.format("%08x", GG.Hash32(tostring(body and body.kind) .. tostring(body and body.id)))
     end
     return "v1"
+end
+
+-- Conservative wire budget under GG.MAX_RECORD_CBOR (2048) for archive pages.
+local ARCHIVE_PAGE_ITEMS = 12
+
+local function SortedItemIds(requestedItems)
+    local ids = {}
+    if type(requestedItems) ~= "table" then
+        return ids
+    end
+    for k in pairs(requestedItems) do
+        ids[#ids + 1] = k
+    end
+    table.sort(ids, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+    return ids
+end
+
+--- Emit archive as meta + item pages so each wire body fits MAX_RECORD_CBOR.
+local function BuildArchiveExportBodies(campaignId, archive, record)
+    local out = {}
+    local items = archive.requestedItems or {}
+    local ids = SortedItemIds(items)
+    local pageCount = math.max(1, math.ceil(math.max(#ids, 1) / ARCHIVE_PAGE_ITEMS))
+    if #ids == 0 then
+        pageCount = 1
+    end
+    local itemsFp = FingerprintBody(items)
+    out[#out + 1] = {
+        id = "gs:ca:" .. campaignId,
+        body = {
+            kind = "campaign-archive",
+            campaignId = campaignId,
+            datasetId = archive.datasetId or record.datasetId,
+            generation = archive.generation,
+            archivedAt = archive.archivedAt,
+            schemaVersion = archive.schemaVersion or GS.SCHEMA_VERSION,
+            itemCount = #ids,
+            pageCount = pageCount,
+            itemsFingerprint = itemsFp,
+            -- Small archives still include items inline for compatibility.
+            requestedItems = (#ids <= ARCHIVE_PAGE_ITEMS) and items or nil,
+        },
+    }
+    if #ids > ARCHIVE_PAGE_ITEMS then
+        for page = 1, pageCount do
+            local slice = {}
+            local start = (page - 1) * ARCHIVE_PAGE_ITEMS + 1
+            local finish = math.min(#ids, page * ARCHIVE_PAGE_ITEMS)
+            for i = start, finish do
+                local iid = ids[i]
+                slice[iid] = items[iid]
+            end
+            out[#out + 1] = {
+                id = "gs:ca:" .. campaignId .. ":p" .. tostring(page),
+                body = {
+                    kind = "campaign-archive-page",
+                    campaignId = campaignId,
+                    datasetId = archive.datasetId or record.datasetId,
+                    page = page,
+                    pageCount = pageCount,
+                    requestedItems = slice,
+                },
+            }
+        end
+    end
+    return out
 end
 
 local function CurrentGuildRecord()
@@ -82,36 +157,22 @@ local function RebuildExportIndex()
     exportState.datasetId = record.datasetId
     exportState.epoch = tonumber(GS._adoptionEpoch) or 0
 
-    local function add(id, versionFp, body)
+    -- Structural add without fingerprinting; EnsureIndex budgets versionFp work.
+    local function add(id, body)
         if type(id) ~= "string" or id == "" or exportState.byId[id] then
             return
         end
         exportState.byId[id] = {
             id = id,
-            versionFp = versionFp,
+            versionFp = nil, -- filled lazily under EnsureIndex budget
             body = body,
+            needsFp = true,
         }
         exportState.order[#exportState.order + 1] = id
     end
 
     -- Compact dataset descriptor (also used for adoption assembly).
-    local acceptedOpCount = 0
-    local opsCountSource = record.operations
-    if type(opsCountSource) == "table" and type(opsCountSource.order) == "table" then
-        acceptedOpCount = #opsCountSource.order
-    end
-    local campaignCount = 0
-    if type(record.campaigns) == "table" then
-        for _ in pairs(record.campaigns) do
-            campaignCount = campaignCount + 1
-        end
-    end
-    local archiveCount = 0
-    if type(record.campaignArchives) == "table" then
-        for _ in pairs(record.campaignArchives) do
-            archiveCount = archiveCount + 1
-        end
-    end
+    -- Counts filled after export enumeration so conflict deps are included.
     local desc = {
         kind = "dataset-desc",
         schemaVersion = GS.PROVIDER_SCHEMA,
@@ -125,11 +186,11 @@ local function RebuildExportIndex()
             or nil,
         currentCampaignId = record.currentCampaignId,
         activation = record.activation,
-        acceptedOpCount = acceptedOpCount,
-        campaignCount = campaignCount,
-        archiveCount = archiveCount,
+        acceptedOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
     }
-    add("gs:desc:" .. record.datasetId, FingerprintBody(desc), desc)
+    add("gs:desc:" .. record.datasetId, desc)
 
     -- Accepted operations (config / campaign / confirm / resolve).
     local ops = record.operations
@@ -148,7 +209,7 @@ local function RebuildExportIndex()
                         body.boundary = header
                     end
                 end
-                add("gs:op:" .. op.id, FingerprintBody(body), body)
+                add("gs:op:" .. op.id, body)
             end
         end
     end
@@ -156,12 +217,7 @@ local function RebuildExportIndex()
     -- Conflict / resolution dependency bodies so late peers can reconstruct
     -- resolutions that reference non-head or losing candidates.
     do
-        local exported = 0
-        local maxExport = (GS.MAX_OPEN_CONFLICTS or 32) * (GS.MAX_CONFLICT_CANDIDATES or 16)
         local function exportCandidate(cid, boundaryHint)
-            if exported >= maxExport then
-                return
-            end
             if type(cid) ~= "string" or exportState.byId["gs:op:" .. cid] then
                 return
             end
@@ -180,8 +236,7 @@ local function RebuildExportIndex()
                     body.boundary = header
                 end
             end
-            add("gs:op:" .. cid, FingerprintBody(body), body)
-            exported = exported + 1
+            add("gs:op:" .. cid, body)
         end
         if type(ops) == "table" and type(ops.openConflicts) == "table" then
             for _, entry in pairs(ops.openConflicts) do
@@ -191,6 +246,14 @@ local function RebuildExportIndex()
                         local hint = entry.boundaries and entry.boundaries[cid]
                         exportCandidate(cid, hint)
                     end
+                end
+            end
+        end
+        -- Pending open candidates not yet in openConflicts maps.
+        if type(ops) == "table" and type(ops.pending) == "table" then
+            for cid, entry in pairs(ops.pending) do
+                if type(entry) == "table" and type(entry.body) == "table" then
+                    exportCandidate(cid, nil)
                 end
             end
         end
@@ -227,33 +290,28 @@ local function RebuildExportIndex()
     if type(record.campaigns) == "table" then
         for campaignId, header in pairs(record.campaigns) do
             if type(header) == "table" and type(campaignId) == "string" then
-                local body = {
+                add("gs:ch:" .. campaignId, {
                     kind = "campaign-header",
                     header = header,
-                }
-                add("gs:ch:" .. campaignId, FingerprintBody(body), body)
+                })
             end
         end
     end
 
-    -- Archived campaign item snapshots (bounded; separate from op envelopes).
+    -- Archived campaign item snapshots (paged to fit MAX_RECORD_CBOR).
     if type(record.campaignArchives) == "table" then
         for campaignId, archive in pairs(record.campaignArchives) do
             if type(archive) == "table" and type(campaignId) == "string" then
-                local body = {
-                    kind = "campaign-archive",
-                    campaignId = campaignId,
-                    datasetId = archive.datasetId or record.datasetId,
-                    requestedItems = archive.requestedItems,
-                    generation = archive.generation,
-                    archivedAt = archive.archivedAt,
-                }
-                add("gs:ca:" .. campaignId, FingerprintBody(body), body)
+                local parts = BuildArchiveExportBodies(campaignId, archive, record)
+                for i = 1, #parts do
+                    add(parts[i].id, parts[i].body)
+                end
             end
         end
     end
 
     -- Descriptor counts must match exported bodies exactly (including conflict deps).
+    -- archiveCount counts logical archives (meta bodies), not page fragments.
     local opExportCount, headerExportCount, archiveExportCount = 0, 0, 0
     for id, entry in pairs(exportState.byId) do
         if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
@@ -272,7 +330,8 @@ local function RebuildExportIndex()
         descEntry.body.acceptedOpCount = opExportCount
         descEntry.body.campaignCount = headerExportCount
         descEntry.body.archiveCount = archiveExportCount
-        descEntry.versionFp = FingerprintBody(descEntry.body)
+        descEntry.needsFp = true
+        descEntry.versionFp = nil
     end
 end
 
@@ -301,19 +360,24 @@ local function UpsertExportBody(id, body)
     if type(id) ~= "string" or id == "" or type(body) ~= "table" then
         return
     end
-    local fp = FingerprintBody(body)
     local existing = exportState.byId[id]
-    if existing and existing.versionFp == fp then
-        existing.body = body
-        return
+    -- Defer fingerprint to EnsureIndex/GetRecord* budget; compare bodies when
+    -- an existing fp is already known.
+    if existing and existing.versionFp and not existing.needsFp then
+        local fp = FingerprintBody(body)
+        if existing.versionFp == fp then
+            existing.body = body
+            return
+        end
     end
     if not existing then
         exportState.order[#exportState.order + 1] = id
     end
     exportState.byId[id] = {
         id = id,
-        versionFp = fp,
+        versionFp = nil,
         body = body,
+        needsFp = true,
     }
     exportState.enumPos = 1
 end
@@ -371,12 +435,18 @@ local function EnsureIndex(index, limits)
         local rid = exportState.order[exportState.enumPos]
         exportState.enumPos = exportState.enumPos + 1
         local r = exportState.byId[rid]
-        if r and GG and GG.IndexUpsert then
-            local _, detail = GG.IndexUpsert(index, rid, r.versionFp, r)
-            if detail == "replaced" and GG.BumpIndexEpoch then
-                GG.BumpIndexEpoch(index)
-                exportState.enumPos = 1
-                return true, n + 1
+        if r then
+            if r.needsFp or not r.versionFp then
+                r.versionFp = FingerprintBody(r.body)
+                r.needsFp = false
+            end
+            if GG and GG.IndexUpsert then
+                local _, detail = GG.IndexUpsert(index, rid, r.versionFp, r)
+                if detail == "replaced" and GG.BumpIndexEpoch then
+                    GG.BumpIndexEpoch(index)
+                    exportState.enumPos = 1
+                    return true, n + 1
+                end
             end
         end
         n = n + 1
@@ -409,7 +479,14 @@ end
 local function GetRecordVersionFp(recordId)
     EnsureExportFresh()
     local r = exportState.byId[tostring(recordId)]
-    return r and r.versionFp or nil
+    if not r then
+        return nil
+    end
+    if r.needsFp or not r.versionFp then
+        r.versionFp = FingerprintBody(r.body)
+        r.needsFp = false
+    end
+    return r.versionFp
 end
 
 local function GetRecordBody(recordId)
@@ -417,6 +494,10 @@ local function GetRecordBody(recordId)
     local r = exportState.byId[tostring(recordId)]
     if not r then
         return nil
+    end
+    if r.needsFp or not r.versionFp then
+        r.versionFp = FingerprintBody(r.body)
+        r.needsFp = false
     end
     return { id = r.id, versionFp = r.versionFp, body = r.body }
 end
@@ -515,7 +596,7 @@ local function ValidateAndApply(record, ctx)
         return "pending", "missing_predecessor"
     end
 
-    if body.kind == "campaign-archive" then
+    if body.kind == "campaign-archive" or body.kind == "campaign-archive-page" then
         if not localRecord then
             return "pending", "awaiting_dataset"
         end
@@ -539,14 +620,55 @@ local function ValidateAndApply(record, ctx)
         if not localRecord.campaigns[body.campaignId] then
             return "pending", "missing_predecessor"
         end
-        local archive = {
-            schemaVersion = body.schemaVersion or GS.SCHEMA_VERSION,
-            campaignId = body.campaignId,
-            datasetId = body.datasetId,
-            requestedItems = body.requestedItems or {},
-            generation = body.generation,
-            archivedAt = body.archivedAt,
-        }
+        local buf = archivePageBuffer[body.campaignId] or { pages = {} }
+        archivePageBuffer[body.campaignId] = buf
+        if body.kind == "campaign-archive" then
+            buf.meta = body
+        else
+            buf.pages[tonumber(body.page) or 0] = body
+            if tonumber(body.pageCount) then
+                buf.pageCount = tonumber(body.pageCount)
+            end
+        end
+        local meta = buf.meta
+        if type(meta) ~= "table" then
+            return "pending", "missing_predecessor"
+        end
+        local archive
+        if type(meta.requestedItems) == "table" then
+            archive = {
+                schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
+                campaignId = meta.campaignId,
+                datasetId = meta.datasetId,
+                requestedItems = meta.requestedItems,
+                generation = meta.generation,
+                archivedAt = meta.archivedAt,
+            }
+        else
+            local pageCount = tonumber(meta.pageCount) or tonumber(buf.pageCount) or 1
+            local merged, got = {}, 0
+            for page = 1, pageCount do
+                local p = buf.pages[page]
+                if type(p) ~= "table" or type(p.requestedItems) ~= "table" then
+                    return "pending", "missing_predecessor"
+                end
+                for k, v in pairs(p.requestedItems) do
+                    merged[k] = v
+                    got = got + 1
+                end
+            end
+            if type(meta.itemCount) == "number" and got ~= meta.itemCount then
+                return "pending", "missing_predecessor"
+            end
+            archive = {
+                schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
+                campaignId = meta.campaignId,
+                datasetId = meta.datasetId,
+                requestedItems = merged,
+                generation = meta.generation,
+                archivedAt = meta.archivedAt,
+            }
+        end
         if not GS.ValidateCampaignArchive
             or not GS.ValidateCampaignArchive(archive, body.campaignId, localRecord) then
             return "rejected", "invalid_campaign_archive"
@@ -554,11 +676,13 @@ local function ValidateAndApply(record, ctx)
         local existing = localRecord.campaignArchives[body.campaignId]
         if existing then
             if GS._DeepEqualOps and GS._DeepEqualOps(existing, archive) then
+                archivePageBuffer[body.campaignId] = nil
                 return "duplicate", "duplicate"
             end
             return "rejected", "id_conflict"
         end
         localRecord.campaignArchives[body.campaignId] = archive
+        archivePageBuffer[body.campaignId] = nil
         if GS.NotifyLocalDurableChange then
             GS.NotifyLocalDurableChange("remote-archive")
         end
@@ -744,23 +868,61 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
             exportState.appendPos = #ops.order
-            -- Bounded export of conflict evidence referenced by resolutions.
-            if type(ops.conflicts) == "table" then
-                local n = 0
-                for cid, entry in pairs(ops.conflicts) do
-                    if n >= 64 then
-                        break
+            -- Incremental conflict/pending/resolution dependency export (full set,
+            -- not a 64-entry truncation). Warm-index peers need open candidates.
+            local function upsertEvidence(cid, boundaryHint)
+                if type(cid) ~= "string" or exportState.byId["gs:op:" .. cid] then
+                    return
+                end
+                local cand = ops.records and ops.records[cid]
+                    or (ops.pending and ops.pending[cid] and ops.pending[cid].body)
+                    or (ops.conflicts and ops.conflicts[cid] and ops.conflicts[cid].body)
+                if type(cand) ~= "table" then
+                    return
+                end
+                local body = { kind = "gs-op", op = cand, evidenceOnly = true }
+                if cand.kind == GS.KIND.START_CAMPAIGN then
+                    local header = boundaryHint
+                        or (record.campaigns and record.campaigns[cid])
+                        or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
+                    if type(header) == "table" then
+                        body.boundary = header
                     end
-                    if type(cid) == "string" and type(entry) == "table"
-                        and not exportState.byId["gs:op:" .. cid] then
-                        local cand = entry.body or entry
-                        if type(cand) == "table" and cand.id then
-                            UpsertExportBody("gs:op:" .. cid, {
-                                kind = "gs-op",
-                                op = cand,
-                                evidenceOnly = true,
-                            })
-                            n = n + 1
+                end
+                UpsertExportBody("gs:op:" .. cid, body)
+            end
+            if type(ops.openConflicts) == "table" then
+                for _, entry in pairs(ops.openConflicts) do
+                    if type(entry) == "table" and type(entry.candidateIds) == "table" then
+                        for i = 1, #entry.candidateIds do
+                            local cid = entry.candidateIds[i]
+                            upsertEvidence(cid, entry.boundaries and entry.boundaries[cid])
+                        end
+                    end
+                end
+            end
+            if type(ops.pending) == "table" then
+                for cid in pairs(ops.pending) do
+                    upsertEvidence(cid, nil)
+                end
+            end
+            if type(ops.conflicts) == "table" then
+                for cid in pairs(ops.conflicts) do
+                    upsertEvidence(cid, nil)
+                end
+            end
+            if type(ops.order) == "table" then
+                for i = 1, #ops.order do
+                    local op = ops.records and ops.records[ops.order[i]]
+                    if type(op) == "table" and op.kind == GS.KIND.RESOLVE_CONFLICT
+                        and type(op.value) == "table" then
+                        if type(op.value.chosenOpId) == "string" then
+                            upsertEvidence(op.value.chosenOpId, nil)
+                        end
+                        if type(op.value.competingOpIds) == "table" then
+                            for j = 1, #op.value.competingOpIds do
+                                upsertEvidence(op.value.competingOpIds[j], nil)
+                            end
                         end
                     end
                 end
@@ -782,17 +944,11 @@ function GS.NotifyLocalDurableChange(reason)
         if type(record.campaignArchives) == "table" then
             for campaignId, archive in pairs(record.campaignArchives) do
                 if type(campaignId) == "string" and type(archive) == "table" then
-                    local exportId = "gs:ca:" .. campaignId
-                    if not exportState.byId[exportId] then
-                        UpsertExportBody(exportId, {
-                            kind = "campaign-archive",
-                            campaignId = campaignId,
-                            datasetId = archive.datasetId or record.datasetId,
-                            requestedItems = archive.requestedItems,
-                            generation = archive.generation,
-                            archivedAt = archive.archivedAt,
-                            schemaVersion = archive.schemaVersion,
-                        })
+                    local parts = BuildArchiveExportBodies(campaignId, archive, record)
+                    for i = 1, #parts do
+                        if not exportState.byId[parts[i].id] then
+                            UpsertExportBody(parts[i].id, parts[i].body)
+                        end
                     end
                 end
             end

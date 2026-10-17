@@ -394,7 +394,8 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
         return false, headsErr
     end
 
-    -- openConflicts is optional (#387); when present it must be a bounded map.
+    -- openConflicts is optional (#387); when present it must be a bounded map of
+    -- dense unique refs to retained/accepted bodies (no invented candidates).
     if ops.openConflicts ~= nil then
         if type(ops.openConflicts) ~= "table" then
             return false, "invalid_operations"
@@ -417,10 +418,26 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
             if n < 2 or n > maxCand then
                 return false, "invalid_operations"
             end
-            for i = 1, n do
-                if type(entry.candidateIds[i]) ~= "string" then
+            local seen = {}
+            local dense = 0
+            for k, id in pairs(entry.candidateIds) do
+                dense = dense + 1
+                if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
                     return false, "invalid_operations"
                 end
+                if type(id) ~= "string" or id == "" or seen[id] then
+                    return false, "invalid_operations"
+                end
+                seen[id] = true
+                local body = ops.records and ops.records[id]
+                    or (ops.pending and ops.pending[id] and ops.pending[id].body)
+                    or (ops.conflicts and ops.conflicts[id] and ops.conflicts[id].body)
+                if type(body) ~= "table" then
+                    return false, "invalid_operations"
+                end
+            end
+            if dense ~= n then
+                return false, "invalid_operations"
             end
         end
     end
