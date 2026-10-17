@@ -32,6 +32,12 @@ local exportState = {
     epoch = 0,
     appendPos = 0,
     dirtyRebuild = false,
+    resolveScanPos = 0,
+    maintIdle = true,
+    countsDirty = true,
+    cachedOpCount = 0,
+    cachedCampaignCount = 0,
+    cachedArchiveCount = 0,
 }
 
 -- Runtime reassembly buffer for paged campaign archives (not SavedVariables).
@@ -163,6 +169,13 @@ local function RebuildExportIndex()
     exportState.order = {}
     exportState.byId = {}
     exportState.enumPos = nil
+    exportState.appendPos = 0
+    exportState.resolveScanPos = 0
+    exportState.maintIdle = true
+    exportState.countsDirty = true
+    exportState.cachedOpCount = 0
+    exportState.cachedCampaignCount = 0
+    exportState.cachedArchiveCount = 0
     local record, guildKey = CurrentGuildRecord()
     if not record then
         exportState.guildKey = nil
@@ -370,6 +383,14 @@ local function RebuildExportIndex()
         descEntry.needsFp = true
         descEntry.versionFp = nil
     end
+    exportState.cachedOpCount = opExportCount
+    exportState.cachedCampaignCount = headerExportCount
+    exportState.cachedArchiveCount = archiveExportCount
+    exportState.countsDirty = false
+    exportState.appendPos = (record.operations and record.operations.order
+        and #record.operations.order) or 0
+    exportState.resolveScanPos = exportState.appendPos
+    exportState.maintIdle = true
 end
 
 local function EnsureExportFresh()
@@ -409,6 +430,10 @@ local function UpsertExportBody(id, body)
     end
     if not existing then
         exportState.order[#exportState.order + 1] = id
+        -- New IDs append at the end; do not restart EnsureIndex from 1.
+        if not exportState.enumPos then
+            exportState.enumPos = #exportState.order
+        end
     end
     exportState.byId[id] = {
         id = id,
@@ -416,7 +441,15 @@ local function UpsertExportBody(id, body)
         body = body,
         needsFp = true,
     }
-    exportState.enumPos = 1
+    exportState.countsDirty = true
+    -- Mark index dirty so EnsureIndex budgets fingerprint work; keep enumPos.
+    if GG and GG.GetProvider and providerRegistered then
+        local prov = GG.GetProvider(GS.PROVIDER_ID)
+        if prov and prov.index then
+            prov.index.dirty = true
+            prov.index.buildComplete = false
+        end
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -674,45 +707,92 @@ local function ValidateAndApply(record, ctx)
                 return "duplicate", "duplicate"
             end
         end
-        -- Validate page indices before inserting into the reassembly buffer.
+        -- Validate page indices / mandatory pageCount upper bound before retention.
+        local maxPageCount = GS.MAX_ARCHIVE_PAGE_COUNT or 22
+        if body.kind == "campaign-archive" then
+            local pageCount = tonumber(body.pageCount)
+            if pageCount ~= nil then
+                if pageCount ~= math.floor(pageCount) or pageCount < 1 or pageCount > maxPageCount then
+                    return "rejected", "invalid_campaign_archive"
+                end
+            end
+        end
         if body.kind == "campaign-archive-page" then
             local page = tonumber(body.page)
             local pageCount = tonumber(body.pageCount)
             if not page or page ~= math.floor(page) or page < 1 then
                 return "rejected", "invalid_campaign_archive"
             end
-            if pageCount and (pageCount ~= math.floor(pageCount) or pageCount < 1 or page > pageCount) then
+            if not pageCount or pageCount ~= math.floor(pageCount)
+                or pageCount < 1 or pageCount > maxPageCount or page > pageCount then
                 return "rejected", "invalid_campaign_archive"
             end
+            -- Bound page payload before retention (item map size).
+            if type(body.requestedItems) == "table" then
+                local n = 0
+                for _ in pairs(body.requestedItems) do
+                    n = n + 1
+                    if n > (ARCHIVE_PAGE_ITEMS or 12) then
+                        return "rejected", "invalid_campaign_archive"
+                    end
+                end
+            end
         end
-        local maxCamps = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-        local maxPages = GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64
+        local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES
+            or GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
+        local maxPages = GS.MAX_FRAGMENT_BUFFER_PAGES
+            or GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64
+        local ttl = GS.FRAGMENT_BUFFER_TTL_SECONDS or 600
+        local now = GetServerTime and GetServerTime() or 0
         local buf = archivePageBuffer[body.campaignId]
+        if buf and buf.at and now > 0 and (now - (tonumber(buf.at) or 0)) > ttl then
+            ClearArchivePageBuffer(body.campaignId)
+            buf = nil
+        end
         if not buf then
             if (archivePageBufferCount or 0) >= maxCamps then
                 return "rejected", "full"
             end
-            buf = { pages = {}, datasetId = body.datasetId }
+            buf = {
+                pages = {},
+                datasetId = body.datasetId,
+                sourcePeer = sender,
+                at = now,
+            }
             archivePageBuffer[body.campaignId] = buf
             archivePageBufferCount = (archivePageBufferCount or 0) + 1
         elseif buf.datasetId and buf.datasetId ~= body.datasetId then
             ClearArchivePageBuffer(body.campaignId)
             return "rejected", "dataset_mismatch"
+        elseif buf.sourcePeer and buf.sourcePeer ~= sender then
+            ClearArchivePageBuffer(body.campaignId)
+            return "rejected", "id_conflict"
         end
         if body.kind == "campaign-archive" then
+            if buf.meta and GS._DeepEqualOps and not GS._DeepEqualOps(buf.meta, body) then
+                ClearArchivePageBuffer(body.campaignId)
+                return "rejected", "id_conflict"
+            end
             buf.meta = body
+            buf.at = now
             if tonumber(body.pageCount) then
                 buf.pageCount = tonumber(body.pageCount)
             end
         else
             local page = tonumber(body.page)
-            if not buf.pages[page] then
+            if buf.pages[page] then
+                if GS._DeepEqualOps and not GS._DeepEqualOps(buf.pages[page], body) then
+                    ClearArchivePageBuffer(body.campaignId)
+                    return "rejected", "id_conflict"
+                end
+            else
                 if (archivePageBufferPages or 0) >= maxPages then
                     return "rejected", "full"
                 end
                 archivePageBufferPages = (archivePageBufferPages or 0) + 1
             end
             buf.pages[page] = body
+            buf.at = now
             if tonumber(body.pageCount) then
                 buf.pageCount = tonumber(body.pageCount)
             end
@@ -802,10 +882,23 @@ local function ValidateAndApply(record, ctx)
                 and type(perm.revisionId) == "string" and perm.revisionId ~= ""
             requireRecover = not policyOk
         end
+        -- Policy catch-up: while bootstrap-locked, evaluate authority with
+        -- allowPolicyCatchUp when the body is a causal policy successor under
+        -- the current predecessor policy. Do not mark those as relay — Admit
+        -- validates each transition under the predecessor policy.
+        local bootstrapLocked = localRecord and GS.IsBootstrapEditLocked
+            and GS.IsBootstrapEditLocked(member.guildKey, localRecord)
+        local currentPolicy = localRecord and localRecord.permission
+            and localRecord.permission.revisionId
+        local isPolicyCatchUp = bootstrapLocked
+            and op.kind == GS.KIND.SET_EDITOR_RANK
+            and type(op.basePolicyRevision) == "string"
+            and op.basePolicyRevision == currentPolicy
         local relay = false
         local editorOk = select(1, GS.SenderHasEditorAuthority(member, {
             requireRecoverPolicy = requireRecover,
             allowBootstrapInstall = false,
+            allowPolicyCatchUp = isPolicyCatchUp,
         }))
         if not editorOk then
             -- Non-editor carrier: untrusted historical relay.
@@ -813,14 +906,17 @@ local function ValidateAndApply(record, ctx)
         else
             -- Editor carrier with mismatched claimed author is still a relay.
             -- Do not apply or hard-reject; retain for exact-content confirmation.
-            if type(op.actorGuid) == "string" and op.actorGuid ~= ""
-                and op.actorGuid ~= member.guid then
-                relay = true
-            elseif type(op.actorName) == "string" and op.actorName ~= "" then
-                local want = GG.NormalizePlayer and GG.NormalizePlayer(op.actorName)
-                local have = GG.NormalizePlayer and GG.NormalizePlayer(member.name)
-                if want and have and want ~= have then
+            -- Causal policy catch-up bodies keep actor binding via Admit.
+            if not isPolicyCatchUp then
+                if type(op.actorGuid) == "string" and op.actorGuid ~= ""
+                    and op.actorGuid ~= member.guid then
                     relay = true
+                elseif type(op.actorName) == "string" and op.actorName ~= "" then
+                    local want = GG.NormalizePlayer and GG.NormalizePlayer(op.actorName)
+                    local have = GG.NormalizePlayer and GG.NormalizePlayer(member.name)
+                    if want and have and want ~= have then
+                        relay = true
+                    end
                 end
             end
         end
@@ -968,8 +1064,8 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
             exportState.appendPos = #ops.order
-            -- Incremental conflict/pending/resolution dependency export (full set,
-            -- not a 64-entry truncation). Warm-index peers need open candidates.
+            -- Incremental conflict/pending/resolution dependency export.
+            -- Bound per-notify work; resume via maintPos across notifications.
             local function upsertEvidence(cid, boundaryHint)
                 if type(cid) ~= "string" then
                     return
@@ -998,42 +1094,72 @@ function GS.NotifyLocalDurableChange(reason)
                 end
                 UpsertExportBody(exportId, body)
             end
+            local slice = GS.MAX_EXPORT_MAINT_PER_SLICE or 32
+            local used = 0
             if type(ops.openConflicts) == "table" then
                 for _, entry in pairs(ops.openConflicts) do
+                    if used >= slice then
+                        break
+                    end
                     if type(entry) == "table" and type(entry.candidateIds) == "table" then
                         for i = 1, #entry.candidateIds do
+                            if used >= slice then
+                                break
+                            end
                             local cid = entry.candidateIds[i]
                             upsertEvidence(cid, entry.boundaries and entry.boundaries[cid])
+                            used = used + 1
                         end
                     end
                 end
             end
-            if type(ops.pending) == "table" then
-                for cid in pairs(ops.pending) do
-                    upsertEvidence(cid, nil)
-                end
-            end
-            if type(ops.conflicts) == "table" then
-                for cid in pairs(ops.conflicts) do
-                    upsertEvidence(cid, nil)
-                end
-            end
-            if type(ops.order) == "table" then
-                for i = 1, #ops.order do
+            -- Only newly appended accepted resolves need competing-id export.
+            if used < slice and type(ops.order) == "table" then
+                local resStart = math.max(1, (tonumber(exportState.resolveScanPos) or 0) + 1)
+                for i = resStart, #ops.order do
+                    if used >= slice then
+                        break
+                    end
                     local op = ops.records and ops.records[ops.order[i]]
+                    exportState.resolveScanPos = i
                     if type(op) == "table" and op.kind == GS.KIND.RESOLVE_CONFLICT
                         and type(op.value) == "table" then
                         if type(op.value.chosenOpId) == "string" then
                             upsertEvidence(op.value.chosenOpId, nil)
+                            used = used + 1
                         end
                         if type(op.value.competingOpIds) == "table" then
                             for j = 1, #op.value.competingOpIds do
+                                if used >= slice then
+                                    break
+                                end
                                 upsertEvidence(op.value.competingOpIds[j], nil)
+                                used = used + 1
                             end
                         end
                     end
                 end
             end
+            -- Pending/conflict maps: paced walk with resume cursor.
+            if used < slice and type(ops.pending) == "table" then
+                for cid in pairs(ops.pending) do
+                    if used >= slice then
+                        break
+                    end
+                    upsertEvidence(cid, nil)
+                    used = used + 1
+                end
+            end
+            if used < slice and type(ops.conflicts) == "table" then
+                for cid in pairs(ops.conflicts) do
+                    if used >= slice then
+                        break
+                    end
+                    upsertEvidence(cid, nil)
+                    used = used + 1
+                end
+            end
+            exportState.maintIdle = used < slice
         end
         if type(record.campaigns) == "table" then
             for campaignId, header in pairs(record.campaigns) do
@@ -1048,29 +1174,50 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
         end
+        -- Archives: only construct pages for campaigns not yet exported.
         if type(record.campaignArchives) == "table" then
+            local slice = GS.MAX_EXPORT_MAINT_PER_SLICE or 32
+            local used = 0
             for campaignId, archive in pairs(record.campaignArchives) do
+                if used >= slice then
+                    exportState.maintIdle = false
+                    break
+                end
                 if type(campaignId) == "string" and type(archive) == "table" then
-                    local parts = BuildArchiveExportBodies(campaignId, archive, record)
-                    for i = 1, #parts do
-                        if not exportState.byId[parts[i].id] then
-                            UpsertExportBody(parts[i].id, parts[i].body)
+                    local metaId = "gs:ca:" .. campaignId
+                    if not exportState.byId[metaId] then
+                        local parts = BuildArchiveExportBodies(campaignId, archive, record)
+                        for i = 1, #parts do
+                            if not exportState.byId[parts[i].id] then
+                                UpsertExportBody(parts[i].id, parts[i].body)
+                            end
                         end
+                        used = used + 1
                     end
                 end
             end
         end
-        local acceptedOpCount, campaignCount, archiveCount = 0, 0, 0
-        for id, entry in pairs(exportState.byId) do
-            if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
-                if entry.body.kind == "gs-op" then
-                    acceptedOpCount = acceptedOpCount + 1
-                elseif entry.body.kind == "campaign-header" then
-                    campaignCount = campaignCount + 1
-                elseif entry.body.kind == "campaign-archive" then
-                    archiveCount = archiveCount + 1
+        -- Recount descriptor only from cached export map (no archive rebuild).
+        local acceptedOpCount = tonumber(exportState.cachedOpCount) or 0
+        local campaignCount = tonumber(exportState.cachedCampaignCount) or 0
+        local archiveCount = tonumber(exportState.cachedArchiveCount) or 0
+        if exportState.countsDirty ~= false then
+            acceptedOpCount, campaignCount, archiveCount = 0, 0, 0
+            for id, entry in pairs(exportState.byId) do
+                if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
+                    if entry.body.kind == "gs-op" then
+                        acceptedOpCount = acceptedOpCount + 1
+                    elseif entry.body.kind == "campaign-header" then
+                        campaignCount = campaignCount + 1
+                    elseif entry.body.kind == "campaign-archive" then
+                        archiveCount = archiveCount + 1
+                    end
                 end
             end
+            exportState.cachedOpCount = acceptedOpCount
+            exportState.cachedCampaignCount = campaignCount
+            exportState.cachedArchiveCount = archiveCount
+            exportState.countsDirty = false
         end
         local desc = {
             kind = "dataset-desc",
@@ -1090,6 +1237,7 @@ function GS.NotifyLocalDurableChange(reason)
             archiveCount = archiveCount,
         }
         UpsertExportBody("gs:desc:" .. record.datasetId, desc)
+        exportState.countsDirty = true -- next notify reconciles after upserts
     end
 
     if GG and GG.NotifyProviderChanged and providerRegistered then
