@@ -1298,6 +1298,21 @@ function GS:IsAdoptionTransferComplete()
     return true, nil, desc
 end
 
+--- Abort in-progress replay session caches without touching live globals.
+-- Forward-declared: BeginDatasetAdoption may replace a prior session mid-replay.
+local function AbortAdoptionReplay(adop, reason)
+    if type(adop) ~= "table" then
+        return
+    end
+    adop.replayTemp = nil
+    adop.replayState = nil
+    adop.replayMember = nil
+    adop._replaySessionRelay = nil
+    adop._replaySessionBoundaries = nil
+    adop._replayScheduled = false
+    DebugWarn("adoption replay aborted: %s", tostring(reason))
+end
+
 --- Begin explicit staged dataset adoption (authorized editor). Runtime-only until commit.
 -- Reuses an in-progress buffer for the same source/dataset; switching sources cancels first.
 function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
@@ -1387,20 +1402,6 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         NotifyAdoptionStateChanged("begin")
     end
     return GS._adoption, "accepted", nil
-end
-
---- Abort in-progress replay session caches without touching live globals.
-local function AbortAdoptionReplay(adop, reason)
-    if type(adop) ~= "table" then
-        return
-    end
-    adop.replayTemp = nil
-    adop.replayState = nil
-    adop.replayMember = nil
-    adop._replaySessionRelay = nil
-    adop._replaySessionBoundaries = nil
-    adop._replayScheduled = false
-    DebugWarn("adoption replay aborted: %s", tostring(reason))
 end
 
 function GS:CancelDatasetAdoption()
@@ -1703,15 +1704,23 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     -- legal reverse-order history that retries dependents before predecessors.
     local admissions = 0
 
-    local function HasUnsettledAcceptableNonRankOnCurrentPolicy()
-        local policyNow = temp.permission and temp.permission.revisionId or temp.datasetId
-        for j = 1, #adop.order do
-            local b = adop.records[adop.order[j]]
+    -- Policy-deferral scan: O(buffer) once per policy epoch. Charged as a single
+    -- unit so it cannot consume the entire admit budget after every progress.
+    local deferRank = state.deferRankCached
+    local policyNow = temp.permission and temp.permission.revisionId or temp.datasetId
+    if deferRank == nil or state.deferRankPolicy ~= policyNow then
+        sliceUsed = sliceUsed + 1
+        local found = false
+        for scanAt = 1, #adop.order do
+            local b = adop.records[adop.order[scanAt]]
             if type(b) == "table" and b.kind == "gs-op" and type(b.op) == "table" then
                 local o = b.op
+                -- Defer rank only while same-policy config mutations remain. Campaign
+                -- starts are not rank-gated and must not sticky-defer SET_EDITOR_RANK.
                 if o.kind ~= GS.KIND.SET_EDITOR_RANK
                     and o.kind ~= GS.KIND.CONFIRM_CANDIDATE
                     and o.kind ~= GS.KIND.RESOLVE_CONFLICT
+                    and o.kind ~= GS.KIND.START_CAMPAIGN
                     and not (temp.operations.records and temp.operations.records[o.id])
                     and not (temp.operations.conflicts and temp.operations.conflicts[o.id]) then
                     if o.basePolicyRevision == policyNow
@@ -1720,16 +1729,20 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         local conf = AdoptionHasConfirmationFor(
                             adop, o.id, o, member, temp.operations)
                         if src or conf then
-                            return true
+                            found = true
+                            break
                         end
                     end
                 end
             end
         end
-        return false
+        deferRank = found
+        state.deferRankCached = found
+        state.deferRankPolicy = policyNow
+        state.deferRankScan = nil
     end
+    deferRank = deferRank == true
 
-    local deferRank = HasUnsettledAcceptableNonRankOnCurrentPolicy()
     local start = tonumber(state.cursor) or 1
     if start < 1 then
         start = 1
@@ -1752,8 +1765,17 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             local opBody = body
             local pageCount = tonumber(body.pageCount) or tonumber(body.op.pageCount)
             if pageCount and pageCount >= 1 and GS.AssembleOpFromPages then
-                -- Assembly/compare work counts toward the slice.
+                -- One unit for page membership gather + assemble validation.
                 sliceUsed = sliceUsed + 1
+                if sliceUsed > sliceBudget then
+                    state.cursor = (i - 1)
+                    if state.cursor < 1 then
+                        state.cursor = #adop.order
+                    end
+                    state.admissions = (tonumber(state.admissions) or 0) + admissions
+                    state.sliceUsed = sliceUsed
+                    return true, nil, progress
+                end
                 local pages = {}
                 for j = 1, #adop.order do
                     local pb = adop.records[adop.order[j]]
@@ -1861,14 +1883,16 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     temp.campaigns[h.campaignId] = h
                     GS._pendingCampaignBoundaries[h.campaignId] = h
                     progress = true
-                    sliceUsed = sliceUsed + 1
                 end
             end
         elseif body.kind == "campaign-archive" and type(body.campaignId) == "string" then
+            local pageCount = tonumber(body.pageCount) or 1
+            local needsPages = (not body.requestedItems) and pageCount >= 1
             if temp.campaignArchives[body.campaignId] == nil then
                 if temp.currentCampaignId ~= body.campaignId and temp.campaigns[body.campaignId] then
                     local pages = {}
-                    if not body.requestedItems then
+                    if needsPages then
+                        sliceUsed = sliceUsed + 1
                         for j = 1, #adop.order do
                             local pb = adop.records[adop.order[j]]
                             if type(pb) == "table" and pb.kind == "campaign-archive-page"
@@ -1879,7 +1903,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     end
                     local archive, aerr = AssemblePagedArchive(body, pages)
                     if not archive then
-                        if aerr ~= "incomplete_archive_pages" then
+                        if aerr == "incomplete_archive_pages" then
+                            unsettledSeen = true
+                        else
                             state.cursor, state.admissions = i, admissions
                             return false, aerr or "invalid_campaign_archive", progress
                         end
@@ -1895,7 +1921,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 end
             else
                 local pages = {}
-                if not body.requestedItems then
+                if needsPages then
+                    sliceUsed = sliceUsed + 1
                     for j = 1, #adop.order do
                         local pb = adop.records[adop.order[j]]
                         if type(pb) == "table" and pb.kind == "campaign-archive-page"
@@ -1903,24 +1930,34 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                             pages[tonumber(pb.page) or 0] = pb
                         end
                     end
-                end
-                local archive, aerr = AssemblePagedArchive(body, pages)
-                if not archive then
-                    if aerr ~= "incomplete_archive_pages" then
+                    local archive, aerr = AssemblePagedArchive(body, pages)
+                    if not archive then
+                        if aerr == "incomplete_archive_pages" then
+                            -- Generated presence alone is insufficient for advertised pages.
+                            unsettledSeen = true
+                            state.archiveNeedsPages = state.archiveNeedsPages or {}
+                            state.archiveNeedsPages[body.campaignId] = true
+                        else
+                            state.cursor, state.admissions = i, admissions
+                            return false, aerr or "invalid_campaign_archive", progress
+                        end
+                    elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
                         state.cursor, state.admissions = i, admissions
-                        return false, aerr or "invalid_campaign_archive", progress
+                        return false, "archive_conflict", progress
+                    else
+                        if state.archiveNeedsPages then
+                            state.archiveNeedsPages[body.campaignId] = nil
+                        end
                     end
-                elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
-                    state.cursor, state.admissions = i, admissions
-                    return false, "archive_conflict", progress
                 end
             end
         end
     end
     state.cursor = i
 
-    -- Pending retries consume slice budget too.
+    -- Pending retries: one unit to collect eligible retries, then admit under budget.
     if sliceUsed < sliceBudget and temp.operations.pending then
+        sliceUsed = sliceUsed + 1
         local retryIds = {}
         for pid, pend in pairs(temp.operations.pending) do
             local pob = pend and pend.body
@@ -1936,6 +1973,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 end
             end
         end
+        table.sort(retryIds)
         for ri = 1, #retryIds do
             if sliceUsed >= sliceBudget then
                 break
@@ -1968,33 +2006,56 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
         end
     end
 
-    -- Confirmation redrive counts toward the slice.
+    -- Confirmation redrive counts toward the slice (uses cached deferRank).
     if sliceUsed < sliceBudget then
-        local deferRankRedrive = HasUnsettledAcceptableNonRankOnCurrentPolicy()
         GS.RedriveExactContentConfirmations(temp, {
             adoptionReplay = true,
             offlineRecord = temp,
             sender = adop.sourcePeer,
             member = member,
-            deferRank = deferRankRedrive,
+            deferRank = deferRank,
         })
         sliceUsed = sliceUsed + 1
         admissions = admissions + 1
+    end
+
+    if progress then
+        state.idlePasses = 0
+        state.noProgressSlices = 0
+        -- Rescan deferral when policy moved; otherwise keep the cached frontier.
+        local policyAfter = temp.permission and temp.permission.revisionId or temp.datasetId
+        if state.deferRankPolicy ~= policyAfter then
+            state.deferRankCached = nil
+            state.deferRankScan = nil
+            state.deferRankPolicy = policyAfter
+        elseif deferRank then
+            -- A non-rank settle may have cleared the deferral reason.
+            state.deferRankCached = nil
+        end
+    else
+        -- Budget-hit slices with no admission progress must still terminate.
+        state.noProgressSlices = (tonumber(state.noProgressSlices) or 0) + 1
     end
 
     state.admissions = (tonumber(state.admissions) or 0) + admissions
     state.sliceUsed = sliceUsed
     state.cursor = i
     local budgetHit = sliceUsed >= sliceBudget
-    -- Continue while progress remains, or budget stopped us with unsettled work.
-    -- A no-progress full scan with no unsettled rows means idle (completeness next).
-    local moreWork = progress or (budgetHit and unsettledSeen)
-    if not progress and not budgetHit and not unsettledSeen then
+    local moreWork = progress or budgetHit or (state.deferRankScan ~= nil)
+    local maxNoProgress = math.max(8, (#adop.order * 2) + 8)
+    if (tonumber(state.noProgressSlices) or 0) > maxNoProgress then
+        return false, "incomplete_transfer", progress
+    end
+    if not progress and not budgetHit and unsettledSeen then
+        -- Full scan found dependents waiting with no progress: finite stall.
+        state.idlePasses = (tonumber(state.idlePasses) or 0) + 1
+        local maxIdle = math.max(4, #adop.order + 2)
+        if state.idlePasses > maxIdle then
+            return false, "incomplete_transfer", progress
+        end
         moreWork = false
-    elseif not progress and not budgetHit and unsettledSeen then
-        -- Full scan found dependents waiting on predecessors: another wave needed
-        -- only when something can still change (progress this wave). Otherwise stall.
-        moreWork = false
+    elseif not progress and not budgetHit and not unsettledSeen then
+        moreWork = state.deferRankScan ~= nil
     end
     return moreWork, nil, progress
 end
@@ -2056,6 +2117,26 @@ local function ValidateAdoptionCompleteness(temp, adop, member)
             if body.campaignId and temp.campaignArchives[body.campaignId] == nil then
                 return false, "invalid_campaign_archive"
             end
+            -- Advertised paged archives must assemble from transfer pages, not
+            -- merely exist as a generated placeholder.
+            local pageCount = tonumber(body.pageCount) or 1
+            if (not body.requestedItems) and pageCount >= 1 then
+                local pages = {}
+                for j = 1, #adop.order do
+                    local pb = adop.records[adop.order[j]]
+                    if type(pb) == "table" and pb.kind == "campaign-archive-page"
+                        and pb.campaignId == body.campaignId then
+                        pages[tonumber(pb.page) or 0] = pb
+                    end
+                end
+                local archive, aerr = AssemblePagedArchive(body, pages)
+                if not archive then
+                    return false, aerr or "incomplete_archive_pages"
+                end
+                if not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
+                    return false, "archive_conflict"
+                end
+            end
         end
     end
     return true, nil
@@ -2066,6 +2147,11 @@ local function ValidateAdoptionEffectiveState(temp, adop, desc)
     for i = 1, #(adop.sourceAcceptedIds or {}) do
         local oid = adop.sourceAcceptedIds[i]
         if not (temp.operations.records and temp.operations.records[oid]) then
+            return false, "incomplete_transfer"
+        end
+        -- Conflict-only retention of a source-accepted id is not the selected result.
+        if temp.operations.conflicts and temp.operations.conflicts[oid]
+            and not (temp.operations.records and temp.operations.records[oid]) then
             return false, "incomplete_transfer"
         end
     end
@@ -2088,6 +2174,22 @@ local function ValidateAdoptionEffectiveState(temp, adop, desc)
         local wantAccepted = tonumber(desc.acceptedOpCount)
         if wantAccepted and acceptedCount ~= wantAccepted then
             return false, "incomplete_transfer"
+        end
+        -- Effective configuration head: bank tab must match the selected source
+        -- when the descriptor advertises one (including explicit nil via flag).
+        if desc.bankTab ~= nil or desc.hasBankTab == true then
+            local liveTab = temp.accounting and temp.accounting._consumables
+                and temp.accounting._consumables.bankTab
+            if (liveTab or nil) ~= (desc.bankTab or nil) then
+                return false, "incomplete_transfer"
+            end
+        end
+        local wantEditor = tonumber(desc.editorRankPosition)
+        if wantEditor then
+            local liveRank = temp.permission and tonumber(temp.permission.editorRankPosition)
+            if liveRank ~= wantEditor then
+                return false, "incomplete_transfer"
+            end
         end
     end
     return true, nil
@@ -2160,11 +2262,15 @@ end
 local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
     opts = opts or {}
     local state = opts.state or { cursor = 1, admissions = 0 }
-    local maxWaves = math.max(8, #adop.order + 8)
+    -- Bounded slices charge searches/assembly; allow enough waves for reverse
+    -- histories under MAX_ADMISSION_WORK_PER_SLICE without raising the slice size.
+    local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+    local maxWaves = math.max(64, (#adop.order * sliceBudget) + 16)
     local wave = tonumber(state.wave) or 0
     local syncDrain = opts.syncDrain == true
         or not (C_Timer and C_Timer.After)
         or opts.adoptionReplaySync == true
+        or GS._adoptionReplaySyncDrain == true
 
     local function runOne()
         wave = wave + 1
@@ -2259,15 +2365,11 @@ local function ContinueAdoptionReplay(adop)
     adop.replayState = state
     adop._replayScheduled = false
     state.wave = (tonumber(state.wave) or 0) + 1
-    local maxWaves = math.max(8, #(adop.order or {}) + 8)
-    if state.wave > maxWaves then
-        AbortAdoptionReplay(adop, "incomplete_transfer")
-        GS._adoption = nil
-        NotifyAdoptionStateChanged("failed")
-        return "rejected", "incomplete_transfer"
-    end
+    -- Stall detection lives in ReplayAdoptionSlice (idlePasses). Do not reject a
+    -- legal reverse-order history merely because search/assembly charged many
+    -- budgeted continuation slices.
 
-    local moreWork, err = WithAdoptionSessionCaches(adop, function()
+    local moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
         return ReplayAdoptionSlice(temp, adop, member, state)
     end)
     if err then
@@ -2278,24 +2380,56 @@ local function ContinueAdoptionReplay(adop)
     end
     if moreWork then
         if GS._adoptionReplaySyncDrain then
-            return ContinueAdoptionReplay(adop)
-        end
-        if not adop._replayScheduled then
-            adop._replayScheduled = true
-            local function cont()
-                if GS._adoption ~= adop or adop.committed then
-                    return
+            -- Iterate rather than recurse; charge-heavy reverse histories can
+            -- need many budget slices. Finite idlePasses still terminate stalls.
+            local guard = 0
+            local maxGuard = math.max(256, (#(adop.order or {}) * ((GS.MAX_ADMISSION_WORK_PER_SLICE or 32) + 2)) + 64)
+            while moreWork and guard < maxGuard do
+                guard = guard + 1
+                moreWork, err, progress = WithAdoptionSessionCaches(adop, function()
+                    return ReplayAdoptionSlice(temp, adop, member, state)
+                end)
+                if err then
+                    AbortAdoptionReplay(adop, err)
+                    GS._adoption = nil
+                    NotifyAdoptionStateChanged("failed")
+                    return "rejected", err
                 end
-                ContinueAdoptionReplay(adop)
+                local ctxOk2, ctxErr2, member2 = ValidateAdoptionCommitContext(adop)
+                if not ctxOk2 then
+                    AbortAdoptionReplay(adop, ctxErr2)
+                    GS._adoption = nil
+                    NotifyAdoptionStateChanged("failed")
+                    return "rejected", ctxErr2 or "unauthorized"
+                end
+                member = member2 or member
+                adop.replayMember = member
             end
-            if C_Timer and C_Timer.After then
-                C_Timer.After(0, cont)
-            else
-                cont()
+            if moreWork then
+                AbortAdoptionReplay(adop, "incomplete_transfer")
+                GS._adoption = nil
+                NotifyAdoptionStateChanged("failed")
+                return "rejected", "incomplete_transfer"
             end
+            -- moreWork cleared: fall through to completeness/publish.
+        else
+            if not adop._replayScheduled then
+                adop._replayScheduled = true
+                local function cont()
+                    if GS._adoption ~= adop or adop.committed then
+                        return
+                    end
+                    ContinueAdoptionReplay(adop)
+                end
+                if C_Timer and C_Timer.After then
+                    C_Timer.After(0, cont)
+                else
+                    cont()
+                end
+            end
+            NotifyAdoptionStateChanged("replay")
+            return "pending", "replay_in_progress"
         end
-        NotifyAdoptionStateChanged("replay")
-        return "pending", "replay_in_progress"
     end
 
     local okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member)
@@ -2305,7 +2439,13 @@ local function ContinueAdoptionReplay(adop)
         NotifyAdoptionStateChanged("failed")
         return "rejected", compErr or "incomplete_transfer"
     end
-    local _, _, desc = GS:IsAdoptionTransferComplete()
+    local complete, completeReason, desc = GS:IsAdoptionTransferComplete()
+    if not complete then
+        AbortAdoptionReplay(adop, completeReason)
+        GS._adoption = nil
+        NotifyAdoptionStateChanged("failed")
+        return "rejected", completeReason or "incomplete_transfer"
+    end
     local okPub, pubErr = PublishAdoptionTemp(adop, temp, desc)
     if not okPub then
         AbortAdoptionReplay(adop, pubErr)
@@ -2534,13 +2674,17 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
 
     -- Off-record shadow record: mutations apply only to projected cfg tables.
     -- Seed bank tab from the CHOSEN immutable boundary (explicit nil clears the
-    -- provisional sibling's live tab).
+    -- provisional sibling's live tab). Target heads start empty except
+    -- campaign-independent policy heads — do not retain losing-campaign heads
+    -- that would mis-classify confirmed chosen-campaign edits as conflicts.
     local projItems = {}
     local projElig = {}
     local shadowHeads = {}
     if type(ops.heads) == "table" then
-        for k, v in pairs(ops.heads) do
-            shadowHeads[k] = v
+        local rankKey = GS._TargetKey and GS._TargetKey(GS.KIND.SET_EDITOR_RANK, "editorRankPosition")
+            or "permission:editorRankPosition"
+        if ops.heads[rankKey] then
+            shadowHeads[rankKey] = ops.heads[rankKey]
         end
     end
     local shadowOps = {
@@ -3761,25 +3905,39 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             and GS._AcceptedCount(ops) + slotsNeeded > GS.MAX_ACCEPTED_OPERATIONS then
             return "rejected", "full"
         end
-        -- Preflight loser evidence retention before any projection/head mutation.
-        -- Pending→conflict relocate is free; reject before apply when a new slot
-        -- would be required and the store is full.
+        -- Preflight the COMPLETE loser retention set before any projection/head
+        -- mutation. Relocates are free; count only brand-new conflict slots once.
+        local retainPlan = {}
+        local newConflictSlots = 0
         if type(value.competingOpIds) == "table" then
             for i = 1, #value.competingOpIds do
                 local cid = value.competingOpIds[i]
                 if cid ~= value.chosenOpId then
                     if ops.conflicts and ops.conflicts[cid] then
-                        -- already retained
+                        retainPlan[#retainPlan + 1] = { cid = cid, mode = "present" }
                     elseif ops.pending and ops.pending[cid] and ops.pending[cid].body then
-                        -- atomic relocate will succeed without a second slot
+                        retainPlan[#retainPlan + 1] = {
+                            cid = cid,
+                            mode = "relocate",
+                            body = ops.pending[cid].body,
+                        }
                     elseif type(value.contentBodies) == "table"
                         and type(value.contentBodies[cid]) == "table" then
-                        if GS._RetentionBodyCount and GS.MAX_PENDING_OPERATIONS
-                            and GS._RetentionBodyCount(ops) >= GS.MAX_PENDING_OPERATIONS then
-                            return "rejected", "full"
-                        end
+                        retainPlan[#retainPlan + 1] = {
+                            cid = cid,
+                            mode = "insert",
+                            body = value.contentBodies[cid],
+                        }
+                        newConflictSlots = newConflictSlots + 1
+                    else
+                        return "pending", "missing_predecessor"
                     end
                 end
+            end
+        end
+        if newConflictSlots > 0 and GS._RetentionBodyCount and GS.MAX_PENDING_OPERATIONS then
+            if GS._RetentionBodyCount(ops) + newConflictSlots > GS.MAX_PENDING_OPERATIONS then
+                return "rejected", "full"
             end
         end
         if chosen.kind == GS.KIND.START_CAMPAIGN then
@@ -3842,26 +4000,16 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if ops.openConflicts then
             ops.openConflicts[targetKey] = nil
         end
-        if type(value.competingOpIds) == "table" then
-            for i = 1, #value.competingOpIds do
-                local cid = value.competingOpIds[i]
-                if cid ~= value.chosenOpId then
-                    if ops.pending and ops.pending[cid] and ops.pending[cid].body then
-                        -- Atomic pending→conflict relocate (no second slot charge).
-                        if GS._RetainConflict then
-                            GS._RetainConflict(ops, ops.pending[cid].body)
-                        end
-                    elseif type(value.contentBodies) == "table"
-                        and type(value.contentBodies[cid]) == "table"
-                        and not (ops.conflicts and ops.conflicts[cid]) then
-                        if GS._RetainConflict then
-                            GS._RetainConflict(ops, value.contentBodies[cid])
-                        end
-                    end
-                    if GS._pendingCampaignBoundaries then
-                        GS._pendingCampaignBoundaries[cid] = nil
-                    end
+        for i = 1, #retainPlan do
+            local step = retainPlan[i]
+            if step.mode == "relocate" or step.mode == "insert" then
+                if not (GS._RetainConflict and GS._RetainConflict(ops, step.body)) then
+                    -- Preflight should have guaranteed capacity; treat as hard reject.
+                    return "rejected", "full"
                 end
+            end
+            if GS._pendingCampaignBoundaries then
+                GS._pendingCampaignBoundaries[step.cid] = nil
             end
         end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then

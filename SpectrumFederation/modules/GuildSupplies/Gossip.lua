@@ -44,6 +44,12 @@ local exportState = {
     openConflictCursor = nil,
     maintScheduled = false,
     archiveBuildCursor = nil,
+    -- Cold accepted-op construction cursor (BuildOpExportBodies is paced).
+    opBuildCursor = nil,
+    opBuildNeeded = false,
+    evidenceBuildNeeded = false,
+    -- Invalidates queued maint closures after disable/replacement.
+    maintGeneration = 0,
 }
 
 -- Runtime reassembly buffer for paged campaign archives and operation manifests
@@ -277,10 +283,51 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
     return out
 end
 
---- Split oversized confirm/resolve envelopes into shell + pages under wire budget.
--- Returns a complete fragment set where every ID/versionFp wrapper fits the budget,
--- or falls back to the inline body only when that itself fits. Never silently
--- truncates supported rows or emits known-oversized fragments.
+--- Serialized/estimated byte size of an assembled page row body (no ID wrapper).
+local function EstimateBodyBytes(body)
+    if type(body) ~= "table" then
+        return 0
+    end
+    if C_EncodingUtil and C_EncodingUtil.SerializeCBOR then
+        local ok, raw = pcall(C_EncodingUtil.SerializeCBOR, body)
+        if ok and type(raw) == "string" then
+            return #raw
+        end
+    end
+    local parts = {}
+    local function walk(v, depth)
+        depth = (depth or 0) + 1
+        if depth > 16 then
+            parts[#parts + 1] = "?"
+            return
+        end
+        local t = type(v)
+        if t == "nil" then
+            parts[#parts + 1] = "N"
+        elseif t == "boolean" then
+            parts[#parts + 1] = v and "T" or "F"
+        elseif t == "number" then
+            parts[#parts + 1] = tostring(v)
+        elseif t == "string" then
+            parts[#parts + 1] = v
+        elseif t == "table" then
+            for k, child in pairs(v) do
+                parts[#parts + 1] = tostring(k)
+                walk(child, depth)
+            end
+        end
+    end
+    walk(body, 0)
+    return #table.concat(parts)
+end
+
+--- Split oversized envelopes into shell + pages under wire budget.
+-- Pages carry authoritative bodies and identifier membership. Shells never retain
+-- originalIds / competingOpIds (those lists blow the shell budget). Ordinary
+-- oversized ops page the complete op body as a single row. Returns a complete
+-- fragment set where every ID/versionFp wrapper fits, or {} only when a single
+-- supported row cannot fit the transport budget alone (caller must not advertise
+-- that omission as a complete accepted set — use logical descriptor counts).
 local function BuildOpExportBodies(op, evidenceOnly, boundary)
     local fullBody = {
         kind = "gs-op",
@@ -292,13 +339,6 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
     local budget = WireBudget()
     if EstimateWireRecordBytes(exportId, fullBody) <= budget then
         return { { id = exportId, body = fullBody } }
-    end
-    -- Only confirm/resolve carry embedded authoritative bodies large enough to page.
-    if op.kind ~= GS.KIND.CONFIRM_CANDIDATE and op.kind ~= GS.KIND.RESOLVE_CONFLICT then
-        -- Ordinary ops that somehow exceed budget cannot be paged; omit rather
-        -- than advertise a known-oversized record as complete.
-        DebugWarn("omitting oversized non-paged op export %s", tostring(op.id))
-        return {}
     end
 
     local rows = {}
@@ -329,11 +369,15 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
                 rows[#rows + 1] = { id = ids[i], body = bodies[ids[i]] }
             end
         end
+    else
+        -- Ordinary oversized op: page the complete public body.
+        rows[1] = { id = op.id, body = op }
     end
     if #rows < 1 then
         if EstimateWireRecordBytes(exportId, fullBody) <= budget then
             return { { id = exportId, body = fullBody } }
         end
+        DebugWarn("op export %s: no pageable rows under wire budget", tostring(op.id))
         return {}
     end
 
@@ -363,13 +407,13 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         }
         if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), trialPage) > budget then
             if #(cur.records) == 0 then
-                -- Single row exceeds budget even alone: cannot export this op.
-                DebugWarn("omitting op export %s: row exceeds wire budget", tostring(op.id))
+                -- Single row exceeds budget even alone: beyond transport support.
+                DebugWarn("op export %s: row exceeds wire budget alone", tostring(op.id))
                 return {}
             end
             flush()
             if #pages >= maxPages then
-                DebugWarn("omitting op export %s: exceeds max manifest pages", tostring(op.id))
+                DebugWarn("op export %s: exceeds max manifest pages", tostring(op.id))
                 return {}
             end
             cur.records[1] = rows[i]
@@ -382,7 +426,7 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
                 records = cur.records,
             }
             if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), alone) > budget then
-                DebugWarn("omitting op export %s: row exceeds wire budget", tostring(op.id))
+                DebugWarn("op export %s: row exceeds wire budget alone", tostring(op.id))
                 return {}
             end
         else
@@ -390,7 +434,7 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         end
     end
     if #(cur.records) > 0 and #pages >= maxPages then
-        DebugWarn("omitting op export %s: exceeds max manifest pages", tostring(op.id))
+        DebugWarn("op export %s: exceeds max manifest pages", tostring(op.id))
         return {}
     end
     flush()
@@ -399,8 +443,8 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
     end
     local pageCount = #pages
 
-    -- Shell: strip embedded bodies. Page rows carry authoritative {id,body};
-    -- keep only compact metadata so identifier lists cannot blow the shell budget.
+    -- Shell: strip embedded bodies and large identifier lists. Membership is
+    -- declared via recordCount + page row ids (and chosenOpId for resolve).
     local shellOp = {}
     for k, v in pairs(op) do
         shellOp[k] = v
@@ -409,15 +453,18 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         local ref = op.candidateRef
         shellOp.candidateRef = {
             recordId = ref.recordId,
-            originalIds = ref.originalIds,
             campaignId = ref.campaignId,
-            -- Membership is declared via recordCount + page row ids.
+            -- originalIds live on pages / reassembled membership, not the shell.
         }
     elseif op.kind == GS.KIND.RESOLVE_CONFLICT and type(op.value) == "table" then
         shellOp.value = {
             chosenOpId = op.value.chosenOpId,
-            competingOpIds = op.value.competingOpIds,
+            -- competingOpIds reconstructed from page row ids on assemble.
         }
+    else
+        -- Ordinary: shell keeps identity/causality metadata; page has full body.
+        shellOp.value = nil
+        shellOp.target = nil
     end
     shellOp.pageCount = pageCount
     shellOp.recordCount = #rows
@@ -431,8 +478,7 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         boundary = boundary,
     }
     if EstimateWireRecordBytes(exportId, shellBody) > budget then
-        -- Shell metadata alone still oversized (e.g. huge competingOpIds): omit.
-        DebugWarn("omitting op export %s: shell exceeds wire budget", tostring(op.id))
+        DebugWarn("op export %s: compact shell still exceeds wire budget", tostring(op.id))
         return {}
     end
 
@@ -514,8 +560,8 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
             end
             seenIds[row.id] = true
             rows[#rows + 1] = row
-            -- Bound assembled payload size (IDs + approximate body walk).
-            totalBytes = totalBytes + #row.id + 64
+            -- Bound assembled payload by actual body bytes + id length.
+            totalBytes = totalBytes + #row.id + EstimateBodyBytes(row.body)
             if totalBytes > maxBytes then
                 return nil, "invalid_operation"
             end
@@ -594,15 +640,30 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
         end
     elseif op.kind == GS.KIND.RESOLVE_CONFLICT then
         local contentBodies = {}
+        local competingOpIds = {}
         for i = 1, #rows do
             contentBodies[rows[i].id] = rows[i].body
+            competingOpIds[i] = rows[i].id
         end
         local value = op.value or {}
+        -- Prefer shell-declared order when present; otherwise page membership.
+        if type(value.competingOpIds) == "table" and #value.competingOpIds > 0 then
+            competingOpIds = value.competingOpIds
+        end
         op.value = {
             chosenOpId = value.chosenOpId,
-            competingOpIds = value.competingOpIds,
+            competingOpIds = competingOpIds,
             contentBodies = contentBodies,
         }
+    else
+        -- Ordinary paged op: authoritative body is the single page row.
+        if #rows ~= 1 or type(rows[1].body) ~= "table" then
+            return nil, "invalid_operation"
+        end
+        op = {}
+        for k, v in pairs(rows[1].body) do
+            op[k] = v
+        end
     end
     return {
         kind = "gs-op",
@@ -698,111 +759,12 @@ local function RebuildExportIndex()
     }
     add("gs:desc:" .. record.datasetId, desc)
 
-    -- Accepted operations (config / campaign / confirm / resolve).
-    -- Oversized confirm/resolve envelopes emit shell + gs-op-page fragments.
     local ops = record.operations
-    if type(ops) == "table" and type(ops.order) == "table" then
-        for i = 1, #ops.order do
-            local oid = ops.order[i]
-            local op = ops.records and ops.records[oid]
-            if type(op) == "table" then
-                local boundary = nil
-                if op.kind == GS.KIND.START_CAMPAIGN then
-                    boundary = record.campaigns and record.campaigns[op.id]
-                end
-                local parts = BuildOpExportBodies(op, false, boundary)
-                for pi = 1, #parts do
-                    add(parts[pi].id, parts[pi].body)
-                end
-            end
-        end
-    end
-
-    -- Conflict / resolution dependency bodies so late peers can reconstruct
-    -- resolutions that reference non-head or losing candidates.
-    -- Accepted bodies are added first above; evidenceOnly must not overwrite them.
-    do
-        local function exportCandidate(cid, boundaryHint)
-            if type(cid) ~= "string" then
-                return
-            end
-            local exportId = "gs:op:" .. cid
-            local existing = exportState.byId[exportId]
-            -- Already exported as accepted (non-evidence) — keep accepted form.
-            if existing and existing.body and existing.body.evidenceOnly ~= true
-                and type(existing.body.op) == "table" then
-                return
-            end
-            local cand = ops.records and ops.records[cid]
-                or (ops.pending and ops.pending[cid] and ops.pending[cid].body)
-                or (ops.conflicts and ops.conflicts[cid] and ops.conflicts[cid].body)
-            if type(cand) ~= "table" then
-                return
-            end
-            -- Prefer accepted record body over pending/conflict evidence.
-            if ops.records and ops.records[cid] then
-                return -- accepted path already exported above
-            end
-            local header = nil
-            if cand.kind == GS.KIND.START_CAMPAIGN then
-                header = boundaryHint
-                    or (record.campaigns and record.campaigns[cid])
-                    or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
-            end
-            local parts = BuildOpExportBodies(cand, true, header)
-            for pi = 1, #parts do
-                add(parts[pi].id, parts[pi].body)
-            end
-        end
-        if type(ops) == "table" and type(ops.openConflicts) == "table" then
-            for _, entry in pairs(ops.openConflicts) do
-                if type(entry) == "table" and type(entry.candidateIds) == "table" then
-                    for i = 1, #entry.candidateIds do
-                        local cid = entry.candidateIds[i]
-                        local hint = entry.boundaries and entry.boundaries[cid]
-                        exportCandidate(cid, hint)
-                    end
-                end
-            end
-        end
-        -- Pending open candidates not yet in openConflicts maps.
-        if type(ops) == "table" and type(ops.pending) == "table" then
-            for cid, entry in pairs(ops.pending) do
-                if type(entry) == "table" and type(entry.body) == "table" then
-                    exportCandidate(cid, nil)
-                end
-            end
-        end
-        -- Losing evidence retained under conflicts (post-resolution).
-        if type(ops) == "table" and type(ops.conflicts) == "table" then
-            for cid, entry in pairs(ops.conflicts) do
-                if type(entry) == "table" then
-                    exportCandidate(cid, nil)
-                end
-            end
-        end
-        -- Accepted resolutions: export every competing id referenced by value.
-        if type(ops) == "table" and type(ops.order) == "table" then
-            for i = 1, #ops.order do
-                local op = ops.records and ops.records[ops.order[i]]
-                if type(op) == "table" and op.kind == GS.KIND.RESOLVE_CONFLICT then
-                    local value = op.value
-                    if type(value) == "table" then
-                        if type(value.chosenOpId) == "string" then
-                            exportCandidate(value.chosenOpId, nil)
-                        end
-                        if type(value.competingOpIds) == "table" then
-                            for j = 1, #value.competingOpIds do
-                                exportCandidate(value.competingOpIds[j], nil)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
 
     -- Campaign headers (immutable originals for late joiners / partial catch-up).
+    -- Headers are small; accepted ops / evidence / archives are paced in maint so
+    -- cold RebuildExportIndex does not synchronously serialize the full history.
+    local headerExportCount = 0
     if type(record.campaigns) == "table" then
         for campaignId, header in pairs(record.campaigns) do
             if type(header) == "table" and type(campaignId) == "string" then
@@ -810,12 +772,40 @@ local function RebuildExportIndex()
                     kind = "campaign-header",
                     header = header,
                 })
+                headerExportCount = headerExportCount + 1
             end
         end
     end
 
+    -- Logical accepted count from durable order — never shrink when an individual
+    -- export body is temporarily unpaged. Emitting from byId alone would advertise
+    -- an incomplete source as complete when BuildOpExportBodies returns {}.
+    local acceptedOpCount = 0
+    if type(ops) == "table" and type(ops.order) == "table" then
+        acceptedOpCount = #ops.order
+    end
+    local evidenceExportCount = 0
+    if type(ops) == "table" then
+        if type(ops.pending) == "table" then
+            for id in pairs(ops.pending) do
+                -- Accepted bodies are already in acceptedOpCount / accepted export.
+                if not (ops.records and ops.records[id]) then
+                    evidenceExportCount = evidenceExportCount + 1
+                end
+            end
+        end
+        if type(ops.conflicts) == "table" then
+            for id in pairs(ops.conflicts) do
+                if not (ops.pending and ops.pending[id])
+                    and not (ops.records and ops.records[id]) then
+                    evidenceExportCount = evidenceExportCount + 1
+                end
+            end
+        end
+    end
+    local transferOpCount = acceptedOpCount + evidenceExportCount
+
     -- Archives are constructed under export maintenance budget (not cold-path).
-    -- Count logical archives for the descriptor; pages fill asynchronously.
     local archiveExportCount = 0
     if type(record.campaignArchives) == "table" then
         for campaignId, archive in pairs(record.campaignArchives) do
@@ -826,25 +816,14 @@ local function RebuildExportIndex()
     end
     exportState.archiveBuildNeeded = archiveExportCount > 0
     exportState.archiveBuildCursor = nil
+    exportState.opBuildNeeded = acceptedOpCount > 0
+    exportState.opBuildCursor = 1
+    exportState.evidenceBuildNeeded = evidenceExportCount > 0
+    exportState.pendingCursor = nil
+    exportState.conflictCursor = nil
+    exportState.openConflictCursor = nil
+    exportState.resolveScanPos = 0
 
-    -- Descriptor counts: acceptedOpCount excludes evidenceOnly; transferOpCount
-    -- includes all gs-op metas (pages are fragments, like archive pages).
-    local acceptedOpCount, transferOpCount, headerExportCount = 0, 0, 0
-    for id, entry in pairs(exportState.byId) do
-        if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
-            if entry.body.kind == "gs-op" then
-                transferOpCount = transferOpCount + 1
-                if entry.body.evidenceOnly ~= true then
-                    acceptedOpCount = acceptedOpCount + 1
-                end
-            elseif entry.body.kind == "campaign-header" then
-                headerExportCount = headerExportCount + 1
-            elseif entry.body.kind == "campaign-archive" then
-                -- pages filled by paced maint; recount below after maint
-            end
-        end
-    end
-    -- Logical archive count from durable store (pages may still be building).
     local descId = "gs:desc:" .. record.datasetId
     local descEntry = exportState.byId[descId]
     if type(descEntry) == "table" and type(descEntry.body) == "table" then
@@ -860,16 +839,15 @@ local function RebuildExportIndex()
     exportState.cachedCampaignCount = headerExportCount
     exportState.cachedArchiveCount = archiveExportCount
     exportState.countsDirty = false
-    exportState.appendPos = (record.operations and record.operations.order
-        and #record.operations.order) or 0
-    exportState.resolveScanPos = exportState.appendPos
-    exportState.maintIdle = not exportState.archiveBuildNeeded
-    exportState.pendingCursor = nil
-    exportState.conflictCursor = nil
+    exportState.appendPos = 0
+    local needsMaint = exportState.archiveBuildNeeded
+        or exportState.opBuildNeeded
+        or exportState.evidenceBuildNeeded
+    exportState.maintIdle = not needsMaint
     exportState.maintScheduled = false
-    -- Cold registration /reload must drain deferred archives without requiring
-    -- an unrelated durable write (NotifyLocalDurableChange also schedules).
-    if exportState.archiveBuildNeeded and ScheduleExportMaintContinuation then
+    -- Cold registration /reload must drain deferred construction without an
+    -- unrelated durable write (NotifyLocalDurableChange also schedules).
+    if needsMaint and ScheduleExportMaintContinuation then
         ScheduleExportMaintContinuation()
     end
 end
@@ -1634,9 +1612,23 @@ function GS:DisableGossipProvider()
         GG.UnregisterProvider(GS.PROVIDER_ID)
     end
     providerRegistered = false
+    -- Invalidate any queued maint closure before clearing export arrays.
+    exportState.maintGeneration = (tonumber(exportState.maintGeneration) or 0) + 1
+    exportState.maintIdle = true
+    exportState.maintScheduled = false
+    exportState.opBuildNeeded = false
+    exportState.evidenceBuildNeeded = false
+    exportState.archiveBuildNeeded = false
+    exportState.opBuildCursor = nil
+    exportState.archiveBuildCursor = nil
+    exportState.pendingCursor = nil
+    exportState.conflictCursor = nil
+    exportState.openConflictCursor = nil
     exportState.order = {}
     exportState.byId = {}
     exportState.enumPos = nil
+    exportState.guildKey = nil
+    exportState.datasetId = nil
     ResetArchivePageBuffers()
 end
 
@@ -1644,19 +1636,46 @@ ScheduleExportMaintContinuation = function()
     if exportState.maintScheduled or exportState.maintIdle then
         return
     end
+    if not providerRegistered then
+        return
+    end
+    -- Nested schedule from Notify while sync-draining is a no-op; the outer loop continues.
+    if GS._exportMaintSyncDraining then
+        return
+    end
+    -- Harness / no-timer environments may sync-drain paced construction.
+    if GS._exportMaintSyncDrain or not (C_Timer and C_Timer.After) then
+        GS._exportMaintSyncDraining = true
+        local guard = 0
+        local maxGuard = 256
+        while not exportState.maintIdle and providerRegistered and guard < maxGuard do
+            guard = guard + 1
+            local gen = tonumber(exportState.maintGeneration) or 0
+            GS.NotifyLocalDurableChange("export-maint")
+            if (tonumber(exportState.maintGeneration) or 0) ~= gen then
+                break
+            end
+        end
+        GS._exportMaintSyncDraining = false
+        return
+    end
     exportState.maintScheduled = true
+    local gen = tonumber(exportState.maintGeneration) or 0
     local function cont()
         exportState.maintScheduled = false
-        if exportState.maintIdle then
+        if (tonumber(exportState.maintGeneration) or 0) ~= gen then
+            return
+        end
+        if exportState.maintIdle or not providerRegistered then
             return
         end
         GS.NotifyLocalDurableChange("export-maint")
     end
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0, cont)
-    else
-        cont()
-    end
+    C_Timer.After(0, cont)
+end
+
+function GS._exportMaintIsIdle()
+    return exportState.maintIdle == true and not exportState.maintScheduled
 end
 
 --- Required after provider-owned durable storage changes outside engine append.
@@ -1697,21 +1716,73 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
         end
-        -- Pace deferred archive construction after cold rebuild.
-        if exportState.archiveBuildNeeded then
+        -- Pace deferred accepted-op / evidence / archive construction after cold rebuild.
+        if exportState.archiveBuildNeeded
+            or exportState.opBuildNeeded
+            or exportState.evidenceBuildNeeded then
             exportState.maintIdle = false
             ScheduleExportMaintContinuation()
         end
     elseif record then
-        -- Incremental: fingerprint only new/missing export ids from appendPos.
-        -- Immutable accepted bodies keep their cached versionFp.
+        -- Incremental / paced cold drain. Budget covers BuildOpExportBodies work
+        -- (serialization while packing) as well as index enumeration.
         local ops = record.operations
-        local start = math.max(1, (tonumber(exportState.appendPos) or 0) + 1)
-        if type(ops) == "table" and type(ops.order) == "table" then
+        local slice = GS.MAX_EXPORT_MAINT_PER_SLICE or 32
+        local used = 0
+        local function upsertEvidence(cid, boundaryHint)
+            if type(cid) ~= "string" then
+                return false
+            end
+            local exportId = "gs:op:" .. cid
+            local existing = exportState.byId[exportId]
+            if existing and existing.body and existing.body.evidenceOnly ~= true then
+                return false
+            end
+            if ops.records and ops.records[cid] then
+                return false
+            end
+            local cand = (ops.pending and ops.pending[cid] and ops.pending[cid].body)
+                or (ops.conflicts and ops.conflicts[cid] and ops.conflicts[cid].body)
+            if type(cand) ~= "table" then
+                return false
+            end
+            local header = nil
+            if cand.kind == GS.KIND.START_CAMPAIGN then
+                header = boundaryHint
+                    or (record.campaigns and record.campaigns[cid])
+                    or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
+            end
+            local parts = BuildOpExportBodies(cand, true, header)
+            for pi = 1, #parts do
+                UpsertExportBody(parts[pi].id, parts[pi].body)
+            end
+            return true
+        end
+        local function sortedKeys(map)
+            local keys = {}
+            if type(map) == "table" then
+                for k in pairs(map) do
+                    keys[#keys + 1] = k
+                end
+                table.sort(keys, function(a, b)
+                    return tostring(a) < tostring(b)
+                end)
+            end
+            return keys
+        end
+
+        -- Cold / rebuild: resume accepted-op construction under slice budget.
+        if type(ops) == "table" and type(ops.order) == "table" and exportState.opBuildNeeded then
+            local start = math.max(1, tonumber(exportState.opBuildCursor) or 1)
             for i = start, #ops.order do
+                if used >= slice then
+                    exportState.opBuildCursor = i
+                    break
+                end
                 local oid = ops.order[i]
                 local exportId = "gs:op:" .. oid
                 local op = ops.records and ops.records[oid]
+                used = used + 1 -- charge serialization/search work even on skip
                 if type(op) == "table" then
                     local existing = exportState.byId[exportId]
                     local mustReplace = existing
@@ -1728,58 +1799,60 @@ function GS.NotifyLocalDurableChange(reason)
                         end
                     end
                 end
+                exportState.opBuildCursor = i + 1
+                exportState.appendPos = i
             end
-            exportState.appendPos = #ops.order
-            local function upsertEvidence(cid, boundaryHint)
-                if type(cid) ~= "string" then
-                    return false
-                end
-                local exportId = "gs:op:" .. cid
-                local existing = exportState.byId[exportId]
-                if existing and existing.body and existing.body.evidenceOnly ~= true then
-                    return false -- accepted export wins; still counts as scanned work
-                end
-                if ops.records and ops.records[cid] then
-                    return false
-                end
-                local cand = (ops.pending and ops.pending[cid] and ops.pending[cid].body)
-                    or (ops.conflicts and ops.conflicts[cid] and ops.conflicts[cid].body)
-                if type(cand) ~= "table" then
-                    return false
-                end
-                local header = nil
-                if cand.kind == GS.KIND.START_CAMPAIGN then
-                    header = boundaryHint
-                        or (record.campaigns and record.campaigns[cid])
-                        or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[cid])
-                end
-                local parts = BuildOpExportBodies(cand, true, header)
-                for pi = 1, #parts do
-                    UpsertExportBody(parts[pi].id, parts[pi].body)
-                end
-                return true
+            if used < slice then
+                exportState.opBuildCursor = nil
+                exportState.opBuildNeeded = false
+                exportState.appendPos = #ops.order
             end
-            local slice = GS.MAX_EXPORT_MAINT_PER_SLICE or 32
-            local used = 0
-            -- Sorted resume cursors so later evidence is not starved.
-            local function sortedKeys(map)
-                local keys = {}
-                if type(map) == "table" then
-                    for k in pairs(map) do
-                        keys[#keys + 1] = k
+        elseif type(ops) == "table" and type(ops.order) == "table" then
+            -- Warm append: only new accepted ops after appendPos.
+            local start = math.max(1, (tonumber(exportState.appendPos) or 0) + 1)
+            for i = start, #ops.order do
+                if used >= slice then
+                    exportState.opBuildNeeded = true
+                    exportState.opBuildCursor = i
+                    break
+                end
+                local oid = ops.order[i]
+                local exportId = "gs:op:" .. oid
+                local op = ops.records and ops.records[oid]
+                used = used + 1
+                if type(op) == "table" then
+                    local existing = exportState.byId[exportId]
+                    local mustReplace = existing
+                        and existing.body
+                        and existing.body.evidenceOnly == true
+                    if not existing or mustReplace then
+                        local boundary = nil
+                        if op.kind == GS.KIND.START_CAMPAIGN then
+                            boundary = record.campaigns and record.campaigns[op.id]
+                        end
+                        local parts = BuildOpExportBodies(op, false, boundary)
+                        for pi = 1, #parts do
+                            UpsertExportBody(parts[pi].id, parts[pi].body)
+                        end
                     end
-                    table.sort(keys, function(a, b)
-                        return tostring(a) < tostring(b)
-                    end)
                 end
-                return keys
+                exportState.appendPos = i
             end
+            if used < slice or exportState.appendPos >= #ops.order then
+                exportState.appendPos = #ops.order
+                exportState.opBuildNeeded = false
+                exportState.opBuildCursor = nil
+            end
+        end
+
+        if used < slice and type(ops) == "table" then
             if type(ops.openConflicts) == "table" then
                 local ocKeys = sortedKeys(ops.openConflicts)
                 local ocStart = tonumber(exportState.openConflictCursor) or 1
                 for ki = ocStart, #ocKeys do
                     if used >= slice then
                         exportState.openConflictCursor = ki
+                        exportState.evidenceBuildNeeded = true
                         break
                     end
                     local entry = ops.openConflicts[ocKeys[ki]]
@@ -1787,11 +1860,12 @@ function GS.NotifyLocalDurableChange(reason)
                         for i = 1, #entry.candidateIds do
                             if used >= slice then
                                 exportState.openConflictCursor = ki
+                                exportState.evidenceBuildNeeded = true
                                 break
                             end
                             upsertEvidence(entry.candidateIds[i],
                                 entry.boundaries and entry.boundaries[entry.candidateIds[i]])
-                            used = used + 1 -- budget scanned work, not only writes
+                            used = used + 1
                         end
                     else
                         used = used + 1
@@ -1808,6 +1882,7 @@ function GS.NotifyLocalDurableChange(reason)
                 local resStart = math.max(1, (tonumber(exportState.resolveScanPos) or 0) + 1)
                 for i = resStart, #ops.order do
                     if used >= slice then
+                        exportState.evidenceBuildNeeded = true
                         break
                     end
                     local op = ops.records and ops.records[ops.order[i]]
@@ -1821,6 +1896,7 @@ function GS.NotifyLocalDurableChange(reason)
                         if type(op.value.competingOpIds) == "table" then
                             for j = 1, #op.value.competingOpIds do
                                 if used >= slice then
+                                    exportState.evidenceBuildNeeded = true
                                     break
                                 end
                                 upsertEvidence(op.value.competingOpIds[j], nil)
@@ -1836,6 +1912,7 @@ function GS.NotifyLocalDurableChange(reason)
                 for ki = startK, #keys do
                     if used >= slice then
                         exportState.pendingCursor = ki
+                        exportState.evidenceBuildNeeded = true
                         break
                     end
                     upsertEvidence(keys[ki], nil)
@@ -1852,6 +1929,7 @@ function GS.NotifyLocalDurableChange(reason)
                 for ki = startK, #keys do
                     if used >= slice then
                         exportState.conflictCursor = ki
+                        exportState.evidenceBuildNeeded = true
                         break
                     end
                     upsertEvidence(keys[ki], nil)
@@ -1862,11 +1940,14 @@ function GS.NotifyLocalDurableChange(reason)
                     exportState.conflictCursor = nil
                 end
             end
-            exportState.maintIdle = used < slice
+            if used < slice
                 and exportState.pendingCursor == nil
                 and exportState.conflictCursor == nil
-                and exportState.openConflictCursor == nil
+                and exportState.openConflictCursor == nil then
+                exportState.evidenceBuildNeeded = false
+            end
         end
+
         if type(record.campaigns) == "table" then
             for campaignId, header in pairs(record.campaigns) do
                 if type(campaignId) == "string" and type(header) == "table" then
@@ -1881,9 +1962,7 @@ function GS.NotifyLocalDurableChange(reason)
             end
         end
         -- Archives: paced construction (also drains cold-rebuild backlog).
-        if type(record.campaignArchives) == "table" then
-            local slice = GS.MAX_EXPORT_MAINT_PER_SLICE or 32
-            local used = 0
+        if type(record.campaignArchives) == "table" and used < slice then
             local keys = {}
             for campaignId, archive in pairs(record.campaignArchives) do
                 if type(campaignId) == "string" and type(archive) == "table" then
@@ -1895,7 +1974,7 @@ function GS.NotifyLocalDurableChange(reason)
             for ki = startK, #keys do
                 if used >= slice then
                     exportState.archiveBuildCursor = ki
-                    exportState.maintIdle = false
+                    exportState.archiveBuildNeeded = true
                     break
                 end
                 local campaignId = keys[ki]
@@ -1915,47 +1994,60 @@ function GS.NotifyLocalDurableChange(reason)
             if used < slice then
                 exportState.archiveBuildCursor = nil
                 exportState.archiveBuildNeeded = false
-            else
-                exportState.maintIdle = false
             end
         end
-        -- Recount descriptor from cached export map (dual accepted/transfer).
-        local acceptedOpCount = tonumber(exportState.cachedOpCount) or 0
-        local transferOpCount = tonumber(exportState.cachedTransferOpCount) or 0
-        local campaignCount = tonumber(exportState.cachedCampaignCount) or 0
-        local archiveCount = tonumber(exportState.cachedArchiveCount) or 0
-        if exportState.countsDirty ~= false then
-            acceptedOpCount, transferOpCount, campaignCount, archiveCount = 0, 0, 0, 0
-            for id, entry in pairs(exportState.byId) do
-                if type(id) == "string" and type(entry) == "table" and type(entry.body) == "table" then
-                    if entry.body.kind == "gs-op" then
-                        transferOpCount = transferOpCount + 1
-                        if entry.body.evidenceOnly ~= true then
-                            acceptedOpCount = acceptedOpCount + 1
-                        end
-                    elseif entry.body.kind == "campaign-header" then
-                        campaignCount = campaignCount + 1
-                    elseif entry.body.kind == "campaign-archive" then
-                        archiveCount = archiveCount + 1
+
+        exportState.maintIdle = used < slice
+            and not exportState.opBuildNeeded
+            and not exportState.evidenceBuildNeeded
+            and not exportState.archiveBuildNeeded
+            and exportState.pendingCursor == nil
+            and exportState.conflictCursor == nil
+            and exportState.openConflictCursor == nil
+            and exportState.opBuildCursor == nil
+            and exportState.archiveBuildCursor == nil
+
+        -- Descriptor counts stay logical (durable store), not emitted-body counts.
+        local acceptedOpCount = 0
+        if type(ops) == "table" and type(ops.order) == "table" then
+            acceptedOpCount = #ops.order
+        end
+        local evidenceExportCount = 0
+        if type(ops) == "table" then
+            if type(ops.pending) == "table" then
+                for id in pairs(ops.pending) do
+                    if not (ops.records and ops.records[id]) then
+                        evidenceExportCount = evidenceExportCount + 1
                     end
                 end
             end
-            -- Logical archive count from durable store while pages are still building.
-            if type(record.campaignArchives) == "table" then
-                local logical = 0
-                for _ in pairs(record.campaignArchives) do
-                    logical = logical + 1
-                end
-                if logical > archiveCount then
-                    archiveCount = logical
+            if type(ops.conflicts) == "table" then
+                for id in pairs(ops.conflicts) do
+                    if not (ops.pending and ops.pending[id])
+                        and not (ops.records and ops.records[id]) then
+                        evidenceExportCount = evidenceExportCount + 1
+                    end
                 end
             end
-            exportState.cachedOpCount = acceptedOpCount
-            exportState.cachedTransferOpCount = transferOpCount
-            exportState.cachedCampaignCount = campaignCount
-            exportState.cachedArchiveCount = archiveCount
-            exportState.countsDirty = false
         end
+        local transferOpCount = acceptedOpCount + evidenceExportCount
+        local campaignCount = 0
+        if type(record.campaigns) == "table" then
+            for _ in pairs(record.campaigns) do
+                campaignCount = campaignCount + 1
+            end
+        end
+        local archiveCount = 0
+        if type(record.campaignArchives) == "table" then
+            for _ in pairs(record.campaignArchives) do
+                archiveCount = archiveCount + 1
+            end
+        end
+        exportState.cachedOpCount = acceptedOpCount
+        exportState.cachedTransferOpCount = transferOpCount
+        exportState.cachedCampaignCount = campaignCount
+        exportState.cachedArchiveCount = archiveCount
+        exportState.countsDirty = false
         local desc = {
             kind = "dataset-desc",
             schemaVersion = GS.PROVIDER_SCHEMA,
@@ -1975,7 +2067,6 @@ function GS.NotifyLocalDurableChange(reason)
             archiveCount = archiveCount,
         }
         UpsertExportBody("gs:desc:" .. record.datasetId, desc)
-        exportState.countsDirty = true -- next notify reconciles after upserts
         if not exportState.maintIdle then
             ScheduleExportMaintContinuation()
         end
