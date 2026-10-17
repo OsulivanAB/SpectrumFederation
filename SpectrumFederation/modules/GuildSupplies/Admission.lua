@@ -1342,7 +1342,9 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                         })
                     elseif confirmed and not isAuthEnvelope then
                         -- Exact-content confirmation is present in the transfer.
-                        -- Retain then let the confirmer envelope promote.
+                        -- Promote under the adopting source's confirmer authority
+                        -- without waiting for the confirm envelope itself (which may
+                        -- pin basePolicyRevision to this candidate).
                         status, reason = GS:AdmitRemoteOperation(op, {
                             sender = adop.sourcePeer,
                             member = member,
@@ -1350,11 +1352,10 @@ local function ReplayAdoptionIntoTemp(temp, adop, member)
                             localWrite = false,
                             adoptionReplay = true,
                             offlineRecord = temp,
-                            relay = true,
+                            preserveAttribution = true,
                         })
-                        if status == "pending" and GS._pendingRelay[op.id]
-                            and not (temp.operations.pending and temp.operations.pending[op.id]) then
-                            DurableRetainOnRecord(temp, op, reason or "untrusted_relay", body.boundary)
+                        if status == "pending" then
+                            DurableRetainOnRecord(temp, op, reason or "stale_base", body.boundary)
                         end
                     elseif isAuthEnvelope then
                         -- Foreign confirm/resolve envelopes are not actor-proof.

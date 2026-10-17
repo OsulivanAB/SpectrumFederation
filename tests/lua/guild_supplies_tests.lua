@@ -6365,7 +6365,9 @@ do
 
     -- Explicit exact-content confirmation of Bob's foreign rank so late-peer
     -- adoption does not treat source selection as approval of unknown authors.
-    local rankFp = GS.ContentFingerprint(rankOp)
+    -- Fingerprint the accepted stored body (not the pre-admit table).
+    local storedRank = GS:GetCurrentRecord().operations.records["rank-from-bob"]
+    local rankFp = GS.ContentFingerprint(storedRank)
     assertTrue(type(rankFp) == "string" and rankFp ~= "", "3A7: rank fingerprint")
     local rankConf, rankConfSt = GS:NewConfirmationOperation({
         recordId = "rank-from-bob",
@@ -6452,6 +6454,17 @@ do
     assertEq(GS:ApplyStagedConflictResolution(resOp), "accepted", "3A7: resolve to Bob")
     assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 5, "3A7: Bob value wins")
     assertEq(#GS:ListOpenConflicts(), 0, "3A7: conflicts cleared")
+
+    -- Confirm Bob's winning tab for late-peer adoption (unknown-author history).
+    local storedBobTab = GS:GetCurrentRecord().operations.records["bob-tab-b"]
+    assertTrue(storedBobTab ~= nil, "3A7: bob tab accepted after resolve")
+    local bobTabFp = GS.ContentFingerprint(storedBobTab)
+    local bobTabConf, bobTabConfSt = GS:NewConfirmationOperation({
+        recordId = "bob-tab-b",
+        contentFingerprint = bobTabFp,
+    })
+    assertEq(bobTabConfSt, "accepted", "3A7: confirm Bob tab prepared")
+    assertEq(GS:ApplyStagedConfirmationOperation(bobTabConf), "accepted", "3A7: confirm Bob tab")
 
     -- Pending relay capacity bound does not corrupt accepted state.
     local tabBefore = GS:GetCurrentRecord().accounting._consumables.bankTab
@@ -7150,14 +7163,14 @@ do
         assertEq(select(1, GS:AdmitRemoteOperation(lateBody, {
             sender = "Dave-Garona", relay = true,
         })), "pending", "3A8: late candidate retained for redrive")
-        -- Ordinary Alice accept must invoke redrive (predecessor-late path).
-        local aliceTab = {
-            schemaVersion = 1, id = "alice-redrive-tab", guildKey = "club:42", datasetId = ds,
-            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+        -- Ordinary Alice accept on a non-conflicting target must invoke redrive.
+        local aliceRank = {
+            schemaVersion = 1, id = "alice-redrive-rank", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-editor-rank", target = "editorRankPosition", value = 2,
             actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 20101,
-            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+            baseTargetRevision = pol, basePolicyRevision = pol, baseCampaignId = camp,
         }
-        assertEq(GS:AdmitRemoteOperation(aliceTab, { sender = "Alice-Garona" }), "accepted",
+        assertEq(GS:AdmitRemoteOperation(aliceRank, { sender = "Alice-Garona" }), "accepted",
             "3A8: alice accept triggers redrive")
         -- Drain remaining confirmationRefs slices (budget 32 ⇒ needs 2nd pass).
         GS._confirmationRedrivePos = 1
