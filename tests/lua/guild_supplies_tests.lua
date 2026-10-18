@@ -13817,6 +13817,522 @@ do
     assertEq(#world.chat, 0, "3A22: no chat")
 end
 
+---------------------------------------------------------------------------
+-- 3A23) Empty fragment-slot leak; resolution fast-path export notify;
+-- confirmation capacity atomicity (r4308709670 / r4308710421 / r4308710709).
+-- DO NOT IMPLEMENT r4308710139 (billion-iteration freeze) — deferred.
+---------------------------------------------------------------------------
+do
+    local function assertSerEq(a, b, msg)
+        assertEq(serTable(a), serTable(b), msg)
+    end
+    local function snapshotDurable(rec)
+        return {
+            datasetId = rec.datasetId,
+            currentCampaignId = rec.currentCampaignId,
+            bankTab = rec.accounting and rec.accounting._consumables
+                and rec.accounting._consumables.bankTab,
+            order = (function()
+                local o = {}
+                for i = 1, #(rec.operations.order or {}) do
+                    o[i] = rec.operations.order[i]
+                end
+                return o
+            end)(),
+            acceptedCount = GS._AcceptedCount and GS._AcceptedCount(rec.operations) or 0,
+            confirmRefs = (function()
+                local r = {}
+                for i = 1, #(rec.confirmationRefs or {}) do
+                    r[i] = rec.confirmationRefs[i]
+                end
+                return r
+            end)(),
+            pendingIds = (function()
+                local ids = {}
+                if type(rec.operations.pending) == "table" then
+                    for id in pairs(rec.operations.pending) do
+                        ids[#ids + 1] = id
+                    end
+                    table.sort(ids)
+                end
+                return ids
+            end)(),
+            conflictIds = (function()
+                local ids = {}
+                if type(rec.operations.conflicts) == "table" then
+                    for id in pairs(rec.operations.conflicts) do
+                        ids[#ids + 1] = id
+                    end
+                    table.sort(ids)
+                end
+                return ids
+            end)(),
+        }
+    end
+
+    -- A) Op-page: page-capacity reject must not leave empty assemblies.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local ds = GS:GetCurrentRecord().datasetId
+    local entry = GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(type(GS.GetFragmentBufferStats) == "function",
+        "3A23: GetFragmentBufferStats exposed")
+    local maxPages = GS.MAX_FRAGMENT_BUFFER_PAGES or 64
+    local maxManifest = GS.MAX_MANIFEST_PAGES or 64
+    local fillPc = math.min(maxManifest, maxPages)
+    for p = 1, fillPc do
+        local st = entry.api.ValidateAndApply({
+            id = "gs:op:fill-pages:p" .. p, versionFp = "vfp" .. p,
+            body = {
+                kind = "gs-op-page", opId = "fill-pages", page = p,
+                pageCount = fillPc, datasetId = ds,
+                chunk = { n = p },
+            },
+        }, { sender = "Dave-Garona" })
+        assertTrue(st == "pending" or st == "rejected",
+            "3A23: fill page " .. p .. " got=" .. tostring(st))
+    end
+    local statsFull = GS.GetFragmentBufferStats()
+    assertTrue(statsFull.opPages >= 1, "3A23: page pool has retained pages")
+    -- Force page pool full for the leak probe when not already saturated.
+    local priorMaxPages = GS.MAX_FRAGMENT_BUFFER_PAGES
+    GS.MAX_FRAGMENT_BUFFER_PAGES = statsFull.opPages
+    local beforeLeak = GS.GetFragmentBufferStats()
+    local stLeak, reasonLeak = entry.api.ValidateAndApply({
+        id = "gs:op:leak-fresh:p1", versionFp = "vleak",
+        body = {
+            kind = "gs-op-page", opId = "leak-fresh", page = 1,
+            pageCount = 2, datasetId = ds, chunk = { x = 1 },
+        },
+    }, { sender = "Dave-Garona" })
+    assertEq(stLeak, "rejected", "3A23: fresh op page rejected when page pool full")
+    assertEq(reasonLeak, "full", "3A23: fresh op page full reason")
+    local afterLeak = GS.GetFragmentBufferStats()
+    assertEq(afterLeak.opAssemblies, beforeLeak.opAssemblies,
+        "3A23: op assembly count unchanged after page-full reject")
+    assertEq(afterLeak.opPages, beforeLeak.opPages,
+        "3A23: op page count unchanged after page-full reject")
+    GS.MAX_FRAGMENT_BUFFER_PAGES = priorMaxPages
+    -- Free real capacity without TTL: complete fill-pages via shell assemble clear.
+    local fillShell = {
+        kind = "gs-op", pageCount = fillPc, datasetId = ds,
+        op = {
+            schemaVersion = 1, id = "fill-pages", guildKey = "club:42", datasetId = ds,
+            kind = "confirm-candidate", candidateRef = {}, pageCount = fillPc,
+            actorGuid = "Player-1-Dave", actorName = "Dave-Garona", timestamp = 1,
+            basePolicyRevision = ds,
+        },
+    }
+    -- Clearing via dataset reclaim after completing is not required; drop by
+    -- advancing reclaim with foreign dataset wipe through Reset is unavailable.
+    -- Completing AssembleOpFromPages path clears the buffer on assemble failure
+    -- or success — send shell; incomplete pages may still clear on invalid assemble.
+    entry.api.ValidateAndApply({
+        id = "gs:op:fill-pages", versionFp = "vfshell", body = fillShell,
+    }, { sender = "Dave-Garona" })
+    -- Explicitly reclaim by temporarily lowering TTL and aging the buffer.
+    local priorTtl = GS.FRAGMENT_BUFFER_TTL_SECONDS
+    GS.FRAGMENT_BUFFER_TTL_SECONDS = 1
+    world.time = (world.time or 0) + 10
+    -- Touch receive path to run ReclaimExpiredFragmentBuffers.
+    entry.api.ValidateAndApply({
+        id = "gs:op:ttl-touch:p1", versionFp = "vttl",
+        body = {
+            kind = "gs-op-page", opId = "ttl-touch", page = 1,
+            pageCount = 1, datasetId = ds, chunk = { t = 1 },
+        },
+    }, { sender = "Alice-Garona" })
+    GS.FRAGMENT_BUFFER_TTL_SECONDS = priorTtl
+    local afterFree = GS.GetFragmentBufferStats()
+    assertTrue(afterFree.opAssemblies < beforeLeak.opAssemblies
+        or afterFree.opPages < beforeLeak.opPages
+        or afterFree.opAssemblies <= 2,
+        "3A23: capacity freed without relying on original TTL window")
+    -- Legitimate editor assembly completes after free.
+    local legShell = {
+        kind = "gs-op", pageCount = 1, datasetId = ds,
+        op = {
+            schemaVersion = 1, id = "leg-op", guildKey = "club:42", datasetId = ds,
+            kind = "confirm-candidate",
+            candidateRef = { recordId = "leg-cand", body = {
+                schemaVersion = 1, id = "leg-cand", guildKey = "club:42", datasetId = ds,
+                campaignId = GS:GetCurrentRecord().currentCampaignId,
+                kind = "set-bank-tab", target = "bankTab", value = 2,
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 2,
+                baseTargetRevision = ds, basePolicyRevision = ds,
+                baseCampaignId = GS:GetCurrentRecord().currentCampaignId,
+            } },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 3,
+            basePolicyRevision = ds, pageCount = 1,
+        },
+    }
+    local stLeg, reasonLeg = entry.api.ValidateAndApply({
+        id = "gs:op:leg-op", versionFp = "vleg", body = legShell,
+    }, { sender = "Alice-Garona" })
+    assertTrue(stLeg == "pending" or stLeg == "accepted",
+        "3A23: legitimate op shell after free got="
+            .. tostring(stLeg) .. "/" .. tostring(reasonLeg))
+    local stLegPage, reasonLegPage = entry.api.ValidateAndApply({
+        id = "gs:op:leg-op2:p1", versionFp = "vleg2",
+        body = {
+            kind = "gs-op-page", opId = "leg-op2", page = 1, pageCount = 1,
+            datasetId = ds, chunk = { ok = 1 },
+        },
+    }, { sender = "Alice-Garona" })
+    assertTrue(not (stLegPage == "rejected" and reasonLegPage == "full"),
+        "3A23: post-free page receive not permanently wedged got="
+            .. tostring(stLegPage) .. "/" .. tostring(reasonLegPage))
+
+    -- A) Archive page: same empty-slot contract.
+    -- Require real non-current campaign headers + editor sender (Bob is unauthorized).
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local fillCamp = startCampaign()
+    local leakCamp = startCampaign()
+    startCampaign() -- leave both fillCamp and leakCamp non-current
+    ds = GS:GetCurrentRecord().datasetId
+    entry = GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(GS:GetCurrentRecord().campaigns[fillCamp.id] ~= nil,
+        "3A23: fill campaign header present")
+    assertTrue(GS:GetCurrentRecord().campaigns[leakCamp.id] ~= nil,
+        "3A23: leak campaign header present")
+    assertTrue(GS:GetCurrentRecord().currentCampaignId ~= fillCamp.id
+        and GS:GetCurrentRecord().currentCampaignId ~= leakCamp.id,
+        "3A23: fill/leak campaigns are not current")
+    local maxArchPages = GS.MAX_FRAGMENT_BUFFER_PAGES or 64
+    local archFill = math.min(8, maxArchPages)
+    for p = 1, archFill do
+        local st = entry.api.ValidateAndApply({
+            id = "gs:ca:fill:p" .. p, versionFp = "vac" .. p,
+            body = {
+                kind = "campaign-archive-page", campaignId = fillCamp.id,
+                datasetId = ds, page = p, pageCount = archFill,
+                requestedItems = { [tostring(p)] = { itemId = p, goal = 1 } },
+            },
+        }, { sender = "Alice-Garona" })
+        assertTrue(st == "pending" or st == "accepted",
+            "3A23: archive fill page " .. p .. " got=" .. tostring(st))
+    end
+    local archBefore = GS.GetFragmentBufferStats()
+    assertTrue(archBefore.archivePages >= 1,
+        "3A23: archive page pool has retained pages got="
+            .. tostring(archBefore.archivePages))
+    local priorArchPages = GS.MAX_FRAGMENT_BUFFER_PAGES
+    GS.MAX_FRAGMENT_BUFFER_PAGES = archBefore.archivePages
+    local stArchLeak, reasonArchLeak = entry.api.ValidateAndApply({
+        id = "gs:ca:leak:p1", versionFp = "valeak",
+        body = {
+            kind = "campaign-archive-page", campaignId = leakCamp.id,
+            datasetId = ds, page = 1, pageCount = 2,
+            requestedItems = { ["9"] = { itemId = 9, goal = 1 } },
+        },
+    }, { sender = "Alice-Garona" })
+    assertEq(stArchLeak, "rejected", "3A23: archive page rejected when page pool full")
+    assertEq(reasonArchLeak, "full", "3A23: archive page full reason")
+    local archAfter = GS.GetFragmentBufferStats()
+    assertEq(archAfter.archiveAssemblies, archBefore.archiveAssemblies,
+        "3A23: archive assembly count unchanged after page-full reject")
+    assertEq(archAfter.archivePages, archBefore.archivePages,
+        "3A23: archive page count unchanged after page-full reject")
+    -- Existing fill shell/pages must remain after the failed fresh allocation.
+    assertTrue(archAfter.archiveAssemblies >= 1,
+        "3A23: preexisting archive assembly preserved")
+    GS.MAX_FRAGMENT_BUFFER_PAGES = priorArchPages
+
+    -- A) Per-peer op assembly cap: reject without empty-slot leak.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    entry = GG.GetProvider(GS.PROVIDER_ID)
+    local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES or 16
+    local daveSlots = 0
+    for i = 1, maxCamps do
+        local st = entry.api.ValidateAndApply({
+            id = "gs:op:dave-slot-" .. i .. ":p1", versionFp = "vds" .. i,
+            body = {
+                kind = "gs-op-page", opId = "dave-slot-" .. i, page = 1,
+                pageCount = 2, datasetId = ds, chunk = { i = i },
+            },
+        }, { sender = "Dave-Garona" })
+        if st == "pending" then
+            daveSlots = daveSlots + 1
+        elseif st == "rejected" then
+            break
+        end
+    end
+    assertTrue(daveSlots >= 1, "3A23: dave held per-peer assemblies")
+    local peerBefore = GS.GetFragmentBufferStats()
+    local stPeer, reasonPeer = entry.api.ValidateAndApply({
+        id = "gs:op:dave-extra:p1", versionFp = "vdex",
+        body = {
+            kind = "gs-op-page", opId = "dave-extra", page = 1,
+            pageCount = 2, datasetId = ds, chunk = { e = 1 },
+        },
+    }, { sender = "Dave-Garona" })
+    assertEq(stPeer, "rejected", "3A23: dave per-peer assembly reject")
+    assertEq(reasonPeer, "full", "3A23: dave per-peer full reason")
+    local peerAfter = GS.GetFragmentBufferStats()
+    assertEq(peerAfter.opAssemblies, peerBefore.opAssemblies,
+        "3A23: per-peer full reject leaves assembly count unchanged")
+
+    -- D/C) Fast-path second resolution notifies export without another edit.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    local camp = GS:GetCurrentRecord().currentCampaignId
+    local pol = GS:GetCurrentRecord().permission.revisionId
+    local tabA = {
+        schemaVersion = 1, id = "fp-tab-a", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 91000,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(tabA, { sender = "Alice-Garona" }), "accepted",
+        "3A23: head A accepted")
+    local tabB = {
+        schemaVersion = 1, id = "fp-tab-b", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 91001,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(select(1, GS:AdmitRemoteOperation(tabB, { sender = "Bob-Garona" })), "pending",
+        "3A23: B conflict/pending")
+    local open = GS:ListOpenConflicts()[1]
+    assertTrue(open ~= nil, "3A23: open bankTab conflict")
+    local res1 = select(1, GS:NewConflictResolutionOperation(open.targetKey, "fp-tab-a", open.candidateIds))
+    assertTrue(res1 ~= nil, "3A23: first resolution prepared")
+    assertEq(GS:ApplyStagedConflictResolution(res1), "accepted", "3A23: first resolve accepted")
+    drainExportMaint(64)
+    -- Second distinct resolution for the same chosen head (fast path).
+    local res2 = {
+        schemaVersion = 1, id = "fp-res-2", guildKey = "club:42", datasetId = ds,
+        kind = "resolve-conflict", target = open.targetKey,
+        value = {
+            chosenOpId = "fp-tab-a",
+            competingOpIds = { "fp-tab-a", "fp-tab-b" },
+            contentBodies = {
+                ["fp-tab-a"] = GS:GetCurrentRecord().operations.records["fp-tab-a"],
+                ["fp-tab-b"] = (GS:GetCurrentRecord().operations.conflicts["fp-tab-b"]
+                    and GS:GetCurrentRecord().operations.conflicts["fp-tab-b"].body)
+                    or tabB,
+            },
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 91010,
+        basePolicyRevision = pol, baseTargetRevision = "fp-tab-a", baseCampaignId = camp,
+    }
+    local stRes2, reasonRes2 = GS:AdmitRemoteOperation(res2, { sender = "Alice-Garona" })
+    assertEq(stRes2, "accepted",
+        "3A23: fast-path second resolution accepted got=" .. tostring(reasonRes2))
+    assertTrue(GS:GetCurrentRecord().operations.records["fp-res-2"] ~= nil,
+        "3A23: second resolution envelope stored")
+    drainExportMaint(128)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local exportId2 = "gs:op:fp-res-2"
+    local body2 = prov.api.GetRecordBody(exportId2)
+    assertTrue(type(body2) == "table" and type(body2.body) == "table",
+        "3A23: second resolution has serviceable GetRecordBody after maint")
+    -- Descriptor counts reflect the new accepted envelope.
+    local desc
+    local acceptedExport = 0
+    do
+        local cursor = 1
+        local guard = 0
+        while cursor and guard < 64 do
+            guard = guard + 1
+            local page, nextCursor = prov.api.ListRecordIds(cursor, 64)
+            for i = 1, #(page or {}) do
+                local r = prov.api.GetRecordBody(page[i])
+                if r and r.body and r.body.kind == "dataset-desc" then
+                    desc = r.body
+                end
+                if type(page[i]) == "string" and page[i]:find("^gs:op:", 1) then
+                    acceptedExport = acceptedExport + 1
+                end
+            end
+            cursor = nextCursor
+        end
+    end
+    assertTrue(type(desc) == "table", "3A23: descriptor present after fast-path resolve")
+    local descCount = tonumber(desc.acceptedCount) or tonumber(desc.acceptedOps)
+        or tonumber(desc.operationCount) or acceptedExport
+    assertTrue(descCount >= 1,
+        "3A23: descriptor/export accepted count current after fast-path got="
+            .. tostring(descCount))
+    -- Third-peer discovery surface: provider enumerates the new resolution and
+    -- retained loser without an unrelated edit or reload.
+    local foundRes2 = false
+    local loserExported = false
+    do
+        local cursor = 1
+        local guard = 0
+        while cursor and guard < 64 do
+            guard = guard + 1
+            local page, nextCursor = prov.api.ListRecordIds(cursor, 64)
+            for i = 1, #(page or {}) do
+                local id = page[i]
+                if id == exportId2 then
+                    foundRes2 = true
+                end
+                local r = prov.api.GetRecordBody(id)
+                if r and r.body then
+                    local op = r.body.op or r.body
+                    if type(op) == "table" and op.id == "fp-tab-b" then
+                        loserExported = true
+                    end
+                end
+            end
+            cursor = nextCursor
+        end
+    end
+    assertTrue(foundRes2, "3A23: third-peer discovery can enumerate gs:op:fp-res-2")
+    assertTrue(loserExported
+        or (GS:GetCurrentRecord().operations.conflicts
+            and GS:GetCurrentRecord().operations.conflicts["fp-tab-b"] ~= nil),
+        "3A23: loser retained for export or still in conflict retention")
+
+    -- C/B) Confirmation capacity atomicity: reject before mutation; exact fit ok.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local rec = GS:GetCurrentRecord()
+    local c1 = {
+        schemaVersion = 1, id = "cap-c1", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 3,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 92000,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local c2 = {
+        schemaVersion = 1, id = "cap-c2", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 4,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 92001,
+        baseTargetRevision = "cap-c1", basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(c1, { sender = "Bob-Garona", relay = true }),
+        "pending", "3A23: c1 retained")
+    assertEq(GS:AdmitRemoteOperation(c2, { sender = "Bob-Garona", relay = true }),
+        "pending", "3A23: c2 retained")
+    local acceptedNow = GS._AcceptedCount(rec.operations)
+    local priorMax = GS.MAX_ACCEPTED_OPERATIONS
+    -- Insufficient: envelope + 2 eligible promotions need 3 slots; allow only 2.
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    local priorSnap = snapshotDurable(GS:GetCurrentRecord())
+    local confInsuf = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "cap-c1", body = c1 },
+            { id = "cap-c2", body = c2 },
+        },
+    }))
+    assertTrue(type(confInsuf) == "table", "3A23: insufficient-capacity confirm prepared")
+    local stInsuf, reasonInsuf = GS:ApplyStagedConfirmationOperation(confInsuf)
+    assertEq(stInsuf, "rejected", "3A23: insufficient capacity rejects local confirm")
+    assertEq(reasonInsuf, "full", "3A23: insufficient capacity reason")
+    assertSerEq(snapshotDurable(GS:GetCurrentRecord()), priorSnap,
+        "3A23: full prior durable state preserved on capacity reject")
+    assertEq(GS:GetCurrentRecord().operations.records["cap-c1"], nil,
+        "3A23: no partial promotion of c1")
+    assertEq(GS:GetCurrentRecord().operations.records["cap-c2"], nil,
+        "3A23: no partial promotion of c2")
+    assertTrue(GS._pendingRelay["cap-c1"] ~= nil and GS._pendingRelay["cap-c2"] ~= nil,
+        "3A23: relay retention preserved after reject")
+    -- Exact capacity: envelope + 2 promotions.
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 3
+    local confExact = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "cap-c1", body = c1 },
+            { id = "cap-c2", body = c2 },
+        },
+    }))
+    assertEq(GS:ApplyStagedConfirmationOperation(confExact), "accepted",
+        "3A23: exact capacity local confirm accepted")
+    assertTrue(GS:GetCurrentRecord().operations.records["cap-c1"] ~= nil,
+        "3A23: exact capacity promoted c1")
+    assertTrue(GS:GetCurrentRecord().operations.records["cap-c2"] ~= nil,
+        "3A23: exact capacity promoted c2")
+    -- Already-accepted candidates do not charge extra slots.
+    local acceptedAfter = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedAfter + 1 -- envelope only
+    local confDedup = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "cap-c1", body = GS:GetCurrentRecord().operations.records["cap-c1"] },
+        },
+    }))
+    local stDedup, reasonDedup = GS:ApplyStagedConfirmationOperation(confDedup)
+    assertEq(stDedup, "accepted",
+        "3A23: already-accepted candidate confirm fits envelope-only capacity got="
+            .. tostring(reasonDedup))
+    -- Remote path insufficient capacity.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    rec = GS:GetCurrentRecord()
+    c1 = {
+        schemaVersion = 1, id = "rcap-c1", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 5,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 92100,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    c2 = {
+        schemaVersion = 1, id = "rcap-c2", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 6,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 92101,
+        baseTargetRevision = "rcap-c1", basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(c1, { sender = "Bob-Garona", relay = true }), "pending",
+        "3A23: remote c1 retained")
+    assertEq(GS:AdmitRemoteOperation(c2, { sender = "Bob-Garona", relay = true }), "pending",
+        "3A23: remote c2 retained")
+    acceptedNow = GS._AcceptedCount(rec.operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    priorSnap = snapshotDurable(GS:GetCurrentRecord())
+    local remoteConf = {
+        schemaVersion = 1, id = "rcap-conf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = {
+            records = {
+                { id = "rcap-c1", body = c1 },
+                { id = "rcap-c2", body = c2 },
+            },
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 92110,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    local stRemote, reasonRemote = GS:AdmitRemoteOperation(remoteConf, { sender = "Alice-Garona" })
+    assertEq(stRemote, "rejected", "3A23: remote confirm capacity reject")
+    assertEq(reasonRemote, "full", "3A23: remote confirm full reason")
+    assertSerEq(snapshotDurable(GS:GetCurrentRecord()), priorSnap,
+        "3A23: remote reject preserves full prior durable state")
+    assertEq(GS:GetCurrentRecord().operations.records["rcap-conf"], nil,
+        "3A23: remote reject did not store envelope")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    assertEq(#world.chat, 0, "3A23: no chat")
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

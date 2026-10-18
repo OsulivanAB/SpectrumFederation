@@ -6284,9 +6284,10 @@ do
 end
 
 ---------------------------------------------------------------------------
--- F93: ReopenUnresolvedEnumeration during an active apply_bodies pull arms
--- needsFollowUp so the same pull cannot rewrite an advanced bookmark past a
--- just-reopened earlier PENDING fragment (Guild Supplies arena-free path).
+-- F93: ReopenUnresolvedEnumeration from a real provider ValidateAndApply
+-- during BODY processing (capacity-freeing late record) arms needsFollowUp
+-- so the same pull cannot rewrite an advanced bookmark past the earlier
+-- PENDING fragment. No synthetic outPull fallback.
 ---------------------------------------------------------------------------
 do
     reset()
@@ -6297,76 +6298,71 @@ do
         id = "sf.synthetic.gossip", instanceKey = "f93a", pendingIds = pendingIds,
     })
     local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f93b" })
-    -- early-1 PENDING, late-1 ACCEPTED in the same exchange.
+    -- early-1 PENDING, late-1 capacity-freeing ACCEPTED in the same bucket/page.
     pB.AppendLocal("early-body", "early-1")
     pB.AppendLocal("late-body", "late-1")
+
+    local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    assertTrue(entryA and entryA.api and type(entryA.api.ValidateAndApply) == "function",
+        "F93: Alice provider ValidateAndApply present")
+    local realApply = entryA.api.ValidateAndApply
+    local midApplyReopen = false
+    local midApplyNeedsFollowUp = false
+    entryA.api.ValidateAndApply = function(record, ctx)
+        local rid = record and tostring(record.id) or ""
+        local result, detail = realApply(record, ctx)
+        -- Production pairing: free capacity then reopen inside ValidateAndApply
+        -- while the engine is still in apply_bodies (arena-free path).
+        if rid == "late-1"
+            and (result == A.GuildGossip.DELIVERY.ACCEPTED
+                or result == A.GuildGossip.DELIVERY.DUPLICATE) then
+            pendingIds["early-1"] = nil
+            local out = A.GuildGossip._engine.outPull
+            if type(out) == "table" and out.phase == "apply_bodies" then
+                A.GuildGossip.ReopenUnresolvedEnumeration("sf.synthetic.gossip")
+                midApplyReopen = true
+                midApplyNeedsFollowUp = out.needsFollowUp == true
+            end
+        end
+        return result, detail
+    end
+
     world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
     world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
     advance(0.5)
-    for i = 1, 40 do
+    for i = 1, 60 do
         stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
         stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
         advance(0.05)
-    end
-    assertTrue(pA.GetStore().records["late-1"] ~= nil, "F93: later record accepted")
-    local unresolved = A.GuildGossip._engine.unresolved or {}
-    local sawEarly = false
-    for _, item in pairs(unresolved) do
-        if item.recordId == "early-1" and item.result == A.GuildGossip.DELIVERY.PENDING then
-            sawEarly = true
+        if midApplyReopen and pA.GetStore().records["late-1"] then
             break
         end
     end
-    assertTrue(sawEarly, "F93: early record still PENDING unresolved")
+    assertTrue(pA.GetStore().records["late-1"] ~= nil, "F93: later capacity-freeing record accepted")
+    assertTrue(midApplyReopen,
+        "F93: reopen triggered from real BODY ValidateAndApply during apply_bodies")
+    assertTrue(midApplyNeedsFollowUp,
+        "F93: needsFollowUp armed by mid-apply reopen")
+    -- Bookmark protection: after the pull advances, afterSeq must not skip early-1.
+    local advancedPastEarly = false
+    for _, bm in pairs(entryA.bookmarks or {}) do
+        if type(bm) == "table" and tonumber(bm.afterSeq) and tonumber(bm.afterSeq) >= 2 then
+            -- With needsFollowUp, setBookmark is skipped for that pull; a restored
+            -- advanced cursor past both seqs would violate the contract.
+            local out = A.GuildGossip._engine.outPull
+            if type(out) == "table" and out.needsFollowUp == true then
+                advancedPastEarly = true
+            end
+        end
+    end
+    assertTrue(not advancedPastEarly,
+        "F93: active pull with needsFollowUp did not restore advanced bookmark")
 
-    -- Start a fresh pull that is mid apply_bodies, then reopen inside that window.
-    pendingIds["early-1"] = nil
-    -- Drive until an outPull is active (or force one via discovery + step).
-    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
-    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
-    local armed = false
-    for step = 1, 60 do
-        local out = A.GuildGossip._engine.outPull
-        if type(out) == "table" and out.phase == "apply_bodies" then
-            A.GuildGossip.ReopenUnresolvedEnumeration("sf.synthetic.gossip")
-            assertEq(out.needsFollowUp, true,
-                "F93: reopen during apply_bodies arms needsFollowUp")
-            armed = true
-            break
-        end
-        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
-        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
-        advance(0.05)
-    end
-    if not armed then
-        -- Fallback: install a synthetic active pull and prove the reopen contract.
-        local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
-        A.GuildGossip._engine.outPull = {
-            providerId = "sf.synthetic.gossip",
-            peer = "Bob-Garona",
-            scopeId = entry and entry.api and entry.api.GetScopeId and entry.api.GetScopeId(),
-            phase = "apply_bodies",
-            needsFollowUp = false,
-        }
-        A.GuildGossip._engine.unresolved["force"] = {
-            providerId = "sf.synthetic.gossip",
-            peer = "Bob-Garona",
-            peerKey = "bob-garona",
-            scopeId = A.GuildGossip._engine.outPull.scopeId,
-            recordId = "early-1",
-            versionFp = "v",
-            result = "pending",
-            at = world.time,
-        }
-        A.GuildGossip.ReopenUnresolvedEnumeration("sf.synthetic.gossip")
-        assertEq(A.GuildGossip._engine.outPull.needsFollowUp, true,
-            "F93: reopen on synthetic active pull arms needsFollowUp")
-        armed = true
-    end
-    assertTrue(armed, "F93: needsFollowUp contract exercised")
     A.GuildGossip.NotifyMeaningfulChange()
     local recovered = false
-    for step = 1, 80 do
+    local ttl = A.GuildGossip.UNRESOLVED_TTL or 300
+    local startTime = world.time
+    for step = 1, 100 do
         stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
         stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
         advance(0.05)
@@ -6374,8 +6370,12 @@ do
             recovered = true
             break
         end
+        assertTrue((world.time - startTime) < ttl,
+            "F93: recovery must complete before UNRESOLVED_TTL")
     end
-    assertTrue(recovered, "F93: early PENDING recovers after mid-pull reopen")
+    assertTrue(recovered, "F93: early PENDING recovers after mid-pull reopen before TTL")
+    -- Restore original apply for later cases sharing the provider id.
+    entryA.api.ValidateAndApply = realApply
 end
 
 ---------------------------------------------------------------------------

@@ -199,6 +199,47 @@ local function ResetArchivePageBuffers()
     opManifestBufferPages = 0
 end
 
+--- Observability for fragment-buffer capacity tests (not SavedVariables).
+function GS.GetFragmentBufferStats()
+    return {
+        archiveAssemblies = archivePageBufferCount or 0,
+        archivePages = archivePageBufferPages or 0,
+        opAssemblies = opManifestBufferCount or 0,
+        opPages = opManifestBufferPages or 0,
+    }
+end
+
+-- True when a newly allocated assembly has no retained shell/meta/pages yet.
+local function OpManifestBufferIsEmpty(buf)
+    if type(buf) ~= "table" then
+        return true
+    end
+    if type(buf.shell) == "table" then
+        return false
+    end
+    if type(buf.pages) == "table" then
+        for _ in pairs(buf.pages) do
+            return false
+        end
+    end
+    return true
+end
+
+local function ArchivePageBufferIsEmpty(buf)
+    if type(buf) ~= "table" then
+        return true
+    end
+    if type(buf.meta) == "table" then
+        return false
+    end
+    if type(buf.pages) == "table" then
+        for _ in pairs(buf.pages) do
+            return false
+        end
+    end
+    return true
+end
+
 --- Worst-case versionFp length used when sizing pages (ContentFingerprint ≤ MAX_OPERATION_ID).
 local function EstimateVersionFp()
     local maxLen = GS.MAX_OPERATION_ID or 192
@@ -1839,8 +1880,14 @@ local function ValidateAndApply(record, ctx)
             guildKey = localRecord and localRecord._guildKey,
         })
         local buf = archivePageBuffer[body.campaignId]
+        local createdEmpty = false
         if not buf then
             if (archivePageBufferCount or 0) >= maxCamps then
+                return "rejected", "full"
+            end
+            -- Page-first: preflight page capacity before allocating an empty slot.
+            if body.kind == "campaign-archive-page"
+                and (archivePageBufferPages or 0) >= maxPages then
                 return "rejected", "full"
             end
             buf = {
@@ -1852,6 +1899,7 @@ local function ValidateAndApply(record, ctx)
             }
             archivePageBuffer[body.campaignId] = buf
             archivePageBufferCount = (archivePageBufferCount or 0) + 1
+            createdEmpty = true
         elseif buf.datasetId and buf.datasetId ~= body.datasetId then
             ClearArchivePageBuffer(body.campaignId)
             return "rejected", "dataset_mismatch"
@@ -1884,6 +1932,10 @@ local function ValidateAndApply(record, ctx)
                 -- Exact page duplicate: do not recreate buffer / recount pages.
             else
                 if (archivePageBufferPages or 0) >= maxPages then
+                    -- Roll back only a newly created empty assembly; keep shells/pages.
+                    if createdEmpty and ArchivePageBufferIsEmpty(buf) then
+                        ClearArchivePageBuffer(body.campaignId)
+                    end
                     return "rejected", "full"
                 end
                 archivePageBufferPages = (archivePageBufferPages or 0) + 1
@@ -1988,8 +2040,13 @@ local function ValidateAndApply(record, ctx)
         local maxPagesBuf = GS.MAX_FRAGMENT_BUFFER_PAGES or 64
         local now = GetServerTime and GetServerTime() or 0
         local buf = opManifestBuffer[opId]
+        local createdEmpty = false
         if not buf then
             if not CanAllocateOpManifestBuffer(sender, maxCamps) then
+                return "rejected", "full"
+            end
+            -- First page: preflight page/per-peer capacity before empty alloc.
+            if not CanRetainOpManifestPage(sender, maxPagesBuf) then
                 return "rejected", "full"
             end
             buf = {
@@ -2001,6 +2058,7 @@ local function ValidateAndApply(record, ctx)
             }
             opManifestBuffer[opId] = buf
             opManifestBufferCount = (opManifestBufferCount or 0) + 1
+            createdEmpty = true
         elseif buf.datasetId and buf.datasetId ~= body.datasetId then
             -- Foreign/mismatched fragment: reject without clearing a legitimate assembly.
             return "rejected", "dataset_mismatch"
@@ -2020,6 +2078,10 @@ local function ValidateAndApply(record, ctx)
             -- Exact duplicate: do not refresh lifetime.
         else
             if not CanRetainOpManifestPage(sender, maxPagesBuf) then
+                -- Roll back only a newly created empty assembly; keep shell/pages.
+                if createdEmpty and OpManifestBufferIsEmpty(buf) then
+                    ClearOpManifestBuffer(opId)
+                end
                 return "rejected", "full"
             end
             opManifestBufferPages = (opManifestBufferPages or 0) + 1

@@ -1711,6 +1711,24 @@ function GS:ApplyStagedConfirmationOperation(op, context)
         return "rejected", "full"
     end
 
+    -- Shared atomic capacity preflight: envelope + distinct eligible promotions.
+    local applyCtx = {
+        sender = context and context.actorName,
+        member = context and {
+            name = context.actorName,
+            guid = context.actorGuid,
+            rankOrder = context.rankOrder,
+            guildKey = context.guildKey,
+        } or nil,
+        localWrite = true,
+    }
+    if GS.PreflightConfirmationCapacity then
+        local capOk, capErr = GS.PreflightConfirmationCapacity(record, stored, applyCtx)
+        if not capOk then
+            return "rejected", capErr or "full"
+        end
+    end
+
     StoreAccepted(ops, stored, nil)
     -- confirmationRefs stores IDs only; do not rewrite campaign associations.
     local refs = record.confirmationRefs
@@ -1727,16 +1745,7 @@ function GS:ApplyStagedConfirmationOperation(op, context)
     -- Exact-content confirmation itself applies eligible retained candidates
     -- without restamping attribution (Admission.ApplyExactContentConfirmation).
     if GS.ApplyExactContentConfirmation then
-        GS.ApplyExactContentConfirmation(record, stored, {
-            sender = context and context.actorName,
-            member = context and {
-                name = context.actorName,
-                guid = context.actorGuid,
-                rankOrder = context.rankOrder,
-                guildKey = context.guildKey,
-            } or nil,
-            localWrite = true,
-        })
+        GS.ApplyExactContentConfirmation(record, stored, applyCtx)
     end
     GS._NotifyLocalDurableChange("confirm")
     return "accepted", nil

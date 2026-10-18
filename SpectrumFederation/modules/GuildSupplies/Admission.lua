@@ -4816,6 +4816,106 @@ local function LookupRetainedCandidate(record, rid)
     return nil
 end
 
+--- Collect distinct candidate ids embedded in a confirmation envelope.
+local function ConfirmationCandidateIds(storedConfirm)
+    local ids = {}
+    local seen = {}
+    local ref = storedConfirm and storedConfirm.candidateRef
+    if type(ref) ~= "table" then
+        return ids
+    end
+    local function note(id)
+        if type(id) == "string" and id ~= "" and not seen[id] then
+            seen[id] = true
+            ids[#ids + 1] = id
+        end
+    end
+    note(ref.recordId)
+    if type(ref.records) == "table" then
+        for i = 1, #ref.records do
+            local row = ref.records[i]
+            if type(row) == "table" then
+                note(row.id)
+            end
+        end
+    end
+    if type(ref.originalIds) == "table" then
+        for i = 1, #ref.originalIds do
+            note(ref.originalIds[i])
+        end
+    end
+    return ids
+end
+
+--- Count distinct not-yet-accepted candidates that are currently eligible for
+-- exact-content promotion (retained body matches envelope authority). Does not
+-- invent permanent reservations; confirm-first/body-late ids are skipped until
+-- retained. Optional startIdx limits to a resume window (paced apply).
+local function CountEligibleConfirmationPromotions(record, storedConfirm, admissionCtx, startIdx)
+    admissionCtx = admissionCtx or {}
+    local ops = record and record.operations
+    if type(ops) ~= "table" or type(storedConfirm) ~= "table" then
+        return 0
+    end
+    local ids = ConfirmationCandidateIds(storedConfirm)
+    startIdx = tonumber(startIdx) or 1
+    if startIdx < 1 then
+        startIdx = 1
+    end
+    local count = 0
+    local counted = {}
+    for i = startIdx, #ids do
+        local rid = ids[i]
+        if type(rid) == "string" and not counted[rid] then
+            counted[rid] = true
+            if not (ops.records and ops.records[rid]) then
+                local authBody = AuthoritativeBodyFromEnvelope(storedConfirm, rid)
+                if type(authBody) == "table" then
+                    local deferRank = admissionCtx.adoptionReplay and admissionCtx.deferRank
+                        and authBody.kind == GS.KIND.SET_EDITOR_RANK
+                    if not deferRank then
+                        local body = LookupRetainedCandidate(record, rid)
+                        if type(body) == "table" and AuthoritativeBodiesEqual(authBody, body) then
+                            count = count + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return count
+end
+
+--- Shared capacity preflight for local/remote confirmation commit.
+-- Accounts for the envelope slot (when not yet accepted) plus distinct eligible
+-- promotions. Rejects before any envelope/ref/head/config/retention mutation.
+-- During adoptionReplay, promotions are deferred to paced redrive — only the
+-- envelope slot is charged here; redrive rechecks when candidates become eligible.
+function GS.PreflightConfirmationCapacity(record, storedConfirm, admissionCtx)
+    admissionCtx = admissionCtx or {}
+    if type(record) ~= "table" or type(storedConfirm) ~= "table" then
+        return false, "invalid_operation"
+    end
+    local ops = record.operations
+    if type(ops) ~= "table" then
+        return false, "invalid_operations"
+    end
+    local slotsNeeded = 0
+    if not (ops.records and ops.records[storedConfirm.id]) then
+        slotsNeeded = slotsNeeded + 1
+    end
+    if not admissionCtx.adoptionReplay then
+        slotsNeeded = slotsNeeded + CountEligibleConfirmationPromotions(
+            record, storedConfirm, admissionCtx, 1)
+    end
+    if slotsNeeded > 0 and GS._AcceptedCount then
+        if GS._AcceptedCount(ops) + slotsNeeded > (GS.MAX_ACCEPTED_OPERATIONS or 4096) then
+            return false, "full"
+        end
+    end
+    return true, nil
+end
+
 --- Shared exact-content confirmation apply: promote matching retained candidates.
 -- Preserves original attribution; does not synthesize approvals.
 -- During adoptionReplay, SET_EDITOR_RANK promotions are deferred while same-base
@@ -4831,28 +4931,7 @@ function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
     end
     -- Bind retained candidates to authoritative bodies embedded in the
     -- authenticated confirmation envelope. Fingerprint equality is never sufficient.
-    local ids = {}
-    local ref = storedConfirm.candidateRef
-    if type(ref) == "table" then
-        if type(ref.recordId) == "string" then
-            ids[1] = ref.recordId
-        end
-        if type(ref.records) == "table" then
-            for i = 1, #ref.records do
-                local row = ref.records[i]
-                if type(row) == "table" and type(row.id) == "string" then
-                    ids[#ids + 1] = row.id
-                end
-            end
-        end
-        if type(ref.originalIds) == "table" then
-            for i = 1, #ref.originalIds do
-                if type(ref.originalIds[i]) == "string" then
-                    ids[#ids + 1] = ref.originalIds[i]
-                end
-            end
-        end
-    end
+    local ids = ConfirmationCandidateIds(storedConfirm)
     local budget = tonumber(admissionCtx.confirmApplyBudget)
     if not budget or budget ~= budget or budget < 1 then
         budget = math.huge
@@ -4860,6 +4939,16 @@ function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
     local startIdx = tonumber(admissionCtx.confirmApplyStartIdx) or 1
     if startIdx < 1 then
         startIdx = 1
+    end
+    -- Fail closed: when eligible promotions in this resume window cannot all fit,
+    -- do not partially apply the batch. Envelope storage is the caller's concern.
+    local eligible = CountEligibleConfirmationPromotions(
+        record, storedConfirm, admissionCtx, startIdx)
+    if eligible > 0 and GS._AcceptedCount and record.operations then
+        if GS._AcceptedCount(record.operations) + eligible
+            > (GS.MAX_ACCEPTED_OPERATIONS or 4096) then
+            return false, "full", 0, 0, startIdx
+        end
     end
     local seen = {}
     -- Skip ids already handled before startIdx so resume does not re-promote.
@@ -5391,6 +5480,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
             return "pending", "stale_base"
         end
+        -- Atomic capacity: envelope + currently eligible promotions (shared with local).
+        local capOk, capErr = GS.PreflightConfirmationCapacity(record, stored, admissionCtx)
+        if not capOk then
+            return "rejected", capErr or "full"
+        end
         if GS._StoreAccepted then
             GS._StoreAccepted(ops, stored, nil)
         end
@@ -5408,6 +5502,8 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         -- Adoption replay applies candidates via paced session redrive; do not
         -- synchronously drain multirow manifests on the admit path.
         if not admissionCtx.adoptionReplay then
+            -- Preflight already required capacity for the eligible batch; Apply
+            -- fail-closes without partial promotions if eligibility raced.
             GS.ApplyExactContentConfirmation(record, stored, admissionCtx)
         end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
@@ -5522,6 +5618,10 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                             return "rejected", "full"
                         end
                     end
+                end
+                -- Fast-path still mutates durable history (envelope + losers).
+                if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
+                    GS._NotifyLocalDurableChange("remote-resolve")
                 end
                 return "accepted", nil
             end
