@@ -339,79 +339,184 @@ local function PageRecordFits(exportId, pageIdx, opId, datasetId, maxPages, reco
     return EstimateWireRecordBytes(exportId .. ":p" .. tostring(pageIdx), trialPage) <= budget
 end
 
+--- Build a nested table that sets `value` at `path` (copy-on-write path nodes).
+local function TableAtPath(path, value)
+    if type(path) ~= "table" or #path < 1 then
+        return value
+    end
+    local root = {}
+    local cur = root
+    for i = 1, #path - 1 do
+        local nxt = {}
+        cur[path[i]] = nxt
+        cur = nxt
+    end
+    cur[path[#path]] = value
+    return root
+end
+
 --- Split one oversized authoritative row body across field-part page records.
--- Each part carries a disjoint subset of top-level body fields; assemble merges
--- them back into the exact original table. Returns page tables or nil.
+-- Splits top-level and nested table fields; chunks oversized scalar strings.
+-- Assemble deep-merges field parts and concatenates string chunks in order.
+-- Returns page tables or nil when a single supported fragment cannot fit.
 local function FragmentOversizedRow(row, exportId, opId, datasetId, budget, maxPages)
     if type(row) ~= "table" or type(row.id) ~= "string" or type(row.body) ~= "table" then
         return nil
     end
-    local body = row.body
-    local keys = {}
-    for k in pairs(body) do
-        keys[#keys + 1] = k
-    end
-    table.sort(keys, function(a, b)
-        return tostring(a) < tostring(b)
-    end)
-    if #keys < 1 then
-        return nil
-    end
-    local provisional = maxPages
-    local groups = {}
-    local cur = {}
-    local curCount = 0
-    for i = 1, #keys do
-        local k = keys[i]
-        local trial = {}
-        for tk, tv in pairs(cur) do
-            trial[tk] = tv
-        end
-        trial[k] = body[k]
+    -- Reserve the full manifest pageCount field width so later sibling rows /
+    -- id-list pages cannot push these fragments over budget when pageCount grows.
+    local reservePages = GS.MAX_MANIFEST_PAGES or 64
+    local unitCap = maxPages
+    local units = {} -- { fields = table } | { chunk = { path, index, count, data } }
+
+    local function recordFits(fields, chunk)
         local rec = {
             id = row.id,
-            part = #groups + 1,
-            partCount = provisional,
-            fields = trial,
+            part = 1,
+            partCount = reservePages,
+            fields = fields or {},
         }
-        if PageRecordFits(exportId, #groups + 1, opId, datasetId, provisional, { rec }, budget) then
-            cur = trial
-            curCount = curCount + 1
-        else
-            if curCount < 1 then
-                -- A single top-level field cannot fit alone: unsupported.
-                return nil
-            end
-            groups[#groups + 1] = cur
-            cur = { [k] = body[k] }
-            curCount = 1
-            rec = {
-                id = row.id,
-                part = #groups + 1,
-                partCount = provisional,
-                fields = cur,
+        if type(chunk) == "table" then
+            rec.chunk = chunk
+        end
+        return PageRecordFits(exportId, 1, opId, datasetId, reservePages, { rec }, budget)
+    end
+
+    local function emitFields(fields)
+        if not recordFits(fields, nil) then
+            return false
+        end
+        units[#units + 1] = { fields = fields }
+        return true
+    end
+
+    local function emitChunks(path, s)
+        if type(s) ~= "string" or #s < 1 then
+            return emitFields(TableAtPath(path, s))
+        end
+        -- Binary-search a chunk length that fits with chunk metadata.
+        local lo, hi = 1, #s
+        local fitLen = nil
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            local trial = {
+                path = path,
+                index = 1,
+                count = math.max(1, math.ceil(#s / mid)),
+                data = string.sub(s, 1, mid),
             }
-            if not PageRecordFits(exportId, #groups + 1, opId, datasetId, provisional, { rec }, budget) then
-                return nil
+            if recordFits({}, trial) then
+                fitLen = mid
+                lo = mid + 1
+            else
+                hi = mid - 1
             end
         end
+        if not fitLen or fitLen < 1 then
+            return false
+        end
+        local count = math.ceil(#s / fitLen)
+        if count > unitCap then
+            return false
+        end
+        for i = 1, count do
+            local a = (i - 1) * fitLen + 1
+            local b = math.min(#s, i * fitLen)
+            units[#units + 1] = {
+                chunk = {
+                    path = path,
+                    index = i,
+                    count = count,
+                    data = string.sub(s, a, b),
+                },
+            }
+            if not recordFits({}, units[#units].chunk) then
+                return false
+            end
+        end
+        return true
     end
-    if curCount > 0 then
-        groups[#groups + 1] = cur
+
+    -- Recursively fragment `value` rooted at `path` into fit-sized units.
+    local function fragmentAt(path, value)
+        local asFields = TableAtPath(path, value)
+        if recordFits(asFields, nil) then
+            return emitFields(asFields)
+        end
+        local t = type(value)
+        if t == "table" then
+            local keys = {}
+            for k in pairs(value) do
+                keys[#keys + 1] = k
+            end
+            table.sort(keys, function(a, b)
+                return tostring(a) < tostring(b)
+            end)
+            if #keys < 1 then
+                return false
+            end
+            -- Pack sibling keys into groups that fit; recurse when a key alone fails.
+            local cur = {}
+            local curCount = 0
+            for i = 1, #keys do
+                local k = keys[i]
+                local trial = {}
+                for ck, cv in pairs(cur) do
+                    trial[ck] = cv
+                end
+                trial[k] = value[k]
+                if recordFits(TableAtPath(path, trial), nil) then
+                    cur = trial
+                    curCount = curCount + 1
+                else
+                    if curCount > 0 then
+                        if not emitFields(TableAtPath(path, cur)) then
+                            return false
+                        end
+                        cur = {}
+                        curCount = 0
+                    end
+                    local childPath = {}
+                    for pi = 1, #path do
+                        childPath[pi] = path[pi]
+                    end
+                    childPath[#childPath + 1] = k
+                    if not fragmentAt(childPath, value[k]) then
+                        return false
+                    end
+                end
+            end
+            if curCount > 0 then
+                return emitFields(TableAtPath(path, cur))
+            end
+            return true
+        elseif t == "string" then
+            return emitChunks(path, value)
+        end
+        -- Atomic non-string scalar that cannot fit alone under the page wrapper.
+        return false
     end
-    if #groups < 1 or #groups > maxPages then
+
+    if not fragmentAt({}, row.body) then
         return nil
     end
-    local partCount = #groups
+    if #units < 1 or #units > unitCap then
+        return nil
+    end
+    local partCount = #units
     local pages = {}
     for i = 1, partCount do
         local rec = {
             id = row.id,
             part = i,
             partCount = partCount,
-            fields = groups[i],
+            fields = units[i].fields or {},
         }
-        if not PageRecordFits(exportId, i, opId, datasetId, partCount, { rec }, budget) then
+        if type(units[i].chunk) == "table" then
+            rec.chunk = units[i].chunk
+        end
+        -- Fit against reserved max pageCount (final manifest may still grow).
+        if not PageRecordFits(exportId, i, opId, datasetId, reservePages, { rec }, budget) then
             return nil
         end
         pages[i] = { records = { rec } }
@@ -787,12 +892,61 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
     local rows = {}
     local rowIndexById = {}
     local seenComplete = {}
-    local partAccum = {} -- id → { partCount, parts = { [n] = fields }, rowSlot }
+    local partAccum = {} -- id → { partCount, parts, chunks, rowSlot }
     local pageOriginalIds = {}
     local pageCompetingOpIds = {}
     local pageBoundary = nil
     local totalBytes = 0
     local maxBytes = GS.MAX_FRAGMENT_ASSEMBLY_BYTES or 49152
+
+    local function deepMergeFields(dst, src)
+        for k, v in pairs(src) do
+            if type(v) == "table" and type(dst[k]) == "table" then
+                if not deepMergeFields(dst[k], v) then
+                    return false
+                end
+            elseif dst[k] ~= nil then
+                return false
+            else
+                dst[k] = v
+            end
+        end
+        return true
+    end
+
+    local function pathKey(path)
+        if type(path) ~= "table" then
+            return nil
+        end
+        local parts = {}
+        for i = 1, #path do
+            parts[i] = tostring(path[i])
+        end
+        return table.concat(parts, "\0")
+    end
+
+    local function assignPath(dst, path, value)
+        if type(path) ~= "table" or #path < 1 then
+            return false
+        end
+        local cur = dst
+        for i = 1, #path - 1 do
+            local p = path[i]
+            if cur[p] == nil then
+                cur[p] = {}
+            elseif type(cur[p]) ~= "table" then
+                return false
+            end
+            cur = cur[p]
+        end
+        local leaf = path[#path]
+        if cur[leaf] ~= nil then
+            return false
+        end
+        cur[leaf] = value
+        return true
+    end
+
     for page = 1, pageCount do
         local p = pagesByIndex and pagesByIndex[page]
         if type(p) ~= "table" or type(p.records) ~= "table" then
@@ -862,7 +1016,7 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
                 if not acc then
                     rows[#rows + 1] = { id = row.id, body = nil, _partsPending = true }
                     rowIndexById[row.id] = #rows
-                    acc = { partCount = partCount, parts = {}, rowSlot = #rows }
+                    acc = { partCount = partCount, parts = {}, chunks = {}, rowSlot = #rows }
                     partAccum[row.id] = acc
                 elseif acc.partCount ~= partCount then
                     return nil, "invalid_operation"
@@ -870,8 +1024,14 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
                 if acc.parts[part] ~= nil then
                     return nil, "invalid_operation"
                 end
-                acc.parts[part] = row.fields
+                acc.parts[part] = {
+                    fields = row.fields,
+                    chunk = row.chunk,
+                }
                 totalBytes = totalBytes + #row.id + EstimateBodyBytes(row.fields)
+                if type(row.chunk) == "table" and type(row.chunk.data) == "string" then
+                    totalBytes = totalBytes + #row.chunk.data
+                end
                 if totalBytes > maxBytes then
                     return nil, "invalid_operation"
                 end
@@ -894,16 +1054,48 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
     end
     for id, acc in pairs(partAccum) do
         local merged = {}
+        local chunkGroups = {}
         for part = 1, acc.partCount do
-            local fields = acc.parts[part]
-            if type(fields) ~= "table" then
+            local entry = acc.parts[part]
+            if type(entry) ~= "table" or type(entry.fields) ~= "table" then
                 return nil, "incomplete_manifest_pages"
             end
-            for k, v in pairs(fields) do
-                if merged[k] ~= nil then
+            if not deepMergeFields(merged, entry.fields) then
+                return nil, "invalid_operation"
+            end
+            local ch = entry.chunk
+            if type(ch) == "table" then
+                if type(ch.path) ~= "table" or type(ch.data) ~= "string"
+                    or type(ch.index) ~= "number" or type(ch.count) ~= "number" then
                     return nil, "invalid_operation"
                 end
-                merged[k] = v
+                local pk = pathKey(ch.path)
+                if not pk then
+                    return nil, "invalid_operation"
+                end
+                local grp = chunkGroups[pk]
+                if not grp then
+                    grp = { path = ch.path, count = ch.count, parts = {} }
+                    chunkGroups[pk] = grp
+                elseif grp.count ~= ch.count then
+                    return nil, "invalid_operation"
+                end
+                if grp.parts[ch.index] ~= nil then
+                    return nil, "invalid_operation"
+                end
+                grp.parts[ch.index] = ch.data
+            end
+        end
+        for _, grp in pairs(chunkGroups) do
+            local pieces = {}
+            for ci = 1, grp.count do
+                if type(grp.parts[ci]) ~= "string" then
+                    return nil, "incomplete_manifest_pages"
+                end
+                pieces[ci] = grp.parts[ci]
+            end
+            if not assignPath(merged, grp.path, table.concat(pieces)) then
+                return nil, "invalid_operation"
             end
         end
         local slot = acc.rowSlot

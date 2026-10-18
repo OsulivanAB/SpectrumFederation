@@ -39,10 +39,15 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- Must fit a full legal accepted export: ops + headers + archive meta/pages +
 -- conflict evidence + operation-manifest pages + descriptor. Archive and
 -- confirm/resolve paging multiply bodies beyond logical operation counts.
+-- Logical adoption buffer: accepted/evidence history + campaigns/archives + headroom.
+-- Wire pages for incomplete paged manifests live in a separate assembly arena so
+-- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
 GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
     + ((GS.MAX_CAMPAIGNS or 64) * 24)
-    + ((GS.MAX_MANIFEST_PAGES or 64) * 24)
     + 512
+-- Concurrent incomplete paged-op assemblies during transfer (not logical history).
+GS.MAX_ADOPTION_ASSEMBLY_OPS = 24
+GS.MAX_ADOPTION_ASSEMBLY_PAGES = (GS.MAX_MANIFEST_PAGES or 64) * (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24)
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
@@ -57,6 +62,7 @@ GS.MAX_ADMISSION_WORK_PER_SLICE = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
 GS.MAX_EXPORT_MAINT_PER_SLICE = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
 -- Aggregate adoption admissions bounded by buffered body count (no silent truncate).
 GS.MAX_ADOPTION_AGGREGATE_ADMISSIONS = GS.MAX_ADOPTION_PENDING_RECORDS
+    + (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0)
 
 -- Runtime-only: adoption / peer discovery / epoch. Not SavedVariables.
 GS._adoptionEpoch = 0
@@ -570,9 +576,7 @@ local ActorMatchesMember -- forward decl; defined below
 -- embeds authoritative content that exactly matches `candidateBody` for `opId`.
 -- Buffered-only envelopes are not authority. Fingerprints are never used.
 -- Selecting an adoption source alone does not confirm unknown authors.
---- Build/reuse an adoption-session index of source-authenticated confirm/resolve
--- envelopes that have already been accepted into temp. Invalid visits for work accounting.
-local function EnsureAdoptionConfirmIndex(adop, member, acceptedOps)
+local function EnsureAdoptionWorkStats(adop)
     if type(adop) ~= "table" then
         return nil
     end
@@ -580,45 +584,80 @@ local function EnsureAdoptionConfirmIndex(adop, member, acceptedOps)
         confirmVisited = 0,
         confirmComparisons = 0,
         completenessVisited = 0,
+        indexVisited = 0,
+        assemblyVisited = 0,
+        archiveVisited = 0,
     }
-    local accepted = acceptedOps and acceptedOps.records
-    local accCount = 0
-    if type(accepted) == "table" then
-        for _ in pairs(accepted) do
-            accCount = accCount + 1
+    return adop._workStats
+end
+
+--- Incremental confirm/resolve target index for an adoption session.
+-- Maps target opId → envelope op ids; envelope bodies live in _confirmEnvelopes.
+-- Built on buffer/compaction; never full-scans adop.order on cache hits.
+local function IndexAdoptionEnvelope(adop, op)
+    if type(adop) ~= "table" or type(op) ~= "table" or type(op.id) ~= "string" then
+        return
+    end
+    local isEnv = op.kind == GS.KIND.CONFIRM_CANDIDATE or op.kind == GS.KIND.RESOLVE_CONFLICT
+    if not isEnv then
+        return
+    end
+    local stats = EnsureAdoptionWorkStats(adop)
+    adop._confirmEnvelopes = adop._confirmEnvelopes or {}
+    adop._confirmByTarget = adop._confirmByTarget or {}
+    if adop._confirmEnvelopes[op.id] == nil then
+        stats.indexVisited = (stats.indexVisited or 0) + 1
+    end
+    adop._confirmEnvelopes[op.id] = op
+    local function noteTarget(tid)
+        if type(tid) ~= "string" then
+            return
         end
+        local list = adop._confirmByTarget[tid]
+        if not list then
+            list = {}
+            adop._confirmByTarget[tid] = list
+        end
+        for i = 1, #list do
+            if list[i] == op.id then
+                return
+            end
+        end
+        list[#list + 1] = op.id
+        stats.indexVisited = (stats.indexVisited or 0) + 1
     end
-    local idx = adop._confirmIndex
-    if type(idx) == "table" and idx.acceptedCount == accCount and idx.memberGuid == (member and member.guid) then
-        return idx
-    end
-    idx = {
-        acceptedCount = accCount,
-        memberGuid = member and member.guid,
-        -- opId → list of { envelopeOp, authBody } for accepted source-auth envelopes
-        byTarget = {},
-        envelopes = {},
-    }
-    for i = 1, #adop.order do
-        local body = adop.records[adop.order[i]]
-        if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
-            local op = body.op
-            local isEnv = op.kind == GS.KIND.CONFIRM_CANDIDATE
-                or op.kind == GS.KIND.RESOLVE_CONFLICT
-            if isEnv and ActorMatchesMember(op, member)
-                and (type(accepted) ~= "table" or type(accepted[op.id]) == "table") then
-                idx.envelopes[#idx.envelopes + 1] = op
+    if op.kind == GS.KIND.CONFIRM_CANDIDATE and type(op.candidateRef) == "table" then
+        local ref = op.candidateRef
+        if type(ref.recordId) == "string" then
+            noteTarget(ref.recordId)
+        end
+        if type(ref.records) == "table" then
+            for i = 1, #ref.records do
+                local row = ref.records[i]
+                if type(row) == "table" then
+                    noteTarget(row.id)
+                end
+            end
+        end
+    elseif op.kind == GS.KIND.RESOLVE_CONFLICT and type(op.value) == "table" then
+        local ids = op.value.competingOpIds
+        if type(ids) == "table" then
+            for i = 1, #ids do
+                noteTarget(ids[i])
+            end
+        end
+        if type(op.value.contentBodies) == "table" then
+            for tid in pairs(op.value.contentBodies) do
+                noteTarget(tid)
             end
         end
     end
-    adop._confirmIndex = idx
-    return idx
 end
 
---- Search buffered confirm/resolve envelopes for exact-content auth of opId.
--- opts.budget / opts.visited charge each visited buffer record; resumes via
--- opts.cursor so a single callback cannot scan the whole transfer unboundedly.
+--- Search indexed confirm/resolve envelopes for exact-content auth of opId.
+-- opts.budget / opts.visited charge each visited envelope; resumes via opts.cursor.
 -- opts.skipSearch=true forces a negative result without scanning (source-authored).
+-- Only walks byTarget[opId]; does not scan adop.order or recount accepted history.
 local function AdoptionHasConfirmationFor(adop, opId, candidateBody, member, acceptedOps, opts)
     if type(adop) ~= "table" or type(opId) ~= "string" or type(candidateBody) ~= "table" then
         return false
@@ -627,22 +666,23 @@ local function AdoptionHasConfirmationFor(adop, opId, candidateBody, member, acc
     if opts.skipSearch == true then
         return false
     end
-    adop._workStats = adop._workStats or {
-        confirmVisited = 0,
-        confirmComparisons = 0,
-        completenessVisited = 0,
-    }
+    local stats = EnsureAdoptionWorkStats(adop)
     local budget = tonumber(opts.budget)
     local visited = 0
     local start = tonumber(opts.cursor) or 1
     if start < 1 then
         start = 1
     end
-
-    local idx = EnsureAdoptionConfirmIndex(adop, member, acceptedOps)
-    local envelopes = idx and idx.envelopes or {}
+    local accepted = acceptedOps and acceptedOps.records
+    local targets = adop._confirmByTarget and adop._confirmByTarget[opId]
+    if type(targets) ~= "table" or #targets < 1 then
+        opts.cursor = nil
+        opts.visited = (tonumber(opts.visited) or 0)
+        opts.budgetExhausted = false
+        return false
+    end
     local i = start
-    while i <= #envelopes do
+    while i <= #targets do
         if budget and visited >= budget then
             opts.cursor = i
             opts.visited = (tonumber(opts.visited) or 0) + visited
@@ -650,16 +690,21 @@ local function AdoptionHasConfirmationFor(adop, opId, candidateBody, member, acc
             return false, "budget"
         end
         visited = visited + 1
-        adop._workStats.confirmVisited = (adop._workStats.confirmVisited or 0) + 1
-        local op = envelopes[i]
-        local authBody = AuthoritativeBodyFromEnvelope(op, opId)
-        if type(authBody) == "table" then
-            adop._workStats.confirmComparisons = (adop._workStats.confirmComparisons or 0) + 1
-            if AuthoritativeBodiesEqual(authBody, candidateBody) then
-                opts.cursor = nil
-                opts.visited = (tonumber(opts.visited) or 0) + visited
-                opts.budgetExhausted = false
-                return true
+        stats.confirmVisited = (stats.confirmVisited or 0) + 1
+        local envId = targets[i]
+        local op = adop._confirmEnvelopes and adop._confirmEnvelopes[envId]
+        if type(op) == "table"
+            and ActorMatchesMember(op, member)
+            and (type(accepted) ~= "table" or type(accepted[op.id]) == "table") then
+            local authBody = AuthoritativeBodyFromEnvelope(op, opId)
+            if type(authBody) == "table" then
+                stats.confirmComparisons = (stats.confirmComparisons or 0) + 1
+                if AuthoritativeBodiesEqual(authBody, candidateBody) then
+                    opts.cursor = nil
+                    opts.visited = (tonumber(opts.visited) or 0) + visited
+                    opts.budgetExhausted = false
+                    return true
+                end
             end
         end
         i = i + 1
@@ -1194,7 +1239,7 @@ end
 local function CountBufferedKinds(adop)
     -- acceptedOps: non-evidenceOnly gs-op bodies (selected accepted history).
     -- transferOps: all gs-op bodies including conflict/pending evidence.
-    -- gs-op-page fragments are not counted (like archive pages).
+    -- Incomplete paged manifests live in adop._assemblies until finalized.
     local acceptedOps, transferOps, headers, archives, desc = 0, 0, 0, 0, nil
     local archivePages = {} -- campaignId → { meta, pages = {}, pageCount }
     local opPages = {} -- opId → { shell, pages = {}, pageCount }
@@ -1207,22 +1252,6 @@ local function CountBufferedKinds(adop)
                 transferOps = transferOps + 1
                 if body.evidenceOnly ~= true then
                     acceptedOps = acceptedOps + 1
-                end
-                local oid = body.op and body.op.id
-                local pc = tonumber(body.pageCount) or (body.op and tonumber(body.op.pageCount))
-                if type(oid) == "string" and pc and pc >= 1 then
-                    opPages[oid] = opPages[oid] or { pages = {}, pageCount = pc }
-                    opPages[oid].shell = body
-                    opPages[oid].pageCount = pc
-                end
-            elseif body.kind == "gs-op-page" then
-                local oid = body.opId
-                if type(oid) == "string" then
-                    opPages[oid] = opPages[oid] or { pages = {}, pageCount = tonumber(body.pageCount) or 1 }
-                    opPages[oid].pages[tonumber(body.page) or 0] = body
-                    if tonumber(body.pageCount) then
-                        opPages[oid].pageCount = tonumber(body.pageCount)
-                    end
                 end
             elseif body.kind == "campaign-header" then
                 headers = headers + 1
@@ -1244,6 +1273,31 @@ local function CountBufferedKinds(adop)
                     end
                 end
             end
+        end
+    end
+    if type(adop._archiveIndex) == "table" then
+        for cid, info in pairs(adop._archiveIndex) do
+            archivePages[cid] = archivePages[cid] or { pages = {}, pageCount = info.pageCount or 1 }
+            if info.meta then
+                archivePages[cid].meta = info.meta
+            end
+            if type(info.pages) == "table" then
+                for p, pb in pairs(info.pages) do
+                    archivePages[cid].pages[p] = pb
+                end
+            end
+            if info.pageCount then
+                archivePages[cid].pageCount = info.pageCount
+            end
+        end
+    end
+    if type(adop._assemblies) == "table" then
+        for oid, asm in pairs(adop._assemblies) do
+            opPages[oid] = {
+                shell = asm.shell,
+                pages = asm.pages or {},
+                pageCount = asm.pageCount,
+            }
         end
     end
     return desc, acceptedOps, transferOps, headers, archives, archivePages, opPages
@@ -1391,6 +1445,9 @@ local function AbortAdoptionReplay(adop, reason)
             confirmVisited = tonumber(adop._workStats.confirmVisited) or 0,
             confirmComparisons = tonumber(adop._workStats.confirmComparisons) or 0,
             completenessVisited = tonumber(adop._workStats.completenessVisited) or 0,
+            indexVisited = tonumber(adop._workStats.indexVisited) or 0,
+            assemblyVisited = tonumber(adop._workStats.assemblyVisited) or 0,
+            archiveVisited = tonumber(adop._workStats.archiveVisited) or 0,
         }
     end
     adop.replayTemp = nil
@@ -1474,6 +1531,20 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         actorGuid = ctx.actorGuid,
         records = {},
         order = {},
+        _assemblies = {},
+        _assemblyPageCount = 0,
+        _assemblyOpCount = 0,
+        _confirmEnvelopes = {},
+        _confirmByTarget = {},
+        _archiveIndex = {},
+        _workStats = {
+            confirmVisited = 0,
+            confirmComparisons = 0,
+            completenessVisited = 0,
+            indexVisited = 0,
+            assemblyVisited = 0,
+            archiveVisited = 0,
+        },
         -- Exact source accepted snapshot (non-evidenceOnly gs-op ids) pinned during transfer.
         sourceAcceptedIds = {},
         sourceAcceptedSet = {},
@@ -1532,63 +1603,40 @@ function GS:GetPendingAdoption()
     return GS._adoption
 end
 
---- Compact a completed paged op manifest in the adoption buffer into one logical
--- gs-op body so fragment pages do not permanently consume pending-record slots.
-local function CompactAdoptionOpManifest(adop, opId)
+--- Finalize a completed assembly into one logical gs-op in adop.order.
+local function FinalizeAdoptionAssembly(adop, opId)
     if type(adop) ~= "table" or type(opId) ~= "string" or not GS.AssembleOpFromPages then
         return false
     end
-    local shellId, shellBody = nil, nil
-    local pagesByIndex = {}
-    local pageIds = {}
-    local pageCount = nil
-    for i = 1, #adop.order do
-        local rid = adop.order[i]
-        local body = adop.records[rid]
-        if type(body) == "table" then
-            if body.kind == "gs-op" and type(body.op) == "table" and body.op.id == opId then
-                local pc = tonumber(body.pageCount) or tonumber(body.op.pageCount)
-                if pc and pc >= 1 then
-                    shellId, shellBody, pageCount = rid, body, pc
-                end
-            elseif body.kind == "gs-op-page" and body.opId == opId then
-                local p = tonumber(body.page) or 0
-                pagesByIndex[p] = body
-                pageIds[#pageIds + 1] = rid
-                if tonumber(body.pageCount) then
-                    pageCount = pageCount or tonumber(body.pageCount)
-                end
-            end
-        end
-    end
-    if not shellBody or not pageCount then
+    local stats = EnsureAdoptionWorkStats(adop)
+    local asm = adop._assemblies and adop._assemblies[opId]
+    if type(asm) ~= "table" or type(asm.shell) ~= "table" then
         return false
     end
+    local pageCount = tonumber(asm.pageCount)
+    if not pageCount then
+        return false
+    end
+    stats.assemblyVisited = (stats.assemblyVisited or 0) + 1
     for p = 1, pageCount do
-        if type(pagesByIndex[p]) ~= "table" then
+        stats.assemblyVisited = (stats.assemblyVisited or 0) + 1
+        if type(asm.pages[p]) ~= "table" then
             return false
         end
     end
-    local assembled, aerr = GS.AssembleOpFromPages(shellBody, pagesByIndex)
+    local assembled, aerr = GS.AssembleOpFromPages(asm.shell, asm.pages)
     if not assembled then
         return false, aerr
     end
-    -- Replace shell with assembled logical body; drop page fragments from order.
-    local drop = {}
-    for i = 1, #pageIds do
-        drop[pageIds[i]] = true
-        adop.records[pageIds[i]] = nil
+    if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
+        return false, "full"
     end
-    local newOrder = {}
-    for i = 1, #adop.order do
-        local rid = adop.order[i]
-        if not drop[rid] then
-            newOrder[#newOrder + 1] = rid
-        end
+    local logicalId = asm.shellRecordId or ("gs:op:" .. opId)
+    if adop.records[logicalId] then
+        logicalId = logicalId .. ":assembled"
     end
-    adop.order = newOrder
-    adop.records[shellId] = assembled
-    -- Assembled body is the logical accepted/evidence op (no pageCount).
+    adop.records[logicalId] = assembled
+    adop.order[#adop.order + 1] = logicalId
     if assembled.evidenceOnly ~= true and type(assembled.op) == "table"
         and type(assembled.op.id) == "string" then
         local oid = assembled.op.id
@@ -1596,9 +1644,111 @@ local function CompactAdoptionOpManifest(adop, opId)
             adop.sourceAcceptedSet[oid] = true
             adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = oid
         end
+        IndexAdoptionEnvelope(adop, assembled.op)
+    elseif type(assembled.op) == "table" then
+        IndexAdoptionEnvelope(adop, assembled.op)
     end
-    adop._confirmIndex = nil
+    local pageN = 0
+    for _ in pairs(asm.pages or {}) do
+        pageN = pageN + 1
+    end
+    if asm.shell then
+        pageN = pageN -- shell was not counted as a page
+    end
+    adop._assemblyPageCount = math.max(0, (tonumber(adop._assemblyPageCount) or 0) - pageN)
+    if adop._assemblies[opId] then
+        adop._assemblyOpCount = math.max(0, (tonumber(adop._assemblyOpCount) or 0) - 1)
+        adop._assemblies[opId] = nil
+    end
     return true
+end
+
+--- Park paged op shells/pages in a bounded assembly arena (not logical order).
+local function BufferAdoptionAssembly(adop, recordId, body)
+    local stats = EnsureAdoptionWorkStats(adop)
+    stats.assemblyVisited = (stats.assemblyVisited or 0) + 1
+    adop._assemblies = adop._assemblies or {}
+    adop._assemblyPageCount = tonumber(adop._assemblyPageCount) or 0
+    adop._assemblyOpCount = tonumber(adop._assemblyOpCount) or 0
+    local opId, pageCount
+    local isShell = body.kind == "gs-op"
+    if isShell then
+        if type(body.op) ~= "table" or type(body.op.id) ~= "string" then
+            return "rejected", "invalid_record"
+        end
+        opId = body.op.id
+        pageCount = tonumber(body.pageCount) or tonumber(body.op.pageCount)
+        if not pageCount or pageCount < 1 then
+            return nil -- not a paged shell; caller handles as logical
+        end
+    else
+        opId = body.opId
+        pageCount = tonumber(body.pageCount)
+        if type(opId) ~= "string" then
+            return "rejected", "invalid_record"
+        end
+    end
+    local asm = adop._assemblies[opId]
+    if not asm then
+        if adop._assemblyOpCount >= (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24) then
+            return "rejected", "full"
+        end
+        asm = { pages = {}, pageCount = pageCount }
+        adop._assemblies[opId] = asm
+        adop._assemblyOpCount = adop._assemblyOpCount + 1
+    end
+    if pageCount and (not asm.pageCount or asm.pageCount < pageCount) then
+        asm.pageCount = pageCount
+    end
+    if isShell then
+        if asm.shell and not DeepEqual(asm.shell, body) then
+            return "rejected", "id_conflict"
+        end
+        if not asm.shell then
+            if adop._assemblyPageCount >= (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0)
+                and (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0) > 0 then
+                -- Shell metadata is required for completion; allow one shell marker
+                -- without counting it as a wire page when arena is at page cap.
+            end
+            asm.shell = body
+            asm.shellRecordId = recordId
+        end
+    else
+        local p = tonumber(body.page) or 0
+        if p < 1 then
+            return "rejected", "invalid_record"
+        end
+        if asm.pages[p] then
+            if DeepEqual(asm.pages[p], body) then
+                local complete = select(1, GS:IsAdoptionTransferComplete())
+                return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+            end
+            return "rejected", "id_conflict"
+        end
+        if adop._assemblyPageCount >= (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0) then
+            return "rejected", "full"
+        end
+        asm.pages[p] = body
+        adop._assemblyPageCount = adop._assemblyPageCount + 1
+        if tonumber(body.pageCount) then
+            asm.pageCount = asm.pageCount or tonumber(body.pageCount)
+        end
+    end
+    local finalized = FinalizeAdoptionAssembly(adop, opId)
+    local complete = select(1, GS:IsAdoptionTransferComplete())
+    adop.ready = complete and true or false
+    if complete then
+        NotifyAdoptionStateChanged("ready")
+    end
+    if finalized then
+        return "accepted", complete and "ready" or nil
+    end
+    return "accepted", complete and "ready" or nil
+end
+
+--- Legacy name: finalize assembly for opId when shell+pages are complete.
+local function CompactAdoptionOpManifest(adop, opId)
+    return FinalizeAdoptionAssembly(adop, opId)
 end
 
 --- Buffer a validated gossip body into the pending adoption session.
@@ -1611,6 +1761,19 @@ function GS:BufferAdoptionRecord(recordId, body)
     if type(recordId) ~= "string" or recordId == "" or type(body) ~= "table" then
         return "rejected", "invalid_record"
     end
+    EnsureAdoptionWorkStats(adop)
+
+    -- Paged op shells/pages: bounded assembly arena (not logical pending slots).
+    if body.kind == "gs-op-page" then
+        return BufferAdoptionAssembly(adop, recordId, body)
+    end
+    if body.kind == "gs-op" and type(body.op) == "table" then
+        local pc = tonumber(body.pageCount) or tonumber(body.op.pageCount)
+        if pc and pc >= 1 then
+            return BufferAdoptionAssembly(adop, recordId, body)
+        end
+    end
+
     if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
         return "rejected", "full"
     end
@@ -1670,6 +1833,19 @@ function GS:BufferAdoptionRecord(recordId, body)
         return nil
     end
 
+    -- Assembly duplicate/conflict check for ids still parked in the arena.
+    if adop._assemblies then
+        for oid, asm in pairs(adop._assemblies) do
+            if asm.shellRecordId == recordId then
+                if DeepEqual(asm.shell, body) then
+                    local complete = select(1, GS:IsAdoptionTransferComplete())
+                    return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+                end
+                return "rejected", "id_conflict"
+            end
+        end
+    end
+
     if adop.records[recordId] then
         if DeepEqual(adop.records[recordId], body) then
             local complete = select(1, GS:IsAdoptionTransferComplete())
@@ -1704,19 +1880,32 @@ function GS:BufferAdoptionRecord(recordId, body)
             adop.sourceAcceptedSet[oid] = true
             adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = oid
         end
+        IndexAdoptionEnvelope(adop, body.op)
+    elseif body.kind == "gs-op" and type(body.op) == "table" then
+        IndexAdoptionEnvelope(adop, body.op)
+    end
+
+    -- Incremental archive-page index for bounded completeness checks.
+    if body.kind == "campaign-archive" and type(body.campaignId) == "string" then
+        adop._archiveIndex = adop._archiveIndex or {}
+        adop._archiveIndex[body.campaignId] = adop._archiveIndex[body.campaignId]
+            or { meta = nil, pages = {} }
+        adop._archiveIndex[body.campaignId].meta = body
+        adop._archiveIndex[body.campaignId].pageCount = tonumber(body.pageCount) or 1
+    elseif body.kind == "campaign-archive-page" and type(body.campaignId) == "string" then
+        adop._archiveIndex = adop._archiveIndex or {}
+        local info = adop._archiveIndex[body.campaignId]
+            or { meta = nil, pages = {} }
+        info.pages[tonumber(body.page) or 0] = body
+        if tonumber(body.pageCount) then
+            info.pageCount = tonumber(body.pageCount)
+        end
+        adop._archiveIndex[body.campaignId] = info
     end
 
     local wasReady = adop.ready == true
     adop.records[recordId] = body
     adop.order[#adop.order + 1] = recordId
-    -- Compact completed paged manifests so multi-envelope histories stay within
-    -- logical pending-record limits without retaining every wire page forever.
-    if body.kind == "gs-op" or body.kind == "gs-op-page" then
-        local opId = (body.kind == "gs-op" and body.op and body.op.id) or body.opId
-        if type(opId) == "string" then
-            CompactAdoptionOpManifest(adop, opId)
-        end
-    end
     local complete = select(1, GS:IsAdoptionTransferComplete())
     adop.ready = complete and true or false
     if adop.ready and not wasReady then
@@ -1737,6 +1926,9 @@ function GS.GetAdoptionWorkStats()
         confirmVisited = tonumber(stats.confirmVisited) or 0,
         confirmComparisons = tonumber(stats.confirmComparisons) or 0,
         completenessVisited = tonumber(stats.completenessVisited) or 0,
+        indexVisited = tonumber(stats.indexVisited) or 0,
+        assemblyVisited = tonumber(stats.assemblyVisited) or 0,
+        archiveVisited = tonumber(stats.archiveVisited) or 0,
     }
 end
 
@@ -2130,13 +2322,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 end
                 admissions = admissions + 1
                 sliceUsed = sliceUsed + 1
-                -- Accept/progress invalidates the confirm envelope index.
-                if status == "accepted" or status == "duplicate" then
-                    adop._confirmIndex = nil
-                end
                 if status == "accepted" or status == "duplicate" then
                     progress = true
                     if state.worklist then state.worklist[op.id] = nil end
+                    if type(op) == "table" then
+                        IndexAdoptionEnvelope(adop, op)
+                    end
                 elseif status == "pending" then
                     local nowPending = temp.operations.pending and temp.operations.pending[op.id] ~= nil
                     local nowRelay = GS._pendingRelay[op.id] ~= nil
@@ -2193,11 +2384,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     local pages = {}
                     if needsPages then
                         sliceUsed = sliceUsed + 1
-                        for j = 1, #adop.order do
-                            local pb = adop.records[adop.order[j]]
-                            if type(pb) == "table" and pb.kind == "campaign-archive-page"
-                                and pb.campaignId == body.campaignId then
-                                pages[tonumber(pb.page) or 0] = pb
+                        local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
+                        if type(info) == "table" and type(info.pages) == "table" then
+                            for p, pb in pairs(info.pages) do
+                                pages[p] = pb
+                                EnsureAdoptionWorkStats(adop).archiveVisited =
+                                    (adop._workStats.archiveVisited or 0) + 1
                             end
                         end
                     end
@@ -2223,31 +2415,32 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 local pages = {}
                 if needsPages then
                     sliceUsed = sliceUsed + 1
-                    for j = 1, #adop.order do
-                        local pb = adop.records[adop.order[j]]
-                        if type(pb) == "table" and pb.kind == "campaign-archive-page"
-                            and pb.campaignId == body.campaignId then
-                            pages[tonumber(pb.page) or 0] = pb
+                    local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
+                    if type(info) == "table" and type(info.pages) == "table" then
+                        for p, pb in pairs(info.pages) do
+                            pages[p] = pb
+                            EnsureAdoptionWorkStats(adop).archiveVisited =
+                                (adop._workStats.archiveVisited or 0) + 1
                         end
                     end
-                    local archive, aerr = AssemblePagedArchive(body, pages)
-                    if not archive then
-                        if aerr == "incomplete_archive_pages" then
-                            -- Generated presence alone is insufficient for advertised pages.
-                            unsettledSeen = true
-                            state.archiveNeedsPages = state.archiveNeedsPages or {}
-                            state.archiveNeedsPages[body.campaignId] = true
-                        else
-                            state.cursor, state.admissions = i, admissions
-                            return false, aerr or "invalid_campaign_archive", progress
-                        end
-                    elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
-                        state.cursor, state.admissions = i, admissions
-                        return false, "archive_conflict", progress
+                end
+                local archive, aerr = AssemblePagedArchive(body, pages)
+                if not archive then
+                    if aerr == "incomplete_archive_pages" then
+                        -- Generated presence alone is insufficient for advertised pages.
+                        unsettledSeen = true
+                        state.archiveNeedsPages = state.archiveNeedsPages or {}
+                        state.archiveNeedsPages[body.campaignId] = true
                     else
-                        if state.archiveNeedsPages then
-                            state.archiveNeedsPages[body.campaignId] = nil
-                        end
+                        state.cursor, state.admissions = i, admissions
+                        return false, aerr or "invalid_campaign_archive", progress
+                    end
+                elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
+                    state.cursor, state.admissions = i, admissions
+                    return false, "archive_conflict", progress
+                else
+                    if state.archiveNeedsPages then
+                        state.archiveNeedsPages[body.campaignId] = nil
                     end
                 end
             end
@@ -2420,6 +2613,17 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             state.quietScanned = 0
         end
     end
+    local ws = EnsureAdoptionWorkStats(adop)
+    GS._lastAdoptionSliceStats = {
+        used = sliceUsed,
+        budget = sliceBudget,
+        scanned = scanned,
+        confirmVisited = tonumber(ws.confirmVisited) or 0,
+        completenessVisited = tonumber(ws.completenessVisited) or 0,
+        indexVisited = tonumber(ws.indexVisited) or 0,
+        assemblyVisited = tonumber(ws.assemblyVisited) or 0,
+        archiveVisited = tonumber(ws.archiveVisited) or 0,
+    }
     return moreWork, nil, progress
 end
 
@@ -2535,15 +2739,35 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             local pageCount = tonumber(body.pageCount) or 1
             if (not body.requestedItems) and pageCount >= 1 then
                 local pages = {}
-                for j = 1, #adop.order do
-                    local pb = adop.records[adop.order[j]]
-                    if type(pb) == "table" and pb.kind == "campaign-archive-page"
-                        and pb.campaignId == body.campaignId then
-                        pages[tonumber(pb.page) or 0] = pb
+                local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
+                if type(info) == "table" and type(info.pages) == "table" then
+                    local startPage = tonumber(opts.archivePageCursor and opts.archivePageCursor[body.campaignId]) or 1
+                    for p = startPage, pageCount do
+                        if visited >= budget then
+                            opts.archivePageCursor = opts.archivePageCursor or {}
+                            opts.archivePageCursor[body.campaignId] = p
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            return false, "budget"
+                        end
                         visited = visited + 1
                         adop._workStats.completenessVisited =
                             (adop._workStats.completenessVisited or 0) + 1
+                        adop._workStats.archiveVisited =
+                            (adop._workStats.archiveVisited or 0) + 1
+                        local pb = info.pages[p]
+                        if type(pb) ~= "table" then
+                            opts.cursor = nil
+                            return false, "incomplete_archive_pages"
+                        end
+                        pages[p] = pb
                     end
+                    if opts.archivePageCursor then
+                        opts.archivePageCursor[body.campaignId] = nil
+                    end
+                else
+                    opts.cursor = nil
+                    return false, "incomplete_archive_pages"
                 end
                 local archive, aerr = AssemblePagedArchive(body, pages)
                 if not archive then
@@ -2778,6 +3002,9 @@ local function PublishAdoptionTemp(adop, temp, desc)
             confirmVisited = tonumber(adop._workStats.confirmVisited) or 0,
             confirmComparisons = tonumber(adop._workStats.confirmComparisons) or 0,
             completenessVisited = tonumber(adop._workStats.completenessVisited) or 0,
+            indexVisited = tonumber(adop._workStats.indexVisited) or 0,
+            assemblyVisited = tonumber(adop._workStats.assemblyVisited) or 0,
+            archiveVisited = tonumber(adop._workStats.archiveVisited) or 0,
         }
     end
     -- Discard session caches only; live globals were never replaced.
