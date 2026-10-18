@@ -1534,6 +1534,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         _assemblies = {},
         _assemblyPageCount = 0,
         _assemblyOpCount = 0,
+        _assembledByOpId = {},
+        _redeliveryAssemblies = {},
         _confirmEnvelopes = {},
         _confirmByTarget = {},
         _archiveIndex = {},
@@ -1603,13 +1605,57 @@ function GS:GetPendingAdoption()
     return GS._adoption
 end
 
+local function ClearAdoptionAssemblySlot(adop, opId, asm)
+    if type(adop) ~= "table" or type(opId) ~= "string" or type(asm) ~= "table" then
+        return
+    end
+    local pageN = 0
+    for _ in pairs(asm.pages or {}) do
+        pageN = pageN + 1
+    end
+    if asm._countsTowardArena ~= false then
+        adop._assemblyPageCount = math.max(0, (tonumber(adop._assemblyPageCount) or 0) - pageN)
+        if adop._assemblies and adop._assemblies[opId] then
+            adop._assemblyOpCount = math.max(0, (tonumber(adop._assemblyOpCount) or 0) - 1)
+            adop._assemblies[opId] = nil
+        end
+    elseif adop._redeliveryAssemblies then
+        adop._redeliveryAssemblies[opId] = nil
+    end
+end
+
+local function FindAssembledLogicalRecord(adop, opId)
+    if type(adop) ~= "table" or type(opId) ~= "string" then
+        return nil, nil
+    end
+    adop._assembledByOpId = adop._assembledByOpId or {}
+    local rid = adop._assembledByOpId[opId]
+    if type(rid) == "string" and type(adop.records[rid]) == "table" then
+        return rid, adop.records[rid]
+    end
+    for i = 1, #(adop.order or {}) do
+        local id = adop.order[i]
+        local body = adop.records[id]
+        if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table"
+            and body.op.id == opId
+            and not tonumber(body.pageCount)
+            and not (body.op and tonumber(body.op.pageCount)) then
+            adop._assembledByOpId[opId] = id
+            return id, body
+        end
+    end
+    return nil, nil
+end
+
 --- Finalize a completed assembly into one logical gs-op in adop.order.
+-- Idempotent for exact redelivery of an already-finalized manifest.
 local function FinalizeAdoptionAssembly(adop, opId)
     if type(adop) ~= "table" or type(opId) ~= "string" or not GS.AssembleOpFromPages then
         return false
     end
     local stats = EnsureAdoptionWorkStats(adop)
-    local asm = adop._assemblies and adop._assemblies[opId]
+    local asm = (adop._assemblies and adop._assemblies[opId])
+        or (adop._redeliveryAssemblies and adop._redeliveryAssemblies[opId])
     if type(asm) ~= "table" or type(asm.shell) ~= "table" then
         return false
     end
@@ -1628,15 +1674,29 @@ local function FinalizeAdoptionAssembly(adop, opId)
     if not assembled then
         return false, aerr
     end
+    local existingRid, existingBody = FindAssembledLogicalRecord(adop, opId)
+    if existingRid and existingBody then
+        if DeepEqual(existingBody, assembled) then
+            ClearAdoptionAssemblySlot(adop, opId, asm)
+            return true, "duplicate"
+        end
+        -- Conflict: leave the logical record untouched.
+        ClearAdoptionAssemblySlot(adop, opId, asm)
+        return false, "id_conflict"
+    end
     if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
         return false, "full"
     end
     local logicalId = asm.shellRecordId or ("gs:op:" .. opId)
     if adop.records[logicalId] then
-        logicalId = logicalId .. ":assembled"
+        -- Distinct body already occupies the shell id; do not invent a second logical op.
+        ClearAdoptionAssemblySlot(adop, opId, asm)
+        return false, "id_conflict"
     end
     adop.records[logicalId] = assembled
     adop.order[#adop.order + 1] = logicalId
+    adop._assembledByOpId = adop._assembledByOpId or {}
+    adop._assembledByOpId[opId] = logicalId
     if assembled.evidenceOnly ~= true and type(assembled.op) == "table"
         and type(assembled.op.id) == "string" then
         local oid = assembled.op.id
@@ -1648,22 +1708,66 @@ local function FinalizeAdoptionAssembly(adop, opId)
     elseif type(assembled.op) == "table" then
         IndexAdoptionEnvelope(adop, assembled.op)
     end
-    local pageN = 0
-    for _ in pairs(asm.pages or {}) do
-        pageN = pageN + 1
-    end
-    if asm.shell then
-        pageN = pageN -- shell was not counted as a page
-    end
-    adop._assemblyPageCount = math.max(0, (tonumber(adop._assemblyPageCount) or 0) - pageN)
-    if adop._assemblies[opId] then
-        adop._assemblyOpCount = math.max(0, (tonumber(adop._assemblyOpCount) or 0) - 1)
-        adop._assemblies[opId] = nil
-    end
+    ClearAdoptionAssemblySlot(adop, opId, asm)
     return true
 end
 
+--- Redelivery of an already-finalized manifest: assemble in a scratch slot and
+-- compare without consuming arena capacity or appending another logical record.
+local function BufferAssembledRedelivery(adop, recordId, body, opId, isShell, pageCount)
+    adop._redeliveryAssemblies = adop._redeliveryAssemblies or {}
+    local asm = adop._redeliveryAssemblies[opId]
+    if not asm then
+        asm = { pages = {}, pageCount = pageCount, _countsTowardArena = false }
+        adop._redeliveryAssemblies[opId] = asm
+    end
+    if pageCount and (not asm.pageCount or asm.pageCount < pageCount) then
+        asm.pageCount = pageCount
+    end
+    if isShell then
+        if asm.shell and not DeepEqual(asm.shell, body) then
+            return "rejected", "id_conflict"
+        end
+        asm.shell = body
+        asm.shellRecordId = recordId
+    else
+        local p = tonumber(body.page) or 0
+        if p < 1 then
+            return "rejected", "invalid_record"
+        end
+        if asm.pages[p] then
+            if DeepEqual(asm.pages[p], body) then
+                local complete = select(1, GS:IsAdoptionTransferComplete())
+                return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+            end
+            return "rejected", "id_conflict"
+        end
+        asm.pages[p] = body
+        if tonumber(body.pageCount) then
+            asm.pageCount = asm.pageCount or tonumber(body.pageCount)
+        end
+    end
+    local ok, detail = FinalizeAdoptionAssembly(adop, opId)
+    local complete = select(1, GS:IsAdoptionTransferComplete())
+    adop.ready = complete and true or false
+    if complete then
+        NotifyAdoptionStateChanged("ready")
+    end
+    if ok and detail == "duplicate" then
+        return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+    end
+    if not ok and detail == "id_conflict" then
+        return "rejected", "id_conflict"
+    end
+    if ok then
+        return "accepted", complete and "ready" or nil
+    end
+    return "accepted", complete and "ready" or nil
+end
+
 --- Park paged op shells/pages in a bounded assembly arena (not logical order).
+-- Arena-full returns pending/assembly_full so provider/transport can retry after
+-- in-flight manifests finalize and free slots (no silent 24-op history cap).
 local function BufferAdoptionAssembly(adop, recordId, body)
     local stats = EnsureAdoptionWorkStats(adop)
     stats.assemblyVisited = (stats.assemblyVisited or 0) + 1
@@ -1688,12 +1792,17 @@ local function BufferAdoptionAssembly(adop, recordId, body)
             return "rejected", "invalid_record"
         end
     end
+    -- Exact redelivery of a completed logical manifest must not append another row.
+    local existingRid = select(1, FindAssembledLogicalRecord(adop, opId))
+    if existingRid then
+        return BufferAssembledRedelivery(adop, recordId, body, opId, isShell, pageCount)
+    end
     local asm = adop._assemblies[opId]
     if not asm then
         if adop._assemblyOpCount >= (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24) then
-            return "rejected", "full"
+            return "pending", "assembly_full"
         end
-        asm = { pages = {}, pageCount = pageCount }
+        asm = { pages = {}, pageCount = pageCount, _countsTowardArena = true }
         adop._assemblies[opId] = asm
         adop._assemblyOpCount = adop._assemblyOpCount + 1
     end
@@ -1705,11 +1814,6 @@ local function BufferAdoptionAssembly(adop, recordId, body)
             return "rejected", "id_conflict"
         end
         if not asm.shell then
-            if adop._assemblyPageCount >= (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0)
-                and (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0) > 0 then
-                -- Shell metadata is required for completion; allow one shell marker
-                -- without counting it as a wire page when arena is at page cap.
-            end
             asm.shell = body
             asm.shellRecordId = recordId
         end
@@ -1726,7 +1830,7 @@ local function BufferAdoptionAssembly(adop, recordId, body)
             return "rejected", "id_conflict"
         end
         if adop._assemblyPageCount >= (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0) then
-            return "rejected", "full"
+            return "pending", "assembly_full"
         end
         asm.pages[p] = body
         adop._assemblyPageCount = adop._assemblyPageCount + 1
@@ -1734,11 +1838,17 @@ local function BufferAdoptionAssembly(adop, recordId, body)
             asm.pageCount = asm.pageCount or tonumber(body.pageCount)
         end
     end
-    local finalized = FinalizeAdoptionAssembly(adop, opId)
+    local finalized, finDetail = FinalizeAdoptionAssembly(adop, opId)
     local complete = select(1, GS:IsAdoptionTransferComplete())
     adop.ready = complete and true or false
     if complete then
         NotifyAdoptionStateChanged("ready")
+    end
+    if finalized and finDetail == "duplicate" then
+        return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+    end
+    if not finalized and finDetail == "id_conflict" then
+        return "rejected", "id_conflict"
     end
     if finalized then
         return "accepted", complete and "ready" or nil
@@ -1929,6 +2039,21 @@ function GS.GetAdoptionWorkStats()
         indexVisited = tonumber(stats.indexVisited) or 0,
         assemblyVisited = tonumber(stats.assemblyVisited) or 0,
         archiveVisited = tonumber(stats.archiveVisited) or 0,
+    }
+end
+
+--- Per-callback final-completeness stats (not replay GS._lastAdoptionSliceStats).
+function GS.GetAdoptionCompletenessStats()
+    local stats = GS._lastAdoptionCompletenessStats
+    if type(stats) ~= "table" then
+        return nil
+    end
+    return {
+        used = tonumber(stats.used) or 0,
+        budget = stats.budget,
+        archiveVisited = tonumber(stats.archiveVisited) or 0,
+        completenessVisited = tonumber(stats.completenessVisited) or 0,
+        budgetExhausted = stats.budgetExhausted == true,
     }
 end
 
@@ -2651,6 +2776,8 @@ end
 -- opts.budget / opts.cursor resume foreign-confirmation and archive checks so the
 -- final publish gate cannot synchronously cross-product a full legal history.
 -- Source-authored bodies skip confirmation search entirely.
+-- Per-callback work is published on GS._lastAdoptionCompletenessStats (separate
+-- from replay GS._lastAdoptionSliceStats).
 local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     opts = opts or {}
     adop._workStats = adop._workStats or {
@@ -2661,14 +2788,29 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     local budget = tonumber(opts.budget) or math.huge
     -- Per-call visit budget; resume position lives in opts.cursor only.
     local visited = 0
+    local archiveVisitedCall = 0
     local start = tonumber(opts.cursor) or 1
     if start < 1 then
         start = 1
+    end
+    local function publishCompletenessStats()
+        local finiteBudget = budget
+        if finiteBudget == math.huge then
+            finiteBudget = nil
+        end
+        GS._lastAdoptionCompletenessStats = {
+            used = visited,
+            budget = finiteBudget,
+            archiveVisited = archiveVisitedCall,
+            completenessVisited = visited,
+            budgetExhausted = opts.budgetExhausted == true,
+        }
     end
     for i = start, #adop.order do
         if visited >= budget then
             opts.cursor = i
             opts.budgetExhausted = true
+            publishCompletenessStats()
             return false, "budget"
         end
         local body = adop.records[adop.order[i]]
@@ -2691,6 +2833,7 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     opts.confirmCursor[oid] = searchOpts.cursor
                     opts.cursor = i
                     opts.budgetExhausted = true
+                    publishCompletenessStats()
                     return false, "budget"
                 elseif opts.confirmCursor then
                     opts.confirmCursor[oid] = nil
@@ -2710,6 +2853,7 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             if not settled then
                 opts.cursor = nil
                 opts.budgetExhausted = false
+                publishCompletenessStats()
                 return false, "incomplete_transfer"
             end
         elseif type(body) == "table" and body.kind == "campaign-header" then
@@ -2724,58 +2868,66 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[h.campaignId])
                 if have == nil then
                     opts.cursor = nil
+                    publishCompletenessStats()
                     return false, "missing_campaign_header"
                 end
             end
         elseif type(body) == "table" and body.kind == "campaign-archive" then
             if body.campaignId and temp.currentCampaignId == body.campaignId then
                 opts.cursor = nil
+                publishCompletenessStats()
                 return false, "invalid_campaign_archive"
             end
             if body.campaignId and temp.campaignArchives[body.campaignId] == nil then
                 opts.cursor = nil
+                publishCompletenessStats()
                 return false, "invalid_campaign_archive"
             end
             local pageCount = tonumber(body.pageCount) or 1
             if (not body.requestedItems) and pageCount >= 1 then
-                local pages = {}
                 local info = adop._archiveIndex and adop._archiveIndex[body.campaignId]
-                if type(info) == "table" and type(info.pages) == "table" then
-                    local startPage = tonumber(opts.archivePageCursor and opts.archivePageCursor[body.campaignId]) or 1
-                    for p = startPage, pageCount do
-                        if visited >= budget then
-                            opts.archivePageCursor = opts.archivePageCursor or {}
-                            opts.archivePageCursor[body.campaignId] = p
-                            opts.cursor = i
-                            opts.budgetExhausted = true
-                            return false, "budget"
-                        end
-                        visited = visited + 1
-                        adop._workStats.completenessVisited =
-                            (adop._workStats.completenessVisited or 0) + 1
-                        adop._workStats.archiveVisited =
-                            (adop._workStats.archiveVisited or 0) + 1
-                        local pb = info.pages[p]
-                        if type(pb) ~= "table" then
-                            opts.cursor = nil
-                            return false, "incomplete_archive_pages"
-                        end
-                        pages[p] = pb
-                    end
-                    if opts.archivePageCursor then
-                        opts.archivePageCursor[body.campaignId] = nil
-                    end
-                else
+                if type(info) ~= "table" or type(info.pages) ~= "table" then
                     opts.cursor = nil
+                    publishCompletenessStats()
                     return false, "incomplete_archive_pages"
                 end
-                local archive, aerr = AssemblePagedArchive(body, pages)
+                -- Bounded presence validation only. Resume charges remaining pages;
+                -- assemble always uses the immutable indexed page set so a yield
+                -- mid-archive cannot drop pages 1..p-1 from a fresh local table.
+                local startPage = tonumber(opts.archivePageCursor and opts.archivePageCursor[body.campaignId]) or 1
+                for p = startPage, pageCount do
+                    if visited >= budget then
+                        opts.archivePageCursor = opts.archivePageCursor or {}
+                        opts.archivePageCursor[body.campaignId] = p
+                        opts.cursor = i
+                        opts.budgetExhausted = true
+                        publishCompletenessStats()
+                        return false, "budget"
+                    end
+                    visited = visited + 1
+                    archiveVisitedCall = archiveVisitedCall + 1
+                    adop._workStats.completenessVisited =
+                        (adop._workStats.completenessVisited or 0) + 1
+                    adop._workStats.archiveVisited =
+                        (adop._workStats.archiveVisited or 0) + 1
+                    if type(info.pages[p]) ~= "table" then
+                        opts.cursor = nil
+                        publishCompletenessStats()
+                        return false, "incomplete_archive_pages"
+                    end
+                end
+                if opts.archivePageCursor then
+                    opts.archivePageCursor[body.campaignId] = nil
+                end
+                local archive, aerr = AssemblePagedArchive(body, info.pages)
                 if not archive then
                     opts.cursor = nil
+                    publishCompletenessStats()
                     return false, aerr or "incomplete_archive_pages"
                 end
                 if not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
                     opts.cursor = nil
+                    publishCompletenessStats()
                     return false, "archive_conflict"
                 end
             end
@@ -2783,6 +2935,7 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     end
     opts.cursor = nil
     opts.budgetExhausted = false
+    publishCompletenessStats()
     return true, nil
 end
 

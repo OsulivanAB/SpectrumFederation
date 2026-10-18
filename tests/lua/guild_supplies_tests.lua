@@ -10756,6 +10756,529 @@ do
     assertEq(#world.chat, 0, "3A16: no chat")
 end
 
+---------------------------------------------------------------------------
+-- 3A17) Archive completeness across slices; completed-manifest idempotency;
+--       >24 interleaved paged ops with provider recovery
+---------------------------------------------------------------------------
+do
+    local function assertSerEq(a, b, msg)
+        assertEq(serTable(a), serTable(b), msg)
+    end
+    local function snapshotDurable(rec)
+        return {
+            datasetId = rec.datasetId,
+            currentCampaignId = rec.currentCampaignId,
+            bankTab = rec.accounting and rec.accounting._consumables
+                and rec.accounting._consumables.bankTab,
+            order = (function()
+                local o = {}
+                for i = 1, #(rec.operations.order or {}) do
+                    o[i] = rec.operations.order[i]
+                end
+                return o
+            end)(),
+            archiveIds = (function()
+                local ids = {}
+                if type(rec.campaignArchives) == "table" then
+                    for id in pairs(rec.campaignArchives) do
+                        ids[#ids + 1] = id
+                    end
+                    table.sort(ids)
+                end
+                return ids
+            end)(),
+            archiveItems = (function()
+                local out = {}
+                if type(rec.campaignArchives) == "table" then
+                    for id, arch in pairs(rec.campaignArchives) do
+                        out[id] = arch.requestedItems
+                    end
+                end
+                return out
+            end)(),
+        }
+    end
+
+    -- A: multi-page archive completeness yields mid-pages across timer slices.
+    -- Fail-before: ValidateAdoptionCompleteness rebuilt local pages={} after yield
+    -- and AssemblePagedArchive missed pages 1..p-1 → incomplete_archive_pages.
+    do
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        local camp1 = startCampaign()
+        local ds = GS:GetCurrentRecord().datasetId
+        -- >12 items → meta without inline requestedItems + ≥2 archive pages.
+        for i = 1, 26 do
+            local op = select(1, GS:NewConfigOperation("set-requested-item",
+                { itemId = 9000 + i }, { itemId = 9000 + i, goal = 1 }))
+            assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "3A17: arch item " .. i)
+        end
+        startCampaign()
+        assertTrue(GS:GetCurrentRecord().campaignArchives
+            and GS:GetCurrentRecord().campaignArchives[camp1.id] ~= nil,
+            "3A17: multi-page archive present")
+        local archivedItems = GS:GetCurrentRecord().campaignArchives[camp1.id].requestedItems
+        local tab = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 7))
+        assertEq(GS:ApplyStagedConfigOperation(tab), "accepted", "3A17: post-archive tab")
+        -- Extra accepted ops so completeness visits many preceding bodies before
+        -- archive page validation (forces archivePageCursor > 1 under tiny slice).
+        for i = 1, 40 do
+            local op = select(1, GS:NewConfigOperation("set-requested-item",
+                { itemId = 9100 + i }, { itemId = 9100 + i, goal = 2 }))
+            assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "3A17: pad op " .. i)
+        end
+        local sourceDataset = GS:GetCurrentRecord().datasetId
+        local snap = snapshotDurable(GS:GetCurrentRecord())
+        GS.NotifyLocalDurableChange("dataset")
+        drainExportMaint(256)
+        local exportAll = collectAllExportBodies()
+        local archMeta, archPages = nil, 0
+        for i = 1, #exportAll do
+            local b = exportAll[i].body
+            if b and b.kind == "campaign-archive" and b.campaignId == camp1.id then
+                archMeta = b
+            elseif b and b.kind == "campaign-archive-page" and b.campaignId == camp1.id then
+                archPages = archPages + 1
+            end
+        end
+        assertTrue(archMeta ~= nil, "3A17: archive meta exported")
+        assertEq(archMeta.requestedItems, nil, "3A17: multi-page archive omits inline items")
+        assertTrue(archPages >= 2, "3A17: ≥2 archive pages exported got=" .. tostring(archPages))
+
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        GS._lastAdoptionCompletenessStats = nil
+        initGS()
+        GS:CreateStagedRecord()
+        local beforeCancel = snapshotDurable(GS:GetCurrentRecord())
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+            "3A17: archive-slice begin")
+        for i = 1, #exportAll do
+            local stB = select(1, GS:BufferAdoptionRecord(exportAll[i].id, exportAll[i].body))
+            assertTrue(stB == "accepted" or stB == "duplicate",
+                "3A17: archive-slice buffer " .. tostring(stB))
+        end
+        assertTrue(GS:GetPendingAdoption().ready, "3A17: archive-slice transfer ready")
+
+        local savedSlice = GS.MAX_ADMISSION_WORK_PER_SLICE
+        GS.MAX_ADMISSION_WORK_PER_SLICE = 4
+        GS._adoptionReplaySyncDrain = false
+        local st1 = select(1, GS:CommitDatasetAdoption())
+        assertTrue(st1 == "pending" or st1 == "accepted", "3A17: archive-slice commit starts")
+        local sawCompletenessYield = false
+        local maxCompUsed = 0
+        local slices = 0
+        while GS._adoption and GS._adoption.replayTemp and slices < 8000 do
+            slices = slices + 1
+            flushTimers()
+            world.time = world.time + 1
+            flushTimers()
+            local cstats = GS._lastAdoptionCompletenessStats
+            if type(cstats) == "table" then
+                local used = tonumber(cstats.used) or 0
+                maxCompUsed = math.max(maxCompUsed, used)
+                assertTrue(used <= (GS.MAX_ADMISSION_WORK_PER_SLICE or 4) + 2,
+                    "3A17: completeness callback used bounded: " .. tostring(used))
+                if cstats.budgetExhausted == true then
+                    sawCompletenessYield = true
+                end
+            end
+        end
+        GS.MAX_ADMISSION_WORK_PER_SLICE = savedSlice
+        GS._adoptionReplaySyncDrain = true
+        assertEq(GS:GetPendingAdoption(), nil, "3A17: archive-slice eventually idle")
+        assertEq(GS:GetCurrentRecord().datasetId, sourceDataset,
+            "3A17: archive-slice adopt dataset")
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 7,
+            "3A17: archive-slice adopt tab")
+        assertSerEq(GS:GetCurrentRecord().campaignArchives[camp1.id].requestedItems,
+            archivedItems, "3A17: exact archive items after mid-slice completeness")
+        assertSerEq(snapshotDurable(GS:GetCurrentRecord()).archiveIds, snap.archiveIds,
+            "3A17: archive id set preserved")
+        assertTrue(sawCompletenessYield or maxCompUsed >= 1,
+            "3A17: completeness callback observed (yield or work)")
+        local finalComp = GS.GetAdoptionCompletenessStats()
+        assertTrue(type(finalComp) == "table", "3A17: completeness stats separate from replay")
+
+        -- Cancel safety: prior durable state preserved mid-transfer.
+        SpectrumFederationDB = {}
+        switchPlayer("Bob", "Player-1-Bob", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        local before = snapshotDurable(GS:GetCurrentRecord())
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+        GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)
+        for i = 1, math.min(20, #exportAll) do
+            GS:BufferAdoptionRecord(exportAll[i].id, exportAll[i].body)
+        end
+        GS:CancelDatasetAdoption()
+        assertSerEq(snapshotDurable(GS:GetCurrentRecord()), before,
+            "3A17: archive-slice cancel preserves prior durable state")
+        assertTrue(type(beforeCancel) == "table", "3A17: carol prior snapshot captured")
+    end
+
+    -- B: completed-manifest redelivery is idempotent before Commit.
+    -- Fail-before: Finalize deleted assembly; redelivery appended ":assembled"
+    -- and broke descriptor counts / readiness.
+    do
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        startCampaign()
+        local ds = GS:GetCurrentRecord().datasetId
+        local rows = {}
+        for i = 1, 12 do
+            local id = string.format("redel-c-%02d", i)
+            local body = {
+                schemaVersion = 1, id = id, guildKey = "club:42", datasetId = ds,
+                campaignId = GS:GetCurrentRecord().currentCampaignId,
+                kind = "set-requested-item",
+                target = { itemId = 9200 + i },
+                value = { itemId = 9200 + i, goal = 1, removed = false },
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+                timestamp = 96000 + i,
+                baseTargetRevision = ds,
+                basePolicyRevision = GS:GetCurrentRecord().permission.revisionId,
+                baseCampaignId = GS:GetCurrentRecord().currentCampaignId,
+            }
+            assertEq(GS:AdmitRemoteOperation(body, { sender = "Bob-Garona", relay = true }),
+                "pending", "3A17: redel cand " .. id)
+            rows[#rows + 1] = { id = id, body = body }
+        end
+        local conf, stc = GS:NewConfirmationOperation({ records = rows })
+        assertEq(stc, "accepted", "3A17: redel confirm prepare")
+        assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "3A17: redel confirm apply")
+        local storedConf = snapshotOp(conf)
+        local tab = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 3))
+        assertEq(GS:ApplyStagedConfigOperation(tab), "accepted", "3A17: redel tab")
+        GS.NotifyLocalDurableChange("dataset")
+        drainExportMaint(128)
+        local exportBodies = collectAllExportBodies()
+        local shellBody, pageBodies = nil, {}
+        for i = 1, #exportBodies do
+            local b = exportBodies[i].body
+            if b and b.kind == "gs-op" and b.op and b.op.id == conf.id and tonumber(b.pageCount) then
+                shellBody = b
+            elseif b and b.kind == "gs-op-page" and b.opId == conf.id then
+                pageBodies[#pageBodies + 1] = b
+            end
+        end
+        assertTrue(shellBody ~= nil, "3A17: redel paged shell")
+        assertTrue(#pageBodies >= 1, "3A17: redel pages")
+
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", ds)), "accepted",
+            "3A17: redel begin")
+        for i = 1, #exportBodies do
+            local stB = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+            assertTrue(stB == "accepted" or stB == "duplicate",
+                "3A17: redel buffer " .. tostring(stB))
+        end
+        local adop = GS:GetPendingAdoption()
+        assertTrue(adop and adop.ready, "3A17: redel ready before redelivery")
+        local orderBefore = #adop.order
+        local acceptedBefore = #(adop.sourceAcceptedIds or {})
+        local completeBefore = select(1, GS:IsAdoptionTransferComplete())
+        assertEq(completeBefore, true, "3A17: transfer complete before redelivery")
+
+        -- Provider-path exact redelivery of shell + every page before Commit.
+        local stShell = select(1, providerApply(shellBody, "Alice-Garona"))
+        assertTrue(stShell == "accepted" or stShell == "duplicate",
+            "3A17: redel shell status " .. tostring(stShell))
+        for i = 1, #pageBodies do
+            local stP = select(1, providerApply(pageBodies[i], "Alice-Garona"))
+            assertTrue(stP == "accepted" or stP == "duplicate",
+                "3A17: redel page status " .. tostring(stP))
+        end
+        adop = GS:GetPendingAdoption()
+        assertTrue(adop ~= nil, "3A17: adoption still open after redelivery")
+        assertEq(#adop.order, orderBefore, "3A17: logical order unchanged after redelivery")
+        assertEq(#(adop.sourceAcceptedIds or {}), acceptedBefore,
+            "3A17: sourceAcceptedIds unchanged after redelivery")
+        assertEq(select(1, GS:IsAdoptionTransferComplete()), true,
+            "3A17: still complete after redelivery")
+        assertTrue(adop.ready, "3A17: readiness preserved after redelivery")
+        -- Conflicting content must reject without mutating logical counts.
+        local badPage = {}
+        for k, v in pairs(pageBodies[1]) do
+            badPage[k] = v
+        end
+        badPage.records = { { id = "tamper", body = { id = "tamper" } } }
+        local stBad, reasonBad = providerApply(badPage, "Alice-Garona")
+        assertEq(stBad, "rejected", "3A17: conflicting redelivery rejected")
+        assertEq(reasonBad, "id_conflict", "3A17: conflict reason id_conflict")
+        assertEq(#GS:GetPendingAdoption().order, orderBefore,
+            "3A17: conflict leaves logical order unchanged")
+
+        local st, reason = GS:CommitDatasetAdoption()
+        local s = 0
+        while GS._adoption and GS._adoption.replayTemp and s < 4000 do
+            s = s + 1
+            flushTimers()
+            world.time = world.time + 1
+            flushTimers()
+        end
+        assertEq(GS:GetCurrentRecord().datasetId, ds,
+            "3A17: redel adopt: " .. tostring(st) .. "/" .. tostring(reason))
+        assertSerEq(snapshotOp(GS:GetCurrentRecord().operations.records[conf.id]),
+            storedConf, "3A17: exact confirm content after idempotent redelivery")
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3,
+            "3A17: redel adopt tab")
+    end
+
+    -- C: >24 legal paged ops complete under interleaving via provider recovery.
+    -- Fail-before: 25th incomplete op hard-rejected as full with no retry path.
+    do
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        startCampaign()
+        local ds = GS:GetCurrentRecord().datasetId
+        local confIds = {}
+        local maxOid = GS.MAX_OPERATION_ID or 192
+        for n = 1, 28 do
+            local id = string.format("arena-%02d", n)
+            local body = {
+                schemaVersion = 1, id = id, guildKey = "club:42", datasetId = ds,
+                campaignId = GS:GetCurrentRecord().currentCampaignId,
+                kind = "set-requested-item",
+                target = { itemId = 9300 + n },
+                value = { itemId = 9300 + n, goal = 1, removed = false },
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+                timestamp = 97000 + n,
+                baseTargetRevision = ds,
+                basePolicyRevision = GS:GetCurrentRecord().permission.revisionId,
+                baseCampaignId = GS:GetCurrentRecord().currentCampaignId,
+            }
+            assertEq(GS:AdmitRemoteOperation(body, { sender = "Bob-Garona", relay = true }),
+                "pending", "3A17: arena cand " .. id)
+            local oids = {}
+            for j = 1, 6 do
+                local raw = string.format("O%02d%02d-", n, j) .. string.rep("w", maxOid)
+                oids[j] = raw:sub(1, maxOid)
+            end
+            local conf, stc = GS:NewConfirmationOperation({
+                recordId = id,
+                originalIds = oids,
+            })
+            assertEq(stc, "accepted", "3A17: arena conf prepare " .. n)
+            assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted",
+                "3A17: arena conf apply " .. n)
+            confIds[#confIds + 1] = conf.id
+        end
+        local tab = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 4))
+        assertEq(GS:ApplyStagedConfigOperation(tab), "accepted", "3A17: arena tab")
+        GS.NotifyLocalDurableChange("dataset")
+        drainExportMaint(256)
+        local exportBodies = collectAllExportBodies()
+        local byOp = {}
+        local others = {}
+        for i = 1, #exportBodies do
+            local b = exportBodies[i].body
+            local oid = nil
+            if b and b.kind == "gs-op" and b.op and tonumber(b.pageCount) then
+                oid = b.op.id
+            elseif b and b.kind == "gs-op-page" then
+                oid = b.opId
+            end
+            if oid and confIds then
+                local isArena = false
+                for ci = 1, #confIds do
+                    if confIds[ci] == oid then
+                        isArena = true
+                        break
+                    end
+                end
+                if isArena then
+                    byOp[oid] = byOp[oid] or { shell = nil, pages = {} }
+                    if b.kind == "gs-op" then
+                        byOp[oid].shell = b
+                    else
+                        byOp[oid].pages[#byOp[oid].pages + 1] = b
+                    end
+                else
+                    others[#others + 1] = exportBodies[i]
+                end
+            else
+                others[#others + 1] = exportBodies[i]
+            end
+        end
+        local pagedOps = 0
+        for i = 1, #confIds do
+            local info = byOp[confIds[i]]
+            if info and info.shell and #info.pages >= 1 then
+                pagedOps = pagedOps + 1
+            end
+        end
+        assertTrue(pagedOps > (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24),
+            "3A17: fixture has >24 paged ops got=" .. tostring(pagedOps))
+
+        SpectrumFederationDB = {}
+        switchPlayer("Carol", "Player-1-Carol", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        local before = snapshotDurable(GS:GetCurrentRecord())
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+        assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", ds)), "accepted",
+            "3A17: arena begin")
+        for i = 1, #others do
+            local stB = select(1, GS:BufferAdoptionRecord(others[i].id, others[i].body))
+            assertTrue(stB == "accepted" or stB == "duplicate",
+                "3A17: arena other buffer " .. tostring(stB))
+        end
+
+        local arenaCap = GS.MAX_ADOPTION_ASSEMBLY_OPS or 24
+        local deferred = {}
+        local sawAssemblyFull = false
+        -- Pages-first for all paged ops: first `arenaCap` occupy slots; rest defer.
+        for i = 1, #confIds do
+            local info = byOp[confIds[i]]
+            if info and info.shell then
+                local blocked = false
+                for pi = 1, #info.pages do
+                    local stP, reasonP = providerApply(info.pages[pi], "Alice-Garona")
+                    if stP == "pending" and reasonP == "assembly_full" then
+                        sawAssemblyFull = true
+                        blocked = true
+                        deferred[#deferred + 1] = { kind = "page", body = info.pages[pi], opId = confIds[i] }
+                    else
+                        assertTrue(stP == "accepted" or stP == "duplicate" or stP == "pending",
+                            "3A17: arena page " .. tostring(stP) .. "/" .. tostring(reasonP))
+                    end
+                end
+                if blocked then
+                    deferred[#deferred + 1] = { kind = "shell", body = info.shell, opId = confIds[i] }
+                end
+            end
+        end
+        assertTrue(sawAssemblyFull, "3A17: observed assembly_full under pages-first interleaving")
+        local adop = GS:GetPendingAdoption()
+        assertTrue((tonumber(adop._assemblyOpCount) or 0) <= arenaCap,
+            "3A17: in-flight assemblies bounded by arena cap")
+
+        -- Finalize in-flight manifests (shells) to free slots, then retry deferred.
+        for i = 1, #confIds do
+            local info = byOp[confIds[i]]
+            if info and info.shell then
+                local stS, reasonS = providerApply(info.shell, "Alice-Garona")
+                assertTrue(
+                    stS == "accepted" or stS == "duplicate" or stS == "pending",
+                    "3A17: arena shell " .. tostring(stS) .. "/" .. tostring(reasonS))
+            end
+        end
+
+        local guard = 0
+        while #deferred > 0 and guard < 400 do
+            guard = guard + 1
+            local nextDeferred = {}
+            for i = 1, #deferred do
+                local d = deferred[i]
+                local stR, reasonR = providerApply(d.body, "Alice-Garona")
+                if stR == "pending" and reasonR == "assembly_full" then
+                    nextDeferred[#nextDeferred + 1] = d
+                else
+                    assertTrue(stR == "accepted" or stR == "duplicate" or stR == "pending",
+                        "3A17: arena retry " .. tostring(stR) .. "/" .. tostring(reasonR))
+                end
+            end
+            -- Free more capacity if retries still blocked.
+            if #nextDeferred > 0 then
+                for i = 1, #confIds do
+                    local info = byOp[confIds[i]]
+                    if info and info.shell then
+                        providerApply(info.shell, "Alice-Garona")
+                        for pi = 1, #info.pages do
+                            providerApply(info.pages[pi], "Alice-Garona")
+                        end
+                    end
+                end
+            end
+            deferred = nextDeferred
+        end
+        assertEq(#deferred, 0, "3A17: all assembly_full records recovered via provider retry")
+        assertTrue(GS:GetPendingAdoption().ready, "3A17: arena transfer ready after recovery")
+        assertTrue((tonumber(GS:GetPendingAdoption()._assemblyOpCount) or 0) == 0,
+            "3A17: assembly arena drained after finalization")
+
+        local st, reason = GS:CommitDatasetAdoption()
+        local s = 0
+        while GS._adoption and GS._adoption.replayTemp and s < 8000 do
+            s = s + 1
+            flushTimers()
+            world.time = world.time + 1
+            flushTimers()
+        end
+        assertEq(GS:GetCurrentRecord().datasetId, ds,
+            "3A17: arena adopt: " .. tostring(st) .. "/" .. tostring(reason))
+        for i = 1, #confIds do
+            assertTrue(GS:GetCurrentRecord().operations.records[confIds[i]] ~= nil,
+                "3A17: arena confirm " .. i .. " present")
+        end
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 4,
+            "3A17: arena adopt tab")
+
+        -- Cancel mid-arena still preserves prior durable state.
+        SpectrumFederationDB = {}
+        switchPlayer("Bob", "Player-1-Bob", 2)
+        settleRoster()
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._adoption = nil
+        initGS()
+        GS:CreateStagedRecord()
+        local before2 = snapshotDurable(GS:GetCurrentRecord())
+        GS:EnsureGossipProvider()
+        GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+        GS:BeginDatasetAdoption("Alice-Garona", ds)
+        for i = 1, math.min(8, #confIds) do
+            local info = byOp[confIds[i]]
+            if info then
+                for pi = 1, #info.pages do
+                    providerApply(info.pages[pi], "Alice-Garona")
+                end
+            end
+        end
+        GS:CancelDatasetAdoption()
+        assertSerEq(snapshotDurable(GS:GetCurrentRecord()), before2,
+            "3A17: arena cancel preserves prior state")
+        assertTrue(type(before) == "table", "3A17: carol arena prior snapshot")
+    end
+
+    assertEq(#world.chat, 0, "3A17: no chat")
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
