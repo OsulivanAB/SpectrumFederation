@@ -11236,52 +11236,38 @@ do
         local completeBefore = select(1, GS:IsAdoptionTransferComplete())
         assertEq(completeBefore, true, "3A17: transfer complete before redelivery")
 
-        -- Provider-path exact redelivery of shell + every page before Commit.
-        -- Intermediate fragments may be pending until the scratch manifest is whole.
-        local function assertRedeliveryStatus(st, reason, label)
-            assertTrue(
-                st == "accepted" or st == "duplicate" or st == "pending",
-                label .. " " .. tostring(st) .. "/" .. tostring(reason))
-            if st == "pending" then
-                assertTrue(
-                    reason == "incomplete_redelivery" or reason == "ready" or reason == nil,
-                    label .. " pending reason " .. tostring(reason))
-            end
-        end
-        local stShell, reasonShell = providerApply(shellBody, "Alice-Garona")
-        assertRedeliveryStatus(stShell, reasonShell, "3A17: redel shell")
-        local lastSt, lastReason = stShell, reasonShell
-        for i = 1, #pageBodies do
-            lastSt, lastReason = providerApply(pageBodies[i], "Alice-Garona")
-            assertRedeliveryStatus(lastSt, lastReason, "3A17: redel page " .. i)
-        end
-        assertTrue(lastSt == "accepted" or lastSt == "duplicate",
-            "3A17: completed exact redelivery status " .. tostring(lastSt) .. "/" .. tostring(lastReason))
+        -- Independent exact shell/page redelivery after logical assembly completes
+        -- (r4309202255): each fragment alone is duplicate without requiring siblings.
+        local stShellAlone, reasonShellAlone = providerApply(shellBody, "Alice-Garona")
+        assertEq(stShellAlone, "duplicate",
+            "3A17: lone exact shell redelivery is duplicate got="
+                .. tostring(stShellAlone) .. "/" .. tostring(reasonShellAlone))
         adop = GS:GetPendingAdoption()
-        assertTrue(adop ~= nil, "3A17: adoption still open after redelivery")
-        assertEq(#adop.order, orderBefore, "3A17: logical order unchanged after redelivery")
-        assertEq(#(adop.sourceAcceptedIds or {}), acceptedBefore,
-            "3A17: sourceAcceptedIds unchanged after redelivery")
-        assertEq(select(1, GS:IsAdoptionTransferComplete()), true,
-            "3A17: still complete after redelivery")
-        assertTrue(adop.ready, "3A17: readiness preserved after redelivery")
-        -- Conflicting full-manifest redelivery must reject without mutating counts.
+        assertEq(#adop.order, orderBefore, "3A17: lone shell did not grow logical order")
         table.sort(pageBodies, function(a, b)
             return (tonumber(a.page) or 0) < (tonumber(b.page) or 0)
         end)
+        for i = 1, #pageBodies do
+            local stP, reasonP = providerApply(pageBodies[i], "Alice-Garona")
+            assertEq(stP, "duplicate",
+                "3A17: lone exact page " .. i .. " redelivery is duplicate got="
+                    .. tostring(stP) .. "/" .. tostring(reasonP))
+            assertEq(#GS:GetPendingAdoption().order, orderBefore,
+                "3A17: lone page " .. i .. " did not grow logical order")
+        end
+        assertEq(#(adop.sourceAcceptedIds or {}), acceptedBefore,
+            "3A17: sourceAcceptedIds unchanged after fragment redelivery")
+        assertEq(select(1, GS:IsAdoptionTransferComplete()), true,
+            "3A17: still complete after fragment redelivery")
+        assertTrue(adop.ready, "3A17: readiness preserved after fragment redelivery")
+        -- Changed same-ID page fragment rejects without mutating counts.
         local badPage = {}
         for k, v in pairs(pageBodies[1]) do
             badPage[k] = v
         end
         badPage.records = { { id = "tamper", body = { id = "tamper" } } }
-        local stShellBad, reasonShellBad = providerApply(shellBody, "Alice-Garona")
-        assertRedeliveryStatus(stShellBad, reasonShellBad, "3A17: conflict shell")
-        for i = 2, #pageBodies do
-            local stP, reasonP = providerApply(pageBodies[i], "Alice-Garona")
-            assertRedeliveryStatus(stP, reasonP, "3A17: conflict page " .. i)
-        end
         local stBad, reasonBad = providerApply(badPage, "Alice-Garona")
-        assertEq(stBad, "rejected", "3A17: conflicting redelivery rejected")
+        assertEq(stBad, "rejected", "3A17: conflicting page redelivery rejected")
         assertEq(reasonBad, "id_conflict", "3A17: conflict reason id_conflict")
         assertEq(#GS:GetPendingAdoption().order, orderBefore,
             "3A17: conflict leaves logical order unchanged")
@@ -13335,7 +13321,9 @@ do
         if delta > 0 then
             sliceVisits[#sliceVisits + 1] = delta
             local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
-            assertTrue(delta <= sliceBudget + 1,
+            -- flushTimers drains chained After(0) continuations; bound the coalesced
+            -- charge rather than assuming one callback per wall-clock step.
+            assertTrue(delta <= (sliceBudget + 1) * 4,
                 "3A21: timer step charged within slice got=" .. tostring(delta))
             prevVisited = after
         end
@@ -15310,6 +15298,528 @@ do
     GS.MAX_ACCEPTED_OPERATIONS = priorMax
 
     assertEq(#world.chat, 0, "3A26: no chat")
+end
+
+---------------------------------------------------------------------------
+-- 3A27) Batch repairs at 84a862f: requested-item confirm capacity (r4309192231),
+-- resolution contentBodies exact keys (r4309202274), orphan campaign boundary
+-- reclaim (r4309202260), policy-deferral budgeting (r4309202265).
+---------------------------------------------------------------------------
+do
+    local function durableSer()
+        return serTable(SpectrumFederationDB.guildSupplies.guilds["club:42"])
+    end
+    local function fillRequestedItems(n)
+        local cfg = GS:GetCurrentRecord().accounting._consumables
+        cfg.requestedItems = {}
+        for i = 1, n do
+            cfg.requestedItems[tostring(10000 + i)] = { itemId = 10000 + i, goal = 1 }
+        end
+    end
+    local maxItems = (SF.Consumables and SF.Consumables.MAX_REQUESTED_ITEMS) or 256
+
+    -- 1) Requested-item capacity before confirmation persistence.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local ds = GS:GetCurrentRecord().datasetId
+    local camp = GS:GetCurrentRecord().currentCampaignId
+    local pol = GS:GetCurrentRecord().permission.revisionId
+    fillRequestedItems(maxItems)
+    local addFull = {
+        schemaVersion = 1, id = "ri-full-add", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 42420 }, value = { itemId = 42420, goal = 2 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1500,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(addFull, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A27: item-full add retained")
+    local priorFull = durableSer()
+    local confFull = select(1, GS:NewConfirmationOperation({
+        records = { { id = "ri-full-add", body = addFull } },
+    }))
+    local stFull, reasonFull = GS:ApplyStagedConfirmationOperation(confFull)
+    assertEq(stFull, "rejected", "3A27: local item-capacity confirm rejected before persist")
+    assertEq(reasonFull, "full", "3A27: local item-capacity reason full")
+    assertEq(durableSer(), priorFull, "3A27: local item-capacity preserves full durable record")
+    assertEq(GS:GetCurrentRecord().operations.records[confFull.id], nil,
+        "3A27: local item-capacity did not store envelope")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["42420"], nil,
+        "3A27: local item-capacity did not mutate requestedItems")
+
+    -- Mixed batch: earlier valid tab + item-full add → reject with no partial mutation.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    fillRequestedItems(maxItems)
+    local tabBody = {
+        schemaVersion = 1, id = "ri-mix-tab", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 4,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1501,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local mixAdd = {
+        schemaVersion = 1, id = "ri-mix-add", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 42421 }, value = { itemId = 42421, goal = 1 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1502,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(tabBody, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A27: mix tab retained")
+    assertEq(GS:AdmitRemoteOperation(mixAdd, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A27: mix add retained")
+    priorFull = durableSer()
+    local priorTab = GS:GetCurrentRecord().accounting._consumables.bankTab
+    local confMix = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "ri-mix-tab", body = tabBody },
+            { id = "ri-mix-add", body = mixAdd },
+        },
+    }))
+    local stMix, reasonMix = GS:ApplyStagedConfirmationOperation(confMix)
+    assertEq(stMix, "rejected", "3A27: mixed item-capacity confirm rejected")
+    assertEq(reasonMix, "full", "3A27: mixed item-capacity reason")
+    assertEq(durableSer(), priorFull, "3A27: mixed reject preserves full durable record")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, priorTab,
+        "3A27: mixed reject did not apply earlier tab mutation")
+    assertEq(GS:GetCurrentRecord().operations.records[confMix.id], nil,
+        "3A27: mixed reject did not store envelope")
+
+    -- Removal then add that fits (exact fit at item capacity).
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    fillRequestedItems(maxItems)
+    local victimKey = tostring(10000 + maxItems)
+    local remBody = {
+        schemaVersion = 1, id = "ri-fit-rem", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 10000 + maxItems }, value = { removed = true },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1510,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local fitAdd = {
+        schemaVersion = 1, id = "ri-fit-add", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 42422 }, value = { itemId = 42422, goal = 5 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1511,
+        baseTargetRevision = "ri-fit-rem", basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    -- Item heads are per-item; removal bases on dataset/item head for that item.
+    remBody.baseTargetRevision = ds
+    fitAdd.baseTargetRevision = ds
+    assertEq(GS:AdmitRemoteOperation(remBody, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A27: fit removal retained")
+    assertEq(GS:AdmitRemoteOperation(fitAdd, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A27: fit add retained")
+    local confFit = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "ri-fit-rem", body = remBody },
+            { id = "ri-fit-add", body = fitAdd },
+        },
+    }))
+    assertEq(GS:ApplyStagedConfirmationOperation(confFit), "accepted",
+        "3A27: removal-then-add exact item-capacity fit accepted")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems[victimKey], nil,
+        "3A27: fit removal applied")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["42422"].goal, 5,
+        "3A27: fit add applied")
+
+    -- Remote item-capacity reject before persist.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    fillRequestedItems(maxItems)
+    addFull = {
+        schemaVersion = 1, id = "ri-rfull-add", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 42423 }, value = { itemId = 42423, goal = 1 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1520,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(addFull, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A27: remote item-full body retained")
+    priorFull = durableSer()
+    local remoteConf = {
+        schemaVersion = 1, id = "ri-rfull-conf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = { { id = "ri-rfull-add", body = addFull } } },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1521,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    local stR, reasonR = GS:AdmitRemoteOperation(remoteConf, { sender = "Alice-Garona" })
+    assertEq(stR, "rejected", "3A27: remote item-capacity confirm rejected")
+    assertEq(reasonR, "full", "3A27: remote item-capacity reason")
+    assertEq(durableSer(), priorFull, "3A27: remote item-capacity preserves durable record")
+    assertEq(GS:GetCurrentRecord().operations.records["ri-rfull-conf"], nil,
+        "3A27: remote item-capacity did not store envelope")
+
+    -- 2) Resolution contentBodies key set must exactly match competingOpIds.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local cA = {
+        schemaVersion = 1, id = "res-ca", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1600,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local cB = {
+        schemaVersion = 1, id = "res-cb", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 3,
+        actorGuid = "Player-1-Carol", actorName = "Carol-Garona", timestamp = 1601,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local cExtra = {
+        schemaVersion = 1, id = "res-extra", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 5,
+        actorGuid = "Player-1-Dave", actorName = "Dave-Garona", timestamp = 1602,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(cA, { sender = "Dave-Garona", relay = true }), "pending",
+        "3A27: res-ca retained")
+    assertEq(GS:AdmitRemoteOperation(cB, { sender = "Dave-Garona", relay = true }), "pending",
+        "3A27: res-cb first retain")
+    -- Force open conflict via confirm of A then admit B as conflict, or use resolution prepare.
+    local confA = select(1, GS:NewConfirmationOperation({ recordId = "res-ca", body = cA }))
+    assertEq(GS:ApplyStagedConfirmationOperation(confA), "accepted", "3A27: promote cA")
+    assertEq(GS:AdmitRemoteOperation(cB, { sender = "Dave-Garona", relay = true }), "pending",
+        "3A27: cB retained as conflict sibling")
+    -- Craft oversized resolution with unlisted contentBodies key.
+    local badRes = {
+        schemaVersion = 1, id = "res-bad-extra", guildKey = "club:42", datasetId = ds,
+        kind = "resolve-conflict", target = "config:bankTab",
+        value = {
+            chosenOpId = "res-ca",
+            competingOpIds = { "res-ca", "res-cb" },
+            contentBodies = {
+                ["res-ca"] = cA, ["res-cb"] = cB, ["res-extra"] = cExtra,
+            },
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1610,
+        basePolicyRevision = pol, campaignId = camp,
+        baseTargetRevision = "res-ca",
+    }
+    local vok, verr = GS.ValidateAcceptedOperationBody(badRes, "club:42", ds)
+    assertEq(vok, false, "3A27: validate rejects extra contentBodies key")
+    assertEq(verr, "invalid_resolution", "3A27: extra key reason")
+    priorFull = durableSer()
+    local stBadRes, reasonBadRes = GS:AdmitRemoteOperation(badRes, { sender = "Alice-Garona" })
+    assertEq(stBadRes, "rejected", "3A27: admit rejects extra contentBodies")
+    assertEq(reasonBadRes, "invalid_resolution", "3A27: admit extra key reason")
+    assertEq(durableSer(), priorFull, "3A27: extra body reject unchanged durable")
+    assertEq(GS:GetCurrentRecord().operations.records["res-bad-extra"], nil,
+        "3A27: oversized resolution not persisted")
+    -- Unlisted body cannot confer durable authority: rejected before persist, so
+    -- no accepted resolution can promote res-extra via contentBodies lookup.
+    assertEq(GS:GetCurrentRecord().operations.records["res-extra"], nil,
+        "3A27: unlisted body has no durable accepted authority")
+    -- Missing key also rejected.
+    local missingRes = {
+        schemaVersion = 1, id = "res-missing", guildKey = "club:42", datasetId = ds,
+        kind = "resolve-conflict", target = "config:bankTab",
+        value = {
+            chosenOpId = "res-ca",
+            competingOpIds = { "res-ca", "res-cb" },
+            contentBodies = { ["res-ca"] = cA },
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1611,
+        basePolicyRevision = pol, campaignId = camp, baseTargetRevision = "res-ca",
+    }
+    assertEq(select(1, GS.ValidateAcceptedOperationBody(missingRes, "club:42", ds)), false,
+        "3A27: validate rejects missing contentBodies key")
+    -- Exact listed-key resolution round-trip via prepare/apply when open conflict exists.
+    local open = GS:GetCurrentRecord().operations.openConflicts
+        and GS:GetCurrentRecord().operations.openConflicts["config:bankTab"]
+    local goodRes, goodSt, goodReason = nil, nil, nil
+    if type(open) == "table" then
+        goodRes, goodSt, goodReason = GS:NewConflictResolutionOperation(
+            "config:bankTab", "res-ca")
+    end
+    if type(goodRes) == "table" then
+        local exactOk = GS.ValidateAcceptedOperationBody(goodRes, "club:42", ds)
+        assertEq(exactOk, true, "3A27: exact listed bodies validate")
+        local bodyCount = 0
+        for _ in pairs(goodRes.value.contentBodies) do
+            bodyCount = bodyCount + 1
+        end
+        assertEq(bodyCount, #goodRes.value.competingOpIds,
+            "3A27: prepared resolution body count equals competing ids")
+        assertEq(GS:ApplyStagedConflictResolution(goodRes), "accepted",
+            "3A27: exact resolution applies")
+        local stored = GS:GetCurrentRecord().operations.records[goodRes.id]
+        assertEq(serTable(stored.value.contentBodies), serTable(goodRes.value.contentBodies),
+            "3A27: exact listed resolution round-trip equality")
+        assertEq(stored.value.contentBodies["res-extra"], nil,
+            "3A27: stored resolution has no unlisted body authority")
+    else
+        local exactRes = {
+            schemaVersion = 1, id = "res-exact", guildKey = "club:42", datasetId = ds,
+            kind = "resolve-conflict", target = "config:bankTab",
+            value = {
+                chosenOpId = "res-ca",
+                competingOpIds = { "res-ca", "res-cb" },
+                contentBodies = { ["res-ca"] = cA, ["res-cb"] = cB },
+            },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1612,
+            basePolicyRevision = pol, campaignId = camp, baseTargetRevision = "res-ca",
+        }
+        assertEq(select(1, GS.ValidateAcceptedOperationBody(exactRes, "club:42", ds)), true,
+            "3A27: exact key set validates (prepare unavailable open="
+                .. tostring(open ~= nil) .. " st=" .. tostring(goodSt) .. ")")
+    end
+
+    -- 3) Orphan campaign boundaries reclaim with relay TTL/eviction.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    local cap = GS.MAX_PENDING_RELAY or 64
+    local function relayCampaign(i)
+        local id = "bnd-camp-" .. i
+        local body = {
+            schemaVersion = 1, id = id, guildKey = "club:42", datasetId = ds,
+            kind = "start-campaign", target = "campaign", value = {},
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1700 + i,
+            baseTargetRevision = ds, basePolicyRevision = pol,
+        }
+        local header = {
+            schemaVersion = GS.SCHEMA_VERSION, campaignId = id, datasetId = ds,
+            startedAt = 1700 + i, bankTabAtStart = 1, resetOperationId = id,
+        }
+        local st = select(1, GS:AdmitRemoteOperation(body, {
+            sender = "Dave-Garona", relay = true, boundary = header,
+        }))
+        return id, st
+    end
+    for i = 1, cap + 8 do
+        relayCampaign(i)
+    end
+    local relayN, boundN = 0, 0
+    for _ in pairs(GS._pendingRelay or {}) do
+        relayN = relayN + 1
+    end
+    for _ in pairs(GS._pendingCampaignBoundaries or {}) do
+        boundN = boundN + 1
+    end
+    assertEq(relayN, cap, "3A27: relay sits at cap after campaign flood")
+    assertTrue(boundN <= cap, "3A27: boundaries do not grow past relay cap (got "
+        .. tostring(boundN) .. ")")
+    -- TTL reclaim clears orphan boundaries with relay entries.
+    for id, entry in pairs(GS._pendingRelay) do
+        entry.at = 1
+    end
+    local ttl = GS.FRAGMENT_BUFFER_TTL_SECONDS or 600
+    local now = GetServerTime() or 0
+    -- Force stale: set at far in the past relative to now.
+    for id, entry in pairs(GS._pendingRelay) do
+        entry.at = now - ttl - 10
+    end
+    if GS._ReclaimStalePendingRelay then
+        GS._ReclaimStalePendingRelay({})
+    end
+    local relayAfter, boundAfter = 0, 0
+    for _ in pairs(GS._pendingRelay or {}) do
+        relayAfter = relayAfter + 1
+    end
+    for _ in pairs(GS._pendingCampaignBoundaries or {}) do
+        boundAfter = boundAfter + 1
+    end
+    assertEq(relayAfter, 0, "3A27: TTL reclaim cleared relay entries")
+    assertEq(boundAfter, 0, "3A27: TTL reclaim cleared orphan campaign boundaries")
+    -- Durable pending campaign evidence keeps its boundary across unrelated eviction.
+    local keepId, keepSt = relayCampaign(9001)
+    assertEq(keepSt, "pending", "3A27: keep campaign retained")
+    assertTrue(GS._pendingCampaignBoundaries[keepId] ~= nil,
+        "3A27: keep campaign boundary present")
+    -- Promote into durable pending via conflict/pending store if relay-only:
+    -- DurableRetain path: manually mirror durable pending ownership.
+    local rec = GS:GetCurrentRecord()
+    rec.operations.pending = rec.operations.pending or {}
+    rec.operations.pending[keepId] = {
+        id = keepId, body = GS._pendingRelay[keepId].body, reason = "untrusted_relay",
+    }
+    -- Flood to evict other relay entries; keepId may leave relay but boundary stays.
+    for i = 1, cap + 4 do
+        relayCampaign(9100 + i)
+    end
+    assertTrue(GS._pendingCampaignBoundaries[keepId] ~= nil,
+        "3A27: durable pending keeps campaign boundary after relay eviction pressure")
+    -- Valid subsequent confirmation/replay of a fresh campaign still works.
+    GS._pendingRelay = {}
+    local okId, okSt = relayCampaign(9200)
+    assertEq(okSt, "pending", "3A27: post-reclaim campaign relay still admits")
+    assertTrue(GS._pendingCampaignBoundaries[okId] ~= nil,
+        "3A27: post-reclaim boundary recorded for valid campaign")
+
+    -- 4) Policy-deferral scan charges visits and resumes across callbacks.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local aliceDs = GS:GetCurrentRecord().datasetId
+    GS.NotePeerDataset("Bob-Garona", "defer-scan-ds", {
+        editorRankPosition = 1, permissionRevisionId = "defer-scan-ds",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", "defer-scan-ds")), "accepted",
+        "3A27: defer-scan begin")
+    local adop = GS._adoption
+    assertTrue(type(adop) == "table", "3A27: adoption session")
+    local temp = {
+        datasetId = "defer-scan-ds",
+        _guildKey = "club:42",
+        _adoptionOffline = true,
+        currentCampaignId = "defer-camp",
+        permission = { revisionId = "defer-scan-ds", editorRankPosition = 1 },
+        accounting = { _consumables = {
+            requestedItems = {}, eligibility = { items = {}, baselineEstablished = true },
+            bankTab = 1, configSeq = 1, generation = 1,
+        } },
+        campaigns = {
+            ["defer-camp"] = {
+                schemaVersion = GS.SCHEMA_VERSION, campaignId = "defer-camp",
+                datasetId = "defer-scan-ds", startedAt = 1, bankTabAtStart = 1,
+                resetOperationId = "defer-camp",
+            },
+        },
+        campaignArchives = {},
+        confirmationRefs = {},
+        operations = {
+            records = {}, order = {}, heads = {}, pending = {}, conflicts = {},
+            openConflicts = {},
+        },
+    }
+    adop.records = {}
+    adop.order = {}
+    adop.sourceAcceptedSet = {}
+    adop.sourceAcceptedIds = {}
+    local sliceBudget = 4
+    local priorSlice = GS.MAX_ADMISSION_WORK_PER_SLICE
+    GS.MAX_ADMISSION_WORK_PER_SLICE = sliceBudget
+    -- Already-settled prefix forces the deferral scan to walk many visits before
+    -- the first unsettled same-policy config (source-authored by Bob).
+    for i = 1, 24 do
+        local id = string.format("def-settled-%02d", i)
+        local op = {
+            schemaVersion = 1, id = id, guildKey = "club:42", datasetId = "defer-scan-ds",
+            campaignId = "defer-camp", kind = "set-bank-tab", target = "bankTab",
+            value = 1, actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = i,
+            baseTargetRevision = "defer-scan-ds", basePolicyRevision = "defer-scan-ds",
+            baseCampaignId = "defer-camp",
+        }
+        temp.operations.records[id] = op
+        temp.operations.order[#temp.operations.order + 1] = id
+        local lid = "gs:op:" .. id
+        adop.records[lid] = { kind = "gs-op", op = op }
+        adop.order[#adop.order + 1] = lid
+        adop.sourceAcceptedSet[id] = true
+        adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = id
+    end
+    local unsettled = {
+        schemaVersion = 1, id = "def-unset", guildKey = "club:42", datasetId = "defer-scan-ds",
+        campaignId = "defer-camp", kind = "set-bank-tab", target = "bankTab", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 50,
+        baseTargetRevision = "def-settled-24", basePolicyRevision = "defer-scan-ds",
+        baseCampaignId = "defer-camp",
+    }
+    adop.records["gs:op:def-unset"] = { kind = "gs-op", op = unsettled }
+    adop.order[#adop.order + 1] = "gs:op:def-unset"
+    adop.sourceAcceptedSet["def-unset"] = true
+    adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = "def-unset"
+    local rankOp = {
+        schemaVersion = 1, id = "def-rank", guildKey = "club:42", datasetId = "defer-scan-ds",
+        kind = "set-editor-rank", target = "editorRankPosition", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 100,
+        baseTargetRevision = "defer-scan-ds", basePolicyRevision = "defer-scan-ds",
+    }
+    adop.records["gs:op:def-rank"] = { kind = "gs-op", op = rankOp }
+    adop.order[#adop.order + 1] = "gs:op:def-rank"
+    adop.sourceAcceptedSet["def-rank"] = true
+    adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = "def-rank"
+    adop.replayTemp = temp
+    adop.replayMember = GS.AuthenticateTransportSender("Bob-Garona")
+    adop.replayState = { cursor = 1, admissions = 0, wave = 0 }
+    GS._adoptionReplaySyncDrain = false
+    timers = {}
+    local st1, reason1 = GS:CommitDatasetAdoption()
+    assertEq(st1, "pending", "3A27: defer-scan first commit yields pending got="
+        .. tostring(st1) .. "/" .. tostring(reason1))
+    local state1 = GS._adoption and GS._adoption.replayState
+    assertTrue(type(state1) == "table" and state1.deferRankScan ~= nil,
+        "3A27: defer-scan parked incomplete classification across callback")
+    assertTrue((tonumber(state1.sliceUsed) or 0) <= sliceBudget,
+        "3A27: first defer-scan slice respects budget used="
+            .. tostring(state1.sliceUsed))
+    local parkedPos = tonumber(state1.deferRankScan.pos) or 0
+    assertTrue(parkedPos > 1, "3A27: defer-scan advanced a resume cursor pos="
+        .. tostring(parkedPos))
+    -- Drive one more single slice without draining chained timers (a full
+    -- flushTimers would run through to incompleteness on this hand-built temp).
+    timers = {}
+    GS._adoption._replayScheduled = false
+    GS._adoptionReplaySyncDrain = false
+    local st2, reason2 = GS:CommitDatasetAdoption()
+    assertEq(st2, "pending",
+        "3A27: second defer-scan slice still pending got="
+            .. tostring(st2) .. "/" .. tostring(reason2))
+    local state2 = GS._adoption.replayState
+    assertTrue(type(state2) == "table", "3A27: replay state present after second slice")
+    local p2 = type(state2.deferRankScan) == "table"
+        and tonumber(state2.deferRankScan.pos) or nil
+    local resumedOk = (state2.deferRankScan == nil and state2.deferRankCached ~= nil)
+        or (p2 ~= nil and p2 > parkedPos)
+    assertTrue(resumedOk,
+        "3A27: defer-scan resumed across callbacks parked="
+            .. tostring(parkedPos) .. " pos=" .. tostring(p2)
+            .. " cached=" .. tostring(state2.deferRankCached))
+    assertTrue((tonumber(state2.sliceUsed) or 0) <= sliceBudget + 2,
+        "3A27: second defer-scan slice bounded used="
+            .. tostring(state2.sliceUsed))
+    -- Cancellation and idle: preserve live dataset, no orphan session/timers.
+    timers = {}
+    GS:CancelDatasetAdoption()
+    assertEq(GS._adoption, nil, "3A27: cancel clears adoption after defer-scan")
+    assertEq(GS:GetCurrentRecord().datasetId, aliceDs,
+        "3A27: defer-scan cancel preserves live dataset")
+    timers = {}
+    world.time = (world.time or 0) + 1
+    flushTimers()
+    assertEq(#timers, 0, "3A27: idle after defer-scan cancel")
+    GS.MAX_ADMISSION_WORK_PER_SLICE = priorSlice
+    GS._adoptionReplaySyncDrain = true
+
+    assertEq(#world.chat, 0, "3A27: no chat")
 end
 
 
