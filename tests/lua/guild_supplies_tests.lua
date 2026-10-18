@@ -14427,8 +14427,11 @@ do
         flushTimers()
     end
     assertTrue(#timers == 0, "3A24: no live After(0) spin after capacity block")
-    assertTrue(anyCapacityBlocked() or countRedriveKeys() >= 0,
-        "3A24: capacity block parks without publication")
+    -- Live capacity block drops scheduling state (no pinned record); evidence stays.
+    assertEq(countRedriveKeys(), 0,
+        "3A24: live capacity block clears redrive scheduling state")
+    assertEq(anyCapacityBlocked(), false,
+        "3A24: live capacity block leaves no capacityBlocked pin")
     -- Extra idle flushes must not promote or grow timer queue.
     for _ = 1, 20 do
         world.time = (world.time or 0) + 1
@@ -14445,40 +14448,28 @@ do
         datasetId = priorSnap.datasetId,
         currentCampaignId = priorSnap.currentCampaignId,
         bankTab = priorSnap.bankTab,
+        confirmRefs = priorSnap.confirmRefs,
     }, {
         datasetId = GS:GetCurrentRecord().datasetId,
         currentCampaignId = GS:GetCurrentRecord().currentCampaignId,
         bankTab = GS:GetCurrentRecord().accounting._consumables.bankTab,
-    }, "3A24: capacity block does not mutate published config")
-
-    -- Cancellation clears parked capacity-blocked redrive state.
-    GS:CancelDatasetAdoption() -- no-op when none; exercise clear path below
-    local blockedKey = nil
-    for k, st in pairs(GS._confirmationRedriveByKey or {}) do
-        if type(st) == "table" and st.capacityBlocked then
-            blockedKey = k
-            break
-        end
-    end
-    if blockedKey then
-        -- Replacement/cancel semantics: drop keyed state (same as AbortAdoptionReplay).
-        GS._confirmationRedriveByKey[blockedKey] = nil
-    end
-    assertEq(anyCapacityBlocked(), false, "3A24: cancel clears capacity-blocked park")
+        confirmRefs = (function()
+            local r = {}
+            local refs = GS:GetCurrentRecord().confirmationRefs or {}
+            for i = 1, #refs do r[i] = refs[i] end
+            return r
+        end)(),
+    }, "3A24: capacity block preserves durable confirmation evidence")
 
     -- Capacity recovery on meaningful recheck: free a slot and redrive.
     GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 1
     timers = {}
-    local doneRec, _, promoRec, errRec = GS.RedriveExactContentConfirmations(
+    local doneRec, _, _, errRec = GS.RedriveExactContentConfirmations(
         GS:GetCurrentRecord(), {})
     assertEq(errRec, nil, "3A24: recheck after capacity free has no full err")
     world.time = (world.time or 0) + 1
     flushTimers()
-    assertTrue(GS:GetCurrentRecord().operations.records["def-late"] ~= nil
-        or doneRec == true,
-        "3A24: recovery promotes or completes after capacity free")
     if GS:GetCurrentRecord().operations.records["def-late"] == nil then
-        -- Finish any budget-yield continuation.
         for _ = 1, 8 do
             flushTimers()
             world.time = (world.time or 0) + 1
@@ -14663,7 +14654,8 @@ do
         flushTimers()
     end
     assertEq(#timers, 0, "3A24: mid-pass capacity block does not spin timers")
-    assertTrue(anyCapacityBlocked(), "3A24: live capacityBlocked parked")
+    assertEq(countRedriveKeys(), 0,
+        "3A24: live mid-pass capacity block drops scheduling state")
     -- Free capacity; meaningful recheck continues (batch atomicity for remaining).
     GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 64
     redriveState.capacityBlocked = nil
@@ -14683,8 +14675,8 @@ do
         "3A24: final paced candidate promoted")
     GS.MAX_ACCEPTED_OPERATIONS = priorMax
 
-    -- 4) Adoption: capacity-blocked confirmation redrive fails closed; prior live
-    -- dataset preserved (no partial publication).
+    -- 4) Adoption Commit continuation: capacity-blocked confirm redrive fails
+    -- closed through ContinueAdoptionReplay; live dataset unpublished.
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
     initGS()
@@ -14693,8 +14685,6 @@ do
     startCampaign()
     local aliceDs = GS:GetCurrentRecord().datasetId
     local aliceSnap = snapshotDurable(GS:GetCurrentRecord())
-    -- Build a minimal foreign adoption buffer with confirm + retained body and
-    -- an accepted store already at capacity for the promotion.
     GS.NotePeerDataset("Bob-Garona", "cap-fail-ds", {
         editorRankPosition = 1, permissionRevisionId = "cap-fail-ds",
     })
@@ -14702,10 +14692,18 @@ do
         "3A24: adoption begin")
     local adop = GS._adoption
     assertTrue(type(adop) == "table", "3A24: adoption session present")
-    -- Seed offline temp as if confirm was accepted and body retained, store full.
+    local bodyFail = {
+        schemaVersion = 1, id = "cap-fail-body", guildKey = "club:42",
+        datasetId = "cap-fail-ds", campaignId = "cap-fail-camp",
+        kind = "set-bank-tab", target = "bankTab", value = 4,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+        timestamp = 1, baseTargetRevision = "cap-fail-ds",
+        basePolicyRevision = "cap-fail-ds", baseCampaignId = "cap-fail-camp",
+    }
     local temp = {
         datasetId = "cap-fail-ds",
         _guildKey = "club:42",
+        _adoptionOffline = true,
         currentCampaignId = "cap-fail-camp",
         permission = { revisionId = "cap-fail-ds", editorRankPosition = 1 },
         accounting = { _consumables = {
@@ -14716,6 +14714,7 @@ do
             ["cap-fail-camp"] = {
                 schemaVersion = GS.SCHEMA_VERSION, campaignId = "cap-fail-camp",
                 datasetId = "cap-fail-ds", startedAt = 1, bankTabAtStart = 1,
+                resetOperationId = "cap-fail-camp",
             },
         },
         campaignArchives = {},
@@ -14725,18 +14724,7 @@ do
                 ["cap-fail-conf"] = {
                     schemaVersion = 1, id = "cap-fail-conf", guildKey = "club:42",
                     datasetId = "cap-fail-ds", kind = "confirm-candidate",
-                    candidateRef = {
-                        recordId = "cap-fail-body",
-                        body = {
-                            schemaVersion = 1, id = "cap-fail-body", guildKey = "club:42",
-                            datasetId = "cap-fail-ds", campaignId = "cap-fail-camp",
-                            kind = "set-bank-tab", target = "bankTab", value = 4,
-                            actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
-                            timestamp = 1, baseTargetRevision = "cap-fail-ds",
-                            basePolicyRevision = "cap-fail-ds",
-                            baseCampaignId = "cap-fail-camp",
-                        },
-                    },
+                    candidateRef = { recordId = "cap-fail-body", body = bodyFail },
                     actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 2,
                     basePolicyRevision = "cap-fail-ds",
                 },
@@ -14744,47 +14732,31 @@ do
             order = { "cap-fail-conf" },
             heads = {},
             pending = {
-                ["cap-fail-body"] = {
-                    body = {
-                        schemaVersion = 1, id = "cap-fail-body", guildKey = "club:42",
-                        datasetId = "cap-fail-ds", campaignId = "cap-fail-camp",
-                        kind = "set-bank-tab", target = "bankTab", value = 4,
-                        actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
-                        timestamp = 1, baseTargetRevision = "cap-fail-ds",
-                        basePolicyRevision = "cap-fail-ds",
-                        baseCampaignId = "cap-fail-camp",
-                    },
-                    reason = "untrusted_relay",
-                },
+                ["cap-fail-body"] = { body = bodyFail, reason = "untrusted_relay" },
             },
             conflicts = {},
             openConflicts = {},
         },
     }
     adop.replayTemp = temp
-    adop.replayState = { cursor = 1, admissions = 0, wave = 0, confirmRedriveComplete = false }
-    adop.order = { "cap-fail-conf", "cap-fail-body" }
+    adop.replayMember = GS.AuthenticateTransportSender("Bob-Garona")
+    adop.records = {}
+    adop.order = {}
     adop.sourceAcceptedSet = { ["cap-fail-conf"] = true, ["cap-fail-body"] = true }
-    -- No room to promote the body.
+    adop.replayState = {
+        cursor = 1, admissions = 0, wave = 0, confirmRedriveComplete = false,
+    }
     local tempAccepted = GS._AcceptedCount(temp.operations)
     GS.MAX_ACCEPTED_OPERATIONS = tempAccepted
     GS._pendingRelay["cap-fail-body"] = {
-        body = temp.operations.pending["cap-fail-body"].body,
-        sender = "Bob-Garona",
-        fingerprint = "x",
+        body = bodyFail, sender = "Bob-Garona", fingerprint = "x",
     }
-    local doneAd, _, _, errAd = GS.RedriveExactContentConfirmations(temp, {
-        adoptionReplay = true,
-        offlineRecord = temp,
-        redriveBudget = 32,
-        redriveState = { pos = 1, remaining = nil },
-    })
-    assertEq(errAd, "full", "3A24: adoption redrive reports full")
-    assertEq(doneAd, false, "3A24: adoption redrive not done on full")
+    local stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    assertEq(stCommit, "rejected", "3A24: Commit rejects on confirmation capacity full")
+    assertEq(reasonCommit, "full", "3A24: Commit reason full from redrive continuation")
+    assertEq(GS._adoption, nil, "3A24: failed Commit clears adoption session")
     assertEq(temp.operations.records["cap-fail-body"], nil,
         "3A24: adoption temp did not partially promote")
-    -- Fail closed through cancel: live dataset unchanged.
-    GS:CancelDatasetAdoption()
     assertEq(GS:GetCurrentRecord().datasetId, aliceDs,
         "3A24: adoption capacity failure preserves live dataset")
     assertSerEq(snapshotDurable(GS:GetCurrentRecord()), aliceSnap,
@@ -14793,6 +14765,328 @@ do
     GS._pendingRelay["cap-fail-body"] = nil
 
     assertEq(#world.chat, 0, "3A24: no chat")
+end
+
+---------------------------------------------------------------------------
+-- 3A25) Confirmation capacity: within-batch policy projection; fail-closed
+-- Apply; production replacement cleanup (r4308966487).
+---------------------------------------------------------------------------
+do
+    local function assertSerEq(a, b, msg)
+        assertEq(serTable(a), serTable(b), msg)
+    end
+    local function snapshotDurable(rec)
+        return {
+            datasetId = rec.datasetId,
+            currentCampaignId = rec.currentCampaignId,
+            bankTab = rec.accounting and rec.accounting._consumables
+                and rec.accounting._consumables.bankTab,
+            policy = rec.permission and rec.permission.revisionId,
+            acceptedCount = GS._AcceptedCount and GS._AcceptedCount(rec.operations) or 0,
+            order = (function()
+                local o = {}
+                for i = 1, #(rec.operations.order or {}) do
+                    o[i] = rec.operations.order[i]
+                end
+                return o
+            end)(),
+            confirmRefs = (function()
+                local r = {}
+                for i = 1, #(rec.confirmationRefs or {}) do
+                    r[i] = rec.confirmationRefs[i]
+                end
+                return r
+            end)(),
+            pendingIds = (function()
+                local ids = {}
+                if type(rec.operations.pending) == "table" then
+                    for id in pairs(rec.operations.pending) do
+                        ids[#ids + 1] = id
+                    end
+                    table.sort(ids)
+                end
+                return ids
+            end)(),
+        }
+    end
+    local function countRedriveKeys()
+        local n = 0
+        for _ in pairs(GS._confirmationRedriveByKey or {}) do
+            n = n + 1
+        end
+        return n
+    end
+
+    -- Rank + dependent config: exact-fit and one-slot-short, local + remote.
+    local function seedRankAndConfig()
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        startCampaign()
+        local ds = GS:GetCurrentRecord().datasetId
+        local camp = GS:GetCurrentRecord().currentCampaignId
+        local pol = GS:GetCurrentRecord().permission.revisionId
+        local rankBody = {
+            schemaVersion = 1, id = "pol-rank-r", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-editor-rank", target = "editorRankPosition",
+            value = 2, actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 94000, baseTargetRevision = pol, basePolicyRevision = pol,
+            baseCampaignId = camp,
+        }
+        local cfgBody = {
+            schemaVersion = 1, id = "pol-cfg-c", guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 3,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 94001,
+            baseTargetRevision = ds, basePolicyRevision = "pol-rank-r",
+            baseCampaignId = camp,
+        }
+        assertEq(GS:AdmitRemoteOperation(rankBody, { sender = "Dave-Garona", relay = true }),
+            "pending", "3A25: rank body retained")
+        assertEq(GS:AdmitRemoteOperation(cfgBody, { sender = "Dave-Garona", relay = true }),
+            "pending", "3A25: config body retained")
+        return ds, camp, pol, rankBody, cfgBody
+    end
+
+    local priorMax = GS.MAX_ACCEPTED_OPERATIONS
+    local ds, camp, pol, rankBody, cfgBody = seedRankAndConfig()
+    local acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    -- One-slot-short: envelope + rank + config need 3; allow only 2.
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    local priorSnap = snapshotDurable(GS:GetCurrentRecord())
+    local confShort = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "pol-rank-r", body = rankBody },
+            { id = "pol-cfg-c", body = cfgBody },
+        },
+    }))
+    local stShort, reasonShort = GS:ApplyStagedConfirmationOperation(confShort)
+    assertEq(stShort, "rejected", "3A25: local one-slot-short rejects before mutation")
+    assertEq(reasonShort, "full", "3A25: local one-slot-short reason")
+    assertSerEq(snapshotDurable(GS:GetCurrentRecord()), priorSnap,
+        "3A25: local one-slot-short preserves full prior durable state")
+    assertEq(GS:GetCurrentRecord().operations.records["pol-rank-r"], nil,
+        "3A25: local short did not partially promote rank")
+    assertEq(GS:GetCurrentRecord().operations.records["pol-cfg-c"], nil,
+        "3A25: local short did not partially promote config")
+    assertEq(GS:GetCurrentRecord().permission.revisionId, pol,
+        "3A25: local short left policy revision unchanged")
+
+    -- Exact fit: envelope + rank + config.
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 3
+    local confExact = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "pol-rank-r", body = rankBody },
+            { id = "pol-cfg-c", body = cfgBody },
+        },
+    }))
+    assertEq(GS:ApplyStagedConfirmationOperation(confExact), "accepted",
+        "3A25: local exact-fit rank+config accepted")
+    assertTrue(GS:GetCurrentRecord().operations.records["pol-rank-r"] ~= nil,
+        "3A25: local exact-fit promoted rank")
+    assertTrue(GS:GetCurrentRecord().operations.records["pol-cfg-c"] ~= nil,
+        "3A25: local exact-fit promoted dependent config")
+    assertEq(GS:GetCurrentRecord().permission.revisionId, "pol-rank-r",
+        "3A25: local exact-fit advanced policy revision")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3,
+        "3A25: local exact-fit applied config value")
+
+    -- Remote path one-slot-short / exact-fit.
+    ds, camp, pol, rankBody, cfgBody = seedRankAndConfig()
+    acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    priorSnap = snapshotDurable(GS:GetCurrentRecord())
+    local remoteConf = {
+        schemaVersion = 1, id = "pol-rconf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = {
+            records = {
+                { id = "pol-rank-r", body = rankBody },
+                { id = "pol-cfg-c", body = cfgBody },
+            },
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 94010,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    local stRemote, reasonRemote = GS:AdmitRemoteOperation(remoteConf, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stRemote, "rejected", "3A25: remote one-slot-short rejects")
+    assertEq(reasonRemote, "full", "3A25: remote one-slot-short reason")
+    assertSerEq(snapshotDurable(GS:GetCurrentRecord()), priorSnap,
+        "3A25: remote one-slot-short preserves full prior durable state")
+    assertEq(GS:GetCurrentRecord().operations.records["pol-rconf"], nil,
+        "3A25: remote short did not store envelope")
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 3
+    remoteConf = {
+        schemaVersion = 1, id = "pol-rconf2", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = {
+            records = {
+                { id = "pol-rank-r", body = rankBody },
+                { id = "pol-cfg-c", body = cfgBody },
+            },
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 94011,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(remoteConf, { sender = "Alice-Garona" }), "accepted",
+        "3A25: remote exact-fit rank+config accepted")
+    assertTrue(GS:GetCurrentRecord().operations.records["pol-rank-r"] ~= nil,
+        "3A25: remote exact-fit promoted rank")
+    assertTrue(GS:GetCurrentRecord().operations.records["pol-cfg-c"] ~= nil,
+        "3A25: remote exact-fit promoted config")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    -- Production record replacement clears live redrive pins (budget-yield park).
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local oldRec = GS:GetCurrentRecord()
+    local paceRows = {}
+    local prevBase = ds
+    for i = 1, 40 do
+        local id = "rep-c" .. i
+        local body = {
+            schemaVersion = 1, id = id, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab",
+            value = ((i - 1) % 8) + 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 94100 + i,
+            baseTargetRevision = prevBase, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        paceRows[#paceRows + 1] = { id = id, body = body }
+        assertEq(GS:AdmitRemoteOperation(body, { sender = "Dave-Garona", relay = true }),
+            "pending", "3A25: replace seed " .. i)
+        prevBase = id
+    end
+    local confRep = {
+        schemaVersion = 1, id = "rep-conf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate", candidateRef = { records = paceRows },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 94200,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    if GS._StoreAccepted then
+        GS._StoreAccepted(oldRec.operations, confRep, nil)
+    end
+    oldRec.confirmationRefs = oldRec.confirmationRefs or {}
+    oldRec.confirmationRefs[#oldRec.confirmationRefs + 1] = "rep-conf"
+    GS._confirmationRedriveByKey = {}
+    timers = {}
+    local priorSlice = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE
+    GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE = 8
+    local doneYield = GS.RedriveExactContentConfirmations(oldRec, {})
+    assertEq(doneYield, false, "3A25: live budget yield leaves unfinished pass")
+    assertTrue(countRedriveKeys() >= 1, "3A25: live redrive state present before replace")
+    local pinnedOld = false
+    for _, st in pairs(GS._confirmationRedriveByKey or {}) do
+        if type(st) == "table" and st.record == oldRec then
+            pinnedOld = true
+        end
+    end
+    assertTrue(pinnedOld, "3A25: old record pinned in redrive map before replace")
+    -- Production publish: Begin + Commit with Install-shaped temp so
+    -- PublishAdoptionTemp clears guild redrive pins for the replaced record.
+    GS.NotePeerDataset("Bob-Garona", "rep-adopt-ds", {
+        editorRankPosition = 1, permissionRevisionId = "rep-adopt-ds",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", "rep-adopt-ds")), "accepted",
+        "3A25: replace adoption begin")
+    local adopRep = GS._adoption
+    local clubId = select(2, GS.ParseGuildKey("club:42")) or "42"
+    local tempRep = {
+        schemaVersion = GS.SCHEMA_VERSION,
+        activation = GS.ACTIVATION_STAGED,
+        datasetId = "rep-adopt-ds",
+        _guildKey = "club:42",
+        currentCampaignId = nil,
+        permission = {
+            revisionId = "rep-adopt-ds", editorRankPosition = 1,
+            bootstrapEditorRankPosition = 1,
+        },
+        accounting = {
+            _consumables = {
+                guild = {
+                    guid = tostring(clubId),
+                    name = (world.guild and world.guild.name) or "Spectrum",
+                    realm = (world.guild and world.guild.realm) or "Garona",
+                },
+                bankTab = nil,
+                requestedItems = {},
+                generation = 0,
+                configSeq = 0,
+                eventSeq = 0,
+                eligibility = {
+                    items = {},
+                    tabEligibleFrom = nil,
+                    baselineEstablished = false,
+                },
+                txnRegistry = {},
+            },
+            _consumableEvents = {},
+            _consumableEventArchive = {},
+        },
+        campaigns = {},
+        campaignArchives = {},
+        campaignContext = {},
+        observations = { byCampaign = {} },
+        confirmationRefs = {},
+        operations = {
+            records = {}, order = {}, heads = {}, pending = {}, conflicts = {},
+            openConflicts = {},
+        },
+        migration = nil,
+    }
+    adopRep.replayTemp = tempRep
+    adopRep.replayMember = GS.AuthenticateTransportSender("Bob-Garona")
+    adopRep.records = {}
+    adopRep.order = {}
+    adopRep.sourceAcceptedIds = {}
+    adopRep.sourceAcceptedSet = {}
+    adopRep.replayState = {
+        cursor = 1, admissions = 0, wave = 0, confirmRedriveComplete = true,
+    }
+    local prevComplete = GS.IsAdoptionTransferComplete
+    GS.IsAdoptionTransferComplete = function()
+        return true, nil, {
+            kind = "dataset-desc", guildKey = "club:42",
+            datasetId = "rep-adopt-ds",
+            permissionRevisionId = "rep-adopt-ds",
+            editorRankPosition = 1, bootstrapEditorRankPosition = 1,
+            acceptedCount = 0, acceptedOpCount = 0,
+        }
+    end
+    local stPub, reasonPub = GS:CommitDatasetAdoption()
+    GS.IsAdoptionTransferComplete = prevComplete
+    assertEq(stPub, "accepted",
+        "3A25: publish commit accepted got=" .. tostring(reasonPub))
+    local oldStillPinned = false
+    for _, st in pairs(GS._confirmationRedriveByKey or {}) do
+        if type(st) == "table" and st.record == oldRec then
+            oldStillPinned = true
+        end
+    end
+    assertEq(oldStillPinned, false,
+        "3A25: production replace cleared live redrive pin for old record")
+    assertEq(GS:GetCurrentRecord().datasetId, "rep-adopt-ds",
+        "3A25: live dataset replaced after publish")
+    -- Durable confirmation evidence on the replaced dataset is gone with the
+    -- old record; confirm the old pin cannot be resumed via timers.
+    timers = {}
+    for _ = 1, 10 do
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertEq(#timers, 0, "3A25: no orphan redrive timers after replace")
+    GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE = priorSlice
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    assertEq(#world.chat, 0, "3A25: no chat")
 end
 
 

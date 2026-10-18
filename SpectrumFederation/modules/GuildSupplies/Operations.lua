@@ -1745,7 +1745,11 @@ function GS:ApplyStagedConfirmationOperation(op, context)
     -- Exact-content confirmation itself applies eligible retained candidates
     -- without restamping attribution (Admission.ApplyExactContentConfirmation).
     if GS.ApplyExactContentConfirmation then
-        GS.ApplyExactContentConfirmation(record, stored, applyCtx)
+        local okApply, errApply = GS.ApplyExactContentConfirmation(record, stored, applyCtx)
+        if okApply == false and errApply == "full" then
+            -- Preflight should prevent this; never report success after capacity fail.
+            return "rejected", "full"
+        end
     end
     GS._NotifyLocalDurableChange("confirm")
     return "accepted", nil

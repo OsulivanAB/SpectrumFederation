@@ -77,6 +77,9 @@ GS._pendingCampaignBoundaries = {} -- [opId] = header
 GS._bootstrapEditLock = {} -- [guildKey] = advertisedPermissionRevisionId
 -- Confirmation redrive state keyed by guild+dataset generation (not global).
 GS._confirmationRedriveByKey = GS._confirmationRedriveByKey or {}
+-- Forward-declared: install/publish paths clear live redrive pins on replacement.
+local ClearConfirmationRedriveForRecord
+local ClearConfirmationRedriveForGuild
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -1391,6 +1394,7 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
         end
     end
 
+    ClearConfirmationRedriveForGuild(guildKey)
     GS._root.guilds[guildKey] = record
     GS._adoptionEpoch = (tonumber(GS._adoptionEpoch) or 0) + 1
     -- Descriptor-first install: keep revisionId == datasetId (empty store). When
@@ -3657,6 +3661,10 @@ local function PublishAdoptionTemp(adop, temp, desc)
             return false, err or "invalid_record"
         end
     end
+    -- Drop live redrive pins for the replaced guild record before publish.
+    local priorLive = GS._root and GS._root.guilds and GS._root.guilds[adop.guildKey]
+    ClearConfirmationRedriveForRecord(priorLive)
+    ClearConfirmationRedriveForGuild(adop.guildKey)
     GS._root.guilds[adop.guildKey] = temp
     GS._adoptionEpoch = (tonumber(GS._adoptionEpoch) or 0) + 1
     adop.committed = true
@@ -4685,9 +4693,6 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
     if ops.conflicts and ops.conflicts[stored.id] then
         return "rejected", "id_conflict"
     end
-    if GS._AcceptedCount and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
-        return "rejected", "full"
-    end
 
     -- Confirmations never synthesize START_CAMPAIGN / RESOLVE / CONFIRM envelopes.
     if stored.kind == GS.KIND.CONFIRM_CANDIDATE
@@ -4773,6 +4778,13 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
         return "pending", classReason or "divergent_edit"
     end
 
+    -- Accepted-ops capacity applies only to apply-class promotions. Conflict /
+    -- pending retention must not be blocked merely because the accepted store
+    -- is full (exact-fit confirmation batches include non-promoting siblings).
+    if GS._AcceptedCount and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
+        return "rejected", "full"
+    end
+
     if stored.kind == GS.KIND.START_CAMPAIGN then
         local ok, err = ApplyRemoteCampaignMutation(record, stored, boundary)
         if not ok then
@@ -4853,8 +4865,8 @@ end
 
 --- Classify whether a retained confirmation candidate would promote now.
 -- Reuses ApplyPreservedAttributionCandidate admission gates (policy/campaign/
--- ClassifyStaleBase) against an optional shadow record for within-batch
--- head projection. Does not mutate durable state.
+-- ClassifyStaleBase) against a temporary projection record. Does not mutate
+-- durable live state.
 -- @return "apply"|"pending"|"conflict"|"obsolete"|"skip"|"duplicate"
 local function ClassifyConfirmationPromotion(record, authBody, admissionCtx)
     if type(record) ~= "table" or type(authBody) ~= "table" then
@@ -4894,13 +4906,46 @@ local function ClassifyConfirmationPromotion(record, authBody, admissionCtx)
     return class or "apply"
 end
 
+--- Project an apply-eligible promotion onto a temporary admission shadow.
+-- Reuses GS._ApplyMutations for policy/config transitions and updates campaign
+-- current id / accepted membership so within-batch dependents classify correctly.
+local function ProjectConfirmationPromotion(shadow, projectedRecords, authBody, boundary)
+    if type(shadow) ~= "table" or type(authBody) ~= "table" then
+        return
+    end
+    projectedRecords[authBody.id] = authBody
+    local targetKey = GS._TargetKey and GS._TargetKey(authBody.kind, authBody.target)
+    if authBody.kind == GS.KIND.START_CAMPAIGN then
+        targetKey = GS.CAMPAIGN_TARGET_KEY
+        shadow.currentCampaignId = authBody.id
+        if type(shadow.campaigns) == "table" then
+            local hdr = boundary
+            if type(hdr) ~= "table" then
+                hdr = shadow.campaigns[authBody.id]
+            end
+            if type(hdr) == "table" then
+                shadow.campaigns[authBody.id] = hdr
+            end
+        end
+    elseif authBody.kind == GS.KIND.SET_EDITOR_RANK
+        or authBody.kind == GS.KIND.SET_BANK_TAB
+        or authBody.kind == GS.KIND.SET_REQUESTED_ITEM then
+        if GS._ApplyMutations then
+            GS._ApplyMutations(shadow, authBody)
+        end
+    end
+    if targetKey and type(shadow.operations) == "table"
+        and type(shadow.operations.heads) == "table" then
+        shadow.operations.heads[targetKey] = authBody.id
+    end
+end
+
 --- Count distinct not-yet-accepted candidates that admission would promote now.
--- Reuses ClassifyConfirmationPromotion / ClassifyStaleBase (not a second
--- eligibility definition). Projects within-batch head advances so causal
--- successors in the same envelope are charged when their predecessors promote.
--- Confirm-first/body-late ids are skipped until retained. Optional startIdx
--- limits to a resume window (paced apply). Duplicate/pending/conflict/obsolete
--- do not charge accepted-store capacity.
+-- Uses a bounded temporary projection that reuses admission classification and
+-- mutation semantics (policy revision, accepted predecessor membership, campaign
+-- current id) so within-batch dependents are charged. Not a parallel eligibility
+-- definition. Confirm-first/body-late ids are skipped until retained. Optional
+-- startIdx limits to a resume window (paced apply).
 local function CountEligibleConfirmationPromotions(record, storedConfirm, admissionCtx, startIdx)
     admissionCtx = admissionCtx or {}
     local ops = record and record.operations
@@ -4912,28 +4957,46 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
     if startIdx < 1 then
         startIdx = 1
     end
-    -- Shadow heads for within-batch dependency projection (shared admission rules).
+    local projectedRecords = {}
     local shadowHeads = {}
     if type(ops.heads) == "table" then
         for k, v in pairs(ops.heads) do
             shadowHeads[k] = v
         end
     end
+    local shadowPermission = {}
+    if type(record.permission) == "table" then
+        for k, v in pairs(record.permission) do
+            shadowPermission[k] = v
+        end
+    end
+    -- Campaign map: copy-on-write only when a projected start inserts a header.
+    local shadowCampaigns = record.campaigns
+    local campaignsCopied = false
+    local shadowRecords = setmetatable({}, {
+        __index = function(_, k)
+            return projectedRecords[k] or (ops.records and ops.records[k])
+        end,
+    })
     local shadowOps = {
-        records = ops.records,
+        records = shadowRecords,
         pending = ops.pending,
         conflicts = ops.conflicts,
         openConflicts = ops.openConflicts,
         heads = shadowHeads,
         order = ops.order,
     }
+    -- Accounting is shared read-only for classification; SET_BANK_TAB projection
+    -- may write bankTab on a shallow consumables copy when needed.
+    local shadowConsumables = nil
+    local shadowAccounting = record.accounting
     local shadow = {
         datasetId = record.datasetId,
         currentCampaignId = record.currentCampaignId,
-        permission = record.permission,
-        accounting = record.accounting,
+        permission = shadowPermission,
+        accounting = shadowAccounting,
         operations = shadowOps,
-        campaigns = record.campaigns,
+        campaigns = shadowCampaigns,
         _guildKey = record._guildKey,
     }
     local count = 0
@@ -4942,23 +5005,56 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
         local rid = ids[i]
         if type(rid) == "string" and not counted[rid] then
             counted[rid] = true
-            if not (ops.records and ops.records[rid]) then
+            if not (ops.records and ops.records[rid]) and not projectedRecords[rid] then
                 local authBody = AuthoritativeBodyFromEnvelope(storedConfirm, rid)
                 if type(authBody) == "table" then
-                    local body = LookupRetainedCandidate(record, rid)
+                    local body, boundary = LookupRetainedCandidate(record, rid)
                     if type(body) == "table" and AuthoritativeBodiesEqual(authBody, body) then
                         local class = ClassifyConfirmationPromotion(
                             shadow, authBody, admissionCtx)
                         if class == "apply" then
                             count = count + 1
-                            local targetKey = GS._TargetKey
-                                and GS._TargetKey(authBody.kind, authBody.target)
-                            if authBody.kind == GS.KIND.START_CAMPAIGN then
-                                targetKey = GS.CAMPAIGN_TARGET_KEY
+                            if authBody.kind == GS.KIND.SET_BANK_TAB
+                                or authBody.kind == GS.KIND.SET_REQUESTED_ITEM then
+                                if not shadowConsumables
+                                    and type(record.accounting) == "table"
+                                    and type(record.accounting._consumables) == "table" then
+                                    local liveCfg = record.accounting._consumables
+                                    shadowConsumables = {}
+                                    for k, v in pairs(liveCfg) do
+                                        shadowConsumables[k] = v
+                                    end
+                                    -- Shallow-copy maps that mutations rewrite.
+                                    if type(liveCfg.requestedItems) == "table" then
+                                        local items = {}
+                                        for ik, iv in pairs(liveCfg.requestedItems) do
+                                            items[ik] = iv
+                                        end
+                                        shadowConsumables.requestedItems = items
+                                    end
+                                    if type(liveCfg.eligibility) == "table" then
+                                        local elig = {}
+                                        for ek, ev in pairs(liveCfg.eligibility) do
+                                            elig[ek] = ev
+                                        end
+                                        shadowConsumables.eligibility = elig
+                                    end
+                                    shadow.accounting = { _consumables = shadowConsumables }
+                                end
                             end
-                            if targetKey then
-                                shadowHeads[targetKey] = authBody.id
+                            if authBody.kind == GS.KIND.START_CAMPAIGN
+                                and not campaignsCopied then
+                                local copy = {}
+                                if type(record.campaigns) == "table" then
+                                    for ck, cv in pairs(record.campaigns) do
+                                        copy[ck] = cv
+                                    end
+                                end
+                                shadow.campaigns = copy
+                                campaignsCopied = true
                             end
+                            ProjectConfirmationPromotion(
+                                shadow, projectedRecords, authBody, boundary)
                         end
                     end
                 end
@@ -4966,6 +5062,34 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
         end
     end
     return count
+end
+
+--- Drop live confirmation-redrive scheduling state for a replaced/obsolete record.
+-- Durable confirmationRefs / relay evidence are not touched.
+ClearConfirmationRedriveForRecord = function(record)
+    if type(GS._confirmationRedriveByKey) ~= "table" or type(record) ~= "table" then
+        return
+    end
+    for k, st in pairs(GS._confirmationRedriveByKey) do
+        if type(st) == "table" and st.record == record then
+            GS._confirmationRedriveByKey[k] = nil
+        end
+    end
+end
+
+ClearConfirmationRedriveForGuild = function(guildKey)
+    if type(GS._confirmationRedriveByKey) ~= "table" or type(guildKey) ~= "string" then
+        return
+    end
+    local prefix = tostring(guildKey) .. "\0"
+    for k, st in pairs(GS._confirmationRedriveByKey) do
+        if type(k) == "string" and string.sub(k, 1, #prefix) == prefix then
+            GS._confirmationRedriveByKey[k] = nil
+        elseif type(st) == "table" and type(st.record) == "table"
+            and st.record._guildKey == guildKey then
+            GS._confirmationRedriveByKey[k] = nil
+        end
+    end
 end
 
 --- Shared capacity preflight for local/remote confirmation commit.
@@ -5080,6 +5204,17 @@ function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
                         end
                     elseif st == "pending" then
                         -- Keep unfinished siblings; confirmation envelope still accepted.
+                    elseif reason == "full" then
+                        -- Fail closed only when an apply-class promotion still cannot
+                        -- fit. Conflict/pending retention full must not abort the
+                        -- envelope (exact-fit batches keep non-promoting siblings).
+                        local classNow = ClassifyConfirmationPromotion(
+                            record, authBody, admissionCtx)
+                        if classNow == "apply" then
+                            return false, "full", promoted, visited, nil
+                        end
+                        DebugWarn("confirm apply skipped id=%s status=%s reason=%s",
+                            rid, tostring(st), tostring(reason))
                     else
                         DebugWarn("confirm apply skipped id=%s status=%s reason=%s",
                             rid, tostring(st), tostring(reason))
@@ -5268,12 +5403,18 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
         end
     end
     if capacityBlocked then
-        -- Preserve retained evidence and parked cursor; stop live timer retries.
-        local remaining = math.max(1, passGoal - envelopesCompleted)
-        state.remaining = remaining
-        state.scheduled = false
         if adoptionReplay then
+            -- Session-owned cursor stays for abort/fail-closed; no live timer.
+            local remaining = math.max(1, passGoal - envelopesCompleted)
+            state.remaining = remaining
+            state.scheduled = false
             state.done = false
+            return false, processed, promoted, "full"
+        end
+        -- Live: drop scheduling state so replacement cannot pin stale records.
+        -- Durable confirmationRefs / relay evidence remain for later recheck.
+        if key then
+            GS._confirmationRedriveByKey[key] = nil
         end
         return false, processed, promoted, "full"
     end
@@ -5321,10 +5462,7 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
                 return
             end
             st.scheduled = false
-            -- Do not timer-spin an unchanged capacity-blocked store.
-            if st.capacityBlocked then
-                return
-            end
+            -- Ownership / replacement first — never pin obsolete records.
             local live = nil
             if type(expectedGuild) == "string" and GS._root and type(GS._root.guilds) == "table" then
                 live = GS._root.guilds[expectedGuild]
@@ -5333,6 +5471,11 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             end
             if live ~= expectedRecord
                 or (type(live) == "table" and live.datasetId ~= expectedDataset) then
+                GS._confirmationRedriveByKey[expectedKey] = nil
+                return
+            end
+            -- Do not timer-spin an unchanged capacity-blocked store.
+            if st.capacityBlocked then
                 GS._confirmationRedriveByKey[expectedKey] = nil
                 return
             end
@@ -5618,7 +5761,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if not admissionCtx.adoptionReplay then
             -- Preflight already required capacity for the eligible batch; Apply
             -- fail-closes without partial promotions if eligibility raced.
-            GS.ApplyExactContentConfirmation(record, stored, admissionCtx)
+            local okApply, errApply = GS.ApplyExactContentConfirmation(
+                record, stored, admissionCtx)
+            if okApply == false and errApply == "full" then
+                return "rejected", "full"
+            end
         end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
             GS._NotifyLocalDurableChange("remote-confirm")
