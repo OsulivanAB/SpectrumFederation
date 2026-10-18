@@ -1209,6 +1209,7 @@ local function ValidateCandidateRef(ref)
         return false, "invalid_candidate_batch"
     end
     local counted = 0
+    local seenIds = {}
     for k, row in pairs(ref.records) do
         counted = counted + 1
         if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
@@ -1220,6 +1221,13 @@ local function ValidateCandidateRef(ref)
             or row.body.id ~= row.id then
             return false, "invalid_candidate_batch"
         end
+        -- Unique records[].id before persistence / historical replay. Duplicate
+        -- complete IDs are incompatible with AssembleOpFromPages; do not silently
+        -- deduplicate authenticated content. originalIds uniqueness is separate.
+        if seenIds[row.id] then
+            return false, "invalid_candidate_batch"
+        end
+        seenIds[row.id] = true
     end
     if counted ~= n then
         return false, "invalid_candidate_batch"

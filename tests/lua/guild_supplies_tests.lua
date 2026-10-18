@@ -12417,6 +12417,456 @@ do
     assertEq(#world.chat, 0, "3A19: no chat")
 end
 
+---------------------------------------------------------------------------
+-- 3A20) Adoption page bounds, paced confirm redrive, exact reconstruction
+-- lookup, unique confirmation records[].id (r4308471902 / 2150 / 2366 /
+-- 2557 / 2798 / 3021)
+---------------------------------------------------------------------------
+do
+    -- A) Adoption page validation rejects bad counts before buffer mutation.
+    resetDb()
+    switchPlayer("Carol", "Player-1-Carol", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local carolDs = GS:GetCurrentRecord().datasetId
+    GS.NotePeerDataset("Alice-Garona", "page-val-ds", {
+        editorRankPosition = 1, permissionRevisionId = "page-val-ds",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", "page-val-ds")), "accepted",
+        "3A20: begin page-val adopt")
+    local entry = GG.GetProvider(GS.PROVIDER_ID)
+    local orderBefore = #(GS._adoption.order or {})
+    local asmBefore = tonumber(GS._adoption._assemblyOpCount) or 0
+    local badCases = {
+        { label = "huge", body = {
+            kind = "gs-op", pageCount = 1e9, datasetId = "page-val-ds",
+            op = { id = "bad-huge", datasetId = "page-val-ds", kind = "confirm-candidate",
+                candidateRef = {}, pageCount = 1e9 },
+        }},
+        { label = "fractional", body = {
+            kind = "gs-op", pageCount = 1.5, datasetId = "page-val-ds",
+            op = { id = "bad-frac", datasetId = "page-val-ds", kind = "confirm-candidate",
+                candidateRef = {}, pageCount = 1.5 },
+        }},
+        { label = "zero", body = {
+            kind = "gs-op", pageCount = 0, datasetId = "page-val-ds",
+            op = { id = "bad-zero", datasetId = "page-val-ds", kind = "confirm-candidate",
+                candidateRef = {}, pageCount = 0 },
+        }},
+        { label = "negative", body = {
+            kind = "gs-op", pageCount = -3, datasetId = "page-val-ds",
+            op = { id = "bad-neg", datasetId = "page-val-ds", kind = "confirm-candidate",
+                candidateRef = {}, pageCount = -3 },
+        }},
+        { label = "page-oor", body = {
+            kind = "gs-op-page", opId = "bad-oor", page = 9, pageCount = 2,
+            datasetId = "page-val-ds", chunk = { x = 1 },
+        }},
+    }
+    for i = 1, #badCases do
+        local c = badCases[i]
+        local st, reason = GG.ApplyRecordToProvider(entry, {
+            id = "gs:bad:" .. c.label, versionFp = "v" .. i, body = c.body,
+        }, { sender = "Alice-Garona" })
+        assertEq(st, "rejected", "3A20: reject " .. c.label .. " status")
+        assertEq(reason, "invalid_operation", "3A20: reject " .. c.label .. " reason")
+        assertEq(#(GS._adoption.order or {}), orderBefore,
+            "3A20: " .. c.label .. " does not grow order")
+        assertEq(tonumber(GS._adoption._assemblyOpCount) or 0, asmBefore,
+            "3A20: " .. c.label .. " does not grow assembly count")
+    end
+    -- Archive metadata bounds.
+    local stArch, reasonArch = GG.ApplyRecordToProvider(entry, {
+        id = "gs:ca:bad", versionFp = "va",
+        body = {
+            kind = "campaign-archive", campaignId = "camp-bad", datasetId = "page-val-ds",
+            pageCount = 1e6, generation = 1, archivedAt = 1,
+        },
+    }, { sender = "Alice-Garona" })
+    assertEq(stArch, "rejected", "3A20: reject huge archive pageCount")
+    assertEq(reasonArch, "invalid_operation", "3A20: archive reason")
+    -- Supported maximum valid paged shell still buffers.
+    local maxPc = GS.MAX_MANIFEST_PAGES or 128
+    local stOk, reasonOk = GG.ApplyRecordToProvider(entry, {
+        id = "gs:op:ok-shell", versionFp = "vok",
+        body = {
+            kind = "gs-op", pageCount = maxPc, datasetId = "page-val-ds",
+            op = {
+                schemaVersion = 1, id = "ok-shell", guildKey = "club:42",
+                datasetId = "page-val-ds", kind = "confirm-candidate",
+                candidateRef = {}, pageCount = maxPc, recordCount = 1,
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1,
+                basePolicyRevision = "page-val-ds",
+            },
+        },
+    }, { sender = "Alice-Garona" })
+    assertTrue(stOk == "accepted" or stOk == "pending",
+        "3A20: max legal shell buffers got=" .. tostring(stOk) .. "/" .. tostring(reasonOk))
+    assertTrue((tonumber(GS._adoption._assemblyOpCount) or 0) >= asmBefore + 1,
+        "3A20: max legal shell reserved assembly slot")
+    GS:CancelDatasetAdoption()
+
+    -- B) Bounded confirmation redrive: measured inner visits per stepped callback.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local ds = GS:GetCurrentRecord().datasetId
+    local camp = GS:GetCurrentRecord().currentCampaignId
+    local pol = GS:GetCurrentRecord().permission.revisionId
+    local record = GS:GetCurrentRecord()
+    record.confirmationRefs = record.confirmationRefs or {}
+    local nConf = 64
+    for i = 1, nConf do
+        local cid = string.format("rd-env-%03d", i)
+        local body = {
+            schemaVersion = 1, id = "rd-body-" .. i, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 94000 + i,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        record.operations.records[cid] = {
+            schemaVersion = 1, id = cid, guildKey = "club:42", datasetId = ds,
+            kind = "confirm-candidate",
+            candidateRef = { recordId = body.id, body = body },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 94100 + i,
+            basePolicyRevision = pol, campaignId = camp,
+        }
+        record.operations.order[#record.operations.order + 1] = cid
+        record.confirmationRefs[#record.confirmationRefs + 1] = cid
+    end
+    -- Adoption-mode paced pass: budget 8 work units; must resume, not drain all 64.
+    local redriveState = { pos = 1, remaining = nil }
+    local done, visited = GS.RedriveExactContentConfirmations(record, {
+        adoptionReplay = true,
+        redriveBudget = 8,
+        redriveState = redriveState,
+    })
+    assertEq(done, false, "3A20: first paced redrive incomplete")
+    assertTrue((tonumber(visited) or 0) > 0, "3A20: first paced redrive visited > 0")
+    assertTrue((tonumber(visited) or 0) <= 8,
+        "3A20: first paced redrive bounded got=" .. tostring(visited))
+    local totalVisited = tonumber(visited) or 0
+    local steps = 1
+    while not done and steps < 40 do
+        steps = steps + 1
+        done, visited = GS.RedriveExactContentConfirmations(record, {
+            adoptionReplay = true,
+            redriveBudget = 8,
+            redriveState = redriveState,
+        })
+        local v = tonumber(visited) or 0
+        assertTrue(v <= 8, "3A20: step " .. steps .. " redrive bounded got=" .. tostring(v))
+        totalVisited = totalVisited + v
+    end
+    assertEq(done, true, "3A20: paced redrive eventually completes")
+    assertTrue(totalVisited >= nConf, "3A20: paced redrive covered envelopes")
+    assertTrue(redriveState.done == true or redriveState.remaining == nil,
+        "3A20: session redrive state marked complete")
+
+    -- Short live pass clears keyed state (no stranded record pin).
+    GS._confirmationRedriveByKey = {}
+    local shortRec = GS:GetCurrentRecord()
+    shortRec.confirmationRefs = shortRec.confirmationRefs or {}
+    -- Keep only 8 refs for a short pass.
+    while #shortRec.confirmationRefs > 8 do
+        table.remove(shortRec.confirmationRefs)
+    end
+    GS.RedriveExactContentConfirmations(shortRec, {})
+    world.time = world.time + 1
+    flushTimers()
+    local liveKeys = 0
+    for _ in pairs(GS._confirmationRedriveByKey or {}) do
+        liveKeys = liveKeys + 1
+    end
+    assertEq(liveKeys, 0, "3A20: short live redrive clears keyed state")
+
+    -- Cancel clears session-owned redrive and abandoned temp pins.
+    resetDb()
+    switchPlayer("Carol", "Player-1-Carol", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    carolDs = GS:GetCurrentRecord().datasetId
+    GS.NotePeerDataset("Alice-Garona", "cancel-rd-ds", {
+        editorRankPosition = 1, permissionRevisionId = "cancel-rd-ds",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", "cancel-rd-ds")), "accepted",
+        "3A20: cancel-redrive begin")
+    local tempPin = {
+        datasetId = "cancel-rd-ds", confirmationRefs = { "x" },
+        operations = { records = {}, order = {} },
+    }
+    GS._adoption.replayTemp = tempPin
+    GS._adoption.replayState = {
+        confirmRedrive = { pos = 2, remaining = 10, record = tempPin },
+    }
+    GS._confirmationRedriveByKey["pin"] = { record = tempPin, pos = 1 }
+    GS:CancelDatasetAdoption()
+    assertEq(GS._confirmationRedriveByKey["pin"], nil,
+        "3A20: cancel clears abandoned temp redrive pin")
+    assertEq(GS:GetCurrentRecord().datasetId, carolDs, "3A20: cancel preserves local dataset")
+
+    -- Confirmation-bearing adoption completes with paced redrive charges (sync drain
+    -- still invokes ReplayAdoptionSlice bounds; per-callback measure is above).
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    -- Causal chain (not same-base siblings): each confirmed tab bases on the prior
+    -- head so the confirmation-heavy adoption can settle every envelope.
+    local prevBase = ds
+    for i = 1, 12 do
+        local candId = "adopt-cand-" .. i
+        local cand = {
+            schemaVersion = 1, id = candId, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab",
+            value = ((i - 1) % 8) + 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 94200 + i,
+            baseTargetRevision = prevBase, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        assertEq(GS:AdmitRemoteOperation(cand, { sender = "Bob-Garona", relay = true }),
+            "pending", "3A20: adopt seed cand " .. i)
+        local conf, stc = GS:NewConfirmationOperation({ recordId = candId, body = cand })
+        assertEq(stc, "accepted", "3A20: adopt prepare conf " .. i)
+        assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted", "3A20: adopt accept conf " .. i)
+        assertEq(GS:GetCurrentRecord().operations.records[candId] ~= nil, true,
+            "3A20: adopt cand settled " .. i)
+        prevBase = candId
+    end
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(80)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = GS:GetCurrentRecord().datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 1)
+    initGS()
+    GS._adoptionReplaySyncDrain = true
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3A20: adopt-with-confirm begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "3A20: adopt-with-confirm ready")
+    local st1, reason1 = GS:CommitDatasetAdoption()
+    assertEq(st1, "accepted",
+        "3A20: adopt-with-confirm commits: " .. tostring(st1) .. "/" .. tostring(reason1))
+    assertEq(GS:GetCurrentRecord().datasetId, sourceDataset,
+        "3A20: adopt-with-confirm dataset")
+    local statsAdopt = GS.GetAdoptionWorkStats()
+    assertTrue(type(statsAdopt) == "table", "3A20: adopt work stats present")
+    assertTrue((tonumber(statsAdopt.confirmRedriveVisited) or 0) > 0,
+        "3A20: adopt path charged confirm redrive visits got="
+            .. tostring(statsAdopt and statsAdopt.confirmRedriveVisited))
+    GS._adoptionReplaySyncDrain = true
+
+    -- C) Exact reconstruction: two envelopes embed different bodies for one ID.
+    local function runExactPromote(orderFirst)
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        GS:EnsureGossipProvider()
+        startCampaign()
+        local datasetId = GS:GetCurrentRecord().datasetId
+        local pol2 = GS:GetCurrentRecord().permission.revisionId
+        local c1 = select(1, GS:NewCampaignOperation())
+        assertEq(GS:ApplyStagedCampaignOperation(c1), "accepted", "3A20: camp X " .. orderFirst)
+        local tabX = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 6))
+        assertEq(GS:ApplyStagedConfigOperation(tabX), "accepted", "3A20: X tab " .. orderFirst)
+        local c2 = {
+            schemaVersion = 1, id = "camp-y-exact", guildKey = "club:42", datasetId = datasetId,
+            campaignId = c1.baseCampaignId, kind = "start-campaign", target = "campaign",
+            value = {}, actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 96001,
+            baseTargetRevision = c1.baseTargetRevision, basePolicyRevision = pol2,
+            baseCampaignId = c1.baseCampaignId,
+        }
+        local border = {
+            schemaVersion = 1, campaignId = c2.id, datasetId = datasetId, guildKey = "club:42",
+            parentCampaignId = c1.baseCampaignId, resetOperationId = c2.id,
+            createdByGuid = "Player-1-Bob", createdByName = "Bob-Garona", startedAt = 96001,
+            bankTabAtStart = nil, boundaryVersion = 1, boundaryKind = "new-goal",
+            contextStatus = "unavailable",
+        }
+        GS:AdmitRemoteOperation(c2, { sender = "Bob-Garona", boundary = border })
+        local bodyWrong = {
+            schemaVersion = 1, id = "y-shared", guildKey = "club:42", datasetId = datasetId,
+            campaignId = "camp-y-exact", kind = "set-bank-tab", target = "bankTab", value = 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 96002,
+            baseTargetRevision = datasetId, basePolicyRevision = pol2, baseCampaignId = "camp-y-exact",
+        }
+        local bodyRight = {
+            schemaVersion = 1, id = "y-shared", guildKey = "club:42", datasetId = datasetId,
+            campaignId = "camp-y-exact", kind = "set-bank-tab", target = "bankTab", value = 3,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 96003,
+            baseTargetRevision = datasetId, basePolicyRevision = pol2, baseCampaignId = "camp-y-exact",
+        }
+        local stPend = GS:AdmitRemoteOperation(bodyRight, { sender = "Bob-Garona", relay = true })
+        assertEq(stPend, "pending", "3A20: retain matching body " .. orderFirst)
+        assertTrue(GS._pendingRelay and GS._pendingRelay["y-shared"] ~= nil,
+            "3A20: matching body retained in relay " .. orderFirst)
+        -- Build two accepted envelopes embedding different bodies for the same ID.
+        local function makeConf(id, body)
+            return {
+                schemaVersion = 1, id = id, guildKey = "club:42", datasetId = datasetId,
+                kind = "confirm-candidate",
+                candidateRef = { recordId = "y-shared", body = body },
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+                timestamp = body.timestamp + 10,
+                basePolicyRevision = pol2, campaignId = "camp-y-exact",
+            }
+        end
+        local confWrong = makeConf("conf-wrong-" .. orderFirst, bodyWrong)
+        local confRight = makeConf("conf-right-" .. orderFirst, bodyRight)
+        assertTrue(confWrong and confRight, "3A20: both envelopes prepared " .. orderFirst)
+        local rec = GS:GetCurrentRecord()
+        rec.confirmationRefs = rec.confirmationRefs or {}
+        local first, second = confWrong, confRight
+        if orderFirst == "right-first" then
+            first, second = confRight, confWrong
+        end
+        rec.operations.records[first.id] = first
+        rec.operations.order[#rec.operations.order + 1] = first.id
+        rec.confirmationRefs[#rec.confirmationRefs + 1] = first.id
+        rec.operations.records[second.id] = second
+        rec.operations.order[#rec.operations.order + 1] = second.id
+        rec.confirmationRefs[#rec.confirmationRefs + 1] = second.id
+        local conflicts = GS:ListOpenConflicts()
+        local open
+        for i = 1, #conflicts do
+            if tostring(conflicts[i].targetKey):find("campaign") then
+                open = conflicts[i]
+                break
+            end
+        end
+        assertTrue(open ~= nil, "3A20: open campaign conflict " .. orderFirst)
+        local resOp = select(1, GS:NewConflictResolutionOperation(
+            open.targetKey, "camp-y-exact", open.candidateIds))
+        assertEq(GS:ApplyStagedConflictResolution(resOp), "accepted",
+            "3A20: resolve " .. orderFirst)
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3,
+            "3A20: exact body value=3 promoted " .. orderFirst)
+        local accepted = GS:GetCurrentRecord().operations.records["y-shared"]
+        assertTrue(type(accepted) == "table", "3A20: y-shared accepted " .. orderFirst)
+        assertEq(accepted.value, 3, "3A20: accepted body is matching envelope " .. orderFirst)
+        local stats = GS._lastReconstructionLookupStats
+        assertTrue(type(stats) == "table", "3A20: reconstruction stats " .. orderFirst)
+        assertTrue((tonumber(stats.envelopeVisits) or 0) >= 2,
+            "3A20: envelopes indexed once-scale " .. orderFirst)
+        return tonumber(stats.envelopeVisits) or 0, tonumber(stats.rowVisits) or 0
+    end
+    local e1, r1 = runExactPromote("wrong-first")
+    local e2, r2 = runExactPromote("right-first")
+    assertTrue(e1 > 0 and e2 > 0, "3A20: both envelope orders measured")
+    -- Work scales with history indexing, not candidates×history blow-up.
+    assertTrue(e1 <= 64 and e2 <= 64, "3A20: envelope visits near history size")
+
+    -- D) Duplicate records[].id rejected locally and remotely; distinct IDs round-trip.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local rowBody = {
+        schemaVersion = 1, id = "dup-row", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 97000,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local confDup, stDup, errDup = GS:NewConfirmationOperation({
+        records = {
+            { id = "dup-row", body = rowBody },
+            { id = "dup-row", body = rowBody },
+        },
+    })
+    assertEq(confDup, nil, "3A20: local duplicate records[].id rejected")
+    assertEq(errDup, "invalid_candidate_batch", "3A20: local dup reason")
+    local divergent = {
+        schemaVersion = 1, id = "dup-row", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 9,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 97001,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    confDup, stDup, errDup = GS:NewConfirmationOperation({
+        records = {
+            { id = "dup-row", body = rowBody },
+            { id = "dup-row", body = divergent },
+        },
+    })
+    assertEq(confDup, nil, "3A20: divergent duplicate id rejected")
+    assertEq(errDup, "invalid_candidate_batch", "3A20: divergent dup reason")
+    -- Remote persistence path.
+    local remoteDup = {
+        schemaVersion = 1, id = "remote-dup-conf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = {
+            records = {
+                { id = "dup-row", body = rowBody },
+                { id = "dup-row", body = rowBody },
+            },
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 97002,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    local stR, reasonR = GS:AdmitRemoteOperation(remoteDup, { sender = "Alice-Garona" })
+    assertEq(stR, "rejected", "3A20: remote duplicate records[].id rejected")
+    assertTrue(reasonR == "invalid_candidate_batch" or reasonR == "invalid_operation",
+        "3A20: remote dup reason got=" .. tostring(reasonR))
+    assertEq(GS:GetCurrentRecord().operations.records["remote-dup-conf"], nil,
+        "3A20: remote dup not persisted")
+    -- Distinct-ID control round-trips.
+    local b1 = {
+        schemaVersion = 1, id = "uniq-a", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 4,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 97010,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local b2 = {
+        schemaVersion = 1, id = "uniq-b", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 5,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 97011,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(b1, { sender = "Bob-Garona", relay = true }), "pending",
+        "3A20: uniq-a retained")
+    assertEq(GS:AdmitRemoteOperation(b2, { sender = "Bob-Garona", relay = true }), "pending",
+        "3A20: uniq-b retained")
+    local confOk, stOk2, errOk = GS:NewConfirmationOperation({
+        records = {
+            { id = "uniq-a", body = b1 },
+            { id = "uniq-b", body = b2 },
+        },
+        originalIds = { "orig-keep-1" },
+    })
+    assertEq(stOk2, "accepted", "3A20: distinct-id confirm prepared: " .. tostring(errOk))
+    assertEq(GS:ApplyStagedConfirmationOperation(confOk), "accepted",
+        "3A20: distinct-id confirm admitted")
+    assertTrue(type(confOk.candidateRef.originalIds) == "table"
+            and confOk.candidateRef.originalIds[1] == "orig-keep-1"
+            and #confOk.candidateRef.originalIds == 1,
+        "3A20: originalIds preserved")
+    assertEq(#confOk.candidateRef.records, 2, "3A20: distinct records retained")
+
+    assertEq(#world.chat, 0, "3A20: no chat")
+    GS._adoptionReplaySyncDrain = true
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
