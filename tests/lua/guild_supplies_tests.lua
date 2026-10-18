@@ -12867,6 +12867,727 @@ do
     GS._adoptionReplaySyncDrain = true
 end
 
+---------------------------------------------------------------------------
+-- 3A21) Page-count consistency both orders; paced multirow redrive under
+-- timer steps; reconstruction comparisons + rollback retention restore
+-- (r4308543626 / r4308543798 / r4308543969)
+---------------------------------------------------------------------------
+do
+    -- A/B) Archive pageCount conflicts in both arrival orders.
+    resetDb()
+    switchPlayer("Carol", "Player-1-Carol", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    GS.NotePeerDataset("Alice-Garona", "pc-consist-ds", {
+        editorRankPosition = 1, permissionRevisionId = "pc-consist-ds",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", "pc-consist-ds")), "accepted",
+        "3A21: begin page-consist adopt")
+    local entry = GG.GetProvider(GS.PROVIDER_ID)
+    local order0 = #(GS._adoption.order or {})
+    -- Page-first then conflicting meta.
+    local stP, reasonP = GG.ApplyRecordToProvider(entry, {
+        id = "gs:cap:p1", versionFp = "p1",
+        body = {
+            kind = "campaign-archive-page", campaignId = "camp-pc", datasetId = "pc-consist-ds",
+            page = 1, pageCount = 2, chunk = { a = 1 },
+        },
+    }, { sender = "Alice-Garona" })
+    assertTrue(stP == "accepted" or stP == "pending",
+        "3A21: archive page-first buffers got=" .. tostring(stP))
+    local idxAfterPage = GS._adoption._archiveIndex
+        and GS._adoption._archiveIndex["camp-pc"]
+    local pcAfterPage = idxAfterPage and idxAfterPage.pageCount
+    local stMetaBad, reasonMetaBad = GG.ApplyRecordToProvider(entry, {
+        id = "gs:ca:meta-bad", versionFp = "mb",
+        body = {
+            kind = "campaign-archive", campaignId = "camp-pc", datasetId = "pc-consist-ds",
+            pageCount = 3, generation = 1, archivedAt = 1,
+        },
+    }, { sender = "Alice-Garona" })
+    assertEq(stMetaBad, "rejected", "3A21: page-first then meta mismatch rejected")
+    assertEq(reasonMetaBad, "invalid_operation", "3A21: page-first meta mismatch reason")
+    assertEq(GS._adoption._archiveIndex["camp-pc"].pageCount, pcAfterPage,
+        "3A21: page-first mismatch preserves prior pageCount")
+    assertEq(GS._adoption._archiveIndex["camp-pc"].meta, nil,
+        "3A21: page-first mismatch does not install conflicting meta")
+
+    -- Meta-first then conflicting page.
+    local stMetaOk, reasonMetaOk = GG.ApplyRecordToProvider(entry, {
+        id = "gs:ca:meta-ok", versionFp = "mo",
+        body = {
+            kind = "campaign-archive", campaignId = "camp-pc2", datasetId = "pc-consist-ds",
+            pageCount = 2, generation = 1, archivedAt = 1,
+        },
+    }, { sender = "Alice-Garona" })
+    assertTrue(stMetaOk == "accepted" or stMetaOk == "pending",
+        "3A21: archive meta-first buffers got=" .. tostring(stMetaOk) .. "/" .. tostring(reasonMetaOk))
+    local orderBeforePageBad = #(GS._adoption.order or {})
+    local stPageBad, reasonPageBad = GG.ApplyRecordToProvider(entry, {
+        id = "gs:cap:p-bad", versionFp = "pb",
+        body = {
+            kind = "campaign-archive-page", campaignId = "camp-pc2", datasetId = "pc-consist-ds",
+            page = 1, pageCount = 3, chunk = { b = 1 },
+        },
+    }, { sender = "Alice-Garona" })
+    assertEq(stPageBad, "rejected", "3A21: meta-first then page mismatch rejected")
+    assertEq(reasonPageBad, "invalid_operation", "3A21: meta-first page mismatch reason")
+    assertEq(#(GS._adoption.order or {}), orderBeforePageBad,
+        "3A21: meta-first mismatch does not grow order")
+    assertEq(GS._adoption._archiveIndex["camp-pc2"].pageCount, 2,
+        "3A21: meta-first mismatch preserves meta pageCount")
+    assertEq(GS._adoption._archiveIndex["camp-pc2"].pages[1], nil,
+        "3A21: meta-first mismatch does not retain bad page")
+
+    -- Outer/inner gs-op shell pageCount conflict.
+    local asmBefore = tonumber(GS._adoption._assemblyOpCount) or 0
+    local stShell, reasonShell = GG.ApplyRecordToProvider(entry, {
+        id = "gs:op:shell-mismatch", versionFp = "sm",
+        body = {
+            kind = "gs-op", pageCount = 2, datasetId = "pc-consist-ds",
+            op = {
+                schemaVersion = 1, id = "shell-mismatch", guildKey = "club:42",
+                datasetId = "pc-consist-ds", kind = "confirm-candidate",
+                candidateRef = {}, pageCount = 3, recordCount = 1,
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1,
+                basePolicyRevision = "pc-consist-ds",
+            },
+        },
+    }, { sender = "Alice-Garona" })
+    assertEq(stShell, "rejected", "3A21: outer/inner shell pageCount mismatch rejected")
+    assertEq(reasonShell, "invalid_operation", "3A21: outer/inner mismatch reason")
+    assertEq(tonumber(GS._adoption._assemblyOpCount) or 0, asmBefore,
+        "3A21: shell mismatch does not grow assembly")
+
+    -- Matching outer/inner still accepted into the assembly arena.
+    local maxPc = math.min(2, GS.MAX_MANIFEST_PAGES or 64)
+    local stMatch, reasonMatch = GG.ApplyRecordToProvider(entry, {
+        id = "gs:op:shell-match", versionFp = "smatch",
+        body = {
+            kind = "gs-op", pageCount = maxPc, recordCount = maxPc,
+            datasetId = "pc-consist-ds",
+            op = {
+                schemaVersion = 1, id = "shell-match", guildKey = "club:42",
+                datasetId = "pc-consist-ds", kind = "confirm-candidate",
+                candidateRef = {},
+                pageCount = maxPc, recordCount = maxPc,
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 2,
+                basePolicyRevision = "pc-consist-ds",
+            },
+        },
+    }, { sender = "Alice-Garona" })
+    assertTrue(stMatch == "accepted" or stMatch == "pending",
+        "3A21: matching outer/inner shell buffers got="
+            .. tostring(stMatch) .. "/" .. tostring(reasonMatch))
+    assertTrue(GS._adoption._assemblies and GS._adoption._assemblies["shell-match"] ~= nil,
+        "3A21: matching shell reserved assembly slot")
+    assertEq(GS._adoption._assemblies["shell-match"].pageCount, maxPc,
+        "3A21: matching shell stored coalesced pageCount")
+    -- Completed-manifest redelivery: install a finished logical op, then redeliver.
+    local doneOp = {
+        schemaVersion = 1, id = "done-op", guildKey = "club:42",
+        datasetId = "pc-consist-ds", kind = "confirm-candidate",
+        candidateRef = { records = { { id = "d1", body = { id = "d1" } } } },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 3,
+        basePolicyRevision = "pc-consist-ds",
+    }
+    local doneBody = { kind = "gs-op", datasetId = "pc-consist-ds", op = doneOp }
+    local doneRid = "gs:op:done-op"
+    GS._adoption.records[doneRid] = doneBody
+    GS._adoption.order[#GS._adoption.order + 1] = doneRid
+    GS._adoption._assembledByOpId = GS._adoption._assembledByOpId or {}
+    GS._adoption._assembledByOpId["done-op"] = doneRid
+    local orderBeforeRedel = #(GS._adoption.order or {})
+    local stRedel, reasonRedel = GG.ApplyRecordToProvider(entry, {
+        id = "gs:op:done-redel", versionFp = "dr",
+        body = {
+            kind = "gs-op", pageCount = 1, recordCount = 1, datasetId = "pc-consist-ds",
+            op = {
+                schemaVersion = 1, id = "done-op", guildKey = "club:42",
+                datasetId = "pc-consist-ds", kind = "confirm-candidate",
+                candidateRef = {}, pageCount = 1, recordCount = 1,
+                actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 3,
+                basePolicyRevision = "pc-consist-ds",
+            },
+        },
+    }, { sender = "Alice-Garona" })
+    assertTrue(stRedel == "duplicate" or stRedel == "pending" or stRedel == "accepted",
+        "3A21: completed-manifest redelivery handled got="
+            .. tostring(stRedel) .. "/" .. tostring(reasonRedel))
+    assertEq(GS._adoption._assembledByOpId["done-op"], doneRid,
+        "3A21: redelivery keeps single assembled logical id")
+    assertEq(#(GS._adoption.order or {}), orderBeforeRedel,
+        "3A21: redelivery does not append another logical row")
+    GS:CancelDatasetAdoption()
+
+    -- B) Multirow envelope exceeding slice: candidate-level resume + bound.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local ds = GS:GetCurrentRecord().datasetId
+    local camp = GS:GetCurrentRecord().currentCampaignId
+    local pol = GS:GetCurrentRecord().permission.revisionId
+    local record = GS:GetCurrentRecord()
+    record.confirmationRefs = record.confirmationRefs or {}
+    local rows = {}
+    local nRows = 40
+    for i = 1, nRows do
+        local bid = "mr-body-" .. i
+        local body = {
+            schemaVersion = 1, id = bid, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 98000 + i,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        rows[#rows + 1] = { id = bid, body = body }
+        GS._pendingRelay[bid] = { body = body, sender = "Bob-Garona", at = 98000 + i }
+    end
+    local bigId = "mr-env-big"
+    record.operations.records[bigId] = {
+        schemaVersion = 1, id = bigId, guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = rows },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 98100,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    record.operations.order[#record.operations.order + 1] = bigId
+    record.confirmationRefs[#record.confirmationRefs + 1] = bigId
+    -- Second small envelope so non-divisible leftover cannot start it early.
+    local smallId = "mr-env-small"
+    local smallBody = {
+        schemaVersion = 1, id = "mr-small-body", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 98101,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    record.operations.records[smallId] = {
+        schemaVersion = 1, id = smallId, guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { recordId = smallBody.id, body = smallBody },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 98102,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    record.operations.order[#record.operations.order + 1] = smallId
+    record.confirmationRefs[#record.confirmationRefs + 1] = smallId
+    GS._pendingRelay[smallBody.id] = { body = smallBody, sender = "Bob-Garona", at = 98101 }
+
+    local rdState = { pos = 1, remaining = nil }
+    local done, visited = GS.RedriveExactContentConfirmations(record, {
+        adoptionReplay = true, redriveBudget = 8, redriveState = rdState,
+    })
+    assertEq(done, false, "3A21: multirow first slice incomplete")
+    assertTrue((tonumber(visited) or 0) <= 8,
+        "3A21: multirow first slice bounded got=" .. tostring(visited))
+    assertTrue(rdState.candRow ~= nil, "3A21: multirow resumes mid-envelope candRow")
+    assertEq(rdState.pos, 1, "3A21: multirow stays on first envelope")
+    local steps = 1
+    local totalV = tonumber(visited) or 0
+    while not done and steps < 20 do
+        steps = steps + 1
+        done, visited = GS.RedriveExactContentConfirmations(record, {
+            adoptionReplay = true, redriveBudget = 8, redriveState = rdState,
+        })
+        local v = tonumber(visited) or 0
+        assertTrue(v <= 8, "3A21: multirow step " .. steps .. " bounded got=" .. tostring(v))
+        totalV = totalV + v
+    end
+    assertEq(done, true, "3A21: multirow paced redrive completes")
+    assertTrue(totalV >= nRows, "3A21: multirow charged candidate rows got=" .. tostring(totalV))
+
+    -- Non-divisible leftover: finish an envelope leaving budget=1; next large
+    -- envelope must not start (candRow remains nil / pos advances only when fit).
+    record.confirmationRefs = { bigId, smallId }
+    -- Rebuild big envelope state only (bodies already in relay from above where not promoted).
+    for i = 1, nRows do
+        local bid = "mr-body-" .. i
+        if not (record.operations.records and record.operations.records[bid]) then
+            local body = rows[i].body
+            GS._pendingRelay[bid] = { body = body, sender = "Bob-Garona", at = 98000 + i }
+        end
+    end
+    -- Use a fresh oversized envelope id to avoid already-accepted promotions.
+    local big2 = "mr-env-big2"
+    local rows2 = {}
+    for i = 1, 10 do
+        local bid = "mr2-body-" .. i
+        local body = {
+            schemaVersion = 1, id = bid, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-requested-item", target = "item:" .. i,
+            value = { itemId = i, qty = 1 },
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 98200 + i,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        rows2[#rows2 + 1] = { id = bid, body = body }
+        GS._pendingRelay[bid] = { body = body, sender = "Bob-Garona", at = 98200 + i }
+    end
+    record.operations.records[big2] = {
+        schemaVersion = 1, id = big2, guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = rows2 },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 98300,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    record.operations.order[#record.operations.order + 1] = big2
+    -- One tiny envelope then the big one: budget 3 completes tiny (2 units) with 1 left.
+    local tinyId = "mr-env-tiny"
+    local tinyBody = {
+        schemaVersion = 1, id = "mr-tiny-body", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item", target = "item:999",
+        value = { itemId = 999, qty = 1 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 98301,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    record.operations.records[tinyId] = {
+        schemaVersion = 1, id = tinyId, guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { recordId = tinyBody.id, body = tinyBody },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 98302,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    record.operations.order[#record.operations.order + 1] = tinyId
+    GS._pendingRelay[tinyBody.id] = { body = tinyBody, sender = "Bob-Garona", at = 98301 }
+    record.confirmationRefs = { tinyId, big2 }
+    local ndState = { pos = 1, remaining = nil }
+    done, visited = GS.RedriveExactContentConfirmations(record, {
+        adoptionReplay = true, redriveBudget = 3, redriveState = ndState,
+    })
+    assertEq(done, false, "3A21: non-divisible slice incomplete")
+    assertTrue((tonumber(visited) or 0) <= 3,
+        "3A21: non-divisible visited bounded got=" .. tostring(visited))
+    -- Tiny completed (2 units); leftover 1 must not start the 10-row envelope.
+    assertEq(ndState.candRow, nil, "3A21: non-divisible did not enter big envelope")
+    assertEq(ndState.pos, 2, "3A21: non-divisible parked at big envelope pos")
+
+    -- Predecessor-late: confirm envelopes exist before the retained body arrives.
+    -- First paced pass completes with zero promotions; after late retain, a
+    -- follow-up session pass (confirmRedriveAgain) promotes exactly once.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    record = GS:GetCurrentRecord()
+    record.confirmationRefs = record.confirmationRefs or {}
+    local lateBody = {
+        schemaVersion = 1, id = "late-pred-body", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 6,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 98950,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    for i = 1, 12 do
+        local cid = "late-env-" .. i
+        local targetId = (i == 12) and lateBody.id or ("late-decoy-" .. i)
+        local authBody = lateBody
+        if i ~= 12 then
+            authBody = {
+                schemaVersion = 1, id = targetId, guildKey = "club:42", datasetId = ds,
+                campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 98900 + i,
+                baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+            }
+        end
+        record.operations.records[cid] = {
+            schemaVersion = 1, id = cid, guildKey = "club:42", datasetId = ds,
+            kind = "confirm-candidate",
+            candidateRef = { recordId = targetId, body = authBody },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 98960 + i, basePolicyRevision = pol, campaignId = camp,
+        }
+        record.operations.order[#record.operations.order + 1] = cid
+        record.confirmationRefs[#record.confirmationRefs + 1] = cid
+    end
+    local lateState = { pos = 1, remaining = nil }
+    local lateDone, lateVisited, latePromo = GS.RedriveExactContentConfirmations(record, {
+        adoptionReplay = true, redriveBudget = 8, redriveState = lateState,
+    })
+    local lateSteps = 1
+    local lateTotalPromo = tonumber(latePromo) or 0
+    while not lateDone and lateSteps < 20 do
+        lateSteps = lateSteps + 1
+        lateDone, lateVisited, latePromo = GS.RedriveExactContentConfirmations(record, {
+            adoptionReplay = true, redriveBudget = 8, redriveState = lateState,
+        })
+        lateTotalPromo = lateTotalPromo + (tonumber(latePromo) or 0)
+    end
+    assertEq(lateDone, true, "3A21: predecessor-absent first pass completes")
+    assertEq(lateTotalPromo, 0, "3A21: predecessor-absent first pass promotes nothing")
+    assertEq(record.operations.records[lateBody.id], nil,
+        "3A21: late body not accepted before retain")
+    -- Install the predecessor into session relay without live Admit redrive
+    -- side effects (Admit would drain confirms synchronously on the live path).
+    GS._pendingRelay[lateBody.id] = {
+        body = lateBody, sender = "Dave-Garona", at = 98955,
+    }
+    assertTrue(GS._pendingRelay[lateBody.id] ~= nil, "3A21: late body retained")
+    assertEq(record.operations.records[lateBody.id], nil,
+        "3A21: late body still unaccepted after retain")
+    -- Follow-up paced pass after late retain (mirrors confirmRedriveAgain).
+    lateState = { pos = 1, remaining = nil }
+    lateDone, lateVisited, latePromo = GS.RedriveExactContentConfirmations(record, {
+        adoptionReplay = true, redriveBudget = 8, redriveState = lateState,
+        sender = "Alice-Garona",
+        member = {
+            name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, guildKey = "club:42",
+        },
+    })
+    lateSteps = 1
+    lateTotalPromo = tonumber(latePromo) or 0
+    while not lateDone and lateSteps < 20 do
+        lateSteps = lateSteps + 1
+        lateDone, lateVisited, latePromo = GS.RedriveExactContentConfirmations(record, {
+            adoptionReplay = true, redriveBudget = 8, redriveState = lateState,
+            sender = "Alice-Garona",
+            member = {
+                name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, guildKey = "club:42",
+            },
+        })
+        lateTotalPromo = lateTotalPromo + (tonumber(latePromo) or 0)
+        assertTrue((tonumber(lateVisited) or 0) <= 8,
+            "3A21: predecessor-late step bounded got=" .. tostring(lateVisited))
+    end
+    assertEq(lateDone, true, "3A21: predecessor-late follow-up completes")
+    assertTrue(lateTotalPromo >= 1,
+        "3A21: predecessor-late follow-up promotes got=" .. tostring(lateTotalPromo))
+    assertTrue(record.operations.records[lateBody.id] ~= nil,
+        "3A21: late confirmed body accepted after follow-up")
+    assertEq(record.accounting._consumables.bankTab, 6,
+        "3A21: predecessor-late tab value exact")
+    assertEq(GS._pendingRelay[lateBody.id], nil, "3A21: late relay cleared after promote")
+
+    -- Timer-stepped adoption with multirow confirm (no sync drain).
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local batchRows = {}
+    local prevBase = ds
+    for i = 1, 20 do
+        local candId = "timer-cand-" .. i
+        local cand = {
+            schemaVersion = 1, id = candId, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab",
+            value = ((i - 1) % 8) + 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 99000 + i,
+            baseTargetRevision = prevBase, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        assertEq(GS:AdmitRemoteOperation(cand, { sender = "Bob-Garona", relay = true }),
+            "pending", "3A21: timer seed cand " .. i)
+        batchRows[#batchRows + 1] = { id = candId, body = cand }
+        prevBase = candId
+    end
+    local confBatch, stBatch, errBatch = GS:NewConfirmationOperation({ records = batchRows })
+    assertEq(stBatch, "accepted", "3A21: timer batch confirm prepared: " .. tostring(errBatch))
+    assertEq(GS:ApplyStagedConfirmationOperation(confBatch), "accepted",
+        "3A21: timer batch confirm admitted")
+    for i = 1, 20 do
+        assertTrue(GS:GetCurrentRecord().operations.records["timer-cand-" .. i] ~= nil,
+            "3A21: timer cand settled " .. i)
+    end
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(80)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = GS:GetCurrentRecord().datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 1)
+    initGS()
+    GS._adoptionReplaySyncDrain = false
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3A21: timer adopt begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "3A21: timer adopt ready")
+    local stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    assertTrue(stCommit == "pending" or stCommit == "accepted",
+        "3A21: timer commit first return got=" .. tostring(stCommit) .. "/" .. tostring(reasonCommit))
+    local sliceVisits = {}
+    local guard = 0
+    local prevVisited = 0
+    do
+        local ws0 = GS.GetAdoptionWorkStats and GS.GetAdoptionWorkStats()
+        if type(ws0) == "table" then
+            prevVisited = tonumber(ws0.confirmRedriveVisited) or 0
+        end
+    end
+    while stCommit == "pending" and guard < 200 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        local ws = GS.GetAdoptionWorkStats and GS.GetAdoptionWorkStats()
+        local after = type(ws) == "table" and (tonumber(ws.confirmRedriveVisited) or 0) or prevVisited
+        local delta = after - prevVisited
+        if delta > 0 then
+            sliceVisits[#sliceVisits + 1] = delta
+            local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+            assertTrue(delta <= sliceBudget + 1,
+                "3A21: timer step charged within slice got=" .. tostring(delta))
+            prevVisited = after
+        end
+        if not GS._adoption then
+            stCommit = "accepted"
+            reasonCommit = nil
+            break
+        end
+        if GS._adoption.committed then
+            stCommit = "accepted"
+            reasonCommit = nil
+            break
+        end
+        stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    end
+    assertEq(stCommit, "accepted",
+        "3A21: timer-stepped adopt completes got=" .. tostring(stCommit)
+            .. "/" .. tostring(reasonCommit) .. " steps=" .. tostring(guard))
+    assertEq(GS:GetCurrentRecord().datasetId, sourceDataset, "3A21: timer adopt dataset")
+    -- Either measured per-callback redrive charges, or final work stats show
+    -- confirmation redrive ran under the timer-yielded commit path.
+    local finalWs = GS.GetAdoptionWorkStats and GS.GetAdoptionWorkStats()
+    local finalVisited = type(finalWs) == "table"
+        and (tonumber(finalWs.confirmRedriveVisited) or 0) or 0
+    assertTrue(#sliceVisits > 0 or finalVisited > 0,
+        "3A21: timer path charged confirm redrive slices="
+            .. tostring(#sliceVisits) .. " visited=" .. tostring(finalVisited))
+    GS._adoptionReplaySyncDrain = true
+    flushTimers()
+
+    -- C) Comparisons measured; no quadratic index dedup. Rollback restores
+    -- conflict/relay/boundary retention after forced post-validation failure.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local c1 = select(1, GS:NewCampaignOperation())
+    assertEq(GS:ApplyStagedCampaignOperation(c1), "accepted", "3A21: camp X")
+    local tabX = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 6))
+    assertEq(GS:ApplyStagedConfigOperation(tabX), "accepted", "3A21: X tab")
+    local c2 = {
+        schemaVersion = 1, id = "camp-y-rb", guildKey = "club:42", datasetId = ds,
+        campaignId = c1.baseCampaignId, kind = "start-campaign", target = "campaign",
+        value = {}, actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 99501,
+        baseTargetRevision = c1.baseTargetRevision, basePolicyRevision = pol,
+        baseCampaignId = c1.baseCampaignId,
+    }
+    local border = {
+        schemaVersion = 1, campaignId = c2.id, datasetId = ds, guildKey = "club:42",
+        parentCampaignId = c1.baseCampaignId, resetOperationId = c2.id,
+        createdByGuid = "Player-1-Bob", createdByName = "Bob-Garona", startedAt = 99501,
+        bankTabAtStart = nil, boundaryVersion = 1, boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+    }
+    local stC2, reasonC2 = GS:AdmitRemoteOperation(c2, { sender = "Bob-Garona", boundary = border })
+    assertTrue(stC2 == "pending" or stC2 == "accepted",
+        "3A21: sibling campaign admitted got=" .. tostring(stC2) .. "/" .. tostring(reasonC2))
+    -- Distinct same-ID bodies across many envelopes for comparison scaling.
+    local nDistinct = 12
+    local matchBody = {
+        schemaVersion = 1, id = "rb-shared", guildKey = "club:42", datasetId = ds,
+        campaignId = "camp-y-rb", kind = "set-bank-tab", target = "bankTab", value = 4,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 99510,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = "camp-y-rb",
+    }
+    assertEq(GS:AdmitRemoteOperation(matchBody, { sender = "Bob-Garona", relay = true }),
+        "pending", "3A21: match body relay retained")
+    assertTrue(GS._pendingRelay["rb-shared"] ~= nil, "3A21: relay present before resolve")
+    local rec = GS:GetCurrentRecord()
+    rec.confirmationRefs = rec.confirmationRefs or {}
+    for i = 1, nDistinct do
+        local body = {
+            schemaVersion = 1, id = "rb-shared", guildKey = "club:42", datasetId = ds,
+            campaignId = "camp-y-rb", kind = "set-bank-tab", target = "bankTab", value = i,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 99510 + i,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = "camp-y-rb",
+        }
+        if i == nDistinct then
+            body = matchBody
+        end
+        local cid = "rb-conf-" .. i
+        rec.operations.records[cid] = {
+            schemaVersion = 1, id = cid, guildKey = "club:42", datasetId = ds,
+            kind = "confirm-candidate",
+            candidateRef = { recordId = "rb-shared", body = body },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 99600 + i, basePolicyRevision = pol, campaignId = "camp-y-rb",
+        }
+        rec.operations.order[#rec.operations.order + 1] = cid
+        rec.confirmationRefs[#rec.confirmationRefs + 1] = cid
+    end
+
+    local conflicts = GS:ListOpenConflicts()
+    local open
+    local campKey = GS.CAMPAIGN_TARGET_KEY or "campaign:lifecycle"
+    for i = 1, #conflicts do
+        if conflicts[i].targetKey == campKey
+            or tostring(conflicts[i].targetKey):find("campaign", 1, true) then
+            open = conflicts[i]
+            break
+        end
+    end
+    if open == nil and rec.operations.openConflicts then
+        open = rec.operations.openConflicts[campKey]
+        if open then
+            open = { targetKey = campKey, candidateIds = open.candidateIds }
+        end
+    end
+    assertTrue(open ~= nil,
+        "3A21: open campaign conflict n=" .. tostring(#conflicts)
+            .. " key=" .. tostring(campKey)
+            .. " raw=" .. tostring(rec.operations.openConflicts
+                and rec.operations.openConflicts[campKey] ~= nil))
+    local resOp = select(1, GS:NewConflictResolutionOperation(
+        open.targetKey, "camp-y-rb", open.candidateIds))
+    assertTrue(resOp ~= nil, "3A21: resolution op prepared")
+    -- Successful path first: comparisons measured, exact body promoted.
+    assertEq(GS:ApplyStagedConflictResolution(resOp), "accepted", "3A21: resolve success")
+    local stats = GS._lastReconstructionLookupStats
+    assertTrue(type(stats) == "table", "3A21: reconstruction stats present")
+    assertTrue((tonumber(stats.envelopeVisits) or 0) >= nDistinct,
+        "3A21: envelope visits scale with history")
+    assertTrue((tonumber(stats.comparisons) or 0) > 0,
+        "3A21: deep comparisons measured got=" .. tostring(stats and stats.comparisons))
+    -- Indexing must not pay N*(N-1)/2: comparisons come from findExact only.
+    local maxCmp = nDistinct * 4 + 8
+    assertTrue((tonumber(stats.comparisons) or 0) <= maxCmp,
+        "3A21: comparisons near O(matches) not N^2 got=" .. tostring(stats.comparisons))
+    assertEq(GS:GetCurrentRecord().operations.records["rb-shared"].value, 4,
+        "3A21: exact matching body promoted")
+    assertEq(GS._pendingRelay["rb-shared"], nil, "3A21: relay cleared after success")
+
+    -- Forced post-validation failure restores conflict/relay/boundary.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    c1 = select(1, GS:NewCampaignOperation())
+    assertEq(GS:ApplyStagedCampaignOperation(c1), "accepted", "3A21: rb2 camp X")
+    tabX = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 5))
+    assertEq(GS:ApplyStagedConfigOperation(tabX), "accepted", "3A21: rb2 X tab")
+    c2 = {
+        schemaVersion = 1, id = "camp-y-rb2", guildKey = "club:42", datasetId = ds,
+        campaignId = c1.baseCampaignId, kind = "start-campaign", target = "campaign",
+        value = {}, actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 99701,
+        baseTargetRevision = c1.baseTargetRevision, basePolicyRevision = pol,
+        baseCampaignId = c1.baseCampaignId,
+    }
+    border = {
+        schemaVersion = 1, campaignId = c2.id, datasetId = ds, guildKey = "club:42",
+        parentCampaignId = c1.baseCampaignId, resetOperationId = c2.id,
+        createdByGuid = "Player-1-Bob", createdByName = "Bob-Garona", startedAt = 99701,
+        bankTabAtStart = nil, boundaryVersion = 1, boundaryKind = "new-goal",
+        contextStatus = "unavailable",
+    }
+    local stC2b, reasonC2b = GS:AdmitRemoteOperation(c2, { sender = "Bob-Garona", boundary = border })
+    assertEq(stC2b, "pending", "3A21: rb2 sibling campaign pending got=" .. tostring(reasonC2b))
+    assertEq(reasonC2b, "campaign_conflict", "3A21: rb2 campaign_conflict reason")
+    local relayBody = {
+        schemaVersion = 1, id = "rb2-relay", guildKey = "club:42", datasetId = ds,
+        campaignId = "camp-y-rb2", kind = "set-bank-tab", target = "bankTab", value = 3,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 99710,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = "camp-y-rb2",
+    }
+    assertEq(GS:AdmitRemoteOperation(relayBody, { sender = "Bob-Garona", relay = true }),
+        "pending", "3A21: rb2 relay retain")
+    rec = GS:GetCurrentRecord()
+    campKey = GS.CAMPAIGN_TARGET_KEY or "campaign:lifecycle"
+    local rawOpen = rec.operations.openConflicts and rec.operations.openConflicts[campKey]
+    assertTrue(type(rawOpen) == "table" and type(rawOpen.candidateIds) == "table",
+        "3A21: rb2 openConflicts entry present")
+    -- Prepare resolution while the record still validates; retention fixtures
+    -- for post-validation rollback are installed next.
+    resOp = select(1, GS:NewConflictResolutionOperation(
+        campKey, "camp-y-rb2", rawOpen.candidateIds))
+    assertTrue(resOp ~= nil, "3A21: rb2 resolution op prepared")
+    rec.confirmationRefs = rec.confirmationRefs or {}
+    local confRelay = {
+        schemaVersion = 1, id = "rb2-conf-relay", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { recordId = "rb2-relay", body = relayBody },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = 99720, basePolicyRevision = pol, campaignId = "camp-y-rb2",
+    }
+    rec.operations.records[confRelay.id] = confRelay
+    rec.operations.order[#rec.operations.order + 1] = confRelay.id
+    rec.confirmationRefs[#rec.confirmationRefs + 1] = confRelay.id
+    local conflictBody = {
+        schemaVersion = 1, id = "rb2-conflict", guildKey = "club:42", datasetId = ds,
+        campaignId = "camp-y-rb2", kind = "set-bank-tab", target = "bankTab", value = 9,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 99711,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = "camp-y-rb2",
+    }
+    rec.operations.conflicts = rec.operations.conflicts or {}
+    -- Retained conflict entries require entry.id == key (structure validation).
+    rec.operations.conflicts["rb2-conflict"] = {
+        id = "rb2-conflict", body = conflictBody, reason = "divergent_edit",
+    }
+    GS._pendingCampaignBoundaries["rb2-conflict"] = {
+        campaignId = "camp-y-rb2", note = "keep-me",
+    }
+    local confC = {
+        schemaVersion = 1, id = "rb2-conf-c", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { recordId = "rb2-conflict", body = conflictBody },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = 99721, basePolicyRevision = pol, campaignId = "camp-y-rb2",
+    }
+    rec.operations.records[confC.id] = confC
+    rec.operations.order[#rec.operations.order + 1] = confC.id
+    rec.confirmationRefs[#rec.confirmationRefs + 1] = confC.id
+    local priorRelay = GS._pendingRelay["rb2-relay"]
+    local priorConflict = rec.operations.conflicts["rb2-conflict"]
+    local priorBoundary = GS._pendingCampaignBoundaries["rb2-conflict"]
+    local priorCamp = rec.currentCampaignId
+    assertTrue(priorRelay ~= nil and priorConflict ~= nil and priorBoundary ~= nil,
+        "3A21: prior retention fixtures were installed")
+    local realValidate = GS._ValidateGuildRecordStructure
+    GS._ValidateGuildRecordStructure = function()
+        return false, "injected_post_failure"
+    end
+    local stFail, reasonFail = GS:ApplyStagedConflictResolution(resOp)
+    GS._ValidateGuildRecordStructure = realValidate
+    assertEq(stFail, "rejected", "3A21: forced post-validation rejects")
+    assertEq(reasonFail, "injected_post_failure", "3A21: forced failure reason")
+    rec = select(1, GS:GetCurrentRecord())
+    assertTrue(rec ~= nil, "3A21: record remains after forced failure")
+    assertEq(rec.currentCampaignId, priorCamp, "3A21: rollback restores campaign")
+    assertEq(rec.operations.records["rb2-relay"], nil, "3A21: rollback no promoted relay body")
+    assertEq(rec.operations.records["rb2-conflict"], nil, "3A21: rollback no promoted conflict body")
+    assertTrue(GS._pendingRelay["rb2-relay"] ~= nil, "3A21: rollback restores relay")
+    assertTrue(rec.operations.conflicts and rec.operations.conflicts["rb2-conflict"] ~= nil,
+        "3A21: rollback restores conflict")
+    assertEq(rec.operations.conflicts["rb2-conflict"].reason, "divergent_edit",
+        "3A21: rollback preserves conflict reason")
+    assertTrue(GS._pendingCampaignBoundaries["rb2-conflict"] ~= nil,
+        "3A21: rollback restores boundary")
+    assertEq(GS._pendingCampaignBoundaries["rb2-conflict"].note, "keep-me",
+        "3A21: rollback preserves boundary note")
+
+    assertEq(#world.chat, 0, "3A21: no chat")
+    GS._adoptionReplaySyncDrain = true
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

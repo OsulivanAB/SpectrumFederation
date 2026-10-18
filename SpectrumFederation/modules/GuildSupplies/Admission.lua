@@ -757,9 +757,12 @@ end
 -- resolve envelopes. Built once per reconstruction: retains distinct bodies that
 -- share an ID (first/last-wins maps are insufficient). Not a persistent cache.
 local function BuildReconstructionAuthLookup(record)
-    local byId = {} -- opId → { body, ... } distinct by AuthoritativeBodiesEqual
+    -- Retain envelope body references without eager pairwise dedup (that costs
+    -- N*(N-1)/2 deep equals during indexing). Exact matching happens in findExact.
+    local byId = {} -- opId → { body, ... }
     local envelopeVisits = 0
     local rowVisits = 0
+    local comparisons = 0
     local function noteBody(opId, body)
         if type(opId) ~= "string" or type(body) ~= "table" then
             return
@@ -768,11 +771,6 @@ local function BuildReconstructionAuthLookup(record)
         if not list then
             byId[opId] = { body }
             return
-        end
-        for i = 1, #list do
-            if AuthoritativeBodiesEqual(list[i], body) then
-                return
-            end
         end
         list[#list + 1] = body
     end
@@ -834,6 +832,7 @@ local function BuildReconstructionAuthLookup(record)
                 return nil
             end
             for i = 1, #list do
+                comparisons = comparisons + 1
                 if AuthoritativeBodiesEqual(list[i], candidateBody) then
                     return list[i]
                 end
@@ -845,6 +844,9 @@ local function BuildReconstructionAuthLookup(record)
         end,
         rowVisits = function()
             return rowVisits
+        end,
+        comparisons = function()
+            return comparisons
         end,
     }
 end
@@ -1950,6 +1952,27 @@ local function ValidateAdoptionPageCount(pageCount, maxPages)
     return pageCount, nil
 end
 
+--- Coalesce outer/inner advertised pageCount values. Both may be present on a
+-- gs-op shell (body.pageCount vs body.op.pageCount); conflicts reject before
+-- arena mutation. Either alone is validated against maxPages.
+local function CoalesceAdvertisedPageCounts(outer, inner, maxPages)
+    if outer == nil and inner == nil then
+        return nil, nil
+    end
+    local a, errA = ValidateAdoptionPageCount(outer, maxPages)
+    if errA then
+        return nil, errA
+    end
+    local b, errB = ValidateAdoptionPageCount(inner, maxPages)
+    if errB then
+        return nil, errB
+    end
+    if a ~= nil and b ~= nil and a ~= b then
+        return nil, "invalid_operation"
+    end
+    return a or b, nil
+end
+
 local function ValidateAdoptionPageIndex(page, pageCount)
     page = tonumber(page)
     if not page or page ~= math.floor(page) or page < 1 then
@@ -2120,16 +2143,16 @@ local function BufferAdoptionAssembly(adop, recordId, body)
             return finish("rejected", "invalid_record")
         end
         opId = body.op.id
-        local rawPc = body.pageCount
-        if rawPc == nil then
-            rawPc = body.op.pageCount
-        end
-        if rawPc == nil then
+        if body.pageCount == nil and (type(body.op) ~= "table" or body.op.pageCount == nil) then
             return nil -- not a paged shell; caller handles as logical
         end
-        local validated, countErr = ValidateAdoptionPageCount(rawPc, maxPages)
+        local validated, countErr = CoalesceAdvertisedPageCounts(
+            body.pageCount, body.op.pageCount, maxPages)
         if countErr then
             return finish("rejected", countErr)
+        end
+        if not validated then
+            return nil
         end
         pageCount = validated
     else
@@ -2233,12 +2256,9 @@ function GS:BufferAdoptionRecord(recordId, body)
         return BufferAdoptionAssembly(adop, recordId, body)
     end
     if body.kind == "gs-op" and type(body.op) == "table" then
-        local rawPc = body.pageCount
-        if rawPc == nil then
-            rawPc = body.op.pageCount
-        end
-        if rawPc ~= nil then
-            local pc, pcErr = ValidateAdoptionPageCount(rawPc, GS.MAX_MANIFEST_PAGES or 64)
+        if body.pageCount ~= nil or body.op.pageCount ~= nil then
+            local pc, pcErr = CoalesceAdvertisedPageCounts(
+                body.pageCount, body.op.pageCount, GS.MAX_MANIFEST_PAGES or 64)
             if pcErr then
                 return "rejected", pcErr
             end
@@ -2374,6 +2394,7 @@ function GS:BufferAdoptionRecord(recordId, body)
 
     -- Incremental archive-page index for bounded completeness checks.
     -- Validate counts/indices before mutating the arena or logical buffer.
+    -- Page-first and meta-first must reject conflicting pageCount equally.
     local maxArchivePages = GS.MAX_ARCHIVE_PAGE_COUNT or 22
     if body.kind == "campaign-archive" and type(body.campaignId) == "string" then
         local archivePc = body.pageCount
@@ -2388,10 +2409,18 @@ function GS:BufferAdoptionRecord(recordId, body)
             archivePc = pc
         end
         adop._archiveIndex = adop._archiveIndex or {}
-        adop._archiveIndex[body.campaignId] = adop._archiveIndex[body.campaignId]
+        local info = adop._archiveIndex[body.campaignId]
             or { meta = nil, pages = {} }
-        adop._archiveIndex[body.campaignId].meta = body
-        adop._archiveIndex[body.campaignId].pageCount = archivePc or 1
+        if info.pageCount and archivePc and info.pageCount ~= archivePc then
+            return "rejected", "invalid_operation"
+        end
+        info.meta = body
+        if archivePc then
+            info.pageCount = info.pageCount or archivePc
+        elseif not info.pageCount then
+            info.pageCount = 1
+        end
+        adop._archiveIndex[body.campaignId] = info
     elseif body.kind == "campaign-archive-page" and type(body.campaignId) == "string" then
         local pc, pcErr = ValidateAdoptionPageCount(body.pageCount, maxArchivePages)
         if pcErr then
@@ -2409,6 +2438,13 @@ function GS:BufferAdoptionRecord(recordId, body)
             or { meta = nil, pages = {} }
         if info.pageCount and info.pageCount ~= pc then
             return "rejected", "invalid_operation"
+        end
+        -- Also reject against meta.pageCount when meta arrived first.
+        if type(info.meta) == "table" and info.meta.pageCount ~= nil then
+            local metaPc = tonumber(info.meta.pageCount)
+            if metaPc and metaPc ~= pc then
+                return "rejected", "invalid_operation"
+            end
         end
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
@@ -3201,6 +3237,11 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
         else
             state.quietScanned = 0
         end
+    end
+    -- Unfinished confirmation redrive is a hard completion gate: idle/quiet
+    -- branches above must not clear moreWork while envelopes remain.
+    if redriveIncomplete then
+        moreWork = true
     end
     local ws = EnsureAdoptionWorkStats(adop)
     GS._lastAdoptionSliceStats = {
@@ -4051,6 +4092,7 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
     GS._lastReconstructionLookupStats = {
         envelopeVisits = authLookup.envelopeVisits(),
         rowVisits = authLookup.rowVisits(),
+        comparisons = authLookup.comparisons(),
         promoteCount = #promoteOps,
     }
     local slotsNeeded = #promoteOps
@@ -4359,9 +4401,14 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
                         end
                     end
                 end
-                -- Restore original pending reason when known.
-                local prior = previousPending[pid]
-                if ops.pending then
+                -- Retention cleanup is deferred until post-validation success, so
+                -- conflict/relay/pending sources normally still hold the body.
+                -- Only synthesize pending when no retention source remains.
+                local stillRetained = (ops.pending and ops.pending[pid])
+                    or (ops.conflicts and ops.conflicts[pid])
+                    or (GS._pendingRelay and GS._pendingRelay[pid])
+                if not stillRetained and ops.pending then
+                    local prior = previousPending[pid]
                     ops.pending[pid] = prior or {
                         body = body,
                         reason = (prior and prior.reason) or "stale_base",
@@ -4441,24 +4488,14 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
         ops.heads[GS.CAMPAIGN_TARGET_KEY] = chosen.id
     end
 
+    -- Store promotions first; defer retention cleanup until post-validation
+    -- succeeds so rollback can restore exact prior conflict/relay/boundary state.
     for i = 1, #(plan.promoteOps or {}) do
         local pop = plan.promoteOps[i]
         local targetKey = GS._TargetKey and GS._TargetKey(pop.kind, pop.target)
         if GS._StoreAccepted then
             GS._StoreAccepted(ops, pop, targetKey)
             promotedIds[#promotedIds + 1] = pop.id
-        end
-        if ops.pending then
-            ops.pending[pop.id] = nil
-        end
-        if ops.conflicts then
-            ops.conflicts[pop.id] = nil
-        end
-        if GS._pendingRelay then
-            GS._pendingRelay[pop.id] = nil
-        end
-        if GS._pendingCampaignBoundaries then
-            GS._pendingCampaignBoundaries[pop.id] = nil
         end
     end
 
@@ -4468,6 +4505,23 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
         if not postOk then
             rollbackActivation()
             return false, postErr or "invalid_record"
+        end
+    end
+    -- Post-validation succeeded: drop retained copies now that accepted history
+    -- owns the promoted bodies.
+    for i = 1, #promotedIds do
+        local pid = promotedIds[i]
+        if ops.pending then
+            ops.pending[pid] = nil
+        end
+        if ops.conflicts then
+            ops.conflicts[pid] = nil
+        end
+        if GS._pendingRelay then
+            GS._pendingRelay[pid] = nil
+        end
+        if GS._pendingCampaignBoundaries then
+            GS._pendingCampaignBoundaries[pid] = nil
         end
     end
     return true
@@ -4766,10 +4820,14 @@ end
 -- Preserves original attribution; does not synthesize approvals.
 -- During adoptionReplay, SET_EDITOR_RANK promotions are deferred while same-base
 -- acceptable non-rank history remains unsettled (matches direct rank Admit gate).
+-- Optional pacing via admissionCtx:
+--   confirmApplyBudget (number) — max candidate-row work units this call
+--   confirmApplyStartIdx (number) — 1-based resume index into the id list
+-- Returns ok, err, promoted, visited, nextIdx (nextIdx nil when envelope done).
 function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
     admissionCtx = admissionCtx or {}
     if type(record) ~= "table" or type(storedConfirm) ~= "table" then
-        return false, "invalid_operation"
+        return false, "invalid_operation", 0, 0, nil
     end
     -- Bind retained candidates to authoritative bodies embedded in the
     -- authenticated confirmation envelope. Fingerprint equality is never sufficient.
@@ -4795,12 +4853,34 @@ function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
             end
         end
     end
+    local budget = tonumber(admissionCtx.confirmApplyBudget)
+    if not budget or budget ~= budget or budget < 1 then
+        budget = math.huge
+    end
+    local startIdx = tonumber(admissionCtx.confirmApplyStartIdx) or 1
+    if startIdx < 1 then
+        startIdx = 1
+    end
     local seen = {}
-    local promoted = 0
-    for i = 1, #ids do
+    -- Skip ids already handled before startIdx so resume does not re-promote.
+    for i = 1, startIdx - 1 do
         local rid = ids[i]
+        if type(rid) == "string" then
+            seen[rid] = true
+        end
+    end
+    local promoted = 0
+    local visited = 0
+    local i = startIdx
+    while i <= #ids do
+        if visited >= budget then
+            return true, nil, promoted, visited, i
+        end
+        local rid = ids[i]
+        i = i + 1
         if type(rid) == "string" and not seen[rid] then
             seen[rid] = true
+            visited = visited + 1
             local authBody = AuthoritativeBodyFromEnvelope(storedConfirm, rid)
             if type(authBody) ~= "table" then
                 DebugWarn("confirm missing authoritative body id=%s", rid)
@@ -4837,7 +4917,7 @@ function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
             end
         end
     end
-    return true, nil, promoted
+    return true, nil, promoted, visited, nil
 end
 
 --- Guild key helper for live confirmation-redrive continuation ownership.
@@ -4920,38 +5000,73 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
         start = 1
     end
     local processed = 0
-    local envelopesProcessed = 0
+    local envelopesCompleted = 0
     local promoted = 0
     local i = start
     local visitBudget = slice
-    while envelopesProcessed < total and processed < visitBudget do
+    -- Candidate-level resume within a large multirow envelope.
+    local candRow = tonumber(state.candRow)
+    while envelopesCompleted < total and processed < visitBudget do
         local cid = record.confirmationRefs[i]
         local conf = ops.records[cid]
         if type(conf) == "table" and conf.kind == GS.KIND.CONFIRM_CANDIDATE then
-            -- Charge envelope + embedded candidate rows as inner work units.
-            local candUnits = 1
-            local ref = conf.candidateRef
-            if type(ref) == "table" then
-                if type(ref.records) == "table" then
-                    candUnits = candUnits + #ref.records
-                elseif type(ref.recordId) == "string" then
-                    candUnits = candUnits + 1
+            local budgetLeft = visitBudget - processed
+            local startIdx = candRow or 1
+            local startingEnvelope = startIdx <= 1
+            -- Envelope meta costs 1; remaining budget pays for candidate rows.
+            -- Never start a new envelope when only a leftover non-divisible unit
+            -- remains and another envelope was already completed this call.
+            local applyBudget = budgetLeft
+            if startingEnvelope then
+                if budgetLeft < 2 and envelopesCompleted > 0 then
+                    break
                 end
+                applyBudget = math.max(1, budgetLeft - 1)
             end
-            if processed + candUnits > visitBudget and envelopesProcessed > 0 then
-                break
+            local applyCtx = {}
+            for k, v in pairs(admissionCtx) do
+                applyCtx[k] = v
             end
-            local _, _, promo = GS.ApplyExactContentConfirmation(record, conf, admissionCtx)
-            promoted = promoted + (tonumber(promo) or 0)
-            processed = processed + candUnits
+            applyCtx.confirmApplyBudget = applyBudget
+            applyCtx.confirmApplyStartIdx = startIdx
+            local _, _, promo, visitedRows, nextIdx = GS.ApplyExactContentConfirmation(
+                record, conf, applyCtx)
+            promo = tonumber(promo) or 0
+            visitedRows = tonumber(visitedRows) or 0
+            local charged = visitedRows + (startingEnvelope and 1 or 0)
+            if charged < 1 then
+                charged = 1
+            end
+            processed = processed + charged
+            promoted = promoted + promo
+            if nextIdx ~= nil then
+                -- Mid-envelope: keep position; do not count envelope complete.
+                state.pos = i
+                state.candRow = nextIdx
+                if adoptionReplay then
+                    local adop = GS._adoption
+                    if type(adop) == "table" then
+                        local stats = EnsureAdoptionWorkStats(adop)
+                        stats.confirmRedriveVisited =
+                            (tonumber(stats.confirmRedriveVisited) or 0) + processed
+                    end
+                end
+                state.done = false
+                return false, processed, promoted
+            end
+            state.candRow = nil
+            candRow = nil
         else
             processed = processed + 1
+            state.candRow = nil
+            candRow = nil
         end
-        envelopesProcessed = envelopesProcessed + 1
+        envelopesCompleted = envelopesCompleted + 1
         i = i + 1
         if i > total then
             i = 1
         end
+        candRow = nil
     end
     if adoptionReplay and processed > 0 then
         local adop = GS._adoption
@@ -4961,15 +5076,17 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
         end
     end
     state.pos = i
+    state.candRow = nil
     local remaining = tonumber(state.remaining)
     if remaining == nil then
         remaining = total
     end
-    remaining = math.max(0, remaining - envelopesProcessed)
+    remaining = math.max(0, remaining - envelopesCompleted)
     state.remaining = remaining
     if remaining <= 0 then
         state.remaining = nil
         state.pos = 1
+        state.candRow = nil
         if adoptionReplay then
             -- Session-owned state cleared by caller / next begin; mark complete.
             state.done = true
@@ -5275,7 +5392,11 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if not already then
             refs[#refs + 1] = stored.id
         end
-        GS.ApplyExactContentConfirmation(record, stored, admissionCtx)
+        -- Adoption replay applies candidates via paced session redrive; do not
+        -- synchronously drain multirow manifests on the admit path.
+        if not admissionCtx.adoptionReplay then
+            GS.ApplyExactContentConfirmation(record, stored, admissionCtx)
+        end
         if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
             GS._NotifyLocalDurableChange("remote-confirm")
         end
