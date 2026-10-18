@@ -2106,6 +2106,19 @@ local function FinalizeAdoptionAssembly(adop, opId)
     NoteBufferedKindInsert(adop, assembled)
     adop._assembledByOpId = adop._assembledByOpId or {}
     adop._assembledByOpId[opId] = logicalId
+    -- Session-bounded exact fragment identity for independent shell/page redelivery
+    -- after arena/scratch clear. Bound by assembled op count (cleared with session).
+    adop._assembledFragments = adop._assembledFragments or {}
+    local fragPages = {}
+    for p, page in pairs(asm.pages or {}) do
+        fragPages[p] = page
+    end
+    adop._assembledFragments[opId] = {
+        shell = asm.shell,
+        shellRecordId = asm.shellRecordId,
+        pages = fragPages,
+        pageCount = pageCount,
+    }
     if assembled.evidenceOnly ~= true and type(assembled.op) == "table"
         and type(assembled.op.id) == "string" then
         local oid = assembled.op.id
@@ -2130,6 +2143,34 @@ local function BufferAssembledRedelivery(adop, recordId, body, opId, isShell, pa
         return "rejected", countErr
     end
     pageCount = validatedCount
+    -- Exact single-fragment redelivery after logical assembly: recognize each
+    -- shell/page independently without requiring soft-acked siblings to replay.
+    local existingRid = select(1, FindAssembledLogicalRecord(adop, opId))
+    local frag = adop._assembledFragments and adop._assembledFragments[opId]
+    if existingRid and type(frag) == "table" then
+        if pageCount and frag.pageCount and pageCount ~= frag.pageCount then
+            return "rejected", "invalid_operation"
+        end
+        if isShell then
+            if type(frag.shell) == "table" and DeepEqual(frag.shell, body) then
+                return "duplicate", "adoption_buffer"
+            end
+            if type(frag.shell) == "table" then
+                return "rejected", "id_conflict"
+            end
+        else
+            local p, pageErr = ValidateAdoptionPageIndex(body.page, pageCount or frag.pageCount)
+            if pageErr then
+                return "rejected", pageErr
+            end
+            if type(frag.pages) == "table" and type(frag.pages[p]) == "table" then
+                if DeepEqual(frag.pages[p], body) then
+                    return "duplicate", "adoption_buffer"
+                end
+                return "rejected", "id_conflict"
+            end
+        end
+    end
     adop._redeliveryAssemblies = adop._redeliveryAssemblies or {}
     local asm = adop._redeliveryAssemblies[opId]
     if not asm then
