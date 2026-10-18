@@ -5006,7 +5006,19 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
     local visitBudget = slice
     -- Candidate-level resume within a large multirow envelope.
     local candRow = tonumber(state.candRow)
-    while envelopesCompleted < total and processed < visitBudget do
+    -- Mid-envelope exits must still run remaining accounting + live scheduling.
+    local midEnvelope = false
+    -- Pass goal is envelopes still owed this circular pass (not a fresh total).
+    -- Bound the loop by passGoal so completing the last owed envelope cannot
+    -- wrap into already-completed work and revive remaining.
+    local passGoal = tonumber(state.remaining)
+    if passGoal == nil then
+        passGoal = total
+    end
+    if passGoal < 1 then
+        passGoal = total
+    end
+    while envelopesCompleted < passGoal and processed < visitBudget do
         local cid = record.confirmationRefs[i]
         local conf = ops.records[cid]
         if type(conf) == "table" and conf.kind == GS.KIND.CONFIRM_CANDIDATE then
@@ -5040,19 +5052,12 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             processed = processed + charged
             promoted = promoted + promo
             if nextIdx ~= nil then
-                -- Mid-envelope: keep position; do not count envelope complete.
+                -- Mid-envelope: keep position/candRow; do not count complete.
+                -- Fall through to shared remaining + scheduling (do not return).
                 state.pos = i
                 state.candRow = nextIdx
-                if adoptionReplay then
-                    local adop = GS._adoption
-                    if type(adop) == "table" then
-                        local stats = EnsureAdoptionWorkStats(adop)
-                        stats.confirmRedriveVisited =
-                            (tonumber(stats.confirmRedriveVisited) or 0) + processed
-                    end
-                end
-                state.done = false
-                return false, processed, promoted
+                midEnvelope = true
+                break
             end
             state.candRow = nil
             candRow = nil
@@ -5075,15 +5080,19 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             stats.confirmRedriveVisited = (tonumber(stats.confirmRedriveVisited) or 0) + processed
         end
     end
-    state.pos = i
-    state.candRow = nil
-    local remaining = tonumber(state.remaining)
-    if remaining == nil then
-        remaining = total
+    if not midEnvelope then
+        state.pos = i
+        state.candRow = nil
     end
-    remaining = math.max(0, remaining - envelopesCompleted)
+    -- Credit only fully completed envelopes; mid-envelope keeps work outstanding.
+    local remaining = math.max(0, passGoal - envelopesCompleted)
+    if midEnvelope then
+        -- Still inside an owed envelope; never treat the pass as finished.
+        remaining = math.max(remaining, 1)
+    end
     state.remaining = remaining
-    if remaining <= 0 then
+    local finished = (not midEnvelope) and remaining <= 0
+    if finished then
         state.remaining = nil
         state.pos = 1
         state.candRow = nil
@@ -5100,6 +5109,7 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
         return false, processed, promoted
     end
     -- Live path: schedule continuation until one full pass completes.
+    -- Mid-envelope partials use the same scheduler (candRow preserved above).
     if not state.scheduled then
         state.scheduled = true
         local expectedKey = key
@@ -5123,12 +5133,15 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
                 GS._confirmationRedriveByKey[expectedKey] = nil
                 return
             end
+            -- Continue while envelopes remain or a mid-envelope candRow is parked.
+            local stillOpen = (tonumber(st.remaining) or 0) > 0 or st.candRow ~= nil
             if type(expectedRecord.confirmationRefs) == "table"
                 and #expectedRecord.confirmationRefs > 0
-                and (tonumber(st.remaining) or 0) > 0 then
+                and stillOpen then
                 GS.RedriveExactContentConfirmations(expectedRecord, admissionCtx or {})
             else
                 st.remaining = nil
+                st.candRow = nil
                 GS._confirmationRedriveByKey[expectedKey] = nil
             end
         end
@@ -5138,7 +5151,7 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             continueRedrive()
         end
     end
-    return false, processed
+    return false, processed, promoted
 end
 
 --- Authenticated remote admission for a durable operation body.

@@ -13588,6 +13588,235 @@ do
     GS._adoptionReplaySyncDrain = true
 end
 
+---------------------------------------------------------------------------
+-- 3A22) Mid-envelope redrive: live continuation schedules + adoption
+-- remaining accounting (r4308632406). Partial and complete outcomes share
+-- progress bookkeeping; candRow preserved; no wrap into completed work.
+---------------------------------------------------------------------------
+do
+    local defaultSlice = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
+    assertTrue(defaultSlice >= 8, "3A22: default redrive slice usable")
+
+    -- Live: one multirow envelope larger than the slice; matching retained
+    -- candidate beyond the first slice. Timers alone must promote and drain.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local ds = GS:GetCurrentRecord().datasetId
+    local camp = GS:GetCurrentRecord().currentCampaignId
+    local pol = GS:GetCurrentRecord().permission.revisionId
+    local record = GS:GetCurrentRecord()
+    record.confirmationRefs = record.confirmationRefs or {}
+    local nLiveRows = 64
+    local matchIdx = 40
+    assertTrue(matchIdx > defaultSlice - 1,
+        "3A22: match index beyond first live slice")
+    local liveRows = {}
+    local matchBody = nil
+    for i = 1, nLiveRows do
+        local bid = "live-mr-" .. i
+        local body = {
+            schemaVersion = 1, id = bid, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab",
+            value = (i == matchIdx) and 7 or 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 88000 + i,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        liveRows[#liveRows + 1] = { id = bid, body = body }
+        if i == matchIdx then
+            matchBody = body
+        end
+    end
+    local liveEnvId = "live-mr-env"
+    record.operations.records[liveEnvId] = {
+        schemaVersion = 1, id = liveEnvId, guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = liveRows },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 88100,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    record.operations.order[#record.operations.order + 1] = liveEnvId
+    record.confirmationRefs[#record.confirmationRefs + 1] = liveEnvId
+    assertEq(GS:AdmitRemoteOperation(matchBody, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A22: live match retained")
+    assertEq(record.operations.records[matchBody.id], nil,
+        "3A22: match not accepted before redrive")
+    GS._confirmationRedriveByKey = {}
+    timers = {}
+    -- Production live entry: first slice must stop mid-envelope and schedule.
+    local doneLive, visitedLive, promoLive = GS.RedriveExactContentConfirmations(record, {})
+    assertEq(doneLive, false, "3A22: live first slice incomplete")
+    assertTrue((tonumber(visitedLive) or 0) <= defaultSlice,
+        "3A22: live first slice bounded got=" .. tostring(visitedLive))
+    assertEq(tonumber(promoLive) or 0, 0, "3A22: live first slice no early promote")
+    assertEq(record.operations.records[matchBody.id], nil,
+        "3A22: match still pending after first slice")
+    local liveKeyCount = 0
+    local liveState = nil
+    for _, st in pairs(GS._confirmationRedriveByKey or {}) do
+        liveKeyCount = liveKeyCount + 1
+        liveState = st
+    end
+    assertTrue(liveKeyCount >= 1, "3A22: live keyed redrive state retained")
+    assertTrue(liveState and (liveState.candRow ~= nil or (tonumber(liveState.remaining) or 0) > 0),
+        "3A22: live mid-envelope remaining/candRow parked")
+    assertTrue(liveState.scheduled == true or #timers > 0,
+        "3A22: live continuation scheduled after mid-envelope")
+    local guard = 0
+    while record.operations.records[matchBody.id] == nil and guard < 40 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertTrue(record.operations.records[matchBody.id] ~= nil,
+        "3A22: timers alone promote match beyond first slice steps=" .. tostring(guard))
+    assertEq(record.accounting._consumables.bankTab, 7,
+        "3A22: live multirow tab value exact")
+    -- Drain any trailing continuation; keyed state must release.
+    for _ = 1, 20 do
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    local keysLeft = 0
+    for _ in pairs(GS._confirmationRedriveByKey or {}) do
+        keysLeft = keysLeft + 1
+    end
+    assertEq(keysLeft, 0, "3A22: live continuation state released after drain")
+    assertEq(#timers, 0, "3A22: no stranded live timers")
+
+    -- Two large adoption envelopes: exact completion with bounded calls/visits.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    record = GS:GetCurrentRecord()
+    record.confirmationRefs = record.confirmationRefs or {}
+    local nAdoptRows = 64
+    local budget = 32
+    local totalVisits = 0
+    local calls = 0
+    local rdState = { pos = 1, remaining = nil }
+    for e = 1, 2 do
+        local rows = {}
+        for i = 1, nAdoptRows do
+            local bid = string.format("ad-mr-%d-%d", e, i)
+            local body = {
+                schemaVersion = 1, id = bid, guildKey = "club:42", datasetId = ds,
+                campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+                timestamp = 89000 + e * 100 + i,
+                baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+            }
+            rows[#rows + 1] = { id = bid, body = body }
+            GS._pendingRelay[bid] = { body = body, sender = "Bob-Garona", at = 89000 + i }
+        end
+        local eid = "ad-mr-env-" .. e
+        record.operations.records[eid] = {
+            schemaVersion = 1, id = eid, guildKey = "club:42", datasetId = ds,
+            kind = "confirm-candidate",
+            candidateRef = { records = rows },
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 89100 + e, basePolicyRevision = pol, campaignId = camp,
+        }
+        record.operations.order[#record.operations.order + 1] = eid
+        record.confirmationRefs[#record.confirmationRefs + 1] = eid
+    end
+    local doneAd = false
+    local visitedAd, promoAd
+    while not doneAd and calls < 80 do
+        calls = calls + 1
+        doneAd, visitedAd, promoAd = GS.RedriveExactContentConfirmations(record, {
+            adoptionReplay = true,
+            redriveBudget = budget,
+            redriveState = rdState,
+            sender = "Alice-Garona",
+            member = {
+                name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, guildKey = "club:42",
+            },
+        })
+        local v = tonumber(visitedAd) or 0
+        assertTrue(v <= budget,
+            "3A22: adoption call " .. calls .. " bounded got=" .. tostring(v))
+        totalVisits = totalVisits + v
+        if doneAd then
+            break
+        end
+        assertTrue(rdState.candRow ~= nil or (tonumber(rdState.remaining) or 0) > 0,
+            "3A22: adoption unfinished state keeps remaining/candRow call=" .. calls)
+    end
+    assertEq(doneAd, true, "3A22: two large adoption envelopes complete")
+    -- Each envelope: 1 meta + 64 rows = 65; two envelopes => 130 visit units.
+    -- Without remaining credit on mid-envelope returns this took ~126 calls.
+    local expectMin = nAdoptRows * 2
+    local expectMax = (nAdoptRows + 1) * 2 + budget
+    assertTrue(totalVisits >= expectMin and totalVisits <= expectMax,
+        "3A22: adoption visits bounded got=" .. tostring(totalVisits)
+            .. " calls=" .. tostring(calls))
+    local maxCalls = math.ceil(((nAdoptRows + 1) * 2) / budget) + 4
+    assertTrue(calls <= maxCalls,
+        "3A22: adoption calls bounded got=" .. tostring(calls)
+            .. " max=" .. tostring(maxCalls))
+    assertTrue(rdState.done == true or rdState.remaining == nil,
+        "3A22: adoption redrive state marked complete")
+
+    -- Cancellation clears abandoned live mid-envelope continuation.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    record = GS:GetCurrentRecord()
+    record.confirmationRefs = record.confirmationRefs or {}
+    local cancelRows = {}
+    for i = 1, 64 do
+        local bid = "cancel-mr-" .. i
+        local body = {
+            schemaVersion = 1, id = bid, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 90000 + i,
+            baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        cancelRows[#cancelRows + 1] = { id = bid, body = body }
+        GS._pendingRelay[bid] = { body = body, sender = "Bob-Garona", at = 90000 + i }
+    end
+    record.operations.records["cancel-mr-env"] = {
+        schemaVersion = 1, id = "cancel-mr-env", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = cancelRows },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 90100,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    record.operations.order[#record.operations.order + 1] = "cancel-mr-env"
+    record.confirmationRefs[#record.confirmationRefs + 1] = "cancel-mr-env"
+    GS._confirmationRedriveByKey = {}
+    timers = {}
+    local doneC = GS.RedriveExactContentConfirmations(record, {})
+    assertEq(doneC, false, "3A22: cancel-fixture first slice incomplete")
+    assertTrue(next(GS._confirmationRedriveByKey) ~= nil, "3A22: cancel-fixture state present")
+    -- Replacement guard: dataset change drops continuation (production check).
+    local oldDs = record.datasetId
+    record.datasetId = oldDs .. "-replaced"
+    world.time = (world.time or 0) + 1
+    flushTimers()
+    local keysAfterReplace = 0
+    for _ in pairs(GS._confirmationRedriveByKey or {}) do
+        keysAfterReplace = keysAfterReplace + 1
+    end
+    assertEq(keysAfterReplace, 0, "3A22: replacement clears live continuation state")
+    record.datasetId = oldDs
+
+    assertEq(#world.chat, 0, "3A22: no chat")
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
