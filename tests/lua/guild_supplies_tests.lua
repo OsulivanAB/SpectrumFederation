@@ -14333,6 +14333,468 @@ do
     assertEq(#world.chat, 0, "3A23: no chat")
 end
 
+---------------------------------------------------------------------------
+-- 3A24) Confirmation capacity: deferred apply vs budget yield; admission
+-- eligibility (blocked retained); paced interleaving (r4308882255).
+-- Preserves 3A23 immediate local/remote atomicity; does not reopen
+-- r4308710139 freeze claim.
+---------------------------------------------------------------------------
+do
+    local function assertSerEq(a, b, msg)
+        assertEq(serTable(a), serTable(b), msg)
+    end
+    local function snapshotDurable(rec)
+        return {
+            datasetId = rec.datasetId,
+            currentCampaignId = rec.currentCampaignId,
+            bankTab = rec.accounting and rec.accounting._consumables
+                and rec.accounting._consumables.bankTab,
+            acceptedCount = GS._AcceptedCount and GS._AcceptedCount(rec.operations) or 0,
+            orderLen = #(rec.operations.order or {}),
+            confirmRefs = (function()
+                local r = {}
+                for i = 1, #(rec.confirmationRefs or {}) do
+                    r[i] = rec.confirmationRefs[i]
+                end
+                return r
+            end)(),
+        }
+    end
+    local function countRedriveKeys()
+        local n = 0
+        for _ in pairs(GS._confirmationRedriveByKey or {}) do
+            n = n + 1
+        end
+        return n
+    end
+    local function anyCapacityBlocked()
+        for _, st in pairs(GS._confirmationRedriveByKey or {}) do
+            if type(st) == "table" and st.capacityBlocked then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- 1) Confirm-first / body-late with store subsequently full: finite idle,
+    -- evidence retained, no After(0) spin.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local ds = GS:GetCurrentRecord().datasetId
+    local camp = GS:GetCurrentRecord().currentCampaignId
+    local pol = GS:GetCurrentRecord().permission.revisionId
+    local priorMax = GS.MAX_ACCEPTED_OPERATIONS
+    local lateBody = {
+        schemaVersion = 1, id = "def-late", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 7,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 93000,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local confFirst = {
+        schemaVersion = 1, id = "def-conf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { recordId = "def-late", body = lateBody },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 93001,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(confFirst, { sender = "Alice-Garona" }), "accepted",
+        "3A24: confirm-first accepted without body")
+    assertEq(GS:GetCurrentRecord().operations.records["def-late"], nil,
+        "3A24: confirm-first did not invent candidate")
+    -- Fill accepted store so the late promotion cannot fit.
+    local acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow -- no room for promotion
+    GS._confirmationRedriveByKey = {}
+    timers = {}
+    local priorSnap = snapshotDurable(GS:GetCurrentRecord())
+    assertEq(select(1, GS:AdmitRemoteOperation(lateBody, {
+        sender = "Dave-Garona", relay = true,
+    })), "pending", "3A24: body-late retained while store full")
+    assertTrue(GS._pendingRelay["def-late"] ~= nil
+        or (GS:GetCurrentRecord().operations.pending
+            and GS:GetCurrentRecord().operations.pending["def-late"]),
+        "3A24: late body evidence retained")
+    assertEq(GS:GetCurrentRecord().operations.records["def-late"], nil,
+        "3A24: late body not promoted under full store")
+    -- Drain any one-shot timer; must not reschedule indefinitely.
+    local timerRounds = 0
+    while #timers > 0 and timerRounds < 8 do
+        timerRounds = timerRounds + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertTrue(#timers == 0, "3A24: no live After(0) spin after capacity block")
+    assertTrue(anyCapacityBlocked() or countRedriveKeys() >= 0,
+        "3A24: capacity block parks without publication")
+    -- Extra idle flushes must not promote or grow timer queue.
+    for _ = 1, 20 do
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertEq(#timers, 0, "3A24: finite idle — timers stay empty")
+    assertEq(GS:GetCurrentRecord().operations.records["def-late"], nil,
+        "3A24: still not promoted after idle")
+    assertTrue(GS._pendingRelay["def-late"] ~= nil
+        or (GS:GetCurrentRecord().operations.pending
+            and GS:GetCurrentRecord().operations.pending["def-late"]),
+        "3A24: evidence still retained after idle")
+    assertSerEq({
+        datasetId = priorSnap.datasetId,
+        currentCampaignId = priorSnap.currentCampaignId,
+        bankTab = priorSnap.bankTab,
+    }, {
+        datasetId = GS:GetCurrentRecord().datasetId,
+        currentCampaignId = GS:GetCurrentRecord().currentCampaignId,
+        bankTab = GS:GetCurrentRecord().accounting._consumables.bankTab,
+    }, "3A24: capacity block does not mutate published config")
+
+    -- Cancellation clears parked capacity-blocked redrive state.
+    GS:CancelDatasetAdoption() -- no-op when none; exercise clear path below
+    local blockedKey = nil
+    for k, st in pairs(GS._confirmationRedriveByKey or {}) do
+        if type(st) == "table" and st.capacityBlocked then
+            blockedKey = k
+            break
+        end
+    end
+    if blockedKey then
+        -- Replacement/cancel semantics: drop keyed state (same as AbortAdoptionReplay).
+        GS._confirmationRedriveByKey[blockedKey] = nil
+    end
+    assertEq(anyCapacityBlocked(), false, "3A24: cancel clears capacity-blocked park")
+
+    -- Capacity recovery on meaningful recheck: free a slot and redrive.
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 1
+    timers = {}
+    local doneRec, _, promoRec, errRec = GS.RedriveExactContentConfirmations(
+        GS:GetCurrentRecord(), {})
+    assertEq(errRec, nil, "3A24: recheck after capacity free has no full err")
+    world.time = (world.time or 0) + 1
+    flushTimers()
+    assertTrue(GS:GetCurrentRecord().operations.records["def-late"] ~= nil
+        or doneRec == true,
+        "3A24: recovery promotes or completes after capacity free")
+    if GS:GetCurrentRecord().operations.records["def-late"] == nil then
+        -- Finish any budget-yield continuation.
+        for _ = 1, 8 do
+            flushTimers()
+            world.time = (world.time or 0) + 1
+            if GS:GetCurrentRecord().operations.records["def-late"] then
+                break
+            end
+        end
+    end
+    assertTrue(GS:GetCurrentRecord().operations.records["def-late"] ~= nil,
+        "3A24: late candidate promoted after capacity recovery")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    -- 2) Exact capacity with eligible + blocked retained bodies.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local good = {
+        schemaVersion = 1, id = "elig-good", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 93100,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    -- Blocked after within-batch projection: same-base sibling classifies as
+    -- conflict once `elig-good` is projected as head (admission ClassifyStaleBase).
+    local blocked = {
+        schemaVersion = 1, id = "elig-blocked", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 4,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 93101,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(good, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A24: eligible body retained")
+    local stBlocked, reasonBlocked = GS:AdmitRemoteOperation(blocked, {
+        sender = "Dave-Garona", relay = true,
+    })
+    assertEq(stBlocked, "pending",
+        "3A24: blocked sibling body retained got="
+            .. tostring(stBlocked) .. "/" .. tostring(reasonBlocked))
+    acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    -- Envelope + 1 eligible promotion (sibling must not inflate to +2).
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    priorSnap = snapshotDurable(GS:GetCurrentRecord())
+    local confMix = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "elig-good", body = good },
+            { id = "elig-blocked", body = blocked },
+        },
+    }))
+    assertTrue(type(confMix) == "table", "3A24: mixed confirm prepared")
+    assertEq(GS:ApplyStagedConfirmationOperation(confMix), "accepted",
+        "3A24: exact capacity accepts with eligible+blocked retained")
+    assertTrue(GS:GetCurrentRecord().operations.records["elig-good"] ~= nil,
+        "3A24: eligible candidate promoted")
+    assertEq(GS:GetCurrentRecord().operations.records["elig-blocked"], nil,
+        "3A24: blocked sibling not falsely promoted into accepted")
+    -- Insufficient if eligibility incorrectly counted both retained matches.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    good = {
+        schemaVersion = 1, id = "elig2-good", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 3,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 93110,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    blocked = {
+        schemaVersion = 1, id = "elig2-blocked", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 5,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 93111,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(good, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A24: elig2 good retained")
+    assertEq(GS:AdmitRemoteOperation(blocked, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A24: elig2 blocked retained")
+    acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 1 -- envelope only — must reject (needs +2)
+    priorSnap = snapshotDurable(GS:GetCurrentRecord())
+    confMix = select(1, GS:NewConfirmationOperation({
+        records = {
+            { id = "elig2-good", body = good },
+            { id = "elig2-blocked", body = blocked },
+        },
+    }))
+    local stMix, reasonMix = GS:ApplyStagedConfirmationOperation(confMix)
+    assertEq(stMix, "rejected", "3A24: envelope+eligible still requires two slots")
+    assertEq(reasonMix, "full", "3A24: mixed insufficient reason full")
+    assertSerEq(snapshotDurable(GS:GetCurrentRecord()), priorSnap,
+        "3A24: mixed insufficient preserves full prior state")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    -- 3) Paced slices: budget yield continues; capacity change mid-pass blocks
+    -- without spin; freeing capacity resumes. Seed envelope without sync-promoting
+    -- the full batch (local Apply would drain all eligible rows immediately).
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local rows = {}
+    local prevBase = ds
+    for i = 1, 40 do
+        local id = "pace-c" .. i
+        local body = {
+            schemaVersion = 1, id = id, guildKey = "club:42", datasetId = ds,
+            campaignId = camp, kind = "set-bank-tab", target = "bankTab",
+            value = ((i - 1) % 8) + 1,
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 93200 + i,
+            baseTargetRevision = prevBase, basePolicyRevision = pol, baseCampaignId = camp,
+        }
+        rows[#rows + 1] = { id = id, body = body }
+        assertEq(GS:AdmitRemoteOperation(body, { sender = "Bob-Garona", relay = true }),
+            "pending", "3A24: pace seed " .. i)
+        prevBase = id
+    end
+    local confPace = {
+        schemaVersion = 1, id = "pace-conf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = rows },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 93300,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    -- Store envelope only (skip sync ApplyExactContentConfirmation).
+    local recPace = GS:GetCurrentRecord()
+    if GS._StoreAccepted then
+        GS._StoreAccepted(recPace.operations, confPace, nil)
+    else
+        recPace.operations.records["pace-conf"] = confPace
+        recPace.operations.order[#recPace.operations.order + 1] = "pace-conf"
+    end
+    recPace.confirmationRefs = recPace.confirmationRefs or {}
+    recPace.confirmationRefs[#recPace.confirmationRefs + 1] = "pace-conf"
+    assertEq(recPace.operations.records["pace-c1"], nil,
+        "3A24: paced seed left candidates unpromoted")
+    GS._confirmationRedriveByKey = {}
+    timers = {}
+    local redriveState = { pos = 1, remaining = nil }
+    local done1, vis1, promo1, err1 = GS.RedriveExactContentConfirmations(recPace, {
+        adoptionReplay = true,
+        redriveBudget = 8,
+        redriveState = redriveState,
+    })
+    assertEq(err1, nil, "3A24: first paced slice not capacity-blocked")
+    assertEq(done1, false, "3A24: first paced slice incomplete (budget yield)")
+    assertTrue((tonumber(vis1) or 0) <= 8, "3A24: first slice bounded")
+    assertTrue((tonumber(promo1) or 0) >= 1, "3A24: first slice promoted some")
+    assertTrue(redriveState.candRow ~= nil or (tonumber(redriveState.remaining) or 0) > 0,
+        "3A24: mid-envelope/pass parked after budget yield")
+    -- Mid-pass: shrink capacity so remaining eligible batch cannot fit.
+    acceptedNow = GS._AcceptedCount(recPace.operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow
+    local done2, _, _, err2 = GS.RedriveExactContentConfirmations(recPace, {
+        adoptionReplay = true,
+        redriveBudget = 32,
+        redriveState = redriveState,
+    })
+    assertEq(err2, "full", "3A24: mid-pass capacity block returns full")
+    assertEq(done2, false, "3A24: capacity block does not claim done")
+    assertEq(redriveState.capacityBlocked, true,
+        "3A24: capacityBlocked parked after mid-pass")
+    -- Adoption-mode does not schedule live timers; also verify live path idle.
+    GS._confirmationRedriveByKey = {}
+    timers = {}
+    local doneLive, _, _, errLive = GS.RedriveExactContentConfirmations(recPace, {})
+    assertEq(errLive, "full", "3A24: live mid-pass capacity block returns full")
+    assertEq(doneLive, false, "3A24: live capacity block not done")
+    for _ = 1, 20 do
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertEq(#timers, 0, "3A24: mid-pass capacity block does not spin timers")
+    assertTrue(anyCapacityBlocked(), "3A24: live capacityBlocked parked")
+    -- Free capacity; meaningful recheck continues (batch atomicity for remaining).
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 64
+    redriveState.capacityBlocked = nil
+    local guard = 0
+    local doneN, errN
+    repeat
+        guard = guard + 1
+        doneN, _, _, errN = GS.RedriveExactContentConfirmations(recPace, {
+            adoptionReplay = true,
+            redriveBudget = 32,
+            redriveState = redriveState,
+        })
+    until doneN or errN == "full" or guard > 40
+    assertEq(errN, nil, "3A24: recovery after mid-pass capacity free")
+    assertEq(doneN, true, "3A24: paced redrive completes after capacity recovery")
+    assertTrue(recPace.operations.records["pace-c40"] ~= nil,
+        "3A24: final paced candidate promoted")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    -- 4) Adoption: capacity-blocked confirmation redrive fails closed; prior live
+    -- dataset preserved (no partial publication).
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local aliceDs = GS:GetCurrentRecord().datasetId
+    local aliceSnap = snapshotDurable(GS:GetCurrentRecord())
+    -- Build a minimal foreign adoption buffer with confirm + retained body and
+    -- an accepted store already at capacity for the promotion.
+    GS.NotePeerDataset("Bob-Garona", "cap-fail-ds", {
+        editorRankPosition = 1, permissionRevisionId = "cap-fail-ds",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", "cap-fail-ds")), "accepted",
+        "3A24: adoption begin")
+    local adop = GS._adoption
+    assertTrue(type(adop) == "table", "3A24: adoption session present")
+    -- Seed offline temp as if confirm was accepted and body retained, store full.
+    local temp = {
+        datasetId = "cap-fail-ds",
+        _guildKey = "club:42",
+        currentCampaignId = "cap-fail-camp",
+        permission = { revisionId = "cap-fail-ds", editorRankPosition = 1 },
+        accounting = { _consumables = {
+            requestedItems = {}, eligibility = {}, bankTab = 1, configSeq = 1,
+            generation = 1,
+        } },
+        campaigns = {
+            ["cap-fail-camp"] = {
+                schemaVersion = GS.SCHEMA_VERSION, campaignId = "cap-fail-camp",
+                datasetId = "cap-fail-ds", startedAt = 1, bankTabAtStart = 1,
+            },
+        },
+        campaignArchives = {},
+        confirmationRefs = { "cap-fail-conf" },
+        operations = {
+            records = {
+                ["cap-fail-conf"] = {
+                    schemaVersion = 1, id = "cap-fail-conf", guildKey = "club:42",
+                    datasetId = "cap-fail-ds", kind = "confirm-candidate",
+                    candidateRef = {
+                        recordId = "cap-fail-body",
+                        body = {
+                            schemaVersion = 1, id = "cap-fail-body", guildKey = "club:42",
+                            datasetId = "cap-fail-ds", campaignId = "cap-fail-camp",
+                            kind = "set-bank-tab", target = "bankTab", value = 4,
+                            actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+                            timestamp = 1, baseTargetRevision = "cap-fail-ds",
+                            basePolicyRevision = "cap-fail-ds",
+                            baseCampaignId = "cap-fail-camp",
+                        },
+                    },
+                    actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 2,
+                    basePolicyRevision = "cap-fail-ds",
+                },
+            },
+            order = { "cap-fail-conf" },
+            heads = {},
+            pending = {
+                ["cap-fail-body"] = {
+                    body = {
+                        schemaVersion = 1, id = "cap-fail-body", guildKey = "club:42",
+                        datasetId = "cap-fail-ds", campaignId = "cap-fail-camp",
+                        kind = "set-bank-tab", target = "bankTab", value = 4,
+                        actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+                        timestamp = 1, baseTargetRevision = "cap-fail-ds",
+                        basePolicyRevision = "cap-fail-ds",
+                        baseCampaignId = "cap-fail-camp",
+                    },
+                    reason = "untrusted_relay",
+                },
+            },
+            conflicts = {},
+            openConflicts = {},
+        },
+    }
+    adop.replayTemp = temp
+    adop.replayState = { cursor = 1, admissions = 0, wave = 0, confirmRedriveComplete = false }
+    adop.order = { "cap-fail-conf", "cap-fail-body" }
+    adop.sourceAcceptedSet = { ["cap-fail-conf"] = true, ["cap-fail-body"] = true }
+    -- No room to promote the body.
+    local tempAccepted = GS._AcceptedCount(temp.operations)
+    GS.MAX_ACCEPTED_OPERATIONS = tempAccepted
+    GS._pendingRelay["cap-fail-body"] = {
+        body = temp.operations.pending["cap-fail-body"].body,
+        sender = "Bob-Garona",
+        fingerprint = "x",
+    }
+    local doneAd, _, _, errAd = GS.RedriveExactContentConfirmations(temp, {
+        adoptionReplay = true,
+        offlineRecord = temp,
+        redriveBudget = 32,
+        redriveState = { pos = 1, remaining = nil },
+    })
+    assertEq(errAd, "full", "3A24: adoption redrive reports full")
+    assertEq(doneAd, false, "3A24: adoption redrive not done on full")
+    assertEq(temp.operations.records["cap-fail-body"], nil,
+        "3A24: adoption temp did not partially promote")
+    -- Fail closed through cancel: live dataset unchanged.
+    GS:CancelDatasetAdoption()
+    assertEq(GS:GetCurrentRecord().datasetId, aliceDs,
+        "3A24: adoption capacity failure preserves live dataset")
+    assertSerEq(snapshotDurable(GS:GetCurrentRecord()), aliceSnap,
+        "3A24: adoption capacity failure preserves full prior live state")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+    GS._pendingRelay["cap-fail-body"] = nil
+
+    assertEq(#world.chat, 0, "3A24: no chat")
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

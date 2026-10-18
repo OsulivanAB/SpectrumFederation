@@ -3103,7 +3103,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
         if sliceUsed < sliceBudget then
             state.confirmRedrive = state.confirmRedrive or { pos = 1, remaining = nil }
             local budgetLeft = sliceBudget - sliceUsed
-            local done, visited, promoted = GS.RedriveExactContentConfirmations(temp, {
+            local done, visited, promoted, redriveErr = GS.RedriveExactContentConfirmations(temp, {
                 adoptionReplay = true,
                 offlineRecord = temp,
                 sender = adop.sourcePeer,
@@ -3112,6 +3112,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 redriveBudget = budgetLeft,
                 redriveState = state.confirmRedrive,
             })
+            -- Capacity-blocked confirmation apply: fail closed without publish.
+            if redriveErr == "full" then
+                return false, "full", progress
+            end
             visited = tonumber(visited) or 0
             promoted = tonumber(promoted) or 0
             if visited > 0 then
@@ -4847,10 +4851,56 @@ local function ConfirmationCandidateIds(storedConfirm)
     return ids
 end
 
---- Count distinct not-yet-accepted candidates that are currently eligible for
--- exact-content promotion (retained body matches envelope authority). Does not
--- invent permanent reservations; confirm-first/body-late ids are skipped until
--- retained. Optional startIdx limits to a resume window (paced apply).
+--- Classify whether a retained confirmation candidate would promote now.
+-- Reuses ApplyPreservedAttributionCandidate admission gates (policy/campaign/
+-- ClassifyStaleBase) against an optional shadow record for within-batch
+-- head projection. Does not mutate durable state.
+-- @return "apply"|"pending"|"conflict"|"obsolete"|"skip"|"duplicate"
+local function ClassifyConfirmationPromotion(record, authBody, admissionCtx)
+    if type(record) ~= "table" or type(authBody) ~= "table" then
+        return "skip"
+    end
+    admissionCtx = admissionCtx or {}
+    if admissionCtx.adoptionReplay and admissionCtx.deferRank
+        and authBody.kind == GS.KIND.SET_EDITOR_RANK then
+        return "pending"
+    end
+    local ops = record.operations
+    if type(ops) ~= "table" then
+        return "skip"
+    end
+    if ops.records and ops.records[authBody.id] then
+        return "duplicate"
+    end
+    if authBody.kind == GS.KIND.CONFIRM_CANDIDATE
+        or authBody.kind == GS.KIND.RESOLVE_CONFLICT then
+        return "skip"
+    end
+    local targetKey = GS._TargetKey and GS._TargetKey(authBody.kind, authBody.target)
+    if authBody.kind == GS.KIND.START_CAMPAIGN then
+        targetKey = GS.CAMPAIGN_TARGET_KEY
+    end
+    if not targetKey then
+        return "skip"
+    end
+    local class = "apply"
+    if authBody.basePolicyRevision ~= CurrentPolicyRevision(record)
+        or (authBody.baseCampaignId or nil) ~= (record.currentCampaignId or nil)
+        or (authBody.kind ~= GS.KIND.START_CAMPAIGN
+            and (authBody.campaignId or nil) ~= (record.currentCampaignId or nil))
+        or authBody.baseTargetRevision ~= CurrentTargetRevision(record, targetKey) then
+        class = select(1, ClassifyStaleBase(record, authBody, targetKey))
+    end
+    return class or "apply"
+end
+
+--- Count distinct not-yet-accepted candidates that admission would promote now.
+-- Reuses ClassifyConfirmationPromotion / ClassifyStaleBase (not a second
+-- eligibility definition). Projects within-batch head advances so causal
+-- successors in the same envelope are charged when their predecessors promote.
+-- Confirm-first/body-late ids are skipped until retained. Optional startIdx
+-- limits to a resume window (paced apply). Duplicate/pending/conflict/obsolete
+-- do not charge accepted-store capacity.
 local function CountEligibleConfirmationPromotions(record, storedConfirm, admissionCtx, startIdx)
     admissionCtx = admissionCtx or {}
     local ops = record and record.operations
@@ -4862,6 +4912,30 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
     if startIdx < 1 then
         startIdx = 1
     end
+    -- Shadow heads for within-batch dependency projection (shared admission rules).
+    local shadowHeads = {}
+    if type(ops.heads) == "table" then
+        for k, v in pairs(ops.heads) do
+            shadowHeads[k] = v
+        end
+    end
+    local shadowOps = {
+        records = ops.records,
+        pending = ops.pending,
+        conflicts = ops.conflicts,
+        openConflicts = ops.openConflicts,
+        heads = shadowHeads,
+        order = ops.order,
+    }
+    local shadow = {
+        datasetId = record.datasetId,
+        currentCampaignId = record.currentCampaignId,
+        permission = record.permission,
+        accounting = record.accounting,
+        operations = shadowOps,
+        campaigns = record.campaigns,
+        _guildKey = record._guildKey,
+    }
     local count = 0
     local counted = {}
     for i = startIdx, #ids do
@@ -4871,12 +4945,20 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
             if not (ops.records and ops.records[rid]) then
                 local authBody = AuthoritativeBodyFromEnvelope(storedConfirm, rid)
                 if type(authBody) == "table" then
-                    local deferRank = admissionCtx.adoptionReplay and admissionCtx.deferRank
-                        and authBody.kind == GS.KIND.SET_EDITOR_RANK
-                    if not deferRank then
-                        local body = LookupRetainedCandidate(record, rid)
-                        if type(body) == "table" and AuthoritativeBodiesEqual(authBody, body) then
+                    local body = LookupRetainedCandidate(record, rid)
+                    if type(body) == "table" and AuthoritativeBodiesEqual(authBody, body) then
+                        local class = ClassifyConfirmationPromotion(
+                            shadow, authBody, admissionCtx)
+                        if class == "apply" then
                             count = count + 1
+                            local targetKey = GS._TargetKey
+                                and GS._TargetKey(authBody.kind, authBody.target)
+                            if authBody.kind == GS.KIND.START_CAMPAIGN then
+                                targetKey = GS.CAMPAIGN_TARGET_KEY
+                            end
+                            if targetKey then
+                                shadowHeads[targetKey] = authBody.id
+                            end
                         end
                     end
                 end
@@ -4942,12 +5024,13 @@ function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
     end
     -- Fail closed: when eligible promotions in this resume window cannot all fit,
     -- do not partially apply the batch. Envelope storage is the caller's concern.
+    -- nextIdx is nil on capacity failure (distinct from budget-yield resume).
     local eligible = CountEligibleConfirmationPromotions(
         record, storedConfirm, admissionCtx, startIdx)
     if eligible > 0 and GS._AcceptedCount and record.operations then
         if GS._AcceptedCount(record.operations) + eligible
             > (GS.MAX_ACCEPTED_OPERATIONS or 4096) then
-            return false, "full", 0, 0, startIdx
+            return false, "full", 0, 0, nil
         end
     end
     local seen = {}
@@ -5040,7 +5123,10 @@ local function ConfirmationRedriveKey(record)
 end
 
 --- Re-apply accepted confirmation envelopes against newly retained candidates.
--- Returns done (bool), visited (number of envelopes charged this call).
+-- Returns done (bool), visited, promoted, err.
+-- err == "full" means capacity-blocked (not a budget yield): live path does not
+-- schedule After(0) retries against an unchanged full store; adoption propagates
+-- the failure. Meaningful retain/accept re-enters and clears capacityBlocked.
 -- Adoption replay uses session-owned state + callback budget (never expands to
 -- the full confirmationRefs length). Live short passes clear keyed state too.
 function GS.RedriveExactContentConfirmations(record, admissionCtx)
@@ -5078,6 +5164,8 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             state.record = record
         end
     end
+    -- A new call is a meaningful recheck opportunity (retain/accept/capacity change).
+    state.capacityBlocked = nil
     local defaultSlice = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
     local slice = defaultSlice
     if adoptionReplay then
@@ -5097,6 +5185,7 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
     local candRow = tonumber(state.candRow)
     -- Mid-envelope exits must still run remaining accounting + live scheduling.
     local midEnvelope = false
+    local capacityBlocked = false
     -- Pass goal is envelopes still owed this circular pass (not a fresh total).
     -- Bound the loop by passGoal so completing the last owed envelope cannot
     -- wrap into already-completed work and revive remaining.
@@ -5130,8 +5219,8 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             end
             applyCtx.confirmApplyBudget = applyBudget
             applyCtx.confirmApplyStartIdx = startIdx
-            local _, _, promo, visitedRows, nextIdx = GS.ApplyExactContentConfirmation(
-                record, conf, applyCtx)
+            local okApply, errApply, promo, visitedRows, nextIdx =
+                GS.ApplyExactContentConfirmation(record, conf, applyCtx)
             promo = tonumber(promo) or 0
             visitedRows = tonumber(visitedRows) or 0
             local charged = visitedRows + (startingEnvelope and 1 or 0)
@@ -5140,9 +5229,18 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             end
             processed = processed + charged
             promoted = promoted + promo
+            -- Capacity failure is not a budget yield: do not treat nextIdx as
+            -- unfinished mid-envelope work and do not schedule After(0) spins.
+            if okApply == false and errApply == "full" then
+                state.pos = i
+                state.candRow = startIdx
+                state.capacityBlocked = true
+                capacityBlocked = true
+                break
+            end
             if nextIdx ~= nil then
-                -- Mid-envelope: keep position/candRow; do not count complete.
-                -- Fall through to shared remaining + scheduling (do not return).
+                -- Mid-envelope budget yield: keep position/candRow; do not count
+                -- complete. Fall through to shared remaining + scheduling.
                 state.pos = i
                 state.candRow = nextIdx
                 midEnvelope = true
@@ -5169,6 +5267,16 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             stats.confirmRedriveVisited = (tonumber(stats.confirmRedriveVisited) or 0) + processed
         end
     end
+    if capacityBlocked then
+        -- Preserve retained evidence and parked cursor; stop live timer retries.
+        local remaining = math.max(1, passGoal - envelopesCompleted)
+        state.remaining = remaining
+        state.scheduled = false
+        if adoptionReplay then
+            state.done = false
+        end
+        return false, processed, promoted, "full"
+    end
     if not midEnvelope then
         state.pos = i
         state.candRow = nil
@@ -5185,6 +5293,7 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
         state.remaining = nil
         state.pos = 1
         state.candRow = nil
+        state.capacityBlocked = nil
         if adoptionReplay then
             -- Session-owned state cleared by caller / next begin; mark complete.
             state.done = true
@@ -5198,7 +5307,8 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
         return false, processed, promoted
     end
     -- Live path: schedule continuation until one full pass completes.
-    -- Mid-envelope partials use the same scheduler (candRow preserved above).
+    -- Mid-envelope budget yields use the same scheduler (candRow preserved above).
+    -- Capacity-blocked exits above never reach this scheduler.
     if not state.scheduled then
         state.scheduled = true
         local expectedKey = key
@@ -5211,6 +5321,10 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
                 return
             end
             st.scheduled = false
+            -- Do not timer-spin an unchanged capacity-blocked store.
+            if st.capacityBlocked then
+                return
+            end
             local live = nil
             if type(expectedGuild) == "string" and GS._root and type(GS._root.guilds) == "table" then
                 live = GS._root.guilds[expectedGuild]
