@@ -10297,10 +10297,6 @@ do
     local function assertSerEq(a, b, msg)
         assertEq(serTable(a), serTable(b), msg)
     end
-    local function longGuid(prefix)
-        local maxGuid = 192 - 4 - 1 - 24 - 1 - 1
-        return (prefix .. string.rep("g", maxGuid)):sub(1, maxGuid)
-    end
     local function snapshotDurable(rec)
         return {
             datasetId = rec.datasetId,
