@@ -467,6 +467,32 @@ do
         end
         world.transientClears = (world.transientClears or 0) + 1
     end
+    -- Production-shaped: clear provider bookmarks/coverage even with empty unresolved
+    -- (soft-acked adoption deliveries leave no unresolved obligation).
+    SF.GuildGossip.ReopenProviderCoverage = function(providerId)
+        world.reopenProviderCoverage = (world.reopenProviderCoverage or 0) + 1
+        world.lastReopenCoverageProviderId = providerId
+        local e = SF.GuildGossip._engine
+        if type(e) ~= "table" then
+            return
+        end
+        local entry = SF.GuildGossip.GetProvider and SF.GuildGossip.GetProvider(providerId)
+        if type(entry) == "table" then
+            entry.bookmarks = {}
+        end
+        if type(e.peers) == "table" then
+            for _, peer in pairs(e.peers) do
+                if type(peer) == "table" and type(peer.covered) == "table" and providerId then
+                    peer.covered[providerId] = nil
+                end
+            end
+        end
+        local out = e.outPull
+        if type(out) == "table" and (not providerId or out.providerId == providerId) then
+            out.needsFollowUp = true
+            world.needsFollowUpArmed = (world.needsFollowUpArmed or 0) + 1
+        end
+    end
     SF.GuildGossip.ReopenUnresolvedEnumeration = function(providerId)
         world.reopenUnresolved = (world.reopenUnresolved or 0) + 1
         world.lastReopenProviderId = providerId
@@ -489,6 +515,8 @@ do
             out.needsFollowUp = true
             world.needsFollowUpArmed = (world.needsFollowUpArmed or 0) + 1
         end
+        -- When unresolved was empty, production still relies on ReopenProviderCoverage
+        -- for soft-ack cancel; do not pretend bookmarks clear here.
     end
     SF.GuildGossip.NotifyMeaningfulChange = function()
         local e = SF.GuildGossip._engine
@@ -11948,6 +11976,7 @@ do
         "3A18: new record owns distinct redrive state")
 
     -- G) Fragment pool: ordinary member fills slots; editor still completes.
+    -- (Page-capacity exhaustion + precise duplicate-TTL timing moved to 3A19.)
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
     initGS()
@@ -11983,7 +12012,6 @@ do
     assertTrue(daveAccepted >= 1, "3A18: dave obtained some fragment slots")
     assertTrue(daveFull >= 1 or daveAccepted < maxCamps,
         "3A18: dave cannot consume entire aggregate pool alone")
-    -- Editor Alice still admits a fragmented confirmation shell+pages.
     local confOp = {
         schemaVersion = 1, id = "editor-conf-frag", guildKey = "club:42",
         datasetId = ds, kind = "confirm-candidate",
@@ -11992,8 +12020,6 @@ do
         actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 80000,
         basePolicyRevision = GS:GetCurrentRecord().permission.revisionId,
     }
-    -- Build a real paged confirm via export helpers when available; otherwise
-    -- admit a small incomplete shell that still allocates under isolation.
     local shellBody = {
         kind = "gs-op",
         op = confOp,
@@ -12009,8 +12035,252 @@ do
         "3A18: editor shell result " .. tostring(stShell) .. "/" .. tostring(reasonShell))
     assertTrue(reasonShell ~= "full" or stShell ~= "rejected",
         "3A18: editor not blocked by dave's fragment exhaustion")
-    -- Duplicate-only traffic must not extend lifetime: seed one incomplete,
-    -- note at, redeliver exact duplicate, at must be unchanged.
+
+    assertEq(#world.chat, 0, "3A18: no chat")
+end
+
+---------------------------------------------------------------------------
+-- 3A19) Recovery coalesce, soft-ack bookmark reopen, page capacity isolation,
+-- open-conflict export progress (r4308272513 / r4308272795 / r4308273212)
+---------------------------------------------------------------------------
+do
+    -- A) Begin→cancel before queued recovery timer must not strand notify flags.
+    resetDb()
+    switchPlayer("Carol", "Player-1-Carol", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local carolDs = GS:GetCurrentRecord().datasetId
+    GS.NotePeerDataset("Alice-Garona", "coalesce-ds", {
+        editorRankPosition = 1, permissionRevisionId = "coalesce-ds",
+    })
+    -- Drain any abandoned recovery timers from prior cases, then start clean.
+    world.time = world.time + 1
+    flushTimers()
+    timers = {}
+    world.meaningfulChange = 0
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", "coalesce-ds")), "accepted",
+        "3A19: begin for coalesce")
+    assertTrue(#timers >= 1, "3A19: begin queued recovery timer")
+    local timersAfterBegin = #timers
+    -- Cancel before the timer fires; a newer-generation callback must still notify.
+    GS:CancelDatasetAdoption()
+    assertTrue(#timers > timersAfterBegin,
+        "3A19: cancel queues a newer recovery callback")
+    local mcBefore = world.meaningfulChange
+    world.time = world.time + 1
+    flushTimers()
+    assertTrue(world.meaningfulChange > mcBefore,
+        "3A19: begin→cancel still delivers recovery notify")
+    -- Begin→source-switch before timer.
+    world.time = world.time + 1
+    flushTimers()
+    timers = {}
+    world.meaningfulChange = 0
+    GS.NotePeerDataset("Bob-Garona", "switch-ds-b", {
+        editorRankPosition = 1, permissionRevisionId = "switch-ds-b",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", "coalesce-ds")), "accepted",
+        "3A19: begin before switch")
+    assertTrue(#timers >= 1, "3A19: begin queued timer before switch")
+    timersAfterBegin = #timers
+    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", "switch-ds-b")), "accepted",
+        "3A19: source switch accepted")
+    assertTrue(#timers > timersAfterBegin,
+        "3A19: switch queues a newer recovery callback")
+    mcBefore = world.meaningfulChange
+    world.time = world.time + 1
+    flushTimers()
+    assertTrue(world.meaningfulChange > mcBefore,
+        "3A19: begin→switch still delivers recovery notify")
+    GS:CancelDatasetAdoption()
+
+    -- B) Cancel clears soft-acks AND reopens bookmarks/coverage with empty unresolved;
+    -- re-adopt unchanged source completes through ApplyRecordToProvider again.
+    resetDb()
+    switchPlayer("Carol", "Player-1-Carol", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    carolDs = GS:GetCurrentRecord().datasetId
+    local entry = GG.GetProvider(GS.PROVIDER_ID)
+    local foreignDesc = {
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "readopt-ds", editorRankPosition = 1,
+        permissionRevisionId = "readopt-ds", bootstrapEditorRankPosition = 1,
+        activation = "staged", acceptedOpCount = 1, transferOpCount = 1,
+        campaignCount = 0, archiveCount = 0,
+    }
+    local tabOp = {
+        schemaVersion = 1, id = "readopt-tab", guildKey = "club:42",
+        datasetId = "readopt-ds", kind = "set-bank-tab", target = "bankTab", value = 7,
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 91000,
+        baseTargetRevision = "readopt-ds", basePolicyRevision = "readopt-ds",
+    }
+    GS.NotePeerDataset("Alice-Garona", "readopt-ds", {
+        editorRankPosition = 1, permissionRevisionId = "readopt-ds",
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", "readopt-ds")), "accepted",
+        "3A19: first adopt begin")
+    flushTimers()
+    assertEq(select(1, GG.ApplyRecordToProvider(entry, {
+        id = "gs:desc:readopt-ds", versionFp = "v-ra", body = foreignDesc,
+    }, { sender = "Alice-Garona" })), "accepted", "3A19: buffer desc")
+    assertEq(select(1, GG.ApplyRecordToProvider(entry, {
+        id = "gs:op:readopt-tab", versionFp = "v-tab",
+        body = { kind = "gs-op", op = tabOp, datasetId = "readopt-ds" },
+    }, { sender = "Alice-Garona" })), "accepted", "3A19: buffer op")
+    assertTrue(GG.HasTransientDeliveryAck(entry, "gs:desc:readopt-ds", "v-ra"),
+        "3A19: soft-ack present before cancel")
+    -- Simulate a completed pull that advanced bookmarks past soft-acked bodies.
+    -- No unresolved entries remain (accepted/duplicate path).
+    GG._engine.unresolved = {}
+    entry.bookmarks = {
+        ["adv"] = {
+            peerKey = "alice-garona",
+            providerId = GS.PROVIDER_ID,
+            scopeId = "club:42",
+            bucketId = 1,
+            afterSeq = 999,
+            epoch = 1,
+            eligibilityGen = 1,
+        },
+    }
+    GG._engine.peers = GG._engine.peers or {}
+    GG._engine.peers["alice-garona"] = {
+        covered = { [GS.PROVIDER_ID] = true },
+    }
+    world.reopenProviderCoverage = 0
+    GS:CancelDatasetAdoption()
+    assertTrue((world.reopenProviderCoverage or 0) >= 1,
+        "3A19: cancel reopens provider coverage with empty unresolved")
+    assertEq(next(entry.bookmarks), nil, "3A19: cancel cleared advanced bookmarks")
+    assertEq(GG._engine.peers["alice-garona"].covered[GS.PROVIDER_ID], nil,
+        "3A19: cancel cleared peer covered flag")
+    assertEq(GG.HasTransientDeliveryAck(entry, "gs:desc:readopt-ds", "v-ra"), false,
+        "3A19: soft-acks cleared on cancel")
+    -- Re-adopt the unchanged source; same bodies must soft-ack again and complete.
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", "readopt-ds")), "accepted",
+        "3A19: re-adopt begin")
+    flushTimers()
+    assertEq(select(1, GG.ApplyRecordToProvider(entry, {
+        id = "gs:desc:readopt-ds", versionFp = "v-ra", body = foreignDesc,
+    }, { sender = "Alice-Garona" })), "accepted", "3A19: re-buffer desc")
+    assertEq(select(1, GG.ApplyRecordToProvider(entry, {
+        id = "gs:op:readopt-tab", versionFp = "v-tab",
+        body = { kind = "gs-op", op = tabOp, datasetId = "readopt-ds" },
+    }, { sender = "Alice-Garona" })), "accepted", "3A19: re-buffer op")
+    assertTrue(GS:GetPendingAdoption().ready == true, "3A19: re-adopt transfer ready")
+    assertEq(select(1, GS:CommitDatasetAdoption()), "accepted", "3A19: re-adopt commits")
+    assertEq(GS:GetCurrentRecord().datasetId, "readopt-ds", "3A19: re-adopt dataset live")
+    assertTrue(GS:GetCurrentRecord().datasetId ~= carolDs, "3A19: replaced prior dataset")
+
+    -- C) Ordinary member fills shared page capacity; editor still assembles+admits.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local ds = GS:GetCurrentRecord().datasetId
+    local camp = GS:GetCurrentRecord().currentCampaignId
+    local pol = GS:GetCurrentRecord().permission.revisionId
+    entry = GG.GetProvider(GS.PROVIDER_ID)
+    local maxPages = GS.MAX_FRAGMENT_BUFFER_PAGES or 128
+    local maxManifest = GS.MAX_MANIFEST_PAGES or 128
+    -- Dave fills one shell-less incomplete manifest up to per-peer page cap.
+    local davePages = 0
+    local daveBlocked = false
+    for p = 1, maxManifest do
+        local st, reason = entry.api.ValidateAndApply({
+            id = "gs:op:dave-pages:p" .. p, versionFp = "vdp" .. p,
+            body = {
+                kind = "gs-op-page", opId = "dave-pages", page = p,
+                pageCount = maxManifest, datasetId = ds,
+                chunk = { pad = string.rep("d", 4), n = p },
+            },
+        }, { sender = "Dave-Garona" })
+        if st == "rejected" and reason == "full" then
+            daveBlocked = true
+            break
+        elseif st == "pending" then
+            davePages = davePages + 1
+        end
+    end
+    assertTrue(davePages >= 1, "3A19: dave retained some pages")
+    assertTrue(daveBlocked or davePages < maxPages,
+        "3A19: dave cannot alone fill entire page pool got=" .. tostring(davePages))
+    -- Real editor fragmented confirm (shell + 2 pages) must assemble/admit.
+    local b1 = {
+        schemaVersion = 1, id = "ed-asm-1", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 2,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 92200,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local b2 = {
+        schemaVersion = 1, id = "ed-asm-2", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 3,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 92201,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    local edShell = {
+        kind = "gs-op",
+        pageCount = 2,
+        recordCount = 2,
+        datasetId = ds,
+        op = {
+            schemaVersion = 1, id = "ed-asm-conf", guildKey = "club:42", datasetId = ds,
+            kind = "confirm-candidate",
+            candidateRef = {},
+            actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+            timestamp = 92202, basePolicyRevision = pol, pageCount = 2, recordCount = 2,
+        },
+    }
+    local edPages = {
+        [1] = {
+            kind = "gs-op-page", opId = "ed-asm-conf", datasetId = ds,
+            page = 1, pageCount = 2, records = { { id = "ed-asm-1", body = b1 } },
+        },
+        [2] = {
+            kind = "gs-op-page", opId = "ed-asm-conf", datasetId = ds,
+            page = 2, pageCount = 2, records = { { id = "ed-asm-2", body = b2 } },
+        },
+    }
+    -- Prove the crafted manifest assembles, then admit via provider under pressure.
+    local preAssembled, preErr = GS.AssembleOpFromPages(edShell, edPages)
+    assertTrue(type(preAssembled) == "table",
+        "3A19: editor manifest assembles offline: " .. tostring(preErr))
+    local stShell, reasonShell = entry.api.ValidateAndApply({
+        id = "gs:op:ed-asm-conf", versionFp = "veshell", body = edShell,
+    }, { sender = "Alice-Garona" })
+    assertTrue(not (stShell == "rejected" and reasonShell == "full"),
+        "3A19: editor shell not full-blocked got=" .. tostring(stShell) .. "/" .. tostring(reasonShell))
+    local assembledOk = (stShell == "accepted" or stShell == "duplicate")
+    local lastSt, lastReason = stShell, reasonShell
+    if stShell == "pending" then
+        for p = 1, 2 do
+            local stP, reasonP = entry.api.ValidateAndApply({
+                id = "gs:op:ed-asm-conf:p" .. p, versionFp = "vep" .. p,
+                body = edPages[p],
+            }, { sender = "Alice-Garona" })
+            assertTrue(not (stP == "rejected" and reasonP == "full"),
+                "3A19: editor page " .. p .. " not full-blocked got="
+                    .. tostring(stP) .. "/" .. tostring(reasonP))
+            lastSt, lastReason = stP, reasonP
+            -- Assembly+admission ran when the final page is accepted, duplicate,
+            -- or retained pending (e.g. stale_base) — not rejected/full.
+            if stP == "accepted" or stP == "duplicate" or stP == "pending" then
+                assembledOk = true
+            end
+        end
+    end
+    assertTrue(assembledOk,
+        "3A19: editor fragmented confirm assembled/admitted under page pressure got="
+            .. tostring(lastSt) .. "/" .. tostring(lastReason))
+
+    -- D) Duplicate expiry: check after original TTL but before duplicate-refreshed TTL.
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
     initGS()
@@ -12019,23 +12289,26 @@ do
     startCampaign()
     ds = GS:GetCurrentRecord().datasetId
     entry = GG.GetProvider(GS.PROVIDER_ID)
+    local ttl = GS.FRAGMENT_BUFFER_TTL_SECONDS or 600
+    local t0 = world.time
     local dupPage = {
         kind = "gs-op-page", opId = "dup-life", page = 1, pageCount = 2,
         datasetId = ds, chunk = { x = 1 },
     }
-    local st1 = entry.api.ValidateAndApply({
+    assertEq(select(1, entry.api.ValidateAndApply({
         id = "gs:op:dup-life:p1", versionFp = "v1", body = dupPage,
-    }, { sender = "Dave-Garona" })
-    assertEq(st1, "pending", "3A18: first page pending")
-    -- Reach into module buffer via a second exact duplicate after time advances.
-    world.time = world.time + 100
-    local st2 = entry.api.ValidateAndApply({
+    }, { sender = "Dave-Garona" })), "pending", "3A19: first page pending")
+    world.time = t0 + 100
+    local stDup = select(1, entry.api.ValidateAndApply({
         id = "gs:op:dup-life:p1", versionFp = "v1", body = dupPage,
-    }, { sender = "Dave-Garona" })
-    assertTrue(st2 == "pending" or st2 == "duplicate",
-        "3A18: exact duplicate page status " .. tostring(st2))
-    -- TTL reclaim after full TTL without progress should free the slot.
-    world.time = world.time + (GS.FRAGMENT_BUFFER_TTL_SECONDS or 600) + 1
+    }, { sender = "Dave-Garona" }))
+    assertTrue(stDup == "pending" or stDup == "duplicate",
+        "3A19: exact duplicate status " .. tostring(stDup))
+    -- Original expiry at t0+ttl; incorrectly refreshed expiry at t0+100+ttl.
+    -- Probe at t0+ttl+1: buffer must already be reclaimable.
+    world.time = t0 + ttl + 1
+    assertTrue(world.time < (t0 + 100 + ttl),
+        "3A19: probe time before duplicate-refreshed expiry")
     local stEditor2, reasonEditor2 = entry.api.ValidateAndApply({
         id = "gs:op:editor-after-ttl", versionFp = "v2",
         body = {
@@ -12044,9 +12317,104 @@ do
         },
     }, { sender = "Alice-Garona" })
     assertTrue(stEditor2 == "pending" or stEditor2 == "accepted",
-        "3A18: after TTL editor allocates got=" .. tostring(stEditor2) .. "/" .. tostring(reasonEditor2))
+        "3A19: original TTL frees slot before refreshed expiry got="
+            .. tostring(stEditor2) .. "/" .. tostring(reasonEditor2))
 
-    assertEq(#world.chat, 0, "3A18: no chat")
+    -- E) Open-conflict export: multi-entry > slice, mutate between stepped callbacks.
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    ds = GS:GetCurrentRecord().datasetId
+    camp = GS:GetCurrentRecord().currentCampaignId
+    pol = GS:GetCurrentRecord().permission.revisionId
+    local ops = GS:GetCurrentRecord().operations
+    ops.openConflicts = ops.openConflicts or {}
+    local allCandIds = {}
+    for oi = 1, 4 do
+        local cands = {}
+        for ci = 1, 6 do
+            local id = string.format("oc-%d-c%02d", oi, ci)
+            cands[#cands + 1] = id
+            allCandIds[#allCandIds + 1] = id
+            local body = {
+                schemaVersion = 1, id = id, guildKey = "club:42", datasetId = ds,
+                campaignId = camp, kind = "set-bank-tab", target = "bankTab",
+                value = oi, actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+                timestamp = 93000 + oi * 10 + ci,
+                baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+            }
+            assertTrue(GS._RetainPending(ops, body, "evidence"),
+                "3A19: seed oc candidate " .. id)
+        end
+        ops.openConflicts[string.format("config:oc-%d", oi)] = { candidateIds = cands }
+    end
+    local prevSlice = GS.MAX_EXPORT_MAINT_PER_SLICE
+    GS.MAX_EXPORT_MAINT_PER_SLICE = 3
+    GS._exportMaintSyncDrain = false
+    timers = {}
+    GS.NotifyLocalDurableChange("remote-evidence")
+    -- Individually step one maint callback, then mutate an earlier key.
+    world.time = world.time + 1
+    assertTrue(#timers >= 1, "3A19: open-conflict maint scheduled")
+    local firstTimer = timers[1]
+    timers = {}
+    if type(firstTimer) == "table" and type(firstTimer.fn) == "function" then
+        firstTimer.fn()
+    elseif type(firstTimer) == "function" then
+        firstTimer()
+    else
+        -- Harness timer shape: { at=, fn= }
+        flushTimers()
+    end
+    -- Insert a candidate that sorts before later keys into the first open conflict.
+    local earlyId = "oc-1-c00-early"
+    assertTrue(GS._RetainPending(ops, {
+        schemaVersion = 1, id = earlyId, guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-bank-tab", target = "bankTab", value = 9,
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 92999,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }, "evidence"), "3A19: mid-drain early oc candidate")
+    local oc1 = ops.openConflicts["config:oc-1"]
+    table.insert(oc1.candidateIds, 1, earlyId)
+    allCandIds[#allCandIds + 1] = earlyId
+    GS.NotifyLocalDurableChange("remote-evidence")
+    for _ = 1, 120 do
+        world.time = world.time + 1
+        flushTimers()
+        if GS._exportMaintIsIdle and GS._exportMaintIsIdle() then
+            break
+        end
+    end
+    GS.MAX_EXPORT_MAINT_PER_SLICE = prevSlice
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local missing = {}
+    for i = 1, #allCandIds do
+        local eid = "gs:op:" .. allCandIds[i]
+        if prov.api.GetRecordVersionFp(eid) == nil then
+            -- Enumerate ListRecordIds as fallback.
+            local found = false
+            local cursor = 1
+            for _ = 1, 80 do
+                local page, nextCursor = prov.api.ListRecordIds(cursor, 64)
+                for j = 1, #page do
+                    if page[j] == eid then found = true break end
+                end
+                if found or not nextCursor then break end
+                cursor = nextCursor
+            end
+            if not found then
+                missing[#missing + 1] = eid
+            end
+        end
+    end
+    assertEq(#missing, 0, "3A19: all open-conflict evidence exported missing="
+        .. table.concat(missing, ","))
+    assertTrue(GS._exportMaintIsIdle(), "3A19: export maint idle after open-conflict drain")
+
+    assertEq(#world.chat, 0, "3A19: no chat")
 end
 
 

@@ -41,7 +41,11 @@ local exportState = {
     cachedArchiveCount = 0,
     pendingCursor = nil,
     conflictCursor = nil,
+    -- Last fully completed open-conflict target key (resume after it).
     openConflictCursor = nil,
+    -- In-progress open-conflict entry: target key + next candidate index.
+    openConflictPartialKey = nil,
+    openConflictCandidatePos = nil,
     maintScheduled = false,
     archiveBuildCursor = nil,
     -- Cold accepted-op construction cursor (BuildOpExportBodies is paced).
@@ -109,6 +113,21 @@ local function CountOpManifestBuffersForPeer(peerName)
     return n
 end
 
+local function CountOpManifestPagesForPeer(peerName)
+    if type(peerName) ~= "string" or peerName == "" then
+        return 0
+    end
+    local n = 0
+    for _, buf in pairs(opManifestBuffer) do
+        if type(buf) == "table" and buf.sourcePeer == peerName and type(buf.pages) == "table" then
+            for _ in pairs(buf.pages) do
+                n = n + 1
+            end
+        end
+    end
+    return n
+end
+
 local function CanAllocateOpManifestBuffer(peerName, maxCamps)
     maxCamps = tonumber(maxCamps) or 16
     if (opManifestBufferCount or 0) >= maxCamps then
@@ -118,6 +137,22 @@ local function CanAllocateOpManifestBuffer(peerName, maxCamps)
     local reserved = math.min(2, math.max(0, maxCamps - 1))
     local perPeerCap = math.max(1, maxCamps - reserved)
     if CountOpManifestBuffersForPeer(peerName) >= perPeerCap then
+        return false
+    end
+    return true
+end
+
+-- Per-source page isolation: one shell-less manifest must not fill the shared
+-- page pool. Reserve at least one full legitimate manifest for other peers.
+local function CanRetainOpManifestPage(peerName, maxPagesBuf)
+    maxPagesBuf = tonumber(maxPagesBuf) or 64
+    if (opManifestBufferPages or 0) >= maxPagesBuf then
+        return false
+    end
+    local oneManifest = GS.MAX_MANIFEST_PAGES or 64
+    local reserved = math.min(oneManifest, math.max(0, maxPagesBuf - 1))
+    local perPeerCap = math.max(1, maxPagesBuf - reserved)
+    if CountOpManifestPagesForPeer(peerName) >= perPeerCap then
         return false
     end
     return true
@@ -1413,6 +1448,8 @@ local function RebuildExportIndex()
     exportState.pendingCursor = nil
     exportState.conflictCursor = nil
     exportState.openConflictCursor = nil
+    exportState.openConflictPartialKey = nil
+    exportState.openConflictCandidatePos = nil
     exportState.resolveScanPos = 0
 
     local descId = "gs:desc:" .. record.datasetId
@@ -1982,7 +2019,7 @@ local function ValidateAndApply(record, ctx)
             end
             -- Exact duplicate: do not refresh lifetime.
         else
-            if (opManifestBufferPages or 0) >= maxPagesBuf then
+            if not CanRetainOpManifestPage(sender, maxPagesBuf) then
                 return "rejected", "full"
             end
             opManifestBufferPages = (opManifestBufferPages or 0) + 1
@@ -2246,6 +2283,8 @@ function GS:DisableGossipProvider()
     exportState.pendingCursor = nil
     exportState.conflictCursor = nil
     exportState.openConflictCursor = nil
+    exportState.openConflictPartialKey = nil
+    exportState.openConflictCandidatePos = nil
     exportState.order = {}
     exportState.byId = {}
     exportState.enumPos = nil
@@ -2362,6 +2401,8 @@ function GS.NotifyLocalDurableChange(reason)
             exportState.pendingCursor = nil
             exportState.conflictCursor = nil
             exportState.openConflictCursor = nil
+            exportState.openConflictPartialKey = nil
+            exportState.openConflictCandidatePos = nil
             exportState.maintIdle = false
         end
         -- Incremental / paced cold drain. Budget covers BuildOpExportBodies work
@@ -2527,25 +2568,94 @@ function GS.NotifyLocalDurableChange(reason)
         if used < slice and type(ops) == "table" then
             if type(ops.openConflicts) == "table" then
                 local ocKeys = sortedKeys(ops.openConflicts)
+                -- Completion is keyed by real exported candidate IDs, not synthetic
+                -- gs:oc: tokens (those IDs are never emitted).
+                local function openConflictKeyExported(targetKey)
+                    local oc = ops.openConflicts[targetKey]
+                    if type(oc) ~= "table" or type(oc.candidateIds) ~= "table" then
+                        return true
+                    end
+                    for ci = 1, #oc.candidateIds do
+                        local cid = oc.candidateIds[ci]
+                        if type(cid) == "string" then
+                            local eid = "gs:op:" .. cid
+                            if exportState.byId[eid] then
+                                -- exported
+                            elseif ops.records and ops.records[cid] then
+                                -- accepted head; no evidence body required
+                            else
+                                local hasBody = (ops.pending and ops.pending[cid])
+                                    or (ops.conflicts and ops.conflicts[cid])
+                                if hasBody then
+                                    return false
+                                end
+                            end
+                        end
+                    end
+                    return true
+                end
                 local ocStart = resumeAfterKey(ocKeys, exportState.openConflictCursor, function(k)
-                    return "gs:oc:" .. tostring(k)
+                    -- Drive prefix re-scan from the first missing candidate export id.
+                    local oc = ops.openConflicts[k]
+                    if type(oc) ~= "table" or type(oc.candidateIds) ~= "table" then
+                        return nil
+                    end
+                    for ci = 1, #oc.candidateIds do
+                        local cid = oc.candidateIds[ci]
+                        if type(cid) == "string" then
+                            local eid = "gs:op:" .. cid
+                            if not exportState.byId[eid]
+                                and not (ops.records and ops.records[cid]) then
+                                local hasBody = (ops.pending and ops.pending[cid])
+                                    or (ops.conflicts and ops.conflicts[cid])
+                                if hasBody then
+                                    return eid
+                                end
+                            end
+                        end
+                    end
+                    -- Fully exported: return a present id so resumeAfterKey keeps progress.
+                    for ci = #oc.candidateIds, 1, -1 do
+                        local cid = oc.candidateIds[ci]
+                        if type(cid) == "string" and exportState.byId["gs:op:" .. cid] then
+                            return "gs:op:" .. cid
+                        end
+                    end
+                    return nil
                 end)
+                -- Resume mid-entry candidate work without marking the key complete.
+                local startCand = 1
+                if type(exportState.openConflictPartialKey) == "string" then
+                    local foundPartial = false
+                    for ki = 1, #ocKeys do
+                        if ocKeys[ki] == exportState.openConflictPartialKey then
+                            ocStart = ki
+                            startCand = math.max(1, tonumber(exportState.openConflictCandidatePos) or 1)
+                            foundPartial = true
+                            break
+                        end
+                    end
+                    if not foundPartial then
+                        exportState.openConflictPartialKey = nil
+                        exportState.openConflictCandidatePos = nil
+                        startCand = 1
+                    end
+                end
                 for ki = ocStart, #ocKeys do
                     if used >= slice then
-                        -- Stay on current key so mid-entry candidate work resumes.
-                        exportState.openConflictCursor = ocKeys[math.max(1, ki - 1)]
-                        if ki == ocStart then
-                            exportState.openConflictCursor = ocKeys[ki]
-                        end
                         exportState.evidenceBuildNeeded = true
                         break
                     end
                     local entry = ops.openConflicts[ocKeys[ki]]
+                    local entryDone = true
                     if type(entry) == "table" and type(entry.candidateIds) == "table" then
-                        for i = 1, #entry.candidateIds do
+                        local candStart = (ki == ocStart) and startCand or 1
+                        for i = candStart, #entry.candidateIds do
                             if used >= slice then
-                                exportState.openConflictCursor = ocKeys[ki]
+                                exportState.openConflictPartialKey = ocKeys[ki]
+                                exportState.openConflictCandidatePos = i
                                 exportState.evidenceBuildNeeded = true
+                                entryDone = false
                                 break
                             end
                             upsertEvidence(entry.candidateIds[i],
@@ -2555,12 +2665,21 @@ function GS.NotifyLocalDurableChange(reason)
                     else
                         used = used + 1
                     end
-                    if used < slice then
-                        exportState.openConflictCursor = ocKeys[ki]
+                    if not entryDone then
+                        break
+                    end
+                    -- Only advance the completed-key cursor after the full candidate list.
+                    exportState.openConflictCursor = ocKeys[ki]
+                    exportState.openConflictPartialKey = nil
+                    exportState.openConflictCandidatePos = nil
+                    if not openConflictKeyExported(ocKeys[ki]) then
+                        exportState.evidenceBuildNeeded = true
                     end
                 end
-                if used < slice then
+                if used < slice
+                    and exportState.openConflictPartialKey == nil then
                     exportState.openConflictCursor = nil
+                    exportState.openConflictCandidatePos = nil
                 end
             end
             if used < slice and type(ops.order) == "table" then
@@ -2638,7 +2757,8 @@ function GS.NotifyLocalDurableChange(reason)
             if used < slice
                 and exportState.pendingCursor == nil
                 and exportState.conflictCursor == nil
-                and exportState.openConflictCursor == nil then
+                and exportState.openConflictCursor == nil
+                and exportState.openConflictPartialKey == nil then
                 exportState.evidenceBuildNeeded = false
             end
         end
@@ -2704,6 +2824,7 @@ function GS.NotifyLocalDurableChange(reason)
             and exportState.pendingCursor == nil
             and exportState.conflictCursor == nil
             and exportState.openConflictCursor == nil
+            and exportState.openConflictPartialKey == nil
             and exportState.opBuildCursor == nil
             and exportState.archiveBuildCursor == nil
 

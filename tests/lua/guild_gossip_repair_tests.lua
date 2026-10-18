@@ -6378,6 +6378,51 @@ do
     assertTrue(recovered, "F93: early PENDING recovers after mid-pull reopen")
 end
 
+---------------------------------------------------------------------------
+-- F94: ReopenProviderCoverage clears bookmarks/coverage with empty unresolved
+-- (soft-acked adoption cancel path) and arms needsFollowUp on an active pull.
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local pA = A.GuildGossip:EnableSynthetic({
+        id = "sf.synthetic.gossip", instanceKey = "f94a",
+    })
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    assertTrue(entry ~= nil, "F94: provider present")
+    entry.bookmarks = {
+        ["adv"] = {
+            peerKey = "bob-garona",
+            providerId = "sf.synthetic.gossip",
+            scopeId = "club:1",
+            bucketId = 1,
+            afterSeq = 50,
+            epoch = 1,
+            eligibilityGen = 1,
+        },
+    }
+    A.GuildGossip._engine.peers["bob-garona"] = A.GuildGossip._engine.peers["bob-garona"] or {}
+    A.GuildGossip._engine.peers["bob-garona"].covered = { ["sf.synthetic.gossip"] = true }
+    A.GuildGossip._engine.unresolved = {}
+    A.GuildGossip._engine.outPull = {
+        providerId = "sf.synthetic.gossip",
+        peer = "Bob-Garona",
+        scopeId = "club:1",
+        phase = "apply_bodies",
+        needsFollowUp = false,
+    }
+    assertTrue(type(A.GuildGossip.ReopenProviderCoverage) == "function",
+        "F94: ReopenProviderCoverage exported")
+    A.GuildGossip.ReopenProviderCoverage("sf.synthetic.gossip")
+    assertEq(next(entry.bookmarks), nil, "F94: bookmarks cleared with empty unresolved")
+    assertEq(A.GuildGossip._engine.peers["bob-garona"].covered["sf.synthetic.gossip"], nil,
+        "F94: covered flag cleared")
+    assertEq(A.GuildGossip._engine.outPull.needsFollowUp, true,
+        "F94: active pull needsFollowUp armed")
+    -- Keep synthetic store referenced so GC-friendly harness stays quiet.
+    assertTrue(pA ~= nil, "F94: synthetic provider retained")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")

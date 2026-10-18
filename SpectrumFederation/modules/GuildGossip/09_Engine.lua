@@ -2425,6 +2425,31 @@ reopenUnresolvedEnumeration = function(providerId)
 end
 GG.ReopenUnresolvedEnumeration = reopenUnresolvedEnumeration
 
+-- Reopen bookmarks/coverage for a provider even when unresolved is empty.
+-- Soft-acked adoption deliveries leave no unresolved entry; cancel/expire must
+-- still clear advanced bookmarks so a re-adopt of the same source is pulled.
+local function reopenProviderCoverage(providerId)
+    if type(providerId) ~= "string" or providerId == "" then
+        return
+    end
+    local e = GG._engine
+    clearBookmarksForScope(nil, providerId, nil)
+    for _, peer in pairs(e.peers or {}) do
+        if type(peer) == "table" and type(peer.covered) == "table" then
+            peer.covered[providerId] = nil
+        end
+    end
+    local out = e.outPull
+    if out and out.providerId == providerId then
+        out.needsFollowUp = true
+        if GG._sched then
+            GG._sched.dirtyFollowUp = true
+        end
+        GG.MarkWorkPending()
+    end
+end
+GG.ReopenProviderCoverage = reopenProviderCoverage
+
 local function advanceOutPull(limits, now)
     local e = GG._engine
     local pull = e.outPull

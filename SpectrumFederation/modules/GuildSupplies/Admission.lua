@@ -51,10 +51,11 @@ GS.MAX_ADOPTION_ASSEMBLY_PAGES = (GS.MAX_MANIFEST_PAGES or 64) * (GS.MAX_ADOPTIO
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
--- Buffer must retain a full paged confirm/resolve (body pages + id-list pages).
+-- Buffer must retain a full paged confirm/resolve for one peer while still
+-- reserving a second full legitimate manifest for editors / other peers.
 GS.MAX_FRAGMENT_BUFFER_PAGES = math.max(
     GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64,
-    GS.MAX_MANIFEST_PAGES or 64
+    (GS.MAX_MANIFEST_PAGES or 64) * 2
 )
 GS.FRAGMENT_BUFFER_TTL_SECONDS = GS.MAX_ADOPTION_SECONDS or 600
 -- Per-slice admission / export maintenance (same order as confirmation redrive).
@@ -819,6 +820,9 @@ end
 
 -- Clear soft-acked adoption deliveries from the provider entry so cancel/expire/
 -- commit cannot leave phantom acknowledgments that suppress legitimate pulls.
+-- Soft-acked bodies were ACCEPTED/DUPLICATE and are absent from unresolved; also
+-- reopen provider bookmarks/coverage so a later re-adopt of the same source is
+-- not skipped by an advanced pull cursor.
 local function ClearAdoptionTransientAcks()
     local gossip = SF.GuildGossip
     if type(gossip) ~= "table" or type(gossip.GetProvider) ~= "function" then
@@ -833,6 +837,9 @@ local function ClearAdoptionTransientAcks()
     elseif type(entry) == "table" then
         entry._transientDeliveryAck = nil
     end
+    if type(gossip.ReopenProviderCoverage) == "function" then
+        gossip.ReopenProviderCoverage(GS.PROVIDER_ID)
+    end
 end
 
 -- Shared scoped recovery for adoption-state transitions and arena capacity free:
@@ -843,14 +850,18 @@ local _adoptionRecoveryNotifyPending = false
 local _adoptionRecoveryNotifyScheduled = false
 local _adoptionRecoveryEpoch = 0
 local function FlushAdoptionDeliveryRecovery(expectedEpoch)
-    if not _adoptionRecoveryNotifyPending then
-        return
-    end
+    -- Stale generations leave pending for the latest callback. Do not clear the
+    -- scheduled latch here: begin→cancel/switch bumps the epoch and queues a
+    -- newer After(0); clearing on the old fire would strand that newer work if
+    -- the harness (or a lost timer) never delivers it.
     if expectedEpoch ~= nil and expectedEpoch ~= _adoptionRecoveryEpoch then
         return
     end
-    _adoptionRecoveryNotifyPending = false
     _adoptionRecoveryNotifyScheduled = false
+    if not _adoptionRecoveryNotifyPending then
+        return
+    end
+    _adoptionRecoveryNotifyPending = false
     local live = GS._adoption
     -- Termination (cancel/expire) still needs the notify to clear backoff; only
     -- skip when a committed session is lingering mid-cleanup.
@@ -881,12 +892,13 @@ local function ScheduleAdoptionDeliveryRecovery(opts)
     if type(gossip) == "table" and type(gossip.ReopenUnresolvedEnumeration) == "function" then
         gossip.ReopenUnresolvedEnumeration(GS.PROVIDER_ID)
     end
+    -- Always bump generation and queue a callback for that generation. Coalescing
+    -- onto a single latch without a new timer strands recovery when begin is
+    -- followed by cancel/switch before the first After(0) runs (or when a prior
+    -- abandoned timer left the latch set). Stale callbacks become no-ops via epoch.
     _adoptionRecoveryEpoch = (tonumber(_adoptionRecoveryEpoch) or 0) + 1
     local epoch = _adoptionRecoveryEpoch
     _adoptionRecoveryNotifyPending = true
-    if _adoptionRecoveryNotifyScheduled then
-        return
-    end
     _adoptionRecoveryNotifyScheduled = true
     if C_Timer and C_Timer.After then
         C_Timer.After(0, function()
