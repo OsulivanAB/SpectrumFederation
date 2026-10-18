@@ -321,6 +321,104 @@ local function EstimateBodyBytes(body)
     return #table.concat(parts)
 end
 
+--- True when a candidate page (records + optional id lists) fits the wire budget.
+local function PageRecordFits(exportId, pageIdx, opId, datasetId, maxPages, records, budget, extras)
+    local trialPage = {
+        kind = "gs-op-page",
+        opId = opId,
+        datasetId = datasetId,
+        page = pageIdx,
+        pageCount = maxPages,
+        records = records or {},
+    }
+    if type(extras) == "table" then
+        for k, v in pairs(extras) do
+            trialPage[k] = v
+        end
+    end
+    return EstimateWireRecordBytes(exportId .. ":p" .. tostring(pageIdx), trialPage) <= budget
+end
+
+--- Split one oversized authoritative row body across field-part page records.
+-- Each part carries a disjoint subset of top-level body fields; assemble merges
+-- them back into the exact original table. Returns page tables or nil.
+local function FragmentOversizedRow(row, exportId, opId, datasetId, budget, maxPages)
+    if type(row) ~= "table" or type(row.id) ~= "string" or type(row.body) ~= "table" then
+        return nil
+    end
+    local body = row.body
+    local keys = {}
+    for k in pairs(body) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+    if #keys < 1 then
+        return nil
+    end
+    local provisional = maxPages
+    local groups = {}
+    local cur = {}
+    local curCount = 0
+    for i = 1, #keys do
+        local k = keys[i]
+        local trial = {}
+        for tk, tv in pairs(cur) do
+            trial[tk] = tv
+        end
+        trial[k] = body[k]
+        local rec = {
+            id = row.id,
+            part = #groups + 1,
+            partCount = provisional,
+            fields = trial,
+        }
+        if PageRecordFits(exportId, #groups + 1, opId, datasetId, provisional, { rec }, budget) then
+            cur = trial
+            curCount = curCount + 1
+        else
+            if curCount < 1 then
+                -- A single top-level field cannot fit alone: unsupported.
+                return nil
+            end
+            groups[#groups + 1] = cur
+            cur = { [k] = body[k] }
+            curCount = 1
+            rec = {
+                id = row.id,
+                part = #groups + 1,
+                partCount = provisional,
+                fields = cur,
+            }
+            if not PageRecordFits(exportId, #groups + 1, opId, datasetId, provisional, { rec }, budget) then
+                return nil
+            end
+        end
+    end
+    if curCount > 0 then
+        groups[#groups + 1] = cur
+    end
+    if #groups < 1 or #groups > maxPages then
+        return nil
+    end
+    local partCount = #groups
+    local pages = {}
+    for i = 1, partCount do
+        local rec = {
+            id = row.id,
+            part = i,
+            partCount = partCount,
+            fields = groups[i],
+        }
+        if not PageRecordFits(exportId, i, opId, datasetId, partCount, { rec }, budget) then
+            return nil
+        end
+        pages[i] = { records = { rec } }
+    end
+    return pages
+end
+
 --- Pack optional identifier lists onto already-built page bodies under budget.
 -- Preserves public snapshot fields (originalIds / competingOpIds) that shells strip.
 local function AttachIdListToPages(pages, fieldName, ids, exportId, opId, datasetId, budget)
@@ -435,14 +533,20 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
             end
         end
     else
-        -- Ordinary oversized op: page only the large mutable payload.
+        -- Ordinary oversized op: page a snapshot of the full authoritative body
+        -- via field parts. Max-length allocated ids make a value/target-stripped
+        -- shell exceed the wire budget alone; AssembleOpFromPages accepts a
+        -- complete page body (schemaVersion+actorGuid) as the reconstructed op.
+        local snapBody = op
+        if GS._SnapshotPublicOp then
+            local stored = select(1, GS._SnapshotPublicOp(op))
+            if type(stored) == "table" then
+                snapBody = stored
+            end
+        end
         rows[1] = {
             id = op.id,
-            body = {
-                id = op.id,
-                value = op.value,
-                target = op.target,
-            },
+            body = snapBody,
         }
     end
     if #rows < 1 then
@@ -468,39 +572,36 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
             trialRecords[j] = cur.records[j]
         end
         trialRecords[#trialRecords + 1] = rows[i]
-        local trialPage = {
-            kind = "gs-op-page",
-            opId = op.id,
-            datasetId = op.datasetId,
-            page = #pages + 1,
-            pageCount = maxPages, -- reserve final pageCount wire space
-            records = trialRecords,
-        }
-        if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), trialPage) > budget then
-            if #(cur.records) == 0 then
-                DebugWarn("op export %s: row exceeds wire budget alone", tostring(op.id))
-                return {}
-            end
+        if PageRecordFits(
+            exportId, #pages + 1, op.id, op.datasetId, maxPages, trialRecords, budget
+        ) then
+            cur.records[#cur.records + 1] = rows[i]
+        else
             flush()
             if #pages >= maxPages then
                 DebugWarn("op export %s: exceeds max manifest pages", tostring(op.id))
                 return {}
             end
-            cur.records[1] = rows[i]
-            local alone = {
-                kind = "gs-op-page",
-                opId = op.id,
-                datasetId = op.datasetId,
-                page = #pages + 1,
-                pageCount = maxPages,
-                records = cur.records,
-            }
-            if EstimateWireRecordBytes(exportId .. ":p" .. tostring(#pages + 1), alone) > budget then
-                DebugWarn("op export %s: row exceeds wire budget alone", tostring(op.id))
-                return {}
+            -- Single complete row may still exceed budget: fragment body fields.
+            if PageRecordFits(
+                exportId, #pages + 1, op.id, op.datasetId, maxPages, { rows[i] }, budget
+            ) then
+                cur.records[1] = rows[i]
+            else
+                local fragPages = FragmentOversizedRow(
+                    rows[i], exportId, op.id, op.datasetId, budget, maxPages - #pages)
+                if not fragPages or #fragPages < 1 then
+                    DebugWarn("op export %s: row exceeds wire budget alone", tostring(op.id))
+                    return {}
+                end
+                if #pages + #fragPages > maxPages then
+                    DebugWarn("op export %s: fragmented row exceeds max pages", tostring(op.id))
+                    return {}
+                end
+                for fi = 1, #fragPages do
+                    pages[#pages + 1] = fragPages[fi]
+                end
             end
-        else
-            cur.records[#cur.records + 1] = rows[i]
         end
     end
     if #(cur.records) > 0 and #pages >= maxPages then
@@ -525,6 +626,65 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
     if #pages > maxPages then
         return {}
     end
+
+    -- Probe whether the shell can carry the campaign boundary. Max-id headers
+    -- often cannot; park the boundary on a page (or a fresh empty page).
+    local shellBoundary = boundary
+    if type(boundary) == "table" then
+        local probeOp = {
+            schemaVersion = op.schemaVersion,
+            id = op.id,
+            guildKey = op.guildKey,
+            datasetId = op.datasetId,
+            kind = op.kind,
+            pageCount = #pages,
+            recordCount = #rows,
+        }
+        if op.kind == GS.KIND.CONFIRM_CANDIDATE or op.kind == GS.KIND.RESOLVE_CONFLICT then
+            probeOp = nil -- confirm/resolve keep their richer shells below
+        end
+        if probeOp then
+            local probeShell = {
+                kind = "gs-op",
+                op = probeOp,
+                pageCount = #pages,
+                recordCount = #rows,
+                evidenceOnly = evidenceOnly and true or nil,
+                boundary = boundary,
+            }
+            if EstimateWireRecordBytes(exportId, probeShell) > budget then
+                shellBoundary = nil
+                local placed = false
+                for p = 1, #pages do
+                    if PageRecordFits(
+                        exportId, p, op.id, op.datasetId, maxPages,
+                        pages[p].records or {}, budget, { boundary = boundary }
+                    ) then
+                        pages[p].boundary = boundary
+                        placed = true
+                        break
+                    end
+                end
+                if not placed then
+                    if #pages < maxPages and PageRecordFits(
+                        exportId, #pages + 1, op.id, op.datasetId, maxPages,
+                        {}, budget, { boundary = boundary }
+                    ) then
+                        pages[#pages + 1] = { records = {}, boundary = boundary }
+                        placed = true
+                    else
+                        -- Boundary alone exceeds the wire budget (max-id headers).
+                        -- Export the start-campaign op without an embedded boundary;
+                        -- receivers resolve it from the companion campaign-header.
+                        DebugWarn(
+                            "op export %s: omitting oversized boundary; use campaign-header",
+                            tostring(op.id))
+                    end
+                end
+            end
+        end
+    end
+
     local pageCount = #pages
 
     local shellOp = {}
@@ -542,8 +702,14 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
             chosenOpId = op.value.chosenOpId,
         }
     else
-        shellOp.value = nil
-        shellOp.target = nil
+        -- Minimal ordinary shell: pages carry the full body (field parts).
+        shellOp = {
+            schemaVersion = op.schemaVersion,
+            id = op.id,
+            guildKey = op.guildKey,
+            datasetId = op.datasetId,
+            kind = op.kind,
+        }
     end
     shellOp.pageCount = pageCount
     shellOp.recordCount = #rows
@@ -554,7 +720,7 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         pageCount = pageCount,
         recordCount = #rows,
         evidenceOnly = evidenceOnly and true or nil,
-        boundary = boundary,
+        boundary = shellBoundary,
     }
     if EstimateWireRecordBytes(exportId, shellBody) > budget then
         DebugWarn("op export %s: compact shell still exceeds wire budget", tostring(op.id))
@@ -581,6 +747,9 @@ local function BuildOpExportBodies(op, evidenceOnly, boundary)
         end
         if type(pages[p].competingOpIds) == "table" then
             pageBody.competingOpIds = pages[p].competingOpIds
+        end
+        if type(pages[p].boundary) == "table" then
+            pageBody.boundary = pages[p].boundary
         end
         local pageId = exportId .. ":p" .. tostring(p)
         if EstimateWireRecordBytes(pageId, pageBody) > budget then
@@ -613,10 +782,15 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
             return nil, "invalid_operation"
         end
     end
+    -- Logical rows in first-seen order. Complete bodies land immediately; field-part
+    -- fragments accumulate until all parts arrive, then merge in place.
     local rows = {}
-    local seenIds = {}
+    local rowIndexById = {}
+    local seenComplete = {}
+    local partAccum = {} -- id → { partCount, parts = { [n] = fields }, rowSlot }
     local pageOriginalIds = {}
     local pageCompetingOpIds = {}
+    local pageBoundary = nil
     local totalBytes = 0
     local maxBytes = GS.MAX_FRAGMENT_ASSEMBLY_BYTES or 49152
     for page = 1, pageCount do
@@ -635,6 +809,14 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
         if type(p.datasetId) == "string" and type(shellBody.op.datasetId) == "string"
             and p.datasetId ~= shellBody.op.datasetId then
             return nil, "dataset_mismatch"
+        end
+        if type(p.boundary) == "table" then
+            if pageBoundary ~= nil then
+                if GS._DeepEqualOps and not GS._DeepEqualOps(pageBoundary, p.boundary) then
+                    return nil, "invalid_operation"
+                end
+            end
+            pageBoundary = p.boundary
         end
         if type(p.originalIds) == "table" then
             for i = 1, #p.originalIds do
@@ -662,21 +844,71 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
         end
         for i = 1, #p.records do
             local row = p.records[i]
-            if type(row) ~= "table" or type(row.id) ~= "string" or row.id == ""
-                or type(row.body) ~= "table" then
+            if type(row) ~= "table" or type(row.id) ~= "string" or row.id == "" then
                 return nil, "invalid_operation"
             end
-            if seenIds[row.id] then
-                return nil, "invalid_operation"
-            end
-            seenIds[row.id] = true
-            rows[#rows + 1] = row
-            -- Bound assembled payload by actual body bytes + id length.
-            totalBytes = totalBytes + #row.id + EstimateBodyBytes(row.body)
-            if totalBytes > maxBytes then
-                return nil, "invalid_operation"
+            local part = tonumber(row.part)
+            local partCount = tonumber(row.partCount)
+            if part and partCount then
+                if part ~= math.floor(part) or partCount ~= math.floor(partCount)
+                    or part < 1 or partCount < 1 or part > partCount
+                    or type(row.fields) ~= "table" then
+                    return nil, "invalid_operation"
+                end
+                if seenComplete[row.id] then
+                    return nil, "invalid_operation"
+                end
+                local acc = partAccum[row.id]
+                if not acc then
+                    rows[#rows + 1] = { id = row.id, body = nil, _partsPending = true }
+                    rowIndexById[row.id] = #rows
+                    acc = { partCount = partCount, parts = {}, rowSlot = #rows }
+                    partAccum[row.id] = acc
+                elseif acc.partCount ~= partCount then
+                    return nil, "invalid_operation"
+                end
+                if acc.parts[part] ~= nil then
+                    return nil, "invalid_operation"
+                end
+                acc.parts[part] = row.fields
+                totalBytes = totalBytes + #row.id + EstimateBodyBytes(row.fields)
+                if totalBytes > maxBytes then
+                    return nil, "invalid_operation"
+                end
+            else
+                if type(row.body) ~= "table" then
+                    return nil, "invalid_operation"
+                end
+                if seenComplete[row.id] or partAccum[row.id] then
+                    return nil, "invalid_operation"
+                end
+                seenComplete[row.id] = true
+                rows[#rows + 1] = row
+                rowIndexById[row.id] = #rows
+                totalBytes = totalBytes + #row.id + EstimateBodyBytes(row.body)
+                if totalBytes > maxBytes then
+                    return nil, "invalid_operation"
+                end
             end
         end
+    end
+    for id, acc in pairs(partAccum) do
+        local merged = {}
+        for part = 1, acc.partCount do
+            local fields = acc.parts[part]
+            if type(fields) ~= "table" then
+                return nil, "incomplete_manifest_pages"
+            end
+            for k, v in pairs(fields) do
+                if merged[k] ~= nil then
+                    return nil, "invalid_operation"
+                end
+                merged[k] = v
+            end
+        end
+        local slot = acc.rowSlot
+        rows[slot] = { id = id, body = merged }
+        seenComplete[id] = true
     end
     if declaredCount ~= nil and #rows ~= declaredCount then
         return nil, "incomplete_manifest_pages"
@@ -795,11 +1027,15 @@ local function AssembleOpFromPages(shellBody, pagesByIndex)
             end
         end
     end
+    local boundary = shellBody.boundary
+    if type(boundary) ~= "table" and type(pageBoundary) == "table" then
+        boundary = pageBoundary
+    end
     return {
         kind = "gs-op",
         op = op,
         evidenceOnly = shellBody.evidenceOnly,
-        boundary = shellBody.boundary,
+        boundary = boundary,
     }, nil
 end
 
@@ -1553,16 +1789,23 @@ local function ValidateAndApply(record, ctx)
         if type(op) ~= "table" then
             return "rejected", "invalid_operation"
         end
-        -- Paged shell: retain fragment buffer until pages arrive.
+        -- Paged shell: retain fragment buffer until pages arrive. Confirm/resolve
+        -- shells omit embedded bodies; ordinary shells omit value/target.
         local pageCount = tonumber(body.pageCount) or tonumber(op.pageCount)
-        if pageCount and pageCount >= 1 and (
-            (op.kind == GS.KIND.CONFIRM_CANDIDATE
-                and (not op.candidateRef or not op.candidateRef.body)
-                and not (op.candidateRef and op.candidateRef.records
-                    and op.candidateRef.records[1] and op.candidateRef.records[1].body))
-            or (op.kind == GS.KIND.RESOLVE_CONFLICT
-                and (not op.value or type(op.value.contentBodies) ~= "table"))
-        ) then
+        local isPagedShell = false
+        if pageCount and pageCount >= 1 then
+            if op.kind == GS.KIND.CONFIRM_CANDIDATE then
+                isPagedShell = (not op.candidateRef or not op.candidateRef.body)
+                    and not (op.candidateRef and op.candidateRef.records
+                        and op.candidateRef.records[1] and op.candidateRef.records[1].body)
+            elseif op.kind == GS.KIND.RESOLVE_CONFLICT then
+                isPagedShell = (not op.value or type(op.value.contentBodies) ~= "table")
+            else
+                -- Ordinary oversized op: shell keeps identity; pages carry payload.
+                isPagedShell = (op.value == nil and op.target == nil)
+            end
+        end
+        if isPagedShell then
             if not localRecord then
                 return "pending", "awaiting_dataset"
             end
@@ -1679,10 +1922,15 @@ local function ValidateAndApply(record, ctx)
                 end
             end
         end
+        local boundary = body.boundary
+        if type(boundary) ~= "table" and op.kind == GS.KIND.START_CAMPAIGN and localRecord then
+            boundary = localRecord.campaigns and localRecord.campaigns[op.id]
+                or (GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[op.id])
+        end
         return GS:AdmitRemoteOperation(op, {
             sender = sender,
             member = member,
-            boundary = body.boundary,
+            boundary = boundary,
             relay = relay,
         })
     end
