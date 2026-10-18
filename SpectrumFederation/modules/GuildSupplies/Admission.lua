@@ -2766,46 +2766,87 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     local admissions = 0
     state.dependencyWaits = 0
 
-    -- Policy-deferral scan: O(buffer) once per policy epoch. Charged as a single
-    -- unit so it cannot consume the entire admit budget after every progress.
+    -- Policy-deferral scan: resumable across callbacks. Charge every order visit
+    -- and nested confirmation-search visit against the shared slice budget.
+    -- Incomplete classification yields (treat as defer) rather than caching false.
     local deferRank = state.deferRankCached
     local policyNow = temp.permission and temp.permission.revisionId or temp.datasetId
     if deferRank == nil or state.deferRankPolicy ~= policyNow then
-        sliceUsed = sliceUsed + 1
-        local found = false
-        for scanAt = 1, #adop.order do
+        local scan = state.deferRankScan
+        if type(scan) ~= "table" or scan.policy ~= policyNow then
+            scan = { pos = 1, policy = policyNow, found = false }
+            state.deferRankScan = scan
+        end
+        local found = scan.found == true
+        local scanAt = tonumber(scan.pos) or 1
+        if scanAt < 1 then
+            scanAt = 1
+        end
+        local scanComplete = false
+        while scanAt <= #adop.order and sliceUsed < sliceBudget do
+            sliceUsed = sliceUsed + 1
             local b = adop.records[adop.order[scanAt]]
-            if type(b) == "table" and b.kind == "gs-op" and type(b.op) == "table" then
-                local o = b.op
-                -- Defer rank only while same-policy config mutations remain. Campaign
-                -- starts are not rank-gated and must not sticky-defer SET_EDITOR_RANK.
-                if o.kind ~= GS.KIND.SET_EDITOR_RANK
-                    and o.kind ~= GS.KIND.CONFIRM_CANDIDATE
-                    and o.kind ~= GS.KIND.RESOLVE_CONFLICT
-                    and o.kind ~= GS.KIND.START_CAMPAIGN
-                    and not (temp.operations.records and temp.operations.records[o.id])
-                    and not (temp.operations.conflicts and temp.operations.conflicts[o.id]) then
-                    if o.basePolicyRevision == policyNow
-                        or o.basePolicyRevision == temp.datasetId then
-                        local src = ActorMatchesMember(o, member)
-                        local conf = false
-                        if not src then
-                            conf = AdoptionHasConfirmationFor(
-                                adop, o.id, o, member, temp.operations,
-                                { budget = math.max(1, sliceBudget - sliceUsed) })
-                        end
-                        if src or conf then
-                            found = true
-                            break
-                        end
+            local o = (type(b) == "table" and b.kind == "gs-op" and type(b.op) == "table")
+                and b.op or nil
+            scanAt = scanAt + 1
+            if type(o) == "table"
+                and o.kind ~= GS.KIND.SET_EDITOR_RANK
+                and o.kind ~= GS.KIND.CONFIRM_CANDIDATE
+                and o.kind ~= GS.KIND.RESOLVE_CONFLICT
+                and o.kind ~= GS.KIND.START_CAMPAIGN
+                and not (temp.operations.records and temp.operations.records[o.id])
+                and not (temp.operations.conflicts and temp.operations.conflicts[o.id])
+                and (o.basePolicyRevision == policyNow
+                    or o.basePolicyRevision == temp.datasetId) then
+                -- Defer rank only while same-policy config mutations remain.
+                local src = ActorMatchesMember(o, member)
+                local conf = false
+                if not src then
+                    local searchOpts = {
+                        budget = math.max(1, sliceBudget - sliceUsed),
+                        cursor = scan.confirmCursor,
+                    }
+                    conf = AdoptionHasConfirmationFor(
+                        adop, o.id, o, member, temp.operations, searchOpts)
+                    local v = tonumber(searchOpts.visited) or 0
+                    if v > 0 then
+                        sliceUsed = sliceUsed + v
                     end
+                    if searchOpts.budgetExhausted then
+                        -- Resume the same order entry; do not treat incomplete search as false.
+                        scan.pos = scanAt - 1
+                        scan.confirmCursor = searchOpts.cursor
+                        scan.found = found
+                        state.deferRankScan = scan
+                        state.sliceUsed = sliceUsed
+                        state.cursor = tonumber(state.cursor) or 1
+                        state.admissions = (tonumber(state.admissions) or 0) + admissions
+                        return true, nil, progress
+                    end
+                    scan.confirmCursor = nil
+                end
+                if src or conf then
+                    found = true
+                    scanComplete = true
+                    break
                 end
             end
         end
-        deferRank = found
-        state.deferRankCached = found
-        state.deferRankPolicy = policyNow
-        state.deferRankScan = nil
+        if not scanComplete and scanAt > #adop.order then
+            scanComplete = true
+        end
+        if scanComplete then
+            deferRank = found
+            state.deferRankCached = found
+            state.deferRankPolicy = policyNow
+            state.deferRankScan = nil
+        else
+            -- Budget exhausted mid-scan: park cursor; conservative defer until done.
+            scan.pos = scanAt
+            scan.found = found
+            state.deferRankScan = scan
+            deferRank = true
+        end
     end
     deferRank = deferRank == true
 
