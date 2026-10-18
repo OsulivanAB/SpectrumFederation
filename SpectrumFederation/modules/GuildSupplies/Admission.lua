@@ -477,6 +477,62 @@ function GS._MarkTargetConflict(ops, targetKey, candidateIds, at, meta)
 end
 
 --- Reclaim stale untrusted relay entries (TTL / guild-dataset scope).
+--- True when durable pending/conflict/open-conflict evidence still owns a
+-- campaign boundary for `id` (must survive relay TTL/eviction reclaim).
+local function DurableBoundaryStillNeeded(id)
+    if type(id) ~= "string" or id == "" then
+        return false
+    end
+    local function opsNeed(ops)
+        if type(ops) ~= "table" then
+            return false
+        end
+        if ops.pending and ops.pending[id] then
+            return true
+        end
+        if ops.conflicts and ops.conflicts[id] then
+            return true
+        end
+        if type(ops.openConflicts) == "table" then
+            for _, open in pairs(ops.openConflicts) do
+                if type(open) == "table" and type(open.boundaries) == "table"
+                    and open.boundaries[id] ~= nil then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    local root = GS._root
+    if type(root) == "table" and type(root.guilds) == "table" then
+        for _, rec in pairs(root.guilds) do
+            if type(rec) == "table" and opsNeed(rec.operations) then
+                return true
+            end
+        end
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" and type(adop.replayTemp) == "table"
+        and opsNeed(adop.replayTemp.operations) then
+        return true
+    end
+    return false
+end
+
+--- Drop a relay entry and reclaim its campaign boundary when nothing durable owns it.
+local function DropPendingRelayEntry(id)
+    if type(id) ~= "string" then
+        return
+    end
+    if GS._pendingRelay then
+        GS._pendingRelay[id] = nil
+    end
+    if GS._pendingCampaignBoundaries and GS._pendingCampaignBoundaries[id] ~= nil
+        and not DurableBoundaryStillNeeded(id) then
+        GS._pendingCampaignBoundaries[id] = nil
+    end
+end
+
 local function ReclaimStalePendingRelay(opts)
     opts = opts or {}
     local now = GetServerTime and GetServerTime() or 0
@@ -496,7 +552,7 @@ local function ReclaimStalePendingRelay(opts)
             stale = true
         end
         if stale then
-            GS._pendingRelay[id] = nil
+            DropPendingRelayEntry(id)
             removed = removed + 1
         end
     end
@@ -550,9 +606,9 @@ local function RetainPendingRelay(recordId, entry)
     end
     local cap = GS.MAX_PENDING_RELAY or 64
     if n >= cap then
-        -- Capacity recovery: drop oldest untrusted entry, then retry slot.
+        -- Capacity recovery: drop oldest untrusted entry (+ orphan boundary), then retry.
         if oldestId then
-            GS._pendingRelay[oldestId] = nil
+            DropPendingRelayEntry(oldestId)
             n = n - 1
         end
         if n >= cap then
