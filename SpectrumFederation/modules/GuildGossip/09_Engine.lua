@@ -1758,7 +1758,10 @@ local function handleManifest(sender, payload, stepLimits)
         pull.usableProgressAt = GG._Now()
         for _, ent in ipairs(entries) do
             local have = GG.IndexGetEntry(entry.index, ent.id)
+            local softAck = GG.HasTransientDeliveryAck
+                and GG.HasTransientDeliveryAck(entry, ent.id, ent.versionFp)
             if (not have or have.versionFp ~= ent.versionFp)
+                and not softAck
                 and not isKnownUnresolvedRevision(
                     pull.providerId, pull.peer, pull.scopeId, ent.id, ent.versionFp) then
                 pull.neededBodies[#pull.neededBodies + 1] = ent
@@ -2413,12 +2416,10 @@ reopenUnresolvedEnumeration = function(providerId)
         local ck = lengthPrefixedKey(item.peerKey or "", item.providerId or "", item.scopeId or "")
         if not touched[ck] then
             touched[ck] = true
-            -- Bookmarks only: obligations for this provider were already removed.
-            clearBookmarksForScope(item.peer, item.providerId, item.scopeId)
-            local peer = item.peerKey and e.peers[item.peerKey]
-            if peer and peer.covered then
-                peer.covered[item.providerId] = nil
-            end
+            -- Reuse scoped reopenCoverage semantics so a live outPull cannot
+            -- rewrite an advanced bookmark after obligations were cleared
+            -- mid-apply (e.g. adoption arena free inside ValidateAndApply).
+            reopenCoverageForUnresolved(item)
         end
     end
 end

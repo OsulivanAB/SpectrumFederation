@@ -74,9 +74,8 @@ GS._pendingCampaignBoundaries = {} -- [opId] = header
 -- After descriptor-first install: block local edits until advertised policy lands.
 -- Durable mirror: permission.pendingPolicyRevisionId (survives /reload).
 GS._bootstrapEditLock = {} -- [guildKey] = advertisedPermissionRevisionId
--- Confirmation redrive cursor across scheduled slices.
-GS._confirmationRedrivePos = 1
-GS._confirmationRedriveScheduled = false
+-- Confirmation redrive state keyed by guild+dataset generation (not global).
+GS._confirmationRedriveByKey = GS._confirmationRedriveByKey or {}
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -805,10 +804,123 @@ local function UnderlyingConflictValueId(ops, id)
     return nil
 end
 
+-- Forward declarations: Notify may invalidate delivery outcomes on failure.
+local InvalidateAdoptionDeliveryOutcomes
+
 local function NotifyAdoptionStateChanged(reason)
     if GS.OnAdoptionStateChanged then
         pcall(GS.OnAdoptionStateChanged, reason)
     end
+    -- Fail paths historically only notified UI; also reopen/clear soft-acks.
+    if reason == "failed" and InvalidateAdoptionDeliveryOutcomes then
+        InvalidateAdoptionDeliveryOutcomes("failed")
+    end
+end
+
+-- Clear soft-acked adoption deliveries from the provider entry so cancel/expire/
+-- commit cannot leave phantom acknowledgments that suppress legitimate pulls.
+local function ClearAdoptionTransientAcks()
+    local gossip = SF.GuildGossip
+    if type(gossip) ~= "table" or type(gossip.GetProvider) ~= "function" then
+        return
+    end
+    if type(GS.PROVIDER_ID) ~= "string" then
+        return
+    end
+    local entry = gossip.GetProvider(GS.PROVIDER_ID)
+    if type(gossip.ClearTransientDeliveryAcks) == "function" then
+        gossip.ClearTransientDeliveryAcks(entry)
+    elseif type(entry) == "table" then
+        entry._transientDeliveryAck = nil
+    end
+end
+
+-- Shared scoped recovery for adoption-state transitions and arena capacity free:
+-- reopen provider unresolved/bookmarks and coalesce NotifyMeaningfulChange.
+-- Session/generation guards prevent stale After(0) callbacks from reviving work
+-- for a replaced or terminated adoption.
+local _adoptionRecoveryNotifyPending = false
+local _adoptionRecoveryNotifyScheduled = false
+local _adoptionRecoveryEpoch = 0
+local function FlushAdoptionDeliveryRecovery(expectedEpoch)
+    if not _adoptionRecoveryNotifyPending then
+        return
+    end
+    if expectedEpoch ~= nil and expectedEpoch ~= _adoptionRecoveryEpoch then
+        return
+    end
+    _adoptionRecoveryNotifyPending = false
+    _adoptionRecoveryNotifyScheduled = false
+    local live = GS._adoption
+    -- Termination (cancel/expire) still needs the notify to clear backoff; only
+    -- skip when a committed session is lingering mid-cleanup.
+    if type(live) == "table" and live.committed then
+        return
+    end
+    local gg = SF.GuildGossip
+    if type(gg) == "table" and type(gg.NotifyMeaningfulChange) == "function" then
+        gg.NotifyMeaningfulChange()
+    elseif type(gg) == "table" and type(gg.MarkWorkPending) == "function" then
+        gg.MarkWorkPending()
+    end
+end
+
+local function ScheduleAdoptionDeliveryRecovery(opts)
+    opts = type(opts) == "table" and opts or {}
+    if type(GS.PROVIDER_ID) ~= "string" then
+        return
+    end
+    local adop = GS._adoption
+    if opts.requireOpenSession and (type(adop) ~= "table" or adop.committed) then
+        return
+    end
+    if type(GS._onAssemblyRecovery) == "function" then
+        pcall(GS._onAssemblyRecovery)
+    end
+    local gossip = SF.GuildGossip
+    if type(gossip) == "table" and type(gossip.ReopenUnresolvedEnumeration) == "function" then
+        gossip.ReopenUnresolvedEnumeration(GS.PROVIDER_ID)
+    end
+    _adoptionRecoveryEpoch = (tonumber(_adoptionRecoveryEpoch) or 0) + 1
+    local epoch = _adoptionRecoveryEpoch
+    _adoptionRecoveryNotifyPending = true
+    if _adoptionRecoveryNotifyScheduled then
+        return
+    end
+    _adoptionRecoveryNotifyScheduled = true
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, function()
+            FlushAdoptionDeliveryRecovery(epoch)
+        end)
+    else
+        FlushAdoptionDeliveryRecovery(epoch)
+    end
+end
+
+-- Legacy names used by arena-slot recovery.
+local function FlushAdoptionAssemblyRecovery()
+    FlushAdoptionDeliveryRecovery(_adoptionRecoveryEpoch)
+end
+
+local function ScheduleAdoptionAssemblyRecovery()
+    ScheduleAdoptionDeliveryRecovery({ requireOpenSession = true })
+end
+
+InvalidateAdoptionDeliveryOutcomes = function(reason)
+    -- Begin/switch: reopen suppressed mismatch outcomes so the selected source
+    -- can be pulled again. Cancel/expire/fail: reopen + clear soft-acks so the
+    -- prior durable index remains the only advertised set.
+    if reason == "cancel" or reason == "expire" or reason == "failed"
+        or reason == "source_changed" or reason == "replaced" or reason == "commit" then
+        ClearAdoptionTransientAcks()
+    end
+    if reason == "commit" then
+        -- Successful swap publishes via NotifyLocalDurableChange; no reopen storm.
+        return
+    end
+    ScheduleAdoptionDeliveryRecovery({
+        requireOpenSession = (reason == "begin" or reason == "assembly_free"),
+    })
 end
 
 function GS:ListOpenConflicts()
@@ -1236,58 +1348,89 @@ function GS.IsBootstrapEditLocked(guildKey, record)
     return false
 end
 
+local function NoteBufferedKindInsert(adop, body)
+    if type(adop) ~= "table" or type(body) ~= "table" then
+        return
+    end
+    local c = adop._bufCounts
+    if type(c) ~= "table" then
+        c = {
+            acceptedOps = 0,
+            transferOps = 0,
+            headers = 0,
+            archives = 0,
+            descId = nil,
+        }
+        adop._bufCounts = c
+    end
+    if body.kind == "dataset-desc" and body.datasetId == adop.sourceDatasetId then
+        -- Descriptor replaces in place; counts stay singular.
+        return
+    elseif body.kind == "gs-op" then
+        c.transferOps = (tonumber(c.transferOps) or 0) + 1
+        if body.evidenceOnly ~= true then
+            c.acceptedOps = (tonumber(c.acceptedOps) or 0) + 1
+        end
+    elseif body.kind == "campaign-header" then
+        c.headers = (tonumber(c.headers) or 0) + 1
+    elseif body.kind == "campaign-archive" then
+        c.archives = (tonumber(c.archives) or 0) + 1
+    end
+end
+
 local function CountBufferedKinds(adop)
-    -- acceptedOps: non-evidenceOnly gs-op bodies (selected accepted history).
-    -- transferOps: all gs-op bodies including conflict/pending evidence.
-    -- Incomplete paged manifests live in adop._assemblies until finalized.
+    -- Prefer session-owned incremental counters; fall back to a one-shot recount
+    -- only when legacy sessions lack _bufCounts (should not happen after begin).
     local acceptedOps, transferOps, headers, archives, desc = 0, 0, 0, 0, nil
     local archivePages = {} -- campaignId → { meta, pages = {}, pageCount }
     local opPages = {} -- opId → { shell, pages = {}, pageCount }
-    for i = 1, #adop.order do
-        local body = adop.records[adop.order[i]]
-        if type(body) == "table" then
-            if body.kind == "dataset-desc" and body.datasetId == adop.sourceDatasetId then
-                desc = body
-            elseif body.kind == "gs-op" then
-                transferOps = transferOps + 1
-                if body.evidenceOnly ~= true then
-                    acceptedOps = acceptedOps + 1
-                end
-            elseif body.kind == "campaign-header" then
-                headers = headers + 1
-            elseif body.kind == "campaign-archive" then
-                archives = archives + 1
-                local cid = body.campaignId
-                if type(cid) == "string" then
-                    archivePages[cid] = archivePages[cid] or { pages = {}, pageCount = tonumber(body.pageCount) or 1 }
-                    archivePages[cid].meta = body
-                    archivePages[cid].pageCount = tonumber(body.pageCount) or 1
-                end
-            elseif body.kind == "campaign-archive-page" then
-                local cid = body.campaignId
-                if type(cid) == "string" then
-                    archivePages[cid] = archivePages[cid] or { pages = {}, pageCount = tonumber(body.pageCount) or 1 }
-                    archivePages[cid].pages[tonumber(body.page) or 0] = body
-                    if tonumber(body.pageCount) then
-                        archivePages[cid].pageCount = tonumber(body.pageCount)
+    local c = adop._bufCounts
+    if type(c) == "table" then
+        acceptedOps = tonumber(c.acceptedOps) or 0
+        transferOps = tonumber(c.transferOps) or 0
+        headers = tonumber(c.headers) or 0
+        archives = tonumber(c.archives) or 0
+        if type(c.descId) == "string" then
+            desc = adop.records and adop.records[c.descId]
+        end
+        if not desc then
+            -- Descriptor id may use the stable gs:desc:<dataset> form.
+            local want = "gs:desc:" .. tostring(adop.sourceDatasetId)
+            desc = adop.records and adop.records[want]
+            if type(desc) == "table" then
+                c.descId = want
+            end
+        end
+    else
+        for i = 1, #adop.order do
+            local body = adop.records[adop.order[i]]
+            if type(body) == "table" then
+                if body.kind == "dataset-desc" and body.datasetId == adop.sourceDatasetId then
+                    desc = body
+                elseif body.kind == "gs-op" then
+                    transferOps = transferOps + 1
+                    if body.evidenceOnly ~= true then
+                        acceptedOps = acceptedOps + 1
                     end
+                elseif body.kind == "campaign-header" then
+                    headers = headers + 1
+                elseif body.kind == "campaign-archive" then
+                    archives = archives + 1
                 end
             end
         end
     end
+    -- Page completeness uses the incremental archive/assembly indexes only —
+    -- not a full logical-order walk.
     if type(adop._archiveIndex) == "table" then
         for cid, info in pairs(adop._archiveIndex) do
-            archivePages[cid] = archivePages[cid] or { pages = {}, pageCount = info.pageCount or 1 }
-            if info.meta then
-                archivePages[cid].meta = info.meta
-            end
-            if type(info.pages) == "table" then
-                for p, pb in pairs(info.pages) do
-                    archivePages[cid].pages[p] = pb
-                end
-            end
-            if info.pageCount then
-                archivePages[cid].pageCount = info.pageCount
+            archivePages[cid] = {
+                meta = info.meta,
+                pages = info.pages or {},
+                pageCount = info.pageCount or 1,
+            }
+            if type(info.meta) == "table" and not desc and info.meta.kind == "dataset-desc" then
+                -- no-op; archives are not descriptors
             end
         end
     end
@@ -1513,8 +1656,10 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         localAcceptedCount = #localRecord.operations.order
     end
     local previous = GS._adoption
-        if type(previous) == "table" then
+    local switching = type(previous) == "table"
+    if switching then
         AbortAdoptionReplay(previous, "replaced")
+        ClearAdoptionTransientAcks()
     end
     GS._adoption = {
         epoch = (tonumber(GS._adoptionEpoch) or 0) + 1,
@@ -1539,6 +1684,14 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         _confirmEnvelopes = {},
         _confirmByTarget = {},
         _archiveIndex = {},
+        -- Incremental receive-stage completeness (avoids full-history recounts).
+        _bufCounts = {
+            acceptedOps = 0,
+            transferOps = 0,
+            headers = 0,
+            archives = 0,
+            descId = nil,
+        },
         _workStats = {
             confirmVisited = 0,
             confirmComparisons = 0,
@@ -1546,6 +1699,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
             indexVisited = 0,
             assemblyVisited = 0,
             archiveVisited = 0,
+            receiveVisited = 0,
         },
         -- Exact source accepted snapshot (non-evidenceOnly gs-op ids) pinned during transfer.
         sourceAcceptedIds = {},
@@ -1562,6 +1716,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
     DebugInfo("began dataset adoption source=%s dataset=%s", member.name, sourceDatasetId)
     if previous ~= GS._adoption then
         NotifyAdoptionStateChanged("begin")
+        -- Reopen engine-suppressed mismatch outcomes for this selected source.
+        InvalidateAdoptionDeliveryOutcomes("begin")
     end
     return GS._adoption, "accepted", nil
 end
@@ -1572,6 +1728,7 @@ function GS:CancelDatasetAdoption()
         AbortAdoptionReplay(GS._adoption, "cancel")
         GS._adoption = nil
         NotifyAdoptionStateChanged("cancel")
+        InvalidateAdoptionDeliveryOutcomes("cancel")
     end
     return "accepted", nil
 end
@@ -1590,6 +1747,7 @@ local function ExpireStaleAdoption()
         AbortAdoptionReplay(adop, "expire")
         GS._adoption = nil
         NotifyAdoptionStateChanged("expire")
+        InvalidateAdoptionDeliveryOutcomes("expire")
     end
 end
 
@@ -1603,60 +1761,6 @@ function GS:GetPendingAdoption()
         adop.ready = complete and true or false
     end
     return GS._adoption
-end
-
--- When arena capacity frees, reopen engine unresolved obligations for this
--- provider and clear scoped pull backoff so suppressed assembly_full revisions
--- can be re-enumerated promptly. Reopen is synchronous (idempotent). The
--- meaningful-change notification is coalesced to once per apply burst via
--- FlushAdoptionAssemblyRecovery (and After(0) as a safety net). Uses existing
--- GG.ReopenUnresolvedEnumeration + GG.NotifyMeaningfulChange (not polling, not
--- global TTL shortening, not NotifyProviderChanged index rebuild).
-local _assemblyRecoveryNotifyPending = false
-local _assemblyRecoveryNotifyScheduled = false
-local function FlushAdoptionAssemblyRecovery()
-    if not _assemblyRecoveryNotifyPending then
-        return
-    end
-    _assemblyRecoveryNotifyPending = false
-    _assemblyRecoveryNotifyScheduled = false
-    local live = GS._adoption
-    if type(live) == "table" and live.committed then
-        return
-    end
-    local gg = SF.GuildGossip
-    if type(gg) == "table" and type(gg.NotifyMeaningfulChange) == "function" then
-        gg.NotifyMeaningfulChange()
-    elseif type(gg) == "table" and type(gg.MarkWorkPending) == "function" then
-        gg.MarkWorkPending()
-    end
-end
-
-local function ScheduleAdoptionAssemblyRecovery()
-    if type(GS.PROVIDER_ID) ~= "string" then
-        return
-    end
-    local adop = GS._adoption
-    if type(adop) == "table" and adop.committed then
-        return
-    end
-    if type(GS._onAssemblyRecovery) == "function" then
-        pcall(GS._onAssemblyRecovery)
-    end
-    local gossip = SF.GuildGossip
-    if type(gossip) == "table" and type(gossip.ReopenUnresolvedEnumeration) == "function" then
-        gossip.ReopenUnresolvedEnumeration(GS.PROVIDER_ID)
-    end
-    _assemblyRecoveryNotifyPending = true
-    if _assemblyRecoveryNotifyScheduled then
-        return
-    end
-    _assemblyRecoveryNotifyScheduled = true
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0, FlushAdoptionAssemblyRecovery)
-    else
-        FlushAdoptionAssemblyRecovery()
-    end
 end
 
 local function ClearAdoptionAssemblySlot(adop, opId, asm)
@@ -1690,21 +1794,16 @@ local function FindAssembledLogicalRecord(adop, opId)
     if type(adop) ~= "table" or type(opId) ~= "string" then
         return nil, nil
     end
+    -- Session-owned opId → logical recordId map is authoritative. Direct inserts
+    -- and assembly finalization both populate it; do not rescan adop.order per
+    -- fragment on cache miss.
     adop._assembledByOpId = adop._assembledByOpId or {}
     local rid = adop._assembledByOpId[opId]
     if type(rid) == "string" and type(adop.records[rid]) == "table" then
         return rid, adop.records[rid]
     end
-    for i = 1, #(adop.order or {}) do
-        local id = adop.order[i]
-        local body = adop.records[id]
-        if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table"
-            and body.op.id == opId
-            and not tonumber(body.pageCount)
-            and not (body.op and tonumber(body.op.pageCount)) then
-            adop._assembledByOpId[opId] = id
-            return id, body
-        end
+    if type(rid) == "string" then
+        adop._assembledByOpId[opId] = nil
     end
     return nil, nil
 end
@@ -1763,6 +1862,7 @@ local function FinalizeAdoptionAssembly(adop, opId)
     end
     adop.records[logicalId] = assembled
     adop.order[#adop.order + 1] = logicalId
+    NoteBufferedKindInsert(adop, assembled)
     adop._assembledByOpId = adop._assembledByOpId or {}
     adop._assembledByOpId[opId] = logicalId
     if assembled.evidenceOnly ~= true and type(assembled.op) == "table"
@@ -1805,8 +1905,7 @@ local function BufferAssembledRedelivery(adop, recordId, body, opId, isShell, pa
         end
         if asm.pages[p] then
             if DeepEqual(asm.pages[p], body) then
-                local complete = select(1, GS:IsAdoptionTransferComplete())
-                return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+                return "duplicate", "adoption_buffer"
             end
             return "rejected", "id_conflict"
         end
@@ -1822,14 +1921,14 @@ local function BufferAssembledRedelivery(adop, recordId, body, opId, isShell, pa
         NotifyAdoptionStateChanged("ready")
     end
     if ok and detail == "duplicate" then
-        return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+        return "duplicate", "adoption_buffer"
     end
     if not ok and detail == "id_conflict" then
         return "rejected", "id_conflict"
     end
     if ok then
         -- Unexpected: finalized a new logical row for an already-assembled opId.
-        return "accepted", complete and "ready" or nil
+        return "accepted", "adoption_buffer"
     end
     -- Scratch is incomplete until shell+pages arrive; do not claim a new accept.
     return "pending", "incomplete_redelivery"
@@ -1900,10 +1999,7 @@ local function BufferAdoptionAssembly(adop, recordId, body)
         end
         if asm.pages[p] then
             if DeepEqual(asm.pages[p], body) then
-                local complete = select(1, GS:IsAdoptionTransferComplete())
-                return finish(
-                    complete and "accepted" or "duplicate",
-                    complete and "ready" or "duplicate")
+                return finish("duplicate", "adoption_buffer")
             end
             return finish("rejected", "id_conflict")
         end
@@ -1923,17 +2019,13 @@ local function BufferAdoptionAssembly(adop, recordId, body)
         NotifyAdoptionStateChanged("ready")
     end
     if finalized and finDetail == "duplicate" then
-        return finish(
-            complete and "accepted" or "duplicate",
-            complete and "ready" or "duplicate")
+        return finish("duplicate", "adoption_buffer")
     end
     if not finalized and finDetail == "id_conflict" then
         return finish("rejected", "id_conflict")
     end
-    if finalized then
-        return finish("accepted", complete and "ready" or nil)
-    end
-    return finish("accepted", complete and "ready" or nil)
+    -- Runtime buffering only; ApplyRecordToProvider must not IndexUpsert.
+    return finish("accepted", "adoption_buffer")
 end
 
 --- Legacy name: finalize assembly for opId when shell+pages are complete.
@@ -1975,6 +2067,7 @@ function GS:BufferAdoptionRecord(recordId, body)
         if type(descBody) ~= "table" or descBody.datasetId ~= adop.sourceDatasetId then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
         local rev = descBody.permissionRevisionId
@@ -1988,6 +2081,7 @@ function GS:BufferAdoptionRecord(recordId, body)
             and rev ~= adop.pinnedPermissionRevisionId then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
         if adop.pinnedAcceptedOpCount == nil and count ~= nil then
@@ -1996,6 +2090,7 @@ function GS:BufferAdoptionRecord(recordId, body)
             and count ~= adop.pinnedAcceptedOpCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
         if adop.pinnedTransferOpCount == nil and transfer ~= nil then
@@ -2004,6 +2099,7 @@ function GS:BufferAdoptionRecord(recordId, body)
             and transfer ~= adop.pinnedTransferOpCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
         if adop.pinnedCampaignCount == nil and camp ~= nil then
@@ -2011,6 +2107,7 @@ function GS:BufferAdoptionRecord(recordId, body)
         elseif camp ~= nil and adop.pinnedCampaignCount ~= nil and camp ~= adop.pinnedCampaignCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
         if adop.pinnedArchiveCount == nil and arch ~= nil then
@@ -2018,18 +2115,21 @@ function GS:BufferAdoptionRecord(recordId, body)
         elseif arch ~= nil and adop.pinnedArchiveCount ~= nil and arch ~= adop.pinnedArchiveCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
         return nil
     end
+
+    local stats = EnsureAdoptionWorkStats(adop)
+    stats.receiveVisited = (tonumber(stats.receiveVisited) or 0) + 1
 
     -- Assembly duplicate/conflict check for ids still parked in the arena.
     if adop._assemblies then
         for oid, asm in pairs(adop._assemblies) do
             if asm.shellRecordId == recordId then
                 if DeepEqual(asm.shell, body) then
-                    local complete = select(1, GS:IsAdoptionTransferComplete())
-                    return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+                    return "duplicate", "adoption_buffer"
                 end
                 return "rejected", "id_conflict"
             end
@@ -2038,8 +2138,7 @@ function GS:BufferAdoptionRecord(recordId, body)
 
     if adop.records[recordId] then
         if DeepEqual(adop.records[recordId], body) then
-            local complete = select(1, GS:IsAdoptionTransferComplete())
-            return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+            return "duplicate", "adoption_buffer"
         end
         if body.kind == "dataset-desc" and adop.records[recordId].kind == "dataset-desc" then
             local invSt, invReason = InvalidatePinnedDescriptor(body)
@@ -2048,9 +2147,15 @@ function GS:BufferAdoptionRecord(recordId, body)
             end
             -- Same pinned fields: replace descriptor content in place.
             adop.records[recordId] = body
+            if type(adop._bufCounts) == "table" then
+                adop._bufCounts.descId = recordId
+            end
             local complete = select(1, GS:IsAdoptionTransferComplete())
             adop.ready = complete and true or false
-            return "accepted", complete and "ready" or "updated"
+            if adop.ready then
+                NotifyAdoptionStateChanged("ready")
+            end
+            return "accepted", "adoption_buffer"
         end
         return "rejected", "id_conflict"
     end
@@ -2096,12 +2201,23 @@ function GS:BufferAdoptionRecord(recordId, body)
     local wasReady = adop.ready == true
     adop.records[recordId] = body
     adop.order[#adop.order + 1] = recordId
+    NoteBufferedKindInsert(adop, body)
+    if body.kind == "dataset-desc" and type(adop._bufCounts) == "table" then
+        adop._bufCounts.descId = recordId
+    end
+    -- Non-paged complete ops populate the opId map so later paged redelivery
+    -- does not need a full-history scan.
+    if body.kind == "gs-op" and type(body.op) == "table" and type(body.op.id) == "string"
+        and not tonumber(body.pageCount) and not tonumber(body.op.pageCount) then
+        adop._assembledByOpId = adop._assembledByOpId or {}
+        adop._assembledByOpId[body.op.id] = recordId
+    end
     local complete = select(1, GS:IsAdoptionTransferComplete())
     adop.ready = complete and true or false
     if adop.ready and not wasReady then
         NotifyAdoptionStateChanged("ready")
     end
-    return "accepted", complete and "ready" or nil
+    return "accepted", "adoption_buffer"
 end
 
 --- Adoption-session work instrumentation (visited confirm/completeness records).
@@ -2119,6 +2235,7 @@ function GS.GetAdoptionWorkStats()
         indexVisited = tonumber(stats.indexVisited) or 0,
         assemblyVisited = tonumber(stats.assemblyVisited) or 0,
         archiveVisited = tonumber(stats.archiveVisited) or 0,
+        receiveVisited = tonumber(stats.receiveVisited) or 0,
     }
 end
 
@@ -3250,10 +3367,12 @@ local function PublishAdoptionTemp(adop, temp, desc)
     GS._adoption = nil
     DebugInfo("committed dataset adoption dataset=%s epoch=%s",
         adop.sourceDatasetId, tostring(GS._adoptionEpoch))
+    ClearAdoptionTransientAcks()
     if GS._NotifyLocalDurableChange then
         GS._NotifyLocalDurableChange("adoption")
     end
     NotifyAdoptionStateChanged("commit")
+    InvalidateAdoptionDeliveryOutcomes("commit")
     return true
 end
 
@@ -4425,6 +4544,35 @@ end
 -- a bounded per-call slice so correctness is not truncated at index 32.
 -- When more refs remain after a live slice, schedules a continuation so a
 -- relevant confirmation beyond the first slice still applies without traffic.
+local function ConfirmationRedriveGuildKey(record)
+    if type(record) ~= "table" then
+        return nil
+    end
+    if type(record._guildKey) == "string" and record._guildKey ~= "" then
+        return record._guildKey
+    end
+    -- Fall back to the live guild handle when the record pointer is installed.
+    local root = GS._root
+    if type(root) == "table" and type(root.guilds) == "table" then
+        for gk, rec in pairs(root.guilds) do
+            if rec == record then
+                return gk
+            end
+        end
+    end
+    return nil
+end
+
+local function ConfirmationRedriveKey(record)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local guildKey = ConfirmationRedriveGuildKey(record) or ""
+    local datasetId = record.datasetId or ""
+    -- Pointer identity distinguishes replacement records that reuse dataset ids.
+    return tostring(guildKey) .. "\0" .. tostring(datasetId) .. "\0" .. tostring(record)
+end
+
 function GS.RedriveExactContentConfirmations(record, admissionCtx)
     if type(record) ~= "table" or type(record.confirmationRefs) ~= "table" then
         return
@@ -4437,12 +4585,21 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
     if total < 1 then
         return
     end
+    local key = ConfirmationRedriveKey(record)
+    GS._confirmationRedriveByKey = GS._confirmationRedriveByKey or {}
+    local state = GS._confirmationRedriveByKey[key]
+    if type(state) ~= "table" then
+        state = { pos = 1, remaining = nil, scheduled = false, record = record }
+        GS._confirmationRedriveByKey[key] = state
+    else
+        state.record = record
+    end
     local slice = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
     -- During adoption replay, drain the full list in this call (offline).
     if admissionCtx and admissionCtx.adoptionReplay then
         slice = total
     end
-    local start = tonumber(GS._confirmationRedrivePos) or 1
+    local start = tonumber(state.pos) or 1
     if start > total then
         start = 1
     end
@@ -4460,26 +4617,48 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
             i = 1
         end
     end
-    GS._confirmationRedrivePos = i
+    state.pos = i
     -- Live path: guarantee continuation until one full pass over confirmationRefs
     -- completes. Do not reschedule forever — drain remaining then clear.
     if not (admissionCtx and admissionCtx.adoptionReplay) and total > slice then
-        local remaining = tonumber(GS._confirmationRedriveRemaining)
+        local remaining = tonumber(state.remaining)
         if remaining == nil then
             remaining = total
         end
         remaining = math.max(0, remaining - processed)
-        GS._confirmationRedriveRemaining = remaining
-        if remaining > 0 and not GS._confirmationRedriveScheduled then
-            GS._confirmationRedriveScheduled = true
+        state.remaining = remaining
+        if remaining > 0 and not state.scheduled then
+            state.scheduled = true
+            local expectedKey = key
+            local expectedRecord = record
+            local expectedDataset = record.datasetId
+            local expectedGuild = ConfirmationRedriveGuildKey(record)
             local function continueRedrive()
-                GS._confirmationRedriveScheduled = false
-                if type(record) == "table" and type(record.confirmationRefs) == "table"
-                    and #record.confirmationRefs > 0
-                    and (tonumber(GS._confirmationRedriveRemaining) or 0) > 0 then
-                    GS.RedriveExactContentConfirmations(record, admissionCtx or {})
+                local st = GS._confirmationRedriveByKey and GS._confirmationRedriveByKey[expectedKey]
+                if type(st) ~= "table" then
+                    return
+                end
+                st.scheduled = false
+                -- Dataset/guild replacement: old closure must be inert.
+                local live = nil
+                if type(expectedGuild) == "string" and GS._root and type(GS._root.guilds) == "table" then
+                    live = GS._root.guilds[expectedGuild]
                 else
-                    GS._confirmationRedriveRemaining = nil
+                    -- No guild key: treat the captured pointer as authoritative.
+                    live = expectedRecord
+                end
+                if live ~= expectedRecord
+                    or (type(live) == "table" and live.datasetId ~= expectedDataset) then
+                    GS._confirmationRedriveByKey[expectedKey] = nil
+                    return
+                end
+                if type(expectedRecord.confirmationRefs) == "table"
+                    and #expectedRecord.confirmationRefs > 0
+                    and (tonumber(st.remaining) or 0) > 0 then
+                    GS.RedriveExactContentConfirmations(expectedRecord, admissionCtx or {})
+                else
+                    st.remaining = nil
+                    GS._confirmationRedriveByKey[expectedKey] = nil
                 end
             end
             if C_Timer and C_Timer.After then
@@ -4490,7 +4669,8 @@ function GS.RedriveExactContentConfirmations(record, admissionCtx)
                 continueRedrive()
             end
         elseif remaining <= 0 then
-            GS._confirmationRedriveRemaining = nil
+            state.remaining = nil
+            GS._confirmationRedriveByKey[key] = nil
         end
     end
 end

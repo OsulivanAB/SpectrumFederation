@@ -94,6 +94,35 @@ local function ClearOpManifestBuffer(opId)
     opManifestBufferPages = math.max(0, (opManifestBufferPages or 0) - pages)
 end
 
+-- Per-source incomplete-assembly count for shared pool isolation. One ordinary
+-- member must not consume every slot needed by a legitimate editor.
+local function CountOpManifestBuffersForPeer(peerName)
+    if type(peerName) ~= "string" or peerName == "" then
+        return 0
+    end
+    local n = 0
+    for _, buf in pairs(opManifestBuffer) do
+        if type(buf) == "table" and buf.sourcePeer == peerName then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function CanAllocateOpManifestBuffer(peerName, maxCamps)
+    maxCamps = tonumber(maxCamps) or 16
+    if (opManifestBufferCount or 0) >= maxCamps then
+        return false
+    end
+    -- Reserve at least two aggregate slots for other peers / editors.
+    local reserved = math.min(2, math.max(0, maxCamps - 1))
+    local perPeerCap = math.max(1, maxCamps - reserved)
+    if CountOpManifestBuffersForPeer(peerName) >= perPeerCap then
+        return false
+    end
+    return true
+end
+
 local function ReclaimExpiredFragmentBuffers(opts)
     opts = opts or {}
     local now = GetServerTime and GetServerTime() or 0
@@ -1923,7 +1952,7 @@ local function ValidateAndApply(record, ctx)
         local now = GetServerTime and GetServerTime() or 0
         local buf = opManifestBuffer[opId]
         if not buf then
-            if (opManifestBufferCount or 0) >= maxCamps then
+            if not CanAllocateOpManifestBuffer(sender, maxCamps) then
                 return "rejected", "full"
             end
             buf = {
@@ -1945,19 +1974,24 @@ local function ValidateAndApply(record, ctx)
         if buf.pageCount and buf.pageCount ~= pageCount then
             return "rejected", "invalid_operation"
         end
+        local madeProgress = false
         if buf.pages[page] then
             if GS._DeepEqualOps and not GS._DeepEqualOps(buf.pages[page], body) then
                 ClearOpManifestBuffer(opId)
                 return "rejected", "id_conflict"
             end
+            -- Exact duplicate: do not refresh lifetime.
         else
             if (opManifestBufferPages or 0) >= maxPagesBuf then
                 return "rejected", "full"
             end
             opManifestBufferPages = (opManifestBufferPages or 0) + 1
             buf.pages[page] = body
+            madeProgress = true
         end
-        buf.at = now
+        if madeProgress then
+            buf.at = now
+        end
         buf.pageCount = pageCount
         if type(buf.shell) ~= "table" then
             return "pending", "missing_predecessor"
@@ -2016,7 +2050,7 @@ local function ValidateAndApply(record, ctx)
             local now = GetServerTime and GetServerTime() or 0
             local buf = opManifestBuffer[op.id]
             if not buf then
-                if (opManifestBufferCount or 0) >= maxCamps then
+                if not CanAllocateOpManifestBuffer(sender, maxCamps) then
                     return "rejected", "full"
                 end
                 buf = {
@@ -2042,9 +2076,20 @@ local function ValidateAndApply(record, ctx)
                 ClearOpManifestBuffer(op.id)
                 return "rejected", "id_conflict"
             end
-            buf.shell = body
+            local shellProgress = false
+            if not buf.shell then
+                buf.shell = body
+                shellProgress = true
+            elseif GS._DeepEqualOps and GS._DeepEqualOps(buf.shell, body) then
+                -- Exact duplicate shell: do not refresh lifetime.
+            else
+                buf.shell = body
+                shellProgress = true
+            end
             buf.pageCount = pageCount
-            buf.at = now
+            if shellProgress then
+                buf.at = now
+            end
             if not buf.sourcePeer then
                 buf.sourcePeer = sender
             end
@@ -2306,6 +2351,19 @@ function GS.NotifyLocalDurableChange(reason)
             ScheduleExportMaintContinuation()
         end
     elseif record then
+        -- Remote evidence/conflict retention can insert keys that sort before a
+        -- saved cursor; force another evidence pass without a full rebuild.
+        if reason == "remote-evidence" or reason == "remote-conflict"
+            or reason == "remote-pending" or reason == "remote-confirm"
+            or reason == "remote-resolve" then
+            exportState.evidenceBuildNeeded = true
+            -- Restart evidence key cursors so newly inserted earlier keys are
+            -- not skipped; accepted-op / archive paced cursors are unchanged.
+            exportState.pendingCursor = nil
+            exportState.conflictCursor = nil
+            exportState.openConflictCursor = nil
+            exportState.maintIdle = false
+        end
         -- Incremental / paced cold drain. Budget covers BuildOpExportBodies work
         -- (serialization while packing) as well as index enumeration.
         local ops = record.operations
@@ -2352,6 +2410,40 @@ function GS.NotifyLocalDurableChange(reason)
                 end)
             end
             return keys
+        end
+        -- Resume after the last completed key (not a positional index). When the
+        -- saved key was deleted, continue from the next surviving sorted key so
+        -- newly inserted earlier keys are not permanently skipped.
+        local function resumeAfterKey(keys, cursorKey, exportIdForKey)
+            if cursorKey == nil or cursorKey == "" then
+                return 1
+            end
+            cursorKey = tostring(cursorKey)
+            local startK = #keys + 1
+            for ki = 1, #keys do
+                if tostring(keys[ki]) == cursorKey then
+                    startK = ki + 1
+                    break
+                end
+            end
+            if startK > #keys then
+                for ki = 1, #keys do
+                    if tostring(keys[ki]) > cursorKey then
+                        startK = ki
+                        break
+                    end
+                end
+            end
+            -- Inserted keys that sort before the saved cursor must not be skipped.
+            if type(exportIdForKey) == "function" and startK > 1 then
+                for ki = 1, startK - 1 do
+                    local eid = exportIdForKey(keys[ki])
+                    if type(eid) == "string" and not exportState.byId[eid] then
+                        return 1
+                    end
+                end
+            end
+            return startK
         end
 
         -- Cold / rebuild: resume accepted-op construction under slice budget.
@@ -2435,10 +2527,16 @@ function GS.NotifyLocalDurableChange(reason)
         if used < slice and type(ops) == "table" then
             if type(ops.openConflicts) == "table" then
                 local ocKeys = sortedKeys(ops.openConflicts)
-                local ocStart = tonumber(exportState.openConflictCursor) or 1
+                local ocStart = resumeAfterKey(ocKeys, exportState.openConflictCursor, function(k)
+                    return "gs:oc:" .. tostring(k)
+                end)
                 for ki = ocStart, #ocKeys do
                     if used >= slice then
-                        exportState.openConflictCursor = ki
+                        -- Stay on current key so mid-entry candidate work resumes.
+                        exportState.openConflictCursor = ocKeys[math.max(1, ki - 1)]
+                        if ki == ocStart then
+                            exportState.openConflictCursor = ocKeys[ki]
+                        end
                         exportState.evidenceBuildNeeded = true
                         break
                     end
@@ -2446,7 +2544,7 @@ function GS.NotifyLocalDurableChange(reason)
                     if type(entry) == "table" and type(entry.candidateIds) == "table" then
                         for i = 1, #entry.candidateIds do
                             if used >= slice then
-                                exportState.openConflictCursor = ki
+                                exportState.openConflictCursor = ocKeys[ki]
                                 exportState.evidenceBuildNeeded = true
                                 break
                             end
@@ -2458,7 +2556,7 @@ function GS.NotifyLocalDurableChange(reason)
                         used = used + 1
                     end
                     if used < slice then
-                        exportState.openConflictCursor = ki + 1
+                        exportState.openConflictCursor = ocKeys[ki]
                     end
                 end
                 if used < slice then
@@ -2495,16 +2593,21 @@ function GS.NotifyLocalDurableChange(reason)
             end
             if used < slice and type(ops.pending) == "table" then
                 local keys = sortedKeys(ops.pending)
-                local startK = tonumber(exportState.pendingCursor) or 1
+                local startK = resumeAfterKey(keys, exportState.pendingCursor, function(k)
+                    return "gs:op:" .. tostring(k)
+                end)
                 for ki = startK, #keys do
                     if used >= slice then
-                        exportState.pendingCursor = ki
+                        exportState.pendingCursor = keys[math.max(1, ki - 1)]
+                        if ki == startK then
+                            exportState.pendingCursor = keys[ki]
+                        end
                         exportState.evidenceBuildNeeded = true
                         break
                     end
                     upsertEvidence(keys[ki], nil)
                     used = used + 1
-                    exportState.pendingCursor = ki + 1
+                    exportState.pendingCursor = keys[ki]
                 end
                 if used < slice then
                     exportState.pendingCursor = nil
@@ -2512,16 +2615,21 @@ function GS.NotifyLocalDurableChange(reason)
             end
             if used < slice and type(ops.conflicts) == "table" then
                 local keys = sortedKeys(ops.conflicts)
-                local startK = tonumber(exportState.conflictCursor) or 1
+                local startK = resumeAfterKey(keys, exportState.conflictCursor, function(k)
+                    return "gs:op:" .. tostring(k)
+                end)
                 for ki = startK, #keys do
                     if used >= slice then
-                        exportState.conflictCursor = ki
+                        exportState.conflictCursor = keys[math.max(1, ki - 1)]
+                        if ki == startK then
+                            exportState.conflictCursor = keys[ki]
+                        end
                         exportState.evidenceBuildNeeded = true
                         break
                     end
                     upsertEvidence(keys[ki], nil)
                     used = used + 1
-                    exportState.conflictCursor = ki + 1
+                    exportState.conflictCursor = keys[ki]
                 end
                 if used < slice then
                     exportState.conflictCursor = nil
@@ -2557,10 +2665,15 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
             table.sort(keys)
-            local startK = tonumber(exportState.archiveBuildCursor) or 1
+            local startK = resumeAfterKey(keys, exportState.archiveBuildCursor, function(k)
+                return "gs:ca:" .. tostring(k)
+            end)
             for ki = startK, #keys do
                 if used >= slice then
-                    exportState.archiveBuildCursor = ki
+                    exportState.archiveBuildCursor = keys[math.max(1, ki - 1)]
+                    if ki == startK then
+                        exportState.archiveBuildCursor = keys[ki]
+                    end
                     exportState.archiveBuildNeeded = true
                     break
                 end
@@ -2576,7 +2689,7 @@ function GS.NotifyLocalDurableChange(reason)
                         end
                     end
                 end
-                exportState.archiveBuildCursor = ki + 1
+                exportState.archiveBuildCursor = keys[ki]
             end
             if used < slice then
                 exportState.archiveBuildCursor = nil

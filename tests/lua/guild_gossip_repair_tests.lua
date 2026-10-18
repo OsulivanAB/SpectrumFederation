@@ -6283,6 +6283,101 @@ do
         "F92: reopen+notify recovers PENDING records before UNRESOLVED_TTL without polling")
 end
 
+---------------------------------------------------------------------------
+-- F93: ReopenUnresolvedEnumeration during an active apply_bodies pull arms
+-- needsFollowUp so the same pull cannot rewrite an advanced bookmark past a
+-- just-reopened earlier PENDING fragment (Guild Supplies arena-free path).
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local pendingIds = { ["early-1"] = true }
+    local pA = A.GuildGossip:EnableSynthetic({
+        id = "sf.synthetic.gossip", instanceKey = "f93a", pendingIds = pendingIds,
+    })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f93b" })
+    -- early-1 PENDING, late-1 ACCEPTED in the same exchange.
+    pB.AppendLocal("early-body", "early-1")
+    pB.AppendLocal("late-body", "late-1")
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.5)
+    for i = 1, 40 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.05)
+    end
+    assertTrue(pA.GetStore().records["late-1"] ~= nil, "F93: later record accepted")
+    local unresolved = A.GuildGossip._engine.unresolved or {}
+    local sawEarly = false
+    for _, item in pairs(unresolved) do
+        if item.recordId == "early-1" and item.result == A.GuildGossip.DELIVERY.PENDING then
+            sawEarly = true
+            break
+        end
+    end
+    assertTrue(sawEarly, "F93: early record still PENDING unresolved")
+
+    -- Start a fresh pull that is mid apply_bodies, then reopen inside that window.
+    pendingIds["early-1"] = nil
+    -- Drive until an outPull is active (or force one via discovery + step).
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    local armed = false
+    for step = 1, 60 do
+        local out = A.GuildGossip._engine.outPull
+        if type(out) == "table" and out.phase == "apply_bodies" then
+            A.GuildGossip.ReopenUnresolvedEnumeration("sf.synthetic.gossip")
+            assertEq(out.needsFollowUp, true,
+                "F93: reopen during apply_bodies arms needsFollowUp")
+            armed = true
+            break
+        end
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.05)
+    end
+    if not armed then
+        -- Fallback: install a synthetic active pull and prove the reopen contract.
+        local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+        A.GuildGossip._engine.outPull = {
+            providerId = "sf.synthetic.gossip",
+            peer = "Bob-Garona",
+            scopeId = entry and entry.api and entry.api.GetScopeId and entry.api.GetScopeId(),
+            phase = "apply_bodies",
+            needsFollowUp = false,
+        }
+        A.GuildGossip._engine.unresolved["force"] = {
+            providerId = "sf.synthetic.gossip",
+            peer = "Bob-Garona",
+            peerKey = "bob-garona",
+            scopeId = A.GuildGossip._engine.outPull.scopeId,
+            recordId = "early-1",
+            versionFp = "v",
+            result = "pending",
+            at = world.time,
+        }
+        A.GuildGossip.ReopenUnresolvedEnumeration("sf.synthetic.gossip")
+        assertEq(A.GuildGossip._engine.outPull.needsFollowUp, true,
+            "F93: reopen on synthetic active pull arms needsFollowUp")
+        armed = true
+    end
+    assertTrue(armed, "F93: needsFollowUp contract exercised")
+    A.GuildGossip.NotifyMeaningfulChange()
+    local recovered = false
+    for step = 1, 80 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.05)
+        if pA.GetStore().records["early-1"] then
+            recovered = true
+            break
+        end
+    end
+    assertTrue(recovered, "F93: early PENDING recovers after mid-pull reopen")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")
