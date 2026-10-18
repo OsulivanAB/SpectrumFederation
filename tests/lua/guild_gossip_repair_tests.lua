@@ -6287,20 +6287,37 @@ end
 -- F93: ReopenUnresolvedEnumeration from a real provider ValidateAndApply
 -- during BODY processing (capacity-freeing late record) arms needsFollowUp
 -- so the same pull cannot rewrite an advanced bookmark past the earlier
--- PENDING fragment. No synthetic outPull fallback.
+-- PENDING fragment. Deterministic same-bucket fixture; bookmark check is
+-- independent of transient outPull; TTL uses UNRESOLVED_TTL_SEC.
 ---------------------------------------------------------------------------
 do
     reset()
     local A = makeClient("Alice")
     local B = makeClient("Bob")
-    local pendingIds = { ["early-1"] = true }
+    local earlyId = "early-1"
+    -- late-26 shares BucketForId with early-1 (bucket 32); late-1 does not.
+    local lateId = "late-26"
+    assertEq(A.GuildGossip.BucketForId(earlyId), A.GuildGossip.BucketForId(lateId),
+        "F93: fixture requires pending+capacity-freeing ids in the same bucket")
+    local pendingIds = { [earlyId] = true }
     local pA = A.GuildGossip:EnableSynthetic({
         id = "sf.synthetic.gossip", instanceKey = "f93a", pendingIds = pendingIds,
     })
     local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f93b" })
-    -- early-1 PENDING, late-1 capacity-freeing ACCEPTED in the same bucket/page.
-    pB.AppendLocal("early-body", "early-1")
-    pB.AppendLocal("late-body", "late-1")
+    -- PENDING then capacity-freeing ACCEPTED in the same bucket (append order → seq).
+    pB.AppendLocal("early-body", earlyId)
+    pB.AppendLocal("late-body", lateId)
+    local entryB = B.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local earlyIdx = entryB and entryB.index and entryB.index.byId and entryB.index.byId[earlyId]
+    assertTrue(type(earlyIdx) == "table", "F93: remote early index entry present")
+    local earlyBucket = tonumber(earlyIdx.bucket)
+    local earlySeq = tonumber(earlyIdx.seq)
+    assertTrue(earlyBucket ~= nil and earlySeq ~= nil, "F93: captured early bucket/seq")
+    local lateIdx = entryB.index.byId[lateId]
+    assertTrue(type(lateIdx) == "table" and tonumber(lateIdx.bucket) == earlyBucket,
+        "F93: late record indexed in the same bucket after early")
+    assertTrue(tonumber(lateIdx.seq) > earlySeq,
+        "F93: late seq follows early in the same bucket")
 
     local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
     assertTrue(entryA and entryA.api and type(entryA.api.ValidateAndApply) == "function",
@@ -6313,10 +6330,10 @@ do
         local result, detail = realApply(record, ctx)
         -- Production pairing: free capacity then reopen inside ValidateAndApply
         -- while the engine is still in apply_bodies (arena-free path).
-        if rid == "late-1"
+        if rid == lateId
             and (result == A.GuildGossip.DELIVERY.ACCEPTED
                 or result == A.GuildGossip.DELIVERY.DUPLICATE) then
-            pendingIds["early-1"] = nil
+            pendingIds[earlyId] = nil
             local out = A.GuildGossip._engine.outPull
             if type(out) == "table" and out.phase == "apply_bodies" then
                 A.GuildGossip.ReopenUnresolvedEnumeration("sf.synthetic.gossip")
@@ -6334,46 +6351,41 @@ do
         stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
         stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
         advance(0.05)
-        if midApplyReopen and pA.GetStore().records["late-1"] then
+        if midApplyReopen and pA.GetStore().records[lateId] then
             break
         end
     end
-    assertTrue(pA.GetStore().records["late-1"] ~= nil, "F93: later capacity-freeing record accepted")
+    assertTrue(pA.GetStore().records[lateId] ~= nil, "F93: later capacity-freeing record accepted")
     assertTrue(midApplyReopen,
         "F93: reopen triggered from real BODY ValidateAndApply during apply_bodies")
     assertTrue(midApplyNeedsFollowUp,
         "F93: needsFollowUp armed by mid-apply reopen")
-    -- Bookmark protection: after the pull advances, afterSeq must not skip early-1.
-    local advancedPastEarly = false
-    for _, bm in pairs(entryA.bookmarks or {}) do
-        if type(bm) == "table" and tonumber(bm.afterSeq) and tonumber(bm.afterSeq) >= 2 then
-            -- With needsFollowUp, setBookmark is skipped for that pull; a restored
-            -- advanced cursor past both seqs would violate the contract.
-            local out = A.GuildGossip._engine.outPull
-            if type(out) == "table" and out.needsFollowUp == true then
-                advancedPastEarly = true
-            end
-        end
-    end
-    assertTrue(not advancedPastEarly,
-        "F93: active pull with needsFollowUp did not restore advanced bookmark")
+    -- At completion of the affected pull (before recovery advances coverage):
+    -- inspect the early bucket bookmark without requiring outPull to still exist.
+    local scopeId = A.GuildGossip.GetGuildScopeId()
+    local bmKey = bookmarkStorageKey("Bob-Garona", entryA.id, scopeId, earlyBucket)
+    local bmAtPull = entryA.bookmarks and entryA.bookmarks[bmKey]
+    local afterAtPull = type(bmAtPull) == "table" and tonumber(bmAtPull.afterSeq) or nil
+    assertTrue(afterAtPull == nil or afterAtPull < earlySeq,
+        "F93: affected pull did not advance bookmark past early seq (afterSeq="
+            .. tostring(afterAtPull) .. " earlySeq=" .. tostring(earlySeq) .. ")")
 
     A.GuildGossip.NotifyMeaningfulChange()
     local recovered = false
-    local ttl = A.GuildGossip.UNRESOLVED_TTL or 300
+    local ttl = A.GuildGossip.UNRESOLVED_TTL_SEC
+    assertTrue(type(ttl) == "number" and ttl > 0, "F93: UNRESOLVED_TTL_SEC present")
     local startTime = world.time
     for step = 1, 100 do
         stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
         stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
         advance(0.05)
-        if pA.GetStore().records["early-1"] then
+        if pA.GetStore().records[earlyId] then
             recovered = true
             break
         end
-        assertTrue((world.time - startTime) < ttl,
-            "F93: recovery must complete before UNRESOLVED_TTL")
     end
-    assertTrue(recovered, "F93: early PENDING recovers after mid-pull reopen before TTL")
+    assertTrue(recovered and (world.time - startTime) < ttl,
+        "F93: early PENDING recovers after mid-pull reopen before UNRESOLVED_TTL")
     -- Restore original apply for later cases sharing the provider id.
     entryA.api.ValidateAndApply = realApply
 end
