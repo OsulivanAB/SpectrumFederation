@@ -6227,6 +6227,62 @@ do
     assertTrue(entryA._indexUsable ~= true, "F91: EnsureIndex BumpIndexEpoch clears usability")
 end
 
+---------------------------------------------------------------------------
+-- F92: capacity-style recovery reopens PENDING unresolved without TTL wait
+-- (Guild Supplies assembly_full uses the same ReopenUnresolvedEnumeration +
+-- NotifyMeaningfulChange pairing when arena slots free.)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local pendingIds = { ["cap-1"] = true, ["cap-2"] = true }
+    local pA = A.GuildGossip:EnableSynthetic({
+        id = "sf.synthetic.gossip", instanceKey = "f92a", pendingIds = pendingIds,
+    })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f92b" })
+    pB.AppendLocal("capacity-one", "cap-1")
+    pB.AppendLocal("capacity-two", "cap-2")
+    pB.AppendLocal("capacity-ok", "ok-1")
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.5)
+    for i = 1, 50 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.1)
+    end
+    local unresolved = A.GuildGossip._engine.unresolved or {}
+    local pendingCount = 0
+    for _, item in pairs(unresolved) do
+        if item.result == A.GuildGossip.DELIVERY.PENDING then
+            pendingCount = pendingCount + 1
+        end
+    end
+    assertTrue(pendingCount >= 1, "F92: PENDING obligations recorded while capacity full")
+    assertTrue(pA.GetStore().records["ok-1"] ~= nil,
+        "F92: later accepted record still synchronizes")
+    -- Free capacity (simulate assembly slot free) and reopen via existing engine APIs.
+    pendingIds["cap-1"] = nil
+    pendingIds["cap-2"] = nil
+    A.GuildGossip.ReopenUnresolvedEnumeration("sf.synthetic.gossip")
+    A.GuildGossip.NotifyMeaningfulChange()
+    assertTrue(next(A.GuildGossip._engine.unresolvedBackoffUntil or {}) == nil,
+        "F92: meaningful recovery cleared unresolved backoff")
+    local recovered = false
+    for step = 1, 80 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
+        advance(0.05)
+        if pA.GetStore().records["cap-1"] and pA.GetStore().records["cap-2"] then
+            recovered = true
+            break
+        end
+    end
+    assertTrue(recovered,
+        "F92: reopen+notify recovers PENDING records before UNRESOLVED_TTL without polling")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end
 io.stdout:write("0 failed\n")

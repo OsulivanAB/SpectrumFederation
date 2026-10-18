@@ -2397,12 +2397,15 @@ end
 
 reopenUnresolvedEnumeration = function(providerId)
     local e = GG._engine
+    -- Snapshot keys first: Lua 5.1 pairs+delete can skip entries mid-walk.
     local snapshot = {}
     for key, item in pairs(e.unresolved or {}) do
-        if not providerId or item.providerId == providerId then
+        if not providerId or (item and item.providerId == providerId) then
             snapshot[#snapshot + 1] = { key = key, item = item }
-            e.unresolved[key] = nil
         end
+    end
+    for i = 1, #snapshot do
+        e.unresolved[snapshot[i].key] = nil
     end
     local touched = {}
     for _, row in ipairs(snapshot) do

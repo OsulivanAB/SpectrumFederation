@@ -1605,6 +1605,60 @@ function GS:GetPendingAdoption()
     return GS._adoption
 end
 
+-- When arena capacity frees, reopen engine unresolved obligations for this
+-- provider and clear scoped pull backoff so suppressed assembly_full revisions
+-- can be re-enumerated promptly. Reopen is synchronous (idempotent). The
+-- meaningful-change notification is coalesced to once per apply burst via
+-- FlushAdoptionAssemblyRecovery (and After(0) as a safety net). Uses existing
+-- GG.ReopenUnresolvedEnumeration + GG.NotifyMeaningfulChange (not polling, not
+-- global TTL shortening, not NotifyProviderChanged index rebuild).
+local _assemblyRecoveryNotifyPending = false
+local _assemblyRecoveryNotifyScheduled = false
+local function FlushAdoptionAssemblyRecovery()
+    if not _assemblyRecoveryNotifyPending then
+        return
+    end
+    _assemblyRecoveryNotifyPending = false
+    _assemblyRecoveryNotifyScheduled = false
+    local live = GS._adoption
+    if type(live) == "table" and live.committed then
+        return
+    end
+    local gg = SF.GuildGossip
+    if type(gg) == "table" and type(gg.NotifyMeaningfulChange) == "function" then
+        gg.NotifyMeaningfulChange()
+    elseif type(gg) == "table" and type(gg.MarkWorkPending) == "function" then
+        gg.MarkWorkPending()
+    end
+end
+
+local function ScheduleAdoptionAssemblyRecovery()
+    if type(GS.PROVIDER_ID) ~= "string" then
+        return
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" and adop.committed then
+        return
+    end
+    if type(GS._onAssemblyRecovery) == "function" then
+        pcall(GS._onAssemblyRecovery)
+    end
+    local gossip = SF.GuildGossip
+    if type(gossip) == "table" and type(gossip.ReopenUnresolvedEnumeration) == "function" then
+        gossip.ReopenUnresolvedEnumeration(GS.PROVIDER_ID)
+    end
+    _assemblyRecoveryNotifyPending = true
+    if _assemblyRecoveryNotifyScheduled then
+        return
+    end
+    _assemblyRecoveryNotifyScheduled = true
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, FlushAdoptionAssemblyRecovery)
+    else
+        FlushAdoptionAssemblyRecovery()
+    end
+end
+
 local function ClearAdoptionAssemblySlot(adop, opId, asm)
     if type(adop) ~= "table" or type(opId) ~= "string" or type(asm) ~= "table" then
         return
@@ -1613,14 +1667,22 @@ local function ClearAdoptionAssemblySlot(adop, opId, asm)
     for _ in pairs(asm.pages or {}) do
         pageN = pageN + 1
     end
+    local freedArena = false
     if asm._countsTowardArena ~= false then
-        adop._assemblyPageCount = math.max(0, (tonumber(adop._assemblyPageCount) or 0) - pageN)
+        local beforeOps = tonumber(adop._assemblyOpCount) or 0
+        local beforePages = tonumber(adop._assemblyPageCount) or 0
+        adop._assemblyPageCount = math.max(0, beforePages - pageN)
         if adop._assemblies and adop._assemblies[opId] then
-            adop._assemblyOpCount = math.max(0, (tonumber(adop._assemblyOpCount) or 0) - 1)
+            adop._assemblyOpCount = math.max(0, beforeOps - 1)
             adop._assemblies[opId] = nil
         end
+        freedArena = (adop._assemblyOpCount or 0) < beforeOps
+            or (adop._assemblyPageCount or 0) < beforePages
     elseif adop._redeliveryAssemblies then
         adop._redeliveryAssemblies[opId] = nil
+    end
+    if freedArena then
+        ScheduleAdoptionAssemblyRecovery()
     end
 end
 
@@ -1777,6 +1839,10 @@ end
 -- Arena-full returns pending/assembly_full so provider/transport can retry after
 -- in-flight manifests finalize and free slots (no silent 24-op history cap).
 local function BufferAdoptionAssembly(adop, recordId, body)
+    local function finish(st, reason)
+        FlushAdoptionAssemblyRecovery()
+        return st, reason
+    end
     local stats = EnsureAdoptionWorkStats(adop)
     stats.assemblyVisited = (stats.assemblyVisited or 0) + 1
     adop._assemblies = adop._assemblies or {}
@@ -1786,7 +1852,7 @@ local function BufferAdoptionAssembly(adop, recordId, body)
     local isShell = body.kind == "gs-op"
     if isShell then
         if type(body.op) ~= "table" or type(body.op.id) ~= "string" then
-            return "rejected", "invalid_record"
+            return finish("rejected", "invalid_record")
         end
         opId = body.op.id
         pageCount = tonumber(body.pageCount) or tonumber(body.op.pageCount)
@@ -1797,18 +1863,20 @@ local function BufferAdoptionAssembly(adop, recordId, body)
         opId = body.opId
         pageCount = tonumber(body.pageCount)
         if type(opId) ~= "string" then
-            return "rejected", "invalid_record"
+            return finish("rejected", "invalid_record")
         end
     end
     -- Exact redelivery of a completed logical manifest must not append another row.
     local existingRid = select(1, FindAssembledLogicalRecord(adop, opId))
     if existingRid then
-        return BufferAssembledRedelivery(adop, recordId, body, opId, isShell, pageCount)
+        local st, reason = BufferAssembledRedelivery(
+            adop, recordId, body, opId, isShell, pageCount)
+        return finish(st, reason)
     end
     local asm = adop._assemblies[opId]
     if not asm then
         if adop._assemblyOpCount >= (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24) then
-            return "pending", "assembly_full"
+            return finish("pending", "assembly_full")
         end
         asm = { pages = {}, pageCount = pageCount, _countsTowardArena = true }
         adop._assemblies[opId] = asm
@@ -1819,7 +1887,7 @@ local function BufferAdoptionAssembly(adop, recordId, body)
     end
     if isShell then
         if asm.shell and not DeepEqual(asm.shell, body) then
-            return "rejected", "id_conflict"
+            return finish("rejected", "id_conflict")
         end
         if not asm.shell then
             asm.shell = body
@@ -1828,17 +1896,19 @@ local function BufferAdoptionAssembly(adop, recordId, body)
     else
         local p = tonumber(body.page) or 0
         if p < 1 then
-            return "rejected", "invalid_record"
+            return finish("rejected", "invalid_record")
         end
         if asm.pages[p] then
             if DeepEqual(asm.pages[p], body) then
                 local complete = select(1, GS:IsAdoptionTransferComplete())
-                return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+                return finish(
+                    complete and "accepted" or "duplicate",
+                    complete and "ready" or "duplicate")
             end
-            return "rejected", "id_conflict"
+            return finish("rejected", "id_conflict")
         end
         if adop._assemblyPageCount >= (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0) then
-            return "pending", "assembly_full"
+            return finish("pending", "assembly_full")
         end
         asm.pages[p] = body
         adop._assemblyPageCount = adop._assemblyPageCount + 1
@@ -1853,15 +1923,17 @@ local function BufferAdoptionAssembly(adop, recordId, body)
         NotifyAdoptionStateChanged("ready")
     end
     if finalized and finDetail == "duplicate" then
-        return complete and "accepted" or "duplicate", complete and "ready" or "duplicate"
+        return finish(
+            complete and "accepted" or "duplicate",
+            complete and "ready" or "duplicate")
     end
     if not finalized and finDetail == "id_conflict" then
-        return "rejected", "id_conflict"
+        return finish("rejected", "id_conflict")
     end
     if finalized then
-        return "accepted", complete and "ready" or nil
+        return finish("accepted", complete and "ready" or nil)
     end
-    return "accepted", complete and "ready" or nil
+    return finish("accepted", complete and "ready" or nil)
 end
 
 --- Legacy name: finalize assembly for opId when shell+pages are complete.

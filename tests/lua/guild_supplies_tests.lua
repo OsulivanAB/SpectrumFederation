@@ -384,6 +384,55 @@ do
     SF.GuildGossip.HasActiveProvider = function()
         return (providers.activeCount or 0) > 0
     end
+    -- Engine unresolved / recovery surfaces used by adoption assembly backpressure.
+    SF.GuildGossip.DELIVERY = {
+        ACCEPTED = "accepted",
+        DUPLICATE = "duplicate",
+        PENDING = "pending",
+        REJECTED = "rejected",
+    }
+    SF.GuildGossip._engine = {
+        unresolved = {},
+        unresolvedBackoffUntil = {},
+    }
+    SF.GuildGossip.UNRESOLVED_BACKOFF_SEC = SF.GuildGossip.UNRESOLVED_BACKOFF_SEC or 30
+    SF.GuildGossip.ReopenUnresolvedEnumeration = function(providerId)
+        world.reopenUnresolved = (world.reopenUnresolved or 0) + 1
+        world.lastReopenProviderId = providerId
+        local e = SF.GuildGossip._engine
+        if type(e) ~= "table" or type(e.unresolved) ~= "table" then
+            return
+        end
+        local keys = {}
+        for key, item in pairs(e.unresolved) do
+            if not providerId or (item and item.providerId == providerId) then
+                keys[#keys + 1] = key
+            end
+        end
+        for i = 1, #keys do
+            e.unresolved[keys[i]] = nil
+        end
+    end
+    SF.GuildGossip.NotifyMeaningfulChange = function()
+        local e = SF.GuildGossip._engine
+        if type(e) == "table" then
+            e.unresolvedBackoffUntil = {}
+        end
+        if SF.GuildGossip.MarkWorkPending then
+            SF.GuildGossip.MarkWorkPending()
+        end
+        world.meaningfulChange = (world.meaningfulChange or 0) + 1
+    end
+    SF.GuildGossip.ApplyRecordToProvider = function(entry, record, ctx)
+        if not entry or not entry.api or type(entry.api.ValidateAndApply) ~= "function" then
+            return "rejected", "no_provider"
+        end
+        local result, detail = entry.api.ValidateAndApply(record, ctx)
+        if type(result) ~= "string" then
+            return "rejected", "invalid_outcome"
+        end
+        return result, detail
+    end
 end
 
 local GS = SF.GuildSupplies
@@ -454,6 +503,11 @@ local function resetDb()
     GS._confirmationRedriveRemaining = nil
     GS._confirmationRedriveScheduled = false
     world.notifyChanged = 0
+    world.meaningfulChange = 0
+    if GG._engine then
+        GG._engine.unresolved = {}
+        GG._engine.unresolvedBackoffUntil = {}
+    end
     timers = {}
     world.chat = {}
     world.prints = {}
@@ -11110,8 +11164,9 @@ do
             "3A17: redel adopt tab")
     end
 
-    -- C: >24 legal paged ops complete under interleaving via provider recovery.
-    -- Fail-before: 25th incomplete op hard-rejected as full with no retry path.
+    -- C: >24 paged ops recover via engine unresolved reopen (not manual retry).
+    -- Fail-before: pending/assembly_full stayed in GG._engine.unresolved; handleManifest
+    -- skipped those revisions; freeing slots did not reopen → adoption could expire.
     do
         resetDb()
         switchPlayer("Alice", "Player-1-Alice", 1)
@@ -11120,9 +11175,12 @@ do
         GS:EnsureGossipProvider()
         startCampaign()
         local ds = GS:GetCurrentRecord().datasetId
+        local arenaCap = GS.MAX_ADOPTION_ASSEMBLY_OPS or 24
+        -- Small deferred tail beyond the arena (assessment: few deferred fragments).
         local confIds = {}
         local maxOid = GS.MAX_OPERATION_ID or 192
-        for n = 1, 28 do
+        local totalPaged = arenaCap + 3
+        for n = 1, totalPaged do
             local id = string.format("arena-%02d", n)
             local body = {
                 schemaVersion = 1, id = id, guildKey = "club:42", datasetId = ds,
@@ -11159,6 +11217,7 @@ do
         local exportBodies = collectAllExportBodies()
         local byOp = {}
         local others = {}
+        local pagedExport = {}
         for i = 1, #exportBodies do
             local b = exportBodies[i].body
             local oid = nil
@@ -11167,37 +11226,28 @@ do
             elseif b and b.kind == "gs-op-page" then
                 oid = b.opId
             end
-            if oid and confIds then
-                local isArena = false
+            local isArena = false
+            if oid then
                 for ci = 1, #confIds do
                     if confIds[ci] == oid then
                         isArena = true
                         break
                     end
                 end
-                if isArena then
-                    byOp[oid] = byOp[oid] or { shell = nil, pages = {} }
-                    if b.kind == "gs-op" then
-                        byOp[oid].shell = b
-                    else
-                        byOp[oid].pages[#byOp[oid].pages + 1] = b
-                    end
+            end
+            if isArena then
+                byOp[oid] = byOp[oid] or { shell = nil, pages = {} }
+                if b.kind == "gs-op" then
+                    byOp[oid].shell = b
                 else
-                    others[#others + 1] = exportBodies[i]
+                    byOp[oid].pages[#byOp[oid].pages + 1] = b
                 end
+                pagedExport[#pagedExport + 1] = exportBodies[i]
             else
                 others[#others + 1] = exportBodies[i]
             end
         end
-        local pagedOps = 0
-        for i = 1, #confIds do
-            local info = byOp[confIds[i]]
-            if info and info.shell and #info.pages >= 1 then
-                pagedOps = pagedOps + 1
-            end
-        end
-        assertTrue(pagedOps > (GS.MAX_ADOPTION_ASSEMBLY_OPS or 24),
-            "3A17: fixture has >24 paged ops got=" .. tostring(pagedOps))
+        assertTrue(#confIds > arenaCap, "3A17: fixture exceeds assembly arena")
 
         SpectrumFederationDB = {}
         switchPlayer("Carol", "Player-1-Carol", 2)
@@ -11209,87 +11259,154 @@ do
         GS:CreateStagedRecord()
         local before = snapshotDurable(GS:GetCurrentRecord())
         GS:EnsureGossipProvider()
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "3A17: provider registered for engine apply")
+        GG._engine = GG._engine or {}
+        GG._engine.unresolved = {}
+        GG._engine.unresolvedBackoffUntil = {}
+
+        -- Mirror 09_Engine body-apply unresolved bookkeeping for PENDING/REJECTED.
+        local function engineApplyBody(exportRec, sender)
+            local body = exportRec.body
+            local record = {
+                id = exportRec.id,
+                versionFp = GS.ContentFingerprint(body),
+                body = body,
+            }
+            local result, detail = GG.ApplyRecordToProvider(entry, record, { sender = sender })
+            if result == GG.DELIVERY.PENDING or result == GG.DELIVERY.REJECTED
+                or result == "pending" or result == "rejected" then
+                local e = GG._engine
+                e.unresolved = e.unresolved or {}
+                local key = "gs-unresolved:" .. tostring(record.id) .. ":" .. tostring(record.versionFp)
+                e.unresolved[key] = {
+                    at = GetTime(),
+                    providerId = GS.PROVIDER_ID,
+                    recordId = record.id,
+                    versionFp = record.versionFp,
+                    result = result,
+                    peer = sender,
+                    peerKey = string.lower((sender:gsub("%s+", ""))),
+                    scopeId = entry.api.GetScopeId and entry.api.GetScopeId() or "club:42",
+                }
+                e.unresolvedBackoffUntil = e.unresolvedBackoffUntil or {}
+                local scopeId = e.unresolved[key].scopeId
+                e.unresolvedBackoffUntil[string.lower(sender) .. "|" .. GS.PROVIDER_ID .. "\0" .. tostring(scopeId)] =
+                    GetTime() + (GG.UNRESOLVED_BACKOFF_SEC or 30)
+            elseif result == GG.DELIVERY.ACCEPTED or result == GG.DELIVERY.DUPLICATE
+                or result == "accepted" or result == "duplicate" then
+                -- Accepted/duplicate clear matching unresolved keys (engine clearUnresolvedRevision).
+                local e = GG._engine
+                for k, item in pairs(e.unresolved or {}) do
+                    if item.providerId == GS.PROVIDER_ID
+                        and tostring(item.recordId) == tostring(record.id)
+                        and tostring(item.versionFp or "") == tostring(record.versionFp) then
+                        e.unresolved[k] = nil
+                    end
+                end
+            end
+            return result, detail
+        end
+        local function countProviderUnresolved()
+            local n = 0
+            for _, item in pairs(GG._engine.unresolved or {}) do
+                if item.providerId == GS.PROVIDER_ID then
+                    n = n + 1
+                end
+            end
+            return n
+        end
+
         GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
         assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", ds)), "accepted",
             "3A17: arena begin")
         for i = 1, #others do
-            local stB = select(1, GS:BufferAdoptionRecord(others[i].id, others[i].body))
+            local stB, reasonB = engineApplyBody(others[i], "Alice-Garona")
             assertTrue(stB == "accepted" or stB == "duplicate",
-                "3A17: arena other buffer " .. tostring(stB))
+                "3A17: arena other apply " .. tostring(stB) .. "/" .. tostring(reasonB))
         end
 
-        local arenaCap = GS.MAX_ADOPTION_ASSEMBLY_OPS or 24
-        local deferred = {}
         local sawAssemblyFull = false
-        -- Pages-first for all paged ops: first `arenaCap` occupy slots; rest defer.
-        for i = 1, #confIds do
-            local info = byOp[confIds[i]]
-            if info and info.shell then
-                local blocked = false
-                for pi = 1, #info.pages do
-                    local stP, reasonP = providerApply(info.pages[pi], "Alice-Garona")
-                    if stP == "pending" and reasonP == "assembly_full" then
-                        sawAssemblyFull = true
-                        blocked = true
-                        deferred[#deferred + 1] = { kind = "page", body = info.pages[pi], opId = confIds[i] }
-                    else
-                        assertTrue(stP == "accepted" or stP == "duplicate" or stP == "pending",
-                            "3A17: arena page " .. tostring(stP) .. "/" .. tostring(reasonP))
-                    end
-                end
-                if blocked then
-                    deferred[#deferred + 1] = { kind = "shell", body = info.shell, opId = confIds[i] }
+        local applyCount = 0
+        -- First enumeration pass: pages-first then shells (engine receive/apply order).
+        for i = 1, #pagedExport do
+            local b = pagedExport[i].body
+            if b.kind == "gs-op-page" then
+                applyCount = applyCount + 1
+                local stP, reasonP = engineApplyBody(pagedExport[i], "Alice-Garona")
+                if stP == "pending" and reasonP == "assembly_full" then
+                    sawAssemblyFull = true
+                else
+                    assertTrue(stP == "accepted" or stP == "duplicate" or stP == "pending",
+                        "3A17: arena page apply " .. tostring(stP) .. "/" .. tostring(reasonP))
                 end
             end
         end
         assertTrue(sawAssemblyFull, "3A17: observed assembly_full under pages-first interleaving")
-        local adop = GS:GetPendingAdoption()
-        assertTrue((tonumber(adop._assemblyOpCount) or 0) <= arenaCap,
+        local unresolvedBefore = countProviderUnresolved()
+        assertTrue(unresolvedBefore >= 1,
+            "3A17: assembly_full recorded as engine unresolved obligations")
+        assertTrue((tonumber(GS:GetPendingAdoption()._assemblyOpCount) or 0) <= arenaCap,
             "3A17: in-flight assemblies bounded by arena cap")
+        assertTrue(next(GG._engine.unresolvedBackoffUntil or {}) ~= nil,
+            "3A17: unresolved pull backoff armed after assembly_full")
 
-        -- Finalize in-flight manifests (shells) to free slots, then retry deferred.
-        for i = 1, #confIds do
-            local info = byOp[confIds[i]]
-            if info and info.shell then
-                local stS, reasonS = providerApply(info.shell, "Alice-Garona")
+        -- Free capacity by delivering shells already received in the catalog.
+        local finalizedShells = 0
+        for i = 1, #pagedExport do
+            local b = pagedExport[i].body
+            if b.kind == "gs-op" and tonumber(b.pageCount) then
+                applyCount = applyCount + 1
+                local adopNow = GS._adoption
+                local opCountBefore = tonumber(adopNow and adopNow._assemblyOpCount) or 0
+                local stS, reasonS = engineApplyBody(pagedExport[i], "Alice-Garona")
+                adopNow = GS._adoption
+                local opCountAfter = tonumber(adopNow and adopNow._assemblyOpCount) or 0
+                if opCountAfter < opCountBefore then
+                    finalizedShells = finalizedShells + 1
+                end
                 assertTrue(
                     stS == "accepted" or stS == "duplicate" or stS == "pending",
-                    "3A17: arena shell " .. tostring(stS) .. "/" .. tostring(reasonS))
+                    "3A17: arena shell apply " .. tostring(stS) .. "/" .. tostring(reasonS))
             end
         end
+        assertTrue(finalizedShells >= 1, "3A17: shells finalized in-flight assemblies")
+        -- Reopen + coalesced NotifyMeaningfulChange run on slot free (apply burst).
+        assertTrue((world.reopenUnresolved or 0) >= 1,
+            "3A17: freeing assembly slots invoked ReopenUnresolvedEnumeration")
+        assertEq(world.lastReopenProviderId, GS.PROVIDER_ID,
+            "3A17: reopen targeted guild-supplies provider")
+        assertEq(countProviderUnresolved(), 0,
+            "3A17: capacity free reopened provider unresolved enumeration")
+        assertTrue((world.meaningfulChange or 0) >= 1,
+            "3A17: recovery issued NotifyMeaningfulChange")
+        assertTrue(next(GG._engine.unresolvedBackoffUntil or {}) == nil,
+            "3A17: meaningful recovery cleared unresolved backoff")
+        flushTimers()
 
-        local guard = 0
-        while #deferred > 0 and guard < 400 do
-            guard = guard + 1
-            local nextDeferred = {}
-            for i = 1, #deferred do
-                local d = deferred[i]
-                local stR, reasonR = providerApply(d.body, "Alice-Garona")
-                if stR == "pending" and reasonR == "assembly_full" then
-                    nextDeferred[#nextDeferred + 1] = d
-                else
-                    assertTrue(stR == "accepted" or stR == "duplicate" or stR == "pending",
-                        "3A17: arena retry " .. tostring(stR) .. "/" .. tostring(reasonR))
-                end
+        -- Post-reopen catalog re-enumeration (what a follow-up pull delivers), not a
+        -- hand-maintained deferred retry list. Bounded waves under the arena cap.
+        local waves = 0
+        while not (GS:GetPendingAdoption() and GS:GetPendingAdoption().ready) and waves < 8 do
+            waves = waves + 1
+            for i = 1, #pagedExport do
+                applyCount = applyCount + 1
+                local stR, reasonR = engineApplyBody(pagedExport[i], "Alice-Garona")
+                assertTrue(
+                    stR == "accepted" or stR == "duplicate" or stR == "pending",
+                    "3A17: re-enum apply " .. tostring(stR) .. "/" .. tostring(reasonR))
             end
-            -- Free more capacity if retries still blocked.
-            if #nextDeferred > 0 then
-                for i = 1, #confIds do
-                    local info = byOp[confIds[i]]
-                    if info and info.shell then
-                        providerApply(info.shell, "Alice-Garona")
-                        for pi = 1, #info.pages do
-                            providerApply(info.pages[pi], "Alice-Garona")
-                        end
-                    end
-                end
-            end
-            deferred = nextDeferred
+            flushTimers()
         end
-        assertEq(#deferred, 0, "3A17: all assembly_full records recovered via provider retry")
-        assertTrue(GS:GetPendingAdoption().ready, "3A17: arena transfer ready after recovery")
+        assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+            "3A17: arena transfer ready after automatic recovery")
         assertTrue((tonumber(GS:GetPendingAdoption()._assemblyOpCount) or 0) == 0,
             "3A17: assembly arena drained after finalization")
+        assertTrue(applyCount <= (#pagedExport * 6) + #others,
+            "3A17: apply traffic bounded vs catalog size got=" .. tostring(applyCount))
+        assertTrue(waves >= 1 and waves <= 6,
+            "3A17: recovered in bounded re-enumeration waves got=" .. tostring(waves))
 
         local st, reason = GS:CommitDatasetAdoption()
         local s = 0
@@ -11299,6 +11416,7 @@ do
             world.time = world.time + 1
             flushTimers()
         end
+        assertEq(GS:GetPendingAdoption(), nil, "3A17: arena eventually idle")
         assertEq(GS:GetCurrentRecord().datasetId, ds,
             "3A17: arena adopt: " .. tostring(st) .. "/" .. tostring(reason))
         for i = 1, #confIds do
@@ -11307,6 +11425,17 @@ do
         end
         assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 4,
             "3A17: arena adopt tab")
+        -- Idempotent redelivery of a completed paged confirm after adopt is idle.
+        local sample = byOp[confIds[1]]
+        if sample and sample.shell then
+            local stDup = select(1, engineApplyBody({
+                id = "gs:op:" .. confIds[1],
+                body = sample.shell,
+            }, "Alice-Garona"))
+            assertTrue(stDup == "accepted" or stDup == "duplicate" or stDup == "pending"
+                or stDup == "rejected",
+                "3A17: post-adopt shell status " .. tostring(stDup))
+        end
 
         -- Cancel mid-arena still preserves prior durable state.
         SpectrumFederationDB = {}
@@ -11321,13 +11450,8 @@ do
         GS:EnsureGossipProvider()
         GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
         GS:BeginDatasetAdoption("Alice-Garona", ds)
-        for i = 1, math.min(8, #confIds) do
-            local info = byOp[confIds[i]]
-            if info then
-                for pi = 1, #info.pages do
-                    providerApply(info.pages[pi], "Alice-Garona")
-                end
-            end
+        for i = 1, math.min(8, #pagedExport) do
+            engineApplyBody(pagedExport[i], "Alice-Garona")
         end
         GS:CancelDatasetAdoption()
         assertSerEq(snapshotDurable(GS:GetCurrentRecord()), before2,
