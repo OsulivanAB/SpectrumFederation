@@ -10823,9 +10823,8 @@ do
         local archivedItems = GS:GetCurrentRecord().campaignArchives[camp1.id].requestedItems
         local tab = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 7))
         assertEq(GS:ApplyStagedConfigOperation(tab), "accepted", "3A17: post-archive tab")
-        -- Extra accepted ops so completeness visits many preceding bodies before
-        -- archive page validation (forces archivePageCursor > 1 under tiny slice).
-        for i = 1, 40 do
+        -- Modest pad so timer-paced replay stays short under a tiny slice budget.
+        for i = 1, 8 do
             local op = select(1, GS:NewConfigOperation("set-requested-item",
                 { itemId = 9100 + i }, { itemId = 9100 + i, goal = 2 }))
             assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "3A17: pad op " .. i)
@@ -10833,7 +10832,7 @@ do
         local sourceDataset = GS:GetCurrentRecord().datasetId
         local snap = snapshotDurable(GS:GetCurrentRecord())
         GS.NotifyLocalDurableChange("dataset")
-        drainExportMaint(256)
+        drainExportMaint(128)
         local exportAll = collectAllExportBodies()
         local archMeta, archPages = nil, 0
         for i = 1, #exportAll do
@@ -10869,30 +10868,59 @@ do
         end
         assertTrue(GS:GetPendingAdoption().ready, "3A17: archive-slice transfer ready")
 
+        -- Tiny completeness budget forces archivePageCursor > 1 mid-archive.
+        -- Replay uses normal slice size so timer pacing stays live; completeness
+        -- budget is overridden via GS._adoptionCompletenessBudgetForTest.
         local savedSlice = GS.MAX_ADMISSION_WORK_PER_SLICE
-        GS.MAX_ADMISSION_WORK_PER_SLICE = 4
+        GS._adoptionCompletenessBudgetForTest = 2
         GS._adoptionReplaySyncDrain = false
+        GS._lastAdoptionCompletenessStats = nil
         local st1 = select(1, GS:CommitDatasetAdoption())
         assertTrue(st1 == "pending" or st1 == "accepted", "3A17: archive-slice commit starts")
         local sawCompletenessYield = false
+        local sawArchiveVisit = false
         local maxCompUsed = 0
-        local slices = 0
-        while GS._adoption and GS._adoption.replayTemp and slices < 8000 do
-            slices = slices + 1
-            flushTimers()
-            world.time = world.time + 1
-            flushTimers()
+        local steps = 0
+        -- Step one due timer at a time so mid-yield completeness stats are visible
+        -- (full flushTimers drains chained After(0) callbacks in one go).
+        local function stepOneTimer()
+            for i = 1, #timers do
+                local t = timers[i]
+                if t.at <= world.time then
+                    table.remove(timers, i)
+                    t.fn()
+                    return true
+                end
+            end
+            return false
+        end
+        while GS._adoption and GS._adoption.replayTemp and steps < 8000 do
+            steps = steps + 1
+            if not stepOneTimer() then
+                world.time = world.time + 1
+                if not stepOneTimer() then
+                    break
+                end
+            end
             local cstats = GS._lastAdoptionCompletenessStats
             if type(cstats) == "table" then
                 local used = tonumber(cstats.used) or 0
                 maxCompUsed = math.max(maxCompUsed, used)
-                assertTrue(used <= (GS.MAX_ADMISSION_WORK_PER_SLICE or 4) + 2,
+                local compBudget = GS._adoptionCompletenessBudgetForTest
+                    or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+                assertTrue(used <= compBudget + 2,
                     "3A17: completeness callback used bounded: " .. tostring(used))
+                if (tonumber(cstats.archiveVisited) or 0) >= 1 then
+                    sawArchiveVisit = true
+                end
                 if cstats.budgetExhausted == true then
                     sawCompletenessYield = true
                 end
             end
         end
+        -- Drain any remaining chained work.
+        flushTimers()
+        GS._adoptionCompletenessBudgetForTest = nil
         GS.MAX_ADMISSION_WORK_PER_SLICE = savedSlice
         GS._adoptionReplaySyncDrain = true
         assertEq(GS:GetPendingAdoption(), nil, "3A17: archive-slice eventually idle")
@@ -10904,10 +10932,16 @@ do
             archivedItems, "3A17: exact archive items after mid-slice completeness")
         assertSerEq(snapshotDurable(GS:GetCurrentRecord()).archiveIds, snap.archiveIds,
             "3A17: archive id set preserved")
-        assertTrue(sawCompletenessYield or maxCompUsed >= 1,
-            "3A17: completeness callback observed (yield or work)")
+        assertTrue(sawCompletenessYield, "3A17: completeness yielded across timer slices")
+        assertTrue(sawArchiveVisit, "3A17: completeness charged archive page visits")
         local finalComp = GS.GetAdoptionCompletenessStats()
         assertTrue(type(finalComp) == "table", "3A17: completeness stats separate from replay")
+        assertTrue(type(GS._lastAdoptionSliceStats) == "table",
+            "3A17: replay slice stats exist separately from completeness")
+        assertTrue((tonumber(finalComp.used) or 0) <= 4,
+            "3A17: final completeness callback remained bounded")
+        assertTrue(steps >= 1 or st1 == "accepted",
+            "3A17: timer-paced slices observed")
 
         -- Cancel safety: prior durable state preserved mid-transfer.
         SpectrumFederationDB = {}
@@ -11007,14 +11041,26 @@ do
         assertEq(completeBefore, true, "3A17: transfer complete before redelivery")
 
         -- Provider-path exact redelivery of shell + every page before Commit.
-        local stShell = select(1, providerApply(shellBody, "Alice-Garona"))
-        assertTrue(stShell == "accepted" or stShell == "duplicate",
-            "3A17: redel shell status " .. tostring(stShell))
-        for i = 1, #pageBodies do
-            local stP = select(1, providerApply(pageBodies[i], "Alice-Garona"))
-            assertTrue(stP == "accepted" or stP == "duplicate",
-                "3A17: redel page status " .. tostring(stP))
+        -- Intermediate fragments may be pending until the scratch manifest is whole.
+        local function assertRedeliveryStatus(st, reason, label)
+            assertTrue(
+                st == "accepted" or st == "duplicate" or st == "pending",
+                label .. " " .. tostring(st) .. "/" .. tostring(reason))
+            if st == "pending" then
+                assertTrue(
+                    reason == "incomplete_redelivery" or reason == "ready" or reason == nil,
+                    label .. " pending reason " .. tostring(reason))
+            end
         end
+        local stShell, reasonShell = providerApply(shellBody, "Alice-Garona")
+        assertRedeliveryStatus(stShell, reasonShell, "3A17: redel shell")
+        local lastSt, lastReason = stShell, reasonShell
+        for i = 1, #pageBodies do
+            lastSt, lastReason = providerApply(pageBodies[i], "Alice-Garona")
+            assertRedeliveryStatus(lastSt, lastReason, "3A17: redel page " .. i)
+        end
+        assertTrue(lastSt == "accepted" or lastSt == "duplicate",
+            "3A17: completed exact redelivery status " .. tostring(lastSt) .. "/" .. tostring(lastReason))
         adop = GS:GetPendingAdoption()
         assertTrue(adop ~= nil, "3A17: adoption still open after redelivery")
         assertEq(#adop.order, orderBefore, "3A17: logical order unchanged after redelivery")
@@ -11023,17 +11069,30 @@ do
         assertEq(select(1, GS:IsAdoptionTransferComplete()), true,
             "3A17: still complete after redelivery")
         assertTrue(adop.ready, "3A17: readiness preserved after redelivery")
-        -- Conflicting content must reject without mutating logical counts.
+        -- Conflicting full-manifest redelivery must reject without mutating counts.
+        table.sort(pageBodies, function(a, b)
+            return (tonumber(a.page) or 0) < (tonumber(b.page) or 0)
+        end)
         local badPage = {}
         for k, v in pairs(pageBodies[1]) do
             badPage[k] = v
         end
         badPage.records = { { id = "tamper", body = { id = "tamper" } } }
+        local stShellBad, reasonShellBad = providerApply(shellBody, "Alice-Garona")
+        assertRedeliveryStatus(stShellBad, reasonShellBad, "3A17: conflict shell")
+        for i = 2, #pageBodies do
+            local stP, reasonP = providerApply(pageBodies[i], "Alice-Garona")
+            assertRedeliveryStatus(stP, reasonP, "3A17: conflict page " .. i)
+        end
         local stBad, reasonBad = providerApply(badPage, "Alice-Garona")
         assertEq(stBad, "rejected", "3A17: conflicting redelivery rejected")
         assertEq(reasonBad, "id_conflict", "3A17: conflict reason id_conflict")
         assertEq(#GS:GetPendingAdoption().order, orderBefore,
             "3A17: conflict leaves logical order unchanged")
+        assertEq(select(1, GS:IsAdoptionTransferComplete()), true,
+            "3A17: still complete after conflicting redelivery")
+        assertTrue(GS:GetPendingAdoption().ready,
+            "3A17: readiness preserved after conflicting redelivery")
 
         local st, reason = GS:CommitDatasetAdoption()
         local s = 0

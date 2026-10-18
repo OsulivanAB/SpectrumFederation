@@ -1670,11 +1670,17 @@ local function FinalizeAdoptionAssembly(adop, opId)
             return false
         end
     end
+    local existingRid, existingBody = FindAssembledLogicalRecord(adop, opId)
     local assembled, aerr = GS.AssembleOpFromPages(asm.shell, asm.pages)
     if not assembled then
+        -- Complete page set that cannot assemble is a conflict when a logical
+        -- manifest already exists; leave that record untouched.
+        if existingRid then
+            ClearAdoptionAssemblySlot(adop, opId, asm)
+            return false, "id_conflict"
+        end
         return false, aerr
     end
-    local existingRid, existingBody = FindAssembledLogicalRecord(adop, opId)
     if existingRid and existingBody then
         if DeepEqual(existingBody, assembled) then
             ClearAdoptionAssemblySlot(adop, opId, asm)
@@ -1760,9 +1766,11 @@ local function BufferAssembledRedelivery(adop, recordId, body, opId, isShell, pa
         return "rejected", "id_conflict"
     end
     if ok then
+        -- Unexpected: finalized a new logical row for an already-assembled opId.
         return "accepted", complete and "ready" or nil
     end
-    return "accepted", complete and "ready" or nil
+    -- Scratch is incomplete until shell+pages arrive; do not claim a new accept.
+    return "pending", "incomplete_redelivery"
 end
 
 --- Park paged op shells/pages in a bounded assembly arena (not logical order).
@@ -3105,15 +3113,16 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
         until status == "done"
     end
 
+    local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
+        or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
     local compOpts = state.completenessOpts or {
-        budget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32,
+        budget = compBudget,
         cursor = 1,
     }
-    compOpts.budget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+    compOpts.budget = compBudget
     local okComp, compErr
     local guard = 0
-    local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
-    local maxGuard = math.max(8, math.ceil((#adop.order or 0) / sliceBudget) * 2 + 8)
+    local maxGuard = math.max(8, math.ceil((#adop.order or 0) / compBudget) * 2 + 8)
     repeat
         guard = guard + 1
         okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member, compOpts)
@@ -3270,18 +3279,21 @@ local function ContinueAdoptionReplay(adop)
     end
 
     -- Final completeness is indexed/resumable; source-authored ops skip searches.
+    -- Optional test override keeps replay slice size unchanged while forcing
+    -- mid-archive completeness yields (GS._adoptionCompletenessBudgetForTest).
+    local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
+        or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
     local compOpts = state.completenessOpts or {
-        budget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32,
+        budget = compBudget,
         cursor = 1,
     }
-    compOpts.budget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+    compOpts.budget = compBudget
     local okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member, compOpts)
     if not okComp and compErr == "budget" then
         state.completenessOpts = compOpts
         if GS._adoptionReplaySyncDrain then
             local guard = 0
-            local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
-            local maxGuard = math.max(8, math.ceil((#adop.order or 0) / sliceBudget) * 2 + 8)
+            local maxGuard = math.max(8, math.ceil((#adop.order or 0) / compBudget) * 2 + 8)
             while not okComp and compErr == "budget" and guard < maxGuard do
                 guard = guard + 1
                 local ctxOk3, ctxErr3, member3 = ValidateAdoptionCommitContext(adop)
