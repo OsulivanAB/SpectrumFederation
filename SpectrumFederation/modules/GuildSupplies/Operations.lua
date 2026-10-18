@@ -1555,12 +1555,20 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         if type(value.contentBodies) ~= "table" then
             return false, "invalid_resolution"
         end
-        for i = 1, n do
-            local cid = value.competingOpIds[i]
-            local cbody = value.contentBodies[cid]
-            if type(cbody) ~= "table" or cbody.id ~= cid then
+        -- Exact key-set equality: every competing ID has a body, and no unlisted
+        -- keys may confer authority the export pager would drop.
+        local bodyCount = 0
+        for k, cbody in pairs(value.contentBodies) do
+            bodyCount = bodyCount + 1
+            if type(k) ~= "string" or not seen[k] then
                 return false, "invalid_resolution"
             end
+            if type(cbody) ~= "table" or cbody.id ~= k then
+                return false, "invalid_resolution"
+            end
+        end
+        if bodyCount ~= n then
+            return false, "invalid_resolution"
         end
     else
         return false, "unsupported_kind"
