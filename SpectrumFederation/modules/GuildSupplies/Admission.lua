@@ -5024,11 +5024,22 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
                                     for k, v in pairs(liveCfg) do
                                         shadowConsumables[k] = v
                                     end
-                                    -- Shallow-copy maps that mutations rewrite.
+                                    -- Isolate nested tables that reused _ApplyMutations /
+                                    -- Note*EligibilityCutoff helpers may write. A shallow
+                                    -- eligibility copy alone still shares eligibility.items
+                                    -- with live durable state.
                                     if type(liveCfg.requestedItems) == "table" then
                                         local items = {}
                                         for ik, iv in pairs(liveCfg.requestedItems) do
-                                            items[ik] = iv
+                                            if type(iv) == "table" then
+                                                local copy = {}
+                                                for fk, fv in pairs(iv) do
+                                                    copy[fk] = fv
+                                                end
+                                                items[ik] = copy
+                                            else
+                                                items[ik] = iv
+                                            end
                                         end
                                         shadowConsumables.requestedItems = items
                                     end
@@ -5036,6 +5047,13 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
                                         local elig = {}
                                         for ek, ev in pairs(liveCfg.eligibility) do
                                             elig[ek] = ev
+                                        end
+                                        if type(liveCfg.eligibility.items) == "table" then
+                                            local eligItems = {}
+                                            for ik, iv in pairs(liveCfg.eligibility.items) do
+                                                eligItems[ik] = iv
+                                            end
+                                            elig.items = eligItems
                                         end
                                         shadowConsumables.eligibility = elig
                                     end

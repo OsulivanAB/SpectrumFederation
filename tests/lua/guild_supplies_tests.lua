@@ -15075,18 +15075,241 @@ do
         "3A25: production replace cleared live redrive pin for old record")
     assertEq(GS:GetCurrentRecord().datasetId, "rep-adopt-ds",
         "3A25: live dataset replaced after publish")
-    -- Durable confirmation evidence on the replaced dataset is gone with the
-    -- old record; confirm the old pin cannot be resumed via timers.
-    timers = {}
-    for _ = 1, 10 do
+    -- Retain already-queued callbacks and drain them; do not clear timers first.
+    -- Ownership checks must make orphaned continuations harmless.
+    local queuedAfterReplace = #timers
+    for _ = 1, 20 do
         world.time = (world.time or 0) + 1
         flushTimers()
+        if #timers == 0 then
+            break
+        end
     end
-    assertEq(#timers, 0, "3A25: no orphan redrive timers after replace")
+    assertEq(#timers, 0,
+        "3A25: queued replace callbacks drained harmlessly (had "
+            .. tostring(queuedAfterReplace) .. ")")
     GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE = priorSlice
     GS.MAX_ACCEPTED_OPERATIONS = priorMax
 
     assertEq(#world.chat, 0, "3A25: no chat")
+end
+
+---------------------------------------------------------------------------
+-- 3A26) Confirmation preflight must not mutate live eligibility.items
+-- (r4309154181). Isolate nested projection state; full durable deep-equal.
+---------------------------------------------------------------------------
+do
+    local function durableSer()
+        return serTable(SpectrumFederationDB.guildSupplies.guilds["club:42"])
+    end
+    local function seedBaselineCampaign()
+        resetDb()
+        switchPlayer("Alice", "Player-1-Alice", 1)
+        initGS()
+        GS:CreateStagedRecord()
+        startCampaign()
+        local rec = GS:GetCurrentRecord()
+        local cfg = rec.accounting._consumables
+        cfg.eligibility = {
+            items = { ["9001"] = 100 },
+            baselineEstablished = true,
+            baselineAt = 100,
+            tabEligibleFrom = 100,
+        }
+        return rec.datasetId, rec.currentCampaignId, rec.permission.revisionId
+    end
+
+    local priorMax = GS.MAX_ACCEPTED_OPERATIONS
+
+    -- Local item-add: one-slot-short must not write live cutoff; exact-fit does.
+    local ds, camp, pol = seedBaselineCampaign()
+    local addBody = {
+        schemaVersion = 1, id = "item-add-l", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 4242 }, value = { itemId = 4242, goal = 7 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 999,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(addBody, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A26: local-path item-add retained")
+    local acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 1 -- envelope only; need +2
+    local priorFull = durableSer()
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["4242"], nil,
+        "3A26: no live item cutoff before short confirm")
+    local confShort = select(1, GS:NewConfirmationOperation({
+        records = { { id = "item-add-l", body = addBody } },
+    }))
+    local stShort, reasonShort = GS:ApplyStagedConfirmationOperation(confShort)
+    assertEq(stShort, "rejected", "3A26: local item-add one-slot-short rejected")
+    assertEq(reasonShort, "full", "3A26: local item-add one-slot-short reason")
+    assertEq(durableSer(), priorFull,
+        "3A26: local item-add short preserves full durable record (incl eligibility)")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["4242"], nil,
+        "3A26: local short did not write item cutoff")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["4242"], nil,
+        "3A26: local short did not add requestedItems")
+    assertEq(GS:GetCurrentRecord().operations.records["item-add-l"], nil,
+        "3A26: local short did not promote item body")
+
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    local confExact = select(1, GS:NewConfirmationOperation({
+        records = { { id = "item-add-l", body = addBody } },
+    }))
+    assertEq(GS:ApplyStagedConfirmationOperation(confExact), "accepted",
+        "3A26: local item-add exact-fit accepted")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["4242"], 999,
+        "3A26: local exact-fit writes original item cutoff timestamp")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["4242"].goal, 7,
+        "3A26: local exact-fit requestedItems goal")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    -- Local re-add after remove: same isolation + original cutoff on commit.
+    ds, camp, pol = seedBaselineCampaign()
+    local firstAdd = select(1, GS:NewConfigOperation(
+        "set-requested-item", { itemId = 5151 }, { itemId = 5151, goal = 3 }))
+    assertEq(GS:ApplyStagedConfigOperation(firstAdd), "accepted", "3A26: seed item for re-add")
+    local rem = select(1, GS:NewConfigOperation(
+        "set-requested-item", { itemId = 5151 }, { removed = true }))
+    assertEq(GS:ApplyStagedConfigOperation(rem), "accepted", "3A26: remove item before re-add")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["5151"], nil,
+        "3A26: item removed from requestedItems")
+    -- Clear prior add cutoff so a leaked preflight write is unambiguous.
+    GS:GetCurrentRecord().accounting._consumables.eligibility.items["5151"] = nil
+    local headItem = rem.id
+    local readdBody = {
+        schemaVersion = 1, id = "item-readd-l", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 5151 }, value = { itemId = 5151, goal = 11 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1200,
+        baseTargetRevision = headItem, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(readdBody, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A26: local-path re-add retained")
+    acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 1
+    priorFull = durableSer()
+    confShort = select(1, GS:NewConfirmationOperation({
+        records = { { id = "item-readd-l", body = readdBody } },
+    }))
+    stShort, reasonShort = GS:ApplyStagedConfirmationOperation(confShort)
+    assertEq(stShort, "rejected", "3A26: local re-add one-slot-short rejected")
+    assertEq(reasonShort, "full", "3A26: local re-add one-slot-short reason")
+    assertEq(durableSer(), priorFull,
+        "3A26: local re-add short preserves full durable record")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["5151"], nil,
+        "3A26: local re-add short did not write cutoff")
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    confExact = select(1, GS:NewConfirmationOperation({
+        records = { { id = "item-readd-l", body = readdBody } },
+    }))
+    assertEq(GS:ApplyStagedConfirmationOperation(confExact), "accepted",
+        "3A26: local re-add exact-fit accepted")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["5151"], 1200,
+        "3A26: local re-add exact-fit original cutoff")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["5151"].goal, 11,
+        "3A26: local re-add exact-fit goal")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    -- Remote item-add one-slot-short / exact-fit.
+    ds, camp, pol = seedBaselineCampaign()
+    addBody = {
+        schemaVersion = 1, id = "item-add-r", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 6161 }, value = { itemId = 6161, goal = 4 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1300,
+        baseTargetRevision = ds, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(addBody, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A26: remote item-add body retained")
+    acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 1
+    priorFull = durableSer()
+    local remoteConf = {
+        schemaVersion = 1, id = "item-add-rconf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = { { id = "item-add-r", body = addBody } } },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1301,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    local stRemote, reasonRemote = GS:AdmitRemoteOperation(remoteConf, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stRemote, "rejected", "3A26: remote item-add one-slot-short rejected")
+    assertEq(reasonRemote, "full", "3A26: remote item-add one-slot-short reason")
+    assertEq(durableSer(), priorFull,
+        "3A26: remote item-add short preserves full durable record")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["6161"], nil,
+        "3A26: remote short did not write item cutoff")
+    assertEq(GS:GetCurrentRecord().operations.records["item-add-rconf"], nil,
+        "3A26: remote short did not store envelope")
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    remoteConf = {
+        schemaVersion = 1, id = "item-add-rconf2", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = { { id = "item-add-r", body = addBody } } },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1302,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(remoteConf, { sender = "Alice-Garona" }), "accepted",
+        "3A26: remote item-add exact-fit accepted")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["6161"], 1300,
+        "3A26: remote exact-fit original item cutoff")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    -- Remote re-add one-slot-short / exact-fit.
+    ds, camp, pol = seedBaselineCampaign()
+    firstAdd = select(1, GS:NewConfigOperation(
+        "set-requested-item", { itemId = 7171 }, { itemId = 7171, goal = 2 }))
+    assertEq(GS:ApplyStagedConfigOperation(firstAdd), "accepted", "3A26: remote seed item")
+    rem = select(1, GS:NewConfigOperation(
+        "set-requested-item", { itemId = 7171 }, { removed = true }))
+    assertEq(GS:ApplyStagedConfigOperation(rem), "accepted", "3A26: remote remove before re-add")
+    GS:GetCurrentRecord().accounting._consumables.eligibility.items["7171"] = nil
+    headItem = rem.id
+    readdBody = {
+        schemaVersion = 1, id = "item-readd-r", guildKey = "club:42", datasetId = ds,
+        campaignId = camp, kind = "set-requested-item",
+        target = { itemId = 7171 }, value = { itemId = 7171, goal = 9 },
+        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 1400,
+        baseTargetRevision = headItem, basePolicyRevision = pol, baseCampaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(readdBody, { sender = "Dave-Garona", relay = true }),
+        "pending", "3A26: remote re-add body retained")
+    acceptedNow = GS._AcceptedCount(GS:GetCurrentRecord().operations)
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 1
+    priorFull = durableSer()
+    remoteConf = {
+        schemaVersion = 1, id = "item-readd-rconf", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = { { id = "item-readd-r", body = readdBody } } },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1401,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    stRemote, reasonRemote = GS:AdmitRemoteOperation(remoteConf, { sender = "Alice-Garona" })
+    assertEq(stRemote, "rejected", "3A26: remote re-add one-slot-short rejected")
+    assertEq(reasonRemote, "full", "3A26: remote re-add one-slot-short reason")
+    assertEq(durableSer(), priorFull,
+        "3A26: remote re-add short preserves full durable record")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["7171"], nil,
+        "3A26: remote re-add short did not write cutoff")
+    GS.MAX_ACCEPTED_OPERATIONS = acceptedNow + 2
+    remoteConf = {
+        schemaVersion = 1, id = "item-readd-rconf2", guildKey = "club:42", datasetId = ds,
+        kind = "confirm-candidate",
+        candidateRef = { records = { { id = "item-readd-r", body = readdBody } } },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 1402,
+        basePolicyRevision = pol, campaignId = camp,
+    }
+    assertEq(GS:AdmitRemoteOperation(remoteConf, { sender = "Alice-Garona" }), "accepted",
+        "3A26: remote re-add exact-fit accepted")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.eligibility.items["7171"], 1400,
+        "3A26: remote re-add exact-fit original cutoff")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.requestedItems["7171"].goal, 9,
+        "3A26: remote re-add exact-fit goal")
+    GS.MAX_ACCEPTED_OPERATIONS = priorMax
+
+    assertEq(#world.chat, 0, "3A26: no chat")
 end
 
 
