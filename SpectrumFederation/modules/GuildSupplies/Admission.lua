@@ -5047,11 +5047,12 @@ end
 --- Project an apply-eligible promotion onto a temporary admission shadow.
 -- Reuses GS._ApplyMutations for policy/config transitions and updates campaign
 -- current id / accepted membership so within-batch dependents classify correctly.
+-- Honors mutation outcomes: failure does not advance projected membership/heads.
+-- @return ok, err
 local function ProjectConfirmationPromotion(shadow, projectedRecords, authBody, boundary)
     if type(shadow) ~= "table" or type(authBody) ~= "table" then
-        return
+        return false, "invalid_operation"
     end
-    projectedRecords[authBody.id] = authBody
     local targetKey = GS._TargetKey and GS._TargetKey(authBody.kind, authBody.target)
     if authBody.kind == GS.KIND.START_CAMPAIGN then
         targetKey = GS.CAMPAIGN_TARGET_KEY
@@ -5069,13 +5070,18 @@ local function ProjectConfirmationPromotion(shadow, projectedRecords, authBody, 
         or authBody.kind == GS.KIND.SET_BANK_TAB
         or authBody.kind == GS.KIND.SET_REQUESTED_ITEM then
         if GS._ApplyMutations then
-            GS._ApplyMutations(shadow, authBody)
+            local ok, err = GS._ApplyMutations(shadow, authBody)
+            if not ok then
+                return false, err or "apply_failed"
+            end
         end
     end
+    projectedRecords[authBody.id] = authBody
     if targetKey and type(shadow.operations) == "table"
         and type(shadow.operations.heads) == "table" then
         shadow.operations.heads[targetKey] = authBody.id
     end
+    return true
 end
 
 --- Count distinct not-yet-accepted candidates that admission would promote now.
@@ -5084,6 +5090,8 @@ end
 -- current id) so within-batch dependents are charged. Not a parallel eligibility
 -- definition. Confirm-first/body-late ids are skipped until retained. Optional
 -- startIdx limits to a resume window (paced apply).
+-- Second return is a mutation-capacity failure (e.g. requestedItems full) distinct
+-- from accepted-operation slot accounting in PreflightConfirmationCapacity.
 local function CountEligibleConfirmationPromotions(record, storedConfirm, admissionCtx, startIdx)
     admissionCtx = admissionCtx or {}
     local ops = record and record.operations
@@ -5209,8 +5217,13 @@ local function CountEligibleConfirmationPromotions(record, storedConfirm, admiss
                                 shadow.campaigns = copy
                                 campaignsCopied = true
                             end
-                            ProjectConfirmationPromotion(
+                            local pok, perr = ProjectConfirmationPromotion(
                                 shadow, projectedRecords, authBody, boundary)
+                            if not pok then
+                                -- Requested-item (and other mutation) capacity must
+                                -- fail closed before envelope persistence.
+                                return count, perr or "full"
+                            end
                         end
                     end
                 end
@@ -5267,8 +5280,17 @@ function GS.PreflightConfirmationCapacity(record, storedConfirm, admissionCtx)
         slotsNeeded = slotsNeeded + 1
     end
     if not admissionCtx.adoptionReplay then
-        slotsNeeded = slotsNeeded + CountEligibleConfirmationPromotions(
+        local eligible, mutErr = CountEligibleConfirmationPromotions(
             record, storedConfirm, admissionCtx, 1)
+        -- Mutation capacity (requestedItems full, etc.) is distinct from
+        -- accepted-operation slot counting but shares the "full" reject reason.
+        if mutErr == "full" then
+            return false, "full"
+        end
+        if mutErr then
+            return false, mutErr
+        end
+        slotsNeeded = slotsNeeded + (tonumber(eligible) or 0)
     end
     if slotsNeeded > 0 and GS._AcceptedCount then
         if GS._AcceptedCount(ops) + slotsNeeded > (GS.MAX_ACCEPTED_OPERATIONS or 4096) then
@@ -5305,8 +5327,12 @@ function GS.ApplyExactContentConfirmation(record, storedConfirm, admissionCtx)
     -- Fail closed: when eligible promotions in this resume window cannot all fit,
     -- do not partially apply the batch. Envelope storage is the caller's concern.
     -- nextIdx is nil on capacity failure (distinct from budget-yield resume).
-    local eligible = CountEligibleConfirmationPromotions(
+    local eligible, mutErr = CountEligibleConfirmationPromotions(
         record, storedConfirm, admissionCtx, startIdx)
+    if mutErr == "full" or mutErr then
+        return false, mutErr or "full", 0, 0, nil
+    end
+    eligible = tonumber(eligible) or 0
     if eligible > 0 and GS._AcceptedCount and record.operations then
         if GS._AcceptedCount(record.operations) + eligible
             > (GS.MAX_ACCEPTED_OPERATIONS or 4096) then
