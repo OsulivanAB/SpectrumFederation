@@ -1,4 +1,4 @@
-"""Run production Lua Guild Supplies Part 2A/2B/3A/3B tests (#385–#388)."""
+"""Run production Lua Guild Supplies Part 2A/2B/3A/3B/3C tests (#385–#389)."""
 
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     authority = toc.find("modules/GuildSupplies/Authority.lua")
     operations = toc.find("modules/GuildSupplies/Operations.lua")
     campaigns = toc.find("modules/GuildSupplies/Campaigns.lua")
+    activation = toc.find("modules/GuildSupplies/Activation.lua")
     ledger = toc.find("modules/GuildSupplies/Ledger.lua")
     admission = toc.find("modules/GuildSupplies/Admission.lua")
     gs_gossip = toc.find("modules/GuildSupplies/Gossip.lua")
@@ -56,7 +57,7 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     logs_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
     obs = toc.find("modules/LootHelper/ConsumablesObservation.lua")
     assert 0 <= obs
-    assert 0 <= gossip < state < authority < operations < campaigns < ledger < admission < gs_gossip
+    assert 0 <= gossip < state < authority < operations < campaigns < activation < ledger < admission < gs_gossip
     assert 0 <= config_page < logs_page
 
 

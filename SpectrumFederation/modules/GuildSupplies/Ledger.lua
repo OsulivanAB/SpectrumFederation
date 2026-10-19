@@ -13,6 +13,13 @@ GS.MAX_WITNESSES_PER_CLUSTER = 16
 GS.MAX_PENDING_EVIDENCE = 128
 -- Aggregate unfinished pending across all campaign buckets (not per arbitrary key).
 GS.MAX_PENDING_EVIDENCE_TOTAL = 256
+-- Per authenticated witness: max unfinished clusters they already appear in when
+-- opening a *new* cluster. Joining existing clusters is unaffected.
+GS.MAX_PENDING_EVIDENCE_PER_WITNESS = 32
+-- Headroom reserved for local bank observations under the per-campaign/total caps.
+GS.RESERVED_LOCAL_PENDING_EVIDENCE = 16
+-- Event-driven stale unfinished pending reclaim (align with ConsumablesObservation).
+GS.PENDING_EVIDENCE_TTL_SECONDS = 14 * 24 * 60 * 60
 GS.MAX_IDENTITY_LINK_GROUPS = 64
 GS.MAX_GUIDS_PER_LINK_GROUP = 16
 GS.MAX_LEDGER_EVENTS = 4096
@@ -414,6 +421,89 @@ local function UnfinishedPendingCount(pending)
         end
     end
     return n
+end
+
+--- Drop unfinished pending clusters whose lastSeen exceeds the TTL.
+-- Event-driven reclaim only (no polling). Never touches verified ledger rows.
+local function ReclaimStaleUnfinishedPending(pending, now)
+    if type(pending) ~= "table" then
+        return 0
+    end
+    local ttl = tonumber(GS.PENDING_EVIDENCE_TTL_SECONDS) or (14 * 24 * 60 * 60)
+    now = tonumber(now) or Now()
+    local write = 1
+    local removed = 0
+    for read = 1, #pending do
+        local cluster = pending[read]
+        local keep = true
+        if type(cluster) == "table" and cluster.status ~= "verified" then
+            local lastSeen = tonumber(cluster.lastSeen) or tonumber(cluster.firstSeen) or 0
+            if lastSeen > 0 and (now - lastSeen) > ttl then
+                keep = false
+                removed = removed + 1
+            end
+        end
+        if keep then
+            pending[write] = cluster
+            write = write + 1
+        end
+    end
+    for i = write, #pending do
+        pending[i] = nil
+    end
+    return removed
+end
+
+local function CountWitnessUnfinishedClusters(pending, witnessGuid)
+    if type(pending) ~= "table" or type(witnessGuid) ~= "string" or witnessGuid == "" then
+        return 0
+    end
+    local n = 0
+    for i = 1, #pending do
+        local cluster = pending[i]
+        if type(cluster) == "table" and cluster.status ~= "verified"
+            and type(cluster.witnesses) == "table"
+            and cluster.witnesses[witnessGuid] ~= nil then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+--- Whether a new unfinished cluster may be opened for this witness.
+-- Local bank observations keep reserved headroom; remote live gossip evidence is
+-- capped per witness and cannot consume the reserved local slots. Authenticated
+-- adoption replay uses the full campaign/total caps (source-authoritative transfer).
+local function CanOpenNewPendingCluster(record, pending, witnessGuid, admissionCtx)
+    local perCap = tonumber(GS.MAX_PENDING_EVIDENCE) or 128
+    local totalCap = tonumber(GS.MAX_PENDING_EVIDENCE_TOTAL) or 256
+    local reserved = tonumber(GS.RESERVED_LOCAL_PENDING_EVIDENCE) or 16
+    local perWitness = tonumber(GS.MAX_PENDING_EVIDENCE_PER_WITNESS) or 32
+    local unfinished = UnfinishedPendingCount(pending)
+    local totalUnfinished = CountTotalUnfinishedPending(record)
+    local isLocal = admissionCtx and (admissionCtx.localWrite or admissionCtx.exportEvidence)
+    local isAdoption = admissionCtx and admissionCtx.adoptionReplay
+    if not isLocal and not isAdoption then
+        local remotePerCap = perCap - reserved
+        if remotePerCap < 1 then
+            remotePerCap = 1
+        end
+        local remoteTotalCap = totalCap - reserved
+        if remoteTotalCap < 1 then
+            remoteTotalCap = 1
+        end
+        if unfinished >= remotePerCap or totalUnfinished >= remoteTotalCap then
+            return false, "full"
+        end
+        if CountWitnessUnfinishedClusters(pending, witnessGuid) >= perWitness then
+            return false, "witness_quota"
+        end
+        return true
+    end
+    if unfinished >= perCap or totalUnfinished >= totalCap then
+        return false, "full"
+    end
+    return true
 end
 
 local function EvidenceView(row)
@@ -1206,6 +1296,59 @@ function GS.GetAccountingMutationSeq(record)
     return tonumber(record.accounting._mutationSeq) or 0
 end
 
+--- Attach authenticated active-exporter cutover provenance to an already-retained
+-- immutable-equivalent adjustment without reapplying quantity (#389 A2).
+-- Never trusts self-declared event.gsProductionCredit / event.gsSourceCutoverMarker.
+local function ReconcileAdjustmentCutoverProvenance(record, existing, admissionCtx)
+    if type(existing) ~= "table" or type(admissionCtx) ~= "table" then
+        return false
+    end
+    local marker = admissionCtx.sourceCutoverMarker
+    if type(marker) ~= "string" or marker == "" then
+        return false
+    end
+    -- Live receivers only accept the installed canonical cutover marker.
+    if GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and marker ~= record.liveCutover.cutoverMarker then
+        return false
+    end
+    local prior = existing.gsSourceCutoverMarker
+    if type(prior) == "string" and prior ~= "" and prior ~= marker then
+        -- Divergent authenticated markers: leave fail-closed.
+        return false
+    end
+    local changed = false
+    if prior ~= marker then
+        existing.gsSourceCutoverMarker = marker
+        changed = true
+    end
+    if GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and existing.gsSourceCutoverMarker == record.liveCutover.cutoverMarker then
+        local approx = tonumber(existing.approxTxnTime) or tonumber(existing.timestamp)
+        local afterOk = true
+        if GS.IsEvidenceAfterLiveCutover then
+            afterOk = select(1, GS.IsEvidenceAfterLiveCutover(record, {
+                approxTxnTime = approx,
+            }))
+        end
+        local credit = afterOk and true or false
+        if existing.gsProductionCredit ~= credit then
+            existing.gsProductionCredit = credit
+            changed = true
+        end
+    end
+    if changed then
+        BumpAccountingMutation(record)
+        -- Refresh Gossip export so newly reconciled provenance is advertised.
+        if GS._NotifyLocalDurableChange then
+            GS._NotifyLocalDurableChange("ledger")
+        end
+    end
+    return changed
+end
+
 local function ValidateDenseLedgerList(list, maxLen, datasetId)
     if type(list) ~= "table" then
         return false, "invalid_accounting"
@@ -1399,6 +1542,11 @@ local function AppendLedgerEvent(record, event)
     local cfg = record.accounting and record.accounting._consumables
     local curGen = tonumber(cfg and cfg.generation)
     local eventGen = type(event) == "table" and tonumber(event.generation) or nil
+    -- Recompute durable production-credit classification; never trust a remote
+    -- self-declared flag to bypass the live cutover boundary.
+    if GS.AssignProductionCredit then
+        GS.AssignProductionCredit(record, event)
+    end
     -- Historical rows belong in the archive list once the live generation advanced.
     if eventGen and curGen and eventGen < curGen then
         return AppendArchivedLedgerEvent(record, event)
@@ -1472,8 +1620,53 @@ local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
     }
 end
 
+--- Read-only eligibility view floored to the immutable live cutover.
+-- Does not mutate archived or live SavedVariables maps.
+local function EligibilityFlooredToLiveCutover(eligibility, record)
+    if not (GS.IsLiveActive and GS.IsLiveActive(record)) or type(record.liveCutover) ~= "table" then
+        return eligibility
+    end
+    local cutTs = tonumber(record.liveCutover.contextObservedAt)
+        or tonumber(record.liveCutover.eligibilityBoundary
+            and record.liveCutover.eligibilityBoundary.tabEligibleFrom)
+    if not cutTs then
+        return eligibility
+    end
+    if type(eligibility) ~= "table" then
+        return eligibility
+    end
+    local floored = {
+        baselineEstablished = true,
+        baselineAt = cutTs,
+        tabEligibleFrom = cutTs,
+        items = {},
+        liveCutoverAt = cutTs,
+        liveCutoverMarker = record.liveCutover.cutoverMarker
+            or eligibility.liveCutoverMarker,
+    }
+    local baselineAt = tonumber(eligibility.baselineAt)
+    if baselineAt and baselineAt > cutTs then
+        floored.baselineAt = baselineAt
+    end
+    local tabFrom = tonumber(eligibility.tabEligibleFrom)
+    if tabFrom and tabFrom > cutTs then
+        floored.tabEligibleFrom = tabFrom
+    end
+    if type(eligibility.items) == "table" then
+        for key, value in pairs(eligibility.items) do
+            local itemFrom = tonumber(value)
+            if itemFrom then
+                floored.items[key] = itemFrom < cutTs and cutTs or itemFrom
+            end
+        end
+    end
+    return floored
+end
+
 --- Resolve generation/items/tab/eligibility for the evidence's campaign.
 -- Historical rows use archived campaign context, never the live campaign alone.
+-- When the dataset is live, archived/live eligibility views are floored to the
+-- canonical cutover so hour-span ambiguity cannot be bypassed (#389).
 local function ResolveEvidenceCampaignContext(record, evidence)
     local live = record.accounting and record.accounting._consumables
     if type(live) ~= "table" then
@@ -1489,7 +1682,7 @@ local function ResolveEvidenceCampaignContext(record, evidence)
             requestedItems = live.requestedItems,
             bankTab = live.bankTab,
             guild = live.guild,
-            eligibility = live.eligibility,
+            eligibility = EligibilityFlooredToLiveCutover(live.eligibility, record),
             historical = false,
         }
     end
@@ -1514,14 +1707,15 @@ local function ResolveEvidenceCampaignContext(record, evidence)
     if eligibility == nil and type(ctx) == "table" and type(ctx.eligibility) == "table" then
         eligibility = ctx.eligibility
     end
+    local hasProof = type(eligibility) == "table"
     return {
         generation = archive.generation,
         requestedItems = archive.requestedItems,
         bankTab = bankTab,
         guild = live.guild,
-        eligibility = eligibility,
+        eligibility = EligibilityFlooredToLiveCutover(eligibility, record),
         historical = true,
-        hasEligibilityProof = type(eligibility) == "table",
+        hasEligibilityProof = hasProof,
     }
 end
 
@@ -1579,7 +1773,9 @@ local function IsEvidenceEligible(record, evidence)
         end
     end
     -- Hour-granular bank evidence that could fall on either side of a cutoff
-    -- must stay pending (never auto-credit).
+    -- must stay pending/ambiguous. Aging cannot prove post-cutover timing:
+    -- approxTxnTime = observedAt - ageHours*3600 stays in the same hour bucket
+    -- while the real deposit may still predate activation (#389).
     if O and O.EvidenceSpansEligibilityBoundary and ctx.eligibility then
         if O.EvidenceSpansEligibilityBoundary(evidence, ctx.eligibility) then
             return false, "ambiguous_boundary"
@@ -1932,6 +2128,23 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         row.generation = tonumber(cfg and cfg.generation) or 0
     end
 
+    -- Authenticated live cutover conflict: fail closed on production credits.
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, admissionCtx)
+        if blocked then
+            return "pending", blockReason or "live_activation_conflict"
+        end
+    end
+
+    -- Live cutover: refuse pre-activation bank rows even if campaign eligibility
+    -- was established earlier during staged development (#389).
+    if GS.IsLiveActive and GS.IsLiveActive(record) and GS.IsEvidenceAfterLiveCutover then
+        local afterOk, afterErr = GS.IsEvidenceAfterLiveCutover(record, row)
+        if not afterOk then
+            return "pending", afterErr or "not_eligible"
+        end
+    end
+
     local eligOk, eligErr = IsEvidenceEligible(record, row)
     local boundaryAmbiguous = (eligErr == "ambiguous_boundary"
         or eligErr == "missing_eligibility_context")
@@ -1965,16 +2178,23 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     end
     local pending = camp.pending
     CompactVerifiedPending(pending)
+    -- Near capacity: reclaim stale unfinished clusters before admitting new ones.
+    local nearFull = UnfinishedPendingCount(pending)
+        >= ((GS.MAX_PENDING_EVIDENCE or 128) - (GS.RESERVED_LOCAL_PENDING_EVIDENCE or 16))
+        or CountTotalUnfinishedPending(record)
+        >= ((GS.MAX_PENDING_EVIDENCE_TOTAL or 256) - (GS.RESERVED_LOCAL_PENDING_EVIDENCE or 16))
+    if nearFull then
+        if ReclaimStaleUnfinishedPending(pending, Now()) > 0 then
+            BumpAccountingMutation(record)
+        end
+    end
     local match, how = AmbiguousBest(pending, row)
     if how == "ambiguous" then
         -- Relays/replays must not mint unlimited zero-witness ambiguous clusters.
         -- Local writers may retain one ambiguous cluster for recovery export only
         -- when capacity remains; never count the replay as a vote.
         if admissionCtx.localWrite or admissionCtx.exportEvidence then
-            local perCap = UnfinishedPendingCount(pending) < (GS.MAX_PENDING_EVIDENCE or 128)
-            local totalCap = CountTotalUnfinishedPending(record)
-                < (GS.MAX_PENDING_EVIDENCE_TOTAL or 256)
-            if perCap and totalCap then
+            if select(1, CanOpenNewPendingCluster(record, pending, witnessGuid, admissionCtx)) then
                 pending[#pending + 1] = {
                     schemaVersion = 1,
                     status = "ambiguous",
@@ -1995,11 +2215,18 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
 
     local cluster = match
     if not cluster then
-        if UnfinishedPendingCount(pending) >= (GS.MAX_PENDING_EVIDENCE or 128) then
-            return "rejected", "full"
+        local openOk, openErr = CanOpenNewPendingCluster(
+            record, pending, witnessGuid, admissionCtx)
+        if not openOk then
+            -- Last-chance stale reclaim then retry capacity once.
+            if ReclaimStaleUnfinishedPending(pending, Now()) > 0 then
+                BumpAccountingMutation(record)
+                openOk, openErr = CanOpenNewPendingCluster(
+                    record, pending, witnessGuid, admissionCtx)
+            end
         end
-        if CountTotalUnfinishedPending(record) >= (GS.MAX_PENDING_EVIDENCE_TOTAL or 256) then
-            return "rejected", "full"
+        if not openOk then
+            return "rejected", openErr or "full"
         end
         cluster = {
             schemaVersion = 1,
@@ -2012,11 +2239,16 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         pending[#pending + 1] = cluster
     else
         -- Refresh evidence fields conservatively (neighbors may strengthen).
+        -- Boundary-spanning clusters stay ambiguous forever: Retail hour buckets
+        -- and activation samples (count/status only, no per-txn identities) cannot
+        -- prove the deposit occurred after cutover. Do not promote on age, a
+        -- mutable reconcile flag, or a later MatchScore hit within TIME_TOLERANCE
+        -- that claims a non-spanning approx (#389).
         cluster.lastSeen = Now()
-        if boundaryAmbiguous then
+        if cluster.status == "ambiguous" or boundaryAmbiguous then
             cluster.status = "ambiguous"
         end
-        if type(cluster.evidence) == "table" then
+        if type(cluster.evidence) == "table" and cluster.evidence ~= row then
             local older = cluster.evidence.neighborsOlder or {}
             local newer = cluster.evidence.neighborsNewer or {}
             if #(row.neighborsOlder or {}) > #older then
@@ -2024,6 +2256,15 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
             end
             if #(row.neighborsNewer or {}) > #newer then
                 cluster.evidence.neighborsNewer = row.neighborsNewer
+            end
+            if cluster.status == "pending" then
+                local prevAge = tonumber(cluster.evidence.ageHours)
+                local newAge = tonumber(row.ageHours)
+                if newAge and (not prevAge or newAge > prevAge) then
+                    cluster.evidence.ageHours = row.ageHours
+                    cluster.evidence.approxTxnTime = row.approxTxnTime
+                    cluster.evidence.observedAt = row.observedAt
+                end
             end
         end
     end
@@ -2248,6 +2489,14 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         return "rejected", "dataset_mismatch"
     end
 
+    -- Authenticated live cutover conflict blocks unsafe canonical writes.
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, admissionCtx)
+        if blocked then
+            return "pending", blockReason or "live_activation_conflict"
+        end
+    end
+
     local ok, err = GS.ValidateLedgerEventBody(event, nil, record.datasetId)
     if not ok then
         return "rejected", err or "invalid_event"
@@ -2305,6 +2554,11 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                         if idHit then
                             if isAdjustment then
                                 if AdjustmentBodiesEquivalent(e, event) then
+                                    -- Op-first delivery may have stored the row without
+                                    -- transport cutover provenance; reconcile from this
+                                    -- authenticated marked ledger body before duplicate.
+                                    ReconcileAdjustmentCutoverProvenance(
+                                        record, e, admissionCtx)
                                     return "duplicate", "duplicate"
                                 end
                                 QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)
@@ -2511,6 +2765,10 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 campaignId = campId,
                 datasetId = record.datasetId,
             }
+            if type(admissionCtx.sourceCutoverMarker) == "string"
+                and admissionCtx.sourceCutoverMarker ~= "" then
+                stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
+            end
             local appendOk, appendErr = AppendLedgerEvent(record, stored)
             if not appendOk then
                 return "rejected", appendErr or "full"
@@ -2603,6 +2861,17 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             campaignId = eventCampaign,
             datasetId = record.datasetId,
         }
+        -- Authenticated active-exporter marker from transport body (never the
+        -- self-declared event field). When already live, only the matching
+        -- canonical marker is retained; divergent markers stay fail-closed.
+        if type(admissionCtx.sourceCutoverMarker) == "string"
+            and admissionCtx.sourceCutoverMarker ~= "" then
+            local liveMarker = record.liveCutover and record.liveCutover.cutoverMarker
+            if not (GS.IsLiveActive and GS.IsLiveActive(record))
+                or liveMarker == admissionCtx.sourceCutoverMarker then
+                stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
+            end
+        end
         local appendOk, appendErr = AppendLedgerEvent(record, stored)
         if not appendOk then
             return "rejected", appendErr or "full"
@@ -2876,7 +3145,8 @@ function GS.ApplyIdentityLinkMutation(record, op)
     return false, "invalid_kind"
 end
 
-function GS.ApplyAdjustmentMutation(record, op)
+function GS.ApplyAdjustmentMutation(record, op, opts)
+    opts = opts or {}
     local itemId = tonumber(op.value and op.value.itemId) or tonumber(op.target and op.target.itemId)
     local quantity = tonumber(op.value and op.value.quantity)
     local attributed = op.value and op.value.attributed
@@ -2928,6 +3198,16 @@ function GS.ApplyAdjustmentMutation(record, op)
         datasetId = record.datasetId,
         opId = op.id,
     }
+    -- Only the local authenticated editor path may mint live cutover provenance
+    -- when this client is already active. Remote gs-op admission stays unmarked
+    -- until a matching authenticated marked ledger event reconciles (#389 A2).
+    if opts.localProductionAuthority
+        and GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and type(record.liveCutover.cutoverMarker) == "string"
+        and record.liveCutover.cutoverMarker ~= "" then
+        event.gsSourceCutoverMarker = record.liveCutover.cutoverMarker
+    end
     local ok, err = AppendLedgerEvent(record, event)
     if not ok then
         return false, err or "full"

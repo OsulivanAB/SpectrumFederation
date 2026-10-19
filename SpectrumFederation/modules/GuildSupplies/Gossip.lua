@@ -1528,7 +1528,8 @@ local function CurrentGuildRecord()
         return nil
     end
     local raw = GS._root and GS._root.guilds and GS._root.guilds[ctx.guildKey]
-    if type(raw) ~= "table" or raw.activation ~= GS.ACTIVATION_STAGED then
+    if type(raw) ~= "table"
+        or not (GS.IsSupportedActivation and GS.IsSupportedActivation(raw.activation)) then
         return nil
     end
     return raw, ctx.guildKey
@@ -1620,6 +1621,8 @@ local function RebuildExportIndex()
             or nil,
         currentCampaignId = record.currentCampaignId,
         activation = record.activation,
+        cutoverMarker = record.liveCutover and record.liveCutover.cutoverMarker or nil,
+        liveCutover = GS.DescribeLiveCutover and GS.DescribeLiveCutover(record.liveCutover) or nil,
         acceptedOpCount = 0,
         transferOpCount = 0,
         campaignCount = 0,
@@ -1832,6 +1835,48 @@ local function UpsertExportBody(id, body)
             prov.index.buildComplete = false
         end
     end
+end
+
+--- Transport cutoverMarker only for rows with established live production provenance.
+-- Becoming active must not launder previously uncredited staged adjustments by
+-- attaching the canonical marker (#389 A2).
+local function ExportCutoverMarkerForEvent(event, liveMarker)
+    if type(liveMarker) ~= "string" or liveMarker == "" or type(event) ~= "table" then
+        return nil
+    end
+    if event.gsProductionCredit ~= true then
+        return nil
+    end
+    local eventType = event.type
+    local isAdjustment = eventType == "adjustment"
+        or (GS.LEDGER_EVENT and eventType == GS.LEDGER_EVENT.ADJUSTMENT)
+        or eventType == "CONSUMABLE_ADJUSTMENT"
+    if isAdjustment and event.gsSourceCutoverMarker ~= liveMarker then
+        return nil
+    end
+    return liveMarker
+end
+
+--- Upsert or refresh a ledger-event export. cutoverMarker is nil unless the row
+-- already carries verified production provenance for the live cutover.
+local function UpsertLedgerEventExport(exportId, datasetId, event, cutoverMarker)
+    if type(exportId) ~= "string" or exportId == "" or type(event) ~= "table" then
+        return
+    end
+    local existing = exportState.byId[exportId]
+    local prev = existing and existing.body
+    if prev and prev.kind == "gs-ledger-event"
+        and prev.cutoverMarker == cutoverMarker
+        and prev.datasetId == datasetId
+        and prev.event == event then
+        return
+    end
+    UpsertExportBody(exportId, {
+        kind = "gs-ledger-event",
+        datasetId = datasetId,
+        event = event,
+        cutoverMarker = cutoverMarker,
+    })
 end
 
 --- Force paced archive→live ledger rebuild after TrimEventArchive removes IDs.
@@ -2081,6 +2126,46 @@ local function ValidateAndApply(record, ctx)
             return st, reason
         end
         if body.datasetId == localRecord.datasetId then
+            -- Same dataset: verified editors may push live activation/cutover
+            -- without requiring a local bank sample (#389 catch-up). Membership
+            -- alone is insufficient; activatedByGuid is not proof of authority.
+            if body.activation == GS.ACTIVATION_ACTIVE
+                and type(body.liveCutover) == "table"
+                and localRecord.activation == GS.ACTIVATION_STAGED
+                and GS.InstallRemoteLiveCutover then
+                local stCut, cutReason = GS.InstallRemoteLiveCutover(
+                    localRecord, body.liveCutover, member.guildKey, {
+                        quarantinePending = true,
+                        member = member,
+                        requireEditorAuthority = true,
+                        -- Compatible catch-up: any current editor may relay the
+                        -- already-activated cutover (actor may be the original
+                        -- activator, not necessarily this sender).
+                        bindActorToSender = false,
+                        authOpts = {},
+                    })
+                if stCut == "accepted" or stCut == "duplicate" then
+                    if GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("activation")
+                    end
+                    return stCut == "duplicate" and "duplicate" or "accepted", cutReason
+                end
+                return "rejected", cutReason or "live_activation_conflict"
+            end
+            if GS.IsLiveActive and GS.IsLiveActive(localRecord)
+                and body.activation == GS.ACTIVATION_ACTIVE
+                and type(body.cutoverMarker) == "string"
+                and type(localRecord.liveCutover) == "table"
+                and body.cutoverMarker ~= localRecord.liveCutover.cutoverMarker then
+                -- Divergent live markers: only authenticated editors can surface
+                -- a durable conflict advertisement (NotePeerDataset below).
+                local editorOk = GS.SenderHasEditorAuthority
+                    and select(1, GS.SenderHasEditorAuthority(member, {}))
+                if editorOk and GS.NotePeerDataset then
+                    GS.NotePeerDataset(sender, body.datasetId, body)
+                end
+                return "rejected", "live_activation_conflict"
+            end
             return "duplicate", "duplicate"
         end
         -- Foreign dataset while local exists: surface mismatch; do not merge.
@@ -2666,10 +2751,19 @@ local function ValidateAndApply(record, ctx)
             return "rejected", "invalid_event"
         end
         event.datasetId = body.datasetId or localRecord.datasetId
+        -- Never trust self-declared credit/provenance on the event payload.
+        event.gsProductionCredit = nil
+        event.gsSourceCutoverMarker = nil
+        -- Transport-level marker from an authenticated active exporter only.
+        local sourceMarker = nil
+        if type(body.cutoverMarker) == "string" and body.cutoverMarker ~= "" then
+            sourceMarker = body.cutoverMarker
+        end
         return GS:AdmitLedgerEvent(event, {
             sender = sender,
             member = member,
             offlineRecord = localRecord,
+            sourceCutoverMarker = sourceMarker,
             -- Donation catch-up is occurrence-deduped; adjustments need editor auth
             -- unless this is a preserved historical body (handled inside Admit).
             relay = false,
@@ -2888,7 +2982,12 @@ function GS.NotifyLocalDurableChange(reason)
         -- and any new direct observations (never re-export relays).
         -- Config/remote-op/campaign paths also append ledger rows (adjustments,
         -- link-triggered verification) and must advertise them for adoption.
-        if reason == "ledger" or reason == "evidence"
+        -- Activation revisits already-exported ledger rows so verified production
+        -- rows can advertise cutoverMarker; uncredited staged rows stay unmarked.
+        if reason == "activation" then
+            exportState.ledgerWarmPos = 0
+        end
+        if reason == "activation" or reason == "ledger" or reason == "evidence"
             or reason == "config" or reason == "remote-op" or reason == "campaign" then
             local events = record.accounting and record.accounting._consumableEvents
             if type(events) ~= "table" then
@@ -2945,17 +3044,25 @@ function GS.NotifyLocalDurableChange(reason)
             else
                 start = hw + 1
             end
+            local liveMarker = nil
+            if GS.IsLiveActive and GS.IsLiveActive(record)
+                and type(record.liveCutover) == "table"
+                and type(record.liveCutover.cutoverMarker) == "string" then
+                liveMarker = record.liveCutover.cutoverMarker
+            end
+            -- Provenance reconcile can upgrade already-exported rows; revisit the
+            -- recent live window so cutoverMarker tracks verified credit only.
+            if liveMarker then
+                start = math.min(start, math.max(1, nLive - 31))
+            end
             for i = start, nLive do
                 local event = events[i]
                 if type(event) == "table" and type(event.id) == "string" then
-                    local exportId = "gs:le:" .. event.id
-                    if not exportState.byId[exportId] then
-                        UpsertExportBody(exportId, {
-                            kind = "gs-ledger-event",
-                            datasetId = record.datasetId,
-                            event = event,
-                        })
-                    end
+                    UpsertLedgerEventExport(
+                        "gs:le:" .. event.id,
+                        record.datasetId,
+                        event,
+                        ExportCutoverMarkerForEvent(event, liveMarker))
                 end
             end
             exportState.ledgerWarmPos = nLive
@@ -3400,6 +3507,12 @@ function GS.NotifyLocalDurableChange(reason)
         -- #388 cold/reload: pace accepted ledger history into the export index.
         -- Archive phase first (prior generations), then live current-generation.
         if exportState.ledgerBuildNeeded and used < slice then
+            local coldMarker = nil
+            if GS.IsLiveActive and GS.IsLiveActive(record)
+                and type(record.liveCutover) == "table"
+                and type(record.liveCutover.cutoverMarker) == "string" then
+                coldMarker = record.liveCutover.cutoverMarker
+            end
             local function upsertLedgerList(list, startAt)
                 local start = math.max(1, tonumber(startAt) or 1)
                 if type(list) ~= "table" then
@@ -3412,14 +3525,11 @@ function GS.NotifyLocalDurableChange(reason)
                     local event = list[i]
                     used = used + 1
                     if type(event) == "table" and type(event.id) == "string" then
-                        local exportId = "gs:le:" .. event.id
-                        if not exportState.byId[exportId] then
-                            UpsertExportBody(exportId, {
-                                kind = "gs-ledger-event",
-                                datasetId = record.datasetId,
-                                event = event,
-                            })
-                        end
+                        UpsertLedgerEventExport(
+                            "gs:le:" .. event.id,
+                            record.datasetId,
+                            event,
+                            ExportCutoverMarkerForEvent(event, coldMarker))
                     end
                     exportState.ledgerBuildCursor = i + 1
                 end
@@ -3604,6 +3714,8 @@ function GS.NotifyLocalDurableChange(reason)
                 or nil,
             currentCampaignId = record.currentCampaignId,
             activation = record.activation,
+            cutoverMarker = record.liveCutover and record.liveCutover.cutoverMarker or nil,
+            liveCutover = GS.DescribeLiveCutover and GS.DescribeLiveCutover(record.liveCutover) or nil,
             acceptedOpCount = acceptedOpCount,
             transferOpCount = transferOpCount,
             campaignCount = campaignCount,

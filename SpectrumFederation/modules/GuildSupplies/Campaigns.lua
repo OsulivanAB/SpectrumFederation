@@ -175,7 +175,13 @@ function GS.ValidateEligibilityContainer(eligibility)
     return true
 end
 
+--- Immutable live cutover floor stored on eligibility after activation/refresh.
+local function LiveCutoverFloor(eligibility)
+    return tonumber(eligibility and eligibility.liveCutoverAt)
+end
+
 --- Tab change establishes a campaign-local cutoff when a baseline exists.
+-- Never regresses below an installed live cutover floor (#389 descriptor-first).
 function GS.NoteTabEligibilityCutoff(cfg, timestamp)
     if type(cfg) ~= "table" then
         return false
@@ -189,6 +195,10 @@ function GS.NoteTabEligibilityCutoff(cfg, timestamp)
         return false
     end
     if eligibility.baselineEstablished == true then
+        local floor = LiveCutoverFloor(eligibility)
+        if floor and ts < floor then
+            ts = floor
+        end
         eligibility.tabEligibleFrom = ts
         return true
     end
@@ -196,7 +206,7 @@ function GS.NoteTabEligibilityCutoff(cfg, timestamp)
 end
 
 --- Item add/re-add establishes a cutoff after the campaign baseline exists.
--- Ordinary goal edits must not call this.
+-- Ordinary goal edits must not call this. Floors to live cutover when present.
 function GS.NoteItemEligibilityCutoff(cfg, itemId, timestamp)
     if type(cfg) ~= "table" then
         return false
@@ -214,6 +224,10 @@ function GS.NoteItemEligibilityCutoff(cfg, itemId, timestamp)
         return false
     end
     if eligibility.baselineEstablished == true then
+        local floor = LiveCutoverFloor(eligibility)
+        if floor and ts < floor then
+            ts = floor
+        end
         eligibility.items[tostring(id)] = ts
         return true
     end
@@ -268,6 +282,8 @@ end
 --- Narrow read-only readiness for a trustworthy bank-log sample on this tab.
 -- Adapts existing ConsumablesBankLog evidence; never queries, polls, or starts
 -- a second observer. Tests may inject GS._BankContextReadinessProbe(tab).
+-- Bounded wall-clock age for a completed sample stamp (matches BankLog WallNow).
+GS.MAX_BANK_SAMPLE_AGE_SECONDS = 120
 -- @return boolean ready, string|nil reason
 function GS.IsBankContextSampleReady(bankTab)
     local tab = tonumber(bankTab)
@@ -302,6 +318,19 @@ function GS.IsBankContextSampleReady(bankTab)
         and type(ctx.guildGuid) == "string" and ctx.guildGuid ~= ""
         and BankLog.lastFreshLogGuild ~= ctx.guildGuid then
         return false, "guild_mismatch"
+    end
+    -- Require a recent completed sample; stale cached logs must not activate.
+    local stampedAt = tonumber(BankLog.lastFreshLogAt)
+    if not stampedAt then
+        return false, "log_not_updated"
+    end
+    -- Same wall clock as ConsumablesBankLog WallNow / lastFreshLogAt.
+    local obs = SF.ConsumablesObservation
+    local now = (obs and obs.Now and obs.Now()) or time()
+    now = tonumber(now) or 0
+    local maxAge = tonumber(GS.MAX_BANK_SAMPLE_AGE_SECONDS) or 120
+    if now < stampedAt or (now - stampedAt) > maxAge then
+        return false, "log_stale"
     end
     if type(ctx.guildGuid) == "string" and ctx.guildGuid ~= "" then
         local gsCtx = GS.GetCurrentContext and GS:GetCurrentContext()
@@ -807,6 +836,11 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
     local itemTotals = {}
     local contributions = {}
     ForEachCampaignLedgerEvent(record, generation, function(event)
+        -- Active datasets exclude pre-activation staged accounting from live totals.
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
         local itemId = tonumber(event.itemId)
         local qty = tonumber(event.quantity) or 0
         if not itemId or qty == 0 then
@@ -861,7 +895,7 @@ local function FormatHistoryTimestamp(event)
     return tostring(math.floor(ts))
 end
 
-local function FormatCampaignHistoryText(event, itemName)
+local function FormatCampaignHistoryText(event, itemName, markUncredited)
     local itemId = tonumber(event.itemId)
     local qty = tonumber(event.quantity) or 0
     local name = itemName
@@ -889,6 +923,9 @@ local function FormatCampaignHistoryText(event, itemName)
     else
         return nil
     end
+    if markUncredited then
+        body = Loc("GUILD_SUPPLIES_HISTORY_UNCREDITED", "[uncredited] %s"):format(body)
+    end
     local when = FormatHistoryTimestamp(event)
     if when then
         return Loc("GUILD_SUPPLIES_HISTORY_WITH_TIME", "%s — %s"):format(when, body)
@@ -898,6 +935,8 @@ end
 
 --- Bounded read-only donation/adjustment history for one campaign.
 -- Newest first. Does not mutate state or invent live verification.
+-- Current live campaigns hide uncredited rows (aligned with progress). Archived
+-- campaigns stay inspectable with an explicit uncredited label (#389).
 -- @return rows table, total number|nil, err string|nil
 function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
     local record, reason = GS:GetCurrentRecord()
@@ -915,9 +954,22 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         return {}, 0, nil
     end
 
+    local isArchived = campaignId ~= record.currentCampaignId
+        and type(record.campaignArchives) == "table"
+        and type(record.campaignArchives[campaignId]) == "table"
+    local filterUncredited = GS.IsLiveActive(record) and not isArchived
+
     local ordered = {}
     local seen = {}
     ForEachCampaignLedgerEvent(record, generation, function(event)
+        local credited = true
+        if GS.EventCountsTowardLiveProgress then
+            credited = GS.EventCountsTowardLiveProgress(record, event) and true or false
+        end
+        -- Live current campaign: keep history aligned with live progress.
+        if filterUncredited and not credited then
+            return
+        end
         local id = event.id
         if type(id) == "string" and id ~= "" then
             if seen[id] then
@@ -958,7 +1010,9 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 itemName = value
             end
         end
-        local text = FormatCampaignHistoryText(event, itemName)
+        local markUncredited = isArchived and GS.IsLiveActive(record)
+            and event.gsProductionCredit ~= true
+        local text = FormatCampaignHistoryText(event, itemName, markUncredited)
         if text and text ~= "" then
             rows[#rows + 1] = {
                 text = text,
@@ -970,6 +1024,7 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 attributed = event.attributed,
                 timestamp = event.timestamp,
                 generation = event.generation,
+                uncredited = markUncredited and true or nil,
             }
         end
     end
@@ -1047,7 +1102,25 @@ function GS.FormatReasonText(reason)
         wrong_guild = Loc("GUILD_SUPPLIES_REASON_WRONG_GUILD",
             "the active guild changed"),
         unsupported_activation = Loc("GUILD_SUPPLIES_REASON_UNSUPPORTED_ACTIVATION",
-            "this dataset is not on the staged activation path"),
+            "this dataset is not on a supported activation path"),
+        already_activated = Loc("GUILD_SUPPLIES_REASON_ALREADY_ACTIVATED",
+            "Guild Supplies is already active for this guild"),
+        not_activated = Loc("GUILD_SUPPLIES_REASON_NOT_ACTIVATED",
+            "Guild Supplies has not been activated for this guild yet"),
+        missing_live_cutover = Loc("GUILD_SUPPLIES_REASON_MISSING_LIVE_CUTOVER",
+            "the live cutover boundary is missing or invalid"),
+        live_activation_conflict = Loc("GUILD_SUPPLIES_REASON_LIVE_ACTIVATION_CONFLICT",
+            "conflicting live activation markers must be resolved by adopting one canonical source"),
+        adoption_in_progress = Loc("GUILD_SUPPLIES_REASON_ADOPTION_IN_PROGRESS",
+            "finish or cancel dataset adoption before activating"),
+        unexpected_live_cutover = Loc("GUILD_SUPPLIES_REASON_UNEXPECTED_LIVE_CUTOVER",
+            "staged datasets cannot carry a live cutover marker"),
+        invalid_live_cutover = Loc("GUILD_SUPPLIES_REASON_INVALID_LIVE_CUTOVER",
+            "the live cutover boundary is malformed"),
+        cutover_boundary_mismatch = Loc("GUILD_SUPPLIES_REASON_CUTOVER_BOUNDARY_MISMATCH",
+            "the live eligibility boundary does not match the bank sample"),
+        invalid_cutover_marker = Loc("GUILD_SUPPLIES_REASON_INVALID_CUTOVER_MARKER",
+            "the live cutover marker is invalid"),
         incomplete_transfer = Loc("GUILD_SUPPLIES_REASON_INCOMPLETE_TRANSFER",
             "the selected dataset transfer is incomplete — local state was left unchanged"),
         replay_in_progress = Loc("GUILD_SUPPLIES_REASON_REPLAY_IN_PROGRESS",
@@ -1136,11 +1209,26 @@ end
 -- @return message string, severity ("success"|"info"|"warn"|"error")
 function GS.FormatMutationFeedback(status, reason)
     if status == "accepted" then
+        if reason == "activated" then
+            return Loc("GUILD_SUPPLIES_STATUS_ACTIVATED",
+                "Guild Supplies is now the live guild-owned writer. Pre-activation bank rows will not be credited."),
+                "success"
+        end
+        if GS.IsLiveActiveForCurrentGuild and GS:IsLiveActiveForCurrentGuild() then
+            return Loc("GUILD_SUPPLIES_STATUS_ACCEPTED_LIVE",
+                "Change admitted to the active Guild Supplies dataset."),
+                "success"
+        end
         return Loc("GUILD_SUPPLIES_STATUS_ACCEPTED",
             "Staged change admitted. Live bank accounting still uses Raid Consumables until activation."),
             "success"
     end
     if status == "duplicate" then
+        if reason == "already_activated" then
+            return Loc("GUILD_SUPPLIES_STATUS_ALREADY_ACTIVATED",
+                "Guild Supplies is already active for this guild."),
+                "info"
+        end
         return Loc("GUILD_SUPPLIES_STATUS_DUPLICATE",
             "No new effect — that change was already admitted."),
             "info"
@@ -1429,8 +1517,15 @@ function GS:ApplyStagedCampaignOperation(op, context)
     if type(record) ~= "table" then
         return "rejected", recordReason or "not_configured"
     end
-    if record.activation ~= GS.ACTIVATION_STAGED then
+    if not (GS.IsSupportedActivation and GS.IsSupportedActivation(record.activation)) then
         return "rejected", "unsupported_activation"
+    end
+    -- Authenticated live cutover conflict fail-closes production campaign writes (#389).
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, context)
+        if blocked then
+            return "rejected", blockReason or "live_activation_conflict"
+        end
     end
 
     local ops = record.operations
@@ -1585,6 +1680,11 @@ function GS:ApplyStagedCampaignOperation(op, context)
     -- Fresh eligibility object so EstablishCampaignBaseline never mutates the prior map.
     cfg.eligibility = {}
     GS.EstablishCampaignBaseline(cfg, op.timestamp)
+    -- Live records keep the immutable cutover as an eligibility floor even when
+    -- a new campaign starts (startedAt is normally later; fail closed if not).
+    if GS.RefreshLiveEligibilityFloor then
+        GS.RefreshLiveEligibilityFloor(record)
+    end
     -- configSeq bump for projection invalidation without gossip.
     cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
     -- Shelve prior-generation ledger rows so the live list cannot permanently

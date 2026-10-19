@@ -6,6 +6,13 @@ local _, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 local function Consumables()
     return SF.Consumables
 end
@@ -770,6 +777,10 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
     if not C then
         return false, "Raid Consumables is unavailable."
     end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        return false, Loc("CONSUMABLES_LEGACY_WRITERS_RETIRED",
+            "Raid Consumables profile writers are retired for this guild. Use Guild Supplies.")
+    end
     opts = opts or {}
     local inSession = SessionFor(profile)
     if inSession and self.IsSafeModeEnabled and self:IsSafeModeEnabled() then
@@ -824,6 +835,12 @@ function Sync:HandleConsumablesOp(sender, payload)
     end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then return end
+    -- Isolate legacy session traffic after Guild Supplies activation for this
+    -- profile's guild (#389) — not merely the logged-in character's guild.
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        Debug("Info", "ignored consumables op: Guild Supplies live writers active")
+        return
+    end
     if not S.AuthorizeOp(profile, payload.op, sender) then
         Debug("Warn", "Unauthorized consumables op %s from %s", tostring(payload.op.name), tostring(sender))
         return
@@ -871,6 +888,10 @@ function Sync:HandleConsumablesConfig(sender, payload)
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then
         -- Profile bootstrap is owned by SendJoinStatus and the cooldown-gated heartbeat.
+        return
+    end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        Debug("Info", "ignored consumables config: Guild Supplies live writers active")
         return
     end
     local ok, status = S.ApplyRemoteConfig(profile, payload, sender, {
@@ -946,6 +967,10 @@ end
 function Sync:CommitConsumablesEvents(profile, token, events)
     local C = Consumables()
     if not C then return false, "Raid Consumables is unavailable." end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        return false, Loc("CONSUMABLES_LEGACY_WRITERS_RETIRED",
+            "Raid Consumables profile writers are retired for this guild. Use Guild Supplies.")
+    end
     local seen = EventIdSet(profile)
     local writer = self._SelfId and self:_SelfId() or nil
     local ok, err = C.CommitEvents(profile, token, events, { writer = writer })
@@ -1004,6 +1029,10 @@ function Sync:HandleConsumablesEvent(sender, payload)
     if not S or not C or type(payload.event) ~= "table" then return end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then return end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        Debug("Info", "ignored consumables event: Guild Supplies live writers active")
+        return
+    end
     local event = payload.event
     local coordinator = self.state and self.state.coordinator
     local isCoordinator = self.state and self.state.isCoordinator == true
@@ -1263,6 +1292,10 @@ function Sync:HandleConsumablesObsReport(sender, payload)
     if not C or not V or type(payload.observations) ~= "table" then return false end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then return false end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        Debug("Info", "ignored consumables obs report: Guild Supplies live writers active")
+        return false
+    end
     self._consumablesObsLimits = self._consumablesObsLimits or {}
     local now = (C.Now and C.Now()) or 0
     local S = Rules()
@@ -1448,6 +1481,10 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
     if not C or not V or type(payload.decision) ~= "table" then return end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then return end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        Debug("Info", "ignored consumables obs decision: Guild Supplies live writers active")
+        return
+    end
 
     -- Followers only apply coordinator-distributed decision notices.
     if not (self.state and self.state.isCoordinator) then

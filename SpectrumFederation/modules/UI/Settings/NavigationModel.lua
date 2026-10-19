@@ -176,6 +176,25 @@ function Model.IsCategoryEnabled(category)
     return category.enabled and true or false
 end
 
+--- Optional page.available (boolean or function) hides retired pages from tabs/search.
+function Model.IsPageAvailable(page)
+    if type(page) ~= "table" then
+        return false
+    end
+    local available = page.available
+    if available == nil then
+        return true
+    end
+    if type(available) == "function" then
+        local ok, result = pcall(available, page)
+        if not ok then
+            return false
+        end
+        return result and true or false
+    end
+    return available and true or false
+end
+
 function Model.IsCategorySelectable(category)
     if type(category) ~= "table" then
         return false
@@ -214,7 +233,7 @@ function Model.GetContentPages(registry, categoryId)
     end
 
     for _, page in ipairs(matching) do
-        if page.id ~= categoryId or not hasNonRoot then
+        if (page.id ~= categoryId or not hasNonRoot) and Model.IsPageAvailable(page) then
             table.insert(result, page)
         end
     end
@@ -428,7 +447,7 @@ function Model.Search(registry, query)
     local matchedCategoryIds = {}
 
     for _, page in ipairs(Model.GetPages(registry)) do
-        if Model.IsContentPage(registry, page.id) then
+        if Model.IsContentPage(registry, page.id) and Model.IsPageAvailable(page) then
             local rank = Model.RankMatch(page, query)
             if rank then
                 local categoryId = PageCategoryId(page)

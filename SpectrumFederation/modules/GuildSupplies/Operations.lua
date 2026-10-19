@@ -1007,7 +1007,7 @@ local function StoreAccepted(ops, stored, targetKey)
     ops.pending[stored.id] = nil
 end
 
-local function ApplyMutations(record, op)
+local function ApplyMutations(record, op, opts)
     if op.kind == KIND.SET_EDITOR_RANK then
         -- Create permission table only on explicit GM-authorized recovery apply.
         if type(record.permission) ~= "table" then
@@ -1031,6 +1031,11 @@ local function ApplyMutations(record, op)
         -- Tab change (including clear↔set) establishes cutoff after baseline.
         if previous ~= op.value and GS.NoteTabEligibilityCutoff then
             GS.NoteTabEligibilityCutoff(cfg, op.timestamp)
+        end
+        -- Descriptor-first catch-up: historical tab ops must not regress the
+        -- immutable live cutover floor after start-campaign refresh (#389).
+        if GS.RefreshLiveEligibilityFloor then
+            GS.RefreshLiveEligibilityFloor(record)
         end
         return true
     elseif op.kind == KIND.SET_REQUESTED_ITEM then
@@ -1080,6 +1085,10 @@ local function ApplyMutations(record, op)
                 -- Exact same goal: no eligibility change (idempotent field write).
             end
         end
+        -- Same cutover floor for historical item-add replay on live records.
+        if GS.RefreshLiveEligibilityFloor then
+            GS.RefreshLiveEligibilityFloor(record)
+        end
         return true
     elseif op.kind == KIND.LINK_CHARACTERS or op.kind == KIND.UNLINK_CHARACTERS then
         if not GS.ApplyIdentityLinkMutation then
@@ -1094,7 +1103,7 @@ local function ApplyMutations(record, op)
         if not GS.ApplyAdjustmentMutation then
             return false, "unsupported_kind"
         end
-        local ok, status = GS.ApplyAdjustmentMutation(record, op)
+        local ok, status = GS.ApplyAdjustmentMutation(record, op, opts)
         if not ok then
             return false, status or "adjustment_floor"
         end
@@ -1208,7 +1217,7 @@ function GS:ApplyStagedConfigOperation(op, context)
     if type(record) ~= "table" then
         return "rejected", resolveReason or "not_configured"
     end
-    if record.activation ~= GS.ACTIVATION_STAGED then
+    if not (GS.IsSupportedActivation and GS.IsSupportedActivation(record.activation)) then
         return "rejected", "unsupported_activation"
     end
     if op.datasetId ~= record.datasetId then
@@ -1216,6 +1225,13 @@ function GS:ApplyStagedConfigOperation(op, context)
     end
     if recovery and op.kind ~= KIND.SET_EDITOR_RANK then
         return "rejected", "invalid_permission"
+    end
+    -- Authenticated live cutover conflict fail-closes production config writes (#389).
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, context)
+        if blocked then
+            return "rejected", blockReason or "live_activation_conflict"
+        end
     end
 
     local ops = record.operations
@@ -1267,7 +1283,11 @@ function GS:ApplyStagedConfigOperation(op, context)
     end
 
     local tKey = TargetKey(op.kind, stored.target)
-    local applied, applyErr = ApplyMutations(record, stored)
+    -- Local authenticated editor writes may establish live cutover provenance on
+    -- adjustments created after this client is already active (#389 A2).
+    local applied, applyErr = ApplyMutations(record, stored, {
+        localProductionAuthority = true,
+    })
     if not applied then
         return "rejected", applyErr or "apply_failed"
     end
@@ -1914,8 +1934,8 @@ function GS._RecognizeExactAcceptedDuplicate(op, stored)
     return RecognizeExactAcceptedDuplicate(op, stored)
 end
 
-function GS._ApplyMutations(record, op)
-    return ApplyMutations(record, op)
+function GS._ApplyMutations(record, op, opts)
+    return ApplyMutations(record, op, opts)
 end
 
 function GS._RetainPending(ops, op, reason)

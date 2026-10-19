@@ -825,3 +825,41 @@ function O.RequestedSetFromConfig(cfg)
     end
     return set
 end
+
+--- Build eligible deposit evidence rows from a bank-log snapshot (#389 live path).
+-- Does not mutate observation stores or credit donations.
+-- Boundary-spanning hour-bucket rows are retained so three-witness admission can
+-- park them as ambiguous; they must not be silently discarded here.
+-- Activation samples only stamp counts/status (not per-txn identities). Blizzard
+-- hour ages never prove that a spanning row is post-cutover — aging alone must
+-- not unlock production credit — so those occurrences stay uncredited.
+function O.ListEligibleEvidenceFromSnapshot(snapshot, opts)
+    opts = opts or {}
+    if type(snapshot) ~= "table" then
+        return {}
+    end
+    local now = tonumber(opts.now) or Now()
+    local evidenceRows = EnrichSnapshotRows(snapshot.rows or snapshot.transactions, snapshot.requestedSet, {
+        guildGuid = tostring(snapshot.guildGuid or ""),
+        bankTab = tonumber(snapshot.bankTab),
+        generation = snapshot.generation,
+        observedBy = snapshot.observedBy,
+        observedAt = tonumber(snapshot.observedAt) or now,
+    })
+    local eligibility = snapshot.eligibility
+    if type(eligibility) == "table" then
+        local filtered = {}
+        for i = 1, #evidenceRows do
+            local row = evidenceRows[i]
+            if O.IsEvidenceEligible(row, eligibility) then
+                if O.EvidenceSpansEligibilityBoundary
+                    and O.EvidenceSpansEligibilityBoundary(row, eligibility) then
+                    row.boundaryAmbiguous = true
+                end
+                filtered[#filtered + 1] = row
+            end
+        end
+        return filtered
+    end
+    return evidenceRows
+end

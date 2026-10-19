@@ -171,7 +171,7 @@ local function MembershipHelpText()
 	end
 	if caps.canRead then
 		return Loc("GUILD_SUPPLIES_LOGS_HELP",
-			"Members can inspect current and archived campaign goals and progress. Privileged edits live on Configuration. Live donation verification is not active on this staged branch.")
+			"Members can inspect current and archived campaign goals and progress. Privileged edits live on Configuration.")
 	end
 	return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
 		"Join a guild with a verified membership to inspect Guild Supplies logs.")
@@ -297,7 +297,7 @@ end
 
 local function HistoryHelpText()
 	return Loc("GUILD_SUPPLIES_LOGS_HISTORY_HELP",
-		"Newest donation and adjustment entries for the selected campaign are first. Each page shows up to %d entries. Live bank verification is not active on this staged branch.")
+		"Newest donation and adjustment entries for the selected campaign are first. Each page shows up to %d entries.")
 		:format(HISTORY_PAGE_SIZE)
 end
 
