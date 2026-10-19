@@ -770,7 +770,7 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
     if not C then
         return false, "Raid Consumables is unavailable."
     end
-    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
         return false, "Raid Consumables profile writers are retired for this guild. Use Guild Supplies."
     end
     opts = opts or {}
@@ -821,17 +821,18 @@ function Sync:HandleConsumablesOp(sender, payload)
     local C = Consumables()
     local S = Rules()
     if not C or not S or type(payload.op) ~= "table" then return end
-    -- Isolate legacy session traffic after Guild Supplies activation (#389).
-    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
-        Debug("Info", "ignored consumables op: Guild Supplies live writers active")
-        return
-    end
     if not (self._SamePlayer and self:_SamePlayer(sender, payload.actor)) then
         Debug("Warn", "Rejected consumables op from %s for actor %s", tostring(sender), tostring(payload.actor))
         return
     end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then return end
+    -- Isolate legacy session traffic after Guild Supplies activation for this
+    -- profile's guild (#389) — not merely the logged-in character's guild.
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        Debug("Info", "ignored consumables op: Guild Supplies live writers active")
+        return
+    end
     if not S.AuthorizeOp(profile, payload.op, sender) then
         Debug("Warn", "Unauthorized consumables op %s from %s", tostring(payload.op.name), tostring(sender))
         return
@@ -872,10 +873,6 @@ function Sync:HandleConsumablesConfig(sender, payload)
     local C = Consumables()
     local S = Rules()
     if not C or not S then return end
-    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
-        Debug("Info", "ignored consumables config: Guild Supplies live writers active")
-        return
-    end
     if not S.RemoteConfigSenderOk(self.state and self.state.coordinator, sender) then
         Debug("Verbose", "Ignored consumables config from non-coordinator %s", tostring(sender))
         return
@@ -883,6 +880,10 @@ function Sync:HandleConsumablesConfig(sender, payload)
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then
         -- Profile bootstrap is owned by SendJoinStatus and the cooldown-gated heartbeat.
+        return
+    end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
+        Debug("Info", "ignored consumables config: Guild Supplies live writers active")
         return
     end
     local ok, status = S.ApplyRemoteConfig(profile, payload, sender, {
@@ -958,7 +959,7 @@ end
 function Sync:CommitConsumablesEvents(profile, token, events)
     local C = Consumables()
     if not C then return false, "Raid Consumables is unavailable." end
-    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
         return false, "Raid Consumables profile writers are retired for this guild. Use Guild Supplies."
     end
     local seen = EventIdSet(profile)
@@ -1017,12 +1018,12 @@ function Sync:HandleConsumablesEvent(sender, payload)
     local C = Consumables()
     local S = Rules()
     if not S or not C or type(payload.event) ~= "table" then return end
-    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
         Debug("Info", "ignored consumables event: Guild Supplies live writers active")
         return
     end
-    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
-    if not profile then return end
     local event = payload.event
     local coordinator = self.state and self.state.coordinator
     local isCoordinator = self.state and self.state.isCoordinator == true
@@ -1280,12 +1281,12 @@ function Sync:HandleConsumablesObsReport(sender, payload)
     local C = Consumables()
     local V = SF.ConsumablesVerification
     if not C or not V or type(payload.observations) ~= "table" then return false end
-    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return false end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
         Debug("Info", "ignored consumables obs report: Guild Supplies live writers active")
         return false
     end
-    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
-    if not profile then return false end
     self._consumablesObsLimits = self._consumablesObsLimits or {}
     local now = (C.Now and C.Now()) or 0
     local S = Rules()
@@ -1469,12 +1470,12 @@ function Sync:HandleConsumablesObsDecision(sender, payload)
     local C = Consumables()
     local V = SF.ConsumablesVerification
     if not C or not V or type(payload.decision) ~= "table" then return end
-    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return end
+    if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
         Debug("Info", "ignored consumables obs decision: Guild Supplies live writers active")
         return
     end
-    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
-    if not profile then return end
 
     -- Followers only apply coordinator-distributed decision notices.
     if not (self.state and self.state.isCoordinator) then

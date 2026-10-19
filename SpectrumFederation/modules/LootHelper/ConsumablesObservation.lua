@@ -828,6 +828,10 @@ end
 
 --- Build eligible deposit evidence rows from a bank-log snapshot (#389 live path).
 -- Does not mutate observation stores or credit donations.
+-- Boundary-spanning hour-bucket rows are retained so three-witness admission can
+-- park them as pending/ambiguous; they must not be silently discarded here.
+-- Activation samples only stamp counts/status (not per-txn identities), so first
+-- hour post-cutover deposits cannot be auto-credited from baseline alone.
 function O.ListEligibleEvidenceFromSnapshot(snapshot, opts)
     opts = opts or {}
     if type(snapshot) ~= "table" then
@@ -845,11 +849,13 @@ function O.ListEligibleEvidenceFromSnapshot(snapshot, opts)
     if type(eligibility) == "table" then
         local filtered = {}
         for i = 1, #evidenceRows do
-            if O.IsEvidenceEligible(evidenceRows[i], eligibility) then
-                if not (O.EvidenceSpansEligibilityBoundary
-                    and O.EvidenceSpansEligibilityBoundary(evidenceRows[i], eligibility)) then
-                    filtered[#filtered + 1] = evidenceRows[i]
+            local row = evidenceRows[i]
+            if O.IsEvidenceEligible(row, eligibility) then
+                if O.EvidenceSpansEligibilityBoundary
+                    and O.EvidenceSpansEligibilityBoundary(row, eligibility) then
+                    row.boundaryAmbiguous = true
                 end
+                filtered[#filtered + 1] = row
             end
         end
         return filtered

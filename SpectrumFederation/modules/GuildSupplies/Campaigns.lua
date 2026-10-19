@@ -1470,6 +1470,13 @@ function GS:ApplyStagedCampaignOperation(op, context)
     if not (GS.IsSupportedActivation and GS.IsSupportedActivation(record.activation)) then
         return "rejected", "unsupported_activation"
     end
+    -- Authenticated live cutover conflict fail-closes production campaign writes (#389).
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, context)
+        if blocked then
+            return "rejected", blockReason or "live_activation_conflict"
+        end
+    end
 
     local ops = record.operations
     local existing = ops.records[op.id]

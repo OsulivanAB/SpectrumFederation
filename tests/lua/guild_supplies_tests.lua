@@ -21556,6 +21556,582 @@ do
     assertEq(#world.chat, 0, "3C17: no chat")
 end
 
+do
+    -- 3C18) Legacy-writer retirement follows the target profile's guild, not login guild
+    loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
+    local C = SF.Consumables
+    local recordA = seedActivatableCampaign(9118, 20)
+    local _, stA = GS:ActivateCanonicalDataset()
+    assertEq(stA, "accepted", "3C18: guild A activated")
+    local datasetA = recordA.datasetId
+    disarmFreshBankSample()
+
+    -- Second guild stays staged/legacy while A is live.
+    world.guild.clubId = 99
+    world.guild.name = "OtherGuild"
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Club flip invalidates prior demand-roster binding until a roster event.
+    assertEq(GS:GetCurrentContext().ready, false, "3C18: B unready before roster update")
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Zoe-Garona", guid = "Player-1-Zoe", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    assertEq(GS:GetCurrentContext().ready, true,
+        "3C18: B ready after roster reason="
+            .. tostring(GS:GetCurrentContext().reason))
+    local recB, stB, reasonB = GS:CreateStagedRecord()
+    assertEq(stB, "accepted",
+        "3C18: guild B staged st=" .. tostring(stB) .. " r=" .. tostring(reasonB))
+    local recordB = recB or GS:GetCurrentRecord()
+    assertEq(recordB.activation, GS.ACTIVATION_STAGED, "3C18: B staged")
+
+    local profileA = {
+        _consumables = {
+            guild = { guid = "42", name = "Spectrum", realm = "Garona" },
+            bankTab = 2,
+            requestedItems = {},
+            generation = 0,
+            configSeq = 0,
+            eventSeq = 0,
+            eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
+            txnRegistry = {},
+        },
+        _consumableEvents = {},
+        _consumableEventArchive = {},
+    }
+    local profileB = {
+        _consumables = {
+            guild = { guid = "99", name = "OtherGuild", realm = "Garona" },
+            bankTab = 1,
+            requestedItems = {},
+            generation = 0,
+            configSeq = 0,
+            eventSeq = 0,
+            eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
+            txnRegistry = {},
+        },
+        _consumableEvents = {},
+        _consumableEventArchive = {},
+    }
+
+    -- Logged into B (staged): A still retired, B still writable.
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(profileA), false,
+        "3C18: on B, profile A (live guild) retired")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(profileB), true,
+        "3C18: on B, profile B (staged guild) allowed")
+    assertEq(C.LegacyWritersAllowed(profileA), false, "3C18: C gate A retired on B login")
+    assertEq(C.LegacyWritersAllowed(profileB), true, "3C18: C gate B allowed on B login")
+    local okA, errA = C.ApplyOp(profileA, { name = "set_bank_tab", bankTab = 3 },
+        "Alice-Garona", { asAdmin = true })
+    assertEq(okA, false, "3C18: ApplyOp blocked for live guild profile while on B")
+    assertTrue(type(errA) == "string" and errA:find("retired", 1, true),
+        "3C18: ApplyOp A reason got=" .. tostring(errA))
+    local okB, errB = C.ApplyOp(profileB, { name = "set_bank_tab", bankTab = 2 },
+        "Alice-Garona", { asAdmin = true })
+    assertEq(okB, true, "3C18: ApplyOp allowed for staged guild profile on B err="
+        .. tostring(errB))
+    assertEq(tonumber(profileB._consumables.bankTab), 2, "3C18: B profile mutated")
+
+    -- Logged into A (live): unrelated B profile still writable; A still retired.
+    world.guild.clubId = 42
+    world.guild.name = "Spectrum"
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    fireEvent("GUILD_ROSTER_UPDATE")
+    assertEq(GS:GetCurrentRecord().datasetId, datasetA, "3C18: back on A")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(profileA), false,
+        "3C18: on A, profile A retired")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(profileB), true,
+        "3C18: on A, profile B still allowed")
+    assertEq(C.MergeSnapshot(profileA, {
+        bankTab = 4, requestedItems = {}, generation = 1, configSeq = 1, eventSeq = 0,
+    }), true, "3C18: MergeSnapshot no-ops for retired guild")
+    assertEq(tonumber(profileA._consumables.bankTab), 2, "3C18: A profile unchanged by snapshot")
+    assertEq(C.MergeSnapshot(profileB, {
+        bankTab = 3, requestedItems = {}, generation = 1, configSeq = 1, eventSeq = 0,
+        guild = { guid = "99", name = "OtherGuild", realm = "Garona" },
+    }), true, "3C18: MergeSnapshot applies for unrelated guild")
+    assertEq(tonumber(profileB._consumables.bankTab), 3, "3C18: B profile snapshot applied")
+    assertEq(#world.chat, 0, "3C18: no chat")
+end
+
+do
+    -- 3C19) Adopting an already-active dataset publishes live cutover (not staged)
+    local sourceDataset
+    local sourceMarker
+    local bodies
+    do
+        local rec = seedActivatableCampaign(9119, 35)
+        local _, st = GS:ActivateCanonicalDataset()
+        assertEq(st, "accepted", "3C19: source activated")
+        rec = GS:GetCurrentRecord()
+        sourceDataset = rec.datasetId
+        sourceMarker = rec.liveCutover.cutoverMarker
+        local boundary = tonumber(rec.liveCutover.contextObservedAt)
+        world.time = boundary + 7200
+        local evidence = makeDepositEvidence(rec, {
+            itemId = 9119, quantity = 6, observedAt = world.time, ageHours = 0,
+        })
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+        end
+        assertEq(tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9119]) or 0,
+            6, "3C19: source credited")
+        GS:EnsureGossipProvider()
+        drainExportMaint(64)
+        bodies = collectAllExportBodies()
+        local sawActiveDesc = false
+        for i = 1, #bodies do
+            local b = bodies[i].body
+            if b and b.kind == "dataset-desc" then
+                assertEq(b.activation, GS.ACTIVATION_ACTIVE, "3C19: desc activation active")
+                assertTrue(type(b.liveCutover) == "table", "3C19: desc carries liveCutover")
+                assertEq(b.liveCutover.cutoverMarker, sourceMarker, "3C19: desc marker")
+                sawActiveDesc = true
+            end
+        end
+        assertTrue(sawActiveDesc, "3C19: export includes active descriptor")
+        disarmFreshBankSample()
+    end
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "3C19: local staged")
+    startCampaign()
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 1)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "3C19: local tab")
+    -- Local client was previously active on a different marker/dataset path:
+    -- activate local staged so adoption must preserve *source* authority.
+    armFreshBankSample(true)
+    local _, stLocal = GS:ActivateCanonicalDataset()
+    assertEq(stLocal, "accepted", "3C19: local activated before adoption")
+    local localMarker = GS:GetCurrentRecord().liveCutover.cutoverMarker
+    assertTrue(localMarker ~= sourceMarker, "3C19: local marker differs from source")
+    disarmFreshBankSample()
+
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, {
+        editorRankPosition = 1,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = sourceMarker,
+    })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3C19: begin adoption of active source")
+    for i = 1, #bodies do
+        local stB = select(1, GS:BufferAdoptionRecord(bodies[i].id, bodies[i].body))
+        assertTrue(stB == "accepted" or stB == "duplicate",
+            "3C19: buffer st=" .. tostring(stB))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and not GS._adoption.committed and guard < 4000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertEq(stAdopt, "accepted",
+        "3C19: adoption accepted st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    assertEq(adopted.datasetId, sourceDataset, "3C19: adopted dataset")
+    assertEq(adopted.activation, GS.ACTIVATION_ACTIVE, "3C19: published active (not staged)")
+    assertEq(adopted.liveCutover.cutoverMarker, sourceMarker, "3C19: source marker preserved")
+    assertEq(tonumber(adopted.accounting._consumables.eligibility.tabEligibleFrom),
+        tonumber(adopted.liveCutover.contextObservedAt),
+        "3C19: eligibility boundary matches cutover")
+    assertEq(tonumber(GS:ProjectCampaignProgress(adopted.currentCampaignId).itemTotals[9119]) or 0,
+        6, "3C19: source credits retained")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), false, "3C19: legacy retired after adopt")
+
+    local saved = SpectrumFederationDB
+    GS._root = nil
+    GS._rootValid = false
+    initGS()
+    local restored = GS:GetCurrentRecord()
+    assertEq(restored.activation, GS.ACTIVATION_ACTIVE, "3C19: reload active")
+    assertEq(restored.liveCutover.cutoverMarker, sourceMarker, "3C19: reload marker")
+    assertTrue(saved == SpectrumFederationDB, "3C19: same db root")
+    assertEq(#world.chat, 0, "3C19: no chat")
+end
+
+do
+    -- 3C20) Authenticated live conflict fail-closes config/campaign (and clears after resolve)
+    local record = seedActivatableCampaign(9120, 25)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C20: activated")
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    local otherAt = boundary + 50
+    local otherMarker = GS.BuildCutoverMarker(record.datasetId, otherAt, record.liveCutover.bankTab)
+    GS._peerDatasets = {
+        ["Bob-Garona"] = {
+            peerName = "Bob-Garona",
+            datasetId = record.datasetId,
+            cutoverMarker = otherMarker,
+            activation = GS.ACTIVATION_ACTIVE,
+        },
+    }
+    assertEq(GS:GetLiveActivationConflictState().blocked, true, "3C20: conflict blocked")
+
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    local stTab, reasonTab = GS:ApplyStagedConfigOperation(tabOp)
+    assertEq(stTab, "rejected", "3C20: bank tab rejected under conflict")
+    assertEq(reasonTab, "live_activation_conflict",
+        "3C20: tab reason got=" .. tostring(reasonTab))
+    assertEq(tonumber(GS:GetCurrentRecord().accounting._consumables.bankTab), 2,
+        "3C20: bank tab unchanged")
+
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 9120 }, {
+        itemId = 9120, goal = 40, removed = false,
+    })
+    local stItem, reasonItem = GS:ApplyStagedConfigOperation(itemOp)
+    assertEq(stItem, "rejected", "3C20: item change rejected")
+    assertEq(reasonItem, "live_activation_conflict", "3C20: item reason")
+
+    local adjOp = select(1, GS:NewAdjustmentOperation(9120, 1, "Donor-Garona"))
+    assertTrue(adjOp ~= nil, "3C20: adjustment prepared")
+    local stAdj, reasonAdj = GS:ApplyStagedConfigOperation(adjOp)
+    assertEq(stAdj, "rejected", "3C20: adjustment rejected")
+    assertEq(reasonAdj, "live_activation_conflict", "3C20: adjustment reason")
+
+    local campOp, campPrep = GS:NewCampaignOperation()
+    assertEq(campPrep, "accepted", "3C20: campaign op prepared")
+    local stCamp, reasonCamp = GS:ApplyStagedCampaignOperation(campOp)
+    assertEq(stCamp, "rejected", "3C20: campaign rejected under conflict")
+    assertEq(reasonCamp, "live_activation_conflict",
+        "3C20: campaign reason got=" .. tostring(reasonCamp))
+    assertEq(GS:GetCurrentRecord().currentCampaignId, record.currentCampaignId,
+        "3C20: campaign unchanged")
+
+    -- Remote mutation boundary also fail-closes (non-adoption).
+    local remoteTab = GS:NewConfigOperation("set-bank-tab", "bankTab", 4)
+    local stRemote, reasonRemote = GS:AdmitRemoteOperation(remoteTab, {
+        member = GS.AuthenticateTransportSender("Bob-Garona"),
+        sender = "Bob-Garona",
+    })
+    assertEq(stRemote, "rejected", "3C20: remote config rejected")
+    assertEq(reasonRemote, "live_activation_conflict", "3C20: remote reason")
+
+    GS._peerDatasets = {}
+    assertEq(GS:GetLiveActivationConflictState().blocked, false, "3C20: conflict cleared")
+    local tabOp2 = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp2), "accepted",
+        "3C20: tab succeeds after resolve")
+    assertEq(tonumber(GS:GetCurrentRecord().accounting._consumables.bankTab), 3,
+        "3C20: tab persisted after resolve")
+    disarmFreshBankSample()
+    assertEq(#world.chat, 0, "3C20: no chat")
+end
+
+do
+    -- 3C21) First-hour boundary-spanning bank evidence is retained (not credited, not lost)
+    local record = seedActivatableCampaign(9121, 30)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C21: activated")
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    local cfg = record.accounting._consumables
+    -- Immediate post-activation observation: ageHours=0 spans the cutover hour bucket.
+    local observedAt = boundary + 60
+    world.time = observedAt
+    local O = SF.ConsumablesObservation
+    local spanning = makeDepositEvidence(record, {
+        itemId = 9121, quantity = 8, observedAt = observedAt, ageHours = 0,
+        donor = "FirstHour-Garona",
+        occurrenceIndex = 1,
+        neighborsOlder = { "older|fh" },
+        neighborsNewer = { "newer|fh" },
+    })
+    assertTrue(spanning.approxTxnTime >= boundary, "3C21: approx at/after boundary")
+    assertTrue(O.EvidenceSpansEligibilityBoundary(spanning, cfg.eligibility),
+        "3C21: spans eligibility boundary")
+    assertTrue(O.IsEvidenceEligible(spanning, cfg.eligibility),
+        "3C21: still eligible (not pre-cutover)")
+
+    local snapshot = {
+        guildGuid = tostring(cfg.guild.guid),
+        bankTab = tonumber(cfg.bankTab),
+        generation = tonumber(cfg.generation),
+        observedBy = "Alice-Garona",
+        observedAt = observedAt,
+        eligibility = cfg.eligibility,
+        requestedSet = O.RequestedSetFromConfig(cfg),
+        rows = {
+            {
+                type = "deposit",
+                name = "FirstHour-Garona",
+                itemLink = "|Hitem:9121::::::::|h[Flask]|h",
+                itemID = 9121,
+                count = 8,
+                year = 2026, month = 10, day = 19, hour = 12,
+                ageHours = 0,
+            },
+        },
+    }
+    local listed = O.ListEligibleEvidenceFromSnapshot(snapshot, { now = observedAt })
+    assertTrue(#listed >= 1, "3C21: spanning row retained in evidence list")
+    local found = false
+    for i = 1, #listed do
+        if listed[i].itemId == 9121 and listed[i].quantity == 8 then
+            found = true
+            assertEq(listed[i].boundaryAmbiguous, true, "3C21: marked boundaryAmbiguous")
+        end
+    end
+    assertTrue(found, "3C21: first-hour deposit present in listed evidence")
+
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        local ast, ars = GS:_AdmitObservationForTests(spanning, pair[1], pair[2])
+        assertTrue(ast == "pending" or ast == "duplicate",
+            "3C21: three-witness path retains ambiguous st=" .. tostring(ast)
+                .. " r=" .. tostring(ars))
+        if ast == "pending" then
+            assertTrue(ars == "ambiguous_boundary" or ars == "awaiting_witnesses",
+                "3C21: pending reason got=" .. tostring(ars))
+        end
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        0, "3C21: no unsafe auto-credit for boundary-spanning row")
+
+    -- Pre-activation backfill still rejected.
+    local pre = makeDepositEvidence(record, {
+        itemId = 9121, quantity = 3,
+        observedAt = boundary + 100,
+        ageHours = 2, -- approx before boundary
+        donor = "PreCutover-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|pre" },
+        neighborsNewer = { "newer|pre" },
+    })
+    assertTrue(pre.approxTxnTime < boundary, "3C21: pre evidence before boundary")
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(pre, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        0, "3C21: pre-cutover still uncredited")
+
+    -- Clearly post-cutover deposit (outside the hour uncertainty) still credits.
+    world.time = boundary + 7200
+    local clear = makeDepositEvidence(record, {
+        itemId = 9121, quantity = 5, observedAt = world.time, ageHours = 0,
+        donor = "ClearPost-Garona",
+        occurrenceIndex = 3,
+        neighborsOlder = { "older|clr" },
+        neighborsNewer = { "newer|clr" },
+    })
+    assertEq(O.EvidenceSpansEligibilityBoundary(clear, cfg.eligibility), false,
+        "3C21: clear post-cutover does not span")
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(clear, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        5, "3C21: clear post-cutover credits once")
+    disarmFreshBankSample()
+    assertEq(#world.chat, 0, "3C21: no chat")
+end
+
+do
+    -- 3C22) Same-dataset divergent live markers converge via authenticated adoption
+    local sourceDataset
+    local sourceMarker
+    local sourceCutover
+    local bodies
+    do
+        local rec = seedActivatableCampaign(9122, 40)
+        local _, st = GS:ActivateCanonicalDataset()
+        assertEq(st, "accepted", "3C22: alice activated")
+        rec = GS:GetCurrentRecord()
+        sourceDataset = rec.datasetId
+        sourceMarker = rec.liveCutover.cutoverMarker
+        sourceCutover = {}
+        for k, v in pairs(rec.liveCutover) do
+            if type(v) == "table" then
+                local copy = {}
+                for ck, cv in pairs(v) do copy[ck] = cv end
+                sourceCutover[k] = copy
+            else
+                sourceCutover[k] = v
+            end
+        end
+        GS:EnsureGossipProvider()
+        drainExportMaint(64)
+        bodies = collectAllExportBodies()
+        disarmFreshBankSample()
+    end
+
+    -- Bob shares the same dataset id but a divergent live marker (conflicted state).
+    local bobAt = (tonumber(sourceCutover.activatedAt) or world.time) + 77
+    local bobMarker = GS.BuildCutoverMarker(sourceDataset, bobAt, sourceCutover.bankTab)
+    local bobCutover = {}
+    for k, v in pairs(sourceCutover) do
+        if type(v) == "table" then
+            local copy = {}
+            for ck, cv in pairs(v) do copy[ck] = cv end
+            bobCutover[k] = copy
+        else
+            bobCutover[k] = v
+        end
+    end
+    bobCutover.activatedAt = bobAt
+    bobCutover.contextObservedAt = bobAt
+    bobCutover.cutoverMarker = bobMarker
+    bobCutover.activatedByGuid = "Player-1-Bob"
+    bobCutover.activatedByName = "Bob-Garona"
+    bobCutover.eligibilityBoundary = {
+        baselineEstablished = true,
+        tabEligibleFrom = bobAt,
+    }
+
+    local aliceRoot = SpectrumFederationDB
+    local aliceGuild = aliceRoot.guildSupplies.guilds["club:42"]
+    SpectrumFederationDB = {
+        guildSupplies = {
+            schemaVersion = 1,
+            localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 },
+            guilds = {
+                ["club:42"] = {
+                    schemaVersion = 1,
+                    activation = GS.ACTIVATION_ACTIVE,
+                    datasetId = sourceDataset,
+                    permission = aliceGuild.permission,
+                    currentCampaignId = aliceGuild.currentCampaignId,
+                    campaigns = aliceGuild.campaigns,
+                    campaignArchives = aliceGuild.campaignArchives or {},
+                    campaignContext = aliceGuild.campaignContext or {},
+                    accounting = {
+                        schemaVersion = 1,
+                        _consumables = aliceGuild.accounting._consumables,
+                        _consumableEvents = {},
+                        _consumableEventArchive = {},
+                        _mutationSeq = 1,
+                    },
+                    observations = { byCampaign = {} },
+                    identityLinks = aliceGuild.identityLinks,
+                    operations = aliceGuild.operations,
+                    confirmationRefs = {},
+                    liveCutover = bobCutover,
+                },
+            },
+        },
+    }
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    local bobRec = GS:GetCurrentRecord()
+    assertEq(bobRec.datasetId, sourceDataset, "3C22: same dataset")
+    assertEq(bobRec.liveCutover.cutoverMarker, bobMarker, "3C22: bob divergent marker")
+
+    -- Without authenticated conflict peer, same_dataset remains rejected.
+    assertEq(select(3, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "same_dataset",
+        "3C22: same_dataset without conflict peer")
+
+    -- Non-editor peer cannot unlock recovery (fails editor auth before same_dataset).
+    GS.NotePeerDataset("Dave-Garona", sourceDataset, {
+        editorRankPosition = 4,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = sourceMarker,
+        liveCutover = sourceCutover,
+    })
+    assertEq(GS:GetLiveActivationConflictState().blocked, false,
+        "3C22: non-editor peer does not create conflict")
+    assertEq(select(3, GS:BeginDatasetAdoption("Dave-Garona", sourceDataset)), "unauthorized",
+        "3C22: non-editor adoption rejected")
+
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, {
+        editorRankPosition = 1,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = sourceMarker,
+        liveCutover = sourceCutover,
+    })
+    local conflict = GS:GetLiveActivationConflictState()
+    assertEq(conflict.blocked, true, "3C22: editor conflict blocked")
+
+    local peers = GS:ListPeerDatasets()
+    local sawCutoverPeer = false
+    for i = 1, #peers do
+        if peers[i].peerName == "Alice-Garona" and peers[i].sameAsLocal then
+            assertEq(peers[i].cutoverMarker, sourceMarker, "3C22: peer cutover exposed")
+            sawCutoverPeer = true
+        end
+    end
+    assertTrue(sawCutoverPeer, "3C22: same-dataset peer listed")
+
+    local adop, stBegin, reasonBegin = GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)
+    assertEq(stBegin, "accepted",
+        "3C22: cutover-resolution begin st=" .. tostring(stBegin)
+            .. " r=" .. tostring(reasonBegin))
+    assertEq(adop.cutoverResolution, true, "3C22: cutoverResolution flagged")
+    for i = 1, #bodies do
+        local stB = select(1, GS:BufferAdoptionRecord(bodies[i].id, bodies[i].body))
+        assertTrue(stB == "accepted" or stB == "duplicate",
+            "3C22: buffer st=" .. tostring(stB))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and not GS._adoption.committed and guard < 4000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    local resolved = GS:GetCurrentRecord()
+    assertEq(stAdopt, "accepted",
+        "3C22: cutover adoption accepted st=" .. tostring(stAdopt)
+            .. " r=" .. tostring(reasonAdopt))
+    assertEq(resolved.datasetId, sourceDataset, "3C22: dataset unchanged")
+    assertEq(resolved.activation, GS.ACTIVATION_ACTIVE, "3C22: remains active")
+    assertEq(resolved.liveCutover.cutoverMarker, sourceMarker,
+        "3C22: converged to alice marker")
+    assertEq(tonumber(resolved.accounting._consumables.eligibility.tabEligibleFrom),
+        tonumber(resolved.liveCutover.contextObservedAt),
+        "3C22: eligibility follows source boundary")
+
+    -- After convergence, conflict clears when peer marker matches.
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, {
+        editorRankPosition = 1,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = sourceMarker,
+        liveCutover = sourceCutover,
+    })
+    assertEq(GS:GetLiveActivationConflictState().blocked, false,
+        "3C22: conflict cleared after convergence")
+    assertEq(#world.chat, 0, "3C22: no chat")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

@@ -179,14 +179,14 @@ function BankLog:EligibleContext()
     local C = SF.Consumables
     local O = SF.ConsumablesObservation
     local GS = SF.GuildSupplies
-    if GS and C and type(C.LegacyWritersAllowed) == "function" and not C.LegacyWritersAllowed() then
-        -- Live Guild Supplies without eligible campaign/items: do not fall back
-        -- to profile writers for the same guild.
-        return nil
-    end
     if not C or not O then return nil end
     local profile = self:AccountingProfile()
     if type(profile) ~= "table" then return nil end
+    if GS and type(C.LegacyWritersAllowed) == "function" and not C.LegacyWritersAllowed(profile) then
+        -- Live Guild Supplies for this profile's guild: do not fall back to
+        -- profile writers for that guild (#389).
+        return nil
+    end
     local cfg = C.Ensure(profile)
     if type(cfg) ~= "table" then return nil end
     if type(cfg.guild) ~= "table" or type(cfg.guild.guid) ~= "string" or cfg.guild.guid == "" then

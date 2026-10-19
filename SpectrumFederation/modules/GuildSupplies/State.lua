@@ -886,6 +886,27 @@ function GS:GetCurrentRecord()
     return record, nil, identity
 end
 
+--- Validated guild record for an explicit durable key (never allocates).
+-- Used for profile-scoped legacy-writer decisions across multi-guild accounts.
+function GS:GetRecordForGuildKey(guildKey)
+    if not GS:IsRootReady() then
+        return nil, GS:GetRootReason()
+    end
+    local key = select(1, GS.ParseGuildKey(guildKey))
+    if not key then
+        return nil, "invalid_guild_key"
+    end
+    local record = GS._root.guilds[key]
+    if record == nil then
+        return nil, "not_configured"
+    end
+    local ok, err = ValidateGuildRecord(key, record)
+    if not ok then
+        return nil, err or "unsupported_schema"
+    end
+    return record, nil
+end
+
 --- Explicit local staged creation. Requires verified current guild + authority.
 -- @param editorRankPosition number|nil GM-selected threshold when fewer than 3 ranks exist.
 --   Ordinary guilds (≥3 ranks) ignore this and use default position 3.

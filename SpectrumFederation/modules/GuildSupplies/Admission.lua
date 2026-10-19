@@ -1981,8 +1981,35 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         return nil, "rejected", "invalid_dataset_id"
     end
     local localRecord = select(1, GS:GetCurrentRecord())
+    local cutoverResolution = false
     if localRecord and localRecord.datasetId == sourceDatasetId then
-        return nil, "rejected", "same_dataset"
+        -- Same dataset ID is normally rejected, except authenticated live
+        -- cutover-marker conflicts where adopting one complete canonical source
+        -- is the explicit recovery path (#389).
+        local peerEntry = GS._peerDatasets and GS._peerDatasets[member.name]
+        local conflict = GS.GetLiveActivationConflictState
+            and GS:GetLiveActivationConflictState() or nil
+        local localMarker = localRecord.liveCutover
+            and localRecord.liveCutover.cutoverMarker or nil
+        if GS.IsLiveActive(localRecord) and conflict and conflict.blocked
+            and type(peerEntry) == "table"
+            and peerEntry.datasetId == sourceDatasetId
+            and type(peerEntry.cutoverMarker) == "string"
+            and peerEntry.cutoverMarker ~= ""
+            and type(localMarker) == "string"
+            and peerEntry.cutoverMarker ~= localMarker then
+            for i = 1, #(conflict.peers or {}) do
+                local p = conflict.peers[i]
+                if p and p.peerName == member.name
+                    and p.cutoverMarker == peerEntry.cutoverMarker then
+                    cutoverResolution = true
+                    break
+                end
+            end
+        end
+        if not cutoverResolution then
+            return nil, "rejected", "same_dataset"
+        end
     end
 
     local existing = GS._adoption
@@ -2039,6 +2066,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         localAccountingMutation = localAccountingMutation,
         localActivation = localActivation,
         localCutoverMarker = localCutoverMarker,
+        cutoverResolution = cutoverResolution and true or false,
         handleGeneration = ctx.handleGeneration,
         actorGuid = ctx.actorGuid,
         records = {},
@@ -4559,6 +4587,23 @@ local function ValidateAdoptionEffectiveState(temp, adop, desc)
                 return false, "incomplete_transfer"
             end
         end
+        -- Active sources must publish with the authenticated cutover installed;
+        -- never accept a staged publish of an already-live canonical dataset (#389).
+        if desc.activation == GS.ACTIVATION_ACTIVE then
+            if temp.activation ~= GS.ACTIVATION_ACTIVE then
+                return false, "incomplete_transfer"
+            end
+            local wantMarker = nil
+            if type(desc.liveCutover) == "table" then
+                wantMarker = desc.liveCutover.cutoverMarker
+            end
+            wantMarker = wantMarker or desc.cutoverMarker
+            local haveMarker = temp.liveCutover and temp.liveCutover.cutoverMarker or nil
+            if type(wantMarker) ~= "string" or wantMarker == ""
+                or haveMarker ~= wantMarker then
+                return false, "incomplete_transfer"
+            end
+        end
     end
     return true, nil
 end
@@ -4756,6 +4801,16 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
 end
 
 local function PublishAdoptionTemp(adop, temp, desc)
+    -- After replay, campaign ops may have rebuilt eligibility maps. Restore the
+    -- authenticated source cutover boundary before structure validation/publish.
+    if GS.IsLiveActive(temp) and type(temp.liveCutover) == "table"
+        and GS.InstallRemoteLiveCutover then
+        GS.InstallRemoteLiveCutover(temp, temp.liveCutover, adop.guildKey, {
+            refreshEligibility = true,
+            quarantinePending = false,
+            classifyPreActivation = false,
+        })
+    end
     local okEff, effErr = ValidateAdoptionEffectiveState(temp, adop, desc)
     if not okEff then
         return false, effErr or "incomplete_transfer"
@@ -5057,6 +5112,27 @@ function GS:CommitDatasetAdoption()
     end
 
     local temp = NewBootstrapRecord(adop.sourceDatasetId, adop.guildKey, identity, bootstrapPos)
+    -- Active source descriptors install their authenticated liveCutover onto the
+    -- temporary record before replay/publish so ledger admissions classify against
+    -- the original eligibility boundary and atomic publish cannot demote live
+    -- authority to staged (#389).
+    if desc.activation == GS.ACTIVATION_ACTIVE then
+        if type(desc.liveCutover) ~= "table" then
+            return "rejected", "missing_live_cutover"
+        end
+        local stCut, cutReason = GS.InstallRemoteLiveCutover(temp, desc.liveCutover, adop.guildKey, {
+            quarantinePending = false,
+            forceActive = true,
+            classifyPreActivation = false,
+            member = member,
+            requireEditorAuthority = true,
+            bindActorToSender = false,
+            authOpts = { allowBootstrapInstall = true },
+        })
+        if stCut ~= "accepted" and stCut ~= "duplicate" then
+            return "rejected", cutReason or "invalid_live_cutover"
+        end
+    end
     -- Offline replay: never publish temp until fully validated. Live guild slot
     -- stays untouched; AdmitRemoteOperation uses offlineRecord=temp only.
     -- Session-local relay/boundary caches; live globals stay in place across yields.
@@ -6709,6 +6785,15 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
     if op.datasetId ~= record.datasetId then
         return "rejected", "dataset_mismatch"
     end
+    -- Shared remote mutation boundary: authenticated live cutover conflict
+    -- fail-closes production config/campaign/ledger-adjacent ops. Adoption
+    -- replay onto a temporary record remains exempt (#389).
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, admissionCtx)
+        if blocked then
+            return "rejected", blockReason or "live_activation_conflict"
+        end
+    end
 
     -- Valid-policy rank changes replicate from ordinary authenticated editors.
     -- GM recovery is required only when the current policy is incoherent.
@@ -7643,6 +7728,9 @@ function GS:ListPeerDatasets()
                     datasetId = entry.datasetId,
                     sameAsLocal = false,
                     editorVerified = true,
+                    activation = entry.activation,
+                    cutoverMarker = entry.cutoverMarker,
+                    liveCutover = entry.liveCutover,
                 }
             elseif editorOk and entry.datasetId == localId then
                 out[#out + 1] = {
@@ -7650,6 +7738,9 @@ function GS:ListPeerDatasets()
                     datasetId = entry.datasetId,
                     sameAsLocal = true,
                     editorVerified = true,
+                    activation = entry.activation,
+                    cutoverMarker = entry.cutoverMarker,
+                    liveCutover = entry.liveCutover,
                 }
             end
         end

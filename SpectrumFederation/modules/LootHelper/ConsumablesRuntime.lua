@@ -30,9 +30,11 @@ end
 
 local function Warn(text)
     Debug("Warn", "%s", tostring(text))
-    -- After Guild Supplies activation, deposit/reminder paths stay chat-free (#389).
+    -- After Guild Supplies activation for the active accounting profile's guild,
+    -- deposit/reminder paths stay chat-free (#389).
     local C = SF.Consumables
-    if C and C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
+    local profile = Runtime.Profile and Runtime:Profile() or nil
+    if C and C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
         return
     end
     if SF.PrintWarning then

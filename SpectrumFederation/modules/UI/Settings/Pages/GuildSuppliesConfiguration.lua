@@ -345,17 +345,45 @@ local function AdoptionSourceOptions()
 	if not g or not g.ListPeerDatasets then
 		return opts
 	end
+	local localRecord = g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	local localMarker = localRecord and localRecord.liveCutover
+		and localRecord.liveCutover.cutoverMarker or nil
+	local conflict = g.GetLiveActivationConflictState
+		and g:GetLiveActivationConflictState() or nil
+	local conflictMarkers = {}
+	if conflict and conflict.blocked then
+		for i = 1, #(conflict.peers or {}) do
+			local cp = conflict.peers[i]
+			if cp and type(cp.peerName) == "string" and type(cp.cutoverMarker) == "string" then
+				conflictMarkers[cp.peerName] = cp.cutoverMarker
+			end
+		end
+	end
 	local peers = g:ListPeerDatasets()
 	for i = 1, #peers do
 		local p = peers[i]
-		if p and not p.sameAsLocal then
-			opts[#opts + 1] = {
-				value = tostring(p.peerName) .. "\0" .. tostring(p.datasetId),
-				label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE_FMT", "%s — %s")
-					:format(tostring(p.peerName), tostring(p.datasetId)),
-				peerName = p.peerName,
-				datasetId = p.datasetId,
-			}
+		if p then
+			local cutoverResolve = p.sameAsLocal
+				and conflictMarkers[p.peerName]
+				and conflictMarkers[p.peerName] ~= localMarker
+			if (not p.sameAsLocal) or cutoverResolve then
+				local label
+				if cutoverResolve then
+					label = Loc("GUILD_SUPPLIES_ADOPTION_CUTOVER_SOURCE_FMT",
+						"%s — resolve live cutover to %s")
+						:format(tostring(p.peerName), tostring(conflictMarkers[p.peerName]))
+				else
+					label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE_FMT", "%s — %s")
+						:format(tostring(p.peerName), tostring(p.datasetId))
+				end
+				opts[#opts + 1] = {
+					value = tostring(p.peerName) .. "\0" .. tostring(p.datasetId),
+					label = label,
+					peerName = p.peerName,
+					datasetId = p.datasetId,
+					cutoverResolution = cutoverResolve and true or false,
+				}
+			end
 		end
 	end
 	return opts
@@ -489,6 +517,17 @@ local function BeginAdoptionTransfer(ctx)
 	end
 	local peer = pendingAdoptionPeer
 	local datasetId = pendingAdoptionDataset
+	local cutoverResolution = false
+	do
+		local opts = AdoptionSourceOptions()
+		for i = 1, #opts do
+			if opts[i].peerName == peer and opts[i].datasetId == datasetId
+				and opts[i].cutoverResolution then
+				cutoverResolution = true
+				break
+			end
+		end
+	end
 	local accept = function()
 		ctx.section:ClearMessage()
 		local session, status, reason = g:BeginDatasetAdoption(peer, datasetId)
@@ -500,9 +539,13 @@ local function BeginAdoptionTransfer(ctx)
 		RefreshPageControls()
 	end
 	if dialogs and dialogs.Confirm then
+		local confirmText = cutoverResolution
+			and Loc("GUILD_SUPPLIES_ADOPTION_CUTOVER_CONFIRM",
+				"Replace this client's live Guild Supplies cutover with the selected peer's authenticated complete dataset and cutover marker? Local divergent live state is not merged. Cancel leaves the current blocked state unchanged.")
+			or Loc("GUILD_SUPPLIES_ADOPTION_CONFIRM",
+				"Replace this client's local staged Guild Supplies configuration/dataset with the selected source dataset? The two datasets are not merged. Cancel leaves local state unchanged. This does not activate live bank accounting.")
 		dialogs:Confirm(
-			Loc("GUILD_SUPPLIES_ADOPTION_CONFIRM",
-				"Replace this client's local staged Guild Supplies configuration/dataset with the selected source dataset? The two datasets are not merged. Cancel leaves local state unchanged. This does not activate live bank accounting."),
+			confirmText,
 			Loc("GUILD_SUPPLIES_ADOPTION_BUTTON", "Adopt selected dataset"),
 			accept
 		)

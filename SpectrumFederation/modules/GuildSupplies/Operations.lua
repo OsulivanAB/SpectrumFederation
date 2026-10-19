@@ -1217,6 +1217,13 @@ function GS:ApplyStagedConfigOperation(op, context)
     if recovery and op.kind ~= KIND.SET_EDITOR_RANK then
         return "rejected", "invalid_permission"
     end
+    -- Authenticated live cutover conflict fail-closes production config writes (#389).
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, context)
+        if blocked then
+            return "rejected", blockReason or "live_activation_conflict"
+        end
+    end
 
     local ops = record.operations
     local existing = ops.records[op.id]

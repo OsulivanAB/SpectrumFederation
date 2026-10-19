@@ -14,17 +14,18 @@ local function Loc(key, default)
 end
 
 --- True while legacy profile-scoped Consumables may mutate production state.
--- Once Guild Supplies is live-active for the current guild, returns false.
-function C.LegacyWritersAllowed()
+-- When `profile` is provided, the decision follows that profile's configured
+-- guild — not merely the logged-in character's current guild (#389).
+function C.LegacyWritersAllowed(profile)
     local GS = SF.GuildSupplies
     if GS and type(GS.ShouldUseLegacyConsumablesWriters) == "function" then
-        return GS:ShouldUseLegacyConsumablesWriters() and true or false
+        return GS:ShouldUseLegacyConsumablesWriters(profile) and true or false
     end
     return true
 end
 
-local function LegacyWriteBlocked()
-    if C.LegacyWritersAllowed() then
+local function LegacyWriteBlocked(profile)
+    if C.LegacyWritersAllowed(profile) then
         return false
     end
     return true, Loc("CONSUMABLES_LEGACY_WRITERS_RETIRED",
@@ -2193,7 +2194,7 @@ local function AssignStoredBody(stored, event)
 end
 
 function C.AppendEvent(profile, event, opts)
-    local blocked, blockReason = LegacyWriteBlocked()
+    local blocked, blockReason = LegacyWriteBlocked(profile)
     if blocked then
         return false, blockReason
     end
@@ -2902,7 +2903,7 @@ end
 
 function C.RecordManualAdjustment(profile, admin, itemId, quantity, attributed, opts)
     do
-        local blocked, blockReason = LegacyWriteBlocked()
+        local blocked, blockReason = LegacyWriteBlocked(profile)
         if blocked then
             return false, blockReason
         end
@@ -3349,9 +3350,10 @@ end
 function C.MergeSnapshot(profile, data, opts)
     C.Ensure(profile)
     if data == nil then return true end
-    -- After Guild Supplies activation, ignore legacy consumables snapshot traffic
-    -- so old clients cannot credit or seize canonical guild accounting (#389).
-    if not C.LegacyWritersAllowed() then
+    -- After Guild Supplies activation for this profile's guild, ignore legacy
+    -- consumables snapshot traffic so old clients cannot credit or seize
+    -- canonical guild accounting (#389).
+    if not C.LegacyWritersAllowed(profile) then
         Debug("Info", "MergeSnapshot ignored: Guild Supplies live writers active")
         return true
     end
@@ -3571,7 +3573,7 @@ function C.CopyConfiguration(source, dest)
 end
 
 function C.ApplyOp(profile, op, actor, opts)
-    local blocked, blockReason = LegacyWriteBlocked()
+    local blocked, blockReason = LegacyWriteBlocked(profile)
     if blocked then
         return false, blockReason
     end
@@ -3595,7 +3597,7 @@ function C.ApplyOp(profile, op, actor, opts)
 end
 
 function C.CommitEvents(profile, token, events, opts)
-    local blocked, blockReason = LegacyWriteBlocked()
+    local blocked, blockReason = LegacyWriteBlocked(profile)
     if blocked then
         return false, blockReason
     end

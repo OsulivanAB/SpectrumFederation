@@ -54,8 +54,53 @@ function GS:IsLiveActiveForCurrentGuild()
     return GS.IsLiveActive(record)
 end
 
---- Legacy profile Consumables may write only while this guild is not live-active.
-function GS:ShouldUseLegacyConsumablesWriters()
+--- Whether legacy profile writers may mutate accounting for a specific guild key.
+-- @param guildKey string durable `club:<id>` key
+-- @return boolean allowed
+function GS.ShouldUseLegacyConsumablesWritersForGuildKey(guildKey)
+    if not GS:IsRootReady() then
+        return true
+    end
+    local key = GS.ParseGuildKey and select(1, GS.ParseGuildKey(guildKey)) or nil
+    if not key then
+        -- Ambiguous target: fail closed (do not allow legacy writes into an
+        -- unresolvable guild identity while GS root is available).
+        return false
+    end
+    local record
+    if GS.GetRecordForGuildKey then
+        record = select(1, GS:GetRecordForGuildKey(key))
+    else
+        record = GS._root and GS._root.guilds and GS._root.guilds[key]
+    end
+    if record == nil then
+        return true
+    end
+    if GS.IsSupportedActivation and not GS.IsSupportedActivation(record.activation) then
+        return false
+    end
+    return not GS.IsLiveActive(record)
+end
+
+--- Legacy profile Consumables may write only when the *target* guild is not live.
+-- @param profileOrGuild optional profile table, club guid string, or guildKey.
+--   When omitted, uses the current character's guild (Settings page visibility).
+function GS:ShouldUseLegacyConsumablesWriters(profileOrGuild)
+    if type(profileOrGuild) == "table" then
+        local cfg = profileOrGuild._consumables
+        local guid = cfg and type(cfg.guild) == "table" and cfg.guild.guid or nil
+        if type(guid) ~= "string" or guid == "" then
+            -- Unbound profile may still configure guild/tab via legacy writers.
+            return true
+        end
+        return GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:" .. tostring(guid))
+    end
+    if type(profileOrGuild) == "string" and profileOrGuild ~= "" then
+        if profileOrGuild:match("^club:") then
+            return GS.ShouldUseLegacyConsumablesWritersForGuildKey(profileOrGuild)
+        end
+        return GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:" .. profileOrGuild)
+    end
     if not GS:IsRootReady() then
         -- Unavailable GS root must not invent live authority; keep legacy for
         -- unrelated guilds/profiles until a validated active record exists.
@@ -757,6 +802,14 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     end
     if GS.IsLiveActive(record) and type(record.liveCutover) == "table" then
         if record.liveCutover.cutoverMarker == copy.cutoverMarker then
+            -- Adoption replay may have rebuilt eligibility via campaign ops;
+            -- refresh the agreed live boundary without reclassifying ledger (#389).
+            if opts.refreshEligibility then
+                local cfg = record.accounting and record.accounting._consumables
+                if type(cfg) == "table" then
+                    ApplyLiveEligibilityBoundary(cfg, copy)
+                end
+            end
             return "duplicate", "already_activated"
         end
         -- Divergent live markers: never silently overwrite.
