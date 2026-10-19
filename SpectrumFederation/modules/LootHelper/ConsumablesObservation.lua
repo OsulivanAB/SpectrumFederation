@@ -825,3 +825,34 @@ function O.RequestedSetFromConfig(cfg)
     end
     return set
 end
+
+--- Build eligible deposit evidence rows from a bank-log snapshot (#389 live path).
+-- Does not mutate observation stores or credit donations.
+function O.ListEligibleEvidenceFromSnapshot(snapshot, opts)
+    opts = opts or {}
+    if type(snapshot) ~= "table" then
+        return {}
+    end
+    local now = tonumber(opts.now) or Now()
+    local evidenceRows = EnrichSnapshotRows(snapshot.rows or snapshot.transactions, snapshot.requestedSet, {
+        guildGuid = tostring(snapshot.guildGuid or ""),
+        bankTab = tonumber(snapshot.bankTab),
+        generation = snapshot.generation,
+        observedBy = snapshot.observedBy,
+        observedAt = tonumber(snapshot.observedAt) or now,
+    })
+    local eligibility = snapshot.eligibility
+    if type(eligibility) == "table" then
+        local filtered = {}
+        for i = 1, #evidenceRows do
+            if O.IsEvidenceEligible(evidenceRows[i], eligibility) then
+                if not (O.EvidenceSpansEligibilityBoundary
+                    and O.EvidenceSpansEligibilityBoundary(evidenceRows[i], eligibility)) then
+                    filtered[#filtered + 1] = evidenceRows[i]
+                end
+            end
+        end
+        return filtered
+    end
+    return evidenceRows
+end

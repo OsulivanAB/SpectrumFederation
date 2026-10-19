@@ -1,5 +1,5 @@
--- Guild Bank transaction-log observer host for Raid Consumables (Issue #366 PR1).
--- Captures local observations only; does not write canonical donation events.
+-- Guild Bank transaction-log observer host for Raid Consumables / Guild Supplies.
+-- After #389 live activation, observations feed Guild Supplies three-witness ledger.
 local _, SF = ...
 
 SF.ConsumablesBankLog = SF.ConsumablesBankLog or {}
@@ -77,9 +77,71 @@ function BankLog:ObserverId()
     return nil
 end
 
+function BankLog:GuildSuppliesEligibleContext()
+    local GS = SF.GuildSupplies
+    local O = SF.ConsumablesObservation
+    if not GS or not O or not GS.IsLiveActiveForCurrentGuild then
+        return nil
+    end
+    if not GS:IsLiveActiveForCurrentGuild() then
+        return nil
+    end
+    local record, reason = GS:GetCurrentRecord()
+    if not record then
+        Debug("Verbose", "guild supplies observation idle: %s", tostring(reason))
+        return nil
+    end
+    local cfg = record.accounting and record.accounting._consumables
+    if type(cfg) ~= "table" then return nil end
+    if type(cfg.guild) ~= "table" or type(cfg.guild.guid) ~= "string" or cfg.guild.guid == "" then
+        return nil
+    end
+    local tab = tonumber(cfg.bankTab)
+    if not tab or tab < 1 or tab > 8 then return nil end
+    local guildGuid = self:CurrentGuildGuid()
+    if not guildGuid or guildGuid ~= tostring(cfg.guild.guid) then
+        return nil
+    end
+    if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+        return nil
+    end
+    local requestedSet = O.RequestedSetFromConfig(cfg)
+    local hasRequested = false
+    for _ in pairs(requestedSet) do
+        hasRequested = true
+        break
+    end
+    if not hasRequested then return nil end
+    return {
+        source = "guildSupplies",
+        record = record,
+        profile = nil,
+        profileId = "guildSupplies:" .. tostring(record.datasetId),
+        cfg = cfg,
+        guildGuid = guildGuid,
+        bankTab = tab,
+        generation = tonumber(cfg.generation) or 0,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        requestedSet = requestedSet,
+        observedBy = self:ObserverId(),
+        eligibility = cfg.eligibility,
+    }
+end
+
 function BankLog:EligibleContext()
+    local gsCtx = self:GuildSuppliesEligibleContext()
+    if gsCtx then
+        return gsCtx
+    end
     local C = SF.Consumables
     local O = SF.ConsumablesObservation
+    local GS = SF.GuildSupplies
+    if GS and C and type(C.LegacyWritersAllowed) == "function" and not C.LegacyWritersAllowed() then
+        -- Live Guild Supplies without eligible campaign/items: do not fall back
+        -- to profile writers for the same guild.
+        return nil
+    end
     if not C or not O then return nil end
     local profile = self:AccountingProfile()
     if type(profile) ~= "table" then return nil end
@@ -102,6 +164,7 @@ function BankLog:EligibleContext()
     end
     if not hasRequested then return nil end
     return {
+        source = "legacyProfile",
         profile = profile,
         profileId = self:ProfileId(profile),
         cfg = cfg,
@@ -111,6 +174,51 @@ function BankLog:EligibleContext()
         requestedSet = requestedSet,
         observedBy = self:ObserverId(),
     }
+end
+
+function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
+    local GS = SF.GuildSupplies
+    local O = SF.ConsumablesObservation
+    if not GS or not O or type(ctx) ~= "table" or type(snapshot) ~= "table" then
+        return { admitted = 0, pending = 0, rejected = 0 }
+    end
+    local evidenceRows = O.ListEligibleEvidenceFromSnapshot(snapshot)
+    local stats = { admitted = 0, pending = 0, rejected = 0, duplicate = 0 }
+    local ctxAuth = GS:GetCurrentContext()
+    if not ctxAuth or not ctxAuth.ready or type(ctxAuth.actorGuid) ~= "string" then
+        Debug("Warn", "guild supplies admit skipped: local actor not ready")
+        return stats
+    end
+    local member = {
+        guid = ctxAuth.actorGuid,
+        name = ctxAuth.actorName or self:ObserverId(),
+        guildKey = ctxAuth.guildKey,
+        rankOrder = ctxAuth.rankOrder,
+    }
+    for i = 1, #evidenceRows do
+        local evidence = evidenceRows[i]
+        if type(evidence) == "table" then
+            evidence.campaignId = evidence.campaignId or ctx.campaignId
+            evidence.datasetId = evidence.datasetId or ctx.datasetId
+            local st, reason = GS:AdmitDirectObservation(evidence, {
+                member = member,
+                sender = member.name,
+                localWrite = true,
+                campaignId = ctx.campaignId,
+            })
+            if st == "accepted" then
+                stats.admitted = stats.admitted + 1
+            elseif st == "duplicate" then
+                stats.duplicate = stats.duplicate + 1
+            elseif st == "pending" then
+                stats.pending = stats.pending + 1
+            else
+                stats.rejected = stats.rejected + 1
+                Debug("Verbose", "guild supplies evidence rejected reason=%s", tostring(reason))
+            end
+        end
+    end
+    return stats
 end
 
 local function ClearFreshLogStamp(self)
@@ -269,8 +377,25 @@ function BankLog:ProcessLogUpdate(reason)
     self.lastFreshLogTab = ctx.bankTab
     self.lastFreshLogGuild = ctx.guildGuid
 
+    -- Guild Supplies live path: no profile, no raid session, three-witness ledger.
+    if ctx.source == "guildSupplies" then
+        snapshot.eligibility = ctx.eligibility
+        local admitStats = self:AdmitGuildSuppliesSnapshot(ctx, snapshot)
+        self.lastStats = admitStats
+        self.lastVerifyStats = nil
+        Debug("Info",
+            "guild supplies bank admit reason=%s accepted=%s pending=%s duplicate=%s rejected=%s rows=%s",
+            tostring(reason or "update"),
+            tostring(admitStats.admitted),
+            tostring(admitStats.pending),
+            tostring(admitStats.duplicate),
+            tostring(admitStats.rejected),
+            tostring(#(snapshot.rows or {})))
+        return
+    end
+
     local C = SF.Consumables
-    if C and C.EligibilitySnapshot then
+    if C and C.EligibilitySnapshot and ctx.profile then
         snapshot.eligibility = C.EligibilitySnapshot(ctx.profile)
     end
 
@@ -291,7 +416,7 @@ function BankLog:ProcessLogUpdate(reason)
         tostring(stats.suppressed),
         tostring(#snapshot.rows))
 
-    if C and C.NoteObservationBaseline then
+    if C and C.NoteObservationBaseline and ctx.profile then
         C.NoteObservationBaseline(ctx.profile)
     end
 
@@ -300,7 +425,7 @@ function BankLog:ProcessLogUpdate(reason)
     local Sync = SF.LootHelperSync
     local sessionActive = Sync and Sync.state and Sync.state.active
         and Sync.state.profileId == ctx.profileId
-    if V and V.ProcessLocalAfterReconcile and scope then
+    if V and V.ProcessLocalAfterReconcile and scope and ctx.profile then
         local historyReady = true
         local historyBaselineAt = nil
         if sessionActive and Sync._ConsumablesHistoryReady then
@@ -324,7 +449,7 @@ function BankLog:ProcessLogUpdate(reason)
     end
     -- Non-admin (and deferred admin) observations must reach the coordinator while
     -- a session is active; do not wait for a local trust commit.
-    if sessionActive and Sync and Sync._FlushPendingConsumableObservations then
+    if sessionActive and Sync and Sync._FlushPendingConsumableObservations and ctx.profile then
         Sync:_FlushPendingConsumableObservations(ctx.profile)
     end
 end

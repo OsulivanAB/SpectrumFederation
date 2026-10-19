@@ -30,6 +30,11 @@ end
 
 local function Warn(text)
     Debug("Warn", "%s", tostring(text))
+    -- After Guild Supplies activation, deposit/reminder paths stay chat-free (#389).
+    local C = SF.Consumables
+    if C and C.LegacyWritersAllowed and not C.LegacyWritersAllowed() then
+        return
+    end
     if SF.PrintWarning then
         SF:PrintWarning(text)
     end
@@ -50,7 +55,34 @@ function Runtime:Profile()
     return nil
 end
 
+function Runtime:GuildSuppliesProxy()
+    local GS = SF.GuildSupplies
+    if not GS or not GS.IsLiveActiveForCurrentGuild or not GS:IsLiveActiveForCurrentGuild() then
+        return nil
+    end
+    local record = select(1, GS:GetCurrentRecord())
+    if not record or type(record.accounting) ~= "table" then
+        return nil
+    end
+    local cfg = record.accounting._consumables
+    if type(cfg) ~= "table" then
+        return nil
+    end
+    return {
+        _sfGuildSuppliesProxy = true,
+        _profileId = "guildSupplies:" .. tostring(record.datasetId or "unknown"),
+        _consumables = cfg,
+        _consumableEvents = record.accounting._consumableEvents or {},
+        _consumableEventArchive = record.accounting._consumableEventArchive or {},
+    }
+end
+
 function Runtime:AccountingProfile()
+    -- Guild Supplies live authority does not require a Loot Helper profile/session.
+    local gsProxy = self:GuildSuppliesProxy()
+    if gsProxy then
+        return gsProxy
+    end
     local active = self:Profile()
     local sync = SF.LootHelperSync
     local state = sync and sync.state

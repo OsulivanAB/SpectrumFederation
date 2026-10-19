@@ -1,5 +1,6 @@
 -- Raid Consumables domain, ledger, and projections.
 -- Configuration lives on the LootProfile. Accounting is append-only events.
+-- After Guild Supplies live activation (#389), profile writers are isolated.
 local _, SF = ...
 
 SF.Consumables = SF.Consumables or {}
@@ -10,6 +11,24 @@ local function Loc(key, default)
         return SF.LocaleText(key, default)
     end
     return default or key
+end
+
+--- True while legacy profile-scoped Consumables may mutate production state.
+-- Once Guild Supplies is live-active for the current guild, returns false.
+function C.LegacyWritersAllowed()
+    local GS = SF.GuildSupplies
+    if GS and type(GS.ShouldUseLegacyConsumablesWriters) == "function" then
+        return GS:ShouldUseLegacyConsumablesWriters() and true or false
+    end
+    return true
+end
+
+local function LegacyWriteBlocked()
+    if C.LegacyWritersAllowed() then
+        return false
+    end
+    return true, Loc("CONSUMABLES_LEGACY_WRITERS_RETIRED",
+        "Raid Consumables profile writers are retired for this guild. Use Guild Supplies.")
 end
 
 C.EVENT = {
@@ -857,6 +876,10 @@ end
 
 function C.Ensure(profile)
     if type(profile) ~= "table" then return nil end
+    -- Read-only Guild Supplies accounting proxy (#389): never allocate/mutate.
+    if profile._sfGuildSuppliesProxy then
+        return type(profile._consumables) == "table" and profile._consumables or nil
+    end
     if type(profile._consumables) ~= "table" then
         profile._consumables = {
             generation = 1,
@@ -2170,6 +2193,10 @@ local function AssignStoredBody(stored, event)
 end
 
 function C.AppendEvent(profile, event, opts)
+    local blocked, blockReason = LegacyWriteBlocked()
+    if blocked then
+        return false, blockReason
+    end
     opts = opts or {}
     if type(event) ~= "table" or type(event.type) ~= "string" then
         return false, "Invalid accounting event."
@@ -2855,6 +2882,13 @@ function C.ManualAdjustmentEvents(profile, admin, itemId, quantity, attributed, 
 end
 
 function C.RecordManualAdjustment(profile, admin, itemId, quantity, attributed, opts)
+    do
+        local blocked, blockReason = LegacyWriteBlocked()
+        if blocked then
+            return false, blockReason
+        end
+    end
+
     local token, events, err = C.ManualAdjustmentEvents(profile, admin, itemId, quantity, attributed, opts)
     if not events then
         return false, err
@@ -3296,6 +3330,12 @@ end
 function C.MergeSnapshot(profile, data, opts)
     C.Ensure(profile)
     if data == nil then return true end
+    -- After Guild Supplies activation, ignore legacy consumables snapshot traffic
+    -- so old clients cannot credit or seize canonical guild accounting (#389).
+    if not C.LegacyWritersAllowed() then
+        Debug("Info", "MergeSnapshot ignored: Guild Supplies live writers active")
+        return true
+    end
     local ok, err = C.ValidateSnapshot(data)
     if not ok then return false, err end
     local localDesc = C.Descriptor(profile)
@@ -3512,6 +3552,10 @@ function C.CopyConfiguration(source, dest)
 end
 
 function C.ApplyOp(profile, op, actor, opts)
+    local blocked, blockReason = LegacyWriteBlocked()
+    if blocked then
+        return false, blockReason
+    end
     if type(op) ~= "table" or type(op.name) ~= "string" then
         return false, "Unknown configuration change."
     end
@@ -3532,6 +3576,10 @@ function C.ApplyOp(profile, op, actor, opts)
 end
 
 function C.CommitEvents(profile, token, events, opts)
+    local blocked, blockReason = LegacyWriteBlocked()
+    if blocked then
+        return false, blockReason
+    end
     if type(token) ~= "string" or token == "" then
         return false, "Missing transaction id."
     end
