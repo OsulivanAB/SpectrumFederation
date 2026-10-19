@@ -344,39 +344,43 @@ local function SortedItemIds(requestedItems)
 end
 
 --- Emit archive as meta + item pages so each wire body fits MAX_RECORD_CBOR.
+-- Eligibility item cutoffs page with requestedItems (never all 256 in one meta
+-- body). Fail closed when a single page cannot fit the wire budget.
 local function BuildArchiveExportBodies(campaignId, archive, record)
     local out = {}
     local items = archive.requestedItems or {}
     local ids = SortedItemIds(items)
-    local pageCount = math.max(1, math.ceil(math.max(#ids, 1) / ARCHIVE_PAGE_ITEMS))
-    if #ids == 0 then
-        pageCount = 1
-    end
+    local eligSrc = type(archive.eligibility) == "table" and archive.eligibility or nil
+    local eligItems = eligSrc and type(eligSrc.items) == "table" and eligSrc.items or nil
+    local eligIds = SortedItemIds(eligItems or {})
     local itemsFp = FingerprintBody(items)
-    -- Eligibility cutoffs + bankTab must travel with the archive so historical
-    -- witness admission can prove original campaign context (#388 / #4310458291).
-    local eligibility = nil
-    if type(archive.eligibility) == "table" then
-        eligibility = {
-            baselineEstablished = archive.eligibility.baselineEstablished,
-            baselineAt = archive.eligibility.baselineAt,
-            tabEligibleFrom = archive.eligibility.tabEligibleFrom,
+    local budget = WireBudget()
+    local exportId = "gs:ca:" .. campaignId
+    local datasetId = archive.datasetId or record.datasetId
+
+    local function EligibilityScalars(withItems)
+        if not eligSrc then
+            return nil
+        end
+        local eligibility = {
+            baselineEstablished = eligSrc.baselineEstablished,
+            baselineAt = eligSrc.baselineAt,
+            tabEligibleFrom = eligSrc.tabEligibleFrom,
             items = {},
         }
-        if type(archive.eligibility.items) == "table" then
-            -- Preserve original item-id key types so export/assembly Deep.equal
-            -- matches ArchiveCurrentCampaignConfig snapshots.
-            for k, v in pairs(archive.eligibility.items) do
+        if withItems and eligItems then
+            for k, v in pairs(eligItems) do
                 eligibility.items[k] = v
             end
         end
+        return eligibility
     end
-    out[#out + 1] = {
-        id = "gs:ca:" .. campaignId,
-        body = {
+
+    local function MetaBody(pageCount, requestedInline, eligibility)
+        return {
             kind = "campaign-archive",
             campaignId = campaignId,
-            datasetId = archive.datasetId or record.datasetId,
+            datasetId = datasetId,
             generation = archive.generation,
             archivedAt = archive.archivedAt,
             schemaVersion = archive.schemaVersion or GS.SCHEMA_VERSION,
@@ -384,32 +388,116 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
             pageCount = pageCount,
             itemsFingerprint = itemsFp,
             bankTab = tonumber(archive.bankTab),
+            eligibilityItemCount = #eligIds,
             eligibility = eligibility,
-            -- Small archives still include items inline for compatibility.
-            requestedItems = (#ids <= ARCHIVE_PAGE_ITEMS) and items or nil,
-        },
-    }
-    if #ids > ARCHIVE_PAGE_ITEMS then
-        for page = 1, pageCount do
-            local slice = {}
-            local start = (page - 1) * ARCHIVE_PAGE_ITEMS + 1
-            local finish = math.min(#ids, page * ARCHIVE_PAGE_ITEMS)
-            for i = start, finish do
-                local iid = ids[i]
-                slice[iid] = items[iid]
-            end
-            out[#out + 1] = {
-                id = "gs:ca:" .. campaignId .. ":p" .. tostring(page),
-                body = {
+            requestedItems = requestedInline,
+        }
+    end
+
+    -- Prefer inline when both maps are small AND the wrapped body fits wire.
+    local canInline = (#ids <= ARCHIVE_PAGE_ITEMS and #eligIds <= ARCHIVE_PAGE_ITEMS)
+    if canInline then
+        local inlineElig = EligibilityScalars(true)
+        local inlineBody = MetaBody(1, (#ids > 0) and items or {}, inlineElig)
+        if EstimateWireRecordBytes(exportId, inlineBody) <= budget then
+            out[#out + 1] = { id = exportId, body = inlineBody }
+            return out
+        end
+    end
+
+    -- Page by the union of requested + eligibility keys so cutoffs never ride
+    -- solely on the meta body (256 cutoffs exceed MAX_RECORD_CBOR).
+    local keySet, pageKeys = {}, {}
+    for i = 1, #ids do
+        local k = ids[i]
+        if keySet[k] == nil then
+            keySet[k] = true
+            pageKeys[#pageKeys + 1] = k
+        end
+    end
+    for i = 1, #eligIds do
+        local k = eligIds[i]
+        if keySet[k] == nil then
+            keySet[k] = true
+            pageKeys[#pageKeys + 1] = k
+        end
+    end
+    table.sort(pageKeys, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+    if #pageKeys < 1 then
+        local emptyElig = EligibilityScalars(false)
+        local emptyBody = MetaBody(1, {}, emptyElig)
+        if EstimateWireRecordBytes(exportId, emptyBody) > budget then
+            DebugWarn("archive export %s: empty meta exceeds wire budget", tostring(campaignId))
+            return {}
+        end
+        out[#out + 1] = { id = exportId, body = emptyBody }
+        return out
+    end
+
+    -- Adaptive page width: start at ARCHIVE_PAGE_ITEMS, shrink until each page fits.
+    local pageWidth = ARCHIVE_PAGE_ITEMS
+    local pages = nil
+    local pageCount = 1
+    while pageWidth >= 1 do
+        pageCount = math.max(1, math.ceil(#pageKeys / pageWidth))
+        if pageCount > (GS.MAX_ARCHIVE_PAGE_COUNT or 22) then
+            pageWidth = pageWidth - 1
+        else
+            local ok = true
+            pages = {}
+            for page = 1, pageCount do
+                local slice, eligSlice = {}, {}
+                local start = (page - 1) * pageWidth + 1
+                local finish = math.min(#pageKeys, page * pageWidth)
+                for i = start, finish do
+                    local iid = pageKeys[i]
+                    if items[iid] ~= nil then
+                        slice[iid] = items[iid]
+                    end
+                    if eligItems and eligItems[iid] ~= nil then
+                        eligSlice[iid] = eligItems[iid]
+                    end
+                end
+                local pageBody = {
                     kind = "campaign-archive-page",
                     campaignId = campaignId,
-                    datasetId = archive.datasetId or record.datasetId,
+                    datasetId = datasetId,
                     page = page,
                     pageCount = pageCount,
                     requestedItems = slice,
-                },
-            }
+                    eligibilityItems = eligSlice,
+                }
+                local pageId = exportId .. ":p" .. tostring(page)
+                if EstimateWireRecordBytes(pageId, pageBody) > budget then
+                    ok = false
+                    break
+                end
+                pages[#pages + 1] = { id = pageId, body = pageBody }
+            end
+            if ok then
+                break
+            end
+            pages = nil
+            pageWidth = pageWidth - 1
         end
+    end
+    if not pages then
+        -- Fail closed: cannot export historical eligibility under wire budget.
+        DebugWarn("archive export %s: eligibility/items exceed wire budget", tostring(campaignId))
+        return {}
+    end
+
+    local metaElig = EligibilityScalars(false) -- scalars only; items on pages
+    local metaBody = MetaBody(pageCount, nil, metaElig)
+    if EstimateWireRecordBytes(exportId, metaBody) > budget then
+        DebugWarn("archive export %s: meta exceeds wire budget", tostring(campaignId))
+        return {}
+    end
+    out[#out + 1] = { id = exportId, body = metaBody }
+    for i = 1, #pages do
+        out[#out + 1] = pages[i]
     end
     return out
 end
@@ -1999,6 +2087,15 @@ local function ValidateAndApply(record, ctx)
                     end
                 end
             end
+            if type(body.eligibilityItems) == "table" then
+                local n = 0
+                for _ in pairs(body.eligibilityItems) do
+                    n = n + 1
+                    if n > (ARCHIVE_PAGE_ITEMS or 12) then
+                        return "rejected", "invalid_campaign_archive"
+                    end
+                end
+            end
         end
         local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES
             or GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
@@ -2082,6 +2179,23 @@ local function ValidateAndApply(record, ctx)
             return "pending", "missing_predecessor"
         end
         local archive
+        local function CopyEligScalars(src, items)
+            if type(src) ~= "table" and type(items) ~= "table" then
+                return nil
+            end
+            local eligibility = {
+                baselineEstablished = src and src.baselineEstablished,
+                baselineAt = src and src.baselineAt,
+                tabEligibleFrom = src and src.tabEligibleFrom,
+                items = items or {},
+            }
+            if type(src) == "table" and type(src.items) == "table" then
+                for k, v in pairs(src.items) do
+                    eligibility.items[k] = v
+                end
+            end
+            return eligibility
+        end
         if type(meta.requestedItems) == "table" then
             archive = {
                 schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
@@ -2090,6 +2204,8 @@ local function ValidateAndApply(record, ctx)
                 requestedItems = meta.requestedItems,
                 generation = meta.generation,
                 archivedAt = meta.archivedAt,
+                bankTab = tonumber(meta.bankTab),
+                eligibility = CopyEligScalars(meta.eligibility, nil),
             }
         else
             local pageCount = tonumber(meta.pageCount) or tonumber(buf.pageCount) or 1
@@ -2098,6 +2214,7 @@ local function ValidateAndApply(record, ctx)
                 return "rejected", "invalid_campaign_archive"
             end
             local merged, got = {}, 0
+            local eligMerged, eligGot = {}, 0
             for page = 1, pageCount do
                 local p = buf.pages[page]
                 if type(p) ~= "table" or type(p.requestedItems) ~= "table" then
@@ -2107,8 +2224,18 @@ local function ValidateAndApply(record, ctx)
                     merged[k] = v
                     got = got + 1
                 end
+                if type(p.eligibilityItems) == "table" then
+                    for k, v in pairs(p.eligibilityItems) do
+                        eligMerged[k] = v
+                        eligGot = eligGot + 1
+                    end
+                end
             end
             if type(meta.itemCount) == "number" and got ~= meta.itemCount then
+                return "pending", "missing_predecessor"
+            end
+            local wantElig = tonumber(meta.eligibilityItemCount)
+            if wantElig ~= nil and eligGot ~= wantElig then
                 return "pending", "missing_predecessor"
             end
             archive = {
@@ -2118,6 +2245,8 @@ local function ValidateAndApply(record, ctx)
                 requestedItems = merged,
                 generation = meta.generation,
                 archivedAt = meta.archivedAt,
+                bankTab = tonumber(meta.bankTab),
+                eligibility = CopyEligScalars(meta.eligibility, eligMerged),
             }
         end
         if not GS.ValidateCampaignArchive

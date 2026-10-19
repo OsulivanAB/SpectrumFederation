@@ -18383,6 +18383,290 @@ do
     assertEq(donated, 2, "3B36: two distinct ledger donations retained got=" .. tostring(donated))
 end
 
+
+do
+    -- 3B37) Replay nested ledger search is budgeted + resumable for unmatched evidence.
+    -- Fail-before shape: scanning 1024 accepted events then charging once would
+    -- exhaust the slice and restart at index 1 forever. After: nested cursor.
+    local aliceRecord = seedStagedCampaignWithItem(9050, 50)
+    GS:EnsureGossipProvider()
+    local cfg = aliceRecord.accounting._consumables
+    local events = aliceRecord.accounting._consumableEvents
+    if type(events) ~= "table" then
+        aliceRecord.accounting._consumableEvents = {}
+        events = aliceRecord.accounting._consumableEvents
+    end
+    local LEDGER_N = 1024
+    for n = 1, LEDGER_N do
+        events[#events + 1] = {
+            type = "donation",
+            id = "ctx:gs:big-" .. n,
+            txnId = "ctx:gs:big-" .. n,
+            itemId = 9050,
+            quantity = 1,
+            generation = cfg.generation,
+            timestamp = (world.time or 1000) - (LEDGER_N - n) * 10,
+            approxTxnTime = (world.time or 1000) - (LEDGER_N - n) * 10,
+            campaignId = aliceRecord.currentCampaignId,
+            datasetId = aliceRecord.datasetId,
+            coreSignature = "big|sig|" .. n,
+            actor = "BigDonor" .. n .. "-Garona",
+            verification = "witnesses",
+            writer = "Player-1-Alice",
+        }
+    end
+    -- One unmatched eligible single-witness observation (must scan past all ledger).
+    local pendingEv = makeDepositEvidence(aliceRecord, {
+        itemId = 9050,
+        quantity = 7,
+        donor = "UnmatchedPending-Garona",
+        occurrenceIndex = 1,
+        neighborsOlder = { "unmatched|older" },
+        neighborsNewer = { "unmatched|newer" },
+    })
+    local stPend, rPend = GS:_AdmitObservationForTests(
+        pendingEv, "Player-1-Alice", "Alice-Garona")
+    assertEq(stPend, "pending", "3B37: single witness pending st=" .. tostring(stPend))
+    assertEq(rPend, "awaiting_witnesses", "3B37: awaiting_witnesses")
+    GS.NotifyLocalDurableChange("ledger")
+    GS.NotifyLocalDurableChange("evidence")
+    drainExportMaint(512)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    local ledgerExports, evidenceExports = 0, 0
+    for i = 1, #exportBodies do
+        local k = exportBodies[i].body and exportBodies[i].body.kind
+        if k == "gs-ledger-event" then ledgerExports = ledgerExports + 1 end
+        if k == "gs-evidence" then evidenceExports = evidenceExports + 1 end
+    end
+    assertTrue(ledgerExports >= LEDGER_N,
+        "3B37: exported ledger bodies got=" .. tostring(ledgerExports))
+    assertTrue(evidenceExports >= 1, "3B37: pending evidence exported")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B37: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    GS._adoptionReplaySyncDrain = false
+    local maxSliceUsed, sliceCallbacks = 0, 0
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 20000 do
+        guard = guard + 1
+        local stats = GS._lastAdoptionSliceStats
+        if type(stats) == "table" then
+            sliceCallbacks = sliceCallbacks + 1
+            local used = tonumber(stats.used) or 0
+            local budget = tonumber(stats.budget) or (GS.MAX_ADMISSION_WORK_PER_SLICE or 32)
+            if used > maxSliceUsed then maxSliceUsed = used end
+            assertTrue(used <= budget + 1,
+                "3B37: slice within budget used=" .. tostring(used)
+                    .. " budget=" .. tostring(budget))
+        end
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                flushTimers()
+            end
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    if stAdopt == "pending" or (GS._adoption and GS._adoption.replayTemp) then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(stAdopt == "accepted"
+        or (adopted and adopted.datasetId == sourceDataset),
+        "3B37: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    local liveEvents = adopted and adopted.accounting and adopted.accounting._consumableEvents
+    assertTrue(type(liveEvents) == "table" and #liveEvents >= LEDGER_N,
+        "3B37: adopted ledger retained got=" .. tostring(liveEvents and #liveEvents))
+    local pending = adopted.observations and adopted.observations.byCampaign
+        and adopted.observations.byCampaign[adopted.currentCampaignId]
+        and adopted.observations.byCampaign[adopted.currentCampaignId].pending
+    local foundPending = false
+    if type(pending) == "table" then
+        for i = 1, #pending do
+            local c = pending[i]
+            if type(c) == "table" and type(c.evidence) == "table"
+                and c.evidence.donor == "UnmatchedPending-Garona" then
+                foundPending = true
+                break
+            end
+        end
+    end
+    assertTrue(foundPending, "3B37: unmatched single-witness pending retained after adoption")
+    assertTrue(maxSliceUsed >= 1 and sliceCallbacks >= 1,
+        "3B37: replay slices observed callbacks=" .. tostring(sliceCallbacks)
+            .. " maxUsed=" .. tostring(maxSliceUsed))
+end
+
+do
+    -- 3B38) Large eligibility cutoff maps page under 2048-byte wire budget.
+    local aliceRecord = seedStagedCampaignWithItem(9051, 10)
+    -- Add many items so archive eligibility.items is huge.
+    local ITEM_N = 180
+    for n = 1, ITEM_N do
+        local op = GS:NewConfigOperation("set-requested-item", { itemId = 20000 + n }, {
+            itemId = 20000 + n, goal = 1, removed = false,
+        })
+        assertEq(GS:ApplyStagedConfigOperation(op), "accepted",
+            "3B38: seed item " .. tostring(n))
+    end
+    local oldCampaign = aliceRecord.currentCampaignId
+    local elig = aliceRecord.accounting._consumables.eligibility
+    assertTrue(type(elig) == "table" and type(elig.items) == "table",
+        "3B38: eligibility map present")
+    local cutoffCount = 0
+    for _ in pairs(elig.items) do cutoffCount = cutoffCount + 1 end
+    assertTrue(cutoffCount >= 50,
+        "3B38: many item cutoffs got=" .. tostring(cutoffCount))
+    -- Fail-before: stuffing the full cutoff map into one meta body exceeds wire.
+    local bloated = {
+        kind = "campaign-archive",
+        campaignId = oldCampaign,
+        datasetId = aliceRecord.datasetId,
+        generation = aliceRecord.accounting._consumables.generation,
+        archivedAt = world.time or 1,
+        schemaVersion = GS.SCHEMA_VERSION,
+        itemCount = cutoffCount,
+        pageCount = 1,
+        bankTab = aliceRecord.accounting._consumables.bankTab,
+        eligibility = {
+            baselineEstablished = elig.baselineEstablished,
+            baselineAt = elig.baselineAt,
+            tabEligibleFrom = elig.tabEligibleFrom,
+            items = {},
+        },
+        requestedItems = aliceRecord.accounting._consumables.requestedItems,
+    }
+    for k, v in pairs(elig.items) do
+        bloated.eligibility.items[k] = v
+    end
+    local bloatedRaw = C_EncodingUtil.SerializeCBOR({
+        id = "gs:ca:" .. oldCampaign,
+        versionFp = string.rep("f", 64),
+        body = bloated,
+    })
+    assertTrue(#bloatedRaw > (GS.MAX_WIRE_RECORD_BYTES or 2048),
+        "3B38: fail-before monolithic eligibility exceeds wire got=" .. tostring(#bloatedRaw))
+
+    startCampaign()
+    assertTrue(aliceRecord.campaignArchives and aliceRecord.campaignArchives[oldCampaign],
+        "3B38: archived")
+    local arch = aliceRecord.campaignArchives[oldCampaign]
+    local archCutoffs = 0
+    if arch.eligibility and type(arch.eligibility.items) == "table" then
+        for _ in pairs(arch.eligibility.items) do archCutoffs = archCutoffs + 1 end
+    end
+    assertTrue(archCutoffs >= 50, "3B38: archive stored cutoffs got=" .. tostring(archCutoffs))
+
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("campaign")
+    drainExportMaint(256)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    local metaBody, pageBodies = nil, {}
+    local oversize = 0
+    for i = 1, #exportBodies do
+        local id = exportBodies[i].id
+        local body = exportBodies[i].body
+        if body and (body.kind == "campaign-archive" or body.kind == "campaign-archive-page")
+            and body.campaignId == oldCampaign then
+            local raw = C_EncodingUtil.SerializeCBOR({
+                id = id,
+                versionFp = string.rep("f", 64),
+                body = body,
+            })
+            if #raw > (GS.MAX_WIRE_RECORD_BYTES or 2048) then
+                oversize = oversize + 1
+            end
+            if body.kind == "campaign-archive" then
+                metaBody = body
+            else
+                pageBodies[#pageBodies + 1] = body
+            end
+        end
+    end
+    assertEq(oversize, 0, "3B38: no archive export body exceeds wire oversize="
+        .. tostring(oversize))
+    assertTrue(metaBody ~= nil, "3B38: archive meta exported")
+    assertTrue(metaBody.eligibility == nil
+        or metaBody.eligibility.items == nil
+        or next(metaBody.eligibility.items) == nil,
+        "3B38: paged meta must not carry full eligibility.items")
+    assertTrue(tonumber(metaBody.eligibilityItemCount) ~= nil
+        and tonumber(metaBody.eligibilityItemCount) >= 50,
+        "3B38: meta advertises eligibilityItemCount")
+    assertTrue(#pageBodies >= 1, "3B38: eligibility/items pages exported")
+    local pageElig = 0
+    for i = 1, #pageBodies do
+        if type(pageBodies[i].eligibilityItems) == "table" then
+            for _ in pairs(pageBodies[i].eligibilityItems) do
+                pageElig = pageElig + 1
+            end
+        end
+    end
+    assertEq(pageElig, tonumber(metaBody.eligibilityItemCount),
+        "3B38: paged eligibilityItems cover advertised count")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B38: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(stAdopt == "accepted"
+        or (adopted and adopted.datasetId == sourceDataset),
+        "3B38: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    local adoptedArch = adopted and adopted.campaignArchives and adopted.campaignArchives[oldCampaign]
+    assertTrue(adoptedArch and type(adoptedArch.eligibility) == "table"
+        and type(adoptedArch.eligibility.items) == "table",
+        "3B38: adopted archive has eligibility items")
+    local adoptedCutoffs = 0
+    for k, v in pairs(adoptedArch.eligibility.items) do
+        adoptedCutoffs = adoptedCutoffs + 1
+        assertTrue(arch.eligibility.items[k] == v,
+            "3B38: cutoff value preserved for " .. tostring(k))
+    end
+    assertEq(adoptedCutoffs, archCutoffs,
+        "3B38: exact cutoff count preserved got=" .. tostring(adoptedCutoffs))
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

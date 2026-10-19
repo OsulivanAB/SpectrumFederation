@@ -1680,6 +1680,8 @@ local function AssemblePagedArchive(meta, pagesByIndex)
     local pageCount = tonumber(meta.pageCount) or 1
     local merged = {}
     local got = 0
+    local eligMerged = {}
+    local eligGot = 0
     for page = 1, pageCount do
         local p = pagesByIndex and pagesByIndex[page]
         if type(p) ~= "table" or type(p.requestedItems) ~= "table" then
@@ -1689,10 +1691,28 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             merged[k] = v
             got = got + 1
         end
+        if type(p.eligibilityItems) == "table" then
+            for k, v in pairs(p.eligibilityItems) do
+                eligMerged[k] = v
+                eligGot = eligGot + 1
+            end
+        end
     end
     -- Page presence already checked; count mismatch is malformed input, not "wait".
     if type(meta.itemCount) == "number" and got ~= meta.itemCount then
         return nil, "invalid_campaign_archive"
+    end
+    local wantElig = tonumber(meta.eligibilityItemCount)
+    if wantElig ~= nil and eligGot ~= wantElig then
+        return nil, "incomplete_archive_pages"
+    end
+    local eligibility = CopyArchiveEligibility(meta.eligibility)
+    if eligibility then
+        eligibility.items = eligMerged
+    elseif eligGot > 0 then
+        eligibility = {
+            items = eligMerged,
+        }
     end
     return {
         schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
@@ -1702,7 +1722,7 @@ local function AssemblePagedArchive(meta, pagesByIndex)
         generation = meta.generation,
         archivedAt = meta.archivedAt,
         bankTab = tonumber(meta.bankTab),
-        eligibility = CopyArchiveEligibility(meta.eligibility),
+        eligibility = eligibility,
     }, nil
 end
 
@@ -3387,7 +3407,6 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 end
             end
             local alreadyEv = false
-            local scanCost = 0
             local evFp = occurrenceFp(evidence)
             if evFp and bucketHasMatch(state.acctIndex.pendingOcc[evFp], evidence) then
                 alreadyEv = true
@@ -3398,26 +3417,56 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 unsettledSeen = true
                 alreadyEv = true
             else
-                local byCampaign = temp.observations and temp.observations.byCampaign
-                local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
-                if type(pending) == "table" then
-                    for pi = 1, #pending do
-                        scanCost = scanCost + 1
-                        local c = pending[pi]
-                        if type(c) == "table" and type(c.evidence) == "table"
-                            and GS.EvidenceOccurrenceMatches
-                            and GS.EvidenceOccurrenceMatches(c.evidence, evidence) then
-                            alreadyEv = true
-                            rememberOcc(state.acctIndex.pendingOcc, c.evidence)
-                            break
+                -- Resumable nested search: charge each pending/ledger visit against
+                -- the slice budget and park a durable cursor so a miss against a
+                -- large accepted ledger cannot restart from index 1 every slice.
+                state.evidenceScanCursor = state.evidenceScanCursor or {}
+                local nest = state.evidenceScanCursor[orderId]
+                if type(nest) ~= "table" then
+                    nest = { phase = "pending", pos = 1 }
+                end
+                local function yieldEvidenceScan(phase, pos)
+                    state.evidenceScanCursor[orderId] = { phase = phase, pos = pos }
+                    unsettledSeen = true
+                    state.cursor = (i - 1)
+                    if state.cursor < 1 then
+                        state.cursor = #adop.order
+                    end
+                    state.admissions = (tonumber(state.admissions) or 0) + admissions
+                    state.sliceUsed = sliceUsed
+                    return true, nil, progress
+                end
+                if nest.phase == "pending" then
+                    local byCampaign = temp.observations and temp.observations.byCampaign
+                    local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
+                    if type(pending) == "table" then
+                        for pi = nest.pos, #pending do
+                            if sliceUsed >= sliceBudget then
+                                return yieldEvidenceScan("pending", pi)
+                            end
+                            sliceUsed = sliceUsed + 1
+                            local c = pending[pi]
+                            if type(c) == "table" and type(c.evidence) == "table"
+                                and GS.EvidenceOccurrenceMatches
+                                and GS.EvidenceOccurrenceMatches(c.evidence, evidence) then
+                                alreadyEv = true
+                                rememberOcc(state.acctIndex.pendingOcc, c.evidence)
+                                break
+                            end
                         end
                     end
+                    if not alreadyEv then
+                        nest = { phase = "events", pos = 1 }
+                    end
                 end
-                if not alreadyEv then
+                if not alreadyEv and nest.phase == "events" then
                     local events = temp.accounting and temp.accounting._consumableEvents
                     if type(events) == "table" then
-                        for j = 1, #events do
-                            scanCost = scanCost + 1
+                        for j = nest.pos, #events do
+                            if sliceUsed >= sliceBudget then
+                                return yieldEvidenceScan("events", j)
+                            end
+                            sliceUsed = sliceUsed + 1
                             local e = events[j]
                             if type(e) == "table" and GS.EvidenceOccurrenceMatches
                                 and GS.EvidenceOccurrenceMatches(e, evidence) then
@@ -3428,9 +3477,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         end
                     end
                 end
-            end
-            if scanCost > 0 then
-                sliceUsed = sliceUsed + math.max(1, math.floor(scanCost / 32))
+                if state.evidenceScanCursor then
+                    state.evidenceScanCursor[orderId] = nil
+                end
             end
             if alreadyEv then
                 -- settled or terminally skipped
@@ -3490,9 +3539,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
         elseif body.kind == "gs-ledger-event" and type(body.event) == "table" then
             local event = body.event
             local eid = event.id or event.opId or event.txnId
+            local orderIdLe = adop.order[i]
             state.acctIndex = state.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
             local alreadyLe = false
-            local scanCost = 0
             -- byId is exact-ID only (never collapses distinct reminted txn ids).
             if type(eid) == "string" and eid ~= "" and state.acctIndex.byId[eid] then
                 alreadyLe = true
@@ -3503,10 +3552,24 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 and state.acctIndex.byId[event.opId] then
                 alreadyLe = true
             else
+                -- Resumable exact-ID ledger scan under the same slice budget.
+                state.ledgerScanCursor = state.ledgerScanCursor or {}
+                local nestPos = tonumber(state.ledgerScanCursor[orderIdLe]) or 1
                 local events = temp.accounting and temp.accounting._consumableEvents
                 if type(events) == "table" then
-                    for j = 1, #events do
-                        scanCost = scanCost + 1
+                    for j = nestPos, #events do
+                        if sliceUsed >= sliceBudget then
+                            state.ledgerScanCursor[orderIdLe] = j
+                            unsettledSeen = true
+                            state.cursor = (i - 1)
+                            if state.cursor < 1 then
+                                state.cursor = #adop.order
+                            end
+                            state.admissions = (tonumber(state.admissions) or 0) + admissions
+                            state.sliceUsed = sliceUsed
+                            return true, nil, progress
+                        end
+                        sliceUsed = sliceUsed + 1
                         local e = events[j]
                         if type(e) == "table" then
                             if (type(eid) == "string" and eid ~= ""
@@ -3524,9 +3587,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         end
                     end
                 end
-            end
-            if scanCost > 0 then
-                sliceUsed = sliceUsed + math.max(1, math.floor(scanCost / 32))
+                if state.ledgerScanCursor then
+                    state.ledgerScanCursor[orderIdLe] = nil
+                end
             end
             if alreadyLe then
                 -- settled
