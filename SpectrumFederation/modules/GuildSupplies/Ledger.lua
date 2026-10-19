@@ -538,7 +538,10 @@ end
 -- when matching fields agree. Hour buckets are intentionally omitted: observers
 -- of the same still-visible deposit can reconstruct different approxTxnTime
 -- hours as ageHours advances. MatchScore (3h tolerance) remains the occurrence
--- matcher; neighbors + occurrenceIndex keep legitimately repeated deposits distinct.
+-- matcher; neighbors + occurrenceIndex keep legitimately repeated deposits
+-- distinct when context differs. Exact-ID collisions that MatchScore rejects
+-- (temporally separated identical empty-context deposits) are reminted or held
+-- ambiguous in CommitVerifiedCluster — never silently merged as duplicates.
 -- Residual neighbor/index disagreements still converge via MatchScore aliasing.
 function GS.OccurrenceFingerprint(evidence)
     if type(evidence) ~= "table" then
@@ -911,12 +914,50 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         return false, "id_failed"
     end
 
-    -- Competing candidate IDs for the same occurrence: keep first committed.
-    if FindRegistryByTxn(cfg, txnId) then
+    -- Competing candidate IDs: only treat exact-ID hits as duplicates when
+    -- MatchScore agrees they are the same occurrence. Fingerprint collisions
+    -- (identical core/neighbors/index, temporally separated deposits) must not
+    -- silently merge. Clear temporal separation remints a seq ID; uncertain
+    -- evidence stays ambiguous rather than inventing uniqueness.
+    do
         local existing = FindRegistryByTxn(cfg, txnId)
         if existing and existing.status == "verified" then
-            cluster.status = "verified"
-            return true, "duplicate"
+            local score = MatchScore(existing, evidence)
+            local minScore = (O and O.MIN_MATCH_SCORE) or 100
+            if score and score >= minScore then
+                cluster.status = "verified"
+                cluster.txnId = existing.txnId
+                return true, "duplicate"
+            end
+            local tExisting = tonumber(existing.approxTxnTime)
+            local tEvidence = tonumber(evidence.approxTxnTime)
+            local tol = (O and O.TIME_TOLERANCE_SECONDS) or (3 * 60 * 60)
+            if tExisting and tEvidence and math.abs(tExisting - tEvidence) > tol then
+                -- Distinct deposits that collided on fingerprint: allocate a
+                -- seq-based id so both can credit without claiming the shared ID.
+                txnId = nil
+                cluster.txnId = nil
+                local cfgAlloc = record.accounting and record.accounting._consumables
+                if type(cfgAlloc) == "table" then
+                    cfgAlloc.txnAllocSeq = (tonumber(cfgAlloc.txnAllocSeq) or 0) + 1
+                    local dataset = tostring(record.datasetId or "gs")
+                    if #dataset > 40 then dataset = dataset:sub(1, 40) end
+                    local w = ValidGuid(writerGuid) or "local"
+                    if #w > 32 then w = w:sub(1, 32) end
+                    local entropy = Now() + cfgAlloc.txnAllocSeq * 17
+                    local reminted = string.format(
+                        "ctx:%s:%s:%d:%x", dataset, w, cfgAlloc.txnAllocSeq, entropy)
+                    txnId = ValidTxnId(reminted)
+                    cluster.txnId = txnId
+                end
+                if not ValidTxnId(txnId) then
+                    cluster.status = "ambiguous"
+                    return false, "ambiguous"
+                end
+            else
+                cluster.status = "ambiguous"
+                return false, "ambiguous"
+            end
         end
     end
 
@@ -1905,14 +1946,12 @@ function GS.ApplyAdjustmentMutation(record, op)
     local itemId = tonumber(op.value and op.value.itemId) or tonumber(op.target and op.target.itemId)
     local quantity = tonumber(op.value and op.value.quantity)
     local attributed = op.value and op.value.attributed
-    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
-        record, itemId, quantity, attributed, record.currentCampaignId)
-    if not floorOk then
-        return false, floorErr or "adjustment_floor"
-    end
     local cfg = record.accounting._consumables
     -- Operation id is the durable idempotency key across ledger-before-op and
-    -- op-before-ledger delivery orders (event.id / event.opId).
+    -- op-before-ledger delivery orders (event.id / event.opId). Exact-id
+    -- duplicate detection must run before the floor check so a ledger-first
+    -- adjustment that already exhausted the balance replays as duplicate
+    -- rather than item_negative.
     local eventId = op.id
     local events = record.accounting._consumableEvents
     if type(events) == "table" then
@@ -1922,6 +1961,11 @@ function GS.ApplyAdjustmentMutation(record, op)
                 return true, "duplicate"
             end
         end
+    end
+    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
+        record, itemId, quantity, attributed, record.currentCampaignId)
+    if not floorOk then
+        return false, floorErr or "adjustment_floor"
     end
     local event = {
         type = GS.LEDGER_EVENT.ADJUSTMENT,

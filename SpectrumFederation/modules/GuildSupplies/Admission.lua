@@ -1540,6 +1540,8 @@ local function NoteBufferedKindInsert(adop, body)
             transferOps = 0,
             headers = 0,
             archives = 0,
+            ledgerEvents = 0,
+            donationEvidence = 0,
             descId = nil,
         }
         adop._bufCounts = c
@@ -1556,6 +1558,10 @@ local function NoteBufferedKindInsert(adop, body)
         c.headers = (tonumber(c.headers) or 0) + 1
     elseif body.kind == "campaign-archive" then
         c.archives = (tonumber(c.archives) or 0) + 1
+    elseif body.kind == "gs-ledger-event" then
+        c.ledgerEvents = (tonumber(c.ledgerEvents) or 0) + 1
+    elseif body.kind == "gs-evidence" then
+        c.donationEvidence = (tonumber(c.donationEvidence) or 0) + 1
     end
 end
 
@@ -1563,6 +1569,7 @@ local function CountBufferedKinds(adop)
     -- Prefer session-owned incremental counters; fall back to a one-shot recount
     -- only when legacy sessions lack _bufCounts (should not happen after begin).
     local acceptedOps, transferOps, headers, archives, desc = 0, 0, 0, 0, nil
+    local ledgerEvents, donationEvidence = 0, 0
     local archivePages = {} -- campaignId → { meta, pages = {}, pageCount }
     local opPages = {} -- opId → { shell, pages = {}, pageCount }
     local c = adop._bufCounts
@@ -1571,6 +1578,8 @@ local function CountBufferedKinds(adop)
         transferOps = tonumber(c.transferOps) or 0
         headers = tonumber(c.headers) or 0
         archives = tonumber(c.archives) or 0
+        ledgerEvents = tonumber(c.ledgerEvents) or 0
+        donationEvidence = tonumber(c.donationEvidence) or 0
         if type(c.descId) == "string" then
             desc = adop.records and adop.records[c.descId]
         end
@@ -1597,6 +1606,10 @@ local function CountBufferedKinds(adop)
                     headers = headers + 1
                 elseif body.kind == "campaign-archive" then
                     archives = archives + 1
+                elseif body.kind == "gs-ledger-event" then
+                    ledgerEvents = ledgerEvents + 1
+                elseif body.kind == "gs-evidence" then
+                    donationEvidence = donationEvidence + 1
                 end
             end
         end
@@ -1624,7 +1637,8 @@ local function CountBufferedKinds(adop)
             }
         end
     end
-    return desc, acceptedOps, transferOps, headers, archives, archivePages, opPages
+    return desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
+        ledgerEvents, donationEvidence
 end
 
 --- Assemble paged archive bodies into a single canonical archive table.
@@ -1676,13 +1690,17 @@ function GS:IsAdoptionTransferComplete()
     if type(adop) ~= "table" or adop.committed then
         return false, "no_adoption"
     end
-    local desc, acceptedOps, transferOps, headers, archives, archivePages, opPages =
+    local desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
+        ledgerEvents, donationEvidence =
         CountBufferedKinds(adop)
     if not desc then
         return false, "incomplete_transfer"
     end
     -- Descriptor counts must be present and exact (no silent zero-default extras).
     -- acceptedOpCount = accepted history; transferOpCount = accepted + evidenceOnly.
+    -- acceptedLedgerCount / donationEvidenceCount bind staged accounting into the
+    -- immutable adoption snapshot so a transfer missing advertised ledger bodies
+    -- cannot complete. Production RebuildExportIndex always emits these counts.
     if desc.acceptedOpCount == nil or desc.campaignCount == nil or desc.archiveCount == nil then
         return false, "incomplete_transfer"
     end
@@ -1694,6 +1712,11 @@ function GS:IsAdoptionTransferComplete()
     end
     local expectHeaders = tonumber(desc.campaignCount)
     local expectArchives = tonumber(desc.archiveCount)
+    -- Accounting manifest: enforce only when the source advertises the count.
+    local hasLedgerManifest = desc.acceptedLedgerCount ~= nil
+    local expectLedger = tonumber(desc.acceptedLedgerCount)
+    local hasEvidenceManifest = desc.donationEvidenceCount ~= nil
+    local expectDonationEvidence = tonumber(desc.donationEvidenceCount)
     if not expectAccepted or not expectTransfer or not expectHeaders or not expectArchives
         or expectAccepted ~= math.floor(expectAccepted) or expectAccepted < 0
         or expectTransfer ~= math.floor(expectTransfer) or expectTransfer < 0
@@ -1702,8 +1725,26 @@ function GS:IsAdoptionTransferComplete()
         or expectArchives ~= math.floor(expectArchives) or expectArchives < 0 then
         return false, "incomplete_transfer"
     end
+    if hasLedgerManifest then
+        if expectLedger == nil or expectLedger ~= math.floor(expectLedger) or expectLedger < 0 then
+            return false, "incomplete_transfer"
+        end
+    end
+    if hasEvidenceManifest then
+        if expectDonationEvidence == nil
+            or expectDonationEvidence ~= math.floor(expectDonationEvidence)
+            or expectDonationEvidence < 0 then
+            return false, "incomplete_transfer"
+        end
+    end
     if acceptedOps ~= expectAccepted or transferOps ~= expectTransfer
         or headers ~= expectHeaders or archives ~= expectArchives then
+        return false, "incomplete_transfer"
+    end
+    if hasLedgerManifest and ledgerEvents ~= expectLedger then
+        return false, "incomplete_transfer"
+    end
+    if hasEvidenceManifest and donationEvidence ~= expectDonationEvidence then
         return false, "incomplete_transfer"
     end
     -- Exact accepted snapshot size must match descriptor (evidenceOnly excluded).
@@ -1711,6 +1752,14 @@ function GS:IsAdoptionTransferComplete()
         return false, "source_changed"
     end
     if adop.pinnedTransferOpCount ~= nil and adop.pinnedTransferOpCount ~= expectTransfer then
+        return false, "source_changed"
+    end
+    if hasLedgerManifest and adop.pinnedAcceptedLedgerCount ~= nil
+        and adop.pinnedAcceptedLedgerCount ~= expectLedger then
+        return false, "source_changed"
+    end
+    if hasEvidenceManifest and adop.pinnedDonationEvidenceCount ~= nil
+        and adop.pinnedDonationEvidenceCount ~= expectDonationEvidence then
         return false, "source_changed"
     end
     if #(adop.sourceAcceptedIds or {}) ~= expectAccepted then
@@ -1888,6 +1937,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
             transferOps = 0,
             headers = 0,
             archives = 0,
+            ledgerEvents = 0,
+            donationEvidence = 0,
             descId = nil,
         },
         _workStats = {
@@ -1908,6 +1959,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedTransferOpCount = nil,
         pinnedCampaignCount = nil,
         pinnedArchiveCount = nil,
+        pinnedAcceptedLedgerCount = nil,
+        pinnedDonationEvidenceCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2398,6 +2451,8 @@ function GS:BufferAdoptionRecord(recordId, body)
         local transfer = tonumber(descBody.transferOpCount)
         local camp = tonumber(descBody.campaignCount)
         local arch = tonumber(descBody.archiveCount)
+        local ledger = tonumber(descBody.acceptedLedgerCount)
+        local donEv = tonumber(descBody.donationEvidenceCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -2436,6 +2491,24 @@ function GS:BufferAdoptionRecord(recordId, body)
         if adop.pinnedArchiveCount == nil and arch ~= nil then
             adop.pinnedArchiveCount = arch
         elseif arch ~= nil and adop.pinnedArchiveCount ~= nil and arch ~= adop.pinnedArchiveCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedAcceptedLedgerCount == nil and ledger ~= nil then
+            adop.pinnedAcceptedLedgerCount = ledger
+        elseif ledger ~= nil and adop.pinnedAcceptedLedgerCount ~= nil
+            and ledger ~= adop.pinnedAcceptedLedgerCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedDonationEvidenceCount == nil and donEv ~= nil then
+            adop.pinnedDonationEvidenceCount = donEv
+        elseif donEv ~= nil and adop.pinnedDonationEvidenceCount ~= nil
+            and donEv ~= adop.pinnedDonationEvidenceCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
             InvalidateAdoptionDeliveryOutcomes("source_changed")
@@ -3852,6 +3925,17 @@ local function ValidateAdoptionEffectiveState(temp, adop, desc)
         local wantAccepted = tonumber(desc.acceptedOpCount)
         if wantAccepted and acceptedCount ~= wantAccepted then
             return false, "incomplete_transfer"
+        end
+        local wantLedger = tonumber(desc.acceptedLedgerCount)
+        if wantLedger ~= nil then
+            local liveLedger = 0
+            local events = temp.accounting and temp.accounting._consumableEvents
+            if type(events) == "table" then
+                liveLedger = #events
+            end
+            if liveLedger ~= wantLedger then
+                return false, "incomplete_transfer"
+            end
         end
         -- Effective configuration head: bank tab must match the selected source
         -- when the descriptor advertises one (including explicit nil via flag).

@@ -1425,6 +1425,9 @@ local function RebuildExportIndex()
         transferOpCount = 0,
         campaignCount = 0,
         archiveCount = 0,
+        -- #388: immutable accounting manifest for adoption completeness.
+        acceptedLedgerCount = 0,
+        donationEvidenceCount = 0,
         -- Pin effective config head for adoption binding (nil is meaningful).
         bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil,
@@ -1526,6 +1529,8 @@ local function RebuildExportIndex()
         descEntry.body.transferOpCount = transferOpCount
         descEntry.body.campaignCount = headerExportCount
         descEntry.body.archiveCount = archiveExportCount
+        descEntry.body.acceptedLedgerCount = ledgerExportCount
+        descEntry.body.donationEvidenceCount = donationEvidenceExportCount
         descEntry.body.bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil
         descEntry.body.hasBankTab = true
@@ -1536,6 +1541,8 @@ local function RebuildExportIndex()
     exportState.cachedTransferOpCount = transferOpCount
     exportState.cachedCampaignCount = headerExportCount
     exportState.cachedArchiveCount = archiveExportCount
+    exportState.cachedAcceptedLedgerCount = ledgerExportCount
+    exportState.cachedDonationEvidenceCount = donationEvidenceExportCount
     exportState.countsDirty = false
     exportState.appendPos = 0
     local needsMaint = exportState.archiveBuildNeeded
@@ -3131,10 +3138,24 @@ function GS.NotifyLocalDurableChange(reason)
                 archiveCount = archiveCount + 1
             end
         end
+        local acceptedLedgerCount = 0
+        local events = record.accounting and record.accounting._consumableEvents
+        if type(events) == "table" then
+            acceptedLedgerCount = #events
+        end
+        local donationEvidenceCount = 0
+        local directExports = record.observations and record.observations.directExports
+        if type(directExports) == "table" then
+            for _ in pairs(directExports) do
+                donationEvidenceCount = donationEvidenceCount + 1
+            end
+        end
         exportState.cachedOpCount = acceptedOpCount
         exportState.cachedTransferOpCount = transferOpCount
         exportState.cachedCampaignCount = campaignCount
         exportState.cachedArchiveCount = archiveCount
+        exportState.cachedAcceptedLedgerCount = acceptedLedgerCount
+        exportState.cachedDonationEvidenceCount = donationEvidenceCount
         exportState.countsDirty = false
         local desc = {
             kind = "dataset-desc",
@@ -3153,6 +3174,8 @@ function GS.NotifyLocalDurableChange(reason)
             transferOpCount = transferOpCount,
             campaignCount = campaignCount,
             archiveCount = archiveCount,
+            acceptedLedgerCount = acceptedLedgerCount,
+            donationEvidenceCount = donationEvidenceCount,
             bankTab = record.accounting and record.accounting._consumables
                 and record.accounting._consumables.bankTab or nil,
             hasBankTab = true,
