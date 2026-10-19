@@ -867,25 +867,64 @@ local function CountTxnConflictKeys(conflicts)
     return n
 end
 
+local function BoundScalarString(value, maxLen)
+    if type(value) ~= "string" then
+        return nil
+    end
+    maxLen = tonumber(maxLen) or 64
+    if value == "" then
+        return nil
+    end
+    if #value > maxLen then
+        return value:sub(1, maxLen)
+    end
+    return value
+end
+
 --- Bounded diagnostic quarantine body (never persist raw peer tables).
+-- Only finite scalars / length-capped strings; nested tables are dropped.
 local function CanonicalConflictSnapshot(body)
     if type(body) ~= "table" then
         return nil
     end
+    local typ = body.type
+    if typ ~= nil and type(typ) ~= "string" then
+        typ = nil
+    elseif type(typ) == "string" and #typ > 32 then
+        typ = typ:sub(1, 32)
+    end
+    local itemId = tonumber(body.itemId)
+    if itemId and (itemId ~= itemId or itemId == math.huge or itemId ~= math.floor(itemId)) then
+        itemId = nil
+    end
+    local quantity = tonumber(body.quantity)
+    if quantity and (quantity ~= quantity or quantity == math.huge or quantity ~= math.floor(quantity)) then
+        quantity = nil
+    end
+    local generation = tonumber(body.generation)
+    if generation and (generation ~= generation or generation == math.huge
+        or generation ~= math.floor(generation) or generation < 0) then
+        generation = nil
+    end
+    local timestamp = tonumber(body.timestamp) or tonumber(body.approxTxnTime)
+    if timestamp and (timestamp ~= timestamp or timestamp == math.huge
+        or timestamp ~= math.floor(timestamp) or timestamp < 0) then
+        timestamp = nil
+    end
     return {
-        type = body.type,
-        id = body.id,
-        txnId = body.txnId,
-        opId = body.opId,
-        itemId = tonumber(body.itemId),
-        quantity = tonumber(body.quantity),
-        attributed = body.attributed,
-        actor = body.actor or body.donor,
-        writer = body.writer,
-        campaignId = body.campaignId,
-        generation = tonumber(body.generation),
-        coreSignature = body.coreSignature,
-        timestamp = tonumber(body.timestamp) or tonumber(body.approxTxnTime),
+        type = typ,
+        id = BoundScalarString(body.id, GS.MAX_OPERATION_ID or 192),
+        txnId = BoundScalarString(body.txnId, GS.MAX_TXN_ID or 160),
+        opId = BoundScalarString(body.opId, GS.MAX_OPERATION_ID or 192),
+        itemId = itemId,
+        quantity = quantity,
+        attributed = BoundScalarString(body.attributed, 96),
+        actor = BoundScalarString(body.actor or body.donor, 96),
+        writer = BoundScalarString(body.writer, 64),
+        campaignId = BoundScalarString(body.campaignId, 96),
+        generation = generation,
+        coreSignature = BoundScalarString(body.coreSignature, 160),
+        timestamp = timestamp,
     }
 end
 
@@ -933,10 +972,12 @@ local function CountDirectExports(exports)
 end
 
 --- Evict oldest exports that are not still referenced by unfinished pending.
+-- @return removedIds dense list of evicted export ids (for Gossip index sync)
 local function EvictDirectEvidenceExports(record, exports, needSlots)
     needSlots = tonumber(needSlots) or 1
+    local removedIds = {}
     if needSlots < 1 then
-        return
+        return removedIds
     end
     local pendingFingerprints = {}
     local byCampaign = record.observations and record.observations.byCampaign
@@ -977,16 +1018,16 @@ local function EvictDirectEvidenceExports(record, exports, needSlots)
         end
         return tostring(a.id) < tostring(b.id)
     end)
-    local removed = 0
     for i = 1, #ranked do
-        if removed >= needSlots then
+        if #removedIds >= needSlots then
             break
         end
         if not ranked[i].required then
             exports[ranked[i].id] = nil
-            removed = removed + 1
+            removedIds[#removedIds + 1] = ranked[i].id
         end
     end
+    return removedIds
 end
 
 --- Record a direct local observation for gossip export (never re-export relays).
@@ -1011,7 +1052,12 @@ function GS.RecordDirectEvidenceExport(record, witnessGuid, evidence)
         local count = CountDirectExports(exports)
         local maxExports = GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256
         if count >= maxExports then
-            EvictDirectEvidenceExports(record, exports, (count - maxExports) + 1)
+            local removedIds = EvictDirectEvidenceExports(
+                record, exports, (count - maxExports) + 1)
+            if type(removedIds) == "table" and #removedIds > 0
+                and GS.RemoveGossipExportBodies then
+                GS.RemoveGossipExportBodies(removedIds)
+            end
             if CountDirectExports(exports) >= maxExports then
                 -- Still full of required quorum/recovery evidence: refuse growth.
                 return nil
@@ -1587,6 +1633,11 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     if type(record) ~= "table" then
         return "pending", recReason or "awaiting_dataset"
     end
+    -- Fail closed before any accounting dereference (guild meta / generation).
+    local usable, usableErr = RequireUsableAccountingRecord(record)
+    if not usable then
+        return "rejected", usableErr or "invalid_record"
+    end
     if record.datasetId and evidence.datasetId and evidence.datasetId ~= record.datasetId then
         return "rejected", "dataset_mismatch"
     end
@@ -1608,11 +1659,6 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     if tonumber(row.generation) == 0 then
         local cfg = record.accounting._consumables
         row.generation = tonumber(cfg and cfg.generation) or 0
-    end
-
-    local usable, usableErr = RequireUsableAccountingRecord(record)
-    if not usable then
-        return "rejected", usableErr or "invalid_record"
     end
 
     local eligOk, eligErr = IsEvidenceEligible(record, row)

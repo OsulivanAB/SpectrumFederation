@@ -17879,8 +17879,26 @@ do
     assertTrue(conflicts == nil or #(conflicts.bodies or {}) == 0,
         "3B30: non-editor must not persist quarantine bodies")
 
-    -- Editor conflict stores bounded canonical snapshot only.
-    local stEd, rEd = GS:AdmitLedgerEvent(forged, {
+    -- Editor conflict stores bounded canonical snapshot only; nested/oversized
+    -- payload fields must be dropped or length-capped (not retained as tables).
+    local nestedForged = {
+        type = "adjustment",
+        id = eventId,
+        opId = eventId,
+        txnId = eventId,
+        itemId = 9034,
+        quantity = -11,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        actor = { nested = "table-must-drop" },
+        attributed = string.rep("A", 400),
+        writer = string.rep("W", 200),
+        coreSignature = { evil = true },
+        campaignIdExtra = { ignore = true },
+    }
+    local stEd, rEd = GS:AdmitLedgerEvent(nestedForged, {
         member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
         offlineRecord = record,
         localWrite = false,
@@ -17892,9 +17910,484 @@ do
     assertTrue(conflicts and type(conflicts.bodies) == "table" and #conflicts.bodies >= 1,
         "3B30: editor quarantine stored")
     local body0 = conflicts.bodies[1]
-    assertTrue(body0.quantity == -9, "3B30: canonical quantity retained")
+    assertTrue(body0.quantity == -11, "3B30: canonical quantity retained")
     assertTrue(body0.raw == nil and body0.evidence == nil,
         "3B30: raw peer tables not persisted")
+    assertTrue(type(body0.actor) ~= "table", "3B30: nested actor dropped")
+    assertTrue(type(body0.coreSignature) ~= "table", "3B30: nested coreSignature dropped")
+    assertTrue(body0.attributed == nil or #tostring(body0.attributed) <= 96,
+        "3B30: attributed length-capped")
+    assertTrue(body0.writer == nil or #tostring(body0.writer) <= 64,
+        "3B30: writer length-capped")
+end
+
+do
+    -- 3B31) Completeness nested scan yields under tight budget; large settled
+    -- ledger + deep evidence match still publish without per-callback overrun.
+    local aliceRecord = seedStagedCampaignWithItem(9040, 200)
+    GS:EnsureGossipProvider()
+    local cfg = aliceRecord.accounting._consumables
+    local events = aliceRecord.accounting._consumableEvents
+    if type(events) ~= "table" then
+        aliceRecord.accounting._consumableEvents = {}
+        events = aliceRecord.accounting._consumableEvents
+    end
+    -- Seed a large settled ledger so evidence MatchScore scan is expensive.
+    for n = 1, 96 do
+        events[#events + 1] = {
+            type = "donation",
+            id = "ctx:gs:pad-" .. n,
+            txnId = "ctx:gs:pad-" .. n,
+            itemId = 9040,
+            quantity = 1,
+            generation = cfg.generation,
+            timestamp = (world.time or 1000) - 100000 - n,
+            approxTxnTime = (world.time or 1000) - 100000 - n,
+            campaignId = aliceRecord.currentCampaignId,
+            datasetId = aliceRecord.datasetId,
+            coreSignature = "pad|sig|" .. n,
+            actor = "PadDonor-Garona",
+            verification = "witnesses",
+        }
+    end
+    local evidence = makeDepositEvidence(aliceRecord, {
+        itemId = 9040, quantity = 5, donor = "DeepMatch-Garona",
+        occurrenceIndex = 1,
+        neighborsOlder = { "deep|older" },
+        neighborsNewer = { "deep|newer" },
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(aliceRecord.currentCampaignId).itemTotals[9040]) or 0,
+        5, "3B31: source credited")
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(256)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    assertTrue(#exportBodies >= 2, "3B31: export bodies present")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B31: begin adoption")
+    for i = 1, #exportBodies do
+        local stB = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(stB == "accepted" or stB == "duplicate",
+            "3B31: buffer st=" .. tostring(stB))
+    end
+    GS._adoptionCompletenessBudgetForTest = 8
+    GS._lastAdoptionCompletenessStats = nil
+    local sawBudget = false
+    local maxUsed = 0
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        local cstats = GS._lastAdoptionCompletenessStats
+        if type(cstats) == "table" then
+            if cstats.budgetExhausted == true then
+                sawBudget = true
+            end
+            if type(cstats.used) == "number" and cstats.used > maxUsed then
+                maxUsed = cstats.used
+            end
+            if type(cstats.budget) == "number" and type(cstats.used) == "number" then
+                assertTrue(cstats.used <= cstats.budget + 1,
+                    "3B31: completeness callback stayed within budget used="
+                        .. tostring(cstats.used) .. " budget=" .. tostring(cstats.budget))
+            end
+        end
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        guard = 0
+        while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+            guard = guard + 1
+            flushTimers()
+            world.time = world.time + 1
+            flushTimers()
+        end
+    end
+    GS._adoptionCompletenessBudgetForTest = nil
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(stAdopt == "accepted"
+        or (adopted and adopted.datasetId == sourceDataset),
+        "3B31: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    assertTrue(sawBudget or maxUsed >= 8,
+        "3B31: tight completeness budget exercised (sawBudget="
+            .. tostring(sawBudget) .. " maxUsed=" .. tostring(maxUsed) .. ")")
+    local prog = adopted and GS:ProjectCampaignProgress(adopted.currentCampaignId)
+    assertEq(tonumber(prog and prog.itemTotals and prog.itemTotals[9040]) or 0, 5,
+        "3B31: adopted client reconstructs donation after nested completeness yields")
+end
+
+do
+    -- 3B32) ≥32 pending-without-store evidence bodies terminate (no async hang).
+    local aliceRecord = seedStagedCampaignWithItem(9041, 40)
+    GS:EnsureGossipProvider()
+    local exportBodies = {}
+    -- Build synthetic transfer: dataset desc + many not_eligible evidence bodies.
+    GS.NotifyLocalDurableChange("config")
+    drainExportMaint(64)
+    for _, row in ipairs(collectAllExportBodies()) do
+        exportBodies[#exportBodies + 1] = row
+    end
+    local sourceDataset = aliceRecord.datasetId
+    local cfg = aliceRecord.accounting._consumables
+    for n = 1, 40 do
+        local ev = makeDepositEvidence(aliceRecord, {
+            itemId = 99991, -- not requested → not_eligible / item_not_requested
+            quantity = 1,
+            donor = "NoStore" .. n .. "-Garona",
+            occurrenceIndex = 1,
+            neighborsOlder = { "ns|o|" .. n },
+            neighborsNewer = { "ns|n|" .. n },
+        })
+        exportBodies[#exportBodies + 1] = {
+            id = "gs:ev:nostore-" .. n,
+            body = {
+                kind = "gs-evidence",
+                datasetId = sourceDataset,
+                campaignId = aliceRecord.currentCampaignId,
+                evidence = ev,
+                witnessGuid = "Player-1-Alice",
+            },
+        }
+    end
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "3B32: create prior dataset")
+    local priorDataset = GS:GetCurrentRecord() and GS:GetCurrentRecord().datasetId
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B32: begin adoption")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    GS._adoptionReplaySyncDrain = false
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 500 do
+        guard = guard + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    GS._adoptionReplaySyncDrain = true
+    if GS._adoption and GS._adoption.replayTemp then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertTrue(guard < 500, "3B32: async replay terminated within bound guard=" .. tostring(guard))
+    local live = GS:GetCurrentRecord()
+    assertTrue(stAdopt ~= "accepted"
+        and (live == nil or live.datasetId == priorDataset or live.datasetId ~= sourceDataset),
+        "3B32: non-retained evidence does not publish foreign dataset st="
+            .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+end
+
+do
+    -- 3B33) directExports eviction drops warm Gossip exportState.byId entries.
+    local record = seedStagedCampaignWithItem(9042, 40)
+    GS:EnsureGossipProvider()
+    local maxExports = GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256
+    for n = 1, maxExports + 8 do
+        local ev = makeDepositEvidence(record, {
+            itemId = 9042,
+            quantity = 1,
+            donor = "EvictDonor" .. n .. "-Garona",
+            occurrenceIndex = 1,
+            neighborsOlder = { "ev|o|" .. n },
+            neighborsNewer = { "ev|n|" .. n },
+            approxTxnTime = (world.time or 1000) - n * 10000,
+        })
+        GS.RecordDirectEvidenceExport(record, "Player-1-Alice", ev)
+    end
+    local exports = record.observations and record.observations.directExports
+    local durableCount = 0
+    if type(exports) == "table" then
+        for _ in pairs(exports) do durableCount = durableCount + 1 end
+    end
+    assertTrue(durableCount <= maxExports,
+        "3B33: durable directExports bounded got=" .. tostring(durableCount))
+    GS.NotifyLocalDurableChange("evidence")
+    drainExportMaint(64)
+    -- Snapshot ids present in Gossip after indexing, then overflow to evict.
+    local beforeIds = {}
+    do
+        local prov = GG.GetProvider(GS.PROVIDER_ID)
+        local cursor = 1
+        local guard = 0
+        while cursor and guard < 64 do
+            guard = guard + 1
+            local page, nextCursor = prov.api.ListRecordIds(cursor, 64)
+            for i = 1, #(page or {}) do
+                local id = page[i]
+                if type(id) == "string" and id:find("gs:ev:", 1, true) then
+                    beforeIds[id] = true
+                end
+            end
+            cursor = nextCursor
+        end
+    end
+    assertTrue(next(beforeIds) ~= nil, "3B33: evidence exports indexed in Gossip")
+    for n = 1, 12 do
+        local ev = makeDepositEvidence(record, {
+            itemId = 9042,
+            quantity = 1,
+            donor = "PostEvict" .. n .. "-Garona",
+            occurrenceIndex = 1,
+            neighborsOlder = { "pe|o|" .. n },
+            neighborsNewer = { "pe|n|" .. n },
+            approxTxnTime = (world.time or 1000) - (maxExports + n) * 10000,
+        })
+        GS.RecordDirectEvidenceExport(record, "Player-1-Alice", ev)
+    end
+    local durable = record.observations.directExports or {}
+    local stale = {}
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    for id, _ in pairs(beforeIds) do
+        if durable[id] == nil then
+            local body = prov.api.GetRecordBody(id)
+            if body and body.body then
+                stale[#stale + 1] = id
+            end
+        end
+    end
+    assertTrue(#stale == 0, "3B33: evicted durable ids removed from Gossip GetRecordBody stale="
+        .. tostring(#stale))
+end
+
+do
+    -- 3B34) Malformed accounting with matching guild meta fails closed before deref.
+    local record = seedStagedCampaignWithItem(9043, 20)
+    local evidence = makeDepositEvidence(record, { itemId = 9043, quantity = 2 })
+    local bad = {
+        datasetId = record.datasetId,
+        currentCampaignId = record.currentCampaignId,
+        accounting = "not-a-table",
+        guildKey = "club:42",
+    }
+    local okCall, stBad, rBad = pcall(function()
+        return GS:AdmitDirectObservation(evidence, {
+            member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+            offlineRecord = bad,
+            localWrite = true,
+        })
+    end)
+    assertEq(okCall, true, "3B34: no Lua error on malformed accounting")
+    assertEq(stBad, "rejected", "3B34: rejected")
+    assertTrue(rBad == "invalid_accounting" or rBad == "invalid_record",
+        "3B34: invalid_accounting reason got=" .. tostring(rBad))
+end
+
+do
+    -- 3B35) Archive eligibility+bankTab survive export → assemble → adoption.
+    local aliceRecord = seedStagedCampaignWithItem(9044, 60)
+    local oldCampaign = aliceRecord.currentCampaignId
+    local evidence = makeDepositEvidence(aliceRecord, { itemId = 9044, quantity = 6 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(oldCampaign).itemTotals[9044]) or 0,
+        6, "3B35: source credited before rollover")
+    local eligBefore = aliceRecord.accounting._consumables.eligibility
+    assertTrue(type(eligBefore) == "table", "3B35: live eligibility present")
+    startCampaign()
+    assertTrue(aliceRecord.campaignArchives and aliceRecord.campaignArchives[oldCampaign],
+        "3B35: archived")
+    local archLocal = aliceRecord.campaignArchives[oldCampaign]
+    assertTrue(archLocal.eligibility ~= nil, "3B35: archive eligibility stored locally")
+    assertTrue(tonumber(archLocal.bankTab) ~= nil, "3B35: archive bankTab stored locally")
+    GS:EnsureGossipProvider()
+    GS.NotifyLocalDurableChange("campaign")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    local sawArchiveElig = false
+    for i = 1, #exportBodies do
+        local b = exportBodies[i].body
+        if b and b.kind == "campaign-archive" and b.campaignId == oldCampaign then
+            assertTrue(b.eligibility ~= nil, "3B35: exported archive includes eligibility")
+            assertTrue(tonumber(b.bankTab) ~= nil, "3B35: exported archive includes bankTab")
+            sawArchiveElig = true
+        end
+    end
+    assertTrue(sawArchiveElig, "3B35: campaign-archive body exported with eligibility")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B35: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 4000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        guard = 0
+        while GS._adoption and GS._adoption.replayTemp and guard < 4000 do
+            guard = guard + 1
+            flushTimers()
+            world.time = world.time + 1
+            flushTimers()
+        end
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(stAdopt == "accepted"
+        or (adopted and adopted.datasetId == sourceDataset),
+        "3B35: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    local adoptedArch = adopted and adopted.campaignArchives and adopted.campaignArchives[oldCampaign]
+    assertTrue(adoptedArch and adoptedArch.eligibility ~= nil,
+        "3B35: adopted archive retained eligibility")
+    assertTrue(adoptedArch and tonumber(adoptedArch.bankTab) ~= nil,
+        "3B35: adopted archive retained bankTab")
+end
+
+do
+    -- 3B36) Two distinct same-fingerprint deposits (>3h apart) both survive adoption.
+    local aliceRecord = seedStagedCampaignWithItem(9045, 80)
+    GS:EnsureGossipProvider()
+    local t0 = world.time or 1000000
+    local shared = {
+        itemId = 9045,
+        quantity = 3,
+        donor = "SameFp-Garona",
+        occurrenceIndex = 1,
+        neighborsOlder = { "same|older" },
+        neighborsNewer = { "same|newer" },
+    }
+    local ev1 = makeDepositEvidence(aliceRecord, shared)
+    ev1.approxTxnTime = t0 - 100
+    ev1.observedAt = t0
+    local ev2 = makeDepositEvidence(aliceRecord, shared)
+    ev2.approxTxnTime = t0 - (4 * 3600) - 100
+    ev2.observedAt = t0 - (4 * 3600)
+    local fp1 = GS.OccurrenceFingerprint(ev1)
+    local fp2 = GS.OccurrenceFingerprint(ev2)
+    assertEq(fp1, fp2, "3B36: fingerprints collide by design")
+    assertTrue(not GS.EvidenceOccurrenceMatches(ev1, ev2),
+        "3B36: MatchScore distinguishes >3h deposits")
+    for _, ev in ipairs({ ev1, ev2 }) do
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(ev, pair[1], pair[2])
+        end
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(aliceRecord.currentCampaignId).itemTotals[9045]) or 0,
+        6, "3B36: source credited both occurrences")
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    local evidenceCount = 0
+    for i = 1, #exportBodies do
+        if exportBodies[i].body and exportBodies[i].body.kind == "gs-evidence" then
+            evidenceCount = evidenceCount + 1
+        end
+    end
+    assertTrue(evidenceCount >= 2, "3B36: both evidence bodies exported got=" .. tostring(evidenceCount))
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B36: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 4000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        guard = 0
+        while GS._adoption and GS._adoption.replayTemp and guard < 4000 do
+            guard = guard + 1
+            flushTimers()
+            world.time = world.time + 1
+            flushTimers()
+        end
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(stAdopt == "accepted"
+        or (adopted and adopted.datasetId == sourceDataset),
+        "3B36: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    local prog = adopted and GS:ProjectCampaignProgress(adopted.currentCampaignId)
+    assertEq(tonumber(prog and prog.itemTotals and prog.itemTotals[9045]) or 0, 6,
+        "3B36: both same-fp occurrences credited after adoption")
+    local donated = 0
+    local events = adopted and adopted.accounting and adopted.accounting._consumableEvents
+    if type(events) == "table" then
+        for i = 1, #events do
+            local e = events[i]
+            if e and e.type == "donation" and tonumber(e.itemId) == 9045
+                and tonumber(e.quantity) == 3 then
+                donated = donated + 1
+            end
+        end
+    end
+    assertEq(donated, 2, "3B36: two distinct ledger donations retained got=" .. tostring(donated))
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

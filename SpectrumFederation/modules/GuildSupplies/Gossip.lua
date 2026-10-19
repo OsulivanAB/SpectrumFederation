@@ -353,6 +353,22 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
         pageCount = 1
     end
     local itemsFp = FingerprintBody(items)
+    -- Eligibility cutoffs + bankTab must travel with the archive so historical
+    -- witness admission can prove original campaign context (#388 / #4310458291).
+    local eligibility = nil
+    if type(archive.eligibility) == "table" then
+        eligibility = {
+            baselineEstablished = archive.eligibility.baselineEstablished,
+            baselineAt = archive.eligibility.baselineAt,
+            tabEligibleFrom = archive.eligibility.tabEligibleFrom,
+            items = {},
+        }
+        if type(archive.eligibility.items) == "table" then
+            for k, v in pairs(archive.eligibility.items) do
+                eligibility.items[tostring(k)] = v
+            end
+        end
+    end
     out[#out + 1] = {
         id = "gs:ca:" .. campaignId,
         body = {
@@ -365,6 +381,8 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
             itemCount = #ids,
             pageCount = pageCount,
             itemsFingerprint = itemsFp,
+            bankTab = tonumber(archive.bankTab),
+            eligibility = eligibility,
             -- Small archives still include items inline for compatibility.
             requestedItems = (#ids <= ARCHIVE_PAGE_ITEMS) and items or nil,
         },
@@ -1643,6 +1661,53 @@ local function UpsertExportBody(id, body)
             prov.index.buildComplete = false
         end
     end
+end
+
+--- Drop evicted durable export ids from the warm Gossip index (bounded).
+-- Called when Ledger evicts directExports so descriptor counts and GetRecord
+-- cannot keep serving removed bodies until a full rebuild.
+function GS.RemoveGossipExportBodies(ids)
+    if type(ids) ~= "table" or #ids < 1 then
+        return 0
+    end
+    local removed = 0
+    local drop = {}
+    local limit = math.min(#ids, 64)
+    for i = 1, limit do
+        local id = ids[i]
+        if type(id) == "string" and exportState.byId[id] then
+            exportState.byId[id] = nil
+            drop[id] = true
+            removed = removed + 1
+        end
+    end
+    if removed < 1 then
+        return 0
+    end
+    local write = 1
+    for read = 1, #exportState.order do
+        local id = exportState.order[read]
+        if not drop[id] then
+            exportState.order[write] = id
+            write = write + 1
+        end
+    end
+    for i = write, #exportState.order do
+        exportState.order[i] = nil
+    end
+    if exportState.enumPos and exportState.enumPos > #exportState.order then
+        exportState.enumPos = #exportState.order
+    end
+    exportState.countsDirty = true
+    exportState.maintIdle = false
+    if GG and GG.GetProvider and providerRegistered then
+        local prov = GG.GetProvider(GS.PROVIDER_ID)
+        if prov and prov.index then
+            prov.index.dirty = true
+            prov.index.buildComplete = false
+        end
+    end
+    return removed
 end
 
 ---------------------------------------------------------------------------

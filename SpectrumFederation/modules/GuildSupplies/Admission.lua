@@ -1646,6 +1646,23 @@ local function AssemblePagedArchive(meta, pagesByIndex)
     if type(meta) ~= "table" then
         return nil, "invalid_campaign_archive"
     end
+    local function CopyArchiveEligibility(src)
+        if type(src) ~= "table" then
+            return nil
+        end
+        local eligibility = {
+            baselineEstablished = src.baselineEstablished,
+            baselineAt = src.baselineAt,
+            tabEligibleFrom = src.tabEligibleFrom,
+            items = {},
+        }
+        if type(src.items) == "table" then
+            for k, v in pairs(src.items) do
+                eligibility.items[tostring(k)] = v
+            end
+        end
+        return eligibility
+    end
     if type(meta.requestedItems) == "table" then
         -- Inline small archive (no pages required).
         return {
@@ -1655,6 +1672,8 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             requestedItems = meta.requestedItems,
             generation = meta.generation,
             archivedAt = meta.archivedAt,
+            bankTab = tonumber(meta.bankTab),
+            eligibility = CopyArchiveEligibility(meta.eligibility),
         }, nil
     end
     local pageCount = tonumber(meta.pageCount) or 1
@@ -1681,6 +1700,8 @@ local function AssemblePagedArchive(meta, pagesByIndex)
         requestedItems = merged,
         generation = meta.generation,
         archivedAt = meta.archivedAt,
+        bankTab = tonumber(meta.bankTab),
+        eligibility = CopyArchiveEligibility(meta.eligibility),
     }, nil
 end
 
@@ -3289,11 +3310,11 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             -- source peer only; verified totals come from gs-ledger-event transfer.
             local evidence = body.evidence
             local campId = evidence.campaignId or body.campaignId or temp.currentCampaignId
-            -- Session-owned occurrence index: settled lookups are not free.
+            local orderId = adop.order[i]
+            -- Session-owned occurrence buckets: fingerprint groups candidates;
+            -- MatchScore decides same-occurrence (fp alone is not identity).
             state.acctIndex = state.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
-            local alreadyEv = false
-            local scanCost = 0
-            local function occurrenceKey(row)
+            local function occurrenceFp(row)
                 if type(row) ~= "table" then return nil end
                 local fp = GS.OccurrenceFingerprint and GS.OccurrenceFingerprint(row)
                 if type(fp) == "string" and fp ~= "" then
@@ -3301,13 +3322,51 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 end
                 return tostring(row.coreSignature or "") .. "|"
                     .. tostring(row.itemId or "") .. "|"
-                    .. tostring(row.quantity or "") .. "|"
-                    .. tostring(row.approxTxnTime or row.timestamp or "")
+                    .. tostring(row.quantity or "")
             end
-            local evKey = occurrenceKey(evidence)
-            if evKey and state.acctIndex.pendingOcc[evKey] then
+            local function bucketHasMatch(bucket, row)
+                if type(bucket) ~= "table" then return false end
+                for bi = 1, #bucket do
+                    if GS.EvidenceOccurrenceMatches
+                        and GS.EvidenceOccurrenceMatches(bucket[bi], row) then
+                        return true
+                    end
+                end
+                return false
+            end
+            local function rememberOcc(map, row)
+                local fp = occurrenceFp(row)
+                if not fp then return end
+                local bucket = map[fp]
+                if type(bucket) ~= "table" then
+                    bucket = {}
+                    map[fp] = bucket
+                end
+                if not bucketHasMatch(bucket, row) and #bucket < 8 then
+                    bucket[#bucket + 1] = {
+                        coreSignature = row.coreSignature,
+                        itemId = row.itemId,
+                        quantity = row.quantity,
+                        approxTxnTime = row.approxTxnTime or row.timestamp,
+                        occurrenceIndex = row.occurrenceIndex,
+                        neighborsOlder = row.neighborsOlder,
+                        neighborsNewer = row.neighborsNewer,
+                        guildGuid = row.guildGuid,
+                        bankTab = row.bankTab,
+                        generation = row.generation,
+                    }
+                end
+            end
+            local alreadyEv = false
+            local scanCost = 0
+            local evFp = occurrenceFp(evidence)
+            if evFp and bucketHasMatch(state.acctIndex.pendingOcc[evFp], evidence) then
                 alreadyEv = true
-            elseif evKey and state.acctIndex.byOcc[evKey] then
+            elseif evFp and bucketHasMatch(state.acctIndex.byOcc[evFp], evidence) then
+                alreadyEv = true
+            elseif state.skipEvidence and state.skipEvidence[orderId] then
+                -- Terminally classified non-retained evidence: do not re-admit.
+                unsettledSeen = true
                 alreadyEv = true
             else
                 local byCampaign = temp.observations and temp.observations.byCampaign
@@ -3320,8 +3379,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                             and GS.EvidenceOccurrenceMatches
                             and GS.EvidenceOccurrenceMatches(c.evidence, evidence) then
                             alreadyEv = true
-                            local pk = occurrenceKey(c.evidence)
-                            if pk then state.acctIndex.pendingOcc[pk] = true end
+                            rememberOcc(state.acctIndex.pendingOcc, c.evidence)
                             break
                         end
                     end
@@ -3335,20 +3393,18 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                             if type(e) == "table" and GS.EvidenceOccurrenceMatches
                                 and GS.EvidenceOccurrenceMatches(e, evidence) then
                                 alreadyEv = true
-                                local ok2 = occurrenceKey(e)
-                                if ok2 then state.acctIndex.byOcc[ok2] = true end
+                                rememberOcc(state.acctIndex.byOcc, e)
                                 break
                             end
                         end
                     end
                 end
             end
-            -- Charge nested scans against the UI-thread slice budget.
             if scanCost > 0 then
                 sliceUsed = sliceUsed + math.max(1, math.floor(scanCost / 32))
             end
             if alreadyEv then
-                -- settled
+                -- settled or terminally skipped
             else
                 if sliceUsed >= sliceBudget then
                     unsettledSeen = true
@@ -3380,7 +3436,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 sliceUsed = sliceUsed + 1
                 if stEv == "accepted" or stEv == "duplicate" then
                     progress = true
-                    if evKey then state.acctIndex.pendingOcc[evKey] = true end
+                    rememberOcc(state.acctIndex.pendingOcc, evidence)
                 elseif stEv == "pending" then
                     local afterPending = 0
                     local byCampPost = temp.observations and temp.observations.byCampaign
@@ -3390,10 +3446,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     end
                     if afterPending ~= beforePending then
                         progress = true
-                        if evKey then state.acctIndex.pendingOcc[evKey] = true end
+                        rememberOcc(state.acctIndex.pendingOcc, evidence)
                     else
-                        -- Retained pending without durable progress must not
-                        -- reset idle/stall detection or perpetually reschedule.
+                        -- No durable cluster stored: classify terminal for this
+                        -- transfer so async replay cannot requeue forever.
+                        state.skipEvidence = state.skipEvidence or {}
+                        state.skipEvidence[orderId] = true
                         unsettledSeen = true
                     end
                 else
@@ -3406,11 +3464,14 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             state.acctIndex = state.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
             local alreadyLe = false
             local scanCost = 0
+            -- byId is exact-ID only (never collapses distinct reminted txn ids).
             if type(eid) == "string" and eid ~= "" and state.acctIndex.byId[eid] then
                 alreadyLe = true
-            elseif type(event.txnId) == "string" and state.acctIndex.byId[event.txnId] then
+            elseif type(event.txnId) == "string" and event.txnId ~= ""
+                and state.acctIndex.byId[event.txnId] then
                 alreadyLe = true
-            elseif type(event.opId) == "string" and state.acctIndex.byId[event.opId] then
+            elseif type(event.opId) == "string" and event.opId ~= ""
+                and state.acctIndex.byId[event.opId] then
                 alreadyLe = true
             else
                 local events = temp.accounting and temp.accounting._consumableEvents
@@ -3612,8 +3673,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             state.deferRankCached = nil
         end
     else
-        -- Worklist waits are not stalls. Budget-exhausted retry slices are still
-        -- productive work and must not accumulate toward the noProgress abort.
+        -- Worklist waits are not stalls. Budget-exhausted slices that made no
+        -- durable progress (e.g. ≥32 pending-without-store bodies) still count
+        -- toward termination so async ContinueAdoptionReplay cannot requeue forever.
         local hasWorklist = false
         if type(state.worklist) == "table" then
             for _ in pairs(state.worklist) do
@@ -3621,8 +3683,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 break
             end
         end
-        local budgetExhausted = sliceUsed >= sliceBudget
-        if not hasWorklist and not budgetExhausted then
+        if not hasWorklist then
             state.noProgressSlices = (tonumber(state.noProgressSlices) or 0) + 1
         end
     end
@@ -3896,78 +3957,193 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             and type(body.event) == "table" then
             local ev = body.event
             local eid = ev.id or ev.opId or ev.txnId
+            -- Session-owned exact-ID index + nested scan cursor so large settled
+            -- ledgers charge work and can yield mid-scan without restarting.
+            opts.acctIndex = opts.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
             local found = false
-            local events = temp.accounting and temp.accounting._consumableEvents
-            if type(events) == "table" then
-                for j = 1, #events do
-                    local e = events[j]
-                    if type(e) == "table" then
-                        if (type(eid) == "string" and eid ~= ""
-                            and (e.id == eid or e.opId == eid or e.txnId == eid))
-                            or (type(ev.txnId) == "string" and ev.txnId ~= ""
-                                and (e.id == ev.txnId or e.txnId == ev.txnId))
-                            or (type(ev.opId) == "string" and ev.opId ~= ""
-                                and (e.id == ev.opId or e.opId == ev.opId)) then
-                            found = true
-                            break
+            if type(eid) == "string" and eid ~= "" and opts.acctIndex.byId[eid] then
+                found = true
+            elseif type(ev.txnId) == "string" and ev.txnId ~= ""
+                and opts.acctIndex.byId[ev.txnId] then
+                found = true
+            elseif type(ev.opId) == "string" and ev.opId ~= ""
+                and opts.acctIndex.byId[ev.opId] then
+                found = true
+            else
+                local events = temp.accounting and temp.accounting._consumableEvents
+                local nest = opts.ledgerScanCursor and opts.ledgerScanCursor[i] or 1
+                if type(events) == "table" then
+                    for j = nest, #events do
+                        if visited >= budget then
+                            opts.ledgerScanCursor = opts.ledgerScanCursor or {}
+                            opts.ledgerScanCursor[i] = j
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false, "budget"
+                        end
+                        -- Charge each nested visit so settled bodies cannot
+                        -- perform unbudgeted O(events) work per callback.
+                        visited = visited + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        local e = events[j]
+                        if type(e) == "table" then
+                            if (type(eid) == "string" and eid ~= ""
+                                and (e.id == eid or e.opId == eid or e.txnId == eid))
+                                or (type(ev.txnId) == "string" and ev.txnId ~= ""
+                                    and (e.id == ev.txnId or e.txnId == ev.txnId))
+                                or (type(ev.opId) == "string" and ev.opId ~= ""
+                                    and (e.id == ev.opId or e.opId == ev.opId)) then
+                                found = true
+                                if type(e.id) == "string" then
+                                    opts.acctIndex.byId[e.id] = true
+                                end
+                                if type(e.txnId) == "string" then
+                                    opts.acctIndex.byId[e.txnId] = true
+                                end
+                                if type(e.opId) == "string" then
+                                    opts.acctIndex.byId[e.opId] = true
+                                end
+                                break
+                            end
                         end
                     end
+                end
+                if found and opts.ledgerScanCursor then
+                    opts.ledgerScanCursor[i] = nil
                 end
             end
             if not found then
                 opts.cursor = nil
+                opts.budgetExhausted = false
                 publishCompletenessStats()
                 return false, "incomplete_transfer"
             end
         elseif type(body) == "table" and body.kind == "gs-evidence"
             and type(body.evidence) == "table" then
             local ev = body.evidence
-            local settled = false
-            local scanCost = 0
-            -- Distinct occurrences with the same core signature must not collapse.
-            local events = temp.accounting and temp.accounting._consumableEvents
-            if type(events) == "table" then
-                for j = 1, #events do
-                    scanCost = scanCost + 1
-                    local e = events[j]
-                    if type(e) == "table" and GS.EvidenceOccurrenceMatches
-                        and GS.EvidenceOccurrenceMatches(e, ev) then
-                        settled = true
-                        break
+            opts.acctIndex = opts.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
+            local function occurrenceFp(row)
+                if type(row) ~= "table" then return nil end
+                local fp = GS.OccurrenceFingerprint and GS.OccurrenceFingerprint(row)
+                if type(fp) == "string" and fp ~= "" then
+                    return fp
+                end
+                return tostring(row.coreSignature or "") .. "|"
+                    .. tostring(row.itemId or "") .. "|"
+                    .. tostring(row.quantity or "")
+            end
+            local function bucketHasMatch(bucket, row)
+                if type(bucket) ~= "table" then return false end
+                for bi = 1, #bucket do
+                    if GS.EvidenceOccurrenceMatches
+                        and GS.EvidenceOccurrenceMatches(bucket[bi], row) then
+                        return true
                     end
                 end
+                return false
             end
-            if not settled then
-                local byCampaign = temp.observations and temp.observations.byCampaign
-                local campId = ev.campaignId or body.campaignId or temp.currentCampaignId
-                local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
-                if type(pending) == "table" then
-                    for pi = 1, #pending do
-                        scanCost = scanCost + 1
-                        local c = pending[pi]
-                        if type(c) == "table" and type(c.evidence) == "table"
-                            and GS.EvidenceOccurrenceMatches
-                            and GS.EvidenceOccurrenceMatches(c.evidence, ev) then
-                            settled = true
-                            break
+            local function rememberOcc(map, row)
+                local fp = occurrenceFp(row)
+                if not fp then return end
+                local bucket = map[fp]
+                if type(bucket) ~= "table" then
+                    bucket = {}
+                    map[fp] = bucket
+                end
+                if not bucketHasMatch(bucket, row) and #bucket < 8 then
+                    bucket[#bucket + 1] = {
+                        coreSignature = row.coreSignature,
+                        itemId = row.itemId,
+                        quantity = row.quantity,
+                        approxTxnTime = row.approxTxnTime or row.timestamp,
+                        occurrenceIndex = row.occurrenceIndex,
+                        neighborsOlder = row.neighborsOlder,
+                        neighborsNewer = row.neighborsNewer,
+                        guildGuid = row.guildGuid,
+                        bankTab = row.bankTab,
+                        generation = row.generation,
+                    }
+                end
+            end
+            local settled = false
+            local evFp = occurrenceFp(ev)
+            if evFp and bucketHasMatch(opts.acctIndex.pendingOcc[evFp], ev) then
+                settled = true
+            elseif evFp and bucketHasMatch(opts.acctIndex.byOcc[evFp], ev) then
+                settled = true
+            else
+                -- Nested cursors: events phase then pending phase. Yield mid-scan
+                -- so an evidence body whose match is deep in a large ledger cannot
+                -- re-scan from index 1 on every budget resume.
+                local nest = opts.evidenceScanCursor and opts.evidenceScanCursor[i]
+                if type(nest) ~= "table" then
+                    nest = { phase = "events", pos = 1 }
+                end
+                if nest.phase == "events" then
+                    local events = temp.accounting and temp.accounting._consumableEvents
+                    if type(events) == "table" then
+                        for j = nest.pos, #events do
+                            if visited >= budget then
+                                opts.evidenceScanCursor = opts.evidenceScanCursor or {}
+                                opts.evidenceScanCursor[i] = { phase = "events", pos = j }
+                                opts.cursor = i
+                                opts.budgetExhausted = true
+                                publishCompletenessStats()
+                                return false, "budget"
+                            end
+                            visited = visited + 1
+                            adop._workStats.completenessVisited =
+                                (adop._workStats.completenessVisited or 0) + 1
+                            local e = events[j]
+                            if type(e) == "table" and GS.EvidenceOccurrenceMatches
+                                and GS.EvidenceOccurrenceMatches(e, ev) then
+                                settled = true
+                                rememberOcc(opts.acctIndex.byOcc, e)
+                                break
+                            end
+                        end
+                    end
+                    if not settled then
+                        nest = { phase = "pending", pos = 1 }
+                    end
+                end
+                if not settled and nest.phase == "pending" then
+                    local byCampaign = temp.observations and temp.observations.byCampaign
+                    local campId = ev.campaignId or body.campaignId or temp.currentCampaignId
+                    local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
+                    if type(pending) == "table" then
+                        for pi = nest.pos, #pending do
+                            if visited >= budget then
+                                opts.evidenceScanCursor = opts.evidenceScanCursor or {}
+                                opts.evidenceScanCursor[i] = { phase = "pending", pos = pi }
+                                opts.cursor = i
+                                opts.budgetExhausted = true
+                                publishCompletenessStats()
+                                return false, "budget"
+                            end
+                            visited = visited + 1
+                            adop._workStats.completenessVisited =
+                                (adop._workStats.completenessVisited or 0) + 1
+                            local c = pending[pi]
+                            if type(c) == "table" and type(c.evidence) == "table"
+                                and GS.EvidenceOccurrenceMatches
+                                and GS.EvidenceOccurrenceMatches(c.evidence, ev) then
+                                settled = true
+                                rememberOcc(opts.acctIndex.pendingOcc, c.evidence)
+                                break
+                            end
                         end
                     end
                 end
-            end
-            if scanCost > 0 then
-                visited = visited + math.max(1, math.floor(scanCost / 32))
-                adop._workStats.completenessVisited =
-                    (adop._workStats.completenessVisited or 0)
-                    + math.max(1, math.floor(scanCost / 32))
-            end
-            if visited >= budget then
-                opts.cursor = i
-                opts.budgetExhausted = true
-                publishCompletenessStats()
-                return false, "budget"
+                if settled and opts.evidenceScanCursor then
+                    opts.evidenceScanCursor[i] = nil
+                end
             end
             if not settled then
                 opts.cursor = nil
+                opts.budgetExhausted = false
                 publishCompletenessStats()
                 return false, "incomplete_transfer"
             end
@@ -3975,6 +4151,12 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     end
     opts.cursor = nil
     opts.budgetExhausted = false
+    if opts.ledgerScanCursor then
+        opts.ledgerScanCursor = nil
+    end
+    if opts.evidenceScanCursor then
+        opts.evidenceScanCursor = nil
+    end
     publishCompletenessStats()
     return true, nil
 end
@@ -4161,11 +4343,20 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
+        acctIndex = state.acctIndex,
     }
     compOpts.budget = compBudget
+    if not compOpts.acctIndex then
+        compOpts.acctIndex = state.acctIndex
+    end
     local okComp, compErr
     local guard = 0
-    local maxGuard = math.max(8, math.ceil((#adop.order or 0) / compBudget) * 2 + 8)
+    -- Nested ledger/evidence scan resumes can exceed top-level body count.
+    local maxGuard = math.max(
+        8,
+        math.ceil((#adop.order or 0) / math.max(1, compBudget)) * 2 + 8,
+        (#adop.order or 0) * 4 + 64
+    )
     repeat
         guard = guard + 1
         okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member, compOpts)
@@ -4337,14 +4528,22 @@ local function ContinueAdoptionReplay(adop)
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
+        acctIndex = state.acctIndex,
     }
     compOpts.budget = compBudget
+    if not compOpts.acctIndex then
+        compOpts.acctIndex = state.acctIndex
+    end
     local okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member, compOpts)
     if not okComp and compErr == "budget" then
         state.completenessOpts = compOpts
         if GS._adoptionReplaySyncDrain then
             local guard = 0
-            local maxGuard = math.max(8, math.ceil((#adop.order or 0) / compBudget) * 2 + 8)
+            local maxGuard = math.max(
+                8,
+                math.ceil((#adop.order or 0) / math.max(1, compBudget)) * 2 + 8,
+                (#adop.order or 0) * 4 + 64
+            )
             while not okComp and compErr == "budget" and guard < maxGuard do
                 guard = guard + 1
                 local ctxOk3, ctxErr3, member3 = ValidateAdoptionCommitContext(adop)
