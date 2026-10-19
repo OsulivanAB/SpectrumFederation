@@ -338,6 +338,7 @@ loadModule("SpectrumFederation/modules/GuildSupplies/State.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Authority.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Operations.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Campaigns.lua")
+loadModule("SpectrumFederation/modules/GuildSupplies/Activation.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Ledger.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Gossip.lua")
@@ -20488,6 +20489,324 @@ do
     assertTrue(elapsed < 1.0, "3B54: repeated GetCurrentRecord bounded elapsed="
         .. tostring(elapsed))
     GS.MAX_LEDGER_EVENTS = priorMax
+end
+
+---------------------------------------------------------------------------
+-- 3C) Guarded activation and legacy cutover (#389)
+---------------------------------------------------------------------------
+
+local function armFreshBankSample(empty)
+    GetNumGuildBankTransactions = function(tab)
+        return empty and 0 or 1
+    end
+    GetGuildBankTransaction = function(tab, index)
+        return "deposit", "Donor-Garona", "|Hitem:9100::::::::|h[Flask]|h", 2,
+            1, 1, 2026, 10, 19, 12
+    end
+    GS._BankContextReadinessProbe = function(tab)
+        return true
+    end
+end
+
+local function disarmFreshBankSample()
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+    GS._BankContextReadinessProbe = nil
+end
+
+local function seedActivatableCampaign(itemId, goal)
+    local record = seedStagedCampaignWithItem(itemId or 9100, goal or 20)
+    armFreshBankSample(true)
+    return record
+end
+
+do
+    -- 3C1) Authorized editor activates; bank sample + cutover persisted
+    local record = seedActivatableCampaign(9101, 30)
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), true, "3C1: legacy writers before activation")
+    local ready = GS:GetActivationReadiness()
+    assertEq(ready.canActivate, true, "3C1: readiness canActivate")
+    local rec, status, reason = GS:ActivateCanonicalDataset()
+    assertEq(status, "accepted", "3C1: activate accepted reason=" .. tostring(reason))
+    assertEq(reason, "activated", "3C1: activated reason")
+    assertTrue(rec and rec.activation == GS.ACTIVATION_ACTIVE, "3C1: activation active")
+    assertTrue(type(rec.liveCutover) == "table", "3C1: liveCutover present")
+    assertEq(rec.liveCutover.contextStatus, "empty", "3C1: verified empty sample")
+    assertTrue(type(rec.liveCutover.cutoverMarker) == "string", "3C1: cutover marker")
+    local cfg = rec.accounting._consumables
+    assertEq(cfg.eligibility.baselineEstablished, true, "3C1: eligibility baseline")
+    assertEq(tonumber(cfg.eligibility.tabEligibleFrom), tonumber(rec.liveCutover.contextObservedAt),
+        "3C1: tabEligibleFrom matches bank sample")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), false, "3C1: legacy writers retired")
+    assertEq(#world.chat, 0, "3C1: no chat")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C2) Non-editor denied; Preview as Non-Admin denied; GM editor allowed
+    local record = seedActivatableCampaign(9102, 10)
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "rejected", "3C2: member rejected")
+    assertEq(reason, "unauthorized", "3C2: unauthorized reason got=" .. tostring(reason))
+    assertEq(record.activation, GS.ACTIVATION_STAGED, "3C2: still staged after deny")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = true
+    _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "rejected", "3C2: preview rejected")
+    assertEq(reason, "preview_non_admin", "3C2: preview reason got=" .. tostring(reason))
+    world.impersonationActive = false
+
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C2: officer editor activates st=" .. tostring(st)
+        .. " r=" .. tostring(reason))
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C3) Fresh bank sample required; unavailable vs verified empty
+    local record = seedStagedCampaignWithItem(9103, 10)
+    disarmFreshBankSample()
+    local ready = GS:GetActivationReadiness()
+    assertEq(ready.canActivate, false, "3C3: not ready without bank")
+    local _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "rejected", "3C3: reject without sample")
+    assertTrue(reason == "api_unavailable" or reason == "log_not_updated"
+        or reason == "bank_closed" or reason == "readiness_unavailable",
+        "3C3: sample reason got=" .. tostring(reason))
+    assertEq(record.activation, GS.ACTIVATION_STAGED, "3C3: unchanged")
+
+    armFreshBankSample(true)
+    _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C3: empty sample activates")
+    assertEq(GS:GetCurrentRecord().liveCutover.contextStatus, "empty", "3C3: empty status")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C4) Idempotent reactivation + reload durability; no legacy fallback
+    local record = seedActivatableCampaign(9104, 10)
+    local _, st1 = GS:ActivateCanonicalDataset()
+    assertEq(st1, "accepted", "3C4: first activate")
+    local marker = GS:GetCurrentRecord().liveCutover.cutoverMarker
+    disarmFreshBankSample() -- later clients need no bank
+    local _, st2, r2 = GS:ActivateCanonicalDataset()
+    assertEq(st2, "duplicate", "3C4: idempotent duplicate")
+    assertEq(r2, "already_activated", "3C4: already_activated")
+    assertEq(GS:GetCurrentRecord().liveCutover.cutoverMarker, marker, "3C4: marker stable")
+
+    local saved = SpectrumFederationDB
+    GS._root = nil
+    GS._rootValid = false
+    initGS()
+    local restored = GS:GetCurrentRecord()
+    assertTrue(restored and restored.activation == GS.ACTIVATION_ACTIVE, "3C4: reload active")
+    assertEq(restored.liveCutover.cutoverMarker, marker, "3C4: reload marker")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), false, "3C4: no legacy after reload")
+    assertTrue(saved == SpectrumFederationDB, "3C4: same db root")
+end
+
+do
+    -- 3C5) Pre-activation evidence never credits; post-activation three-witness does
+    local record = seedActivatableCampaign(9105, 40)
+    local cutoverAt = world.time
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C5: activated")
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    local pre = makeDepositEvidence(record, {
+        itemId = 9105, quantity = 3,
+        observedAt = boundary + 100,
+        ageHours = 2, -- approxTxnTime = observedAt - 7200 < boundary
+    })
+    assertTrue(pre.approxTxnTime < boundary, "3C5: pre evidence before boundary")
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(pre, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9105]) or 0,
+        0, "3C5: pre-cutover uncredited")
+
+    world.time = boundary + 7200
+    local post = makeDepositEvidence(record, {
+        itemId = 9105, quantity = 5,
+        observedAt = world.time,
+        ageHours = 0,
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(post, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9105]) or 0,
+        5, "3C5: post-cutover credited once")
+    -- Fourth witness / replay must not double-credit.
+    assertEq(select(1, GS:_AdmitObservationForTests(post, "Player-1-Dave", "Dave-Garona")),
+        "duplicate", "3C5: fourth witness duplicate")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9105]) or 0,
+        5, "3C5: still once")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C6) Compatible catch-up installs remote live cutover without bank sample
+    local alice = seedActivatableCampaign(9106, 10)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C6: alice activates")
+    local cutover = alice.liveCutover
+    local marker = cutover.cutoverMarker
+    disarmFreshBankSample()
+
+    -- Simulate Bob with same staged dataset receiving descriptor catch-up.
+    local bobRoot = {
+        schemaVersion = 1,
+        localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 },
+        guilds = {
+            ["club:42"] = {
+                schemaVersion = 1,
+                activation = GS.ACTIVATION_STAGED,
+                datasetId = alice.datasetId,
+                permission = alice.permission,
+                currentCampaignId = alice.currentCampaignId,
+                campaigns = alice.campaigns,
+                campaignArchives = alice.campaignArchives or {},
+                campaignContext = alice.campaignContext or {},
+                accounting = alice.accounting,
+                observations = { byCampaign = {} },
+                identityLinks = alice.identityLinks,
+                operations = alice.operations,
+                confirmationRefs = alice.confirmationRefs or {},
+                migration = nil,
+            },
+        },
+    }
+    SpectrumFederationDB = { guildSupplies = bobRoot }
+    GS._root = nil
+    GS._rootValid = false
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    initGS()
+    local bobRec = GS:GetCurrentRecord()
+    assertEq(bobRec.activation, GS.ACTIVATION_STAGED, "3C6: bob starts staged")
+    local stCut, cutReason = GS.InstallRemoteLiveCutover(bobRec, cutover, "club:42", {
+        quarantinePending = true,
+    })
+    assertTrue(stCut == "accepted" or stCut == "duplicate",
+        "3C6: catch-up st=" .. tostring(stCut) .. " r=" .. tostring(cutReason))
+    assertEq(bobRec.activation, GS.ACTIVATION_ACTIVE, "3C6: bob now active")
+    assertEq(bobRec.liveCutover.cutoverMarker, marker, "3C6: same marker")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), false, "3C6: bob legacy retired")
+end
+
+do
+    -- 3C7) Conflicting live cutover markers fail closed
+    local record = seedActivatableCampaign(9107, 10)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C7: activated")
+    record = GS:GetCurrentRecord()
+    local other = {
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        activatedAt = (tonumber(record.liveCutover.activatedAt) or 0) + 99,
+        activatedByGuid = "Player-1-Eve",
+        activatedByName = "Eve-Garona",
+        bankTab = record.liveCutover.bankTab,
+        contextStatus = "empty",
+        contextObservedAt = (tonumber(record.liveCutover.activatedAt) or 0) + 99,
+        contextRecordCount = 0,
+        cutoverMarker = nil,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = (tonumber(record.liveCutover.activatedAt) or 0) + 99,
+        },
+    }
+    other.cutoverMarker = GS.BuildCutoverMarker(other.datasetId, other.activatedAt, other.bankTab)
+    local stCut, cutReason = GS.InstallRemoteLiveCutover(record, other, "club:42")
+    assertEq(stCut, "rejected", "3C7: conflict rejected")
+    assertEq(cutReason, "live_activation_conflict", "3C7: conflict reason")
+    assertEq(record.liveCutover.cutoverMarker,
+        GS.BuildCutoverMarker(record.datasetId, record.liveCutover.activatedAt, record.liveCutover.bankTab),
+        "3C7: original marker preserved")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C8) Open conflicts / dataset mismatch block activation
+    local record = seedActivatableCampaign(9108, 10)
+    local oldConflicts = GS.ListOpenConflicts
+    GS.ListOpenConflicts = function()
+        return { { targetKey = "item:9108", candidates = { { id = "op-a" }, { id = "op-b" } } } }
+    end
+    local ready = GS:GetActivationReadiness()
+    assertEq(ready.canActivate, false, "3C8: blocked by conflict")
+    local _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "rejected", "3C8: rejected")
+    assertEq(reason, "divergent_edit", "3C8: divergent_edit got=" .. tostring(reason))
+    GS.ListOpenConflicts = oldConflicts
+
+    local oldMismatch = GS.GetDatasetMismatchState
+    GS.GetDatasetMismatchState = function()
+        return {
+            blocked = true,
+            localDatasetId = record.datasetId,
+            peers = { { peerName = "Eve-Garona", datasetId = "gs1:foreign:aaaaaaaaaaaaaaaaaaaaaaaa:1" } },
+        }
+    end
+    ready = GS:GetActivationReadiness()
+    assertEq(ready.canActivate, false, "3C8: blocked by dataset mismatch")
+    _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "rejected", "3C8: mismatch rejected")
+    assertEq(reason, "dataset_mismatch", "3C8: mismatch reason got=" .. tostring(reason))
+    GS.GetDatasetMismatchState = oldMismatch
+    assertEq(record.activation, GS.ACTIVATION_STAGED, "3C8: still staged after blocks")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C9) Activation feedback helpers are chat-free; pages report activated
+    local record = seedActivatableCampaign(9109, 10)
+    local _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C9: activated")
+    local msg, sev = GS.FormatMutationFeedback(st, reason)
+    assertEq(sev, "success", "3C9: severity")
+    assertTrue(msg:find("live", 1, true) or msg:find("Live", 1, true)
+        or msg:find("active", 1, true) or msg:find("Active", 1, true)
+        or msg:find("credited", 1, true),
+        "3C9: activation banner wording msg=" .. tostring(msg))
+    assertEq(#world.chat, 0, "3C9: no chat")
+    assertEq(#world.prints, 0, "3C9: no prints")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C10) Campaign reset after activation keeps shared tab/policy and cutover identity
+    local record = seedActivatableCampaign(9110, 10)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C10: activated")
+    record = GS:GetCurrentRecord()
+    local marker = record.liveCutover.cutoverMarker
+    local tab = record.accounting._consumables.bankTab
+    local policy = record.permission.editorRankPosition
+    -- New campaign still needs bank readiness for campaign apply.
+    armFreshBankSample(true)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertEq(record.activation, GS.ACTIVATION_ACTIVE, "3C10: still active")
+    assertEq(record.liveCutover.cutoverMarker, marker, "3C10: cutover survives campaign")
+    assertEq(record.accounting._consumables.bankTab, tab, "3C10: bank tab preserved")
+    assertEq(record.permission.editorRankPosition, policy, "3C10: policy preserved")
+    local items = record.accounting._consumables.requestedItems
+    local n = 0
+    for _ in pairs(items or {}) do n = n + 1 end
+    assertEq(n, 0, "3C10: new campaign empty items")
+    disarmFreshBankSample()
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
