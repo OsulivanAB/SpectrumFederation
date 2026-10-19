@@ -17779,6 +17779,16 @@ do
         end
     end
     temp.accounting._consumableEvents = kept
+    -- Campaign rollover shelves prior-generation ledger into the archive; strip
+    -- that copy too so restore exercises Admit rather than duplicate.
+    local keptArch = {}
+    for i = 1, #(temp.accounting._consumableEventArchive or {}) do
+        local e = temp.accounting._consumableEventArchive[i]
+        if not (e and e.id == histAdj.id) then
+            keptArch[#keptArch + 1] = e
+        end
+    end
+    temp.accounting._consumableEventArchive = keptArch
     -- Live gossip still rejects foreign campaign adjustments.
     local stLive, rLive = GS:AdmitLedgerEvent(deepCopy(histAdj), {
         member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },

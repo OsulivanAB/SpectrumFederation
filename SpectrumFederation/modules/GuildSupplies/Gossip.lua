@@ -364,6 +364,9 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
     local exportId = "gs:ca:" .. campaignId
     local datasetId = archive.datasetId or record.datasetId
     local maxPages = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    -- Prefer ARCHIVE_PAGE_ITEMS packing so ordinary archives stay multi-page under
+    -- the wire budget; raise only when a single key would not fit that width.
+    local packWidth = ARCHIVE_PAGE_ITEMS
     local maxItemsPerPage = GS.MAX_ARCHIVE_PAGE_ITEMS or 64
 
     local function EligibilityScalars(withItems)
@@ -488,7 +491,7 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
         }
         local trialId = exportId .. ":p" .. tostring(#pageSlices + 1)
         local overBudget = EstimateWireRecordBytes(trialId, trialBody) > budget
-        local overItems = trialCount > maxItemsPerPage
+        local overItems = trialCount > packWidth or trialCount > maxItemsPerPage
         if sliceCount > 0 and (overBudget or overItems) then
             if not flushSlice() then
                 DebugWarn("archive export %s: eligibility/items exceed page ceiling",
@@ -2173,8 +2176,9 @@ local function ValidateAndApply(record, ctx)
         end
         local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES
             or GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-        local maxPages = GS.MAX_FRAGMENT_BUFFER_PAGES
-            or GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64
+        -- Campaign-archive assembly uses the raised archive page ceiling.
+        local maxPages = GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES
+            or GS.MAX_FRAGMENT_BUFFER_PAGES or 512
         local now = GetServerTime and GetServerTime() or 0
         -- Reclaim expired assemblies across the whole pool before capacity checks.
         ReclaimExpiredFragmentBuffers({

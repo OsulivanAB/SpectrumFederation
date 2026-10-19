@@ -2100,11 +2100,16 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
 
     -- Exact ID duplicate for non-donation kinds. Adjustments require exact
     -- immutable-body equivalence; divergent same-ID bodies quarantine.
+    -- Live gossip only dedupes against the live list so historical archive hits
+    -- still reach stale_campaign / stale_generation checks. Adoption also
+    -- searches the archive so transferred history is idempotent.
     if not isDonation then
         local lists = {
             record.accounting._consumableEvents,
-            record.accounting._consumableEventArchive,
         }
+        if admissionCtx.adoptionReplay then
+            lists[#lists + 1] = record.accounting._consumableEventArchive
+        end
         for li = 1, #lists do
             local events = lists[li]
             if type(events) == "table" then

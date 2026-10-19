@@ -59,10 +59,11 @@ GS.MAX_ADOPTION_ASSEMBLY_PAGES = (GS.MAX_MANIFEST_PAGES or 64) * (GS.MAX_ADOPTIO
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
--- Buffer must retain a full paged confirm/resolve for one peer while still
--- reserving a second full legitimate manifest for editors / other peers.
+-- Operation-manifest FragmentBuffer (confirm/resolve pages). Kept independent of
+-- the raised campaign-archive page ceiling so assembly_full / recovery tests and
+-- live confirm paging remain within the supported manifest bound.
 GS.MAX_FRAGMENT_BUFFER_PAGES = math.max(
-    GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 512,
+    64,
     (GS.MAX_MANIFEST_PAGES or 64) * 2
 )
 GS.FRAGMENT_BUFFER_TTL_SECONDS = GS.MAX_ADOPTION_SECONDS or 600
@@ -4626,15 +4627,20 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
     local seedIndex = state.acctIndex
+    local seedArchTail = state.acctIndexArchiveTail
+    local seedLiveTail = state.acctIndexLiveTail
     if GS._adoptionCompletenessColdIndexForTest then
+        -- Force a cold rebuild: empty index AND zero tails so catch-up work is charged.
         seedIndex = nil
+        seedArchTail = nil
+        seedLiveTail = nil
     end
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
         acctIndex = seedIndex,
-        acctIndexArchiveTail = state.acctIndexArchiveTail,
-        acctIndexLiveTail = state.acctIndexLiveTail,
+        acctIndexArchiveTail = seedArchTail,
+        acctIndexLiveTail = seedLiveTail,
     }
     compOpts.budget = compBudget
     if not compOpts.acctIndex and not GS._adoptionCompletenessColdIndexForTest then
@@ -4819,15 +4825,19 @@ local function ContinueAdoptionReplay(adop)
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
     local seedIndex = state.acctIndex
+    local seedArchTail = state.acctIndexArchiveTail
+    local seedLiveTail = state.acctIndexLiveTail
     if GS._adoptionCompletenessColdIndexForTest then
         seedIndex = nil
+        seedArchTail = nil
+        seedLiveTail = nil
     end
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
         acctIndex = seedIndex,
-        acctIndexArchiveTail = state.acctIndexArchiveTail,
-        acctIndexLiveTail = state.acctIndexLiveTail,
+        acctIndexArchiveTail = seedArchTail,
+        acctIndexLiveTail = seedLiveTail,
     }
     compOpts.budget = compBudget
     if not compOpts.acctIndex and not GS._adoptionCompletenessColdIndexForTest then
