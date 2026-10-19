@@ -628,6 +628,84 @@ local function DonationBodiesConflict(existing, incoming)
     return false
 end
 
+--- Immutable adjustment payload equivalence (ledger event or staged op shape).
+-- Same operation id with divergent item/quantity/attribution/campaign/generation/
+-- actor is a conflicting body, not a harmless duplicate.
+local function AdjustmentBodiesEquivalent(existing, incoming)
+    if type(existing) ~= "table" or type(incoming) ~= "table" then
+        return false
+    end
+    local inItem = tonumber(incoming.itemId)
+        or tonumber(incoming.value and incoming.value.itemId)
+        or tonumber(incoming.target and incoming.target.itemId)
+    local inQty = tonumber(incoming.quantity)
+        or tonumber(incoming.value and incoming.value.quantity)
+    local inAttr = NormName(incoming.attributed
+        or (incoming.value and incoming.value.attributed))
+    local inCamp = incoming.campaignId
+    local inGen = tonumber(incoming.generation)
+    local inActor = NormName(incoming.actor or incoming.actorName)
+    local exItem = tonumber(existing.itemId)
+    local exQty = tonumber(existing.quantity)
+    local exAttr = NormName(existing.attributed)
+    local exCamp = existing.campaignId
+    local exGen = tonumber(existing.generation)
+    local exActor = NormName(existing.actor)
+    if exItem ~= inItem or exQty ~= inQty then
+        return false
+    end
+    if (exAttr or nil) ~= (inAttr or nil) then
+        return false
+    end
+    if inCamp ~= nil and exCamp ~= nil and exCamp ~= inCamp then
+        return false
+    end
+    if inGen ~= nil and exGen ~= nil and exGen ~= inGen then
+        return false
+    end
+    if inActor ~= nil and exActor ~= nil and exActor ~= inActor then
+        return false
+    end
+    return true
+end
+
+--- Seq-based txn id used when a fingerprint collides with a distinct occurrence.
+local function AllocateCollisionRemintTxnId(record, writerGuid)
+    local cfgAlloc = record and record.accounting and record.accounting._consumables
+    if type(cfgAlloc) ~= "table" then
+        return nil
+    end
+    cfgAlloc.txnAllocSeq = (tonumber(cfgAlloc.txnAllocSeq) or 0) + 1
+    local dataset = tostring(record.datasetId or "gs")
+    if #dataset > 40 then dataset = dataset:sub(1, 40) end
+    local w = ValidGuid(writerGuid) or "local"
+    if #w > 32 then w = w:sub(1, 32) end
+    local entropy = Now() + cfgAlloc.txnAllocSeq * 17
+    local reminted = string.format(
+        "ctx:%s:%s:%d:%x", dataset, w, cfgAlloc.txnAllocSeq, entropy)
+    return ValidTxnId(reminted)
+end
+
+--- MatchScore agreement for an exact-ID registry/candidate hit.
+-- Returns "same", "distinct", or "uncertain".
+local function ExactIdOccurrenceRelation(existing, evidence)
+    if type(existing) ~= "table" or type(evidence) ~= "table" then
+        return "uncertain"
+    end
+    local score = MatchScore(existing, evidence)
+    local minScore = (O and O.MIN_MATCH_SCORE) or 100
+    if score and score >= minScore then
+        return "same"
+    end
+    local tExisting = tonumber(existing.approxTxnTime or existing.timestamp)
+    local tEvidence = tonumber(evidence.approxTxnTime or evidence.timestamp)
+    local tol = (O and O.TIME_TOLERANCE_SECONDS) or (3 * 60 * 60)
+    if tExisting and tEvidence and math.abs(tExisting - tEvidence) > tol then
+        return "distinct"
+    end
+    return "uncertain"
+end
+
 local function EnsureDirectEvidenceExports(record)
     if type(record.observations) ~= "table" then
         record.observations = { byCampaign = {} }
@@ -664,7 +742,12 @@ function GS.RecordDirectEvidenceExport(record, witnessGuid, evidence)
     end
     local exports = EnsureDirectEvidenceExports(record)
     local occ = GS.OccurrenceFingerprint(row) or tostring(row.coreSignature)
-    local exportId = "gs:ev:" .. witnessGuid .. ":" .. occ
+    -- Coarse time bucket (MatchScore TIME_TOLERANCE) keeps temporally separated
+    -- identical deposits from overwriting each other under the same fingerprint,
+    -- while still-visible deposits within tolerance share an export identity.
+    local tol = (O and O.TIME_TOLERANCE_SECONDS) or (3 * 60 * 60)
+    local bucket = math.floor((tonumber(row.approxTxnTime) or 0) / tol)
+    local exportId = "gs:ev:" .. witnessGuid .. ":" .. occ .. ":t" .. tostring(bucket)
     if #exportId > 190 then
         exportId = exportId:sub(1, 190)
     end
@@ -922,34 +1005,14 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
     do
         local existing = FindRegistryByTxn(cfg, txnId)
         if existing and existing.status == "verified" then
-            local score = MatchScore(existing, evidence)
-            local minScore = (O and O.MIN_MATCH_SCORE) or 100
-            if score and score >= minScore then
+            local relation = ExactIdOccurrenceRelation(existing, evidence)
+            if relation == "same" then
                 cluster.status = "verified"
                 cluster.txnId = existing.txnId
                 return true, "duplicate"
-            end
-            local tExisting = tonumber(existing.approxTxnTime)
-            local tEvidence = tonumber(evidence.approxTxnTime)
-            local tol = (O and O.TIME_TOLERANCE_SECONDS) or (3 * 60 * 60)
-            if tExisting and tEvidence and math.abs(tExisting - tEvidence) > tol then
-                -- Distinct deposits that collided on fingerprint: allocate a
-                -- seq-based id so both can credit without claiming the shared ID.
-                txnId = nil
-                cluster.txnId = nil
-                local cfgAlloc = record.accounting and record.accounting._consumables
-                if type(cfgAlloc) == "table" then
-                    cfgAlloc.txnAllocSeq = (tonumber(cfgAlloc.txnAllocSeq) or 0) + 1
-                    local dataset = tostring(record.datasetId or "gs")
-                    if #dataset > 40 then dataset = dataset:sub(1, 40) end
-                    local w = ValidGuid(writerGuid) or "local"
-                    if #w > 32 then w = w:sub(1, 32) end
-                    local entropy = Now() + cfgAlloc.txnAllocSeq * 17
-                    local reminted = string.format(
-                        "ctx:%s:%s:%d:%x", dataset, w, cfgAlloc.txnAllocSeq, entropy)
-                    txnId = ValidTxnId(reminted)
-                    cluster.txnId = txnId
-                end
+            elseif relation == "distinct" then
+                txnId = AllocateCollisionRemintTxnId(record, writerGuid)
+                cluster.txnId = txnId
                 if not ValidTxnId(txnId) then
                     cluster.status = "ambiguous"
                     return false, "ambiguous"
@@ -1440,19 +1503,31 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         end
     end
 
-    -- Exact ID duplicate for non-donation kinds. Donations defer to the
-    -- provenance branch so conflicting bodies can quarantine instead of
-    -- silently treating a forged payload as a harmless duplicate.
+    -- Exact ID duplicate for non-donation kinds. Adjustments require exact
+    -- immutable-body equivalence; divergent same-ID bodies quarantine.
     if not isDonation then
         local events = record.accounting._consumableEvents
         if type(events) == "table" then
             for i = 1, #events do
                 local e = events[i]
                 if type(e) == "table" then
-                    if e.id == txnId or e.txnId == txnId then
-                        return "duplicate", "duplicate"
-                    end
-                    if adjustmentEventId and (e.id == adjustmentEventId or e.opId == adjustmentEventId) then
+                    local idHit = (e.id == txnId or e.txnId == txnId)
+                        or (adjustmentEventId
+                            and (e.id == adjustmentEventId or e.opId == adjustmentEventId))
+                    if idHit then
+                        if isAdjustment then
+                            if AdjustmentBodiesEquivalent(e, event) then
+                                return "duplicate", "duplicate"
+                            end
+                            local conflicts = EnsureTxnConflicts(cfg)
+                            local qid = adjustmentEventId or txnId
+                            conflicts[qid] = conflicts[qid] or { bodies = {} }
+                            local bodies = conflicts[qid].bodies
+                            if #bodies < 8 then
+                                bodies[#bodies + 1] = event
+                            end
+                            return "rejected", "id_conflict"
+                        end
                         return "duplicate", "duplicate"
                     end
                 end
@@ -1492,38 +1567,81 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             donor = NormName(event.actor or event.donor),
         }
 
-        -- Same ID already verified with a conflicting body → quarantine.
+        -- Exact fingerprint ID may be shared by temporally distinct deposits.
+        -- Only treat as duplicate when MatchScore agrees; otherwise remint the
+        -- candidate identity (distinct) or hold ambiguous (uncertain).
         local existingReg = FindRegistryByTxn(cfg, txnId)
         if existingReg and existingReg.status == "verified" then
-            if DonationBodiesConflict(existingReg, candidate) then
-                local conflicts = EnsureTxnConflicts(cfg)
-                conflicts[txnId] = conflicts[txnId] or { bodies = {} }
-                local bodies = conflicts[txnId].bodies
-                if #bodies < 8 then
-                    bodies[#bodies + 1] = candidate
+            local relation = ExactIdOccurrenceRelation(existingReg, candidate)
+            if relation == "same" then
+                if DonationBodiesConflict(existingReg, candidate) then
+                    local conflicts = EnsureTxnConflicts(cfg)
+                    conflicts[txnId] = conflicts[txnId] or { bodies = {} }
+                    local bodies = conflicts[txnId].bodies
+                    if #bodies < 8 then
+                        bodies[#bodies + 1] = candidate
+                    end
+                    return "rejected", "id_conflict"
                 end
-                return "rejected", "id_conflict"
+                return "duplicate", "duplicate"
+            elseif relation == "distinct" then
+                local reminted = AllocateCollisionRemintTxnId(
+                    record, candidate.writer or (member and member.guid))
+                if not ValidTxnId(reminted) then
+                    return "pending", "ambiguous"
+                end
+                candidate.id = reminted
+                candidate.txnId = reminted
+                txnId = reminted
+            else
+                return "pending", "ambiguous"
             end
-            return "duplicate", "duplicate"
-        end
-        if existingReg and existingReg.status == "alias" then
-            return "duplicate", "duplicate"
+        elseif existingReg and existingReg.status == "alias" then
+            local relation = ExactIdOccurrenceRelation(existingReg, candidate)
+            if relation == "same" then
+                return "duplicate", "duplicate"
+            elseif relation == "distinct" then
+                local reminted = AllocateCollisionRemintTxnId(
+                    record, candidate.writer or (member and member.guid))
+                if not ValidTxnId(reminted) then
+                    return "pending", "ambiguous"
+                end
+                candidate.id = reminted
+                candidate.txnId = reminted
+                txnId = reminted
+            else
+                return "pending", "ambiguous"
+            end
         end
 
-        -- Pending candidate with same ID: conflict or duplicate.
+        -- Pending candidate with same ID: conflict, duplicate, or remint.
         local pendingCands = EnsurePendingDonationCandidates(record)
         local priorCand = pendingCands and pendingCands[txnId]
         if type(priorCand) == "table" then
-            if DonationBodiesConflict(priorCand, candidate) then
-                local conflicts = EnsureTxnConflicts(cfg)
-                conflicts[txnId] = conflicts[txnId] or { bodies = {} }
-                local bodies = conflicts[txnId].bodies
-                if #bodies < 8 then
-                    bodies[#bodies + 1] = candidate
+            local relation = ExactIdOccurrenceRelation(priorCand, candidate)
+            if relation == "same" then
+                if DonationBodiesConflict(priorCand, candidate) then
+                    local conflicts = EnsureTxnConflicts(cfg)
+                    conflicts[txnId] = conflicts[txnId] or { bodies = {} }
+                    local bodies = conflicts[txnId].bodies
+                    if #bodies < 8 then
+                        bodies[#bodies + 1] = candidate
+                    end
+                    return "rejected", "id_conflict"
                 end
-                return "rejected", "id_conflict"
+                return "duplicate", "duplicate"
+            elseif relation == "distinct" then
+                local reminted = AllocateCollisionRemintTxnId(
+                    record, candidate.writer or (member and member.guid))
+                if not ValidTxnId(reminted) then
+                    return "pending", "ambiguous"
+                end
+                candidate.id = reminted
+                candidate.txnId = reminted
+                txnId = reminted
+            else
+                return "pending", "ambiguous"
             end
-            return "duplicate", "duplicate"
         end
 
         if type(candidate.coreSignature) == "string" and candidate.coreSignature ~= "" then
@@ -1547,16 +1665,40 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "duplicate", "occurrence_duplicate"
             end
             if ledHit and (ledHit.txnId or ledHit.id) == txnId then
-                if DonationBodiesConflict(ledHit, candidate) then
-                    local conflicts = EnsureTxnConflicts(cfg)
-                    conflicts[txnId] = conflicts[txnId] or { bodies = {} }
-                    local bodies = conflicts[txnId].bodies
-                    if #bodies < 8 then
-                        bodies[#bodies + 1] = candidate
+                local relation = ExactIdOccurrenceRelation({
+                    coreSignature = ledHit.coreSignature,
+                    guildGuid = ledHit.guildGuid,
+                    bankTab = ledHit.bankTab,
+                    generation = ledHit.generation,
+                    approxTxnTime = ledHit.timestamp or ledHit.approxTxnTime,
+                    occurrenceIndex = ledHit.occurrenceIndex,
+                    neighborsOlder = ledHit.neighborsOlder,
+                    neighborsNewer = ledHit.neighborsNewer,
+                    status = "verified",
+                }, candidate)
+                if relation == "same" then
+                    if DonationBodiesConflict(ledHit, candidate) then
+                        local conflicts = EnsureTxnConflicts(cfg)
+                        conflicts[txnId] = conflicts[txnId] or { bodies = {} }
+                        local bodies = conflicts[txnId].bodies
+                        if #bodies < 8 then
+                            bodies[#bodies + 1] = candidate
+                        end
+                        return "rejected", "id_conflict"
                     end
-                    return "rejected", "id_conflict"
+                    return "duplicate", "duplicate"
+                elseif relation == "distinct" then
+                    local reminted = AllocateCollisionRemintTxnId(
+                        record, candidate.writer or (member and member.guid))
+                    if not ValidTxnId(reminted) then
+                        return "pending", "ambiguous"
+                    end
+                    candidate.id = reminted
+                    candidate.txnId = reminted
+                    txnId = reminted
+                else
+                    return "pending", "ambiguous"
                 end
-                return "duplicate", "duplicate"
             end
         end
 
@@ -1951,14 +2093,31 @@ function GS.ApplyAdjustmentMutation(record, op)
     -- op-before-ledger delivery orders (event.id / event.opId). Exact-id
     -- duplicate detection must run before the floor check so a ledger-first
     -- adjustment that already exhausted the balance replays as duplicate
-    -- rather than item_negative.
+    -- rather than item_negative. Divergent same-ID bodies quarantine.
     local eventId = op.id
+    local incomingView = {
+        itemId = itemId,
+        quantity = quantity,
+        attributed = attributed,
+        campaignId = record.currentCampaignId,
+        generation = tonumber(cfg.generation) or 1,
+        actor = NormName(op.actorName) or op.actorGuid,
+    }
     local events = record.accounting._consumableEvents
     if type(events) == "table" then
         for i = 1, #events do
             local e = events[i]
             if e and (e.id == eventId or e.opId == eventId) then
-                return true, "duplicate"
+                if AdjustmentBodiesEquivalent(e, incomingView) then
+                    return true, "duplicate"
+                end
+                local conflicts = EnsureTxnConflicts(cfg)
+                conflicts[eventId] = conflicts[eventId] or { bodies = {} }
+                local bodies = conflicts[eventId].bodies
+                if #bodies < 8 then
+                    bodies[#bodies + 1] = incomingView
+                end
+                return false, "id_conflict"
             end
         end
     end

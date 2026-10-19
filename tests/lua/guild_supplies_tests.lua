@@ -17354,6 +17354,239 @@ do
     end
 end
 
+do
+    -- 3B25) Disconnected clients with colliding fingerprint IDs converge on reconnect
+    local configRoot
+    do
+        local rec = seedStagedCampaignWithItem(9025, 100)
+        GS:EnsureGossipProvider()
+        configRoot = snapshotConfigRoot()
+    end
+    world.time = (world.time or 0) + 80000
+
+    local function makeEmptyNeighborDeposit(rec, approxTxnTime)
+        return makeDepositEvidence(rec, {
+            itemId = 9025,
+            quantity = 6,
+            donor = "DonorXClient-Garona",
+            observedAt = approxTxnTime,
+            ageHours = 0,
+            occurrenceIndex = 1,
+            neighborsOlder = {},
+            neighborsNewer = {},
+            approxTxnTime = approxTxnTime,
+        })
+    end
+
+    local function creditThree(ev)
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(ev, pair[1], pair[2])
+        end
+    end
+
+    local function exportAccountingBodies()
+        GS.NotifyLocalDurableChange("ledger")
+        GS.NotifyLocalDurableChange("evidence")
+        drainExportMaint(128)
+        local all = collectAllExportBodies()
+        local out = {}
+        for i = 1, #all do
+            local k = all[i].body and all[i].body.kind
+            if k == "gs-ledger-event" or k == "gs-evidence" then
+                out[#out + 1] = all[i]
+            end
+        end
+        return out
+    end
+
+    local guidToSender = {
+        ["Player-1-Alice"] = "Alice-Garona",
+        ["Player-1-Bob"] = "Bob-Garona",
+        ["Player-1-Carol"] = "Carol-Garona",
+    }
+
+    local function senderForBody(row, fallback)
+        local body = row.body
+        if body and body.kind == "gs-evidence" then
+            local guid = body.observedBy
+            if type(guid) ~= "string" and type(row.id) == "string" then
+                guid = row.id:match("^gs:ev:([^:]+)")
+            end
+            if type(guid) == "string" and guidToSender[guid] then
+                return guidToSender[guid]
+            end
+        end
+        return fallback
+    end
+
+    local function applyBodies(bodies, fallbackSender, order)
+        local idxs = {}
+        if order == "reverse" then
+            for i = #bodies, 1, -1 do idxs[#idxs + 1] = i end
+        else
+            for i = 1, #bodies do idxs[#idxs + 1] = i end
+        end
+        for _, i in ipairs(idxs) do
+            local row = bodies[i]
+            applyExportBody(row.body, senderForBody(row, fallbackSender))
+        end
+    end
+
+    local t1 = (world.time or 1000000) - (12 * 3600)
+    local t2 = t1 + (5 * 3600)
+
+    -- Client A sees both deposits (later remints under fingerprint collision).
+    local recA = loadClientFromConfigRoot(configRoot, "Alice", "Player-1-Alice", 1)
+    local evEarly = makeEmptyNeighborDeposit(recA, t1)
+    local evLate = makeEmptyNeighborDeposit(recA, t2)
+    assertEq(GS.OccurrenceFingerprint(evEarly), GS.OccurrenceFingerprint(evLate),
+        "3B25: colliding fingerprints")
+    creditThree(evEarly)
+    creditThree(evLate)
+    assertEq(tonumber(GS:ProjectCampaignProgress(recA.currentCampaignId).itemTotals[9025]) or 0,
+        12, "3B25: client A both deposits")
+    local exportA = exportAccountingBodies()
+    local evidenceA = 0
+    local ledgerA = 0
+    for i = 1, #exportA do
+        local k = exportA[i].body and exportA[i].body.kind
+        if k == "gs-evidence" then evidenceA = evidenceA + 1 end
+        if k == "gs-ledger-event" then ledgerA = ledgerA + 1 end
+    end
+    assertTrue(ledgerA >= 2, "3B25: client A exported both ledger events got=" .. tostring(ledgerA))
+    assertTrue(evidenceA >= 6, "3B25: client A exported early+late evidence got=" .. tostring(evidenceA))
+
+    -- Client B independently verifies only the later deposit under the shared fingerprint.
+    local recB = loadClientFromConfigRoot(configRoot, "Bob", "Player-1-Bob", 2)
+    creditThree(evLate)
+    assertEq(tonumber(GS:ProjectCampaignProgress(recB.currentCampaignId).itemTotals[9025]) or 0,
+        6, "3B25: client B later-only under fingerprint")
+    local exportB = exportAccountingBodies()
+
+    -- Exchange A→B then B→A (forward delivery). A's export carries early+late
+    -- ledger and three-witness evidence; B must retain the early donation rather
+    -- than discarding it as a fingerprint duplicate of the later deposit.
+    applyBodies(exportA, "Alice-Garona", "forward")
+    assertEq(tonumber(GS:ProjectCampaignProgress(recB.currentCampaignId).itemTotals[9025]) or 0,
+        12, "3B25: B converges to both after A history/evidence exchange")
+    applyBodies(exportB, "Bob-Garona", "forward")
+    assertEq(tonumber(GS:ProjectCampaignProgress(recA.currentCampaignId).itemTotals[9025]) or 0,
+        12, "3B25: A unchanged after B later-only exchange (no double)")
+
+    -- Opposite delivery order on a restarted late peer (Carol sees only later).
+    local recC = loadClientFromConfigRoot(configRoot, "Carol", "Player-1-Carol", 2)
+    creditThree(evLate)
+    assertEq(tonumber(GS:ProjectCampaignProgress(recC.currentCampaignId).itemTotals[9025]) or 0,
+        6, "3B25: late peer later-only")
+    applyBodies(exportA, "Alice-Garona", "reverse")
+    assertEq(tonumber(GS:ProjectCampaignProgress(recC.currentCampaignId).itemTotals[9025]) or 0,
+        12, "3B25: late peer converges under reverse delivery")
+    -- Replaying A's exports again must not double-credit.
+    applyBodies(exportA, "Alice-Garona", "forward")
+    assertEq(tonumber(GS:ProjectCampaignProgress(recC.currentCampaignId).itemTotals[9025]) or 0,
+        12, "3B25: replayed peer history does not double-credit")
+end
+
+do
+    -- 3B26) Legitimate adjustment replay vs conflicting same-ID bodies
+    local record = seedStagedCampaignWithItem(9026, 40)
+    local evidence = makeDepositEvidence(record, { itemId = 9026, quantity = 10 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9026]) or 0,
+        10, "3B26: seed donation")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9026, -10, nil))
+    assertTrue(adjOp ~= nil, "3B26: exact-zero adjust prepared")
+    local ledgerExact = {
+        type = "adjustment",
+        id = adjOp.id,
+        txnId = adjOp.id,
+        opId = adjOp.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9026,
+        quantity = -10,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }
+    assertEq(select(1, GS:AdmitLedgerEvent(ledgerExact, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+    })), "accepted", "3B26: ledger-first exact-zero")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9026]) or 0,
+        0, "3B26: balance exhausted")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "3B26: legitimate op replay")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9026]) or 0,
+        0, "3B26: replay stays exhausted")
+
+    -- Same ID, altered quantity → quarantine; totals unchanged.
+    local stConflict, rConflict = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = adjOp.id,
+        txnId = adjOp.id,
+        opId = adjOp.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9026,
+        quantity = -3,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+    })
+    assertEq(stConflict, "rejected", "3B26: conflicting quantity rejected")
+    assertEq(rConflict, "id_conflict", "3B26: id_conflict for altered quantity")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9026]) or 0,
+        0, "3B26: conflicting body does not alter totals")
+
+    -- Same ID, altered item → quarantine via mutation path after refill.
+    local refill = select(1, GS:NewAdjustmentOperation(9026, 8, nil))
+    assertEq(GS:ApplyStagedConfigOperation(refill), "accepted", "3B26: refill")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9026]) or 0,
+        8, "3B26: refill applied")
+    local conflictOp = select(1, GS:NewAdjustmentOperation(9026, -2, nil))
+    assertTrue(conflictOp ~= nil, "3B26: second adjust prepared")
+    -- Apply legitimate -2 first so ledger holds that op id.
+    assertEq(GS:ApplyStagedConfigOperation(conflictOp), "accepted", "3B26: legitimate -2")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9026]) or 0,
+        6, "3B26: -2 applied")
+    -- Mutate a divergent body through ApplyAdjustmentMutation with the same id.
+    local forgedOp = {
+        id = conflictOp.id,
+        kind = conflictOp.kind,
+        actorGuid = conflictOp.actorGuid,
+        actorName = conflictOp.actorName,
+        timestamp = conflictOp.timestamp,
+        target = { itemId = 9999 },
+        value = { itemId = 9999, quantity = -2, attributed = "Eve-Garona" },
+        campaignId = record.currentCampaignId,
+    }
+    local mutOk, mutErr = GS.ApplyAdjustmentMutation(record, forgedOp)
+    assertEq(mutOk, false, "3B26: divergent same-ID mutation rejected")
+    assertEq(mutErr, "id_conflict", "3B26: mutation id_conflict")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9026]) or 0,
+        6, "3B26: forged mutation leaves accounting unchanged")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9999]) or 0,
+        0, "3B26: forged item never credited")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
