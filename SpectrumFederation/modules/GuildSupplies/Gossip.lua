@@ -2084,15 +2084,24 @@ local function ValidateAndApply(record, ctx)
             return st, reason
         end
         if body.datasetId == localRecord.datasetId then
-            -- Same dataset: compatible peers may push live activation/cutover
-            -- without requiring a local bank sample (#389 catch-up).
+            -- Same dataset: verified editors may push live activation/cutover
+            -- without requiring a local bank sample (#389 catch-up). Membership
+            -- alone is insufficient; activatedByGuid is not proof of authority.
             if body.activation == GS.ACTIVATION_ACTIVE
                 and type(body.liveCutover) == "table"
                 and localRecord.activation == GS.ACTIVATION_STAGED
                 and GS.InstallRemoteLiveCutover then
                 local stCut, cutReason = GS.InstallRemoteLiveCutover(
-                    localRecord, body.liveCutover, member.guildKey,
-                    { quarantinePending = true })
+                    localRecord, body.liveCutover, member.guildKey, {
+                        quarantinePending = true,
+                        member = member,
+                        requireEditorAuthority = true,
+                        -- Compatible catch-up: any current editor may relay the
+                        -- already-activated cutover (actor may be the original
+                        -- activator, not necessarily this sender).
+                        bindActorToSender = false,
+                        authOpts = {},
+                    })
                 if stCut == "accepted" or stCut == "duplicate" then
                     if GS._NotifyLocalDurableChange then
                         GS._NotifyLocalDurableChange("activation")
@@ -2106,7 +2115,13 @@ local function ValidateAndApply(record, ctx)
                 and type(body.cutoverMarker) == "string"
                 and type(localRecord.liveCutover) == "table"
                 and body.cutoverMarker ~= localRecord.liveCutover.cutoverMarker then
-                -- Divergent live markers for the same dataset id: fail closed.
+                -- Divergent live markers: only authenticated editors can surface
+                -- a durable conflict advertisement (NotePeerDataset below).
+                local editorOk = GS.SenderHasEditorAuthority
+                    and select(1, GS.SenderHasEditorAuthority(member, {}))
+                if editorOk and GS.NotePeerDataset then
+                    GS.NotePeerDataset(sender, body.datasetId, body)
+                end
                 return "rejected", "live_activation_conflict"
             end
             return "duplicate", "duplicate"

@@ -807,6 +807,11 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
     local itemTotals = {}
     local contributions = {}
     ForEachCampaignLedgerEvent(record, generation, function(event)
+        -- Active datasets exclude pre-activation staged accounting from live totals.
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
         local itemId = tonumber(event.itemId)
         local qty = tonumber(event.quantity) or 0
         if not itemId or qty == 0 then

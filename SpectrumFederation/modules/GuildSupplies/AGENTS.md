@@ -30,10 +30,11 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 6. Missing data fails closed; commit/admission rechecks guild/rank/policy.
 7. Chat-free: enabled `SF.Debug` only. Settings banners use `FormatMutationFeedback`.
 8. **3C:** Any verified authorized editor (not GM-only) may activate. Activation requires a fresh bank sample on the activating client, publishes a durable cutover marker, and is idempotent.
-9. **3C:** Pre-activation bank rows / staged pending evidence never become live credit. Compatible peers adopt cutover without reopening the bank. Divergent live markers fail closed.
+9. **3C:** Pre-activation bank rows / staged pending evidence / staged accepted ledger rows never become live credit (`gsProductionCredit`). Compatible peers adopt cutover without reopening the bank. Authenticated divergent live markers fail closed on production writers.
 10. **3C:** After activation, `ShouldUseLegacyConsumablesWriters()` is false; profile ApplyOp/CommitEvents/MergeSnapshot and legacy sync handlers cannot mutate production accounting for that guild.
-11. **3B:** Exactly three independent authenticated witness identities automatically credit one donation. No manual donation approve/reject.
-12. **3A:** Independently initialized dataset IDs never silently merge; explicit adoption replaces.
+11. **3C:** Staged sample-only bank observation lets an authorized editor stamp the configured GS tab without admitting donations or requiring a legacy profile. Remote live cutover install requires verified editor authority.
+12. **3B:** Exactly three independent authenticated witness identities automatically credit one donation. No manual donation approve/reject.
+13. **3A:** Independently initialized dataset IDs never silently merge; explicit adoption replaces.
 
 ## Lifecycle
 
@@ -42,9 +43,11 @@ login → Initialize(empty root) → EnsureGossipProvider
 explicit CreateStagedRecord → staged record
 New Campaign → empty items + immutable boundary
 config ops / gossip / adoption (staged)
+sample-only bank observation (editor, no admit) → fresh stamp
 ActivateCanonicalDataset (editor + fresh bank sample) → active + liveCutover
-bank observation → AdmitDirectObservation → 3 witnesses → ledger credit
-compatible peers InstallRemoteLiveCutover (no bank)
+  + ClassifyPreActivationAccounting (staged ledger retained, not live credit)
+bank observation → AdmitDirectObservation → 3 witnesses → production credit
+compatible editor peers InstallRemoteLiveCutover (no bank; editor auth required)
 legacy profile writers isolated for that guild
 ```
 

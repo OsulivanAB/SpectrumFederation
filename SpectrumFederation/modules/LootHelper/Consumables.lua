@@ -2420,9 +2420,28 @@ local function BuildProjection(profile, cfg)
 end
 
 function C.Project(profile)
+    -- Active Guild Supplies helper: use canonical campaign progress (lowercase
+    -- donation/adjustment types), not the legacy uppercase Consumables projector.
+    if type(profile) == "table" and profile._sfGuildSuppliesProxy then
+        local GS = SF.GuildSupplies
+        if GS and GS.ProjectCampaignProgressOnRecord and GS.GetCurrentRecord then
+            local record = select(1, GS:GetCurrentRecord())
+            if record then
+                local campaignId = record.currentCampaignId
+                local progress = GS.ProjectCampaignProgressOnRecord(record, campaignId)
+                if type(progress) == "table" then
+                    return {
+                        contributions = progress.contributions or {},
+                        itemTotals = progress.itemTotals or {},
+                    }
+                end
+            end
+        end
+        return { contributions = {}, itemTotals = {} }
+    end
     local cfg = C.Ensure(profile)
     local cached = projectionCache[profile]
-    local key = tostring(cfg.generation) .. ":" .. tostring(cfg.configSeq) .. ":" .. tostring(#profile._consumableEvents)
+    local key = tostring(cfg.generation) .. ":" .. tostring(cfg.configSeq) .. ":" .. tostring(#(profile._consumableEvents or {}))
     if cached and cached.key == key then
         return cached.value
     end

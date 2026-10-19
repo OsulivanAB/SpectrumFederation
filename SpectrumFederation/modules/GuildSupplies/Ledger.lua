@@ -1399,6 +1399,11 @@ local function AppendLedgerEvent(record, event)
     local cfg = record.accounting and record.accounting._consumables
     local curGen = tonumber(cfg and cfg.generation)
     local eventGen = type(event) == "table" and tonumber(event.generation) or nil
+    -- Recompute durable production-credit classification; never trust a remote
+    -- self-declared flag to bypass the live cutover boundary.
+    if GS.AssignProductionCredit then
+        GS.AssignProductionCredit(record, event)
+    end
     -- Historical rows belong in the archive list once the live generation advanced.
     if eventGen and curGen and eventGen < curGen then
         return AppendArchivedLedgerEvent(record, event)
@@ -1932,6 +1937,14 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         row.generation = tonumber(cfg and cfg.generation) or 0
     end
 
+    -- Authenticated live cutover conflict: fail closed on production credits.
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, admissionCtx)
+        if blocked then
+            return "pending", blockReason or "live_activation_conflict"
+        end
+    end
+
     -- Live cutover: refuse pre-activation bank rows even if campaign eligibility
     -- was established earlier during staged development (#389).
     if GS.IsLiveActive and GS.IsLiveActive(record) and GS.IsEvidenceAfterLiveCutover then
@@ -2255,6 +2268,14 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     end
     if event.datasetId and event.datasetId ~= record.datasetId then
         return "rejected", "dataset_mismatch"
+    end
+
+    -- Authenticated live cutover conflict blocks unsafe canonical writes.
+    if GS.LiveAccountingWritesBlocked then
+        local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, admissionCtx)
+        if blocked then
+            return "pending", blockReason or "live_activation_conflict"
+        end
     end
 
     local ok, err = GS.ValidateLedgerEventBody(event, nil, record.datasetId)

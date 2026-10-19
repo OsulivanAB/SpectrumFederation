@@ -20809,6 +20809,683 @@ do
     disarmFreshBankSample()
 end
 
+do
+    -- 3C11) Sample-only staged bank observation activates without a legacy profile.
+    -- Must process a real BankLog update (not _BankContextReadinessProbe alone).
+    local record = seedStagedCampaignWithItem(9111, 25)
+    disarmFreshBankSample()
+    GS._BankContextReadinessProbe = nil
+    SF.GetActiveProfile = function() return nil end
+    SF.ConsumablesRuntime = SF.ConsumablesRuntime or {}
+    SF.ConsumablesRuntime.AccountingProfile = function() return nil end
+    SF.ConsumablesRuntime.CurrentGuild = function()
+        return { guid = tostring(world.guild.clubId) }
+    end
+
+    world.bankTxnCounts = { [2] = 0 }
+    world.bankTabInfo = { [2] = { name = "Supplies", isViewable = true } }
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction()
+        return "deposit", "Donor-Garona", nil, 1, nil, nil, 0, 1, 1, 1
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    function QueryGuildBankLog() end
+
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    BankLog.bankOpen = true
+    BankLog.active = false
+    BankLog.awaitingLogUpdate = false
+    BankLog.queryRetries = 0
+    BankLog.queryToken = 0
+    BankLog.activeContext = nil
+    BankLog.lastFreshLogAt = nil
+    BankLog.lastFreshLogTab = nil
+    BankLog.lastFreshLogGuild = nil
+
+    local sampleCtx = BankLog:GuildSuppliesSampleOnlyContext()
+    assertTrue(type(sampleCtx) == "table", "3C11: sample-only context available")
+    assertEq(sampleCtx.sampleOnly, true, "3C11: sampleOnly flag")
+    assertEq(sampleCtx.bankTab, 2, "3C11: GS tab")
+    assertEq(BankLog:BeginObservation("open"), true, "3C11: begin observation")
+    assertEq(BankLog.activeContext.sampleOnly, true, "3C11: activeContext sample-only")
+    BankLog:ProcessLogUpdate("event")
+    assertEq(BankLog.lastFreshLogTab, 2, "3C11: fresh stamp from real update")
+    assertEq(BankLog.lastFreshLogGuild, "42", "3C11: stamp guild")
+    assertTrue(BankLog.lastStats and BankLog.lastStats.sampleOnly == true,
+        "3C11: sample-only stats")
+    assertEq(#(record.accounting._consumableEvents or {}), 0,
+        "3C11: no ledger admissions during sample-only")
+    assertEq(GS:GetActivationReadiness().canActivate, true,
+        "3C11: readiness after real bank stamp")
+    local _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C11: activate without legacy profile st="
+        .. tostring(st) .. " r=" .. tostring(reason))
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE, "3C11: active")
+    disarmFreshBankSample()
+    GetGuildBankTabInfo = nil
+    QueryGuildBankLog = nil
+end
+
+do
+    -- 3C12) Remote activation requires verified editor authority
+    local alice = seedActivatableCampaign(9112, 10)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C12: alice activates")
+    local cutover = alice.liveCutover
+    local datasetId = alice.datasetId
+    local marker = cutover.cutoverMarker
+    local descBody = {
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = datasetId,
+        editorRankPosition = alice.permission.editorRankPosition,
+        permissionRevisionId = alice.permission.revisionId,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = marker,
+        liveCutover = GS.DescribeLiveCutover(cutover),
+    }
+    disarmFreshBankSample()
+    GS:EnsureGossipProvider()
+
+    -- Bob starts with the same staged dataset (no bank sample).
+    local bobRoot = {
+        schemaVersion = 1,
+        localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 },
+        guilds = {
+            ["club:42"] = {
+                schemaVersion = 1,
+                activation = GS.ACTIVATION_STAGED,
+                datasetId = datasetId,
+                permission = alice.permission,
+                currentCampaignId = alice.currentCampaignId,
+                campaigns = alice.campaigns,
+                campaignArchives = alice.campaignArchives or {},
+                campaignContext = alice.campaignContext or {},
+                accounting = {
+                    schemaVersion = 1,
+                    _consumables = alice.accounting._consumables,
+                    _consumableEvents = {},
+                    _consumableEventArchive = {},
+                    _mutationSeq = 0,
+                },
+                observations = { byCampaign = {} },
+                identityLinks = alice.identityLinks,
+                operations = alice.operations,
+                confirmationRefs = {},
+                migration = nil,
+            },
+        },
+    }
+    SpectrumFederationDB = { guildSupplies = bobRoot }
+    GS._root = nil
+    GS._rootValid = false
+    GS._peerDatasets = {}
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    initGS()
+    GS:EnsureGossipProvider()
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_STAGED, "3C12: bob staged")
+
+    -- Non-editor forgery must not mutate.
+    local stForge, reasonForge = providerApply(descBody, "Dave-Garona")
+    assertEq(stForge, "rejected", "3C12: non-editor forgery rejected")
+    assertEq(reasonForge, "unauthorized", "3C12: forgery reason got=" .. tostring(reasonForge))
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_STAGED, "3C12: still staged after forge")
+    assertEq(GS:GetCurrentRecord().liveCutover, nil, "3C12: no cutover after forge")
+
+    -- Mismatched actor on a non-editor sender (self-declared activatedByGuid is not proof).
+    local forgedActor = {}
+    for k, v in pairs(descBody.liveCutover) do forgedActor[k] = v end
+    forgedActor.activatedByGuid = "Player-1-Dave"
+    local stMismatch = providerApply({
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = datasetId,
+        editorRankPosition = 3,
+        permissionRevisionId = alice.permission.revisionId,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = marker,
+        liveCutover = forgedActor,
+    }, "Dave-Garona")
+    assertEq(stMismatch, "rejected", "3C12: mismatched non-editor rejected")
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_STAGED, "3C12: unchanged after mismatch")
+
+    -- Authorized editor catch-up (Bob is officer editor; may relay Alice's cutover).
+    local stOk, reasonOk = providerApply(descBody, "Alice-Garona")
+    assertTrue(stOk == "accepted" or stOk == "duplicate",
+        "3C12: editor catch-up st=" .. tostring(stOk) .. " r=" .. tostring(reasonOk))
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE, "3C12: bob active")
+    assertEq(GS:GetCurrentRecord().liveCutover.cutoverMarker, marker, "3C12: marker installed")
+
+    -- Harmless replay.
+    local stReplay, reasonReplay = providerApply(descBody, "Alice-Garona")
+    assertEq(stReplay, "duplicate", "3C12: replay duplicate got=" .. tostring(stReplay)
+        .. "/" .. tostring(reasonReplay))
+    assertEq(GS:GetCurrentRecord().liveCutover.cutoverMarker, marker, "3C12: marker stable")
+
+    -- Permission revocation: demote Alice, attempt cutover install on a fresh staged peer.
+    SpectrumFederationDB = { guildSupplies = {
+        schemaVersion = 1,
+        localWriter = { nonce = "cccccccccccccccccccccccc", nextSeq = 1 },
+        guilds = {
+            ["club:42"] = {
+                schemaVersion = 1,
+                activation = GS.ACTIVATION_STAGED,
+                datasetId = datasetId,
+                permission = { schemaVersion = 1, editorRankPosition = 2,
+                    revisionId = alice.permission.revisionId },
+                currentCampaignId = alice.currentCampaignId,
+                campaigns = alice.campaigns,
+                campaignArchives = {},
+                campaignContext = {},
+                accounting = alice.accounting,
+                observations = { byCampaign = {} },
+                identityLinks = alice.identityLinks,
+                operations = { records = {}, order = {}, heads = {}, pending = {},
+                    conflicts = {}, openConflicts = {} },
+                confirmationRefs = {},
+            },
+        },
+    } }
+    GS._root = nil
+    GS._rootValid = false
+    switchPlayer("Carol", "Player-1-Carol", 3)
+    -- Alice demoted below editor threshold (policy position 2 ⇒ need rank <= 2).
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Alice" then m.rankOrder = 4 end
+    end
+    initGS()
+    GS:EnsureGossipProvider()
+    local stRevoked, reasonRevoked = providerApply(descBody, "Alice-Garona")
+    assertEq(stRevoked, "rejected", "3C12: revoked editor rejected")
+    assertEq(reasonRevoked, "unauthorized", "3C12: revoked reason got=" .. tostring(reasonRevoked))
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_STAGED, "3C12: still staged after revoke")
+
+    -- Guild Master recovery / editor path still works.
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Alice" then m.rankOrder = 1 end
+    end
+    local stGm, reasonGm = providerApply(descBody, "Alice-Garona")
+    assertTrue(stGm == "accepted" or stGm == "duplicate",
+        "3C12: GM editor catch-up st=" .. tostring(stGm) .. " r=" .. tostring(reasonGm))
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE, "3C12: active after GM")
+
+    -- Empty-client active bootstrap also requires editor authority.
+    SpectrumFederationDB = {}
+    GS._root = nil
+    GS._rootValid = false
+    GS._peerDatasets = {}
+    switchPlayer("Dave", "Player-1-Dave", 4)
+    initGS()
+    GS:EnsureGossipProvider()
+    local stEmptyForge = providerApply(descBody, "Dave-Garona")
+    assertEq(stEmptyForge, "rejected", "3C12: empty-client non-editor rejected")
+    assertEq(select(2, GS:GetCurrentRecord()), "not_configured", "3C12: empty stays empty")
+    local stEmptyOk = providerApply(descBody, "Alice-Garona")
+    assertEq(stEmptyOk, "accepted", "3C12: empty-client editor bootstrap")
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE, "3C12: empty bootstrap active")
+end
+
+do
+    -- 3C13) Deposit helper uses GS campaign progress (donation + adjustment types)
+    loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+    local record = seedActivatableCampaign(9113, 20)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C13: activated")
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    world.time = boundary + 7200
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9113, quantity = 12, observedAt = world.time, ageHours = 0,
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9113, -2, "Donor-Garona"))
+    assertTrue(adjOp ~= nil, "3C13: adjustment prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "3C13: adjustment accepted")
+    local gsProgress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(gsProgress.itemTotals[9113]) or 0, 10, "3C13: GS total 12-2=10")
+
+    local Runtime = SF.ConsumablesRuntime
+    local proxy = Runtime:GuildSuppliesProxy()
+    assertTrue(type(proxy) == "table" and proxy._sfGuildSuppliesProxy,
+        "3C13: proxy available without raid session")
+    local C = SF.Consumables
+    local projected = C.Project(proxy)
+    assertEq(tonumber(projected.itemTotals[9113]) or 0, 10,
+        "3C13: helper Project sees GS totals (not stuck at 0)")
+    local goal = C.GoalProgress(proxy)
+    local donated = nil
+    for i = 1, #(goal.items or {}) do
+        if goal.items[i].itemId == 9113 then donated = goal.items[i].donated end
+    end
+    assertEq(tonumber(donated) or 0, 10, "3C13: GoalProgress donated")
+    local plan = C.BuildDonationPlan(proxy, {
+        { itemId = 9113, available = 50, quantity = 50 },
+    }, { guildBankUsable = true })
+    assertEq(#plan.lines, 1, "3C13: plan has line")
+    assertEq(plan.lines[1].donated, 10, "3C13: plan donated")
+    assertEq(plan.lines[1].suggested, 10, "3C13: suggests remaining 10 toward goal 20")
+
+    -- Complete the goal; helper must not over-suggest.
+    world.time = world.time + 100
+    local evidence2 = makeDepositEvidence(record, {
+        itemId = 9113, quantity = 10, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|sig2" },
+        neighborsNewer = { "newer|sig2" },
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence2, pair[1], pair[2])
+    end
+    plan = C.BuildDonationPlan(proxy, {
+        { itemId = 9113, available = 50, quantity = 50 },
+    }, { guildBankUsable = true })
+    assertEq(plan.lines[1].donated, 20, "3C13: goal met donated=20")
+    assertEq(plan.lines[1].suggested, 0, "3C13: no over-suggest after complete")
+    assertEq(plan.lines[1].goalComplete, true, "3C13: goalComplete")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C14) Authenticated live cutover conflict blocks production credits
+    local record = seedActivatableCampaign(9114, 30)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C14: activated")
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    local localMarker = record.liveCutover.cutoverMarker
+    world.time = boundary + 7200
+
+    -- Spoofed non-editor peer marker must NOT block.
+    GS._peerDatasets = {
+        ["Dave-Garona"] = {
+            peerName = "Dave-Garona",
+            datasetId = record.datasetId,
+            cutoverMarker = "gsc1:forged:1:2",
+            activation = GS.ACTIVATION_ACTIVE,
+        },
+    }
+    local conflict = GS:GetLiveActivationConflictState()
+    assertEq(conflict.blocked, false, "3C14: non-editor spoof does not block")
+
+    local post = makeDepositEvidence(record, {
+        itemId = 9114, quantity = 4, observedAt = world.time, ageHours = 0,
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        local ast = GS:_AdmitObservationForTests(post, pair[1], pair[2])
+        assertTrue(ast == "accepted" or ast == "pending" or ast == "duplicate",
+            "3C14: ordinary admit progresses st=" .. tostring(ast))
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9114]) or 0,
+        4, "3C14: matching-marker credits continue")
+
+    -- Authenticated editor peer with divergent marker blocks new credits.
+    local otherAt = boundary + 99
+    local otherMarker = GS.BuildCutoverMarker(record.datasetId, otherAt, record.liveCutover.bankTab)
+    GS._peerDatasets = {
+        ["Bob-Garona"] = {
+            peerName = "Bob-Garona",
+            datasetId = record.datasetId,
+            cutoverMarker = otherMarker,
+            activation = GS.ACTIVATION_ACTIVE,
+        },
+    }
+    conflict = GS:GetLiveActivationConflictState()
+    assertEq(conflict.blocked, true, "3C14: editor conflict blocks")
+    assertEq(conflict.reason, "live_activation_conflict", "3C14: conflict reason")
+    assertEq(record.liveCutover.cutoverMarker, localMarker, "3C14: local marker retained")
+
+    world.time = world.time + 100
+    local blockedEv = makeDepositEvidence(record, {
+        itemId = 9114, quantity = 7, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|blk" },
+        neighborsNewer = { "newer|blk" },
+    })
+    local stBlock, reasonBlock = GS:_AdmitObservationForTests(
+        blockedEv, "Player-1-Alice", "Alice-Garona")
+    assertEq(stBlock, "pending", "3C14: admit pending under conflict")
+    assertEq(reasonBlock, "live_activation_conflict",
+        "3C14: conflict reason on admit got=" .. tostring(reasonBlock))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9114]) or 0,
+        4, "3C14: no new credit while conflicted")
+
+    -- Clear conflict; ordinary operation resumes.
+    GS._peerDatasets = {}
+    assertEq(GS:GetLiveActivationConflictState().blocked, false, "3C14: conflict cleared")
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(blockedEv, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9114]) or 0,
+        11, "3C14: credits resume after resolve")
+    disarmFreshBankSample()
+end
+
+do
+    -- 3C15) Activation during adoption replay aborts publish; active marker survives
+    local sourceDataset
+    local bodies
+    do
+        local rec = seedStagedCampaignWithItem(9115, 40)
+        sourceDataset = rec.datasetId
+        local evidence = makeDepositEvidence(rec, { itemId = 9115, quantity = 3 })
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+        end
+        GS:EnsureGossipProvider()
+        drainExportMaint(64)
+        bodies = collectAllExportBodies()
+    end
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "3C15: create staged")
+    startCampaign()
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "3C15: tab")
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 9115 }, {
+        itemId = 9115, goal = 40, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "3C15: item")
+    world.time = (world.time or 0) + 7200
+    local localRec = GS:GetCurrentRecord()
+    local localDs = localRec.datasetId
+    assertEq(localRec.activation, GS.ACTIVATION_STAGED, "3C15: starts staged")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3C15: begin adoption")
+    assertEq(GS._adoption.localActivation, GS.ACTIVATION_STAGED, "3C15: activation pinned")
+    for i = 1, #bodies do
+        GS:BufferAdoptionRecord(bodies[i].id, bodies[i].body)
+    end
+    GS._adoptionReplaySyncDrain = false
+    local stCommit = GS:CommitDatasetAdoption()
+    assertTrue(stCommit == "pending" or stCommit == "accepted",
+        "3C15: first commit got=" .. tostring(stCommit))
+
+    -- Mid-replay: local staged dataset becomes active (cutover install race).
+    -- ActivateCanonicalDataset itself refuses adoption_in_progress; the pin must
+    -- still catch any live activation that lands on the record during replay.
+    local live = GS:GetCurrentRecord()
+    local observedAt = world.time
+    local tab = tonumber(live.accounting._consumables.bankTab)
+    local activeMarker = GS.BuildCutoverMarker(live.datasetId, observedAt, tab)
+    local raceCutover = {
+        schemaVersion = 1,
+        datasetId = live.datasetId,
+        guildKey = "club:42",
+        activatedAt = observedAt,
+        activatedByGuid = "Player-1-Carol",
+        activatedByName = "Carol-Garona",
+        bankTab = tab,
+        contextStatus = "empty",
+        contextObservedAt = observedAt,
+        contextRecordCount = 0,
+        cutoverMarker = activeMarker,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = observedAt,
+        },
+    }
+    local stRace = GS.InstallRemoteLiveCutover(live, raceCutover, "club:42", {
+        quarantinePending = true,
+    })
+    assertEq(stRace, "accepted", "3C15: mid-replay activation applied")
+    assertEq(GS:GetCurrentRecord().datasetId, localDs, "3C15: local dataset retained")
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE, "3C15: now active")
+
+    local guard = 0
+    local finalSt, finalReason = stCommit, nil
+    while GS._adoption and not GS._adoption.committed and guard < 400 do
+        guard = guard + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                finalSt, finalReason = GS:CommitDatasetAdoption()
+                if finalSt == "rejected" or finalSt == "accepted" then
+                    break
+                end
+            end
+        end
+    end
+    if GS._adoption and not GS._adoption.committed then
+        finalSt, finalReason = GS:CommitDatasetAdoption()
+    end
+    assertTrue(finalSt == "rejected"
+        or GS._lastAdoptionAbortReason == "stale_base"
+        or GS._adoption == nil,
+        "3C15: adoption aborted st=" .. tostring(finalSt)
+            .. " r=" .. tostring(finalReason)
+            .. " abort=" .. tostring(GS._lastAdoptionAbortReason))
+    local live = GS:GetCurrentRecord()
+    assertEq(live.datasetId, localDs, "3C15: active dataset survives")
+    assertEq(live.activation, GS.ACTIVATION_ACTIVE, "3C15: still active")
+    assertEq(live.liveCutover.cutoverMarker, activeMarker, "3C15: marker unchanged")
+    assertTrue(live.datasetId ~= sourceDataset, "3C15: did not publish foreign staged dataset")
+    GS._adoptionReplaySyncDrain = true
+end
+
+do
+    -- 3C16) Pre-activation staged accounting never becomes live credit
+    local record = seedStagedCampaignWithItem(9116, 50)
+    local stagedEvidence = makeDepositEvidence(record, {
+        itemId = 9116, quantity = 8, donor = "StagedDonor-Garona",
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(stagedEvidence, pair[1], pair[2])
+    end
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9116, 2, nil))
+    assertTrue(adjOp ~= nil, "3C16: staged adjustment prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "3C16: staged adjustment")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9116]) or 0,
+        10, "3C16: staged projection includes staged rows")
+    local stagedEventCount = #(record.accounting._consumableEvents or {})
+    assertTrue(stagedEventCount >= 2, "3C16: staged events retained")
+
+    armFreshBankSample(true)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C16: activated")
+    record = GS:GetCurrentRecord()
+    local aliceDataset = record.datasetId
+    local aliceCampaign = record.currentCampaignId
+    local cutover = record.liveCutover
+    assertEq(#(record.accounting._consumableEvents or {}), stagedEventCount,
+        "3C16: staged rows not deleted")
+    for i = 1, stagedEventCount do
+        assertEq(record.accounting._consumableEvents[i].gsProductionCredit, false,
+            "3C16: staged row classified non-production i=" .. tostring(i))
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(aliceCampaign).itemTotals[9116]) or 0,
+        0, "3C16: live totals exclude pre-activation rows")
+
+    -- Snapshot Alice's active record (including retained staged rows) for peer sync.
+    local aliceEvents = {}
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local src = record.accounting._consumableEvents[i]
+        local copy = {}
+        for k, v in pairs(src) do copy[k] = v end
+        -- Forged remote claim of production credit must not bypass cutoff.
+        copy.gsProductionCredit = true
+        aliceEvents[i] = copy
+    end
+
+    SpectrumFederationDB = {
+        guildSupplies = {
+            schemaVersion = 1,
+            localWriter = { nonce = "dddddddddddddddddddddddd", nextSeq = 1 },
+            guilds = {
+                ["club:42"] = {
+                    schemaVersion = 1,
+                    activation = GS.ACTIVATION_STAGED,
+                    datasetId = aliceDataset,
+                    permission = record.permission,
+                    currentCampaignId = aliceCampaign,
+                    campaigns = record.campaigns,
+                    campaignArchives = {},
+                    campaignContext = {},
+                    accounting = {
+                        schemaVersion = 1,
+                        _consumables = record.accounting._consumables,
+                        _consumableEvents = aliceEvents,
+                        _consumableEventArchive = {},
+                        _mutationSeq = 1,
+                    },
+                    observations = { byCampaign = {} },
+                    identityLinks = record.identityLinks,
+                    operations = record.operations,
+                    confirmationRefs = {},
+                },
+            },
+        },
+    }
+    GS._root = nil
+    GS._rootValid = false
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    initGS()
+    local bobRec = GS:GetCurrentRecord()
+    local stCut = GS.InstallRemoteLiveCutover(bobRec, cutover, "club:42", {
+        quarantinePending = true,
+        member = GS.AuthenticateTransportSender("Alice-Garona"),
+        requireEditorAuthority = true,
+        bindActorToSender = false,
+    })
+    assertTrue(stCut == "accepted" or stCut == "duplicate",
+        "3C16: bob catch-up st=" .. tostring(stCut))
+    -- InstallRemoteLiveCutover classifies pre-activation rows; forged true → false.
+    for i = 1, #(bobRec.accounting._consumableEvents or {}) do
+        assertEq(bobRec.accounting._consumableEvents[i].gsProductionCredit, false,
+            "3C16: bob reclassified forged credit i=" .. tostring(i))
+    end
+    assertEq(tonumber(GS.ProjectCampaignProgressOnRecord(bobRec, aliceCampaign)
+        .itemTotals[9116]) or 0, 0, "3C16: bob live totals exclude staged rows")
+
+    -- Admit a forged "production" ledger event minted before the cutover boundary.
+    local forged = {
+        type = "donation",
+        id = "ctx:gs:forged-pre",
+        txnId = "ctx:gs:forged-pre",
+        itemId = 9116,
+        quantity = 99,
+        generation = tonumber(bobRec.accounting._consumables.generation) or 1,
+        timestamp = (tonumber(cutover.contextObservedAt) or 0) - 10,
+        approxTxnTime = (tonumber(cutover.contextObservedAt) or 0) - 10,
+        actor = "Forger-Garona",
+        source = "guildbank",
+        writer = "Player-1-Eve",
+        verification = "witnesses",
+        campaignId = aliceCampaign,
+        datasetId = aliceDataset,
+        gsProductionCredit = true,
+        coreSignature = "forged|pre",
+        guildGuid = "42",
+        bankTab = 2,
+        occurrenceIndex = 9,
+    }
+    local stForge = GS:AdmitLedgerEvent(forged, {
+        member = GS.AuthenticateTransportSender("Alice-Garona"),
+        sender = "Alice-Garona",
+        adoptionReplay = true,
+        preserveAttribution = true,
+    })
+    -- Adoption-transfer path may accept retention; production credit must stay false.
+    if stForge == "accepted" or stForge == "duplicate" then
+        local found = nil
+        for i = 1, #(bobRec.accounting._consumableEvents or {}) do
+            if bobRec.accounting._consumableEvents[i].id == "ctx:gs:forged-pre" then
+                found = bobRec.accounting._consumableEvents[i]
+            end
+        end
+        if found then
+            assertEq(found.gsProductionCredit, false,
+                "3C16: forged remote production flag recomputed false")
+        end
+    end
+    assertEq(tonumber(GS.ProjectCampaignProgressOnRecord(bobRec, aliceCampaign)
+        .itemTotals[9116]) or 0, 0, "3C16: forged pre-boundary never live credit")
+
+    -- Legitimate post-activation entries credit normally (Alice).
+    SpectrumFederationDB = {
+        guildSupplies = {
+            schemaVersion = 1,
+            localWriter = { nonce = "aaaaaaaaaaaaaaaaaaaaaaaa", nextSeq = 10 },
+            guilds = { ["club:42"] = record },
+        },
+    }
+    GS._root = nil
+    GS._rootValid = false
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    world.time = boundary + 7200
+    local liveEv = makeDepositEvidence(record, {
+        itemId = 9116, quantity = 5, observedAt = world.time, ageHours = 0,
+        donor = "LiveDonor-Garona",
+        occurrenceIndex = 3,
+        neighborsOlder = { "older|live" },
+        neighborsNewer = { "newer|live" },
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(liveEv, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9116]) or 0,
+        5, "3C16: only post-activation credits live totals")
+    local sawLiveCredit = false
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev.gsProductionCredit == true and tonumber(ev.quantity) == 5 then
+            sawLiveCredit = true
+        end
+    end
+    assertTrue(sawLiveCredit, "3C16: post-activation event marked production credit")
+    disarmFreshBankSample()
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

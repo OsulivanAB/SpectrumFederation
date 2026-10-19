@@ -272,6 +272,63 @@ local function QuarantinePreActivationPending(record)
     end
 end
 
+local function StampLedgerListProductionCredit(list, credit)
+    if type(list) ~= "table" then
+        return
+    end
+    for i = 1, #list do
+        local event = list[i]
+        if type(event) == "table" then
+            event.gsProductionCredit = credit and true or false
+        end
+    end
+end
+
+--- Durable classification: retained staged ledger rows never become live credit.
+-- Does not delete history; projections skip gsProductionCredit == false when live.
+function GS.ClassifyPreActivationAccounting(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return
+    end
+    StampLedgerListProductionCredit(record.accounting._consumableEvents, false)
+    StampLedgerListProductionCredit(record.accounting._consumableEventArchive, false)
+end
+
+--- Whether an accepted ledger event counts toward live campaign totals.
+-- Staged records include all accepted rows for preparation UI. Active records
+-- only count production-classified rows (post-cutover admissions).
+function GS.EventCountsTowardLiveProgress(record, event)
+    if type(event) ~= "table" then
+        return false
+    end
+    if not GS.IsLiveActive(record) then
+        return true
+    end
+    return event.gsProductionCredit == true
+end
+
+--- Assign durable production-credit classification for a newly admitted event.
+-- Never trusts a remote self-declared flag alone: recomputes from live state +
+-- cutover boundary so peers cannot mint pre-activation rows as live credit.
+function GS.AssignProductionCredit(record, event)
+    if type(event) ~= "table" then
+        return false
+    end
+    if not GS.IsLiveActive(record) then
+        event.gsProductionCredit = false
+        return false
+    end
+    local approx = tonumber(event.approxTxnTime) or tonumber(event.timestamp)
+    local afterOk = true
+    if GS.IsEvidenceAfterLiveCutover then
+        afterOk = select(1, GS.IsEvidenceAfterLiveCutover(record, {
+            approxTxnTime = approx,
+        }))
+    end
+    event.gsProductionCredit = afterOk and true or false
+    return event.gsProductionCredit
+end
+
 local function OpenConflictsBlockActivation()
     if type(GS.ListOpenConflicts) ~= "function" then
         return false
@@ -289,6 +346,8 @@ local function DatasetMismatchBlocksActivation()
 end
 
 --- Peer live cutover that conflicts with the local active marker.
+-- Only authenticated same-guild *editors* can create a blocking conflict so a
+-- forged non-editor descriptor cannot indefinitely freeze production writes.
 function GS:GetLiveActivationConflictState()
     local record = select(1, GS:GetCurrentRecord())
     if not GS.IsLiveActive(record) or type(record.liveCutover) ~= "table" then
@@ -305,12 +364,16 @@ function GS:GetLiveActivationConflictState()
             and entry.cutoverMarker ~= "" and entry.cutoverMarker ~= localMarker then
             local member = GS.AuthenticateTransportSender and GS.AuthenticateTransportSender(entry.peerName)
             if member and ctx and member.guildKey == ctx.guildKey then
-                peers[#peers + 1] = {
-                    peerName = entry.peerName,
-                    datasetId = entry.datasetId,
-                    cutoverMarker = entry.cutoverMarker,
-                    activation = entry.activation,
-                }
+                local editorOk = GS.SenderHasEditorAuthority
+                    and select(1, GS.SenderHasEditorAuthority(member, {}))
+                if editorOk then
+                    peers[#peers + 1] = {
+                        peerName = entry.peerName,
+                        datasetId = entry.datasetId,
+                        cutoverMarker = entry.cutoverMarker,
+                        activation = entry.activation,
+                    }
+                end
             end
         end
     end
@@ -323,6 +386,69 @@ function GS:GetLiveActivationConflictState()
         }
     end
     return { blocked = false, reason = nil, peers = peers }
+end
+
+--- True when authenticated live cutover conflict must fail-closed on writers.
+-- Adoption replay onto a temporary record is exempt (not production writes).
+-- offlineRecord alone is not an exemption when it is the live guild record
+-- (test helpers and local writes still fail closed).
+function GS.LiveAccountingWritesBlocked(record, admissionCtx)
+    admissionCtx = admissionCtx or {}
+    if admissionCtx.adoptionReplay then
+        return false, nil
+    end
+    if admissionCtx.offlineRecord and type(GS.GetCurrentRecord) == "function" then
+        local current = select(1, GS:GetCurrentRecord())
+        if current and admissionCtx.offlineRecord ~= current then
+            return false, nil
+        end
+    end
+    if not GS.IsLiveActive(record) then
+        return false, nil
+    end
+    if type(GS.GetLiveActivationConflictState) ~= "function" then
+        return false, nil
+    end
+    local state = GS:GetLiveActivationConflictState()
+    if type(state) == "table" and state.blocked then
+        return true, state.reason or "live_activation_conflict"
+    end
+    return false, nil
+end
+
+--- Verified editor authority for remote live cutover install / catch-up.
+-- A self-declared activatedByGuid is provenance metadata, not proof.
+-- @return boolean ok, string|nil reason
+function GS.AuthorizeRemoteLiveCutover(member, cutover, record, opts)
+    opts = opts or {}
+    if type(member) ~= "table" then
+        return false, "unauthorized"
+    end
+    if type(GS.SenderHasEditorAuthority) ~= "function" then
+        return false, "unauthorized"
+    end
+    local authOpts = opts.authOpts or {}
+    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, authOpts)
+    if not editorOk then
+        return false, editorReason or "unauthorized"
+    end
+    if type(cutover) ~= "table" then
+        return false, "invalid_live_cutover"
+    end
+    -- Bind actor to the authenticated sender unless an editor is explicitly
+    -- relaying a previously activated cutover (compatible catch-up).
+    if opts.bindActorToSender ~= false then
+        if type(cutover.activatedByGuid) ~= "string"
+            or cutover.activatedByGuid ~= member.guid then
+            return false, "cutover_actor_mismatch"
+        end
+    end
+    if type(record) == "table" and type(cutover.datasetId) == "string"
+        and type(record.datasetId) == "string"
+        and cutover.datasetId ~= record.datasetId then
+        return false, "cutover_dataset_mismatch"
+    end
+    return true, nil
 end
 
 --- Readiness probe for Settings banners (does not mutate).
@@ -546,6 +672,7 @@ function GS:ActivateCanonicalDataset()
         return nil, "rejected", "invalid_cutover_boundary"
     end
     QuarantinePreActivationPending(record)
+    GS.ClassifyPreActivationAccounting(record)
 
     local structOk, structErr = GS._ValidateGuildRecordStructure(ctx.guildKey, record)
     if not structOk then
@@ -566,6 +693,8 @@ end
 
 --- Install an authenticated remote liveCutover onto a record (adoption / catch-up).
 -- Does not require a local bank sample. Fails closed on incompatible markers.
+-- When opts.member is supplied (production gossip/bootstrap), requires verified
+-- current editor authority; activatedByGuid alone is never sufficient proof.
 -- @return status, reason
 function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     opts = opts or {}
@@ -576,6 +705,16 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     local ok, err = GS.ValidateLiveCutover(copy, record, guildKey)
     if not ok then
         return "rejected", err or "invalid_live_cutover"
+    end
+    if opts.member ~= nil or opts.requireEditorAuthority then
+        local authOk, authErr = GS.AuthorizeRemoteLiveCutover(
+            opts.member, copy, record, {
+                authOpts = opts.authOpts,
+                bindActorToSender = opts.bindActorToSender,
+            })
+        if not authOk then
+            return "rejected", authErr or "unauthorized"
+        end
     end
     if GS.IsLiveActive(record) and type(record.liveCutover) == "table" then
         if record.liveCutover.cutoverMarker == copy.cutoverMarker then
@@ -602,6 +741,9 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     end
     if opts.quarantinePending ~= false then
         QuarantinePreActivationPending(record)
+    end
+    if opts.classifyPreActivation ~= false then
+        GS.ClassifyPreActivationAccounting(record)
     end
 
     if GS._ValidateGuildRecordStructure then

@@ -1479,6 +1479,12 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
         local stCut, cutReason = GS.InstallRemoteLiveCutover(record, descriptor.liveCutover, guildKey, {
             quarantinePending = false,
             forceActive = true,
+            member = member,
+            requireEditorAuthority = true,
+            -- Empty-client active bootstrap: actor may be the original activator
+            -- while the installing peer is any verified editor distributor.
+            bindActorToSender = false,
+            authOpts = { allowBootstrapInstall = true },
         })
         if stCut ~= "accepted" and stCut ~= "duplicate" then
             return "rejected", cutReason or "invalid_live_cutover"
@@ -2006,6 +2012,13 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
     if GS.GetAccountingMutationSeq then
         localAccountingMutation = GS.GetAccountingMutationSeq(localRecord)
     end
+    -- Pin activation / cutover so a mid-replay local activation cannot be
+    -- overwritten by publishing a staged adoption temp (#389 repair).
+    local localActivation = localRecord and localRecord.activation or nil
+    local localCutoverMarker = nil
+    if localRecord and type(localRecord.liveCutover) == "table" then
+        localCutoverMarker = localRecord.liveCutover.cutoverMarker
+    end
     local previous = GS._adoption
     local switching = type(previous) == "table"
     if switching then
@@ -2024,6 +2037,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         localConfigSeq = localConfigSeq,
         localAcceptedCount = localAcceptedCount,
         localAccountingMutation = localAccountingMutation,
+        localActivation = localActivation,
+        localCutoverMarker = localCutoverMarker,
         handleGeneration = ctx.handleGeneration,
         actorGuid = ctx.actorGuid,
         records = {},
@@ -4609,6 +4624,18 @@ local function ValidateAdoptionCommitContext(adop)
             if liveMut ~= adop.localAccountingMutation then
                 return false, "stale_base"
             end
+        end
+        -- Activation / cutover identity: abort when the live record activates
+        -- (or changes marker) while a replacement adoption is still replaying.
+        if (adop.localActivation or nil) ~= (live.activation or nil) then
+            return false, "stale_base"
+        end
+        local liveMarker = nil
+        if type(live.liveCutover) == "table" then
+            liveMarker = live.liveCutover.cutoverMarker
+        end
+        if (adop.localCutoverMarker or nil) ~= (liveMarker or nil) then
+            return false, "stale_base"
         end
     end
     if type(adop.pinnedPermissionRevisionId) == "string" then

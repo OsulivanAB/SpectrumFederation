@@ -77,18 +77,13 @@ function BankLog:ObserverId()
     return nil
 end
 
-function BankLog:GuildSuppliesEligibleContext()
+--- Shared Guild Supplies bank-tab context (live admission or staged sample-only).
+-- @param opts { sampleOnly?: boolean }
+function BankLog:BuildGuildSuppliesContext(record, opts)
+    opts = opts or {}
     local GS = SF.GuildSupplies
     local O = SF.ConsumablesObservation
-    if not GS or not O or not GS.IsLiveActiveForCurrentGuild then
-        return nil
-    end
-    if not GS:IsLiveActiveForCurrentGuild() then
-        return nil
-    end
-    local record, reason = GS:GetCurrentRecord()
-    if not record then
-        Debug("Verbose", "guild supplies observation idle: %s", tostring(reason))
+    if not GS or not O or type(record) ~= "table" then
         return nil
     end
     local cfg = record.accounting and record.accounting._consumables
@@ -112,11 +107,14 @@ function BankLog:GuildSuppliesEligibleContext()
         break
     end
     if not hasRequested then return nil end
+    local sampleOnly = opts.sampleOnly == true
     return {
         source = "guildSupplies",
+        sampleOnly = sampleOnly,
         record = record,
         profile = nil,
-        profileId = "guildSupplies:" .. tostring(record.datasetId),
+        profileId = (sampleOnly and "guildSuppliesSample:" or "guildSupplies:")
+            .. tostring(record.datasetId),
         cfg = cfg,
         guildGuid = guildGuid,
         bankTab = tab,
@@ -129,10 +127,54 @@ function BankLog:GuildSuppliesEligibleContext()
     }
 end
 
+function BankLog:GuildSuppliesEligibleContext()
+    local GS = SF.GuildSupplies
+    local O = SF.ConsumablesObservation
+    if not GS or not O or not GS.IsLiveActiveForCurrentGuild then
+        return nil
+    end
+    if not GS:IsLiveActiveForCurrentGuild() then
+        return nil
+    end
+    local record, reason = GS:GetCurrentRecord()
+    if not record then
+        Debug("Verbose", "guild supplies observation idle: %s", tostring(reason))
+        return nil
+    end
+    return self:BuildGuildSuppliesContext(record, { sampleOnly = false })
+end
+
+--- Staged sample-only observation: query/stamp the configured GS tab without
+-- admitting donations or mutating staged production accounting (#389 repair).
+function BankLog:GuildSuppliesSampleOnlyContext()
+    local GS = SF.GuildSupplies
+    local O = SF.ConsumablesObservation
+    if not GS or not O or not GS.GetCurrentRecord then
+        return nil
+    end
+    if GS.IsLiveActiveForCurrentGuild and GS:IsLiveActiveForCurrentGuild() then
+        return nil
+    end
+    local record = select(1, GS:GetCurrentRecord())
+    if not record or record.activation ~= GS.ACTIVATION_STAGED then
+        return nil
+    end
+    -- Only authorized editors need the pre-activation bank sample path.
+    local caps = GS.GetCapabilities and GS:GetCapabilities()
+    if not caps or not caps.canEdit then
+        return nil
+    end
+    return self:BuildGuildSuppliesContext(record, { sampleOnly = true })
+end
+
 function BankLog:EligibleContext()
     local gsCtx = self:GuildSuppliesEligibleContext()
     if gsCtx then
         return gsCtx
+    end
+    local sampleCtx = self:GuildSuppliesSampleOnlyContext()
+    if sampleCtx then
+        return sampleCtx
     end
     local C = SF.Consumables
     local O = SF.ConsumablesObservation
@@ -377,12 +419,24 @@ function BankLog:ProcessLogUpdate(reason)
     self.lastFreshLogTab = ctx.bankTab
     self.lastFreshLogGuild = ctx.guildGuid
 
-    -- Guild Supplies live path: no profile, no raid session, three-witness ledger.
+    -- Guild Supplies paths: no Loot Helper profile / raid session required.
     if ctx.source == "guildSupplies" then
+        self.lastVerifyStats = nil
+        if ctx.sampleOnly then
+            -- Staged preparation: freshness stamp only; never admit donations.
+            self.lastStats = {
+                admitted = 0, pending = 0, rejected = 0, duplicate = 0, sampleOnly = true,
+            }
+            Debug("Info",
+                "guild supplies sample-only stamp reason=%s tab=%s rows=%s",
+                tostring(reason or "update"),
+                tostring(ctx.bankTab),
+                tostring(#(snapshot.rows or {})))
+            return
+        end
         snapshot.eligibility = ctx.eligibility
         local admitStats = self:AdmitGuildSuppliesSnapshot(ctx, snapshot)
         self.lastStats = admitStats
-        self.lastVerifyStats = nil
         Debug("Info",
             "guild supplies bank admit reason=%s accepted=%s pending=%s duplicate=%s rejected=%s rows=%s",
             tostring(reason or "update"),
