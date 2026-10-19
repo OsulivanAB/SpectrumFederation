@@ -17432,7 +17432,9 @@ do
         end
         for _, i in ipairs(idxs) do
             local row = bodies[i]
-            applyExportBody(row.body, senderForBody(row, fallbackSender))
+            -- Deep-copy: ValidateAndApply mutates body.evidence/event in place.
+            local bodyCopy = deepCopy(row.body)
+            applyExportBody(bodyCopy, senderForBody({ id = row.id, body = bodyCopy }, fallbackSender))
         end
     end
 

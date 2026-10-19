@@ -433,6 +433,19 @@ local function EnsureTxnRegistry(cfg)
     return cfg.txnRegistry
 end
 
+local function FindRegistryByTxnExact(cfg, txnId)
+    txnId = ValidTxnId(txnId)
+    if not txnId then return nil end
+    local list = EnsureTxnRegistry(cfg)
+    for i = 1, #list do
+        local row = list[i]
+        if type(row) == "table" and row.txnId == txnId then
+            return row, i
+        end
+    end
+    return nil
+end
+
 local function FindRegistryByTxn(cfg, txnId)
     txnId = ValidTxnId(txnId)
     if not txnId then return nil end
@@ -773,7 +786,9 @@ local function RegisterTxn(cfg, entry)
         return false
     end
     local list = EnsureTxnRegistry(cfg)
-    local existing = FindRegistryByTxn(cfg, entry.txnId)
+    -- Exact txnId only: alias-aware lookup would find the primary row after
+    -- aliases[] was updated and overwrite it when registering the alias entry.
+    local existing = FindRegistryByTxnExact(cfg, entry.txnId)
     if existing then
         if existing.committed then entry.committed = true end
         for k, v in pairs(entry) do
@@ -956,26 +971,43 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         return false, "ambiguous"
     end
     if ledHit and ValidTxnId(ledHit.txnId) then
-        cluster.status = "verified"
-        cluster.txnId = ledHit.txnId
-        RegisterTxn(cfg, {
-            txnId = ledHit.txnId,
+        local ledRelation = ExactIdOccurrenceRelation({
+            coreSignature = ledHit.coreSignature,
+            guildGuid = ledHit.guildGuid,
+            bankTab = ledHit.bankTab,
+            generation = ledHit.generation,
+            approxTxnTime = ledHit.timestamp or ledHit.approxTxnTime,
+            occurrenceIndex = ledHit.occurrenceIndex,
+            neighborsOlder = ledHit.neighborsOlder,
+            neighborsNewer = ledHit.neighborsNewer,
             status = "verified",
-            committed = true,
-            coreSignature = evidence.coreSignature,
-            approxTxnTime = evidence.approxTxnTime,
-            donor = evidence.donor,
-            itemId = evidence.itemId,
-            quantity = evidence.quantity,
-            guildGuid = evidence.guildGuid,
-            bankTab = evidence.bankTab,
-            generation = evidence.generation,
-            occurrenceIndex = evidence.occurrenceIndex,
-            neighborsOlder = evidence.neighborsOlder,
-            neighborsNewer = evidence.neighborsNewer,
-            verification = GS.VERIFICATION.WITNESSES,
-        })
-        return true, "duplicate"
+        }, evidence)
+        if ledRelation == "same" then
+            cluster.status = "verified"
+            cluster.txnId = ledHit.txnId
+            RegisterTxn(cfg, {
+                txnId = ledHit.txnId,
+                status = "verified",
+                committed = true,
+                coreSignature = evidence.coreSignature,
+                approxTxnTime = evidence.approxTxnTime,
+                donor = evidence.donor,
+                itemId = evidence.itemId,
+                quantity = evidence.quantity,
+                guildGuid = evidence.guildGuid,
+                bankTab = evidence.bankTab,
+                generation = evidence.generation,
+                occurrenceIndex = evidence.occurrenceIndex,
+                neighborsOlder = evidence.neighborsOlder,
+                neighborsNewer = evidence.neighborsNewer,
+                verification = GS.VERIFICATION.WITNESSES,
+            })
+            return true, "duplicate"
+        elseif ledRelation == "uncertain" then
+            cluster.status = "ambiguous"
+            return false, "ambiguous"
+        end
+        -- Distinct ledger row matched by residual scoring: fall through and remint.
     end
 
     -- Re-check boundary uncertainty immediately before credit.
@@ -997,34 +1029,51 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         return false, "id_failed"
     end
 
+    local function ResolveExactIdCollision(candidateId)
+        local existing = FindRegistryByTxn(cfg, candidateId)
+        if not existing then
+            return candidateId, nil
+        end
+        if existing.status == "alias" and type(existing.aliasOf) == "string" then
+            existing = FindRegistryByTxn(cfg, existing.aliasOf) or existing
+        end
+        if existing.status ~= "verified" then
+            return candidateId, nil
+        end
+        local relation = ExactIdOccurrenceRelation(existing, evidence)
+        if relation == "same" then
+            return existing.txnId, "duplicate"
+        elseif relation == "distinct" then
+            local reminted = AllocateCollisionRemintTxnId(record, writerGuid)
+            if not ValidTxnId(reminted) then
+                return nil, "ambiguous"
+            end
+            return reminted, nil
+        end
+        return nil, "ambiguous"
+    end
+
     -- Competing candidate IDs: only treat exact-ID hits as duplicates when
     -- MatchScore agrees they are the same occurrence. Fingerprint collisions
     -- (identical core/neighbors/index, temporally separated deposits) must not
     -- silently merge. Clear temporal separation remints a seq ID; uncertain
     -- evidence stays ambiguous rather than inventing uniqueness.
     do
-        local existing = FindRegistryByTxn(cfg, txnId)
-        if existing and existing.status == "verified" then
-            local relation = ExactIdOccurrenceRelation(existing, evidence)
-            if relation == "same" then
-                cluster.status = "verified"
-                cluster.txnId = existing.txnId
-                return true, "duplicate"
-            elseif relation == "distinct" then
-                txnId = AllocateCollisionRemintTxnId(record, writerGuid)
-                cluster.txnId = txnId
-                if not ValidTxnId(txnId) then
-                    cluster.status = "ambiguous"
-                    return false, "ambiguous"
-                end
-            else
-                cluster.status = "ambiguous"
-                return false, "ambiguous"
-            end
+        local resolved, how = ResolveExactIdCollision(txnId)
+        if how == "duplicate" then
+            cluster.status = "verified"
+            cluster.txnId = resolved
+            return true, "duplicate"
+        elseif how == "ambiguous" then
+            cluster.status = "ambiguous"
+            return false, "ambiguous"
         end
+        txnId = resolved
+        cluster.txnId = txnId
     end
 
     -- Prefer lexicographically smaller ID when a pending candidate already used one.
+    -- Never reclaim an ID already owned by a verified distinct occurrence.
     local pendingCands = EnsurePendingDonationCandidates(record)
     if type(pendingCands) == "table" then
         for candId, cand in pairs(pendingCands) do
@@ -1042,12 +1091,31 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
                 }, evidence)
                 if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
                     if candId < txnId then
-                        txnId = candId
-                        cluster.txnId = txnId
+                        local resolved, how = ResolveExactIdCollision(candId)
+                        if how == nil and ValidTxnId(resolved) then
+                            txnId = resolved
+                            cluster.txnId = txnId
+                        end
                     end
                 end
             end
         end
+    end
+
+    -- Final exact-ID guard after pending preference (prevents reclaiming a
+    -- colliding fingerprint that a peer ledger retained as a pending candidate).
+    do
+        local resolved, how = ResolveExactIdCollision(txnId)
+        if how == "duplicate" then
+            cluster.status = "verified"
+            cluster.txnId = resolved
+            return true, "duplicate"
+        elseif how == "ambiguous" then
+            cluster.status = "ambiguous"
+            return false, "ambiguous"
+        end
+        txnId = resolved
+        cluster.txnId = txnId
     end
 
     local event = BuildDonationEvent(evidence, writerGuid, txnId, GS.VERIFICATION.WITNESSES)
