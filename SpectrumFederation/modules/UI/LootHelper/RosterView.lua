@@ -42,13 +42,15 @@ local COLUMN_KEYS_RIGHT_TO_LEFT = {
 }
 
 -- Hide optional glance columns in this order once the name is at its floor.
+-- Att./Prep. are temporarily not requested by the roster; keep them in the
+-- hide order so a future re-enable reuses the same responsive policy.
 local OPTIONAL_HIDE_ORDER = { "bis", "preparedness", "attendance" }
 local READY_TEXTURE = {
     not_ready = "Interface\\RaidFrame\\ReadyCheck-NotReady",
 }
 
 -- Ready and unknown rows show no icon. The column still occupies READY_WIDTH
--- so Att./BiS/Points stay aligned with not-ready rows.
+-- so BiS/Points stay aligned with not-ready rows.
 function View.ShowsReadinessIcon(state)
     return state == "not_ready"
 end
@@ -65,8 +67,9 @@ function View.GlanceColumns(model)
     end
     return {
         points = model.showPoints and true or false,
-        attendance = true,
-        preparedness = true,
+        -- Temporarily hide Att./Prep. glance columns; history still computes.
+        attendance = false,
+        preparedness = false,
         bis = true,
         readiness = true,
     }
@@ -668,13 +671,33 @@ function View:_LayoutButtons(r, model)
 		r.Points:SetText("")
 	end
 
+	-- Att./Prep./BiS/readiness are independent glance columns. Do not gate
+	-- BiS or readiness on attendance visibility (Att./Prep. are temporarily off).
 	if columns.attendance then
 		r.Attendance:Show()
 		r.Attendance:SetText(model.attendanceText or "—")
+	else
+		r.Attendance:Hide()
+		r.Attendance:SetText("")
+	end
+
+	if columns.preparedness then
 		r.Preparedness:Show()
 		r.Preparedness:SetText(model.preparednessText or "—")
+	else
+		r.Preparedness:Hide()
+		r.Preparedness:SetText("")
+	end
+
+	if columns.bis then
 		r.Bis:Show()
 		r.Bis:SetText(model.bisText or "—")
+	else
+		r.Bis:Hide()
+		r.Bis:SetText("")
+	end
+
+	if columns.readiness then
 		r.Readiness:Show()
 		if View.ShowsReadinessIcon(model.readinessState) then
 			r.Readiness.Icon:SetTexture(READY_TEXTURE.not_ready)
@@ -701,12 +724,6 @@ function View:_LayoutButtons(r, model)
 			r.Readiness:SetScript("OnLeave", nil)
 		end
 	else
-		r.Attendance:Hide()
-		r.Attendance:SetText("")
-		r.Preparedness:Hide()
-		r.Preparedness:SetText("")
-		r.Bis:Hide()
-		r.Bis:SetText("")
 		r.Readiness:Hide()
 		r.Readiness:SetScript("OnEnter", nil)
 		r.Readiness:SetScript("OnLeave", nil)
@@ -958,8 +975,8 @@ function View:ApplyResponsiveLayout(force, depth)
 
     local request = self._layoutRequest or {
         points = false,
-        attendance = true,
-        preparedness = true,
+        attendance = false,
+        preparedness = false,
         bis = true,
         readiness = true,
         hasAction = true,
@@ -1095,8 +1112,8 @@ function View:Render(models, meta)
     self._pointName = pointName
     self._layoutRequest = {
         points = showPoints,
-        attendance = true,
-        preparedness = true,
+        attendance = false,
+        preparedness = false,
         bis = true,
         readiness = true,
         hasAction = true,
