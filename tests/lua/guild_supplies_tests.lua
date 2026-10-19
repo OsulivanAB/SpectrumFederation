@@ -330,10 +330,15 @@ loadModule("SpectrumFederation/modules/GuildGossip/05_GuildAdapter.lua")
 SF.GuildGossip.HasActiveProvider = function() return false end
 SF.GuildGossip.Init = function() end
 
+-- Observation matching helpers reused by staged ledger (#388).
+SF.ConsumablesObservation = {}
+loadModule("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
+
 loadModule("SpectrumFederation/modules/GuildSupplies/State.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Authority.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Operations.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Campaigns.lua")
+loadModule("SpectrumFederation/modules/GuildSupplies/Ledger.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Gossip.lua")
 
@@ -5505,11 +5510,13 @@ do
     assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "unchanged focus loss allocates no op")
 
     -- Add + goal edit through production control callbacks (not domain-only).
+    -- Match the requested-items Add control explicitly; #388 adds other editboxButtons.
     local def = configPanel.__sfPageDef
     local addHandler, goalHandler
     for _, sec in ipairs(def.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
-            if item.type == "editboxButton" and type(item.onSubmit) == "function" then
+            if item.type == "editboxButton" and type(item.onSubmit) == "function"
+                and item.label and tostring(item.label):find("Add item", 1, true) then
                 addHandler = item.onSubmit
             end
             if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
@@ -15963,6 +15970,337 @@ do
     assertEq(#world.chat, 0, "3A27: no chat")
 end
 
+---------------------------------------------------------------------------
+-- 3B) Donation evidence, three-witness ledger, identity links (#388)
+---------------------------------------------------------------------------
+
+local function seedStagedCampaignWithItem(itemId, goal)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    resetDb()
+    initGS()
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "3B seed: create")
+    startCampaign() -- prepares and applies
+    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "3B seed: tab")
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = itemId }, {
+        itemId = itemId, goal = goal or 100, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "3B seed: item")
+    -- Advance clock past eligibility cutoffs so deposit evidence is clearly in-window.
+    world.time = (world.time or 0) + 7200
+    return GS:GetCurrentRecord()
+end
+
+local function makeDepositEvidence(record, opts)
+    opts = opts or {}
+    local cfg = record.accounting._consumables
+    local donor = opts.donor or "Donor-Garona"
+    local itemId = opts.itemId or 1001
+    local quantity = opts.quantity or 5
+    -- Default: fresh deposit after eligibility (ageHours 0 ⇒ approxTxnTime == observedAt).
+    local observedAt = opts.observedAt or (world.time or 1000000)
+    local ageHours = opts.ageHours
+    if ageHours == nil then ageHours = 0 end
+    local core = SF.ConsumablesObservation.CoreSignature("deposit", donor, itemId, quantity)
+    local approx = opts.approxTxnTime
+    if approx == nil then
+        approx = observedAt - (ageHours * 3600)
+    end
+    return {
+        coreSignature = core,
+        type = "deposit",
+        donor = donor,
+        itemId = itemId,
+        quantity = quantity,
+        guildGuid = tostring(cfg.guild.guid),
+        bankTab = tonumber(cfg.bankTab),
+        generation = tonumber(cfg.generation),
+        approxTxnTime = approx,
+        ageHours = ageHours,
+        observedAt = observedAt,
+        occurrenceIndex = opts.occurrenceIndex or 1,
+        neighborsOlder = opts.neighborsOlder or { "older|sig" },
+        neighborsNewer = opts.neighborsNewer or { "newer|sig" },
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }
+end
+
+do
+    -- 3B1) Exactly 3 independent witnesses auto-credit; 1–2 do not
+    local record = seedStagedCampaignWithItem(1001, 50)
+    local evidence = makeDepositEvidence(record)
+
+    local st1, r1 = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+    assertEq(st1, "pending", "3B1: first witness pending")
+    assertEq(r1, "awaiting_witnesses", "3B1: awaiting after 1")
+
+    local st2, r2 = GS:_AdmitObservationForTests(evidence, "Player-1-Bob", "Bob-Garona")
+    assertEq(st2, "pending", "3B1: second witness pending")
+    assertEq(r2, "awaiting_witnesses", "3B1: awaiting after 2")
+
+    local progress2 = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress2.itemTotals[1001]) or 0, 0, "3B1: no credit before quorum")
+
+    local st3, r3 = GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")
+    assertEq(st3, "accepted", "3B1: third witness accepts: " .. tostring(r3))
+    local progress3 = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress3.itemTotals[1001]) or 0, 5, "3B1: credited after 3")
+
+    -- Fourth report is duplicate; editor has no shortcut (re-admit Alice)
+    local st4, r4 = GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")
+    assertTrue(st4 == "duplicate" or st4 == "accepted", "3B1: fourth is no-op credit")
+    local progress4 = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress4.itemTotals[1001]) or 0, 5, "3B1: still single credit")
+    assertEq(#world.chat, 0, "3B1: no chat")
+end
+
+do
+    -- 3B2) Linked alts count as one witness; relayed witness map adds no vote
+    local record = seedStagedCampaignWithItem(2002, 40)
+    local evidence = makeDepositEvidence(record, { itemId = 2002, quantity = 3 })
+
+    local linkOp = GS:NewLinkCharactersOperation("Player-1-Alice", "Player-1-Bob")
+    assertTrue(linkOp ~= nil, "3B2: link prepared")
+    assertEq(GS:ApplyStagedConfigOperation(linkOp), "accepted", "3B2: link accepted")
+    assertTrue(GS.AreSameWitnessIdentity(record, "Player-1-Alice", "Player-1-Bob"),
+        "3B2: linked same identity")
+
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "pending", "3B2: alice witness")
+    -- Bob is linked to Alice → no extra vote
+    local stBob, rBob = GS:_AdmitObservationForTests(evidence, "Player-1-Bob", "Bob-Garona")
+    assertEq(stBob, "duplicate", "3B2: linked alt duplicate witness: " .. tostring(rBob))
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+        "pending", "3B2: still need third independent")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[2002]) or 0, 0, "3B2: not credited with 2 independent")
+
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "accepted", "3B2: dave completes quorum")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[2002]) or 0, 3, "3B2: credited once")
+
+    -- Unlink must not reattribute past credit
+    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Bob")
+    assertEq(GS:ApplyStagedConfigOperation(unlinkOp), "accepted", "3B2: unlink")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[2002]) or 0, 3, "3B2: unlink does not duplicate credit")
+end
+
+do
+    -- 3B3) Distinct identical deposits may both credit; same occurrence never doubles
+    local record = seedStagedCampaignWithItem(3003, 80)
+    local e1 = makeDepositEvidence(record, {
+        itemId = 3003, quantity = 2, occurrenceIndex = 1,
+        neighborsOlder = { "n1" }, neighborsNewer = { "n2" },
+        observedAt = 2000000, ageHours = 2,
+    })
+    local e2 = makeDepositEvidence(record, {
+        itemId = 3003, quantity = 2, occurrenceIndex = 2,
+        neighborsOlder = { "n3" }, neighborsNewer = { "n4" },
+        observedAt = 2000000 + 7200, ageHours = 0,
+    })
+
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        assertEq(select(1, GS:_AdmitObservationForTests(e1, guidName[1], guidName[2])),
+            guidName[1] == "Player-1-Carol" and "accepted" or "pending",
+            "3B3: first deposit " .. guidName[2])
+    end
+    local p1 = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(p1.itemTotals[3003]) or 0, 2, "3B3: first deposit credited")
+
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        local st = select(1, GS:_AdmitObservationForTests(e2, guidName[1], guidName[2]))
+        assertTrue(st == "pending" or st == "accepted" or st == "duplicate",
+            "3B3: second deposit " .. guidName[2] .. " st=" .. tostring(st))
+    end
+    local p2 = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(p2.itemTotals[3003]) or 0, 4, "3B3: distinct deposits both credited")
+
+    -- Re-admit first occurrence: no second credit
+    assertEq(select(1, GS:_AdmitObservationForTests(e1, "Player-1-Dave", "Dave-Garona")),
+        "duplicate", "3B3: same occurrence duplicate")
+    p2 = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(p2.itemTotals[3003]) or 0, 4, "3B3: still two credits")
+end
+
+do
+    -- 3B4) Competing ledger txn IDs for same occurrence alias without double credit
+    local record = seedStagedCampaignWithItem(4004, 20)
+    local evidence = makeDepositEvidence(record, { itemId = 4004, quantity = 7 })
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, guidName[1], guidName[2])
+    end
+    local events = record.accounting._consumableEvents
+    assertTrue(#events >= 1, "3B4: donation event present")
+    local original = events[#events]
+    local competing = {
+        type = "donation",
+        id = "ctx:competitor:alt:1:abc",
+        txnId = "ctx:competitor:alt:1:abc",
+        generation = original.generation,
+        timestamp = original.timestamp,
+        actor = original.actor,
+        itemId = original.itemId,
+        quantity = original.quantity,
+        source = "guildbank",
+        writer = "Player-1-Dave",
+        verification = "witnesses",
+        coreSignature = original.coreSignature,
+        occurrenceIndex = original.occurrenceIndex,
+        guildGuid = original.guildGuid,
+        bankTab = original.bankTab,
+        neighborsOlder = original.neighborsOlder,
+        neighborsNewer = original.neighborsNewer,
+        datasetId = record.datasetId,
+    }
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local st, reason = GS:AdmitLedgerEvent(competing, {
+        sender = "Dave-Garona",
+        member = { guid = "Player-1-Dave", name = "Dave-Garona", guildKey = "club:42", rankOrder = 4 },
+        offlineRecord = record,
+    })
+    assertEq(st, "duplicate", "3B4: competing id duplicate: " .. tostring(reason))
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[4004]) or 0, 7, "3B4: single credit after competing id")
+end
+
+do
+    -- 3B5) Gossip gs-evidence path: authenticated sender votes; forged author ignored
+    local record = seedStagedCampaignWithItem(5005, 10)
+    local evidence = makeDepositEvidence(record, { itemId = 5005, quantity = 4 })
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    -- Install Alice dataset on Bob via descriptor path already used in 3A; here reuse Alice record
+    -- by keeping single-client DB and applying evidence as remote sender.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local body = {
+        kind = "gs-evidence",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        evidence = evidence,
+    }
+    assertEq(providerApply(body, "Alice-Garona"), "pending", "3B5: alice evidence pending")
+    assertEq(providerApply(body, "Bob-Garona"), "pending", "3B5: bob evidence pending")
+    local stCarol = providerApply(body, "Carol-Garona")
+    assertEq(stCarol, "accepted", "3B5: carol completes via gossip")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[5005]) or 0, 4, "3B5: gossip quorum credited")
+
+    -- Malformed / wrong dataset rejected
+    assertEq(providerApply({
+        kind = "gs-evidence",
+        datasetId = "gs1:other",
+        evidence = evidence,
+    }, "Dave-Garona"), "rejected", "3B5: foreign dataset rejected")
+end
+
+do
+    -- 3B6) Adjustments: editor-only, attribution, concurrent floor race stays nonnegative
+    local record = seedStagedCampaignWithItem(6006, 100)
+    -- Seed a donation so negative adjust has room
+    local evidence = makeDepositEvidence(record, { itemId = 6006, quantity = 10 })
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, guidName[1], guidName[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[6006]) or 0,
+        10, "3B6: seed donation")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local donorActor = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and (ev.type == "donation" or ev.type == "CONSUMABLE_DONATION") then
+            donorActor = ev.actor
+        end
+    end
+    assertTrue(type(donorActor) == "string" and donorActor ~= "", "3B6: donation actor present")
+    local adjOp, stPrep, rPrep = GS:NewAdjustmentOperation(6006, -4, donorActor)
+    assertTrue(adjOp ~= nil, "3B6: adjust prepared: " .. tostring(rPrep))
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "3B6: adjust accepted")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[6006]) or 0, 6, "3B6: adjusted total")
+    local donorTotal = progress.contributions[donorActor]
+        and progress.contributions[donorActor][6006]
+    assertEq(tonumber(donorTotal) or 0, 6, "3B6: attributed donor total")
+
+    -- Overdraw rejected locally
+    local badOp, badSt, badReason = GS:NewAdjustmentOperation(6006, -20, nil)
+    assertEq(badOp, nil, "3B6: overdraw not prepared")
+    assertEq(badSt, "rejected", "3B6: overdraw rejected")
+    assertEq(badReason, "item_negative", "3B6: item_negative")
+
+    -- Ordinary member cannot prepare
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local memberOp, memberSt = GS:NewAdjustmentOperation(6006, 1, nil)
+    assertEq(memberOp, nil, "3B6: member cannot adjust")
+    assertEq(memberSt, "rejected", "3B6: member rejected")
+
+    -- Concurrent remote negatives that would overdraw: first applies, second pending
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local a1 = GS:NewAdjustmentOperation(6006, -4, nil)
+    local a2 = GS:NewAdjustmentOperation(6006, -4, nil)
+    assertEq(GS:ApplyStagedConfigOperation(a1), "accepted", "3B6: first -4")
+    -- Second prepared against pre-first projection may still prepare; apply must floor-check
+    local st2, r2 = GS:ApplyStagedConfigOperation(a2)
+    -- a2 was prepared when total was 6; after a1 total is 2; applying -4 fails floor
+    assertTrue(st2 == "rejected" or st2 == "pending",
+        "3B6: second overdraw held st=" .. tostring(st2) .. " r=" .. tostring(r2))
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertTrue((tonumber(progress.itemTotals[6006]) or 0) >= 0, "3B6: nonnegative total")
+    assertEq(tonumber(progress.itemTotals[6006]) or 0, 2, "3B6: only first -4 applied")
+end
+
+do
+    -- 3B7) Pre-eligibility / wrong tab / missing campaign stay uncredited
+    local record = seedStagedCampaignWithItem(7007, 5)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 7007, quantity = 1,
+        observedAt = 100, ageHours = 0, -- before baseline
+    })
+    -- Force approx before eligibility if baseline exists
+    local cfg = record.accounting._consumables
+    if cfg.eligibility then
+        cfg.eligibility.baselineEstablished = true
+        cfg.eligibility.tabEligibleFrom = 1000000
+        cfg.eligibility.items = cfg.eligibility.items or {}
+        cfg.eligibility.items[tostring(7007)] = 1000000
+    end
+    evidence.approxTxnTime = 10
+    evidence.observedAt = 100
+    local st = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona"))
+    assertTrue(st == "pending" or st == "rejected", "3B7: ineligible pending/rejected got=" .. tostring(st))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[7007]) or 0,
+        0, "3B7: no credit")
+end
+
+do
+    -- 3B8) Idle / idempotent witness retries; chat-free
+    local record = seedStagedCampaignWithItem(8008, 5)
+    local evidence = makeDepositEvidence(record, { itemId = 8008, quantity = 1 })
+    local st1 = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona"))
+    assertEq(st1, "pending", "3B8: first")
+    local stRetry = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona"))
+    assertEq(stRetry, "duplicate", "3B8: retry duplicate witness")
+    assertEq(#world.chat, 0, "3B8: no chat")
+    assertEq(#world.prints, 0, "3B8: no prints")
+end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

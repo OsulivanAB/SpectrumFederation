@@ -1279,6 +1279,12 @@ local function ClassifyStaleBase(record, op, targetKey)
         return "apply", nil
     end
 
+    -- #388 adjustments: append-only with commit-time floor checks. Do not open
+    -- config-style divergent conflicts; incompatible negatives stay pending.
+    if op.kind == GS.KIND.ADJUST_QUANTITY then
+        return "apply", nil
+    end
+
     -- Open conflict already holds this target: retain as additional candidate.
     if type(ops.openConflicts) == "table" and ops.openConflicts[targetKey] then
         return "conflict", "open_conflict"
@@ -1431,6 +1437,9 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
             _consumableEventArchive = {},
         },
         observations = { byCampaign = {} },
+        identityLinks = GS.EmptyIdentityLinks and GS.EmptyIdentityLinks() or {
+            schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil,
+        },
         operations = {
             records = {},
             order = {},
@@ -2649,6 +2658,9 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
             _consumableEventArchive = {},
         },
         observations = { byCampaign = {} },
+        identityLinks = GS.EmptyIdentityLinks and GS.EmptyIdentityLinks() or {
+            schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil,
+        },
         operations = {
             records = {},
             order = {},
@@ -6432,6 +6444,20 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if GS._ApplyMutations then
             local ok, err = GS._ApplyMutations(record, stored)
             if not ok then
+                if stored.kind == GS.KIND.ADJUST_QUANTITY
+                    and (err == "item_negative" or err == "player_negative"
+                        or err == "adjustment_floor") then
+                    local stPend, reasonPend = "pending", err
+                    if GS._AdmitPendingOrConflict then
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)
+                    end
+                    if (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("remote-pending")
+                    end
+                    return stPend, reasonPend
+                end
                 return "rejected", err or "apply_failed"
             end
         end

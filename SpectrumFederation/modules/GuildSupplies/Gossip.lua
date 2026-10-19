@@ -1,6 +1,7 @@
 -- Guild Supplies staged configuration gossip provider (#387).
 -- Registers through the production Guild Gossip API. Does not activate live
--- bank/accounting writers (#389) and does not carry donation evidence (#388).
+-- Live bank/accounting writers remain inactive until #389. Phase 3B (#388) adds
+-- staged donation evidence, identity links, and ledger gossip on this provider.
 local addonName, SF = ...
 
 SF.GuildSupplies = SF.GuildSupplies or {}
@@ -2271,6 +2272,53 @@ local function ValidateAndApply(record, ctx)
         })
     end
 
+    -- #388 staged donation evidence: only the authenticated transport sender votes.
+    if body.kind == "gs-evidence" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if body.datasetId and body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        local evidence = body.evidence
+        if type(evidence) ~= "table" then
+            return "rejected", "invalid_evidence"
+        end
+        -- Relayed witness maps / claimed observedBy are not identity proof.
+        evidence.datasetId = body.datasetId or localRecord.datasetId
+        evidence.campaignId = evidence.campaignId or body.campaignId
+            or localRecord.currentCampaignId
+        return GS:AdmitDirectObservation(evidence, {
+            sender = sender,
+            member = member,
+            offlineRecord = localRecord,
+            campaignId = evidence.campaignId,
+        })
+    end
+
+    -- #388 accepted ledger events (donations / adjustments) for catch-up.
+    if body.kind == "gs-ledger-event" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if body.datasetId and body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        local event = body.event
+        if type(event) ~= "table" then
+            return "rejected", "invalid_event"
+        end
+        event.datasetId = body.datasetId or localRecord.datasetId
+        return GS:AdmitLedgerEvent(event, {
+            sender = sender,
+            member = member,
+            offlineRecord = localRecord,
+            -- Donation catch-up is occurrence-deduped; adjustments need editor auth
+            -- unless this is a preserved historical body (handled inside Admit).
+            relay = false,
+        })
+    end
+
     return "rejected", "unsupported_kind"
 end
 
@@ -2465,6 +2513,27 @@ function GS.NotifyLocalDurableChange(reason)
             exportState.openConflictCursor = nil
             exportState.openConflictPartialKey = nil
             exportState.openConflictCandidatePos = nil
+            exportState.maintIdle = false
+        end
+        -- #388 staged ledger / donation evidence: upsert accepted events.
+        if reason == "ledger" or reason == "evidence" then
+            local events = record.accounting and record.accounting._consumableEvents
+            if type(events) == "table" then
+                local start = math.max(1, #events - 31)
+                for i = start, #events do
+                    local event = events[i]
+                    if type(event) == "table" and type(event.id) == "string" then
+                        local exportId = "gs:le:" .. event.id
+                        if not exportState.byId[exportId] then
+                            UpsertExportBody(exportId, {
+                                kind = "gs-ledger-event",
+                                datasetId = record.datasetId,
+                                event = event,
+                            })
+                        end
+                    end
+                end
+            end
             exportState.maintIdle = false
         end
         -- Incremental / paced cold drain. Budget covers BuildOpExportBodies work

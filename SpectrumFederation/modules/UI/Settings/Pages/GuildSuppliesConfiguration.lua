@@ -1114,6 +1114,176 @@ local function Definition()
 				},
 			},
 			{
+				id = "gsAdjust",
+				title = Loc("GUILD_SUPPLIES_ADJUST_TITLE", "Quantity adjustment"),
+				tooltip = Loc("GUILD_SUPPLIES_ADJUST_TIP",
+					"Authenticated editors may adjust item totals. Adjustments never verify Guild Bank deposits."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = function()
+							return Loc("GUILD_SUPPLIES_ADJUST_HELP",
+								"Signed quantity changes apply to the staged guild ledger. Attribution may name a guild character or stay unattributed. Live bank accounting remains Raid Consumables until activation (#389).")
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_ADJUST_ITEM", "Item ID")
+							.. " / " .. Loc("GUILD_SUPPLIES_ADJUST_QTY", "Signed quantity")
+							.. " / " .. Loc("GUILD_SUPPLIES_ADJUST_ATTR", "Credit to (optional)"),
+						buttonText = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
+						buttonWidth = 140,
+						editWidth = 220,
+						enabled = function()
+							local rec = CurrentRecord()
+							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						onSubmit = function(ctx, text)
+							local g = GS()
+							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+							if not g or not g.NewAdjustmentOperation then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local itemPart, qtyPart, attrPart = tostring(text or "")
+								:match("^%s*(%S+)%s+([%-%+]?%d+)%s*(.-)%s*$")
+							local itemId = tonumber(itemPart)
+							local quantity = tonumber(qtyPart)
+							local attributed = attrPart
+							if attributed == "" then attributed = nil end
+							if not itemId or not quantity then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ITEM", "Enter an item ID or paste an item link."),
+									"error")
+								return
+							end
+							local op, prepStatus, prepReason = g:NewAdjustmentOperation(itemId, quantity, attributed)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason)
+								return
+							end
+							local boundOp = op
+							local accept = function()
+								ctx.section:ClearMessage()
+								local status, reason = g:ApplyStagedConfigOperation(boundOp)
+								ReportStatus(ctx, status, reason)
+								RefreshPageControls()
+							end
+							local confirmMsg = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM",
+								"Adjust item %s by %+d on the staged Guild Supplies ledger?")
+								:format(tostring(itemId), quantity)
+							if dialogs and dialogs.Confirm then
+								dialogs:Confirm(confirmMsg,
+									Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"), accept)
+							else
+								accept()
+							end
+						end,
+					},
+				},
+			},
+			{
+				id = "gsLinks",
+				title = Loc("GUILD_SUPPLIES_LINKS_TITLE", "Witness character links"),
+				tooltip = Loc("GUILD_SUPPLIES_LINKS_TIP",
+					"Link known alternate characters so they count as one witness identity for donation quorum."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = function()
+							return Loc("GUILD_SUPPLIES_LINKS_HELP",
+								"Guild-owned links only. Linking does not rewrite accepted donations. Unlinked characters remain separate witnesses. Does not use Loot Helper profiles.")
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_LINKS_APPLY", "Link characters"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_LINKS_GUID_A", "Character GUID A")
+							.. " " .. Loc("GUILD_SUPPLIES_LINKS_GUID_B", "Character GUID B"),
+						buttonText = Loc("GUILD_SUPPLIES_LINKS_APPLY", "Link characters"),
+						buttonWidth = 140,
+						editWidth = 260,
+						enabled = function()
+							return Caps().canEdit and CurrentRecord() ~= nil
+						end,
+						onSubmit = function(ctx, text)
+							local g = GS()
+							if not g or not g.NewLinkCharactersOperation then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local a, b = tostring(text or ""):match("^%s*(%S+)%s+(%S+)%s*$")
+							local op, prepStatus, prepReason = g:NewLinkCharactersOperation(a, b)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason)
+								return
+							end
+							ctx.section:ClearMessage()
+							local status, reason = g:ApplyStagedConfigOperation(op)
+							ReportStatus(ctx, status, reason)
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_LINKS_UNLINK", "Unlink character"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_LINKS_UNLINK_GUID", "Character GUID to unlink"),
+						buttonText = Loc("GUILD_SUPPLIES_LINKS_UNLINK", "Unlink character"),
+						buttonWidth = 140,
+						editWidth = 260,
+						enabled = function()
+							return Caps().canEdit and CurrentRecord() ~= nil
+						end,
+						onSubmit = function(ctx, text)
+							local g = GS()
+							if not g or not g.NewUnlinkCharacterOperation then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local guid = tostring(text or ""):match("^%s*(%S+)%s*$")
+							local op, prepStatus, prepReason = g:NewUnlinkCharacterOperation(guid)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason)
+								return
+							end
+							ctx.section:ClearMessage()
+							local status, reason = g:ApplyStagedConfigOperation(op)
+							ReportStatus(ctx, status, reason)
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "display",
+						label = Loc("GUILD_SUPPLIES_LINKS_TITLE", "Witness character links"),
+						get = function()
+							local rec = CurrentRecord()
+							local links = rec and rec.identityLinks
+							if type(links) ~= "table" or type(links.groups) ~= "table" then
+								return Loc("GUILD_SUPPLIES_LINKS_EMPTY", "No character links yet.")
+							end
+							local n = 0
+							for _ in pairs(links.groups) do n = n + 1 end
+							if n == 0 then
+								return Loc("GUILD_SUPPLIES_LINKS_EMPTY", "No character links yet.")
+							end
+							return tostring(n) .. " link group(s)"
+						end,
+					},
+				},
+			},
+			{
 				id = "gsPersonal",
 				title = Loc("GUILD_SUPPLIES_PERSONAL_TITLE", "Personal preferences"),
 				tooltip = Loc("GUILD_SUPPLIES_PERSONAL_TIP",

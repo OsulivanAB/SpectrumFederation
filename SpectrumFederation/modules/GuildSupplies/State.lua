@@ -549,6 +549,17 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if record.campaignContext ~= nil and type(record.campaignContext) ~= "table" then
         return false, "invalid_record_shape"
     end
+    -- Optional #388 identity links: absent is fine for older staged records.
+    if record.identityLinks ~= nil then
+        if GS.ValidateIdentityLinks then
+            local linkOk, linkErr = GS.ValidateIdentityLinks(record.identityLinks)
+            if not linkOk then
+                return false, linkErr or "invalid_identity_links"
+            end
+        elseif type(record.identityLinks) ~= "table" then
+            return false, "invalid_identity_links"
+        end
+    end
     if GS.CountCampaignHeaders and GS.CountCampaignHeaders(record) > (GS.MAX_CAMPAIGNS or 64) then
         return false, "full"
     end
@@ -928,6 +939,9 @@ function GS:CreateStagedRecord(editorRankPosition)
         campaignContext = {}, -- bounded bank-context anchors (#386); not gossip envelopes
         accounting = EmptyAccounting(clubId, ctx.guildName, ctx.guildRealm),
         observations = { byCampaign = {} },
+        identityLinks = GS.EmptyIdentityLinks and GS.EmptyIdentityLinks() or {
+            schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil,
+        },
         operations = EmptyOperations(),
         confirmationRefs = {},
         -- Explicitly unused: hard reset replaces legacy migration (#386).

@@ -25,6 +25,10 @@ local KIND = {
     CONFIRM_CANDIDATE = "confirm-candidate",
     START_CAMPAIGN = "start-campaign",
     RESOLVE_CONFLICT = "resolve-conflict",
+    -- #388 staged accounting / identity (not live writers)
+    LINK_CHARACTERS = "link-characters",
+    UNLINK_CHARACTERS = "unlink-characters",
+    ADJUST_QUANTITY = "adjust-quantity",
 }
 
 GS.KIND = KIND
@@ -353,6 +357,14 @@ local function TargetKey(kind, target)
             return target.targetKey
         end
         return nil
+    elseif kind == KIND.LINK_CHARACTERS or kind == KIND.UNLINK_CHARACTERS then
+        return "identity-links"
+    elseif kind == KIND.ADJUST_QUANTITY then
+        local canon = CanonicalItemTarget(target)
+        if not canon then
+            return nil
+        end
+        return "adjust:" .. tostring(canon.itemId)
     end
     return nil
 end
@@ -600,6 +612,57 @@ local function ValidateKindValue(op)
         return false, "use_campaign_api"
     elseif kind == KIND.CONFIRM_CANDIDATE then
         return false, "use_confirmation_api"
+    elseif kind == KIND.LINK_CHARACTERS then
+        if type(op.target) ~= "string" or op.target ~= "identity-links" then
+            return false, "invalid_target"
+        end
+        local guids = op.value and op.value.guids
+        if type(guids) ~= "table" or #guids < 2 then
+            return false, "invalid_guid"
+        end
+        for i = 1, #guids do
+            if type(guids[i]) ~= "string" or guids[i] == "" or #guids[i] > 64 then
+                return false, "invalid_guid"
+            end
+        end
+        if guids[1] == guids[2] then
+            return false, "invalid_guid"
+        end
+        return true
+    elseif kind == KIND.UNLINK_CHARACTERS then
+        if type(op.target) ~= "string" or op.target ~= "identity-links" then
+            return false, "invalid_target"
+        end
+        local guid = op.value and op.value.guid
+        if type(guid) ~= "string" or guid == "" or #guid > 64 then
+            return false, "invalid_guid"
+        end
+        return true
+    elseif kind == KIND.ADJUST_QUANTITY then
+        local canon = CanonicalItemTarget(op.target)
+        if not canon then
+            return false, "invalid_target"
+        end
+        if type(op.value) ~= "table" then
+            return false, "invalid_value"
+        end
+        local itemId = tonumber(op.value.itemId)
+        local quantity = tonumber(op.value.quantity)
+        if itemId ~= canon.itemId then
+            return false, "item_id_mismatch"
+        end
+        if not quantity or quantity ~= math.floor(quantity) or quantity == 0 then
+            return false, "invalid_quantity"
+        end
+        if math.abs(quantity) > (GS.MAX_OBS_QUANTITY or 100000) then
+            return false, "invalid_quantity"
+        end
+        if op.value.attributed ~= nil and op.value.attributed ~= "" then
+            if type(op.value.attributed) ~= "string" or #op.value.attributed > 64 then
+                return false, "invalid_attribution"
+            end
+        end
+        return true
     end
     return false, "unsupported_kind"
 end
@@ -629,7 +692,9 @@ function GS:NewConfigOperation(kind, target, value)
         return nil, "rejected", "server_time_unavailable"
     end
 
-    if kind ~= KIND.SET_EDITOR_RANK and kind ~= KIND.SET_BANK_TAB and kind ~= KIND.SET_REQUESTED_ITEM then
+    if kind ~= KIND.SET_EDITOR_RANK and kind ~= KIND.SET_BANK_TAB and kind ~= KIND.SET_REQUESTED_ITEM
+        and kind ~= KIND.LINK_CHARACTERS and kind ~= KIND.UNLINK_CHARACTERS
+        and kind ~= KIND.ADJUST_QUANTITY then
         return nil, "rejected", "unsupported_kind"
     end
 
@@ -675,6 +740,35 @@ function GS:NewConfigOperation(kind, target, value)
             return nil, "rejected", err
         end
         value = normalized
+    elseif kind == KIND.ADJUST_QUANTITY then
+        if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+            return nil, "rejected", "no_campaign"
+        end
+        local canon = CanonicalItemTarget(target)
+        if not canon then
+            return nil, "rejected", "invalid_target"
+        end
+        target = canon
+        if type(value) ~= "table" then
+            return nil, "rejected", "invalid_value"
+        end
+        local floorOk, floorErr, normAttr = true, nil, value.attributed
+        if GS.AdjustmentFloorOk then
+            floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
+                record, canon.itemId, value.quantity, value.attributed)
+            if not floorOk then
+                return nil, "rejected", floorErr or "adjustment_floor"
+            end
+        end
+        value = {
+            itemId = canon.itemId,
+            quantity = tonumber(value.quantity),
+            attributed = normAttr,
+        }
+    elseif kind == KIND.LINK_CHARACTERS then
+        target = "identity-links"
+    elseif kind == KIND.UNLINK_CHARACTERS then
+        target = "identity-links"
     elseif kind == KIND.SET_EDITOR_RANK then
         target = "editorRankPosition"
         value = tonumber(value)
@@ -982,6 +1076,24 @@ local function ApplyMutations(record, op)
             end
         end
         return true
+    elseif op.kind == KIND.LINK_CHARACTERS or op.kind == KIND.UNLINK_CHARACTERS then
+        if not GS.ApplyIdentityLinkMutation then
+            return false, "unsupported_kind"
+        end
+        local ok, status = GS.ApplyIdentityLinkMutation(record, op)
+        if not ok then
+            return false, status or "invalid_identity_links"
+        end
+        return true, status
+    elseif op.kind == KIND.ADJUST_QUANTITY then
+        if not GS.ApplyAdjustmentMutation then
+            return false, "unsupported_kind"
+        end
+        local ok, status = GS.ApplyAdjustmentMutation(record, op)
+        if not ok then
+            return false, status or "adjustment_floor"
+        end
+        return true, status
     end
     return false, "unsupported_kind"
 end
@@ -1498,7 +1610,9 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
             return false, "unsupported_kind"
         end
         return true
-    elseif kind == KIND.SET_EDITOR_RANK or kind == KIND.SET_BANK_TAB or kind == KIND.SET_REQUESTED_ITEM then
+    elseif kind == KIND.SET_EDITOR_RANK or kind == KIND.SET_BANK_TAB or kind == KIND.SET_REQUESTED_ITEM
+        or kind == KIND.LINK_CHARACTERS or kind == KIND.UNLINK_CHARACTERS
+        or kind == KIND.ADJUST_QUANTITY then
         local ok, err = ValidateConfigShape(body)
         if not ok then
             return false, err or "invalid_operations"
