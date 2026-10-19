@@ -18865,10 +18865,14 @@ end
 do
     -- 3B41) Cumulative eligibility cutoffs >264 via item rotation remain exportable
     -- and adoptable with exact cutoff values (no silent prune).
-    local aliceRecord = seedStagedCampaignWithItem(30001, 1)
+    local aliceRecord = seedStagedCampaignWithItem(30999, 1)
+    -- Also remove the seed item so rotation alone drives cumulative cutoffs.
+    assertEq(GS:ApplyStagedConfigOperation(GS:NewConfigOperation(
+        "set-requested-item", { itemId = 30999 }, { removed = true })),
+        "accepted", "3B41: remove seed item")
     local ROTATE_N = 280
     for n = 1, ROTATE_N do
-        local itemId = 30000 + n
+        local itemId = 31000 + n
         local addOp = GS:NewConfigOperation("set-requested-item", { itemId = itemId }, {
             itemId = itemId, goal = 1, removed = false,
         })
