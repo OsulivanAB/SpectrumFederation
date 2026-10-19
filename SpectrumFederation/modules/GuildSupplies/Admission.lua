@@ -1978,6 +1978,10 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
     if localRecord and localRecord.operations and type(localRecord.operations.order) == "table" then
         localAcceptedCount = #localRecord.operations.order
     end
+    local localAccountingMutation = 0
+    if GS.GetAccountingMutationSeq then
+        localAccountingMutation = GS.GetAccountingMutationSeq(localRecord)
+    end
     local previous = GS._adoption
     local switching = type(previous) == "table"
     if switching then
@@ -1995,6 +1999,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         localCampaignId = localCampaign,
         localConfigSeq = localConfigSeq,
         localAcceptedCount = localAcceptedCount,
+        localAccountingMutation = localAccountingMutation,
         handleGeneration = ctx.handleGeneration,
         actorGuid = ctx.actorGuid,
         records = {},
@@ -4559,6 +4564,15 @@ local function ValidateAdoptionCommitContext(adop)
         end
         if adop.localAcceptedCount ~= nil and liveAccepted ~= adop.localAcceptedCount then
             return false, "stale_base"
+        end
+        -- Ledger/evidence mutations do not advance configSeq or accepted-op
+        -- count; pin a cheap monotonic revision so async publication cannot
+        -- discard local donations or retained witnesses accepted mid-replay.
+        if adop.localAccountingMutation ~= nil and GS.GetAccountingMutationSeq then
+            local liveMut = GS.GetAccountingMutationSeq(live)
+            if liveMut ~= adop.localAccountingMutation then
+                return false, "stale_base"
+            end
         end
     end
     if type(adop.pinnedPermissionRevisionId) == "string" then
