@@ -18428,9 +18428,12 @@ do
         pendingEv, "Player-1-Alice", "Alice-Garona")
     assertEq(stPend, "pending", "3B37: single witness pending st=" .. tostring(stPend))
     assertEq(rPend, "awaiting_witnesses", "3B37: awaiting_witnesses")
-    GS.NotifyLocalDurableChange("ledger")
-    GS.NotifyLocalDurableChange("evidence")
-    drainExportMaint(512)
+    -- Incremental ledger Notify only upserts the latest window; force a cold
+    -- rebuild so paced export emits the full accepted ledger history.
+    GS:DisableGossipProvider()
+    assertEq(GS:EnsureGossipProvider(), true, "3B37: rebuild provider for cold ledger export")
+    local rounds = drainExportMaint(256)
+    assertTrue(rounds >= 1, "3B37: paced export ran rounds=" .. tostring(rounds))
     local exportBodies = collectAllExportBodies()
     local sourceDataset = aliceRecord.datasetId
     local ledgerExports, evidenceExports = 0, 0
@@ -18471,25 +18474,26 @@ do
             local used = tonumber(stats.used) or 0
             local budget = tonumber(stats.budget) or (GS.MAX_ADMISSION_WORK_PER_SLICE or 32)
             if used > maxSliceUsed then maxSliceUsed = used end
-            assertTrue(used <= budget + 1,
-                "3B37: slice within budget used=" .. tostring(used)
+            if used > budget + 1 then
+                fail("3B37: slice exceeded budget used=" .. tostring(used)
                     .. " budget=" .. tostring(budget))
+            end
         end
         if not runOneDueTimer() then
             world.time = (world.time or 0) + 1
             if not runOneDueTimer() then
-                flushTimers()
+                break
             end
         end
     end
     GS._adoptionReplaySyncDrain = true
-    if stAdopt == "pending" or (GS._adoption and GS._adoption.replayTemp) then
+    if GS._adoption and GS._adoption.replayTemp then
         stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
     end
     local adopted = GS:GetCurrentRecord()
-    assertTrue(stAdopt == "accepted"
-        or (adopted and adopted.datasetId == sourceDataset),
-        "3B37: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    assertTrue(adopted and adopted.datasetId == sourceDataset,
+        "3B37: adoption published source dataset st=" .. tostring(stAdopt)
+            .. " r=" .. tostring(reasonAdopt))
     local liveEvents = adopted and adopted.accounting and adopted.accounting._consumableEvents
     assertTrue(type(liveEvents) == "table" and #liveEvents >= LEDGER_N,
         "3B37: adopted ledger retained got=" .. tostring(liveEvents and #liveEvents))
