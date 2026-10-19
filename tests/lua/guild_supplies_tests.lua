@@ -20432,6 +20432,30 @@ do
     assertEq(missErr, "invalid_id", "3B54: invalid_id reason")
     assertEq(GS:GetCurrentRecord(), nil, "3B54: missing-id GetCurrentRecord fails closed")
 
+    -- Otherwise-complete donation with valid txnId but no event.id: Gossip would
+    -- skip export while descriptor still counts the row — fail closed.
+    events[2] = {
+        type = "donation",
+        txnId = "ctx:gs:body-txn-only",
+        itemId = 9068,
+        quantity = 1,
+        generation = 1,
+        timestamp = 2,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        coreSignature = "body|txn-only",
+        actor = "BodyValid-Garona",
+        verification = "witnesses",
+    }
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local txnOnlyOk, txnOnlyErr = GS.ValidateLedgerEventLists(record.accounting, record.datasetId)
+    assertEq(txnOnlyOk, false, "3B54: txnId-without-id body rejected")
+    assertEq(txnOnlyErr, "invalid_id", "3B54: txnId-without-id reason got="
+        .. tostring(txnOnlyErr))
+    assertEq(GS:GetCurrentRecord(), nil, "3B54: txnId-without-id GetCurrentRecord fails closed")
+    assertEq(events[2].txnId, "ctx:gs:body-txn-only", "3B54: txnId-only row retained untruncated")
+    assertEq(events[2].id, nil, "3B54: txnId-only row still has no id")
+
     -- Restore fully valid near-cap list; repeated reads stay cached/cheap.
     events[2] = {
         type = "donation",

@@ -2177,8 +2177,11 @@ function GS.ValidateLedgerEventBody(event, guildKey, datasetId)
         and typ ~= "CONSUMABLE_DONATION" and typ ~= "CONSUMABLE_ADJUSTMENT" then
         return false, "invalid_kind"
     end
-    local id = ValidTxnId(event.txnId) or (type(event.id) == "string" and event.id)
-    if type(id) ~= "string" or id == "" or #id > (GS.MAX_OPERATION_ID or 192) then
+    -- Persisted accepted rows must carry event.id. Gossip ledger export upserts
+    -- only when type(event.id)=="string"; accepting ValidTxnId(txnId) alone left
+    -- SV rows advertised in acceptedLedgerCount but never exported.
+    if type(event.id) ~= "string" or event.id == ""
+        or #event.id > (GS.MAX_OPERATION_ID or 192) then
         return false, "invalid_id"
     end
     if datasetId and event.datasetId and event.datasetId ~= datasetId then
