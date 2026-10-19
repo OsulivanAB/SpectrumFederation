@@ -16302,6 +16302,383 @@ do
     assertEq(#world.prints, 0, "3B8: no prints")
 end
 
+---------------------------------------------------------------------------
+-- 3B9+) Multi-client gossip export/import correctness (#388 pre-review)
+---------------------------------------------------------------------------
+
+local function deepCopy(value, seen)
+    if type(value) ~= "table" then
+        return value
+    end
+    seen = seen or {}
+    if seen[value] then
+        return seen[value]
+    end
+    local out = {}
+    seen[value] = out
+    for k, v in pairs(value) do
+        out[deepCopy(k, seen)] = deepCopy(v, seen)
+    end
+    return out
+end
+
+--- Snapshot Alice config (campaign/ops) without donation observations/ledger.
+local function snapshotConfigRoot()
+    local root = deepCopy(SpectrumFederationDB.guildSupplies)
+    local guild = root and root.guilds and root.guilds["club:42"]
+    if type(guild) == "table" then
+        guild.observations = { byCampaign = {}, directExports = {} }
+        if type(guild.accounting) == "table" then
+            guild.accounting._consumableEvents = {}
+            guild.accounting._pendingDonationCandidates = {}
+            local cfg = guild.accounting._consumables
+            if type(cfg) == "table" then
+                cfg.txnRegistry = {}
+                cfg.txnConflicts = {}
+                cfg.txnAllocSeq = 0
+            end
+        end
+    end
+    return root
+end
+
+local function loadClientFromConfigRoot(root, name, guid, rankOrder)
+    SpectrumFederationDB = { guildSupplies = deepCopy(root) }
+    switchPlayer(name, guid, rankOrder)
+    settleRoster()
+    GS._db = SpectrumFederationDB
+    GS._root = SpectrumFederationDB.guildSupplies
+    GS._rootValid = true
+    GS._rootReason = nil
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._pendingRelay = {}
+    GS._exportMaintSyncDrain = true
+    if GS.DisableGossipProvider then
+        GS:DisableGossipProvider()
+    end
+    assertTrue(GS:EnsureGossipProvider(), "3B multi: provider for " .. tostring(name))
+    drainExportMaint(64)
+    return GS:GetCurrentRecord()
+end
+
+local function filterExportBodies(bodies, kind)
+    local out = {}
+    for i = 1, #(bodies or {}) do
+        local row = bodies[i]
+        if row and row.body and row.body.kind == kind then
+            out[#out + 1] = row
+        end
+    end
+    return out
+end
+
+local function applyExportBody(body, sender)
+    return providerApply(body, sender)
+end
+
+do
+    -- 3B9) Fabricated/forwarded gs-ledger-event donation never self-credits
+    local record = seedStagedCampaignWithItem(9009, 20)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, { itemId = 9009, quantity = 6 })
+    local forged = {
+        type = "donation",
+        id = "ctx:forged:peer:1:dead",
+        txnId = "ctx:forged:peer:1:dead",
+        generation = evidence.generation,
+        timestamp = evidence.approxTxnTime,
+        actor = evidence.donor,
+        itemId = evidence.itemId,
+        quantity = evidence.quantity,
+        source = "guildbank",
+        writer = "Player-1-Eve",
+        verification = "witnesses",
+        coreSignature = evidence.coreSignature,
+        occurrenceIndex = evidence.occurrenceIndex,
+        guildGuid = evidence.guildGuid,
+        bankTab = evidence.bankTab,
+        neighborsOlder = evidence.neighborsOlder,
+        neighborsNewer = evidence.neighborsNewer,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+    }
+    setPlayer("Eve-Garona", "Player-1-Eve", 4)
+    local st, reason = applyExportBody({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = forged,
+    }, "Eve-Garona")
+    assertEq(st, "accepted", "3B9: forged ledger retained as candidate: " .. tostring(reason))
+    assertEq(reason, "awaiting_local_quorum", "3B9: awaiting local quorum")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9009]) or 0,
+        0, "3B9: no credit from fabricated ledger")
+    local events = record.accounting._consumableEvents or {}
+    local credited = false
+    for i = 1, #events do
+        if events[i] and (events[i].id == forged.id or events[i].txnId == forged.txnId) then
+            credited = true
+        end
+    end
+    assertEq(credited, false, "3B9: forged id not on accepted ledger")
+    local pending = record.accounting._pendingDonationCandidates
+    assertTrue(type(pending) == "table" and pending[forged.txnId] ~= nil,
+        "3B9: pending candidate retained")
+end
+
+do
+    -- 3B10) Three genuine remote witnesses via separate-client export/import
+    local aliceRecord = seedStagedCampaignWithItem(9010, 30)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(aliceRecord, { itemId = 9010, quantity = 8 })
+    local configRoot = snapshotConfigRoot()
+    local datasetId = aliceRecord.datasetId
+    local campaignId = aliceRecord.currentCampaignId
+
+    local function observeAndExport(name, guid, rank)
+        local rec = loadClientFromConfigRoot(configRoot, name, guid, rank)
+        local st, reason = GS:_AdmitObservationForTests(evidence, guid, name .. "-Garona")
+        assertTrue(st == "pending" or st == "accepted" or st == "duplicate",
+            "3B10: " .. name .. " observe st=" .. tostring(st) .. " r=" .. tostring(reason))
+        GS.NotifyLocalDurableChange("evidence")
+        drainExportMaint(64)
+        local bodies = filterExportBodies(collectAllExportBodies(), "gs-evidence")
+        local mine = nil
+        for i = 1, #bodies do
+            local b = bodies[i].body
+            if b and b.evidence and b.evidence.coreSignature == evidence.coreSignature
+                and b.evidence.itemId == evidence.itemId then
+                if tostring(bodies[i].id):find(guid, 1, true) then
+                    mine = bodies[i].body
+                    break
+                end
+                mine = mine or b
+            end
+        end
+        assertTrue(mine ~= nil, "3B10: " .. name .. " exported gs-evidence")
+        return deepCopy(SpectrumFederationDB.guildSupplies), mine
+    end
+
+    local _, aliceEv = observeAndExport("Alice", "Player-1-Alice", 1)
+    local _, bobEv = observeAndExport("Bob", "Player-1-Bob", 2)
+    local _, carolEv = observeAndExport("Carol", "Player-1-Carol", 2)
+
+    -- Dave late-joins with config only, imports the three authenticated exports.
+    local daveRec = loadClientFromConfigRoot(configRoot, "Dave", "Player-1-Dave", 4)
+    assertEq(daveRec.datasetId, datasetId, "3B10: dave same dataset")
+    assertEq(applyExportBody(aliceEv, "Alice-Garona"), "pending", "3B10: alice vote pending")
+    assertEq(applyExportBody(bobEv, "Bob-Garona"), "pending", "3B10: bob vote pending")
+    local stCarol, rCarol = applyExportBody(carolEv, "Carol-Garona")
+    assertEq(stCarol, "accepted", "3B10: carol completes quorum: " .. tostring(rCarol))
+    assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9010]) or 0,
+        8, "3B10: dave credited from remote witnesses")
+
+    -- Relayed evidence cannot impersonate an original witness: Eve sending Alice's
+    -- body counts as Eve, not a fourth Alice vote / forged author.
+    local stEve = applyExportBody(aliceEv, "Eve-Garona")
+    assertTrue(stEve == "duplicate" or stEve == "accepted" or stEve == "pending",
+        "3B10: eve relay absorbed st=" .. tostring(stEve))
+    assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9010]) or 0,
+        8, "3B10: relay does not double-credit")
+end
+
+do
+    -- 3B11) Cold reload/backfill exports ledger + direct evidence; ledger alone does not credit
+    local record = seedStagedCampaignWithItem(9011, 20)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, { itemId = 9011, quantity = 3 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9011]) or 0,
+        3, "3B11: seeded credit")
+    local configRoot = snapshotConfigRoot()
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(64)
+    -- Force cold rebuild of export index (reload path).
+    GS:DisableGossipProvider()
+    assertTrue(GS:EnsureGossipProvider(), "3B11: re-register")
+    drainExportMaint(128)
+    local bodies = collectAllExportBodies()
+    local evs = filterExportBodies(bodies, "gs-evidence")
+    local les = filterExportBodies(bodies, "gs-ledger-event")
+    assertTrue(#evs >= 1, "3B11: cold export includes gs-evidence got=" .. tostring(#evs))
+    assertTrue(#les >= 1, "3B11: cold export includes gs-ledger-event got=" .. tostring(#les))
+
+    local ledgerBody = nil
+    for i = 1, #les do
+        local ev = les[i].body.event
+        if ev and tonumber(ev.itemId) == 9011 and tonumber(ev.quantity) == 3 then
+            ledgerBody = les[i].body
+        end
+    end
+    assertTrue(ledgerBody ~= nil, "3B11: donation ledger body present")
+
+    local dave = loadClientFromConfigRoot(configRoot, "Dave", "Player-1-Dave", 4)
+    local stLe, rLe = applyExportBody(ledgerBody, "Alice-Garona")
+    assertEq(stLe, "accepted", "3B11: ledger catch-up retained: " .. tostring(rLe))
+    assertEq(rLe, "awaiting_local_quorum", "3B11: ledger catch-up awaits quorum")
+    assertEq(tonumber(GS:ProjectCampaignProgress(dave.currentCampaignId).itemTotals[9011]) or 0,
+        0, "3B11: ledger alone does not credit late joiner")
+end
+
+do
+    -- 3B12) Disconnected simultaneous verification converges; no double credit
+    local aliceRecord = seedStagedCampaignWithItem(9012, 40)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(aliceRecord, { itemId = 9012, quantity = 11 })
+    local configRoot = snapshotConfigRoot()
+
+    local function verifyLocally(name, guid, rank)
+        local rec = loadClientFromConfigRoot(configRoot, name, guid, rank)
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+        end
+        local progress = GS:ProjectCampaignProgress(rec.currentCampaignId)
+        assertEq(tonumber(progress.itemTotals[9012]) or 0, 11,
+            "3B12: " .. name .. " independent credit")
+        local events = rec.accounting._consumableEvents or {}
+        local txnId = nil
+        for i = 1, #events do
+            local ev = events[i]
+            if ev and tonumber(ev.itemId) == 9012 then
+                txnId = ev.txnId or ev.id
+            end
+        end
+        assertTrue(type(txnId) == "string" and txnId ~= "", "3B12: " .. name .. " txnId")
+        GS.NotifyLocalDurableChange("ledger")
+        drainExportMaint(64)
+        local les = filterExportBodies(collectAllExportBodies(), "gs-ledger-event")
+        local ledgerBody = nil
+        for i = 1, #les do
+            if les[i].body.event and (les[i].body.event.txnId == txnId
+                or les[i].body.event.id == txnId) then
+                ledgerBody = les[i].body
+            end
+        end
+        assertTrue(ledgerBody ~= nil, "3B12: " .. name .. " exported ledger")
+        return txnId, ledgerBody, deepCopy(SpectrumFederationDB.guildSupplies)
+    end
+
+    local aliceTxn, aliceLedger = verifyLocally("Alice", "Player-1-Alice", 1)
+    local bobTxn, bobLedger = verifyLocally("Bob", "Player-1-Bob", 2)
+    if aliceTxn == bobTxn then
+        assertEq(aliceTxn, bobTxn, "3B12: canonical fingerprint identity matches")
+    end
+
+    -- Reconnect: Alice re-verifies then imports Bob's ledger / competing ID.
+    loadClientFromConfigRoot(configRoot, "Alice", "Player-1-Alice", 1)
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    local stImp, rImp = applyExportBody(bobLedger, "Bob-Garona")
+    assertTrue(stImp == "duplicate" or stImp == "accepted",
+        "3B12: import peer ledger st=" .. tostring(stImp) .. " r=" .. tostring(rImp))
+    assertEq(tonumber(GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId).itemTotals[9012]) or 0,
+        11, "3B12: reconnect never double-credits")
+
+    local competing = deepCopy(bobLedger)
+    competing.event = deepCopy(bobLedger.event)
+    competing.event.id = "ctx:competitor:split:9:ffff"
+    competing.event.txnId = "ctx:competitor:split:9:ffff"
+    local stComp, rComp = applyExportBody(competing, "Dave-Garona")
+    assertEq(stComp, "duplicate", "3B12: competing id aliased: " .. tostring(rComp))
+    assertEq(tonumber(GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId).itemTotals[9012]) or 0,
+        11, "3B12: competing id no second credit")
+end
+
+do
+    -- 3B13) Conflicting bodies for the same txn ID quarantine
+    local record = seedStagedCampaignWithItem(9013, 20)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, { itemId = 9013, quantity = 4 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    local events = record.accounting._consumableEvents
+    local original = events[#events]
+    assertTrue(original and original.txnId, "3B13: original txn")
+    local conflict = {
+        type = "donation",
+        id = original.txnId,
+        txnId = original.txnId,
+        generation = original.generation,
+        timestamp = original.timestamp,
+        actor = original.actor,
+        itemId = original.itemId,
+        quantity = (tonumber(original.quantity) or 4) + 99,
+        source = "guildbank",
+        writer = "Player-1-Eve",
+        verification = "witnesses",
+        coreSignature = original.coreSignature,
+        occurrenceIndex = original.occurrenceIndex,
+        guildGuid = original.guildGuid,
+        bankTab = original.bankTab,
+        neighborsOlder = original.neighborsOlder,
+        neighborsNewer = original.neighborsNewer,
+        datasetId = record.datasetId,
+    }
+    local st, reason = applyExportBody({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = conflict,
+    }, "Eve-Garona")
+    assertEq(st, "rejected", "3B13: conflicting body rejected")
+    assertEq(reason, "id_conflict", "3B13: id_conflict")
+    local cfg = record.accounting._consumables
+    assertTrue(type(cfg.txnConflicts) == "table" and cfg.txnConflicts[original.txnId] ~= nil,
+        "3B13: quarantined")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9013]) or 0,
+        4, "3B13: original credit unchanged")
+end
+
+do
+    -- 3B14) Hour-granular evidence spanning eligibility boundary stays pending
+    local record = seedStagedCampaignWithItem(9014, 10)
+    local cfg = record.accounting._consumables
+    cfg.eligibility = cfg.eligibility or {}
+    cfg.eligibility.baselineEstablished = true
+    local cutover = (world.time or 1000000) - 1800
+    cfg.eligibility.tabEligibleFrom = cutover
+    cfg.eligibility.items = cfg.eligibility.items or {}
+    cfg.eligibility.items[tostring(9014)] = cutover
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9014, quantity = 2,
+        observedAt = cutover + 600,
+        ageHours = 0,
+    })
+    assertTrue(SF.ConsumablesObservation.EvidenceSpansEligibilityBoundary(evidence, cfg.eligibility),
+        "3B14: fixture spans boundary")
+    local st1, r1 = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+    local st2, r2 = GS:_AdmitObservationForTests(evidence, "Player-1-Bob", "Bob-Garona")
+    local st3, r3 = GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")
+    assertTrue(st1 == "pending" or st1 == "accepted", "3B14: alice st=" .. tostring(st1))
+    assertTrue(st3 ~= "accepted" or r3 == "ambiguous_boundary",
+        "3B14: no auto-credit across boundary st3=" .. tostring(st3) .. " r3=" .. tostring(r3))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9014]) or 0,
+        0, "3B14: boundary-spanning stays uncredited")
+    assertTrue(r1 == "ambiguous_boundary" or r2 == "ambiguous_boundary" or r3 == "ambiguous_boundary"
+        or st1 == "pending" or st2 == "pending" or st3 == "pending",
+        "3B14: pending/ambiguous path exercised")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

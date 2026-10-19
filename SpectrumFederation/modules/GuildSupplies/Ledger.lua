@@ -18,6 +18,7 @@ GS.MAX_TXN_REGISTRY = 512
 GS.MAX_TXN_ID = 160
 GS.MAX_OBS_QUANTITY = 100000
 GS.MAX_PENDING_ADJUSTMENTS = 32
+GS.MAX_PENDING_DONATION_CANDIDATES = 256
 
 GS.LEDGER_EVENT = {
     DONATION = "donation",
@@ -463,7 +464,54 @@ local function FindLedgerDonationOccurrence(record, evidence)
     return nil, "none"
 end
 
-function GS.AllocateCanonicalTxnId(record, writerGuid)
+--- Stable occurrence fingerprint so independent verifiers mint the same txnId
+-- when matching fields agree. Neighbor/hour differences may still diverge; those
+-- cases converge later via MatchScore aliasing without a second credit.
+function GS.OccurrenceFingerprint(evidence)
+    if type(evidence) ~= "table" then
+        return nil
+    end
+    if type(evidence.coreSignature) ~= "string" or evidence.coreSignature == "" then
+        return nil
+    end
+    local older = CopyStringList(evidence.neighborsOlder, 3)
+    local newer = CopyStringList(evidence.neighborsNewer, 3)
+    table.sort(older)
+    table.sort(newer)
+    local hourBucket = math.floor((tonumber(evidence.approxTxnTime) or 0) / 3600)
+    local body = {
+        kind = "gs-occ-v1",
+        core = evidence.coreSignature,
+        guild = tostring(evidence.guildGuid or ""),
+        tab = tonumber(evidence.bankTab) or 0,
+        gen = tonumber(evidence.generation) or 0,
+        occ = tonumber(evidence.occurrenceIndex) or 1,
+        hour = hourBucket,
+        older = older,
+        newer = newer,
+    }
+    local fp = nil
+    if GS.ContentFingerprint then
+        fp = GS.ContentFingerprint(body)
+    end
+    if type(fp) ~= "string" or fp == "" then
+        -- Fail closed to seq mint when Hash32 is unavailable.
+        return nil
+    end
+    if #fp > 120 then
+        fp = fp:sub(1, 120)
+    end
+    return fp
+end
+
+function GS.AllocateCanonicalTxnId(record, writerGuid, evidence)
+    local occ = evidence and GS.OccurrenceFingerprint(evidence)
+    if occ then
+        local txnId = "ctx:gs:" .. occ
+        if ValidTxnId(txnId) then
+            return txnId
+        end
+    end
     local cfg = record and record.accounting and record.accounting._consumables
     if type(cfg) ~= "table" then return nil end
     cfg.txnAllocSeq = (tonumber(cfg.txnAllocSeq) or 0) + 1
@@ -474,6 +522,93 @@ function GS.AllocateCanonicalTxnId(record, writerGuid)
     local entropy = Now() + cfg.txnAllocSeq * 17
     local txnId = string.format("ctx:%s:%s:%d:%x", dataset, w, cfg.txnAllocSeq, entropy)
     return ValidTxnId(txnId)
+end
+
+local function DonationBodiesConflict(existing, incoming)
+    if type(existing) ~= "table" or type(incoming) ~= "table" then
+        return true
+    end
+    -- Compare occurrence identity fields only. Writer/verification/source/timestamps
+    -- may differ across independent verifiers of the same deposit and must not
+    -- quarantine a matching body during ledger catch-up.
+    local fields = {
+        "coreSignature", "itemId", "quantity", "generation", "guildGuid", "bankTab",
+        "occurrenceIndex", "actor", "donor",
+    }
+    for i = 1, #fields do
+        local f = fields[i]
+        local a, b = existing[f], incoming[f]
+        if f == "actor" or f == "donor" then
+            a = NormName(existing.actor or existing.donor)
+            b = NormName(incoming.actor or incoming.donor)
+        elseif f == "itemId" or f == "quantity" or f == "generation" or f == "bankTab"
+            or f == "occurrenceIndex" then
+            a, b = tonumber(a), tonumber(b)
+        else
+            a, b = tostring(a or ""), tostring(b or "")
+        end
+        if a ~= b then
+            return true
+        end
+    end
+    return false
+end
+
+local function EnsureDirectEvidenceExports(record)
+    if type(record.observations) ~= "table" then
+        record.observations = { byCampaign = {} }
+    end
+    if type(record.observations.directExports) ~= "table" then
+        record.observations.directExports = {}
+    end
+    return record.observations.directExports
+end
+
+local function EnsurePendingDonationCandidates(record)
+    if type(record.accounting) ~= "table" then
+        return nil
+    end
+    if type(record.accounting._pendingDonationCandidates) ~= "table" then
+        record.accounting._pendingDonationCandidates = {}
+    end
+    return record.accounting._pendingDonationCandidates
+end
+
+local function EnsureTxnConflicts(cfg)
+    if type(cfg.txnConflicts) ~= "table" then
+        cfg.txnConflicts = {}
+    end
+    return cfg.txnConflicts
+end
+
+--- Record a direct local observation for gossip export (never re-export relays).
+function GS.RecordDirectEvidenceExport(record, witnessGuid, evidence)
+    witnessGuid = ValidGuid(witnessGuid)
+    local row = GS.SerializeEvidence(evidence)
+    if not witnessGuid or not row then
+        return nil
+    end
+    local exports = EnsureDirectEvidenceExports(record)
+    local occ = GS.OccurrenceFingerprint(row) or tostring(row.coreSignature)
+    local exportId = "gs:ev:" .. witnessGuid .. ":" .. occ
+    if #exportId > 190 then
+        exportId = exportId:sub(1, 190)
+    end
+    exports[exportId] = {
+        witnessGuid = witnessGuid,
+        evidence = row,
+        campaignId = row.campaignId,
+        datasetId = record.datasetId,
+        at = Now(),
+    }
+    return exportId
+end
+
+function GS.ListDirectEvidenceExports(record)
+    if type(record) ~= "table" or type(record.observations) ~= "table" then
+        return {}
+    end
+    return record.observations.directExports or {}
 end
 
 local function RegisterTxn(cfg, entry)
@@ -630,6 +765,13 @@ local function IsEvidenceEligible(record, evidence)
             end
         end
     end
+    -- Hour-granular bank evidence that could fall on either side of a cutoff
+    -- must stay pending (never auto-credit).
+    if O and O.EvidenceSpansEligibilityBoundary and cfg.eligibility then
+        if O.EvidenceSpansEligibilityBoundary(evidence, cfg.eligibility) then
+            return false, "ambiguous_boundary"
+        end
+    end
     return true
 end
 
@@ -679,9 +821,19 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         return true, "duplicate"
     end
 
+    -- Re-check boundary uncertainty immediately before credit.
+    local eligOk, eligErr = IsEvidenceEligible(record, evidence)
+    if not eligOk then
+        if eligErr == "ambiguous_boundary" then
+            cluster.status = "ambiguous"
+            return false, "ambiguous_boundary"
+        end
+        return false, eligErr or "not_eligible"
+    end
+
     local txnId = cluster.txnId
     if not ValidTxnId(txnId) then
-        txnId = GS.AllocateCanonicalTxnId(record, writerGuid)
+        txnId = GS.AllocateCanonicalTxnId(record, writerGuid, evidence)
         cluster.txnId = txnId
     end
     if not ValidTxnId(txnId) then
@@ -697,11 +849,38 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         end
     end
 
+    -- Prefer lexicographically smaller ID when a pending candidate already used one.
+    local pendingCands = EnsurePendingDonationCandidates(record)
+    if type(pendingCands) == "table" then
+        for candId, cand in pairs(pendingCands) do
+            if type(cand) == "table" and ValidTxnId(candId) then
+                local score = MatchScore({
+                    coreSignature = cand.coreSignature,
+                    guildGuid = cand.guildGuid,
+                    bankTab = cand.bankTab,
+                    generation = cand.generation,
+                    approxTxnTime = cand.timestamp or cand.approxTxnTime,
+                    occurrenceIndex = cand.occurrenceIndex,
+                    neighborsOlder = cand.neighborsOlder,
+                    neighborsNewer = cand.neighborsNewer,
+                    status = "pending",
+                }, evidence)
+                if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
+                    if candId < txnId then
+                        txnId = candId
+                        cluster.txnId = txnId
+                    end
+                end
+            end
+        end
+    end
+
     local event = BuildDonationEvent(evidence, writerGuid, txnId, GS.VERIFICATION.WITNESSES)
     if not event then
         return false, "invalid_event"
     end
     event.campaignId = record.currentCampaignId
+    event.datasetId = record.datasetId
     local ok, err = AppendLedgerEvent(record, event)
     if not ok then
         return false, err or "full"
@@ -725,6 +904,30 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         decidedBy = writerGuid,
         decidedAt = Now(),
     })
+    -- Alias any pending relayed donation candidates for this occurrence.
+    if type(pendingCands) == "table" then
+        for candId, cand in pairs(pendingCands) do
+            if type(cand) == "table" and ValidTxnId(candId) and candId ~= txnId then
+                local score = MatchScore({
+                    coreSignature = cand.coreSignature,
+                    guildGuid = cand.guildGuid,
+                    bankTab = cand.bankTab,
+                    generation = cand.generation,
+                    approxTxnTime = cand.timestamp or cand.approxTxnTime,
+                    occurrenceIndex = cand.occurrenceIndex,
+                    neighborsOlder = cand.neighborsOlder,
+                    neighborsNewer = cand.neighborsNewer,
+                    status = "pending",
+                }, evidence)
+                if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
+                    AddTxnAlias(cfg, txnId, candId)
+                    pendingCands[candId] = nil
+                end
+            elseif candId == txnId then
+                pendingCands[candId] = nil
+            end
+        end
+    end
     cluster.status = "verified"
     cluster.txnId = txnId
     Debug("Info", "three-witness donation committed txn=%s witnesses=%s",
@@ -734,6 +937,9 @@ end
 
 local function TryAutoVerify(record, cluster)
     if type(cluster) ~= "table" or cluster.status == "verified" then
+        return false
+    end
+    if cluster.status == "ambiguous" then
         return false
     end
     local n = GS.CountIndependentWitnesses(record, cluster.witnesses)
@@ -749,7 +955,11 @@ local function TryAutoVerify(record, cluster)
     end
     table.sort(keys)
     writer = keys[1]
-    local ok = CommitVerifiedCluster(record, cluster, writer)
+    local ok, err = CommitVerifiedCluster(record, cluster, writer)
+    if not ok and err == "ambiguous_boundary" then
+        cluster.status = "ambiguous"
+        return false
+    end
     return ok and true or false
 end
 
@@ -821,7 +1031,8 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     end
 
     local eligOk, eligErr = IsEvidenceEligible(record, row)
-    if not eligOk then
+    local boundaryAmbiguous = (eligErr == "ambiguous_boundary")
+    if not eligOk and not boundaryAmbiguous then
         if eligErr == "not_eligible" or eligErr == "item_not_requested" then
             return "pending", eligErr
         end
@@ -861,6 +1072,12 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         if #pending < (GS.MAX_PENDING_EVIDENCE or 128) then
             pending[#pending + 1] = ambiguous
         end
+        if admissionCtx.localWrite or admissionCtx.exportEvidence then
+            GS.RecordDirectEvidenceExport(record, witnessGuid, row)
+            if GS._NotifyLocalDurableChange then
+                GS._NotifyLocalDurableChange("evidence")
+            end
+        end
         return "pending", "ambiguous"
     end
 
@@ -871,7 +1088,7 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         end
         cluster = {
             schemaVersion = 1,
-            status = "pending",
+            status = boundaryAmbiguous and "ambiguous" or "pending",
             evidence = row,
             witnesses = {},
             firstSeen = Now(),
@@ -881,6 +1098,9 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     else
         -- Refresh evidence fields conservatively (neighbors may strengthen).
         cluster.lastSeen = Now()
+        if boundaryAmbiguous then
+            cluster.status = "ambiguous"
+        end
         if type(cluster.evidence) == "table" then
             local older = cluster.evidence.neighborsOlder or {}
             local newer = cluster.evidence.neighborsNewer or {}
@@ -898,7 +1118,8 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     end
     if GS.WitnessAlreadyCounted(record, cluster.witnesses, witnessGuid) then
         local n = GS.CountIndependentWitnesses(record, cluster.witnesses)
-        if n >= (GS.WITNESS_THRESHOLD or 3) and cluster.status ~= "verified" then
+        if n >= (GS.WITNESS_THRESHOLD or 3) and cluster.status ~= "verified"
+            and cluster.status ~= "ambiguous" then
             TryAutoVerify(record, cluster)
         end
         if cluster.status == "verified" then
@@ -922,12 +1143,24 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         observedAt = row.observedAt,
     }
 
-    local verified = TryAutoVerify(record, cluster)
+    -- Only the originating observer exports this evidence body. Relays must not
+    -- re-publish it under a different authenticated sender.
+    if admissionCtx.localWrite or admissionCtx.exportEvidence then
+        GS.RecordDirectEvidenceExport(record, witnessGuid, row)
+    end
+
+    local verified = false
+    if cluster.status ~= "ambiguous" then
+        verified = TryAutoVerify(record, cluster)
+    end
     if GS._NotifyLocalDurableChange then
         GS._NotifyLocalDurableChange(verified and "ledger" or "evidence")
     end
     if verified then
         return "accepted", nil, cluster
+    end
+    if cluster.status == "ambiguous" or boundaryAmbiguous then
+        return "pending", "ambiguous_boundary", cluster
     end
     return "pending", "awaiting_witnesses", cluster
 end
@@ -1072,62 +1305,34 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     local txnId = ValidTxnId(event.txnId) or event.id
     txnId = ValidTxnId(txnId) or txnId
 
-    -- Exact ID duplicate.
-    local events = record.accounting._consumableEvents
-    if type(events) == "table" then
-        for i = 1, #events do
-            local e = events[i]
-            if type(e) == "table" and (e.id == txnId or e.txnId == txnId) then
-                return "duplicate", "duplicate"
-            end
-        end
-    end
-    local aliasHit = FindRegistryByTxn(cfg, txnId)
-    if aliasHit and (aliasHit.status == "verified" or aliasHit.status == "alias") then
-        return "duplicate", "duplicate"
-    end
-
     local isDonation = event.type == GS.LEDGER_EVENT.DONATION or event.type == "CONSUMABLE_DONATION"
     local isAdjustment = event.type == GS.LEDGER_EVENT.ADJUSTMENT or event.type == "CONSUMABLE_ADJUSTMENT"
 
-    if isDonation then
-        -- Relayed donation is historical candidate data. Accept only when
-        -- occurrence is not already credited; do not invent witness quorum from it.
-        local evidence = {
-            coreSignature = event.coreSignature,
-            donor = event.actor or event.donor,
-            itemId = event.itemId,
-            quantity = event.quantity,
-            guildGuid = event.guildGuid,
-            bankTab = event.bankTab,
-            generation = event.generation,
-            approxTxnTime = event.timestamp or event.approxTxnTime,
-            occurrenceIndex = event.occurrenceIndex,
-            neighborsOlder = event.neighborsOlder,
-            neighborsNewer = event.neighborsNewer,
-            status = "verified",
-        }
-        if type(evidence.coreSignature) == "string" then
-            local regHit, regHow = RegistryMatchOccurrence(cfg, evidence)
-            if regHow == "ambiguous" then
-                return "pending", "ambiguous"
-            end
-            if regHit and ValidTxnId(regHit.txnId) and regHit.txnId ~= txnId then
-                -- Same occurrence, competing ID: alias without second credit.
-                AddTxnAlias(cfg, regHit.txnId, txnId)
-                return "duplicate", "occurrence_duplicate"
-            end
-            local ledHit, ledHow = FindLedgerDonationOccurrence(record, evidence)
-            if ledHow == "ambiguous" then
-                return "pending", "ambiguous"
-            end
-            if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
-                AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId)
-                return "duplicate", "occurrence_duplicate"
+    -- Exact ID duplicate for non-donation kinds. Donations defer to the
+    -- provenance branch so conflicting bodies can quarantine instead of
+    -- silently treating a forged payload as a harmless duplicate.
+    if not isDonation then
+        local events = record.accounting._consumableEvents
+        if type(events) == "table" then
+            for i = 1, #events do
+                local e = events[i]
+                if type(e) == "table" and (e.id == txnId or e.txnId == txnId) then
+                    return "duplicate", "duplicate"
+                end
             end
         end
+        local aliasHit = FindRegistryByTxn(cfg, txnId)
+        if aliasHit and (aliasHit.status == "verified" or aliasHit.status == "alias") then
+            return "duplicate", "duplicate"
+        end
+    end
 
-        local stored = {
+    if isDonation then
+        -- Relayed gs-ledger-event donations are catch-up candidates only.
+        -- A forwarded verification flag or event ID is not authenticated quorum.
+        -- Never append verified credit here; live credit requires three-witness
+        -- evidence admission (AdmitDirectObservation → CommitVerifiedCluster).
+        local candidate = {
             type = GS.LEDGER_EVENT.DONATION,
             id = txnId,
             txnId = txnId,
@@ -1138,7 +1343,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             quantity = FloorNonNeg(event.quantity),
             source = "guildbank",
             writer = ValidGuid(event.writer) or (member and member.guid) or "remote",
-            verification = event.verification or GS.VERIFICATION.WITNESSES,
+            verification = event.verification, -- retained for diagnostics; not authority
             coreSignature = event.coreSignature,
             occurrenceIndex = event.occurrenceIndex,
             guildGuid = event.guildGuid,
@@ -1147,32 +1352,91 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             neighborsNewer = CopyStringList(event.neighborsNewer, 3),
             campaignId = event.campaignId or record.currentCampaignId,
             datasetId = record.datasetId,
+            approxTxnTime = tonumber(event.timestamp) or tonumber(event.approxTxnTime),
+            donor = NormName(event.actor or event.donor),
         }
-        local appendOk, appendErr = AppendLedgerEvent(record, stored)
-        if not appendOk then
-            return "rejected", appendErr or "full"
+
+        -- Same ID already verified with a conflicting body → quarantine.
+        local existingReg = FindRegistryByTxn(cfg, txnId)
+        if existingReg and existingReg.status == "verified" then
+            if DonationBodiesConflict(existingReg, candidate) then
+                local conflicts = EnsureTxnConflicts(cfg)
+                conflicts[txnId] = conflicts[txnId] or { bodies = {} }
+                local bodies = conflicts[txnId].bodies
+                if #bodies < 8 then
+                    bodies[#bodies + 1] = candidate
+                end
+                return "rejected", "id_conflict"
+            end
+            return "duplicate", "duplicate"
         end
-        RegisterTxn(cfg, {
-            txnId = txnId,
-            status = "verified",
-            committed = true,
-            coreSignature = stored.coreSignature,
-            approxTxnTime = stored.timestamp,
-            donor = stored.actor,
-            itemId = stored.itemId,
-            quantity = stored.quantity,
-            guildGuid = stored.guildGuid,
-            bankTab = stored.bankTab,
-            generation = stored.generation,
-            occurrenceIndex = stored.occurrenceIndex,
-            neighborsOlder = stored.neighborsOlder,
-            neighborsNewer = stored.neighborsNewer,
-            verification = stored.verification,
-        })
-        if GS._NotifyLocalDurableChange then
-            GS._NotifyLocalDurableChange("ledger")
+        if existingReg and existingReg.status == "alias" then
+            return "duplicate", "duplicate"
         end
-        return "accepted"
+
+        -- Pending candidate with same ID: conflict or duplicate.
+        local pendingCands = EnsurePendingDonationCandidates(record)
+        local priorCand = pendingCands and pendingCands[txnId]
+        if type(priorCand) == "table" then
+            if DonationBodiesConflict(priorCand, candidate) then
+                local conflicts = EnsureTxnConflicts(cfg)
+                conflicts[txnId] = conflicts[txnId] or { bodies = {} }
+                local bodies = conflicts[txnId].bodies
+                if #bodies < 8 then
+                    bodies[#bodies + 1] = candidate
+                end
+                return "rejected", "id_conflict"
+            end
+            return "duplicate", "duplicate"
+        end
+
+        if type(candidate.coreSignature) == "string" and candidate.coreSignature ~= "" then
+            local regHit, regHow = RegistryMatchOccurrence(cfg, candidate)
+            if regHow == "ambiguous" then
+                return "pending", "ambiguous"
+            end
+            if regHit and ValidTxnId(regHit.txnId) and regHit.txnId ~= txnId then
+                -- Same occurrence, competing ID: alias without second credit.
+                if regHit.status == "verified" then
+                    AddTxnAlias(cfg, regHit.txnId, txnId)
+                    return "duplicate", "occurrence_duplicate"
+                end
+            end
+            local ledHit, ledHow = FindLedgerDonationOccurrence(record, candidate)
+            if ledHow == "ambiguous" then
+                return "pending", "ambiguous"
+            end
+            if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
+                AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId)
+                return "duplicate", "occurrence_duplicate"
+            end
+            if ledHit and (ledHit.txnId or ledHit.id) == txnId then
+                if DonationBodiesConflict(ledHit, candidate) then
+                    local conflicts = EnsureTxnConflicts(cfg)
+                    conflicts[txnId] = conflicts[txnId] or { bodies = {} }
+                    local bodies = conflicts[txnId].bodies
+                    if #bodies < 8 then
+                        bodies[#bodies + 1] = candidate
+                    end
+                    return "rejected", "id_conflict"
+                end
+                return "duplicate", "duplicate"
+            end
+        end
+
+        -- Retain as unverified candidate for ID convergence; do not credit.
+        if type(pendingCands) ~= "table" then
+            return "rejected", "invalid_accounting"
+        end
+        local candCount = 0
+        for _ in pairs(pendingCands) do
+            candCount = candCount + 1
+        end
+        if candCount >= (GS.MAX_PENDING_DONATION_CANDIDATES or 256) then
+            return "rejected", "full"
+        end
+        pendingCands[txnId] = candidate
+        return "accepted", "awaiting_local_quorum"
     end
 
     if isAdjustment then

@@ -53,6 +53,11 @@ local exportState = {
     opBuildCursor = nil,
     opBuildNeeded = false,
     evidenceBuildNeeded = false,
+    -- #388 paced cold construction for donation evidence + accepted ledger.
+    ledgerBuildNeeded = false,
+    ledgerBuildCursor = nil,
+    donationEvidenceBuildNeeded = false,
+    donationEvidenceBuildCursor = nil,
     -- Invalidates queued maint closures after disable/replacement.
     maintGeneration = 0,
 }
@@ -1494,6 +1499,26 @@ local function RebuildExportIndex()
     exportState.openConflictCandidatePos = nil
     exportState.resolveScanPos = 0
 
+    -- #388: pace cold export of accepted ledger events and direct observations.
+    -- Relayed evidence is never stored in directExports, so re-export cannot
+    -- impersonate the original witness under a different authenticated sender.
+    local ledgerExportCount = 0
+    local events = record.accounting and record.accounting._consumableEvents
+    if type(events) == "table" then
+        ledgerExportCount = #events
+    end
+    local donationEvidenceExportCount = 0
+    local directExports = record.observations and record.observations.directExports
+    if type(directExports) == "table" then
+        for _ in pairs(directExports) do
+            donationEvidenceExportCount = donationEvidenceExportCount + 1
+        end
+    end
+    exportState.ledgerBuildNeeded = ledgerExportCount > 0
+    exportState.ledgerBuildCursor = nil
+    exportState.donationEvidenceBuildNeeded = donationEvidenceExportCount > 0
+    exportState.donationEvidenceBuildCursor = nil
+
     local descId = "gs:desc:" .. record.datasetId
     local descEntry = exportState.byId[descId]
     if type(descEntry) == "table" and type(descEntry.body) == "table" then
@@ -1516,6 +1541,8 @@ local function RebuildExportIndex()
     local needsMaint = exportState.archiveBuildNeeded
         or exportState.opBuildNeeded
         or exportState.evidenceBuildNeeded
+        or exportState.ledgerBuildNeeded
+        or exportState.donationEvidenceBuildNeeded
     exportState.maintIdle = not needsMaint
     exportState.maintScheduled = false
     -- Cold registration /reload must drain deferred construction without an
@@ -2388,8 +2415,12 @@ function GS:DisableGossipProvider()
     exportState.opBuildNeeded = false
     exportState.evidenceBuildNeeded = false
     exportState.archiveBuildNeeded = false
+    exportState.ledgerBuildNeeded = false
+    exportState.donationEvidenceBuildNeeded = false
     exportState.opBuildCursor = nil
     exportState.archiveBuildCursor = nil
+    exportState.ledgerBuildCursor = nil
+    exportState.donationEvidenceBuildCursor = nil
     exportState.pendingCursor = nil
     exportState.conflictCursor = nil
     exportState.openConflictCursor = nil
@@ -2492,10 +2523,13 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
         end
-        -- Pace deferred accepted-op / evidence / archive construction after cold rebuild.
+        -- Pace deferred accepted-op / evidence / archive / ledger construction
+        -- after cold rebuild.
         if exportState.archiveBuildNeeded
             or exportState.opBuildNeeded
-            or exportState.evidenceBuildNeeded then
+            or exportState.evidenceBuildNeeded
+            or exportState.ledgerBuildNeeded
+            or exportState.donationEvidenceBuildNeeded then
             exportState.maintIdle = false
             ScheduleExportMaintContinuation()
         end
@@ -2515,7 +2549,8 @@ function GS.NotifyLocalDurableChange(reason)
             exportState.openConflictCandidatePos = nil
             exportState.maintIdle = false
         end
-        -- #388 staged ledger / donation evidence: upsert accepted events.
+        -- #388 staged ledger / donation evidence: upsert recent accepted events
+        -- and any new direct observations (never re-export relays).
         if reason == "ledger" or reason == "evidence" then
             local events = record.accounting and record.accounting._consumableEvents
             if type(events) == "table" then
@@ -2531,6 +2566,25 @@ function GS.NotifyLocalDurableChange(reason)
                                 event = event,
                             })
                         end
+                    end
+                end
+            end
+            local directExports = record.observations and record.observations.directExports
+            if type(directExports) == "table" then
+                for exportId, row in pairs(directExports) do
+                    if type(exportId) == "string" and type(row) == "table"
+                        and type(row.evidence) == "table"
+                        and type(row.witnessGuid) == "string"
+                        and not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "gs-evidence",
+                            datasetId = record.datasetId,
+                            campaignId = row.campaignId,
+                            evidence = row.evidence,
+                            -- Diagnostic only; ValidateAndApply votes the
+                            -- authenticated transport sender, never this field.
+                            observedBy = row.witnessGuid,
+                        })
                     end
                 end
             end
@@ -2948,16 +3002,96 @@ function GS.NotifyLocalDurableChange(reason)
             end
         end
 
+        -- #388 cold/reload: pace accepted ledger history into the export index.
+        if exportState.ledgerBuildNeeded and used < slice then
+            local events = record.accounting and record.accounting._consumableEvents
+            if type(events) == "table" then
+                local start = math.max(1, tonumber(exportState.ledgerBuildCursor) or 1)
+                for i = start, #events do
+                    if used >= slice then
+                        exportState.ledgerBuildCursor = i
+                        break
+                    end
+                    local event = events[i]
+                    used = used + 1
+                    if type(event) == "table" and type(event.id) == "string" then
+                        local exportId = "gs:le:" .. event.id
+                        if not exportState.byId[exportId] then
+                            UpsertExportBody(exportId, {
+                                kind = "gs-ledger-event",
+                                datasetId = record.datasetId,
+                                event = event,
+                            })
+                        end
+                    end
+                    exportState.ledgerBuildCursor = i + 1
+                end
+                if used < slice then
+                    exportState.ledgerBuildCursor = nil
+                    exportState.ledgerBuildNeeded = false
+                end
+            else
+                exportState.ledgerBuildCursor = nil
+                exportState.ledgerBuildNeeded = false
+            end
+        end
+
+        -- #388 cold/reload: pace direct local observations (not relays).
+        if exportState.donationEvidenceBuildNeeded and used < slice then
+            local directExports = record.observations and record.observations.directExports
+            if type(directExports) == "table" then
+                local keys = sortedKeys(directExports)
+                local startK = resumeAfterKey(keys, exportState.donationEvidenceBuildCursor, function(k)
+                    return tostring(k)
+                end)
+                for ki = startK, #keys do
+                    if used >= slice then
+                        exportState.donationEvidenceBuildCursor = keys[math.max(1, ki - 1)]
+                        if ki == startK then
+                            exportState.donationEvidenceBuildCursor = keys[ki]
+                        end
+                        break
+                    end
+                    local exportId = keys[ki]
+                    local row = directExports[exportId]
+                    used = used + 1
+                    if type(exportId) == "string" and type(row) == "table"
+                        and type(row.evidence) == "table"
+                        and not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "gs-evidence",
+                            datasetId = record.datasetId,
+                            campaignId = row.campaignId,
+                            evidence = row.evidence,
+                            observedBy = row.witnessGuid,
+                        })
+                    end
+                    exportState.donationEvidenceBuildCursor = keys[ki]
+                end
+                if used < slice then
+                    exportState.donationEvidenceBuildCursor = nil
+                    exportState.donationEvidenceBuildNeeded = false
+                end
+            else
+                exportState.donationEvidenceBuildCursor = nil
+                exportState.donationEvidenceBuildNeeded = false
+            end
+        end
+
         exportState.maintIdle = used < slice
             and not exportState.opBuildNeeded
             and not exportState.evidenceBuildNeeded
             and not exportState.archiveBuildNeeded
+            and not exportState.ledgerBuildNeeded
+            and not exportState.donationEvidenceBuildNeeded
             and exportState.pendingCursor == nil
             and exportState.conflictCursor == nil
             and exportState.openConflictCursor == nil
             and exportState.openConflictPartialKey == nil
             and exportState.opBuildCursor == nil
             and exportState.archiveBuildCursor == nil
+            and exportState.ledgerBuildCursor == nil
+            and exportState.donationEvidenceBuildCursor == nil
 
         -- Descriptor counts stay logical (durable store), not emitted-body counts.
         local acceptedOpCount = 0
