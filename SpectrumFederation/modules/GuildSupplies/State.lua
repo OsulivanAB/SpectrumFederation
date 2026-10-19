@@ -534,6 +534,22 @@ local function ValidateGuildRecordStructure(guildKey, record)
         or type(accounting._consumableEventArchive) ~= "table" then
         return false, "invalid_accounting"
     end
+    -- Fail closed on over-cap / sparse / malformed restored ledger arrays.
+    -- Cheap length checks always; deep density scan is one-time/cached per
+    -- mutation revision so GetCurrentRecord hot paths stay bounded.
+    if GS.ValidateLedgerEventLists then
+        local listsOk, listsErr = GS.ValidateLedgerEventLists(accounting, record.datasetId)
+        if not listsOk then
+            return false, listsErr or "invalid_accounting"
+        end
+    else
+        local maxLive = GS.MAX_LEDGER_EVENTS or 4096
+        local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+        if #accounting._consumableEvents > maxLive
+            or #accounting._consumableEventArchive > maxArch then
+            return false, "ledger_overflow"
+        end
+    end
     if not IsValidBankTabValue(cfg.bankTab) then
         return false, "invalid_accounting"
     end
@@ -548,6 +564,17 @@ local function ValidateGuildRecordStructure(guildKey, record)
     end
     if record.campaignContext ~= nil and type(record.campaignContext) ~= "table" then
         return false, "invalid_record_shape"
+    end
+    -- Optional #388 identity links: absent is fine for older staged records.
+    if record.identityLinks ~= nil then
+        if GS.ValidateIdentityLinks then
+            local linkOk, linkErr = GS.ValidateIdentityLinks(record.identityLinks)
+            if not linkOk then
+                return false, linkErr or "invalid_identity_links"
+            end
+        elseif type(record.identityLinks) ~= "table" then
+            return false, "invalid_identity_links"
+        end
     end
     if GS.CountCampaignHeaders and GS.CountCampaignHeaders(record) > (GS.MAX_CAMPAIGNS or 64) then
         return false, "full"
@@ -928,6 +955,9 @@ function GS:CreateStagedRecord(editorRankPosition)
         campaignContext = {}, -- bounded bank-context anchors (#386); not gossip envelopes
         accounting = EmptyAccounting(clubId, ctx.guildName, ctx.guildRealm),
         observations = { byCampaign = {} },
+        identityLinks = GS.EmptyIdentityLinks and GS.EmptyIdentityLinks() or {
+            schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil,
+        },
         operations = EmptyOperations(),
         confirmationRefs = {},
         -- Explicitly unused: hard reset replaces legacy migration (#386).

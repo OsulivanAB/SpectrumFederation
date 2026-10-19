@@ -1,8 +1,8 @@
-# Guild Supplies Foundation (Phase 2A + 2B + 3A)
+# Guild Supplies Foundation (Phase 2A + 2B + 3A + 3B)
 
-Part **2A** (#385) delivers a **dormant, guild-keyed staged foundation**. Part **2B** (#386) adds **fresh-start campaigns**, local eligibility cutoffs, and **visible standalone Settings**. Part **3A** (#387) connects staged configuration to the Guild Gossip provider for authenticated exchange, conflict resolution, and explicit dataset adoption. None of these phases migrate legacy Consumables data or activate live guild-wide bank writes.
+Part **2A** (#385) delivers a **dormant, guild-keyed staged foundation**. Part **2B** (#386) adds **fresh-start campaigns**, local eligibility cutoffs, and **visible standalone Settings**. Part **3A** (#387) connects staged configuration to the Guild Gossip provider for authenticated exchange, conflict resolution, and explicit dataset adoption. Part **3B** (#388) adds **staged donation evidence**, automatic **three-witness** verification, guild-owned **character links**, and **ledger gossip** (including editor quantity adjustments). None of these phases migrate legacy Consumables data or activate live guild-wide bank writes.
 
-Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/385), [#386](https://github.com/OsulivanAB/SpectrumFederation/issues/386), [#387](https://github.com/OsulivanAB/SpectrumFederation/issues/387). Parent roadmap: [#384](https://github.com/OsulivanAB/SpectrumFederation/issues/384). Transport dependency: [#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378).
+Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/385), [#386](https://github.com/OsulivanAB/SpectrumFederation/issues/386), [#387](https://github.com/OsulivanAB/SpectrumFederation/issues/387), [#388](https://github.com/OsulivanAB/SpectrumFederation/issues/388). Parent roadmap: [#384](https://github.com/OsulivanAB/SpectrumFederation/issues/384) / [#379](https://github.com/OsulivanAB/SpectrumFederation/issues/379). Transport dependency: [#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378).
 
 **Hard release invariant:** Legacy profile-scoped Consumables remains the only live authoritative writer until [#389](https://github.com/OsulivanAB/SpectrumFederation/issues/389).
 
@@ -15,9 +15,10 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Operation IDs, typed validation, staged local admission | `Operations` (`ApplyStaged*`) |
 | Authenticated remote admission / adoption / conflicts | `Admission` (`AdmitRemote*`, adoption APIs) |
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
-| Staged configuration gossip provider | `Gossip` (`sf.guildsupplies.config`) via Guild Gossip API |
+| Staged configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`) via Guild Gossip API |
+| Donation evidence / three-witness ledger / identity links | `Ledger` (staged only; #388) |
 | Configuration / Logs Settings pages | `UI/Settings/Pages/GuildSupplies*.lua` |
-| Live donation ledger / bank verification | Legacy Consumables (unchanged) |
+| Live donation ledger / bank verification | Legacy Consumables (unchanged until #389) |
 | Gossip transport / discovery | Guild Gossip engine |
 
 ## Fresh start (no legacy migration)
@@ -50,7 +51,8 @@ SpectrumFederationDB.guildSupplies = {
         _consumableEvents = {},
         _consumableEventArchive = {},
       },
-      observations = { byCampaign = {} },
+      observations = { byCampaign = {} }, -- pending evidence clusters per campaign (#388)
+      identityLinks = { schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil }, -- #388
       operations = { records = {}, order = {}, heads = {}, pending = {}, conflicts = {}, openConflicts = {} },
       confirmationRefs = {},
       migration = nil, -- unused; hard reset replaces import workflows
@@ -95,6 +97,10 @@ SpectrumFederationDB.guildSupplies = {
 | `:GetCampaignRequestedItems(campaignId)` | Defensive copy of live or archived items |
 | `:ProjectCampaignProgress(campaignId)` | Bounded generation-scoped totals (current + archive ledger; attributed adjustments) |
 | `:ListCampaignHistory(campaignId, limit, offset)` | Bounded read-only donation/adjustment history for Logs |
+| `:AdmitDirectObservation(evidence, ctx)` | Authenticated sender GUID votes once; auto-credits at 3 independent witnesses |
+| `:AdmitLedgerEvent(event, ctx)` | Catch-up admission with occurrence-aware donation dedupe |
+| `:ListPendingEvidence(campaignId)` | Read-only pending/ambiguous deposit clusters |
+| `:NewLinkCharactersOperation` / `:NewUnlinkCharacterOperation` / `:NewAdjustmentOperation` | Editor link/adjust prepare APIs |
 | `IsBankContextSampleReady(bankTab)` | Read-only readiness via existing bank-log evidence / test probe |
 | `CaptureBankContext(bankTab)` | Non-crediting context: `captured` / `empty` only when ready; otherwise `unavailable` |
 | `FormatMutationFeedback(status, reason)` / `FormatReasonText(reason)` | Localized Settings banner text + severity |
@@ -109,15 +115,18 @@ Mutation statuses: `accepted`, `duplicate`, `pending`, `rejected`. `accepted` me
 - `confirm-candidate` → confirmation envelope
 - `start-campaign` → target `campaign` (campaign id == operation id == `resetOperationId`)
 - `resolve-conflict` → target = conflicted target key; value references competing op IDs + exact fingerprints
+- `link-characters` / `unlink-characters` → target `identity-links` (#388)
+- `adjust-quantity` → target `{ itemId }` (#388; never verifies deposits)
 
-Caps: **4,096** accepted operations / guild; **128** pending+conflict bodies; **64** campaigns; **16** bank-context anchors / campaign; **32** open target conflicts. Capacity exhaustion returns `full` without partial mutation. Durable snapshots stay whitelisted/bounded; the **2 KiB** transport export cap is unchanged.
+Caps: **4,096** accepted operations / guild; **128** pending+conflict bodies; **64** campaigns; **16** bank-context anchors / campaign; **32** open target conflicts; **128** pending evidence clusters; **64** identity-link groups. Capacity exhaustion returns `full` without partial mutation. Durable snapshots stay whitelisted/bounded; the **2 KiB** transport export cap is unchanged.
 
-### Staged configuration gossip (#387)
+### Staged configuration gossip (#387) + accounting (#388)
 
 Provider id: `sf.guildsupplies.config`.
 
 - Registers through `SF.GuildGossip:Register` / `RegisterProvider` on `Initialize`.
-- Exports compact `dataset-desc`, accepted `gs-op` envelopes (with original campaign boundaries), campaign headers, and archives.
+- Exports compact `dataset-desc`, accepted `gs-op` envelopes (with original campaign boundaries), campaign headers, archives, and staged `gs-ledger-event` bodies.
+- Also admits `gs-evidence` records: only the authenticated transport sender GUID counts as a witness.
 - Discovery capabilities stay compact (`datasetId`, schema, staged flags) — no detailed history in guild discovery.
 - `ValidateAndApply` authenticates `ctx.sender` via `GG.GetGuildMember`; payload author/rank fields are not authentication.
 - Ordinary members may receive an authenticated editor's dataset (replication) without gaining edit rights.
@@ -126,6 +135,16 @@ Provider id: `sf.guildsupplies.config`.
 - Untrusted relays remain pending until an authenticated editor confirms exact content.
 - Remote replay preserves original eligibility timestamps/boundaries; receipt time is never substituted.
 - Local durable writes call `GG.NotifyProviderChanged`.
+
+### Donation evidence and ledger (#388)
+
+- **Fixed quorum: 3** independent authenticated Guild Bank observers (character GUIDs after guild-owned link collapse). No admin-trust shortcut or manual donation review.
+- Matching reuses `ConsumablesObservation` (relative-time / neighbor / occurrence). Core signature alone does not prove uniqueness.
+- Competing txn IDs for the same occurrence alias without a second credit. Ambiguous evidence stays pending.
+- Character links are guild/dataset-scoped editor ops; changing links does not rewrite accepted donations.
+- Editor quantity adjustments are separate from verification; nonnegative floors are enforced against the accepted projection at commit.
+- Honest limitation: "independent" means distinct authenticated GUIDs after known links — not cryptographically proven distinct humans/accounts.
+- Staged only: live bank observer / helper / production Settings writers remain legacy until #389.
 
 ### Campaign lifecycle
 
@@ -161,8 +180,8 @@ Unchanged from 2A: default editor threshold 3; actual rank-name labels; GM recov
 
 | Area | Access |
 | --- | --- |
-| **Guild Supplies → Configuration** | Eligible editors / GM recovery: initialize, editor rank, bank tab, New Campaign, items/goals, staged dataset adoption, conflict resolution, staged status |
-| **Guild Supplies → Logs** | Verified same-guild members: inspect current/archived campaigns, goals, progress, and bounded donation/adjustment history |
+| **Guild Supplies → Configuration** | Eligible editors / GM recovery: initialize, editor rank, bank tab, New Campaign, items/goals, character links, quantity adjustments, staged dataset adoption, conflict resolution, staged status |
+| **Guild Supplies → Logs** | Verified same-guild members: inspect current/archived campaigns, goals, progress, pending evidence, and bounded donation/adjustment history |
 | **Personal preferences** | Account-local reminder checkbox; available to ordinary members |
 
 Pages must show staged/inactive wording. They do not claim live bank-helper authority has switched. Guild Supplies access does not depend on Loot Helper profile/admin/session.
@@ -171,8 +190,8 @@ Pages must show staged/inactive wording. They do not claim live bank-helper auth
 
 | Ticket | Owns |
 | --- | --- |
-| #388 | Gossip accounting/verification / historical reconciliation |
-| #389 | Live activation, agreed cutover eligibility, canonical adoption, legacy-writer retirement |
+| #388 | Staged donation evidence, three-witness ledger, identity links, adjustment gossip (this document) |
+| #389 | Live activation, agreed cutover eligibility, canonical adoption, legacy-writer retirement (including removal of legacy donation-review consumers) |
 
 ## Chat-free policy
 
@@ -197,3 +216,10 @@ Automated production-Lua tests do **not** replace Retail QA.
 5. On A and B: independently edit different fields; confirm convergence. Edit the same field from divergent bases; confirm Configuration shows a conflict and an authorized choice resolves both clients to the same result regardless of delivery order.
 6. On A and B: independently Initialize if needed to produce different dataset IDs; confirm mismatch stays blocked until an authorized editor adopts with confirmation; cancel and incomplete transfer leave the prior dataset; after successful adoption, delayed old-dataset traffic does not restore it.
 7. Disconnect/rejoin, `/reload`, rank demotion, and guild switch: confirm pending/rejected behavior stays bounded and idle, with no game Chat output.
+
+### Additional #388 Retail smoke (human; not claimed by automation)
+
+8. Three same-guild observers with the Guild Bank open see the same eligible deposit: confirm automatic staged credit at the third independent witness with no approval UI and no Chat.
+9. Link two alt GUIDs as an editor: confirm those alts count as one witness; unlinked third party still required for quorum.
+10. Two editors attempt concurrent negative adjustments that would overdraw: confirm totals never go negative and incompatible candidates stay pending.
+11. Confirm Logs shows pending evidence read-only and Configuration adjustments/links use contextual banners only.

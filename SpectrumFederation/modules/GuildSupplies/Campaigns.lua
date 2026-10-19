@@ -554,6 +554,20 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
     if type(copiedItems) ~= "table" then
         return false, copyErr or "invalid_accounting"
     end
+    local eligibilityCopy = nil
+    if type(cfg.eligibility) == "table" then
+        eligibilityCopy = {
+            baselineEstablished = cfg.eligibility.baselineEstablished,
+            baselineAt = cfg.eligibility.baselineAt,
+            tabEligibleFrom = cfg.eligibility.tabEligibleFrom,
+            items = {},
+        }
+        if type(cfg.eligibility.items) == "table" then
+            for k, v in pairs(cfg.eligibility.items) do
+                eligibilityCopy.items[k] = v
+            end
+        end
+    end
     archives[campaignId] = {
         schemaVersion = GS.SCHEMA_VERSION,
         campaignId = campaignId,
@@ -561,6 +575,8 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
         requestedItems = copiedItems,
         generation = generation,
         archivedAt = timestamp,
+        bankTab = tonumber(cfg.bankTab),
+        eligibility = eligibilityCopy,
     }
     return true
 end
@@ -771,12 +787,10 @@ local function ResolveCampaignGeneration(record, campaignId)
     return nil, "missing_campaign_archive"
 end
 
---- Bounded progress projection for a campaign generation (read-only copies).
--- Includes archived ledger records and signed attributed/unattributed adjustments.
-function GS:ProjectCampaignProgress(campaignId)
-    local record, reason = GS:GetCurrentRecord()
-    if not record then
-        return nil, reason or "not_ready"
+--- Project progress for an explicit guild record (adoption / offline admission).
+function GS.ProjectCampaignProgressOnRecord(record, campaignId)
+    if type(record) ~= "table" then
+        return nil, "not_ready"
     end
     if type(campaignId) ~= "string" or campaignId == "" then
         return nil, "invalid_campaign"
@@ -821,6 +835,16 @@ function GS:ProjectCampaignProgress(campaignId)
         contributions = contributions,
         generation = generation,
     }
+end
+
+--- Bounded progress projection for a campaign generation (read-only copies).
+-- Includes archived ledger records and signed attributed/unattributed adjustments.
+function GS:ProjectCampaignProgress(campaignId)
+    local record, reason = GS:GetCurrentRecord()
+    if not record then
+        return nil, reason or "not_ready"
+    end
+    return GS.ProjectCampaignProgressOnRecord(record, campaignId)
 end
 
 local function FormatHistoryTimestamp(event)
@@ -1076,6 +1100,26 @@ function GS.FormatReasonText(reason)
             "the Guild Bank log could not be read"),
         invalid_bank_tab = Loc("GUILD_SUPPLIES_REASON_INVALID_BANK_TAB",
             "enter a bank tab from 1 to 8"),
+        invalid_guid = Loc("GUILD_SUPPLIES_REASON_INVALID_GUID",
+            "choose two distinct verified guild character identities"),
+        invalid_attribution = Loc("GUILD_SUPPLIES_REASON_INVALID_ATTRIBUTION",
+            "credited character name is invalid"),
+        item_negative = Loc("GUILD_SUPPLIES_REASON_ITEM_NEGATIVE",
+            "received quantity cannot become negative"),
+        player_negative = Loc("GUILD_SUPPLIES_REASON_PLAYER_NEGATIVE",
+            "that player's contribution cannot become negative"),
+        adjustment_floor = Loc("GUILD_SUPPLIES_REASON_ADJUSTMENT_FLOOR",
+            "that adjustment would make totals negative"),
+        awaiting_witnesses = Loc("GUILD_SUPPLIES_REASON_AWAITING_WITNESSES",
+            "waiting for additional independent Guild Bank observers"),
+        ambiguous = Loc("GUILD_SUPPLIES_REASON_AMBIGUOUS",
+            "deposit evidence is ambiguous and stays uncredited until stronger observations arrive"),
+        not_eligible = Loc("GUILD_SUPPLIES_REASON_NOT_ELIGIBLE",
+            "that deposit is outside the current campaign eligibility window"),
+        item_not_requested = Loc("GUILD_SUPPLIES_REASON_ITEM_NOT_REQUESTED",
+            "that item is not on the current campaign"),
+        duplicate_witness = Loc("GUILD_SUPPLIES_REASON_DUPLICATE_WITNESS",
+            "that observer already contributed a witness for this deposit"),
     }
     if known[code] then
         return known[code]
@@ -1543,6 +1587,11 @@ function GS:ApplyStagedCampaignOperation(op, context)
     GS.EstablishCampaignBaseline(cfg, op.timestamp)
     -- configSeq bump for projection invalidation without gossip.
     cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    -- Shelve prior-generation ledger rows so the live list cannot permanently
+    -- fill across campaign rollovers (projections still walk the archive).
+    if GS.ShelvePriorGenerationsOnRecord then
+        GS.ShelvePriorGenerationsOnRecord(record)
+    end
 
     record.campaigns[op.id] = header
     record.currentCampaignId = op.id

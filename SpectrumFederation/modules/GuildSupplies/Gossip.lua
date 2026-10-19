@@ -1,6 +1,7 @@
 -- Guild Supplies staged configuration gossip provider (#387).
 -- Registers through the production Guild Gossip API. Does not activate live
--- bank/accounting writers (#389) and does not carry donation evidence (#388).
+-- Live bank/accounting writers remain inactive until #389. Phase 3B (#388) adds
+-- staged donation evidence, identity links, and ledger gossip on this provider.
 local addonName, SF = ...
 
 SF.GuildSupplies = SF.GuildSupplies or {}
@@ -52,6 +53,17 @@ local exportState = {
     opBuildCursor = nil,
     opBuildNeeded = false,
     evidenceBuildNeeded = false,
+    -- #388 paced cold construction for donation evidence + accepted ledger.
+    ledgerBuildNeeded = false,
+    ledgerBuildCursor = nil,
+    -- "archive" then "live": cold drain covers shelved + current-generation rows.
+    ledgerBuildPhase = nil,
+    -- Warm high-water for live _consumableEvents (not a fixed trailing window).
+    ledgerWarmPos = 0,
+    -- Warm high-water for _consumableEventArchive (late historical appends).
+    ledgerArchiveWarmPos = 0,
+    donationEvidenceBuildNeeded = false,
+    donationEvidenceBuildCursor = nil,
     -- Invalidates queued maint closures after disable/replacement.
     maintGeneration = 0,
 }
@@ -320,7 +332,7 @@ local function FingerprintBody(body)
     return "v1"
 end
 
--- Conservative wire budget under GG.MAX_RECORD_CBOR (2048) for archive pages.
+-- Preferred inline threshold; byte-aware paging may pack more keys per page.
 local ARCHIVE_PAGE_ITEMS = 12
 
 local function SortedItemIds(requestedItems)
@@ -338,52 +350,221 @@ local function SortedItemIds(requestedItems)
 end
 
 --- Emit archive as meta + item pages so each wire body fits MAX_RECORD_CBOR.
+-- Eligibility item cutoffs page with requestedItems. Cumulative cutoff keys from
+-- item rotation can exceed the live requested-item cap; greedy byte-aware packing
+-- preserves every cutoff without silent prune. Fail closed only when a single
+-- key cannot fit or the page ceiling is exceeded.
 local function BuildArchiveExportBodies(campaignId, archive, record)
     local out = {}
     local items = archive.requestedItems or {}
     local ids = SortedItemIds(items)
-    local pageCount = math.max(1, math.ceil(math.max(#ids, 1) / ARCHIVE_PAGE_ITEMS))
-    if #ids == 0 then
-        pageCount = 1
-    end
+    local eligSrc = type(archive.eligibility) == "table" and archive.eligibility or nil
+    local eligItems = eligSrc and type(eligSrc.items) == "table" and eligSrc.items or nil
+    local eligIds = SortedItemIds(eligItems or {})
     local itemsFp = FingerprintBody(items)
-    out[#out + 1] = {
-        id = "gs:ca:" .. campaignId,
-        body = {
+    local budget = WireBudget()
+    local exportId = "gs:ca:" .. campaignId
+    local datasetId = archive.datasetId or record.datasetId
+    local maxPages = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+    -- Prefer ARCHIVE_PAGE_ITEMS packing so ordinary archives stay multi-page under
+    -- the wire budget; raise only when a single key would not fit that width.
+    local packWidth = ARCHIVE_PAGE_ITEMS
+    local maxItemsPerPage = GS.MAX_ARCHIVE_PAGE_ITEMS or 64
+
+    local function EligibilityScalars(withItems)
+        if not eligSrc then
+            return nil
+        end
+        local eligibility = {
+            baselineEstablished = eligSrc.baselineEstablished,
+            baselineAt = eligSrc.baselineAt,
+            tabEligibleFrom = eligSrc.tabEligibleFrom,
+            items = {},
+        }
+        if withItems and eligItems then
+            for k, v in pairs(eligItems) do
+                eligibility.items[k] = v
+            end
+        end
+        return eligibility
+    end
+
+    local function MetaBody(pageCount, requestedInline, eligibility)
+        return {
             kind = "campaign-archive",
             campaignId = campaignId,
-            datasetId = archive.datasetId or record.datasetId,
+            datasetId = datasetId,
             generation = archive.generation,
             archivedAt = archive.archivedAt,
             schemaVersion = archive.schemaVersion or GS.SCHEMA_VERSION,
             itemCount = #ids,
             pageCount = pageCount,
             itemsFingerprint = itemsFp,
-            -- Small archives still include items inline for compatibility.
-            requestedItems = (#ids <= ARCHIVE_PAGE_ITEMS) and items or nil,
-        },
-    }
-    if #ids > ARCHIVE_PAGE_ITEMS then
-        for page = 1, pageCount do
-            local slice = {}
-            local start = (page - 1) * ARCHIVE_PAGE_ITEMS + 1
-            local finish = math.min(#ids, page * ARCHIVE_PAGE_ITEMS)
-            for i = start, finish do
-                local iid = ids[i]
-                slice[iid] = items[iid]
-            end
-            out[#out + 1] = {
-                id = "gs:ca:" .. campaignId .. ":p" .. tostring(page),
-                body = {
-                    kind = "campaign-archive-page",
-                    campaignId = campaignId,
-                    datasetId = archive.datasetId or record.datasetId,
-                    page = page,
-                    pageCount = pageCount,
-                    requestedItems = slice,
-                },
-            }
+            bankTab = tonumber(archive.bankTab),
+            eligibilityItemCount = #eligIds,
+            eligibility = eligibility,
+            requestedItems = requestedInline,
+        }
+    end
+
+    -- Prefer inline when both maps are small AND the wrapped body fits wire.
+    local canInline = (#ids <= ARCHIVE_PAGE_ITEMS and #eligIds <= ARCHIVE_PAGE_ITEMS)
+    if canInline then
+        local inlineElig = EligibilityScalars(true)
+        local inlineBody = MetaBody(1, (#ids > 0) and items or {}, inlineElig)
+        if EstimateWireRecordBytes(exportId, inlineBody) <= budget then
+            out[#out + 1] = { id = exportId, body = inlineBody }
+            return out
         end
+    end
+
+    -- Page by the union of requested + eligibility keys so cutoffs never ride
+    -- solely on the meta body.
+    local keySet, pageKeys = {}, {}
+    for i = 1, #ids do
+        local k = ids[i]
+        if keySet[k] == nil then
+            keySet[k] = true
+            pageKeys[#pageKeys + 1] = k
+        end
+    end
+    for i = 1, #eligIds do
+        local k = eligIds[i]
+        if keySet[k] == nil then
+            keySet[k] = true
+            pageKeys[#pageKeys + 1] = k
+        end
+    end
+    table.sort(pageKeys, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+    if #pageKeys < 1 then
+        local emptyElig = EligibilityScalars(false)
+        local emptyBody = MetaBody(1, {}, emptyElig)
+        if EstimateWireRecordBytes(exportId, emptyBody) > budget then
+            DebugWarn("archive export %s: empty meta exceeds wire budget", tostring(campaignId))
+            return {}
+        end
+        out[#out + 1] = { id = exportId, body = emptyBody }
+        return out
+    end
+
+    -- Greedy byte-aware packing: fill each page until the next key would exceed
+    -- the wire budget or the per-page item bound. Never shrink width when the
+    -- page count is high — that only increases pageCount.
+    local pageSlices = {}
+    local slice, eligSlice = {}, {}
+    local sliceCount = 0
+    local function flushSlice()
+        if sliceCount < 1 then
+            return true
+        end
+        if #pageSlices >= maxPages then
+            return false
+        end
+        pageSlices[#pageSlices + 1] = { items = slice, elig = eligSlice }
+        slice, eligSlice, sliceCount = {}, {}, 0
+        return true
+    end
+    for ki = 1, #pageKeys do
+        local iid = pageKeys[ki]
+        local trialItems, trialElig = {}, {}
+        for k, v in pairs(slice) do
+            trialItems[k] = v
+        end
+        for k, v in pairs(eligSlice) do
+            trialElig[k] = v
+        end
+        if items[iid] ~= nil then
+            trialItems[iid] = items[iid]
+        end
+        if eligItems and eligItems[iid] ~= nil then
+            trialElig[iid] = eligItems[iid]
+        end
+        local trialCount = sliceCount + 1
+        local trialBody = {
+            kind = "campaign-archive-page",
+            campaignId = campaignId,
+            datasetId = datasetId,
+            page = #pageSlices + 1,
+            pageCount = 1, -- placeholder; rewritten after packing
+            requestedItems = trialItems,
+            eligibilityItems = trialElig,
+        }
+        local trialId = exportId .. ":p" .. tostring(#pageSlices + 1)
+        local overBudget = EstimateWireRecordBytes(trialId, trialBody) > budget
+        local overItems = trialCount > packWidth or trialCount > maxItemsPerPage
+        if sliceCount > 0 and (overBudget or overItems) then
+            if not flushSlice() then
+                DebugWarn("archive export %s: eligibility/items exceed page ceiling",
+                    tostring(campaignId))
+                return {}
+            end
+            trialItems, trialElig, trialCount = {}, {}, 1
+            if items[iid] ~= nil then
+                trialItems[iid] = items[iid]
+            end
+            if eligItems and eligItems[iid] ~= nil then
+                trialElig[iid] = eligItems[iid]
+            end
+            trialBody.requestedItems = trialItems
+            trialBody.eligibilityItems = trialElig
+            trialBody.page = #pageSlices + 1
+            trialId = exportId .. ":p" .. tostring(#pageSlices + 1)
+            if EstimateWireRecordBytes(trialId, trialBody) > budget then
+                DebugWarn("archive export %s: single key exceeds wire budget",
+                    tostring(campaignId))
+                return {}
+            end
+        elseif sliceCount < 1 and overBudget then
+            DebugWarn("archive export %s: single key exceeds wire budget",
+                tostring(campaignId))
+            return {}
+        end
+        slice, eligSlice, sliceCount = trialItems, trialElig, trialCount
+    end
+    if not flushSlice() then
+        DebugWarn("archive export %s: eligibility/items exceed page ceiling",
+            tostring(campaignId))
+        return {}
+    end
+    local pageCount = #pageSlices
+    if pageCount < 1 or pageCount > maxPages then
+        DebugWarn("archive export %s: pageCount=%s exceeds ceiling",
+            tostring(campaignId), tostring(pageCount))
+        return {}
+    end
+
+    local pages = {}
+    for page = 1, pageCount do
+        local packed = pageSlices[page]
+        local pageBody = {
+            kind = "campaign-archive-page",
+            campaignId = campaignId,
+            datasetId = datasetId,
+            page = page,
+            pageCount = pageCount,
+            requestedItems = packed.items,
+            eligibilityItems = packed.elig,
+        }
+        local pageId = exportId .. ":p" .. tostring(page)
+        if EstimateWireRecordBytes(pageId, pageBody) > budget then
+            DebugWarn("archive export %s: page %s exceeds wire budget",
+                tostring(campaignId), tostring(page))
+            return {}
+        end
+        pages[#pages + 1] = { id = pageId, body = pageBody }
+    end
+
+    local metaElig = EligibilityScalars(false) -- scalars only; items on pages
+    local metaBody = MetaBody(pageCount, nil, metaElig)
+    if EstimateWireRecordBytes(exportId, metaBody) > budget then
+        DebugWarn("archive export %s: meta exceeds wire budget", tostring(campaignId))
+        return {}
+    end
+    out[#out + 1] = { id = exportId, body = metaBody }
+    for i = 1, #pages do
+        out[#out + 1] = pages[i]
     end
     return out
 end
@@ -1353,6 +1534,28 @@ local function CurrentGuildRecord()
     return raw, ctx.guildKey
 end
 
+--- Authenticated local character only. Account-wide directExports must not vote
+-- as an alt after character switch.
+local function LocalExportWitnessGuid()
+    if GS.GetLocalPlayerGuid then
+        return GS.GetLocalPlayerGuid()
+    end
+    if UnitGUID then
+        local guid = UnitGUID("player")
+        if type(guid) == "string" and guid ~= "" then
+            return guid
+        end
+    end
+    return nil
+end
+
+local function DirectExportOwnedByLocal(row, localGuid)
+    if type(row) ~= "table" or type(localGuid) ~= "string" then
+        return false
+    end
+    return row.witnessGuid == localGuid
+end
+
 -- Forward-declared: cold registration and Notify both schedule archive drain.
 local ScheduleExportMaintContinuation
 
@@ -1371,8 +1574,10 @@ local function RebuildExportIndex()
     if not record then
         exportState.guildKey = nil
         exportState.datasetId = nil
+        exportState.localGuid = nil
         return
     end
+    exportState.localGuid = LocalExportWitnessGuid()
     -- Never index/export raw invalid SavedVariables guild records.
     if GS._ValidateGuildRecordStructure then
         local ok = GS._ValidateGuildRecordStructure(guildKey, record)
@@ -1419,6 +1624,9 @@ local function RebuildExportIndex()
         transferOpCount = 0,
         campaignCount = 0,
         archiveCount = 0,
+        -- #388: immutable accounting manifest for adoption completeness.
+        acceptedLedgerCount = 0,
+        donationEvidenceCount = 0,
         -- Pin effective config head for adoption binding (nil is meaningful).
         bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil,
@@ -1493,6 +1701,43 @@ local function RebuildExportIndex()
     exportState.openConflictCandidatePos = nil
     exportState.resolveScanPos = 0
 
+    -- #388: pace cold export of accepted ledger events and direct observations.
+    -- Relayed evidence is never stored in directExports, so re-export cannot
+    -- impersonate the original witness under a different authenticated sender.
+    local ledgerExportCount = 0
+    if GS.CountAcceptedLedgerEvents then
+        ledgerExportCount = GS.CountAcceptedLedgerEvents(record)
+    else
+        local events = record.accounting and record.accounting._consumableEvents
+        local archive = record.accounting and record.accounting._consumableEventArchive
+        if type(events) == "table" then
+            ledgerExportCount = ledgerExportCount + #events
+        end
+        if type(archive) == "table" then
+            ledgerExportCount = ledgerExportCount + #archive
+        end
+    end
+    local donationEvidenceExportCount = 0
+    local localGuid = exportState.localGuid or LocalExportWitnessGuid()
+    local directExports = record.observations and record.observations.directExports
+    if type(directExports) == "table" then
+        for _, row in pairs(directExports) do
+            if DirectExportOwnedByLocal(row, localGuid) then
+                donationEvidenceExportCount = donationEvidenceExportCount + 1
+            end
+        end
+    end
+    exportState.ledgerBuildNeeded = ledgerExportCount > 0
+    exportState.ledgerBuildCursor = nil
+    exportState.ledgerBuildPhase = "archive"
+    local liveEvents = record.accounting and record.accounting._consumableEvents
+    exportState.ledgerWarmPos = type(liveEvents) == "table" and #liveEvents or 0
+    -- Cold rebuild re-drains archive from the start; warm watermark advances as
+    -- the paced archive phase completes (see NotifyLocalDurableChange).
+    exportState.ledgerArchiveWarmPos = 0
+    exportState.donationEvidenceBuildNeeded = donationEvidenceExportCount > 0
+    exportState.donationEvidenceBuildCursor = nil
+
     local descId = "gs:desc:" .. record.datasetId
     local descEntry = exportState.byId[descId]
     if type(descEntry) == "table" and type(descEntry.body) == "table" then
@@ -1500,6 +1745,8 @@ local function RebuildExportIndex()
         descEntry.body.transferOpCount = transferOpCount
         descEntry.body.campaignCount = headerExportCount
         descEntry.body.archiveCount = archiveExportCount
+        descEntry.body.acceptedLedgerCount = ledgerExportCount
+        descEntry.body.donationEvidenceCount = donationEvidenceExportCount
         descEntry.body.bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil
         descEntry.body.hasBankTab = true
@@ -1510,11 +1757,15 @@ local function RebuildExportIndex()
     exportState.cachedTransferOpCount = transferOpCount
     exportState.cachedCampaignCount = headerExportCount
     exportState.cachedArchiveCount = archiveExportCount
+    exportState.cachedAcceptedLedgerCount = ledgerExportCount
+    exportState.cachedDonationEvidenceCount = donationEvidenceExportCount
     exportState.countsDirty = false
     exportState.appendPos = 0
     local needsMaint = exportState.archiveBuildNeeded
         or exportState.opBuildNeeded
         or exportState.evidenceBuildNeeded
+        or exportState.ledgerBuildNeeded
+        or exportState.donationEvidenceBuildNeeded
     exportState.maintIdle = not needsMaint
     exportState.maintScheduled = false
     -- Cold registration /reload must drain deferred construction without an
@@ -1581,6 +1832,68 @@ local function UpsertExportBody(id, body)
             prov.index.buildComplete = false
         end
     end
+end
+
+--- Force paced archive→live ledger rebuild after TrimEventArchive removes IDs.
+-- Archive length can stay unchanged across shelve+trim while export IDs were
+-- dropped; warm high-water alone cannot detect that content swap.
+function GS.MarkLedgerArchiveExportStale()
+    exportState.ledgerArchiveWarmPos = 0
+    exportState.ledgerBuildNeeded = true
+    exportState.ledgerBuildPhase = "archive"
+    exportState.ledgerBuildCursor = 1
+    exportState.countsDirty = true
+    exportState.maintIdle = false
+    if providerRegistered and ScheduleExportMaintContinuation then
+        ScheduleExportMaintContinuation()
+    end
+end
+
+--- Drop evicted durable export ids from the warm Gossip index (bounded).
+-- Called when Ledger evicts directExports so descriptor counts and GetRecord
+-- cannot keep serving removed bodies until a full rebuild.
+function GS.RemoveGossipExportBodies(ids)
+    if type(ids) ~= "table" or #ids < 1 then
+        return 0
+    end
+    local removed = 0
+    local drop = {}
+    local limit = math.min(#ids, 64)
+    for i = 1, limit do
+        local id = ids[i]
+        if type(id) == "string" and exportState.byId[id] then
+            exportState.byId[id] = nil
+            drop[id] = true
+            removed = removed + 1
+        end
+    end
+    if removed < 1 then
+        return 0
+    end
+    local write = 1
+    for read = 1, #exportState.order do
+        local id = exportState.order[read]
+        if not drop[id] then
+            exportState.order[write] = id
+            write = write + 1
+        end
+    end
+    for i = write, #exportState.order do
+        exportState.order[i] = nil
+    end
+    if exportState.enumPos and exportState.enumPos > #exportState.order then
+        exportState.enumPos = #exportState.order
+    end
+    exportState.countsDirty = true
+    exportState.maintIdle = false
+    if GG and GG.GetProvider and providerRegistered then
+        local prov = GG.GetProvider(GS.PROVIDER_ID)
+        if prov and prov.index then
+            prov.index.dirty = true
+            prov.index.buildComplete = false
+        end
+    end
+    return removed
 end
 
 ---------------------------------------------------------------------------
@@ -1737,6 +2050,8 @@ local function ValidateAndApply(record, ctx)
             local ds = body.datasetId
                 or (body.op and body.op.datasetId)
                 or (body.header and body.header.datasetId)
+                or (body.event and body.event.datasetId)
+                or (body.evidence and body.evidence.datasetId)
             if ds == adop.sourceDatasetId or body.kind == "dataset-desc" then
                 local st, reason = GS:BufferAdoptionRecord(tostring(record.id), body)
                 return st, reason
@@ -1839,7 +2154,8 @@ local function ValidateAndApply(record, ctx)
             end
         end
         -- Validate page indices / mandatory pageCount upper bound before retention.
-        local maxPageCount = GS.MAX_ARCHIVE_PAGE_COUNT or 22
+        local maxPageCount = GS.MAX_ARCHIVE_PAGE_COUNT or 512
+        local maxPageItems = GS.MAX_ARCHIVE_PAGE_ITEMS or 64
         if body.kind == "campaign-archive" then
             local pageCount = tonumber(body.pageCount)
             if pageCount ~= nil then
@@ -1863,7 +2179,16 @@ local function ValidateAndApply(record, ctx)
                 local n = 0
                 for _ in pairs(body.requestedItems) do
                     n = n + 1
-                    if n > (ARCHIVE_PAGE_ITEMS or 12) then
+                    if n > maxPageItems then
+                        return "rejected", "invalid_campaign_archive"
+                    end
+                end
+            end
+            if type(body.eligibilityItems) == "table" then
+                local n = 0
+                for _ in pairs(body.eligibilityItems) do
+                    n = n + 1
+                    if n > maxPageItems then
                         return "rejected", "invalid_campaign_archive"
                     end
                 end
@@ -1871,8 +2196,9 @@ local function ValidateAndApply(record, ctx)
         end
         local maxCamps = GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES
             or GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
-        local maxPages = GS.MAX_FRAGMENT_BUFFER_PAGES
-            or GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64
+        -- Campaign-archive assembly uses the raised archive page ceiling.
+        local maxPages = GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES
+            or GS.MAX_FRAGMENT_BUFFER_PAGES or 512
         local now = GetServerTime and GetServerTime() or 0
         -- Reclaim expired assemblies across the whole pool before capacity checks.
         ReclaimExpiredFragmentBuffers({
@@ -1951,6 +2277,23 @@ local function ValidateAndApply(record, ctx)
             return "pending", "missing_predecessor"
         end
         local archive
+        local function CopyEligScalars(src, items)
+            if type(src) ~= "table" and type(items) ~= "table" then
+                return nil
+            end
+            local eligibility = {
+                baselineEstablished = src and src.baselineEstablished,
+                baselineAt = src and src.baselineAt,
+                tabEligibleFrom = src and src.tabEligibleFrom,
+                items = items or {},
+            }
+            if type(src) == "table" and type(src.items) == "table" then
+                for k, v in pairs(src.items) do
+                    eligibility.items[k] = v
+                end
+            end
+            return eligibility
+        end
         if type(meta.requestedItems) == "table" then
             archive = {
                 schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
@@ -1959,6 +2302,8 @@ local function ValidateAndApply(record, ctx)
                 requestedItems = meta.requestedItems,
                 generation = meta.generation,
                 archivedAt = meta.archivedAt,
+                bankTab = tonumber(meta.bankTab),
+                eligibility = CopyEligScalars(meta.eligibility, nil),
             }
         else
             local pageCount = tonumber(meta.pageCount) or tonumber(buf.pageCount) or 1
@@ -1967,6 +2312,7 @@ local function ValidateAndApply(record, ctx)
                 return "rejected", "invalid_campaign_archive"
             end
             local merged, got = {}, 0
+            local eligMerged, eligGot = {}, 0
             for page = 1, pageCount do
                 local p = buf.pages[page]
                 if type(p) ~= "table" or type(p.requestedItems) ~= "table" then
@@ -1976,8 +2322,18 @@ local function ValidateAndApply(record, ctx)
                     merged[k] = v
                     got = got + 1
                 end
+                if type(p.eligibilityItems) == "table" then
+                    for k, v in pairs(p.eligibilityItems) do
+                        eligMerged[k] = v
+                        eligGot = eligGot + 1
+                    end
+                end
             end
             if type(meta.itemCount) == "number" and got ~= meta.itemCount then
+                return "pending", "missing_predecessor"
+            end
+            local wantElig = tonumber(meta.eligibilityItemCount)
+            if wantElig ~= nil and eligGot ~= wantElig then
                 return "pending", "missing_predecessor"
             end
             archive = {
@@ -1987,6 +2343,8 @@ local function ValidateAndApply(record, ctx)
                 requestedItems = merged,
                 generation = meta.generation,
                 archivedAt = meta.archivedAt,
+                bankTab = tonumber(meta.bankTab),
+                eligibility = CopyEligScalars(meta.eligibility, eligMerged),
             }
         end
         if not GS.ValidateCampaignArchive
@@ -2271,6 +2629,53 @@ local function ValidateAndApply(record, ctx)
         })
     end
 
+    -- #388 staged donation evidence: only the authenticated transport sender votes.
+    if body.kind == "gs-evidence" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if body.datasetId and body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        local evidence = body.evidence
+        if type(evidence) ~= "table" then
+            return "rejected", "invalid_evidence"
+        end
+        -- Relayed witness maps / claimed observedBy are not identity proof.
+        evidence.datasetId = body.datasetId or localRecord.datasetId
+        evidence.campaignId = evidence.campaignId or body.campaignId
+            or localRecord.currentCampaignId
+        return GS:AdmitDirectObservation(evidence, {
+            sender = sender,
+            member = member,
+            offlineRecord = localRecord,
+            campaignId = evidence.campaignId,
+        })
+    end
+
+    -- #388 accepted ledger events (donations / adjustments) for catch-up.
+    if body.kind == "gs-ledger-event" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if body.datasetId and body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        local event = body.event
+        if type(event) ~= "table" then
+            return "rejected", "invalid_event"
+        end
+        event.datasetId = body.datasetId or localRecord.datasetId
+        return GS:AdmitLedgerEvent(event, {
+            sender = sender,
+            member = member,
+            offlineRecord = localRecord,
+            -- Donation catch-up is occurrence-deduped; adjustments need editor auth
+            -- unless this is a preserved historical body (handled inside Admit).
+            relay = false,
+        })
+    end
+
     return "rejected", "unsupported_kind"
 end
 
@@ -2340,8 +2745,15 @@ function GS:DisableGossipProvider()
     exportState.opBuildNeeded = false
     exportState.evidenceBuildNeeded = false
     exportState.archiveBuildNeeded = false
+    exportState.ledgerBuildNeeded = false
+    exportState.donationEvidenceBuildNeeded = false
     exportState.opBuildCursor = nil
     exportState.archiveBuildCursor = nil
+    exportState.ledgerBuildCursor = nil
+    exportState.ledgerBuildPhase = nil
+    exportState.ledgerWarmPos = 0
+    exportState.ledgerArchiveWarmPos = 0
+    exportState.donationEvidenceBuildCursor = nil
     exportState.pendingCursor = nil
     exportState.conflictCursor = nil
     exportState.openConflictCursor = nil
@@ -2412,6 +2824,7 @@ function GS.NotifyLocalDurableChange(reason)
         return
     end
     local record, guildKey = CurrentGuildRecord()
+    local localGuid = LocalExportWitnessGuid()
     local fullRebuild = reason == "adoption"
         or reason == "install"
         or reason == "dataset"
@@ -2419,6 +2832,7 @@ function GS.NotifyLocalDurableChange(reason)
         or exportState.guildKey ~= guildKey
         or exportState.datasetId ~= (record and record.datasetId)
         or exportState.epoch ~= (tonumber(GS._adoptionEpoch) or 0)
+        or exportState.localGuid ~= localGuid
 
     if fullRebuild then
         local prevOrder = exportState.order
@@ -2444,10 +2858,13 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
         end
-        -- Pace deferred accepted-op / evidence / archive construction after cold rebuild.
+        -- Pace deferred accepted-op / evidence / archive / ledger construction
+        -- after cold rebuild.
         if exportState.archiveBuildNeeded
             or exportState.opBuildNeeded
-            or exportState.evidenceBuildNeeded then
+            or exportState.evidenceBuildNeeded
+            or exportState.ledgerBuildNeeded
+            or exportState.donationEvidenceBuildNeeded then
             exportState.maintIdle = false
             ScheduleExportMaintContinuation()
         end
@@ -2466,6 +2883,107 @@ function GS.NotifyLocalDurableChange(reason)
             exportState.openConflictPartialKey = nil
             exportState.openConflictCandidatePos = nil
             exportState.maintIdle = false
+        end
+        -- #388 staged ledger / donation evidence: upsert recent accepted events
+        -- and any new direct observations (never re-export relays).
+        -- Config/remote-op/campaign paths also append ledger rows (adjustments,
+        -- link-triggered verification) and must advertise them for adoption.
+        if reason == "ledger" or reason == "evidence"
+            or reason == "config" or reason == "remote-op" or reason == "campaign" then
+            local events = record.accounting and record.accounting._consumableEvents
+            if type(events) ~= "table" then
+                events = {}
+            end
+            local archive = record.accounting and record.accounting._consumableEventArchive
+            if type(archive) ~= "table" then
+                archive = {}
+            end
+            -- High-water mark: export every not-yet-seen live row. When more
+            -- than 32 events arrive between notifications, hand the backlog
+            -- to the paced cold builder instead of dropping older IDs.
+            -- Shelving (campaign rollover / capacity) replaces the live array with
+            -- a shorter kept list; hw can then exceed #events and skip new rows.
+            -- Reconcile by resetting warm pos and re-running archive→live paced
+            -- construction so newly shelved + new live IDs stay exportable.
+            -- Late historical quorum appends grow the archive without shrinking
+            -- live; restart paced archive drain from the archive high-water so
+            -- descriptor acceptedLedgerCount cannot exceed exported IDs.
+            local hw = tonumber(exportState.ledgerWarmPos) or 0
+            local nLive = #events
+            local nArch = #archive
+            local archHw = tonumber(exportState.ledgerArchiveWarmPos) or 0
+            if hw > nLive or nArch < archHw then
+                -- Live shrink (shelve) or archive trim: rebuild archive→live.
+                exportState.ledgerBuildNeeded = true
+                exportState.ledgerBuildPhase = "archive"
+                exportState.ledgerBuildCursor = 1
+                hw = 0
+                exportState.ledgerWarmPos = 0
+                exportState.ledgerArchiveWarmPos = 0
+                archHw = 0
+            elseif nArch > archHw then
+                -- Archive grew without live shrink (AppendArchivedLedgerEvent).
+                exportState.ledgerBuildNeeded = true
+                if exportState.ledgerBuildPhase ~= "archive" then
+                    exportState.ledgerBuildPhase = "archive"
+                    exportState.ledgerBuildCursor = archHw + 1
+                elseif exportState.ledgerBuildCursor == nil then
+                    exportState.ledgerBuildCursor = archHw + 1
+                end
+            end
+            local start = math.max(1, nLive - 31)
+            if hw + 1 < start then
+                exportState.ledgerBuildNeeded = true
+                if exportState.ledgerBuildCursor == nil then
+                    exportState.ledgerBuildPhase = exportState.ledgerBuildPhase or "live"
+                    exportState.ledgerBuildCursor = hw + 1
+                elseif exportState.ledgerBuildPhase == "live"
+                    and (tonumber(exportState.ledgerBuildCursor) or 1) > nLive then
+                    -- Stale live cursor after shrink: restart from the backlog.
+                    exportState.ledgerBuildCursor = hw + 1
+                end
+            else
+                start = hw + 1
+            end
+            for i = start, nLive do
+                local event = events[i]
+                if type(event) == "table" and type(event.id) == "string" then
+                    local exportId = "gs:le:" .. event.id
+                    if not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "gs-ledger-event",
+                            datasetId = record.datasetId,
+                            event = event,
+                        })
+                    end
+                end
+            end
+            exportState.ledgerWarmPos = nLive
+            local warmGuid = localGuid or LocalExportWitnessGuid()
+            local directExports = record.observations and record.observations.directExports
+            if type(directExports) == "table" then
+                for exportId, row in pairs(directExports) do
+                    if type(exportId) == "string" and type(row) == "table"
+                        and type(row.evidence) == "table"
+                        and DirectExportOwnedByLocal(row, warmGuid)
+                        and not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "gs-evidence",
+                            datasetId = record.datasetId,
+                            campaignId = row.campaignId,
+                            evidence = row.evidence,
+                            -- Diagnostic only; ValidateAndApply votes the
+                            -- authenticated transport sender, never this field.
+                            observedBy = row.witnessGuid,
+                        })
+                    end
+                end
+            end
+            exportState.maintIdle = false
+            exportState.countsDirty = true
+            if exportState.ledgerBuildNeeded and ScheduleExportMaintContinuation then
+                ScheduleExportMaintContinuation()
+            end
         end
         -- Incremental / paced cold drain. Budget covers BuildOpExportBodies work
         -- (serialization while packing) as well as index enumeration.
@@ -2879,16 +3397,133 @@ function GS.NotifyLocalDurableChange(reason)
             end
         end
 
+        -- #388 cold/reload: pace accepted ledger history into the export index.
+        -- Archive phase first (prior generations), then live current-generation.
+        if exportState.ledgerBuildNeeded and used < slice then
+            local function upsertLedgerList(list, startAt)
+                local start = math.max(1, tonumber(startAt) or 1)
+                if type(list) ~= "table" then
+                    return nil, true
+                end
+                for i = start, #list do
+                    if used >= slice then
+                        return i, false
+                    end
+                    local event = list[i]
+                    used = used + 1
+                    if type(event) == "table" and type(event.id) == "string" then
+                        local exportId = "gs:le:" .. event.id
+                        if not exportState.byId[exportId] then
+                            UpsertExportBody(exportId, {
+                                kind = "gs-ledger-event",
+                                datasetId = record.datasetId,
+                                event = event,
+                            })
+                        end
+                    end
+                    exportState.ledgerBuildCursor = i + 1
+                end
+                return nil, true
+            end
+            local phase = exportState.ledgerBuildPhase or "archive"
+            if phase == "archive" then
+                local archive = record.accounting and record.accounting._consumableEventArchive
+                local cursor, done = upsertLedgerList(archive, exportState.ledgerBuildCursor)
+                if not done then
+                    exportState.ledgerBuildCursor = cursor
+                    exportState.ledgerBuildPhase = "archive"
+                else
+                    exportState.ledgerArchiveWarmPos = type(archive) == "table" and #archive or 0
+                    exportState.ledgerBuildPhase = "live"
+                    exportState.ledgerBuildCursor = 1
+                    phase = "live"
+                end
+            end
+            if phase == "live" and used < slice then
+                local events = record.accounting and record.accounting._consumableEvents
+                local liveCursor = tonumber(exportState.ledgerBuildCursor) or 1
+                if type(events) ~= "table" then
+                    events = {}
+                end
+                -- Shelving can shrink the live list under an in-flight live cursor.
+                if liveCursor > #events + 1 then
+                    liveCursor = 1
+                    exportState.ledgerBuildCursor = 1
+                end
+                local cursor, done = upsertLedgerList(events, liveCursor)
+                if not done then
+                    exportState.ledgerBuildCursor = cursor
+                    exportState.ledgerBuildPhase = "live"
+                else
+                    exportState.ledgerBuildCursor = nil
+                    exportState.ledgerBuildPhase = nil
+                    exportState.ledgerBuildNeeded = false
+                    exportState.ledgerWarmPos = #events
+                    local archDone = record.accounting and record.accounting._consumableEventArchive
+                    exportState.ledgerArchiveWarmPos = type(archDone) == "table" and #archDone or 0
+                end
+            end
+        end
+
+        -- #388 cold/reload: pace direct local observations (not relays).
+        -- Only the current authenticated character's rows may be cold-exported.
+        if exportState.donationEvidenceBuildNeeded and used < slice then
+            local coldGuid = exportState.localGuid or LocalExportWitnessGuid()
+            local directExports = record.observations and record.observations.directExports
+            if type(directExports) == "table" then
+                local keys = sortedKeys(directExports)
+                local startK = resumeAfterKey(keys, exportState.donationEvidenceBuildCursor, function(k)
+                    return tostring(k)
+                end)
+                for ki = startK, #keys do
+                    if used >= slice then
+                        exportState.donationEvidenceBuildCursor = keys[math.max(1, ki - 1)]
+                        if ki == startK then
+                            exportState.donationEvidenceBuildCursor = keys[ki]
+                        end
+                        break
+                    end
+                    local exportId = keys[ki]
+                    local row = directExports[exportId]
+                    used = used + 1
+                    if type(exportId) == "string" and type(row) == "table"
+                        and type(row.evidence) == "table"
+                        and DirectExportOwnedByLocal(row, coldGuid)
+                        and not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "gs-evidence",
+                            datasetId = record.datasetId,
+                            campaignId = row.campaignId,
+                            evidence = row.evidence,
+                            observedBy = row.witnessGuid,
+                        })
+                    end
+                    exportState.donationEvidenceBuildCursor = keys[ki]
+                end
+                if used < slice then
+                    exportState.donationEvidenceBuildCursor = nil
+                    exportState.donationEvidenceBuildNeeded = false
+                end
+            else
+                exportState.donationEvidenceBuildCursor = nil
+                exportState.donationEvidenceBuildNeeded = false
+            end
+        end
+
         exportState.maintIdle = used < slice
             and not exportState.opBuildNeeded
             and not exportState.evidenceBuildNeeded
             and not exportState.archiveBuildNeeded
+            and not exportState.ledgerBuildNeeded
+            and not exportState.donationEvidenceBuildNeeded
             and exportState.pendingCursor == nil
             and exportState.conflictCursor == nil
             and exportState.openConflictCursor == nil
             and exportState.openConflictPartialKey == nil
             and exportState.opBuildCursor == nil
             and exportState.archiveBuildCursor == nil
+            and exportState.ledgerBuildCursor == nil
+            and exportState.donationEvidenceBuildCursor == nil
 
         -- Descriptor counts stay logical (durable store), not emitted-body counts.
         local acceptedOpCount = 0
@@ -2926,10 +3561,35 @@ function GS.NotifyLocalDurableChange(reason)
                 archiveCount = archiveCount + 1
             end
         end
+        local acceptedLedgerCount = 0
+        if GS.CountAcceptedLedgerEvents then
+            acceptedLedgerCount = GS.CountAcceptedLedgerEvents(record)
+        else
+            local events = record.accounting and record.accounting._consumableEvents
+            local archive = record.accounting and record.accounting._consumableEventArchive
+            if type(events) == "table" then
+                acceptedLedgerCount = acceptedLedgerCount + #events
+            end
+            if type(archive) == "table" then
+                acceptedLedgerCount = acceptedLedgerCount + #archive
+            end
+        end
+        local donationEvidenceCount = 0
+        local descGuid = exportState.localGuid or LocalExportWitnessGuid()
+        local directExports = record.observations and record.observations.directExports
+        if type(directExports) == "table" then
+            for _, row in pairs(directExports) do
+                if DirectExportOwnedByLocal(row, descGuid) then
+                    donationEvidenceCount = donationEvidenceCount + 1
+                end
+            end
+        end
         exportState.cachedOpCount = acceptedOpCount
         exportState.cachedTransferOpCount = transferOpCount
         exportState.cachedCampaignCount = campaignCount
         exportState.cachedArchiveCount = archiveCount
+        exportState.cachedAcceptedLedgerCount = acceptedLedgerCount
+        exportState.cachedDonationEvidenceCount = donationEvidenceCount
         exportState.countsDirty = false
         local desc = {
             kind = "dataset-desc",
@@ -2948,6 +3608,8 @@ function GS.NotifyLocalDurableChange(reason)
             transferOpCount = transferOpCount,
             campaignCount = campaignCount,
             archiveCount = archiveCount,
+            acceptedLedgerCount = acceptedLedgerCount,
+            donationEvidenceCount = donationEvidenceCount,
             bankTab = record.accounting and record.accounting._consumables
                 and record.accounting._consumables.bankTab or nil,
             hasBankTab = true,

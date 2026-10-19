@@ -19,16 +19,19 @@ GS.MAX_PENDING_RELAY = 64
 GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE = 32
 -- Aggregate archive / operation-manifest reassembly buffer.
 GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS = 16
-GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 64
 ---------------------------------------------------------------------------
 -- Concrete transfer / work limits derived from existing supported maxima.
 -- Wrapper-inclusive wire budget equals Guild Gossip MAX_RECORD_CBOR (2048).
 -- Ask the owner only if supporting these maxima needs a product scope change.
 ---------------------------------------------------------------------------
 GS.MAX_WIRE_RECORD_BYTES = 2048
--- Campaign archive pages: ceil(MAX_REQUESTED_ITEMS / ARCHIVE_PAGE_ITEMS).
--- MAX_REQUESTED_ITEMS defaults to 256; ARCHIVE_PAGE_ITEMS is 12 in Gossip.lua.
-GS.MAX_ARCHIVE_PAGE_COUNT = 22
+-- Campaign archive item/eligibility pages. Cumulative eligibility cutoff keys
+-- survive item remove/re-add beyond MAX_REQUESTED_ITEMS (live map only); byte-
+-- aware packing emits one key per page in the worst case, so the page ceiling
+-- must cover large historical cutoff maps without silent prune.
+GS.MAX_ARCHIVE_PAGE_ITEMS = 64
+GS.MAX_ARCHIVE_PAGE_COUNT = 512
+GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = 512
 -- Operation-manifest pages: one page per confirmed/resolved body in the worst
 -- case, plus headroom for page-carried originalIds / competingOpIds lists that
 -- shells strip (those lists may need additional pages when record pages are full).
@@ -39,10 +42,15 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- Must fit a full legal accepted export: ops + headers + archive meta/pages +
 -- conflict evidence + operation-manifest pages + descriptor. Archive and
 -- confirm/resolve paging multiply bodies beyond logical operation counts.
--- Logical adoption buffer: accepted/evidence history + campaigns/archives + headroom.
+-- Logical adoption buffer: accepted ops + live/archived ledger + donation
+-- evidence + campaigns/archives + headroom. Ledger and ops are independently
+-- capped; the shared buffer must hold both at once.
 -- Wire pages for incomplete paged manifests live in a separate assembly arena so
 -- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
 GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+    + (GS.MAX_LEDGER_EVENTS or 4096)
+    + (GS.MAX_ARCHIVED_EVENTS or 4096)
+    + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
     + ((GS.MAX_CAMPAIGNS or 64) * 24)
     + 512
 -- Concurrent incomplete paged-op assemblies during transfer (not logical history).
@@ -51,10 +59,11 @@ GS.MAX_ADOPTION_ASSEMBLY_PAGES = (GS.MAX_MANIFEST_PAGES or 64) * (GS.MAX_ADOPTIO
 -- Assembled fragment byte budget matches snapshot string budget.
 GS.MAX_FRAGMENT_ASSEMBLY_BYTES = GS.MAX_SNAPSHOT_STRING_BYTES or 49152
 GS.MAX_FRAGMENT_BUFFER_ASSEMBLIES = GS.MAX_ARCHIVE_PAGE_BUFFER_CAMPAIGNS or 16
--- Buffer must retain a full paged confirm/resolve for one peer while still
--- reserving a second full legitimate manifest for editors / other peers.
+-- Operation-manifest FragmentBuffer (confirm/resolve pages). Kept independent of
+-- the raised campaign-archive page ceiling so assembly_full / recovery tests and
+-- live confirm paging remain within the supported manifest bound.
 GS.MAX_FRAGMENT_BUFFER_PAGES = math.max(
-    GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES or 64,
+    64,
     (GS.MAX_MANIFEST_PAGES or 64) * 2
 )
 GS.FRAGMENT_BUFFER_TTL_SECONDS = GS.MAX_ADOPTION_SECONDS or 600
@@ -1279,6 +1288,12 @@ local function ClassifyStaleBase(record, op, targetKey)
         return "apply", nil
     end
 
+    -- #388 adjustments: append-only with commit-time floor checks. Do not open
+    -- config-style divergent conflicts; incompatible negatives stay pending.
+    if op.kind == GS.KIND.ADJUST_QUANTITY then
+        return "apply", nil
+    end
+
     -- Open conflict already holds this target: retain as additional candidate.
     if type(ops.openConflicts) == "table" and ops.openConflicts[targetKey] then
         return "conflict", "open_conflict"
@@ -1431,6 +1446,9 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
             _consumableEventArchive = {},
         },
         observations = { byCampaign = {} },
+        identityLinks = GS.EmptyIdentityLinks and GS.EmptyIdentityLinks() or {
+            schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil,
+        },
         operations = {
             records = {},
             order = {},
@@ -1531,6 +1549,8 @@ local function NoteBufferedKindInsert(adop, body)
             transferOps = 0,
             headers = 0,
             archives = 0,
+            ledgerEvents = 0,
+            donationEvidence = 0,
             descId = nil,
         }
         adop._bufCounts = c
@@ -1547,6 +1567,10 @@ local function NoteBufferedKindInsert(adop, body)
         c.headers = (tonumber(c.headers) or 0) + 1
     elseif body.kind == "campaign-archive" then
         c.archives = (tonumber(c.archives) or 0) + 1
+    elseif body.kind == "gs-ledger-event" then
+        c.ledgerEvents = (tonumber(c.ledgerEvents) or 0) + 1
+    elseif body.kind == "gs-evidence" then
+        c.donationEvidence = (tonumber(c.donationEvidence) or 0) + 1
     end
 end
 
@@ -1554,6 +1578,7 @@ local function CountBufferedKinds(adop)
     -- Prefer session-owned incremental counters; fall back to a one-shot recount
     -- only when legacy sessions lack _bufCounts (should not happen after begin).
     local acceptedOps, transferOps, headers, archives, desc = 0, 0, 0, 0, nil
+    local ledgerEvents, donationEvidence = 0, 0
     local archivePages = {} -- campaignId → { meta, pages = {}, pageCount }
     local opPages = {} -- opId → { shell, pages = {}, pageCount }
     local c = adop._bufCounts
@@ -1562,6 +1587,8 @@ local function CountBufferedKinds(adop)
         transferOps = tonumber(c.transferOps) or 0
         headers = tonumber(c.headers) or 0
         archives = tonumber(c.archives) or 0
+        ledgerEvents = tonumber(c.ledgerEvents) or 0
+        donationEvidence = tonumber(c.donationEvidence) or 0
         if type(c.descId) == "string" then
             desc = adop.records and adop.records[c.descId]
         end
@@ -1588,6 +1615,10 @@ local function CountBufferedKinds(adop)
                     headers = headers + 1
                 elseif body.kind == "campaign-archive" then
                     archives = archives + 1
+                elseif body.kind == "gs-ledger-event" then
+                    ledgerEvents = ledgerEvents + 1
+                elseif body.kind == "gs-evidence" then
+                    donationEvidence = donationEvidence + 1
                 end
             end
         end
@@ -1615,13 +1646,32 @@ local function CountBufferedKinds(adop)
             }
         end
     end
-    return desc, acceptedOps, transferOps, headers, archives, archivePages, opPages
+    return desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
+        ledgerEvents, donationEvidence
 end
 
 --- Assemble paged archive bodies into a single canonical archive table.
 local function AssemblePagedArchive(meta, pagesByIndex)
     if type(meta) ~= "table" then
         return nil, "invalid_campaign_archive"
+    end
+    local function CopyArchiveEligibility(src)
+        if type(src) ~= "table" then
+            return nil
+        end
+        local eligibility = {
+            baselineEstablished = src.baselineEstablished,
+            baselineAt = src.baselineAt,
+            tabEligibleFrom = src.tabEligibleFrom,
+            items = {},
+        }
+        if type(src.items) == "table" then
+            -- Preserve original item-id key types for Deep.equal with stored archives.
+            for k, v in pairs(src.items) do
+                eligibility.items[k] = v
+            end
+        end
+        return eligibility
     end
     if type(meta.requestedItems) == "table" then
         -- Inline small archive (no pages required).
@@ -1632,11 +1682,15 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             requestedItems = meta.requestedItems,
             generation = meta.generation,
             archivedAt = meta.archivedAt,
+            bankTab = tonumber(meta.bankTab),
+            eligibility = CopyArchiveEligibility(meta.eligibility),
         }, nil
     end
     local pageCount = tonumber(meta.pageCount) or 1
     local merged = {}
     local got = 0
+    local eligMerged = {}
+    local eligGot = 0
     for page = 1, pageCount do
         local p = pagesByIndex and pagesByIndex[page]
         if type(p) ~= "table" or type(p.requestedItems) ~= "table" then
@@ -1646,10 +1700,28 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             merged[k] = v
             got = got + 1
         end
+        if type(p.eligibilityItems) == "table" then
+            for k, v in pairs(p.eligibilityItems) do
+                eligMerged[k] = v
+                eligGot = eligGot + 1
+            end
+        end
     end
     -- Page presence already checked; count mismatch is malformed input, not "wait".
     if type(meta.itemCount) == "number" and got ~= meta.itemCount then
         return nil, "invalid_campaign_archive"
+    end
+    local wantElig = tonumber(meta.eligibilityItemCount)
+    if wantElig ~= nil and eligGot ~= wantElig then
+        return nil, "incomplete_archive_pages"
+    end
+    local eligibility = CopyArchiveEligibility(meta.eligibility)
+    if eligibility then
+        eligibility.items = eligMerged
+    elseif eligGot > 0 then
+        eligibility = {
+            items = eligMerged,
+        }
     end
     return {
         schemaVersion = meta.schemaVersion or GS.SCHEMA_VERSION,
@@ -1658,8 +1730,35 @@ local function AssemblePagedArchive(meta, pagesByIndex)
         requestedItems = merged,
         generation = meta.generation,
         archivedAt = meta.archivedAt,
+        bankTab = tonumber(meta.bankTab),
+        eligibility = eligibility,
     }, nil
 end
+
+--- Core archive identity (items/generation/ids), ignoring eligibility/bankTab.
+local function ArchiveCoreEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    if a.schemaVersion ~= b.schemaVersion then
+        return false
+    end
+    if a.campaignId ~= b.campaignId or a.datasetId ~= b.datasetId then
+        return false
+    end
+    if a.generation ~= b.generation or a.archivedAt ~= b.archivedAt then
+        return false
+    end
+    return DeepEqual(a.requestedItems, b.requestedItems)
+end
+
+--- When core archive identity matches, prefer the gossip-assembled body so
+-- eligibility/bankTab historical proof from export replaces an op-replay snapshot
+-- that omitted those fields (or diverged only on that context).
+local function PreferArchiveHistoricalContext(existing, assembled)
+    return ArchiveCoreEqual(existing, assembled)
+end
+
 
 --- True when buffered records match the authenticated source descriptor contract.
 function GS:IsAdoptionTransferComplete()
@@ -1667,13 +1766,17 @@ function GS:IsAdoptionTransferComplete()
     if type(adop) ~= "table" or adop.committed then
         return false, "no_adoption"
     end
-    local desc, acceptedOps, transferOps, headers, archives, archivePages, opPages =
+    local desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
+        ledgerEvents, donationEvidence =
         CountBufferedKinds(adop)
     if not desc then
         return false, "incomplete_transfer"
     end
     -- Descriptor counts must be present and exact (no silent zero-default extras).
     -- acceptedOpCount = accepted history; transferOpCount = accepted + evidenceOnly.
+    -- acceptedLedgerCount / donationEvidenceCount bind staged accounting into the
+    -- immutable adoption snapshot so a transfer missing advertised ledger bodies
+    -- cannot complete. Production RebuildExportIndex always emits these counts.
     if desc.acceptedOpCount == nil or desc.campaignCount == nil or desc.archiveCount == nil then
         return false, "incomplete_transfer"
     end
@@ -1685,6 +1788,11 @@ function GS:IsAdoptionTransferComplete()
     end
     local expectHeaders = tonumber(desc.campaignCount)
     local expectArchives = tonumber(desc.archiveCount)
+    -- Accounting manifest: enforce only when the source advertises the count.
+    local hasLedgerManifest = desc.acceptedLedgerCount ~= nil
+    local expectLedger = tonumber(desc.acceptedLedgerCount)
+    local hasEvidenceManifest = desc.donationEvidenceCount ~= nil
+    local expectDonationEvidence = tonumber(desc.donationEvidenceCount)
     if not expectAccepted or not expectTransfer or not expectHeaders or not expectArchives
         or expectAccepted ~= math.floor(expectAccepted) or expectAccepted < 0
         or expectTransfer ~= math.floor(expectTransfer) or expectTransfer < 0
@@ -1693,8 +1801,26 @@ function GS:IsAdoptionTransferComplete()
         or expectArchives ~= math.floor(expectArchives) or expectArchives < 0 then
         return false, "incomplete_transfer"
     end
+    if hasLedgerManifest then
+        if expectLedger == nil or expectLedger ~= math.floor(expectLedger) or expectLedger < 0 then
+            return false, "incomplete_transfer"
+        end
+    end
+    if hasEvidenceManifest then
+        if expectDonationEvidence == nil
+            or expectDonationEvidence ~= math.floor(expectDonationEvidence)
+            or expectDonationEvidence < 0 then
+            return false, "incomplete_transfer"
+        end
+    end
     if acceptedOps ~= expectAccepted or transferOps ~= expectTransfer
         or headers ~= expectHeaders or archives ~= expectArchives then
+        return false, "incomplete_transfer"
+    end
+    if hasLedgerManifest and ledgerEvents ~= expectLedger then
+        return false, "incomplete_transfer"
+    end
+    if hasEvidenceManifest and donationEvidence ~= expectDonationEvidence then
         return false, "incomplete_transfer"
     end
     -- Exact accepted snapshot size must match descriptor (evidenceOnly excluded).
@@ -1702,6 +1828,14 @@ function GS:IsAdoptionTransferComplete()
         return false, "source_changed"
     end
     if adop.pinnedTransferOpCount ~= nil and adop.pinnedTransferOpCount ~= expectTransfer then
+        return false, "source_changed"
+    end
+    if hasLedgerManifest and adop.pinnedAcceptedLedgerCount ~= nil
+        and adop.pinnedAcceptedLedgerCount ~= expectLedger then
+        return false, "source_changed"
+    end
+    if hasEvidenceManifest and adop.pinnedDonationEvidenceCount ~= nil
+        and adop.pinnedDonationEvidenceCount ~= expectDonationEvidence then
         return false, "source_changed"
     end
     if #(adop.sourceAcceptedIds or {}) ~= expectAccepted then
@@ -1844,6 +1978,10 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
     if localRecord and localRecord.operations and type(localRecord.operations.order) == "table" then
         localAcceptedCount = #localRecord.operations.order
     end
+    local localAccountingMutation = 0
+    if GS.GetAccountingMutationSeq then
+        localAccountingMutation = GS.GetAccountingMutationSeq(localRecord)
+    end
     local previous = GS._adoption
     local switching = type(previous) == "table"
     if switching then
@@ -1861,6 +1999,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         localCampaignId = localCampaign,
         localConfigSeq = localConfigSeq,
         localAcceptedCount = localAcceptedCount,
+        localAccountingMutation = localAccountingMutation,
         handleGeneration = ctx.handleGeneration,
         actorGuid = ctx.actorGuid,
         records = {},
@@ -1879,6 +2018,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
             transferOps = 0,
             headers = 0,
             archives = 0,
+            ledgerEvents = 0,
+            donationEvidence = 0,
             descId = nil,
         },
         _workStats = {
@@ -1899,6 +2040,8 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedTransferOpCount = nil,
         pinnedCampaignCount = nil,
         pinnedArchiveCount = nil,
+        pinnedAcceptedLedgerCount = nil,
+        pinnedDonationEvidenceCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2389,6 +2532,8 @@ function GS:BufferAdoptionRecord(recordId, body)
         local transfer = tonumber(descBody.transferOpCount)
         local camp = tonumber(descBody.campaignCount)
         local arch = tonumber(descBody.archiveCount)
+        local ledger = tonumber(descBody.acceptedLedgerCount)
+        local donEv = tonumber(descBody.donationEvidenceCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -2427,6 +2572,24 @@ function GS:BufferAdoptionRecord(recordId, body)
         if adop.pinnedArchiveCount == nil and arch ~= nil then
             adop.pinnedArchiveCount = arch
         elseif arch ~= nil and adop.pinnedArchiveCount ~= nil and arch ~= adop.pinnedArchiveCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedAcceptedLedgerCount == nil and ledger ~= nil then
+            adop.pinnedAcceptedLedgerCount = ledger
+        elseif ledger ~= nil and adop.pinnedAcceptedLedgerCount ~= nil
+            and ledger ~= adop.pinnedAcceptedLedgerCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedDonationEvidenceCount == nil and donEv ~= nil then
+            adop.pinnedDonationEvidenceCount = donEv
+        elseif donEv ~= nil and adop.pinnedDonationEvidenceCount ~= nil
+            and donEv ~= adop.pinnedDonationEvidenceCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
             InvalidateAdoptionDeliveryOutcomes("source_changed")
@@ -2649,6 +2812,9 @@ local function NewBootstrapRecord(datasetId, guildKey, identity, bootstrapEditor
             _consumableEventArchive = {},
         },
         observations = { byCampaign = {} },
+        identityLinks = GS.EmptyIdentityLinks and GS.EmptyIdentityLinks() or {
+            schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil,
+        },
         operations = {
             records = {},
             order = {},
@@ -3120,13 +3286,21 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 if boundaryOk then
                     -- Park on the adoption session (not live GS._pendingCampaignBoundaries):
                     -- replay swaps that global per slice, and final completeness runs outside.
+                    -- Only count progress when newly parking or installing; re-parking an
+                    -- already-known header must not reset idle detection forever.
+                    local alreadyParked = adop._headerByCampaignId
+                        and adop._headerByCampaignId[h.campaignId] ~= nil
                     adop._headerByCampaignId = adop._headerByCampaignId or {}
                     adop._headerByCampaignId[h.campaignId] = h
                     GS._pendingCampaignBoundaries[h.campaignId] = h
                     if startPresent then
                         temp.campaigns[h.campaignId] = h
+                        progress = true
+                    elseif not alreadyParked then
+                        progress = true
+                    else
+                        unsettledSeen = true
                     end
-                    progress = true
                 elseif not startPresent then
                     unsettledSeen = true
                 end
@@ -3190,6 +3364,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         state.cursor, state.admissions = i, admissions
                         return false, aerr or "invalid_campaign_archive", progress
                     end
+                elseif PreferArchiveHistoricalContext(
+                    temp.campaignArchives[body.campaignId], archive) then
+                    temp.campaignArchives[body.campaignId] = archive
                 elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
                     state.cursor, state.admissions = i, admissions
                     return false, "archive_conflict", progress
@@ -3197,6 +3374,365 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     if state.archiveNeedsPages then
                         state.archiveNeedsPages[body.campaignId] = nil
                     end
+                end
+            end
+        elseif body.kind == "gs-evidence" and type(body.evidence) == "table" then
+            -- Transfer source direct observations. Votes use the authenticated
+            -- source peer only; verified totals come from gs-ledger-event transfer.
+            local evidence = body.evidence
+            local campId = evidence.campaignId or body.campaignId or temp.currentCampaignId
+            local orderId = adop.order[i]
+            -- Session-owned occurrence buckets: fingerprint groups candidates;
+            -- MatchScore decides same-occurrence (fp alone is not identity).
+            -- Index the accepted ledger tail once per session (byId + byOcc) so
+            -- unmatched bodies do not rescan O(events) work per body.
+            state.acctIndex = state.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
+            local function occurrenceFp(row)
+                if type(row) ~= "table" then return nil end
+                local fp = GS.OccurrenceFingerprint and GS.OccurrenceFingerprint(row)
+                if type(fp) == "string" and fp ~= "" then
+                    return fp
+                end
+                return tostring(row.coreSignature or "") .. "|"
+                    .. tostring(row.itemId or "") .. "|"
+                    .. tostring(row.quantity or "")
+            end
+            local function bucketHasMatch(bucket, row)
+                if type(bucket) ~= "table" then return false end
+                for bi = 1, #bucket do
+                    if GS.EvidenceOccurrenceMatches
+                        and GS.EvidenceOccurrenceMatches(bucket[bi], row) then
+                        return true
+                    end
+                end
+                return false
+            end
+            local function rememberOcc(map, row)
+                local fp = occurrenceFp(row)
+                if not fp then return end
+                local bucket = map[fp]
+                if type(bucket) ~= "table" then
+                    bucket = {}
+                    map[fp] = bucket
+                end
+                if not bucketHasMatch(bucket, row) and #bucket < 8 then
+                    bucket[#bucket + 1] = {
+                        coreSignature = row.coreSignature,
+                        itemId = row.itemId,
+                        quantity = row.quantity,
+                        approxTxnTime = row.approxTxnTime or row.timestamp,
+                        occurrenceIndex = row.occurrenceIndex,
+                        neighborsOlder = row.neighborsOlder,
+                        neighborsNewer = row.neighborsNewer,
+                        guildGuid = row.guildGuid,
+                        bankTab = row.bankTab,
+                        generation = row.generation,
+                    }
+                end
+            end
+            local function indexLedgerRow(e)
+                if type(e) ~= "table" then return end
+                if type(e.id) == "string" and e.id ~= "" then
+                    state.acctIndex.byId[e.id] = true
+                end
+                if type(e.txnId) == "string" and e.txnId ~= "" then
+                    state.acctIndex.byId[e.txnId] = true
+                end
+                if type(e.opId) == "string" and e.opId ~= "" then
+                    state.acctIndex.byId[e.opId] = true
+                end
+                rememberOcc(state.acctIndex.byOcc, e)
+            end
+            local function catchUpAcctIndex()
+                local archive = temp.accounting and temp.accounting._consumableEventArchive
+                local events = temp.accounting and temp.accounting._consumableEvents
+                local archTail = tonumber(state.acctIndexArchiveTail) or 0
+                local liveTail = tonumber(state.acctIndexLiveTail) or 0
+                if type(archive) == "table" then
+                    for j = archTail + 1, #archive do
+                        if sliceUsed >= sliceBudget then
+                            state.acctIndexArchiveTail = j - 1
+                            return false
+                        end
+                        sliceUsed = sliceUsed + 1
+                        indexLedgerRow(archive[j])
+                        state.acctIndexArchiveTail = j
+                    end
+                end
+                if type(events) == "table" then
+                    for j = liveTail + 1, #events do
+                        if sliceUsed >= sliceBudget then
+                            state.acctIndexLiveTail = j - 1
+                            return false
+                        end
+                        sliceUsed = sliceUsed + 1
+                        indexLedgerRow(events[j])
+                        state.acctIndexLiveTail = j
+                    end
+                end
+                return true
+            end
+            local function yieldReplayCursor()
+                unsettledSeen = true
+                state.cursor = (i - 1)
+                if state.cursor < 1 then
+                    state.cursor = #adop.order
+                end
+                state.admissions = (tonumber(state.admissions) or 0) + admissions
+                state.sliceUsed = sliceUsed
+                return true, nil, progress
+            end
+            local alreadyEv = false
+            local evFp = occurrenceFp(evidence)
+            if evFp and bucketHasMatch(state.acctIndex.pendingOcc[evFp], evidence) then
+                alreadyEv = true
+            elseif evFp and bucketHasMatch(state.acctIndex.byOcc[evFp], evidence) then
+                alreadyEv = true
+            elseif state.skipEvidence and state.skipEvidence[orderId] then
+                -- Terminally classified non-retained evidence: do not re-admit.
+                unsettledSeen = true
+                alreadyEv = true
+            else
+                if not catchUpAcctIndex() then
+                    return yieldReplayCursor()
+                end
+                if evFp and bucketHasMatch(state.acctIndex.byOcc[evFp], evidence) then
+                    alreadyEv = true
+                else
+                    -- Pending observations are not part of the ledger index; scan
+                    -- the campaign pending list under the shared slice budget.
+                    state.evidenceScanCursor = state.evidenceScanCursor or {}
+                    local nest = state.evidenceScanCursor[orderId]
+                    if type(nest) ~= "table" then
+                        nest = { phase = "pending", pos = 1 }
+                    end
+                    local byCampaign = temp.observations and temp.observations.byCampaign
+                    local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
+                    if type(pending) == "table" then
+                        for pi = nest.pos, #pending do
+                            if sliceUsed >= sliceBudget then
+                                state.evidenceScanCursor[orderId] = { phase = "pending", pos = pi }
+                                return yieldReplayCursor()
+                            end
+                            sliceUsed = sliceUsed + 1
+                            local c = pending[pi]
+                            if type(c) == "table" and type(c.evidence) == "table"
+                                and GS.EvidenceOccurrenceMatches
+                                and GS.EvidenceOccurrenceMatches(c.evidence, evidence) then
+                                alreadyEv = true
+                                rememberOcc(state.acctIndex.pendingOcc, c.evidence)
+                                break
+                            end
+                        end
+                    end
+                    if state.evidenceScanCursor then
+                        state.evidenceScanCursor[orderId] = nil
+                    end
+                end
+            end
+            if alreadyEv then
+                -- settled or terminally skipped
+            else
+                if sliceUsed >= sliceBudget then
+                    return yieldReplayCursor()
+                end
+                local beforePending = 0
+                local byCampPre = temp.observations and temp.observations.byCampaign
+                local pendPre = byCampPre and byCampPre[campId] and byCampPre[campId].pending
+                if type(pendPre) == "table" then
+                    beforePending = #pendPre
+                end
+                evidence.datasetId = body.datasetId or temp.datasetId
+                evidence.campaignId = campId
+                local stEv = GS:AdmitDirectObservation(evidence, {
+                    sender = adop.sourcePeer,
+                    member = member,
+                    offlineRecord = temp,
+                    campaignId = campId,
+                    adoptionReplay = true,
+                    localWrite = false,
+                })
+                admissions = admissions + 1
+                sliceUsed = sliceUsed + 1
+                if stEv == "accepted" or stEv == "duplicate" then
+                    progress = true
+                    rememberOcc(state.acctIndex.pendingOcc, evidence)
+                elseif stEv == "pending" then
+                    local afterPending = 0
+                    local byCampPost = temp.observations and temp.observations.byCampaign
+                    local pendPost = byCampPost and byCampPost[campId] and byCampPost[campId].pending
+                    if type(pendPost) == "table" then
+                        afterPending = #pendPost
+                    end
+                    if afterPending ~= beforePending then
+                        progress = true
+                        rememberOcc(state.acctIndex.pendingOcc, evidence)
+                    else
+                        -- No durable cluster stored: classify terminal for this
+                        -- transfer so async replay cannot requeue forever.
+                        state.skipEvidence = state.skipEvidence or {}
+                        state.skipEvidence[orderId] = true
+                        unsettledSeen = true
+                    end
+                else
+                    unsettledSeen = true
+                end
+            end
+        elseif body.kind == "gs-ledger-event" and type(body.event) == "table" then
+            local event = body.event
+            local eid = event.id or event.opId or event.txnId
+            state.acctIndex = state.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
+            local function occurrenceFpLe(row)
+                if type(row) ~= "table" then return nil end
+                local fp = GS.OccurrenceFingerprint and GS.OccurrenceFingerprint(row)
+                if type(fp) == "string" and fp ~= "" then
+                    return fp
+                end
+                return tostring(row.coreSignature or "") .. "|"
+                    .. tostring(row.itemId or "") .. "|"
+                    .. tostring(row.quantity or "")
+            end
+            local function bucketHasMatchLe(bucket, row)
+                if type(bucket) ~= "table" then return false end
+                for bi = 1, #bucket do
+                    if GS.EvidenceOccurrenceMatches
+                        and GS.EvidenceOccurrenceMatches(bucket[bi], row) then
+                        return true
+                    end
+                end
+                return false
+            end
+            local function rememberOccLe(map, row)
+                local fp = occurrenceFpLe(row)
+                if not fp then return end
+                local bucket = map[fp]
+                if type(bucket) ~= "table" then
+                    bucket = {}
+                    map[fp] = bucket
+                end
+                if not bucketHasMatchLe(bucket, row) and #bucket < 8 then
+                    bucket[#bucket + 1] = {
+                        coreSignature = row.coreSignature,
+                        itemId = row.itemId,
+                        quantity = row.quantity,
+                        approxTxnTime = row.approxTxnTime or row.timestamp,
+                        occurrenceIndex = row.occurrenceIndex,
+                        neighborsOlder = row.neighborsOlder,
+                        neighborsNewer = row.neighborsNewer,
+                        guildGuid = row.guildGuid,
+                        bankTab = row.bankTab,
+                        generation = row.generation,
+                    }
+                end
+            end
+            local function indexLedgerRowLe(e)
+                if type(e) ~= "table" then return end
+                if type(e.id) == "string" and e.id ~= "" then
+                    state.acctIndex.byId[e.id] = true
+                end
+                if type(e.txnId) == "string" and e.txnId ~= "" then
+                    state.acctIndex.byId[e.txnId] = true
+                end
+                if type(e.opId) == "string" and e.opId ~= "" then
+                    state.acctIndex.byId[e.opId] = true
+                end
+                rememberOccLe(state.acctIndex.byOcc, e)
+            end
+            local function catchUpAcctIndexLe()
+                local archive = temp.accounting and temp.accounting._consumableEventArchive
+                local events = temp.accounting and temp.accounting._consumableEvents
+                local archTail = tonumber(state.acctIndexArchiveTail) or 0
+                local liveTail = tonumber(state.acctIndexLiveTail) or 0
+                if type(archive) == "table" then
+                    for j = archTail + 1, #archive do
+                        if sliceUsed >= sliceBudget then
+                            state.acctIndexArchiveTail = j - 1
+                            return false
+                        end
+                        sliceUsed = sliceUsed + 1
+                        indexLedgerRowLe(archive[j])
+                        state.acctIndexArchiveTail = j
+                    end
+                end
+                if type(events) == "table" then
+                    for j = liveTail + 1, #events do
+                        if sliceUsed >= sliceBudget then
+                            state.acctIndexLiveTail = j - 1
+                            return false
+                        end
+                        sliceUsed = sliceUsed + 1
+                        indexLedgerRowLe(events[j])
+                        state.acctIndexLiveTail = j
+                    end
+                end
+                return true
+            end
+            local function yieldReplayCursorLe()
+                unsettledSeen = true
+                state.cursor = (i - 1)
+                if state.cursor < 1 then
+                    state.cursor = #adop.order
+                end
+                state.admissions = (tonumber(state.admissions) or 0) + admissions
+                state.sliceUsed = sliceUsed
+                return true, nil, progress
+            end
+            local alreadyLe = false
+            -- byId is exact-ID only (never collapses distinct reminted txn ids).
+            if type(eid) == "string" and eid ~= "" and state.acctIndex.byId[eid] then
+                alreadyLe = true
+            elseif type(event.txnId) == "string" and event.txnId ~= ""
+                and state.acctIndex.byId[event.txnId] then
+                alreadyLe = true
+            elseif type(event.opId) == "string" and event.opId ~= ""
+                and state.acctIndex.byId[event.opId] then
+                alreadyLe = true
+            else
+                if not catchUpAcctIndexLe() then
+                    return yieldReplayCursorLe()
+                end
+                if type(eid) == "string" and eid ~= "" and state.acctIndex.byId[eid] then
+                    alreadyLe = true
+                elseif type(event.txnId) == "string" and event.txnId ~= ""
+                    and state.acctIndex.byId[event.txnId] then
+                    alreadyLe = true
+                elseif type(event.opId) == "string" and event.opId ~= ""
+                    and state.acctIndex.byId[event.opId] then
+                    alreadyLe = true
+                end
+            end
+            if alreadyLe then
+                -- settled
+            else
+                if sliceUsed >= sliceBudget then
+                    return yieldReplayCursorLe()
+                end
+                event.datasetId = body.datasetId or temp.datasetId
+                local stLe = GS:AdmitLedgerEvent(event, {
+                    sender = adop.sourcePeer,
+                    member = member,
+                    offlineRecord = temp,
+                    adoptionReplay = true,
+                    preserveAttribution = true,
+                    localWrite = false,
+                })
+                admissions = admissions + 1
+                sliceUsed = sliceUsed + 1
+                if stLe == "accepted" or stLe == "duplicate" then
+                    progress = true
+                    indexLedgerRowLe(event)
+                    -- Keep tails consistent with lists that grew via Admit.
+                    local live = temp.accounting and temp.accounting._consumableEvents
+                    local arch = temp.accounting and temp.accounting._consumableEventArchive
+                    if type(live) == "table" then
+                        state.acctIndexLiveTail = #live
+                    end
+                    if type(arch) == "table" then
+                        state.acctIndexArchiveTail = #arch
+                    end
+                else
+                    -- Floor-held adjustments / rejected bodies remain unsettled.
+                    unsettledSeen = true
                 end
             end
         end
@@ -3339,8 +3875,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             state.deferRankCached = nil
         end
     else
-        -- Worklist waits are not stalls. Budget-exhausted retry slices are still
-        -- productive work and must not accumulate toward the noProgress abort.
+        -- Worklist waits are not stalls. Budget-exhausted slices that made no
+        -- durable progress (e.g. ≥32 pending-without-store bodies) still count
+        -- toward termination so async ContinueAdoptionReplay cannot requeue forever.
         local hasWorklist = false
         if type(state.worklist) == "table" then
             for _ in pairs(state.worklist) do
@@ -3348,8 +3885,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 break
             end
         end
-        local budgetExhausted = sliceUsed >= sliceBudget
-        if not hasWorklist and not budgetExhausted then
+        if not hasWorklist then
             state.noProgressSlices = (tonumber(state.noProgressSlices) or 0) + 1
         end
     end
@@ -3613,16 +4149,305 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     publishCompletenessStats()
                     return false, aerr or "incomplete_archive_pages"
                 end
-                if not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
+                if PreferArchiveHistoricalContext(
+                    temp.campaignArchives[body.campaignId], archive) then
+                    temp.campaignArchives[body.campaignId] = archive
+                elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
                     opts.cursor = nil
                     publishCompletenessStats()
                     return false, "archive_conflict"
                 end
             end
+        elseif type(body) == "table" and body.kind == "gs-ledger-event"
+            and type(body.event) == "table" then
+            local ev = body.event
+            local eid = ev.id or ev.opId or ev.txnId
+            -- Incremental once-per-session ledger index (archive + live tails).
+            opts.acctIndex = opts.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
+            local function occurrenceFpLe(row)
+                if type(row) ~= "table" then return nil end
+                local fp = GS.OccurrenceFingerprint and GS.OccurrenceFingerprint(row)
+                if type(fp) == "string" and fp ~= "" then
+                    return fp
+                end
+                return tostring(row.coreSignature or "") .. "|"
+                    .. tostring(row.itemId or "") .. "|"
+                    .. tostring(row.quantity or "")
+            end
+            local function bucketHasMatchLe(bucket, row)
+                if type(bucket) ~= "table" then return false end
+                for bi = 1, #bucket do
+                    if GS.EvidenceOccurrenceMatches
+                        and GS.EvidenceOccurrenceMatches(bucket[bi], row) then
+                        return true
+                    end
+                end
+                return false
+            end
+            local function rememberOccLe(map, row)
+                local fp = occurrenceFpLe(row)
+                if not fp then return end
+                local bucket = map[fp]
+                if type(bucket) ~= "table" then
+                    bucket = {}
+                    map[fp] = bucket
+                end
+                if not bucketHasMatchLe(bucket, row) and #bucket < 8 then
+                    bucket[#bucket + 1] = {
+                        coreSignature = row.coreSignature,
+                        itemId = row.itemId,
+                        quantity = row.quantity,
+                        approxTxnTime = row.approxTxnTime or row.timestamp,
+                        occurrenceIndex = row.occurrenceIndex,
+                        neighborsOlder = row.neighborsOlder,
+                        neighborsNewer = row.neighborsNewer,
+                        guildGuid = row.guildGuid,
+                        bankTab = row.bankTab,
+                        generation = row.generation,
+                    }
+                end
+            end
+            local function indexLedgerRowLe(e)
+                if type(e) ~= "table" then return end
+                if type(e.id) == "string" and e.id ~= "" then
+                    opts.acctIndex.byId[e.id] = true
+                end
+                if type(e.txnId) == "string" and e.txnId ~= "" then
+                    opts.acctIndex.byId[e.txnId] = true
+                end
+                if type(e.opId) == "string" and e.opId ~= "" then
+                    opts.acctIndex.byId[e.opId] = true
+                end
+                rememberOccLe(opts.acctIndex.byOcc, e)
+            end
+            local function catchUpAcctIndexLe()
+                local archive = temp.accounting and temp.accounting._consumableEventArchive
+                local events = temp.accounting and temp.accounting._consumableEvents
+                local archTail = tonumber(opts.acctIndexArchiveTail) or 0
+                local liveTail = tonumber(opts.acctIndexLiveTail) or 0
+                if type(archive) == "table" then
+                    for j = archTail + 1, #archive do
+                        if visited >= budget then
+                            opts.acctIndexArchiveTail = j - 1
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false
+                        end
+                        visited = visited + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        indexLedgerRowLe(archive[j])
+                        opts.acctIndexArchiveTail = j
+                    end
+                end
+                if type(events) == "table" then
+                    for j = liveTail + 1, #events do
+                        if visited >= budget then
+                            opts.acctIndexLiveTail = j - 1
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false
+                        end
+                        visited = visited + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        indexLedgerRowLe(events[j])
+                        opts.acctIndexLiveTail = j
+                    end
+                end
+                return true
+            end
+            local found = false
+            if type(eid) == "string" and eid ~= "" and opts.acctIndex.byId[eid] then
+                found = true
+            elseif type(ev.txnId) == "string" and ev.txnId ~= ""
+                and opts.acctIndex.byId[ev.txnId] then
+                found = true
+            elseif type(ev.opId) == "string" and ev.opId ~= ""
+                and opts.acctIndex.byId[ev.opId] then
+                found = true
+            else
+                if not catchUpAcctIndexLe() then
+                    return false, "budget"
+                end
+                if type(eid) == "string" and eid ~= "" and opts.acctIndex.byId[eid] then
+                    found = true
+                elseif type(ev.txnId) == "string" and ev.txnId ~= ""
+                    and opts.acctIndex.byId[ev.txnId] then
+                    found = true
+                elseif type(ev.opId) == "string" and ev.opId ~= ""
+                    and opts.acctIndex.byId[ev.opId] then
+                    found = true
+                end
+            end
+            if not found then
+                opts.cursor = nil
+                opts.budgetExhausted = false
+                publishCompletenessStats()
+                return false, "incomplete_transfer"
+            end
+        elseif type(body) == "table" and body.kind == "gs-evidence"
+            and type(body.evidence) == "table" then
+            local ev = body.evidence
+            opts.acctIndex = opts.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
+            local function occurrenceFp(row)
+                if type(row) ~= "table" then return nil end
+                local fp = GS.OccurrenceFingerprint and GS.OccurrenceFingerprint(row)
+                if type(fp) == "string" and fp ~= "" then
+                    return fp
+                end
+                return tostring(row.coreSignature or "") .. "|"
+                    .. tostring(row.itemId or "") .. "|"
+                    .. tostring(row.quantity or "")
+            end
+            local function bucketHasMatch(bucket, row)
+                if type(bucket) ~= "table" then return false end
+                for bi = 1, #bucket do
+                    if GS.EvidenceOccurrenceMatches
+                        and GS.EvidenceOccurrenceMatches(bucket[bi], row) then
+                        return true
+                    end
+                end
+                return false
+            end
+            local function rememberOcc(map, row)
+                local fp = occurrenceFp(row)
+                if not fp then return end
+                local bucket = map[fp]
+                if type(bucket) ~= "table" then
+                    bucket = {}
+                    map[fp] = bucket
+                end
+                if not bucketHasMatch(bucket, row) and #bucket < 8 then
+                    bucket[#bucket + 1] = {
+                        coreSignature = row.coreSignature,
+                        itemId = row.itemId,
+                        quantity = row.quantity,
+                        approxTxnTime = row.approxTxnTime or row.timestamp,
+                        occurrenceIndex = row.occurrenceIndex,
+                        neighborsOlder = row.neighborsOlder,
+                        neighborsNewer = row.neighborsNewer,
+                        guildGuid = row.guildGuid,
+                        bankTab = row.bankTab,
+                        generation = row.generation,
+                    }
+                end
+            end
+            local function indexLedgerRow(e)
+                if type(e) ~= "table" then return end
+                if type(e.id) == "string" and e.id ~= "" then
+                    opts.acctIndex.byId[e.id] = true
+                end
+                if type(e.txnId) == "string" and e.txnId ~= "" then
+                    opts.acctIndex.byId[e.txnId] = true
+                end
+                if type(e.opId) == "string" and e.opId ~= "" then
+                    opts.acctIndex.byId[e.opId] = true
+                end
+                rememberOcc(opts.acctIndex.byOcc, e)
+            end
+            local function catchUpAcctIndex()
+                local archive = temp.accounting and temp.accounting._consumableEventArchive
+                local events = temp.accounting and temp.accounting._consumableEvents
+                local archTail = tonumber(opts.acctIndexArchiveTail) or 0
+                local liveTail = tonumber(opts.acctIndexLiveTail) or 0
+                if type(archive) == "table" then
+                    for j = archTail + 1, #archive do
+                        if visited >= budget then
+                            opts.acctIndexArchiveTail = j - 1
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false
+                        end
+                        visited = visited + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        indexLedgerRow(archive[j])
+                        opts.acctIndexArchiveTail = j
+                    end
+                end
+                if type(events) == "table" then
+                    for j = liveTail + 1, #events do
+                        if visited >= budget then
+                            opts.acctIndexLiveTail = j - 1
+                            opts.cursor = i
+                            opts.budgetExhausted = true
+                            publishCompletenessStats()
+                            return false
+                        end
+                        visited = visited + 1
+                        adop._workStats.completenessVisited =
+                            (adop._workStats.completenessVisited or 0) + 1
+                        indexLedgerRow(events[j])
+                        opts.acctIndexLiveTail = j
+                    end
+                end
+                return true
+            end
+            local settled = false
+            local evFp = occurrenceFp(ev)
+            if evFp and bucketHasMatch(opts.acctIndex.pendingOcc[evFp], ev) then
+                settled = true
+            elseif evFp and bucketHasMatch(opts.acctIndex.byOcc[evFp], ev) then
+                settled = true
+            else
+                if not catchUpAcctIndex() then
+                    return false, "budget"
+                end
+                if evFp and bucketHasMatch(opts.acctIndex.byOcc[evFp], ev) then
+                    settled = true
+                else
+                    local nest = opts.evidenceScanCursor and opts.evidenceScanCursor[i]
+                    if type(nest) ~= "table" then
+                        nest = { phase = "pending", pos = 1 }
+                    end
+                    local byCampaign = temp.observations and temp.observations.byCampaign
+                    local campId = ev.campaignId or body.campaignId or temp.currentCampaignId
+                    local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
+                    if type(pending) == "table" then
+                        for pi = nest.pos, #pending do
+                            if visited >= budget then
+                                opts.evidenceScanCursor = opts.evidenceScanCursor or {}
+                                opts.evidenceScanCursor[i] = { phase = "pending", pos = pi }
+                                opts.cursor = i
+                                opts.budgetExhausted = true
+                                publishCompletenessStats()
+                                return false, "budget"
+                            end
+                            visited = visited + 1
+                            adop._workStats.completenessVisited =
+                                (adop._workStats.completenessVisited or 0) + 1
+                            local c = pending[pi]
+                            if type(c) == "table" and type(c.evidence) == "table"
+                                and GS.EvidenceOccurrenceMatches
+                                and GS.EvidenceOccurrenceMatches(c.evidence, ev) then
+                                settled = true
+                                rememberOcc(opts.acctIndex.pendingOcc, c.evidence)
+                                break
+                            end
+                        end
+                    end
+                    if settled and opts.evidenceScanCursor then
+                        opts.evidenceScanCursor[i] = nil
+                    end
+                end
+            end
+            if not settled then
+                opts.cursor = nil
+                opts.budgetExhausted = false
+                publishCompletenessStats()
+                return false, "incomplete_transfer"
+            end
         end
     end
     opts.cursor = nil
     opts.budgetExhausted = false
+    if opts.evidenceScanCursor then
+        opts.evidenceScanCursor = nil
+    end
     publishCompletenessStats()
     return true, nil
 end
@@ -3659,6 +4484,25 @@ local function ValidateAdoptionEffectiveState(temp, adop, desc)
         local wantAccepted = tonumber(desc.acceptedOpCount)
         if wantAccepted and acceptedCount ~= wantAccepted then
             return false, "incomplete_transfer"
+        end
+        local wantLedger = tonumber(desc.acceptedLedgerCount)
+        if wantLedger ~= nil then
+            local liveLedger = 0
+            if GS.CountAcceptedLedgerEvents then
+                liveLedger = GS.CountAcceptedLedgerEvents(temp)
+            else
+                local events = temp.accounting and temp.accounting._consumableEvents
+                local archive = temp.accounting and temp.accounting._consumableEventArchive
+                if type(events) == "table" then
+                    liveLedger = liveLedger + #events
+                end
+                if type(archive) == "table" then
+                    liveLedger = liveLedger + #archive
+                end
+            end
+            if liveLedger ~= wantLedger then
+                return false, "incomplete_transfer"
+            end
         end
         -- Effective configuration head: bank tab must match the selected source
         -- when the descriptor advertises one (including explicit nil via flag).
@@ -3707,7 +4551,11 @@ local function ValidateAdoptionCommitContext(adop)
     end
     local live = GS._root.guilds[adop.guildKey]
     if type(live) == "table" then
-        if adop.localDatasetId and live.datasetId ~= adop.localDatasetId then
+        -- Compare full optional dataset identity, including nil vs non-nil.
+        -- Begin-with-no-record pins localDatasetId=nil; an editor CreateStagedRecord
+        -- mid-replay must abort rather than overwrite that newly created dataset.
+        -- Legitimate bootstrap (still no local record) never enters this branch.
+        if (adop.localDatasetId or nil) ~= (live.datasetId or nil) then
             return false, "source_changed"
         end
         local livePolicy = live.permission and live.permission.revisionId
@@ -3728,6 +4576,15 @@ local function ValidateAdoptionCommitContext(adop)
         end
         if adop.localAcceptedCount ~= nil and liveAccepted ~= adop.localAcceptedCount then
             return false, "stale_base"
+        end
+        -- Ledger/evidence mutations do not advance configSeq or accepted-op
+        -- count; pin a cheap monotonic revision so async publication cannot
+        -- discard local donations or retained witnesses accepted mid-replay.
+        if adop.localAccountingMutation ~= nil and GS.GetAccountingMutationSeq then
+            local liveMut = GS.GetAccountingMutationSeq(live)
+            if liveMut ~= adop.localAccountingMutation then
+                return false, "stale_base"
+            end
         end
     end
     if type(adop.pinnedPermissionRevisionId) == "string" then
@@ -3795,14 +4652,36 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
 
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+    local seedIndex = state.acctIndex
+    local seedArchTail = state.acctIndexArchiveTail
+    local seedLiveTail = state.acctIndexLiveTail
+    if GS._adoptionCompletenessColdIndexForTest then
+        -- Force a cold rebuild: empty index AND zero tails so catch-up work is charged.
+        seedIndex = nil
+        seedArchTail = nil
+        seedLiveTail = nil
+    end
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
+        acctIndex = seedIndex,
+        acctIndexArchiveTail = seedArchTail,
+        acctIndexLiveTail = seedLiveTail,
     }
     compOpts.budget = compBudget
+    if not compOpts.acctIndex and not GS._adoptionCompletenessColdIndexForTest then
+        compOpts.acctIndex = state.acctIndex
+        compOpts.acctIndexArchiveTail = state.acctIndexArchiveTail
+        compOpts.acctIndexLiveTail = state.acctIndexLiveTail
+    end
     local okComp, compErr
     local guard = 0
-    local maxGuard = math.max(8, math.ceil((#adop.order or 0) / compBudget) * 2 + 8)
+    -- Nested ledger/evidence scan resumes can exceed top-level body count.
+    local maxGuard = math.max(
+        8,
+        math.ceil((#adop.order or 0) / math.max(1, compBudget)) * 2 + 8,
+        (#adop.order or 0) * 4 + 64
+    )
     repeat
         guard = guard + 1
         okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member, compOpts)
@@ -3971,17 +4850,37 @@ local function ContinueAdoptionReplay(adop)
     -- mid-archive completeness yields (GS._adoptionCompletenessBudgetForTest).
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+    local seedIndex = state.acctIndex
+    local seedArchTail = state.acctIndexArchiveTail
+    local seedLiveTail = state.acctIndexLiveTail
+    if GS._adoptionCompletenessColdIndexForTest then
+        seedIndex = nil
+        seedArchTail = nil
+        seedLiveTail = nil
+    end
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
+        acctIndex = seedIndex,
+        acctIndexArchiveTail = seedArchTail,
+        acctIndexLiveTail = seedLiveTail,
     }
     compOpts.budget = compBudget
+    if not compOpts.acctIndex and not GS._adoptionCompletenessColdIndexForTest then
+        compOpts.acctIndex = state.acctIndex
+        compOpts.acctIndexArchiveTail = state.acctIndexArchiveTail
+        compOpts.acctIndexLiveTail = state.acctIndexLiveTail
+    end
     local okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member, compOpts)
     if not okComp and compErr == "budget" then
         state.completenessOpts = compOpts
         if GS._adoptionReplaySyncDrain then
             local guard = 0
-            local maxGuard = math.max(8, math.ceil((#adop.order or 0) / compBudget) * 2 + 8)
+            local maxGuard = math.max(
+                8,
+                math.ceil((#adop.order or 0) / math.max(1, compBudget)) * 2 + 8,
+                (#adop.order or 0) * 4 + 64
+            )
             while not okComp and compErr == "budget" and guard < maxGuard do
                 guard = guard + 1
                 local ctxOk3, ctxErr3, member3 = ValidateAdoptionCommitContext(adop)
@@ -4792,6 +5691,9 @@ local function ApplyRemoteCampaignMutation(record, stored, boundary)
     -- Original startedAt / boundary timestamps — never receipt time.
     GS.EstablishCampaignBaseline(cfg, boundary.startedAt or stored.timestamp)
     cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    if GS.ShelvePriorGenerationsOnRecord then
+        GS.ShelvePriorGenerationsOnRecord(record)
+    end
 
     record.campaigns[stored.id] = boundary
     record.currentCampaignId = stored.id
@@ -5779,10 +6681,22 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         and op.kind == GS.KIND.SET_EDITOR_RANK
         and type(op.basePolicyRevision) == "string"
         and op.basePolicyRevision == currentPolicy
-    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {
+    -- Offline adoption onto an empty client: SenderHasEditorAuthority looks up the
+    -- live guild slot (not offlineRecord). Without allowBootstrapInstall it returns
+    -- not_configured and every source-authored body becomes untrusted_relay, so
+    -- START_CAMPAIGN never lands and replay cannot converge. Begin already gated
+    -- the source under allowBootstrapInstall; reuse that while live is absent.
+    local authOpts = {
         requireRecoverPolicy = requireRecover,
         allowPolicyCatchUp = isPolicyCatchUp,
-    })
+    }
+    if admissionCtx.adoptionReplay and type(admissionCtx.offlineRecord) == "table" then
+        local liveGuild = GS._root and GS._root.guilds and GS._root.guilds[member.guildKey]
+        if type(liveGuild) ~= "table" then
+            authOpts.allowBootstrapInstall = true
+        end
+    end
+    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, authOpts)
 
     -- Policy catch-up must not be forced into the relay branch by Gossip's
     -- pre-admit relay flag; catch-up context overrides relay for this body only.
@@ -6432,6 +7346,20 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         if GS._ApplyMutations then
             local ok, err = GS._ApplyMutations(record, stored)
             if not ok then
+                if stored.kind == GS.KIND.ADJUST_QUANTITY
+                    and (err == "item_negative" or err == "player_negative"
+                        or err == "adjustment_floor") then
+                    local stPend, reasonPend = "pending", err
+                    if GS._AdmitPendingOrConflict then
+                        stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)
+                    end
+                    if (stPend == "pending" or stPend == "duplicate")
+                        and not admissionCtx.adoptionReplay
+                        and GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("remote-pending")
+                    end
+                    return stPend, reasonPend
+                end
                 return "rejected", err or "apply_failed"
             end
         end

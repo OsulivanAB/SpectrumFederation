@@ -381,6 +381,69 @@ local function Definition()
 					{
 						type = "help",
 						indent = "label",
+						getText = function()
+							return Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_HELP",
+								"Read-only. Deposits become verified automatically when three independent authenticated Guild Bank observers agree. There is no manual approval.")
+						end,
+					},
+					{
+						type = "scrollList",
+						label = Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_TITLE", "Pending deposit evidence"),
+						height = 100,
+						rowHeight = 20,
+						getItems = function()
+							if not Caps().canRead then
+								return {}
+							end
+							local g = GS()
+							local campaignId = ResolveSelectedCampaign()
+							if not g or not campaignId or not g.ListPendingEvidence then
+								return {}
+							end
+							local pending = g:ListPendingEvidence(campaignId, 20)
+							local items = {}
+							if type(pending) == "table" then
+								for i = 1, #pending do
+									local row = pending[i]
+									local donor = row.donor or "?"
+									local qty = tonumber(row.quantity) or 0
+									local itemId = tostring(row.itemId or "?")
+									local statusKey = tostring(row.status or "pending")
+									local statusText
+									if statusKey == "ambiguous" then
+										statusText = Loc("GUILD_SUPPLIES_PENDING_STATUS_AMBIGUOUS",
+											"ambiguous")
+									else
+										statusText = Loc("GUILD_SUPPLIES_PENDING_STATUS_PENDING",
+											"pending")
+									end
+									items[#items + 1] = {
+										text = Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_ROW",
+											"%s ×%d — %s (%d/%d witnesses) [%s]")
+											:format(donor, qty, itemId,
+												tonumber(row.witnessCount) or 0,
+												tonumber(row.threshold) or 3,
+												statusText),
+										canRemove = false,
+									}
+								end
+							end
+							if #items == 0 then
+								items[1] = {
+									text = Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_NONE",
+										"No pending deposit evidence."),
+									canRemove = false,
+								}
+							end
+							return items
+						end,
+						enabled = function()
+							return Caps().canRead
+						end,
+					},
+					{
+						type = "help",
+						indent = "label",
 						getText = HistoryHelpText,
 					},
 					{
