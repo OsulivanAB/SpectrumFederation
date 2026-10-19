@@ -175,7 +175,13 @@ function GS.ValidateEligibilityContainer(eligibility)
     return true
 end
 
+--- Immutable live cutover floor stored on eligibility after activation/refresh.
+local function LiveCutoverFloor(eligibility)
+    return tonumber(eligibility and eligibility.liveCutoverAt)
+end
+
 --- Tab change establishes a campaign-local cutoff when a baseline exists.
+-- Never regresses below an installed live cutover floor (#389 descriptor-first).
 function GS.NoteTabEligibilityCutoff(cfg, timestamp)
     if type(cfg) ~= "table" then
         return false
@@ -189,6 +195,10 @@ function GS.NoteTabEligibilityCutoff(cfg, timestamp)
         return false
     end
     if eligibility.baselineEstablished == true then
+        local floor = LiveCutoverFloor(eligibility)
+        if floor and ts < floor then
+            ts = floor
+        end
         eligibility.tabEligibleFrom = ts
         return true
     end
@@ -196,7 +206,7 @@ function GS.NoteTabEligibilityCutoff(cfg, timestamp)
 end
 
 --- Item add/re-add establishes a cutoff after the campaign baseline exists.
--- Ordinary goal edits must not call this.
+-- Ordinary goal edits must not call this. Floors to live cutover when present.
 function GS.NoteItemEligibilityCutoff(cfg, itemId, timestamp)
     if type(cfg) ~= "table" then
         return false
@@ -214,6 +224,10 @@ function GS.NoteItemEligibilityCutoff(cfg, itemId, timestamp)
         return false
     end
     if eligibility.baselineEstablished == true then
+        local floor = LiveCutoverFloor(eligibility)
+        if floor and ts < floor then
+            ts = floor
+        end
         eligibility.items[tostring(id)] = ts
         return true
     end

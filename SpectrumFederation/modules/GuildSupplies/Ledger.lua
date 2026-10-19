@@ -1296,6 +1296,49 @@ function GS.GetAccountingMutationSeq(record)
     return tonumber(record.accounting._mutationSeq) or 0
 end
 
+--- Attach authenticated active-exporter cutover provenance to an already-retained
+-- immutable-equivalent adjustment without reapplying quantity (#389 A2).
+-- Never trusts self-declared event.gsProductionCredit / event.gsSourceCutoverMarker.
+local function ReconcileAdjustmentCutoverProvenance(record, existing, admissionCtx)
+    if type(existing) ~= "table" or type(admissionCtx) ~= "table" then
+        return false
+    end
+    local marker = admissionCtx.sourceCutoverMarker
+    if type(marker) ~= "string" or marker == "" then
+        return false
+    end
+    local prior = existing.gsSourceCutoverMarker
+    if type(prior) == "string" and prior ~= "" and prior ~= marker then
+        -- Divergent authenticated markers: leave fail-closed.
+        return false
+    end
+    local changed = false
+    if prior ~= marker then
+        existing.gsSourceCutoverMarker = marker
+        changed = true
+    end
+    if GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and existing.gsSourceCutoverMarker == record.liveCutover.cutoverMarker then
+        local approx = tonumber(existing.approxTxnTime) or tonumber(existing.timestamp)
+        local afterOk = true
+        if GS.IsEvidenceAfterLiveCutover then
+            afterOk = select(1, GS.IsEvidenceAfterLiveCutover(record, {
+                approxTxnTime = approx,
+            }))
+        end
+        local credit = afterOk and true or false
+        if existing.gsProductionCredit ~= credit then
+            existing.gsProductionCredit = credit
+            changed = true
+        end
+    end
+    if changed then
+        BumpAccountingMutation(record)
+    end
+    return changed
+end
+
 local function ValidateDenseLedgerList(list, maxLen, datasetId)
     if type(list) ~= "table" then
         return false, "invalid_accounting"
@@ -1567,8 +1610,53 @@ local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
     }
 end
 
+--- Read-only eligibility view floored to the immutable live cutover.
+-- Does not mutate archived or live SavedVariables maps.
+local function EligibilityFlooredToLiveCutover(eligibility, record)
+    if not (GS.IsLiveActive and GS.IsLiveActive(record)) or type(record.liveCutover) ~= "table" then
+        return eligibility
+    end
+    local cutTs = tonumber(record.liveCutover.contextObservedAt)
+        or tonumber(record.liveCutover.eligibilityBoundary
+            and record.liveCutover.eligibilityBoundary.tabEligibleFrom)
+    if not cutTs then
+        return eligibility
+    end
+    if type(eligibility) ~= "table" then
+        return eligibility
+    end
+    local floored = {
+        baselineEstablished = true,
+        baselineAt = cutTs,
+        tabEligibleFrom = cutTs,
+        items = {},
+        liveCutoverAt = cutTs,
+        liveCutoverMarker = record.liveCutover.cutoverMarker
+            or eligibility.liveCutoverMarker,
+    }
+    local baselineAt = tonumber(eligibility.baselineAt)
+    if baselineAt and baselineAt > cutTs then
+        floored.baselineAt = baselineAt
+    end
+    local tabFrom = tonumber(eligibility.tabEligibleFrom)
+    if tabFrom and tabFrom > cutTs then
+        floored.tabEligibleFrom = tabFrom
+    end
+    if type(eligibility.items) == "table" then
+        for key, value in pairs(eligibility.items) do
+            local itemFrom = tonumber(value)
+            if itemFrom then
+                floored.items[key] = itemFrom < cutTs and cutTs or itemFrom
+            end
+        end
+    end
+    return floored
+end
+
 --- Resolve generation/items/tab/eligibility for the evidence's campaign.
 -- Historical rows use archived campaign context, never the live campaign alone.
+-- When the dataset is live, archived/live eligibility views are floored to the
+-- canonical cutover so hour-span ambiguity cannot be bypassed (#389).
 local function ResolveEvidenceCampaignContext(record, evidence)
     local live = record.accounting and record.accounting._consumables
     if type(live) ~= "table" then
@@ -1584,7 +1672,7 @@ local function ResolveEvidenceCampaignContext(record, evidence)
             requestedItems = live.requestedItems,
             bankTab = live.bankTab,
             guild = live.guild,
-            eligibility = live.eligibility,
+            eligibility = EligibilityFlooredToLiveCutover(live.eligibility, record),
             historical = false,
         }
     end
@@ -1609,14 +1697,15 @@ local function ResolveEvidenceCampaignContext(record, evidence)
     if eligibility == nil and type(ctx) == "table" and type(ctx.eligibility) == "table" then
         eligibility = ctx.eligibility
     end
+    local hasProof = type(eligibility) == "table"
     return {
         generation = archive.generation,
         requestedItems = archive.requestedItems,
         bankTab = bankTab,
         guild = live.guild,
-        eligibility = eligibility,
+        eligibility = EligibilityFlooredToLiveCutover(eligibility, record),
         historical = true,
-        hasEligibilityProof = type(eligibility) == "table",
+        hasEligibilityProof = hasProof,
     }
 end
 
@@ -2455,6 +2544,11 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                         if idHit then
                             if isAdjustment then
                                 if AdjustmentBodiesEquivalent(e, event) then
+                                    -- Op-first delivery may have stored the row without
+                                    -- transport cutover provenance; reconcile from this
+                                    -- authenticated marked ledger body before duplicate.
+                                    ReconcileAdjustmentCutoverProvenance(
+                                        record, e, admissionCtx)
                                     return "duplicate", "duplicate"
                                 end
                                 QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)

@@ -1032,6 +1032,11 @@ local function ApplyMutations(record, op)
         if previous ~= op.value and GS.NoteTabEligibilityCutoff then
             GS.NoteTabEligibilityCutoff(cfg, op.timestamp)
         end
+        -- Descriptor-first catch-up: historical tab ops must not regress the
+        -- immutable live cutover floor after start-campaign refresh (#389).
+        if GS.RefreshLiveEligibilityFloor then
+            GS.RefreshLiveEligibilityFloor(record)
+        end
         return true
     elseif op.kind == KIND.SET_REQUESTED_ITEM then
         local cfg = record.accounting._consumables
@@ -1079,6 +1084,10 @@ local function ApplyMutations(record, op)
             elseif not isAddOrReadd and previousGoal == newGoal then
                 -- Exact same goal: no eligibility change (idempotent field write).
             end
+        end
+        -- Same cutover floor for historical item-add replay on live records.
+        if GS.RefreshLiveEligibilityFloor then
+            GS.RefreshLiveEligibilityFloor(record)
         end
         return true
     elseif op.kind == KIND.LINK_CHARACTERS or op.kind == KIND.UNLINK_CHARACTERS then

@@ -1837,6 +1837,29 @@ local function UpsertExportBody(id, body)
     end
 end
 
+--- Upsert or refresh a ledger-event export, stamping live cutover provenance.
+-- Staged peers may export the row with cutoverMarker=nil; once active, the same
+-- export id must gain the canonical marker for downstream catch-up (#389 A2).
+local function UpsertLedgerEventExport(exportId, datasetId, event, cutoverMarker)
+    if type(exportId) ~= "string" or exportId == "" or type(event) ~= "table" then
+        return
+    end
+    local existing = exportState.byId[exportId]
+    local prev = existing and existing.body
+    if prev and prev.kind == "gs-ledger-event"
+        and prev.cutoverMarker == cutoverMarker
+        and prev.datasetId == datasetId
+        and prev.event == event then
+        return
+    end
+    UpsertExportBody(exportId, {
+        kind = "gs-ledger-event",
+        datasetId = datasetId,
+        event = event,
+        cutoverMarker = cutoverMarker,
+    })
+end
+
 --- Force paced archive→live ledger rebuild after TrimEventArchive removes IDs.
 -- Archive length can stay unchanged across shelve+trim while export IDs were
 -- dropped; warm high-water alone cannot detect that content swap.
@@ -2940,7 +2963,12 @@ function GS.NotifyLocalDurableChange(reason)
         -- and any new direct observations (never re-export relays).
         -- Config/remote-op/campaign paths also append ledger rows (adjustments,
         -- link-triggered verification) and must advertise them for adoption.
-        if reason == "ledger" or reason == "evidence"
+        -- Activation revisits already-exported staged ledger rows so their
+        -- cutoverMarker gains the live exporter provenance (#389 A2).
+        if reason == "activation" then
+            exportState.ledgerWarmPos = 0
+        end
+        if reason == "activation" or reason == "ledger" or reason == "evidence"
             or reason == "config" or reason == "remote-op" or reason == "campaign" then
             local events = record.accounting and record.accounting._consumableEvents
             if type(events) ~= "table" then
@@ -3006,16 +3034,9 @@ function GS.NotifyLocalDurableChange(reason)
             for i = start, nLive do
                 local event = events[i]
                 if type(event) == "table" and type(event.id) == "string" then
-                    local exportId = "gs:le:" .. event.id
-                    if not exportState.byId[exportId] then
-                        UpsertExportBody(exportId, {
-                            kind = "gs-ledger-event",
-                            datasetId = record.datasetId,
-                            event = event,
-                            -- Active-exporter provenance for order-independent credit.
-                            cutoverMarker = liveMarker,
-                        })
-                    end
+                    -- Refresh marker when a staged nil export becomes live.
+                    UpsertLedgerEventExport(
+                        "gs:le:" .. event.id, record.datasetId, event, liveMarker)
                 end
             end
             exportState.ledgerWarmPos = nLive
@@ -3478,15 +3499,8 @@ function GS.NotifyLocalDurableChange(reason)
                     local event = list[i]
                     used = used + 1
                     if type(event) == "table" and type(event.id) == "string" then
-                        local exportId = "gs:le:" .. event.id
-                        if not exportState.byId[exportId] then
-                            UpsertExportBody(exportId, {
-                                kind = "gs-ledger-event",
-                                datasetId = record.datasetId,
-                                event = event,
-                                cutoverMarker = coldMarker,
-                            })
-                        end
+                        UpsertLedgerEventExport(
+                            "gs:le:" .. event.id, record.datasetId, event, coldMarker)
                     end
                     exportState.ledgerBuildCursor = i + 1
                 end

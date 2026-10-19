@@ -22582,32 +22582,43 @@ end
 ---------------------------------------------------------------------------
 
 do
-    -- 3C25) A1: descriptor-first bootstrap keeps cutover eligibility floor; spanning
-    -- hour-bucket deposit stays uncredited; later deposit credits; reload durable.
+    -- 3C25) A1: descriptor-first catch-up keeps cutover floor through campaign +
+    -- historical set-bank-tab / set-requested-item replay (real provider path).
     local alice = seedActivatableCampaign(9125, 40)
-    local campStored = nil
+    local campStored, tabStored, itemStored = nil, nil, nil
     local ops = alice.operations
     if type(ops) == "table" and type(ops.order) == "table" then
         for i = 1, #ops.order do
             local id = ops.order[i]
             local op = ops.records and ops.records[id]
-            if type(op) == "table" and op.kind == GS.KIND.START_CAMPAIGN then
-                campStored = snapshotOp(op)
-                break
+            if type(op) == "table" then
+                if op.kind == GS.KIND.START_CAMPAIGN and not campStored then
+                    campStored = snapshotOp(op)
+                elseif op.kind == GS.KIND.SET_BANK_TAB and not tabStored then
+                    tabStored = snapshotOp(op)
+                elseif op.kind == GS.KIND.SET_REQUESTED_ITEM and not itemStored then
+                    itemStored = snapshotOp(op)
+                end
             end
         end
     end
     assertTrue(type(campStored) == "table", "3C25: start-campaign op snapshot")
+    assertTrue(type(tabStored) == "table", "3C25: set-bank-tab op snapshot")
+    assertTrue(type(itemStored) == "table", "3C25: set-requested-item op snapshot")
     local header = GS:GetCurrentCampaignBoundary()
     assertTrue(type(header) == "table", "3C25: campaign boundary")
     local startedAt = tonumber(header.startedAt) or tonumber(campStored.timestamp)
-    assertTrue(startedAt ~= nil, "3C25: startedAt")
+    local tabTs = tonumber(tabStored.timestamp)
+    local itemTs = tonumber(itemStored.timestamp)
+    assertTrue(startedAt ~= nil and tabTs ~= nil and itemTs ~= nil, "3C25: historical op times")
+    assertTrue(tabTs < world.time, "3C25: tab op predates later activation window")
     local _, stAct = GS:ActivateCanonicalDataset()
     assertEq(stAct, "accepted", "3C25: alice activates")
     alice = GS:GetCurrentRecord()
     local cutover = alice.liveCutover
     local cutTs = tonumber(cutover.contextObservedAt)
-    assertTrue(cutTs and cutTs > startedAt, "3C25: cutover after campaign start")
+    assertTrue(cutTs and cutTs > startedAt and cutTs > tabTs,
+        "3C25: cutover after campaign/tab timestamps")
     local datasetId = alice.datasetId
     local campaignId = alice.currentCampaignId
     local descBody = {
@@ -22623,7 +22634,79 @@ do
         currentCampaignId = campaignId,
     }
 
-    -- Empty Bob: descriptor-first, then historical start-campaign with old startedAt.
+    local function replayConfigOps(label)
+        local stCamp, reasonCamp = providerApply({
+            kind = "gs-op", op = campStored, boundary = header,
+        }, "Alice-Garona")
+        assertTrue(stCamp == "accepted" or stCamp == "duplicate",
+            label .. " campaign st=" .. tostring(stCamp) .. " r=" .. tostring(reasonCamp))
+        local stTab, reasonTab = providerApply({
+            kind = "gs-op", op = tabStored,
+        }, "Alice-Garona")
+        assertTrue(stTab == "accepted" or stTab == "duplicate",
+            label .. " tab st=" .. tostring(stTab) .. " r=" .. tostring(reasonTab))
+        local stItem, reasonItem = providerApply({
+            kind = "gs-op", op = itemStored,
+        }, "Alice-Garona")
+        assertTrue(stItem == "accepted" or stItem == "duplicate",
+            label .. " item st=" .. tostring(stItem) .. " r=" .. tostring(reasonItem))
+    end
+
+    local function assertFloorAndCredit(label)
+        local rec = GS:GetCurrentRecord()
+        local elig = rec.accounting._consumables.eligibility
+        assertEq(tonumber(elig.tabEligibleFrom), cutTs,
+            label .. ": tabEligibleFrom floored to cutover")
+        assertEq(elig.liveCutoverMarker, cutover.cutoverMarker,
+            label .. ": liveCutoverMarker retained")
+        local itemFrom = tonumber(elig.items and (elig.items["9125"] or elig.items[9125]))
+        assertTrue(itemFrom == nil or itemFrom >= cutTs,
+            label .. ": item cutoff not below cutover got=" .. tostring(itemFrom))
+        assertEq(tonumber(rec.accounting._consumables.bankTab), 2,
+            label .. ": bank tab from replayed op")
+        assertTrue(type(rec.accounting._consumables.requestedItems["9125"]) == "table"
+            or type(rec.accounting._consumables.requestedItems[9125]) == "table",
+            label .. ": requested item from replayed op")
+
+        world.time = cutTs + 300
+        local spanning = makeDepositEvidence(rec, {
+            itemId = 9125, quantity = 3, donor = "Span-Garona",
+            observedAt = cutTs + 300, ageHours = 0,
+            approxTxnTime = cutTs + 60,
+            occurrenceIndex = 1,
+            neighborsOlder = { "older|span|" .. label },
+            neighborsNewer = { "newer|span|" .. label },
+        })
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(spanning, pair[1], pair[2])
+        end
+        assertEq(tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9125]) or 0, 0,
+            label .. ": spanning deposit uncredited")
+
+        world.time = cutTs + 7200
+        local clear = makeDepositEvidence(rec, {
+            itemId = 9125, quantity = 5, donor = "Clear-Garona",
+            observedAt = cutTs + 7200, ageHours = 0,
+            occurrenceIndex = 2,
+            neighborsOlder = { "older|clear|" .. label },
+            neighborsNewer = { "newer|clear|" .. label },
+        })
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(clear, pair[1], pair[2])
+        end
+        assertEq(tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9125]) or 0, 5,
+            label .. ": clearly post-cutover deposit credits")
+    end
+
+    -- Order 1: descriptor → campaign → tab → item.
     SpectrumFederationDB = {}
     switchPlayer("Bob", "Player-1-Bob", 2)
     GS._adoptionEpoch = 0
@@ -22636,63 +22719,14 @@ do
     local bob = GS:GetCurrentRecord()
     assertEq(bob.activation, GS.ACTIVATION_ACTIVE, "3C25: bob active from descriptor")
     assertEq(tonumber(bob.accounting._consumables.eligibility.tabEligibleFrom), cutTs,
-        "3C25: eligibility floor from cutover before campaign replay")
-    -- Force historical campaign replay that would otherwise regress the floor.
-    local stCamp, reasonCamp = providerApply({
-        kind = "gs-op",
-        op = campStored,
-        boundary = header,
-    }, "Alice-Garona")
-    assertTrue(stCamp == "accepted" or stCamp == "duplicate",
-        "3C25: campaign replay st=" .. tostring(stCamp) .. " r=" .. tostring(reasonCamp))
+        "3C25: eligibility floor from cutover before config replay")
+    replayConfigOps("3C25 desc-first")
     bob = GS:GetCurrentRecord()
-    assertEq(tonumber(bob.accounting._consumables.eligibility.tabEligibleFrom), cutTs,
-        "3C25: cutover floor survives start-campaign replay")
-    assertEq(bob.accounting._consumables.eligibility.liveCutoverMarker, cutover.cutoverMarker,
-        "3C25: liveCutoverMarker retained on eligibility")
-
-    -- Hour-spanning pre-cutover deposit (approx after cutover, real time may precede).
-    world.time = cutTs + 300
-    local spanning = makeDepositEvidence(bob, {
-        itemId = 9125, quantity = 3, donor = "Span-Garona",
-        observedAt = cutTs + 300, ageHours = 0,
-        approxTxnTime = cutTs + 60,
-        occurrenceIndex = 1,
-        neighborsOlder = { "older|span" },
-        neighborsNewer = { "newer|span" },
-    })
-    -- Ensure requested item exists on bob after sparse install.
-    bob.accounting._consumables.requestedItems = bob.accounting._consumables.requestedItems or {}
-    bob.accounting._consumables.requestedItems["9125"] = { itemId = 9125, goal = 40 }
-    bob.accounting._consumables.bankTab = 2
-    for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
-    }) do
-        GS:_AdmitObservationForTests(spanning, pair[1], pair[2])
-    end
-    assertEq(tonumber(GS:ProjectCampaignProgress(bob.currentCampaignId).itemTotals[9125]) or 0, 0,
-        "3C25: spanning deposit uncredited after descriptor-first replay")
-
-    local clear = makeDepositEvidence(bob, {
-        itemId = 9125, quantity = 5, donor = "Clear-Garona",
-        observedAt = cutTs + 7200, ageHours = 0,
-        occurrenceIndex = 2,
-        neighborsOlder = { "older|clear" },
-        neighborsNewer = { "newer|clear" },
-    })
-    world.time = cutTs + 7200
-    for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
-    }) do
-        GS:_AdmitObservationForTests(clear, pair[1], pair[2])
-    end
-    assertEq(tonumber(GS:ProjectCampaignProgress(bob.currentCampaignId).itemTotals[9125]) or 0, 5,
-        "3C25: clearly post-cutover deposit credits")
-
+    -- Historical tab timestamp must not win over the cutover floor.
+    assertTrue(tonumber(bob.accounting._consumables.eligibility.tabEligibleFrom) ~= tabTs
+        or tabTs >= cutTs,
+        "3C25: historical tab timestamp did not regress floor")
+    assertFloorAndCredit("3C25 desc-first")
     simulateRuntimeReload()
     bob = GS:GetCurrentRecord()
     assertEq(tonumber(bob.accounting._consumables.eligibility.tabEligibleFrom), cutTs,
@@ -22700,7 +22734,7 @@ do
     assertEq(tonumber(GS:ProjectCampaignProgress(bob.currentCampaignId).itemTotals[9125]) or 0, 5,
         "3C25: credit durable after reload")
 
-    -- Campaign-first order on a staged peer, then remote cutover: floor still applies.
+    -- Order 2: staged install → campaign/tab/item → remote cutover.
     SpectrumFederationDB = {}
     switchPlayer("Carol", "Player-1-Carol", 3)
     GS._adoptionEpoch = 0
@@ -22715,29 +22749,68 @@ do
     stagedDesc.liveCutover = nil
     stagedDesc.cutoverMarker = nil
     assertEq(providerApply(stagedDesc, "Alice-Garona"), "accepted", "3C25: staged install")
-    assertEq(providerApply({
-        kind = "gs-op", op = campStored, boundary = header,
-    }, "Alice-Garona"), "accepted", "3C25: campaign-first before cutover")
+    replayConfigOps("3C25 camp-first")
     local carol = GS:GetCurrentRecord()
     local preFloor = tonumber(carol.accounting._consumables.eligibility.tabEligibleFrom)
-    assertTrue(preFloor == startedAt or preFloor ~= cutTs,
-        "3C25: pre-cutover eligibility is campaign start")
-    local stCut = GS.InstallRemoteLiveCutover(carol, cutover, "club:42", {
-        quarantinePending = true,
-        member = GS.AuthenticateTransportSender("Alice-Garona"),
-        requireEditorAuthority = true,
-        bindActorToSender = false,
-    })
+    assertTrue(preFloor == tabTs or preFloor == startedAt or preFloor ~= cutTs,
+        "3C25: pre-cutover eligibility reflects historical ops")
+    local stCut = providerApply(descBody, "Alice-Garona")
     assertTrue(stCut == "accepted" or stCut == "duplicate",
-        "3C25: campaign-first then cutover st=" .. tostring(stCut))
+        "3C25: camp-first then descriptor st=" .. tostring(stCut))
+    carol = GS:GetCurrentRecord()
+    assertEq(carol.activation, GS.ACTIVATION_ACTIVE, "3C25: carol active after descriptor")
     assertEq(tonumber(carol.accounting._consumables.eligibility.tabEligibleFrom), cutTs,
-        "3C25: cutover floors eligibility after campaign-first")
+        "3C25: cutover floors eligibility after camp-first config replay")
+    assertFloorAndCredit("3C25 camp-first")
+
+    -- Historical campaign archive eligibility cannot bypass the live cutover floor.
+    local archId = "camp-arch-3c25"
+    carol.campaignArchives[archId] = {
+        schemaVersion = 1,
+        campaignId = archId,
+        generation = 1,
+        bankTab = 2,
+        requestedItems = { ["9125"] = { itemId = 9125, goal = 40 } },
+        eligibility = {
+            baselineEstablished = true,
+            baselineAt = startedAt,
+            tabEligibleFrom = startedAt,
+            items = { ["9125"] = itemTs },
+        },
+    }
+    carol.campaigns[archId] = {
+        id = archId, startedAt = startedAt, generation = 1, bankTabAtStart = 2,
+    }
+    local histEv = makeDepositEvidence(carol, {
+        itemId = 9125, quantity = 2, donor = "HistSpan-Garona",
+        observedAt = cutTs + 300, ageHours = 0,
+        approxTxnTime = cutTs + 60,
+        occurrenceIndex = 9,
+        campaignId = archId,
+        generation = 1,
+        neighborsOlder = { "older|hist" },
+        neighborsNewer = { "newer|hist" },
+    })
+    histEv.campaignId = archId
+    histEv.generation = 1
+    local stH1 = select(1, GS:_AdmitObservationForTests(histEv, "Player-1-Alice", "Alice-Garona"))
+    local stH2 = select(1, GS:_AdmitObservationForTests(histEv, "Player-1-Bob", "Bob-Garona"))
+    local stH3 = select(1, GS:_AdmitObservationForTests(histEv, "Player-1-Carol", "Carol-Garona"))
+    assertTrue(stH1 == "pending" or stH2 == "pending" or stH3 == "pending"
+        or stH1 == "rejected" or stH2 == "rejected" or stH3 == "rejected",
+        "3C25: historical spanning row not auto-credited")
+    local histProgress = GS.ProjectCampaignProgressOnRecord
+        and GS.ProjectCampaignProgressOnRecord(carol, archId)
+    local histTotal = histProgress and histProgress.itemTotals
+        and tonumber(histProgress.itemTotals[9125]) or 0
+    assertEq(histTotal, 0,
+        "3C25: archived campaign spanning stays uncredited under live cutover")
     disarmFreshBankSample()
     assertEq(#world.chat, 0, "3C25: no chat")
 end
 
 do
-    -- 3C26) A2: post-cutover adjustment converges regardless of event/descriptor order.
+    -- 3C26) A2: adjustment op / ledger event / descriptor order converges.
     local alice = seedActivatableCampaign(9126, 20)
     local _, st = GS:ActivateCanonicalDataset()
     assertEq(st, "accepted", "3C26: activate")
@@ -22751,13 +22824,14 @@ do
     assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "3C26: alice adjustment")
     assertEq(tonumber(GS:ProjectCampaignProgress(alice.currentCampaignId).itemTotals[9126]) or 0, 4,
         "3C26: alice live total")
+    local adjOpStored = snapshotOp(adjOp)
+    assertTrue(type(adjOpStored) == "table", "3C26: adjustment op snapshot")
     local adjEvent = nil
     for i = 1, #(alice.accounting._consumableEvents or {}) do
         local ev = alice.accounting._consumableEvents[i]
         if ev and ev.id == adjOp.id then
             adjEvent = {}
             for k, v in pairs(ev) do adjEvent[k] = v end
-            adjEvent.gsProductionCredit = true -- forged claim must not be required
             break
         end
     end
@@ -22766,8 +22840,70 @@ do
     local campaignId = alice.currentCampaignId
     local permission = alice.permission
     local aliceSnapshot = alice
+    local descBody = {
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = datasetId,
+        editorRankPosition = 3,
+        permissionRevisionId = permission.revisionId,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = marker,
+        liveCutover = GS.DescribeLiveCutover(cutover),
+        currentCampaignId = campaignId,
+    }
 
     local function seedStagedPeer(name, guid, rank, priorEvents)
+        -- Deep-copy consumables so peers do not share alice's live maps/events.
+        -- Operations stay empty (valid shape) so ADJUST_QUANTITY still mutates the
+        -- ledger on first admit — alice's accepted adjustment must not pre-exist.
+        local srcCons = aliceSnapshot.accounting._consumables
+        local cons = {
+            guild = srcCons.guild,
+            bankTab = srcCons.bankTab,
+            requestedItems = {},
+            generation = srcCons.generation,
+            configSeq = srcCons.configSeq,
+            eventSeq = 0,
+            txnRegistry = {},
+        }
+        if type(srcCons.requestedItems) == "table" then
+            for ik, iv in pairs(srcCons.requestedItems) do
+                if type(iv) == "table" then
+                    local copy = {}
+                    for fk, fv in pairs(iv) do copy[fk] = fv end
+                    cons.requestedItems[ik] = copy
+                else
+                    cons.requestedItems[ik] = iv
+                end
+            end
+        end
+        local elig = {
+            baselineEstablished = true,
+            baselineAt = cutTs - 100,
+            tabEligibleFrom = cutTs - 100,
+            items = {},
+        }
+        if type(srcCons.eligibility) == "table"
+            and type(srcCons.eligibility.items) == "table" then
+            for ik, iv in pairs(srcCons.eligibility.items) do
+                local itemFrom = tonumber(iv)
+                -- Keep item keys but hold them below cutover until descriptor floors.
+                elig.items[ik] = (itemFrom and itemFrom < cutTs) and itemFrom or (cutTs - 100)
+            end
+        end
+        cons.eligibility = elig
+        local prior = {}
+        if type(priorEvents) == "table" then
+            for i = 1, #priorEvents do
+                local src = priorEvents[i]
+                if type(src) == "table" then
+                    local row = {}
+                    for k, v in pairs(src) do row[k] = v end
+                    prior[#prior + 1] = row
+                end
+            end
+        end
         SpectrumFederationDB = {
             guildSupplies = {
                 schemaVersion = 1,
@@ -22784,22 +22920,41 @@ do
                         campaignContext = aliceSnapshot.campaignContext or {},
                         accounting = {
                             schemaVersion = 1,
-                            _consumables = aliceSnapshot.accounting._consumables,
-                            _consumableEvents = priorEvents or {},
+                            _consumables = cons,
+                            _consumableEvents = prior,
                             _consumableEventArchive = {},
                             _mutationSeq = 1,
                         },
-                        observations = aliceSnapshot.observations or { byCampaign = {} },
+                        observations = {
+                            byCampaign = {
+                                [campaignId] = {
+                                    schemaVersion = 1, seq = 0, scopes = {}, pending = {},
+                                },
+                            },
+                        },
                         identityLinks = aliceSnapshot.identityLinks,
-                        operations = aliceSnapshot.operations,
-                        confirmationRefs = aliceSnapshot.confirmationRefs or {},
+                        operations = {
+                            schemaVersion = 1,
+                            order = {},
+                            records = {},
+                            heads = {},
+                            pending = {},
+                            conflicts = {},
+                            openConflicts = {},
+                        },
+                        confirmationRefs = {},
                     },
                 },
             },
         }
+        setPlayer(name .. "-Garona", guid, rank)
         switchPlayer(name, guid, rank)
         GS._root = nil
         GS._rootValid = false
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._pendingRelay = {}
+        GS._adoption = nil
         initGS()
         GS:EnsureGossipProvider()
         local rec, reason = GS:GetCurrentRecord()
@@ -22811,96 +22966,111 @@ do
     local function copyEvent(src)
         local e = {}
         for k, v in pairs(src) do e[k] = v end
+        e.gsProductionCredit = true -- forged claim must not mint credit alone
+        e.gsSourceCutoverMarker = "forged-marker"
         return e
     end
 
-    -- Order 1: event then descriptor.
-    local bob = seedStagedPeer("Bob", "Player-1-Bob", 2, {})
-    local forgedEvent = copyEvent(adjEvent)
-    forgedEvent.gsProductionCredit = true
-    forgedEvent.gsSourceCutoverMarker = "forged-marker"
-    local stEv1, reasonEv1 = providerApply({
-        kind = "gs-ledger-event",
-        datasetId = datasetId,
-        cutoverMarker = marker,
-        event = forgedEvent,
-    }, "Alice-Garona")
-    assertTrue(stEv1 == "accepted" or stEv1 == "duplicate",
-        "3C26: bob event-first st=" .. tostring(stEv1) .. " r=" .. tostring(reasonEv1))
-    bob = GS:GetCurrentRecord()
-    assertEq(bob.activation, GS.ACTIVATION_STAGED, "3C26: bob still staged after event")
-    local stCut1 = providerApply({
-        kind = "dataset-desc",
-        schemaVersion = 1,
-        guildKey = "club:42",
-        datasetId = datasetId,
-        editorRankPosition = 3,
-        permissionRevisionId = permission.revisionId,
-        activation = GS.ACTIVATION_ACTIVE,
-        cutoverMarker = marker,
-        liveCutover = GS.DescribeLiveCutover(cutover),
-        currentCampaignId = campaignId,
-    }, "Alice-Garona")
-    assertTrue(stCut1 == "accepted" or stCut1 == "duplicate",
-        "3C26: bob descriptor after event st=" .. tostring(stCut1))
-    bob = GS:GetCurrentRecord()
-    local bobCredit = nil
-    for i = 1, #(bob.accounting._consumableEvents or {}) do
-        local ev = bob.accounting._consumableEvents[i]
-        if ev and ev.id == adjOp.id then
-            bobCredit = ev.gsProductionCredit
-            assertEq(ev.gsSourceCutoverMarker, marker, "3C26: bob stores transport marker")
-            break
-        end
+    local function applyOp(label)
+        local st, reason = providerApply({ kind = "gs-op", op = adjOpStored }, "Alice-Garona")
+        assertTrue(st == "accepted" or st == "duplicate",
+            label .. " op st=" .. tostring(st) .. " r=" .. tostring(reason))
+        return st
     end
-    assertEq(bobCredit, true, "3C26: event-then-descriptor credits legitimate adjustment")
-    assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9126]) or 0, 4,
-        "3C26: bob totals after event-first")
 
-    -- Order 2: descriptor then event.
-    local carol = seedStagedPeer("Carol", "Player-1-Carol", 3, {})
-    local stCut2 = providerApply({
-        kind = "dataset-desc",
-        schemaVersion = 1,
-        guildKey = "club:42",
-        datasetId = datasetId,
-        editorRankPosition = 3,
-        permissionRevisionId = permission.revisionId,
-        activation = GS.ACTIVATION_ACTIVE,
-        cutoverMarker = marker,
-        liveCutover = GS.DescribeLiveCutover(cutover),
-        currentCampaignId = campaignId,
-    }, "Alice-Garona")
-    assertTrue(stCut2 == "accepted" or stCut2 == "duplicate",
-        "3C26: carol descriptor-first st=" .. tostring(stCut2))
-    local stEv2, reasonEv2 = providerApply({
-        kind = "gs-ledger-event",
-        datasetId = datasetId,
-        cutoverMarker = marker,
-        event = (function()
-            local e = copyEvent(adjEvent)
-            e.gsProductionCredit = false
-            return e
-        end)(),
-    }, "Alice-Garona")
-    assertTrue(stEv2 == "accepted" or stEv2 == "duplicate",
-        "3C26: carol event after descriptor st=" .. tostring(stEv2)
-            .. " r=" .. tostring(reasonEv2))
-    carol = GS:GetCurrentRecord()
-    local carolCredit = nil
-    for i = 1, #(carol.accounting._consumableEvents or {}) do
-        local ev = carol.accounting._consumableEvents[i]
-        if ev and ev.id == adjOp.id then
-            carolCredit = ev.gsProductionCredit
-            break
-        end
+    local function applyLedger(label)
+        local st, reason = providerApply({
+            kind = "gs-ledger-event",
+            datasetId = datasetId,
+            cutoverMarker = marker,
+            event = copyEvent(adjEvent),
+        }, "Alice-Garona")
+        assertTrue(st == "accepted" or st == "duplicate",
+            label .. " ledger st=" .. tostring(st) .. " r=" .. tostring(reason))
+        return st
     end
-    assertEq(carolCredit, true, "3C26: descriptor-then-event credits")
-    assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9126]) or 0, 4,
-        "3C26: carol totals match bob")
+
+    local function applyDesc(label)
+        local st, reason = providerApply(descBody, "Alice-Garona")
+        assertTrue(st == "accepted" or st == "duplicate",
+            label .. " desc st=" .. tostring(st) .. " r=" .. tostring(reason))
+        return st
+    end
+
+    local function assertConverged(label)
+        local rec = GS:GetCurrentRecord()
+        assertEq(rec.activation, GS.ACTIVATION_ACTIVE, label .. ": active")
+        local found, credit, srcMarker = 0, nil, nil
+        for i = 1, #(rec.accounting._consumableEvents or {}) do
+            local ev = rec.accounting._consumableEvents[i]
+            if ev and (ev.id == adjOp.id or ev.opId == adjOp.id) then
+                found = found + 1
+                credit = ev.gsProductionCredit
+                srcMarker = ev.gsSourceCutoverMarker
+            end
+        end
+        assertEq(found, 1, label .. ": once-only adjustment rows=" .. tostring(found))
+        assertEq(srcMarker, marker, label .. ": transport marker reconciled")
+        assertEq(credit, true, label .. ": production credit")
+        assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9126]) or 0, 4,
+            label .. ": credited total")
+        simulateRuntimeReload()
+        rec = GS:GetCurrentRecord()
+        assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9126]) or 0, 4,
+            label .. ": durable after reload")
+        -- Outbound gossip preserves authenticated cutover provenance for peers.
+        GS:EnsureGossipProvider()
+        drainExportMaint(64)
+        local bodies = collectAllExportBodies()
+        local sawMarked = false
+        for i = 1, #bodies do
+            local body = bodies[i].body
+            if body and body.kind == "gs-ledger-event"
+                and body.event and (body.event.id == adjOp.id or body.event.opId == adjOp.id) then
+                assertEq(body.cutoverMarker, marker,
+                    label .. ": export body cutoverMarker")
+                sawMarked = true
+            end
+        end
+        assertTrue(sawMarked, label .. ": ledger export present with marker")
+    end
+
+    -- Sequence matrix through real provider admission.
+    local sequences = {
+        {
+            name = "op-ledger-desc",
+            player = { "Bob", "Player-1-Bob", 2 },
+            steps = { applyOp, applyLedger, applyDesc },
+        },
+        {
+            name = "op-desc-ledger",
+            player = { "Carol", "Player-1-Carol", 3 },
+            steps = { applyOp, applyDesc, applyLedger },
+        },
+        {
+            name = "ledger-op-desc",
+            player = { "Dave", "Player-1-Dave", 2 },
+            steps = { applyLedger, applyOp, applyDesc },
+        },
+        {
+            name = "desc-op-ledger",
+            player = { "Eve", "Player-1-Eve", 2 },
+            steps = { applyDesc, applyOp, applyLedger },
+        },
+    }
+    -- Ensure Eve exists in roster for editor-adjacent tests (rank 2 officer).
+    setPlayer("Eve-Garona", "Player-1-Eve", 2)
+
+    for _, seq in ipairs(sequences) do
+        seedStagedPeer(seq.player[1], seq.player[2], seq.player[3], {})
+        for _, step in ipairs(seq.steps) do
+            step("3C26 " .. seq.name)
+        end
+        assertConverged("3C26 " .. seq.name)
+    end
 
     -- Pre-cutover staged row without transport marker stays uncredited.
-    local dave = seedStagedPeer("Dave", "Player-1-Dave", 4, {
+    local frank = seedStagedPeer("Frank", "Player-1-Frank", 4, {
         {
             type = "adjustment",
             id = "ctx:gs:old-adj",
@@ -22917,20 +23087,44 @@ do
             gsProductionCredit = true,
         },
     })
-    GS.InstallRemoteLiveCutover(dave, cutover, "club:42", {
-        quarantinePending = true,
-        member = GS.AuthenticateTransportSender("Alice-Garona"),
-        requireEditorAuthority = true,
-        bindActorToSender = false,
-    })
-    assertEq(dave.accounting._consumableEvents[1].gsProductionCredit, false,
-        "3C26: pre-cutover row without source marker stays uncredited")
-    assertEq(tonumber(GS.ProjectCampaignProgressOnRecord(dave, campaignId).itemTotals[9126]) or 0, 0,
+    setPlayer("Frank-Garona", "Player-1-Frank", 4)
+    applyDesc("3C26 old-row")
+    frank = GS:GetCurrentRecord()
+    local oldCredit = nil
+    for i = 1, #(frank.accounting._consumableEvents or {}) do
+        local ev = frank.accounting._consumableEvents[i]
+        if ev and ev.id == "ctx:gs:old-adj" then
+            oldCredit = ev.gsProductionCredit
+            break
+        end
+    end
+    assertEq(oldCredit, false, "3C26: pre-cutover row without source marker stays uncredited")
+    assertEq(tonumber(GS.ProjectCampaignProgressOnRecord(frank, campaignId).itemTotals[9126]) or 0, 0,
         "3C26: forged/old staged totals remain zero")
-    simulateRuntimeReload()
-    dave = GS:GetCurrentRecord()
-    assertEq(dave.accounting._consumableEvents[1].gsProductionCredit, false,
-        "3C26: uncredited durable after reload")
+    -- Marked ledger for a different pre-cutover body must not upgrade the old row.
+    providerApply({
+        kind = "gs-ledger-event",
+        datasetId = datasetId,
+        cutoverMarker = marker,
+        event = {
+            type = "adjustment",
+            id = "ctx:gs:old-adj",
+            txnId = "ctx:gs:old-adj",
+            opId = "ctx:gs:old-adj",
+            itemId = 9126,
+            quantity = 9,
+            generation = tonumber(aliceSnapshot.accounting._consumables.generation) or 1,
+            timestamp = cutTs - 100,
+            actor = "OldAdj-Garona",
+            writer = "Player-1-Alice",
+            campaignId = campaignId,
+            datasetId = datasetId,
+            gsProductionCredit = true,
+        },
+    }, "Alice-Garona")
+    frank = GS:GetCurrentRecord()
+    assertEq(frank.accounting._consumableEvents[1].gsProductionCredit, false,
+        "3C26: marked but pre-cutover duplicate stays uncredited")
     disarmFreshBankSample()
     assertEq(#world.chat, 0, "3C26: no chat")
 end
