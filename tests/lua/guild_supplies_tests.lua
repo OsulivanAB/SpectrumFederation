@@ -4928,6 +4928,48 @@ do
     assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
     assertTrue(foundHelpGetText, "status help uses getText")
 
+    -- Activation guidance in status help (bank sample states; no Chat).
+    local statusHelpGetText
+    for _, sec in ipairs(pageDef.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "help" and type(item.getText) == "function" then
+                statusHelpGetText = item.getText
+                break
+            end
+        end
+        if statusHelpGetText then break end
+    end
+    assertTrue(type(statusHelpGetText) == "function", "status help getText captured")
+    -- Unset bank tab → actionable configure-tab guidance; campaign setup still available.
+    local unsetOp = GS:NewConfigOperation("set-bank-tab", "bankTab", nil)
+    if unsetOp then GS:ApplyStagedConfigOperation(unsetOp) end
+    GS:GetCurrentRecord().accounting._consumables.bankTab = nil
+    local helpUnset = statusHelpGetText()
+    assertTrue(type(helpUnset) == "string" and helpUnset:find("Configure a Guild Bank tab", 1, true),
+        "status help guides unset bank tab got=" .. tostring(helpUnset))
+    assertTrue(helpUnset:find("do not require the bank", 1, true)
+        or helpUnset:find("campaign setup", 1, true),
+        "status help notes config without open bank")
+    -- Restore tab; closed bank → open-bank guidance.
+    local tabOpUi = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOpUi), "accepted", "UI test restore bank tab")
+    GS._BankContextReadinessProbe = function() return false, "bank_closed" end
+    local helpClosed = statusHelpGetText()
+    assertTrue(helpClosed:find("Open the Guild Bank", 1, true),
+        "status help guides closed bank got=" .. tostring(helpClosed))
+    GS._BankContextReadinessProbe = function() return false, "log_pending" end
+    local helpPending = statusHelpGetText()
+    assertTrue(helpPending:find("fresh transaction-log sample", 1, true)
+        or helpPending:find("become available", 1, true),
+        "status help guides log pending got=" .. tostring(helpPending))
+    GS._BankContextReadinessProbe = function() return false, "tab_access_denied" end
+    local helpDenied = statusHelpGetText()
+    assertTrue(helpDenied:find("permission to view", 1, true)
+        or helpDenied:find("needs permission", 1, true),
+        "status help guides tab access denied got=" .. tostring(helpDenied))
+    GS._BankContextReadinessProbe = nil
+    assertEq(#world.chat, 0, "activation guidance emits no Chat")
+
     local edits = findEditBoxes(configPanel)
     assertTrue(#edits >= 1, "bank tab editbox present")
     local bankEdit = edits[1]
@@ -21484,6 +21526,34 @@ do
     end
     assertTrue(sawLiveCredit, "3C16: post-activation event marked production credit")
     disarmFreshBankSample()
+end
+
+do
+    -- 3C17) Actionable activation guidance for staged bank-sample states
+    assertTrue(type(GS.FormatActivationGuidance) == "function", "3C17: FormatActivationGuidance present")
+    local guideUnset = GS.FormatActivationGuidance({ reason = "bank_tab_unset" })
+    assertTrue(type(guideUnset) == "string" and guideUnset:find("Configure a Guild Bank tab", 1, true),
+        "3C17: unset tab guide")
+    assertTrue(guideUnset:find("do not require the bank", 1, true),
+        "3C17: unset notes config without bank")
+    local guideClosed = GS.FormatActivationGuidance({ reason = "bank_closed" })
+    assertTrue(guideClosed:find("Open the Guild Bank", 1, true), "3C17: closed bank guide")
+    assertTrue(guideClosed:find("configured tab", 1, true), "3C17: closed mentions configured tab")
+    local guidePending = GS.FormatActivationGuidance({ reason = "log_pending" })
+    assertTrue(guidePending:find("become available", 1, true)
+        or guidePending:find("fresh transaction-log sample", 1, true),
+        "3C17: log pending guide")
+    local guideNotUpdated = GS.FormatActivationGuidance({ reason = "log_not_updated" })
+    assertEq(guideNotUpdated, guidePending, "3C17: log_not_updated shares pending guide")
+    local guideDenied = GS.FormatActivationGuidance({ reason = "tab_access_denied" })
+    assertTrue(guideDenied:find("permission to view", 1, true), "3C17: access denied guide")
+    assertNil(GS.FormatActivationGuidance({ canActivate = true }), "3C17: nil when ready")
+    assertNil(GS.FormatActivationGuidance({ alreadyActive = true, reason = "already_activated" }),
+        "3C17: nil when already active")
+    -- Non-sample blockers fall back to FormatReasonText in Settings (no dedicated guide).
+    assertNil(GS.FormatActivationGuidance({ reason = "divergent_edit" }),
+        "3C17: no sample guide for divergent_edit")
+    assertEq(#world.chat, 0, "3C17: no chat")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

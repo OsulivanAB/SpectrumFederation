@@ -527,6 +527,45 @@ function GS:GetActivationReadiness()
     return result
 end
 
+--- Actionable Settings guidance while staged activation waits on a bank sample.
+-- Ordinary Initialize / campaign configuration does not require an open bank;
+-- only initial live activation needs a verified fresh transaction-log sample.
+-- @return string|nil full sentence for status/help, or nil to use FormatReasonText
+function GS.FormatActivationGuidance(readiness)
+    if type(readiness) ~= "table" then
+        return nil
+    end
+    if readiness.canActivate or readiness.alreadyActive then
+        return nil
+    end
+    local reason = readiness.reason or readiness.bankReason
+    if reason == "bank_tab_unset" then
+        return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_BANK_TAB_UNSET",
+            "Configure a Guild Bank tab below before activation. Initialize and campaign setup do not require the bank to be open.")
+    end
+    if reason == "bank_closed" then
+        return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_BANK_CLOSED",
+            "Open the Guild Bank and select the configured tab so a fresh transaction-log sample can be verified. Only live activation requires this sample.")
+    end
+    if reason == "not_observing" or reason == "tab_not_ready" then
+        return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_NOT_OBSERVING",
+            "Open the Guild Bank and select the configured tab so a fresh transaction-log sample can be taken for activation.")
+    end
+    if reason == "log_pending" or reason == "log_not_updated" then
+        return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_LOG_PENDING",
+            "The Guild Bank is open. Activation will become available once a fresh transaction-log sample for the configured tab is verified.")
+    end
+    if reason == "tab_access_denied" then
+        return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_TAB_ACCESS_DENIED",
+            "This character needs permission to view the configured Guild Bank tab before activation can proceed.")
+    end
+    if reason == "tab_access_unknown" then
+        return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_TAB_ACCESS_UNKNOWN",
+            "Bank tab access could not be verified. Open the Guild Bank on the configured tab, or check this character's bank permissions.")
+    end
+    return nil
+end
+
 --- Explicit authorized activation of the current staged guild dataset.
 -- Idempotent when already active with a matching cutover marker.
 -- @return record|nil, status ("accepted"|"duplicate"|"rejected"), reason|nil

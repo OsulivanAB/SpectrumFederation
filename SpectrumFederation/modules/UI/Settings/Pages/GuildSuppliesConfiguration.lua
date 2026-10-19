@@ -89,6 +89,7 @@ local pendingInitGuildKey = nil
 local pendingInitRankCount = nil
 local refreshQueued = false
 local rosterFrame = nil
+local bankFrame = nil
 
 --- Refresh controls through Page:Refresh so passCache bounds the render.
 local function RefreshPageControls()
@@ -304,8 +305,13 @@ local function StagedStatusText()
 			"Staged only — use Activate Guild Supplies at the Guild Bank when configuration is ready.")
 		local readiness = g and g.GetActivationReadiness and g:GetActivationReadiness() or nil
 		if readiness and not readiness.canActivate and readiness.reason then
-			activation = activation .. " " .. Loc("GUILD_SUPPLIES_STATUS_ACTIVATION_BLOCKED",
-				"Activation not ready: %s."):format(formatReason(readiness.reason))
+			local guide = g.FormatActivationGuidance and g.FormatActivationGuidance(readiness) or nil
+			if type(guide) == "string" and guide ~= "" then
+				activation = activation .. " " .. guide
+			else
+				activation = activation .. " " .. Loc("GUILD_SUPPLIES_STATUS_ACTIVATION_BLOCKED",
+					"Activation not ready: %s."):format(formatReason(readiness.reason))
+			end
 		end
 	end
 	local mismatch = g and g.GetDatasetMismatchState and g:GetDatasetMismatchState() or nil
@@ -1424,6 +1430,38 @@ local function EnsureRosterListener()
 	end)
 end
 
+--- Event-driven refresh when bank open/close/log updates change activation readiness.
+-- No continuous polling; coalesced via QueueRefresh while the page is visible.
+local function EnsureBankListener()
+	if bankFrame or type(CreateFrame) ~= "function" then
+		return
+	end
+	local frame = CreateFrame("Frame")
+	bankFrame = frame
+	local events = {
+		"GUILDBANKFRAME_OPENED",
+		"GUILDBANKFRAME_CLOSED",
+		"GUILDBANKLOG_UPDATE",
+		"PLAYER_INTERACTION_MANAGER_FRAME_SHOW",
+		"PLAYER_INTERACTION_MANAGER_FRAME_HIDE",
+	}
+	for i = 1, #events do
+		if frame.RegisterEvent then
+			pcall(frame.RegisterEvent, frame, events[i])
+		end
+	end
+	frame:SetScript("OnEvent", function(_, event, arg1)
+		if event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW"
+			or event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+			if not (Enum and Enum.PlayerInteractionType
+				and arg1 == Enum.PlayerInteractionType.GuildBanker) then
+				return
+			end
+		end
+		QueueRefresh()
+	end)
+end
+
 --- Coalesced refresh when adoption ready/expiry flips asynchronously (Settings open).
 local adoptionHooked = false
 local function EnsureAdoptionListener()
@@ -1450,6 +1488,7 @@ function Page:Build(panel)
 		return
 	end
 	EnsureRosterListener()
+	EnsureBankListener()
 	EnsureAdoptionListener()
 	BeginRenderPass()
 	renderer:Build(panel, Definition())
@@ -1482,6 +1521,7 @@ function Page:OnHide()
 end
 
 EnsureRosterListener()
+EnsureBankListener()
 EnsureAdoptionListener()
 
 SF.SettingsUI:RegisterPage(Page)
