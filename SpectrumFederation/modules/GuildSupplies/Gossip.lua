@@ -2709,10 +2709,19 @@ local function ValidateAndApply(record, ctx)
             return "rejected", "invalid_event"
         end
         event.datasetId = body.datasetId or localRecord.datasetId
+        -- Never trust self-declared credit/provenance on the event payload.
+        event.gsProductionCredit = nil
+        event.gsSourceCutoverMarker = nil
+        -- Transport-level marker from an authenticated active exporter only.
+        local sourceMarker = nil
+        if type(body.cutoverMarker) == "string" and body.cutoverMarker ~= "" then
+            sourceMarker = body.cutoverMarker
+        end
         return GS:AdmitLedgerEvent(event, {
             sender = sender,
             member = member,
             offlineRecord = localRecord,
+            sourceCutoverMarker = sourceMarker,
             -- Donation catch-up is occurrence-deduped; adjustments need editor auth
             -- unless this is a preserved historical body (handled inside Admit).
             relay = false,
@@ -2988,6 +2997,12 @@ function GS.NotifyLocalDurableChange(reason)
             else
                 start = hw + 1
             end
+            local liveMarker = nil
+            if GS.IsLiveActive and GS.IsLiveActive(record)
+                and type(record.liveCutover) == "table"
+                and type(record.liveCutover.cutoverMarker) == "string" then
+                liveMarker = record.liveCutover.cutoverMarker
+            end
             for i = start, nLive do
                 local event = events[i]
                 if type(event) == "table" and type(event.id) == "string" then
@@ -2997,6 +3012,8 @@ function GS.NotifyLocalDurableChange(reason)
                             kind = "gs-ledger-event",
                             datasetId = record.datasetId,
                             event = event,
+                            -- Active-exporter provenance for order-independent credit.
+                            cutoverMarker = liveMarker,
                         })
                     end
                 end
@@ -3443,6 +3460,12 @@ function GS.NotifyLocalDurableChange(reason)
         -- #388 cold/reload: pace accepted ledger history into the export index.
         -- Archive phase first (prior generations), then live current-generation.
         if exportState.ledgerBuildNeeded and used < slice then
+            local coldMarker = nil
+            if GS.IsLiveActive and GS.IsLiveActive(record)
+                and type(record.liveCutover) == "table"
+                and type(record.liveCutover.cutoverMarker) == "string" then
+                coldMarker = record.liveCutover.cutoverMarker
+            end
             local function upsertLedgerList(list, startAt)
                 local start = math.max(1, tonumber(startAt) or 1)
                 if type(list) ~= "table" then
@@ -3461,6 +3484,7 @@ function GS.NotifyLocalDurableChange(reason)
                                 kind = "gs-ledger-event",
                                 datasetId = record.datasetId,
                                 event = event,
+                                cutoverMarker = coldMarker,
                             })
                         end
                     end

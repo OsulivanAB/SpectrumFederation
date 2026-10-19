@@ -100,14 +100,16 @@ function BankLog:BuildGuildSuppliesContext(record, opts)
     if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
         return nil
     end
+    local sampleOnly = opts.sampleOnly == true
     local requestedSet = O.RequestedSetFromConfig(cfg)
     local hasRequested = false
     for _ in pairs(requestedSet) do
         hasRequested = true
         break
     end
-    if not hasRequested then return nil end
-    local sampleOnly = opts.sampleOnly == true
+    -- Sample-only staged activation may query an empty requested-item campaign;
+    -- live donation observation still requires at least one requested item.
+    if not hasRequested and not sampleOnly then return nil end
     return {
         source = "guildSupplies",
         sampleOnly = sampleOnly,

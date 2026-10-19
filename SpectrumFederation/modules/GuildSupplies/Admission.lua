@@ -5822,6 +5822,13 @@ local function ApplyRemoteCampaignMutation(record, stored, boundary)
     cfg.eligibility = {}
     -- Original startedAt / boundary timestamps — never receipt time.
     GS.EstablishCampaignBaseline(cfg, boundary.startedAt or stored.timestamp)
+    -- Descriptor-first active bootstrap installs liveCutover before historical
+    -- start-campaign replay; re-floor eligibility so campaign startedAt cannot
+    -- regress the immutable cutover (#389). Adoption PublishAdoptionTemp also
+    -- refreshes; this covers live gossip catch-up without waiting for publish.
+    if GS.RefreshLiveEligibilityFloor then
+        GS.RefreshLiveEligibilityFloor(record)
+    end
     cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
     if GS.ShelvePriorGenerationsOnRecord then
         GS.ShelvePriorGenerationsOnRecord(record)

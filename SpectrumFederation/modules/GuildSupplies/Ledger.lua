@@ -13,6 +13,13 @@ GS.MAX_WITNESSES_PER_CLUSTER = 16
 GS.MAX_PENDING_EVIDENCE = 128
 -- Aggregate unfinished pending across all campaign buckets (not per arbitrary key).
 GS.MAX_PENDING_EVIDENCE_TOTAL = 256
+-- Per authenticated witness: max unfinished clusters they already appear in when
+-- opening a *new* cluster. Joining existing clusters is unaffected.
+GS.MAX_PENDING_EVIDENCE_PER_WITNESS = 32
+-- Headroom reserved for local bank observations under the per-campaign/total caps.
+GS.RESERVED_LOCAL_PENDING_EVIDENCE = 16
+-- Event-driven stale unfinished pending reclaim (align with ConsumablesObservation).
+GS.PENDING_EVIDENCE_TTL_SECONDS = 14 * 24 * 60 * 60
 GS.MAX_IDENTITY_LINK_GROUPS = 64
 GS.MAX_GUIDS_PER_LINK_GROUP = 16
 GS.MAX_LEDGER_EVENTS = 4096
@@ -414,6 +421,89 @@ local function UnfinishedPendingCount(pending)
         end
     end
     return n
+end
+
+--- Drop unfinished pending clusters whose lastSeen exceeds the TTL.
+-- Event-driven reclaim only (no polling). Never touches verified ledger rows.
+local function ReclaimStaleUnfinishedPending(pending, now)
+    if type(pending) ~= "table" then
+        return 0
+    end
+    local ttl = tonumber(GS.PENDING_EVIDENCE_TTL_SECONDS) or (14 * 24 * 60 * 60)
+    now = tonumber(now) or Now()
+    local write = 1
+    local removed = 0
+    for read = 1, #pending do
+        local cluster = pending[read]
+        local keep = true
+        if type(cluster) == "table" and cluster.status ~= "verified" then
+            local lastSeen = tonumber(cluster.lastSeen) or tonumber(cluster.firstSeen) or 0
+            if lastSeen > 0 and (now - lastSeen) > ttl then
+                keep = false
+                removed = removed + 1
+            end
+        end
+        if keep then
+            pending[write] = cluster
+            write = write + 1
+        end
+    end
+    for i = write, #pending do
+        pending[i] = nil
+    end
+    return removed
+end
+
+local function CountWitnessUnfinishedClusters(pending, witnessGuid)
+    if type(pending) ~= "table" or type(witnessGuid) ~= "string" or witnessGuid == "" then
+        return 0
+    end
+    local n = 0
+    for i = 1, #pending do
+        local cluster = pending[i]
+        if type(cluster) == "table" and cluster.status ~= "verified"
+            and type(cluster.witnesses) == "table"
+            and cluster.witnesses[witnessGuid] ~= nil then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+--- Whether a new unfinished cluster may be opened for this witness.
+-- Local bank observations keep reserved headroom; remote live gossip evidence is
+-- capped per witness and cannot consume the reserved local slots. Authenticated
+-- adoption replay uses the full campaign/total caps (source-authoritative transfer).
+local function CanOpenNewPendingCluster(record, pending, witnessGuid, admissionCtx)
+    local perCap = tonumber(GS.MAX_PENDING_EVIDENCE) or 128
+    local totalCap = tonumber(GS.MAX_PENDING_EVIDENCE_TOTAL) or 256
+    local reserved = tonumber(GS.RESERVED_LOCAL_PENDING_EVIDENCE) or 16
+    local perWitness = tonumber(GS.MAX_PENDING_EVIDENCE_PER_WITNESS) or 32
+    local unfinished = UnfinishedPendingCount(pending)
+    local totalUnfinished = CountTotalUnfinishedPending(record)
+    local isLocal = admissionCtx and (admissionCtx.localWrite or admissionCtx.exportEvidence)
+    local isAdoption = admissionCtx and admissionCtx.adoptionReplay
+    if not isLocal and not isAdoption then
+        local remotePerCap = perCap - reserved
+        if remotePerCap < 1 then
+            remotePerCap = 1
+        end
+        local remoteTotalCap = totalCap - reserved
+        if remoteTotalCap < 1 then
+            remoteTotalCap = 1
+        end
+        if unfinished >= remotePerCap or totalUnfinished >= remoteTotalCap then
+            return false, "full"
+        end
+        if CountWitnessUnfinishedClusters(pending, witnessGuid) >= perWitness then
+            return false, "witness_quota"
+        end
+        return true
+    end
+    if unfinished >= perCap or totalUnfinished >= totalCap then
+        return false, "full"
+    end
+    return true
 end
 
 local function EvidenceView(row)
@@ -1989,16 +2079,23 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     end
     local pending = camp.pending
     CompactVerifiedPending(pending)
+    -- Near capacity: reclaim stale unfinished clusters before admitting new ones.
+    local nearFull = UnfinishedPendingCount(pending)
+        >= ((GS.MAX_PENDING_EVIDENCE or 128) - (GS.RESERVED_LOCAL_PENDING_EVIDENCE or 16))
+        or CountTotalUnfinishedPending(record)
+        >= ((GS.MAX_PENDING_EVIDENCE_TOTAL or 256) - (GS.RESERVED_LOCAL_PENDING_EVIDENCE or 16))
+    if nearFull then
+        if ReclaimStaleUnfinishedPending(pending, Now()) > 0 then
+            BumpAccountingMutation(record)
+        end
+    end
     local match, how = AmbiguousBest(pending, row)
     if how == "ambiguous" then
         -- Relays/replays must not mint unlimited zero-witness ambiguous clusters.
         -- Local writers may retain one ambiguous cluster for recovery export only
         -- when capacity remains; never count the replay as a vote.
         if admissionCtx.localWrite or admissionCtx.exportEvidence then
-            local perCap = UnfinishedPendingCount(pending) < (GS.MAX_PENDING_EVIDENCE or 128)
-            local totalCap = CountTotalUnfinishedPending(record)
-                < (GS.MAX_PENDING_EVIDENCE_TOTAL or 256)
-            if perCap and totalCap then
+            if select(1, CanOpenNewPendingCluster(record, pending, witnessGuid, admissionCtx)) then
                 pending[#pending + 1] = {
                     schemaVersion = 1,
                     status = "ambiguous",
@@ -2019,11 +2116,18 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
 
     local cluster = match
     if not cluster then
-        if UnfinishedPendingCount(pending) >= (GS.MAX_PENDING_EVIDENCE or 128) then
-            return "rejected", "full"
+        local openOk, openErr = CanOpenNewPendingCluster(
+            record, pending, witnessGuid, admissionCtx)
+        if not openOk then
+            -- Last-chance stale reclaim then retry capacity once.
+            if ReclaimStaleUnfinishedPending(pending, Now()) > 0 then
+                BumpAccountingMutation(record)
+                openOk, openErr = CanOpenNewPendingCluster(
+                    record, pending, witnessGuid, admissionCtx)
+            end
         end
-        if CountTotalUnfinishedPending(record) >= (GS.MAX_PENDING_EVIDENCE_TOTAL or 256) then
-            return "rejected", "full"
+        if not openOk then
+            return "rejected", openErr or "full"
         end
         cluster = {
             schemaVersion = 1,
@@ -2557,6 +2661,10 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 campaignId = campId,
                 datasetId = record.datasetId,
             }
+            if type(admissionCtx.sourceCutoverMarker) == "string"
+                and admissionCtx.sourceCutoverMarker ~= "" then
+                stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
+            end
             local appendOk, appendErr = AppendLedgerEvent(record, stored)
             if not appendOk then
                 return "rejected", appendErr or "full"
@@ -2649,6 +2757,12 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             campaignId = eventCampaign,
             datasetId = record.datasetId,
         }
+        -- Authenticated active-exporter marker from transport body (never the
+        -- self-declared event field). Enables order-independent credit on cutover.
+        if type(admissionCtx.sourceCutoverMarker) == "string"
+            and admissionCtx.sourceCutoverMarker ~= "" then
+            stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
+        end
         local appendOk, appendErr = AppendLedgerEvent(record, stored)
         if not appendOk then
             return "rejected", appendErr or "full"

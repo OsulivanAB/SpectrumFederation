@@ -275,15 +275,47 @@ local function CopyLiveCutover(cutover)
 end
 
 --- Apply the agreed live eligibility boundary onto accounting._consumables.
--- Does not credit donations. Clears item cutoffs so only the tab boundary gates
--- post-activation deposits until new items are added after activation.
-local function ApplyLiveEligibilityBoundary(cfg, cutover)
+-- Initial activation (opts.refreshOnly unset): replaces eligibility so only the
+-- tab cutover gates post-activation deposits until new items are added.
+-- Refresh (opts.refreshOnly): floors tab/item cutoffs to the immutable cutover
+-- without wiping legitimate later campaign/item cutoffs rebuilt by replay.
+local function ApplyLiveEligibilityBoundary(cfg, cutover, opts)
     if type(cfg) ~= "table" or type(cutover) ~= "table" then
         return false
     end
     local ts = tonumber(cutover.contextObservedAt)
     if not ts then
         return false
+    end
+    opts = opts or {}
+    if opts.refreshOnly then
+        local eligibility = cfg.eligibility
+        if type(eligibility) ~= "table" then
+            eligibility = {}
+            cfg.eligibility = eligibility
+        end
+        local tabFrom = tonumber(eligibility.tabEligibleFrom)
+        if not tabFrom or tabFrom < ts then
+            eligibility.tabEligibleFrom = ts
+        end
+        local baselineAt = tonumber(eligibility.baselineAt)
+        if not baselineAt or baselineAt < ts then
+            eligibility.baselineAt = ts
+        end
+        eligibility.baselineEstablished = true
+        eligibility.liveCutoverAt = ts
+        eligibility.liveCutoverMarker = cutover.cutoverMarker
+        if type(eligibility.items) ~= "table" then
+            eligibility.items = {}
+        else
+            for key, value in pairs(eligibility.items) do
+                local itemFrom = tonumber(value)
+                if itemFrom and itemFrom < ts then
+                    eligibility.items[key] = ts
+                end
+            end
+        end
+        return true
     end
     cfg.eligibility = {
         items = {},
@@ -294,6 +326,20 @@ local function ApplyLiveEligibilityBoundary(cfg, cutover)
         liveCutoverMarker = cutover.cutoverMarker,
     }
     return true
+end
+
+--- Re-floor accounting eligibility to an already-installed live cutover.
+-- Used after campaign replay rebuilds eligibility from historical startedAt.
+-- Preserves later item cutoffs (refreshOnly). No-op when not live.
+function GS.RefreshLiveEligibilityFloor(record)
+    if not GS.IsLiveActive(record) or type(record.liveCutover) ~= "table" then
+        return false
+    end
+    local cfg = record.accounting and record.accounting._consumables
+    if type(cfg) ~= "table" then
+        return false
+    end
+    return ApplyLiveEligibilityBoundary(cfg, record.liveCutover, { refreshOnly = true })
 end
 
 --- Drop unfinished pending evidence so staged/synthetic observations cannot
@@ -345,6 +391,41 @@ function GS.ClassifyPreActivationAccounting(record)
     end
     StampLedgerListProductionCredit(record.accounting._consumableEvents, false)
     StampLedgerListProductionCredit(record.accounting._consumableEventArchive, false)
+end
+
+--- Reclassify retained rows when a remote live cutover installs on a staged peer.
+-- Never trusts self-declared gsProductionCredit. Only rows admitted from an
+-- authenticated active exporter (gsSourceCutoverMarker matches the installed
+-- cutover) and after the cutover boundary may become production credit. All
+-- other retained staged/synthetic rows stay uncredited (#389 order convergence).
+function GS.ClassifyAccountingForRemoteCutover(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return
+    end
+    local marker = record.liveCutover and record.liveCutover.cutoverMarker
+    local function classifyList(list)
+        if type(list) ~= "table" then
+            return
+        end
+        for i = 1, #list do
+            local event = list[i]
+            if type(event) == "table" then
+                local credit = false
+                if type(marker) == "string" and marker ~= ""
+                    and event.gsSourceCutoverMarker == marker
+                    and GS.IsEvidenceAfterLiveCutover then
+                    local approx = tonumber(event.approxTxnTime) or tonumber(event.timestamp)
+                    local afterOk = select(1, GS.IsEvidenceAfterLiveCutover(record, {
+                        approxTxnTime = approx,
+                    }))
+                    credit = afterOk and true or false
+                end
+                event.gsProductionCredit = credit
+            end
+        end
+    end
+    classifyList(record.accounting._consumableEvents)
+    classifyList(record.accounting._consumableEventArchive)
 end
 
 --- Whether an accepted ledger event counts toward live campaign totals.
@@ -608,6 +689,10 @@ function GS.FormatActivationGuidance(readiness)
         return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_LOG_PENDING",
             "The Guild Bank is open. Activation will become available once a fresh transaction-log sample for the configured tab is verified.")
     end
+    if reason == "log_stale" then
+        return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_LOG_STALE",
+            "The Guild Bank log sample is stale. Select the configured tab again (or reopen the Guild Bank) so a fresh transaction-log sample can be verified before activation.")
+    end
     if reason == "tab_access_denied" then
         return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_TAB_ACCESS_DENIED",
             "This character needs permission to view the configured Guild Bank tab before activation can proceed.")
@@ -810,13 +895,10 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     end
     if GS.IsLiveActive(record) and type(record.liveCutover) == "table" then
         if record.liveCutover.cutoverMarker == copy.cutoverMarker then
-            -- Adoption replay may have rebuilt eligibility via campaign ops;
-            -- refresh the agreed live boundary without reclassifying ledger (#389).
+            -- Adoption / campaign replay may have rebuilt eligibility; refresh the
+            -- agreed live floor without wiping later item cutoffs or reclassifying.
             if opts.refreshEligibility then
-                local cfg = record.accounting and record.accounting._consumables
-                if type(cfg) == "table" then
-                    ApplyLiveEligibilityBoundary(cfg, copy)
-                end
+                GS.RefreshLiveEligibilityFloor(record)
             end
             return "duplicate", "already_activated"
         end
@@ -843,7 +925,13 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
         QuarantinePreActivationPending(record)
     end
     if opts.classifyPreActivation ~= false then
-        GS.ClassifyPreActivationAccounting(record)
+        -- Same-dataset catch-up: preserve authenticated post-cutover rows that
+        -- arrived while this peer was still staged (marker-bound provenance).
+        if GS.ClassifyAccountingForRemoteCutover then
+            GS.ClassifyAccountingForRemoteCutover(record)
+        else
+            GS.ClassifyPreActivationAccounting(record)
+        end
     end
 
     if GS._ValidateGuildRecordStructure then

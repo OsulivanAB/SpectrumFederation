@@ -268,6 +268,8 @@ end
 --- Narrow read-only readiness for a trustworthy bank-log sample on this tab.
 -- Adapts existing ConsumablesBankLog evidence; never queries, polls, or starts
 -- a second observer. Tests may inject GS._BankContextReadinessProbe(tab).
+-- Bounded wall-clock age for a completed sample stamp (matches BankLog WallNow).
+GS.MAX_BANK_SAMPLE_AGE_SECONDS = 120
 -- @return boolean ready, string|nil reason
 function GS.IsBankContextSampleReady(bankTab)
     local tab = tonumber(bankTab)
@@ -302,6 +304,19 @@ function GS.IsBankContextSampleReady(bankTab)
         and type(ctx.guildGuid) == "string" and ctx.guildGuid ~= ""
         and BankLog.lastFreshLogGuild ~= ctx.guildGuid then
         return false, "guild_mismatch"
+    end
+    -- Require a recent completed sample; stale cached logs must not activate.
+    local stampedAt = tonumber(BankLog.lastFreshLogAt)
+    if not stampedAt then
+        return false, "log_not_updated"
+    end
+    -- Same wall clock as ConsumablesBankLog WallNow / lastFreshLogAt.
+    local obs = SF.ConsumablesObservation
+    local now = (obs and obs.Now and obs.Now()) or time()
+    now = tonumber(now) or 0
+    local maxAge = tonumber(GS.MAX_BANK_SAMPLE_AGE_SECONDS) or 120
+    if now < stampedAt or (now - stampedAt) > maxAge then
+        return false, "log_stale"
     end
     if type(ctx.guildGuid) == "string" and ctx.guildGuid ~= "" then
         local gsCtx = GS.GetCurrentContext and GS:GetCurrentContext()
@@ -866,7 +881,7 @@ local function FormatHistoryTimestamp(event)
     return tostring(math.floor(ts))
 end
 
-local function FormatCampaignHistoryText(event, itemName)
+local function FormatCampaignHistoryText(event, itemName, markUncredited)
     local itemId = tonumber(event.itemId)
     local qty = tonumber(event.quantity) or 0
     local name = itemName
@@ -894,6 +909,9 @@ local function FormatCampaignHistoryText(event, itemName)
     else
         return nil
     end
+    if markUncredited then
+        body = Loc("GUILD_SUPPLIES_HISTORY_UNCREDITED", "[uncredited] %s"):format(body)
+    end
     local when = FormatHistoryTimestamp(event)
     if when then
         return Loc("GUILD_SUPPLIES_HISTORY_WITH_TIME", "%s — %s"):format(when, body)
@@ -903,6 +921,8 @@ end
 
 --- Bounded read-only donation/adjustment history for one campaign.
 -- Newest first. Does not mutate state or invent live verification.
+-- Current live campaigns hide uncredited rows (aligned with progress). Archived
+-- campaigns stay inspectable with an explicit uncredited label (#389).
 -- @return rows table, total number|nil, err string|nil
 function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
     local record, reason = GS:GetCurrentRecord()
@@ -920,13 +940,20 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         return {}, 0, nil
     end
 
+    local isArchived = campaignId ~= record.currentCampaignId
+        and type(record.campaignArchives) == "table"
+        and type(record.campaignArchives[campaignId]) == "table"
+    local filterUncredited = GS.IsLiveActive(record) and not isArchived
+
     local ordered = {}
     local seen = {}
     ForEachCampaignLedgerEvent(record, generation, function(event)
-        -- Keep history aligned with live progress: uncredited staged rows stay
-        -- in durable storage but are not shown as ordinary credited history (#389).
-        if GS.EventCountsTowardLiveProgress
-            and not GS.EventCountsTowardLiveProgress(record, event) then
+        local credited = true
+        if GS.EventCountsTowardLiveProgress then
+            credited = GS.EventCountsTowardLiveProgress(record, event) and true or false
+        end
+        -- Live current campaign: keep history aligned with live progress.
+        if filterUncredited and not credited then
             return
         end
         local id = event.id
@@ -969,7 +996,9 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 itemName = value
             end
         end
-        local text = FormatCampaignHistoryText(event, itemName)
+        local markUncredited = isArchived and GS.IsLiveActive(record)
+            and event.gsProductionCredit ~= true
+        local text = FormatCampaignHistoryText(event, itemName, markUncredited)
         if text and text ~= "" then
             rows[#rows + 1] = {
                 text = text,
@@ -981,6 +1010,7 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 attributed = event.attributed,
                 timestamp = event.timestamp,
                 generation = event.generation,
+                uncredited = markUncredited and true or nil,
             }
         end
     end
@@ -1636,6 +1666,11 @@ function GS:ApplyStagedCampaignOperation(op, context)
     -- Fresh eligibility object so EstablishCampaignBaseline never mutates the prior map.
     cfg.eligibility = {}
     GS.EstablishCampaignBaseline(cfg, op.timestamp)
+    -- Live records keep the immutable cutover as an eligibility floor even when
+    -- a new campaign starts (startedAt is normally later; fail closed if not).
+    if GS.RefreshLiveEligibilityFloor then
+        GS.RefreshLiveEligibilityFloor(record)
+    end
     -- configSeq bump for projection invalidation without gossip.
     cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
     -- Shelve prior-generation ledger rows so the live list cannot permanently
