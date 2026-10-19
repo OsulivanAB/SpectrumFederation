@@ -21910,42 +21910,50 @@ do
 end
 
 do
-    -- 3C21) First-hour boundary-spanning bank evidence is retained (not credited, not lost)
+    -- 3C21) Cutover eligibility proof: hour-bucket spanning stays uncredited;
+    -- only deposits whose entire ±1h uncertainty window is after cutover credit.
+    -- Activation samples stamp counts/status only (no per-txn identities), so
+    -- aging cannot prove a spanning row is post-cutover (#389).
     local record = seedActivatableCampaign(9121, 30)
     local _, st = GS:ActivateCanonicalDataset()
     assertEq(st, "accepted", "3C21: activated")
     record = GS:GetCurrentRecord()
+    -- Concrete failure case (relative): deposit 5m before cutover, activate at T,
+    -- observe T+5m (age=0 → approx T+5m), then T+2h05m (age=2 → same approx).
+    -- Aging must not unlock credit for that still-spanning occurrence.
     local boundary = tonumber(record.liveCutover.contextObservedAt)
     local cfg = record.accounting._consumables
-    -- Immediate post-activation observation: ageHours=0 spans the cutover hour bucket.
-    local observedAt = boundary + 60
-    world.time = observedAt
     local O = SF.ConsumablesObservation
-    local spanning = makeDepositEvidence(record, {
-        itemId = 9121, quantity = 8, observedAt = observedAt, ageHours = 0,
-        donor = "FirstHour-Garona",
+
+    -- Pre-cutover deposit observed shortly after activation (ageHours=0 → approx looks post).
+    local observeEarly = boundary + 300 -- +5 minutes
+    world.time = observeEarly
+    local preAsSpanning = makeDepositEvidence(record, {
+        itemId = 9121, quantity = 8,
+        observedAt = observeEarly,
+        ageHours = 0, -- approxTxnTime = T+5m (actual deposit was T-5m)
+        donor = "PreCutoverHour-Garona",
         occurrenceIndex = 1,
-        neighborsOlder = { "older|fh" },
-        neighborsNewer = { "newer|fh" },
+        neighborsOlder = { "older|pre55" },
+        neighborsNewer = { "newer|pre55" },
     })
-    assertTrue(spanning.approxTxnTime >= boundary, "3C21: approx at/after boundary")
-    assertTrue(O.EvidenceSpansEligibilityBoundary(spanning, cfg.eligibility),
-        "3C21: spans eligibility boundary")
-    assertTrue(O.IsEvidenceEligible(spanning, cfg.eligibility),
-        "3C21: still eligible (not pre-cutover)")
+    assertEq(preAsSpanning.approxTxnTime, observeEarly, "3C21: early approx is observe time")
+    assertTrue(preAsSpanning.approxTxnTime >= boundary, "3C21: approx looks post-cutover")
+    assertTrue(O.EvidenceSpansEligibilityBoundary(preAsSpanning, cfg.eligibility),
+        "3C21: pre-cutover row still spans hour bucket")
 
     local snapshot = {
         guildGuid = tostring(cfg.guild.guid),
         bankTab = tonumber(cfg.bankTab),
         generation = tonumber(cfg.generation),
         observedBy = "Alice-Garona",
-        observedAt = observedAt,
+        observedAt = observeEarly,
         eligibility = cfg.eligibility,
         requestedSet = O.RequestedSetFromConfig(cfg),
         rows = {
             {
                 type = "deposit",
-                name = "FirstHour-Garona",
+                name = "PreCutoverHour-Garona",
                 itemLink = "|Hitem:9121::::::::|h[Flask]|h",
                 itemID = 9121,
                 count = 8,
@@ -21954,7 +21962,7 @@ do
             },
         },
     }
-    local listed = O.ListEligibleEvidenceFromSnapshot(snapshot, { now = observedAt })
+    local listed = O.ListEligibleEvidenceFromSnapshot(snapshot, { now = observeEarly })
     assertTrue(#listed >= 1, "3C21: spanning row retained in evidence list")
     local found = false
     for i = 1, #listed do
@@ -21963,89 +21971,96 @@ do
             assertEq(listed[i].boundaryAmbiguous, true, "3C21: marked boundaryAmbiguous")
         end
     end
-    assertTrue(found, "3C21: first-hour deposit present in listed evidence")
+    assertTrue(found, "3C21: boundary-spanning deposit present in listed evidence")
 
     for _, pair in ipairs({
         { "Player-1-Alice", "Alice-Garona" },
         { "Player-1-Bob", "Bob-Garona" },
         { "Player-1-Carol", "Carol-Garona" },
     }) do
-        local ast, ars = GS:_AdmitObservationForTests(spanning, pair[1], pair[2])
+        local ast, ars = GS:_AdmitObservationForTests(preAsSpanning, pair[1], pair[2])
         assertTrue(ast == "pending" or ast == "duplicate",
             "3C21: three-witness path retains ambiguous st=" .. tostring(ast)
                 .. " r=" .. tostring(ars))
         if ast == "pending" then
-            assertTrue(ars == "ambiguous_boundary" or ars == "awaiting_witnesses",
+            assertEq(ars, "ambiguous_boundary",
                 "3C21: pending reason got=" .. tostring(ars))
         end
     end
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
         0, "3C21: no unsafe auto-credit for boundary-spanning row")
 
-    -- Pre-activation backfill still rejected.
-    local pre = makeDepositEvidence(record, {
+    -- Age the same occurrence (14:05, ageHours=2): approx stays 12:05. Three fresh
+    -- witnesses must still never credit — aging is not post-cutover proof.
+    local observeAged = boundary + 300 + 7200 -- 14:05
+    world.time = observeAged
+    local agedPre = makeDepositEvidence(record, {
+        itemId = 9121, quantity = 8,
+        observedAt = observeAged,
+        ageHours = 2,
+        donor = "PreCutoverHour-Garona",
+        occurrenceIndex = 1,
+        neighborsOlder = { "older|pre55" },
+        neighborsNewer = { "newer|pre55" },
+    })
+    assertEq(agedPre.approxTxnTime, preAsSpanning.approxTxnTime,
+        "3C21: aged rescan keeps reconstructed txn time")
+    assertTrue(O.EvidenceSpansEligibilityBoundary(agedPre, cfg.eligibility),
+        "3C21: aged hour-bucket still spans; no reconcile-by-age")
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+    }) do
+        local ast, ars = GS:_AdmitObservationForTests(agedPre, pair[1], pair[2])
+        assertTrue(ast == "pending" or ast == "duplicate",
+            "3C21: aged pre-cutover st=" .. tostring(ast) .. " r=" .. tostring(ars))
+        if ast == "pending" then
+            assertEq(ars, "ambiguous_boundary",
+                "3C21: aged pre stays ambiguous got=" .. tostring(ars))
+        end
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        0, "3C21: pre-cutover deposit never credits after aging + witnesses")
+
+    -- Reload must not upgrade retained ambiguous evidence into credit.
+    simulateRuntimeReload()
+    assertEq(GS:Initialize(SpectrumFederationDB), true, "3C21: reload initialize")
+    settleRoster()
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "3C21: record after reload")
+    cfg = record.accounting._consumables
+    world.time = observeAged + 60
+    assertEq(select(1, GS:_AdmitObservationForTests(agedPre, "Player-1-Alice", "Alice-Garona")),
+        "duplicate", "3C21: reload replay duplicate")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        0, "3C21: reload cannot upgrade uncertainty into credit")
+
+    -- Explicitly pre-boundary approx (age reconstructs before cutover) rejected.
+    local explicitPre = makeDepositEvidence(record, {
         itemId = 9121, quantity = 3,
         observedAt = boundary + 100,
-        ageHours = 2, -- approx before boundary
-        donor = "PreCutover-Garona",
+        ageHours = 2,
+        donor = "ExplicitPre-Garona",
         occurrenceIndex = 2,
         neighborsOlder = { "older|pre" },
         neighborsNewer = { "newer|pre" },
     })
-    assertTrue(pre.approxTxnTime < boundary, "3C21: pre evidence before boundary")
+    assertTrue(explicitPre.approxTxnTime < boundary, "3C21: explicit pre before boundary")
     for _, pair in ipairs({
         { "Player-1-Alice", "Alice-Garona" },
         { "Player-1-Bob", "Bob-Garona" },
         { "Player-1-Carol", "Carol-Garona" },
     }) do
-        GS:_AdmitObservationForTests(pre, pair[1], pair[2])
+        GS:_AdmitObservationForTests(explicitPre, pair[1], pair[2])
     end
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
-        0, "3C21: pre-cutover still uncredited")
+        0, "3C21: explicit pre-cutover still uncredited")
 
-    -- Same first-hour occurrence rescanned after the hour ages: one forged/single
-    -- clear vote must not inherit the three ambiguous witnesses.
-    world.time = boundary + 60 + 7200
-    local agedSame = makeDepositEvidence(record, {
-        itemId = 9121, quantity = 8,
-        observedAt = world.time,
-        ageHours = 2, -- approxTxnTime stays boundary+60; aged past first-hour window
-        donor = "FirstHour-Garona",
-        occurrenceIndex = 1,
-        neighborsOlder = { "older|fh" },
-        neighborsNewer = { "newer|fh" },
-    })
-    assertEq(agedSame.approxTxnTime, spanning.approxTxnTime,
-        "3C21: aged rescan keeps reconstructed txn time")
-    assertTrue(O.EvidenceSpansEligibilityBoundary(agedSame, cfg.eligibility),
-        "3C21: hour-bucket still formally spans; reconciliation uses age>=1")
-    local stOne, rOne = GS:_AdmitObservationForTests(agedSame, "Player-1-Alice", "Alice-Garona")
-    assertTrue(stOne == "pending" or stOne == "duplicate",
-        "3C21: single aged rescan pending st=" .. tostring(stOne) .. " r=" .. tostring(rOne))
-    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
-        0, "3C21: single aged observation does not inherit ambiguous quorum")
-
-    -- Fresh independent aged witnesses of the same occurrence → exactly one credit.
-    for _, pair in ipairs({
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
-        { "Player-1-Dave", "Dave-Garona" },
-    }) do
-        local ast, ars = GS:_AdmitObservationForTests(agedSame, pair[1], pair[2])
-        assertTrue(ast == "pending" or ast == "accepted" or ast == "duplicate",
-            "3C21: aged quorum st=" .. tostring(ast) .. " r=" .. tostring(ars))
-    end
-    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
-        8, "3C21: same first-hour occurrence credits once after aged reconciliation")
-
-    -- Replay / fourth witness stays idempotent.
-    assertEq(select(1, GS:_AdmitObservationForTests(agedSame, "Player-1-Alice", "Alice-Garona")),
-        "duplicate", "3C21: aged replay duplicate")
-    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
-        8, "3C21: still once after replay")
-
-    -- Clearly post-cutover *distinct* deposit (outside the hour uncertainty) still credits.
-    world.time = boundary + 10800
+    -- Provably post-cutover: entire uncertainty window after boundary
+    -- (approxTxnTime - 3600 >= cutover ⇒ EvidenceSpansEligibilityBoundary false).
+    world.time = boundary + 10800 -- 15:00
     local clear = makeDepositEvidence(record, {
         itemId = 9121, quantity = 5, observedAt = world.time, ageHours = 0,
         donor = "ClearPost-Garona",
@@ -22053,6 +22068,8 @@ do
         neighborsOlder = { "older|clr" },
         neighborsNewer = { "newer|clr" },
     })
+    assertTrue(clear.approxTxnTime - 3600 >= boundary,
+        "3C21: clear deposit uncertainty entirely after cutover")
     assertEq(O.EvidenceSpansEligibilityBoundary(clear, cfg.eligibility), false,
         "3C21: clear post-cutover does not span")
     for _, pair in ipairs({
@@ -22060,13 +22077,16 @@ do
         { "Player-1-Bob", "Bob-Garona" },
         { "Player-1-Carol", "Carol-Garona" },
     }) do
-        GS:_AdmitObservationForTests(clear, pair[1], pair[2])
+        local ast = select(1, GS:_AdmitObservationForTests(clear, pair[1], pair[2]))
+        assertTrue(ast == "pending" or ast == "accepted" or ast == "duplicate",
+            "3C21: clear admit st=" .. tostring(ast))
     end
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
-        13, "3C21: clear post-cutover credits once more (8+5)")
-    -- Pre-cutover fixture from earlier remains excluded.
+        5, "3C21: clear post-cutover credits exactly once")
+    assertEq(select(1, GS:_AdmitObservationForTests(clear, "Player-1-Dave", "Dave-Garona")),
+        "duplicate", "3C21: clear replay duplicate")
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
-        13, "3C21: totals exclude pre-cutover backfill")
+        5, "3C21: still once after clear replay; spanning/pre remain excluded")
     disarmFreshBankSample()
     assertEq(#world.chat, 0, "3C21: no chat")
 end

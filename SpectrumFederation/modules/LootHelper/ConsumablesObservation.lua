@@ -829,9 +829,10 @@ end
 --- Build eligible deposit evidence rows from a bank-log snapshot (#389 live path).
 -- Does not mutate observation stores or credit donations.
 -- Boundary-spanning hour-bucket rows are retained so three-witness admission can
--- park them as pending/ambiguous; they must not be silently discarded here.
--- Activation samples only stamp counts/status (not per-txn identities), so first
--- hour post-cutover deposits cannot be auto-credited from baseline alone.
+-- park them as ambiguous; they must not be silently discarded here.
+-- Activation samples only stamp counts/status (not per-txn identities). Blizzard
+-- hour ages never prove that a spanning row is post-cutover — aging alone must
+-- not unlock production credit — so those occurrences stay uncredited.
 function O.ListEligibleEvidenceFromSnapshot(snapshot, opts)
     opts = opts or {}
     if type(snapshot) ~= "table" then
