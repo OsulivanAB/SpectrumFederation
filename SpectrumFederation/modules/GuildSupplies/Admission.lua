@@ -334,7 +334,8 @@ function GS.SenderHasEditorAuthority(member, opts)
         return false, "not_configured"
     end
 
-    if type(record) ~= "table" or record.activation ~= GS.ACTIVATION_STAGED then
+    if type(record) ~= "table"
+        or not (GS.IsSupportedActivation and GS.IsSupportedActivation(record.activation)) then
         return false, "unsupported_activation"
     end
     local perm = record.permission
@@ -1410,9 +1411,16 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
         end
     end
 
+    local installActivation = GS.ACTIVATION_STAGED
+    if descriptor.activation == GS.ACTIVATION_ACTIVE
+        and type(descriptor.liveCutover) == "table" then
+        installActivation = GS.ACTIVATION_ACTIVE
+    elseif GS.IsSupportedActivation and GS.IsSupportedActivation(descriptor.activation) then
+        installActivation = descriptor.activation
+    end
     local record = {
         schemaVersion = GS.SCHEMA_VERSION,
-        activation = GS.ACTIVATION_STAGED,
+        activation = installActivation,
         datasetId = descriptor.datasetId,
         permission = {
             editorRankPosition = editorPos,
@@ -1459,7 +1467,23 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
         },
         confirmationRefs = {},
         migration = nil,
+        liveCutover = nil,
     }
+
+    -- Active remote datasets install with the authenticated cutover marker so
+    -- joining clients adopt live authority without a local bank sample (#389).
+    if installActivation == GS.ACTIVATION_ACTIVE then
+        if type(descriptor.liveCutover) ~= "table" then
+            return "rejected", "missing_live_cutover"
+        end
+        local stCut, cutReason = GS.InstallRemoteLiveCutover(record, descriptor.liveCutover, guildKey, {
+            quarantinePending = false,
+            forceActive = true,
+        })
+        if stCut ~= "accepted" and stCut ~= "duplicate" then
+            return "rejected", cutReason or "invalid_live_cutover"
+        end
+    end
 
     if GS._ValidateGuildRecordStructure then
         local ok, err = GS._ValidateGuildRecordStructure(guildKey, record)
@@ -1483,8 +1507,8 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
         record.permission.pendingPolicyRevisionId = nil
         GS._bootstrapEditLock[guildKey] = nil
     end
-    DebugInfo("installed remote staged dataset key=%s dataset=%s from=%s",
-        guildKey, descriptor.datasetId, tostring(member.name))
+    DebugInfo("installed remote dataset key=%s dataset=%s activation=%s from=%s",
+        guildKey, descriptor.datasetId, tostring(record.activation), tostring(member.name))
     if GS._NotifyLocalDurableChange then
         GS._NotifyLocalDurableChange("install")
     end
@@ -5049,8 +5073,13 @@ end
 
 local function EnsureRecordForRemote(guildKey, opts)
     opts = opts or {}
+    local function supported(rec)
+        return type(rec) == "table"
+            and GS.IsSupportedActivation
+            and GS.IsSupportedActivation(rec.activation)
+    end
     if type(opts.offlineRecord) == "table" then
-        if opts.offlineRecord.activation ~= GS.ACTIVATION_STAGED then
+        if not supported(opts.offlineRecord) then
             return nil, "unsupported_activation"
         end
         return opts.offlineRecord
@@ -5062,7 +5091,7 @@ local function EnsureRecordForRemote(guildKey, opts)
     if type(raw) ~= "table" then
         return nil, "not_configured"
     end
-    if raw.activation ~= GS.ACTIVATION_STAGED then
+    if not supported(raw) then
         return nil, "unsupported_activation"
     end
     return raw
@@ -7565,6 +7594,9 @@ function GS.NotePeerDataset(peerName, datasetId, caps)
         datasetId = datasetId,
         editorRankPosition = caps and caps.editorRankPosition or nil,
         permissionRevisionId = caps and caps.permissionRevisionId or nil,
+        activation = caps and caps.activation or nil,
+        cutoverMarker = caps and caps.cutoverMarker or nil,
+        liveCutover = caps and caps.liveCutover or nil,
         at = GetServerTime and GetServerTime() or nil,
     }
 end

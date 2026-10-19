@@ -1528,7 +1528,8 @@ local function CurrentGuildRecord()
         return nil
     end
     local raw = GS._root and GS._root.guilds and GS._root.guilds[ctx.guildKey]
-    if type(raw) ~= "table" or raw.activation ~= GS.ACTIVATION_STAGED then
+    if type(raw) ~= "table"
+        or not (GS.IsSupportedActivation and GS.IsSupportedActivation(raw.activation)) then
         return nil
     end
     return raw, ctx.guildKey
@@ -1620,6 +1621,8 @@ local function RebuildExportIndex()
             or nil,
         currentCampaignId = record.currentCampaignId,
         activation = record.activation,
+        cutoverMarker = record.liveCutover and record.liveCutover.cutoverMarker or nil,
+        liveCutover = GS.DescribeLiveCutover and GS.DescribeLiveCutover(record.liveCutover) or nil,
         acceptedOpCount = 0,
         transferOpCount = 0,
         campaignCount = 0,
@@ -2081,6 +2084,31 @@ local function ValidateAndApply(record, ctx)
             return st, reason
         end
         if body.datasetId == localRecord.datasetId then
+            -- Same dataset: compatible peers may push live activation/cutover
+            -- without requiring a local bank sample (#389 catch-up).
+            if body.activation == GS.ACTIVATION_ACTIVE
+                and type(body.liveCutover) == "table"
+                and localRecord.activation == GS.ACTIVATION_STAGED
+                and GS.InstallRemoteLiveCutover then
+                local stCut, cutReason = GS.InstallRemoteLiveCutover(
+                    localRecord, body.liveCutover, member.guildKey,
+                    { quarantinePending = true })
+                if stCut == "accepted" or stCut == "duplicate" then
+                    if GS._NotifyLocalDurableChange then
+                        GS._NotifyLocalDurableChange("activation")
+                    end
+                    return stCut == "duplicate" and "duplicate" or "accepted", cutReason
+                end
+                return "rejected", cutReason or "live_activation_conflict"
+            end
+            if GS.IsLiveActive and GS.IsLiveActive(localRecord)
+                and body.activation == GS.ACTIVATION_ACTIVE
+                and type(body.cutoverMarker) == "string"
+                and type(localRecord.liveCutover) == "table"
+                and body.cutoverMarker ~= localRecord.liveCutover.cutoverMarker then
+                -- Divergent live markers for the same dataset id: fail closed.
+                return "rejected", "live_activation_conflict"
+            end
             return "duplicate", "duplicate"
         end
         -- Foreign dataset while local exists: surface mismatch; do not merge.
@@ -3604,6 +3632,8 @@ function GS.NotifyLocalDurableChange(reason)
                 or nil,
             currentCampaignId = record.currentCampaignId,
             activation = record.activation,
+            cutoverMarker = record.liveCutover and record.liveCutover.cutoverMarker or nil,
+            liveCutover = GS.DescribeLiveCutover and GS.DescribeLiveCutover(record.liveCutover) or nil,
             acceptedOpCount = acceptedOpCount,
             transferOpCount = transferOpCount,
             campaignCount = campaignCount,
