@@ -269,74 +269,164 @@ local function ClearPendingConflictChoice()
 	pendingConflictChosen = nil
 end
 
-local function StagedStatusText()
+--- Compact Configuration status area: status / campaign / next step / warnings.
+-- One snapshot per render pass so display/help rows stay consistent without
+-- repeating activation or campaign guidance across rows.
+local function BuildStatusSnapshot()
+	local snap = {
+		status = "",
+		showCampaign = false,
+		campaign = "",
+		nextStep = nil,
+		warning = nil,
+	}
 	local caps = Caps()
-	if not caps.canRead then
-		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
-			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
-	end
 	local g = GS()
-	local record, recReason = CurrentRecord()
 	local formatReason = g and g.FormatReasonText or function(r)
 		return tostring(r or "unknown")
 	end
+
+	local function SetNextStep(body)
+		if type(body) ~= "string" or body == "" then
+			return
+		end
+		snap.nextStep = Loc("GUILD_SUPPLIES_NEXT_STEP_FMT", "Next step: %s"):format(body)
+	end
+
+	local function AppendWarning(text)
+		if type(text) ~= "string" or text == "" then
+			return
+		end
+		if snap.warning and snap.warning ~= "" then
+			snap.warning = snap.warning .. " " .. text
+		else
+			snap.warning = text
+		end
+	end
+
+	if not caps.canRead then
+		snap.status = Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
+			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
+		return snap
+	end
+
+	local record, recReason = CurrentRecord()
 	if not record then
 		if caps.reason == "not_configured" or recReason == "not_configured" then
-			return Loc("GUILD_SUPPLIES_STATUS_NOT_CONFIGURED",
-				"No staged Guild Supplies dataset for this guild yet. Use Initialize Guild Supplies.")
+			snap.status = Loc("GUILD_SUPPLIES_STATUS_VALUE_NOT_CONFIGURED", "Not configured")
+			SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_INITIALIZE",
+				"Use Initialize Guild Supplies to create a staged dataset for this guild."))
+			return snap
 		end
-		return Loc("GUILD_SUPPLIES_STATUS_UNAVAILABLE",
-			"Guild Supplies data is unavailable (%s)."):format(formatReason(caps.reason or recReason or "unknown"))
+		snap.status = Loc("GUILD_SUPPLIES_STATUS_VALUE_UNAVAILABLE", "Unavailable (%s)")
+			:format(formatReason(caps.reason or recReason or "unknown"))
+		return snap
 	end
-	local campaign = record.currentCampaignId
-	local activation
+
+	snap.showCampaign = true
+	local campaignId = record.currentCampaignId
+	if type(campaignId) == "string" and campaignId ~= "" then
+		snap.campaign = campaignId
+	else
+		snap.campaign = Loc("GUILD_SUPPLIES_CAMPAIGN_NOT_STARTED", "Not started.")
+	end
+
+	local warningCoversReason = {}
+	local mismatch = g and g.GetDatasetMismatchState and g:GetDatasetMismatchState() or nil
+	if mismatch and mismatch.blocked and mismatch.peers and mismatch.peers[1] then
+		local p = mismatch.peers[1]
+		AppendWarning(Loc("GUILD_SUPPLIES_ADOPTION_BLOCKED",
+			"A different staged dataset was advertised by %s (%s). Choose a source below to replace this client's local staged dataset, or cancel to keep the current one.")
+			:format(tostring(p.peerName), tostring(p.datasetId)))
+		warningCoversReason.dataset_mismatch = true
+	end
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption() or nil
+	if type(adop) == "table" then
+		AppendWarning(Loc("GUILD_SUPPLIES_ADOPTION_PENDING",
+			"Adoption in progress for dataset %s from %s. Waiting for a complete validated transfer before switching.")
+			:format(tostring(adop.sourceDatasetId), tostring(adop.sourcePeer)))
+		warningCoversReason.adoption_in_progress = true
+	end
+
 	if record.activation == (g and g.ACTIVATION_ACTIVE) then
 		local marker = record.liveCutover and record.liveCutover.cutoverMarker or "?"
-		activation = Loc("GUILD_SUPPLIES_STATUS_ACTIVE",
+		snap.status = Loc("GUILD_SUPPLIES_STATUS_ACTIVE",
 			"Live — Guild Supplies owns guild bank accounting for this guild (cutover %s).")
 			:format(tostring(marker))
 		local liveConflict = g and g.GetLiveActivationConflictState and g:GetLiveActivationConflictState() or nil
 		if liveConflict and liveConflict.blocked then
-			activation = activation .. " " .. Loc("GUILD_SUPPLIES_STATUS_LIVE_CONFLICT",
-				"Blocked: a peer advertised a conflicting live cutover marker. Adopt one canonical source before continuing.")
+			AppendWarning(Loc("GUILD_SUPPLIES_STATUS_LIVE_CONFLICT",
+				"Blocked: a peer advertised a conflicting live cutover marker. Adopt one canonical source before continuing."))
+			warningCoversReason.live_activation_conflict = true
+			SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_RESOLVE_CUTOVER",
+				"Adopt one canonical live source below before continuing."))
 		end
-	else
-		activation = Loc("GUILD_SUPPLIES_STATUS_STAGED",
-			"Staged only — use Activate Guild Supplies at the Guild Bank when configuration is ready.")
-		local readiness = g and g.GetActivationReadiness and g:GetActivationReadiness() or nil
-		if readiness and not readiness.canActivate and readiness.reason then
-			local guide = g.FormatActivationGuidance and g.FormatActivationGuidance(readiness) or nil
-			if type(guide) == "string" and guide ~= "" then
-				activation = activation .. " " .. guide
-			else
-				activation = activation .. " " .. Loc("GUILD_SUPPLIES_STATUS_ACTIVATION_BLOCKED",
-					"Activation not ready: %s."):format(formatReason(readiness.reason))
-			end
+		return snap
+	end
+
+	snap.status = Loc("GUILD_SUPPLIES_STATUS_VALUE_STAGED", "Staged")
+	local readiness = g and g.GetActivationReadiness and g:GetActivationReadiness() or nil
+	if type(campaignId) ~= "string" or campaignId == "" then
+		SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_NEW_CAMPAIGN",
+			"Start a New Campaign to begin configuring Guild Supplies."))
+		return snap
+	end
+	if readiness and readiness.canActivate then
+		SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_ACTIVATE_READY",
+			"Configuration is ready. Use Activate Guild Supplies at the Guild Bank."))
+		return snap
+	end
+	if readiness and readiness.reason and not warningCoversReason[readiness.reason] then
+		local guide = g.FormatActivationGuidance and g.FormatActivationGuidance(readiness) or nil
+		if type(guide) == "string" and guide ~= "" then
+			SetNextStep(guide)
+		else
+			SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_ACTIVATION_BLOCKED",
+				"Activation not ready: %s."):format(formatReason(readiness.reason)))
 		end
 	end
-	local mismatch = g and g.GetDatasetMismatchState and g:GetDatasetMismatchState() or nil
-	local mismatchNote = ""
-	if mismatch and mismatch.blocked and mismatch.peers and mismatch.peers[1] then
-		local p = mismatch.peers[1]
-		mismatchNote = " " .. Loc("GUILD_SUPPLIES_ADOPTION_BLOCKED",
-			"A different staged dataset was advertised by %s (%s). Choose a source below to replace this client's local staged dataset, or cancel to keep the current one.")
-			:format(tostring(p.peerName), tostring(p.datasetId))
+	return snap
+end
+
+local function StatusSnapshot()
+	if passCache and passCache.statusSnapshot then
+		return passCache.statusSnapshot
 	end
-	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption() or nil
-	local adopNote = ""
-	if type(adop) == "table" then
-		adopNote = " " .. Loc("GUILD_SUPPLIES_ADOPTION_PENDING",
-			"Adoption in progress for dataset %s from %s. Waiting for a complete validated transfer before switching.")
-			:format(tostring(adop.sourceDatasetId), tostring(adop.sourcePeer))
+	local snap = BuildStatusSnapshot()
+	if passCache then
+		passCache.statusSnapshot = snap
 	end
-	if type(campaign) ~= "string" or campaign == "" then
-		return activation .. " "
-			.. Loc("GUILD_SUPPLIES_STATUS_NO_CAMPAIGN", "No campaign yet. Start a New Campaign before adding items.")
-			.. mismatchNote .. adopNote
-	end
-	return activation .. " "
-		.. Loc("GUILD_SUPPLIES_STATUS_CURRENT_CAMPAIGN", "Current campaign: %s"):format(campaign)
-		.. mismatchNote .. adopNote
+	return snap
+end
+
+local function StatusRowText()
+	return StatusSnapshot().status
+end
+
+local function CampaignRowVisible()
+	return StatusSnapshot().showCampaign == true
+end
+
+local function CampaignRowText()
+	return StatusSnapshot().campaign
+end
+
+local function NextStepVisible()
+	local step = StatusSnapshot().nextStep
+	return type(step) == "string" and step ~= ""
+end
+
+local function NextStepText()
+	return StatusSnapshot().nextStep or ""
+end
+
+local function WarningVisible()
+	local warning = StatusSnapshot().warning
+	return type(warning) == "string" and warning ~= ""
+end
+
+local function WarningText()
+	return StatusSnapshot().warning or ""
 end
 
 local function AdoptionSourceOptions()
@@ -723,9 +813,33 @@ local function Definition()
 					"Guild-keyed staged configuration. Does not depend on Loot Helper profiles."),
 				items = {
 					{
+						type = "display",
+						label = Loc("GUILD_SUPPLIES_STATUS_ROW_LABEL", "Current Status"),
+						get = StatusRowText,
+					},
+					{
+						type = "display",
+						label = Loc("GUILD_SUPPLIES_CAMPAIGN_ROW_LABEL", "Campaign"),
+						get = CampaignRowText,
+						visible = CampaignRowVisible,
+					},
+					{
 						type = "help",
 						indent = "label",
-						getText = StagedStatusText,
+						padTop = 4,
+						getText = NextStepText,
+						visible = NextStepVisible,
+					},
+					{
+						type = "help",
+						indent = "label",
+						padTop = 2,
+						getText = WarningText,
+						visible = WarningVisible,
+					},
+					{
+						type = "spacer",
+						height = 4,
 					},
 					{
 						type = "dropdown",
