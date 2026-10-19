@@ -534,6 +534,22 @@ local function ValidateGuildRecordStructure(guildKey, record)
         or type(accounting._consumableEventArchive) ~= "table" then
         return false, "invalid_accounting"
     end
+    -- Fail closed on over-cap / sparse / malformed restored ledger arrays.
+    -- Cheap length checks always; deep density scan is one-time/cached per
+    -- mutation revision so GetCurrentRecord hot paths stay bounded.
+    if GS.ValidateLedgerEventLists then
+        local listsOk, listsErr = GS.ValidateLedgerEventLists(accounting)
+        if not listsOk then
+            return false, listsErr or "invalid_accounting"
+        end
+    else
+        local maxLive = GS.MAX_LEDGER_EVENTS or 4096
+        local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+        if #accounting._consumableEvents > maxLive
+            or #accounting._consumableEventArchive > maxArch then
+            return false, "ledger_overflow"
+        end
+    end
     if not IsValidBankTabValue(cfg.bankTab) then
         return false, "invalid_accounting"
     end
