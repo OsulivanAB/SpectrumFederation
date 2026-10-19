@@ -60,6 +60,8 @@ local exportState = {
     ledgerBuildPhase = nil,
     -- Warm high-water for live _consumableEvents (not a fixed trailing window).
     ledgerWarmPos = 0,
+    -- Warm high-water for _consumableEventArchive (late historical appends).
+    ledgerArchiveWarmPos = 0,
     donationEvidenceBuildNeeded = false,
     donationEvidenceBuildCursor = nil,
     -- Invalidates queued maint closures after disable/replacement.
@@ -1730,6 +1732,9 @@ local function RebuildExportIndex()
     exportState.ledgerBuildPhase = "archive"
     local liveEvents = record.accounting and record.accounting._consumableEvents
     exportState.ledgerWarmPos = type(liveEvents) == "table" and #liveEvents or 0
+    -- Cold rebuild re-drains archive from the start; warm watermark advances as
+    -- the paced archive phase completes (see NotifyLocalDurableChange).
+    exportState.ledgerArchiveWarmPos = 0
     exportState.donationEvidenceBuildNeeded = donationEvidenceExportCount > 0
     exportState.donationEvidenceBuildCursor = nil
 
@@ -1826,6 +1831,21 @@ local function UpsertExportBody(id, body)
             prov.index.dirty = true
             prov.index.buildComplete = false
         end
+    end
+end
+
+--- Force paced archive→live ledger rebuild after TrimEventArchive removes IDs.
+-- Archive length can stay unchanged across shelve+trim while export IDs were
+-- dropped; warm high-water alone cannot detect that content swap.
+function GS.MarkLedgerArchiveExportStale()
+    exportState.ledgerArchiveWarmPos = 0
+    exportState.ledgerBuildNeeded = true
+    exportState.ledgerBuildPhase = "archive"
+    exportState.ledgerBuildCursor = 1
+    exportState.countsDirty = true
+    exportState.maintIdle = false
+    if providerRegistered and ScheduleExportMaintContinuation then
+        ScheduleExportMaintContinuation()
     end
 end
 
@@ -2732,6 +2752,7 @@ function GS:DisableGossipProvider()
     exportState.ledgerBuildCursor = nil
     exportState.ledgerBuildPhase = nil
     exportState.ledgerWarmPos = 0
+    exportState.ledgerArchiveWarmPos = 0
     exportState.donationEvidenceBuildCursor = nil
     exportState.pendingCursor = nil
     exportState.conflictCursor = nil
@@ -2873,6 +2894,10 @@ function GS.NotifyLocalDurableChange(reason)
             if type(events) ~= "table" then
                 events = {}
             end
+            local archive = record.accounting and record.accounting._consumableEventArchive
+            if type(archive) ~= "table" then
+                archive = {}
+            end
             -- High-water mark: export every not-yet-seen live row. When more
             -- than 32 events arrive between notifications, hand the backlog
             -- to the paced cold builder instead of dropping older IDs.
@@ -2880,14 +2905,31 @@ function GS.NotifyLocalDurableChange(reason)
             -- a shorter kept list; hw can then exceed #events and skip new rows.
             -- Reconcile by resetting warm pos and re-running archive→live paced
             -- construction so newly shelved + new live IDs stay exportable.
+            -- Late historical quorum appends grow the archive without shrinking
+            -- live; restart paced archive drain from the archive high-water so
+            -- descriptor acceptedLedgerCount cannot exceed exported IDs.
             local hw = tonumber(exportState.ledgerWarmPos) or 0
             local nLive = #events
-            if hw > nLive then
+            local nArch = #archive
+            local archHw = tonumber(exportState.ledgerArchiveWarmPos) or 0
+            if hw > nLive or nArch < archHw then
+                -- Live shrink (shelve) or archive trim: rebuild archive→live.
                 exportState.ledgerBuildNeeded = true
                 exportState.ledgerBuildPhase = "archive"
                 exportState.ledgerBuildCursor = 1
                 hw = 0
                 exportState.ledgerWarmPos = 0
+                exportState.ledgerArchiveWarmPos = 0
+                archHw = 0
+            elseif nArch > archHw then
+                -- Archive grew without live shrink (AppendArchivedLedgerEvent).
+                exportState.ledgerBuildNeeded = true
+                if exportState.ledgerBuildPhase ~= "archive" then
+                    exportState.ledgerBuildPhase = "archive"
+                    exportState.ledgerBuildCursor = archHw + 1
+                elseif exportState.ledgerBuildCursor == nil then
+                    exportState.ledgerBuildCursor = archHw + 1
+                end
             end
             local start = math.max(1, nLive - 31)
             if hw + 1 < start then
@@ -3391,6 +3433,7 @@ function GS.NotifyLocalDurableChange(reason)
                     exportState.ledgerBuildCursor = cursor
                     exportState.ledgerBuildPhase = "archive"
                 else
+                    exportState.ledgerArchiveWarmPos = type(archive) == "table" and #archive or 0
                     exportState.ledgerBuildPhase = "live"
                     exportState.ledgerBuildCursor = 1
                     phase = "live"
@@ -3416,6 +3459,8 @@ function GS.NotifyLocalDurableChange(reason)
                     exportState.ledgerBuildPhase = nil
                     exportState.ledgerBuildNeeded = false
                     exportState.ledgerWarmPos = #events
+                    local archDone = record.accounting and record.accounting._consumableEventArchive
+                    exportState.ledgerArchiveWarmPos = type(archDone) == "table" and #archDone or 0
                 end
             end
         end
