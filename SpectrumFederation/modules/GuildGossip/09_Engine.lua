@@ -1758,7 +1758,10 @@ local function handleManifest(sender, payload, stepLimits)
         pull.usableProgressAt = GG._Now()
         for _, ent in ipairs(entries) do
             local have = GG.IndexGetEntry(entry.index, ent.id)
+            local softAck = GG.HasTransientDeliveryAck
+                and GG.HasTransientDeliveryAck(entry, ent.id, ent.versionFp)
             if (not have or have.versionFp ~= ent.versionFp)
+                and not softAck
                 and not isKnownUnresolvedRevision(
                     pull.providerId, pull.peer, pull.scopeId, ent.id, ent.versionFp) then
                 pull.neededBodies[#pull.neededBodies + 1] = ent
@@ -2397,12 +2400,15 @@ end
 
 reopenUnresolvedEnumeration = function(providerId)
     local e = GG._engine
+    -- Snapshot keys first: Lua 5.1 pairs+delete can skip entries mid-walk.
     local snapshot = {}
     for key, item in pairs(e.unresolved or {}) do
-        if not providerId or item.providerId == providerId then
+        if not providerId or (item and item.providerId == providerId) then
             snapshot[#snapshot + 1] = { key = key, item = item }
-            e.unresolved[key] = nil
         end
+    end
+    for i = 1, #snapshot do
+        e.unresolved[snapshot[i].key] = nil
     end
     local touched = {}
     for _, row in ipairs(snapshot) do
@@ -2410,16 +2416,39 @@ reopenUnresolvedEnumeration = function(providerId)
         local ck = lengthPrefixedKey(item.peerKey or "", item.providerId or "", item.scopeId or "")
         if not touched[ck] then
             touched[ck] = true
-            -- Bookmarks only: obligations for this provider were already removed.
-            clearBookmarksForScope(item.peer, item.providerId, item.scopeId)
-            local peer = item.peerKey and e.peers[item.peerKey]
-            if peer and peer.covered then
-                peer.covered[item.providerId] = nil
-            end
+            -- Reuse scoped reopenCoverage semantics so a live outPull cannot
+            -- rewrite an advanced bookmark after obligations were cleared
+            -- mid-apply (e.g. adoption arena free inside ValidateAndApply).
+            reopenCoverageForUnresolved(item)
         end
     end
 end
 GG.ReopenUnresolvedEnumeration = reopenUnresolvedEnumeration
+
+-- Reopen bookmarks/coverage for a provider even when unresolved is empty.
+-- Soft-acked adoption deliveries leave no unresolved entry; cancel/expire must
+-- still clear advanced bookmarks so a re-adopt of the same source is pulled.
+local function reopenProviderCoverage(providerId)
+    if type(providerId) ~= "string" or providerId == "" then
+        return
+    end
+    local e = GG._engine
+    clearBookmarksForScope(nil, providerId, nil)
+    for _, peer in pairs(e.peers or {}) do
+        if type(peer) == "table" and type(peer.covered) == "table" then
+            peer.covered[providerId] = nil
+        end
+    end
+    local out = e.outPull
+    if out and out.providerId == providerId then
+        out.needsFollowUp = true
+        if GG._sched then
+            GG._sched.dirtyFollowUp = true
+        end
+        GG.MarkWorkPending()
+    end
+end
+GG.ReopenProviderCoverage = reopenProviderCoverage
 
 local function advanceOutPull(limits, now)
     local e = GG._engine

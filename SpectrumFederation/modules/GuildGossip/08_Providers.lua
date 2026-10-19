@@ -627,6 +627,40 @@ function GG.EnsureProviderIndex(entry, limits)
     return true
 end
 
+-- Runtime-only adoption buffering acknowledges delivery without publishing into
+-- the durable provider index. Soft-acks prevent immediate re-request while the
+-- session is open; cancel/expire/commit clear them. Live IndexUpsert remains
+-- reserved for durable accepts.
+local TRANSIENT_ACCEPT_DETAILS = {
+    adoption_buffer = true,
+    ready = true,
+    updated = true,
+}
+
+function GG.AckTransientDelivery(entry, recordId, versionFp)
+    if type(entry) ~= "table" or recordId == nil or versionFp == nil then
+        return
+    end
+    entry._transientDeliveryAck = entry._transientDeliveryAck or {}
+    entry._transientDeliveryAck[tostring(recordId)] = tostring(versionFp)
+end
+
+function GG.HasTransientDeliveryAck(entry, recordId, versionFp)
+    if type(entry) ~= "table" or type(entry._transientDeliveryAck) ~= "table" then
+        return false
+    end
+    if recordId == nil or versionFp == nil then
+        return false
+    end
+    return entry._transientDeliveryAck[tostring(recordId)] == tostring(versionFp)
+end
+
+function GG.ClearTransientDeliveryAcks(entry)
+    if type(entry) == "table" then
+        entry._transientDeliveryAck = nil
+    end
+end
+
 function GG.ApplyRecordToProvider(entry, record, ctx)
     if not entry or not entry.api or type(entry.api.ValidateAndApply) ~= "function" then
         return RESULT.REJECTED, "no_provider"
@@ -652,15 +686,33 @@ function GG.ApplyRecordToProvider(entry, record, ctx)
     if result == RESULT.ACCEPTED then
         local id = record and (record.id or record.recordId)
         local vfp = record and (record.versionFp or record.v)
-        if id and vfp then
-            local added, info = GG.IndexUpsert(entry.index, id, tostring(vfp), record)
-            if info == "replaced" then
-                GG.BumpIndexEpoch(entry.index)
-                GG.IndexUpsert(entry.index, id, tostring(vfp), record)
+        local transient = type(detail) == "string" and TRANSIENT_ACCEPT_DETAILS[detail] == true
+        if transient then
+            -- Acknowledge receipt for pull bookkeeping without advertising foreign
+            -- adoption bodies through the still-local durable index.
+            if id and vfp then
+                GG.AckTransientDelivery(entry, id, vfp)
             end
+        else
+            if id and vfp then
+                local added, info = GG.IndexUpsert(entry.index, id, tostring(vfp), record)
+                if info == "replaced" then
+                    GG.BumpIndexEpoch(entry.index)
+                    GG.IndexUpsert(entry.index, id, tostring(vfp), record)
+                end
+            end
+            GG.BumpProviderChangeGen(entry.id)
+            GG.NotifyMeaningfulChange()
         end
-        GG.BumpProviderChangeGen(entry.id)
-        GG.NotifyMeaningfulChange()
+    elseif result == RESULT.DUPLICATE and type(detail) == "string"
+        and TRANSIENT_ACCEPT_DETAILS[detail] == true then
+        -- Exact redelivery during runtime buffering: retain soft-ack so the next
+        -- manifest page does not re-request while the session is open.
+        local id = record and (record.id or record.recordId)
+        local vfp = record and (record.versionFp or record.v)
+        if id and vfp then
+            GG.AckTransientDelivery(entry, id, vfp)
+        end
     end
     return result, detail
 end

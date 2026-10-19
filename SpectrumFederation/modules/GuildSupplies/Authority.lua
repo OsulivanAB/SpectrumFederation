@@ -227,6 +227,11 @@ function GS:GetCapabilities()
             result.canEdit = false
             result.canRecoverPolicy = false
             result.reason = "preview_non_admin"
+        elseif GS.IsBootstrapEditLocked and GS.IsBootstrapEditLocked(ctx.guildKey) then
+            -- Descriptor-first install: replication continues, local edits blocked
+            -- until the advertised policy revision is reconstructed.
+            result.canEdit = false
+            result.reason = "awaiting_policy"
         elseif policyValid and policyInRange and policyPos and ctx.rankOrder <= policyPos then
             result.canEdit = true
             result.reason = nil
