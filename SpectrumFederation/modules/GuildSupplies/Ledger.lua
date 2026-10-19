@@ -1193,6 +1193,8 @@ local function BumpAccountingMutation(record)
     record.accounting._mutationSeq = n + 1
     local cached = ledgerListShapeCache[record.accounting]
     if cached and cached.ok then
+        -- Controlled append/shelve paths only add ValidateLedgerEventBody-valid
+        -- rows; advance the cache watermark without a full body rescan.
         cached.mut = record.accounting._mutationSeq
     end
 end
@@ -1204,7 +1206,7 @@ function GS.GetAccountingMutationSeq(record)
     return tonumber(record.accounting._mutationSeq) or 0
 end
 
-local function ValidateDenseLedgerList(list, maxLen)
+local function ValidateDenseLedgerList(list, maxLen, datasetId)
     if type(list) ~= "table" then
         return false, "invalid_accounting"
     end
@@ -1228,6 +1230,17 @@ local function ValidateDenseLedgerList(list, maxLen)
         if type(v) ~= "table" then
             return false, "ledger_malformed"
         end
+        -- Dense table rows must also be exportable ledger bodies. Empty `{}` or
+        -- id-only stubs pass type(table) but Gossip skips/mis-exports them,
+        -- leaving descriptor counts permanently incomplete for peers.
+        if GS.ValidateLedgerEventBody then
+            local bodyOk, bodyErr = GS.ValidateLedgerEventBody(v, nil, datasetId)
+            if not bodyOk then
+                return false, bodyErr or "ledger_malformed"
+            end
+        elseif type(v.id) ~= "string" or v.id == "" then
+            return false, "invalid_id"
+        end
     end
     -- Sparse or holey arrays: #list disagrees with dense 1..n occupancy.
     if counted ~= n or (n > 0 and maxIndex ~= n) then
@@ -1237,8 +1250,10 @@ local function ValidateDenseLedgerList(list, maxLen)
 end
 
 --- Fail-closed shape/bounds check for live + archived ledger arrays.
--- Cheap length overflow always; deep sparse/malformed scan cached per mutation.
-function GS.ValidateLedgerEventLists(accounting)
+-- Cheap length overflow always; deep sparse/malformed/body scan cached per mutation.
+-- @param accounting table
+-- @param datasetId string|nil optional dataset scope for ValidateLedgerEventBody
+function GS.ValidateLedgerEventLists(accounting, datasetId)
     if type(accounting) ~= "table" then
         return false, "invalid_accounting"
     end
@@ -1255,23 +1270,29 @@ function GS.ValidateLedgerEventLists(accounting)
     end
     local mut = tonumber(accounting._mutationSeq) or 0
     local cached = ledgerListShapeCache[accounting]
-    if cached and cached.mut == mut then
+    if cached and cached.mut == mut and cached.datasetId == (datasetId or false) then
         if cached.ok then
             return true
         end
         return false, cached.err or "invalid_accounting"
     end
-    local ok, err = ValidateDenseLedgerList(live, maxLive)
+    local ok, err = ValidateDenseLedgerList(live, maxLive, datasetId)
     if not ok then
-        ledgerListShapeCache[accounting] = { mut = mut, ok = false, err = err }
+        ledgerListShapeCache[accounting] = {
+            mut = mut, ok = false, err = err, datasetId = datasetId or false,
+        }
         return false, err
     end
-    ok, err = ValidateDenseLedgerList(archive, maxArch)
+    ok, err = ValidateDenseLedgerList(archive, maxArch, datasetId)
     if not ok then
-        ledgerListShapeCache[accounting] = { mut = mut, ok = false, err = err }
+        ledgerListShapeCache[accounting] = {
+            mut = mut, ok = false, err = err, datasetId = datasetId or false,
+        }
         return false, err
     end
-    ledgerListShapeCache[accounting] = { mut = mut, ok = true }
+    ledgerListShapeCache[accounting] = {
+        mut = mut, ok = true, datasetId = datasetId or false,
+    }
     return true
 end
 

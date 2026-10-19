@@ -538,7 +538,7 @@ local function ValidateGuildRecordStructure(guildKey, record)
     -- Cheap length checks always; deep density scan is one-time/cached per
     -- mutation revision so GetCurrentRecord hot paths stay bounded.
     if GS.ValidateLedgerEventLists then
-        local listsOk, listsErr = GS.ValidateLedgerEventLists(accounting)
+        local listsOk, listsErr = GS.ValidateLedgerEventLists(accounting, record.datasetId)
         if not listsOk then
             return false, listsErr or "invalid_accounting"
         end

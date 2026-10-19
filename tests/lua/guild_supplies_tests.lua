@@ -20219,6 +20219,253 @@ do
         "3B52: no inflated re-credit after additional witness on verified cluster")
 end
 
+do
+    -- 3B53) Begin adoption with no local record, then CreateStagedRecord mid-replay:
+    -- publication must abort and retain the newly created dataset. Unchanged
+    -- no-record adoption still succeeds.
+    local sourceDataset
+    local bodies
+    do
+        local rec = seedStagedCampaignWithItem(9067, 30)
+        sourceDataset = rec.datasetId
+        local evidence = makeDepositEvidence(rec, { itemId = 9067, quantity = 4 })
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+        end
+        GS:EnsureGossipProvider()
+        drainExportMaint(64)
+        bodies = collectAllExportBodies()
+    end
+
+    local function bufferCopies()
+        local n = 0
+        for i = 1, #bodies do
+            local row = { id = bodies[i].id, body = deepCopy(bodies[i].body) }
+            local stB = GS:BufferAdoptionRecord(row.id, row.body)
+            if stB == "accepted" or stB == "duplicate" then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    -- Happy path first (isolated): no local record throughout.
+    SpectrumFederationDB = {}
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._lastAdoptionAbortReason = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "3B53: happy no local record")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B53: happy begin")
+    assertEq(GS._adoption.localDatasetId, nil, "3B53: happy pin still nil")
+    assertTrue(bufferCopies() >= 1, "3B53: happy buffered bodies")
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "3B53: happy adoption ready")
+    GS._adoptionReplaySyncDrain = true
+    local stOk, rOk = GS:CommitDatasetAdoption()
+    local g2 = 0
+    while GS._adoption and GS._adoption.replayTemp and g2 < 8000 do
+        g2 = g2 + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stOk == "pending" then
+        stOk, rOk = GS:CommitDatasetAdoption()
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(stOk == "accepted"
+        or (adopted and adopted.datasetId == sourceDataset),
+        "3B53: unchanged no-record adoption succeeds st="
+            .. tostring(stOk) .. " r=" .. tostring(rOk)
+            .. " abort=" .. tostring(GS._lastAdoptionAbortReason))
+    assertEq(adopted and adopted.datasetId, sourceDataset,
+        "3B53: happy path installed source dataset")
+
+    -- Race: no local staged record at Begin; create one during async replay.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._lastAdoptionAbortReason = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "3B53: no local record before begin")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B53: begin with no local record")
+    assertEq(GS._adoption.localDatasetId, nil, "3B53: pin localDatasetId=nil")
+    assertTrue(bufferCopies() >= 1, "3B53: race buffered bodies")
+    GS._adoptionReplaySyncDrain = false
+    local stCommit = GS:CommitDatasetAdoption()
+    assertTrue(stCommit == "pending" or stCommit == "accepted",
+        "3B53: first commit got=" .. tostring(stCommit))
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "3B53: create during replay")
+    local created = GS:GetCurrentRecord()
+    assertTrue(created ~= nil and type(created.datasetId) == "string",
+        "3B53: newly created dataset present")
+    local createdDs = created.datasetId
+    assertTrue(createdDs ~= sourceDataset, "3B53: created dataset differs from source")
+    local guard = 0
+    local finalSt, finalReason = stCommit, nil
+    while GS._adoption and not GS._adoption.committed and guard < 400 do
+        guard = guard + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                finalSt, finalReason = GS:CommitDatasetAdoption()
+                if finalSt == "rejected" or finalSt == "accepted" then
+                    break
+                end
+            end
+        end
+    end
+    if GS._adoption and not GS._adoption.committed then
+        finalSt, finalReason = GS:CommitDatasetAdoption()
+    elseif not GS._adoption then
+        finalSt = "rejected"
+        finalReason = GS._lastAdoptionAbortReason
+    end
+    assertEq(finalSt, "rejected",
+        "3B53: publish aborts after CreateStagedRecord st="
+            .. tostring(finalSt) .. " r=" .. tostring(finalReason))
+    assertTrue(finalReason == "source_changed" or finalReason == "stale_base",
+        "3B53: source_changed/stale_base reason got=" .. tostring(finalReason))
+    local after = GS:GetCurrentRecord()
+    assertTrue(after ~= nil, "3B53: created record still usable")
+    assertEq(after.datasetId, createdDs, "3B53: newly created dataset retained")
+    GS._adoptionReplaySyncDrain = true
+end
+
+do
+    -- 3B54) Dense ledger arrays with empty `{}` or id-only invalid bodies fail
+    -- closed; valid near-cap histories stay accessible; repeated reads stay cheap.
+    local record = seedStagedCampaignWithItem(9068, 20)
+    local guildKey = select(1, GS:GetCurrentContext()).guildKey
+    local priorMax = GS.MAX_LEDGER_EVENTS
+    GS.MAX_LEDGER_EVENTS = 12
+    local events = record.accounting._consumableEvents
+    for n = 1, 10 do
+        events[#events + 1] = {
+            type = "donation",
+            id = "ctx:gs:body-" .. n,
+            txnId = "ctx:gs:body-" .. n,
+            itemId = 9068,
+            quantity = 1,
+            generation = 1,
+            timestamp = n,
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            coreSignature = "body|" .. n,
+            actor = "BodyValid-Garona",
+            verification = "witnesses",
+        }
+    end
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    assertEq(select(1, GS.ValidateLedgerEventLists(record.accounting, record.datasetId)), true,
+        "3B54: valid near-cap dense ok")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "3B54: near-cap record usable")
+
+    -- Empty table body: dense structure ok, body shape fails.
+    events[1] = {}
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local emptyOk, emptyErr = GS.ValidateLedgerEventLists(record.accounting, record.datasetId)
+    assertEq(emptyOk, false, "3B54: empty {} body rejected")
+    assertTrue(emptyErr ~= nil, "3B54: empty body reason present got=" .. tostring(emptyErr))
+    assertEq(GS:GetCurrentRecord(), nil, "3B54: empty body GetCurrentRecord fails closed")
+    assertEq(type(events[1]), "table", "3B54: empty row retained (no SV rewrite)")
+
+    -- Restore valid row 1, then string-id stub missing required fields.
+    events[1] = {
+        type = "donation",
+        id = "ctx:gs:body-1",
+        txnId = "ctx:gs:body-1",
+        itemId = 9068,
+        quantity = 1,
+        generation = 1,
+        timestamp = 1,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        coreSignature = "body|1",
+        actor = "BodyValid-Garona",
+        verification = "witnesses",
+    }
+    events[2] = {
+        type = "donation",
+        id = "ctx:gs:body-stub",
+        txnId = "ctx:gs:body-stub",
+        -- missing itemId / quantity / timestamp / generation
+    }
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local stubOk, stubErr = GS.ValidateLedgerEventLists(record.accounting, record.datasetId)
+    assertEq(stubOk, false, "3B54: id-only invalid body rejected")
+    assertTrue(stubErr == "invalid_item" or stubErr == "invalid_quantity"
+        or stubErr == "invalid_event" or stubErr == "invalid_generation"
+        or stubErr == "ledger_malformed",
+        "3B54: stub body reason got=" .. tostring(stubErr))
+    assertEq(GS:GetCurrentRecord(), nil, "3B54: stub body GetCurrentRecord fails closed")
+    assertEq(events[2].id, "ctx:gs:body-stub", "3B54: stub row retained untruncated")
+
+    -- Missing id entirely (table with type but no id/txnId).
+    events[2] = {
+        type = "donation",
+        itemId = 9068,
+        quantity = 1,
+        generation = 1,
+        timestamp = 2,
+    }
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local missOk, missErr = GS.ValidateLedgerEventLists(record.accounting, record.datasetId)
+    assertEq(missOk, false, "3B54: missing-id body rejected")
+    assertEq(missErr, "invalid_id", "3B54: invalid_id reason")
+    assertEq(GS:GetCurrentRecord(), nil, "3B54: missing-id GetCurrentRecord fails closed")
+
+    -- Restore fully valid near-cap list; repeated reads stay cached/cheap.
+    events[2] = {
+        type = "donation",
+        id = "ctx:gs:body-2",
+        txnId = "ctx:gs:body-2",
+        itemId = 9068,
+        quantity = 1,
+        generation = 1,
+        timestamp = 2,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        coreSignature = "body|2",
+        actor = "BodyValid-Garona",
+        verification = "witnesses",
+    }
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    assertEq(select(1, GS.ValidateLedgerEventLists(record.accounting, record.datasetId)), true,
+        "3B54: restored valid bodies ok")
+    assertTrue(GS:GetCurrentRecord() ~= nil, "3B54: restored usable")
+    local t0 = os.clock()
+    local hotOk = true
+    for _ = 1, 200 do
+        if GS:GetCurrentRecord() == nil then
+            hotOk = false
+            break
+        end
+    end
+    local elapsed = os.clock() - t0
+    assertTrue(hotOk, "3B54: repeated GetCurrentRecord stayed usable")
+    assertTrue(elapsed < 1.0, "3B54: repeated GetCurrentRecord bounded elapsed="
+        .. tostring(elapsed))
+    GS.MAX_LEDGER_EVENTS = priorMax
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

@@ -3286,13 +3286,21 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 if boundaryOk then
                     -- Park on the adoption session (not live GS._pendingCampaignBoundaries):
                     -- replay swaps that global per slice, and final completeness runs outside.
+                    -- Only count progress when newly parking or installing; re-parking an
+                    -- already-known header must not reset idle detection forever.
+                    local alreadyParked = adop._headerByCampaignId
+                        and adop._headerByCampaignId[h.campaignId] ~= nil
                     adop._headerByCampaignId = adop._headerByCampaignId or {}
                     adop._headerByCampaignId[h.campaignId] = h
                     GS._pendingCampaignBoundaries[h.campaignId] = h
                     if startPresent then
                         temp.campaigns[h.campaignId] = h
+                        progress = true
+                    elseif not alreadyParked then
+                        progress = true
+                    else
+                        unsettledSeen = true
                     end
-                    progress = true
                 elseif not startPresent then
                     unsettledSeen = true
                 end
@@ -4543,7 +4551,11 @@ local function ValidateAdoptionCommitContext(adop)
     end
     local live = GS._root.guilds[adop.guildKey]
     if type(live) == "table" then
-        if adop.localDatasetId and live.datasetId ~= adop.localDatasetId then
+        -- Compare full optional dataset identity, including nil vs non-nil.
+        -- Begin-with-no-record pins localDatasetId=nil; an editor CreateStagedRecord
+        -- mid-replay must abort rather than overwrite that newly created dataset.
+        -- Legitimate bootstrap (still no local record) never enters this branch.
+        if (adop.localDatasetId or nil) ~= (live.datasetId or nil) then
             return false, "source_changed"
         end
         local livePolicy = live.permission and live.permission.revisionId
@@ -6669,10 +6681,22 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         and op.kind == GS.KIND.SET_EDITOR_RANK
         and type(op.basePolicyRevision) == "string"
         and op.basePolicyRevision == currentPolicy
-    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {
+    -- Offline adoption onto an empty client: SenderHasEditorAuthority looks up the
+    -- live guild slot (not offlineRecord). Without allowBootstrapInstall it returns
+    -- not_configured and every source-authored body becomes untrusted_relay, so
+    -- START_CAMPAIGN never lands and replay cannot converge. Begin already gated
+    -- the source under allowBootstrapInstall; reuse that while live is absent.
+    local authOpts = {
         requireRecoverPolicy = requireRecover,
         allowPolicyCatchUp = isPolicyCatchUp,
-    })
+    }
+    if admissionCtx.adoptionReplay and type(admissionCtx.offlineRecord) == "table" then
+        local liveGuild = GS._root and GS._root.guilds and GS._root.guilds[member.guildKey]
+        if type(liveGuild) ~= "table" then
+            authOpts.allowBootstrapInstall = true
+        end
+    end
+    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, authOpts)
 
     -- Policy catch-up must not be forced into the relay branch by Gossip's
     -- pre-admit relay flag; catch-up context overrides relay for this body only.
