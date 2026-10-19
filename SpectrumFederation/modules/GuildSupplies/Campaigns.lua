@@ -771,12 +771,10 @@ local function ResolveCampaignGeneration(record, campaignId)
     return nil, "missing_campaign_archive"
 end
 
---- Bounded progress projection for a campaign generation (read-only copies).
--- Includes archived ledger records and signed attributed/unattributed adjustments.
-function GS:ProjectCampaignProgress(campaignId)
-    local record, reason = GS:GetCurrentRecord()
-    if not record then
-        return nil, reason or "not_ready"
+--- Project progress for an explicit guild record (adoption / offline admission).
+function GS.ProjectCampaignProgressOnRecord(record, campaignId)
+    if type(record) ~= "table" then
+        return nil, "not_ready"
     end
     if type(campaignId) ~= "string" or campaignId == "" then
         return nil, "invalid_campaign"
@@ -821,6 +819,16 @@ function GS:ProjectCampaignProgress(campaignId)
         contributions = contributions,
         generation = generation,
     }
+end
+
+--- Bounded progress projection for a campaign generation (read-only copies).
+-- Includes archived ledger records and signed attributed/unattributed adjustments.
+function GS:ProjectCampaignProgress(campaignId)
+    local record, reason = GS:GetCurrentRecord()
+    if not record then
+        return nil, reason or "not_ready"
+    end
+    return GS.ProjectCampaignProgressOnRecord(record, campaignId)
 end
 
 local function FormatHistoryTimestamp(event)

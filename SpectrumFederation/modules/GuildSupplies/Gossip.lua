@@ -1765,6 +1765,8 @@ local function ValidateAndApply(record, ctx)
             local ds = body.datasetId
                 or (body.op and body.op.datasetId)
                 or (body.header and body.header.datasetId)
+                or (body.event and body.event.datasetId)
+                or (body.evidence and body.evidence.datasetId)
             if ds == adop.sourceDatasetId or body.kind == "dataset-desc" then
                 local st, reason = GS:BufferAdoptionRecord(tostring(record.id), body)
                 return st, reason

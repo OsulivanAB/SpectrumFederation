@@ -128,10 +128,14 @@ function GS.ValidateIdentityLinks(links)
     if type(links.groups) ~= "table" or type(links.byGuid) ~= "table" then
         return false, "invalid_identity_links"
     end
+    local maxGroups = GS.MAX_IDENTITY_LINK_GROUPS or 64
+    local maxPerGroup = GS.MAX_GUIDS_PER_LINK_GROUP or 16
     local groupCount = 0
+    local expectedByGuid = {}
+    local guidCount = 0
     for gid, group in pairs(links.groups) do
         groupCount = groupCount + 1
-        if groupCount > (GS.MAX_IDENTITY_LINK_GROUPS or 64) then
+        if groupCount > maxGroups then
             return false, "full"
         end
         if type(gid) ~= "string" or gid == "" or #gid > (GS.MAX_OPERATION_ID or 192) then
@@ -140,9 +144,42 @@ function GS.ValidateIdentityLinks(links)
         if type(group) ~= "table" or type(group.guids) ~= "table" then
             return false, "invalid_identity_links"
         end
-        if #group.guids > (GS.MAX_GUIDS_PER_LINK_GROUP or 16) then
+        if #group.guids > maxPerGroup then
             return false, "full"
         end
+        local seenInGroup = {}
+        for i = 1, #group.guids do
+            local g = ValidGuid(group.guids[i])
+            if not g then
+                return false, "invalid_identity_links"
+            end
+            if seenInGroup[g] then
+                return false, "invalid_identity_links"
+            end
+            seenInGroup[g] = true
+            if expectedByGuid[g] and expectedByGuid[g] ~= gid then
+                return false, "invalid_identity_links"
+            end
+            expectedByGuid[g] = gid
+            guidCount = guidCount + 1
+            if guidCount > maxGroups * maxPerGroup then
+                return false, "full"
+            end
+        end
+    end
+    -- Derived index must be bounded and exactly agree with canonical groups.
+    local byCount = 0
+    for g, gid in pairs(links.byGuid) do
+        byCount = byCount + 1
+        if byCount > guidCount then
+            return false, "invalid_identity_links"
+        end
+        if not ValidGuid(g) or expectedByGuid[g] ~= gid then
+            return false, "invalid_identity_links"
+        end
+    end
+    if byCount ~= guidCount then
+        return false, "invalid_identity_links"
     end
     return true
 end
@@ -249,6 +286,39 @@ local function EnsureCampaignPending(record, campaignId)
         camp.pending = {}
     end
     return camp
+end
+
+--- Verified clusters no longer consume pending capacity; reclaim after commit.
+local function CompactVerifiedPending(pending)
+    if type(pending) ~= "table" then
+        return 0
+    end
+    local write = 1
+    for read = 1, #pending do
+        local cluster = pending[read]
+        if type(cluster) == "table" and cluster.status ~= "verified" then
+            pending[write] = cluster
+            write = write + 1
+        end
+    end
+    for i = write, #pending do
+        pending[i] = nil
+    end
+    return write - 1
+end
+
+local function UnfinishedPendingCount(pending)
+    if type(pending) ~= "table" then
+        return 0
+    end
+    local n = 0
+    for i = 1, #pending do
+        local cluster = pending[i]
+        if type(cluster) == "table" and cluster.status ~= "verified" then
+            n = n + 1
+        end
+    end
+    return n
 end
 
 local function EvidenceView(row)
@@ -465,8 +535,11 @@ local function FindLedgerDonationOccurrence(record, evidence)
 end
 
 --- Stable occurrence fingerprint so independent verifiers mint the same txnId
--- when matching fields agree. Neighbor/hour differences may still diverge; those
--- cases converge later via MatchScore aliasing without a second credit.
+-- when matching fields agree. Hour buckets are intentionally omitted: observers
+-- of the same still-visible deposit can reconstruct different approxTxnTime
+-- hours as ageHours advances. MatchScore (3h tolerance) remains the occurrence
+-- matcher; neighbors + occurrenceIndex keep legitimately repeated deposits distinct.
+-- Residual neighbor/index disagreements still converge via MatchScore aliasing.
 function GS.OccurrenceFingerprint(evidence)
     if type(evidence) ~= "table" then
         return nil
@@ -478,15 +551,13 @@ function GS.OccurrenceFingerprint(evidence)
     local newer = CopyStringList(evidence.neighborsNewer, 3)
     table.sort(older)
     table.sort(newer)
-    local hourBucket = math.floor((tonumber(evidence.approxTxnTime) or 0) / 3600)
     local body = {
-        kind = "gs-occ-v1",
+        kind = "gs-occ-v2",
         core = evidence.coreSignature,
         guild = tostring(evidence.guildGuid or ""),
         tab = tonumber(evidence.bankTab) or 0,
         gen = tonumber(evidence.generation) or 0,
         occ = tonumber(evidence.occurrenceIndex) or 1,
-        hour = hourBucket,
         older = older,
         newer = newer,
     }
@@ -930,6 +1001,15 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
     end
     cluster.status = "verified"
     cluster.txnId = txnId
+    -- Reclaim verified rows so pending capacity tracks unfinished work only.
+    local campId = evidence.campaignId or record.currentCampaignId
+    if type(campId) == "string" and campId ~= "" then
+        local camp = record.observations and record.observations.byCampaign
+            and record.observations.byCampaign[campId]
+        if type(camp) == "table" then
+            CompactVerifiedPending(camp.pending)
+        end
+    end
     Debug("Info", "three-witness donation committed txn=%s witnesses=%s",
         tostring(txnId), tostring(GS.CountIndependentWitnesses(record, cluster.witnesses)))
     return true, "accepted"
@@ -1058,6 +1138,7 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
 
     local camp = EnsureCampaignPending(record, campaignId)
     local pending = camp.pending
+    CompactVerifiedPending(pending)
     local match, how = AmbiguousBest(pending, row)
     if how == "ambiguous" then
         -- Keep evidence pending without inventing a second cluster credit path.
@@ -1069,7 +1150,7 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
             firstSeen = Now(),
             lastSeen = Now(),
         }
-        if #pending < (GS.MAX_PENDING_EVIDENCE or 128) then
+        if UnfinishedPendingCount(pending) < (GS.MAX_PENDING_EVIDENCE or 128) then
             pending[#pending + 1] = ambiguous
         end
         if admissionCtx.localWrite or admissionCtx.exportEvidence then
@@ -1083,7 +1164,7 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
 
     local cluster = match
     if not cluster then
-        if #pending >= (GS.MAX_PENDING_EVIDENCE or 128) then
+        if UnfinishedPendingCount(pending) >= (GS.MAX_PENDING_EVIDENCE or 128) then
             return "rejected", "full"
         end
         cluster = {
@@ -1308,6 +1389,16 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     local isDonation = event.type == GS.LEDGER_EVENT.DONATION or event.type == "CONSUMABLE_DONATION"
     local isAdjustment = event.type == GS.LEDGER_EVENT.ADJUSTMENT or event.type == "CONSUMABLE_ADJUSTMENT"
 
+    -- Adjustment idempotency uses the original operation id when present.
+    local adjustmentEventId = nil
+    if isAdjustment then
+        if type(event.opId) == "string" and event.opId ~= "" then
+            adjustmentEventId = event.opId
+        elseif type(event.id) == "string" and event.id ~= "" then
+            adjustmentEventId = event.id
+        end
+    end
+
     -- Exact ID duplicate for non-donation kinds. Donations defer to the
     -- provenance branch so conflicting bodies can quarantine instead of
     -- silently treating a forged payload as a harmless duplicate.
@@ -1316,8 +1407,13 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         if type(events) == "table" then
             for i = 1, #events do
                 local e = events[i]
-                if type(e) == "table" and (e.id == txnId or e.txnId == txnId) then
-                    return "duplicate", "duplicate"
+                if type(e) == "table" then
+                    if e.id == txnId or e.txnId == txnId then
+                        return "duplicate", "duplicate"
+                    end
+                    if adjustmentEventId and (e.id == adjustmentEventId or e.opId == adjustmentEventId) then
+                        return "duplicate", "duplicate"
+                    end
                 end
             end
         end
@@ -1328,10 +1424,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     end
 
     if isDonation then
-        -- Relayed gs-ledger-event donations are catch-up candidates only.
-        -- A forwarded verification flag or event ID is not authenticated quorum.
-        -- Never append verified credit here; live credit requires three-witness
-        -- evidence admission (AdmitDirectObservation → CommitVerifiedCluster).
+        -- Live gossip: catch-up candidates only (no invented quorum).
+        -- Authenticated dataset adoption may transfer source-accepted donations
+        -- with preserveAttribution without bypassing live witness rules.
         local candidate = {
             type = GS.LEDGER_EVENT.DONATION,
             id = txnId,
@@ -1424,6 +1519,54 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             end
         end
 
+        -- Authenticated adoption transfers source-accepted donations into the
+        -- temporary record. Live gossip never takes this branch.
+        if admissionCtx.adoptionReplay and admissionCtx.preserveAttribution then
+            local stored = {
+                type = GS.LEDGER_EVENT.DONATION,
+                id = txnId,
+                txnId = txnId,
+                generation = tonumber(candidate.generation),
+                timestamp = tonumber(candidate.timestamp) or Now(),
+                actor = candidate.actor,
+                itemId = candidate.itemId,
+                quantity = candidate.quantity,
+                source = "guildbank",
+                writer = candidate.writer,
+                verification = GS.VERIFICATION.WITNESSES,
+                coreSignature = candidate.coreSignature,
+                occurrenceIndex = candidate.occurrenceIndex,
+                guildGuid = candidate.guildGuid,
+                bankTab = candidate.bankTab,
+                neighborsOlder = candidate.neighborsOlder,
+                neighborsNewer = candidate.neighborsNewer,
+                campaignId = candidate.campaignId,
+                datasetId = record.datasetId,
+            }
+            local appendOk, appendErr = AppendLedgerEvent(record, stored)
+            if not appendOk then
+                return "rejected", appendErr or "full"
+            end
+            RegisterTxn(cfg, {
+                txnId = txnId,
+                status = "verified",
+                committed = true,
+                coreSignature = stored.coreSignature,
+                approxTxnTime = stored.timestamp,
+                donor = stored.actor,
+                itemId = stored.itemId,
+                quantity = stored.quantity,
+                guildGuid = stored.guildGuid,
+                bankTab = stored.bankTab,
+                generation = stored.generation,
+                occurrenceIndex = stored.occurrenceIndex,
+                neighborsOlder = stored.neighborsOlder,
+                neighborsNewer = stored.neighborsNewer,
+                verification = stored.verification,
+            })
+            return "accepted", "adoption_transfer"
+        end
+
         -- Retain as unverified candidate for ID convergence; do not credit.
         if type(pendingCands) ~= "table" then
             return "rejected", "invalid_accounting"
@@ -1447,32 +1590,49 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "pending", "untrusted_relay"
             end
         end
+        local eventCampaign = event.campaignId or record.currentCampaignId
+        if type(eventCampaign) ~= "string" or eventCampaign == "" then
+            return "rejected", "invalid_campaign"
+        end
+        -- Historical adjustments for a different campaign must not floor-check
+        -- against the current campaign (and are rejected without archive provenance).
+        if eventCampaign ~= record.currentCampaignId then
+            return "rejected", "stale_campaign"
+        end
+        local eventGen = tonumber(event.generation)
+        local curGen = tonumber(cfg.generation)
+        if eventGen and curGen and eventGen ~= curGen then
+            return "rejected", "stale_generation"
+        end
         local attributed = NormName(event.attributed)
         local qty = tonumber(event.quantity)
-        local floorOk, floorErr = GS.AdjustmentFloorOk(record, tonumber(event.itemId), qty, attributed)
+        local floorOk, floorErr = GS.AdjustmentFloorOk(
+            record, tonumber(event.itemId), qty, attributed, eventCampaign)
         if not floorOk then
             -- Hold incompatible negative adjustment pending (no silent overwrite).
             return "pending", floorErr or "adjustment_floor"
         end
+        local eventId = adjustmentEventId or txnId
         local stored = {
             type = GS.LEDGER_EVENT.ADJUSTMENT,
-            id = txnId,
-            txnId = txnId,
-            generation = tonumber(event.generation) or tonumber(cfg.generation),
+            id = eventId,
+            txnId = ValidTxnId(event.txnId) or eventId,
+            opId = (type(event.opId) == "string" and event.opId) or eventId,
+            generation = eventGen or curGen,
             timestamp = tonumber(event.timestamp) or Now(),
             actor = NormName(event.actor) or (member and member.name),
             writer = ValidGuid(event.writer) or (member and member.guid),
             itemId = tonumber(event.itemId),
             quantity = qty,
             attributed = attributed,
-            campaignId = event.campaignId or record.currentCampaignId,
+            campaignId = eventCampaign,
             datasetId = record.datasetId,
         }
         local appendOk, appendErr = AppendLedgerEvent(record, stored)
         if not appendOk then
             return "rejected", appendErr or "full"
         end
-        if GS._NotifyLocalDurableChange then
+        if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
             GS._NotifyLocalDurableChange("ledger")
         end
         return "accepted"
@@ -1485,21 +1645,31 @@ end
 -- Adjustment floor + staged local API
 ---------------------------------------------------------------------------
 
-local function ActorItemTotal(record, actorName, itemId)
-    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+local function ProgressOnRecord(record, campaignId)
+    campaignId = campaignId or (record and record.currentCampaignId)
+    if GS.ProjectCampaignProgressOnRecord then
+        return GS.ProjectCampaignProgressOnRecord(record, campaignId)
+    end
+    return GS:ProjectCampaignProgress(campaignId)
+end
+
+local function ActorItemTotal(record, actorName, itemId, campaignId)
+    local progress = ProgressOnRecord(record, campaignId)
     if not progress then return 0 end
     local contrib = progress.contributions and progress.contributions[actorName]
     return (contrib and tonumber(contrib[itemId])) or 0
 end
 
-local function ItemTotal(record, itemId)
-    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+local function ItemTotal(record, itemId, campaignId)
+    local progress = ProgressOnRecord(record, campaignId)
     if not progress then return 0 end
     return tonumber(progress.itemTotals and progress.itemTotals[itemId]) or 0
 end
 
 --- Floor against accepted authoritative projection at commit time.
-function GS.AdjustmentFloorOk(record, itemId, quantity, attributed)
+-- @param campaignId optional; defaults to record.currentCampaignId. Callers that
+--   cannot prove historical campaign provenance should reject before calling.
+function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId)
     itemId = tonumber(itemId)
     quantity = tonumber(quantity)
     if not IsItemId(itemId) then
@@ -1519,14 +1689,21 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed)
     else
         attributed = nil
     end
-    if not record or not record.currentCampaignId then
+    if not record then
         return false, "no_campaign"
     end
-    local currentItem = ItemTotal(record, itemId)
+    campaignId = campaignId or record.currentCampaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return false, "no_campaign"
+    end
+    if campaignId ~= record.currentCampaignId then
+        return false, "stale_campaign"
+    end
+    local currentItem = ItemTotal(record, itemId, campaignId)
     if currentItem + quantity < 0 then
         return false, "item_negative"
     end
-    if attributed and ActorItemTotal(record, attributed, itemId) + quantity < 0 then
+    if attributed and ActorItemTotal(record, attributed, itemId, campaignId) + quantity < 0 then
         return false, "player_negative"
     end
     return true, nil, attributed
@@ -1623,19 +1800,27 @@ function GS.ApplyIdentityLinkMutation(record, op)
             if type(keepGroup) ~= "table" or type(dropGroup) ~= "table" then
                 return false, "invalid_identity_links"
             end
-            for i = 1, #(dropGroup.guids or {}) do
-                local g = dropGroup.guids[i]
-                local found = false
-                for j = 1, #keepGroup.guids do
-                    if keepGroup.guids[j] == g then found = true break end
-                end
-                if not found then
-                    if #keepGroup.guids >= (GS.MAX_GUIDS_PER_LINK_GROUP or 16) then
-                        return false, "full"
-                    end
-                    keepGroup.guids[#keepGroup.guids + 1] = g
+            -- Precompute the merged set so a capacity rejection leaves prior state intact.
+            local merged = {}
+            local seen = {}
+            for i = 1, #(keepGroup.guids or {}) do
+                local g = ValidGuid(keepGroup.guids[i])
+                if g and not seen[g] then
+                    seen[g] = true
+                    merged[#merged + 1] = g
                 end
             end
+            for i = 1, #(dropGroup.guids or {}) do
+                local g = ValidGuid(dropGroup.guids[i])
+                if g and not seen[g] then
+                    seen[g] = true
+                    merged[#merged + 1] = g
+                end
+            end
+            if #merged > (GS.MAX_GUIDS_PER_LINK_GROUP or 16) then
+                return false, "full"
+            end
+            keepGroup.guids = merged
             links.groups[drop] = nil
             RebuildByGuid(links)
             links.revisionId = op.id
@@ -1720,22 +1905,20 @@ function GS.ApplyAdjustmentMutation(record, op)
     local itemId = tonumber(op.value and op.value.itemId) or tonumber(op.target and op.target.itemId)
     local quantity = tonumber(op.value and op.value.quantity)
     local attributed = op.value and op.value.attributed
-    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(record, itemId, quantity, attributed)
+    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
+        record, itemId, quantity, attributed, record.currentCampaignId)
     if not floorOk then
         return false, floorErr or "adjustment_floor"
     end
     local cfg = record.accounting._consumables
-    local txnId = op.id
-    if not ValidTxnId(txnId) then
-        -- Operation ids from GS:_NewOperationId are not ctx:-prefixed; mint ledger id.
-        txnId = GS.AllocateCanonicalTxnId(record, op.actorGuid)
-    end
-    -- Prefer embedding op.id as event id for dedupe of the adjustment operation itself.
+    -- Operation id is the durable idempotency key across ledger-before-op and
+    -- op-before-ledger delivery orders (event.id / event.opId).
     local eventId = op.id
     local events = record.accounting._consumableEvents
     if type(events) == "table" then
         for i = 1, #events do
-            if events[i] and events[i].id == eventId then
+            local e = events[i]
+            if e and (e.id == eventId or e.opId == eventId) then
                 return true, "duplicate"
             end
         end
@@ -1743,7 +1926,7 @@ function GS.ApplyAdjustmentMutation(record, op)
     local event = {
         type = GS.LEDGER_EVENT.ADJUSTMENT,
         id = eventId,
-        txnId = ValidTxnId(txnId) or eventId,
+        txnId = eventId,
         generation = tonumber(cfg.generation) or 1,
         timestamp = tonumber(op.timestamp) or Now(),
         actor = NormName(op.actorName) or op.actorGuid,

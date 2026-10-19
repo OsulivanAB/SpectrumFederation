@@ -3211,6 +3211,122 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     end
                 end
             end
+        elseif body.kind == "gs-evidence" and type(body.evidence) == "table" then
+            -- Transfer source direct observations. Votes use the authenticated
+            -- source peer only; verified totals come from gs-ledger-event transfer.
+            local evidence = body.evidence
+            local campId = evidence.campaignId or body.campaignId or temp.currentCampaignId
+            local alreadyEv = false
+            local byCampaign = temp.observations and temp.observations.byCampaign
+            local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
+            if type(pending) == "table" then
+                for pi = 1, #pending do
+                    local c = pending[pi]
+                    if type(c) == "table" and type(c.evidence) == "table"
+                        and c.evidence.coreSignature == evidence.coreSignature
+                        and tonumber(c.evidence.itemId) == tonumber(evidence.itemId) then
+                        alreadyEv = true
+                        break
+                    end
+                end
+            end
+            if not alreadyEv then
+                local events = temp.accounting and temp.accounting._consumableEvents
+                if type(events) == "table" then
+                    for j = 1, #events do
+                        local e = events[j]
+                        if type(e) == "table" and e.coreSignature == evidence.coreSignature
+                            and tonumber(e.itemId) == tonumber(evidence.itemId)
+                            and tonumber(e.quantity) == tonumber(evidence.quantity) then
+                            alreadyEv = true
+                            break
+                        end
+                    end
+                end
+            end
+            if alreadyEv then
+                -- settled: free
+            else
+                if sliceUsed >= sliceBudget then
+                    unsettledSeen = true
+                    state.cursor = (i - 1)
+                    if state.cursor < 1 then
+                        state.cursor = #adop.order
+                    end
+                    state.admissions = (tonumber(state.admissions) or 0) + admissions
+                    state.sliceUsed = sliceUsed
+                    return true, nil, progress
+                end
+                evidence.datasetId = body.datasetId or temp.datasetId
+                evidence.campaignId = campId
+                local stEv = GS:AdmitDirectObservation(evidence, {
+                    sender = adop.sourcePeer,
+                    member = member,
+                    offlineRecord = temp,
+                    campaignId = campId,
+                    adoptionReplay = true,
+                    localWrite = false,
+                })
+                admissions = admissions + 1
+                sliceUsed = sliceUsed + 1
+                if stEv == "accepted" or stEv == "duplicate" or stEv == "pending" then
+                    progress = true
+                else
+                    unsettledSeen = true
+                end
+            end
+        elseif body.kind == "gs-ledger-event" and type(body.event) == "table" then
+            local event = body.event
+            local eid = event.id or event.opId or event.txnId
+            local alreadyLe = false
+            local events = temp.accounting and temp.accounting._consumableEvents
+            if type(events) == "table" then
+                for j = 1, #events do
+                    local e = events[j]
+                    if type(e) == "table" then
+                        if (type(eid) == "string" and eid ~= ""
+                            and (e.id == eid or e.opId == eid or e.txnId == eid))
+                            or (type(event.txnId) == "string" and event.txnId ~= ""
+                                and (e.id == event.txnId or e.txnId == event.txnId))
+                            or (type(event.opId) == "string" and event.opId ~= ""
+                                and (e.id == event.opId or e.opId == event.opId)) then
+                            alreadyLe = true
+                            break
+                        end
+                    end
+                end
+            end
+            if alreadyLe then
+                -- settled: free
+            else
+                if sliceUsed >= sliceBudget then
+                    unsettledSeen = true
+                    state.cursor = (i - 1)
+                    if state.cursor < 1 then
+                        state.cursor = #adop.order
+                    end
+                    state.admissions = (tonumber(state.admissions) or 0) + admissions
+                    state.sliceUsed = sliceUsed
+                    return true, nil, progress
+                end
+                event.datasetId = body.datasetId or temp.datasetId
+                local stLe = GS:AdmitLedgerEvent(event, {
+                    sender = adop.sourcePeer,
+                    member = member,
+                    offlineRecord = temp,
+                    adoptionReplay = true,
+                    preserveAttribution = true,
+                    localWrite = false,
+                })
+                admissions = admissions + 1
+                sliceUsed = sliceUsed + 1
+                if stLe == "accepted" or stLe == "duplicate" then
+                    progress = true
+                else
+                    -- Floor-held adjustments / rejected bodies remain unsettled.
+                    unsettledSeen = true
+                end
+            end
         end
     end
     state.cursor = i
@@ -3630,6 +3746,71 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     publishCompletenessStats()
                     return false, "archive_conflict"
                 end
+            end
+        elseif type(body) == "table" and body.kind == "gs-ledger-event"
+            and type(body.event) == "table" then
+            local ev = body.event
+            local eid = ev.id or ev.opId or ev.txnId
+            local found = false
+            local events = temp.accounting and temp.accounting._consumableEvents
+            if type(events) == "table" then
+                for j = 1, #events do
+                    local e = events[j]
+                    if type(e) == "table" then
+                        if (type(eid) == "string" and eid ~= ""
+                            and (e.id == eid or e.opId == eid or e.txnId == eid))
+                            or (type(ev.txnId) == "string" and ev.txnId ~= ""
+                                and (e.id == ev.txnId or e.txnId == ev.txnId))
+                            or (type(ev.opId) == "string" and ev.opId ~= ""
+                                and (e.id == ev.opId or e.opId == ev.opId)) then
+                            found = true
+                            break
+                        end
+                    end
+                end
+            end
+            if not found then
+                opts.cursor = nil
+                publishCompletenessStats()
+                return false, "incomplete_transfer"
+            end
+        elseif type(body) == "table" and body.kind == "gs-evidence"
+            and type(body.evidence) == "table" then
+            local ev = body.evidence
+            local settled = false
+            -- Occurrence already credited on the adopted ledger, or pending cluster retained.
+            local events = temp.accounting and temp.accounting._consumableEvents
+            if type(events) == "table" then
+                for j = 1, #events do
+                    local e = events[j]
+                    if type(e) == "table" and e.coreSignature == ev.coreSignature
+                        and tonumber(e.itemId) == tonumber(ev.itemId)
+                        and tonumber(e.quantity) == tonumber(ev.quantity) then
+                        settled = true
+                        break
+                    end
+                end
+            end
+            if not settled then
+                local byCampaign = temp.observations and temp.observations.byCampaign
+                local campId = ev.campaignId or body.campaignId or temp.currentCampaignId
+                local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
+                if type(pending) == "table" then
+                    for pi = 1, #pending do
+                        local c = pending[pi]
+                        if type(c) == "table" and type(c.evidence) == "table"
+                            and c.evidence.coreSignature == ev.coreSignature
+                            and tonumber(c.evidence.itemId) == tonumber(ev.itemId) then
+                            settled = true
+                            break
+                        end
+                    end
+                end
+            end
+            if not settled then
+                opts.cursor = nil
+                publishCompletenessStats()
+                return false, "incomplete_transfer"
             end
         end
     end

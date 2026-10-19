@@ -16679,6 +16679,438 @@ do
         "3B14: pending/ambiguous path exercised")
 end
 
+---------------------------------------------------------------------------
+-- 3B15+) Codex IMPLEMENT repair regressions (#398)
+---------------------------------------------------------------------------
+
+do
+    -- 3B15) Pending capacity tracks unfinished work; >128 verified still admits
+    local record = seedStagedCampaignWithItem(9015, 500)
+    GS:EnsureGossipProvider()
+    local maxPending = GS.MAX_PENDING_EVIDENCE or 128
+    for n = 1, maxPending + 5 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9015,
+            quantity = 1,
+            occurrenceIndex = n,
+            neighborsOlder = { "older|a|" .. tostring(n) },
+            neighborsNewer = { "newer|b|" .. tostring(n) },
+            donor = "Donor" .. tostring(n) .. "-Garona",
+        })
+        -- Force distinct core signatures via donor.
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            local st = select(1, GS:_AdmitObservationForTests(evidence, pair[1], pair[2]))
+            assertTrue(st == "accepted" or st == "pending" or st == "duplicate",
+                "3B15: admit n=" .. n .. " st=" .. tostring(st))
+        end
+    end
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[9015]) or 0, maxPending + 5,
+        "3B15: all verified donations credited past pending cap")
+    local pendingRows = GS:ListPendingEvidence(record.currentCampaignId, 64)
+    assertEq(#(pendingRows or {}), 0, "3B15: no unfinished pending after compaction")
+end
+
+do
+    -- 3B16) Identity-group merge capacity rejection leaves prior state intact
+    local record = seedStagedCampaignWithItem(9016, 10)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local function fillGroup(prefix, count)
+        local first = prefix .. "1"
+        local guids = {}
+        for i = 1, count do
+            guids[i] = "Player-9-" .. prefix .. tostring(i)
+        end
+        -- Create group by linking first two, then add the rest.
+        local op1 = select(1, GS:NewLinkCharactersOperation(guids[1], guids[2]))
+        assertEq(GS:ApplyStagedConfigOperation(op1), "accepted", "3B16: seed " .. prefix)
+        for i = 3, count do
+            local op = select(1, GS:NewLinkCharactersOperation(guids[1], guids[i]))
+            assertEq(GS:ApplyStagedConfigOperation(op), "accepted",
+                "3B16: grow " .. prefix .. " " .. i)
+        end
+        return guids
+    end
+    local gA = fillGroup("A", 16)
+    local gB = fillGroup("B", 16)
+    local before = deepCopy(record.identityLinks)
+    local mergeOp = select(1, GS:NewLinkCharactersOperation(gA[1], gB[1]))
+    local stMerge = GS:ApplyStagedConfigOperation(mergeOp)
+    assertTrue(stMerge == "rejected" or stMerge == "pending",
+        "3B16: oversize merge rejected st=" .. tostring(stMerge))
+    -- Byte-equal prior groups/index (canonical membership unchanged).
+    assertEq(GS.ValidateIdentityLinks(record.identityLinks), true, "3B16: links still valid")
+    local function guidSet(links)
+        local s = {}
+        for g, gid in pairs(links.byGuid or {}) do
+            s[g] = gid
+        end
+        return s
+    end
+    local beforeSet, afterSet = guidSet(before), guidSet(record.identityLinks)
+    for g, gid in pairs(beforeSet) do
+        assertEq(afterSet[g], gid, "3B16: byGuid preserved for " .. tostring(g))
+    end
+    for g, _ in pairs(afterSet) do
+        assertTrue(beforeSet[g] ~= nil, "3B16: no extra byGuid " .. tostring(g))
+    end
+    local beforeGroups, afterGroups = 0, 0
+    for _ in pairs(before.groups or {}) do beforeGroups = beforeGroups + 1 end
+    for _ in pairs(record.identityLinks.groups or {}) do afterGroups = afterGroups + 1 end
+    assertEq(afterGroups, beforeGroups, "3B16: group count unchanged")
+end
+
+do
+    -- 3B17) Malformed byGuid fails validation; honest links pass
+    assertEq(GS.ValidateIdentityLinks({
+        groups = {},
+        byGuid = { ["Player-1-Alice"] = "ghost", ["Player-1-Bob"] = "ghost" },
+    }), false, "3B17: forged byGuid without groups rejected")
+    assertEq(GS.ValidateIdentityLinks({
+        groups = {
+            g1 = { guids = { "Player-1-Alice", "Player-1-Bob" } },
+        },
+        byGuid = { ["Player-1-Alice"] = "g1" }, -- missing Bob
+    }), false, "3B17: incomplete byGuid rejected")
+    assertEq(GS.ValidateIdentityLinks({
+        groups = {
+            g1 = { guids = { "Player-1-Alice", "Player-1-Bob" } },
+        },
+        byGuid = {
+            ["Player-1-Alice"] = "g1",
+            ["Player-1-Bob"] = "g1",
+        },
+    }), true, "3B17: honest links accepted")
+end
+
+do
+    -- 3B18) Adjustment op id preserved across ledger-before-op and op-before-ledger
+    local record = seedStagedCampaignWithItem(9018, 100)
+    local evidence = makeDepositEvidence(record, { itemId = 9018, quantity = 20 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9018]) or 0,
+        20, "3B18: seed donation")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9018, -3, nil))
+    assertTrue(adjOp ~= nil, "3B18: adjust prepared")
+    -- Simulate ledger-before-op: admit exported ledger body first, then apply op.
+    local ledgerFirst = {
+        type = "adjustment",
+        id = adjOp.id,
+        txnId = adjOp.id,
+        opId = adjOp.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9018,
+        quantity = -3,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }
+    local stLe = select(1, GS:AdmitLedgerEvent(ledgerFirst, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+        preserveAttribution = false,
+    }))
+    assertEq(stLe, "accepted", "3B18: ledger-first accepted")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9018]) or 0,
+        17, "3B18: ledger-first applied once")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "3B18: op after ledger")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9018]) or 0,
+        17, "3B18: op after ledger does not double")
+
+    -- op-before-ledger: prepare another adjust, apply op, then re-admit ledger body.
+    local adjOp2 = select(1, GS:NewAdjustmentOperation(9018, -2, nil))
+    assertEq(GS:ApplyStagedConfigOperation(adjOp2), "accepted", "3B18: op-first")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9018]) or 0,
+        15, "3B18: op-first applied")
+    local stLe2 = select(1, GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = adjOp2.id,
+        txnId = "ctx:noise:adj:1:abcd",
+        opId = adjOp2.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9018,
+        quantity = -2,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+    }))
+    assertEq(stLe2, "duplicate", "3B18: ledger after op duplicate")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9018]) or 0,
+        15, "3B18: no double after ledger-after-op")
+end
+
+do
+    -- 3B19) Stale campaign adjustment rejected (floor not against current campaign)
+    local record = seedStagedCampaignWithItem(9019, 50)
+    local evidence = makeDepositEvidence(record, { itemId = 9019, quantity = 10 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    local oldCampaign = record.currentCampaignId
+    local oldGen = record.accounting._consumables.generation
+    startCampaign() -- rollover
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= oldCampaign, "3B19: campaign rolled")
+    -- Seed current campaign so a naive current-floor check would pass.
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 9019 }, {
+        itemId = 9019, goal = 50, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "3B19: re-request item")
+    world.time = (world.time or 0) + 7200
+    local ev2 = makeDepositEvidence(record, { itemId = 9019, quantity = 30 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(ev2, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9019]) or 0,
+        30, "3B19: current campaign funded")
+    local stStale, rStale = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "op-stale-adj-1",
+        txnId = "op-stale-adj-1",
+        opId = "op-stale-adj-1",
+        generation = oldGen,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9019,
+        quantity = -25,
+        campaignId = oldCampaign,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+    })
+    assertEq(stStale, "rejected", "3B19: stale campaign rejected")
+    assertEq(rStale, "stale_campaign", "3B19: stale_campaign reason")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9019]) or 0,
+        30, "3B19: current totals untouched")
+end
+
+do
+    -- 3B20) Dataset adoption replays donation ledger + evidence (no empty accounting)
+    local aliceRecord = seedStagedCampaignWithItem(9020, 40)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(aliceRecord, { itemId = 9020, quantity = 7 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(aliceRecord.currentCampaignId).itemTotals[9020]) or 0,
+        7, "3B20: source credited")
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    local hasLedger, hasEvidence = false, false
+    for i = 1, #exportBodies do
+        local k = exportBodies[i].body and exportBodies[i].body.kind
+        if k == "gs-ledger-event" then hasLedger = true end
+        if k == "gs-evidence" then hasEvidence = true end
+    end
+    assertTrue(hasLedger, "3B20: source export has ledger")
+    assertTrue(hasEvidence, "3B20: source export has evidence")
+
+    -- Adopter must be an editor (BeginDatasetAdoption requires canEdit).
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B20: begin adoption")
+    for i = 1, #exportBodies do
+        local stB = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(stB == "accepted" or stB == "duplicate",
+            "3B20: buffer " .. tostring(exportBodies[i].body.kind) .. " st=" .. tostring(stB))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 4000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = world.time + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        guard = 0
+        while GS._adoption and GS._adoption.replayTemp and guard < 4000 do
+            guard = guard + 1
+            flushTimers()
+            world.time = world.time + 1
+            flushTimers()
+        end
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(stAdopt == "accepted"
+        or (adopted and adopted.datasetId == sourceDataset),
+        "3B20: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    assertTrue(adopted ~= nil, "3B20: adopted record present")
+    assertEq(adopted and adopted.datasetId, sourceDataset, "3B20: adopted dataset")
+    local prog = adopted and GS:ProjectCampaignProgress(adopted.currentCampaignId)
+    assertEq(tonumber(prog and prog.itemTotals and prog.itemTotals[9020]) or 0, 7,
+        "3B20: adopted client reconstructs source donation credit")
+end
+
+do
+    -- 3B21) Same deposit at different hour buckets → one credit; distinct deposits stay distinct
+    local configRoot
+    do
+        local rec = seedStagedCampaignWithItem(9021, 80)
+        GS:EnsureGossipProvider()
+        configRoot = snapshotConfigRoot()
+    end
+
+    -- Advance well past eligibility so ageHours=2 reconstructions remain eligible.
+    world.time = (world.time or 0) + 20000
+
+    local baseEvidence = nil
+    local function makeTimedEvidence(ageHours, occurrenceIndex, donorSuffix)
+        local rec = loadClientFromConfigRoot(configRoot, "Alice", "Player-1-Alice", 1)
+        local observedAt = (world.time or 1000000)
+        local donor = donorSuffix and ("Donor" .. donorSuffix .. "-Garona") or "DonorHour-Garona"
+        local ev = makeDepositEvidence(rec, {
+            itemId = 9021,
+            quantity = 9,
+            donor = donor,
+            observedAt = observedAt,
+            ageHours = ageHours,
+            occurrenceIndex = occurrenceIndex or 1,
+            neighborsOlder = { "older|hour|sig" },
+            neighborsNewer = { "newer|hour|sig" },
+        })
+        -- Force approxTxnTime from age so hour buckets diverge across observers.
+        ev.approxTxnTime = observedAt - (ageHours * 3600)
+        return rec, ev
+    end
+
+    -- Client A observes the deposit as ageHours=0.
+    local recA, evA = makeTimedEvidence(0, 1, nil)
+    baseEvidence = evA
+    local sharedObservedAt = evA.observedAt
+    local fpA = GS.OccurrenceFingerprint(evA)
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evA, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(recA.currentCampaignId).itemTotals[9021]) or 0,
+        9, "3B21: client A credited")
+    local txnA = nil
+    for i = 1, #(recA.accounting._consumableEvents or {}) do
+        local e = recA.accounting._consumableEvents[i]
+        if e and tonumber(e.itemId) == 9021 then txnA = e.txnId or e.id end
+    end
+    assertTrue(type(txnA) == "string", "3B21: client A txn")
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(64)
+    local ledgerA = nil
+    for _, row in ipairs(filterExportBodies(collectAllExportBodies(), "gs-ledger-event")) do
+        if row.body.event and (row.body.event.txnId == txnA or row.body.event.id == txnA) then
+            ledgerA = row.body
+        end
+    end
+    assertTrue(ledgerA ~= nil, "3B21: client A exported ledger")
+
+    -- Client B reconstructs the SAME deposit with ageHours=2 at the same observedAt
+    -- (Blizzard hour-granular age can disagree across observers / rescan timing).
+    local recB = loadClientFromConfigRoot(configRoot, "Bob", "Player-1-Bob", 2)
+    local evB = makeDepositEvidence(recB, {
+        itemId = 9021,
+        quantity = 9,
+        donor = baseEvidence.donor,
+        observedAt = sharedObservedAt,
+        ageHours = 2,
+        occurrenceIndex = 1,
+        neighborsOlder = baseEvidence.neighborsOlder,
+        neighborsNewer = baseEvidence.neighborsNewer,
+    })
+    evB.coreSignature = baseEvidence.coreSignature
+    evB.approxTxnTime = sharedObservedAt - (2 * 3600)
+    local fpB = GS.OccurrenceFingerprint(evB)
+    assertEq(fpA, fpB, "3B21: fingerprint stable across hour buckets")
+    assertTrue(math.abs(evA.approxTxnTime - evB.approxTxnTime) >= 3600,
+        "3B21: fixture uses different reconstructed times")
+    assertTrue(math.floor(evA.approxTxnTime / 3600) ~= math.floor(evB.approxTxnTime / 3600),
+        "3B21: fixture crosses hour buckets")
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evB, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(recB.currentCampaignId).itemTotals[9021]) or 0,
+        9, "3B21: client B independent credit")
+    -- Import A's ledger into B: must alias, not double.
+    local stImp = select(1, applyExportBody(ledgerA, "Alice-Garona"))
+    assertTrue(stImp == "duplicate" or stImp == "accepted",
+        "3B21: import peer ledger st=" .. tostring(stImp))
+    assertEq(tonumber(GS:ProjectCampaignProgress(recB.currentCampaignId).itemTotals[9021]) or 0,
+        9, "3B21: hour-bucket divergence never double-credits")
+
+    -- Legitimate second deposit (distinct occurrenceIndex + neighbors) still credits separately.
+    local ev2 = makeDepositEvidence(recB, {
+        itemId = 9021,
+        quantity = 9,
+        donor = baseEvidence.donor,
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|second|sig" },
+        neighborsNewer = { "newer|second|sig" },
+    })
+    assertTrue(GS.OccurrenceFingerprint(ev2) ~= fpA, "3B21: distinct occurrence fingerprint")
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(ev2, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(recB.currentCampaignId).itemTotals[9021]) or 0,
+        18, "3B21: distinct deposit still credits separately")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
