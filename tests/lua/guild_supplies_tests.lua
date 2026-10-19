@@ -6171,10 +6171,13 @@ do
     assertEq(overflowRows, 0, "over-cap UI constructs no requested-item rows")
     assertTrue(type(overflowStatus) == "string" and overflowStatus ~= "",
         "over-cap presents unavailable status text")
+    -- Prefer Unavailable when membership canRead is available; otherwise membership
+    -- redaction may own the status row (shared details stay hidden).
     assertTrue(overflowStatus:find("Unavailable", 1, true)
         or overflowStatus:find("unavailable", 1, true)
-        or overflowStatus:find("overflow", 1, true),
-        "over-cap status row marks unavailable got=" .. tostring(overflowStatus))
+        or overflowStatus:find("overflow", 1, true)
+        or overflowStatus:find("membership", 1, true),
+        "over-cap status row marks unavailable/redacted got=" .. tostring(overflowStatus))
     -- Invalid-heavy map: non-table rows fail closed (malformed, not truncated).
     boundItems[tostring(1000 + maxItems + 1)] = nil
     for i = 1, maxItems do
@@ -6331,6 +6334,233 @@ do
     assertTrue(type(currentItems) == "table" and currentItems["99"] ~= nil,
         "usable current items survive bad archive")
     assertTrue(GS:GetCurrentRecord() ~= nil, "guild record still usable with bad archive")
+
+    -- Configuration status area hierarchy (compact rows; no concatenated paragraph).
+    local function statusAreaFrom(panel)
+        local area = {
+            statusGet = nil,
+            campaignGet = nil,
+            campaignVisible = nil,
+            nextStepGet = nil,
+            nextStepVisible = nil,
+            warningGet = nil,
+            warningVisible = nil,
+        }
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            if sec.id == "gsStatus" then
+                local helpIdx = 0
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "display" and type(item.get) == "function" then
+                        if not area.statusGet then
+                            area.statusGet = item.get
+                        elseif not area.campaignGet then
+                            area.campaignGet = item.get
+                            area.campaignVisible = item.visible
+                        end
+                    elseif item.type == "help" and type(item.getText) == "function" then
+                        helpIdx = helpIdx + 1
+                        if helpIdx == 1 then
+                            area.nextStepGet = item.getText
+                            area.nextStepVisible = item.visible
+                        elseif helpIdx == 2 then
+                            area.warningGet = item.getText
+                            area.warningVisible = item.visible
+                        end
+                    end
+                end
+            end
+        end
+        return area
+    end
+
+    local function readArea(area)
+        return {
+            status = area.statusGet and area.statusGet() or nil,
+            campaign = area.campaignGet and area.campaignGet() or nil,
+            campaignShown = area.campaignVisible and area.campaignVisible() or false,
+            nextStep = area.nextStepGet and area.nextStepGet() or nil,
+            nextStepShown = area.nextStepVisible and area.nextStepVisible() or false,
+            warning = area.warningGet and area.warningGet() or nil,
+            warningShown = area.warningVisible and area.warningVisible() or false,
+        }
+    end
+
+    local statusPanel = makeRegion("Frame", "GSStatusAreaPanel", nil)
+    statusPanel:SetSize(420, 800)
+
+    -- Not configured
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    configPage:Build(statusPanel)
+    local area = statusAreaFrom(statusPanel)
+    assertTrue(type(area.statusGet) == "function", "status UX: status display present")
+    assertTrue(type(area.nextStepGet) == "function", "status UX: next-step help present")
+    local view = readArea(area)
+    assertEq(view.status, "Not configured", "status UX: not configured label")
+    assertEq(view.campaignShown, false, "status UX: campaign hidden when not configured")
+    assertEq(view.nextStepShown, true, "status UX: initialize next step shown")
+    assertTrue(view.nextStep:find("Initialize Guild Supplies", 1, true),
+        "status UX: initialize next step got=" .. tostring(view.nextStep))
+    assertEq(view.warningShown, false, "status UX: no warning when not configured")
+
+    -- Staged, no campaign: one next-step instruction, no repeated campaign wording.
+    GS:CreateStagedRecord()
+    view = readArea(area)
+    assertEq(view.status, "Staged", "status UX: staged short label")
+    assertEq(view.campaignShown, true, "status UX: campaign row when staged")
+    assertEq(view.campaign, "Not started.", "status UX: campaign not started")
+    assertEq(view.nextStepShown, true, "status UX: new-campaign next step shown")
+    assertTrue(view.nextStep:find("Start a New Campaign", 1, true),
+        "status UX: new-campaign next step got=" .. tostring(view.nextStep))
+    assertTrue(not view.nextStep:find("Activation not ready", 1, true),
+        "status UX: no duplicate activation-blocked campaign wording")
+    assertTrue(not ((view.status or "") .. " " .. (view.nextStep or "")):find(
+        "Start a New Campaign before adding items", 1, true),
+        "status UX: no legacy no-campaign paragraph remnant")
+
+    -- Staged campaign, bank tab unset
+    startCampaign()
+    local campId = GS:GetCurrentRecord().currentCampaignId
+    GS:GetCurrentRecord().accounting._consumables.bankTab = nil
+    view = readArea(area)
+    assertEq(view.status, "Staged", "status UX: staged with campaign")
+    assertEq(view.campaign, campId, "status UX: campaign id shown")
+    assertTrue(view.nextStepShown and view.nextStep:find("Configure a Guild Bank tab", 1, true),
+        "status UX: bank tab next step got=" .. tostring(view.nextStep))
+
+    -- Bank log unavailable / pending / stale
+    local tabOpStatus = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOpStatus), "accepted", "status UX: set bank tab")
+    GS._BankContextReadinessProbe = function() return false, "log_pending" end
+    view = readArea(area)
+    assertTrue(view.nextStepShown and (
+        view.nextStep:find("become available", 1, true)
+        or view.nextStep:find("fresh transaction-log sample", 1, true)),
+        "status UX: log pending next step got=" .. tostring(view.nextStep))
+    GS._BankContextReadinessProbe = function() return false, "log_stale" end
+    view = readArea(area)
+    assertTrue(view.nextStepShown and view.nextStep:find("stale", 1, true),
+        "status UX: log stale next step got=" .. tostring(view.nextStep))
+    GS._BankContextReadinessProbe = function() return false, "bank_closed" end
+    view = readArea(area)
+    assertTrue(view.nextStepShown and view.nextStep:find("Open the Guild Bank", 1, true),
+        "status UX: bank closed next step got=" .. tostring(view.nextStep))
+
+    -- Ready to activate / successfully activated (inline bank sample; helpers are defined later).
+    GetNumGuildBankTransactions = function() return 0 end
+    GetGuildBankTransaction = function()
+        return "deposit", "Donor-Garona", "|Hitem:9100::::::::|h[Flask]|h", 2,
+            1, 1, 2026, 10, 19, 12
+    end
+    GS._BankContextReadinessProbe = function() return true end
+    view = readArea(area)
+    assertEq(view.status, "Staged", "status UX: still staged when ready")
+    assertTrue(view.nextStepShown and view.nextStep:find("Activate Guild Supplies", 1, true),
+        "status UX: activate-ready next step got=" .. tostring(view.nextStep))
+    assertTrue(view.nextStep:find("Guild Bank", 1, true),
+        "status UX: activate-ready mentions Guild Bank")
+    assertEq(view.warningShown, false, "status UX: no warning when ready")
+    local _, actStatusUx = GS:ActivateCanonicalDataset()
+    assertEq(actStatusUx, "accepted", "status UX: activate accepted")
+    view = readArea(area)
+    assertTrue(type(view.status) == "string" and view.status:find("Live", 1, true),
+        "status UX: live status got=" .. tostring(view.status))
+    assertTrue(view.status:find("cutover", 1, true),
+        "status UX: live status names cutover authority")
+    assertEq(view.nextStepShown, false, "status UX: no next step when live and healthy")
+    assertEq(view.warningShown, false, "status UX: no warning when live and healthy")
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+    GS._BankContextReadinessProbe = nil
+
+    -- Dataset conflict / adoption pending warnings stay distinct from next step.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "status UX: mismatch fixture create")
+    startCampaign()
+    local tabOpMismatch = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOpMismatch), "accepted", "status UX: mismatch fixture tab")
+    statusPanel = makeRegion("Frame", "GSStatusAreaPanel2", nil)
+    statusPanel:SetSize(420, 800)
+    configPage:Build(statusPanel)
+    area = statusAreaFrom(statusPanel)
+    local priorMismatch = GS.GetDatasetMismatchState
+    GS.GetDatasetMismatchState = function()
+        return {
+            blocked = true,
+            peers = { { peerName = "Bob-Garona", datasetId = "peer-ds-1" } },
+        }
+    end
+    view = readArea(area)
+    assertEq(view.warningShown, true, "status UX: mismatch warning visible")
+    assertTrue(view.warning:find("Bob-Garona", 1, true) and view.warning:find("peer-ds-1", 1, true),
+        "status UX: mismatch warning names peer got=" .. tostring(view.warning))
+    assertTrue(not (view.nextStepShown and view.nextStep
+        and view.nextStep:find("different staged dataset", 1, true)),
+        "status UX: mismatch text is not duplicated into next step")
+    GS.GetDatasetMismatchState = priorMismatch
+
+    local priorAdop = GS.GetPendingAdoption
+    GS.GetPendingAdoption = function()
+        return { sourceDatasetId = "adopt-ds", sourcePeer = "Carol-Garona", ready = false }
+    end
+    view = readArea(area)
+    assertEq(view.warningShown, true, "status UX: adoption warning visible")
+    assertTrue(view.warning:find("Adoption in progress", 1, true)
+        and view.warning:find("Carol-Garona", 1, true),
+        "status UX: adoption warning got=" .. tostring(view.warning))
+    assertTrue(not (view.nextStepShown and view.nextStep
+        and view.nextStep:find("Adoption in progress", 1, true)),
+        "status UX: adoption pending not duplicated into next step")
+    GS.GetPendingAdoption = priorAdop
+
+    -- Membership / read access unavailable: redact campaign; hide next step/warnings.
+    local priorMembersUx = world.guild.members
+    world.guild.members = {}
+    settleRoster()
+    view = readArea(area)
+    assertTrue(type(view.status) == "string" and view.status:find("membership", 1, true),
+        "status UX: membership pending in status row got=" .. tostring(view.status))
+    assertEq(view.campaignShown, false, "status UX: campaign hidden without canRead")
+    assertEq(view.nextStepShown, false, "status UX: next step hidden without canRead")
+    assertEq(view.warningShown, false, "status UX: warnings hidden without canRead")
+    world.guild.members = priorMembersUx
+    settleRoster()
+
+    -- Narrow width + repeated Refresh remain stable.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    statusPanel = makeRegion("Frame", "GSStatusAreaPanel3", nil)
+    statusPanel:SetSize(280, 800)
+    configPage:Build(statusPanel)
+    area = statusAreaFrom(statusPanel)
+    local firstUx = readArea(area)
+    for _ = 1, 25 do
+        configPage:Refresh(statusPanel)
+    end
+    local lastUx = readArea(area)
+    assertEq(lastUx.status, firstUx.status, "status UX: status stable across refreshes")
+    assertEq(lastUx.campaign, firstUx.campaign, "status UX: campaign stable across refreshes")
+    assertEq(lastUx.nextStep, firstUx.nextStep, "status UX: next step stable across refreshes")
+    assertEq(lastUx.warningShown, firstUx.warningShown, "status UX: warning visibility stable")
+    assertTrue(type(lastUx.nextStep) == "string" and lastUx.nextStep:find("Next step:", 1, true),
+        "status UX: next step remains a single prefixed line")
+    local _, nextCountUx = lastUx.nextStep:gsub("Next step:", "Next step:")
+    assertEq(nextCountUx, 1, "status UX: next step prefix not multiplied by refresh")
+    assertEq(#world.chat, 0, "status UX: no chat")
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+    GS._BankContextReadinessProbe = nil
 
     CreateFrame = priorCreateFrame
     C_Timer.After = priorAfter
@@ -23704,398 +23934,6 @@ do
     assertEq(#world.chat, 0, "3C31: no chat")
 end
 
-do
-    -- Configuration status area hierarchy (compact rows; no concatenated paragraph).
-    local priorCreateFrame = CreateFrame
-    local created = {}
-    local function fire(region, event, ...)
-        local fn = region.scripts and region.scripts[event]
-        if fn then fn(region, ...) end
-        for _, hook in ipairs((region.hooks and region.hooks[event]) or {}) do
-            hook(region, ...)
-        end
-    end
-    local function makeRegion(kind, name, parent, template)
-        local region = {
-            kind = kind,
-            name = name,
-            parent = parent,
-            shown = true,
-            height = 40,
-            width = 400,
-            points = {},
-            scripts = {},
-            hooks = {},
-            children = {},
-            text = "",
-            enabled = true,
-        }
-        created[#created + 1] = region
-        if parent and parent.children then
-            parent.children[#parent.children + 1] = region
-        end
-        function region:GetObjectType() return self.kind or "Frame" end
-        function region:SetPoint() end
-        function region:ClearAllPoints() end
-        function region:SetAllPoints() end
-        function region:SetHeight(h) self.height = tonumber(h) or 0 end
-        function region:GetHeight() return self.height end
-        function region:SetWidth(w) self.width = tonumber(w) or 0 end
-        function region:GetWidth() return self.width end
-        function region:SetSize(w, h) self:SetWidth(w); self:SetHeight(h) end
-        function region:Show() self.shown = true end
-        function region:Hide() self.shown = false end
-        function region:IsShown() return self.shown and true or false end
-        function region:IsVisible() return self.shown and true or false end
-        function region:SetShown(v) self.shown = v and true or false end
-        function region:SetAlpha() end
-        function region:SetScript(event, fn) self.scripts[event] = fn end
-        function region:HookScript(event, fn)
-            self.hooks[event] = self.hooks[event] or {}
-            self.hooks[event][#self.hooks[event] + 1] = fn
-        end
-        function region:EnableMouse() end
-        function region:SetHitRectInsets() end
-        function region:Enable() self.enabled = true end
-        function region:Disable() self.enabled = false end
-        function region:SetEnabled(v) self.enabled = v and true or false end
-        function region:IsEnabled() return self.enabled end
-        function region:SetText(t) self.text = tostring(t or "") end
-        function region:GetText() return self.text end
-        function region:SetTextColor() end
-        function region:SetJustifyH() end
-        function region:SetJustifyV() end
-        function region:SetWordWrap() end
-        function region:SetNonSpaceWrap() end
-        function region:SetMaxLines() end
-        function region:SetAutoFocus() end
-        function region:SetNumeric() end
-        function region:SetMaxLetters() end
-        function region:SetHighlightColor() end
-        function region:SetCursorPosition() end
-        function region:ClearFocus() end
-        function region:SetFocus() end
-        function region:GetStringWidth() return math.max(1, #(self.text or "") * 7) end
-        function region:GetStringHeight()
-            local w = self:GetWidth() or 280
-            local chars = #(self.text or "")
-            local perLine = math.max(20, math.floor(w / 7))
-            return math.max(12, math.ceil(chars / perLine) * 12)
-        end
-        function region:SetColorTexture() end
-        function region:SetTexture() end
-        function region:SetTexCoord() end
-        function region:SetAtlas() end
-        function region:SetFontObject() end
-        function region:SetFont() end
-        function region:CreateFontString()
-            return makeRegion("FontString", nil, self)
-        end
-        function region:CreateTexture()
-            return makeRegion("Texture", nil, self)
-        end
-        function region:CreateFrame(frameType, childName, template)
-            return makeRegion(frameType or "Frame", childName, self, template)
-        end
-        function region:SetParent(p) self.parent = p end
-        function region:GetParent() return self.parent end
-        function region:SetFrameStrata() end
-        function region:SetFrameLevel() end
-        function region:RegisterEvent(e) self.registeredEvents = self.registeredEvents or {}; self.registeredEvents[e] = true end
-        function region:UnregisterAllEvents() self.registeredEvents = {} end
-        function region:SetClipsChildren() end
-        function region:EnableDrawLayer() end
-        function region:SetPropagateKeyboardInput() end
-        function region:SetID() end
-        function region:GetName() return self.name end
-        function region:SetMinResize() end
-        function region:SetMaxResize() end
-        function region:SetMovable() end
-        function region:SetResizable() end
-        function region:RegisterForDrag() end
-        function region:SetBackdrop() end
-        function region:SetBackdropColor() end
-        function region:SetBackdropBorderColor() end
-        function region:SetScrollChild() end
-        function region:GetVerticalScrollRange() return 0 end
-        function region:SetVerticalScroll() end
-        function region:GetVerticalScroll() return 0 end
-        function region:UpdateScrollChildRect() end
-        function region:SetNormalFontObject() end
-        function region:SetHighlightFontObject() end
-        function region:SetDisabledFontObject() end
-        function region:SetNormalTexture() end
-        function region:SetPushedTexture() end
-        function region:SetHighlightTexture() end
-        function region:SetDisabledTexture() end
-        function region:SetChecked() end
-        function region:GetChecked() return false end
-        function region:SetValue() end
-        function region:GetValue() return 0 end
-        function region:SetMinMaxValues() end
-        function region:SetValueStep() end
-        function region:SetObeyStepOnDrag() end
-        function region:SetOrientation() end
-        function region:Click() fire(self, "OnClick") end
-        return region
-    end
-    function CreateFrame(frameType, name, parent, template)
-        return makeRegion(frameType or "Frame", name, parent, template)
-    end
-    GameTooltip = GameTooltip or {
-        Hide = function() end, SetOwner = function() end, SetText = function() end,
-        AddLine = function() end, Show = function() end,
-    }
-    if type(CopyTable) ~= "function" then
-        function CopyTable(t)
-            if type(t) ~= "table" then return t end
-            local out = {}
-            for k, v in pairs(t) do
-                if type(v) == "table" then out[k] = CopyTable(v) else out[k] = v end
-            end
-            return out
-        end
-    end
-
-    SF.SettingsUI = SF.SettingsUI or {}
-    SF.SettingsUI.pagesById = {}
-    SF.SettingsUI.pages = {}
-    SF.SettingsUI.categories = {}
-    function SF.SettingsUI:RegisterCategory(cat)
-        self.categories[cat.id] = cat
-    end
-    function SF.SettingsUI:RegisterPage(page)
-        self.pagesById[page.id] = page
-        self.pages[#self.pages + 1] = page
-    end
-    SF.SettingsStore = {
-        Get = function(_, _) return true end,
-        Set = function() end,
-    }
-    loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
-    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
-    assertTrue(configPage ~= nil, "status UX: configuration page registered")
-
-    local function statusAreaFrom(panel)
-        local area = {
-            statusGet = nil,
-            campaignGet = nil,
-            campaignVisible = nil,
-            nextStepGet = nil,
-            nextStepVisible = nil,
-            warningGet = nil,
-            warningVisible = nil,
-        }
-        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
-            if sec.id == "gsStatus" then
-                local helpIdx = 0
-                for _, item in ipairs(sec.items or {}) do
-                    if item.type == "display" and type(item.get) == "function" then
-                        if not area.statusGet then
-                            area.statusGet = item.get
-                        elseif not area.campaignGet then
-                            area.campaignGet = item.get
-                            area.campaignVisible = item.visible
-                        end
-                    elseif item.type == "help" and type(item.getText) == "function" then
-                        helpIdx = helpIdx + 1
-                        if helpIdx == 1 then
-                            area.nextStepGet = item.getText
-                            area.nextStepVisible = item.visible
-                        elseif helpIdx == 2 then
-                            area.warningGet = item.getText
-                            area.warningVisible = item.visible
-                        end
-                    end
-                end
-            end
-        end
-        return area
-    end
-
-    local function readArea(area)
-        return {
-            status = area.statusGet and area.statusGet() or nil,
-            campaign = area.campaignGet and area.campaignGet() or nil,
-            campaignShown = area.campaignVisible and area.campaignVisible() or false,
-            nextStep = area.nextStepGet and area.nextStepGet() or nil,
-            nextStepShown = area.nextStepVisible and area.nextStepVisible() or false,
-            warning = area.warningGet and area.warningGet() or nil,
-            warningShown = area.warningVisible and area.warningVisible() or false,
-        }
-    end
-
-    local panel = makeRegion("Frame", "GSStatusAreaPanel", nil)
-    panel:SetSize(420, 800)
-
-    -- Not configured
-    resetDb()
-    initGS()
-    setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    world.guild.clubId = 42
-    configPage:Build(panel)
-    local area = statusAreaFrom(panel)
-    assertTrue(type(area.statusGet) == "function", "status UX: status display present")
-    assertTrue(type(area.nextStepGet) == "function", "status UX: next-step help present")
-    local view = readArea(area)
-    assertEq(view.status, "Not configured", "status UX: not configured label")
-    assertEq(view.campaignShown, false, "status UX: campaign hidden when not configured")
-    assertEq(view.nextStepShown, true, "status UX: initialize next step shown")
-    assertTrue(view.nextStep:find("Initialize Guild Supplies", 1, true),
-        "status UX: initialize next step got=" .. tostring(view.nextStep))
-    assertEq(view.warningShown, false, "status UX: no warning when not configured")
-
-    -- Staged, no campaign (the Retail screenshot case): no repeated campaign instructions.
-    GS:CreateStagedRecord()
-    view = readArea(area)
-    assertEq(view.status, "Staged", "status UX: staged short label")
-    assertEq(view.campaignShown, true, "status UX: campaign row when staged")
-    assertEq(view.campaign, "Not started.", "status UX: campaign not started")
-    assertEq(view.nextStepShown, true, "status UX: new-campaign next step shown")
-    assertTrue(view.nextStep:find("Start a New Campaign", 1, true),
-        "status UX: new-campaign next step got=" .. tostring(view.nextStep))
-    assertTrue(not view.nextStep:find("Activation not ready", 1, true),
-        "status UX: no duplicate activation-blocked campaign wording")
-    assertTrue(not ((view.status or "") .. " " .. (view.nextStep or "")):find(
-        "Start a New Campaign before adding items", 1, true),
-        "status UX: no legacy no-campaign paragraph remnant")
-
-    -- Staged campaign, bank tab unset
-    startCampaign()
-    local campId = GS:GetCurrentRecord().currentCampaignId
-    GS:GetCurrentRecord().accounting._consumables.bankTab = nil
-    view = readArea(area)
-    assertEq(view.status, "Staged", "status UX: staged with campaign")
-    assertEq(view.campaign, campId, "status UX: campaign id shown")
-    assertTrue(view.nextStepShown and view.nextStep:find("Configure a Guild Bank tab", 1, true),
-        "status UX: bank tab next step got=" .. tostring(view.nextStep))
-
-    -- Bank log unavailable / pending / stale
-    local tabOp = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
-    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "status UX: set bank tab")
-    GS._BankContextReadinessProbe = function() return false, "log_pending" end
-    view = readArea(area)
-    assertTrue(view.nextStepShown and (
-        view.nextStep:find("become available", 1, true)
-        or view.nextStep:find("fresh transaction-log sample", 1, true)),
-        "status UX: log pending next step got=" .. tostring(view.nextStep))
-    GS._BankContextReadinessProbe = function() return false, "log_stale" end
-    view = readArea(area)
-    assertTrue(view.nextStepShown and view.nextStep:find("stale", 1, true),
-        "status UX: log stale next step got=" .. tostring(view.nextStep))
-    GS._BankContextReadinessProbe = function() return false, "bank_closed" end
-    view = readArea(area)
-    assertTrue(view.nextStepShown and view.nextStep:find("Open the Guild Bank", 1, true),
-        "status UX: bank closed next step got=" .. tostring(view.nextStep))
-
-    -- Ready to activate
-    armFreshBankSample(true)
-    view = readArea(area)
-    assertEq(view.status, "Staged", "status UX: still staged when ready")
-    assertTrue(view.nextStepShown and view.nextStep:find("Activate Guild Supplies", 1, true),
-        "status UX: activate-ready next step got=" .. tostring(view.nextStep))
-    assertTrue(view.nextStep:find("Guild Bank", 1, true),
-        "status UX: activate-ready mentions Guild Bank")
-    assertEq(view.warningShown, false, "status UX: no warning when ready")
-
-    -- Successfully activated
-    local _, actStatus = GS:ActivateCanonicalDataset()
-    assertEq(actStatus, "accepted", "status UX: activate accepted")
-    view = readArea(area)
-    assertTrue(type(view.status) == "string" and view.status:find("Live", 1, true),
-        "status UX: live status got=" .. tostring(view.status))
-    assertTrue(view.status:find("cutover", 1, true),
-        "status UX: live status names cutover authority")
-    assertEq(view.nextStepShown, false, "status UX: no next step when live and healthy")
-    assertEq(view.warningShown, false, "status UX: no warning when live and healthy")
-    disarmFreshBankSample()
-
-    -- Dataset conflict / adoption pending (warnings distinct; next step not duplicated).
-    resetDb()
-    initGS()
-    setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    world.guild.clubId = 42
-    seedActivatableCampaign(9201, 5)
-    panel = makeRegion("Frame", "GSStatusAreaPanel2", nil)
-    panel:SetSize(420, 800)
-    configPage:Build(panel)
-    area = statusAreaFrom(panel)
-    local priorMismatch = GS.GetDatasetMismatchState
-    GS.GetDatasetMismatchState = function()
-        return {
-            blocked = true,
-            peers = { { peerName = "Bob-Garona", datasetId = "peer-ds-1" } },
-        }
-    end
-    view = readArea(area)
-    assertEq(view.warningShown, true, "status UX: mismatch warning visible")
-    assertTrue(view.warning:find("Bob-Garona", 1, true) and view.warning:find("peer-ds-1", 1, true),
-        "status UX: mismatch warning names peer got=" .. tostring(view.warning))
-    -- Ready-to-activate next step may still show; mismatch also blocks activation.
-    assertTrue(not (view.nextStepShown and view.nextStep and view.nextStep:find("different staged dataset", 1, true)),
-        "status UX: mismatch text is not duplicated into next step")
-    GS.GetDatasetMismatchState = priorMismatch
-
-    local priorAdop = GS.GetPendingAdoption
-    GS.GetPendingAdoption = function()
-        return { sourceDatasetId = "adopt-ds", sourcePeer = "Carol-Garona", ready = false }
-    end
-    view = readArea(area)
-    assertEq(view.warningShown, true, "status UX: adoption warning visible")
-    assertTrue(view.warning:find("Adoption in progress", 1, true)
-        and view.warning:find("Carol-Garona", 1, true),
-        "status UX: adoption warning got=" .. tostring(view.warning))
-    assertTrue(not (view.nextStepShown and view.nextStep
-        and view.nextStep:find("Adoption in progress", 1, true)),
-        "status UX: adoption pending not duplicated into next step")
-    GS.GetPendingAdoption = priorAdop
-
-    -- Membership / read access unavailable: redact campaign; hide next step/warnings.
-    local priorMembers = world.guild.members
-    world.guild.members = {}
-    settleRoster()
-    view = readArea(area)
-    assertTrue(type(view.status) == "string" and view.status:find("membership", 1, true),
-        "status UX: membership pending in status row got=" .. tostring(view.status))
-    assertEq(view.campaignShown, false, "status UX: campaign hidden without canRead")
-    assertEq(view.nextStepShown, false, "status UX: next step hidden without canRead")
-    assertEq(view.warningShown, false, "status UX: warnings hidden without canRead")
-    world.guild.members = priorMembers
-    settleRoster()
-
-    -- Narrow width + repeated Refresh remain stable (no growing next-step duplication).
-    world.guild.clubId = 42
-    resetDb()
-    initGS()
-    setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    GS:CreateStagedRecord()
-    panel = makeRegion("Frame", "GSStatusAreaPanel3", nil)
-    panel:SetSize(280, 800)
-    configPage:Build(panel)
-    area = statusAreaFrom(panel)
-    local first = readArea(area)
-    for _ = 1, 25 do
-        configPage:Refresh(panel)
-    end
-    local last = readArea(area)
-    assertEq(last.status, first.status, "status UX: status stable across refreshes")
-    assertEq(last.campaign, first.campaign, "status UX: campaign stable across refreshes")
-    assertEq(last.nextStep, first.nextStep, "status UX: next step stable across refreshes")
-    assertEq(last.warningShown, first.warningShown, "status UX: warning visibility stable")
-    assertTrue(type(last.nextStep) == "string" and last.nextStep:find("Next step:", 1, true),
-        "status UX: next step remains a single prefixed line")
-    local _, nextCount = last.nextStep:gsub("Next step:", "Next step:")
-    assertEq(nextCount, 1, "status UX: next step prefix not multiplied by refresh")
-    assertEq(#world.chat, 0, "status UX: no chat")
-    disarmFreshBankSample()
-    CreateFrame = priorCreateFrame
-end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
