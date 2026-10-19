@@ -923,6 +923,12 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
     local ordered = {}
     local seen = {}
     ForEachCampaignLedgerEvent(record, generation, function(event)
+        -- Keep history aligned with live progress: uncredited staged rows stay
+        -- in durable storage but are not shown as ordinary credited history (#389).
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
         local id = event.id
         if type(id) == "string" and id ~= "" then
             if seen[id] then

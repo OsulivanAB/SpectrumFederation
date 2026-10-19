@@ -872,7 +872,10 @@ local function Definition()
 									Loc("GUILD_SUPPLIES_ACTIVATE_CONFIRM_OK", "Activate"),
 									commit)
 							else
-								commit()
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+										"Confirmation is required and is unavailable right now."),
+									"error")
 							end
 						end,
 					},
@@ -1233,7 +1236,7 @@ local function Definition()
 						indent = "label",
 						getText = function()
 							return Loc("GUILD_SUPPLIES_ADJUST_HELP",
-								"Signed quantity changes apply to the staged guild ledger. Attribution may name a guild character or stay unattributed. Live bank accounting remains Raid Consumables until activation (#389).")
+								"Signed quantity changes apply to the guild-owned Guild Supplies ledger. Attribution may name a guild character or stay unattributed. Adjustments never verify Guild Bank deposits.")
 						end,
 					},
 					{
@@ -1284,7 +1287,7 @@ local function Definition()
 								RefreshPageControls()
 							end
 							local confirmMsg = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM",
-								"Adjust item %s by %+d on the staged Guild Supplies ledger?")
+								"Adjust item %s by %+d on the Guild Supplies ledger?")
 								:format(tostring(itemId), quantity)
 							if dialogs and dialogs.Confirm then
 								dialogs:Confirm(confirmMsg,

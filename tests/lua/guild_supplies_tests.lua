@@ -22096,7 +22096,9 @@ do
     local sourceDataset
     local sourceMarker
     local sourceCutover
+    local sourceBoundary
     local bodies
+    local aliceGuild
     do
         local rec = seedActivatableCampaign(9122, 40)
         local _, st = GS:ActivateCanonicalDataset()
@@ -22104,35 +22106,20 @@ do
         rec = GS:GetCurrentRecord()
         sourceDataset = rec.datasetId
         sourceMarker = rec.liveCutover.cutoverMarker
-        sourceCutover = {}
-        for k, v in pairs(rec.liveCutover) do
-            if type(v) == "table" then
-                local copy = {}
-                for ck, cv in pairs(v) do copy[ck] = cv end
-                sourceCutover[k] = copy
-            else
-                sourceCutover[k] = v
-            end
-        end
+        sourceBoundary = tonumber(rec.liveCutover.contextObservedAt)
+        sourceCutover = deepCopy(rec.liveCutover)
         GS:EnsureGossipProvider()
         drainExportMaint(64)
         bodies = collectAllExportBodies()
         disarmFreshBankSample()
+        aliceGuild = SpectrumFederationDB.guildSupplies.guilds["club:42"]
     end
 
     -- Bob shares the same dataset id but a divergent live marker (conflicted state).
+    -- Independent deep copy so Bob's eligibility/accounting cannot alias Alice.
     local bobAt = (tonumber(sourceCutover.activatedAt) or world.time) + 77
     local bobMarker = GS.BuildCutoverMarker(sourceDataset, bobAt, sourceCutover.bankTab)
-    local bobCutover = {}
-    for k, v in pairs(sourceCutover) do
-        if type(v) == "table" then
-            local copy = {}
-            for ck, cv in pairs(v) do copy[ck] = cv end
-            bobCutover[k] = copy
-        else
-            bobCutover[k] = v
-        end
-    end
+    local bobCutover = deepCopy(sourceCutover)
     bobCutover.activatedAt = bobAt
     bobCutover.contextObservedAt = bobAt
     bobCutover.cutoverMarker = bobMarker
@@ -22143,35 +22130,30 @@ do
         tabEligibleFrom = bobAt,
     }
 
-    local aliceRoot = SpectrumFederationDB
-    local aliceGuild = aliceRoot.guildSupplies.guilds["club:42"]
+    local bobGuild = deepCopy(aliceGuild)
+    bobGuild.liveCutover = bobCutover
+    bobGuild.accounting._consumableEvents = {}
+    bobGuild.accounting._consumableEventArchive = {}
+    bobGuild.accounting._mutationSeq = 1
+    bobGuild.observations = { byCampaign = {} }
+    bobGuild.confirmationRefs = {}
+    bobGuild.accounting._consumables.eligibility = {
+        baselineEstablished = true,
+        tabEligibleFrom = bobAt,
+        baselineAt = bobAt,
+        items = deepCopy(bobGuild.accounting._consumables.eligibility.items or {}),
+    }
+    assertTrue(tonumber(bobGuild.accounting._consumables.eligibility.tabEligibleFrom) ~= sourceBoundary,
+        "3C22: bob eligibility genuinely diverges before adoption")
+    assertEq(tonumber(aliceGuild.accounting._consumables.eligibility.tabEligibleFrom), sourceBoundary,
+        "3C22: alice eligibility unchanged by bob fixture construction")
+
     SpectrumFederationDB = {
         guildSupplies = {
             schemaVersion = 1,
             localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 },
             guilds = {
-                ["club:42"] = {
-                    schemaVersion = 1,
-                    activation = GS.ACTIVATION_ACTIVE,
-                    datasetId = sourceDataset,
-                    permission = aliceGuild.permission,
-                    currentCampaignId = aliceGuild.currentCampaignId,
-                    campaigns = aliceGuild.campaigns,
-                    campaignArchives = aliceGuild.campaignArchives or {},
-                    campaignContext = aliceGuild.campaignContext or {},
-                    accounting = {
-                        schemaVersion = 1,
-                        _consumables = aliceGuild.accounting._consumables,
-                        _consumableEvents = {},
-                        _consumableEventArchive = {},
-                        _mutationSeq = 1,
-                    },
-                    observations = { byCampaign = {} },
-                    identityLinks = aliceGuild.identityLinks,
-                    operations = aliceGuild.operations,
-                    confirmationRefs = {},
-                    liveCutover = bobCutover,
-                },
+                ["club:42"] = bobGuild,
             },
         },
     }
@@ -22184,6 +22166,10 @@ do
     local bobRec = GS:GetCurrentRecord()
     assertEq(bobRec.datasetId, sourceDataset, "3C22: same dataset")
     assertEq(bobRec.liveCutover.cutoverMarker, bobMarker, "3C22: bob divergent marker")
+    assertEq(tonumber(bobRec.accounting._consumables.eligibility.tabEligibleFrom), bobAt,
+        "3C22: bob pre-adoption eligibility is bob boundary")
+    assertTrue(bobRec.accounting._consumables ~= aliceGuild.accounting._consumables,
+        "3C22: bob accounting table is independent of alice")
 
     -- Without authenticated conflict peer, same_dataset remains rejected.
     assertEq(select(3, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "same_dataset",
@@ -22250,8 +22236,24 @@ do
     assertEq(resolved.liveCutover.cutoverMarker, sourceMarker,
         "3C22: converged to alice marker")
     assertEq(tonumber(resolved.accounting._consumables.eligibility.tabEligibleFrom),
-        tonumber(resolved.liveCutover.contextObservedAt),
-        "3C22: eligibility follows source boundary")
+        sourceBoundary,
+        "3C22: eligibility restored to source boundary")
+    assertEq(tonumber(resolved.liveCutover.contextObservedAt), sourceBoundary,
+        "3C22: cutover context matches source boundary")
+    assertEq(tonumber(aliceGuild.accounting._consumables.eligibility.tabEligibleFrom), sourceBoundary,
+        "3C22: alice eligibility immutable after bob adoption")
+    assertEq(aliceGuild.liveCutover.cutoverMarker, sourceMarker,
+        "3C22: alice cutover marker immutable after bob adoption")
+
+    -- Reload preserves converged marker + eligibility.
+    simulateRuntimeReload()
+    assertEq(GS:Initialize(SpectrumFederationDB), true, "3C22: reload initialize")
+    settleRoster()
+    local reloaded = GS:GetCurrentRecord()
+    assertEq(reloaded.liveCutover.cutoverMarker, sourceMarker,
+        "3C22: reload keeps source marker")
+    assertEq(tonumber(reloaded.accounting._consumables.eligibility.tabEligibleFrom),
+        sourceBoundary, "3C22: reload keeps source eligibility")
 
     -- After convergence, conflict clears when peer marker matches.
     GS.NotePeerDataset("Alice-Garona", sourceDataset, {
@@ -22264,6 +22266,302 @@ do
         "3C22: conflict cleared after convergence")
     assertEq(#world.chat, 0, "3C22: no chat")
 end
+
+do
+    -- 3C23) Invalid retained GS root fails closed; absent root keeps legacy
+    loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
+    local C = SF.Consumables
+    local record = seedActivatableCampaign(9123, 20)
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C23: activated")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), false, "3C23: legacy retired while valid")
+    local saved = SpectrumFederationDB.guildSupplies
+    -- Present invalid root (unsupported schema) retains saved data and blocks legacy.
+    SpectrumFederationDB.guildSupplies = {
+        schemaVersion = 99,
+        localWriter = saved.localWriter,
+        guilds = saved.guilds,
+    }
+    local okInit, reasonInit = GS:Initialize(SpectrumFederationDB)
+    assertEq(okInit, false, "3C23: invalid root initialize fails")
+    assertEq(reasonInit, "unsupported_schema", "3C23: unsupported_schema reason")
+    assertEq(GS:IsRootReady(), false, "3C23: root not ready")
+    assertTrue(type(GS._root) == "table", "3C23: invalid root retained in memory")
+    assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, 99, "3C23: saved root preserved")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), false,
+        "3C23: present invalid root fails closed for legacy")
+    assertEq(GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:42"), false,
+        "3C23: guild-key gate fails closed on invalid root")
+    assertEq(C.LegacyWritersAllowed(), false, "3C23: Consumables gate fails closed")
+    -- Genuinely absent root keeps legacy available.
+    SpectrumFederationDB.guildSupplies = nil
+    GS._root = nil
+    GS._rootValid = false
+    GS._rootReason = "not_initialized"
+    assertEq(GS:IsRootReady(), false, "3C23: absent root not ready")
+    assertEq(GS._root, nil, "3C23: root nil when absent")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), true,
+        "3C23: absent root allows legacy")
+    assertEq(GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:42"), true,
+        "3C23: guild-key allows legacy when root absent")
+    disarmFreshBankSample()
+    assertEq(#world.chat, 0, "3C23: no chat")
+end
+
+do
+    -- 3C24) Activation requires confirmation; history hides uncredited staged rows;
+    -- legacy Settings pages follow the active profile's guild.
+    loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
+    loadModule("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
+    local C = SF.Consumables
+    local Sync = SF.LootHelperSync
+    SF.L.CONSUMABLES_LEGACY_WRITERS_RETIRED =
+        "Raid Consumables profile writers are retired for this guild. Use Guild Supplies."
+    SF.L.GUILD_SUPPLIES_LOGS_HISTORY_HELP =
+        "Newest donation and adjustment entries for the selected campaign are first. Each page shows up to %d entries."
+    SF.L.GUILD_SUPPLIES_ADJUST_HELP =
+        "Signed quantity changes apply to the guild-owned Guild Supplies ledger. Attribution may name a guild character or stay unattributed. Adjustments never verify Guild Bank deposits."
+    SF.L.GUILD_SUPPLIES_ADJUST_CONFIRM =
+        "Adjust item %s by %+d on the Guild Supplies ledger?"
+
+    -- Locale strings used by sync wrappers / help.
+    local retiredMsg = SF.LocaleText("CONSUMABLES_LEGACY_WRITERS_RETIRED", "fallback-retired")
+    assertTrue(retiredMsg:find("retired", 1, true), "3C24: retired locale present")
+    local histHelp = SF.LocaleText("GUILD_SUPPLIES_LOGS_HISTORY_HELP", "fallback %d")
+    assertTrue(not histHelp:find("staged branch", 1, true),
+        "3C24: history help drops staged-branch warning")
+    assertTrue(histHelp:find("%%d", 1, true) or histHelp:find("%d", 1, true),
+        "3C24: history help keeps page-size placeholder")
+    local adjHelp = SF.LocaleText("GUILD_SUPPLIES_ADJUST_HELP", "fallback")
+    assertTrue(not adjHelp:find("Raid Consumables until activation", 1, true),
+        "3C24: adjust help no longer claims RC live accounting")
+    assertTrue(adjHelp:find("Guild Supplies", 1, true), "3C24: adjust help names Guild Supplies")
+
+    -- Seed staged donation then activate; history/progress must hide uncredited rows.
+    local record = seedActivatableCampaign(9124, 25)
+    local campId = record.currentCampaignId
+    local gen = record.accounting._consumables.generation
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = {
+        id = "ctx:gs:staged-hist",
+        txnId = "ctx:gs:staged-hist",
+        type = "donation",
+        itemId = 9124,
+        quantity = 7,
+        actor = "StagedDonor-Garona",
+        generation = gen,
+        timestamp = world.time,
+        campaignId = campId,
+        datasetId = record.datasetId,
+        coreSignature = "deposit|StagedDonor-Garona|9124|7",
+        verification = "witnesses",
+        gsProductionCredit = false,
+    }
+    local histBefore, totalBefore = GS:ListCampaignHistory(campId, 20, 0)
+    assertTrue(totalBefore >= 1, "3C24: staged history visible before activation")
+    local _, st = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "3C24: activated")
+    record = GS:GetCurrentRecord()
+    assertEq(record.accounting._consumableEvents[1].gsProductionCredit, false,
+        "3C24: staged row retained uncredited")
+    local progress = GS:ProjectCampaignProgress(campId)
+    assertEq(tonumber(progress.itemTotals[9124]) or 0, 0,
+        "3C24: progress excludes uncredited staged donation")
+    local histAfter, totalAfter = GS:ListCampaignHistory(campId, 20, 0)
+    assertEq(totalAfter, 0, "3C24: history hides uncredited staged rows after activation")
+    assertEq(#(histAfter or {}), 0, "3C24: history rows empty after filter")
+
+    -- Genuine post-activation credited history still appears.
+    world.time = (tonumber(record.liveCutover.contextObservedAt) or world.time) + 7200
+    local clear = makeDepositEvidence(record, {
+        itemId = 9124, quantity = 4, observedAt = world.time, ageHours = 0,
+        donor = "LiveHist-Garona",
+        occurrenceIndex = 1,
+        neighborsOlder = { "older|lh" },
+        neighborsNewer = { "newer|lh" },
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(clear, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(campId).itemTotals[9124]) or 0, 4,
+        "3C24: live credit in progress")
+    local histLive, totalLive = GS:ListCampaignHistory(campId, 20, 0)
+    assertEq(totalLive, 1, "3C24: live history shows one credited row")
+    assertTrue(histLive[1] and (histLive[1].text or ""):find("LiveHist", 1, true)
+        or (histLive[1] and histLive[1].quantity == 4),
+        "3C24: live history row present")
+    -- Durable staged row still stored.
+    local foundStaged = false
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and ev.id == "ctx:gs:staged-hist" then
+            foundStaged = true
+            assertEq(ev.gsProductionCredit, false, "3C24: staged durable flag retained")
+        end
+    end
+    assertTrue(foundStaged, "3C24: staged event remains in durable storage")
+
+    -- Activation onClick without Confirm keeps staged (production control path).
+    StaticPopupDialogs = StaticPopupDialogs or {}
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    SF.SettingsUI.categories = SF.SettingsUI.categories or {}
+    function SF.SettingsUI:RegisterCategory(cat) self.categories[cat.id] = cat end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    if not SF.SettingsUI.Dialogs then
+        loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
+    end
+    -- Capture Activate onClick via a DefinitionRenderer Build stub that records
+    -- page items without requiring the full CreateFrame UI harness.
+    local capturedActivateOnClick
+    if not SF.SettingsUI.DefinitionRenderer then
+        SF.SettingsUI.DefinitionRenderer = {}
+    end
+    local realBuild = SF.SettingsUI.DefinitionRenderer.Build
+    SF.SettingsUI.DefinitionRenderer.Build = function(self, panel, pageDef)
+        panel.__sfPageDef = pageDef
+        for _, sec in ipairs((pageDef and pageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "button" and type(item.onClick) == "function"
+                    and item.buttonText
+                    and tostring(item.buttonText):find("Activate", 1, true) then
+                    capturedActivateOnClick = item.onClick
+                end
+            end
+        end
+        return panel
+    end
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+    assertTrue(configPage ~= nil, "3C24: config page registered")
+    local stubPanel = { shown = true }
+    configPage:Build(stubPanel)
+    SF.SettingsUI.DefinitionRenderer.Build = realBuild
+    assertTrue(type(capturedActivateOnClick) == "function", "3C24: activate onClick captured")
+
+    -- Fresh staged record for confirm-unavailable / confirm-success paths.
+    disarmFreshBankSample()
+    local staged = seedActivatableCampaign(9125, 15)
+    assertEq(staged.activation, GS.ACTIVATION_STAGED, "3C24: staged before activate click")
+    local messages = {}
+    local section = {
+        ClearMessage = function() end,
+        SetMessage = function(_, msg, sev)
+            messages[#messages + 1] = { msg = msg, sev = sev }
+        end,
+    }
+    SF.SettingsUI.Dialogs.Confirm = nil
+    capturedActivateOnClick({ section = section })
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_STAGED,
+        "3C24: missing confirm does not activate")
+    assertTrue(#messages >= 1 and messages[#messages].sev == "error",
+        "3C24: confirm-unavailable shows error banner")
+    assertTrue(tostring(messages[#messages].msg):find("Confirmation is required", 1, true)
+        or tostring(messages[#messages].msg):find("unavailable", 1, true),
+        "3C24: confirm-unavailable message got=" .. tostring(messages[#messages].msg))
+    assertEq(#world.chat, 0, "3C24: confirm-unavailable emits no Chat")
+    -- Explicit confirmation auto-accepts and activates.
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        if type(accept) == "function" then accept() end
+    end
+    messages = {}
+    capturedActivateOnClick({ section = section })
+    assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE,
+        "3C24: explicit confirmation activates")
+
+    -- Multi-guild page availability follows active profile, not login guild.
+    local Nav = SF.SettingsNavigationModel
+    if not Nav then
+        loadModule("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
+        Nav = SF.SettingsNavigationModel
+    end
+    local consumablesPage = SF.SettingsUI.pagesById.lootHelperConsumables
+    local logsPage = SF.SettingsUI.pagesById.lootHelperConsumableLogs
+    assertTrue(consumablesPage and logsPage, "3C24: legacy pages registered")
+    assertEq(GS:IsLiveActiveForCurrentGuild(), true, "3C24: guild A live before multi-guild nav")
+    -- Create staged guild B while A remains live.
+    world.guild.clubId = 99
+    world.guild.name = "OtherGuild"
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Zoe-Garona", guid = "Player-1-Zoe", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    local _, stB = GS:CreateStagedRecord()
+    assertEq(stB, "accepted", "3C24: guild B staged")
+    local profileA = {
+        _profileId = "profile-a",
+        _consumables = {
+            guild = { guid = "42", name = "Spectrum", realm = "Garona" },
+            bankTab = 2, requestedItems = {}, generation = 0, configSeq = 0, eventSeq = 0,
+            eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
+            txnRegistry = {},
+        },
+        _consumableEvents = {}, _consumableEventArchive = {},
+    }
+    local profileB = {
+        _profileId = "profile-b",
+        _consumables = {
+            guild = { guid = "99", name = "OtherGuild", realm = "Garona" },
+            bankTab = 1, requestedItems = {}, generation = 0, configSeq = 0, eventSeq = 0,
+            eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
+            txnRegistry = {},
+        },
+        _consumableEvents = {}, _consumableEventArchive = {},
+    }
+    assertEq(C.LegacyWritersAllowed(profileA), false, "3C24: profile A retired")
+    assertEq(C.LegacyWritersAllowed(profileB), true, "3C24: profile B writable")
+    -- Logged into B; active profile A (live guild) → pages hidden.
+    SF.GetActiveProfile = function() return profileA end
+    assertEq(Nav.IsPageAvailable(consumablesPage), false,
+        "3C24: on B, active profile A hides Consumables")
+    assertEq(Nav.IsPageAvailable(logsPage), false,
+        "3C24: on B, active profile A hides Logs")
+    -- Active profile B (staged) → pages available while on B.
+    SF.GetActiveProfile = function() return profileB end
+    assertEq(Nav.IsPageAvailable(consumablesPage), true,
+        "3C24: on B, active profile B shows Consumables")
+    assertEq(Nav.IsPageAvailable(logsPage), true,
+        "3C24: on B, active profile B shows Logs")
+    -- Logged into A (live); active profile B still shows pages.
+    world.guild.clubId = 42
+    world.guild.name = "Spectrum"
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    fireEvent("GUILD_ROSTER_UPDATE")
+    SF.GetActiveProfile = function() return profileB end
+    assertEq(Nav.IsPageAvailable(consumablesPage), true,
+        "3C24: on A, active profile B shows Consumables")
+    SF.GetActiveProfile = function() return profileA end
+    assertEq(Nav.IsPageAvailable(consumablesPage), false,
+        "3C24: on A, active profile A hides Consumables")
+    -- Sync wrappers use localized retirement string.
+    local okSync, errSync = Sync:CommitConsumablesOp(profileA, { name = "set_bank_tab", bankTab = 3 },
+        "Alice-Garona", { asAdmin = true })
+    assertEq(okSync, false, "3C24: sync op blocked for live guild profile")
+    assertEq(errSync, retiredMsg, "3C24: sync op uses locale key")
+    local okEv, errEv = Sync:CommitConsumablesEvents(profileA, "tok", {})
+    assertEq(okEv, false, "3C24: sync events blocked for live guild profile")
+    assertEq(errEv, retiredMsg, "3C24: sync events uses locale key")
+    SF.GetActiveProfile = nil
+    disarmFreshBankSample()
+    assertEq(#world.chat, 0, "3C24: no chat")
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

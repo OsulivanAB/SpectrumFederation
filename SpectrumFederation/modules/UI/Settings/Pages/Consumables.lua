@@ -1,6 +1,13 @@
 -- Loot Helper → Consumables. Profile configuration is edited through the domain.
 local _, SF = ...
 
+local function ActiveProfile()
+	if SF.GetActiveProfile then
+		return SF:GetActiveProfile()
+	end
+	return SF.lootHelperDB and SF.lootHelperDB.activeProfile or nil
+end
+
 local Page = {
 	id = "lootHelperConsumables",
 	parentId = "lootHelper",
@@ -8,22 +15,15 @@ local Page = {
 	navLabel = "Consumables",
 	description = "Configure the guild bank and exact items members can donate as raid supplies.",
 	order = 23.6,
-	-- Retire from navigation once Guild Supplies is the live writer (#389).
+	-- Retire from navigation when the *active profile's* guild is live (#389).
 	available = function()
 		local C = SF.Consumables
 		if C and C.LegacyWritersAllowed then
-			return C.LegacyWritersAllowed()
+			return C.LegacyWritersAllowed(ActiveProfile())
 		end
 		return true
 	end,
 }
-
-local function ActiveProfile()
-	if SF.GetActiveProfile then
-		return SF:GetActiveProfile()
-	end
-	return SF.lootHelperDB and SF.lootHelperDB.activeProfile or nil
-end
 
 local function ProfileKey(profile)
 	if type(profile) ~= "table" then return nil end

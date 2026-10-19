@@ -6,6 +6,13 @@ local _, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 local function Consumables()
     return SF.Consumables
 end
@@ -771,7 +778,8 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
         return false, "Raid Consumables is unavailable."
     end
     if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
-        return false, "Raid Consumables profile writers are retired for this guild. Use Guild Supplies."
+        return false, Loc("CONSUMABLES_LEGACY_WRITERS_RETIRED",
+            "Raid Consumables profile writers are retired for this guild. Use Guild Supplies.")
     end
     opts = opts or {}
     local inSession = SessionFor(profile)
@@ -960,7 +968,8 @@ function Sync:CommitConsumablesEvents(profile, token, events)
     local C = Consumables()
     if not C then return false, "Raid Consumables is unavailable." end
     if C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
-        return false, "Raid Consumables profile writers are retired for this guild. Use Guild Supplies."
+        return false, Loc("CONSUMABLES_LEGACY_WRITERS_RETIRED",
+            "Raid Consumables profile writers are retired for this guild. Use Guild Supplies.")
     end
     local seen = EventIdSet(profile)
     local writer = self._SelfId and self:_SelfId() or nil
