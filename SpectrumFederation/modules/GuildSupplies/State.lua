@@ -1,5 +1,5 @@
--- Guild Supplies staged foundation — durable state (#385 Part 2A).
--- Live authoritative writer remains legacy profile-scoped Consumables.
+-- Guild Supplies durable guild-keyed state (#385–#389).
+-- Production live writers activate via Activation.lua (#389).
 local addonName, SF = ...
 
 SF.GuildSupplies = SF.GuildSupplies or {}
@@ -7,6 +7,7 @@ local GS = SF.GuildSupplies
 
 GS.SCHEMA_VERSION = 1
 GS.ACTIVATION_STAGED = "staged"
+GS.ACTIVATION_ACTIVE = GS.ACTIVATION_ACTIVE or "active"
 GS.DEFAULT_EDITOR_RANK_POSITION = 3
 GS.MAX_ACCEPTED_OPERATIONS = 4096
 GS.MAX_PENDING_OPERATIONS = 128
@@ -491,12 +492,28 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if not schema or schema ~= GS.SCHEMA_VERSION then
         return false, "unsupported_schema"
     end
-    if record.activation ~= GS.ACTIVATION_STAGED then
-        -- #385 never activates; unknown activation is unavailable, not rewritten.
-        return false, "unsupported_activation"
+    if not GS.IsSupportedActivation or not GS.IsSupportedActivation(record.activation) then
+        -- Unknown activation is unavailable, not rewritten into defaults.
+        if record.activation ~= GS.ACTIVATION_STAGED and record.activation ~= GS.ACTIVATION_ACTIVE then
+            return false, "unsupported_activation"
+        end
     end
     if type(record.datasetId) ~= "string" or record.datasetId == "" then
         return false, "invalid_dataset_id"
+    end
+    -- Active records require a durable agreed live-cutover boundary (#389).
+    if record.activation == GS.ACTIVATION_ACTIVE then
+        if GS.ValidateLiveCutover then
+            local cutOk, cutErr = GS.ValidateLiveCutover(record.liveCutover, record, guildKey)
+            if not cutOk then
+                return false, cutErr or "missing_live_cutover"
+            end
+        elseif type(record.liveCutover) ~= "table" then
+            return false, "missing_live_cutover"
+        end
+    elseif record.liveCutover ~= nil then
+        -- Staged records must not carry a live cutover marker.
+        return false, "unexpected_live_cutover"
     end
     local _, clubId = GS.ParseGuildKey(guildKey)
     if not clubId then

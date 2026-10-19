@@ -1932,6 +1932,15 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         row.generation = tonumber(cfg and cfg.generation) or 0
     end
 
+    -- Live cutover: refuse pre-activation bank rows even if campaign eligibility
+    -- was established earlier during staged development (#389).
+    if GS.IsLiveActive and GS.IsLiveActive(record) and GS.IsEvidenceAfterLiveCutover then
+        local afterOk, afterErr = GS.IsEvidenceAfterLiveCutover(record, row)
+        if not afterOk then
+            return "pending", afterErr or "not_eligible"
+        end
+    end
+
     local eligOk, eligErr = IsEvidenceEligible(record, row)
     local boundaryAmbiguous = (eligErr == "ambiguous_boundary"
         or eligErr == "missing_eligibility_context")

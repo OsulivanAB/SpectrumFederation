@@ -1208,7 +1208,7 @@ function GS:ApplyStagedConfigOperation(op, context)
     if type(record) ~= "table" then
         return "rejected", resolveReason or "not_configured"
     end
-    if record.activation ~= GS.ACTIVATION_STAGED then
+    if not (GS.IsSupportedActivation and GS.IsSupportedActivation(record.activation)) then
         return "rejected", "unsupported_activation"
     end
     if op.datasetId ~= record.datasetId then

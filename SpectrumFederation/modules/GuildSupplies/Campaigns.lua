@@ -1047,7 +1047,25 @@ function GS.FormatReasonText(reason)
         wrong_guild = Loc("GUILD_SUPPLIES_REASON_WRONG_GUILD",
             "the active guild changed"),
         unsupported_activation = Loc("GUILD_SUPPLIES_REASON_UNSUPPORTED_ACTIVATION",
-            "this dataset is not on the staged activation path"),
+            "this dataset is not on a supported activation path"),
+        already_activated = Loc("GUILD_SUPPLIES_REASON_ALREADY_ACTIVATED",
+            "Guild Supplies is already active for this guild"),
+        not_activated = Loc("GUILD_SUPPLIES_REASON_NOT_ACTIVATED",
+            "Guild Supplies has not been activated for this guild yet"),
+        missing_live_cutover = Loc("GUILD_SUPPLIES_REASON_MISSING_LIVE_CUTOVER",
+            "the live cutover boundary is missing or invalid"),
+        live_activation_conflict = Loc("GUILD_SUPPLIES_REASON_LIVE_ACTIVATION_CONFLICT",
+            "conflicting live activation markers must be resolved by adopting one canonical source"),
+        adoption_in_progress = Loc("GUILD_SUPPLIES_REASON_ADOPTION_IN_PROGRESS",
+            "finish or cancel dataset adoption before activating"),
+        unexpected_live_cutover = Loc("GUILD_SUPPLIES_REASON_UNEXPECTED_LIVE_CUTOVER",
+            "staged datasets cannot carry a live cutover marker"),
+        invalid_live_cutover = Loc("GUILD_SUPPLIES_REASON_INVALID_LIVE_CUTOVER",
+            "the live cutover boundary is malformed"),
+        cutover_boundary_mismatch = Loc("GUILD_SUPPLIES_REASON_CUTOVER_BOUNDARY_MISMATCH",
+            "the live eligibility boundary does not match the bank sample"),
+        invalid_cutover_marker = Loc("GUILD_SUPPLIES_REASON_INVALID_CUTOVER_MARKER",
+            "the live cutover marker is invalid"),
         incomplete_transfer = Loc("GUILD_SUPPLIES_REASON_INCOMPLETE_TRANSFER",
             "the selected dataset transfer is incomplete — local state was left unchanged"),
         replay_in_progress = Loc("GUILD_SUPPLIES_REASON_REPLAY_IN_PROGRESS",
@@ -1136,11 +1154,26 @@ end
 -- @return message string, severity ("success"|"info"|"warn"|"error")
 function GS.FormatMutationFeedback(status, reason)
     if status == "accepted" then
+        if reason == "activated" then
+            return Loc("GUILD_SUPPLIES_STATUS_ACTIVATED",
+                "Guild Supplies is now the live guild-owned writer. Pre-activation bank rows will not be credited."),
+                "success"
+        end
+        if GS.IsLiveActiveForCurrentGuild and GS:IsLiveActiveForCurrentGuild() then
+            return Loc("GUILD_SUPPLIES_STATUS_ACCEPTED_LIVE",
+                "Change admitted to the active Guild Supplies dataset."),
+                "success"
+        end
         return Loc("GUILD_SUPPLIES_STATUS_ACCEPTED",
             "Staged change admitted. Live bank accounting still uses Raid Consumables until activation."),
             "success"
     end
     if status == "duplicate" then
+        if reason == "already_activated" then
+            return Loc("GUILD_SUPPLIES_STATUS_ALREADY_ACTIVATED",
+                "Guild Supplies is already active for this guild."),
+                "info"
+        end
         return Loc("GUILD_SUPPLIES_STATUS_DUPLICATE",
             "No new effect — that change was already admitted."),
             "info"
@@ -1429,7 +1462,7 @@ function GS:ApplyStagedCampaignOperation(op, context)
     if type(record) ~= "table" then
         return "rejected", recordReason or "not_configured"
     end
-    if record.activation ~= GS.ACTIVATION_STAGED then
+    if not (GS.IsSupportedActivation and GS.IsSupportedActivation(record.activation)) then
         return "rejected", "unsupported_activation"
     end
 

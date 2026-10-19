@@ -1,0 +1,643 @@
+-- Guild Supplies Phase 3C (#389) — guarded production activation and cutover.
+-- Canonical live authority for one guild-owned dataset; retires legacy writers.
+local addonName, SF = ...
+
+SF.GuildSupplies = SF.GuildSupplies or {}
+local GS = SF.GuildSupplies
+
+GS.ACTIVATION_ACTIVE = "active"
+GS.LIVE_CUTOVER_SCHEMA = 1
+
+local function DebugInfo(fmt, ...)
+    if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+        SF.Debug:Info("GUILD_SUPPLIES", fmt, ...)
+    end
+end
+
+local function DebugWarn(fmt, ...)
+    if SF.Debug and SF.Debug.Warn and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+        SF.Debug:Warn("GUILD_SUPPLIES", fmt, ...)
+    end
+end
+
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default
+end
+
+--- True for staged or active activation values this build understands.
+function GS.IsSupportedActivation(activation)
+    return activation == GS.ACTIVATION_STAGED or activation == GS.ACTIVATION_ACTIVE
+end
+
+--- True when the record is the canonical live Guild Supplies writer.
+function GS.IsLiveActive(record)
+    return type(record) == "table" and record.activation == GS.ACTIVATION_ACTIVE
+end
+
+--- Validated current-guild live record, or nil + reason.
+function GS:GetLiveActiveRecord()
+    local record, reason = GS:GetCurrentRecord()
+    if not record then
+        return nil, reason or "not_ready"
+    end
+    if not GS.IsLiveActive(record) then
+        return nil, "not_activated"
+    end
+    return record, nil
+end
+
+function GS:IsLiveActiveForCurrentGuild()
+    local record = select(1, GS:GetCurrentRecord())
+    return GS.IsLiveActive(record)
+end
+
+--- Legacy profile Consumables may write only while this guild is not live-active.
+function GS:ShouldUseLegacyConsumablesWriters()
+    if not GS:IsRootReady() then
+        -- Unavailable GS root must not invent live authority; keep legacy for
+        -- unrelated guilds/profiles until a validated active record exists.
+        return true
+    end
+    local record, reason = GS:GetCurrentRecord()
+    if record == nil then
+        -- not_configured / identity waiting: legacy remains for other profiles.
+        if reason == "not_configured" or reason == "identity_unavailable"
+            or reason == "not_ready" or reason == "not_a_member" then
+            return true
+        end
+        -- Malformed/unsupported retained records fail closed for both writers.
+        return false
+    end
+    return not GS.IsLiveActive(record)
+end
+
+local function IsFiniteNonnegInt(value)
+    if GS.IsFiniteNonnegInt then
+        return GS.IsFiniteNonnegInt(value)
+    end
+    local n = tonumber(value)
+    return n and n == math.floor(n) and n >= 0 and n == n and n ~= math.huge
+end
+
+local function IsBoundedActorString(value)
+    return type(value) == "string" and value ~= "" and #value <= (GS.MAX_OPERATION_ID or 192)
+end
+
+--- Build a durable cutover marker shared via gossip descriptors.
+function GS.BuildCutoverMarker(datasetId, activatedAt, bankTab)
+    if type(datasetId) ~= "string" or datasetId == "" then
+        return nil
+    end
+    if not IsFiniteNonnegInt(activatedAt) then
+        return nil
+    end
+    local tab = tonumber(bankTab)
+    if not tab or tab ~= math.floor(tab) or tab < 1 or tab > (GS.MAX_BANK_TAB or 8) then
+        return nil
+    end
+    return string.format("gsc1:%s:%d:%d", datasetId, activatedAt, tab)
+end
+
+--- Validate a persisted liveCutover block (active records only).
+-- @return boolean ok, string|nil reason
+function GS.ValidateLiveCutover(cutover, record, guildKey)
+    if cutover == nil then
+        return false, "missing_live_cutover"
+    end
+    if type(cutover) ~= "table" then
+        return false, "invalid_live_cutover"
+    end
+    local schema = tonumber(cutover.schemaVersion)
+    if not schema or schema ~= GS.LIVE_CUTOVER_SCHEMA then
+        return false, "unsupported_cutover_schema"
+    end
+    if type(cutover.datasetId) ~= "string" or cutover.datasetId == "" then
+        return false, "invalid_cutover_dataset"
+    end
+    if type(record) == "table" and type(record.datasetId) == "string"
+        and cutover.datasetId ~= record.datasetId then
+        return false, "cutover_dataset_mismatch"
+    end
+    if type(guildKey) == "string" and type(cutover.guildKey) == "string"
+        and cutover.guildKey ~= "" and cutover.guildKey ~= guildKey then
+        return false, "cutover_guild_mismatch"
+    end
+    if not IsFiniteNonnegInt(cutover.activatedAt) then
+        return false, "invalid_cutover_time"
+    end
+    if not IsBoundedActorString(cutover.activatedByGuid) then
+        return false, "invalid_cutover_actor"
+    end
+    local tab = tonumber(cutover.bankTab)
+    if not tab or tab ~= math.floor(tab) or tab < 1 or tab > (GS.MAX_BANK_TAB or 8) then
+        return false, "invalid_cutover_bank_tab"
+    end
+    local status = cutover.contextStatus
+    if status ~= "captured" and status ~= "empty" then
+        return false, "invalid_cutover_context"
+    end
+    if not IsFiniteNonnegInt(cutover.contextObservedAt) then
+        return false, "invalid_cutover_context_time"
+    end
+    if status == "empty" then
+        if tonumber(cutover.contextRecordCount) ~= 0 then
+            return false, "invalid_cutover_context_count"
+        end
+    elseif not IsFiniteNonnegInt(cutover.contextRecordCount) then
+        return false, "invalid_cutover_context_count"
+    end
+    local marker = cutover.cutoverMarker
+    local expected = GS.BuildCutoverMarker(cutover.datasetId, cutover.activatedAt, tab)
+    if type(marker) ~= "string" or marker == "" or marker ~= expected then
+        return false, "invalid_cutover_marker"
+    end
+    local boundary = cutover.eligibilityBoundary
+    if type(boundary) ~= "table" then
+        return false, "invalid_cutover_boundary"
+    end
+    if boundary.baselineEstablished ~= true then
+        return false, "invalid_cutover_boundary"
+    end
+    if not IsFiniteNonnegInt(boundary.tabEligibleFrom) then
+        return false, "invalid_cutover_boundary"
+    end
+    -- Boundary must match the trustworthy bank sample observation time.
+    if tonumber(boundary.tabEligibleFrom) ~= tonumber(cutover.contextObservedAt) then
+        return false, "cutover_boundary_mismatch"
+    end
+    return true
+end
+
+--- Compact cutover summary for gossip descriptors (no bank anchors).
+function GS.DescribeLiveCutover(cutover)
+    if type(cutover) ~= "table" then
+        return nil
+    end
+    return {
+        schemaVersion = tonumber(cutover.schemaVersion) or GS.LIVE_CUTOVER_SCHEMA,
+        datasetId = cutover.datasetId,
+        guildKey = cutover.guildKey,
+        activatedAt = cutover.activatedAt,
+        activatedByGuid = cutover.activatedByGuid,
+        bankTab = cutover.bankTab,
+        contextStatus = cutover.contextStatus,
+        contextObservedAt = cutover.contextObservedAt,
+        contextRecordCount = cutover.contextRecordCount,
+        cutoverMarker = cutover.cutoverMarker,
+        eligibilityBoundary = type(cutover.eligibilityBoundary) == "table" and {
+            baselineEstablished = cutover.eligibilityBoundary.baselineEstablished == true,
+            tabEligibleFrom = cutover.eligibilityBoundary.tabEligibleFrom,
+        } or nil,
+    }
+end
+
+local function CopyLiveCutover(cutover)
+    if type(cutover) ~= "table" then
+        return nil
+    end
+    local copy = {
+        schemaVersion = cutover.schemaVersion,
+        datasetId = cutover.datasetId,
+        guildKey = cutover.guildKey,
+        activatedAt = cutover.activatedAt,
+        activatedByGuid = cutover.activatedByGuid,
+        activatedByName = cutover.activatedByName,
+        bankTab = cutover.bankTab,
+        contextStatus = cutover.contextStatus,
+        contextObservedAt = cutover.contextObservedAt,
+        contextRecordCount = cutover.contextRecordCount,
+        cutoverMarker = cutover.cutoverMarker,
+        eligibilityBoundary = nil,
+    }
+    if type(cutover.eligibilityBoundary) == "table" then
+        copy.eligibilityBoundary = {
+            baselineEstablished = cutover.eligibilityBoundary.baselineEstablished == true,
+            tabEligibleFrom = cutover.eligibilityBoundary.tabEligibleFrom,
+        }
+    end
+    return copy
+end
+
+--- Apply the agreed live eligibility boundary onto accounting._consumables.
+-- Does not credit donations. Clears item cutoffs so only the tab boundary gates
+-- post-activation deposits until new items are added after activation.
+local function ApplyLiveEligibilityBoundary(cfg, cutover)
+    if type(cfg) ~= "table" or type(cutover) ~= "table" then
+        return false
+    end
+    local ts = tonumber(cutover.contextObservedAt)
+    if not ts then
+        return false
+    end
+    cfg.eligibility = {
+        items = {},
+        tabEligibleFrom = ts,
+        baselineEstablished = true,
+        baselineAt = ts,
+        liveCutoverAt = ts,
+        liveCutoverMarker = cutover.cutoverMarker,
+    }
+    return true
+end
+
+--- Drop unfinished pending evidence so staged/synthetic observations cannot
+-- retrospectively credit after activation. Accepted ledger events stay.
+local function QuarantinePreActivationPending(record)
+    if type(record) ~= "table" or type(record.observations) ~= "table" then
+        return
+    end
+    local byCampaign = record.observations.byCampaign
+    if type(byCampaign) ~= "table" then
+        return
+    end
+    for _, camp in pairs(byCampaign) do
+        if type(camp) == "table" and type(camp.pending) == "table" then
+            local kept = {}
+            for i = 1, #camp.pending do
+                local cluster = camp.pending[i]
+                -- Retain only already-verified clusters (should be rare/empty).
+                if type(cluster) == "table" and cluster.status == "verified" then
+                    kept[#kept + 1] = cluster
+                end
+            end
+            camp.pending = kept
+        end
+    end
+    -- Local directExports are re-created by post-activation observation.
+    if type(record.observations.directExports) == "table" then
+        record.observations.directExports = {}
+    end
+end
+
+local function OpenConflictsBlockActivation()
+    if type(GS.ListOpenConflicts) ~= "function" then
+        return false
+    end
+    local conflicts = GS:ListOpenConflicts()
+    return type(conflicts) == "table" and #conflicts > 0
+end
+
+local function DatasetMismatchBlocksActivation()
+    if type(GS.GetDatasetMismatchState) ~= "function" then
+        return false
+    end
+    local state = GS:GetDatasetMismatchState()
+    return type(state) == "table" and state.blocked == true
+end
+
+--- Peer live cutover that conflicts with the local active marker.
+function GS:GetLiveActivationConflictState()
+    local record = select(1, GS:GetCurrentRecord())
+    if not GS.IsLiveActive(record) or type(record.liveCutover) ~= "table" then
+        return { blocked = false, reason = nil, peers = {} }
+    end
+    local localMarker = record.liveCutover.cutoverMarker
+    local peers = {}
+    if type(GS._peerDatasets) ~= "table" then
+        return { blocked = false, reason = nil, peers = peers }
+    end
+    local ctx = GS:GetCurrentContext()
+    for _, entry in pairs(GS._peerDatasets) do
+        if type(entry) == "table" and type(entry.cutoverMarker) == "string"
+            and entry.cutoverMarker ~= "" and entry.cutoverMarker ~= localMarker then
+            local member = GS.AuthenticateTransportSender and GS.AuthenticateTransportSender(entry.peerName)
+            if member and ctx and member.guildKey == ctx.guildKey then
+                peers[#peers + 1] = {
+                    peerName = entry.peerName,
+                    datasetId = entry.datasetId,
+                    cutoverMarker = entry.cutoverMarker,
+                    activation = entry.activation,
+                }
+            end
+        end
+    end
+    if #peers > 0 then
+        return {
+            blocked = true,
+            reason = "live_activation_conflict",
+            localCutoverMarker = localMarker,
+            peers = peers,
+        }
+    end
+    return { blocked = false, reason = nil, peers = peers }
+end
+
+--- Readiness probe for Settings banners (does not mutate).
+function GS:GetActivationReadiness()
+    local result = {
+        canActivate = false,
+        alreadyActive = false,
+        reason = "not_ready",
+        bankReady = false,
+        bankReason = nil,
+        bankStatus = nil,
+    }
+    if not GS:IsRootReady() then
+        result.reason = GS:GetRootReason() or "not_ready"
+        return result
+    end
+    local caps = GS:GetCapabilities()
+    local record, recReason = GS:GetCurrentRecord()
+    if GS.IsLiveActive(record) then
+        result.alreadyActive = true
+        result.canActivate = false
+        result.reason = "already_activated"
+        return result
+    end
+    if not record then
+        result.reason = recReason or caps.reason or "not_configured"
+        return result
+    end
+    if record.activation ~= GS.ACTIVATION_STAGED then
+        result.reason = "unsupported_activation"
+        return result
+    end
+    if not caps.canEdit then
+        result.reason = caps.reason or "unauthorized"
+        return result
+    end
+    if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+        result.reason = "no_campaign"
+        return result
+    end
+    local cfg = record.accounting and record.accounting._consumables
+    local tab = cfg and tonumber(cfg.bankTab) or nil
+    if not tab then
+        result.reason = "bank_tab_unset"
+        return result
+    end
+    if OpenConflictsBlockActivation() then
+        result.reason = "divergent_edit"
+        return result
+    end
+    if DatasetMismatchBlocksActivation() then
+        result.reason = "dataset_mismatch"
+        return result
+    end
+    local pendingAdoption = GS.GetPendingAdoption and GS:GetPendingAdoption()
+    if type(pendingAdoption) == "table" then
+        result.reason = "adoption_in_progress"
+        return result
+    end
+    local ready, readyReason = GS.IsBankContextSampleReady(tab)
+    result.bankReady = ready and true or false
+    result.bankReason = readyReason
+    if not ready then
+        result.reason = readyReason or "log_not_updated"
+        return result
+    end
+    -- Capture is non-mutating for readiness classification when APIs exist.
+    local sample = GS.CaptureBankContext(tab)
+    result.bankStatus = sample and sample.status or nil
+    if not sample or (sample.status ~= "captured" and sample.status ~= "empty") then
+        result.reason = (sample and sample.reason) or "readiness_unavailable"
+        return result
+    end
+    result.canActivate = true
+    result.reason = nil
+    return result
+end
+
+--- Explicit authorized activation of the current staged guild dataset.
+-- Idempotent when already active with a matching cutover marker.
+-- @return record|nil, status ("accepted"|"duplicate"|"rejected"), reason|nil
+function GS:ActivateCanonicalDataset()
+    if not GS:IsRootReady() then
+        return nil, "rejected", GS:GetRootReason() or "not_ready"
+    end
+
+    local prepared = {
+        guildKey = nil,
+        handleGeneration = GS.GetHandleGeneration(),
+        actorGuid = nil,
+    }
+    local ctx = GS:GetCurrentContext()
+    if not ctx or not ctx.ready or not ctx.guildKey then
+        return nil, "rejected", (ctx and ctx.reason) or "not_ready"
+    end
+    prepared.guildKey = ctx.guildKey
+    prepared.actorGuid = ctx.actorGuid
+
+    local authOk, authReason, fresh = GS:_AuthorizeCommit(prepared, {})
+    if not authOk then
+        return nil, "rejected", authReason or "unauthorized"
+    end
+    ctx = fresh or ctx
+
+    local record, recReason = GS:GetCurrentRecord()
+    if not record then
+        return nil, "rejected", recReason or "not_configured"
+    end
+
+    -- Idempotent success when already active with a valid cutover.
+    if GS.IsLiveActive(record) then
+        local cutOk, cutErr = GS.ValidateLiveCutover(record.liveCutover, record, ctx.guildKey)
+        if cutOk then
+            return record, "duplicate", "already_activated"
+        end
+        -- Active without recoverable cutover: fail closed; do not silently repair.
+        DebugWarn("active record missing valid liveCutover err=%s", tostring(cutErr))
+        return nil, "rejected", cutErr or "missing_live_cutover"
+    end
+
+    if record.activation ~= GS.ACTIVATION_STAGED then
+        return nil, "rejected", "unsupported_activation"
+    end
+    if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+        return nil, "rejected", "no_campaign"
+    end
+    local cfg = record.accounting and record.accounting._consumables
+    if type(cfg) ~= "table" then
+        return nil, "rejected", "invalid_accounting"
+    end
+    local tab = tonumber(cfg.bankTab)
+    if not tab then
+        return nil, "rejected", "bank_tab_unset"
+    end
+    if OpenConflictsBlockActivation() then
+        return nil, "rejected", "divergent_edit"
+    end
+    if DatasetMismatchBlocksActivation() then
+        return nil, "rejected", "dataset_mismatch"
+    end
+    local pendingAdoption = GS.GetPendingAdoption and GS:GetPendingAdoption()
+    if type(pendingAdoption) == "table" then
+        return nil, "rejected", "adoption_in_progress"
+    end
+
+    -- Fresh bank sample required on the activating client only.
+    local sample = GS.CaptureBankContext(tab)
+    if type(sample) ~= "table"
+        or (sample.status ~= "captured" and sample.status ~= "empty") then
+        return nil, "rejected", (sample and sample.reason) or "log_not_updated"
+    end
+    local observedAt = tonumber(sample.observedAt)
+    if not IsFiniteNonnegInt(observedAt) then
+        return nil, "rejected", "server_time_unavailable"
+    end
+
+    -- Re-authorize immediately before commitment (rank/guild may have changed).
+    authOk, authReason, fresh = GS:_AuthorizeCommit(prepared, {})
+    if not authOk then
+        return nil, "rejected", authReason or "unauthorized"
+    end
+    ctx = fresh or ctx
+    if ctx.guildKey ~= prepared.guildKey then
+        return nil, "rejected", "wrong_guild"
+    end
+
+    -- Re-read record after auth; refuse if displaced.
+    local liveRecord, liveReason = GS:GetCurrentRecord()
+    if not liveRecord or liveRecord ~= record then
+        return nil, "rejected", liveReason or "dataset_mismatch"
+    end
+    if liveRecord.datasetId ~= record.datasetId then
+        return nil, "rejected", "dataset_mismatch"
+    end
+    if liveRecord.activation ~= GS.ACTIVATION_STAGED then
+        if GS.IsLiveActive(liveRecord) then
+            return liveRecord, "duplicate", "already_activated"
+        end
+        return nil, "rejected", "unsupported_activation"
+    end
+
+    local marker = GS.BuildCutoverMarker(record.datasetId, observedAt, tab)
+    if not marker then
+        return nil, "rejected", "invalid_cutover_marker"
+    end
+
+    local previousActivation = record.activation
+    local previousCutover = record.liveCutover
+    local previousEligibility = cfg.eligibility
+
+    local cutover = {
+        schemaVersion = GS.LIVE_CUTOVER_SCHEMA,
+        datasetId = record.datasetId,
+        guildKey = ctx.guildKey,
+        activatedAt = observedAt,
+        activatedByGuid = ctx.actorGuid,
+        activatedByName = ctx.actorName,
+        bankTab = tab,
+        contextStatus = sample.status,
+        contextObservedAt = observedAt,
+        contextRecordCount = tonumber(sample.recordCount) or (sample.status == "empty" and 0 or nil),
+        cutoverMarker = marker,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = observedAt,
+        },
+    }
+
+    local cutOk, cutErr = GS.ValidateLiveCutover(cutover, record, ctx.guildKey)
+    if not cutOk then
+        return nil, "rejected", cutErr or "invalid_live_cutover"
+    end
+
+    -- Atomic local commitment.
+    record.activation = GS.ACTIVATION_ACTIVE
+    record.liveCutover = cutover
+    if not ApplyLiveEligibilityBoundary(cfg, cutover) then
+        record.activation = previousActivation
+        record.liveCutover = previousCutover
+        cfg.eligibility = previousEligibility
+        return nil, "rejected", "invalid_cutover_boundary"
+    end
+    QuarantinePreActivationPending(record)
+
+    local structOk, structErr = GS._ValidateGuildRecordStructure(ctx.guildKey, record)
+    if not structOk then
+        record.activation = previousActivation
+        record.liveCutover = previousCutover
+        cfg.eligibility = previousEligibility
+        DebugWarn("activation structural rollback err=%s", tostring(structErr))
+        return nil, "rejected", structErr or "invalid_record"
+    end
+
+    DebugInfo("activated canonical dataset=%s marker=%s tab=%s status=%s",
+        tostring(record.datasetId), tostring(marker), tostring(tab), tostring(sample.status))
+    if GS._NotifyLocalDurableChange then
+        GS._NotifyLocalDurableChange("activation")
+    end
+    return record, "accepted", "activated"
+end
+
+--- Install an authenticated remote liveCutover onto a record (adoption / catch-up).
+-- Does not require a local bank sample. Fails closed on incompatible markers.
+-- @return status, reason
+function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
+    opts = opts or {}
+    if type(record) ~= "table" then
+        return "rejected", "invalid_record"
+    end
+    local copy = CopyLiveCutover(cutover)
+    local ok, err = GS.ValidateLiveCutover(copy, record, guildKey)
+    if not ok then
+        return "rejected", err or "invalid_live_cutover"
+    end
+    if GS.IsLiveActive(record) and type(record.liveCutover) == "table" then
+        if record.liveCutover.cutoverMarker == copy.cutoverMarker then
+            return "duplicate", "already_activated"
+        end
+        -- Divergent live markers: never silently overwrite.
+        return "rejected", "live_activation_conflict"
+    end
+    if record.activation ~= GS.ACTIVATION_STAGED and not opts.forceActive then
+        if not GS.IsSupportedActivation(record.activation) then
+            return "rejected", "unsupported_activation"
+        end
+    end
+
+    local cfg = record.accounting and record.accounting._consumables
+    local previousActivation = record.activation
+    local previousCutover = record.liveCutover
+    local previousEligibility = cfg and cfg.eligibility
+
+    record.activation = GS.ACTIVATION_ACTIVE
+    record.liveCutover = copy
+    if type(cfg) == "table" then
+        ApplyLiveEligibilityBoundary(cfg, copy)
+    end
+    if opts.quarantinePending ~= false then
+        QuarantinePreActivationPending(record)
+    end
+
+    if GS._ValidateGuildRecordStructure then
+        local structOk, structErr = GS._ValidateGuildRecordStructure(guildKey, record)
+        if not structOk then
+            record.activation = previousActivation
+            record.liveCutover = previousCutover
+            if type(cfg) == "table" then
+                cfg.eligibility = previousEligibility
+            end
+            return "rejected", structErr or "invalid_record"
+        end
+    end
+    return "accepted", nil
+end
+
+--- Evidence time must be at/after the live cutover boundary when active.
+function GS.IsEvidenceAfterLiveCutover(record, evidence)
+    if not GS.IsLiveActive(record) then
+        return true
+    end
+    local cutover = record.liveCutover
+    if type(cutover) ~= "table" then
+        return false, "missing_live_cutover"
+    end
+    local boundary = tonumber(cutover.eligibilityBoundary and cutover.eligibilityBoundary.tabEligibleFrom)
+        or tonumber(cutover.contextObservedAt)
+    if not boundary then
+        return false, "missing_live_cutover"
+    end
+    local approx = tonumber(evidence and evidence.approxTxnTime)
+    if not approx then
+        return false, "not_eligible"
+    end
+    if approx < boundary then
+        return false, "not_eligible"
+    end
+    return true
+end
