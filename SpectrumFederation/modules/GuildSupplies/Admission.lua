@@ -1657,8 +1657,9 @@ local function AssemblePagedArchive(meta, pagesByIndex)
             items = {},
         }
         if type(src.items) == "table" then
+            -- Preserve original item-id key types for Deep.equal with stored archives.
             for k, v in pairs(src.items) do
-                eligibility.items[tostring(k)] = v
+                eligibility.items[k] = v
             end
         end
         return eligibility
@@ -1704,6 +1705,31 @@ local function AssemblePagedArchive(meta, pagesByIndex)
         eligibility = CopyArchiveEligibility(meta.eligibility),
     }, nil
 end
+
+--- Core archive identity (items/generation/ids), ignoring eligibility/bankTab.
+local function ArchiveCoreEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    if a.schemaVersion ~= b.schemaVersion then
+        return false
+    end
+    if a.campaignId ~= b.campaignId or a.datasetId ~= b.datasetId then
+        return false
+    end
+    if a.generation ~= b.generation or a.archivedAt ~= b.archivedAt then
+        return false
+    end
+    return DeepEqual(a.requestedItems, b.requestedItems)
+end
+
+--- When core archive identity matches, prefer the gossip-assembled body so
+-- eligibility/bankTab historical proof from export replaces an op-replay snapshot
+-- that omitted those fields (or diverged only on that context).
+local function PreferArchiveHistoricalContext(existing, assembled)
+    return ArchiveCoreEqual(existing, assembled)
+end
+
 
 --- True when buffered records match the authenticated source descriptor contract.
 function GS:IsAdoptionTransferComplete()
@@ -3296,6 +3322,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         state.cursor, state.admissions = i, admissions
                         return false, aerr or "invalid_campaign_archive", progress
                     end
+                elseif PreferArchiveHistoricalContext(
+                    temp.campaignArchives[body.campaignId], archive) then
+                    temp.campaignArchives[body.campaignId] = archive
                 elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
                     state.cursor, state.admissions = i, admissions
                     return false, "archive_conflict", progress
@@ -3947,7 +3976,10 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                     publishCompletenessStats()
                     return false, aerr or "incomplete_archive_pages"
                 end
-                if not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
+                if PreferArchiveHistoricalContext(
+                    temp.campaignArchives[body.campaignId], archive) then
+                    temp.campaignArchives[body.campaignId] = archive
+                elseif not DeepEqual(temp.campaignArchives[body.campaignId], archive) then
                     opts.cursor = nil
                     publishCompletenessStats()
                     return false, "archive_conflict"
@@ -4340,13 +4372,17 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
 
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+    local seedIndex = state.acctIndex
+    if GS._adoptionCompletenessColdIndexForTest then
+        seedIndex = nil
+    end
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
-        acctIndex = state.acctIndex,
+        acctIndex = seedIndex,
     }
     compOpts.budget = compBudget
-    if not compOpts.acctIndex then
+    if not compOpts.acctIndex and not GS._adoptionCompletenessColdIndexForTest then
         compOpts.acctIndex = state.acctIndex
     end
     local okComp, compErr
@@ -4525,13 +4561,17 @@ local function ContinueAdoptionReplay(adop)
     -- mid-archive completeness yields (GS._adoptionCompletenessBudgetForTest).
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+    local seedIndex = state.acctIndex
+    if GS._adoptionCompletenessColdIndexForTest then
+        seedIndex = nil
+    end
     local compOpts = state.completenessOpts or {
         budget = compBudget,
         cursor = 1,
-        acctIndex = state.acctIndex,
+        acctIndex = seedIndex,
     }
     compOpts.budget = compBudget
-    if not compOpts.acctIndex then
+    if not compOpts.acctIndex and not GS._adoptionCompletenessColdIndexForTest then
         compOpts.acctIndex = state.acctIndex
     end
     local okComp, compErr = ValidateAdoptionCompleteness(temp, adop, member, compOpts)

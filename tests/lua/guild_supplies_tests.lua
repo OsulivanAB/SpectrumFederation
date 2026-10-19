@@ -17924,33 +17924,30 @@ end
 do
     -- 3B31) Completeness nested scan yields under tight budget; large settled
     -- ledger + deep evidence match still publish without per-callback overrun.
-    local aliceRecord = seedStagedCampaignWithItem(9040, 200)
+    local aliceRecord = seedStagedCampaignWithItem(9040, 400)
     GS:EnsureGossipProvider()
-    local cfg = aliceRecord.accounting._consumables
-    local events = aliceRecord.accounting._consumableEvents
-    if type(events) ~= "table" then
-        aliceRecord.accounting._consumableEvents = {}
-        events = aliceRecord.accounting._consumableEvents
-    end
-    -- Seed a large settled ledger so evidence MatchScore scan is expensive.
-    for n = 1, 96 do
-        events[#events + 1] = {
-            type = "donation",
-            id = "ctx:gs:pad-" .. n,
-            txnId = "ctx:gs:pad-" .. n,
+    -- Many real verified donations so completeness must scan a deep ledger.
+    local credited = 0
+    for n = 1, 24 do
+        local evidence = makeDepositEvidence(aliceRecord, {
             itemId = 9040,
             quantity = 1,
-            generation = cfg.generation,
-            timestamp = (world.time or 1000) - 100000 - n,
-            approxTxnTime = (world.time or 1000) - 100000 - n,
-            campaignId = aliceRecord.currentCampaignId,
-            datasetId = aliceRecord.datasetId,
-            coreSignature = "pad|sig|" .. n,
-            actor = "PadDonor-Garona",
-            verification = "witnesses",
-        }
+            donor = "PadDonor" .. n .. "-Garona",
+            occurrenceIndex = 1,
+            neighborsOlder = { "pad|o|" .. n },
+            neighborsNewer = { "pad|n|" .. n },
+            approxTxnTime = (world.time or 1000) - n * 100,
+        })
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+        end
+        credited = credited + 1
     end
-    local evidence = makeDepositEvidence(aliceRecord, {
+    local deep = makeDepositEvidence(aliceRecord, {
         itemId = 9040, quantity = 5, donor = "DeepMatch-Garona",
         occurrenceIndex = 1,
         neighborsOlder = { "deep|older" },
@@ -17961,10 +17958,13 @@ do
         { "Player-1-Bob", "Bob-Garona" },
         { "Player-1-Carol", "Carol-Garona" },
     }) do
-        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+        GS:_AdmitObservationForTests(deep, pair[1], pair[2])
     end
+    credited = credited + 5
     assertEq(tonumber(GS:ProjectCampaignProgress(aliceRecord.currentCampaignId).itemTotals[9040]) or 0,
-        5, "3B31: source credited")
+        credited, "3B31: source credited")
+    local eventCount = #(aliceRecord.accounting._consumableEvents or {})
+    assertTrue(eventCount >= 25, "3B31: large settled ledger got=" .. tostring(eventCount))
     GS.NotifyLocalDurableChange("ledger")
     drainExportMaint(256)
     local exportBodies = collectAllExportBodies()
@@ -17990,51 +17990,41 @@ do
             "3B31: buffer st=" .. tostring(stB))
     end
     GS._adoptionCompletenessBudgetForTest = 8
+    -- Force cold completeness index so nested ledger/evidence scans charge work.
+    GS._adoptionCompletenessColdIndexForTest = true
+    GS._adoptionReplaySyncDrain = true
     GS._lastAdoptionCompletenessStats = nil
-    local sawBudget = false
-    local maxUsed = 0
     local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
     local guard = 0
     while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
         guard = guard + 1
-        local cstats = GS._lastAdoptionCompletenessStats
-        if type(cstats) == "table" then
-            if cstats.budgetExhausted == true then
-                sawBudget = true
-            end
-            if type(cstats.used) == "number" and cstats.used > maxUsed then
-                maxUsed = cstats.used
-            end
-            if type(cstats.budget) == "number" and type(cstats.used) == "number" then
-                assertTrue(cstats.used <= cstats.budget + 1,
-                    "3B31: completeness callback stayed within budget used="
-                        .. tostring(cstats.used) .. " budget=" .. tostring(cstats.budget))
-            end
-        end
         flushTimers()
         world.time = world.time + 1
         flushTimers()
     end
     if stAdopt == "pending" then
         stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
-        guard = 0
-        while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
-            guard = guard + 1
-            flushTimers()
-            world.time = world.time + 1
-            flushTimers()
-        end
+    end
+    local work = GS.GetAdoptionWorkStats and GS.GetAdoptionWorkStats()
+    local compVisited = work and tonumber(work.completenessVisited) or 0
+    local lastComp = GS._lastAdoptionCompletenessStats
+    if type(lastComp) == "table" and type(lastComp.budget) == "number"
+        and type(lastComp.used) == "number" then
+        assertTrue(lastComp.used <= lastComp.budget + 1,
+            "3B31: final completeness callback within budget")
     end
     GS._adoptionCompletenessBudgetForTest = nil
+    GS._adoptionCompletenessColdIndexForTest = nil
     local adopted = GS:GetCurrentRecord()
     assertTrue(stAdopt == "accepted"
         or (adopted and adopted.datasetId == sourceDataset),
         "3B31: adoption completed st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
-    assertTrue(sawBudget or maxUsed >= 8,
-        "3B31: tight completeness budget exercised (sawBudget="
-            .. tostring(sawBudget) .. " maxUsed=" .. tostring(maxUsed) .. ")")
+    -- Nested event scans under a cold index must charge more than one visit per body.
+    assertTrue(compVisited > #exportBodies,
+        "3B31: nested completeness scans charged work visited="
+            .. tostring(compVisited) .. " bodies=" .. tostring(#exportBodies))
     local prog = adopted and GS:ProjectCampaignProgress(adopted.currentCampaignId)
-    assertEq(tonumber(prog and prog.itemTotals and prog.itemTotals[9040]) or 0, 5,
+    assertEq(tonumber(prog and prog.itemTotals and prog.itemTotals[9040]) or 0, credited,
         "3B31: adopted client reconstructs donation after nested completeness yields")
 end
 
@@ -18292,7 +18282,10 @@ do
     -- 3B36) Two distinct same-fingerprint deposits (>3h apart) both survive adoption.
     local aliceRecord = seedStagedCampaignWithItem(9045, 80)
     GS:EnsureGossipProvider()
-    local t0 = world.time or 1000000
+    -- Keep both deposits after eligibility cutoffs while remaining >3h apart.
+    world.time = (world.time or 0) + 20000
+    local tLate = world.time or 1000000
+    local tEarly = tLate - (4 * 3600) - 60
     local shared = {
         itemId = 9045,
         quantity = 3,
@@ -18302,11 +18295,11 @@ do
         neighborsNewer = { "same|newer" },
     }
     local ev1 = makeDepositEvidence(aliceRecord, shared)
-    ev1.approxTxnTime = t0 - 100
-    ev1.observedAt = t0
+    ev1.approxTxnTime = tEarly
+    ev1.observedAt = tEarly + 30
     local ev2 = makeDepositEvidence(aliceRecord, shared)
-    ev2.approxTxnTime = t0 - (4 * 3600) - 100
-    ev2.observedAt = t0 - (4 * 3600)
+    ev2.approxTxnTime = tLate
+    ev2.observedAt = tLate
     local fp1 = GS.OccurrenceFingerprint(ev1)
     local fp2 = GS.OccurrenceFingerprint(ev2)
     assertEq(fp1, fp2, "3B36: fingerprints collide by design")

@@ -364,8 +364,10 @@ local function BuildArchiveExportBodies(campaignId, archive, record)
             items = {},
         }
         if type(archive.eligibility.items) == "table" then
+            -- Preserve original item-id key types so export/assembly Deep.equal
+            -- matches ArchiveCurrentCampaignConfig snapshots.
             for k, v in pairs(archive.eligibility.items) do
-                eligibility.items[tostring(k)] = v
+                eligibility.items[k] = v
             end
         end
     end
