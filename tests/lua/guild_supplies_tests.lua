@@ -14028,7 +14028,10 @@ do
     assertTrue(GS:GetCurrentRecord().currentCampaignId ~= fillCamp.id
         and GS:GetCurrentRecord().currentCampaignId ~= leakCamp.id,
         "3A23: fill/leak campaigns are not current")
-    local maxArchPages = GS.MAX_FRAGMENT_BUFFER_PAGES or 64
+    -- Archive assembly uses MAX_ARCHIVE_PAGE_BUFFER_PAGES (independent of the
+    -- op-manifest FragmentBuffer ceiling).
+    local maxArchPages = GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES
+        or GS.MAX_FRAGMENT_BUFFER_PAGES or 64
     local archFill = math.min(8, maxArchPages)
     for p = 1, archFill do
         local st = entry.api.ValidateAndApply({
@@ -14046,8 +14049,8 @@ do
     assertTrue(archBefore.archivePages >= 1,
         "3A23: archive page pool has retained pages got="
             .. tostring(archBefore.archivePages))
-    local priorArchPages = GS.MAX_FRAGMENT_BUFFER_PAGES
-    GS.MAX_FRAGMENT_BUFFER_PAGES = archBefore.archivePages
+    local priorArchPages = GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES
+    GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = archBefore.archivePages
     local stArchLeak, reasonArchLeak = entry.api.ValidateAndApply({
         id = "gs:ca:leak:p1", versionFp = "valeak",
         body = {
@@ -14066,7 +14069,7 @@ do
     -- Existing fill shell/pages must remain after the failed fresh allocation.
     assertTrue(archAfter.archiveAssemblies >= 1,
         "3A23: preexisting archive assembly preserved")
-    GS.MAX_FRAGMENT_BUFFER_PAGES = priorArchPages
+    GS.MAX_ARCHIVE_PAGE_BUFFER_PAGES = priorArchPages
 
     -- A) Per-peer op assembly cap: reject without empty-slot leak.
     resetDb()
