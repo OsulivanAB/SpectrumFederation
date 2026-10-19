@@ -2870,36 +2870,53 @@ function GS.NotifyLocalDurableChange(reason)
         if reason == "ledger" or reason == "evidence"
             or reason == "config" or reason == "remote-op" or reason == "campaign" then
             local events = record.accounting and record.accounting._consumableEvents
-            if type(events) == "table" then
-                -- High-water mark: export every not-yet-seen live row. When more
-                -- than 32 events arrive between notifications, hand the backlog
-                -- to the paced cold builder instead of dropping older IDs.
-                local hw = tonumber(exportState.ledgerWarmPos) or 0
-                local start = math.max(1, #events - 31)
-                if hw + 1 < start then
-                    exportState.ledgerBuildNeeded = true
-                    if exportState.ledgerBuildCursor == nil then
-                        exportState.ledgerBuildPhase = exportState.ledgerBuildPhase or "live"
-                        exportState.ledgerBuildCursor = hw + 1
-                    end
-                else
-                    start = hw + 1
-                end
-                for i = start, #events do
-                    local event = events[i]
-                    if type(event) == "table" and type(event.id) == "string" then
-                        local exportId = "gs:le:" .. event.id
-                        if not exportState.byId[exportId] then
-                            UpsertExportBody(exportId, {
-                                kind = "gs-ledger-event",
-                                datasetId = record.datasetId,
-                                event = event,
-                            })
-                        end
-                    end
-                end
-                exportState.ledgerWarmPos = #events
+            if type(events) ~= "table" then
+                events = {}
             end
+            -- High-water mark: export every not-yet-seen live row. When more
+            -- than 32 events arrive between notifications, hand the backlog
+            -- to the paced cold builder instead of dropping older IDs.
+            -- Shelving (campaign rollover / capacity) replaces the live array with
+            -- a shorter kept list; hw can then exceed #events and skip new rows.
+            -- Reconcile by resetting warm pos and re-running archive→live paced
+            -- construction so newly shelved + new live IDs stay exportable.
+            local hw = tonumber(exportState.ledgerWarmPos) or 0
+            local nLive = #events
+            if hw > nLive then
+                exportState.ledgerBuildNeeded = true
+                exportState.ledgerBuildPhase = "archive"
+                exportState.ledgerBuildCursor = 1
+                hw = 0
+                exportState.ledgerWarmPos = 0
+            end
+            local start = math.max(1, nLive - 31)
+            if hw + 1 < start then
+                exportState.ledgerBuildNeeded = true
+                if exportState.ledgerBuildCursor == nil then
+                    exportState.ledgerBuildPhase = exportState.ledgerBuildPhase or "live"
+                    exportState.ledgerBuildCursor = hw + 1
+                elseif exportState.ledgerBuildPhase == "live"
+                    and (tonumber(exportState.ledgerBuildCursor) or 1) > nLive then
+                    -- Stale live cursor after shrink: restart from the backlog.
+                    exportState.ledgerBuildCursor = hw + 1
+                end
+            else
+                start = hw + 1
+            end
+            for i = start, nLive do
+                local event = events[i]
+                if type(event) == "table" and type(event.id) == "string" then
+                    local exportId = "gs:le:" .. event.id
+                    if not exportState.byId[exportId] then
+                        UpsertExportBody(exportId, {
+                            kind = "gs-ledger-event",
+                            datasetId = record.datasetId,
+                            event = event,
+                        })
+                    end
+                end
+            end
+            exportState.ledgerWarmPos = nLive
             local warmGuid = localGuid or LocalExportWitnessGuid()
             local directExports = record.observations and record.observations.directExports
             if type(directExports) == "table" then
@@ -3381,7 +3398,16 @@ function GS.NotifyLocalDurableChange(reason)
             end
             if phase == "live" and used < slice then
                 local events = record.accounting and record.accounting._consumableEvents
-                local cursor, done = upsertLedgerList(events, exportState.ledgerBuildCursor)
+                local liveCursor = tonumber(exportState.ledgerBuildCursor) or 1
+                if type(events) ~= "table" then
+                    events = {}
+                end
+                -- Shelving can shrink the live list under an in-flight live cursor.
+                if liveCursor > #events + 1 then
+                    liveCursor = 1
+                    exportState.ledgerBuildCursor = 1
+                end
+                local cursor, done = upsertLedgerList(events, liveCursor)
                 if not done then
                     exportState.ledgerBuildCursor = cursor
                     exportState.ledgerBuildPhase = "live"
@@ -3389,7 +3415,7 @@ function GS.NotifyLocalDurableChange(reason)
                     exportState.ledgerBuildCursor = nil
                     exportState.ledgerBuildPhase = nil
                     exportState.ledgerBuildNeeded = false
-                    exportState.ledgerWarmPos = type(events) == "table" and #events or 0
+                    exportState.ledgerWarmPos = #events
                 end
             end
         end

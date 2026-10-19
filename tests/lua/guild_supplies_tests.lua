@@ -19283,6 +19283,261 @@ do
     GS.MAX_ADOPTION_PENDING_RECORDS = priorPending
 end
 
+do
+    -- 3B44) Warm ledger high-water survives campaign shelving without reload:
+    -- archived prior-gen IDs + new live ID remain provider-exportable and adoptable.
+    local aliceRecord = seedStagedCampaignWithItem(9056, 80)
+    assertEq(GS:EnsureGossipProvider(), true, "3B44: provider")
+    drainExportMaint(64)
+    local cfg = aliceRecord.accounting._consumables
+    local events = aliceRecord.accounting._consumableEvents
+    if type(events) ~= "table" then
+        aliceRecord.accounting._consumableEvents = {}
+        events = aliceRecord.accounting._consumableEvents
+    end
+    local GEN1_N = 40
+    local gen1Ids = {}
+    for n = 1, GEN1_N do
+        local id = "ctx:gs:shelve-warm-" .. n
+        gen1Ids[#gen1Ids + 1] = id
+        events[#events + 1] = {
+            type = "donation",
+            id = id,
+            txnId = id,
+            itemId = 9056,
+            quantity = 1,
+            generation = cfg.generation,
+            timestamp = (world.time or 1000) + n,
+            approxTxnTime = (world.time or 1000) + n,
+            campaignId = aliceRecord.currentCampaignId,
+            datasetId = aliceRecord.datasetId,
+            coreSignature = "shelve-warm|sig|" .. n,
+            actor = "ShelveWarm-Garona",
+            verification = "witnesses",
+            writer = "Player-1-Alice",
+        }
+    end
+    -- Warm the export index (no DisableGossipProvider / rebuild).
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(128)
+    local function ledgerExportIdSet()
+        local set = {}
+        for _, row in ipairs(collectAllExportBodies()) do
+            local body = row.body
+            if body and body.kind == "gs-ledger-event" and body.event and body.event.id then
+                set[body.event.id] = true
+            end
+        end
+        return set
+    end
+    local warmed = ledgerExportIdSet()
+    for i = 1, #gen1Ids do
+        assertTrue(warmed[gen1Ids[i]],
+            "3B44: gen1 id warmed before rollover " .. gen1Ids[i])
+    end
+    -- Genuine start-campaign shelves prior-generation live rows into archive.
+    local oldCampaign = aliceRecord.currentCampaignId
+    startCampaign()
+    -- startCampaign notifies "campaign"; drain paced archive→live rebuild.
+    drainExportMaint(128)
+    local archive = aliceRecord.accounting._consumableEventArchive
+    local live = aliceRecord.accounting._consumableEvents
+    assertTrue(type(archive) == "table" and #archive >= GEN1_N,
+        "3B44: shelved into archive got=" .. tostring(archive and #archive))
+    assertTrue(type(live) == "table" and #live == 0,
+        "3B44: live empty after rollover got=" .. tostring(live and #live))
+    cfg = aliceRecord.accounting._consumables
+    local newId = "ctx:gs:shelve-warm-new"
+    live[#live + 1] = {
+        type = "donation",
+        id = newId,
+        txnId = newId,
+        itemId = 9056,
+        quantity = 2,
+        generation = cfg.generation,
+        timestamp = (world.time or 2000) + 1,
+        approxTxnTime = (world.time or 2000) + 1,
+        campaignId = aliceRecord.currentCampaignId,
+        datasetId = aliceRecord.datasetId,
+        coreSignature = "shelve-warm|new",
+        actor = "ShelveWarmNew-Garona",
+        verification = "witnesses",
+        writer = "Player-1-Alice",
+    }
+    -- Fail-before: stale hw > #live would set start=hw+1 past the new row.
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(128)
+    local after = ledgerExportIdSet()
+    local missingArch = {}
+    for i = 1, #gen1Ids do
+        if not after[gen1Ids[i]] then
+            missingArch[#missingArch + 1] = gen1Ids[i]
+        end
+    end
+    assertEq(#missingArch, 0,
+        "3B44: archived ids still exported after shelve missing="
+            .. table.concat(missingArch, ","))
+    assertTrue(after[newId], "3B44: new live id exported after shelve without reload")
+    local descLedger = nil
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "dataset-desc" then
+            descLedger = tonumber(row.body.acceptedLedgerCount)
+        end
+    end
+    local expectCount = GS.CountAcceptedLedgerEvents(aliceRecord)
+    assertEq(descLedger, expectCount,
+        "3B44: descriptor acceptedLedgerCount matches live+archive")
+
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = aliceRecord.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "3B44: begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    local adopted = GS:GetCurrentRecord()
+    assertTrue(adopted and adopted.datasetId == sourceDataset,
+        "3B44: adopted st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    local total = GS.CountAcceptedLedgerEvents(adopted)
+    assertTrue(total >= GEN1_N + 1,
+        "3B44: adopted complete accounting history got=" .. tostring(total))
+    local adoptedIds = {}
+    local function noteList(list)
+        if type(list) ~= "table" then return end
+        for i = 1, #list do
+            if list[i] and list[i].id then
+                adoptedIds[list[i].id] = true
+            end
+        end
+    end
+    noteList(adopted.accounting and adopted.accounting._consumableEvents)
+    noteList(adopted.accounting and adopted.accounting._consumableEventArchive)
+    for i = 1, #gen1Ids do
+        assertTrue(adoptedIds[gen1Ids[i]],
+            "3B44: adopted retained archived id " .. gen1Ids[i])
+    end
+    assertTrue(adoptedIds[newId], "3B44: adopted retained new live id")
+    -- oldCampaign still inspectable via archive projection
+    assertTrue(oldCampaign ~= nil, "3B44: prior campaign id retained for projection")
+end
+
+do
+    -- 3B45) Capacity-triggered shelving also reconciles warm high-water / paced
+    -- archive phase without provider disable or dataset rebuild.
+    local priorMax = GS.MAX_LEDGER_EVENTS
+    local priorArch = GS.MAX_ARCHIVED_EVENTS
+    GS.MAX_LEDGER_EVENTS = 12
+    GS.MAX_ARCHIVED_EVENTS = 24
+    local aliceRecord = seedStagedCampaignWithItem(9057, 40)
+    assertEq(GS:EnsureGossipProvider(), true, "3B45: provider")
+    drainExportMaint(32)
+    local cfg = aliceRecord.accounting._consumables
+    local events = aliceRecord.accounting._consumableEvents
+    if type(events) ~= "table" then
+        aliceRecord.accounting._consumableEvents = {}
+        events = aliceRecord.accounting._consumableEvents
+    end
+    local FILL = 12
+    local oldIds = {}
+    for n = 1, FILL do
+        local id = "ctx:gs:cap-shelve-" .. n
+        oldIds[#oldIds + 1] = id
+        events[#events + 1] = {
+            type = "donation",
+            id = id,
+            txnId = id,
+            itemId = 9057,
+            quantity = 1,
+            generation = cfg.generation,
+            timestamp = (world.time or 1000) + n,
+            approxTxnTime = (world.time or 1000) + n,
+            campaignId = aliceRecord.currentCampaignId,
+            datasetId = aliceRecord.datasetId,
+            coreSignature = "cap-shelve|sig|" .. n,
+            actor = "CapShelve-Garona",
+            verification = "witnesses",
+            writer = "Player-1-Alice",
+        }
+    end
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(64)
+    -- Advance generation without startCampaign so capacity path must shelve.
+    local genBefore = tonumber(cfg.generation) or 1
+    cfg.generation = genBefore + 1
+    local newId = "ctx:gs:cap-shelve-new"
+    local stLe, rLe = GS:AdmitLedgerEvent({
+        type = "donation",
+        id = newId,
+        txnId = newId,
+        itemId = 9057,
+        quantity = 1,
+        generation = cfg.generation,
+        timestamp = (world.time or 3000),
+        actor = "CapShelveNew-Garona",
+        writer = "Player-1-Alice",
+        verification = "witnesses",
+        coreSignature = "cap-shelve|new",
+        campaignId = aliceRecord.currentCampaignId,
+        datasetId = aliceRecord.datasetId,
+        guildGuid = tostring(cfg.guild.guid),
+        bankTab = tonumber(cfg.bankTab),
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42" },
+        offlineRecord = aliceRecord,
+        adoptionReplay = true,
+        preserveAttribution = true,
+        localWrite = false,
+    })
+    assertTrue(stLe == "accepted" or stLe == "duplicate",
+        "3B45: capacity admit after shelve st=" .. tostring(stLe) .. " r=" .. tostring(rLe))
+    local archive = aliceRecord.accounting._consumableEventArchive
+    assertTrue(type(archive) == "table" and #archive >= FILL,
+        "3B45: capacity shelved prior gen got=" .. tostring(archive and #archive))
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(64)
+    local byId = {}
+    for _, row in ipairs(collectAllExportBodies()) do
+        local body = row.body
+        if body and body.kind == "gs-ledger-event" and body.event and body.event.id then
+            byId[body.event.id] = true
+        end
+    end
+    local missing = {}
+    for i = 1, #oldIds do
+        if not byId[oldIds[i]] then
+            missing[#missing + 1] = oldIds[i]
+        end
+    end
+    assertEq(#missing, 0,
+        "3B45: capacity-shelved ids exported missing=" .. table.concat(missing, ","))
+    assertTrue(byId[newId], "3B45: new live id exported after capacity shelve")
+    GS.MAX_LEDGER_EVENTS = priorMax
+    GS.MAX_ARCHIVED_EVENTS = priorArch
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
