@@ -22836,6 +22836,9 @@ do
         end
     end
     assertTrue(adjEvent ~= nil, "3C26: captured adjustment event")
+    assertEq(adjEvent.gsSourceCutoverMarker, marker,
+        "3C26: local post-activation adjustment carries cutover provenance")
+    assertEq(adjEvent.gsProductionCredit, true, "3C26: local live adjustment credited")
     local datasetId = alice.datasetId
     local campaignId = alice.currentCampaignId
     local permission = alice.permission
@@ -23407,6 +23410,284 @@ do
     assertTrue(liveFound, "3C30: credited archived history visible")
     disarmFreshBankSample()
     assertEq(#world.chat, 0, "3C30: no chat")
+end
+
+do
+    -- 3C31) A2 provenance: staged post-cutover adjustment must not launder into
+    -- live credit via activation export or unmarked remote gs-op (#389).
+    local alice = seedActivatableCampaign(9131, 40)
+    local _, stAct = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted", "3C31: alice activates")
+    alice = GS:GetCurrentRecord()
+    local cutover = alice.liveCutover
+    local marker = cutover.cutoverMarker
+    local cutTs = tonumber(cutover.contextObservedAt)
+    local datasetId = alice.datasetId
+    local campaignId = alice.currentCampaignId
+    local permission = alice.permission
+    local aliceSnapshot = alice
+    local descBody = {
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = datasetId,
+        editorRankPosition = 3,
+        permissionRevisionId = permission.revisionId,
+        activation = GS.ACTIVATION_ACTIVE,
+        cutoverMarker = marker,
+        liveCutover = GS.DescribeLiveCutover(cutover),
+        currentCampaignId = campaignId,
+    }
+
+    local function seedStagedSameDataset(name, guid, rank)
+        local srcCons = aliceSnapshot.accounting._consumables
+        local cons = {
+            guild = srcCons.guild,
+            bankTab = srcCons.bankTab,
+            requestedItems = {},
+            generation = srcCons.generation,
+            configSeq = srcCons.configSeq,
+            eventSeq = 0,
+            txnRegistry = {},
+            eligibility = {
+                baselineEstablished = true,
+                baselineAt = cutTs - 100,
+                tabEligibleFrom = cutTs - 100,
+                items = {},
+            },
+        }
+        if type(srcCons.requestedItems) == "table" then
+            for ik, iv in pairs(srcCons.requestedItems) do
+                if type(iv) == "table" then
+                    local copy = {}
+                    for fk, fv in pairs(iv) do copy[fk] = fv end
+                    cons.requestedItems[ik] = copy
+                else
+                    cons.requestedItems[ik] = iv
+                end
+            end
+        end
+        SpectrumFederationDB = {
+            guildSupplies = {
+                schemaVersion = 1,
+                localWriter = { nonce = "ffffffffffffffffffffffff", nextSeq = 1 },
+                guilds = {
+                    ["club:42"] = {
+                        schemaVersion = 1,
+                        activation = GS.ACTIVATION_STAGED,
+                        datasetId = datasetId,
+                        permission = permission,
+                        currentCampaignId = campaignId,
+                        campaigns = aliceSnapshot.campaigns,
+                        campaignArchives = aliceSnapshot.campaignArchives or {},
+                        campaignContext = aliceSnapshot.campaignContext or {},
+                        accounting = {
+                            schemaVersion = 1,
+                            _consumables = cons,
+                            _consumableEvents = {},
+                            _consumableEventArchive = {},
+                            _mutationSeq = 1,
+                        },
+                        observations = {
+                            byCampaign = {
+                                [campaignId] = {
+                                    schemaVersion = 1, seq = 0, scopes = {}, pending = {},
+                                },
+                            },
+                        },
+                        identityLinks = aliceSnapshot.identityLinks,
+                        operations = {
+                            schemaVersion = 1,
+                            order = {}, records = {}, heads = {},
+                            pending = {}, conflicts = {}, openConflicts = {},
+                        },
+                        confirmationRefs = {},
+                    },
+                },
+            },
+        }
+        setPlayer(name .. "-Garona", guid, rank)
+        switchPlayer(name, guid, rank)
+        GS._root = nil
+        GS._rootValid = false
+        GS._adoptionEpoch = 0
+        GS._peerDatasets = {}
+        GS._pendingRelay = {}
+        GS._adoption = nil
+        initGS()
+        GS:EnsureGossipProvider()
+        local rec, reason = GS:GetCurrentRecord()
+        assertTrue(rec ~= nil, "3C31: staged peer ready name=" .. name
+            .. " reason=" .. tostring(reason))
+        assertEq(rec.activation, GS.ACTIVATION_STAGED, "3C31: " .. name .. " staged")
+        return rec
+    end
+
+    local function seedActiveCarol()
+        -- Same-dataset staged shell (matching generation/campaign) then cutover.
+        seedStagedSameDataset("Carol", "Player-1-Carol", 3)
+        assertEq(providerApply(descBody, "Alice-Garona"), "accepted",
+            "3C31: carol installs active descriptor")
+        local carol = GS:GetCurrentRecord()
+        assertEq(carol.activation, GS.ACTIVATION_ACTIVE, "3C31: carol active")
+        return carol
+    end
+
+    local function bobStagedAdjustment()
+        local bob = seedStagedSameDataset("Bob", "Player-1-Bob", 2)
+        world.time = cutTs + 60
+        local adjOp = select(1, GS:NewAdjustmentOperation(9131, 7, nil))
+        assertTrue(adjOp ~= nil, "3C31: bob staged adjustment prepared")
+        assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted",
+            "3C31: bob creates staged adjustment after alice cutover")
+        bob = GS:GetCurrentRecord()
+        local stagedEv = nil
+        for i = 1, #(bob.accounting._consumableEvents or {}) do
+            local ev = bob.accounting._consumableEvents[i]
+            if ev and ev.id == adjOp.id then
+                stagedEv = ev
+                break
+            end
+        end
+        assertTrue(stagedEv ~= nil, "3C31: bob staged ledger row present")
+        assertEq(stagedEv.gsProductionCredit, false, "3C31: staged credit false")
+        assertTrue(stagedEv.gsSourceCutoverMarker == nil
+            or stagedEv.gsSourceCutoverMarker == "",
+            "3C31: staged row has no cutover provenance")
+        local adjOpStored = snapshotOp(adjOp)
+        local adjEvent = {}
+        for k, v in pairs(stagedEv) do adjEvent[k] = v end
+        return bob, adjOp, adjOpStored, adjEvent
+    end
+
+    local function exportAdjMarker(adjOpId)
+        GS:EnsureGossipProvider()
+        drainExportMaint(64)
+        local bodies = collectAllExportBodies()
+        local markerOut, saw = nil, false
+        for i = 1, #bodies do
+            local body = bodies[i].body
+            if body and body.kind == "gs-ledger-event"
+                and body.event and (body.event.id == adjOpId or body.event.opId == adjOpId) then
+                saw = true
+                markerOut = body.cutoverMarker
+            end
+        end
+        assertTrue(saw, "3C31: bob exports ledger body for staged adj")
+        return markerOut
+    end
+
+    local function carolTotal()
+        local progress = GS:ProjectCampaignProgress(campaignId)
+        return tonumber(progress and progress.itemTotals and progress.itemTotals[9131]) or 0
+    end
+
+    -- Path 1: Bob activates then exports unmarked staged adj → Carol stays at 0.
+    local bob, adjOp, adjOpStored, adjEvent = bobStagedAdjustment()
+    assertEq(providerApply(descBody, "Alice-Garona"), "accepted",
+        "3C31: bob receives activation after staged adj")
+    bob = GS:GetCurrentRecord()
+    assertEq(bob.activation, GS.ACTIVATION_ACTIVE, "3C31: bob active")
+    local bobCredit = nil
+    for i = 1, #(bob.accounting._consumableEvents or {}) do
+        local ev = bob.accounting._consumableEvents[i]
+        if ev and ev.id == adjOp.id then
+            bobCredit = ev.gsProductionCredit
+            assertTrue(ev.gsSourceCutoverMarker == nil or ev.gsSourceCutoverMarker == "",
+                "3C31: activation did not mint provenance on staged adj")
+            break
+        end
+    end
+    assertEq(bobCredit, false, "3C31: bob staged adj remains uncredited after activation")
+    assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9131]) or 0, 0,
+        "3C31: bob live totals exclude staged adj")
+    assertEq(exportAdjMarker(adjOp.id), nil,
+        "3C31: bob export must not stamp cutoverMarker on uncredited staged adj")
+
+    local carol = seedActiveCarol()
+    local forgedExport = {}
+    for k, v in pairs(adjEvent) do forgedExport[k] = v end
+    forgedExport.gsProductionCredit = true
+    forgedExport.gsSourceCutoverMarker = marker
+    local stLedger, reasonLedger = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = datasetId,
+        -- Honest Bob export after fix has nil marker; also reject claimed flags.
+        cutoverMarker = nil,
+        event = forgedExport,
+    }, "Bob-Garona")
+    assertTrue(stLedger == "accepted" or stLedger == "duplicate",
+        "3C31: carol admits unmarked bob ledger st=" .. tostring(stLedger)
+            .. " r=" .. tostring(reasonLedger))
+    assertEq(carolTotal(), 0, "3C31: carol does not credit unmarked bob ledger export")
+
+    -- Path 2: unmarked gs-op alone must not mint live credit on active Carol.
+    local stOp, reasonOp = providerApply({ kind = "gs-op", op = adjOpStored }, "Bob-Garona")
+    assertTrue(stOp == "accepted" or stOp == "duplicate",
+        "3C31: carol admits bob gs-op st=" .. tostring(stOp)
+            .. " r=" .. tostring(reasonOp))
+    carol = GS:GetCurrentRecord()
+    local opCredit = nil
+    for i = 1, #(carol.accounting._consumableEvents or {}) do
+        local ev = carol.accounting._consumableEvents[i]
+        if ev and (ev.id == adjOp.id or ev.opId == adjOp.id) then
+            opCredit = ev.gsProductionCredit
+            assertTrue(ev.gsSourceCutoverMarker == nil or ev.gsSourceCutoverMarker == "",
+                "3C31: remote op did not mint cutover provenance")
+            break
+        end
+    end
+    assertEq(opCredit, false, "3C31: remote unmarked op stays uncredited on live carol")
+    assertEq(carolTotal(), 0, "3C31: carol totals still zero after unmarked op")
+
+    -- Order variants + reload: still zero; claimed credit flags ignored.
+    for _, orderName in ipairs({ "ledger-then-op", "op-then-ledger", "dup-reload" }) do
+        carol = seedActiveCarol()
+        if orderName == "ledger-then-op" then
+            providerApply({
+                kind = "gs-ledger-event", datasetId = datasetId, cutoverMarker = nil,
+                event = (function()
+                    local e = {}
+                    for k, v in pairs(adjEvent) do e[k] = v end
+                    e.gsProductionCredit = true
+                    e.gsSourceCutoverMarker = marker
+                    return e
+                end)(),
+            }, "Bob-Garona")
+            providerApply({ kind = "gs-op", op = adjOpStored }, "Bob-Garona")
+        elseif orderName == "op-then-ledger" then
+            providerApply({ kind = "gs-op", op = adjOpStored }, "Bob-Garona")
+            providerApply({
+                kind = "gs-ledger-event", datasetId = datasetId, cutoverMarker = nil,
+                event = adjEvent,
+            }, "Bob-Garona")
+        else
+            providerApply({ kind = "gs-op", op = adjOpStored }, "Bob-Garona")
+            providerApply({ kind = "gs-op", op = adjOpStored }, "Bob-Garona")
+            providerApply({
+                kind = "gs-ledger-event", datasetId = datasetId, cutoverMarker = nil,
+                event = adjEvent,
+            }, "Bob-Garona")
+            simulateRuntimeReload()
+        end
+        assertEq(carolTotal(), 0, "3C31: " .. orderName .. " stays uncredited")
+    end
+
+    -- Divergent / arbitrary transport marker must not upgrade the staged body.
+    carol = seedActiveCarol()
+    providerApply({ kind = "gs-op", op = adjOpStored }, "Bob-Garona")
+    providerApply({
+        kind = "gs-ledger-event",
+        datasetId = datasetId,
+        cutoverMarker = "forged-not-canonical",
+        event = adjEvent,
+    }, "Bob-Garona")
+    assertEq(carolTotal(), 0, "3C31: forged transport marker does not mint credit")
+    simulateRuntimeReload()
+    assertEq(carolTotal(), 0, "3C31: uncredited durable after reload")
+
+    disarmFreshBankSample()
+    assertEq(#world.chat, 0, "3C31: no chat")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

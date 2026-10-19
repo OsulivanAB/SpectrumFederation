@@ -442,8 +442,9 @@ function GS.EventCountsTowardLiveProgress(record, event)
 end
 
 --- Assign durable production-credit classification for a newly admitted event.
--- Never trusts a remote self-declared flag alone: recomputes from live state +
--- cutover boundary so peers cannot mint pre-activation rows as live credit.
+-- Never trusts a remote self-declared flag alone. Adjustments additionally require
+-- authenticated cutover provenance (gsSourceCutoverMarker matches the installed
+-- live marker); a post-cutover timestamp alone must not mint live credit (#389 A2).
 function GS.AssignProductionCredit(record, event)
     if type(event) ~= "table" then
         return false
@@ -459,8 +460,24 @@ function GS.AssignProductionCredit(record, event)
             approxTxnTime = approx,
         }))
     end
-    event.gsProductionCredit = afterOk and true or false
-    return event.gsProductionCredit
+    if not afterOk then
+        event.gsProductionCredit = false
+        return false
+    end
+    local eventType = event.type
+    local isAdjustment = eventType == "adjustment"
+        or (GS.LEDGER_EVENT and eventType == GS.LEDGER_EVENT.ADJUSTMENT)
+        or eventType == "CONSUMABLE_ADJUSTMENT"
+    if isAdjustment then
+        local marker = record.liveCutover and record.liveCutover.cutoverMarker
+        if type(marker) ~= "string" or marker == ""
+            or event.gsSourceCutoverMarker ~= marker then
+            event.gsProductionCredit = false
+            return false
+        end
+    end
+    event.gsProductionCredit = true
+    return true
 end
 
 local function OpenConflictsBlockActivation()

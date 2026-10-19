@@ -1007,7 +1007,7 @@ local function StoreAccepted(ops, stored, targetKey)
     ops.pending[stored.id] = nil
 end
 
-local function ApplyMutations(record, op)
+local function ApplyMutations(record, op, opts)
     if op.kind == KIND.SET_EDITOR_RANK then
         -- Create permission table only on explicit GM-authorized recovery apply.
         if type(record.permission) ~= "table" then
@@ -1103,7 +1103,7 @@ local function ApplyMutations(record, op)
         if not GS.ApplyAdjustmentMutation then
             return false, "unsupported_kind"
         end
-        local ok, status = GS.ApplyAdjustmentMutation(record, op)
+        local ok, status = GS.ApplyAdjustmentMutation(record, op, opts)
         if not ok then
             return false, status or "adjustment_floor"
         end
@@ -1283,7 +1283,11 @@ function GS:ApplyStagedConfigOperation(op, context)
     end
 
     local tKey = TargetKey(op.kind, stored.target)
-    local applied, applyErr = ApplyMutations(record, stored)
+    -- Local authenticated editor writes may establish live cutover provenance on
+    -- adjustments created after this client is already active (#389 A2).
+    local applied, applyErr = ApplyMutations(record, stored, {
+        localProductionAuthority = true,
+    })
     if not applied then
         return "rejected", applyErr or "apply_failed"
     end
@@ -1930,8 +1934,8 @@ function GS._RecognizeExactAcceptedDuplicate(op, stored)
     return RecognizeExactAcceptedDuplicate(op, stored)
 end
 
-function GS._ApplyMutations(record, op)
-    return ApplyMutations(record, op)
+function GS._ApplyMutations(record, op, opts)
+    return ApplyMutations(record, op, opts)
 end
 
 function GS._RetainPending(ops, op, reason)

@@ -1837,9 +1837,28 @@ local function UpsertExportBody(id, body)
     end
 end
 
---- Upsert or refresh a ledger-event export, stamping live cutover provenance.
--- Staged peers may export the row with cutoverMarker=nil; once active, the same
--- export id must gain the canonical marker for downstream catch-up (#389 A2).
+--- Transport cutoverMarker only for rows with established live production provenance.
+-- Becoming active must not launder previously uncredited staged adjustments by
+-- attaching the canonical marker (#389 A2).
+local function ExportCutoverMarkerForEvent(event, liveMarker)
+    if type(liveMarker) ~= "string" or liveMarker == "" or type(event) ~= "table" then
+        return nil
+    end
+    if event.gsProductionCredit ~= true then
+        return nil
+    end
+    local eventType = event.type
+    local isAdjustment = eventType == "adjustment"
+        or (GS.LEDGER_EVENT and eventType == GS.LEDGER_EVENT.ADJUSTMENT)
+        or eventType == "CONSUMABLE_ADJUSTMENT"
+    if isAdjustment and event.gsSourceCutoverMarker ~= liveMarker then
+        return nil
+    end
+    return liveMarker
+end
+
+--- Upsert or refresh a ledger-event export. cutoverMarker is nil unless the row
+-- already carries verified production provenance for the live cutover.
 local function UpsertLedgerEventExport(exportId, datasetId, event, cutoverMarker)
     if type(exportId) ~= "string" or exportId == "" or type(event) ~= "table" then
         return
@@ -2963,8 +2982,8 @@ function GS.NotifyLocalDurableChange(reason)
         -- and any new direct observations (never re-export relays).
         -- Config/remote-op/campaign paths also append ledger rows (adjustments,
         -- link-triggered verification) and must advertise them for adoption.
-        -- Activation revisits already-exported staged ledger rows so their
-        -- cutoverMarker gains the live exporter provenance (#389 A2).
+        -- Activation revisits already-exported ledger rows so verified production
+        -- rows can advertise cutoverMarker; uncredited staged rows stay unmarked.
         if reason == "activation" then
             exportState.ledgerWarmPos = 0
         end
@@ -3031,12 +3050,19 @@ function GS.NotifyLocalDurableChange(reason)
                 and type(record.liveCutover.cutoverMarker) == "string" then
                 liveMarker = record.liveCutover.cutoverMarker
             end
+            -- Provenance reconcile can upgrade already-exported rows; revisit the
+            -- recent live window so cutoverMarker tracks verified credit only.
+            if liveMarker then
+                start = math.min(start, math.max(1, nLive - 31))
+            end
             for i = start, nLive do
                 local event = events[i]
                 if type(event) == "table" and type(event.id) == "string" then
-                    -- Refresh marker when a staged nil export becomes live.
                     UpsertLedgerEventExport(
-                        "gs:le:" .. event.id, record.datasetId, event, liveMarker)
+                        "gs:le:" .. event.id,
+                        record.datasetId,
+                        event,
+                        ExportCutoverMarkerForEvent(event, liveMarker))
                 end
             end
             exportState.ledgerWarmPos = nLive
@@ -3500,7 +3526,10 @@ function GS.NotifyLocalDurableChange(reason)
                     used = used + 1
                     if type(event) == "table" and type(event.id) == "string" then
                         UpsertLedgerEventExport(
-                            "gs:le:" .. event.id, record.datasetId, event, coldMarker)
+                            "gs:le:" .. event.id,
+                            record.datasetId,
+                            event,
+                            ExportCutoverMarkerForEvent(event, coldMarker))
                     end
                     exportState.ledgerBuildCursor = i + 1
                 end

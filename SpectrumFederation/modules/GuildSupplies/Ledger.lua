@@ -1307,6 +1307,12 @@ local function ReconcileAdjustmentCutoverProvenance(record, existing, admissionC
     if type(marker) ~= "string" or marker == "" then
         return false
     end
+    -- Live receivers only accept the installed canonical cutover marker.
+    if GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and marker ~= record.liveCutover.cutoverMarker then
+        return false
+    end
     local prior = existing.gsSourceCutoverMarker
     if type(prior) == "string" and prior ~= "" and prior ~= marker then
         -- Divergent authenticated markers: leave fail-closed.
@@ -1335,6 +1341,10 @@ local function ReconcileAdjustmentCutoverProvenance(record, existing, admissionC
     end
     if changed then
         BumpAccountingMutation(record)
+        -- Refresh Gossip export so newly reconciled provenance is advertised.
+        if GS._NotifyLocalDurableChange then
+            GS._NotifyLocalDurableChange("ledger")
+        end
     end
     return changed
 end
@@ -2852,10 +2862,15 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             datasetId = record.datasetId,
         }
         -- Authenticated active-exporter marker from transport body (never the
-        -- self-declared event field). Enables order-independent credit on cutover.
+        -- self-declared event field). When already live, only the matching
+        -- canonical marker is retained; divergent markers stay fail-closed.
         if type(admissionCtx.sourceCutoverMarker) == "string"
             and admissionCtx.sourceCutoverMarker ~= "" then
-            stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
+            local liveMarker = record.liveCutover and record.liveCutover.cutoverMarker
+            if not (GS.IsLiveActive and GS.IsLiveActive(record))
+                or liveMarker == admissionCtx.sourceCutoverMarker then
+                stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
+            end
         end
         local appendOk, appendErr = AppendLedgerEvent(record, stored)
         if not appendOk then
@@ -3130,7 +3145,8 @@ function GS.ApplyIdentityLinkMutation(record, op)
     return false, "invalid_kind"
 end
 
-function GS.ApplyAdjustmentMutation(record, op)
+function GS.ApplyAdjustmentMutation(record, op, opts)
+    opts = opts or {}
     local itemId = tonumber(op.value and op.value.itemId) or tonumber(op.target and op.target.itemId)
     local quantity = tonumber(op.value and op.value.quantity)
     local attributed = op.value and op.value.attributed
@@ -3182,6 +3198,16 @@ function GS.ApplyAdjustmentMutation(record, op)
         datasetId = record.datasetId,
         opId = op.id,
     }
+    -- Only the local authenticated editor path may mint live cutover provenance
+    -- when this client is already active. Remote gs-op admission stays unmarked
+    -- until a matching authenticated marked ledger event reconciles (#389 A2).
+    if opts.localProductionAuthority
+        and GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and type(record.liveCutover.cutoverMarker) == "string"
+        and record.liveCutover.cutoverMarker ~= "" then
+        event.gsSourceCutoverMarker = record.liveCutover.cutoverMarker
+    end
     local ok, err = AppendLedgerEvent(record, event)
     if not ok then
         return false, err or "full"
