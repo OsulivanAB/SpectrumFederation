@@ -3289,36 +3289,66 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             -- source peer only; verified totals come from gs-ledger-event transfer.
             local evidence = body.evidence
             local campId = evidence.campaignId or body.campaignId or temp.currentCampaignId
+            -- Session-owned occurrence index: settled lookups are not free.
+            state.acctIndex = state.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
             local alreadyEv = false
-            local byCampaign = temp.observations and temp.observations.byCampaign
-            local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
-            if type(pending) == "table" then
-                for pi = 1, #pending do
-                    local c = pending[pi]
-                    if type(c) == "table" and type(c.evidence) == "table"
-                        and c.evidence.coreSignature == evidence.coreSignature
-                        and tonumber(c.evidence.itemId) == tonumber(evidence.itemId) then
-                        alreadyEv = true
-                        break
-                    end
+            local scanCost = 0
+            local function occurrenceKey(row)
+                if type(row) ~= "table" then return nil end
+                local fp = GS.OccurrenceFingerprint and GS.OccurrenceFingerprint(row)
+                if type(fp) == "string" and fp ~= "" then
+                    return fp
                 end
+                return tostring(row.coreSignature or "") .. "|"
+                    .. tostring(row.itemId or "") .. "|"
+                    .. tostring(row.quantity or "") .. "|"
+                    .. tostring(row.approxTxnTime or row.timestamp or "")
             end
-            if not alreadyEv then
-                local events = temp.accounting and temp.accounting._consumableEvents
-                if type(events) == "table" then
-                    for j = 1, #events do
-                        local e = events[j]
-                        if type(e) == "table" and e.coreSignature == evidence.coreSignature
-                            and tonumber(e.itemId) == tonumber(evidence.itemId)
-                            and tonumber(e.quantity) == tonumber(evidence.quantity) then
+            local evKey = occurrenceKey(evidence)
+            if evKey and state.acctIndex.pendingOcc[evKey] then
+                alreadyEv = true
+            elseif evKey and state.acctIndex.byOcc[evKey] then
+                alreadyEv = true
+            else
+                local byCampaign = temp.observations and temp.observations.byCampaign
+                local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
+                if type(pending) == "table" then
+                    for pi = 1, #pending do
+                        scanCost = scanCost + 1
+                        local c = pending[pi]
+                        if type(c) == "table" and type(c.evidence) == "table"
+                            and GS.EvidenceOccurrenceMatches
+                            and GS.EvidenceOccurrenceMatches(c.evidence, evidence) then
                             alreadyEv = true
+                            local pk = occurrenceKey(c.evidence)
+                            if pk then state.acctIndex.pendingOcc[pk] = true end
                             break
                         end
                     end
                 end
+                if not alreadyEv then
+                    local events = temp.accounting and temp.accounting._consumableEvents
+                    if type(events) == "table" then
+                        for j = 1, #events do
+                            scanCost = scanCost + 1
+                            local e = events[j]
+                            if type(e) == "table" and GS.EvidenceOccurrenceMatches
+                                and GS.EvidenceOccurrenceMatches(e, evidence) then
+                                alreadyEv = true
+                                local ok2 = occurrenceKey(e)
+                                if ok2 then state.acctIndex.byOcc[ok2] = true end
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            -- Charge nested scans against the UI-thread slice budget.
+            if scanCost > 0 then
+                sliceUsed = sliceUsed + math.max(1, math.floor(scanCost / 32))
             end
             if alreadyEv then
-                -- settled: free
+                -- settled
             else
                 if sliceUsed >= sliceBudget then
                     unsettledSeen = true
@@ -3329,6 +3359,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     state.admissions = (tonumber(state.admissions) or 0) + admissions
                     state.sliceUsed = sliceUsed
                     return true, nil, progress
+                end
+                local beforePending = 0
+                local byCampPre = temp.observations and temp.observations.byCampaign
+                local pendPre = byCampPre and byCampPre[campId] and byCampPre[campId].pending
+                if type(pendPre) == "table" then
+                    beforePending = #pendPre
                 end
                 evidence.datasetId = body.datasetId or temp.datasetId
                 evidence.campaignId = campId
@@ -3342,8 +3378,24 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 })
                 admissions = admissions + 1
                 sliceUsed = sliceUsed + 1
-                if stEv == "accepted" or stEv == "duplicate" or stEv == "pending" then
+                if stEv == "accepted" or stEv == "duplicate" then
                     progress = true
+                    if evKey then state.acctIndex.pendingOcc[evKey] = true end
+                elseif stEv == "pending" then
+                    local afterPending = 0
+                    local byCampPost = temp.observations and temp.observations.byCampaign
+                    local pendPost = byCampPost and byCampPost[campId] and byCampPost[campId].pending
+                    if type(pendPost) == "table" then
+                        afterPending = #pendPost
+                    end
+                    if afterPending ~= beforePending then
+                        progress = true
+                        if evKey then state.acctIndex.pendingOcc[evKey] = true end
+                    else
+                        -- Retained pending without durable progress must not
+                        -- reset idle/stall detection or perpetually reschedule.
+                        unsettledSeen = true
+                    end
                 else
                     unsettledSeen = true
                 end
@@ -3351,26 +3403,43 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
         elseif body.kind == "gs-ledger-event" and type(body.event) == "table" then
             local event = body.event
             local eid = event.id or event.opId or event.txnId
+            state.acctIndex = state.acctIndex or { byId = {}, byOcc = {}, pendingOcc = {} }
             local alreadyLe = false
-            local events = temp.accounting and temp.accounting._consumableEvents
-            if type(events) == "table" then
-                for j = 1, #events do
-                    local e = events[j]
-                    if type(e) == "table" then
-                        if (type(eid) == "string" and eid ~= ""
-                            and (e.id == eid or e.opId == eid or e.txnId == eid))
-                            or (type(event.txnId) == "string" and event.txnId ~= ""
-                                and (e.id == event.txnId or e.txnId == event.txnId))
-                            or (type(event.opId) == "string" and event.opId ~= ""
-                                and (e.id == event.opId or e.opId == event.opId)) then
-                            alreadyLe = true
-                            break
+            local scanCost = 0
+            if type(eid) == "string" and eid ~= "" and state.acctIndex.byId[eid] then
+                alreadyLe = true
+            elseif type(event.txnId) == "string" and state.acctIndex.byId[event.txnId] then
+                alreadyLe = true
+            elseif type(event.opId) == "string" and state.acctIndex.byId[event.opId] then
+                alreadyLe = true
+            else
+                local events = temp.accounting and temp.accounting._consumableEvents
+                if type(events) == "table" then
+                    for j = 1, #events do
+                        scanCost = scanCost + 1
+                        local e = events[j]
+                        if type(e) == "table" then
+                            if (type(eid) == "string" and eid ~= ""
+                                and (e.id == eid or e.opId == eid or e.txnId == eid))
+                                or (type(event.txnId) == "string" and event.txnId ~= ""
+                                    and (e.id == event.txnId or e.txnId == event.txnId))
+                                or (type(event.opId) == "string" and event.opId ~= ""
+                                    and (e.id == event.opId or e.opId == event.opId)) then
+                                alreadyLe = true
+                                if type(e.id) == "string" then state.acctIndex.byId[e.id] = true end
+                                if type(e.txnId) == "string" then state.acctIndex.byId[e.txnId] = true end
+                                if type(e.opId) == "string" then state.acctIndex.byId[e.opId] = true end
+                                break
+                            end
                         end
                     end
                 end
             end
+            if scanCost > 0 then
+                sliceUsed = sliceUsed + math.max(1, math.floor(scanCost / 32))
+            end
             if alreadyLe then
-                -- settled: free
+                -- settled
             else
                 if sliceUsed >= sliceBudget then
                     unsettledSeen = true
@@ -3395,6 +3464,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 sliceUsed = sliceUsed + 1
                 if stLe == "accepted" or stLe == "duplicate" then
                     progress = true
+                    if type(eid) == "string" then state.acctIndex.byId[eid] = true end
+                    if type(event.txnId) == "string" then state.acctIndex.byId[event.txnId] = true end
+                    if type(event.opId) == "string" then state.acctIndex.byId[event.opId] = true end
                 else
                     -- Floor-held adjustments / rejected bodies remain unsettled.
                     unsettledSeen = true
@@ -3851,14 +3923,15 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             and type(body.evidence) == "table" then
             local ev = body.evidence
             local settled = false
-            -- Occurrence already credited on the adopted ledger, or pending cluster retained.
+            local scanCost = 0
+            -- Distinct occurrences with the same core signature must not collapse.
             local events = temp.accounting and temp.accounting._consumableEvents
             if type(events) == "table" then
                 for j = 1, #events do
+                    scanCost = scanCost + 1
                     local e = events[j]
-                    if type(e) == "table" and e.coreSignature == ev.coreSignature
-                        and tonumber(e.itemId) == tonumber(ev.itemId)
-                        and tonumber(e.quantity) == tonumber(ev.quantity) then
+                    if type(e) == "table" and GS.EvidenceOccurrenceMatches
+                        and GS.EvidenceOccurrenceMatches(e, ev) then
                         settled = true
                         break
                     end
@@ -3870,15 +3943,28 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 local pending = byCampaign and byCampaign[campId] and byCampaign[campId].pending
                 if type(pending) == "table" then
                     for pi = 1, #pending do
+                        scanCost = scanCost + 1
                         local c = pending[pi]
                         if type(c) == "table" and type(c.evidence) == "table"
-                            and c.evidence.coreSignature == ev.coreSignature
-                            and tonumber(c.evidence.itemId) == tonumber(ev.itemId) then
+                            and GS.EvidenceOccurrenceMatches
+                            and GS.EvidenceOccurrenceMatches(c.evidence, ev) then
                             settled = true
                             break
                         end
                     end
                 end
+            end
+            if scanCost > 0 then
+                visited = visited + math.max(1, math.floor(scanCost / 32))
+                adop._workStats.completenessVisited =
+                    (adop._workStats.completenessVisited or 0)
+                    + math.max(1, math.floor(scanCost / 32))
+            end
+            if visited >= budget then
+                opts.cursor = i
+                opts.budgetExhausted = true
+                publishCompletenessStats()
+                return false, "budget"
             end
             if not settled then
                 opts.cursor = nil

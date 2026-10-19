@@ -1181,7 +1181,10 @@ local function Definition()
 								dialogs:Confirm(confirmMsg,
 									Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"), accept)
 							else
-								accept()
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+										"Confirmation is required and is unavailable right now."),
+									"error")
 							end
 						end,
 					},
@@ -1278,7 +1281,7 @@ local function Definition()
 							if n == 0 then
 								return Loc("GUILD_SUPPLIES_LINKS_EMPTY", "No character links yet.")
 							end
-							return tostring(n) .. " link group(s)"
+							return Loc("GUILD_SUPPLIES_LINKS_COUNT", "%d link group(s)"):format(n)
 						end,
 					},
 				},

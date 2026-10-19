@@ -408,14 +408,22 @@ local function Definition()
 									local donor = row.donor or "?"
 									local qty = tonumber(row.quantity) or 0
 									local itemId = tostring(row.itemId or "?")
-									local status = tostring(row.status or "pending")
+									local statusKey = tostring(row.status or "pending")
+									local statusText
+									if statusKey == "ambiguous" then
+										statusText = Loc("GUILD_SUPPLIES_PENDING_STATUS_AMBIGUOUS",
+											"ambiguous")
+									else
+										statusText = Loc("GUILD_SUPPLIES_PENDING_STATUS_PENDING",
+											"pending")
+									end
 									items[#items + 1] = {
 										text = Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_ROW",
-											"%s ×%d — %s (%d/%d witnesses)")
+											"%s ×%d — %s (%d/%d witnesses) [%s]")
 											:format(donor, qty, itemId,
 												tonumber(row.witnessCount) or 0,
-												tonumber(row.threshold) or 3)
-											.. " [" .. status .. "]",
+												tonumber(row.threshold) or 3,
+												statusText),
 										canRemove = false,
 									}
 								end

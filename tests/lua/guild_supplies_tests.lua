@@ -17355,7 +17355,8 @@ do
 end
 
 do
-    -- 3B25) Disconnected clients with colliding fingerprint IDs converge on reconnect
+    -- 3B25) Disconnected clients with colliding fingerprint IDs converge on reconnect.
+    -- Each character exports only their own direct evidence (current-GUID filter).
     local configRoot
     do
         local rec = seedStagedCampaignWithItem(9025, 100)
@@ -17403,26 +17404,6 @@ do
         return out
     end
 
-    local guidToSender = {
-        ["Player-1-Alice"] = "Alice-Garona",
-        ["Player-1-Bob"] = "Bob-Garona",
-        ["Player-1-Carol"] = "Carol-Garona",
-    }
-
-    local function senderForBody(row, fallback)
-        local body = row.body
-        if body and body.kind == "gs-evidence" then
-            local guid = body.observedBy
-            if type(guid) ~= "string" and type(row.id) == "string" then
-                guid = row.id:match("^gs:ev:([^:]+)")
-            end
-            if type(guid) == "string" and guidToSender[guid] then
-                return guidToSender[guid]
-            end
-        end
-        return fallback
-    end
-
     local function applyBodies(bodies, fallbackSender, order)
         local idxs = {}
         if order == "reverse" then
@@ -17432,16 +17413,15 @@ do
         end
         for _, i in ipairs(idxs) do
             local row = bodies[i]
-            -- Deep-copy: ValidateAndApply mutates body.evidence/event in place.
             local bodyCopy = deepCopy(row.body)
-            applyExportBody(bodyCopy, senderForBody({ id = row.id, body = bodyCopy }, fallbackSender))
+            applyExportBody(bodyCopy, fallbackSender)
         end
     end
 
     local t1 = (world.time or 1000000) - (12 * 3600)
     local t2 = t1 + (5 * 3600)
 
-    -- Client A sees both deposits (later remints under fingerprint collision).
+    -- Three independent clients each witness both deposits with their own GUID.
     local recA = loadClientFromConfigRoot(configRoot, "Alice", "Player-1-Alice", 1)
     local evEarly = makeEmptyNeighborDeposit(recA, t1)
     local evLate = makeEmptyNeighborDeposit(recA, t2)
@@ -17460,37 +17440,85 @@ do
         if k == "gs-ledger-event" then ledgerA = ledgerA + 1 end
     end
     assertTrue(ledgerA >= 2, "3B25: client A exported both ledger events got=" .. tostring(ledgerA))
-    assertTrue(evidenceA >= 6, "3B25: client A exported early+late evidence got=" .. tostring(evidenceA))
+    -- Alice may only cold/warm-export her own witness rows (not Bob/Carol alts).
+    assertTrue(evidenceA >= 2 and evidenceA <= 2,
+        "3B25: Alice exports only own early+late evidence got=" .. tostring(evidenceA))
 
-    -- Client B independently verifies only the later deposit under the shared fingerprint.
-    local recB = loadClientFromConfigRoot(configRoot, "Bob", "Player-1-Bob", 2)
+    local recBFull = loadClientFromConfigRoot(configRoot, "Bob", "Player-1-Bob", 2)
+    creditThree(evEarly)
     creditThree(evLate)
-    assertEq(tonumber(GS:ProjectCampaignProgress(recB.currentCampaignId).itemTotals[9025]) or 0,
-        6, "3B25: client B later-only under fingerprint")
-    local exportB = exportAccountingBodies()
+    assertEq(tonumber(GS:ProjectCampaignProgress(recBFull.currentCampaignId).itemTotals[9025]) or 0,
+        12, "3B25: client B both deposits independently")
+    local exportBFull = exportAccountingBodies()
 
-    -- Exchange A→B then B→A (forward delivery). A's export carries early+late
-    -- ledger and three-witness evidence; B must retain the early donation rather
-    -- than discarding it as a fingerprint duplicate of the later deposit.
+    local recCFull = loadClientFromConfigRoot(configRoot, "Carol", "Player-1-Carol", 3)
+    creditThree(evEarly)
+    creditThree(evLate)
+    local exportCFull = exportAccountingBodies()
+
+    -- Late-only peer: saw only the later deposit under the shared fingerprint.
+    local recLate = loadClientFromConfigRoot(configRoot, "Dave", "Player-1-Dave", 4)
+    creditThree(evLate)
+    assertEq(tonumber(GS:ProjectCampaignProgress(recLate.currentCampaignId).itemTotals[9025]) or 0,
+        6, "3B25: late peer later-only under fingerprint")
+
+    -- Forward exchange: each witness exports their own early evidence + ledger.
     applyBodies(exportA, "Alice-Garona", "forward")
-    assertEq(tonumber(GS:ProjectCampaignProgress(recB.currentCampaignId).itemTotals[9025]) or 0,
-        12, "3B25: B converges to both after A history/evidence exchange")
-    applyBodies(exportB, "Bob-Garona", "forward")
-    assertEq(tonumber(GS:ProjectCampaignProgress(recA.currentCampaignId).itemTotals[9025]) or 0,
-        12, "3B25: A unchanged after B later-only exchange (no double)")
+    applyBodies(exportBFull, "Bob-Garona", "forward")
+    applyBodies(exportCFull, "Carol-Garona", "forward")
+    assertEq(tonumber(GS:ProjectCampaignProgress(recLate.currentCampaignId).itemTotals[9025]) or 0,
+        12, "3B25: late peer converges after three-witness early evidence")
 
-    -- Opposite delivery order on a restarted late peer (Carol sees only later).
-    local recC = loadClientFromConfigRoot(configRoot, "Carol", "Player-1-Carol", 2)
+    -- Reverse delivery on a restarted late-only peer.
+    local recLate2 = loadClientFromConfigRoot(configRoot, "Dave", "Player-1-Dave", 4)
     creditThree(evLate)
-    assertEq(tonumber(GS:ProjectCampaignProgress(recC.currentCampaignId).itemTotals[9025]) or 0,
-        6, "3B25: late peer later-only")
+    assertEq(tonumber(GS:ProjectCampaignProgress(recLate2.currentCampaignId).itemTotals[9025]) or 0,
+        6, "3B25: restarted late peer later-only")
+    applyBodies(exportCFull, "Carol-Garona", "reverse")
+    applyBodies(exportBFull, "Bob-Garona", "reverse")
     applyBodies(exportA, "Alice-Garona", "reverse")
-    assertEq(tonumber(GS:ProjectCampaignProgress(recC.currentCampaignId).itemTotals[9025]) or 0,
+    assertEq(tonumber(GS:ProjectCampaignProgress(recLate2.currentCampaignId).itemTotals[9025]) or 0,
         12, "3B25: late peer converges under reverse delivery")
-    -- Replaying A's exports again must not double-credit.
     applyBodies(exportA, "Alice-Garona", "forward")
-    assertEq(tonumber(GS:ProjectCampaignProgress(recC.currentCampaignId).itemTotals[9025]) or 0,
+    assertEq(tonumber(GS:ProjectCampaignProgress(recLate2.currentCampaignId).itemTotals[9025]) or 0,
         12, "3B25: replayed peer history does not double-credit")
+
+    -- Character switch: account-wide directExports must not republish as the alt.
+    local sharedRoot = snapshotConfigRoot()
+    local recAlice = loadClientFromConfigRoot(sharedRoot, "Alice", "Player-1-Alice", 1)
+    creditThree(evEarly)
+    local aliceExportCount = 0
+    for _, row in ipairs(exportAccountingBodies()) do
+        if row.body and row.body.kind == "gs-evidence" then
+            aliceExportCount = aliceExportCount + 1
+            assertEq(row.body.observedBy, "Player-1-Alice", "3B25: Alice exports own GUID")
+        end
+    end
+    assertTrue(aliceExportCount >= 1, "3B25: Alice exported own evidence")
+    -- Same SavedVariables root, different authenticated character.
+    SpectrumFederationDB = { guildSupplies = deepCopy(sharedRoot) }
+    -- Preserve Alice's directExports in the shared account root.
+    local aliceRec = recAlice
+    if aliceRec and aliceRec.observations and aliceRec.observations.directExports then
+        local gk = select(1, GS:GetCurrentContext()).guildKey
+        SpectrumFederationDB.guildSupplies.guilds[gk].observations =
+            deepCopy(aliceRec.observations)
+    end
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._db = SpectrumFederationDB
+    GS._root = SpectrumFederationDB.guildSupplies
+    GS._rootValid = true
+    if GS.DisableGossipProvider then GS:DisableGossipProvider() end
+    assertTrue(GS:EnsureGossipProvider(), "3B25: Bob provider after switch")
+    GS.NotifyLocalDurableChange("evidence")
+    drainExportMaint(128)
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "gs-evidence" then
+            assertEq(row.body.observedBy, "Player-1-Bob",
+                "3B25: Bob must not export Alice witness rows as himself")
+        end
+    end
 end
 
 do
@@ -17587,6 +17615,286 @@ do
         6, "3B26: forged mutation leaves accounting unchanged")
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9999]) or 0,
         0, "3B26: forged item never credited")
+end
+
+do
+    -- 3B27) Spoofed campaign ids cannot allocate pending buckets; aggregate bound holds.
+    local record = seedStagedCampaignWithItem(9030, 40)
+    local evidence = makeDepositEvidence(record, { itemId = 9030, quantity = 3 })
+    evidence.campaignId = "gs:campaign:spoofed-not-real"
+    local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+    assertEq(st, "rejected", "3B27: spoofed campaign rejected")
+    assertTrue(reason == "unknown_campaign" or reason == "invalid_campaign"
+        or reason == "missing_campaign_archive",
+        "3B27: campaign validation reason got=" .. tostring(reason))
+    local byCampaign = record.observations and record.observations.byCampaign
+    assertTrue(byCampaign == nil or byCampaign["gs:campaign:spoofed-not-real"] == nil,
+        "3B27: no durable bucket for spoofed campaign")
+
+    -- Malformed record shape fails closed before mutation.
+    local stBad = GS:AdmitDirectObservation(evidence, {
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = { datasetId = record.datasetId }, -- missing accounting
+        localWrite = true,
+    })
+    assertEq(stBad, "rejected", "3B27: malformed record rejected")
+
+    -- Invalid ledger timestamps rejected.
+    local badTs = {
+        type = "donation",
+        id = "ctx:gs:badts",
+        txnId = "ctx:gs:badts",
+        itemId = 9030,
+        quantity = 1,
+        generation = 1,
+        timestamp = -5,
+        datasetId = record.datasetId,
+    }
+    local stTs, rTs = GS:AdmitLedgerEvent(badTs, {
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = true,
+    })
+    assertEq(stTs, "rejected", "3B27: negative timestamp rejected")
+    assertEq(rTs, "invalid_event", "3B27: invalid_event for bad timestamp")
+
+    -- Non-table link value must not Lua-error.
+    local okLink, errLink = GS.ValidateAcceptedOperationBody({
+        kind = "link-characters",
+        id = "op-link-bad",
+        target = "identity-links",
+        value = 5,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        timestamp = world.time,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        basePolicyRevision = record.permission and record.permission.revisionId,
+        baseCampaignId = record.currentCampaignId,
+        campaignId = record.currentCampaignId,
+        baseTargetRevision = "none",
+    })
+    assertEq(okLink, false, "3B27: non-table link value rejected")
+    assertTrue(errLink ~= nil, "3B27: link validation reason present")
+end
+
+do
+    -- 3B28) Compatible sibling adjustments remain applicable; config notifies ledger export.
+    local record = seedStagedCampaignWithItem(9031, 80)
+    local evidence = makeDepositEvidence(record, { itemId = 9031, quantity = 20 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9031]) or 0,
+        20, "3B28: seed donation")
+    GS:EnsureGossipProvider()
+    local adj1 = GS:NewConfigOperation(GS.KIND.ADJUST_QUANTITY, { itemId = 9031 }, {
+        itemId = 9031, quantity = -3,
+    })
+    assertTrue(adj1 ~= nil, "3B28: first adjust prepared")
+    local adj2 = GS:NewConfigOperation(GS.KIND.ADJUST_QUANTITY, { itemId = 9031 }, {
+        itemId = 9031, quantity = -2,
+    })
+    assertTrue(adj2 ~= nil, "3B28: second adjust prepared while first uncommitted")
+    assertEq(GS:ApplyStagedConfigOperation(adj1), "accepted", "3B28: first adjust applies")
+    -- Sibling prepared op must not stay permanently stale_base after head advance.
+    assertEq(GS:ApplyStagedConfigOperation(adj2), "accepted",
+        "3B28: compatible sibling adjust applies after peer adjust")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9031]) or 0,
+        15, "3B28: both adjustments applied")
+    drainExportMaint(64)
+    local bodies = collectAllExportBodies()
+    local ledgerExports = 0
+    for i = 1, #bodies do
+        if bodies[i].body and bodies[i].body.kind == "gs-ledger-event" then
+            ledgerExports = ledgerExports + 1
+        end
+    end
+    assertTrue(ledgerExports >= 3,
+        "3B28: config-path adjustments scheduled ledger export got=" .. tostring(ledgerExports))
+end
+
+do
+    -- 3B29) Historical adjustment adoption + link compaction does not skip clusters.
+    local configRoot
+    local sourceCampaign
+    local sourceDataset
+    do
+        local rec = seedStagedCampaignWithItem(9032, 50)
+        sourceCampaign = rec.currentCampaignId
+        sourceDataset = rec.datasetId
+        local evidence = makeDepositEvidence(rec, { itemId = 9032, quantity = 10 })
+        for _, pair in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+        end
+        local adj = GS:NewConfigOperation(GS.KIND.ADJUST_QUANTITY, { itemId = 9032 }, {
+            itemId = 9032, quantity = -4,
+        })
+        assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "3B29: source adjust")
+        assertEq(tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9032]) or 0,
+            6, "3B29: source total after adjust")
+        local histAdjLocal = nil
+        local eventsPre = rec.accounting and rec.accounting._consumableEvents
+        if type(eventsPre) == "table" then
+            for i = 1, #eventsPre do
+                if eventsPre[i] and eventsPre[i].id == adj.id then
+                    histAdjLocal = deepCopy(eventsPre[i])
+                    break
+                end
+            end
+        end
+        assertTrue(histAdjLocal ~= nil, "3B29: adjustment ledger event captured")
+        -- Start a new campaign so the prior one is archived with eligibility.
+        startCampaign()
+        assertTrue(rec.campaignArchives and rec.campaignArchives[sourceCampaign] ~= nil,
+            "3B29: prior campaign archived")
+        assertTrue(rec.campaignArchives[sourceCampaign].eligibility ~= nil,
+            "3B29: archive stores eligibility")
+        GS:EnsureGossipProvider()
+        configRoot = snapshotConfigRoot()
+        -- Stash on a durable upvalue via configRoot sidecar.
+        configRoot._testHistAdj = histAdjLocal
+        configRoot._testSourceCampaign = sourceCampaign
+    end
+
+    loadClientFromConfigRoot(configRoot, "Bob", "Player-1-Bob", 2)
+    local sourceRec = GS._root.guilds[select(1, GS:GetCurrentContext()).guildKey]
+    local histAdj = deepCopy(configRoot._testHistAdj)
+    assertTrue(histAdj ~= nil, "3B29: historical adjustment present on source")
+    -- Build a temp with archives but without the historical adjustment body.
+    local temp = deepCopy(sourceRec)
+    local kept = {}
+    for i = 1, #(temp.accounting._consumableEvents or {}) do
+        local e = temp.accounting._consumableEvents[i]
+        if not (e and e.id == histAdj.id) then
+            kept[#kept + 1] = e
+        end
+    end
+    temp.accounting._consumableEvents = kept
+    -- Live gossip still rejects foreign campaign adjustments.
+    local stLive, rLive = GS:AdmitLedgerEvent(deepCopy(histAdj), {
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = temp,
+        localWrite = false,
+        preserveAttribution = false,
+    })
+    assertEq(stLive, "rejected", "3B29: live path rejects historical adjust")
+    assertEq(rLive, "stale_campaign", "3B29: stale_campaign for live historical adjust")
+
+    -- Authenticated adoption restores the accepted historical adjustment.
+    local stAdopt, rAdopt = GS:AdmitLedgerEvent(deepCopy(histAdj), {
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = temp,
+        adoptionReplay = true,
+        preserveAttribution = true,
+        localWrite = false,
+    })
+    assertEq(stAdopt, "accepted",
+        "3B29: adoption restores historical adjust r=" .. tostring(rAdopt))
+
+    -- Link compaction: two pending clusters reaching quorum must both verify.
+    local rec = seedStagedCampaignWithItem(9033, 40)
+    local ev1 = makeDepositEvidence(rec, {
+        itemId = 9033, quantity = 5, donor = "CompactA-Garona", occurrenceIndex = 1,
+        neighborsOlder = {}, neighborsNewer = { "n1" },
+    })
+    local ev2 = makeDepositEvidence(rec, {
+        itemId = 9033, quantity = 7, donor = "CompactB-Garona", occurrenceIndex = 2,
+        neighborsOlder = { "n1" }, neighborsNewer = {},
+    })
+    -- Store Alice+Bob witnesses first (unlinked), then link so both GUIDs remain
+    -- recorded while independent count collapses, then add Carol.
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(ev1, pair[1], pair[2])
+        GS:_AdmitObservationForTests(ev2, pair[1], pair[2])
+    end
+    local linkOp = GS:NewLinkCharactersOperation("Player-1-Alice", "Player-1-Bob")
+    assertTrue(linkOp ~= nil, "3B29: link prepared")
+    assertEq(GS:ApplyStagedConfigOperation(linkOp), "accepted", "3B29: link accepted")
+    GS:_AdmitObservationForTests(ev1, "Player-1-Carol", "Carol-Garona")
+    GS:_AdmitObservationForTests(ev2, "Player-1-Carol", "Carol-Garona")
+    assertEq(tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9033]) or 0,
+        0, "3B29: linked alts hold both clusters pending")
+    -- Unlink restores three independents; reevaluate must verify both without skip.
+    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Bob")
+    assertTrue(unlinkOp ~= nil, "3B29: unlink prepared")
+    assertEq(GS:ApplyStagedConfigOperation(unlinkOp), "accepted", "3B29: unlink accepted")
+    local total = tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9033]) or 0
+    assertEq(total, 12,
+        "3B29: both clusters verified after compaction-safe reevaluate got=" .. tostring(total))
+end
+
+do
+    -- 3B30) Conflict quarantine is bounded; non-editor cannot write quarantine.
+    local record = seedStagedCampaignWithItem(9034, 40)
+    local evidence = makeDepositEvidence(record, { itemId = 9034, quantity = 8 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    local adj = GS:NewConfigOperation(GS.KIND.ADJUST_QUANTITY, { itemId = 9034 }, {
+        itemId = 9034, quantity = -1,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "3B30: baseline adjust")
+    local eventId = adj.id
+    -- Non-editor member attempting conflicting same-ID body.
+    local forged = {
+        type = "adjustment",
+        id = eventId,
+        opId = eventId,
+        txnId = eventId,
+        itemId = 9034,
+        quantity = -9,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        actor = "Dave-Garona",
+        writer = "Player-1-Dave",
+    }
+    local stNe, rNe = GS:AdmitLedgerEvent(forged, {
+        member = { guid = "Player-1-Dave", name = "Dave-Garona", guildKey = "club:42", rankOrder = 4 },
+        offlineRecord = record,
+        localWrite = false,
+        preserveAttribution = false,
+    })
+    assertTrue(stNe == "pending" or stNe == "rejected",
+        "3B30: non-editor conflict held/rejected st=" .. tostring(stNe))
+    local cfg = record.accounting._consumables
+    local conflicts = cfg.txnConflicts and cfg.txnConflicts[eventId]
+    assertTrue(conflicts == nil or #(conflicts.bodies or {}) == 0,
+        "3B30: non-editor must not persist quarantine bodies")
+
+    -- Editor conflict stores bounded canonical snapshot only.
+    local stEd, rEd = GS:AdmitLedgerEvent(forged, {
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+        preserveAttribution = false,
+    })
+    assertEq(stEd, "rejected", "3B30: editor conflicting body rejected")
+    assertEq(rEd, "id_conflict", "3B30: id_conflict")
+    conflicts = cfg.txnConflicts and cfg.txnConflicts[eventId]
+    assertTrue(conflicts and type(conflicts.bodies) == "table" and #conflicts.bodies >= 1,
+        "3B30: editor quarantine stored")
+    local body0 = conflicts.bodies[1]
+    assertTrue(body0.quantity == -9, "3B30: canonical quantity retained")
+    assertTrue(body0.raw == nil and body0.evidence == nil,
+        "3B30: raw peer tables not persisted")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

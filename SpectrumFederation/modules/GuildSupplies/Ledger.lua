@@ -11,6 +11,8 @@ local O = SF.ConsumablesObservation
 GS.WITNESS_THRESHOLD = 3
 GS.MAX_WITNESSES_PER_CLUSTER = 16
 GS.MAX_PENDING_EVIDENCE = 128
+-- Aggregate unfinished pending across all campaign buckets (not per arbitrary key).
+GS.MAX_PENDING_EVIDENCE_TOTAL = 256
 GS.MAX_IDENTITY_LINK_GROUPS = 64
 GS.MAX_GUIDS_PER_LINK_GROUP = 16
 GS.MAX_LEDGER_EVENTS = 4096
@@ -19,6 +21,9 @@ GS.MAX_TXN_ID = 160
 GS.MAX_OBS_QUANTITY = 100000
 GS.MAX_PENDING_ADJUSTMENTS = 32
 GS.MAX_PENDING_DONATION_CANDIDATES = 256
+GS.MAX_DIRECT_EVIDENCE_EXPORTS = 256
+GS.MAX_TXN_CONFLICT_KEYS = 64
+GS.MAX_TXN_CONFLICT_BODIES = 8
 
 GS.LEDGER_EVENT = {
     DONATION = "donation",
@@ -270,7 +275,64 @@ end
 -- Pending evidence clusters (automatic three-witness; no manual review)
 ---------------------------------------------------------------------------
 
+--- Current/archived campaign only — never allocate durable buckets for spoofed ids.
+local function IsValidPendingCampaign(record, campaignId)
+    if type(record) ~= "table" or type(campaignId) ~= "string" or campaignId == "" then
+        return false, "invalid_campaign"
+    end
+    if record.currentCampaignId == campaignId then
+        return true
+    end
+    local header = record.campaigns and record.campaigns[campaignId]
+    if type(header) ~= "table" then
+        return false, "unknown_campaign"
+    end
+    local archive = record.campaignArchives and record.campaignArchives[campaignId]
+    if type(archive) == "table" then
+        if GS.ValidateCampaignArchive then
+            local ok = GS.ValidateCampaignArchive(archive, campaignId, record)
+            if not ok then
+                return false, "invalid_campaign_archive"
+            end
+        end
+        return true
+    end
+    -- Non-current without archive: retain only when the boundary allows missing
+    -- archives (legacy/other); otherwise fail closed.
+    if header.boundaryKind == "new-goal" then
+        return false, "missing_campaign_archive"
+    end
+    return true
+end
+
+local function CountTotalUnfinishedPending(record)
+    local total = 0
+    local byCampaign = record and record.observations and record.observations.byCampaign
+    if type(byCampaign) ~= "table" then
+        return 0
+    end
+    local cap = (GS.MAX_PENDING_EVIDENCE_TOTAL or 256) + 1
+    for _, camp in pairs(byCampaign) do
+        if type(camp) == "table" and type(camp.pending) == "table" then
+            for i = 1, #camp.pending do
+                local cluster = camp.pending[i]
+                if type(cluster) == "table" and cluster.status ~= "verified" then
+                    total = total + 1
+                    if total >= cap then
+                        return total
+                    end
+                end
+            end
+        end
+    end
+    return total
+end
+
 local function EnsureCampaignPending(record, campaignId)
+    local ok, err = IsValidPendingCampaign(record, campaignId)
+    if not ok then
+        return nil, err or "invalid_campaign"
+    end
     if type(record.observations) ~= "table" then
         record.observations = { byCampaign = {} }
     end
@@ -286,6 +348,37 @@ local function EnsureCampaignPending(record, campaignId)
         camp.pending = {}
     end
     return camp
+end
+
+local function LocalPlayerGuid()
+    if UnitGUID then
+        local guid = UnitGUID("player")
+        if type(guid) == "string" and guid ~= "" then
+            return guid
+        end
+    end
+    return nil
+end
+
+--- Fail closed before ledger mutation when the staged record shape is unusable.
+local function RequireUsableAccountingRecord(record)
+    if type(record) ~= "table" then
+        return false, "invalid_record"
+    end
+    if type(record.datasetId) ~= "string" or record.datasetId == "" then
+        return false, "invalid_dataset"
+    end
+    if type(record.accounting) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    if type(record.accounting._consumables) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    if record.accounting._consumableEvents ~= nil
+        and type(record.accounting._consumableEvents) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    return true
 end
 
 --- Verified clusters no longer consume pending capacity; reclaim after commit.
@@ -348,6 +441,19 @@ local function MatchScore(existing, evidence)
         return nil
     end
     return O.MatchScore(EvidenceView(existing), evidence)
+end
+
+--- Occurrence match for adoption/completeness (not coreSignature alone).
+function GS.EvidenceOccurrenceMatches(existing, evidence)
+    if type(existing) ~= "table" or type(evidence) ~= "table" then
+        return false
+    end
+    local view = type(existing.evidence) == "table" and existing.evidence or existing
+    local score = MatchScore(view, evidence)
+    if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
+        return true
+    end
+    return false
 end
 
 local function AmbiguousBest(pendingList, evidence)
@@ -746,6 +852,143 @@ local function EnsureTxnConflicts(cfg)
     return cfg.txnConflicts
 end
 
+local function CountTxnConflictKeys(conflicts)
+    local n = 0
+    if type(conflicts) ~= "table" then
+        return 0
+    end
+    local cap = (GS.MAX_TXN_CONFLICT_KEYS or 64) + 1
+    for _ in pairs(conflicts) do
+        n = n + 1
+        if n >= cap then
+            return n
+        end
+    end
+    return n
+end
+
+--- Bounded diagnostic quarantine body (never persist raw peer tables).
+local function CanonicalConflictSnapshot(body)
+    if type(body) ~= "table" then
+        return nil
+    end
+    return {
+        type = body.type,
+        id = body.id,
+        txnId = body.txnId,
+        opId = body.opId,
+        itemId = tonumber(body.itemId),
+        quantity = tonumber(body.quantity),
+        attributed = body.attributed,
+        actor = body.actor or body.donor,
+        writer = body.writer,
+        campaignId = body.campaignId,
+        generation = tonumber(body.generation),
+        coreSignature = body.coreSignature,
+        timestamp = tonumber(body.timestamp) or tonumber(body.approxTxnTime),
+    }
+end
+
+local function QuarantineConflictBody(cfg, qid, body)
+    if type(qid) ~= "string" or qid == "" or type(cfg) ~= "table" then
+        return false
+    end
+    local snap = CanonicalConflictSnapshot(body)
+    if not snap then
+        return false
+    end
+    local conflicts = EnsureTxnConflicts(cfg)
+    local entry = conflicts[qid]
+    if type(entry) ~= "table" then
+        if CountTxnConflictKeys(conflicts) >= (GS.MAX_TXN_CONFLICT_KEYS or 64) then
+            return false
+        end
+        entry = { bodies = {} }
+        conflicts[qid] = entry
+    end
+    if type(entry.bodies) ~= "table" then
+        entry.bodies = {}
+    end
+    local maxBodies = GS.MAX_TXN_CONFLICT_BODIES or 8
+    if #entry.bodies >= maxBodies then
+        return false
+    end
+    entry.bodies[#entry.bodies + 1] = snap
+    return true
+end
+
+local function CountDirectExports(exports)
+    local n = 0
+    if type(exports) ~= "table" then
+        return 0
+    end
+    local cap = (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256) + 1
+    for _ in pairs(exports) do
+        n = n + 1
+        if n >= cap then
+            return n
+        end
+    end
+    return n
+end
+
+--- Evict oldest exports that are not still referenced by unfinished pending.
+local function EvictDirectEvidenceExports(record, exports, needSlots)
+    needSlots = tonumber(needSlots) or 1
+    if needSlots < 1 then
+        return
+    end
+    local pendingFingerprints = {}
+    local byCampaign = record.observations and record.observations.byCampaign
+    if type(byCampaign) == "table" then
+        for _, camp in pairs(byCampaign) do
+            if type(camp) == "table" and type(camp.pending) == "table" then
+                for i = 1, #camp.pending do
+                    local cluster = camp.pending[i]
+                    if type(cluster) == "table" and cluster.status ~= "verified"
+                        and type(cluster.evidence) == "table" then
+                        local fp = GS.OccurrenceFingerprint(cluster.evidence)
+                        if type(fp) == "string" then
+                            pendingFingerprints[fp] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local ranked = {}
+    for exportId, row in pairs(exports) do
+        if type(row) == "table" then
+            local fp = row.evidence and GS.OccurrenceFingerprint(row.evidence)
+            local required = type(fp) == "string" and pendingFingerprints[fp]
+            ranked[#ranked + 1] = {
+                id = exportId,
+                at = tonumber(row.at) or 0,
+                required = required and true or false,
+            }
+        end
+    end
+    table.sort(ranked, function(a, b)
+        if a.required ~= b.required then
+            return not a.required and b.required
+        end
+        if a.at ~= b.at then
+            return a.at < b.at
+        end
+        return tostring(a.id) < tostring(b.id)
+    end)
+    local removed = 0
+    for i = 1, #ranked do
+        if removed >= needSlots then
+            break
+        end
+        if not ranked[i].required then
+            exports[ranked[i].id] = nil
+            removed = removed + 1
+        end
+    end
+end
+
 --- Record a direct local observation for gossip export (never re-export relays).
 function GS.RecordDirectEvidenceExport(record, witnessGuid, evidence)
     witnessGuid = ValidGuid(witnessGuid)
@@ -764,6 +1007,17 @@ function GS.RecordDirectEvidenceExport(record, witnessGuid, evidence)
     if #exportId > 190 then
         exportId = exportId:sub(1, 190)
     end
+    if exports[exportId] == nil then
+        local count = CountDirectExports(exports)
+        local maxExports = GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256
+        if count >= maxExports then
+            EvictDirectEvidenceExports(record, exports, (count - maxExports) + 1)
+            if CountDirectExports(exports) >= maxExports then
+                -- Still full of required quorum/recovery evidence: refuse growth.
+                return nil
+            end
+        end
+    end
     exports[exportId] = {
         witnessGuid = witnessGuid,
         evidence = row,
@@ -774,11 +1028,27 @@ function GS.RecordDirectEvidenceExport(record, witnessGuid, evidence)
     return exportId
 end
 
-function GS.ListDirectEvidenceExports(record)
+--- List direct exports; when witnessGuid is set, only that character's rows.
+function GS.ListDirectEvidenceExports(record, witnessGuid)
     if type(record) ~= "table" or type(record.observations) ~= "table" then
         return {}
     end
-    return record.observations.directExports or {}
+    local exports = record.observations.directExports or {}
+    witnessGuid = ValidGuid(witnessGuid)
+    if not witnessGuid then
+        return exports
+    end
+    local filtered = {}
+    for exportId, row in pairs(exports) do
+        if type(row) == "table" and row.witnessGuid == witnessGuid then
+            filtered[exportId] = row
+        end
+    end
+    return filtered
+end
+
+function GS.GetLocalPlayerGuid()
+    return LocalPlayerGuid()
 end
 
 local function RegisterTxn(cfg, entry)
@@ -889,24 +1159,78 @@ local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
     }
 end
 
+--- Resolve generation/items/tab/eligibility for the evidence's campaign.
+-- Historical rows use archived campaign context, never the live campaign alone.
+local function ResolveEvidenceCampaignContext(record, evidence)
+    local live = record.accounting and record.accounting._consumables
+    if type(live) ~= "table" then
+        return nil, "invalid_accounting"
+    end
+    local campaignId = evidence and evidence.campaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        campaignId = record.currentCampaignId
+    end
+    if campaignId == record.currentCampaignId then
+        return {
+            generation = live.generation,
+            requestedItems = live.requestedItems,
+            bankTab = live.bankTab,
+            guild = live.guild,
+            eligibility = live.eligibility,
+            historical = false,
+        }
+    end
+    local archive = record.campaignArchives and record.campaignArchives[campaignId]
+    if type(archive) ~= "table" then
+        return nil, "missing_campaign_archive"
+    end
+    if GS.ValidateCampaignArchive then
+        local ok, err = GS.ValidateCampaignArchive(archive, campaignId, record)
+        if not ok then
+            return nil, err or "invalid_campaign_archive"
+        end
+    end
+    local header = record.campaigns and record.campaigns[campaignId]
+    local ctx = record.campaignContext and record.campaignContext[campaignId]
+    local bankTab = tonumber(archive.bankTab)
+        or tonumber(header and header.bankTabAtStart)
+        or tonumber(ctx and ctx.bankTab)
+        or tonumber(live.bankTab)
+    -- Prefer archived eligibility when present; otherwise fail closed for credit.
+    local eligibility = archive.eligibility
+    if eligibility == nil and type(ctx) == "table" and type(ctx.eligibility) == "table" then
+        eligibility = ctx.eligibility
+    end
+    return {
+        generation = archive.generation,
+        requestedItems = archive.requestedItems,
+        bankTab = bankTab,
+        guild = live.guild,
+        eligibility = eligibility,
+        historical = true,
+        hasEligibilityProof = type(eligibility) == "table",
+    }
+end
+
 local function IsEvidenceEligible(record, evidence)
-    local cfg = record.accounting and record.accounting._consumables
-    if type(cfg) ~= "table" then return false, "invalid_accounting" end
-    if tonumber(evidence.generation) ~= tonumber(cfg.generation) then
+    local ctx, ctxErr = ResolveEvidenceCampaignContext(record, evidence)
+    if not ctx then
+        return false, ctxErr or "invalid_accounting"
+    end
+    if tonumber(evidence.generation) ~= tonumber(ctx.generation) then
         return false, "generation_mismatch"
     end
-    local clubId = cfg.guild and tostring(cfg.guild.guid or "")
+    local clubId = ctx.guild and tostring(ctx.guild.guid or "")
     if clubId == "" or tostring(evidence.guildGuid or "") ~= clubId then
         return false, "guild_mismatch"
     end
-    local tab = tonumber(cfg.bankTab)
+    local tab = tonumber(ctx.bankTab)
     if not tab or tonumber(evidence.bankTab) ~= tab then
         return false, "bank_tab_mismatch"
     end
-    -- Requested item required for current campaign credit.
-    local items = cfg.requestedItems
+    -- Requested item required for the evidence's campaign credit.
+    local items = ctx.requestedItems
     if type(items) ~= "table" or type(items[tostring(evidence.itemId)] or items[evidence.itemId]) ~= "table" then
-        -- Also allow numeric-key maps.
         local found = false
         for _, row in pairs(items or {}) do
             if type(row) == "table" and tonumber(row.itemId) == tonumber(evidence.itemId) then
@@ -918,12 +1242,16 @@ local function IsEvidenceEligible(record, evidence)
             return false, "item_not_requested"
         end
     end
-    if O and O.IsEvidenceEligible and cfg.eligibility then
-        if not O.IsEvidenceEligible(evidence, cfg.eligibility) then
+    -- Historical campaigns without recoverable cutoffs cannot prove eligibility.
+    if ctx.historical and not ctx.hasEligibilityProof then
+        return false, "missing_eligibility_context"
+    end
+    if O and O.IsEvidenceEligible and ctx.eligibility then
+        if not O.IsEvidenceEligible(evidence, ctx.eligibility) then
             return false, "not_eligible"
         end
-    elseif cfg.eligibility then
-        local elig = cfg.eligibility
+    elseif ctx.eligibility then
+        local elig = ctx.eligibility
         local approx = tonumber(evidence.approxTxnTime)
         if elig.baselineEstablished and approx then
             local tabFrom = tonumber(elig.tabEligibleFrom)
@@ -939,8 +1267,8 @@ local function IsEvidenceEligible(record, evidence)
     end
     -- Hour-granular bank evidence that could fall on either side of a cutoff
     -- must stay pending (never auto-credit).
-    if O and O.EvidenceSpansEligibilityBoundary and cfg.eligibility then
-        if O.EvidenceSpansEligibilityBoundary(evidence, cfg.eligibility) then
+    if O and O.EvidenceSpansEligibilityBoundary and ctx.eligibility then
+        if O.EvidenceSpansEligibilityBoundary(evidence, ctx.eligibility) then
             return false, "ambiguous_boundary"
         end
     end
@@ -1282,8 +1610,14 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         row.generation = tonumber(cfg and cfg.generation) or 0
     end
 
+    local usable, usableErr = RequireUsableAccountingRecord(record)
+    if not usable then
+        return "rejected", usableErr or "invalid_record"
+    end
+
     local eligOk, eligErr = IsEvidenceEligible(record, row)
-    local boundaryAmbiguous = (eligErr == "ambiguous_boundary")
+    local boundaryAmbiguous = (eligErr == "ambiguous_boundary"
+        or eligErr == "missing_eligibility_context")
     if not eligOk and not boundaryAmbiguous then
         if eligErr == "not_eligible" or eligErr == "item_not_requested" then
             return "pending", eligErr
@@ -1308,24 +1642,31 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         return "duplicate", "duplicate"
     end
 
-    local camp = EnsureCampaignPending(record, campaignId)
+    local camp, campErr = EnsureCampaignPending(record, campaignId)
+    if not camp then
+        return "rejected", campErr or "invalid_campaign"
+    end
     local pending = camp.pending
     CompactVerifiedPending(pending)
     local match, how = AmbiguousBest(pending, row)
     if how == "ambiguous" then
-        -- Keep evidence pending without inventing a second cluster credit path.
-        local ambiguous = {
-            schemaVersion = 1,
-            status = "ambiguous",
-            evidence = row,
-            witnesses = {},
-            firstSeen = Now(),
-            lastSeen = Now(),
-        }
-        if UnfinishedPendingCount(pending) < (GS.MAX_PENDING_EVIDENCE or 128) then
-            pending[#pending + 1] = ambiguous
-        end
+        -- Relays/replays must not mint unlimited zero-witness ambiguous clusters.
+        -- Local writers may retain one ambiguous cluster for recovery export only
+        -- when capacity remains; never count the replay as a vote.
         if admissionCtx.localWrite or admissionCtx.exportEvidence then
+            local perCap = UnfinishedPendingCount(pending) < (GS.MAX_PENDING_EVIDENCE or 128)
+            local totalCap = CountTotalUnfinishedPending(record)
+                < (GS.MAX_PENDING_EVIDENCE_TOTAL or 256)
+            if perCap and totalCap then
+                pending[#pending + 1] = {
+                    schemaVersion = 1,
+                    status = "ambiguous",
+                    evidence = row,
+                    witnesses = {},
+                    firstSeen = Now(),
+                    lastSeen = Now(),
+                }
+            end
             GS.RecordDirectEvidenceExport(record, witnessGuid, row)
             if GS._NotifyLocalDurableChange then
                 GS._NotifyLocalDurableChange("evidence")
@@ -1337,6 +1678,9 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     local cluster = match
     if not cluster then
         if UnfinishedPendingCount(pending) >= (GS.MAX_PENDING_EVIDENCE or 128) then
+            return "rejected", "full"
+        end
+        if CountTotalUnfinishedPending(record) >= (GS.MAX_PENDING_EVIDENCE_TOTAL or 256) then
             return "rejected", "full"
         end
         cluster = {
@@ -1419,6 +1763,7 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
 end
 
 --- Reevaluate unfinished evidence after link-map changes (conservative).
+-- Compaction may remove the current index; do not skip the shifted cluster.
 function GS.ReevaluatePendingEvidence(record)
     if type(record) ~= "table" or type(record.observations) ~= "table" then
         return 0
@@ -1426,14 +1771,32 @@ function GS.ReevaluatePendingEvidence(record)
     local byCampaign = record.observations.byCampaign
     if type(byCampaign) ~= "table" then return 0 end
     local verified = 0
+    local guard = 0
+    local maxGuard = (GS.MAX_PENDING_EVIDENCE_TOTAL or 256) + 8
     for _, camp in pairs(byCampaign) do
         if type(camp) == "table" and type(camp.pending) == "table" then
-            for i = 1, #camp.pending do
+            local i = 1
+            while i <= #camp.pending do
+                guard = guard + 1
+                if guard > maxGuard then
+                    return verified
+                end
                 local cluster = camp.pending[i]
+                local beforeLen = #camp.pending
                 if type(cluster) == "table" and cluster.status ~= "verified" then
                     if TryAutoVerify(record, cluster) then
                         verified = verified + 1
+                        -- CompactVerifiedPending shifts later entries into i.
+                        if #camp.pending < beforeLen then
+                            -- stay on i
+                        else
+                            i = i + 1
+                        end
+                    else
+                        i = i + 1
                     end
+                else
+                    i = i + 1
                 end
             end
         end
@@ -1510,8 +1873,8 @@ function GS.ValidateLedgerEventBody(event, guildKey, datasetId)
     if math.abs(qty) > (GS.MAX_OBS_QUANTITY or 100000) then
         return false, "invalid_quantity"
     end
-    if not GS.IsFiniteNonnegInt(event.timestamp) and not GS.IsFiniteNonnegInt(event.generation) then
-        -- require at least generation
+    if not GS.IsFiniteNonnegInt(event.timestamp) then
+        return false, "invalid_event"
     end
     if not tonumber(event.generation) or tonumber(event.generation) < 1 then
         return false, "invalid_generation"
@@ -1541,6 +1904,10 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     if type(record) ~= "table" then
         return "pending", "awaiting_dataset"
     end
+    local usable, usableErr = RequireUsableAccountingRecord(record)
+    if not usable then
+        return "rejected", usableErr or "invalid_record"
+    end
     if event.datasetId and event.datasetId ~= record.datasetId then
         return "rejected", "dataset_mismatch"
     end
@@ -1569,6 +1936,13 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         elseif type(event.id) == "string" and event.id ~= "" then
             adjustmentEventId = event.id
         end
+        -- Authenticate editor rank before any durable quarantine writes.
+        if not admissionCtx.preserveAttribution and not admissionCtx.localWrite then
+            local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {})
+            if not editorOk then
+                return "pending", editorReason or "untrusted_relay"
+            end
+        end
     end
 
     -- Exact ID duplicate for non-donation kinds. Adjustments require exact
@@ -1587,13 +1961,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                             if AdjustmentBodiesEquivalent(e, event) then
                                 return "duplicate", "duplicate"
                             end
-                            local conflicts = EnsureTxnConflicts(cfg)
-                            local qid = adjustmentEventId or txnId
-                            conflicts[qid] = conflicts[qid] or { bodies = {} }
-                            local bodies = conflicts[qid].bodies
-                            if #bodies < 8 then
-                                bodies[#bodies + 1] = event
-                            end
+                            QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)
                             return "rejected", "id_conflict"
                         end
                         return "duplicate", "duplicate"
@@ -1643,12 +2011,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             local relation = ExactIdOccurrenceRelation(existingReg, candidate)
             if relation == "same" then
                 if DonationBodiesConflict(existingReg, candidate) then
-                    local conflicts = EnsureTxnConflicts(cfg)
-                    conflicts[txnId] = conflicts[txnId] or { bodies = {} }
-                    local bodies = conflicts[txnId].bodies
-                    if #bodies < 8 then
-                        bodies[#bodies + 1] = candidate
-                    end
+                    QuarantineConflictBody(cfg, txnId, candidate)
                     return "rejected", "id_conflict"
                 end
                 return "duplicate", "duplicate"
@@ -1689,12 +2052,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             local relation = ExactIdOccurrenceRelation(priorCand, candidate)
             if relation == "same" then
                 if DonationBodiesConflict(priorCand, candidate) then
-                    local conflicts = EnsureTxnConflicts(cfg)
-                    conflicts[txnId] = conflicts[txnId] or { bodies = {} }
-                    local bodies = conflicts[txnId].bodies
-                    if #bodies < 8 then
-                        bodies[#bodies + 1] = candidate
-                    end
+                    QuarantineConflictBody(cfg, txnId, candidate)
                     return "rejected", "id_conflict"
                 end
                 return "duplicate", "duplicate"
@@ -1746,12 +2104,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 }, candidate)
                 if relation == "same" then
                     if DonationBodiesConflict(ledHit, candidate) then
-                        local conflicts = EnsureTxnConflicts(cfg)
-                        conflicts[txnId] = conflicts[txnId] or { bodies = {} }
-                        local bodies = conflicts[txnId].bodies
-                        if #bodies < 8 then
-                            bodies[#bodies + 1] = candidate
-                        end
+                        QuarantineConflictBody(cfg, txnId, candidate)
                         return "rejected", "id_conflict"
                     end
                     return "duplicate", "duplicate"
@@ -1834,34 +2187,41 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     end
 
     if isAdjustment then
-        -- Adjustments require authenticated editor authority (or preserved adoption).
-        if not admissionCtx.preserveAttribution and not admissionCtx.localWrite then
-            local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {})
-            if not editorOk then
-                return "pending", "untrusted_relay"
-            end
-        end
+        -- Editor authority already checked before duplicate/quarantine writes.
         local eventCampaign = event.campaignId or record.currentCampaignId
         if type(eventCampaign) ~= "string" or eventCampaign == "" then
             return "rejected", "invalid_campaign"
         end
-        -- Historical adjustments for a different campaign must not floor-check
-        -- against the current campaign (and are rejected without archive provenance).
-        if eventCampaign ~= record.currentCampaignId then
-            return "rejected", "stale_campaign"
-        end
         local eventGen = tonumber(event.generation)
         local curGen = tonumber(cfg.generation)
-        if eventGen and curGen and eventGen ~= curGen then
-            return "rejected", "stale_generation"
-        end
         local attributed = NormName(event.attributed)
         local qty = tonumber(event.quantity)
-        local floorOk, floorErr = GS.AdjustmentFloorOk(
-            record, tonumber(event.itemId), qty, attributed, eventCampaign)
-        if not floorOk then
-            -- Hold incompatible negative adjustment pending (no silent overwrite).
-            return "pending", floorErr or "adjustment_floor"
+        local historicalAdoption = admissionCtx.adoptionReplay
+            and admissionCtx.preserveAttribution
+            and eventCampaign ~= record.currentCampaignId
+        if historicalAdoption then
+            -- Authenticated source adoption restores original accepted history
+            -- (including archived-campaign adjustments) without live floor replay.
+            local archive = record.campaignArchives and record.campaignArchives[eventCampaign]
+            if type(archive) ~= "table" then
+                return "rejected", "stale_campaign"
+            end
+            if eventGen and tonumber(archive.generation) and eventGen ~= tonumber(archive.generation) then
+                return "rejected", "stale_generation"
+            end
+        else
+            -- Live gossip/local writes: reject foreign campaign/generation packets.
+            if eventCampaign ~= record.currentCampaignId then
+                return "rejected", "stale_campaign"
+            end
+            if eventGen and curGen and eventGen ~= curGen then
+                return "rejected", "stale_generation"
+            end
+            local floorOk, floorErr = GS.AdjustmentFloorOk(
+                record, tonumber(event.itemId), qty, attributed, eventCampaign)
+            if not floorOk then
+                return "pending", floorErr or "adjustment_floor"
+            end
         end
         local eventId = adjustmentEventId or txnId
         local stored = {
@@ -2179,12 +2539,7 @@ function GS.ApplyAdjustmentMutation(record, op)
                 if AdjustmentBodiesEquivalent(e, incomingView) then
                     return true, "duplicate"
                 end
-                local conflicts = EnsureTxnConflicts(cfg)
-                conflicts[eventId] = conflicts[eventId] or { bodies = {} }
-                local bodies = conflicts[eventId].bodies
-                if #bodies < 8 then
-                    bodies[#bodies + 1] = incomingView
-                end
+                QuarantineConflictBody(cfg, eventId, incomingView)
                 return false, "id_conflict"
             end
         end

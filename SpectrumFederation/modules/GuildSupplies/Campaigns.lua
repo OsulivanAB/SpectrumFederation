@@ -554,6 +554,20 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
     if type(copiedItems) ~= "table" then
         return false, copyErr or "invalid_accounting"
     end
+    local eligibilityCopy = nil
+    if type(cfg.eligibility) == "table" then
+        eligibilityCopy = {
+            baselineEstablished = cfg.eligibility.baselineEstablished,
+            baselineAt = cfg.eligibility.baselineAt,
+            tabEligibleFrom = cfg.eligibility.tabEligibleFrom,
+            items = {},
+        }
+        if type(cfg.eligibility.items) == "table" then
+            for k, v in pairs(cfg.eligibility.items) do
+                eligibilityCopy.items[k] = v
+            end
+        end
+    end
     archives[campaignId] = {
         schemaVersion = GS.SCHEMA_VERSION,
         campaignId = campaignId,
@@ -561,6 +575,8 @@ local function ArchiveCurrentCampaignConfig(record, campaignId, timestamp)
         requestedItems = copiedItems,
         generation = generation,
         archivedAt = timestamp,
+        bankTab = tonumber(cfg.bankTab),
+        eligibility = eligibilityCopy,
     }
     return true
 end

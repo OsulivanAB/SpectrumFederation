@@ -1359,6 +1359,28 @@ local function CurrentGuildRecord()
     return raw, ctx.guildKey
 end
 
+--- Authenticated local character only. Account-wide directExports must not vote
+-- as an alt after character switch.
+local function LocalExportWitnessGuid()
+    if GS.GetLocalPlayerGuid then
+        return GS.GetLocalPlayerGuid()
+    end
+    if UnitGUID then
+        local guid = UnitGUID("player")
+        if type(guid) == "string" and guid ~= "" then
+            return guid
+        end
+    end
+    return nil
+end
+
+local function DirectExportOwnedByLocal(row, localGuid)
+    if type(row) ~= "table" or type(localGuid) ~= "string" then
+        return false
+    end
+    return row.witnessGuid == localGuid
+end
+
 -- Forward-declared: cold registration and Notify both schedule archive drain.
 local ScheduleExportMaintContinuation
 
@@ -1377,8 +1399,10 @@ local function RebuildExportIndex()
     if not record then
         exportState.guildKey = nil
         exportState.datasetId = nil
+        exportState.localGuid = nil
         return
     end
+    exportState.localGuid = LocalExportWitnessGuid()
     -- Never index/export raw invalid SavedVariables guild records.
     if GS._ValidateGuildRecordStructure then
         local ok = GS._ValidateGuildRecordStructure(guildKey, record)
@@ -1511,10 +1535,13 @@ local function RebuildExportIndex()
         ledgerExportCount = #events
     end
     local donationEvidenceExportCount = 0
+    local localGuid = exportState.localGuid or LocalExportWitnessGuid()
     local directExports = record.observations and record.observations.directExports
     if type(directExports) == "table" then
-        for _ in pairs(directExports) do
-            donationEvidenceExportCount = donationEvidenceExportCount + 1
+        for _, row in pairs(directExports) do
+            if DirectExportOwnedByLocal(row, localGuid) then
+                donationEvidenceExportCount = donationEvidenceExportCount + 1
+            end
         end
     end
     exportState.ledgerBuildNeeded = ledgerExportCount > 0
@@ -2500,6 +2527,7 @@ function GS.NotifyLocalDurableChange(reason)
         return
     end
     local record, guildKey = CurrentGuildRecord()
+    local localGuid = LocalExportWitnessGuid()
     local fullRebuild = reason == "adoption"
         or reason == "install"
         or reason == "dataset"
@@ -2507,6 +2535,7 @@ function GS.NotifyLocalDurableChange(reason)
         or exportState.guildKey ~= guildKey
         or exportState.datasetId ~= (record and record.datasetId)
         or exportState.epoch ~= (tonumber(GS._adoptionEpoch) or 0)
+        or exportState.localGuid ~= localGuid
 
     if fullRebuild then
         local prevOrder = exportState.order
@@ -2560,7 +2589,10 @@ function GS.NotifyLocalDurableChange(reason)
         end
         -- #388 staged ledger / donation evidence: upsert recent accepted events
         -- and any new direct observations (never re-export relays).
-        if reason == "ledger" or reason == "evidence" then
+        -- Config/remote-op/campaign paths also append ledger rows (adjustments,
+        -- link-triggered verification) and must advertise them for adoption.
+        if reason == "ledger" or reason == "evidence"
+            or reason == "config" or reason == "remote-op" or reason == "campaign" then
             local events = record.accounting and record.accounting._consumableEvents
             if type(events) == "table" then
                 local start = math.max(1, #events - 31)
@@ -2578,12 +2610,13 @@ function GS.NotifyLocalDurableChange(reason)
                     end
                 end
             end
+            local warmGuid = localGuid or LocalExportWitnessGuid()
             local directExports = record.observations and record.observations.directExports
             if type(directExports) == "table" then
                 for exportId, row in pairs(directExports) do
                     if type(exportId) == "string" and type(row) == "table"
                         and type(row.evidence) == "table"
-                        and type(row.witnessGuid) == "string"
+                        and DirectExportOwnedByLocal(row, warmGuid)
                         and not exportState.byId[exportId] then
                         UpsertExportBody(exportId, {
                             kind = "gs-evidence",
@@ -2598,6 +2631,7 @@ function GS.NotifyLocalDurableChange(reason)
                 end
             end
             exportState.maintIdle = false
+            exportState.countsDirty = true
         end
         -- Incremental / paced cold drain. Budget covers BuildOpExportBodies work
         -- (serialization while packing) as well as index enumeration.
@@ -3046,7 +3080,9 @@ function GS.NotifyLocalDurableChange(reason)
         end
 
         -- #388 cold/reload: pace direct local observations (not relays).
+        -- Only the current authenticated character's rows may be cold-exported.
         if exportState.donationEvidenceBuildNeeded and used < slice then
+            local coldGuid = exportState.localGuid or LocalExportWitnessGuid()
             local directExports = record.observations and record.observations.directExports
             if type(directExports) == "table" then
                 local keys = sortedKeys(directExports)
@@ -3066,6 +3102,7 @@ function GS.NotifyLocalDurableChange(reason)
                     used = used + 1
                     if type(exportId) == "string" and type(row) == "table"
                         and type(row.evidence) == "table"
+                        and DirectExportOwnedByLocal(row, coldGuid)
                         and not exportState.byId[exportId] then
                         UpsertExportBody(exportId, {
                             kind = "gs-evidence",
@@ -3144,10 +3181,13 @@ function GS.NotifyLocalDurableChange(reason)
             acceptedLedgerCount = #events
         end
         local donationEvidenceCount = 0
+        local descGuid = exportState.localGuid or LocalExportWitnessGuid()
         local directExports = record.observations and record.observations.directExports
         if type(directExports) == "table" then
-            for _ in pairs(directExports) do
-                donationEvidenceCount = donationEvidenceCount + 1
+            for _, row in pairs(directExports) do
+                if DirectExportOwnedByLocal(row, descGuid) then
+                    donationEvidenceCount = donationEvidenceCount + 1
+                end
             end
         end
         exportState.cachedOpCount = acceptedOpCount

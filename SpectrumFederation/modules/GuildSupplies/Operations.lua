@@ -616,7 +616,7 @@ local function ValidateKindValue(op)
         if type(op.target) ~= "string" or op.target ~= "identity-links" then
             return false, "invalid_target"
         end
-        local guids = op.value and op.value.guids
+        local guids = type(op.value) == "table" and op.value.guids or nil
         if type(guids) ~= "table" or #guids < 2 then
             return false, "invalid_guid"
         end
@@ -633,7 +633,7 @@ local function ValidateKindValue(op)
         if type(op.target) ~= "string" or op.target ~= "identity-links" then
             return false, "invalid_target"
         end
-        local guid = op.value and op.value.guid
+        local guid = type(op.value) == "table" and op.value.guid or nil
         if type(guid) ~= "string" or guid == "" or #guid > 64 then
             return false, "invalid_guid"
         end
@@ -862,9 +862,14 @@ function GS:ValidateConfigOperation(op, context)
     if not tKey then
         return false, "invalid_target"
     end
-    local currentRev = CurrentTargetRevision(record, tKey)
-    if op.baseTargetRevision ~= currentRev then
-        return false, "stale_base"
+    -- Compatible prepared local quantity adjustments must not stay permanently
+    -- stale after a sibling adjustment advances adjust:<itemId>. Commit-time
+    -- floor validation in ApplyAdjustmentMutation remains authoritative.
+    if op.kind ~= KIND.ADJUST_QUANTITY then
+        local currentRev = CurrentTargetRevision(record, tKey)
+        if op.baseTargetRevision ~= currentRev then
+            return false, "stale_base"
+        end
     end
 
     local caps = GS:GetCapabilities()

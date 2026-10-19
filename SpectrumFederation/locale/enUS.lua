@@ -278,10 +278,13 @@ L["GUILD_SUPPLIES_LINKS_APPLY"] = "Link characters"
 L["GUILD_SUPPLIES_LINKS_UNLINK_GUID"] = "Character GUID to unlink"
 L["GUILD_SUPPLIES_LINKS_UNLINK"] = "Unlink character"
 L["GUILD_SUPPLIES_LINKS_EMPTY"] = "No character links yet."
+L["GUILD_SUPPLIES_LINKS_COUNT"] = "%d link group(s)"
 L["GUILD_SUPPLIES_PENDING_EVIDENCE_TITLE"] = "Pending deposit evidence"
 L["GUILD_SUPPLIES_PENDING_EVIDENCE_HELP"] = "Read-only. Deposits become verified automatically when three independent authenticated Guild Bank observers agree. There is no manual approval."
-L["GUILD_SUPPLIES_PENDING_EVIDENCE_ROW"] = "%s ×%d — %s (%d/%d witnesses)"
+L["GUILD_SUPPLIES_PENDING_EVIDENCE_ROW"] = "%s ×%d — %s (%d/%d witnesses) [%s]"
 L["GUILD_SUPPLIES_PENDING_EVIDENCE_NONE"] = "No pending deposit evidence."
+L["GUILD_SUPPLIES_PENDING_STATUS_PENDING"] = "pending"
+L["GUILD_SUPPLIES_PENDING_STATUS_AMBIGUOUS"] = "ambiguous"
 
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)
