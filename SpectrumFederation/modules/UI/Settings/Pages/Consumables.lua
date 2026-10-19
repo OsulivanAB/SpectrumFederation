@@ -8,6 +8,14 @@ local Page = {
 	navLabel = "Consumables",
 	description = "Configure the guild bank and exact items members can donate as raid supplies.",
 	order = 23.6,
+	-- Retire from navigation once Guild Supplies is the live writer (#389).
+	available = function()
+		local C = SF.Consumables
+		if C and C.LegacyWritersAllowed then
+			return C.LegacyWritersAllowed()
+		end
+		return true
+	end,
 }
 
 local function ActiveProfile()

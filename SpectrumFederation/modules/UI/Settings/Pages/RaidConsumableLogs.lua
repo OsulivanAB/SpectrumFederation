@@ -9,6 +9,14 @@ local Page = {
 	navLabel = "Consumable Logs",
 	description = "Review raid-supply Guild Bank donations, pending verification, manual adjustments, and configuration clears.",
 	order = 23.7,
+	-- Retire from navigation once Guild Supplies is the live writer (#389).
+	available = function()
+		local C = SF.Consumables
+		if C and C.LegacyWritersAllowed then
+			return C.LegacyWritersAllowed()
+		end
+		return true
+	end,
 }
 
 local function Loc(key, default)

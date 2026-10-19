@@ -1,5 +1,4 @@
--- Guild Supplies → Configuration (#386). Staged guild setup and campaign editors.
--- Live bank helper / donation writer remains legacy Consumables until #389.
+-- Guild Supplies → Configuration (#386/#389). Guild setup, campaigns, and live activation.
 local _, SF = ...
 
 local function Loc(key, default)
@@ -280,20 +279,35 @@ local function StagedStatusText()
 	local formatReason = g and g.FormatReasonText or function(r)
 		return tostring(r or "unknown")
 	end
-	local gossipNote = Loc("GUILD_SUPPLIES_STATUS_GOSSIP",
-		"Staged configuration gossip is active for development on this branch. Live bank helper authority remains Raid Consumables until activation (#389).")
 	if not record then
 		if caps.reason == "not_configured" or recReason == "not_configured" then
 			return Loc("GUILD_SUPPLIES_STATUS_NOT_CONFIGURED",
 				"No staged Guild Supplies dataset for this guild yet. Use Initialize Guild Supplies.")
-				.. " " .. gossipNote
 		end
 		return Loc("GUILD_SUPPLIES_STATUS_UNAVAILABLE",
 			"Guild Supplies data is unavailable (%s)."):format(formatReason(caps.reason or recReason or "unknown"))
 	end
 	local campaign = record.currentCampaignId
-	local activation = Loc("GUILD_SUPPLIES_STATUS_STAGED",
-		"Staged only — live Guild Bank accounting still uses Raid Consumables until activation (#389).")
+	local activation
+	if record.activation == (g and g.ACTIVATION_ACTIVE) then
+		local marker = record.liveCutover and record.liveCutover.cutoverMarker or "?"
+		activation = Loc("GUILD_SUPPLIES_STATUS_ACTIVE",
+			"Live — Guild Supplies owns guild bank accounting for this guild (cutover %s).")
+			:format(tostring(marker))
+		local liveConflict = g and g.GetLiveActivationConflictState and g:GetLiveActivationConflictState() or nil
+		if liveConflict and liveConflict.blocked then
+			activation = activation .. " " .. Loc("GUILD_SUPPLIES_STATUS_LIVE_CONFLICT",
+				"Blocked: a peer advertised a conflicting live cutover marker. Adopt one canonical source before continuing.")
+		end
+	else
+		activation = Loc("GUILD_SUPPLIES_STATUS_STAGED",
+			"Staged only — use Activate Guild Supplies at the Guild Bank when configuration is ready.")
+		local readiness = g and g.GetActivationReadiness and g:GetActivationReadiness() or nil
+		if readiness and not readiness.canActivate and readiness.reason then
+			activation = activation .. " " .. Loc("GUILD_SUPPLIES_STATUS_ACTIVATION_BLOCKED",
+				"Activation not ready: %s."):format(formatReason(readiness.reason))
+		end
+	end
 	local mismatch = g and g.GetDatasetMismatchState and g:GetDatasetMismatchState() or nil
 	local mismatchNote = ""
 	if mismatch and mismatch.blocked and mismatch.peers and mismatch.peers[1] then
@@ -765,6 +779,52 @@ local function Definition()
 								ClearPendingInitRank()
 							end
 							ReportStatus(ctx, status or "rejected", reason)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ACTIVATE_LABEL", "Live activation"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ACTIVATE_BUTTON", "Activate Guild Supplies"),
+						width = 200,
+						tooltip = Loc("GUILD_SUPPLIES_ACTIVATE_TIP",
+							"Any authorized editor may activate. Requires a fresh Guild Bank log sample for the configured tab. Idempotent after success."),
+						enabled = function()
+							local mod = GS()
+							if not Caps().canEdit or not mod or not mod.GetActivationReadiness then
+								return false
+							end
+							local ready = mod:GetActivationReadiness()
+							return ready and ready.canActivate == true
+						end,
+						onClick = function(ctx)
+							local mod = GS()
+							ctx.section:ClearMessage()
+							if not mod or not mod.ActivateCanonicalDataset then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+							local function commit()
+								local _, status, reason = mod:ActivateCanonicalDataset()
+								ReportStatus(ctx, status or "rejected", reason)
+								-- Rebuild navigation so retired Raid Consumables pages disappear.
+								local win = SF.SettingsUI and SF.SettingsUI.StandaloneWindow
+								if win and win.BuildNavItemsFromRegistry then
+									win:BuildNavItemsFromRegistry()
+								end
+							end
+							if dialogs and dialogs.Confirm then
+								dialogs:Confirm(
+									Loc("GUILD_SUPPLIES_ACTIVATE_CONFIRM",
+										"Activate Guild Supplies as the live guild-owned writer? Pre-activation bank rows will not be credited. This cannot silently fall back to Raid Consumables profiles."),
+									Loc("GUILD_SUPPLIES_ACTIVATE_CONFIRM_OK", "Activate"),
+									commit)
+							else
+								commit()
+							end
 						end,
 					},
 					{
@@ -1296,7 +1356,7 @@ local function Definition()
 						type = "checkbox",
 						label = Loc("GUILD_SUPPLIES_REMINDERS", "Show raid supply reminders"),
 						tooltip = Loc("GUILD_SUPPLIES_REMINDERS_TIP",
-							"Personal reminder preference. Live reminder wiring remains with Raid Consumables until activation."),
+							"Personal reminder preference for raid supply deposits."),
 						get = function()
 							local store = SF.SettingsStore
 							if not store or not store.Get then return true end
