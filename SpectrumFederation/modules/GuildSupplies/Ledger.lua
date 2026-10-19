@@ -16,6 +16,8 @@ GS.MAX_PENDING_EVIDENCE_TOTAL = 256
 GS.MAX_IDENTITY_LINK_GROUPS = 64
 GS.MAX_GUIDS_PER_LINK_GROUP = 16
 GS.MAX_LEDGER_EVENTS = 4096
+-- Prior-generation rows shelved out of the live list (projection + gossip).
+GS.MAX_ARCHIVED_EVENTS = 4096
 GS.MAX_TXN_REGISTRY = 512
 GS.MAX_TXN_ID = 160
 GS.MAX_OBS_QUANTITY = 100000
@@ -1159,19 +1161,124 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId)
     return true
 end
 
+local function EnsureEventArchive(record)
+    if type(record.accounting) ~= "table" then
+        return nil
+    end
+    if type(record.accounting._consumableEventArchive) ~= "table" then
+        record.accounting._consumableEventArchive = {}
+    end
+    return record.accounting._consumableEventArchive
+end
+
+local function TrimEventArchive(record)
+    local archive = EnsureEventArchive(record)
+    if type(archive) ~= "table" then
+        return false
+    end
+    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    local overflow = #archive - maxArch
+    if overflow <= 0 then
+        return false
+    end
+    local kept = {}
+    for i = overflow + 1, #archive do
+        kept[#kept + 1] = archive[i]
+    end
+    record.accounting._consumableEventArchive = kept
+    return true
+end
+
+--- Move prior-generation live ledger rows into the bounded archive list.
+-- Mirrors legacy Consumables.ShelvePriorGenerations so campaign rollover and
+-- capacity pressure cannot permanently block new current-generation commits.
+function GS.ShelvePriorGenerationsOnRecord(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return false
+    end
+    local cfg = record.accounting._consumables
+    local generation = tonumber(cfg and cfg.generation) or 1
+    local events = record.accounting._consumableEvents
+    if type(events) ~= "table" or #events < 1 then
+        return false
+    end
+    local archive = EnsureEventArchive(record)
+    local kept = {}
+    local moved = false
+    for i = 1, #events do
+        local event = events[i]
+        local eventGen = type(event) == "table" and tonumber(event.generation) or nil
+        if eventGen and eventGen < generation then
+            archive[#archive + 1] = event
+            moved = true
+        else
+            kept[#kept + 1] = event
+        end
+    end
+    if not moved then
+        return false
+    end
+    record.accounting._consumableEvents = kept
+    TrimEventArchive(record)
+    return true
+end
+
+local function AppendArchivedLedgerEvent(record, event)
+    local archive = EnsureEventArchive(record)
+    if type(archive) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    if #archive >= maxArch then
+        return false, "full"
+    end
+    archive[#archive + 1] = event
+    return true
+end
+
 local function AppendLedgerEvent(record, event)
+    local cfg = record.accounting and record.accounting._consumables
+    local curGen = tonumber(cfg and cfg.generation)
+    local eventGen = type(event) == "table" and tonumber(event.generation) or nil
+    -- Historical rows belong in the archive list once the live generation advanced.
+    if eventGen and curGen and eventGen < curGen then
+        return AppendArchivedLedgerEvent(record, event)
+    end
     local list = record.accounting._consumableEvents
     if type(list) ~= "table" then
         record.accounting._consumableEvents = {}
         list = record.accounting._consumableEvents
     end
     if #list >= (GS.MAX_LEDGER_EVENTS or 4096) then
-        return false, "full"
+        if GS.ShelvePriorGenerationsOnRecord(record)
+            and #(record.accounting._consumableEvents or {}) < (GS.MAX_LEDGER_EVENTS or 4096) then
+            list = record.accounting._consumableEvents
+        else
+            return false, "full"
+        end
     end
     list[#list + 1] = event
-    local cfg = record.accounting._consumables
-    cfg.eventSeq = (tonumber(cfg.eventSeq) or 0) + 1
+    if type(cfg) == "table" then
+        cfg.eventSeq = (tonumber(cfg.eventSeq) or 0) + 1
+    end
     return true
+end
+
+--- Total transferable accepted ledger rows (live + archived).
+function GS.CountAcceptedLedgerEvents(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return 0
+    end
+    local n = 0
+    local live = record.accounting._consumableEvents
+    local archive = record.accounting._consumableEventArchive
+    if type(live) == "table" then
+        n = n + #live
+    end
+    if type(archive) == "table" then
+        n = n + #archive
+    end
+    return n
 end
 
 local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
@@ -1994,23 +2101,29 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
     -- Exact ID duplicate for non-donation kinds. Adjustments require exact
     -- immutable-body equivalence; divergent same-ID bodies quarantine.
     if not isDonation then
-        local events = record.accounting._consumableEvents
-        if type(events) == "table" then
-            for i = 1, #events do
-                local e = events[i]
-                if type(e) == "table" then
-                    local idHit = (e.id == txnId or e.txnId == txnId)
-                        or (adjustmentEventId
-                            and (e.id == adjustmentEventId or e.opId == adjustmentEventId))
-                    if idHit then
-                        if isAdjustment then
-                            if AdjustmentBodiesEquivalent(e, event) then
-                                return "duplicate", "duplicate"
+        local lists = {
+            record.accounting._consumableEvents,
+            record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local events = lists[li]
+            if type(events) == "table" then
+                for i = 1, #events do
+                    local e = events[i]
+                    if type(e) == "table" then
+                        local idHit = (e.id == txnId or e.txnId == txnId)
+                            or (adjustmentEventId
+                                and (e.id == adjustmentEventId or e.opId == adjustmentEventId))
+                        if idHit then
+                            if isAdjustment then
+                                if AdjustmentBodiesEquivalent(e, event) then
+                                    return "duplicate", "duplicate"
+                                end
+                                QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)
+                                return "rejected", "id_conflict"
                             end
-                            QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)
-                            return "rejected", "id_conflict"
+                            return "duplicate", "duplicate"
                         end
-                        return "duplicate", "duplicate"
                     end
                 end
             end

@@ -1587,6 +1587,11 @@ function GS:ApplyStagedCampaignOperation(op, context)
     GS.EstablishCampaignBaseline(cfg, op.timestamp)
     -- configSeq bump for projection invalidation without gossip.
     cfg.configSeq = (tonumber(cfg.configSeq) or 0) + 1
+    -- Shelve prior-generation ledger rows so the live list cannot permanently
+    -- fill across campaign rollovers (projections still walk the archive).
+    if GS.ShelvePriorGenerationsOnRecord then
+        GS.ShelvePriorGenerationsOnRecord(record)
+    end
 
     record.campaigns[op.id] = header
     record.currentCampaignId = op.id
