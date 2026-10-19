@@ -145,6 +145,20 @@ local function flushTimers()
     end
 end
 
+--- Run exactly one due timer callback (no coalesced drain of chained After(0)).
+local function runOneDueTimer()
+    local i = 1
+    while i <= #timers do
+        if timers[i].at <= (world.time or 0) then
+            local t = table.remove(timers, i)
+            t.fn()
+            return true
+        end
+        i = i + 1
+    end
+    return false
+end
+
 -- Size-correlated CBOR stand-in (not bit-identical to Retail, but wrapper-byte aware).
 local function serTable(t, depth)
     depth = (depth or 0) + 1
@@ -13311,20 +13325,34 @@ do
             prevVisited = tonumber(ws0.confirmRedriveVisited) or 0
         end
     end
-    while stCommit == "pending" and guard < 200 do
+    while stCommit == "pending" and guard < 400 do
         guard = guard + 1
-        world.time = (world.time or 0) + 1
-        flushTimers()
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                if GS._adoption and not GS._adoption.committed then
+                    stCommit, reasonCommit = GS:CommitDatasetAdoption()
+                else
+                    break
+                end
+            end
+        end
+        local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
+        local sliceStats = GS._lastAdoptionSliceStats
+        if type(sliceStats) == "table" then
+            local used = tonumber(sliceStats.used) or 0
+            assertTrue(used <= sliceBudget,
+                "3A21: per-callback slice used within budget got=" .. tostring(used)
+                    .. " budget=" .. tostring(sliceBudget))
+        end
         local ws = GS.GetAdoptionWorkStats and GS.GetAdoptionWorkStats()
         local after = type(ws) == "table" and (tonumber(ws.confirmRedriveVisited) or 0) or prevVisited
         local delta = after - prevVisited
         if delta > 0 then
             sliceVisits[#sliceVisits + 1] = delta
-            local sliceBudget = GS.MAX_ADMISSION_WORK_PER_SLICE or 32
-            -- flushTimers drains chained After(0) continuations; bound the coalesced
-            -- charge rather than assuming one callback per wall-clock step.
-            assertTrue(delta <= (sliceBudget + 1) * 4,
-                "3A21: timer step charged within slice got=" .. tostring(delta))
+            assertTrue(delta <= sliceBudget,
+                "3A21: per-callback confirmRedrive delta within budget got="
+                    .. tostring(delta))
             prevVisited = after
         end
         if not GS._adoption then
@@ -13337,7 +13365,6 @@ do
             reasonCommit = nil
             break
         end
-        stCommit, reasonCommit = GS:CommitDatasetAdoption()
     end
     assertEq(stCommit, "accepted",
         "3A21: timer-stepped adopt completes got=" .. tostring(stCommit)
@@ -15301,9 +15328,10 @@ do
 end
 
 ---------------------------------------------------------------------------
--- 3A27) Batch repairs at 84a862f: requested-item confirm capacity (r4309192231),
--- resolution contentBodies exact keys (r4309202274), orphan campaign boundary
--- reclaim (r4309202260), policy-deferral budgeting (r4309202265).
+-- 3A27) Batch repairs at 84a862f / 9af1341: requested-item confirm capacity
+-- (r4309192231), resolution contentBodies exact keys (r4309202274), orphan
+-- campaign boundary reclaim (r4309202260), policy-deferral budgeting
+-- (r4309202265 / r4309469547).
 ---------------------------------------------------------------------------
 do
     local function durableSer()
@@ -15681,141 +15709,254 @@ do
     assertTrue(GS._pendingCampaignBoundaries[okId] ~= nil,
         "3A27: post-reclaim boundary recorded for valid campaign")
 
-    -- 4) Policy-deferral scan charges visits and resumes across callbacks.
+    -- 4) Policy-deferral budgeting: yield before nested confirm search at the
+    -- order-entry budget edge; valid mixed policy/config adoption with a foreign
+    -- candidate; per-callback visit measurement; cancel with queued callbacks.
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
     initGS()
     GS:CreateStagedRecord()
     GS:EnsureGossipProvider()
     startCampaign()
-    local aliceDs = GS:GetCurrentRecord().datasetId
-    GS.NotePeerDataset("Bob-Garona", "defer-scan-ds", {
-        editorRankPosition = 1, permissionRevisionId = "defer-scan-ds",
-    })
-    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", "defer-scan-ds")), "accepted",
-        "3A27: defer-scan begin")
-    local adop = GS._adoption
-    assertTrue(type(adop) == "table", "3A27: adoption session")
-    local temp = {
-        datasetId = "defer-scan-ds",
-        _guildKey = "club:42",
-        _adoptionOffline = true,
-        currentCampaignId = "defer-camp",
-        permission = { revisionId = "defer-scan-ds", editorRankPosition = 1 },
-        accounting = { _consumables = {
-            requestedItems = {}, eligibility = { items = {}, baselineEstablished = true },
-            bankTab = 1, configSeq = 1, generation = 1,
-        } },
-        campaigns = {
-            ["defer-camp"] = {
-                schemaVersion = GS.SCHEMA_VERSION, campaignId = "defer-camp",
-                datasetId = "defer-scan-ds", startedAt = 1, bankTabAtStart = 1,
-                resetOperationId = "defer-camp",
-            },
-        },
-        campaignArchives = {},
-        confirmationRefs = {},
-        operations = {
-            records = {}, order = {}, heads = {}, pending = {}, conflicts = {},
-            openConflicts = {},
-        },
-    }
-    adop.records = {}
-    adop.order = {}
-    adop.sourceAcceptedSet = {}
-    adop.sourceAcceptedIds = {}
+    local srcDs = GS:GetCurrentRecord().datasetId
+    local srcCamp = GS:GetCurrentRecord().currentCampaignId
+    local srcPol = GS:GetCurrentRecord().permission.revisionId
+    -- Foreign candidates + Alice confirms (padding confirms are charged but skip
+    -- nested search; foreign bodies require confirmation search at budget edges).
+    local foreignIds = {}
+    for i = 1, 3 do
+        local id = "def-foreign-" .. i
+        foreignIds[#foreignIds + 1] = id
+        local body = {
+            schemaVersion = 1, id = id, guildKey = "club:42", datasetId = srcDs,
+            campaignId = srcCamp, kind = "set-requested-item",
+            target = { itemId = 43000 + i },
+            value = { itemId = 43000 + i, goal = 1, removed = false },
+            actorGuid = "Player-1-Bob", actorName = "Bob-Garona",
+            timestamp = 16000 + i,
+            baseTargetRevision = srcDs, basePolicyRevision = srcPol,
+            baseCampaignId = srcCamp,
+        }
+        assertEq(GS:AdmitRemoteOperation(body, { sender = "Bob-Garona", relay = true }),
+            "pending", "3A27: defer foreign cand " .. id)
+        local conf, stc = GS:NewConfirmationOperation({ recordId = id })
+        assertEq(stc, "accepted", "3A27: defer foreign conf prepare " .. i)
+        assertEq(GS:ApplyStagedConfirmationOperation(conf), "accepted",
+            "3A27: defer foreign conf apply " .. i)
+    end
+    -- Alice-authored config + policy change (mixed policy/config history).
+    local tabOp = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 5))
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "3A27: defer alice tab")
+    local rankOp = select(1, GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2))
+    assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted", "3A27: defer alice rank")
+    local tabAfter = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 6))
+    assertEq(GS:ApplyStagedConfigOperation(tabAfter), "accepted", "3A27: defer post-rank tab")
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 6, "3A27: defer export has mixed bodies got="
+        .. tostring(#exportBodies))
+
+    -- Cancellation with callbacks still queued (do not clear timers to cancel).
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    local priorDs = GS:GetCurrentRecord().datasetId
+    local priorSer = serTable(SpectrumFederationDB.guildSupplies.guilds["club:42"])
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", srcDs, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", srcDs)), "accepted",
+        "3A27: defer cancel begin")
+    for i = 1, #exportBodies do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "3A27: defer cancel transfer ready")
     local sliceBudget = 4
     local priorSlice = GS.MAX_ADMISSION_WORK_PER_SLICE
     GS.MAX_ADMISSION_WORK_PER_SLICE = sliceBudget
-    -- Already-settled prefix forces the deferral scan to walk many visits before
-    -- the first unsettled same-policy config (source-authored by Bob).
-    for i = 1, 24 do
-        local id = string.format("def-settled-%02d", i)
-        local op = {
-            schemaVersion = 1, id = id, guildKey = "club:42", datasetId = "defer-scan-ds",
-            campaignId = "defer-camp", kind = "set-bank-tab", target = "bankTab",
-            value = 1, actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = i,
-            baseTargetRevision = "defer-scan-ds", basePolicyRevision = "defer-scan-ds",
-            baseCampaignId = "defer-camp",
-        }
-        temp.operations.records[id] = op
-        temp.operations.order[#temp.operations.order + 1] = id
-        local lid = "gs:op:" .. id
-        adop.records[lid] = { kind = "gs-op", op = op }
-        adop.order[#adop.order + 1] = lid
-        adop.sourceAcceptedSet[id] = true
-        adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = id
-    end
-    local unsettled = {
-        schemaVersion = 1, id = "def-unset", guildKey = "club:42", datasetId = "defer-scan-ds",
-        campaignId = "defer-camp", kind = "set-bank-tab", target = "bankTab", value = 2,
-        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 50,
-        baseTargetRevision = "def-settled-24", basePolicyRevision = "defer-scan-ds",
-        baseCampaignId = "defer-camp",
-    }
-    adop.records["gs:op:def-unset"] = { kind = "gs-op", op = unsettled }
-    adop.order[#adop.order + 1] = "gs:op:def-unset"
-    adop.sourceAcceptedSet["def-unset"] = true
-    adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = "def-unset"
-    local rankOp = {
-        schemaVersion = 1, id = "def-rank", guildKey = "club:42", datasetId = "defer-scan-ds",
-        kind = "set-editor-rank", target = "editorRankPosition", value = 2,
-        actorGuid = "Player-1-Bob", actorName = "Bob-Garona", timestamp = 100,
-        baseTargetRevision = "defer-scan-ds", basePolicyRevision = "defer-scan-ds",
-    }
-    adop.records["gs:op:def-rank"] = { kind = "gs-op", op = rankOp }
-    adop.order[#adop.order + 1] = "gs:op:def-rank"
-    adop.sourceAcceptedSet["def-rank"] = true
-    adop.sourceAcceptedIds[#adop.sourceAcceptedIds + 1] = "def-rank"
-    adop.replayTemp = temp
-    adop.replayMember = GS.AuthenticateTransportSender("Bob-Garona")
-    adop.replayState = { cursor = 1, admissions = 0, wave = 0 }
     GS._adoptionReplaySyncDrain = false
     timers = {}
-    local st1, reason1 = GS:CommitDatasetAdoption()
-    assertEq(st1, "pending", "3A27: defer-scan first commit yields pending got="
-        .. tostring(st1) .. "/" .. tostring(reason1))
-    local state1 = GS._adoption and GS._adoption.replayState
-    assertTrue(type(state1) == "table" and state1.deferRankScan ~= nil,
-        "3A27: defer-scan parked incomplete classification across callback")
-    assertTrue((tonumber(state1.sliceUsed) or 0) <= sliceBudget,
-        "3A27: first defer-scan slice respects budget used="
-            .. tostring(state1.sliceUsed))
-    local parkedPos = tonumber(state1.deferRankScan.pos) or 0
-    assertTrue(parkedPos > 1, "3A27: defer-scan advanced a resume cursor pos="
-        .. tostring(parkedPos))
-    -- Drive one more single slice without draining chained timers (a full
-    -- flushTimers would run through to incompleteness on this hand-built temp).
-    timers = {}
-    GS._adoption._replayScheduled = false
-    GS._adoptionReplaySyncDrain = false
-    local st2, reason2 = GS:CommitDatasetAdoption()
-    assertEq(st2, "pending",
-        "3A27: second defer-scan slice still pending got="
-            .. tostring(st2) .. "/" .. tostring(reason2))
-    local state2 = GS._adoption.replayState
-    assertTrue(type(state2) == "table", "3A27: replay state present after second slice")
-    local p2 = type(state2.deferRankScan) == "table"
-        and tonumber(state2.deferRankScan.pos) or nil
-    local resumedOk = (state2.deferRankScan == nil and state2.deferRankCached ~= nil)
-        or (p2 ~= nil and p2 > parkedPos)
-    assertTrue(resumedOk,
-        "3A27: defer-scan resumed across callbacks parked="
-            .. tostring(parkedPos) .. " pos=" .. tostring(p2)
-            .. " cached=" .. tostring(state2.deferRankCached))
-    assertTrue((tonumber(state2.sliceUsed) or 0) <= sliceBudget + 2,
-        "3A27: second defer-scan slice bounded used="
-            .. tostring(state2.sliceUsed))
-    -- Cancellation and idle: preserve live dataset, no orphan session/timers.
-    timers = {}
+    local stCancelPend, reasonCancelPend = GS:CommitDatasetAdoption()
+    assertEq(stCancelPend, "pending",
+        "3A27: defer cancel commit pending got="
+            .. tostring(stCancelPend) .. "/" .. tostring(reasonCancelPend))
+    assertTrue(#timers >= 1, "3A27: defer cancel has queued callback(s) got="
+        .. tostring(#timers))
     GS:CancelDatasetAdoption()
-    assertEq(GS._adoption, nil, "3A27: cancel clears adoption after defer-scan")
-    assertEq(GS:GetCurrentRecord().datasetId, aliceDs,
-        "3A27: defer-scan cancel preserves live dataset")
+    assertEq(GS._adoption, nil, "3A27: defer cancel clears adoption session")
+    assertEq(GS:GetCurrentRecord().datasetId, priorDs,
+        "3A27: defer cancel preserves live dataset before drain")
+    -- Drain stale callbacks individually; live state must remain unchanged.
+    local drainGuard = 0
+    while drainGuard < 64 do
+        drainGuard = drainGuard + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+    end
+    assertEq(GS._adoption, nil, "3A27: stale callbacks did not revive adoption")
+    assertEq(GS:GetCurrentRecord().datasetId, priorDs,
+        "3A27: defer cancel live dataset unchanged after drain")
+    assertEq(serTable(SpectrumFederationDB.guildSupplies.guilds["club:42"]), priorSer,
+        "3A27: defer cancel full live state unchanged after draining queued callbacks")
+    assertEq(#timers, 0, "3A27: idle after defer cancel drain")
+    GS.MAX_ADMISSION_WORK_PER_SLICE = priorSlice
+    GS._adoptionReplaySyncDrain = true
+
+    -- Successful mixed adoption: per-callback bounds, foreign confirm search,
+    -- exact publication and idle.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    GS._lastAdoptionSliceStats = nil
+    GS._lastAdoptionWorkStats = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", srcDs, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", srcDs)), "accepted",
+        "3A27: defer adopt begin")
+    for i = 1, #exportBodies do
+        local stB, reasonB = GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+        assertTrue(stB == "accepted" or stB == "duplicate",
+            "3A27: defer buffer " .. tostring(stB) .. "/" .. tostring(reasonB))
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "3A27: defer adopt ready")
+    GS.MAX_ADMISSION_WORK_PER_SLICE = sliceBudget
+    GS._adoptionReplaySyncDrain = false
     timers = {}
-    world.time = (world.time or 0) + 1
-    flushTimers()
-    assertEq(#timers, 0, "3A27: idle after defer-scan cancel")
+    GS._lastAdoptionAbortReason = nil
+    local adoptFailReason = nil
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertTrue(stAdopt == "pending" or stAdopt == "accepted",
+        "3A27: defer adopt first return got="
+            .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt))
+    if stAdopt == "rejected" then
+        adoptFailReason = reasonAdopt
+    end
+    local sawAwaitingSearch = false
+    local sawParkedScan = false
+    local maxUsed = 0
+    local callbacks = 0
+    local guard = 0
+    while guard < 800 do
+        guard = guard + 1
+        if not GS._adoption then
+            break
+        end
+        if GS._adoption.committed then
+            stAdopt = "accepted"
+            reasonAdopt = nil
+            break
+        end
+        local state = GS._adoption.replayState
+        if type(state) == "table" and type(state.deferRankScan) == "table" then
+            sawParkedScan = true
+            -- awaitingSearch is set only when an order-entry visit exhausts the
+            -- slice before nested confirmation search begins (not mid-search).
+            if state.deferRankScan.awaitingSearch == true then
+                sawAwaitingSearch = true
+                local usedEdge = type(GS._lastAdoptionSliceStats) == "table"
+                    and tonumber(GS._lastAdoptionSliceStats.used) or nil
+                if usedEdge ~= nil then
+                    assertTrue(usedEdge <= sliceBudget,
+                        "3A27: yield-before-search slice used within budget got="
+                            .. tostring(usedEdge) .. " budget=" .. tostring(sliceBudget))
+                end
+            end
+        end
+        local stats = GS._lastAdoptionSliceStats
+        if type(stats) == "table" then
+            local used = tonumber(stats.used) or 0
+            maxUsed = math.max(maxUsed, used)
+            -- Per-callback bound: one trailing assemble/admit charge-then-check may
+            -- report budget+1. Do not allow coalesced multi-callback multiples.
+            assertTrue(used <= sliceBudget + 1,
+                "3A27: per-callback defer-scan/admission used within budget got="
+                    .. tostring(used) .. " budget=" .. tostring(sliceBudget))
+        end
+        if runOneDueTimer() then
+            callbacks = callbacks + 1
+        else
+            world.time = (world.time or 0) + 1
+            if runOneDueTimer() then
+                callbacks = callbacks + 1
+            elseif GS._adoption and not GS._adoption.committed then
+                stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+                callbacks = callbacks + 1
+                if stAdopt == "rejected" then
+                    adoptFailReason = reasonAdopt
+                    break
+                end
+                if stAdopt == "accepted" then
+                    break
+                end
+            else
+                break
+            end
+        end
+    end
+    if adoptFailReason == nil and GS._lastAdoptionAbortReason ~= nil then
+        adoptFailReason = GS._lastAdoptionAbortReason
+    end
+    assertEq(adoptFailReason, nil,
+        "3A27: defer adopt must not abort got=" .. tostring(adoptFailReason)
+            .. " st=" .. tostring(stAdopt) .. "/" .. tostring(reasonAdopt)
+            .. " guard=" .. tostring(guard))
+    assertEq(GS:GetPendingAdoption(), nil, "3A27: defer adopt eventually idle")
+    assertEq(GS:GetCurrentRecord().datasetId, srcDs,
+        "3A27: defer adopt exact dataset publication")
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 6,
+        "3A27: defer adopt post-rank tab published")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2,
+        "3A27: defer adopt editor rank published")
+    for i = 1, #foreignIds do
+        assertTrue(GS:GetCurrentRecord().operations.records[foreignIds[i]] ~= nil,
+            "3A27: defer adopt foreign " .. foreignIds[i] .. " accepted via confirm")
+    end
+    assertTrue(maxUsed >= 1 or stAdopt == "accepted",
+        "3A27: observed per-callback work or sync accept maxUsed="
+            .. tostring(maxUsed))
+    assertTrue(maxUsed <= sliceBudget + 1,
+        "3A27: max per-callback used within budget got=" .. tostring(maxUsed))
+    assertTrue(sawParkedScan,
+        "3A27: defer adopt parked deferRankScan across callbacks")
+    assertTrue(sawAwaitingSearch,
+        "3A27: defer adopt yielded before nested confirm search at budget edge")
+    assertTrue(callbacks >= 1,
+        "3A27: defer adopt drove real queued callbacks count="
+            .. tostring(callbacks))
+    local agg = GS.GetAdoptionWorkStats and GS.GetAdoptionWorkStats()
+    assertTrue(type(agg) == "table" and (tonumber(agg.confirmVisited) or 0) >= 1,
+        "3A27: foreign confirmation search visited during adopt")
+    -- Drain any terminal notify timer; session must stay gone.
+    local idleGuard = 0
+    while #timers > 0 and idleGuard < 16 do
+        idleGuard = idleGuard + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+    end
+    assertEq(GS._adoption, nil, "3A27: idle session after successful defer adopt")
+    assertEq(#timers, 0, "3A27: idle timers after successful defer adopt")
     GS.MAX_ADMISSION_WORK_PER_SLICE = priorSlice
     GS._adoptionReplaySyncDrain = true
 
