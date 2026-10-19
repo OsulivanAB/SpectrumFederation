@@ -1584,13 +1584,41 @@ local function IsEvidenceEligible(record, evidence)
         end
     end
     -- Hour-granular bank evidence that could fall on either side of a cutoff
-    -- must stay pending (never auto-credit).
+    -- must stay pending (never auto-credit), unless a later aged observation
+    -- marked the occurrence boundary-reconciled (#389).
     if O and O.EvidenceSpansEligibilityBoundary and ctx.eligibility then
-        if O.EvidenceSpansEligibilityBoundary(evidence, ctx.eligibility) then
+        if evidence.boundaryReconciled ~= true
+            and O.EvidenceSpansEligibilityBoundary(evidence, ctx.eligibility) then
             return false, "ambiguous_boundary"
         end
     end
     return true
+end
+
+--- True when a new observation may promote an ambiguous cluster to pending.
+-- Truly non-spanning evidence always clears. Spanning first-hour rows may clear
+-- only after ageHours >= 1 while still reconstructing at/after cutover so the
+-- hour bucket has aged past the activation window without inventing pre-cutover
+-- credit (#389).
+local function ObservationClearsBoundaryAmbiguity(record, evidence, boundaryAmbiguous)
+    if not boundaryAmbiguous then
+        return true
+    end
+    local ageHours = tonumber(evidence and evidence.ageHours)
+    local approx = tonumber(evidence and evidence.approxTxnTime)
+        or tonumber(evidence and evidence.observedAt)
+    if not ageHours or ageHours < 1 or ageHours ~= math.floor(ageHours) or not approx then
+        return false
+    end
+    local cutover = nil
+    if GS.IsLiveActive and GS.IsLiveActive(record) and type(record.liveCutover) == "table" then
+        local boundary = record.liveCutover.eligibilityBoundary
+        cutover = tonumber(boundary and boundary.tabEligibleFrom)
+            or tonumber(record.liveCutover.contextObservedAt)
+    end
+    local cfg = record and record.accounting and record.accounting._consumables
+    cutover = cutover or (cfg and cfg.eligibility and tonumber(cfg.eligibility.tabEligibleFrom))
+    return cutover ~= nil and approx >= cutover
 end
 
 local function CommitVerifiedCluster(record, cluster, writerGuid)
@@ -2035,10 +2063,26 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     else
         -- Refresh evidence fields conservatively (neighbors may strengthen).
         cluster.lastSeen = Now()
-        if boundaryAmbiguous then
+        local reconciledPending = cluster.status == "pending"
+            and type(cluster.evidence) == "table"
+            and cluster.evidence.boundaryReconciled == true
+        if cluster.status == "ambiguous"
+            and ObservationClearsBoundaryAmbiguity(record, row, boundaryAmbiguous) then
+            -- Same occurrence later observed clearly (or aged past the first-hour
+            -- window): promote to pending and discard prior ambiguous votes so a
+            -- single forged clear observation cannot inherit a three-witness
+            -- quorum (#389).
+            cluster.status = "pending"
+            cluster.witnesses = {}
+            cluster.evidence = row
+            if boundaryAmbiguous then
+                cluster.evidence.boundaryReconciled = true
+            end
+            reconciledPending = cluster.evidence.boundaryReconciled == true
+        elseif boundaryAmbiguous and not reconciledPending then
             cluster.status = "ambiguous"
         end
-        if type(cluster.evidence) == "table" then
+        if type(cluster.evidence) == "table" and cluster.evidence ~= row then
             local older = cluster.evidence.neighborsOlder or {}
             local newer = cluster.evidence.neighborsNewer or {}
             if #(row.neighborsOlder or {}) > #older then
@@ -2046,6 +2090,18 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
             end
             if #(row.neighborsNewer or {}) > #newer then
                 cluster.evidence.neighborsNewer = row.neighborsNewer
+            end
+            if cluster.status == "pending" then
+                local prevAge = tonumber(cluster.evidence.ageHours)
+                local newAge = tonumber(row.ageHours)
+                if newAge and (not prevAge or newAge > prevAge) then
+                    cluster.evidence.ageHours = row.ageHours
+                    cluster.evidence.approxTxnTime = row.approxTxnTime
+                    cluster.evidence.observedAt = row.observedAt
+                    if reconciledPending or row.boundaryReconciled then
+                        cluster.evidence.boundaryReconciled = true
+                    end
+                end
             end
         end
     end
@@ -2099,7 +2155,11 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     if verified then
         return "accepted", nil, cluster
     end
-    if cluster.status == "ambiguous" or boundaryAmbiguous then
+    if cluster.status == "ambiguous" then
+        return "pending", "ambiguous_boundary", cluster
+    end
+    if boundaryAmbiguous
+        and not (cluster.evidence and cluster.evidence.boundaryReconciled == true) then
         return "pending", "ambiguous_boundary", cluster
     end
     return "pending", "awaiting_witnesses", cluster

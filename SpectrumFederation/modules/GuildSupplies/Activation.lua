@@ -67,12 +67,17 @@ function GS.ShouldUseLegacyConsumablesWritersForGuildKey(guildKey)
         -- unresolvable guild identity while GS root is available).
         return false
     end
-    local record
     if GS.GetRecordForGuildKey then
-        record = select(1, GS:GetRecordForGuildKey(key))
-    else
-        record = GS._root and GS._root.guilds and GS._root.guilds[key]
+        local record, reason = GS:GetRecordForGuildKey(key)
+        if record == nil then
+            -- Only a genuinely missing guild slot permits legacy fallback.
+            -- Retained malformed/unsupported (including corrupt active) records
+            -- must fail closed so cutover cannot silently re-enable writers (#389).
+            return reason == "not_configured"
+        end
+        return not GS.IsLiveActive(record)
     end
+    local record = GS._root and GS._root.guilds and GS._root.guilds[key]
     if record == nil then
         return true
     end

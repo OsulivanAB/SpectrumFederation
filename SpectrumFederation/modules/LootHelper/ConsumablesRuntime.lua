@@ -30,10 +30,17 @@ end
 
 local function Warn(text)
     Debug("Warn", "%s", tostring(text))
-    -- After Guild Supplies activation for the active accounting profile's guild,
-    -- deposit/reminder paths stay chat-free (#389).
+    -- Live Guild Supplies deposit/reminder paths stay chat-free (#389), even when
+    -- an unrelated Loot Helper profile is selected. Gate on the active accounting
+    -- context (GS proxy / current guild), not merely GetActiveProfile().
+    local GS = SF.GuildSupplies
+    if GS and GS.IsLiveActiveForCurrentGuild and GS:IsLiveActiveForCurrentGuild() then
+        return
+    end
     local C = SF.Consumables
-    local profile = Runtime.Profile and Runtime:Profile() or nil
+    local profile = (Runtime.AccountingProfile and Runtime:AccountingProfile())
+        or (Runtime.Profile and Runtime:Profile())
+        or nil
     if C and C.LegacyWritersAllowed and not C.LegacyWritersAllowed(profile) then
         return
     end

@@ -21657,6 +21657,75 @@ do
         guild = { guid = "99", name = "OtherGuild", realm = "Garona" },
     }), true, "3C18: MergeSnapshot applies for unrelated guild")
     assertEq(tonumber(profileB._consumables.bankTab), 3, "3C18: B profile snapshot applied")
+
+    -- Retained corrupt/unsupported active record must fail closed (not legacy fallback).
+    SpectrumFederationDB.guildSupplies.guilds["club:77"] = {
+        schemaVersion = 1,
+        activation = GS.ACTIVATION_ACTIVE,
+        datasetId = "corrupt-active-77",
+        -- Missing liveCutover: ValidateGuildRecord fails closed.
+        permission = {
+            editorRankPosition = 3,
+            bootstrapEditorRankPosition = 3,
+            revisionId = "corrupt-active-77",
+        },
+        currentCampaignId = nil,
+        campaigns = {},
+        campaignArchives = {},
+        campaignContext = {},
+        accounting = {
+            _consumables = {
+                guild = { guid = "77", name = "Corrupt", realm = "Garona" },
+                bankTab = 1,
+                requestedItems = {},
+                generation = 0,
+                configSeq = 0,
+                eventSeq = 0,
+                eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
+                txnRegistry = {},
+            },
+            _consumableEvents = {},
+            _consumableEventArchive = {},
+        },
+        observations = { byCampaign = {} },
+        identityLinks = { schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil },
+        operations = {
+            records = {}, order = {}, heads = {}, pending = {}, conflicts = {}, openConflicts = {},
+        },
+        confirmationRefs = {},
+    }
+    local badRec, badReason = GS:GetRecordForGuildKey("club:77")
+    assertNil(badRec, "3C18: corrupt active GetRecordForGuildKey nil")
+    assertTrue(badReason ~= "not_configured",
+        "3C18: corrupt reason not not_configured got=" .. tostring(badReason))
+    assertEq(GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:77"), false,
+        "3C18: corrupt active fails closed for legacy writers")
+    assertEq(GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:88"), true,
+        "3C18: genuinely missing guild still allows legacy")
+
+    -- Live GS deposit Warn must stay chat-free even with unrelated selected profile.
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+    local Runtime = SF.ConsumablesRuntime
+    function SF:PrintWarning(msg)
+        world.chat[#world.chat + 1] = tostring(msg)
+    end
+    SF.GetActiveProfile = function()
+        return profileB
+    end
+    local priorEnsure = Runtime.EnsureReview
+    Runtime.EnsureReview = function()
+        return { IsShown = function() return false end }
+    end
+    world.chat = {}
+    assertEq(GS:IsLiveActiveForCurrentGuild(), true, "3C18: current guild A still live")
+    assertEq(C.LegacyWritersAllowed(profileB), true,
+        "3C18: selected profile B still legacy-writable")
+    Runtime:BeginDeposit({ itemId = 9118 }, { profile = profileB })
+    assertEq(#world.chat, 0,
+        "3C18: live GS deposit Warn emits no Chat with unrelated selected profile")
+    Runtime.EnsureReview = priorEnsure
+    SF.GetActiveProfile = nil
+    SF.PrintWarning = nil
     assertEq(#world.chat, 0, "3C18: no chat")
 end
 
@@ -21934,8 +22003,49 @@ do
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
         0, "3C21: pre-cutover still uncredited")
 
-    -- Clearly post-cutover deposit (outside the hour uncertainty) still credits.
-    world.time = boundary + 7200
+    -- Same first-hour occurrence rescanned after the hour ages: one forged/single
+    -- clear vote must not inherit the three ambiguous witnesses.
+    world.time = boundary + 60 + 7200
+    local agedSame = makeDepositEvidence(record, {
+        itemId = 9121, quantity = 8,
+        observedAt = world.time,
+        ageHours = 2, -- approxTxnTime stays boundary+60; aged past first-hour window
+        donor = "FirstHour-Garona",
+        occurrenceIndex = 1,
+        neighborsOlder = { "older|fh" },
+        neighborsNewer = { "newer|fh" },
+    })
+    assertEq(agedSame.approxTxnTime, spanning.approxTxnTime,
+        "3C21: aged rescan keeps reconstructed txn time")
+    assertTrue(O.EvidenceSpansEligibilityBoundary(agedSame, cfg.eligibility),
+        "3C21: hour-bucket still formally spans; reconciliation uses age>=1")
+    local stOne, rOne = GS:_AdmitObservationForTests(agedSame, "Player-1-Alice", "Alice-Garona")
+    assertTrue(stOne == "pending" or stOne == "duplicate",
+        "3C21: single aged rescan pending st=" .. tostring(stOne) .. " r=" .. tostring(rOne))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        0, "3C21: single aged observation does not inherit ambiguous quorum")
+
+    -- Fresh independent aged witnesses of the same occurrence → exactly one credit.
+    for _, pair in ipairs({
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+    }) do
+        local ast, ars = GS:_AdmitObservationForTests(agedSame, pair[1], pair[2])
+        assertTrue(ast == "pending" or ast == "accepted" or ast == "duplicate",
+            "3C21: aged quorum st=" .. tostring(ast) .. " r=" .. tostring(ars))
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        8, "3C21: same first-hour occurrence credits once after aged reconciliation")
+
+    -- Replay / fourth witness stays idempotent.
+    assertEq(select(1, GS:_AdmitObservationForTests(agedSame, "Player-1-Alice", "Alice-Garona")),
+        "duplicate", "3C21: aged replay duplicate")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        8, "3C21: still once after replay")
+
+    -- Clearly post-cutover *distinct* deposit (outside the hour uncertainty) still credits.
+    world.time = boundary + 10800
     local clear = makeDepositEvidence(record, {
         itemId = 9121, quantity = 5, observedAt = world.time, ageHours = 0,
         donor = "ClearPost-Garona",
@@ -21953,7 +22063,10 @@ do
         GS:_AdmitObservationForTests(clear, pair[1], pair[2])
     end
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
-        5, "3C21: clear post-cutover credits once")
+        13, "3C21: clear post-cutover credits once more (8+5)")
+    -- Pre-cutover fixture from earlier remains excluded.
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9121]) or 0,
+        13, "3C21: totals exclude pre-cutover backfill")
     disarmFreshBankSample()
     assertEq(#world.chat, 0, "3C21: no chat")
 end
