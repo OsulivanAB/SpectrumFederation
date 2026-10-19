@@ -496,13 +496,18 @@ function GS.SerializeEvidence(evidence)
     local guildGuid = type(evidence.guildGuid) == "string" and evidence.guildGuid or nil
     local bankTab = tonumber(evidence.bankTab)
     if not guildGuid or not bankTab or bankTab < 1 or bankTab > 8 then return nil end
-    local core = evidence.coreSignature
-    if type(core) ~= "string" or core == "" then
-        if O and O.CoreSignature then
-            core = O.CoreSignature("deposit", donor, itemId, quantity)
-        end
+    -- Always recompute from normalized credited fields. A nonempty claimed
+    -- signature that disagrees is rejected (never silently rewritten), so one
+    -- forged witness cannot inflate quantity while matching honest votes.
+    local core = nil
+    if O and O.CoreSignature then
+        core = O.CoreSignature("deposit", donor, itemId, quantity)
     end
     if type(core) ~= "string" or core == "" then return nil end
+    local claimed = evidence.coreSignature
+    if type(claimed) == "string" and claimed ~= "" and claimed ~= core then
+        return nil
+    end
     return {
         coreSignature = core,
         type = "deposit",
@@ -1171,6 +1176,121 @@ local function EnsureEventArchive(record)
     return record.accounting._consumableEventArchive
 end
 
+-- Ephemeral density-validation cache keyed by accounting table (not SavedVariables).
+-- Avoids rescanning up to 8K rows on every GetCurrentRecord after the first check
+-- for an unchanged mutation revision. Declared before BumpAccountingMutation so the
+-- local upvalue resolves correctly under Lua 5.1.
+local ledgerListShapeCache = setmetatable({}, { __mode = "k" })
+
+--- Monotonic local ledger/evidence mutation counter (adoption stale-base pin).
+-- Cheap O(1) bump; never scans ledger arrays. Controlled append/shelve/trim
+-- paths keep dense shape, so advance a prior ok cache entry without rescanning.
+local function BumpAccountingMutation(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return
+    end
+    local n = tonumber(record.accounting._mutationSeq) or 0
+    record.accounting._mutationSeq = n + 1
+    local cached = ledgerListShapeCache[record.accounting]
+    if cached and cached.ok then
+        cached.mut = record.accounting._mutationSeq
+    end
+end
+
+function GS.GetAccountingMutationSeq(record)
+    if type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return 0
+    end
+    return tonumber(record.accounting._mutationSeq) or 0
+end
+
+local function ValidateDenseLedgerList(list, maxLen)
+    if type(list) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    local n = #list
+    if n > maxLen then
+        return false, "ledger_overflow"
+    end
+    local counted = 0
+    local maxIndex = 0
+    for k, v in pairs(list) do
+        counted = counted + 1
+        if counted > maxLen then
+            return false, "ledger_overflow"
+        end
+        if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
+            return false, "ledger_malformed"
+        end
+        if k > maxIndex then
+            maxIndex = k
+        end
+        if type(v) ~= "table" then
+            return false, "ledger_malformed"
+        end
+    end
+    -- Sparse or holey arrays: #list disagrees with dense 1..n occupancy.
+    if counted ~= n or (n > 0 and maxIndex ~= n) then
+        return false, "ledger_sparse"
+    end
+    return true
+end
+
+--- Fail-closed shape/bounds check for live + archived ledger arrays.
+-- Cheap length overflow always; deep sparse/malformed scan cached per mutation.
+function GS.ValidateLedgerEventLists(accounting)
+    if type(accounting) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    local live = accounting._consumableEvents
+    local archive = accounting._consumableEventArchive
+    if type(live) ~= "table" or type(archive) ~= "table" then
+        return false, "invalid_accounting"
+    end
+    local maxLive = GS.MAX_LEDGER_EVENTS or 4096
+    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    -- Always-cheap overflow gate (no pairs walk).
+    if #live > maxLive or #archive > maxArch then
+        return false, "ledger_overflow"
+    end
+    local mut = tonumber(accounting._mutationSeq) or 0
+    local cached = ledgerListShapeCache[accounting]
+    if cached and cached.mut == mut then
+        if cached.ok then
+            return true
+        end
+        return false, cached.err or "invalid_accounting"
+    end
+    local ok, err = ValidateDenseLedgerList(live, maxLive)
+    if not ok then
+        ledgerListShapeCache[accounting] = { mut = mut, ok = false, err = err }
+        return false, err
+    end
+    ok, err = ValidateDenseLedgerList(archive, maxArch)
+    if not ok then
+        ledgerListShapeCache[accounting] = { mut = mut, ok = false, err = err }
+        return false, err
+    end
+    ledgerListShapeCache[accounting] = { mut = mut, ok = true }
+    return true
+end
+
+local function RemoveEvictedLedgerExportIds(removedIds)
+    if type(removedIds) ~= "table" or #removedIds < 1 or not GS.RemoveGossipExportBodies then
+        return
+    end
+    local offset = 1
+    while offset <= #removedIds do
+        local chunk = {}
+        local last = math.min(offset + 63, #removedIds)
+        for i = offset, last do
+            chunk[#chunk + 1] = removedIds[i]
+        end
+        GS.RemoveGossipExportBodies(chunk)
+        offset = last + 1
+    end
+end
+
 local function TrimEventArchive(record)
     local archive = EnsureEventArchive(record)
     if type(archive) ~= "table" then
@@ -1181,11 +1301,26 @@ local function TrimEventArchive(record)
     if overflow <= 0 then
         return false
     end
+    local removedIds = {}
+    for i = 1, overflow do
+        local ev = archive[i]
+        if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
+            removedIds[#removedIds + 1] = "gs:le:" .. ev.id
+        end
+    end
     local kept = {}
     for i = overflow + 1, #archive do
         kept[#kept + 1] = archive[i]
     end
     record.accounting._consumableEventArchive = kept
+    BumpAccountingMutation(record)
+    RemoveEvictedLedgerExportIds(removedIds)
+    -- Length may match the prior warm watermark after shelve+trim; still force
+    -- archive paced rebuild so newly retained rows are exported and descriptor
+    -- counts cannot exceed GetRecord coverage.
+    if GS.MarkLedgerArchiveExportStale then
+        GS.MarkLedgerArchiveExportStale()
+    end
     return true
 end
 
@@ -1220,6 +1355,8 @@ function GS.ShelvePriorGenerationsOnRecord(record)
     end
     record.accounting._consumableEvents = kept
     TrimEventArchive(record)
+    -- Shelve mutates live+archive occupancy even when trim is a no-op.
+    BumpAccountingMutation(record)
     return true
 end
 
@@ -1233,6 +1370,7 @@ local function AppendArchivedLedgerEvent(record, event)
         return false, "full"
     end
     archive[#archive + 1] = event
+    BumpAccountingMutation(record)
     return true
 end
 
@@ -1261,6 +1399,7 @@ local function AppendLedgerEvent(record, event)
     if type(cfg) == "table" then
         cfg.eventSeq = (tonumber(cfg.eventSeq) or 0) + 1
     end
+    BumpAccountingMutation(record)
     return true
 end
 
@@ -1603,7 +1742,11 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
     if not event then
         return false, "invalid_event"
     end
-    event.campaignId = record.currentCampaignId
+    -- Preserve validated evidence campaign provenance (historical late quorum
+    -- must not rewrite archived campaignId onto the current campaign).
+    if type(event.campaignId) ~= "string" or event.campaignId == "" then
+        event.campaignId = record.currentCampaignId
+    end
     event.datasetId = record.datasetId
     local ok, err = AppendLedgerEvent(record, event)
     if not ok then
@@ -1819,6 +1962,7 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
                     firstSeen = Now(),
                     lastSeen = Now(),
                 }
+                BumpAccountingMutation(record)
             end
             GS.RecordDirectEvidenceExport(record, witnessGuid, row)
             if GS._NotifyLocalDurableChange then
@@ -1892,6 +2036,9 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
         at = Now(),
         observedAt = row.observedAt,
     }
+    -- Retained witness / pending evidence is local accounting work that adoption
+    -- must not silently discard (stale-base pin uses _mutationSeq).
+    BumpAccountingMutation(record)
 
     -- Only the originating observer exports this evidence body. Relays must not
     -- re-publish it under a different authenticated sender.
@@ -2020,7 +2167,19 @@ function GS.ValidateLedgerEventBody(event, guildKey, datasetId)
         return false, "invalid_item"
     end
     local qty = tonumber(event.quantity)
-    if not qty or qty ~= math.floor(qty) or qty == 0 then
+    local isDonation = typ == GS.LEDGER_EVENT.DONATION or typ == "CONSUMABLE_DONATION"
+    -- Donations: finite strictly positive integers only (FloorNonNeg must not
+    -- convert authenticated negatives into zero-quantity accepted credits).
+    -- Adjustments: signed nonzero integers within the existing max abs bound.
+    if not qty or qty ~= qty or qty == math.huge or qty == -math.huge
+        or qty ~= math.floor(qty) then
+        return false, "invalid_quantity"
+    end
+    if isDonation then
+        if qty < 1 then
+            return false, "invalid_quantity"
+        end
+    elseif qty == 0 then
         return false, "invalid_quantity"
     end
     if math.abs(qty) > (GS.MAX_OBS_QUANTITY or 100000) then
@@ -2290,6 +2449,23 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         -- Authenticated adoption transfers source-accepted donations into the
         -- temporary record. Live gossip never takes this branch.
         if admissionCtx.adoptionReplay and admissionCtx.preserveAttribution then
+            -- Resolve campaign/header/archive generation before preserving.
+            -- Missing archive context waits (out-of-order transfer); wrong
+            -- generation fails closed so projections cannot misattribute.
+            local campId = candidate.campaignId
+            if type(campId) ~= "string" or campId == "" then
+                return "rejected", "invalid_campaign"
+            end
+            local campCtx, campErr = ResolveEvidenceCampaignContext(record, candidate)
+            if not campCtx then
+                if campErr == "missing_campaign_archive" then
+                    return "pending", "awaiting_campaign_context"
+                end
+                return "rejected", campErr or "invalid_campaign"
+            end
+            if tonumber(candidate.generation) ~= tonumber(campCtx.generation) then
+                return "rejected", "generation_mismatch"
+            end
             local stored = {
                 type = GS.LEDGER_EVENT.DONATION,
                 id = txnId,
@@ -2308,7 +2484,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 bankTab = candidate.bankTab,
                 neighborsOlder = candidate.neighborsOlder,
                 neighborsNewer = candidate.neighborsNewer,
-                campaignId = candidate.campaignId,
+                campaignId = campId,
                 datasetId = record.datasetId,
             }
             local appendOk, appendErr = AppendLedgerEvent(record, stored)
