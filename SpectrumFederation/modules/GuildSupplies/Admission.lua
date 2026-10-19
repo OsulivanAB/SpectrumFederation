@@ -1787,6 +1787,7 @@ local function AbortAdoptionReplay(adop, reason)
     adop._replaySessionRelay = nil
     adop._replaySessionBoundaries = nil
     adop._replayScheduled = false
+    GS._lastAdoptionAbortReason = reason
     DebugWarn("adoption replay aborted: %s", tostring(reason))
 end
 
@@ -2784,11 +2785,15 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
         end
         local scanComplete = false
         while scanAt <= #adop.order and sliceUsed < sliceBudget do
-            sliceUsed = sliceUsed + 1
             local b = adop.records[adop.order[scanAt]]
             local o = (type(b) == "table" and b.kind == "gs-op" and type(b.op) == "table")
                 and b.op or nil
-            scanAt = scanAt + 1
+            -- Resuming a nested confirmation search must not re-charge the order
+            -- entry or starve/restart the search after a prior yield.
+            local resumingSearch = scan.awaitingSearch == true or scan.confirmCursor ~= nil
+            if not resumingSearch then
+                sliceUsed = sliceUsed + 1
+            end
             if type(o) == "table"
                 and o.kind ~= GS.KIND.SET_EDITOR_RANK
                 and o.kind ~= GS.KIND.CONFIRM_CANDIDATE
@@ -2802,8 +2807,21 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 local src = ActorMatchesMember(o, member)
                 local conf = false
                 if not src then
+                    local remaining = sliceBudget - sliceUsed
+                    if remaining < 1 then
+                        -- Order-entry visit used the last unit: yield before nested
+                        -- confirmation search; resume this entry without restarting.
+                        scan.pos = scanAt
+                        scan.awaitingSearch = true
+                        scan.found = found
+                        state.deferRankScan = scan
+                        state.sliceUsed = sliceUsed
+                        state.cursor = tonumber(state.cursor) or 1
+                        state.admissions = (tonumber(state.admissions) or 0) + admissions
+                        return true, nil, progress
+                    end
                     local searchOpts = {
-                        budget = math.max(1, sliceBudget - sliceUsed),
+                        budget = remaining,
                         cursor = scan.confirmCursor,
                     }
                     conf = AdoptionHasConfirmationFor(
@@ -2814,8 +2832,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     end
                     if searchOpts.budgetExhausted then
                         -- Resume the same order entry; do not treat incomplete search as false.
-                        scan.pos = scanAt - 1
+                        scan.pos = scanAt
                         scan.confirmCursor = searchOpts.cursor
+                        scan.awaitingSearch = true
                         scan.found = found
                         state.deferRankScan = scan
                         state.sliceUsed = sliceUsed
@@ -2824,13 +2843,22 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         return true, nil, progress
                     end
                     scan.confirmCursor = nil
+                    scan.awaitingSearch = nil
+                else
+                    scan.confirmCursor = nil
+                    scan.awaitingSearch = nil
                 end
                 if src or conf then
                     found = true
                     scanComplete = true
+                    scanAt = scanAt + 1
                     break
                 end
+            else
+                scan.confirmCursor = nil
+                scan.awaitingSearch = nil
             end
+            scanAt = scanAt + 1
         end
         if not scanComplete and scanAt > #adop.order then
             scanComplete = true
@@ -2933,17 +2961,31 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 -- Source-authored bodies need no confirmation search.
                 local confirmed = false
                 if not sourceAuthored then
+                    local remaining = sliceBudget - sliceUsed
+                    if remaining < 1 then
+                        -- Yield before nested confirmation search when the slice
+                        -- has no search budget left; resume this cursor next slice.
+                        state.cursor = (i - 1)
+                        if state.cursor < 1 then
+                            state.cursor = #adop.order
+                        end
+                        state.admissions = (tonumber(state.admissions) or 0) + admissions
+                        state.sliceUsed = sliceUsed
+                        return true, nil, progress
+                    end
                     local searchOpts = {
-                        budget = math.max(1, sliceBudget - sliceUsed),
+                        budget = remaining,
                         cursor = state.confirmCursor and state.confirmCursor[op.id] or nil,
                     }
                     confirmed = AdoptionHasConfirmationFor(
                         adop, op.id, op, member, temp.operations, searchOpts)
+                    local v = tonumber(searchOpts.visited) or 0
+                    if v > 0 then
+                        sliceUsed = sliceUsed + v
+                    end
                     if searchOpts.budgetExhausted then
                         state.confirmCursor = state.confirmCursor or {}
                         state.confirmCursor[op.id] = searchOpts.cursor
-                        -- Charge visited work; resume next slice.
-                        sliceUsed = sliceBudget
                         state.cursor = (i - 1)
                         if state.cursor < 1 then
                             state.cursor = #adop.order
@@ -2953,11 +2995,6 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         return true, nil, progress
                     elseif state.confirmCursor then
                         state.confirmCursor[op.id] = nil
-                    end
-                    -- Account confirmation visits toward the slice budget.
-                    local v = tonumber(searchOpts.visited) or 0
-                    if v > 1 then
-                        sliceUsed = sliceUsed + (v - 1)
                     end
                 end
                 local isAuthEnvelope = op.kind == GS.KIND.CONFIRM_CANDIDATE
