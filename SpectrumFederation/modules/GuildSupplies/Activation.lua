@@ -59,14 +59,11 @@ end
 -- @return boolean allowed
 function GS.ShouldUseLegacyConsumablesWritersForGuildKey(guildKey)
     if not GS:IsRootReady() then
-        -- Present-but-invalid saved roots are retained in GS._root with
-        -- _rootValid=false and may still contain previously active guilds.
-        -- Fail closed so cutover cannot silently reopen legacy writers. A
-        -- genuinely absent/uninitialized root (nil) keeps legacy available.
-        if type(GS._root) == "table" then
-            return false
-        end
-        return true
+        -- Present-but-invalid saved roots (any non-nil value, including
+        -- non-tables) are retained in GS._root with _rootValid=false.
+        -- Fail closed so cutover cannot silently reopen legacy writers.
+        -- Only a genuinely absent root (nil) keeps legacy available.
+        return GS._root == nil
     end
     local key = GS.ParseGuildKey and select(1, GS.ParseGuildKey(guildKey)) or nil
     if not key then
@@ -115,10 +112,7 @@ function GS:ShouldUseLegacyConsumablesWriters(profileOrGuild)
     end
     if not GS:IsRootReady() then
         -- Same present-invalid vs absent distinction as the guild-key helper.
-        if type(GS._root) == "table" then
-            return false
-        end
-        return true
+        return GS._root == nil
     end
     local record, reason = GS:GetCurrentRecord()
     if record == nil then

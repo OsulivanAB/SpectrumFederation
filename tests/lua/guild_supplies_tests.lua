@@ -22293,6 +22293,21 @@ do
     assertEq(GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:42"), false,
         "3C23: guild-key gate fails closed on invalid root")
     assertEq(C.LegacyWritersAllowed(), false, "3C23: Consumables gate fails closed")
+    -- Non-table, non-nil persisted root retained by Initialize must also fail closed.
+    SpectrumFederationDB.guildSupplies = "corrupt"
+    local okCorrupt, reasonCorrupt = GS:Initialize(SpectrumFederationDB)
+    assertEq(okCorrupt, false, "3C23: non-table root initialize fails")
+    assertEq(GS:IsRootReady(), false, "3C23: non-table root not ready")
+    assertTrue(GS._root ~= nil, "3C23: non-table root retained in memory")
+    assertEq(type(GS._root) ~= "table", true, "3C23: retained root is non-table")
+    assertEq(SpectrumFederationDB.guildSupplies, "corrupt",
+        "3C23: non-table saved root preserved unchanged")
+    assertEq(GS:ShouldUseLegacyConsumablesWriters(), false,
+        "3C23: non-table present root fails closed")
+    assertEq(GS.ShouldUseLegacyConsumablesWritersForGuildKey("club:42"), false,
+        "3C23: guild-key fails closed on non-table root")
+    assertEq(C.LegacyWritersAllowed(), false,
+        "3C23: Consumables gate fails closed on non-table root")
     -- Genuinely absent root keeps legacy available.
     SpectrumFederationDB.guildSupplies = nil
     GS._root = nil
