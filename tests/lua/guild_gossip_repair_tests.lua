@@ -6687,6 +6687,106 @@ do
     reset()
 end
 
+---------------------------------------------------------------------------
+-- F97: abandoned served VIEW cannot immediately reacquire; other peer serves
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    local p = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f97" })
+    for i = 1, 4 do p.AppendLocal("f97-" .. i, "f97-" .. i) end
+    for _ = 1, 8 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local entry = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    local scope = A.GuildGossip.GetGuildScopeId()
+    assertTrue(entry and entry.index and entry.index.buildComplete, "F97: index ready")
+
+    local busyAcks = {}
+    local origSend = A.GuildGossip.SendGossip
+    A.GuildGossip.SendGossip = function(msgType, payload, dist, target, opts)
+        if msgType == A.GuildGossip.MSG.ACK and type(payload) == "table" and payload.busy then
+            busyAcks[#busyAcks + 1] = { target = target, payload = payload }
+        end
+        return origSend(msgType, payload, dist, target, opts)
+    end
+
+    -- Bob obtains the sole served-pull slot with a valid VIEW.
+    world._unitName = "Alice"
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v97-bob", providerId = "sf.synthetic.gossip",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    for _ = 1, 10 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        if e.inPull and e.inPull.peer == "Bob-Garona" then break end
+    end
+    assertTrue(e.inPull ~= nil and e.inPull.peer == "Bob-Garona",
+        "F97: Bob occupies served pull")
+    local lease = e.inPull.usableProgressAt or world.time
+
+    -- Bob abandons: idle lease expires without ACK done.
+    world.time = lease + A.GuildGossip.SERVED_VIEW_IDLE_TIMEOUT_SEC + 5
+    stepClient(A, A.GuildGossip.GetStepLimits("SLOW"))
+    assertTrue(e.inPull == nil, "F97: abandoned VIEW frees served pull")
+    local bobKey = "bob-garona"
+    assertTrue(e.peerServeCooldownUntil and e.peerServeCooldownUntil[bobKey]
+            and e.peerServeCooldownUntil[bobKey] > world.time,
+        "F97: abandoner gets serve cooldown")
+    assertTrue(not e.peerCooldownUntil or not e.peerCooldownUntil[bobKey]
+            or e.peerCooldownUntil[bobKey] <= world.time,
+        "F97: abandon cooldown is serve-only (initiate path free)")
+
+    -- Bob's immediate reacquire is refused; Carol can obtain the slot.
+    local busyBefore = #busyAcks
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v97-bob-retry", providerId = "sf.synthetic.gossip",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(#busyAcks > busyBefore, "F97: Bob reacquire receives busy ACK")
+    assertTrue(e.inPull == nil, "F97: Bob cannot reacquire during serve cooldown")
+
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v97-carol", providerId = "sf.synthetic.gossip",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Carol-Garona")
+    for _ = 1, 10 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        if e.inPull and e.inPull.peer == "Carol-Garona" then break end
+    end
+    assertTrue(e.inPull ~= nil and e.inPull.peer == "Carol-Garona",
+        "F97: Carol obtains freed slot while Bob cools")
+
+    -- Carol completes successfully (ACK done) — no serve cooldown for success.
+    local carolLease = e.inPull.usableProgressAt
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.ACK, {
+        viewId = e.inPull.viewId, providerId = "sf.synthetic.gossip",
+        scopeId = scope, done = true,
+    }), "WHISPER", "Carol-Garona")
+    stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+    assertTrue(e.inPull == nil, "F97: successful transfer closes served pull")
+    local carolKey = "carol-garona"
+    assertTrue(not e.peerServeCooldownUntil or not e.peerServeCooldownUntil[carolKey]
+            or e.peerServeCooldownUntil[carolKey] <= world.time,
+        "F97: successful peer is not serve-penalized")
+
+    -- After cooldown, Bob can converge again.
+    world.time = (e.peerServeCooldownUntil[bobKey] or world.time) + 1
+    A.GuildGossip.OnGossipCommReceived("SF_GG", A.GuildGossip.BuildWireMessage(A.GuildGossip.MSG.VIEW, {
+        op = "request", viewId = "v97-bob-recover", providerId = "sf.synthetic.gossip",
+        scopeId = scope, schema = 1, mode = "NORMAL",
+    }), "WHISPER", "Bob-Garona")
+    for _ = 1, 10 do
+        stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
+        if e.inPull and e.inPull.peer == "Bob-Garona" then break end
+    end
+    assertTrue(e.inPull ~= nil and e.inPull.peer == "Bob-Garona",
+        "F97: Bob recovers after serve cooldown")
+
+    A.GuildGossip.SendGossip = origSend
+    A.GuildGossip:DisableProvider("sf.synthetic.gossip")
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end

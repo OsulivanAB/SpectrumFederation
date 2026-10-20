@@ -357,7 +357,14 @@ function Model.ResolveSidebarSelect(registry, session, categoryId)
     session = session or {}
     local category = Model.GetCategory(registry, categoryId)
     if not Model.IsCategorySelectable(category) then
-        return CurrentSelection(session)
+        -- Do not keep a retired/unavailable page pinned when the category is
+        -- gone or disabled; callers that need a different category (e.g.
+        -- SettingsWindow:HandleRegistryChanged) resolve general themselves.
+        local selection = CurrentSelection(session)
+        if selection.pageId and not Model.IsContentPage(registry, selection.pageId) then
+            return CopySelection(selection.categoryId, nil, true)
+        end
+        return selection
     end
 
     local lastPageId = session.lastPageByCategory and session.lastPageByCategory[categoryId]

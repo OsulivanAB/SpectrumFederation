@@ -2129,7 +2129,13 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     end
 
     -- Authenticated live cutover conflict: fail closed on production credits.
-    if GS.LiveAccountingWritesBlocked then
+    -- Bank-snapshot admission may supply a one-shot cached probe for the same
+    -- record/actor so a full log does not re-walk roster per row.
+    if admissionCtx.liveWritesBlockedCached then
+        if admissionCtx.liveWritesBlocked then
+            return "pending", admissionCtx.liveWritesBlockReason or "live_activation_conflict"
+        end
+    elseif GS.LiveAccountingWritesBlocked then
         local blocked, blockReason = GS.LiveAccountingWritesBlocked(record, admissionCtx)
         if blocked then
             return "pending", blockReason or "live_activation_conflict"

@@ -345,6 +345,23 @@ function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
         guildKey = ctxAuth.guildKey,
         rankOrder = ctxAuth.rankOrder,
     }
+    -- One completed bank snapshot: probe live-write conflict once (same record
+    -- and local actor for every row) and coalesce durable/export notifications
+    -- so nested evidence/ledger notifies do not each rescan roster/exports.
+    local record = select(1, GS:GetCurrentRecord())
+    local liveBlocked, liveBlockReason = false, nil
+    if type(record) == "table" and GS.LiveAccountingWritesBlocked then
+        liveBlocked, liveBlockReason = GS.LiveAccountingWritesBlocked(record, {
+            member = member,
+            sender = member.name,
+            localWrite = true,
+        })
+    end
+    local beganBatch = false
+    if GS.BeginLocalDurableNotifyBatch then
+        GS.BeginLocalDurableNotifyBatch()
+        beganBatch = true
+    end
     for i = 1, #evidenceRows do
         local evidence = evidenceRows[i]
         if type(evidence) == "table" then
@@ -355,6 +372,9 @@ function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
                 sender = member.name,
                 localWrite = true,
                 campaignId = ctx.campaignId,
+                liveWritesBlockedCached = true,
+                liveWritesBlocked = liveBlocked and true or false,
+                liveWritesBlockReason = liveBlockReason,
             })
             if st == "accepted" then
                 stats.admitted = stats.admitted + 1
@@ -367,6 +387,9 @@ function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
                 Debug("Verbose", "guild supplies evidence rejected reason=%s", tostring(reason))
             end
         end
+    end
+    if beganBatch and GS.EndLocalDurableNotifyBatch then
+        GS.EndLocalDurableNotifyBatch()
     end
     return stats
 end

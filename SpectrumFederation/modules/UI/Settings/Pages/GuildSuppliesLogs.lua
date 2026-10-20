@@ -618,12 +618,30 @@ local function EnsureRosterListener()
 	end)
 end
 
-function Page:Build(panel)
-	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
-	if not renderer or not renderer.Build then
+local durableListenerRegistered = false
+local function EnsureDurableListener()
+	if durableListenerRegistered then
 		return
 	end
+	local GS = SF.GuildSupplies
+	if not GS or type(GS.RegisterUIListener) ~= "function" then
+		return
+	end
+	GS.RegisterUIListener(function()
+		-- QueueRefresh already gates on PanelVisible and coalesces.
+		QueueRefresh()
+	end)
+	durableListenerRegistered = true
+end
+
+function Page:Build(panel)
 	EnsureRosterListener()
+	EnsureDurableListener()
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if not renderer or not renderer.Build then
+		self.panel = panel
+		return
+	end
 	BeginRenderPass()
 	EnsureHistoryState()
 	renderer:Build(panel, Definition())
@@ -659,5 +677,6 @@ function Page:OnHide()
 end
 
 EnsureRosterListener()
+EnsureDurableListener()
 
 SF.SettingsUI:RegisterPage(Page)

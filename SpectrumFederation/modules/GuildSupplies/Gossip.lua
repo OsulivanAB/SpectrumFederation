@@ -2956,14 +2956,147 @@ function GS._exportMaintIsIdle()
     return exportState.maintIdle == true and not exportState.maintScheduled
 end
 
+-- Coalesce NotifyLocalDurableChange during a completed bank-log snapshot (or
+-- any other short local batch). Nested ledger/evidence notifies defer export
+-- rebuild + NotifyProviderChanged until EndLocalDurableNotifyBatch.
+local durableNotifyBatchDepth = 0
+local durableNotifyBatchPending = nil
+
+local DURABLE_NOTIFY_REASON_RANK = {
+    ["export-maint"] = 0,
+    evidence = 40,
+    ["remote-evidence"] = 40,
+    ["remote-pending"] = 40,
+    ["remote-conflict"] = 45,
+    ["remote-confirm"] = 45,
+    ["remote-resolve"] = 45,
+    config = 45,
+    campaign = 45,
+    ["remote-op"] = 45,
+    ledger = 50,
+    create = 60,
+    confirm = 60,
+    activation = 100,
+    adoption = 100,
+    install = 100,
+    dataset = 100,
+}
+
+local function PreferDurableNotifyReason(current, incoming)
+    if type(current) ~= "string" or current == "" then
+        return incoming
+    end
+    if type(incoming) ~= "string" or incoming == "" then
+        return current
+    end
+    local cr = DURABLE_NOTIFY_REASON_RANK[current] or 10
+    local ir = DURABLE_NOTIFY_REASON_RANK[incoming] or 10
+    if ir >= cr then
+        return incoming
+    end
+    return current
+end
+
+--- Begin coalescing durable/export notifications. Nested calls nest.
+function GS.BeginLocalDurableNotifyBatch()
+    durableNotifyBatchDepth = (tonumber(durableNotifyBatchDepth) or 0) + 1
+end
+
+--- Flush one coalesced NotifyLocalDurableChange when the outermost batch ends.
+function GS.EndLocalDurableNotifyBatch()
+    local depth = tonumber(durableNotifyBatchDepth) or 0
+    if depth <= 0 then
+        durableNotifyBatchDepth = 0
+        durableNotifyBatchPending = nil
+        return
+    end
+    depth = depth - 1
+    durableNotifyBatchDepth = depth
+    if depth > 0 then
+        return
+    end
+    local pending = durableNotifyBatchPending
+    durableNotifyBatchPending = nil
+    if pending and GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange(pending)
+    end
+end
+
+-- Settings / page UI listeners for authoritative durable-state changes.
+-- Export-maintenance continuations must not poke the UI.
+local uiListeners = {}
+local uiNotifying = false
+local uiNotifyQueued = false
+local uiNotifyQueuedReason = nil
+
+function GS.RegisterUIListener(fn)
+    if type(fn) ~= "function" then
+        return nil
+    end
+    uiListeners[#uiListeners + 1] = fn
+    return fn
+end
+
+local function DeliverUINotify(reason)
+    if uiNotifying then
+        return
+    end
+    uiNotifying = true
+    for i = 1, #uiListeners do
+        local fn = uiListeners[i]
+        if type(fn) == "function" then
+            pcall(fn, reason)
+        end
+    end
+    uiNotifying = false
+end
+
+--- Settings/UI poke after durable GS state changes (not export-maint).
+-- Delivers synchronously with a re-entrancy follow-up (Consumables NotifyUI
+-- style). Bank-snapshot Begin/End batching already coalesces export work before
+-- a single NotifyUI; visible pages further coalesce via their QueueRefresh.
+function GS.NotifyUI(reason)
+    reason = tostring(reason or "local")
+    if reason == "export-maint" then
+        return
+    end
+    if #uiListeners == 0 then
+        return
+    end
+    if uiNotifying then
+        uiNotifyQueuedReason = PreferDurableNotifyReason(uiNotifyQueuedReason, reason)
+        uiNotifyQueued = true
+        return
+    end
+    DeliverUINotify(reason)
+    while uiNotifyQueued do
+        uiNotifyQueued = false
+        local queued = uiNotifyQueuedReason
+        uiNotifyQueuedReason = nil
+        if queued then
+            DeliverUINotify(queued)
+        end
+    end
+end
+
 --- Required after provider-owned durable storage changes outside engine append.
 -- Adoption / dataset replacement rebuilds the full export index and drops stale
 -- IDs. Ordinary accepted ops upsert incrementally so catch-up stays bounded.
 function GS.NotifyLocalDurableChange(reason)
     reason = tostring(reason or "local")
+    -- Bank-snapshot (and similar) batches coalesce redundant export work.
+    if (tonumber(durableNotifyBatchDepth) or 0) > 0 then
+        durableNotifyBatchPending = PreferDurableNotifyReason(durableNotifyBatchPending, reason)
+        return
+    end
     -- Disabled / unregistered providers must not rebuild export state from
     -- stale Notify calls (queued maint is invalidated via maintGeneration).
     if not providerRegistered then
+        -- Still poke Settings when activation/config retires pages even if the
+        -- gossip provider is not registered yet.
+        if reason ~= "export-maint" then
+            GS.NotifyUI(reason)
+        end
         return
     end
     local record, guildKey = CurrentGuildRecord()
@@ -3785,6 +3918,11 @@ function GS.NotifyLocalDurableChange(reason)
         GG.NotifyProviderChanged(GS.PROVIDER_ID)
     end
     DebugInfo("provider changed reason=%s", reason)
+    -- Visible Settings pages (and selection revalidation) listen here.
+    -- Export-maintenance continuations must not drive continuous UI rebuilds.
+    if reason ~= "export-maint" then
+        GS.NotifyUI(reason)
+    end
 end
 
 -- Hook Initialize to register the provider after the durable root is ready.

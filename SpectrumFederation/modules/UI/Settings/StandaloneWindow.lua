@@ -1019,6 +1019,19 @@ function SettingsWindow:Init()
         self._registryListener = true
     end
 
+    -- Guild Supplies durable-state changes (activation, accounting, adoption)
+    -- can retire legacy pages or alter chrome without a registry rewrite.
+    local GS = SF.GuildSupplies
+    if GS and GS.RegisterUIListener and not self._gsDurableListener then
+        GS.RegisterUIListener(function()
+            if not SettingsWindow.initialized or not SettingsWindow.navPanel then
+                return
+            end
+            SettingsWindow:HandleRegistryChanged()
+        end)
+        self._gsDurableListener = true
+    end
+
     self:BuildNavItemsFromRegistry()
     self:CreateWindow()
 
@@ -1035,7 +1048,13 @@ function SettingsWindow:Show()
     self:RefreshEnablementIfNeeded()
     self:UpdateImpersonationBanner()
     if self.currentCategoryId then
-        self:RefreshCurrentPage()
+        -- Revalidate selection before refresh: Guild Supplies activation (or
+        -- other availability flips) can retire the previous page while the
+        -- window was closed. Reuse HandleRegistryChanged fallback.
+        self:HandleRegistryChanged()
+        if self.currentPageId then
+            self:RefreshCurrentPage()
+        end
     end
     self.frame:Show()
 

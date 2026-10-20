@@ -724,6 +724,19 @@ local function coolDownPeer(peerName)
     e.peerServeCooldownUntil[key] = untilTime
 end
 
+--- Serve-only cooldown: rejected from admitting a new inPull without blocking
+-- the peer's outgoing initiate path (busy-ACK initiate backoff stays separate).
+local function coolDownPeerServe(peerName)
+    local e = GG._engine
+    if not peerName then
+        return
+    end
+    local key = peerKey(peerName)
+    local untilTime = GG._Now() + GG.POST_EXHAUSTION_COOLDOWN_SEC
+    e.peerServeCooldownUntil = e.peerServeCooldownUntil or {}
+    e.peerServeCooldownUntil[key] = untilTime
+end
+
 local function indexReadyForView(entry)
     local index = entry and entry.index
     if not index or entry.indexFailed then
@@ -2809,7 +2822,12 @@ local function advanceInPull(now)
     -- serving states. Delayed SendGossip callbacks cannot revive a closed pull
     -- (noteInPullSubmission / trySendServedOffer / gossipValid check identity).
     if servedUsableIdleExpired(pull, now) then
+        -- Abandoned / idle served lease: free the slot for other peers, but
+        -- penalize the abandoner from immediately reacquiring it. Successful
+        -- acked_done transfers must not take this path.
+        local abandonedPeer = pull.peer
         closeInPull("served_view_idle")
+        coolDownPeerServe(abandonedPeer)
         return true
     end
     if pull.phase == "capturing" then

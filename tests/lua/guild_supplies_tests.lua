@@ -26161,6 +26161,414 @@ do
         "C3: unlink disabled tip uses unlink action key")
 end
 
+do
+    -- Codex A) Bank-snapshot durable/export notifications coalesce (Retail ~25 rows).
+    local itemId = 9201
+    local record = seedActivatableCampaign(itemId, 100)
+    GS:EnsureGossipProvider()
+    armFreshBankSample(true)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "A-batch: activate")
+    disarmFreshBankSample()
+    record = GS:GetCurrentRecord()
+    assertTrue(GS.IsLiveActive(record), "A-batch: live after activate")
+
+    -- Near-cap directExports so each naive notify would rescan a large map.
+    record.observations = record.observations or {}
+    record.observations.directExports = record.observations.directExports or {}
+    local nearCap = (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256) - 16
+    for i = 1, nearCap do
+        record.observations.directExports["gs:ev:seed-" .. i] = {
+            schemaVersion = 1,
+            witnessGuid = "Player-1-Alice",
+            evidence = {
+                coreSignature = "seed|" .. i,
+                type = "deposit",
+                donor = "Seed-Garona",
+                itemId = itemId,
+                quantity = 1,
+                guildGuid = "42",
+                bankTab = 2,
+                generation = tonumber(record.accounting._consumables.generation) or 1,
+                observedAt = world.time - 1000,
+                ageHours = 0,
+                approxTxnTime = world.time - 1000,
+                occurrenceIndex = i,
+                neighborsOlder = { "o" },
+                neighborsNewer = { "n" },
+                campaignId = record.currentCampaignId,
+                datasetId = record.datasetId,
+            },
+        }
+    end
+
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    local O = SF.ConsumablesObservation
+    local ctx = BankLog:GuildSuppliesEligibleContext()
+    assertTrue(ctx and ctx.source == "guildSupplies" and not ctx.sampleOnly,
+        "A-batch: live GS observation context")
+
+    local rows = {}
+    world.bankTxnRows = { [2] = {} }
+    for i = 1, 25 do
+        local row = {
+            "deposit",
+            "Donor" .. i .. "-Garona",
+            "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Flask]|h|r",
+            1, nil, nil, 0, 0, 0, 0,
+        }
+        world.bankTxnRows[2][i] = row
+        rows[i] = {
+            type = "deposit",
+            name = "Donor" .. i .. "-Garona",
+            itemLink = row[3],
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            index = i,
+        }
+    end
+    world.bankTxnCounts = { [2] = 25 }
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction(tab, index)
+        local r = world.bankTxnRows[tab] and world.bankTxnRows[tab][index]
+        if not r then return nil end
+        return unpack(r)
+    end
+
+    local ctxCalls = 0
+    local priorGetCtx = GS.GetCurrentContext
+    GS.GetCurrentContext = function(self)
+        ctxCalls = ctxCalls + 1
+        return priorGetCtx(self)
+    end
+    local rosterWalks = 0
+    local priorRoster = GetGuildRosterInfo
+    function GetGuildRosterInfo(i)
+        rosterWalks = rosterWalks + 1
+        if priorRoster then return priorRoster(i) end
+        local m = world.guild.members[i]
+        if m then return m.name, "R", 0, 80, "W", "Z", "", "", true, 0 end
+    end
+
+    world.notifyChanged = 0
+    local notifyCalls = 0
+    local priorNotify = GS.NotifyLocalDurableChange
+    GS.NotifyLocalDurableChange = function(reason)
+        notifyCalls = notifyCalls + 1
+        return priorNotify(reason)
+    end
+
+    BankLog.bankOpen = true
+    BankLog.active = true
+    BankLog.activeContext = ctx
+    BankLog.requireBankReopenForFreshness = false
+    BankLog.awaitingLogUpdate = true
+    BankLog.pendingQuery = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        profileId = ctx.profileId,
+        guildGuid = ctx.guildGuid,
+        bankTab = ctx.bankTab,
+        generation = ctx.generation,
+        campaignId = ctx.campaignId,
+        datasetId = ctx.datasetId,
+        requestedSet = ctx.requestedSet,
+        observedBy = ctx.observedBy,
+        eligibility = ctx.eligibility,
+    }
+    BankLog:ProcessLogUpdate("codex-a-batch")
+    -- Drain any After(0) export-maint / UI notify timers.
+    world.time = (world.time or 0) + 0.05
+    flushTimers()
+    if GS._exportMaintSyncDrain or GS._exportMaintIsIdle then
+        drainExportMaint(64)
+    end
+
+    assertTrue((BankLog.lastStats and (BankLog.lastStats.admitted or 0)
+            + (BankLog.lastStats.pending or 0)
+            + (BankLog.lastStats.duplicate or 0)) >= 25
+        or (BankLog.lastStats and (BankLog.lastStats.admitted or 0)
+            + (BankLog.lastStats.pending or 0) >= 20),
+        "A-batch: full log retains evidence admitted="
+            .. tostring(BankLog.lastStats and BankLog.lastStats.admitted)
+            .. " pending=" .. tostring(BankLog.lastStats and BankLog.lastStats.pending))
+    -- Coalesce is measured by provider notifications / roster work, not by the
+    -- number of deferred NotifyLocalDurableChange entries (those still run and
+    -- return immediately while the batch is open).
+    assertTrue(notifyCalls >= 25, "A-batch: per-row notifies still invoked API")
+    assertTrue((world.notifyChanged or 0) >= 1
+            and (world.notifyChanged or 0) <= 4,
+        "A-batch: NotifyProviderChanged coalesced got=" .. tostring(world.notifyChanged))
+    -- LiveWritesBlocked + CurrentGuildRecord must not scale with 25 rows.
+    assertTrue(ctxCalls < 40,
+        "A-batch: GetCurrentContext bounded got=" .. tostring(ctxCalls))
+    assertTrue(rosterWalks < 200,
+        "A-batch: roster walks bounded got=" .. tostring(rosterWalks))
+
+    -- Evidence must remain exportable after the single flush.
+    local exports = record.observations and record.observations.directExports or {}
+    local newExports = 0
+    for id, row in pairs(exports) do
+        if type(id) == "string" and not id:find("gs:ev:seed-", 1, true)
+            and type(row) == "table" then
+            newExports = newExports + 1
+        end
+    end
+    assertTrue(newExports >= 20,
+        "A-batch: new directExports retained got=" .. tostring(newExports))
+
+    GS.GetCurrentContext = priorGetCtx
+    GS.NotifyLocalDurableChange = priorNotify
+    GetGuildRosterInfo = priorRoster
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+end
+
+do
+    -- Codex B) Settings durable-change UI: selection revalidation + Logs refresh.
+    local record = seedActivatableCampaign(9202, 20)
+    GS:EnsureGossipProvider()
+    -- Ensure no leaked bank-snapshot batch suppresses UI notifies.
+    if GS.EndLocalDurableNotifyBatch then
+        for _ = 1, 4 do GS.EndLocalDurableNotifyBatch() end
+    end
+    loadModule("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    local Nav = SF.SettingsNavigationModel
+    local ui = SF.SettingsUI
+    assertTrue(Nav and ui and ui.pagesById, "B-ui: settings registry present")
+
+    local consumablesPage = ui.pagesById.lootHelperConsumables
+    assertTrue(consumablesPage and type(consumablesPage.available) == "function",
+        "B-ui: legacy consumables page registered")
+    assertEq(Nav.IsPageAvailable(consumablesPage), true,
+        "B-ui: legacy page available while staged")
+
+    local uiReasons = {}
+    assertTrue(type(GS.RegisterUIListener) == "function", "B-ui: RegisterUIListener present")
+    assertTrue(type(GS.NotifyUI) == "function", "B-ui: NotifyUI present")
+    GS.RegisterUIListener(function(reason)
+        uiReasons[#uiReasons + 1] = reason
+    end)
+    -- Sanity: direct poke reaches the listener through the coalesced timer path.
+    GS.NotifyUI("probe")
+    world.time = (world.time or 0) + 0.05
+    flushTimers()
+    assertTrue(#uiReasons >= 1 and uiReasons[1] == "probe",
+        "B-ui: direct NotifyUI delivers to listeners")
+
+    armFreshBankSample(true)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "B-ui: activate")
+    disarmFreshBankSample()
+    world.time = (world.time or 0) + 0.05
+    flushTimers()
+
+    assertTrue(#uiReasons >= 2, "B-ui: activation notifies Settings listeners")
+    local sawActivation = false
+    for i = 1, #uiReasons do
+        if uiReasons[i] == "activation" then sawActivation = true end
+        assertTrue(uiReasons[i] ~= "export-maint",
+            "B-ui: export-maint must not reach UI listeners")
+    end
+    assertTrue(sawActivation, "B-ui: activation reason delivered")
+    assertEq(Nav.IsPageAvailable(consumablesPage), false,
+        "B-ui: legacy page unavailable after activation")
+    assertEq(Nav.IsContentPage(ui, "lootHelperConsumables"), false,
+        "B-ui: retired page excluded from content pages")
+
+    -- Earlier suite stubs may RegisterPage without UpsertCategoryFromPage.
+    -- Mirror production Loot Helper category + always-available General fallback
+    -- so ResolveSidebarSelect can leave the retired Consumables tab.
+    local categoryId = consumablesPage.parentId or "lootHelper"
+    consumablesPage.categoryId = consumablesPage.categoryId or categoryId
+    ui.categoriesById = ui.categoriesById or {}
+    ui.categories = ui.categories or {}
+    ui.pages = ui.pages or {}
+    if not ui.categoriesById[categoryId] then
+        local cat = {
+            id = categoryId,
+            name = "Loot Helper",
+            navLabel = "Loot Helper",
+            defaultChildId = "lootHelperGeneral",
+            enabled = true,
+            enablementResolved = true,
+            order = 20,
+            source = "page",
+        }
+        ui.categoriesById[categoryId] = cat
+        ui.categories[#ui.categories + 1] = cat
+    end
+    if not ui.pagesById.lootHelperGeneral then
+        local general = {
+            id = "lootHelperGeneral",
+            parentId = categoryId,
+            categoryId = categoryId,
+            name = "General Settings",
+            navLabel = "General",
+            order = 20.5,
+        }
+        ui.pagesById.lootHelperGeneral = general
+        ui.pages[#ui.pages + 1] = general
+    end
+
+    -- ResolveSidebarSelect must not restore the retired last-tab.
+    local session = {
+        currentCategoryId = categoryId,
+        currentPageId = "lootHelperConsumables",
+        lastPageByCategory = { [categoryId] = "lootHelperConsumables" },
+    }
+    local sidebar = Nav.ResolveSidebarSelect(ui, session, categoryId)
+    assertTrue(sidebar.pageId ~= "lootHelperConsumables",
+        "B-ui: sidebar fallback leaves retired consumables page got="
+            .. tostring(sidebar.pageId))
+    assertEq(sidebar.pageId, "lootHelperGeneral",
+        "B-ui: sidebar falls back to default Loot Helper page")
+
+    -- StandaloneWindow:Show revalidates via HandleRegistryChanged (source contract).
+    local winSrc = io.open("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua", "r")
+    assertTrue(winSrc ~= nil, "B-ui: StandaloneWindow readable")
+    local winBody = winSrc:read("*a")
+    winSrc:close()
+    assertTrue(winBody:find("HandleRegistryChanged", 1, true)
+            and winBody:find("function SettingsWindow:Show", 1, true),
+        "B-ui: Show path references HandleRegistryChanged")
+    assertTrue(winBody:find("RegisterUIListener", 1, true),
+        "B-ui: SettingsWindow registers GS durable UI listener")
+
+    -- Visible Guild Supplies Logs refreshes on durable notify; hidden does not.
+    local Logs = SF.SettingsUI.pagesById.guildSuppliesLogs
+        or (SF.SettingsPages and SF.SettingsPages.GuildSuppliesLogs)
+    -- Page module stores itself on SF via RegisterPage; locate Refreshable panel.
+    local pageMod = nil
+    for _, p in pairs(ui.pagesById or {}) do
+        if p.id == "guildSuppliesLogs" or (p.name and tostring(p.name):find("Logs")) then
+            if p.id and tostring(p.id):find("guildSupplies", 1, true)
+                and tostring(p.id):find("Logs", 1, true) then
+                pageMod = p
+                break
+            end
+        end
+    end
+    -- Prefer the module table attached during load.
+    pageMod = pageMod or SF.GuildSuppliesLogsPage
+    -- Build a minimal visible panel and install QueueRefresh path via page API.
+    local refreshCount = 0
+    local panel = {
+        shown = true,
+        visible = true,
+        IsShown = function(self) return self.shown end,
+        IsVisible = function(self) return self.visible end,
+        HookScript = function() end,
+    }
+    -- Locate the Logs page object that owns Build/Refresh (registered page may wrap it).
+    local logsPageObj = nil
+    for _, mod in pairs({ SF.SettingsPages, SF }) do
+        if type(mod) == "table" then
+            for k, v in pairs(mod) do
+                if type(v) == "table" and type(v.Refresh) == "function"
+                    and type(v.Build) == "function"
+                    and (k == "GuildSuppliesLogs" or (v.id == "guildSuppliesLogs")) then
+                    logsPageObj = v
+                end
+            end
+        end
+    end
+    -- Fall back: the loaded page file registers into SettingsUI; use definition id.
+    if not logsPageObj then
+        for _, p in pairs(ui.pagesById or {}) do
+            if p.id == "guildSuppliesLogs" then
+                logsPageObj = p
+                break
+            end
+        end
+    end
+    assertTrue(logsPageObj and type(logsPageObj.Refresh) == "function",
+        "B-ui: Guild Supplies Logs page object available")
+    local priorRefresh = logsPageObj.Refresh
+    logsPageObj.Refresh = function(self, p)
+        refreshCount = refreshCount + 1
+        if priorRefresh then
+            return priorRefresh(self, p)
+        end
+    end
+    if logsPageObj.Build then
+        pcall(function() logsPageObj:Build(panel) end)
+    end
+    logsPageObj.panel = panel
+    panel.shown = true
+    panel.visible = true
+    local beforeRefresh = refreshCount
+    GS.NotifyLocalDurableChange("ledger")
+    world.time = (world.time or 0) + 0.05
+    flushTimers()
+    assertTrue(refreshCount > beforeRefresh,
+        "B-ui: visible Logs refreshes on durable ledger notify")
+
+    -- Hidden / closed Settings: no additional refresh.
+    panel.visible = false
+    panel.shown = false
+    local midRefresh = refreshCount
+    GS.NotifyLocalDurableChange("ledger")
+    world.time = (world.time or 0) + 0.05
+    flushTimers()
+    assertEq(refreshCount, midRefresh,
+        "B-ui: hidden Logs does not refresh on durable notify")
+
+    -- export-maint must not poke UI.
+    local uiBeforeMaint = #uiReasons
+    GS.NotifyLocalDurableChange("export-maint")
+    world.time = (world.time or 0) + 0.05
+    flushTimers()
+    assertEq(#uiReasons, uiBeforeMaint,
+        "B-ui: export-maint does not enqueue UI notify")
+
+    -- Repeated show/hide cycles stay idle (no listener accumulation storm).
+    panel.visible = true
+    panel.shown = true
+    for _ = 1, 5 do
+        GS.NotifyLocalDurableChange("evidence")
+    end
+    world.time = (world.time or 0) + 0.05
+    flushTimers()
+    assertTrue(refreshCount < midRefresh + 10,
+        "B-ui: coalesced durable notifies stay bounded refreshes="
+            .. tostring(refreshCount - midRefresh))
+
+    logsPageObj.Refresh = priorRefresh
+    assertEq(#world.chat, 0, "B-ui: no Chat from durable UI notify")
+end
+
+do
+    -- Codex B) SettingsWindow:Show revalidates retired selection while open.
+    loadModule("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua")
+    local SettingsWindow = SF.SettingsWindow
+    assertTrue(SettingsWindow and SettingsWindow.HandleRegistryChanged,
+        "B-show: SettingsWindow loaded")
+    local calls = 0
+    local priorHandle = SettingsWindow.HandleRegistryChanged
+    SettingsWindow.HandleRegistryChanged = function(self)
+        calls = calls + 1
+        -- Avoid full nav rebuild in this harness; count invocations only.
+    end
+    SettingsWindow.initialized = true
+    SettingsWindow.navPanel = SettingsWindow.navPanel or { name = "nav" }
+    SettingsWindow.currentCategoryId = "lootHelper"
+    SettingsWindow.currentPageId = "lootHelperConsumables"
+    SettingsWindow.frame = SettingsWindow.frame or {
+        Show = function() end,
+        IsShown = function() return false end,
+    }
+    SettingsWindow.RefreshEnablementIfNeeded = function() end
+    SettingsWindow.UpdateImpersonationBanner = function() end
+    SettingsWindow.RefreshCurrentPage = function() end
+    SettingsWindow:Show()
+    assertTrue(calls >= 1, "B-show: Show revalidates via HandleRegistryChanged")
+    SettingsWindow.HandleRegistryChanged = priorHandle
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
