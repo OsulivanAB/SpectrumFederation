@@ -5,7 +5,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [1.5.12-beta.16] - 2026-10-20
 
 ### Added
-- Guild Info: guild-wide Main/Alt Assignments (#402)
+- Guild Info: guild-wide Main/Alt Assignments (#402) — versioned current-state membership/group records (no append-only op log)
 
 ## [1.5.12-beta.15] - 2026-10-20
 
