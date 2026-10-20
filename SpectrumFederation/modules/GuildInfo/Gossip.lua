@@ -89,7 +89,7 @@ local function GroupRecordId(groupId)
     return "gi-g:" .. tostring(groupId)
 end
 
-local function MemberVersionFp(m)
+local function MemberVersionFp(m, gen)
     return HashParts(
         tostring(m.guid or ""),
         tostring(m.groupId == false and "U" or m.groupId or ""),
@@ -97,46 +97,82 @@ local function MemberVersionFp(m)
         tostring(m.ver and m.ver.w or ""),
         tostring(m.at or 0),
         tostring(m.nameRealm or ""),
-        tostring(m.classFile or "")
+        tostring(m.classFile or ""),
+        tostring(gen and gen.n or 0),
+        tostring(gen and gen.w or "")
     )
 end
 
-local function GroupVersionFp(g)
+local function GroupVersionFp(g, gen)
     return HashParts(
         tostring(g.groupId or ""),
         tostring(g.mainGuid or ""),
         tostring(g.ver and g.ver.n or 0),
         tostring(g.ver and g.ver.w or ""),
         tostring(g.at or 0),
-        g.dissolved and "1" or "0"
+        g.dissolved and "1" or "0",
+        tostring(g.forwardTo or ""),
+        tostring(gen and gen.n or 0),
+        tostring(gen and gen.w or "")
     )
 end
 
-local function WireForMember(m)
+local function EpochVersionFp(body)
+    return HashParts(
+        "epoch",
+        tostring(body.gen and body.gen.n or 0),
+        tostring(body.gen and body.gen.w or ""),
+        tostring(body.memberCount or 0),
+        tostring(body.groupCount or 0),
+        tostring(body.contentFp or "")
+    )
+end
+
+local function WireForEpoch(body)
+    if type(body) ~= "table" or type(body.gen) ~= "table" then
+        return nil
+    end
+    return {
+        id = GI.EpochRecordId and GI.EpochRecordId() or "gi-e:current",
+        versionFp = EpochVersionFp(body),
+        body = {
+            kind = "guildinfo-epoch",
+            schema = GI.PROVIDER_SCHEMA,
+            gen = { n = body.gen.n, w = body.gen.w },
+            memberCount = tonumber(body.memberCount) or 0,
+            groupCount = tonumber(body.groupCount) or 0,
+            contentFp = tostring(body.contentFp or ""),
+        },
+    }
+end
+
+local function WireForMember(m, gen)
     if type(m) ~= "table" or type(m.guid) ~= "string" then
         return nil
     end
     return {
         id = MemberRecordId(m.guid),
-        versionFp = MemberVersionFp(m),
+        versionFp = MemberVersionFp(m, gen),
         body = {
             kind = "guildinfo-member",
             schema = GI.PROVIDER_SCHEMA,
+            gen = gen and { n = gen.n, w = gen.w } or nil,
             member = m,
         },
     }
 end
 
-local function WireForGroup(g)
+local function WireForGroup(g, gen)
     if type(g) ~= "table" or type(g.groupId) ~= "string" then
         return nil
     end
     return {
         id = GroupRecordId(g.groupId),
-        versionFp = GroupVersionFp(g),
+        versionFp = GroupVersionFp(g, gen),
         body = {
             kind = "guildinfo-group",
             schema = GI.PROVIDER_SCHEMA,
+            gen = gen and { n = gen.n, w = gen.w } or nil,
             group = g,
         },
     }
@@ -173,10 +209,13 @@ local function RebuildExportIndex()
     local bodies = GI.ListStateBodies(record)
     for i = 1, #bodies do
         local wire
-        if bodies[i].kind == "guildinfo-member" then
-            wire = WireForMember(bodies[i].member)
+        local b = bodies[i]
+        if b.kind == "guildinfo-epoch" then
+            wire = WireForEpoch(b)
+        elseif b.kind == "guildinfo-member" then
+            wire = WireForMember(b.member, b.gen)
         else
-            wire = WireForGroup(bodies[i].group)
+            wire = WireForGroup(b.group, b.gen)
         end
         if wire and GI.RecordWithinGossipCap(wire) then
             exportState.byId[wire.id] = {
@@ -337,9 +376,10 @@ local function ValidateAndApply(record, ctx)
     end
     local body = record.body
     local kind = body.kind
-    if kind ~= "guildinfo-member" and kind ~= "guildinfo-group" then
+    if kind ~= "guildinfo-member" and kind ~= "guildinfo-group" and kind ~= "guildinfo-epoch" then
         return "rejected", "unsupported_kind"
     end
+    -- Schema 2 (pre-epoch) wires are rejected once the provider speaks schema 3.
     if tonumber(body.schema) and tonumber(body.schema) ~= GI.PROVIDER_SCHEMA then
         return "rejected", "unsupported_schema"
     end
@@ -360,18 +400,25 @@ local function ValidateAndApply(record, ctx)
     end
 
     local status, detail
-    if kind == "guildinfo-member" then
+    if kind == "guildinfo-epoch" then
+        local okAdopt, adoptDetail = GI.AdoptSyncGeneration(guildRec, body)
+        if not okAdopt then
+            return "rejected", adoptDetail or "stale_generation"
+        end
+        status = adoptDetail == "duplicate" and "duplicate" or "accepted"
+        detail = adoptDetail
+    elseif kind == "guildinfo-member" then
         local m = body.member
         if type(m) ~= "table" then
             return "rejected", "malformed"
         end
-        status, detail = GI.MergeMember(guildRec, m, { remote = true })
+        status, detail = GI.MergeMember(guildRec, m, { remote = true, gen = body.gen })
     else
         local g = body.group
         if type(g) ~= "table" then
             return "rejected", "malformed"
         end
-        status, detail = GI.MergeGroup(guildRec, g, { remote = true })
+        status, detail = GI.MergeGroup(guildRec, g, { remote = true, gen = body.gen })
     end
 
     if status == "accepted" then

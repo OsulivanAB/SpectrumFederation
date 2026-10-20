@@ -341,6 +341,12 @@ end
 local function AccessStatusText()
 	local caps = Caps()
 	local roster = Roster()
+	local g = GI()
+	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if record and g.IsBaselineComplete and not g.IsBaselineComplete(record) then
+		return Loc("GUILD_INFO_STATUS_GENERATION_SYNCING",
+			"Synchronizing a newer Guild Info history generation. Assignments stay unavailable until the baseline finishes loading.")
+	end
 	if not caps.canRead then
 		return Loc("GUILD_INFO_STATUS_MEMBERSHIP_PENDING",
 			"Guild membership is still being verified. Shared Guild Info stays hidden until then.")
@@ -357,9 +363,34 @@ local function AccessStatusText()
 		"View only. Guild ranks 1–3 may change assignments.")
 end
 
+local function CleanupConfirmMessage()
+	local g = GI()
+	local preview = g and g.PreviewCleanup and g:PreviewCleanup() or {}
+	local recover = preview.capacityRecovered
+		and Loc("GUILD_INFO_CLEANUP_RECOVER_YES", "Yes — obsolete history will free capacity.")
+		or Loc("GUILD_INFO_CLEANUP_RECOVER_NO", "No meaningful capacity recovery (active relationships fill the limits, or nothing obsolete remains).")
+	return Loc(
+		"GUILD_INFO_CLEANUP_CONFIRM",
+		"Clean up retained Guild Info history?\n\nPreserve %d active relationship group(s) (%d characters, %d groups).\nRemove approximately %d solo-main shell(s), %d unassign tombstone(s), and %d forwarding alias/obsolete group(s).\nCapacity recovery: %s\n\nWarning: your currently known relationships become the new guild-wide baseline. Offline or unsynchronized edits from the previous generation will not be imported."
+	):format(
+		tonumber(preview.relationships) or 0,
+		tonumber(preview.retainedMembers) or 0,
+		tonumber(preview.retainedGroups) or 0,
+		tonumber(preview.discardSoloShells) or 0,
+		tonumber(preview.discardTombstones) or 0,
+		tonumber(preview.discardAliases) or 0,
+		recover
+	)
+end
+
 local function FieldsEnabled()
 	local caps = Caps()
 	local roster = Roster()
+	local g = GI()
+	local record = g and g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	if record and g.IsBaselineComplete and not g.IsBaselineComplete(record) then
+		return false
+	end
 	return caps.canEdit and roster and roster.complete
 end
 
@@ -595,6 +626,52 @@ local function Definition()
 							end
 							if dialogs and dialogs.Confirm then
 								dialogs:Confirm(msg, Loc("GUILD_INFO_CHANGE_MAIN_BUTTON", "Change Main"), commit)
+							else
+								commit()
+							end
+						end,
+					},
+				},
+			},
+			{
+				id = "guildInfoMainAltCleanup",
+				title = Loc("GUILD_INFO_SECTION_CLEANUP", "History cleanup"),
+				items = {
+					{
+						type = "display",
+						label = Loc("GUILD_INFO_CLEANUP_HELP_LABEL", "About cleanup"),
+						get = function()
+							return Loc(
+								"GUILD_INFO_CLEANUP_HELP",
+								"Removes obsolete solo-main shells, unassign tombstones, and forwarding aliases while keeping currently known active relationships. This is not Delete All Assignments."
+							)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_INFO_CLEANUP_LABEL", "Clean up retained Guild Info history"),
+						buttonText = Loc("GUILD_INFO_CLEANUP_BUTTON", "Clean up history"),
+						enabled = function()
+							local gi = GI()
+							local record = gi and gi.GetCurrentRecord and select(1, gi:GetCurrentRecord()) or nil
+							if record and gi.IsBaselineComplete and not gi.IsBaselineComplete(record) then
+								return false
+							end
+							return Caps().canEdit
+						end,
+						onClick = function(ctx)
+							local gi = GI()
+							if not gi or not gi.CleanupHistory then
+								return
+							end
+							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+							local msg = CleanupConfirmMessage()
+							local function commit()
+								local status, reason = gi:CleanupHistory({})
+								ReportStatus(ctx, status, reason)
+							end
+							if dialogs and dialogs.Confirm then
+								dialogs:Confirm(msg, Loc("GUILD_INFO_CLEANUP_BUTTON", "Clean up history"), commit)
 							else
 								commit()
 							end

@@ -18,6 +18,12 @@ function GI.FormatMutationFeedback(status, reason)
     if status == "accepted" and reason == "noop" then
         return Loc("GUILD_INFO_STATUS_DUPLICATE", "No change — that relationship was already recorded."), "info"
     end
+    if status == "accepted" and reason == "cleanup_done" then
+        return Loc("GUILD_INFO_STATUS_CLEANUP_DONE", "Obsolete Guild Info history was cleaned up. Active relationships were preserved."), "success"
+    end
+    if status == "accepted" and reason == "cleanup_noop" then
+        return Loc("GUILD_INFO_STATUS_CLEANUP_NOOP", "No obsolete Guild Info history to remove."), "info"
+    end
     if status == "accepted" then
         return Loc("GUILD_INFO_STATUS_ACCEPTED", "Assignment updated."), "success"
     end
@@ -57,6 +63,14 @@ function GI.FormatMutationFeedback(status, reason)
         members_overflow = Loc("GUILD_INFO_ERR_MEMBERS_OVERFLOW", "Guild Info has reached its retained-character limit (active assignments plus unassigned history). New characters cannot be added until an existing retained identity is reused; unassigned history is not deleted automatically."),
         groups_overflow = Loc("GUILD_INFO_ERR_GROUPS_OVERFLOW", "Guild Info could not create another relationship group after reclaiming unused groups. Remove unused assignments and try again."),
         ops_overflow = Loc("GUILD_INFO_ERR_OPS_OVERFLOW", "Too many pending relationship operations."),
+        stale_generation = Loc("GUILD_INFO_ERR_STALE_GENERATION", "That change belongs to an older Guild Info history generation and was discarded."),
+        generation_syncing = Loc("GUILD_INFO_ERR_GENERATION_SYNCING", "Guild Info is synchronizing a newer history generation. Try again when sync finishes."),
+        generation_pending = Loc("GUILD_INFO_ERR_GENERATION_PENDING", "A newer Guild Info history generation was announced; wait for its baseline to arrive."),
+        cleanup_no_capacity = Loc("GUILD_INFO_ERR_CLEANUP_NO_CAPACITY", "Cleanup cannot free capacity because every retained slot is part of an active relationship. Unassign unused alts first."),
+        cleanup_failed = Loc("GUILD_INFO_ERR_CLEANUP_FAILED", "Cleanup could not rebuild a valid baseline."),
+        cleanup_invalid = Loc("GUILD_INFO_ERR_CLEANUP_INVALID", "Cleanup produced an invalid relationship baseline and was aborted."),
+        cleanup_serialize = Loc("GUILD_INFO_ERR_CLEANUP_SERIALIZE", "Cleanup could not serialize the new baseline for Guild Gossip and was aborted."),
+        cleanup_active_overflow = Loc("GUILD_INFO_ERR_CLEANUP_ACTIVE_OVERFLOW", "Active relationships alone exceed Guild Info capacity; cleanup cannot proceed."),
     }
     local msg = map[reason]
     if msg then
@@ -178,4 +192,33 @@ function GI:ChangeMain(oldMainGuid, newMainGuid, opts)
     end
 
     return GI:ApplyChangeMain(oldMainGuid, newMainGuid, { guildKey = ctx.guildKey })
+end
+
+--- Officer-controlled history cleanup (Option B). Preserves active relationships.
+function GI:CleanupHistory(opts)
+    opts = opts or {}
+    local okAuth, authReason, ctx = GI:_AuthorizeCommit({
+        expectedGuildKey = opts.expectedGuildKey,
+        expectedHandleGeneration = opts.expectedHandleGeneration,
+        expectedActorGuid = opts.expectedActorGuid,
+    })
+    if not okAuth then
+        return "rejected", authReason
+    end
+    local status, detail, meta = GI:ApplyCleanupHistory({ guildKey = ctx.guildKey })
+    if status == "accepted" and detail == nil then
+        return "accepted", "cleanup_done", meta
+    end
+    return status, detail, meta
+end
+
+function GI:PreviewCleanup(opts)
+    opts = opts or {}
+    local record
+    if opts.guildKey then
+        record = select(1, GI:EnsureGuildRecord(opts.guildKey))
+    else
+        record = select(1, GI:GetCurrentRecord())
+    end
+    return GI.PreviewCleanupHistory(record)
 end

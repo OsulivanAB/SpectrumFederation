@@ -69,16 +69,21 @@ def test_guild_info_state_based_schema_markers():
     state = (GI_DIR / "State.lua").read_text(encoding="utf-8")
     gossip = (GI_DIR / "Gossip.lua").read_text(encoding="utf-8")
     docs = DOCS.read_text(encoding="utf-8")
-    assert "SCHEMA_VERSION = 2" in state
-    assert "PROVIDER_SCHEMA = 2" in state or "PROVIDER_SCHEMA = 2" in gossip
+    assert "SCHEMA_VERSION = 3" in state
+    assert "PROVIDER_SCHEMA = 3" in state or "PROVIDER_SCHEMA = 3" in gossip
     assert "guildinfo-member" in gossip
     assert "guildinfo-group" in gossip
+    assert "guildinfo-epoch" in gossip
     assert "MAX_MEMBERS = 256" in state
     assert "MAX_GROUPS = 128" in state
-    assert "schemaVersion = 2" in docs
+    assert "schemaVersion = 3" in docs
+    assert "syncGen" in state or "sync generation" in docs.lower()
     assert "versioned" in docs.lower()
     assert "operation log" in docs.lower() or "op-log" in docs.lower() or "append-only" in docs.lower()
     assert "guildinfo-op" not in gossip
+    cleanup = (GI_DIR / "Cleanup.lua").read_text(encoding="utf-8")
+    assert "ApplyCleanupHistory" in cleanup
+    assert "AdoptSyncGeneration" in cleanup
 
 
 def test_guild_info_does_not_touch_supplies_or_loot_helper_identity():

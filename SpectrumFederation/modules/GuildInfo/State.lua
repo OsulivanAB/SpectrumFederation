@@ -5,9 +5,9 @@ local addonName, SF = ...
 SF.GuildInfo = SF.GuildInfo or {}
 local GI = SF.GuildInfo
 
-GI.SCHEMA_VERSION = 2
+GI.SCHEMA_VERSION = 3
 GI.PROVIDER_ID = "sf.guildinfo.relationships"
-GI.PROVIDER_SCHEMA = 2
+GI.PROVIDER_SCHEMA = 3
 GI.EDITOR_RANK_MAX = 3
 GI.MAX_OPERATION_ID = 192
 GI.MAX_EVENT_SEQ = 2147483647
@@ -188,6 +188,7 @@ local function EmptyGraph()
 end
 
 local function EmptyRecord(guildKey, clubId)
+    local syncGen = GI.DefaultSyncGen and GI.DefaultSyncGen() or { n = 1, w = "bootstrap" }
     return {
         schemaVersion = GI.SCHEMA_VERSION,
         guildKey = guildKey,
@@ -195,6 +196,13 @@ local function EmptyRecord(guildKey, clubId)
         members = {}, -- [guid] = membership
         groups = {}, -- [groupId] = group
         characters = {}, -- last-known display (subset; also mirrored on membership)
+        syncGen = syncGen,
+        baseline = {
+            complete = true,
+            memberCount = 0,
+            groupCount = 0,
+            contentFp = "",
+        },
         graph = EmptyGraph(),
         revision = 0,
         openConflicts = {},
@@ -508,6 +516,16 @@ local function ValidateGuildRecord(guildKey, record)
     if type(record.characters) ~= "table" then
         return false, "invalid_characters"
     end
+    if type(record.syncGen) ~= "table"
+        or not IsFiniteNonnegInt(record.syncGen.n)
+        or type(record.syncGen.w) ~= "string"
+        or record.syncGen.w == ""
+    then
+        return false, "invalid_sync_gen"
+    end
+    if type(record.baseline) ~= "table" then
+        return false, "invalid_baseline"
+    end
     return true
 end
 
@@ -581,12 +599,25 @@ function GI:Initialize(db)
         return true
     end
 
+    local existingSchema = tonumber(existing.schemaVersion)
     -- Schema 1 was the unmerged op-log prototype; replace with empty state-based root.
-    if tonumber(existing.schemaVersion) ~= GI.SCHEMA_VERSION then
+    -- Schema 2 (pre-epoch) migrates in place to schema 3 with bootstrap syncGen.
+    if existingSchema == 1 then
         GI._root = ResetGuildInfoRoot(db, "schema_upgrade")
         GI._rootValid = true
         GI._rootReason = nil
         return true
+    end
+    if existingSchema ~= nil and existingSchema ~= GI.SCHEMA_VERSION and existingSchema ~= 2 then
+        GI._root = ResetGuildInfoRoot(db, "schema_upgrade")
+        GI._rootValid = true
+        GI._rootReason = nil
+        return true
+    end
+
+    if existingSchema == 2 then
+        existing.schemaVersion = GI.SCHEMA_VERSION
+        DebugWarn("migrating guildInfo root schema 2 → %s (sync generation)", tostring(GI.SCHEMA_VERSION))
     end
 
     local ok, reason = ValidateRoot(existing)
@@ -614,7 +645,7 @@ function GI:Initialize(db)
         return true
     end
 
-    -- Drop any leftover op-log fields from partial upgrades.
+    -- Drop any leftover op-log fields from partial upgrades; ensure syncGen/baseline.
     if type(existing.guilds) == "table" then
         for _, rec in pairs(existing.guilds) do
             if type(rec) == "table" then
@@ -628,7 +659,21 @@ function GI:Initialize(db)
                 if type(rec.groups) ~= "table" then
                     rec.groups = {}
                 end
+                rec.schemaVersion = GI.SCHEMA_VERSION
+                if GI.EnsureSyncGenerationFields then
+                    GI.EnsureSyncGenerationFields(rec)
+                end
                 RebuildDerived(rec)
+                if GI.EnsureSyncGenerationFields then
+                    -- Recompute contentFp after derived rebuild for migrated records.
+                    if type(rec.baseline) == "table" and rec.baseline.complete then
+                        rec.baseline.memberCount = CountKeys(rec.members)
+                        rec.baseline.groupCount = CountKeys(rec.groups)
+                        if GI.ComputeBaselineContentFp then
+                            rec.baseline.contentFp = GI.ComputeBaselineContentFp(rec.members, rec.groups)
+                        end
+                    end
+                end
             end
         end
     end
@@ -716,6 +761,10 @@ function GI:EnsureGuildRecord(guildKey)
         GI._root.guilds[key] = record
         DebugInfo("created empty guildInfo record key=%s", key)
     end
+    if GI.EnsureSyncGenerationFields then
+        GI.EnsureSyncGenerationFields(record)
+    end
+    record.schemaVersion = GI.SCHEMA_VERSION
     local ok, reason = ValidateGuildRecord(key, record)
     if not ok then
         return nil, reason
@@ -933,6 +982,20 @@ function GI.MergeMember(record, member, opts)
     if type(record) ~= "table" or type(record.members) ~= "table" then
         return "rejected", "not_ready"
     end
+    if GI.EnsureSyncGenerationFields then
+        GI.EnsureSyncGenerationFields(record)
+    end
+    if opts.remote then
+        local gate = GI.EvaluateRecordGeneration and GI.EvaluateRecordGeneration(record, opts.gen) or "ok"
+        if gate == "stale" then
+            return "rejected", "stale_generation"
+        end
+        if gate == "newer_without_epoch" then
+            return "rejected", "generation_pending"
+        end
+    elseif GI.IsBaselineComplete and not GI.IsBaselineComplete(record) then
+        return "rejected", "generation_syncing"
+    end
     local ok, err = ValidateMemberBody(member)
     if not ok then
         return "rejected", err
@@ -984,6 +1047,9 @@ function GI.MergeMember(record, member, opts)
         ReconcileSplitMains(record)
     end
     RebuildDerived(record)
+    if opts.remote and GI.TrySealBaseline then
+        GI.TrySealBaseline(record)
+    end
     return "accepted", nil
 end
 
@@ -994,6 +1060,20 @@ function GI.MergeGroup(record, group, opts)
     opts = opts or {}
     if type(record) ~= "table" or type(record.groups) ~= "table" then
         return "rejected", "not_ready"
+    end
+    if GI.EnsureSyncGenerationFields then
+        GI.EnsureSyncGenerationFields(record)
+    end
+    if opts.remote then
+        local gate = GI.EvaluateRecordGeneration and GI.EvaluateRecordGeneration(record, opts.gen) or "ok"
+        if gate == "stale" then
+            return "rejected", "stale_generation"
+        end
+        if gate == "newer_without_epoch" then
+            return "rejected", "generation_pending"
+        end
+    elseif GI.IsBaselineComplete and not GI.IsBaselineComplete(record) then
+        return "rejected", "generation_syncing"
     end
     local ok, err = ValidateGroupBody(group)
     if not ok then
@@ -1027,6 +1107,9 @@ function GI.MergeGroup(record, group, opts)
         group.forwardTo
     )
     RebuildDerived(record)
+    if opts.remote and GI.TrySealBaseline then
+        GI.TrySealBaseline(record)
+    end
     return "accepted", nil
 end
 
@@ -1649,6 +1732,11 @@ function GI:GetRelationshipGroups(guildKey)
         end
         return nil, reason
     end
+    if GI.IsBaselineComplete and not GI.IsBaselineComplete(record) then
+        -- Incomplete new-generation sync: do not present a false empty baseline
+        -- as authoritative finished state; callers may show a syncing banner.
+        return {}, "generation_syncing", record
+    end
     local groups = {}
     local mains = record.graph and record.graph.mains or {}
     for mainGuid, group in pairs(mains) do
@@ -1714,15 +1802,35 @@ function GI.UpdateCharacterDisplay(record, guid, nameRealm, classFile)
 end
 
 --- Enumerate exportable state bodies for Gossip.
+-- Epoch meta is always first. While a new generation baseline is incomplete,
+-- only the epoch is exported so peers do not treat a partial set as complete.
 function GI.ListStateBodies(record)
     local bodies = {}
     if type(record) ~= "table" then
+        return bodies
+    end
+    if GI.EnsureSyncGenerationFields then
+        GI.EnsureSyncGenerationFields(record)
+    end
+    local syncGen = record.syncGen or (GI.DefaultSyncGen and GI.DefaultSyncGen())
+    local baseline = record.baseline or {}
+    bodies[#bodies + 1] = {
+        kind = "guildinfo-epoch",
+        gen = syncGen,
+        memberCount = tonumber(baseline.memberCount) or CountKeys(record.members),
+        groupCount = tonumber(baseline.groupCount) or CountKeys(record.groups),
+        contentFp = tostring(baseline.contentFp or ""),
+        _sort = "a:epoch",
+    }
+    if GI.IsBaselineComplete and not GI.IsBaselineComplete(record) then
+        bodies[1]._sort = nil
         return bodies
     end
     for guid, m in pairs(record.members or {}) do
         bodies[#bodies + 1] = {
             kind = "guildinfo-member",
             member = m,
+            gen = syncGen,
             _sort = "m:" .. guid,
         }
     end
@@ -1730,6 +1838,7 @@ function GI.ListStateBodies(record)
         bodies[#bodies + 1] = {
             kind = "guildinfo-group",
             group = g,
+            gen = syncGen,
             _sort = "g:" .. gid,
         }
     end

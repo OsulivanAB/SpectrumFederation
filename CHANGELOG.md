@@ -14,6 +14,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Guild Info: forward aliases and their destinations are retained through ordinary Unassign and capacity reclaim so late Gossip memberships stay resolvable (#402)
 - Guild Info: moving a solo main with unresolved inbound `forwardTo` aliases retargets those aliases onto the new group so late members stay visible (#402)
 - Guild Info: Unassign keeps reusable solo-main shells; demotion repurposes the shell or retires it as `forwardTo` so offline independent edits are not erased (#402)
+- Guild Info: officer **Clean up retained Guild Info history** rebuilds a compact baseline under a guild-scoped sync generation so obsolete shells, tombstones, and aliases no longer permanently exhaust capacity (#402 Option B)
+- Guild Info: schema/provider 3 adds `guildinfo-epoch` Gossip meta; older-generation records are rejected; incomplete new baselines fail closed (`generation_syncing`) (#402)
 
 ## [1.5.12-beta.15] - 2026-10-20
 

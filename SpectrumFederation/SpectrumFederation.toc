@@ -88,6 +88,7 @@ modules/GuildSupplies/Ledger.lua
 modules/GuildSupplies/Admission.lua
 modules/GuildSupplies/Gossip.lua
 modules/GuildInfo/State.lua
+modules/GuildInfo/Cleanup.lua
 modules/GuildInfo/Authority.lua
 modules/GuildInfo/Operations.lua
 modules/GuildInfo/Roster.lua

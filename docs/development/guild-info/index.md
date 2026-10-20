@@ -31,17 +31,24 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
 - Configurable editor rank policies or multi-level family trees.
 - Append-only operation logs, cutovers, or compaction checkpoints.
 
-## Saved schema (`schemaVersion = 2`)
+## Saved schema (`schemaVersion = 3`)
 
 ```lua
 SpectrumFederationDB.guildInfo = {
-  schemaVersion = 2,
+  schemaVersion = 3,
   localWriter = { nonce = "<24 hex>", nextSeq = 1 },
   guilds = {
     ["club:<actual club id>"] = {
-      schemaVersion = 2,
+      schemaVersion = 3,
       guildKey = "club:<id>",
       clubId = "<id>",
+      syncGen = { n = <int>, w = "<writer nonce>" }, -- guild-scoped sync generation
+      baseline = {
+        complete = true|false,
+        memberCount = <int>,
+        groupCount = <int>,
+        contentFp = "<fingerprint>",
+      },
       members = {
         -- [guid] = {
         --   guid, groupId = "<id>" | false (unassigned tombstone),
@@ -51,7 +58,7 @@ SpectrumFederationDB.guildInfo = {
       },
       groups = {
         -- [groupId] = {
-        --   groupId, mainGuid?, dissolved?,
+        --   groupId, mainGuid?, dissolved?, forwardTo?,
         --   ver = { n, w }, at = <server time>
         -- }
       },
@@ -69,7 +76,7 @@ SpectrumFederationDB.guildInfo = {
 }
 ```
 
-**Migration:** Schema 1 was the unmerged op-log prototype. On load, Guild Info performs a **Guild Info-only hard reset** to an empty schema-2 root. Guild Supplies, Loot Helper, and unrelated SavedVariables are never touched.
+**Migration:** Schema 1 (op-log prototype) hard-resets to an empty schema-3 root. Schema 2 (pre-epoch state) migrates in place: relationships are preserved and a bootstrap `syncGen` / sealed `baseline` is installed. Guild Supplies, Loot Helper, and unrelated SavedVariables are never touched.
 
 Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 
@@ -102,18 +109,29 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 
 **Concurrent first assign:** If two officers independently create groups for the same ungrouped main, the **derived graph** absorbs loser-group members into the canonical group (main’s durable membership group when present; otherwise highest group version). Automatic reconciliation does **not** rewrite durable membership/group versions or dissolve loser shells. Officer mutations against the displayed logical group stay consistent: Unassign keeps a solo-main physical group while any sibling live claimant exists (including membership-empty shells — absence is incomplete sync, not emptiness); Change Main consolidates currently known absorbed members into the canonical group with genuine local versions, then retires sibling claimants as dissolved `forwardTo` aliases so late memberships remain resolvable. At equal membership revision `n`, a live-group assignment beats an unassign tombstone. Unrelated established groups with different mains are never merged.
 
-**Membership tombstones:** Unassigned membership rows are **not** deleted automatically. They remain until the 256-identity cap so stale peers cannot resurrect removed links. Hitting the cap surfaces truthful Settings feedback (`members_overflow`); recovery is to reuse an already-retained identity, not an unbounded offline history. Indefinitely disconnected editors that never receive current tombstones cannot be given unbounded write-back without either unbounded tombstone retention or resurrection risk.
+**Membership tombstones:** Unassigned membership rows are **not** deleted automatically during normal Assign/Unassign. They remain until the 256-identity cap so same-generation stale peers cannot resurrect removed links. Hitting the cap surfaces truthful Settings feedback (`members_overflow`).
+
+### Officer history cleanup / sync generation (Option B)
+
+Ranks 1–3 may run **Clean up retained Guild Info history** in Settings. This is not Delete All Assignments.
+
+- **Retains:** currently known valid main/alt relationships (including departed characters’ last-known display identity).
+- **Discards:** empty solo-main shells, unassign tombstones, forwarding aliases, and other obsolete groups that are not part of a visible relationship.
+- **Generation:** commits a new guild-scoped `syncGen` and sealed `baseline` (`memberCount` / `groupCount` / `contentFp`). Older-generation member/group wires are rejected even with higher individual `ver.n`. Competing cleanups at the same `n` tie-break on lexicographic writer nonce `w`.
+- **Incomplete sync:** a follower that adopts a newer epoch wipes prior relationships and stays `baseline.complete = false` until the sealed counts/fingerprint match. Relationship APIs report `generation_syncing` rather than an authoritative empty finished state. While incomplete, Gossip export advertises only the epoch meta record.
+- **Tradeoff:** the confirming officer’s known view becomes the new guild-wide baseline. Offline edits that never entered that baseline are intentionally invalidated. Cleanup works at capacity; if every slot is a genuine active relationship, Settings explains that no capacity can be recovered.
 
 ## Gossip provider
 
-Provider id: `sf.guildinfo.relationships` (`PROVIDER_SCHEMA = 2`).
+Provider id: `sf.guildinfo.relationships` (`PROVIDER_SCHEMA = 3`).
 
 | Wire kind | Record id | Body |
 | --- | --- | --- |
-| `guildinfo-member` | `gi-m:<guid>` | versioned membership |
-| `guildinfo-group` | `gi-g:<groupId>` | versioned group |
+| `guildinfo-epoch` | `gi-e:current` | `{ gen, memberCount, groupCount, contentFp }` |
+| `guildinfo-member` | `gi-m:<guid>` | versioned membership + `gen` |
+| `guildinfo-group` | `gi-g:<groupId>` | versioned group + `gen` |
 
-Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Payload versions/authors never grant editing authority. Ordinary members may receive/view state but cannot originate or launder mutations.
+Schema-2 (epochless) wires are rejected. Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Payload versions/authors/epochs never grant editing authority by themselves. Ordinary members may receive/view state but cannot originate or launder mutations.
 
 ## Public read API
 
