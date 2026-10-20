@@ -63,12 +63,12 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 | `assign` | Place alt under main (idempotent if already there; move when confirmed) |
 | `unassign` | Remove one alt from its main |
 | `change_main` | Promote a rostered alt; previous main becomes an alt; other alts retained |
-| `cutover` | Replicated compaction boundary: clears prior graph; watermark is `op.at` |
+| `cutover` | Replicated compaction boundary: clears prior graph; `coveredIds` lists incorporated ops |
 | `snapshot` | Legacy compaction marker (fold-supported); not emitted by new compaction |
 
 Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Authorization is the transport sender only; payload `actorGuid` is provenance kept version-stable for editor-to-editor relay/catch-up and is never treated as authentication.
 
-Compaction is a bounded replicated cutover: the editor replaces a full log with one small `cutover` op plus officer-authored per-relationship assign checkpoints (each within Guild Gossip’s 2048-byte record cap). Peers that receive the cutover purge superseded live ops (including missed Unassigns) and raise `compactWatermarkAt`. The pending edit that triggered compaction is folded into the checkpoint graph so same-second `(at,id)` ordering cannot acknowledge an Unassign while checkpoints recreate the removed link. Ops that sort at or before the live cutover are treated as superseded.
+Compaction is a bounded replicated cutover produced only by a **local editor commit** (remote ingest never manufactures a cutover from a partial view). The editor replaces its incorporated log with one `cutover` (including explicit `coveredIds`) plus officer-authored per-relationship assign checkpoints (each within Guild Gossip’s 2048-byte record cap). Peers purge only ops listed in `coveredIds`; independent edits the compactor never observed are retained and applied after cutover/checkpoints. The pending edit that triggered compaction is folded into the checkpoint graph and listed in `coveredIds` so same-second `(at,id)` ordering cannot acknowledge an Unassign while checkpoints recreate the removed link. If `coveredIds` cannot fit the Gossip record cap, compaction fails closed and the admit is refused with `ops_overflow` (capacity limitation) rather than silently dropping accepted work.
 
 ## Public read API
 

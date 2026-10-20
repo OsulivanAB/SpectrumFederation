@@ -73,6 +73,10 @@ local function OpVersionFp(op)
     if not g or not g.Hash32 then
         return tostring(op and op.id or "")
     end
+    local covered = ""
+    if type(op.coveredIds) == "table" then
+        covered = table.concat(op.coveredIds, ",")
+    end
     local parts = {
         tostring(op.id or ""),
         tostring(op.kind or ""),
@@ -81,6 +85,7 @@ local function OpVersionFp(op)
         tostring(op.altGuid or ""),
         tostring(op.newMainGuid or ""),
         tostring(op.actorGuid or ""),
+        covered,
     }
     return string.format("%08x", g.Hash32(table.concat(parts, "\0")))
 end

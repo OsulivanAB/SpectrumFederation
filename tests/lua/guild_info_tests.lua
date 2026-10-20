@@ -1293,6 +1293,8 @@ do
         if op and op.kind == GI.KIND.CUTOVER then
             cutCount = cutCount + 1
             assertEq(op.actorGuid, "Player-1-Alice", "cutover authored by officer")
+            assertTrue(type(op.coveredIds) == "table" and #op.coveredIds >= 1,
+                "cutover lists coveredIds for supersession proof")
             local wire = {
                 id = "gi-op:" .. op.id,
                 versionFp = "x",
@@ -1381,8 +1383,18 @@ do
         altGuid = "Player-1-Dave",
     }, { remote = true })
     assertEq(st, "duplicate", "compacted id rejected as duplicate")
-    local resurrect = {
-        id = "gi1:Player-1-Alice:resurrectaaaaaaaaaaaaaa:1",
+    -- Re-admit an id explicitly listed in cutover.coveredIds must not resurrect links.
+    local coveredReplayId = nil
+    for i = 1, #record.order do
+        local op = record.ops[record.order[i]]
+        if op and op.kind == GI.KIND.CUTOVER and type(op.coveredIds) == "table" then
+            coveredReplayId = op.coveredIds[1]
+            break
+        end
+    end
+    assertTrue(type(coveredReplayId) == "string", "cutover exposes a covered id to replay")
+    st = GI:AdmitOperation({
+        id = coveredReplayId,
         kind = GI.KIND.ASSIGN,
         at = 1,
         actorGuid = "Player-1-Alice",
@@ -1392,11 +1404,10 @@ do
         mainName = "Carol-Garona",
         altGuid = "Player-1-Eve",
         altName = "Eve-Garona",
-    }
-    st = GI:AdmitOperation(resurrect, { remote = true })
-    assertEq(st, "duplicate", "op older than watermark superseded")
+    }, { remote = true })
+    assertEq(st, "duplicate", "covered cutover id rejected as superseded")
     assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
-        "superseded op did not move Eve off Alice")
+        "covered replay did not move Eve off Alice")
 
     -- Late peer catch-up via cutover + checkpoint assigns + editor relay.
     local exportOps = {}
@@ -1754,6 +1765,8 @@ do
         "Change Main compact converges on remote peer")
 
     -- Conflicting assign after cutover: deterministic id order across peers.
+    -- Restore normal capacity so both remote ops can be retained for the fold.
+    GI.MAX_ACCEPTED_OPS = prevMax
     local cutAt = 0
     SpectrumFederationDB = peerDB
     GI:Initialize(peerDB)
@@ -1789,16 +1802,206 @@ do
         altName = "Dave-Garona",
     }
     local dbX, dbY = deepCopy(peerDB), deepCopy(peerDB)
-    peerAdmit(dbX, postA)
-    peerAdmit(dbX, postB)
-    peerAdmit(dbY, postB)
-    peerAdmit(dbY, postA)
+    assertEq(peerAdmit(dbX, postA), "accepted", "post-cutover assign A retained")
+    assertEq(peerAdmit(dbX, postB), "accepted", "post-cutover assign B retained")
+    assertEq(peerAdmit(dbY, postB), "accepted", "post-cutover assign B retained (rev)")
+    assertEq(peerAdmit(dbY, postA), "accepted", "post-cutover assign A retained (rev)")
     local roleX, mainX = peerRole(dbX, "Player-1-Dave")
     local roleY, mainY = peerRole(dbY, "Player-1-Dave")
     assertEq(roleX, roleY, "post-cutover conflict roles converge")
     assertEq(mainX, mainY, "post-cutover conflict mains converge")
     -- Player-1-Alice < Player-1-Carol in the id string → Alice folds first, Carol wins.
     assertEq(mainX, "Player-1-Carol", "later post-cutover assign wins by (at,id)")
+
+    resetDB()
+end
+
+---------------------------------------------------------------------------
+-- C3) Partition-safe cutover: unobserved independent edits + remote capacity
+---------------------------------------------------------------------------
+
+do
+    -- Officers A/B share history; B accepts an independent assign A never sees;
+    -- A compacts; both edits must survive both delivery orders.
+    resetDB()
+    local prevMax = GI.MAX_ACCEPTED_OPS
+    GI.MAX_ACCEPTED_OPS = 5
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "C3 shared Bob")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "C3 shared Eve")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "C3 shared Dave")
+    -- Shared history length 3; Carol remains free for B's independent group.
+
+    local sharedDB = deepCopy(SpectrumFederationDB)
+    local dbA = deepCopy(sharedDB)
+    local dbB = deepCopy(sharedDB)
+
+    -- B accepts independent Carol→Area52-Bob (unobserved by A; nonconflicting).
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    GI.MAX_ACCEPTED_OPS = 5
+    local bIndep = {
+        id = "gi1:Player-1-Carol:indeppartitionbbbbbbbb:1",
+        kind = GI.KIND.ASSIGN,
+        at = world.time,
+        actorGuid = "Player-1-Carol",
+        actorName = "Carol-Garona",
+        guildKey = "club:42",
+        mainGuid = "Player-1-Carol",
+        mainName = "Carol-Garona",
+        altGuid = "Player-2-Bob",
+        altName = "Bob-Area52",
+    }
+    assertEq(GI:AdmitOperation(bIndep, { remote = false }), "accepted",
+        "C3 B accepts independent assign while partitioned")
+    assertEq(GI:GetCharacterRole("Player-2-Bob"), "alt", "C3 B has Area52 Bob alt")
+    assertEq(select(2, GI:GetCharacterRole("Player-2-Bob")), "Player-1-Carol",
+        "C3 B independent main is Carol")
+    dbB = deepCopy(SpectrumFederationDB)
+    local bIndepCopy = deepCopy(bIndep)
+
+    -- A fills to capacity and compacts without observing B's edit (does not touch Carol).
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    GI:EnsureGossipProvider()
+    GI.MAX_ACCEPTED_OPS = 5
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    world.time = world.time + 1
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "C3 A unassign Dave")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "C3 A refill to threshold")
+    assertEq(#select(1, GI:GetCurrentRecord()).order, 5, "C3 A at compact threshold")
+    local stCompact = GI:UnassignAlt("Player-1-Eve", {})
+    assertEq(stCompact, "accepted", "C3 A compaction-triggering Unassign Eve")
+    local recA = select(1, GI:GetCurrentRecord())
+    local cutA = nil
+    for i = 1, #recA.order do
+        local op = recA.ops[recA.order[i]]
+        if op and op.kind == GI.KIND.CUTOVER then
+            cutA = op
+        end
+    end
+    assertTrue(cutA ~= nil, "C3 A emitted cutover")
+    assertTrue(type(cutA.coveredIds) == "table", "C3 cutover has coveredIds")
+    local coveredIndep = false
+    for i = 1, #cutA.coveredIds do
+        if cutA.coveredIds[i] == bIndepCopy.id then
+            coveredIndep = true
+        end
+    end
+    assertTrue(not coveredIndep, "C3 A's coveredIds omit B's unobserved edit")
+    assertNil(GI:GetCharacterRole("Player-2-Bob"), "C3 A still lacks B's independent alt")
+    assertNil(GI:GetCharacterRole("Player-1-Eve"), "C3 A compacted Eve unassign")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "C3 A keeps Bob")
+    DriveEnsureIndex(GI.PROVIDER_ID)
+    local exportA = collectLiveExportOps()
+    dbA = deepCopy(SpectrumFederationDB)
+
+    -- Delivery order 1: A's cutover/checkpoints onto B (already has independent op).
+    local dbB1 = deepCopy(dbB)
+    admitExportBundle(dbB1, exportA, "Alice-Garona")
+    GI.MAX_ACCEPTED_OPS = 5
+    SpectrumFederationDB = dbB1
+    GI:Initialize(dbB1)
+    assertEq(GI:GetCharacterRole("Player-2-Bob"), "alt",
+        "C3 order1: B keeps independent alt after A's cutover")
+    assertEq(select(2, GI:GetCharacterRole("Player-2-Bob")), "Player-1-Carol",
+        "C3 order1: independent main preserved")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt",
+        "C3 order1: shared Bob retained via checkpoints")
+    assertNil(GI:GetCharacterRole("Player-1-Eve"),
+        "C3 order1: A's Eve unassign honored")
+
+    -- Delivery order 2: B's unobserved op onto post-compact A.
+    local dbA2 = deepCopy(dbA)
+    SpectrumFederationDB = dbA2
+    GI:Initialize(dbA2)
+    GI:EnsureGossipProvider()
+    GI.MAX_ACCEPTED_OPS = 5
+    local stA = SF.GuildGossip._providers[GI.PROVIDER_ID].spec.ValidateAndApply({
+        id = "gi-op:" .. bIndepCopy.id,
+        versionFp = "b",
+        body = { kind = "guildinfo-op", op = deepCopy(bIndepCopy) },
+    }, { sender = "Carol-Garona" })
+    assertEq(stA, "accepted", "C3 order2: A admits B's earlier independent assign")
+    assertEq(GI:GetCharacterRole("Player-2-Bob"), "alt", "C3 order2: A gains B's alt")
+    assertEq(select(2, GI:GetCharacterRole("Player-2-Bob")), "Player-1-Carol",
+        "C3 order2: Carol remains main for independent group")
+    assertNil(GI:GetCharacterRole("Player-1-Eve"), "C3 order2: Eve stays unassigned")
+
+    -- Fresh late joiner receives A's export then B's independent op.
+    local lateDB = {}
+    admitExportBundle(lateDB, exportA, "Carol-Garona")
+    SpectrumFederationDB = lateDB
+    GI:Initialize(lateDB)
+    GI:EnsureGossipProvider()
+    GI.MAX_ACCEPTED_OPS = 5
+    assertEq(SF.GuildGossip._providers[GI.PROVIDER_ID].spec.ValidateAndApply({
+        id = "gi-op:" .. bIndepCopy.id,
+        versionFp = "b",
+        body = { kind = "guildinfo-op", op = deepCopy(bIndepCopy) },
+    }, { sender = "Alice-Garona" }), "accepted", "C3 late joiner admits B's independent op")
+    local lateFp = relationshipFingerprint(lateDB)
+    local b1Fp = relationshipFingerprint(dbB1)
+    local a2Fp = relationshipFingerprint(dbA2)
+    assertEq(b1Fp, a2Fp, "C3 both delivery orders agree on final relationships")
+    assertEq(lateFp, a2Fp, "C3 late joiner matches reconciled editors")
+    SpectrumFederationDB = dbA2
+    GI:Initialize(dbA2)
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "C3 Bob retained from shared history")
+    assertEq(GI:GetCharacterRole("Player-2-Bob"), "alt", "C3 independent edit preserved")
+
+    -- Read-only / remote ingest at capacity must not manufacture a cutover.
+    resetDB()
+    GI.MAX_ACCEPTED_OPS = 3
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    world.time = world.time + 1
+    assign("Alice-Garona", "Bob-Garona")
+    world.time = world.time + 1
+    assign("Alice-Garona", "Eve-Garona")
+    world.time = world.time + 1
+    assign("Alice-Garona", "Dave-Garona")
+    assertEq(#select(1, GI:GetCurrentRecord()).order, 3, "C3 capacity peer log full")
+    local fullBefore = deepCopy(SpectrumFederationDB)
+    local beforeFp = relationshipFingerprint(fullBefore)
+    local remoteExtra = {
+        id = "gi1:Player-1-Carol:remotefullcccccccccccc:1",
+        kind = GI.KIND.ASSIGN,
+        at = world.time + 1,
+        actorGuid = "Player-1-Carol",
+        actorName = "Carol-Garona",
+        guildKey = "club:42",
+        mainGuid = "Player-1-Carol",
+        mainName = "Carol-Garona",
+        altGuid = "Player-2-Bob",
+        altName = "Bob-Area52",
+    }
+    SpectrumFederationDB = fullBefore
+    GI:Initialize(fullBefore)
+    GI:EnsureGossipProvider()
+    GI.MAX_ACCEPTED_OPS = 3
+    local stRemote = SF.GuildGossip._providers[GI.PROVIDER_ID].spec.ValidateAndApply({
+        id = "gi-op:" .. remoteExtra.id,
+        versionFp = "x",
+        body = { kind = "guildinfo-op", op = remoteExtra },
+    }, { sender = "Carol-Garona" })
+    assertEq(stRemote, "rejected", "C3 remote ingest at capacity rejected")
+    local recFull = select(1, GI:GetCurrentRecord())
+    local madeCutover = false
+    for i = 1, #recFull.order do
+        local op = recFull.ops[recFull.order[i]]
+        if op and op.kind == GI.KIND.CUTOVER then
+            madeCutover = true
+        end
+    end
+    assertTrue(not madeCutover, "C3 remote full peer did not emit cutover")
+    assertEq(#recFull.order, 3, "C3 remote full peer durable log unchanged")
+    assertEq(relationshipFingerprint(fullBefore), beforeFp,
+        "C3 remote capacity refuse preserves prior relationships")
 
     GI.MAX_ACCEPTED_OPS = prevMax
     resetDB()

@@ -391,40 +391,7 @@ local function FoldApplyOp(graph, characters, op)
     return false
 end
 
---- Deterministic fold of accepted ops → relationship graph.
--- @return table graph, table characters
-function GI.FoldOperations(opsById, order)
-    local graph = EmptyGraph()
-    local characters = {}
-    if type(opsById) ~= "table" or type(order) ~= "table" then
-        return graph, characters
-    end
-
-    local list = {}
-    for i = 1, #order do
-        local id = order[i]
-        local op = opsById[id]
-        if type(op) == "table" and type(op.id) == "string" then
-            list[#list + 1] = op
-            if type(op.mainGuid) == "string" then
-                RememberCharacter(characters, op.mainGuid, op.mainName, op.mainClass)
-            end
-            if type(op.altGuid) == "string" then
-                RememberCharacter(characters, op.altGuid, op.altName, op.altClass)
-            end
-            if type(op.newMainGuid) == "string" then
-                RememberCharacter(characters, op.newMainGuid, op.newMainName, op.newMainClass)
-            end
-            if type(op.characters) == "table" then
-                for guid, row in pairs(op.characters) do
-                    if type(row) == "table" then
-                        RememberCharacter(characters, guid, row.nameRealm, row.classFile)
-                    end
-                end
-            end
-        end
-    end
-
+local function SortOpsByAtId(list)
     table.sort(list, function(a, b)
         local atA = tonumber(a.at) or 0
         local atB = tonumber(b.at) or 0
@@ -433,9 +400,110 @@ function GI.FoldOperations(opsById, order)
         end
         return tostring(a.id) < tostring(b.id)
     end)
+end
 
-    for i = 1, #list do
-        FoldApplyOp(graph, characters, list[i])
+local function IsCutoverBoundaryOp(op)
+    if type(op) ~= "table" or type(op.kind) ~= "string" then
+        return false
+    end
+    if op.kind == GI.KIND.CUTOVER then
+        return true
+    end
+    -- Compaction checkpoints share the cutover timestamp; id marker is authoritative.
+    if op.kind == GI.KIND.ASSIGN and type(op.id) == "string" and op.id:find("a1ckpt", 1, true) then
+        return true
+    end
+    return false
+end
+
+local function CoveredIdSetFromCutover(cutover)
+    local set = {}
+    if type(cutover) ~= "table" or type(cutover.coveredIds) ~= "table" then
+        return set
+    end
+    for i = 1, #cutover.coveredIds do
+        local id = cutover.coveredIds[i]
+        if type(id) == "string" and id ~= "" then
+            set[id] = true
+        end
+    end
+    return set
+end
+
+local function BuildCoveredIdSet(opsById, order)
+    local covered = {}
+    if type(opsById) ~= "table" or type(order) ~= "table" then
+        return covered
+    end
+    for i = 1, #order do
+        local op = opsById[order[i]]
+        if type(op) == "table" and op.kind == GI.KIND.CUTOVER then
+            local set = CoveredIdSetFromCutover(op)
+            for id in pairs(set) do
+                covered[id] = true
+            end
+        end
+    end
+    return covered
+end
+
+local function RememberOpCharacters(characters, op)
+    if type(op.mainGuid) == "string" then
+        RememberCharacter(characters, op.mainGuid, op.mainName, op.mainClass)
+    end
+    if type(op.altGuid) == "string" then
+        RememberCharacter(characters, op.altGuid, op.altName, op.altClass)
+    end
+    if type(op.newMainGuid) == "string" then
+        RememberCharacter(characters, op.newMainGuid, op.newMainName, op.newMainClass)
+    end
+    if type(op.characters) == "table" then
+        for guid, row in pairs(op.characters) do
+            if type(row) == "table" then
+                RememberCharacter(characters, guid, row.nameRealm, row.classFile)
+            end
+        end
+    end
+end
+
+--- Deterministic fold of accepted ops → relationship graph.
+-- Cutover clears prior graph; checkpoints rebuild the incorporated state. Ops a cutover
+-- lists in coveredIds are skipped. Uncovered ops (including independent edits the
+-- compactor never observed) apply after all cutover/checkpoint boundaries so partition
+-- survivors are not wiped by (at,id) ordering alone.
+-- @return table graph, table characters
+function GI.FoldOperations(opsById, order)
+    local graph = EmptyGraph()
+    local characters = {}
+    if type(opsById) ~= "table" or type(order) ~= "table" then
+        return graph, characters
+    end
+
+    local covered = BuildCoveredIdSet(opsById, order)
+    local boundary = {}
+    local other = {}
+    for i = 1, #order do
+        local id = order[i]
+        local op = opsById[id]
+        if type(op) == "table" and type(op.id) == "string" then
+            RememberOpCharacters(characters, op)
+            if covered[op.id] then
+                -- Explicitly incorporated/superseded by a cutover: omit from fold.
+            elseif IsCutoverBoundaryOp(op) then
+                boundary[#boundary + 1] = op
+            else
+                other[#other + 1] = op
+            end
+        end
+    end
+
+    SortOpsByAtId(boundary)
+    SortOpsByAtId(other)
+    for i = 1, #boundary do
+        FoldApplyOp(graph, characters, boundary[i])
+    end
+    for i = 1, #other do
+        FoldApplyOp(graph, characters, other[i])
     end
     return graph, characters
 end
@@ -513,9 +581,22 @@ local function ValidateOpBody(op)
             return false, "invalid_snapshot"
         end
     elseif kind == GI.KIND.CUTOVER then
-        -- Cutover is a small replicated boundary; watermark is op.at.
+        -- Cutover must list every incorporated op id; receivers purge only that set.
         if op.groups ~= nil then
             return false, "invalid_cutover"
+        end
+        if type(op.coveredIds) ~= "table" or #op.coveredIds < 1 then
+            return false, "invalid_cutover"
+        end
+        -- May include the pending compacting op beyond the prior live-log bound.
+        if #op.coveredIds > GI.MAX_ACCEPTED_OPS + 1 then
+            return false, "invalid_cutover"
+        end
+        for i = 1, #op.coveredIds do
+            local cid = op.coveredIds[i]
+            if type(cid) ~= "string" or cid == "" or #cid > GI.MAX_OPERATION_ID then
+                return false, "invalid_cutover"
+            end
         end
     else
         return false, "unsupported_op_kind"
@@ -847,25 +928,50 @@ local function SnapshotGroupsFromRecord(record)
     return GroupsFromGraph(graph, record.characters)
 end
 
---- Whether opA should be purged when cutover is admitted (sorts at/before cutover).
+--- Whether an existing op is explicitly covered by cutover.coveredIds.
+-- Cutover must not supersede unobserved independent edits by (at,id) alone.
 local function OpSupersededByCutover(existing, cutover)
     if type(existing) ~= "table" or type(cutover) ~= "table" then
-        return true
+        return false
     end
     if existing.id == cutover.id then
         return false
     end
-    local atE = tonumber(existing.at) or 0
-    local atC = tonumber(cutover.at) or 0
-    if atE < atC then
-        return true
-    end
-    if atE > atC then
+    local set = CoveredIdSetFromCutover(cutover)
+    return set[existing.id] == true
+end
+
+local function OpCoveredByAnyLiveCutover(record, opId)
+    if type(opId) ~= "string" or opId == "" then
         return false
     end
-    -- Same second: keep only ops that sort strictly after the cutover id so the
-    -- cutover clears state before checkpoint assigns / newer same-second edits.
-    return tostring(existing.id) <= tostring(cutover.id)
+    for i = 1, #(record.order or {}) do
+        local existing = record.ops and record.ops[record.order[i]]
+        if type(existing) == "table" and existing.kind == GI.KIND.CUTOVER then
+            if CoveredIdSetFromCutover(existing)[opId] then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--- Fail closed when the cutover (with coveredIds) cannot traverse Gossip.
+local function CutoverWithinTransportCap(cutover)
+    if type(cutover) ~= "table" then
+        return false
+    end
+    if type(GI.RecordWithinGossipCap) == "function" then
+        local wire = {
+            id = "gi-op:" .. tostring(cutover.id),
+            versionFp = "cut",
+            body = { kind = "guildinfo-op", op = cutover },
+        }
+        local ok = GI.RecordWithinGossipCap(wire)
+        return ok and true or false
+    end
+    -- Gossip module not loaded: keep coveredIds small enough for the 2048-byte cap.
+    return type(cutover.coveredIds) == "table" and #cutover.coveredIds <= 32
 end
 
 local function RetainCompactedId(record, opId)
@@ -898,18 +1004,24 @@ local function BoundCompactedIds(record, liveOrder)
     end
 end
 
---- Apply a replicated cutover: raise watermark and drop superseded live ops.
+--- Apply a replicated cutover: raise watermark and drop explicitly covered live ops.
 local function ApplyCutoverToRecord(record, cutover)
     local wm = tonumber(cutover.at) or 0
     record.compactWatermarkAt = math.max(tonumber(record.compactWatermarkAt) or 0, wm)
+    -- Tombstone every covered id (even if not present locally) so delayed copies
+    -- cannot resurrect after the peer already applied this cutover.
+    local covered = CoveredIdSetFromCutover(cutover)
+    for id in pairs(covered) do
+        RetainCompactedId(record, id)
+    end
     local newOps = {}
     local newOrder = {}
     for i = 1, #(record.order or {}) do
         local id = record.order[i]
         local existing = record.ops and record.ops[id]
         if type(existing) == "table" then
-            if OpSupersededByCutover(existing, cutover) then
-                RetainCompactedId(record, id)
+            if covered[id] or OpSupersededByCutover(existing, cutover) then
+                -- already retained
             else
                 newOps[id] = existing
                 newOrder[#newOrder + 1] = id
@@ -946,9 +1058,10 @@ local function MaxOpAt(record)
 end
 
 --- Compact a full op log into a replicated cutover + transport-sized checkpoints.
--- Cutover is exported so peers with partial history purge superseded ops (including
--- missed Unassigns). The optional pendingOp is folded into checkpoint state so a
--- same-second triggering edit is not lost to (at,id) ordering against checkpoints.
+-- Cutover.coveredIds is the only supersession proof peers may apply. If that list
+-- (plus cutover metadata) cannot fit Gossip's record cap, compaction fails closed
+-- and the caller must refuse the admit with ops_overflow rather than drop edits.
+-- Pending op is folded into checkpoint state so same-second triggers are not lost.
 -- Returns: didCompact (bool), pendingIncluded (bool).
 local function CompactIfNeeded(record, actorGuid, actorName, pendingOp)
     if #record.order < GI.MAX_ACCEPTED_OPS then
@@ -963,12 +1076,14 @@ local function CompactIfNeeded(record, actorGuid, actorName, pendingOp)
 
     local foldOps = {}
     local foldOrder = {}
+    local coveredIds = {}
     for i = 1, #record.order do
         local id = record.order[i]
         local body = record.ops[id]
         if type(body) == "table" then
             foldOps[id] = body
             foldOrder[#foldOrder + 1] = id
+            coveredIds[#coveredIds + 1] = id
         end
     end
     local pendingIncluded = false
@@ -977,6 +1092,7 @@ local function CompactIfNeeded(record, actorGuid, actorName, pendingOp)
         if pok and not foldOps[pendingOp.id] then
             foldOps[pendingOp.id] = pendingOp
             foldOrder[#foldOrder + 1] = pendingOp.id
+            coveredIds[#coveredIds + 1] = pendingOp.id
             pendingIncluded = true
         end
     end
@@ -1019,7 +1135,17 @@ local function CompactIfNeeded(record, actorGuid, actorName, pendingOp)
         actorGuid = actorGuid,
         actorName = actorNameSafe,
         guildKey = record.guildKey,
+        coveredIds = coveredIds,
     }
+
+    -- Fail closed: never emit a cutover that cannot prove its covered set on the wire.
+    if not CutoverWithinTransportCap(cutover) then
+        DebugWarn(
+            "refusing guildInfo compaction: cutover coveredIds=%d exceeds Gossip record cap",
+            #coveredIds
+        )
+        return false, false
+    end
 
     local newOps = { [cutId] = cutover }
     local newOrder = { cutId }
@@ -1077,32 +1203,13 @@ local function CompactIfNeeded(record, actorGuid, actorName, pendingOp)
     BoundCompactedIds(record, newOrder)
     RebuildDerived(record)
     DebugInfo(
-        "compacted guildInfo into cutover+%d checkpoints actor=%s watermark=%s pendingIncluded=%s",
+        "compacted guildInfo into cutover+%d checkpoints actor=%s covered=%d pendingIncluded=%s",
         #newOrder - 1,
         actorGuid,
-        tostring(record.compactWatermarkAt),
+        #coveredIds,
         tostring(pendingIncluded)
     )
     return true, pendingIncluded
-end
-
-local function LatestLiveCutover(record)
-    local best = nil
-    for i = 1, #(record.order or {}) do
-        local existing = record.ops and record.ops[record.order[i]]
-        if type(existing) == "table" and existing.kind == GI.KIND.CUTOVER then
-            if not best then
-                best = existing
-            else
-                local atE = tonumber(existing.at) or 0
-                local atB = tonumber(best.at) or 0
-                if atE > atB or (atE == atB and tostring(existing.id) > tostring(best.id)) then
-                    best = existing
-                end
-            end
-        end
-    end
-    return best
 end
 
 --- Whether admitting `op` into `record` would produce the intended assign effect.
@@ -1147,30 +1254,18 @@ function GI:AdmitOperation(op, opts)
         return "duplicate", "compacted"
     end
 
-    -- Ops strictly older than the compaction watermark (or a legacy snapshot) are
-    -- superseded so compacted history cannot resurrect removed links.
-    if op.kind ~= GI.KIND.SNAPSHOT then
-        local watermark = tonumber(record.compactWatermarkAt) or 0
-        for i = 1, #(record.order or {}) do
-            local existing = record.ops[record.order[i]]
-            if existing and existing.kind == GI.KIND.SNAPSHOT then
-                local at = tonumber(existing.at) or 0
-                if at > watermark then
-                    watermark = at
-                end
-            end
-        end
-        if watermark > 0 and (tonumber(op.at) or 0) < watermark then
-            return "duplicate", "superseded"
-        end
-    else
-        -- Stale snapshots must not undo newer accepted relationships.
+    -- Explicit cutover coverage / compacted ids supersede history. Do not reject by
+    -- watermark timestamp alone: that drops valid independent edits a compactor never saw.
+    if op.kind == GI.KIND.SNAPSHOT then
         local watermark = tonumber(record.compactWatermarkAt) or 0
         local maxLive = MaxOpAt(record)
         local snapAt = tonumber(op.at) or 0
         if (watermark > 0 and snapAt < watermark) or (maxLive > 0 and snapAt < maxLive) then
             return "duplicate", "superseded"
         end
+    elseif OpCoveredByAnyLiveCutover(record, op.id) then
+        RetainCompactedId(record, op.id)
+        return "duplicate", "superseded"
     end
 
     -- Local-only confirmation / staleness gates (not used for remote sync admission).
@@ -1222,8 +1317,11 @@ function GI:AdmitOperation(op, opts)
         end
     end
 
-    -- Replicated cutover: purge superseded live ops and raise watermark.
+    -- Replicated cutover: purge only explicitly covered live ops; keep unobserved edits.
     if op.kind == GI.KIND.CUTOVER then
+        if not CutoverWithinTransportCap(op) then
+            return "rejected", "record_too_large"
+        end
         ApplyCutoverToRecord(record, op)
         if GI._NotifyLocalDurableChange then
             GI._NotifyLocalDurableChange("compact")
@@ -1231,16 +1329,11 @@ function GI:AdmitOperation(op, opts)
         return "accepted", nil
     end
 
-    -- Ops that sort at/before a live cutover are tombstoned (missed Unassigns, etc.).
-    local liveCutover = LatestLiveCutover(record)
-    if liveCutover and OpSupersededByCutover(op, liveCutover) then
-        RetainCompactedId(record, op.id)
-        return "duplicate", "superseded"
-    end
-
     local compacted = false
     local pendingIncluded = false
-    if #record.order >= GI.MAX_ACCEPTED_OPS then
+    -- Only a local editor commit may manufacture a cutover. Remote ingest on a
+    -- full/partial log must not promote an incomplete view into an authoritative boundary.
+    if not opts.remote and #record.order >= GI.MAX_ACCEPTED_OPS then
         compacted, pendingIncluded = CompactIfNeeded(record, op.actorGuid, op.actorName, op)
         compacted = compacted and true or false
         pendingIncluded = pendingIncluded and true or false
