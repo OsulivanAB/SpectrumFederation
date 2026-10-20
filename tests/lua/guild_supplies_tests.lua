@@ -26427,14 +26427,16 @@ do
     assertEq(sidebar.pageId, "lootHelperGeneral",
         "B-ui: sidebar falls back to default Loot Helper page")
 
-    -- StandaloneWindow:Show revalidates via HandleRegistryChanged (source contract).
+    -- StandaloneWindow:Show revalidates selection without sidebar rebuild.
     local winSrc = io.open("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua", "r")
     assertTrue(winSrc ~= nil, "B-ui: StandaloneWindow readable")
     local winBody = winSrc:read("*a")
     winSrc:close()
-    assertTrue(winBody:find("HandleRegistryChanged", 1, true)
+    assertTrue(winBody:find("RevalidateSelection", 1, true)
             and winBody:find("function SettingsWindow:Show", 1, true),
-        "B-ui: Show path references HandleRegistryChanged")
+        "B-ui: Show path references RevalidateSelection")
+    assertTrue(winBody:find("HandleDurableAvailabilityChange", 1, true),
+        "B-ui: SettingsWindow gates durable notifies via HandleDurableAvailabilityChange")
     assertTrue(winBody:find("RegisterUIListener", 1, true),
         "B-ui: SettingsWindow registers GS durable UI listener")
 
@@ -26542,31 +26544,347 @@ do
 end
 
 do
-    -- Codex B) SettingsWindow:Show revalidates retired selection while open.
+    -- Codex B-lifecycle) Production SettingsWindow selection revalidation without
+    -- nav frame churn. Measures CreateFrame + nav object identity; does not stub
+    -- HandleRegistryChanged / RevalidateSelection.
+    local priorCreateFrame = CreateFrame
+    local createFrameCount = 0
+    local navCreateCount = 0
+    local navParentRef = { panel = nil }
+    local function makeRegion(kind, name, parent)
+        local region = {
+            kind = kind,
+            name = name,
+            parent = parent,
+            shown = true,
+            height = 0,
+            width = 0,
+            points = {},
+            scripts = {},
+            children = {},
+        }
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetHeight(h) self.height = h end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = w end
+        function region:SetSize(w, h) self.width = w self.height = h end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown and true or false end
+        function region:SetAllPoints() end
+        function region:SetColorTexture() end
+        function region:SetTexture() end
+        function region:SetTexCoord() end
+        function region:SetText(t) self.text = t end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetFontObject() end
+        function region:SetScript(e, fn) self.scripts[e] = fn end
+        function region:HookScript(e, fn) self.scripts["hook:" .. e] = fn end
+        function region:EnableMouse() end
+        function region:SetParent(p) self.parent = p end
+        function region:CreateTexture()
+            local t = makeRegion("Texture", nil, self)
+            self.children[#self.children + 1] = t
+            return t
+        end
+        function region:CreateFontString()
+            local f = makeRegion("FontString", nil, self)
+            self.children[#self.children + 1] = f
+            return f
+        end
+        return region
+    end
+    function CreateFrame(frameType, name, parent)
+        createFrameCount = createFrameCount + 1
+        if navParentRef.panel and parent == navParentRef.panel then
+            navCreateCount = navCreateCount + 1
+        end
+        return makeRegion(frameType or "Frame", name, parent)
+    end
+
+    loadModule("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua")
     local SettingsWindow = SF.SettingsWindow
-    assertTrue(SettingsWindow and SettingsWindow.HandleRegistryChanged,
-        "B-show: SettingsWindow loaded")
-    local calls = 0
-    local priorHandle = SettingsWindow.HandleRegistryChanged
-    SettingsWindow.HandleRegistryChanged = function(self)
-        calls = calls + 1
-        -- Avoid full nav rebuild in this harness; count invocations only.
+    local Nav = SF.SettingsNavigationModel
+    local ui = SF.SettingsUI
+    assertTrue(SettingsWindow and SettingsWindow.RevalidateSelection
+            and SettingsWindow.HandleDurableAvailabilityChange
+            and SettingsWindow.HandleRegistryChanged,
+        "B-life: SettingsWindow lifecycle APIs present")
+
+    -- Ensure production-shaped Loot Helper category + fallback pages.
+    ui.categoriesById = ui.categoriesById or {}
+    ui.categories = ui.categories or {}
+    ui.pagesById = ui.pagesById or {}
+    ui.pages = ui.pages or {}
+    -- StandaloneWindow GetCategory requires the Registry API (not a raw map).
+    function ui:GetCategory(categoryId)
+        if not categoryId then
+            return nil
+        end
+        return self.categoriesById and self.categoriesById[categoryId] or nil
     end
+    local function ensurePage(page)
+        if ui.pagesById[page.id] then
+            local existing = ui.pagesById[page.id]
+            for k, v in pairs(page) do
+                if existing[k] == nil then existing[k] = v end
+            end
+            return existing
+        end
+        ui.pagesById[page.id] = page
+        ui.pages[#ui.pages + 1] = page
+        return page
+    end
+    if not ui.categoriesById.lootHelper then
+        local cat = {
+            id = "lootHelper",
+            name = "Loot Helper",
+            navLabel = "Loot Helper",
+            defaultChildId = "lootHelperGeneral",
+            enabled = true,
+            enablementResolved = true,
+            order = 20,
+            group = "Loot Tools",
+        }
+        ui.categoriesById.lootHelper = cat
+        -- Categories must be an array for BuildSidebarItems ipairs traversal.
+        local found = false
+        for _, c in ipairs(ui.categories) do
+            if c.id == "lootHelper" then found = true break end
+        end
+        if not found then
+            ui.categories[#ui.categories + 1] = cat
+        end
+    end
+    ensurePage({
+        id = "lootHelperGeneral",
+        parentId = "lootHelper",
+        categoryId = "lootHelper",
+        name = "General Settings",
+        navLabel = "General",
+        order = 20.5,
+        Build = function() end,
+        Refresh = function() end,
+    })
+    local consumablesPage = ensurePage({
+        id = "lootHelperConsumables",
+        parentId = "lootHelper",
+        categoryId = "lootHelper",
+        name = "Raid Consumables",
+        navLabel = "Consumables",
+        order = 23.6,
+        available = function()
+            local C = SF.Consumables
+            if C and C.LegacyWritersAllowed then
+                return C.LegacyWritersAllowed()
+            end
+            return true
+        end,
+        Build = function() end,
+        Refresh = function() end,
+    })
+    assertTrue(type(consumablesPage.available) == "function", "B-life: consumables available hook")
+    -- Prior B-ui block activates Guild Supplies for this guild; Consumables is retired.
+    assertEq(Nav.IsPageAvailable(consumablesPage), false,
+        "B-life: consumables already retired after prior activation")
+    GS:EnsureGossipProvider()
+    if GS.EndLocalDurableNotifyBatch then
+        for _ = 1, 4 do GS.EndLocalDurableNotifyBatch() end
+    end
+
+    -- Minimal window shell so production RebuildNavRows / Show paths run.
     SettingsWindow.initialized = true
-    SettingsWindow.navPanel = SettingsWindow.navPanel or { name = "nav" }
+    SettingsWindow.navPanel = CreateFrame("Frame", "SF_TestNav")
+    navParentRef.panel = SettingsWindow.navPanel
+    SettingsWindow.contentHost = CreateFrame("Frame", "SF_TestHost")
+    SettingsWindow.contentTitleText = { SetText = function() end }
+    SettingsWindow.contentDescriptionText = {
+        SetText = function() end,
+        ClearAllPoints = function() end,
+        SetPoint = function() end,
+    }
+    SettingsWindow.contentHeadingText = {
+        SetText = function() end,
+        Show = function() end,
+        Hide = function() end,
+    }
+    SettingsWindow.contentHeader = { SetHeight = function() end }
+    SettingsWindow.tabBar = nil
+    SettingsWindow.emptyState = nil
+    SettingsWindow.impersonationBanner = nil
+    SettingsWindow.pagePanels = {}
+    SettingsWindow.navButtons = {}
+    SettingsWindow.navGroups = {}
+    SettingsWindow.navItems = {}
+    SettingsWindow.lastPageByCategory = {}
+    SettingsWindow._contentPagesSig = nil
+    SettingsWindow._selectionRevalidatePending = false
+    SettingsWindow._gsDurableListener = true -- Init already registered in prior loads; avoid double
+    -- Register durable listener explicitly for this window instance path.
+    local durableCalls = 0
+    GS.RegisterUIListener(function()
+        durableCalls = durableCalls + 1
+        SettingsWindow:HandleDurableAvailabilityChange()
+    end)
+
     SettingsWindow.currentCategoryId = "lootHelper"
     SettingsWindow.currentPageId = "lootHelperConsumables"
-    SettingsWindow.frame = SettingsWindow.frame or {
-        Show = function() end,
-        IsShown = function() return false end,
+    SettingsWindow.lastPageByCategory.lootHelper = "lootHelperConsumables"
+    local shown = true
+    SettingsWindow.frame = {
+        Show = function() shown = true end,
+        Hide = function() shown = false end,
+        IsShown = function() return shown end,
     }
     SettingsWindow.RefreshEnablementIfNeeded = function() end
     SettingsWindow.UpdateImpersonationBanner = function() end
-    SettingsWindow.RefreshCurrentPage = function() end
+    SettingsWindow.ApplyPreferredWindowMin = function() end
+    -- Avoid PageBuilder/ScrollFrame dependencies; this suite measures nav churn.
+    SettingsWindow.GetOrCreatePagePanel = function(self, pageId)
+        if self.pagePanels[pageId] then
+            return self.pagePanels[pageId]
+        end
+        local panel = CreateFrame("Frame", nil, self.contentHost)
+        panel:Hide()
+        self.pagePanels[pageId] = panel
+        return panel
+    end
+    for _, id in ipairs({ "lootHelperGeneral", "lootHelperConsumables" }) do
+        local p = ui.pagesById[id]
+        if p then
+            p.Build = function() end
+            p.Refresh = function() end
+        end
+    end
+
+    navCreateCount = 0
+    createFrameCount = 0
+    SettingsWindow:RebuildNavRows()
+    local navAfterBuild = navCreateCount
+    assertTrue(navAfterBuild > 0, "B-life: initial RebuildNavRows creates nav frames got="
+        .. tostring(navAfterBuild))
+    local buttonSnapshot = {}
+    local buttonCount = 0
+    for id, btn in pairs(SettingsWindow.navButtons) do
+        buttonSnapshot[id] = btn
+        buttonCount = buttonCount + 1
+    end
+    assertTrue(buttonCount >= 1, "B-life: sidebar has category buttons")
+    -- Capture content-page signature so later evidence notifies are true no-ops.
+    SettingsWindow:RevalidateSelection()
+    assertEq(navCreateCount, navAfterBuild,
+        "B-life: RevalidateSelection after build creates no nav frames")
+
+    -- Activation-shaped durable UI notify while Settings is open on Consumables.
+    -- Use NotifyUI (production delivery after NotifyLocalDurableChange) so export
+    -- rebuild side effects cannot mask the Settings listener path.
+    shown = true
+    SettingsWindow.currentPageId = "lootHelperConsumables"
+    SettingsWindow.lastPageByCategory.lootHelper = "lootHelperConsumables"
+    assertEq(Nav.IsContentPage(ui, "lootHelperConsumables"), false,
+        "B-life: retired page is not a content page before open notify")
+    local navBeforeOpenNotify = navCreateCount
+    local durableBefore = durableCalls
+    GS.NotifyUI("activation")
+    assertTrue(durableCalls > durableBefore,
+        "B-life: NotifyUI reaches Settings durable listener")
+    assertTrue(SettingsWindow.currentPageId ~= "lootHelperConsumables",
+        "B-life: open activation notify leaves retired page got="
+            .. tostring(SettingsWindow.currentPageId))
+    assertEq(SettingsWindow.currentPageId, "lootHelperGeneral",
+        "B-life: open activation notify selects General fallback")
+    assertEq(navCreateCount, navBeforeOpenNotify,
+        "B-life: open activation notify creates no nav frames")
+    for id, btn in pairs(buttonSnapshot) do
+        assertTrue(SettingsWindow.navButtons[id] == btn,
+            "B-life: nav button identity stable after activation notify id=" .. tostring(id))
+    end
+
+    -- Ordinary evidence/ledger notifies must not rebuild navigation.
+    local midNav = navCreateCount
+    local midPage = SettingsWindow.currentPageId
+    local midTotal = createFrameCount
+    for _ = 1, 12 do
+        GS.NotifyUI("evidence")
+        GS.NotifyUI("ledger")
+        GS.NotifyUI("remote-evidence")
+    end
+    assertEq(navCreateCount, midNav,
+        "B-life: evidence/ledger notifies create no nav frames")
+    assertEq(createFrameCount, midTotal,
+        "B-life: evidence/ledger notifies create no frames at all")
+    assertEq(SettingsWindow.currentPageId, midPage,
+        "B-life: evidence/ledger preserve selection")
+
+    -- Activation while Settings is closed, then reopen.
+    SettingsWindow.currentPageId = "lootHelperConsumables"
+    SettingsWindow.lastPageByCategory.lootHelper = "lootHelperConsumables"
+    shown = false
+    local closedNav = navCreateCount
+    local closedTotal = createFrameCount
+    GS.NotifyUI("activation")
+    assertEq(navCreateCount, closedNav,
+        "B-life: hidden durable notify creates no nav frames")
+    assertEq(createFrameCount, closedTotal,
+        "B-life: hidden durable notify creates no frames")
+    assertEq(SettingsWindow.currentPageId, "lootHelperConsumables",
+        "B-life: hidden durable notify defers selection change")
+    assertEq(SettingsWindow._selectionRevalidatePending, true,
+        "B-life: hidden durable notify marks pending revalidate")
     SettingsWindow:Show()
-    assertTrue(calls >= 1, "B-show: Show revalidates via HandleRegistryChanged")
-    SettingsWindow.HandleRegistryChanged = priorHandle
+    assertTrue(SettingsWindow.currentPageId ~= "lootHelperConsumables",
+        "B-life: Show after closed activation leaves retired page got="
+            .. tostring(SettingsWindow.currentPageId))
+    assertEq(SettingsWindow.currentPageId, "lootHelperGeneral",
+        "B-life: Show selects General after deferred activation")
+    assertEq(navCreateCount, closedNav,
+        "B-life: Show revalidate creates no nav frames")
+
+    -- Direct ShowPage of retired tab must not restore it.
+    SettingsWindow:ShowPage("lootHelperConsumables")
+    assertTrue(SettingsWindow.currentPageId ~= "lootHelperConsumables",
+        "B-life: ShowPage(retired) does not restore got="
+            .. tostring(SettingsWindow.currentPageId))
+    local showPageResolved = Nav.ResolveShowPage(ui, SettingsWindow:Session(), "lootHelperConsumables")
+    assertTrue(showPageResolved.pageId ~= "lootHelperConsumables",
+        "B-life: ResolveShowPage(retired) falls back got="
+            .. tostring(showPageResolved.pageId))
+
+    -- 80 Show/Hide cycles: no nav frame accumulation.
+    local cycleNav = navCreateCount
+    local cycleButtons = {}
+    for id, btn in pairs(SettingsWindow.navButtons) do
+        cycleButtons[id] = btn
+    end
+    for _ = 1, 80 do
+        SettingsWindow:Hide()
+        SettingsWindow:Show()
+    end
+    assertEq(navCreateCount, cycleNav,
+        "B-life: 80 Show/Hide cycles create no nav frames delta="
+            .. tostring(navCreateCount - cycleNav))
+    for id, btn in pairs(cycleButtons) do
+        assertTrue(SettingsWindow.navButtons[id] == btn,
+            "B-life: nav button identity stable across Show/Hide id=" .. tostring(id))
+    end
+
+    -- Genuine registry change still rebuilds navigation.
+    local beforeRegistryNav = navCreateCount
+    local oldLootBtn = SettingsWindow.navButtons.lootHelper
+    SettingsWindow:HandleRegistryChanged()
+    assertTrue(navCreateCount > beforeRegistryNav,
+        "B-life: HandleRegistryChanged recreates nav frames")
+    assertTrue(SettingsWindow.navButtons.lootHelper ~= nil, "B-life: rebuilt lootHelper button")
+    assertTrue(SettingsWindow.navButtons.lootHelper ~= oldLootBtn,
+        "B-life: registry rebuild replaces prior nav button objects")
+
+    CreateFrame = priorCreateFrame
+    assertEq(#world.chat, 0, "B-life: no Chat from lifecycle repair")
 end
 
 

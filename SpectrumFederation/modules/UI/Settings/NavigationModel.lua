@@ -342,6 +342,20 @@ function Model.ResolveShowPage(registry, session, id)
         return CopySelection(categoryId, Model.GetDefaultPageId(registry, categoryId), true)
     end
 
+    -- Known page that is not currently selectable content (retired / unavailable):
+    -- open the category default instead of resurrecting a stale session selection.
+    if page then
+        local categoryId = PageCategoryId(page)
+        local targetCategory = Model.GetCategory(registry, categoryId)
+        if Model.IsCategorySelectable(targetCategory) then
+            return CopySelection(categoryId, Model.GetDefaultPageId(registry, categoryId), true)
+        end
+        if id ~= "general" then
+            return Model.ResolveShowPage(registry, session, "general")
+        end
+        return CurrentSelection(session)
+    end
+
     if session.currentCategoryId then
         return CurrentSelection(session)
     end

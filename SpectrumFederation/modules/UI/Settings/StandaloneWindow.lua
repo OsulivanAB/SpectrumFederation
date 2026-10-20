@@ -117,8 +117,15 @@ end
 
 local function GetCategory(categoryId)
     local ui = Registry()
-    if ui and ui.GetCategory then
+    if not categoryId or not ui then
+        return nil
+    end
+    if ui.GetCategory then
         return ui:GetCategory(categoryId)
+    end
+    -- Match NavigationModel: allow categoriesById when Registry helpers are absent.
+    if ui.categoriesById then
+        return ui.categoriesById[categoryId]
     end
     return nil
 end
@@ -956,28 +963,54 @@ end
 -- Public API
 -- ============================================================
 
-function SettingsWindow:HandleRegistryChanged()
-    if not self.navPanel then
-        return
+local function ContentPagesSignature(model, ui, categoryId)
+    if not model or not ui or not categoryId or not model.GetContentPageIds then
+        return ""
     end
+    local ids = model.GetContentPageIds(ui, categoryId)
+    if type(ids) ~= "table" then
+        return ""
+    end
+    return table.concat(ids, "\0")
+end
 
-    self:RebuildNavRows()
+local function SelectionNeedsFallback(self, model, ui)
+    if not self.currentCategoryId then
+        return false
+    end
+    local category = GetCategory(self.currentCategoryId)
+    if not category or not model.IsCategorySelectable(category) then
+        return true
+    end
+    if self.currentPageId and not model.IsContentPage(ui, self.currentPageId) then
+        return true
+    end
+    if not self.currentPageId then
+        return true
+    end
+    return false
+end
 
+--- Revalidate category/page selection and content chrome without recreating
+-- sidebar navigation frames. Used for availability flips and Show().
+function SettingsWindow:RevalidateSelection()
     local model = Model()
     local ui = Registry()
     if not model or not ui or not self.currentCategoryId then
-        return
+        return false
     end
 
     local category = GetCategory(self.currentCategoryId)
     if not category or not model.IsCategorySelectable(category) then
         self:ApplySelection(model.ResolveShowPage(ui, self:Session(), "general"), { rememberTab = false })
-        return
+        self._contentPagesSig = ContentPagesSignature(model, ui, self.currentCategoryId)
+        return true
     end
 
     if self.currentPageId and not model.IsContentPage(ui, self.currentPageId) then
         self:ApplySelection(model.ResolveSidebarSelect(ui, self:Session(), self.currentCategoryId), { rememberTab = true })
-        return
+        self._contentPagesSig = ContentPagesSignature(model, ui, self.currentCategoryId)
+        return true
     end
 
     if not self.currentPageId then
@@ -988,12 +1021,62 @@ function SettingsWindow:HandleRegistryChanged()
                 pageId = defaultPageId,
                 changed = true,
             }, { rememberTab = true })
-            return
+            self._contentPagesSig = ContentPagesSignature(model, ui, self.currentCategoryId)
+            return true
         end
     end
 
     self:UpdateContentChrome()
     self:UpdateNavButtonStates()
+    self._contentPagesSig = ContentPagesSignature(model, ui, self.currentCategoryId)
+    return false
+end
+
+--- Guild Supplies durable notifies: retire unavailable pages / refresh tabs only
+-- when selection or content-page availability actually changed. Never rebuilds
+-- sidebar nav frames. Hidden windows defer until the next Show().
+function SettingsWindow:HandleDurableAvailabilityChange()
+    if not self.initialized or not self.navPanel then
+        return
+    end
+
+    local model = Model()
+    local ui = Registry()
+    if not model or not ui then
+        return
+    end
+
+    local needsFallback = SelectionNeedsFallback(self, model, ui)
+    local sig = ContentPagesSignature(model, ui, self.currentCategoryId)
+    local tabsChanged = self._contentPagesSig ~= nil and sig ~= self._contentPagesSig
+    if not needsFallback and not tabsChanged then
+        return
+    end
+
+    local shown = self.frame and self.frame.IsShown and self.frame:IsShown()
+    if not shown then
+        self._selectionRevalidatePending = true
+        return
+    end
+
+    if needsFallback then
+        self:RevalidateSelection()
+    else
+        self:UpdateContentChrome()
+        self:UpdateNavButtonStates()
+        self._contentPagesSig = sig
+    end
+    self._selectionRevalidatePending = false
+end
+
+function SettingsWindow:HandleRegistryChanged()
+    if not self.navPanel then
+        return
+    end
+
+    -- Genuine registry / enablement changes rebuild sidebar rows once.
+    self:RebuildNavRows()
+    self:RevalidateSelection()
 end
 
 function SettingsWindow:RefreshEnablementIfNeeded()
@@ -1019,15 +1102,12 @@ function SettingsWindow:Init()
         self._registryListener = true
     end
 
-    -- Guild Supplies durable-state changes (activation, accounting, adoption)
-    -- can retire legacy pages or alter chrome without a registry rewrite.
+    -- Guild Supplies durable-state changes can retire legacy pages without a
+    -- registry rewrite. Revalidate selection/tabs only; do not rebuild nav.
     local GS = SF.GuildSupplies
     if GS and GS.RegisterUIListener and not self._gsDurableListener then
         GS.RegisterUIListener(function()
-            if not SettingsWindow.initialized or not SettingsWindow.navPanel then
-                return
-            end
-            SettingsWindow:HandleRegistryChanged()
+            SettingsWindow:HandleDurableAvailabilityChange()
         end)
         self._gsDurableListener = true
     end
@@ -1048,10 +1128,10 @@ function SettingsWindow:Show()
     self:RefreshEnablementIfNeeded()
     self:UpdateImpersonationBanner()
     if self.currentCategoryId then
-        -- Revalidate selection before refresh: Guild Supplies activation (or
-        -- other availability flips) can retire the previous page while the
-        -- window was closed. Reuse HandleRegistryChanged fallback.
-        self:HandleRegistryChanged()
+        -- Revalidate retired/unavailable selection without recreating sidebar
+        -- frames. Registry-driven RebuildNavRows stays on HandleRegistryChanged.
+        self:RevalidateSelection()
+        self._selectionRevalidatePending = false
         if self.currentPageId then
             self:RefreshCurrentPage()
         end
