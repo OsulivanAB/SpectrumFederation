@@ -91,6 +91,18 @@ local refreshQueued = false
 local rosterFrame = nil
 local bankFrame = nil
 
+-- Session-local Guild Bank tab name catalog (never SavedVariables / Gossip).
+-- Authority: Retail GetNumGuildBankTabs / GetGuildBankTabInfo while the bank is open.
+-- Scope: keyed by guildKey so names never cross guilds. Not proof of a fresh log sample.
+local BANK_TAB_UNSET = false -- UI-only clear sentinel; schema still stores nil.
+local bankTabCatalog = {
+	guildKey = nil,
+	loaded = false,
+	-- [tabIndex] = { name = string, viewable = boolean }
+	entries = {},
+}
+local guildBankOpen = false
+
 --- Refresh controls through Page:Refresh so passCache bounds the render.
 local function RefreshPageControls()
 	if Page.Refresh and Page.panel then
@@ -210,6 +222,152 @@ local function CurrentBankTab()
 	local tab = rec and rec.accounting and rec.accounting._consumables
 		and rec.accounting._consumables.bankTab
 	return tab ~= nil and tonumber(tab) or nil
+end
+
+local function CurrentGuildKey()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	if ctx and type(ctx.guildKey) == "string" and ctx.guildKey ~= "" then
+		return ctx.guildKey
+	end
+	return nil
+end
+
+local function ClearBankTabCatalog()
+	bankTabCatalog.guildKey = nil
+	bankTabCatalog.loaded = false
+	bankTabCatalog.entries = {}
+end
+
+--- Drop catalog entries when the player changes guilds.
+local function SyncBankTabCatalogGuild()
+	local key = CurrentGuildKey()
+	if key == nil then
+		if bankTabCatalog.guildKey ~= nil or bankTabCatalog.loaded then
+			ClearBankTabCatalog()
+		end
+		return
+	end
+	if bankTabCatalog.guildKey ~= nil and bankTabCatalog.guildKey ~= key then
+		ClearBankTabCatalog()
+	end
+end
+
+--- Read purchased, named Guild Bank tabs. Only marks loaded when the API returns
+-- coherent names; never invents labels. Caches viewable names for Settings.
+-- @return boolean true when the catalog was refreshed from live API data
+local function ObserveGuildBankTabs()
+	SyncBankTabCatalogGuild()
+	local key = CurrentGuildKey()
+	if key == nil then
+		return false
+	end
+	if type(GetNumGuildBankTabs) ~= "function" or type(GetGuildBankTabInfo) ~= "function" then
+		return false
+	end
+	local okNum, num = pcall(GetNumGuildBankTabs)
+	if not okNum or type(num) ~= "number" or num ~= math.floor(num) or num < 0 then
+		return false
+	end
+	local maxTab = 8
+	local g = GS()
+	if g and tonumber(g.MAX_BANK_TAB) then
+		maxTab = tonumber(g.MAX_BANK_TAB)
+	end
+	num = math.min(num, maxTab)
+	local nextEntries = {}
+	for i = 1, num do
+		local ok, name, _, isViewable = pcall(GetGuildBankTabInfo, i)
+		if not ok then
+			return false
+		end
+		-- Purchased tabs must expose a non-empty name; empty means data not ready.
+		if type(name) ~= "string" or name == "" then
+			return false
+		end
+		nextEntries[i] = {
+			name = name,
+			viewable = isViewable == true,
+		}
+	end
+	bankTabCatalog.guildKey = key
+	bankTabCatalog.entries = nextEntries
+	bankTabCatalog.loaded = true
+	return true
+end
+
+local function BankTabCatalogLoaded()
+	SyncBankTabCatalogGuild()
+	return bankTabCatalog.loaded == true
+		and bankTabCatalog.guildKey ~= nil
+		and bankTabCatalog.guildKey == CurrentGuildKey()
+end
+
+local function FormatBankTabLabel(index, name)
+	if type(name) == "string" and name ~= "" then
+		return Loc("GUILD_SUPPLIES_BANK_TAB_OPTION_FMT", "Tab %d — %s")
+			:format(index, name)
+	end
+	return Loc("GUILD_SUPPLIES_BANK_TAB_NUMBER_FMT", "Tab %d"):format(index)
+end
+
+--- Dropdown options: clear sentinel + purchased viewable tabs only.
+local function BankTabOptions()
+	local opts = {}
+	if not BankTabCatalogLoaded() then
+		return opts
+	end
+	opts[#opts + 1] = {
+		value = BANK_TAB_UNSET,
+		label = Loc("GUILD_SUPPLIES_BANK_TAB_CLEAR", "Not configured"),
+	}
+	local indices = {}
+	for index, entry in pairs(bankTabCatalog.entries) do
+		if entry and entry.viewable and type(entry.name) == "string" and entry.name ~= "" then
+			indices[#indices + 1] = index
+		end
+	end
+	table.sort(indices)
+	for i = 1, #indices do
+		local index = indices[i]
+		local entry = bankTabCatalog.entries[index]
+		opts[#opts + 1] = {
+			value = index,
+			label = FormatBankTabLabel(index, entry.name),
+		}
+	end
+	return opts
+end
+
+--- Default button text when the configured value is not among selectable options.
+local function BankTabDefaultText()
+	local tab = CurrentBankTab()
+	if tab == nil then
+		if BankTabCatalogLoaded() then
+			return Loc("GUILD_SUPPLIES_BANK_TAB_CLEAR", "Not configured")
+		end
+		return Loc("GUILD_SUPPLIES_BANK_TAB_SELECT", "Select a bank tab")
+	end
+	SyncBankTabCatalogGuild()
+	local entry = bankTabCatalog.entries[tab]
+	if entry and type(entry.name) == "string" and entry.name ~= "" then
+		if entry.viewable then
+			return FormatBankTabLabel(tab, entry.name)
+		end
+		-- Known but not selectable for this character: show number only, no private name.
+		return Loc("GUILD_SUPPLIES_BANK_TAB_UNAVAILABLE_FMT", "Tab %d — unavailable")
+			:format(tab)
+	end
+	-- Configured value preserved without inventing a name.
+	return Loc("GUILD_SUPPLIES_BANK_TAB_NUMBER_FMT", "Tab %d"):format(tab)
+end
+
+local function BankTabDropdownValue()
+	local tab = CurrentBankTab()
+	if tab == nil then
+		return BANK_TAB_UNSET
+	end
+	return tab
 end
 
 local function RequestedItemRows()
@@ -862,6 +1020,20 @@ local function DisabledNeedCampaignTip(actionNoun)
 		"Start a New Campaign before continuing.")
 end
 
+local function DisabledBankTabTip()
+	-- Auth / init blockers take precedence over "open the Guild Bank".
+	local tip = DisabledNeedRecordTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_BANK_TAB", "configuring the bank tab"))
+	if tip then
+		return tip
+	end
+	if BankTabCatalogLoaded() then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_BANK_TAB_OPEN",
+		"Open your Guild Bank to load the available tabs.")
+end
+
 local function DisabledEditorRankTip()
 	local c = Caps()
 	if NeedsExplicitInitThreshold() then
@@ -1301,39 +1473,45 @@ local function Definition()
 						end,
 					},
 					{
-						type = "editbox",
+						type = "dropdown",
 						label = Loc("GUILD_SUPPLIES_BANK_TAB", "Bank Tab"),
 						adminOnly = true,
-						maxLetters = 1,
+						width = 220,
 						tooltip = Loc("GUILD_SUPPLIES_BANK_TAB_TIP",
 							"Shared across campaigns. Changing the tab establishes a new eligibility cutoff."),
-						get = function()
-							local tab = CurrentBankTab()
-							return tab ~= nil and tostring(tab) or ""
-						end,
+						defaultText = BankTabDefaultText,
+						options = BankTabOptions,
+						get = BankTabDropdownValue,
 						set = function() end,
 						enabled = function()
-							return Caps().canEdit and CurrentRecord() ~= nil
+							return Caps().canEdit
+								and CurrentRecord() ~= nil
+								and BankTabCatalogLoaded()
 						end,
-						getDisabledTooltip = function()
-							return DisabledNeedRecordTip(
-								Loc("GUILD_SUPPLIES_DISABLED_ACTION_BANK_TAB", "configuring the bank tab"))
-						end,
-						onCommit = function(ctx, text)
-							-- Enter then ClearFocus both fire Commit; skip unchanged values
-							-- so one Enter admits one operation and idle focus loss admits none.
+						getDisabledTooltip = DisabledBankTabTip,
+						onValueChanged = function(ctx, value)
 							local current = CurrentBankTab()
-							if text == nil or text == "" then
+							if value == BANK_TAB_UNSET or value == nil then
 								if current == nil then
 									return
 								end
 								CommitConfig(ctx, "set-bank-tab", "bankTab", nil)
 								return
 							end
-							local tab = tonumber(text)
+							local tab = tonumber(value)
 							if not tab or tab < 1 or tab > 8 or tab ~= math.floor(tab) then
 								ctx.section:SetMessage(
-									Loc("GUILD_SUPPLIES_ERR_BANK_TAB", "Enter a bank tab from 1 to 8, or clear the field."),
+									Loc("GUILD_SUPPLIES_ERR_BANK_TAB",
+										"Choose a Guild Bank tab from the list, or clear the selection."),
+									"error")
+								return
+							end
+							-- Only accept tabs currently offered as viewable; never invent.
+							local entry = BankTabCatalogLoaded() and bankTabCatalog.entries[tab] or nil
+							if not entry or entry.viewable ~= true then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_BANK_TAB",
+										"Choose a Guild Bank tab from the list, or clear the selection."),
 									"error")
 								return
 							end
@@ -1907,6 +2085,11 @@ local function QueueRefresh()
 		if not Page.panel or not Page.Refresh then return end
 		if not PanelVisible(Page.panel) then return end
 		SyncPendingInitContext()
+		SyncBankTabCatalogGuild()
+		-- Re-read names while the bank is open so delayed API responses surface Settings.
+		if guildBankOpen then
+			ObserveGuildBankTabs()
+		end
 		Page:Refresh(Page.panel)
 	end
 	if C_Timer and C_Timer.After then
@@ -1928,11 +2111,12 @@ local function EnsureRosterListener()
 	end
 	frame:SetScript("OnEvent", function()
 		SyncPendingInitContext()
+		SyncBankTabCatalogGuild()
 		QueueRefresh()
 	end)
 end
 
---- Event-driven refresh when bank open/close/log updates change activation readiness.
+--- Event-driven refresh when bank open/close/log/tab updates change readiness or names.
 -- No continuous polling; coalesced via QueueRefresh while the page is visible.
 local function EnsureBankListener()
 	if bankFrame or type(CreateFrame) ~= "function" then
@@ -1944,6 +2128,7 @@ local function EnsureBankListener()
 		"GUILDBANKFRAME_OPENED",
 		"GUILDBANKFRAME_CLOSED",
 		"GUILDBANKLOG_UPDATE",
+		"GUILDBANK_UPDATE_TABS",
 		"PLAYER_INTERACTION_MANAGER_FRAME_SHOW",
 		"PLAYER_INTERACTION_MANAGER_FRAME_HIDE",
 	}
@@ -1959,7 +2144,24 @@ local function EnsureBankListener()
 				and arg1 == Enum.PlayerInteractionType.GuildBanker) then
 				return
 			end
+			if event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" then
+				guildBankOpen = true
+				ObserveGuildBankTabs()
+			else
+				guildBankOpen = false
+			end
+		elseif event == "GUILDBANKFRAME_OPENED" then
+			guildBankOpen = true
+			ObserveGuildBankTabs()
+		elseif event == "GUILDBANKFRAME_CLOSED" then
+			guildBankOpen = false
+		elseif event == "GUILDBANK_UPDATE_TABS" then
+			-- Renames / newly purchased tabs; keep session cache fresh while open.
+			if guildBankOpen then
+				ObserveGuildBankTabs()
+			end
 		end
+		-- GUILDBANKLOG_UPDATE only drives activation-readiness refresh (not names).
 		QueueRefresh()
 	end)
 end

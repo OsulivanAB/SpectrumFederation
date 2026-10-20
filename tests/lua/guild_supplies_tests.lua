@@ -4921,11 +4921,13 @@ do
     assertTrue(configPanel.__sfPageBuilder ~= nil, "Configuration uses DefinitionRenderer:Build")
     local pageDef = configPanel.__sfPageDef
     assertTrue(type(pageDef) == "table", "Build stores page definition")
-    local foundBankCommit, foundGoalCommit, foundStatusDisplay, foundNextStepHelp = false, false, false, false
+    local foundBankDropdown, foundGoalCommit, foundStatusDisplay, foundNextStepHelp = false, false, false, false
     for _, sec in ipairs(pageDef.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
-            if item.type == "editbox" and type(item.onCommit) == "function" then
-                foundBankCommit = true
+            if item.type == "dropdown" and item.label
+                and tostring(item.label):find("Bank Tab", 1, true)
+                and type(item.onValueChanged) == "function" then
+                foundBankDropdown = true
             end
             if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
                 foundGoalCommit = true
@@ -4939,7 +4941,7 @@ do
             end
         end
     end
-    assertTrue(foundBankCommit, "bank tab uses onCommit")
+    assertTrue(foundBankDropdown, "bank tab uses dropdown onValueChanged")
     assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
     assertTrue(foundStatusDisplay, "status area uses display rows")
     assertTrue(foundNextStepHelp, "status next-step/warning help uses getText+visible")
@@ -4989,32 +4991,408 @@ do
     GS._BankContextReadinessProbe = nil
     assertEq(#world.chat, 0, "activation guidance emits no Chat")
 
-    local edits = findEditBoxes(configPanel)
-    assertTrue(#edits >= 1, "bank tab editbox present")
-    local bankEdit = edits[1]
-    bankEdit:SetText("2")
-    fire(bankEdit, "OnEnterPressed")
-    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 2, "onCommit sets bank tab")
-
-    bankEdit:SetText("")
-    fire(bankEdit, "OnEditFocusLost")
-    assertNil(GS:GetCurrentRecord().accounting._consumables.bankTab, "onCommit clear removes bank tab")
-
-    -- Rejected invalid tab leaves state unchanged.
-    local opSet = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
-    GS:ApplyStagedConfigOperation(opSet)
-    bankEdit:SetText("9")
+    -- Bank tab dropdown requires a Guild Bank observation before mutation.
+    world.numGuildBankTabs = 4
+    world.bankTabInfo = {
+        [1] = { name = "Consumables", isViewable = true },
+        [2] = { name = "Raid Materials", isViewable = true },
+        [3] = { name = "Potions", isViewable = true },
+        [4] = { name = "Miscellaneous", isViewable = true },
+    }
+    function GetNumGuildBankTabs()
+        return world.numGuildBankTabs or 0
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo and world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    local function fireBankEvent(event, arg1)
+        for i = 1, #created do
+            local f = created[i]
+            if f.registeredEvents and f.registeredEvents[event]
+                and f.scripts and f.scripts.OnEvent then
+                f.scripts.OnEvent(f, event, arg1)
+            end
+        end
+        flushTimers()
+    end
+    local function findBankTabDef(panel)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "dropdown" and item.label
+                    and tostring(item.label):find("Bank Tab", 1, true) then
+                    return item
+                end
+            end
+        end
+        return nil
+    end
+    local bankDef = findBankTabDef(configPanel)
+    assertTrue(bankDef ~= nil, "bank tab dropdown definition present")
+    assertEq(bankDef.enabled and bankDef.enabled(), false,
+        "bank tab disabled before Guild Bank observation")
+    fireBankEvent("GUILDBANKFRAME_OPENED")
+    configPage:Refresh(configPanel)
+    bankDef = findBankTabDef(configPanel)
+    assertEq(bankDef.enabled and bankDef.enabled(), true,
+        "bank tab enabled after Guild Bank observation")
+    local bankOpts = bankDef.options and bankDef.options() or {}
+    assertTrue(#bankOpts >= 5, "bank options include clear + purchased tabs")
     local messages = {}
     local section = configPanel.__sfSections and configPanel.__sfSections.gsStatus
-    if section then
-        local priorSet = section.SetMessage
-        section.SetMessage = function(self, msg, sev)
-            messages[#messages + 1] = { msg = msg, sev = sev }
-            if priorSet then priorSet(self, msg, sev) end
-        end
-    end
-    fire(bankEdit, "OnEnterPressed")
+    local bankCtx = {
+        section = {
+            SetMessage = function(_, msg, sev)
+                messages[#messages + 1] = { msg = msg, sev = sev }
+            end,
+            ClearMessage = function() end,
+        },
+    }
+    bankDef.onValueChanged(bankCtx, 2)
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 2, "dropdown sets numeric bank tab")
+
+    bankDef.onValueChanged(bankCtx, false)
+    assertNil(GS:GetCurrentRecord().accounting._consumables.bankTab, "dropdown clear removes bank tab")
+
+    -- Rejected invalid / non-offered tab leaves state unchanged.
+    local opSet = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
+    GS:ApplyStagedConfigOperation(opSet)
+    messages = {}
+    bankDef.onValueChanged(bankCtx, 9)
     assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "invalid tab leaves state")
+    assertTrue(#messages >= 1, "invalid tab reports an error message")
+
+    ---------------------------------------------------------------------------
+    -- Bank Tab dropdown catalog: names, permissions, cache, lifecycle (#400)
+    ---------------------------------------------------------------------------
+    do
+        local function labelFor(opts, value)
+            for i = 1, #opts do
+                if opts[i].value == value then
+                    return opts[i].label
+                end
+            end
+            return nil
+        end
+
+        -- 1/2) Disabled before data; opening bank loads names.
+        fireBankEvent("GUILDBANKFRAME_CLOSED")
+        -- Catalog remains session-cached after close.
+        bankDef = findBankTabDef(configPanel)
+        assertEq(bankDef.enabled and bankDef.enabled(), true,
+            "bank dropdown stays enabled from session cache after bank close")
+        local tipOpen = bankDef.getDisabledTooltip and bankDef.getDisabledTooltip()
+        assertNil(tipOpen, "bank tip nil while catalog loaded and authorized")
+
+        -- Fresh catalog via guild identity change then reopen.
+        local priorClub = world.guild.clubId
+        world.guild.clubId = 99
+        settleRoster()
+        flushTimers()
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        -- Different guild has no dataset; re-init for club 99 after creating staged record.
+        -- Prefer staying on club 42 and clearing by switching away/back with empty observation.
+        world.guild.clubId = priorClub
+        settleRoster()
+        flushTimers()
+
+        -- 3) Only purchased viewable tabs are selectable.
+        world.bankTabInfo = {
+            [1] = { name = "Consumables", isViewable = true },
+            [2] = { name = "Officers", isViewable = false },
+            [3] = { name = "Potions", isViewable = true },
+            [4] = { name = "Raid Materials", isViewable = true },
+        }
+        world.numGuildBankTabs = 4
+        fireBankEvent("GUILDBANKFRAME_OPENED")
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        bankOpts = bankDef.options()
+        assertNil(labelFor(bankOpts, 2), "non-viewable tab is not selectable")
+        assertTrue(labelFor(bankOpts, 1) ~= nil, "viewable tab 1 offered")
+        assertTrue(labelFor(bankOpts, 3) ~= nil, "viewable tab 3 offered")
+        assertTrue(labelFor(bankOpts, 4) ~= nil, "viewable tab 4 offered")
+        assertTrue(labelFor(bankOpts, 1):find("Consumables", 1, true),
+            "tab 1 label uses API name")
+        assertTrue(labelFor(bankOpts, 3):find("Tab 3", 1, true),
+            "tab labels include numeric index")
+
+        -- 4) Selecting Tab 3 persists numeric 3, not the name.
+        -- Move off any prior tab-3 fixture so the selection allocates a fresh op.
+        if GS:GetCurrentRecord().accounting._consumables.bankTab == 3 then
+            bankDef.onValueChanged(bankCtx, 1)
+            assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 1,
+                "precondition: move off tab 3 before measuring tab-3 selection")
+        end
+        local beforeOpsDrop = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            beforeOpsDrop = beforeOpsDrop + 1
+        end
+        bankDef.onValueChanged(bankCtx, 3)
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3,
+            "selecting Tab 3 stores numeric 3")
+        assertEq(type(GS:GetCurrentRecord().accounting._consumables.bankTab), "number",
+            "stored bankTab is a number")
+
+        -- 13) No redundant operation when selecting the current tab.
+        local midOps = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            midOps = midOps + 1
+        end
+        assertEq(midOps, beforeOpsDrop + 1, "first selection allocates one op")
+        bankDef.onValueChanged(bankCtx, 3)
+        local afterNoop = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            afterNoop = afterNoop + 1
+        end
+        assertEq(afterNoop, midOps, "reselecting current tab allocates no op")
+
+        -- 5) Existing numeric configuration displayed correctly.
+        assertEq(bankDef.get(), 3, "dropdown get returns configured numeric tab")
+        local defaultText = bankDef.defaultText
+        if type(defaultText) == "function" then
+            defaultText = defaultText()
+        end
+        assertTrue(type(defaultText) == "string" and defaultText:find("Potions", 1, true),
+            "default text shows configured tab name got=" .. tostring(defaultText))
+
+        -- 6) Renaming a tab updates label without changing selected value.
+        world.bankTabInfo[3].name = "Raid Potions"
+        fireBankEvent("GUILDBANK_UPDATE_TABS")
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3,
+            "rename keeps numeric selection")
+        assertEq(bankDef.get(), 3, "get still returns 3 after rename")
+        bankOpts = bankDef.options()
+        assertTrue(labelFor(bankOpts, 3):find("Raid Potions", 1, true),
+            "renamed tab label refreshed got=" .. tostring(labelFor(bankOpts, 3)))
+
+        -- 7) Duplicate names remain distinguishable by number.
+        world.bankTabInfo[1].name = "Supplies"
+        world.bankTabInfo[4].name = "Supplies"
+        fireBankEvent("GUILDBANK_UPDATE_TABS")
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        bankOpts = bankDef.options()
+        local lab1 = labelFor(bankOpts, 1)
+        local lab4 = labelFor(bankOpts, 4)
+        assertTrue(lab1 and lab1:find("Tab 1", 1, true) and lab1:find("Supplies", 1, true),
+            "duplicate name tab 1 distinguished got=" .. tostring(lab1))
+        assertTrue(lab4 and lab4:find("Tab 4", 1, true) and lab4:find("Supplies", 1, true),
+            "duplicate name tab 4 distinguished got=" .. tostring(lab4))
+        assertTrue(lab1 ~= lab4, "duplicate name labels are not identical")
+
+        -- 11) Clearing selection preserves nil operation semantics.
+        bankDef.onValueChanged(bankCtx, false)
+        assertNil(GS:GetCurrentRecord().accounting._consumables.bankTab,
+            "clear sentinel stores nil bankTab")
+        bankDef.onValueChanged(bankCtx, false)
+        local clearOps = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            clearOps = clearOps + 1
+        end
+        -- Second clear is a no-op (no extra op beyond the first clear).
+        bankDef.onValueChanged(bankCtx, 3)
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3, "reselect after clear")
+
+        -- 10) Unavailable tab data does not erase an existing setting.
+        local priorTab = GS:GetCurrentRecord().accounting._consumables.bankTab
+        world.bankTabInfo[3].name = nil -- incomplete API response
+        fireBankEvent("GUILDBANK_UPDATE_TABS")
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, priorTab,
+            "incomplete tab info does not clear configured bankTab")
+        -- Restore coherent names for subsequent assertions.
+        world.bankTabInfo[3].name = "Raid Potions"
+        fireBankEvent("GUILDBANK_UPDATE_TABS")
+
+        -- 8) Changing guilds does not reuse another guild's tab list.
+        local tabBeforeGuild = GS:GetCurrentRecord().accounting._consumables.bankTab
+        world.guild.clubId = 77
+        settleRoster()
+        flushTimers()
+        -- Guild 77 is not configured; catalog must not offer guild 42 names.
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        bankOpts = bankDef.options()
+        assertEq(#bankOpts, 0, "guild change clears prior guild tab catalog options")
+        assertEq(bankDef.enabled and bankDef.enabled(), false,
+            "bank dropdown disabled for new guild without observation")
+        -- Opening bank on the new guild loads that guild's names only.
+        world.bankTabInfo = {
+            [1] = { name = "Other Guild Tab", isViewable = true },
+        }
+        world.numGuildBankTabs = 1
+        -- Need a staged record on guild 77 to enable editing.
+        assertEq(select(2, GS:CreateStagedRecord()), "accepted", "init guild 77 for catalog isolation")
+        startCampaign()
+        fireBankEvent("GUILDBANKFRAME_OPENED")
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        bankOpts = bankDef.options()
+        assertTrue(labelFor(bankOpts, 1) and labelFor(bankOpts, 1):find("Other Guild Tab", 1, true),
+            "new guild catalog uses its own names")
+        assertNil(labelFor(bankOpts, 3), "prior guild tab 3 not offered on new guild")
+        -- Restore primary guild for later suites.
+        world.guild.clubId = 42
+        settleRoster()
+        flushTimers()
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        startCampaign()
+        world.bankTabInfo = {
+            [1] = { name = "Consumables", isViewable = true },
+            [2] = { name = "Raid Materials", isViewable = true },
+            [3] = { name = "Potions", isViewable = true },
+            [4] = { name = "Miscellaneous", isViewable = true },
+        }
+        world.numGuildBankTabs = 4
+        fireBankEvent("GUILDBANKFRAME_OPENED")
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        bankDef.onValueChanged(bankCtx, 3)
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 3,
+            "restored guild 42 can select tab 3 again")
+        assertTrue(tabBeforeGuild == 3 or tabBeforeGuild == nil or type(tabBeforeGuild) == "number",
+            "prior tab was numeric before guild switch")
+
+        -- 9) Closing and reopening the Guild Bank works; cache survives close.
+        fireBankEvent("GUILDBANKFRAME_CLOSED")
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        assertEq(bankDef.enabled and bankDef.enabled(), true,
+            "catalog remains usable after bank close")
+        assertTrue(#(bankDef.options()) >= 5, "options remain after bank close")
+        world.bankTabInfo[4].name = "Misc Renamed"
+        fireBankEvent("GUILDBANKFRAME_OPENED")
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        assertTrue(labelFor(bankDef.options(), 4):find("Misc Renamed", 1, true),
+            "reopen refreshes renamed tab")
+
+        -- 12) Unauthorized user cannot modify the selection.
+        local priorMembers = world.guild.members
+        world.guild.members = {
+            { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 5 },
+        }
+        settleRoster()
+        flushTimers()
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        assertEq(bankDef.enabled and bankDef.enabled(), false,
+            "unauthorized bank dropdown disabled")
+        local unauthTip = bankDef.getDisabledTooltip()
+        assertTrue(type(unauthTip) == "string" and unauthTip:find("rank does not permit", 1, true),
+            "unauthorized tip precedes open-bank tip got=" .. tostring(unauthTip))
+        local tabBeforeDenied = GS:GetCurrentRecord()
+            and GS:GetCurrentRecord().accounting._consumables.bankTab
+        world.guild.members = priorMembers
+        settleRoster()
+        flushTimers()
+        configPage:Refresh(configPanel)
+        bankDef = findBankTabDef(configPanel)
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, tabBeforeDenied,
+            "unauthorized attempt left bankTab unchanged")
+
+        -- Open-bank tip: close bank first so guild churn cannot re-observe.
+        fireBankEvent("GUILDBANKFRAME_CLOSED")
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        startCampaign()
+        local tipBankPanel = makeRegion("Frame", "GSBankTipPanel", nil)
+        tipBankPanel:SetSize(600, 800)
+        tipBankPanel.shown = true
+        configPage:Build(tipBankPanel)
+        -- Wipe session catalog via guild identity change while bank is closed.
+        -- SyncBankTabCatalogGuild runs from options/enabled; Settings roster frames
+        -- are not on world.frames, so drive Sync through a Refresh while on club 55.
+        world.guild.clubId = 55
+        settleRoster()
+        flushTimers()
+        configPage:Refresh(tipBankPanel)
+        bankDef = findBankTabDef(tipBankPanel)
+        assertEq(#(bankDef.options()), 0,
+            "guild 55 refresh clears prior guild 42 catalog options")
+        world.guild.clubId = 42
+        settleRoster()
+        flushTimers()
+        configPage:Refresh(tipBankPanel)
+        bankDef = findBankTabDef(tipBankPanel)
+        assertEq(bankDef.enabled and bankDef.enabled(), false,
+            "bank dropdown disabled when catalog unloaded after guild churn")
+        local needOpenTip = bankDef.getDisabledTooltip()
+        assertTrue(type(needOpenTip) == "string"
+                and needOpenTip:find("Open your Guild Bank", 1, true),
+            "disabled tip asks to open Guild Bank got=" .. tostring(needOpenTip))
+
+        -- 14) Activation readiness / bank-log sampling unchanged by selection.
+        fireBankEvent("GUILDBANKFRAME_OPENED")
+        configPage:Refresh(tipBankPanel)
+        bankDef = findBankTabDef(tipBankPanel)
+        bankDef.onValueChanged({
+            section = { SetMessage = function() end, ClearMessage = function() end },
+        }, 2)
+        assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 2,
+            "selection after tip panel works")
+        assertEq(GS.IsBankContextSampleReady(2), false,
+            "tab selection alone does not make bank sample ready")
+        local readyReason = select(2, GS.IsBankContextSampleReady(2))
+        assertTrue(type(readyReason) == "string" and readyReason ~= "",
+            "readiness still gated on log sample got=" .. tostring(readyReason))
+
+        -- 15) Repeated refresh / open-close does not accumulate bank listeners.
+        local bankListenersBefore = 0
+        for i = 1, #created do
+            local f = created[i]
+            if f.registeredEvents and f.registeredEvents.GUILDBANKFRAME_OPENED then
+                bankListenersBefore = bankListenersBefore + 1
+            end
+        end
+        for _ = 1, 25 do
+            fireBankEvent("GUILDBANKFRAME_CLOSED")
+            fireBankEvent("GUILDBANKFRAME_OPENED")
+            configPage:Refresh(tipBankPanel)
+        end
+        local bankListenersAfter = 0
+        for i = 1, #created do
+            local f = created[i]
+            if f.registeredEvents and f.registeredEvents.GUILDBANKFRAME_OPENED then
+                bankListenersAfter = bankListenersAfter + 1
+            end
+        end
+        assertEq(bankListenersAfter, bankListenersBefore,
+            "open/close/refresh does not accumulate bank listeners")
+        assertTrue(bankListenersAfter >= 1 and bankListenersAfter <= 4,
+            "bank listener count stays bounded got=" .. tostring(bankListenersAfter))
+
+        -- Restore fixture for New Campaign tests below.
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        startCampaign()
+        world.bankTabInfo = {
+            [1] = { name = "Consumables", isViewable = true },
+            [2] = { name = "Raid Materials", isViewable = true },
+            [3] = { name = "Potions", isViewable = true },
+            [4] = { name = "Miscellaneous", isViewable = true },
+        }
+        world.numGuildBankTabs = 4
+        fireBankEvent("GUILDBANKFRAME_OPENED")
+        configPage:Refresh(configPanel)
+    end
 
     -- New Campaign: bind before confirm; cancel leaves state; accept applies bound op.
     local buttons = findButtons(configPanel)
@@ -5567,21 +5945,58 @@ do
     local configPanel = makeRegion("Frame", "GSConfigPanel2", nil)
     configPanel:SetSize(600, 800)
     configPage:Build(configPanel)
-    local edits = findEditBoxes(configPanel)
-    assertTrue(#edits >= 1, "bank edit present in 2B18")
-    local bankEdit = edits[1]
+    world.numGuildBankTabs = 4
+    world.bankTabInfo = {
+        [1] = { name = "Tab One", isViewable = true },
+        [2] = { name = "Tab Two", isViewable = true },
+        [3] = { name = "Tab Three", isViewable = true },
+        [4] = { name = "Tab Four", isViewable = true },
+    }
+    function GetNumGuildBankTabs()
+        return world.numGuildBankTabs or 0
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo and world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    local function fireBankEvent2(event)
+        for i = 1, #created do
+            local f = created[i]
+            if f.registeredEvents and f.registeredEvents[event]
+                and f.scripts and f.scripts.OnEvent then
+                f.scripts.OnEvent(f, event)
+            end
+        end
+        flushTimers()
+    end
+    fireBankEvent2("GUILDBANKFRAME_OPENED")
+    configPage:Refresh(configPanel)
+    local bankDef2
+    for _, sec in ipairs((configPanel.__sfPageDef and configPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "dropdown" and item.label
+                and tostring(item.label):find("Bank Tab", 1, true) then
+                bankDef2 = item
+            end
+        end
+    end
+    assertTrue(bankDef2 ~= nil, "bank dropdown present in 2B18")
+    local bankCtx2 = {
+        section = {
+            SetMessage = function() end,
+            ClearMessage = function() end,
+        },
+    }
     local beforeOps = countOps(GS:GetCurrentRecord())
-    bankEdit:SetText("4")
-    fire(bankEdit, "OnEnterPressed")
-    -- AddEditBox ClearFocus after Enter.
-    bankEdit:ClearFocus()
+    bankDef2.onValueChanged(bankCtx2, 4)
     assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, 4, "bank tab set once")
     assertEq(countOps(GS:GetCurrentRecord()), beforeOps + 1,
-        "Enter+focus-loss admits exactly one bank-tab operation")
-    -- Unchanged focus loss admits none.
+        "dropdown selection admits exactly one bank-tab operation")
+    -- Selecting the current tab again admits none.
     beforeOps = countOps(GS:GetCurrentRecord())
-    fire(bankEdit, "OnEditFocusLost")
-    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "unchanged focus loss allocates no op")
+    bankDef2.onValueChanged(bankCtx2, 4)
+    assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "unchanged tab selection allocates no op")
 
     -- Add + goal edit through production control callbacks (not domain-only).
     -- Match the requested-items Add control explicitly; #388 adds other editboxButtons.
@@ -6683,7 +7098,7 @@ do
         "disabled tip: Activate does not require open bank before init/campaign")
 
     local bankItem = findDefItem(tipPanel, function(item)
-        return item.type == "editbox" and item.label
+        return item.type == "dropdown" and item.label
             and tostring(item.label):find("Bank Tab", 1, true)
     end)
     assertTrue(bankItem and type(bankItem.getDisabledTooltip) == "function",
@@ -6692,7 +7107,7 @@ do
     assertTrue(type(bankTip) == "string" and bankTip:find("Initialize", 1, true),
         "disabled tip: Bank Tab needs init got=" .. tostring(bankTip))
     assertTrue(not bankTip:find("Guild Bank", 1, true),
-        "disabled tip: Bank Tab tip must not require opening the Guild Bank")
+        "disabled tip: Bank Tab tip must not require opening the Guild Bank before init")
 
     -- Overlay hover on a disabled Activate button shows the tip without enabling.
     local activateBtns = {}

@@ -1069,7 +1069,16 @@ function Controls:AddDropdown(section, opts)
 		local dropdown = CreateFrame("DropdownButton", nil, control, "WowStyle1DropdownTemplate")
 		dropdown:SetPoint("LEFT", control, "LEFT", 0, 0)
 		dropdown:SetWidth(opts.width or CONTROL_WIDTH)
-		dropdown:SetDefaultText(opts.defaultText or "Select...")
+
+		local function ResolveDefaultText()
+			local d = opts.defaultText
+			if type(d) == "function" then
+				return d()
+			end
+			return d or "Select..."
+		end
+
+		dropdown:SetDefaultText(ResolveDefaultText())
 
 		local function GetOptions()
 			local o = opts.options
@@ -1112,6 +1121,7 @@ function Controls:AddDropdown(section, opts)
 		dropdown:SetupMenu(Generator)
 
 		local function Refresh()
+			dropdown:SetDefaultText(ResolveDefaultText())
 			self:_ApplyRowState(row, section, opts, {dropdown})
 			if dropdown.GenerateMenu then
 				dropdown:GenerateMenu()
