@@ -1758,6 +1758,240 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- Scenario A: genuine later move must survive synthetic reconcile versions
+---------------------------------------------------------------------------
+
+do
+    -- A: G1 Alice+Bob+Dave. B offline: G2 Alice+Carol. A absorbs Carol in view.
+    -- B (still partitioned) moves Carol→Eve and accepts. On reconnect the move wins.
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "A: Bob under Alice")
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Dave-Garona"),
+        "accepted", "A: Dave under Alice")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "B: Carol under Alice (partition)")
+
+    -- A receives B's concurrent group; derived view absorbs Carol. No durable BeatVers.
+    syncAll(dbB, dbA, "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Carol")), "Player-1-Alice",
+        "A derived view shows Carol under Alice after split")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    local carolA = select(1, GI:GetCurrentRecord()).members["Player-1-Carol"]
+    assertTrue(carolA and carolA.ver and carolA.ver.n == 1,
+        "A did not invent a higher Carol membership version (n=" .. tostring(carolA and carolA.ver and carolA.ver.n) .. ")")
+
+    -- B, still disconnected, moves Carol under Eve.
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(GI:AssignAlt("Eve-Garona", "Carol-Garona", {
+        moveConfirmed = true,
+        expectedOldMain = "Player-1-Alice",
+        roster = GI.GetRosterSnapshot(true),
+    }), "accepted", "B moves Carol under Eve while partitioned")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Carol")), "Player-1-Eve", "B accepts Carol→Eve")
+    local carolB = select(1, GI:GetCurrentRecord()).members["Player-1-Carol"]
+    assertTrue(carolB and carolB.ver and carolB.ver.n >= 2,
+        "B Carol move raised a genuine version n=" .. tostring(carolB and carolB.ver and carolB.ver.n))
+
+    -- Reconnect both ways + catch-up; reverse order on a fresh pair of copies.
+    local function reconnectAndAssert(orderAB)
+        local a = deepCopy(dbA)
+        local b = deepCopy(dbB)
+        if orderAB then
+            syncAll(a, b, "Alice-Garona")
+            syncAll(b, a, "Carol-Garona")
+        else
+            syncAll(b, a, "Carol-Garona")
+            syncAll(a, b, "Alice-Garona")
+        end
+        syncAll(a, b, "Alice-Garona")
+        syncAll(b, a, "Carol-Garona")
+        local label = orderAB and "AB" or "BA"
+        assertEq(select(2, peerRole(a, "Player-1-Carol")), "Player-1-Eve",
+            label .. " A: Carol under Eve survives")
+        assertEq(select(2, peerRole(b, "Player-1-Carol")), "Player-1-Eve",
+            label .. " B: Carol under Eve survives")
+        assertEq(select(2, peerRole(a, "Player-1-Bob")), "Player-1-Alice", label .. " A Bob under Alice")
+        assertEq(select(2, peerRole(a, "Player-1-Dave")), "Player-1-Alice", label .. " A Dave under Alice")
+        assertEq(select(2, peerRole(b, "Player-1-Bob")), "Player-1-Alice", label .. " B Bob under Alice")
+        -- Reload convergence.
+        local saved = deepCopy(a)
+        reloadModules(saved)
+        assertEq(select(2, GI:GetCharacterRole("Player-1-Carol")), "Player-1-Eve",
+            label .. " reload keeps Carol→Eve")
+    end
+    reconnectAndAssert(true)
+    reconnectAndAssert(false)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+---------------------------------------------------------------------------
+-- Scenario B: late member after derived split absorption is not lost
+---------------------------------------------------------------------------
+
+do
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+
+    -- A: Alice+Bob+Dave. B: Alice+Carol+Eve (Eve stays on B until after A reconciles).
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "B-scen A: Bob")
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Dave-Garona"),
+        "accepted", "B-scen A: Dave")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "B-scen B: Carol")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Eve-Garona"),
+        "accepted", "B-scen B: Eve")
+
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local recB = select(1, GI:GetCurrentRecord())
+    local gB = nil
+    for gid, g in pairs(recB.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            gB = g
+            break
+        end
+    end
+    assertTrue(gB ~= nil, "B has Alice group")
+    local eveMem = recB.members["Player-1-Eve"]
+    assertTrue(eveMem and eveMem.groupId == gB.groupId, "Eve durable on B's Alice group")
+
+    -- Partial sync: A gets B's group + Alice/Carol/Bob-side records, but NOT Eve yet.
+    local partial = {}
+    for _, w in ipairs(exportWires(dbB)) do
+        local body = w.body
+        if body.kind == "guildinfo-group" then
+            partial[#partial + 1] = w
+        elseif body.kind == "guildinfo-member" then
+            local guid = body.member and body.member.guid
+            if guid ~= "Player-1-Eve" then
+                partial[#partial + 1] = w
+            end
+        end
+    end
+    for i = 1, #partial do
+        admitWire(dbA, partial[i], "Carol-Garona")
+    end
+    assertEq(select(2, peerRole(dbA, "Player-1-Carol")), "Player-1-Alice",
+        "A absorbs Carol after partial split")
+    assertNil(select(1, peerRole(dbA, "Player-1-Eve")), "Eve not yet on A")
+
+    -- Loser group shell must remain live (not dissolved) so Eve can arrive.
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    local recA = select(1, GI:GetCurrentRecord())
+    assertTrue(recA.groups[gB.groupId] ~= nil and not recA.groups[gB.groupId].dissolved,
+        "A kept B's group shell live for late members")
+
+    -- Late Eve arrives; B goes offline (no further sync from B).
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Alice",
+        "late Eve appears under Alice, not orphaned")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    local groups = GI:GetRelationshipGroups()
+    assertEq(#groups, 1, "single visible Alice group after late Eve")
+    local alts = groups[1].altGuids
+    local seen = {}
+    for i = 1, #alts do seen[alts[i]] = true end
+    assertTrue(seen["Player-1-Bob"], "Bob visible")
+    assertTrue(seen["Player-1-Dave"], "Dave visible")
+    assertTrue(seen["Player-1-Carol"], "Carol visible")
+    assertTrue(seen["Player-1-Eve"], "Eve visible after late delivery")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+---------------------------------------------------------------------------
+-- Capacity guard: group-first shell near MAX_GROUPS is not discarded
+---------------------------------------------------------------------------
+
+do
+    resetDB()
+    local savedMax = GI.MAX_GROUPS
+    GI.MAX_GROUPS = 4
+
+    -- Fill 3 live groups.
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "cap seed 1")
+    assertEq(assign("Carol-Garona", "Dave-Garona"), "accepted", "cap seed 2")
+    -- Third: Eve alone needs a partner — use Frank synthetic.
+    table.insert(world.guild.members, {
+        name = "Frank-Garona", guid = "Player-1-Frank", rankOrder = 5, online = false, class = "WARRIOR",
+    })
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("Eve-Garona", "Frank-Garona"), "accepted", "cap seed 3")
+
+    local record = select(1, GI:GetCurrentRecord())
+    assertEq(GI.CountRetainedState().groups, 3, "three live groups before shell")
+
+    -- Admit a fourth group shell (group-first) claiming a new main.
+    table.insert(world.guild.members, {
+        name = "Gina-Garona", guid = "Player-1-Gina", rankOrder = 5, online = false, class = "HUNTER",
+    })
+    table.insert(world.guild.members, {
+        name = "Hank-Garona", guid = "Player-1-Hank", rankOrder = 5, online = false, class = "DRUID",
+    })
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+
+    local shellId = "gig:capacity-shell-test-0001"
+    assertEq(GI.MergeGroup(record, {
+        groupId = shellId,
+        mainGuid = "Player-1-Gina",
+        ver = { n = 1, w = "shellwriter000000000001" },
+        at = 1,
+    }), "accepted", "group-first shell admitted at capacity-1")
+    assertTrue(record.groups[shellId] ~= nil and not record.groups[shellId].dissolved,
+        "shell retained after admit")
+
+    -- At MAX_GROUPS, EnsureGroupCapacity must fail closed without deleting the shell.
+    assertEq(select(1, GI.EnsureGroupCapacity(record)), false, "no room without eviction")
+    assertEq(select(2, GI.EnsureGroupCapacity(record)), "groups_overflow", "fail closed reason")
+    assertTrue(record.groups[shellId] ~= nil and not record.groups[shellId].dissolved,
+        "live shell not discarded at capacity")
+
+    -- Member-later completes the relationship.
+    assertEq(GI.MergeMember(record, {
+        guid = "Player-1-Gina",
+        groupId = shellId,
+        ver = { n = 1, w = "shellwriter000000000001" },
+        at = 2,
+        nameRealm = "Gina-Garona",
+        classFile = "HUNTER",
+    }), "accepted", "Gina membership after shell")
+    assertEq(GI.MergeMember(record, {
+        guid = "Player-1-Hank",
+        groupId = shellId,
+        ver = { n = 1, w = "shellwriter000000000001" },
+        at = 2,
+        nameRealm = "Hank-Garona",
+        classFile = "DRUID",
+    }), "accepted", "Hank membership after shell")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Hank")), "Player-1-Gina",
+        "incomplete shell completed into visible relationship")
+
+    GI.MAX_GROUPS = savedMax
+    -- Drop synthetic roster rows for later tests.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Frank" and m.guid ~= "Player-1-Gina" and m.guid ~= "Player-1-Hank" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+---------------------------------------------------------------------------
 -- Long-running stress: successful create/dissolve without manual cleanup
 ---------------------------------------------------------------------------
 

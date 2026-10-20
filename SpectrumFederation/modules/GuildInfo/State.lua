@@ -233,21 +233,78 @@ local function RememberCharacter(characters, guid, nameRealm, classFile)
 end
 
 --- Derive mains/alts from membership + group records.
+--- Canonical live group among several that claim the same designated main.
+-- Prefer the main's durable membership group when it is a claimant; otherwise
+-- highest group version (CompareVer), with gid sort as the stable seed order.
+local function PickCanonicalClaimGroup(record, mainGuid, claimantGids)
+    local mainMem = record.members and record.members[mainGuid]
+    if mainMem and type(mainMem.groupId) == "string" and mainMem.groupId ~= "" then
+        for i = 1, #claimantGids do
+            if claimantGids[i] == mainMem.groupId then
+                return mainMem.groupId
+            end
+        end
+    end
+    local winner = claimantGids[1]
+    for i = 2, #claimantGids do
+        local gid = claimantGids[i]
+        if GI.CompareVer(record.groups[gid].ver, record.groups[winner].ver) > 0 then
+            winner = gid
+        end
+    end
+    return winner
+end
+
+--- Build derived display graph. Concurrent groups that claim the same main are
+-- absorbed into one canonical view without rewriting durable membership/group
+-- versions (no BeatVers / dissolve). Loser shells stay stored until genuine
+-- user edits move their members away.
 local function RebuildDerived(record)
     local graph = EmptyGraph()
     local members = record.members or {}
     local groups = record.groups or {}
 
-    -- Collect live members per groupId.
+    -- Deterministic absorb map: loser live groupId → canonical live groupId
+    -- when multiple live groups claim the same mainGuid.
+    local absorbTo = {}
+    local mainsClaimed = {}
+    for _, g in pairs(groups) do
+        if type(g) == "table" and not g.dissolved and ValidGuid(g.mainGuid) then
+            mainsClaimed[g.mainGuid] = true
+        end
+    end
+    for mainGuid in pairs(mainsClaimed) do
+        local gids = {}
+        for gid, g in pairs(groups) do
+            if type(g) == "table" and not g.dissolved and g.mainGuid == mainGuid then
+                gids[#gids + 1] = gid
+            end
+        end
+        table.sort(gids)
+        if #gids > 1 then
+            local canon = PickCanonicalClaimGroup(record, mainGuid, gids)
+            for i = 1, #gids do
+                if gids[i] ~= canon then
+                    absorbTo[gids[i]] = canon
+                end
+            end
+        end
+    end
+
+    -- Collect members per effective (post-absorb) groupId.
     local byGroup = {}
     for guid, m in pairs(members) do
         if type(m) == "table" and ValidGuid(guid) then
             local gid = m.groupId
             if type(gid) == "string" and gid ~= "" then
-                local g = groups[gid]
-                if type(g) == "table" and not g.dissolved then
-                    byGroup[gid] = byGroup[gid] or {}
-                    byGroup[gid][#byGroup[gid] + 1] = guid
+                local src = groups[gid]
+                if type(src) == "table" and not src.dissolved then
+                    local effective = absorbTo[gid] or gid
+                    local g = groups[effective]
+                    if type(g) == "table" and not g.dissolved then
+                        byGroup[effective] = byGroup[effective] or {}
+                        byGroup[effective][#byGroup[effective] + 1] = guid
+                    end
                 end
             end
         end
@@ -260,11 +317,12 @@ local function RebuildDerived(record)
         local mainMovedAway = false
         if type(g.mainGuid) == "string" then
             local mm = members[g.mainGuid]
-            if mm and mm.groupId == gid then
+            local mmGid = mm and mm.groupId
+            local mmEffective = (type(mmGid) == "string" and mmGid ~= "") and (absorbTo[mmGid] or mmGid) or nil
+            if mm and mmEffective == gid then
                 mainGuid = g.mainGuid
-            elseif mm and type(mm.groupId) == "string" and mm.groupId ~= "" and mm.groupId ~= gid then
-                -- Designated main lives in another live group: do not invent a
-                -- fallback main from orphaned alts (concurrent group birth).
+            elseif mm and type(mmGid) == "string" and mmGid ~= "" and mmEffective ~= gid then
+                -- Designated main lives in another non-absorbed live group.
                 mainMovedAway = true
             end
         end
@@ -283,7 +341,6 @@ local function RebuildDerived(record)
                     graph.byGuid[guid] = { role = "alt", mainGuid = mainGuid, groupId = gid }
                 end
             end
-            -- Keep groups that still have at least the main (solo main hidden in UI via display rows).
             graph.mains[mainGuid] = {
                 mainGuid = mainGuid,
                 groupId = gid,
@@ -766,9 +823,10 @@ function GI.ReclaimUnreferencedDissolved(record)
     return removed, victims
 end
 
---- Ensure room for one new group id by reclaiming unreferenced slots.
--- Prefers dissolved tombstones; may also drop live groups with zero members
--- (empty shells from out-of-order Gossip) when still at capacity.
+--- Ensure room for one new group id by reclaiming unreferenced dissolved slots.
+-- Never deletes live empty shells: group-first Gossip can admit a shell before
+-- its memberships arrive; discarding it loses the incomplete relationship.
+-- Fail closed with groups_overflow when only live groups fill the cap.
 function GI.EnsureGroupCapacity(record)
     if type(record) ~= "table" then
         return false, "not_ready"
@@ -780,158 +838,17 @@ function GI.EnsureGroupCapacity(record)
     if CountKeys(record.groups) < GI.MAX_GROUPS then
         return true
     end
-    local emptyLive = {}
-    for gid, g in pairs(record.groups or {}) do
-        if GroupIsLive(g) and not GroupIsReferenced(record, gid) then
-            emptyLive[#emptyLive + 1] = gid
-        end
-    end
-    for i = 1, #emptyLive do
-        record.groups[emptyLive[i]] = nil
-        if CountKeys(record.groups) < GI.MAX_GROUPS then
-            RebuildDerived(record)
-            return true
-        end
-    end
-    if #emptyLive > 0 then
-        RebuildDerived(record)
-    end
-    if CountKeys(record.groups) < GI.MAX_GROUPS then
-        return true
-    end
     return false, "groups_overflow"
 end
 
-local reconciling = false
-
-local function LiveGroupsClaimingMain(record, mainGuid)
-    local gids = {}
-    for gid, g in pairs(record.groups or {}) do
-        if GroupIsLive(g) and g.mainGuid == mainGuid then
-            gids[#gids + 1] = gid
-        end
-    end
-    table.sort(gids)
-    return gids
-end
-
---- Absorb concurrent first-assign splits for the same designated main.
--- Runs after membership merges only (never on bare group admission) so an
--- empty newly-created group is not dissolved before its members arrive.
--- Winner: main's current groupId if it claims that main; else highest group ver.
--- Does not merge unrelated established groups with different mainGuids.
+--- Legacy entry point kept for callers/tests. Concurrent same-main groups are
+-- resolved only in RebuildDerived (derived-view absorption). Never invents
+-- membership/group versions or dissolves loser shells.
 local function ReconcileSplitMains(record)
-    if reconciling or type(record) ~= "table" then
-        return false
-    end
-    reconciling = true
-    local changed = false
-
-    local mains = {}
-    for gid, g in pairs(record.groups or {}) do
-        if GroupIsLive(g) and ValidGuid(g.mainGuid) then
-            mains[g.mainGuid] = true
-        end
-    end
-
-    for mainGuid in pairs(mains) do
-        local gids = LiveGroupsClaimingMain(record, mainGuid)
-        if #gids > 1 then
-            -- Only reconcile when at least two claimed groups have members.
-            local populated = 0
-            for i = 1, #gids do
-                if GroupIsReferenced(record, gids[i]) then
-                    populated = populated + 1
-                end
-            end
-            if populated >= 2 then
-                local mainMem = record.members[mainGuid]
-                local winner = nil
-                if mainMem and type(mainMem.groupId) == "string" then
-                    for i = 1, #gids do
-                        if gids[i] == mainMem.groupId then
-                            winner = gids[i]
-                            break
-                        end
-                    end
-                end
-                if not winner then
-                    winner = gids[1]
-                    for i = 2, #gids do
-                        if GI.CompareVer(record.groups[gids[i]].ver, record.groups[winner].ver) > 0 then
-                            winner = gids[i]
-                        end
-                    end
-                end
-
-                if not mainMem or mainMem.groupId ~= winner then
-                    local beat = BeatVers(
-                        mainMem and mainMem.ver,
-                        record.groups[winner] and record.groups[winner].ver
-                    )
-                    StoreMemberDirect(
-                        record,
-                        mainGuid,
-                        winner,
-                        beat,
-                        Now(),
-                        mainMem and mainMem.nameRealm,
-                        mainMem and mainMem.classFile
-                    )
-                    changed = true
-                    mainMem = record.members[mainGuid]
-                end
-
-                for i = 1, #gids do
-                    local gid = gids[i]
-                    if gid ~= winner then
-                        local moveGuids = {}
-                        for guid, m in pairs(record.members) do
-                            if m.groupId == gid then
-                                moveGuids[#moveGuids + 1] = guid
-                            end
-                        end
-                        for j = 1, #moveGuids do
-                            local guid = moveGuids[j]
-                            if guid ~= mainGuid then
-                                local m = record.members[guid]
-                                local beat = BeatVers(
-                                    m and m.ver,
-                                    record.groups[gid] and record.groups[gid].ver,
-                                    record.groups[winner] and record.groups[winner].ver,
-                                    mainMem and mainMem.ver
-                                )
-                                StoreMemberDirect(
-                                    record,
-                                    guid,
-                                    winner,
-                                    beat,
-                                    Now(),
-                                    m and m.nameRealm,
-                                    m and m.classFile
-                                )
-                                changed = true
-                            end
-                        end
-                        local oldG = record.groups[gid]
-                        if oldG and not oldG.dissolved then
-                            local dVer = BeatVers(oldG.ver, mainMem and mainMem.ver)
-                            StoreGroupDirect(record, gid, nil, dVer, Now(), true)
-                            changed = true
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- Do not dissolve unreferenced live groups here: empty group shells from
-    -- out-of-order Gossip must survive until their memberships arrive.
-    if changed then
+    if type(record) == "table" then
         RebuildDerived(record)
     end
-    reconciling = false
-    return changed
+    return false
 end
 
 function GI.ReconcileSplitMains(record)
@@ -1035,6 +952,26 @@ local function CountAltsInGroup(record, groupId)
     return math.max(0, n - 1)
 end
 
+--- True when a live group has no durable alts left (empty or solo designated main).
+-- A loser concurrent shell that still holds only alts (main lives elsewhere) must
+-- NOT dissolve — those alts remain authoritative until a genuine edit moves them.
+local function GroupHasNoDurableAlts(record, groupId)
+    local g = record.groups and record.groups[groupId]
+    if type(g) ~= "table" or g.dissolved then
+        return false
+    end
+    local any = false
+    for guid, m in pairs(record.members or {}) do
+        if m.groupId == groupId then
+            any = true
+            if guid ~= g.mainGuid then
+                return false
+            end
+        end
+    end
+    return true -- empty or solo main only
+end
+
 local function FindGroupIdForMain(record, mainGuid)
     local info = record.graph and record.graph.byGuid and record.graph.byGuid[mainGuid]
     if info and info.role == "main" and type(info.groupId) == "string" then
@@ -1114,6 +1051,8 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
     local altMem = record.members[altGuid]
     local mainInfo = record.graph.byGuid and record.graph.byGuid[mainGuid]
     local altInfo = record.graph.byGuid and record.graph.byGuid[altGuid]
+    -- Durable home before mutation (derived groupId may differ under absorb).
+    local durablePrevGid = altMem and type(altMem.groupId) == "string" and altMem.groupId or nil
 
     -- Hierarchy gates (local).
     if altInfo and altInfo.role == "main" then
@@ -1174,11 +1113,12 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
             return "rejected", st
         end
     else
-        if CountAltsInGroup(record, targetGroupId) >= GI.MAX_ALTS_PER_MAIN then
+        local derivedAlts = record.graph.mains and record.graph.mains[mainGuid]
+        local altCount = derivedAlts and #(derivedAlts.altGuids or {}) or CountAltsInGroup(record, targetGroupId)
+        if altCount >= GI.MAX_ALTS_PER_MAIN then
             -- Moving within same group doesn't add; moving in from outside does.
             if not (altInfo and altInfo.groupId == targetGroupId) then
                 if not (altInfo and altInfo.role == "alt" and altInfo.mainGuid == mainGuid) then
-                    -- count current alts; if alt already in group as something else
                     local already = altMem and altMem.groupId == targetGroupId
                     if not already then
                         return "rejected", "group_full"
@@ -1225,19 +1165,11 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         return "rejected", stAlt
     end
 
-    -- Dissolve previous group when the move leaves it with no alts.
-    if altInfo and type(altInfo.groupId) == "string" and altInfo.groupId ~= targetGroupId then
+    -- Dissolve previous durable home when the move leaves it with no alts.
+    if durablePrevGid and durablePrevGid ~= targetGroupId then
         RebuildDerived(record)
-        local oldGid = altInfo.groupId
-        local ginfo = nil
-        for _, g in pairs(record.graph.mains or {}) do
-            if g.groupId == oldGid then
-                ginfo = g
-                break
-            end
-        end
-        if not ginfo or #(ginfo.altGuids or {}) == 0 then
-            DissolveEmptyGroup(record, oldGid)
+        if GroupHasNoDurableAlts(record, durablePrevGid) then
+            DissolveEmptyGroup(record, durablePrevGid)
         end
     end
 
@@ -1269,7 +1201,8 @@ function GI:ApplyUnassign(altGuid, opts)
     if not ver then
         return "rejected", vErr
     end
-    local oldGid = info.groupId
+    -- Prefer durable membership home; derived absorb groupId may differ.
+    local oldGid = (mem and type(mem.groupId) == "string" and mem.groupId) or info.groupId
     local st = GI.MergeMember(record, {
         guid = altGuid,
         groupId = GI.UNASSIGNED,
@@ -1284,15 +1217,7 @@ function GI:ApplyUnassign(altGuid, opts)
 
     if type(oldGid) == "string" then
         RebuildDerived(record)
-        local ginfo = nil
-        for _, g in pairs(record.graph.mains or {}) do
-            if g.groupId == oldGid then
-                ginfo = g
-                break
-            end
-        end
-        -- Dissolve when the group has no remaining alts (solo main is not a displayed relationship).
-        if not ginfo or #(ginfo.altGuids or {}) == 0 then
+        if GroupHasNoDurableAlts(record, oldGid) then
             DissolveEmptyGroup(record, oldGid)
         end
     end

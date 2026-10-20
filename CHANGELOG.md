@@ -7,6 +7,9 @@ All notable changes to SpectrumFederation will be documented in this file.
 ### Added
 - Guild Info: guild-wide Main/Alt Assignments (#402) — versioned current-state membership/group records (no append-only op log)
 
+### Fixed
+- Guild Info: concurrent same-main groups use derived-view absorption (no synthetic versions / loser dissolve) so genuine offline moves and late member records survive (#402)
+
 ## [1.5.12-beta.15] - 2026-10-20
 
 ### Changed
