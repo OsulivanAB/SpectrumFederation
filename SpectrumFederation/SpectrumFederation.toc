@@ -1,7 +1,7 @@
 ## Interface: 120105
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 1.5.11
+## Version: 1.5.12-beta.15
 ## Notes: Loot profile management and helper tools for guild coordination. Create and manage raid loot profiles, track distributions, and coordinate gear allocation across your guild.
 ## IconTexture: Interface\AddOns\SpectrumFederation\media\Icons\SpectrumFederationIconV2
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
@@ -69,6 +69,24 @@ modules/LootHelperSync/17_DebugSlash.lua
 modules/LootHelperSync/18_PublicAPI.lua
 modules/LootHelperSync/19_Consumables.lua
 modules/LootHelper/Comm.lua
+modules/GuildGossip/01_Constants.lua
+modules/GuildGossip/02_Util.lua
+modules/GuildGossip/03_Codec.lua
+modules/GuildGossip/04_ReceiveGuard.lua
+modules/GuildGossip/05_GuildAdapter.lua
+modules/GuildGossip/06_Scheduler.lua
+modules/GuildGossip/07_Index.lua
+modules/GuildGossip/08_Providers.lua
+modules/GuildGossip/09_Engine.lua
+modules/GuildGossip/10_PublicAPI.lua
+modules/GuildSupplies/State.lua
+modules/GuildSupplies/Authority.lua
+modules/GuildSupplies/Operations.lua
+modules/GuildSupplies/Campaigns.lua
+modules/GuildSupplies/Activation.lua
+modules/GuildSupplies/Ledger.lua
+modules/GuildSupplies/Admission.lua
+modules/GuildSupplies/Gossip.lua
 modules/RaidEquipment/Policy.lua
 modules/RaidEquipment/CheckRun.lua
 modules/RaidCheck.lua
@@ -103,6 +121,8 @@ modules/UI/Settings/Pages/NicheFeatures.lua
 modules/UI/Settings/Pages/LootHelper.lua
 modules/UI/Settings/Pages/Consumables.lua
 modules/UI/Settings/Pages/RaidConsumableLogs.lua
+modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua
+modules/UI/Settings/Pages/GuildSuppliesLogs.lua
 modules/UI/Settings/Pages/RaidEquipment.lua
 modules/UI/Settings/Pages/LootLogs.lua
 modules/UI/Settings/Pages/Debugging.lua

@@ -2,6 +2,10 @@
 -- admin manual adjustments, and admin review.
 local _, SF = ...
 
+local function ActiveProfile()
+	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
+end
+
 local Page = {
 	id = "lootHelperConsumableLogs",
 	parentId = "lootHelper",
@@ -9,6 +13,14 @@ local Page = {
 	navLabel = "Consumable Logs",
 	description = "Review raid-supply Guild Bank donations, pending verification, manual adjustments, and configuration clears.",
 	order = 23.7,
+	-- Retire from navigation when the *active profile's* guild is live (#389).
+	available = function()
+		local C = SF.Consumables
+		if C and C.LegacyWritersAllowed then
+			return C.LegacyWritersAllowed(ActiveProfile())
+		end
+		return true
+	end,
 }
 
 local function Loc(key, default)
@@ -51,10 +63,6 @@ local adjustQuantityText = ""
 local guildClassByKey = nil
 local guildRosterFrame = nil
 local EnsureGuildRosterListener
-
-local function ActiveProfile()
-	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
-end
 
 local function InvalidateGuildClassIndex()
 	guildClassByKey = nil

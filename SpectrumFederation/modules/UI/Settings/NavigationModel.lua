@@ -176,6 +176,25 @@ function Model.IsCategoryEnabled(category)
     return category.enabled and true or false
 end
 
+--- Optional page.available (boolean or function) hides retired pages from tabs/search.
+function Model.IsPageAvailable(page)
+    if type(page) ~= "table" then
+        return false
+    end
+    local available = page.available
+    if available == nil then
+        return true
+    end
+    if type(available) == "function" then
+        local ok, result = pcall(available, page)
+        if not ok then
+            return false
+        end
+        return result and true or false
+    end
+    return available and true or false
+end
+
 function Model.IsCategorySelectable(category)
     if type(category) ~= "table" then
         return false
@@ -214,7 +233,7 @@ function Model.GetContentPages(registry, categoryId)
     end
 
     for _, page in ipairs(matching) do
-        if page.id ~= categoryId or not hasNonRoot then
+        if (page.id ~= categoryId or not hasNonRoot) and Model.IsPageAvailable(page) then
             table.insert(result, page)
         end
     end
@@ -323,6 +342,20 @@ function Model.ResolveShowPage(registry, session, id)
         return CopySelection(categoryId, Model.GetDefaultPageId(registry, categoryId), true)
     end
 
+    -- Known page that is not currently selectable content (retired / unavailable):
+    -- open the category default instead of resurrecting a stale session selection.
+    if page then
+        local categoryId = PageCategoryId(page)
+        local targetCategory = Model.GetCategory(registry, categoryId)
+        if Model.IsCategorySelectable(targetCategory) then
+            return CopySelection(categoryId, Model.GetDefaultPageId(registry, categoryId), true)
+        end
+        if id ~= "general" then
+            return Model.ResolveShowPage(registry, session, "general")
+        end
+        return CurrentSelection(session)
+    end
+
     if session.currentCategoryId then
         return CurrentSelection(session)
     end
@@ -338,7 +371,14 @@ function Model.ResolveSidebarSelect(registry, session, categoryId)
     session = session or {}
     local category = Model.GetCategory(registry, categoryId)
     if not Model.IsCategorySelectable(category) then
-        return CurrentSelection(session)
+        -- Do not keep a retired/unavailable page pinned when the category is
+        -- gone or disabled; callers that need a different category (e.g.
+        -- SettingsWindow:HandleRegistryChanged) resolve general themselves.
+        local selection = CurrentSelection(session)
+        if selection.pageId and not Model.IsContentPage(registry, selection.pageId) then
+            return CopySelection(selection.categoryId, nil, true)
+        end
+        return selection
     end
 
     local lastPageId = session.lastPageByCategory and session.lastPageByCategory[categoryId]
@@ -428,7 +468,7 @@ function Model.Search(registry, query)
     local matchedCategoryIds = {}
 
     for _, page in ipairs(Model.GetPages(registry)) do
-        if Model.IsContentPage(registry, page.id) then
+        if Model.IsContentPage(registry, page.id) and Model.IsPageAvailable(page) then
             local rank = Model.RankMatch(page, query)
             if rank then
                 local categoryId = PageCategoryId(page)
