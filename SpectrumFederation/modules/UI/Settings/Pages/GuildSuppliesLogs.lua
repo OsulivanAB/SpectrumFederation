@@ -301,6 +301,51 @@ local function HistoryHelpText()
 		:format(HISTORY_PAGE_SIZE)
 end
 
+local function DisabledLogsMembershipTip()
+	return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
+		"Join a guild with a verified membership to inspect Guild Supplies logs.")
+end
+
+local function DisabledCampaignSelectTip()
+	if not Caps().canRead then
+		return DisabledLogsMembershipTip()
+	end
+	if #CampaignOptions() > 0 then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_LOGS_NO_CAMPAIGNS",
+		"No campaigns are available to inspect yet.")
+end
+
+local function DisabledLogsListTip()
+	if Caps().canRead then
+		return nil
+	end
+	return DisabledLogsMembershipTip()
+end
+
+local function DisabledHistoryNewerTip()
+	if not Caps().canRead then
+		return DisabledLogsMembershipTip()
+	end
+	if historyOffset > 0 then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_HISTORY_FIRST",
+		"You're already on the first page.")
+end
+
+local function DisabledHistoryOlderTip()
+	if not Caps().canRead then
+		return DisabledLogsMembershipTip()
+	end
+	if historyOffset + HISTORY_PAGE_SIZE < (Page.historyTotal or 0) then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_HISTORY_LAST",
+		"You're already on the last page.")
+end
+
 local function Definition()
 	return {
 		sections = {
@@ -332,6 +377,7 @@ local function Definition()
 						enabled = function()
 							return Caps().canRead and #CampaignOptions() > 0
 						end,
+						getDisabledTooltip = DisabledCampaignSelectTip,
 						onValueChanged = function(ctx)
 							historyOffset = 0
 							cachedHistoryItems = nil
@@ -377,6 +423,7 @@ local function Definition()
 						enabled = function()
 							return Caps().canRead
 						end,
+						getDisabledTooltip = DisabledLogsListTip,
 					},
 					{
 						type = "help",
@@ -440,6 +487,7 @@ local function Definition()
 						enabled = function()
 							return Caps().canRead
 						end,
+						getDisabledTooltip = DisabledLogsListTip,
 					},
 					{
 						type = "help",
@@ -460,6 +508,7 @@ local function Definition()
 						enabled = function()
 							return Caps().canRead
 						end,
+						getDisabledTooltip = DisabledLogsListTip,
 					},
 					{
 						type = "button",
@@ -470,6 +519,7 @@ local function Definition()
 							-- Page.historyTotal is synced in Page:Refresh before control refresh.
 							return Caps().canRead and historyOffset > 0
 						end,
+						getDisabledTooltip = DisabledHistoryNewerTip,
 						onClick = function()
 							ShiftHistory(-1)
 						end,
@@ -483,6 +533,7 @@ local function Definition()
 							return Caps().canRead
 								and historyOffset + HISTORY_PAGE_SIZE < (Page.historyTotal or 0)
 						end,
+						getDisabledTooltip = DisabledHistoryOlderTip,
 						onClick = function()
 							ShiftHistory(1)
 						end,

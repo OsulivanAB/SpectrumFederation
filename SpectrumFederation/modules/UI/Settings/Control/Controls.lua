@@ -117,6 +117,143 @@ local function HasAdminOnlyItems(items)
 	return false
 end
 
+-- Resolve a stable tooltip title for a control definition.
+local function ResolveTooltipTitle(opts)
+	opts = opts or {}
+	local title = opts.buttonText or opts.label or opts.defaultText or ""
+	if type(title) == "function" then
+		local ok, res = pcall(title)
+		if ok and type(res) == "string" then
+			return res
+		end
+		return opts.label or ""
+	end
+	return tostring(title)
+end
+
+-- Disabled WoW widgets often swallow mouse enter without firing scripts.
+-- A transparent overlay covers the widget only while it is disabled so the
+-- explanatory tooltip still appears; the overlay never enables the action.
+-- @param widget Region Interactive control widget
+-- @param enabled boolean Current enabled state after EvalEnabled
+-- @param opts table Control options (may include getDisabledTooltip)
+-- @return nil
+local function SyncDisabledTooltipOverlay(widget, enabled, opts)
+	if not widget then
+		return
+	end
+	opts = opts or {}
+	local getDisabled = opts.getDisabledTooltip
+	local overlay = widget.__sfDisabledTipOverlay
+
+	if type(getDisabled) ~= "function" then
+		if overlay then
+			local wasCatching = overlay.__sfMouseCatching
+			overlay.__sfMouseCatching = false
+			if overlay.EnableMouse then
+				overlay:EnableMouse(false)
+			end
+			if overlay.Hide then
+				overlay:Hide()
+			end
+			if wasCatching and GameTooltip and GameTooltip.Hide then
+				GameTooltip:Hide()
+			end
+		end
+		return
+	end
+
+	if not overlay then
+		local parent = (widget.GetParent and widget:GetParent()) or widget
+		overlay = CreateFrame("Frame", nil, parent)
+		local baseLevel = (widget.GetFrameLevel and widget:GetFrameLevel()) or 0
+		if overlay.SetFrameLevel then
+			overlay:SetFrameLevel(baseLevel + 5)
+		end
+		if overlay.SetAllPoints then
+			overlay:SetAllPoints(widget)
+		end
+		if overlay.EnableMouse then
+			overlay:EnableMouse(false)
+		end
+		if overlay.Hide then
+			overlay:Hide()
+		end
+		overlay.__sfMouseCatching = false
+		overlay:SetScript("OnEnter", function(self)
+			local fn = self.__sfGetDisabledTooltip
+			local text = type(fn) == "function" and fn() or nil
+			if type(text) ~= "string" or text == "" then
+				return
+			end
+			if not GameTooltip then
+				return
+			end
+			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			GameTooltip:SetText(
+				FormatTooltipTitle(self.__sfTipTitle, self.__sfAdminOnly, self.__sfOwnerOnly),
+				1, 1, 1)
+			GameTooltip:AddLine(text, nil, nil, nil, true)
+			GameTooltip:Show()
+		end)
+		overlay:SetScript("OnLeave", function()
+			if GameTooltip and GameTooltip.Hide then
+				GameTooltip:Hide()
+			end
+		end)
+		widget.__sfDisabledTipOverlay = overlay
+	end
+
+	overlay.__sfGetDisabledTooltip = getDisabled
+	overlay.__sfTipTitle = ResolveTooltipTitle(opts)
+	overlay.__sfAdminOnly = opts.adminOnly and true or false
+	overlay.__sfOwnerOnly = opts.ownerOnly and true or false
+
+	if enabled then
+		local wasCatching = overlay.__sfMouseCatching
+		overlay.__sfMouseCatching = false
+		if overlay.EnableMouse then
+			overlay:EnableMouse(false)
+		end
+		if overlay.Hide then
+			overlay:Hide()
+		end
+		if wasCatching and GameTooltip and GameTooltip.Hide then
+			GameTooltip:Hide()
+		end
+		return
+	end
+
+	-- Decide whether a tip is available before intercepting the mouse.
+	local text = getDisabled()
+	if type(text) ~= "string" or text == "" then
+		local wasCatching = overlay.__sfMouseCatching
+		overlay.__sfMouseCatching = false
+		if overlay.EnableMouse then
+			overlay:EnableMouse(false)
+		end
+		if overlay.Hide then
+			overlay:Hide()
+		end
+		if wasCatching and GameTooltip and GameTooltip.Hide then
+			GameTooltip:Hide()
+		end
+		return
+	end
+
+	if overlay.ClearAllPoints and overlay.SetAllPoints then
+		overlay:ClearAllPoints()
+		overlay:SetAllPoints(widget)
+	end
+	if overlay.Show then
+		overlay:Show()
+	end
+	if overlay.EnableMouse then
+		overlay:EnableMouse(true)
+	end
+	overlay.__sfMouseCatching = true
+end
+
 -- Apply visibility/enabled state to a row and its widgets
 -- @param row Frame Row frame to update
 -- @param section table Section containing the row
@@ -150,6 +287,9 @@ function Controls:_ApplyRowState(row, section, opts, widgets)
 				elseif w.EnableMouse then
 					w:EnableMouse(enabled)
 				end
+				-- Optional disabled-state tip: overlay catches hover without
+				-- enabling the widget. No-op when getDisabledTooltip is absent.
+				SyncDisabledTooltipOverlay(w, enabled, opts)
 			end
 		end
 	end

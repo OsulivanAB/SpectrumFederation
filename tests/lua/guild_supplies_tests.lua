@@ -4693,7 +4693,17 @@ do
             self.hooks[event] = self.hooks[event] or {}
             self.hooks[event][#self.hooks[event] + 1] = fn
         end
-        function region:EnableMouse() end
+        region.mouseEnabled = true
+        function region:EnableMouse(v)
+            if v == nil then
+                self.mouseEnabled = true
+                return
+            end
+            self.mouseEnabled = v and true or false
+        end
+        function region:IsMouseEnabled()
+            return self.mouseEnabled and true or false
+        end
         function region:SetHitRectInsets() end
         function region:Enable() self.enabled = true end
         function region:Disable() self.enabled = false end
@@ -4777,6 +4787,7 @@ do
         function region:GetParent() return self.parent end
         function region:SetFrameStrata() end
         function region:SetFrameLevel() end
+        function region:GetFrameLevel() return self.frameLevel or 0 end
         function region:SetClipsChildren() end
         function region:EnableDrawLayer() end
         function region:DisableDrawLayer() end
@@ -5370,7 +5381,17 @@ do
             self.hooks[event] = self.hooks[event] or {}
             self.hooks[event][#self.hooks[event] + 1] = fn
         end
-        function region:EnableMouse() end
+        region.mouseEnabled = true
+        function region:EnableMouse(v)
+            if v == nil then
+                self.mouseEnabled = true
+                return
+            end
+            self.mouseEnabled = v and true or false
+        end
+        function region:IsMouseEnabled()
+            return self.mouseEnabled and true or false
+        end
         function region:SetHitRectInsets() end
         function region:Enable() self.enabled = true end
         function region:Disable() self.enabled = false end
@@ -5444,7 +5465,8 @@ do
         function region:SetParent(p) self.parent = p end
         function region:GetParent() return self.parent end
         function region:SetFrameStrata() end
-        function region:SetFrameLevel() end
+        function region:SetFrameLevel(level) self.frameLevel = tonumber(level) or 0 end
+        function region:GetFrameLevel() return self.frameLevel or 0 end
         function region:SetClipsChildren() end
         function region:EnableDrawLayer() end
         function region:DisableDrawLayer() end
@@ -6561,6 +6583,379 @@ do
     GetNumGuildBankTransactions = nil
     GetGuildBankTransaction = nil
     GS._BankContextReadinessProbe = nil
+
+    -----------------------------------------------------------------------
+    -- Disabled-control explanatory tooltips (Configuration + Logs)
+    -- Nested function keeps locals under Lua 5.1's 200-local main limit.
+    -----------------------------------------------------------------------
+    local function runDisabledTooltipTests()
+    local tipLog = { owner = nil, title = nil, lines = {}, shown = false }
+    local realTooltip = GameTooltip
+    GameTooltip = {
+        Hide = function()
+            tipLog.shown = false
+            tipLog.owner = nil
+            tipLog.title = nil
+            tipLog.lines = {}
+        end,
+        SetOwner = function(_, owner)
+            tipLog.owner = owner
+        end,
+        SetText = function(_, title)
+            tipLog.title = title
+            tipLog.lines = {}
+        end,
+        AddLine = function(_, text)
+            tipLog.lines[#tipLog.lines + 1] = text
+        end,
+        Show = function()
+            tipLog.shown = true
+        end,
+    }
+
+    local function findDefItem(panel, pred)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if pred(item) then
+                    return item
+                end
+            end
+        end
+        return nil
+    end
+
+    local function findButtonByText(node, needle, out)
+        if node.kind == "Button" and node.text and tostring(node.text):find(needle, 1, true) then
+            out[#out + 1] = node
+        end
+        for _, child in ipairs(node.children or {}) do
+            findButtonByText(child, needle, out)
+        end
+    end
+
+    local function fireEnter(region)
+        local script = region.scripts and region.scripts.OnEnter
+        if script then
+            script(region)
+        end
+    end
+
+    local function fireLeave(region)
+        local script = region.scripts and region.scripts.OnLeave
+        if script then
+            script(region)
+        end
+    end
+
+    -- Fresh not-configured: Initialize tip distinguishes already-init vs need-rank.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    settleRoster()
+    local tipPanel = makeRegion("Frame", "GSDisabledTipPanel", nil)
+    tipPanel:SetSize(600, 900)
+    configPage:Build(tipPanel)
+    local initItem = findDefItem(tipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Initialize", 1, true)
+    end)
+    assertTrue(initItem and type(initItem.getDisabledTooltip) == "function",
+        "disabled tip: Initialize exposes getDisabledTooltip")
+    assertEq(initItem.enabled and initItem.enabled(), true,
+        "disabled tip: ordinary Initialize enabled")
+    assertNil(initItem.getDisabledTooltip(),
+        "disabled tip: Initialize tip nil while enabled")
+
+    local activateItem = findDefItem(tipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Activate", 1, true)
+    end)
+    assertTrue(activateItem and type(activateItem.getDisabledTooltip) == "function",
+        "disabled tip: Activate exposes getDisabledTooltip")
+    assertEq(activateItem.enabled and activateItem.enabled(), false,
+        "disabled tip: Activate disabled before campaign")
+    local actTip = activateItem.getDisabledTooltip()
+    assertTrue(type(actTip) == "string" and actTip:find("Initialize", 1, true),
+        "disabled tip: Activate asks for Initialize when not configured got=" .. tostring(actTip))
+    assertTrue(not actTip:find("Guild Bank", 1, true),
+        "disabled tip: Activate does not require open bank before init/campaign")
+
+    local bankItem = findDefItem(tipPanel, function(item)
+        return item.type == "editbox" and item.label
+            and tostring(item.label):find("Bank Tab", 1, true)
+    end)
+    assertTrue(bankItem and type(bankItem.getDisabledTooltip) == "function",
+        "disabled tip: Bank Tab exposes getDisabledTooltip")
+    local bankTip = bankItem.getDisabledTooltip()
+    assertTrue(type(bankTip) == "string" and bankTip:find("Initialize", 1, true),
+        "disabled tip: Bank Tab needs init got=" .. tostring(bankTip))
+    assertTrue(not bankTip:find("Guild Bank", 1, true),
+        "disabled tip: Bank Tab tip must not require opening the Guild Bank")
+
+    -- Overlay hover on a disabled Activate button shows the tip without enabling.
+    local activateBtns = {}
+    findButtonByText(tipPanel, "Activate", activateBtns)
+    assertTrue(#activateBtns >= 1, "disabled tip: Activate button widget present")
+    local actBtn = activateBtns[1]
+    assertEq(actBtn.enabled, false, "disabled tip: Activate widget remains disabled")
+    configPage:Refresh(tipPanel)
+    findButtonByText(tipPanel, "Activate", activateBtns)
+    actBtn = activateBtns[#activateBtns] or actBtn
+    local overlay = actBtn.__sfDisabledTipOverlay
+    assertTrue(overlay ~= nil, "disabled tip: overlay created for disabled Activate")
+    assertEq(overlay.__sfMouseCatching, true, "disabled tip: overlay catches mouse while disabled")
+    assertEq(overlay.mouseEnabled, true, "disabled tip: overlay EnableMouse(true) while disabled")
+    tipLog.shown = false
+    fireEnter(overlay)
+    assertEq(tipLog.shown, true, "disabled tip: hover shows GameTooltip")
+    assertTrue(type(tipLog.lines[1]) == "string" and tipLog.lines[1]:find("Initialize", 1, true),
+        "disabled tip: hover body matches Activate tip got=" .. tostring(tipLog.lines[1]))
+    fireLeave(overlay)
+    assertEq(tipLog.shown, false, "disabled tip: leave hides GameTooltip")
+    -- Overlay must not make the button clickable.
+    actBtn:Click()
+    assertNil(select(1, GS:GetCurrentRecord()),
+        "disabled tip: clicking disabled Activate does nothing")
+
+    -- After Initialize + campaign without bank tab: tip updates to bank-tab guidance.
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "disabled tip: initialize for activate tips")
+    startCampaign()
+    configPage:Refresh(tipPanel)
+    activateItem = findDefItem(tipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Activate", 1, true)
+    end)
+    actTip = activateItem.getDisabledTooltip()
+    assertTrue(type(actTip) == "string"
+            and (actTip:find("bank tab", 1, true) or actTip:find("Bank tab", 1, true)
+                or actTip:find("Guild Bank tab", 1, true)),
+        "disabled tip: Activate asks for bank tab after campaign got=" .. tostring(actTip))
+    assertTrue(actTip:find("do not require the bank to be open", 1, true)
+            or actTip:find("Configure a Guild Bank tab", 1, true),
+        "disabled tip: bank-tab guidance keeps campaign/init bank-open free got=" .. tostring(actTip))
+
+    -- Unauthorized member: permission tip takes priority; no guild config leakage.
+    local priorMembersTip = world.guild.members
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 5 },
+    }
+    settleRoster()
+    configPage:Refresh(tipPanel)
+    activateItem = findDefItem(tipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Activate", 1, true)
+    end)
+    actTip = activateItem.getDisabledTooltip()
+    assertTrue(type(actTip) == "string" and actTip:find("rank does not permit", 1, true),
+        "disabled tip: unauthorized Activate tip got=" .. tostring(actTip))
+    assertTrue(not actTip:find("bank tab", 1, true) and not actTip:find("campaign", 1, true),
+        "disabled tip: unauthorized tip does not leak config prerequisites")
+    local itemsItem = findDefItem(tipPanel, function(item)
+        return item.type == "editboxButton" and item.label
+            and tostring(item.label):find("Add item", 1, true)
+    end)
+    local itemsTip = itemsItem.getDisabledTooltip()
+    assertTrue(type(itemsTip) == "string" and itemsTip:find("rank does not permit", 1, true),
+        "disabled tip: unauthorized items tip got=" .. tostring(itemsTip))
+    world.guild.members = priorMembersTip
+    settleRoster()
+
+    -- Adoption / conflict tips when no sources / no conflicts.
+    configPage:Refresh(tipPanel)
+    local adoptSource = findDefItem(tipPanel, function(item)
+        return item.type == "dropdown" and item.label
+            and tostring(item.label):find("Source dataset", 1, true)
+    end)
+    local adoptTip = adoptSource.getDisabledTooltip()
+    assertTrue(type(adoptTip) == "string" and adoptTip:find("No eligible peer", 1, true),
+        "disabled tip: adoption source empty got=" .. tostring(adoptTip))
+    local adoptBegin = findDefItem(tipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Start adoption", 1, true)
+    end)
+    assertTrue(adoptBegin.getDisabledTooltip():find("No eligible peer", 1, true)
+            or adoptBegin.getDisabledTooltip():find("Select a source", 1, true),
+        "disabled tip: start adoption blocked without source")
+    local adoptCancel = findDefItem(tipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Cancel adoption", 1, true)
+    end)
+    assertEq(adoptCancel.getDisabledTooltip(),
+        "There is no adoption in progress.",
+        "disabled tip: cancel adoption when idle")
+    local conflictOpen = findDefItem(tipPanel, function(item)
+        return item.type == "dropdown" and item.label
+            and tostring(item.label):find("Open conflict", 1, true)
+    end)
+    assertTrue(conflictOpen.getDisabledTooltip():find("no unresolved", 1, true)
+            or conflictOpen.getDisabledTooltip():find("no unresolved configuration", 1, true)
+            or conflictOpen.getDisabledTooltip():find("There are no unresolved", 1, true),
+        "disabled tip: open conflict none got=" .. tostring(conflictOpen.getDisabledTooltip()))
+    local conflictChoose = findDefItem(tipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Use this value", 1, true)
+    end)
+    assertTrue(conflictChoose.getDisabledTooltip():find("no unresolved", 1, true)
+            or conflictChoose.getDisabledTooltip():find("Select an open", 1, true),
+        "disabled tip: use-this-value without selection")
+
+    -- Small-guild init: need explicit rank before Initialize enables.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Member" }
+    settleRoster()
+    local smallTipPanel = makeRegion("Frame", "GSDisabledTipSmall", nil)
+    smallTipPanel:SetSize(600, 800)
+    configPage:Build(smallTipPanel)
+    initItem = findDefItem(smallTipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Initialize", 1, true)
+    end)
+    assertEq(initItem.enabled and initItem.enabled(), false,
+        "disabled tip: small-guild Initialize disabled until rank")
+    assertTrue(initItem.getDisabledTooltip():find("editor rank", 1, true),
+        "disabled tip: small-guild Initialize asks for rank got="
+            .. tostring(initItem.getDisabledTooltip()))
+
+    -- Already initialized: Initialize tip says already done.
+    assertEq(select(2, GS:CreateStagedRecord(2)), "accepted", "disabled tip: small init")
+    configPage:Refresh(smallTipPanel)
+    initItem = findDefItem(smallTipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Initialize", 1, true)
+    end)
+    assertEq(initItem.enabled and initItem.enabled(), false,
+        "disabled tip: Initialize disabled after init")
+    assertTrue(initItem.getDisabledTooltip():find("already been initialized", 1, true),
+        "disabled tip: already initialized got=" .. tostring(initItem.getDisabledTooltip()))
+
+    -- Logs: campaign/history pagination tips + membership privacy.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local logsTipPanel = makeRegion("Frame", "GSDisabledTipLogs", nil)
+    logsTipPanel:SetSize(600, 800)
+    logsPage:Build(logsTipPanel)
+    local newerItem = findDefItem(logsTipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Newer", 1, true)
+    end)
+    local olderItem = findDefItem(logsTipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Older", 1, true)
+    end)
+    assertTrue(newerItem and olderItem, "disabled tip: Newer/Older defs present")
+    assertTrue(newerItem.getDisabledTooltip():find("first page", 1, true),
+        "disabled tip: Newer on first page got=" .. tostring(newerItem.getDisabledTooltip()))
+    assertTrue(olderItem.getDisabledTooltip():find("last page", 1, true),
+        "disabled tip: Older on last/empty page got=" .. tostring(olderItem.getDisabledTooltip()))
+
+    local campItem = findDefItem(logsTipPanel, function(item)
+        return item.type == "dropdown" and item.label
+            and tostring(item.label):find("Campaign", 1, true)
+            and item.getDisabledTooltip
+    end)
+    assertTrue(campItem ~= nil, "disabled tip: Logs campaign dropdown present")
+    -- With a campaign, dropdown should be enabled → tip nil.
+    assertEq(campItem.enabled and campItem.enabled(), true,
+        "disabled tip: campaign select enabled with campaign")
+    assertNil(campItem.getDisabledTooltip(),
+        "disabled tip: campaign select tip nil while enabled")
+
+    -- Unverified membership: logs tips stay membership-only.
+    world.guild.members = {}
+    settleRoster()
+    logsPage:Refresh(logsTipPanel)
+    campItem = findDefItem(logsTipPanel, function(item)
+        return item.type == "dropdown" and item.label
+            and tostring(item.label):find("Campaign", 1, true)
+            and item.getDisabledTooltip
+    end)
+    local campTip = campItem.getDisabledTooltip()
+    assertTrue(type(campTip) == "string" and campTip:find("verified membership", 1, true),
+        "disabled tip: logs campaign membership tip got=" .. tostring(campTip))
+    newerItem = findDefItem(logsTipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Newer", 1, true)
+    end)
+    assertTrue(newerItem.getDisabledTooltip():find("verified membership", 1, true),
+        "disabled tip: Newer membership tip")
+    world.guild.members = priorMembersTip
+    settleRoster()
+
+    -- Repeated refresh must not accumulate overlays/handlers (one overlay per widget).
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    local refreshTipPanel = makeRegion("Frame", "GSDisabledTipRefresh", nil)
+    refreshTipPanel:SetSize(600, 800)
+    configPage:Build(refreshTipPanel)
+    local createdBefore = #created
+    for _ = 1, 40 do
+        configPage:Refresh(refreshTipPanel)
+    end
+    local activateRefresh = {}
+    findButtonByText(refreshTipPanel, "Activate", activateRefresh)
+    assertTrue(#activateRefresh >= 1, "disabled tip: activate present after refresh loop")
+    local ov = activateRefresh[1].__sfDisabledTipOverlay
+    assertTrue(ov ~= nil, "disabled tip: overlay survives refresh")
+    -- Overlay is created once; refreshes must not spawn unbounded Frame children.
+    assertTrue((#created - createdBefore) < 80,
+        "disabled tip: refresh does not accumulate frames grew="
+            .. tostring(#created - createdBefore))
+    -- Re-enter after refresh still works with one handler.
+    tipLog.shown = false
+    fireEnter(ov)
+    assertEq(tipLog.shown, true, "disabled tip: hover still works after many refreshes")
+    fireLeave(ov)
+
+    -- Enabled New Campaign (after init) must not leave a catching overlay.
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "disabled tip: init for enabled overlay")
+    configPage:Refresh(refreshTipPanel)
+    local newCampBtns = {}
+    findButtonByText(refreshTipPanel, "New Campaign", newCampBtns)
+    assertTrue(#newCampBtns >= 1, "disabled tip: New Campaign button present")
+    local nc = newCampBtns[1]
+    assertEq(nc.enabled, true, "disabled tip: New Campaign enabled with record")
+    local ncOverlay = nc.__sfDisabledTipOverlay
+    if ncOverlay then
+        assertEq(ncOverlay.__sfMouseCatching, false,
+            "disabled tip: enabled control overlay does not catch mouse")
+        assertEq(ncOverlay.mouseEnabled, false,
+            "disabled tip: enabled control overlay EnableMouse(false)")
+    end
+    -- Static enabled tooltip on Activate row (when tip assigned) remains on definition.
+    activateItem = findDefItem(refreshTipPanel, function(item)
+        return item.type == "button" and item.buttonText
+            and tostring(item.buttonText):find("Activate", 1, true)
+    end)
+    assertTrue(type(activateItem.tooltip) == "string" and activateItem.tooltip ~= "",
+        "disabled tip: enabled Activate retains normal tooltip copy")
+
+    GameTooltip = realTooltip
+    -- Restore the default four-member roster (incl. Dave) for later 3A suites.
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    world.unitName = "Alice-Garona"
+    world.unitGuid = "Player-1-Alice"
+    settleRoster()
+    end
+    runDisabledTooltipTests()
 
     CreateFrame = priorCreateFrame
     C_Timer.After = priorAfter

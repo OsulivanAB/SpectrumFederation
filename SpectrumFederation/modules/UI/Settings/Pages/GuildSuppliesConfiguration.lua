@@ -800,6 +800,310 @@ local function CommitNewCampaign(ctx)
 	end
 end
 
+-- Disabled-control tips: derive from the same Caps/record/readiness predicates
+-- that gate enabled. Prefer the immediate blocker; never invent prerequisites.
+-- Unverified membership must not learn guild-owned configuration details.
+
+local function DisabledMembershipTip()
+	return Loc("GUILD_SUPPLIES_DISABLED_MEMBERSHIP",
+		"Join a guild with a verified membership before using Guild Supplies.")
+end
+
+local function DisabledUnauthorizedTip(action)
+	return Loc("GUILD_SUPPLIES_DISABLED_UNAUTHORIZED_FMT",
+		"Your guild rank does not permit %s."):format(action)
+end
+
+--- Permission/membership gate shared by privileged Configuration controls.
+-- @param action string short action phrase for unauthorized copy
+-- @param allowRecover boolean|nil also accept canRecoverPolicy
+-- @return string|nil tip when blocked, else nil
+local function DisabledAuthTip(action, allowRecover)
+	local c = Caps()
+	if not c.canRead then
+		return DisabledMembershipTip()
+	end
+	if c.canEdit then
+		return nil
+	end
+	if allowRecover and c.canRecoverPolicy then
+		return nil
+	end
+	return DisabledUnauthorizedTip(action)
+end
+
+local function DisabledNeedRecordTip(actionNoun)
+	local auth = DisabledAuthTip(actionNoun, false)
+	if auth then
+		return auth
+	end
+	if CurrentRecord() ~= nil then
+		return nil
+	end
+	if IsNotConfigured() then
+		return Loc("GUILD_SUPPLIES_DISABLED_NEED_INIT",
+			"Initialize Guild Supplies for this guild first.")
+	end
+	-- canRead but record unavailable (permission-only / redacted): no guild detail.
+	return Loc("GUILD_SUPPLIES_DISABLED_DATA_UNAVAILABLE",
+		"Guild Supplies data is unavailable right now.")
+end
+
+local function DisabledNeedCampaignTip(actionNoun)
+	local tip = DisabledNeedRecordTip(actionNoun)
+	if tip then
+		return tip
+	end
+	local rec = CurrentRecord()
+	if rec and type(rec.currentCampaignId) == "string" then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_NEED_CAMPAIGN",
+		"Start a New Campaign before continuing.")
+end
+
+local function DisabledEditorRankTip()
+	local c = Caps()
+	if NeedsExplicitInitThreshold() then
+		if c.canRecoverPolicy then
+			return nil
+		end
+		if not c.canRead then
+			return DisabledMembershipTip()
+		end
+		return DisabledUnauthorizedTip(
+			Loc("GUILD_SUPPLIES_DISABLED_ACTION_EDITOR_RANK", "changing editor ranks"))
+	end
+	if IsNotConfigured() then
+		if not c.canRead then
+			return DisabledMembershipTip()
+		end
+		if not c.canEdit and not c.canRecoverPolicy then
+			return DisabledUnauthorizedTip(
+				Loc("GUILD_SUPPLIES_DISABLED_ACTION_EDITOR_RANK", "changing editor ranks"))
+		end
+		return Loc("GUILD_SUPPLIES_DISABLED_RANK_BEFORE_INIT",
+			"Initialize Guild Supplies before changing the editor rank.")
+	end
+	if c.canRecoverPolicy or (CurrentRecord() ~= nil and c.canEdit) then
+		return nil
+	end
+	if not c.canRead then
+		return DisabledMembershipTip()
+	end
+	if not c.canEdit then
+		return DisabledUnauthorizedTip(
+			Loc("GUILD_SUPPLIES_DISABLED_ACTION_EDITOR_RANK", "changing editor ranks"))
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_DATA_UNAVAILABLE",
+		"Guild Supplies data is unavailable right now.")
+end
+
+local function DisabledInitializeTip()
+	local c = Caps()
+	if not c.canEdit and not c.canRecoverPolicy then
+		if not c.canRead then
+			return DisabledMembershipTip()
+		end
+		return DisabledUnauthorizedTip(
+			Loc("GUILD_SUPPLIES_DISABLED_ACTION_INITIALIZE", "initializing Guild Supplies"))
+	end
+	if not IsNotConfigured() then
+		-- Already have a dataset (or recovery path); do not claim init is incomplete.
+		return Loc("GUILD_SUPPLIES_DISABLED_ALREADY_INITIALIZED",
+			"Guild Supplies has already been initialized for this guild.")
+	end
+	SyncPendingInitContext()
+	if NeedsExplicitInitThreshold() and pendingInitRank == nil then
+		return Loc("GUILD_SUPPLIES_DISABLED_INIT_NEED_RANK",
+			"Choose an editor rank threshold before initializing Guild Supplies.")
+	end
+	return nil
+end
+
+local function DisabledActivateTip()
+	local mod = GS()
+	local c = Caps()
+	if not c.canEdit then
+		if not c.canRead then
+			return DisabledMembershipTip()
+		end
+		return DisabledUnauthorizedTip(
+			Loc("GUILD_SUPPLIES_DISABLED_ACTION_ACTIVATE", "activating Guild Supplies"))
+	end
+	if not mod or not mod.GetActivationReadiness then
+		return Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable.")
+	end
+	local ready = mod:GetActivationReadiness()
+	if ready and ready.canActivate then
+		return nil
+	end
+	if ready and ready.alreadyActive then
+		return Loc("GUILD_SUPPLIES_DISABLED_ALREADY_ACTIVE",
+			"Guild Supplies is already active for this guild.")
+	end
+	local reason = ready and ready.reason or nil
+	if reason == "no_campaign" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_NEED_CAMPAIGN",
+			"Start a New Campaign before activating Guild Supplies.")
+	end
+	if reason == "divergent_edit" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_CONFLICTS",
+			"Resolve open configuration conflicts before activating Guild Supplies.")
+	end
+	if reason == "dataset_mismatch" or reason == "live_activation_conflict" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_DATASET",
+			"Resolve the conflicting dataset (adoption) before activating Guild Supplies.")
+	end
+	if reason == "adoption_in_progress" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_ADOPTION",
+			"Finish or cancel dataset adoption before activating Guild Supplies.")
+	end
+	if reason == "not_configured" then
+		return Loc("GUILD_SUPPLIES_DISABLED_NEED_INIT",
+			"Initialize Guild Supplies for this guild first.")
+	end
+	local guide = mod.FormatActivationGuidance and mod.FormatActivationGuidance(ready) or nil
+	if type(guide) == "string" and guide ~= "" then
+		return guide
+	end
+	local formatReason = mod.FormatReasonText or function(r)
+		return tostring(r or "unknown")
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_FMT",
+		"Cannot activate yet: %s."):format(formatReason(reason or "not_ready"))
+end
+
+local function DisabledAdoptionSourceTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
+	if auth then
+		return auth
+	end
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) == "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_IN_PROGRESS",
+			"Finish or cancel the current dataset adoption before selecting a new source.")
+	end
+	if #AdoptionSourceOptions() > 0 then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NO_SOURCES",
+		"No eligible peer datasets are currently available for adoption.")
+end
+
+local function DisabledAdoptionBeginTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
+	if auth then
+		return auth
+	end
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) == "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_IN_PROGRESS",
+			"Finish or cancel the current dataset adoption before selecting a new source.")
+	end
+	if pendingAdoptionPeer == nil or pendingAdoptionDataset == nil then
+		if #AdoptionSourceOptions() == 0 then
+			return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NO_SOURCES",
+				"No eligible peer datasets are currently available for adoption.")
+		end
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_SELECT_SOURCE",
+			"Select a source dataset first.")
+	end
+	return nil
+end
+
+local function DisabledAdoptionCommitTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
+	if auth then
+		return auth
+	end
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) ~= "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NONE_COMMIT",
+			"There is no adoption ready to commit.")
+	end
+	if type(adop.replayTemp) == "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_REPLAY",
+			"Wait for the dataset transfer to finish applying before committing.")
+	end
+	if adop.ready ~= true then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_WAIT_TRANSFER",
+			"Wait for the dataset transfer to finish before committing.")
+	end
+	return nil
+end
+
+local function DisabledAdoptionCancelTip()
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) == "table" then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NONE_CANCEL",
+		"There is no adoption in progress.")
+end
+
+local function DisabledConflictTargetTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
+	if auth then
+		return auth
+	end
+	if #ConflictTargetOptions() > 0 then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
+		"There are no unresolved configuration conflicts.")
+end
+
+local function DisabledConflictCandidateTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
+	if auth then
+		return auth
+	end
+	if pendingConflictTarget == nil then
+		if #ConflictTargetOptions() == 0 then
+			return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
+				"There are no unresolved configuration conflicts.")
+		end
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_SELECT",
+			"Select an open configuration conflict first.")
+	end
+	if #ConflictCandidateOptions() < 2 then
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_CANDIDATES",
+			"Select a conflict that still has competing candidate values.")
+	end
+	return nil
+end
+
+local function DisabledConflictChooseTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
+	if auth then
+		return auth
+	end
+	if pendingConflictTarget == nil then
+		if #ConflictTargetOptions() == 0 then
+			return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
+				"There are no unresolved configuration conflicts.")
+		end
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_SELECT",
+			"Select an open configuration conflict first.")
+	end
+	if pendingConflictChosen == nil or #ConflictCandidateOptions() < 2 then
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_CHOOSE",
+			"Select a conflict and a candidate value before resolving it.")
+	end
+	return nil
+end
+
 local function Definition()
 	return {
 		isAdmin = function()
@@ -885,6 +1189,7 @@ local function Definition()
 							local rec = CurrentRecord()
 							return rec ~= nil and c.canEdit == true
 						end,
+						getDisabledTooltip = DisabledEditorRankTip,
 						onValueChanged = function(ctx, value)
 							if NeedsExplicitInitThreshold() then
 								SetPendingInitRank(value)
@@ -915,6 +1220,7 @@ local function Definition()
 							end
 							return true
 						end,
+						getDisabledTooltip = DisabledInitializeTip,
 						onClick = function(ctx)
 							local mod = GS()
 							ctx.section:ClearMessage()
@@ -960,6 +1266,7 @@ local function Definition()
 							local ready = mod:GetActivationReadiness()
 							return ready and ready.canActivate == true
 						end,
+						getDisabledTooltip = DisabledActivateTip,
 						onClick = function(ctx)
 							local mod = GS()
 							ctx.section:ClearMessage()
@@ -1008,6 +1315,10 @@ local function Definition()
 						enabled = function()
 							return Caps().canEdit and CurrentRecord() ~= nil
 						end,
+						getDisabledTooltip = function()
+							return DisabledNeedRecordTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_BANK_TAB", "configuring the bank tab"))
+						end,
 						onCommit = function(ctx, text)
 							-- Enter then ClearFocus both fire Commit; skip unchanged values
 							-- so one Enter admits one operation and idle focus loss admits none.
@@ -1040,6 +1351,10 @@ local function Definition()
 						width = 160,
 						enabled = function()
 							return Caps().canEdit and CurrentRecord() ~= nil
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedRecordTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_NEW_CAMPAIGN", "starting a New Campaign"))
 						end,
 						onClick = function(ctx)
 							CommitNewCampaign(ctx)
@@ -1090,6 +1405,7 @@ local function Definition()
 							local c = Caps()
 							return (c.canEdit or c.canRecoverPolicy) and #AdoptionSourceOptions() > 0
 						end,
+						getDisabledTooltip = DisabledAdoptionSourceTip,
 						onValueChanged = function(ctx, value)
 							if type(value) ~= "string" then
 								ClearPendingAdoptionChoice()
@@ -1120,6 +1436,7 @@ local function Definition()
 								and pendingAdoptionDataset ~= nil
 								and type(adop) ~= "table"
 						end,
+						getDisabledTooltip = DisabledAdoptionBeginTip,
 						onClick = function(ctx)
 							BeginAdoptionTransfer(ctx)
 						end,
@@ -1139,6 +1456,7 @@ local function Definition()
 								and adop.ready == true
 								and type(adop.replayTemp) ~= "table"
 						end,
+						getDisabledTooltip = DisabledAdoptionCommitTip,
 						onClick = function(ctx)
 							CommitAdoptionTransfer(ctx)
 						end,
@@ -1154,6 +1472,7 @@ local function Definition()
 							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
 							return type(adop) == "table"
 						end,
+						getDisabledTooltip = DisabledAdoptionCancelTip,
 						onClick = function(ctx)
 							local g = GS()
 							ctx.section:ClearMessage()
@@ -1194,6 +1513,7 @@ local function Definition()
 						enabled = function()
 							return Caps().canEdit and #ConflictTargetOptions() > 0
 						end,
+						getDisabledTooltip = DisabledConflictTargetTip,
 						onValueChanged = function(ctx, value)
 							if type(value) == "string" and value ~= "" then
 								pendingConflictTarget = value
@@ -1219,6 +1539,7 @@ local function Definition()
 								and pendingConflictTarget ~= nil
 								and #ConflictCandidateOptions() >= 2
 						end,
+						getDisabledTooltip = DisabledConflictCandidateTip,
 						onValueChanged = function(ctx, value)
 							if type(value) == "string" and value ~= "" then
 								pendingConflictChosen = value
@@ -1240,6 +1561,7 @@ local function Definition()
 								and pendingConflictChosen ~= nil
 								and #ConflictCandidateOptions() >= 2
 						end,
+						getDisabledTooltip = DisabledConflictChooseTip,
 						onClick = function(ctx)
 							CommitConflictChoice(ctx, pendingConflictTarget, pendingConflictChosen, nil)
 						end,
@@ -1268,6 +1590,10 @@ local function Definition()
 						enabled = function()
 							local rec = CurrentRecord()
 							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ITEMS", "editing requested items"))
 						end,
 						onSubmit = function(ctx, text)
 							local C = SF.Consumables
@@ -1306,6 +1632,10 @@ local function Definition()
 						enabled = function()
 							local rec = CurrentRecord()
 							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ITEMS", "editing requested items"))
 						end,
 						onRemove = function(ctx, item)
 							if not item or not item.itemId then return end
@@ -1366,6 +1696,10 @@ local function Definition()
 						enabled = function()
 							local rec = CurrentRecord()
 							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
 						end,
 						onSubmit = function(ctx, text)
 							local g = GS()
@@ -1442,6 +1776,10 @@ local function Definition()
 						enabled = function()
 							return Caps().canEdit and CurrentRecord() ~= nil
 						end,
+						getDisabledTooltip = function()
+							return DisabledNeedRecordTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_LINKS", "linking characters"))
+						end,
 						onSubmit = function(ctx, text)
 							local g = GS()
 							if not g or not g.NewLinkCharactersOperation then
@@ -1472,6 +1810,10 @@ local function Definition()
 						editWidth = 260,
 						enabled = function()
 							return Caps().canEdit and CurrentRecord() ~= nil
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedRecordTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_LINKS", "unlinking characters"))
 						end,
 						onSubmit = function(ctx, text)
 							local g = GS()
