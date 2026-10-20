@@ -24983,7 +24983,7 @@ do
 end
 
 do
-    -- B1) Overlapping tab queries require bank reopen; unsolicited updates never stamp.
+    -- B1) Overlapping / mid-flight tab changes require bank reopen; no unsolicited stamp.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -25020,37 +25020,71 @@ do
 
     loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
     local BankLog = SF.ConsumablesBankLog
-    BankLog.bankOpen = true
-    BankLog.active = false
-    BankLog.awaitingLogUpdate = false
-    BankLog.queryRetries = 0
-    BankLog.queryToken = 0
-    BankLog.activeContext = nil
-    BankLog.pendingQuery = nil
-    BankLog.pendingAdmit = nil
-    BankLog.requireBankReopenForFreshness = false
-    BankLog.lastFreshLogAt = nil
-    BankLog.lastFreshLogTab = nil
-    BankLog.lastFreshLogGuild = nil
 
-    assertEq(BankLog:BeginObservation("open"), true, "B1: begin observation on tab A")
-    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 1, "B1: pending bound to A")
+    local function resetBankObserver()
+        BankLog.bankOpen = true
+        BankLog.active = false
+        BankLog.awaitingLogUpdate = false
+        BankLog.queryRetries = 0
+        BankLog.queryToken = 0
+        BankLog.activeContext = nil
+        BankLog.pendingQuery = nil
+        BankLog.pendingAdmit = nil
+        BankLog.requireBankReopenForFreshness = false
+        BankLog.lastFreshLogAt = nil
+        BankLog.lastFreshLogTab = nil
+        BankLog.lastFreshLogGuild = nil
+    end
+
+    -- Order 1: configure B → OnProfileMaybeChanged (overlap) → late A update.
+    resetBankObserver()
+    assertEq(BankLog:BeginObservation("open"), true, "B1-o1: begin observation on tab A")
+    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 1, "B1-o1: pending bound to A")
     local queriesAfterA = #queriedTabs
 
-    -- Switch to B while A's query is outstanding → overlap gate, no B query yet.
     local tabOpB = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
-    assertEq(GS:ApplyStagedConfigOperation(tabOpB), "accepted", "B1: switch to tab B")
+    assertEq(GS:ApplyStagedConfigOperation(tabOpB), "accepted", "B1-o1: switch to tab B")
     BankLog:OnProfileMaybeChanged()
-    assertEq(BankLog.requireBankReopenForFreshness, true, "B1: overlap requires bank reopen")
-    assertNil(BankLog.pendingQuery, "B1: pending cleared on overlap")
-    assertEq(BankLog.awaitingLogUpdate, false, "B1: not awaiting after overlap")
-    assertEq(#queriedTabs, queriesAfterA, "B1: no QueryGuildBankLog for B until reopen")
+    assertEq(BankLog.requireBankReopenForFreshness, true, "B1-o1: overlap requires bank reopen")
+    assertNil(BankLog.pendingQuery, "B1-o1: pending cleared on overlap")
+    assertEq(BankLog.awaitingLogUpdate, false, "B1-o1: not awaiting after overlap")
+    assertEq(#queriedTabs, queriesAfterA, "B1-o1: no QueryGuildBankLog for B until reopen")
 
-    -- Late uncorrelated A event must not stamp B.
-    BankLog:ProcessLogUpdate("late-A")
+    BankLog:ProcessLogUpdate("late-A-after-profile")
     assertTrue(BankLog.lastFreshLogTab ~= 2,
-        "B1: late A must not stamp tab B got=" .. tostring(BankLog.lastFreshLogTab))
-    assertEq(GS.IsBankContextSampleReady(2), false, "B1: tab B not ready after late A")
+        "B1-o1: late A must not stamp tab B got=" .. tostring(BankLog.lastFreshLogTab))
+    assertEq(GS.IsBankContextSampleReady(2), false, "B1-o1: tab B not ready after late A")
+    assertEq(BankLog.requireBankReopenForFreshness, true, "B1-o1: gate remains after late A")
+    assertEq(#queriedTabs, queriesAfterA, "B1-o1: late A does not start B query")
+
+    -- Order 2: configure B → late A before OnProfileMaybeChanged (ProcessLogUpdate mismatch).
+    local tabOpBackA = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 1))
+    assertEq(GS:ApplyStagedConfigOperation(tabOpBackA), "accepted", "B1-o2: restore tab A")
+    resetBankObserver()
+    BankLog:OnBankClosed()
+    BankLog:OnBankOpened()
+    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 1, "B1-o2: pending bound to A")
+    local queriesBeforeMismatch = #queriedTabs
+
+    local tabOpB2 = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
+    assertEq(GS:ApplyStagedConfigOperation(tabOpB2), "accepted", "B1-o2: configure tab B")
+    -- Intentionally skip OnProfileMaybeChanged: live EligibleContext is already B.
+    BankLog:ProcessLogUpdate("late-A-before-profile")
+    assertEq(BankLog.requireBankReopenForFreshness, true,
+        "B1-o2: mismatch during completion requires bank reopen")
+    assertNil(BankLog.pendingQuery, "B1-o2: pending cleared on mismatch")
+    assertEq(BankLog.awaitingLogUpdate, false, "B1-o2: not awaiting after mismatch")
+    assertTrue(BankLog.lastFreshLogTab ~= 2,
+        "B1-o2: late A must not stamp tab B got=" .. tostring(BankLog.lastFreshLogTab))
+    assertEq(GS.IsBankContextSampleReady(2), false, "B1-o2: tab B not ready after mismatch")
+    assertEq(#queriedTabs, queriesBeforeMismatch,
+        "B1-o2: mismatch must not RequestLog B in the same open session")
+
+    -- OnProfileMaybeChanged after mismatch still must not query B while gated.
+    BankLog:OnProfileMaybeChanged()
+    assertEq(#queriedTabs, queriesBeforeMismatch,
+        "B1-o2: OnProfileMaybeChanged does not query B while reopen required")
+    assertEq(GS.IsBankContextSampleReady(2), false, "B1-o2: B still unready after profile notify")
 
     -- Unsolicited update with no pending query cannot stamp readiness.
     BankLog.requireBankReopenForFreshness = false
@@ -25086,14 +25120,14 @@ do
 end
 
 do
-    -- B2) Deferred admit recovers after roster settles; witness admitted once.
+    -- B2) Deferred admit recovers via After(0) after the same roster event settles.
+    -- Never call TryAdmitPendingSnapshot as a test fallback.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     settleRoster()
     local record = seedActivatableCampaign(9402, 5)
-    -- Ensure requested item 100 matches bank deposit for a real witness path.
     local itemOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 100 }, {
         itemId = 100, goal = 5, removed = false,
     }))
@@ -25140,59 +25174,91 @@ do
         return priorGetCtx(self)
     end
 
-    assertEq(BankLog:BeginObservation("open"), true, "B2: begin live observation")
+    local function frameOnEvent(frame)
+        return frame and (frame._onEvent or (frame.scripts and frame.scripts.OnEvent))
+    end
+
+    local function assertOneWitness(label)
+        local stats = BankLog.lastStats or {}
+        assertEq(stats.pending or 0, 1,
+            label .. ": exactly one qualifying witness pending="
+                .. tostring(stats.pending) .. " admitted=" .. tostring(stats.admitted))
+        assertEq(stats.admitted or 0, 0, label .. ": single witness does not auto-credit")
+        local pendingRows = GS:ListPendingEvidence(GS:GetCurrentRecord().currentCampaignId, 64)
+        assertTrue(type(pendingRows) == "table" and #pendingRows == 1,
+            label .. ": exactly one pending evidence cluster")
+        assertEq(pendingRows[1].witnessCount or 0, 1,
+            label .. ": exactly one independent witness in cluster")
+        assertEq(pendingRows[1].itemId, 100, label .. ": recovered witness is item 100")
+        return pendingRows
+    end
+
+    -- Scenario 1: bank listener runs first; authority settles before After(0); one event.
+    assertEq(BankLog:BeginObservation("open"), true, "B2-s1: begin live observation")
     BankLog:ProcessLogUpdate("early")
-    assertTrue(type(BankLog.pendingAdmit) == "table", "B2: snapshot retained while roster incomplete")
-    assertTrue(BankLog.lastStats and BankLog.lastStats.deferred == true, "B2: admit deferred")
-
-    assertTrue(BankLog.rosterAdmitFrame ~= nil, "B2: roster admit listener armed")
+    assertTrue(type(BankLog.pendingAdmit) == "table", "B2-s1: snapshot retained while roster incomplete")
+    assertTrue(BankLog.lastStats and BankLog.lastStats.deferred == true, "B2-s1: admit deferred")
+    assertTrue(BankLog.rosterAdmitFrame ~= nil, "B2-s1: roster admit listener armed")
     local frame = BankLog.rosterAdmitFrame
-    -- Harness CreateFrame stores OnEvent on `_onEvent` (SetScript).
-    local onEvent = frame._onEvent or (frame.scripts and frame.scripts.OnEvent)
-    assertTrue(type(onEvent) == "function", "B2: roster listener has OnEvent")
+    local onEvent = frameOnEvent(frame)
+    assertTrue(type(onEvent) == "function", "B2-s1: roster listener has OnEvent")
 
-    -- Order 1: listener fires while context still blocked (Gossip bind not finished).
+    timers = {}
+    onEvent(frame, "GUILD_ROSTER_UPDATE")
+    assertTrue(#timers >= 1, "B2-s1: After(0) scheduled from roster event")
+    assertTrue(type(BankLog.pendingAdmit) == "table",
+        "B2-s1: still pending immediately (before deferred evaluate)")
+    -- Same event: roster authority settles before the deferred callback runs.
+    ctxBlocked = false
+    world.time = (world.time or 0) + 0.01
+    flushTimers()
+    assertNil(BankLog.pendingAdmit, "B2-s1: pending admit cleared by deferred callback")
+    assertTrue(BankLog.rosterAdmitFrame == nil, "B2-s1: roster listener released after admit")
+    local pendingRows = assertOneWitness("B2-s1")
+
+    -- Duplicate roster event on a released listener must not double-admit.
     onEvent(frame, "GUILD_ROSTER_UPDATE")
     world.time = (world.time or 0) + 0.01
     flushTimers()
-    assertTrue(type(BankLog.pendingAdmit) == "table",
-        "B2: still pending when roster callback ran before context ready")
-
-    -- Order 2: context ready, then roster event → deferred After(0) admits.
-    ctxBlocked = false
-    onEvent(frame, "GUILD_ROSTER_UPDATE")
-    world.time = (world.time or 0) + 1
-    flushTimers()
-    if type(BankLog.pendingAdmit) == "table" then
-        BankLog:TryAdmitPendingSnapshot()
-        if type(BankLog.pendingAdmit) ~= "table" then
-            BankLog:ReleaseRosterAdmitListener()
-        end
-    end
-    assertNil(BankLog.pendingAdmit, "B2: pending admit cleared after settled recovery")
-    assertTrue(BankLog.rosterAdmitFrame == nil, "B2: roster listener released")
-    local stats = BankLog.lastStats or {}
-    -- Single-witness deposits land as pending (awaiting quorum), not auto-accepted.
-    assertEq(stats.pending or 0, 1,
-        "B2: exactly one qualifying witness admitted pending="
-            .. tostring(stats.pending) .. " admitted=" .. tostring(stats.admitted))
-    assertEq(stats.admitted or 0, 0, "B2: single witness does not auto-credit")
-    local pendingRows = GS:ListPendingEvidence(GS:GetCurrentRecord().currentCampaignId, 64)
-    assertTrue(type(pendingRows) == "table" and #pendingRows >= 1,
-        "B2: pending evidence cluster present after recovery")
-    assertEq(pendingRows[1].witnessCount or 0, 1,
-        "B2: exactly one independent witness in cluster")
-    assertEq(pendingRows[1].itemId, 100, "B2: recovered witness is item 100")
-
-    -- Duplicate roster event must not double-admit.
-    if type(onEvent) == "function" then
-        onEvent(frame, "GUILD_ROSTER_UPDATE")
-        flushTimers()
-    end
     local pendingAfterDup = GS:ListPendingEvidence(GS:GetCurrentRecord().currentCampaignId, 64)
     assertEq(pendingAfterDup[1].witnessCount or 0, 1,
-        "B2: no duplicate witness after second roster event")
-    assertEq(#pendingAfterDup, #pendingRows, "B2: no extra pending clusters")
+        "B2-s1: no duplicate witness after second roster event")
+    assertEq(#pendingAfterDup, #pendingRows, "B2-s1: no extra pending clusters")
+
+    -- Scenario 2: authority already settled before the bank listener runs; one event.
+    do
+        local rec = GS:GetCurrentRecord()
+        if rec and rec.observations and rec.observations.byCampaign then
+            rec.observations.byCampaign[rec.currentCampaignId] = nil
+        end
+    end
+    BankLog.pendingAdmit = nil
+    BankLog.rosterAdmitFrame = nil
+    BankLog.rosterAdmitGen = 0
+    BankLog.lastStats = nil
+    BankLog.bankOpen = true
+    BankLog.active = true
+    BankLog.requireBankReopenForFreshness = false
+    ctxBlocked = false
+    BankLog:RequestLog("s2-rearm")
+    assertEq(BankLog.awaitingLogUpdate, true, "B2-s2: rearmed bank query")
+    ctxBlocked = true
+    BankLog:ProcessLogUpdate("s2-early")
+    assertTrue(type(BankLog.pendingAdmit) == "table", "B2-s2: snapshot retained")
+    assertTrue(BankLog.lastStats and BankLog.lastStats.deferred == true, "B2-s2: admit deferred")
+    frame = BankLog.rosterAdmitFrame
+    onEvent = frameOnEvent(frame)
+    assertTrue(type(onEvent) == "function", "B2-s2: listener armed")
+    -- Authority already ready before the listener observes the roster event.
+    ctxBlocked = false
+    timers = {}
+    onEvent(frame, "GUILD_ROSTER_UPDATE")
+    assertTrue(#timers >= 1, "B2-s2: After(0) scheduled")
+    world.time = (world.time or 0) + 0.01
+    flushTimers()
+    assertNil(BankLog.pendingAdmit, "B2-s2: pending cleared after one settled event")
+    assertTrue(BankLog.rosterAdmitFrame == nil, "B2-s2: listener released")
+    assertOneWitness("B2-s2")
 
     -- Guild change while deferred: drop snapshot (no stale admission).
     BankLog.pendingAdmit = {
@@ -25201,14 +25267,13 @@ do
     }
     BankLog:EnsureRosterAdmitListener()
     local guildFrame = BankLog.rosterAdmitFrame
-    local guildOnEvent = guildFrame and (guildFrame._onEvent
-        or (guildFrame.scripts and guildFrame.scripts.OnEvent))
+    local guildOnEvent = frameOnEvent(guildFrame)
     assertTrue(type(guildOnEvent) == "function", "B2: guild-change listener armed")
     guildOnEvent(guildFrame, "PLAYER_GUILD_UPDATE")
     assertNil(BankLog.pendingAdmit, "B2: guild change clears pending admit")
     assertTrue(BankLog.rosterAdmitFrame == nil, "B2: guild change releases listener")
 
-    -- Tab change while deferred: live mismatch discards snapshot.
+    -- Tab change while deferred: live mismatch discarded by deferred evaluate.
     BankLog.bankOpen = true
     BankLog.active = true
     BankLog.pendingAdmit = {
@@ -25220,6 +25285,10 @@ do
         },
         snapshot = { rows = { { kind = "deposit" } } },
     }
+    BankLog:EnsureRosterAdmitListener()
+    local tabFrame = BankLog.rosterAdmitFrame
+    local tabOnEvent = frameOnEvent(tabFrame)
+    assertTrue(type(tabOnEvent) == "function", "B2: tab-change listener armed")
     local priorEligible = BankLog.EligibleContext
     function BankLog:EligibleContext()
         return {
@@ -25228,8 +25297,12 @@ do
             campaignId = GS:GetCurrentRecord().currentCampaignId, generation = 1,
         }
     end
-    assertEq(BankLog:TryAdmitPendingSnapshot(), false, "B2: tab mismatch discards")
-    assertNil(BankLog.pendingAdmit, "B2: tab change clears pending admit")
+    timers = {}
+    tabOnEvent(tabFrame, "GUILD_ROSTER_UPDATE")
+    world.time = (world.time or 0) + 0.01
+    flushTimers()
+    assertNil(BankLog.pendingAdmit, "B2: tab change clears pending admit via deferred evaluate")
+    assertTrue(BankLog.rosterAdmitFrame == nil, "B2: tab change releases listener")
     BankLog.EligibleContext = priorEligible
 
     -- Bank close clears deferred state / listeners.

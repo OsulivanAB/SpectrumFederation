@@ -504,9 +504,13 @@ function BankLog:ProcessLogUpdate(reason)
     if not QueryContextMatchesLive(pending, live) then
         -- Late/uncorrelated update after tab/guild/dataset change: never stamp
         -- the new live tab from a query started for a different context.
+        -- GUILDBANKLOG_UPDATE carries no query identity, so starting a
+        -- replacement B query in the same open session is not trustworthy —
+        -- same fail-closed reopen gate as RequestLog overlap.
         Debug("Info",
-            "log update discarded: query context mismatch pendingTab=%s liveTab=%s",
+            "log update discarded: query context mismatch pendingTab=%s liveTab=%s; require bank reopen",
             tostring(pending.bankTab), tostring(live.bankTab))
+        self.requireBankReopenForFreshness = true
         self.awaitingLogUpdate = false
         ClearPendingQuery(self)
         ClearPendingAdmit(self)
@@ -514,7 +518,6 @@ function BankLog:ProcessLogUpdate(reason)
         self.queryRetries = 0
         self.queryToken = (self.queryToken or 0) + 1
         self.activeContext = live
-        self:RequestLog("context_mismatch")
         return
     end
     -- Read and stamp the queried identity (pending), not a rebuilt live table.
