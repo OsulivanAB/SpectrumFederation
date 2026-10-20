@@ -1093,11 +1093,14 @@ local function LogicalMainHasOtherAlts(record, mainGuid, excludeGuid)
     return false
 end
 
---- Dissolve a physical group only when doing so cannot hide logical-group alts.
--- Empty live shells are NOT dissolved here: absence of memberships means
--- incomplete Gossip, not proof the group is empty. Solo designated main: keep
--- while any sibling live claimant exists (shell or populated), or while any
--- inbound forward alias may still deliver late members to this destination.
+--- Dissolve a physical group only when doing so cannot hide logical-group alts
+-- or erase independent offline edits to the same group id.
+-- Empty live shells are NOT dissolved: absence of memberships means incomplete
+-- Gossip, not proof the group is empty. Solo designated main shells are also
+-- retained: unassigning the last *locally visible* alt must not imply every peer
+-- agrees the group is empty, and the shell remains reusable for later assigns.
+-- Groups are retired as forward aliases when their designated main moves into
+-- another live group (see ApplyAssign), not by local emptiness alone.
 local function ShouldDissolvePhysicalGroup(record, groupId)
     local g = record.groups and record.groups[groupId]
     if not GroupIsLive(g) then
@@ -1122,19 +1125,11 @@ local function ShouldDissolvePhysicalGroup(record, groupId)
     if hasAlt then
         return false
     end
-    -- Solo main: keep while a sibling claimant shell/group may still deliver alts.
+    -- Solo designated main (or any remaining main membership): keep reusable shell.
     if ValidGuid(g.mainGuid) then
-        local siblings = ClaimantGroupIds(record, g.mainGuid)
-        for i = 1, #siblings do
-            if siblings[i] ~= groupId then
-                return false
-            end
-        end
-        if LogicalMainHasOtherAlts(record, g.mainGuid, nil) then
-            return false
-        end
+        return false
     end
-    return true
+    return false
 end
 
 local function FindGroupIdForMain(record, mainGuid)
@@ -1380,35 +1375,68 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         end
     end
 
-    if not targetGroupId then
-        -- Creating a new group: reclaim dissolved slots first, then allocate.
-        local room, roomErr = GI.EnsureGroupCapacity(record)
-        if not room then
-            return "rejected", roomErr or "groups_overflow"
+    -- When the demoted solo main has exactly one live claimant shell and the
+    -- new main has no group yet, repurpose that shell (flip mainGuid) instead
+    -- of allocating a new group id + forward alias. Same-identity churn then
+    -- stays bounded while late memberships that still cite the shell remain
+    -- resolvable under the new main.
+    local repurposedShell = nil
+    if not targetGroupId and vacatedMainGroups and #vacatedMainGroups == 1 then
+        local candidate = vacatedMainGroups[1]
+        local cg = record.groups and record.groups[candidate]
+        if GroupIsLive(cg) and cg.mainGuid == altGuid then
+            repurposedShell = candidate
         end
+    end
+
+    if not targetGroupId then
         if not mainMem and CountKeys(record.members) >= GI.MAX_MEMBERS then
             return "rejected", "members_overflow"
         end
         if not altMem and CountKeys(record.members) >= GI.MAX_MEMBERS - (mainMem and 0 or 1) then
             return "rejected", "members_overflow"
         end
-        local gid, gErr = GI:_AllocateGroupId()
-        if not gid then
-            return "rejected", gErr
-        end
-        targetGroupId = gid
-        local gVer, gvErr = GI:_NextVer(nil)
-        if not gVer then
-            return "rejected", gvErr
-        end
-        local st = GI.MergeGroup(record, {
-            groupId = gid,
-            mainGuid = mainGuid,
-            ver = gVer,
-            at = Now(),
-        })
-        if st ~= "accepted" and st ~= "duplicate" then
-            return "rejected", st
+        if repurposedShell then
+            local oldG = record.groups[repurposedShell]
+            local gVer, gvErr = GI:_NextVer(oldG and oldG.ver)
+            if not gVer then
+                return "rejected", gvErr
+            end
+            local st = GI.MergeGroup(record, {
+                groupId = repurposedShell,
+                mainGuid = mainGuid,
+                ver = gVer,
+                at = Now(),
+            })
+            if st ~= "accepted" and st ~= "duplicate" then
+                return "rejected", st
+            end
+            targetGroupId = repurposedShell
+            vacatedMainGroups = nil
+        else
+            -- Creating a new group: reclaim dissolved slots first, then allocate.
+            local room, roomErr = GI.EnsureGroupCapacity(record)
+            if not room then
+                return "rejected", roomErr or "groups_overflow"
+            end
+            local gid, gErr = GI:_AllocateGroupId()
+            if not gid then
+                return "rejected", gErr
+            end
+            targetGroupId = gid
+            local gVer, gvErr = GI:_NextVer(nil)
+            if not gVer then
+                return "rejected", gvErr
+            end
+            local st = GI.MergeGroup(record, {
+                groupId = gid,
+                mainGuid = mainGuid,
+                ver = gVer,
+                at = Now(),
+            })
+            if st ~= "accepted" and st ~= "duplicate" then
+                return "rejected", st
+            end
         end
     else
         local derivedAlts = record.graph.mains and record.graph.mains[mainGuid]
@@ -1463,36 +1491,32 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         return "rejected", stAlt
     end
 
-    -- Solo main moved into another group: retarget unresolved inbound forwards
-    -- onto the new live group so delayed Gossip memberships stay visible.
+    -- Solo main moved into a *different* existing group: retire the vacated
+    -- shell as a forward alias so delayed memberships that still cite it stay
+    -- resolvable. (Repurpose path above clears vacatedMainGroups.)
     if vacatedMainGroups then
         for i = 1, #vacatedMainGroups do
             local vacated = vacatedMainGroups[i]
-            if vacated ~= targetGroupId and GroupHasInboundForwards(record, vacated) then
+            if vacated ~= targetGroupId then
                 local okR, errR = RetargetInboundForwards(record, vacated, targetGroupId)
                 if not okR then
                     return "rejected", errR or "no_effect"
                 end
+                local okF, errF = RetireGroupAsForward(record, vacated, targetGroupId)
+                if not okF then
+                    return "rejected", errF or "no_effect"
+                end
             end
         end
+        RebuildDerived(record)
     end
 
-    -- Dissolve previous durable home when safe for the logical group.
+    -- Previous durable home of a moved *alt* may become a solo-main shell; keep it.
     if durablePrevGid and durablePrevGid ~= targetGroupId then
         RebuildDerived(record)
         if ShouldDissolvePhysicalGroup(record, durablePrevGid) then
             DissolveEmptyGroup(record, durablePrevGid)
         end
-    end
-    if vacatedMainGroups then
-        RebuildDerived(record)
-        for i = 1, #vacatedMainGroups do
-            local vacated = vacatedMainGroups[i]
-            if vacated ~= targetGroupId and ShouldDissolvePhysicalGroup(record, vacated) then
-                DissolveEmptyGroup(record, vacated)
-            end
-        end
-        RebuildDerived(record)
     end
 
     NotifyDurable("local")
@@ -1538,22 +1562,14 @@ function GI:ApplyUnassign(altGuid, opts)
         return "rejected", st
     end
 
-    if type(oldGid) == "string" and ShouldDissolvePhysicalGroup(record, oldGid) then
-        DissolveEmptyGroup(record, oldGid)
-    end
-
-    -- When the logical main has no remaining alts, dissolve leftover solo-main
-    -- claimant shells (same outcome as unassigning the last alt of a single group).
+    -- Do not dissolve on Unassign. Local absence of alts is not agreement that
+    -- the group is empty; solo-main shells stay reusable for offline peers.
     RebuildDerived(record)
-    if ValidGuid(logicalMain) then
-        local ginfo = record.graph.mains and record.graph.mains[logicalMain]
-        if not ginfo or #(ginfo.altGuids or {}) == 0 then
-            local claimants = ClaimantGroupIds(record, logicalMain)
-            for i = 1, #claimants do
-                if ShouldDissolvePhysicalGroup(record, claimants[i]) then
-                    DissolveEmptyGroup(record, claimants[i])
-                end
-            end
+    if ValidGuid(logicalMain) and type(oldGid) == "string" then
+        -- Keep graph coherent; ShouldDissolvePhysicalGroup is intentionally
+        -- false for solo-main / empty shells under the shared-group lifecycle.
+        if ShouldDissolvePhysicalGroup(record, oldGid) then
+            DissolveEmptyGroup(record, oldGid)
             RebuildDerived(record)
         end
     end

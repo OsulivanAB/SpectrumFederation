@@ -1323,12 +1323,14 @@ do
     assertEq(status, "duplicate", "stale assignment loses to tombstone")
     assertNil(GI:GetCharacterRole("Player-1-Bob"), "Bob stays unassigned after stale replay")
 
-    -- After reclaiming dissolved groups, tombstone still protects.
+    -- Solo-main shell for Alice is retained (not dissolved on last-alt Unassign).
+    -- Tombstone still protects even after an explicit reclaim pass.
     local record = select(1, GI:GetCurrentRecord())
+    assertTrue(record.graph.mains["Player-1-Alice"] ~= nil, "Alice solo-main shell retained")
     local removed = GI.ReclaimUnreferencedDissolved(record)
-    assertTrue(removed >= 1, "dissolved group reclaimed when unreferenced")
+    assertTrue(removed >= 0, "reclaim is safe with retained solo-main shell")
     status = GI.MergeMember(record, oldBob)
-    assertEq(status, "duplicate", "tombstone still blocks after group reclaim")
+    assertEq(status, "duplicate", "tombstone still blocks after reclaim pass")
     assertNil(GI:GetCharacterRole("Player-1-Bob"), "no resurrection after reclaim")
 end
 
@@ -1508,7 +1510,8 @@ do
         local c = GI.CountRetainedState()
         if c.groups > peakGroups then peakGroups = c.groups end
         assertTrue(c.groups <= GI.MAX_GROUPS, "capacity reclaim keeps groups <= MAX got=" .. c.groups)
-        assertTrue(c.liveGroups <= 1, "no live group after unassign got=" .. tostring(c.liveGroups))
+        -- Solo-main shell is retained and reused; churn must not grow live groups.
+        assertTrue(c.liveGroups <= 1, "solo-main shell reusable after unassign got=" .. tostring(c.liveGroups))
     end
     assertEq(successes, 40, "40 successful assign/unassign cycles without manual reclaim")
     assertTrue(peakGroups <= GI.MAX_GROUPS, "peak groups bounded by MAX got=" .. peakGroups)
@@ -1531,8 +1534,10 @@ do
     local finalCounts = GI.CountRetainedState()
     assertTrue(finalCounts.groups <= GI.MAX_GROUPS,
         "after 140 cycles groups <= MAX_GROUPS got=" .. finalCounts.groups)
-    assertTrue(finalCounts.liveGroups == 0, "no live group after final unassign")
-    -- Capacity reclaim must have fired: dissolved alone cannot exceed MAX forever.
+    -- Same-pair churn reuses one solo-main shell rather than dissolving each cycle.
+    assertEq(finalCounts.liveGroups, 1, "reusable solo-main shell retained after final unassign")
+    assertTrue(finalCounts.groups <= 2,
+        "same-pair churn does not accumulate group ids got=" .. finalCounts.groups)
     assertTrue(finalCounts.dissolved <= GI.MAX_GROUPS, "dissolved capped by reclaim")
 
     -- Stale dissolved/live group replay must not resurrect Bob.
@@ -2467,6 +2472,181 @@ do
     assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Dave", "faD Eve reused")
     assertEq(GI:UnassignAlt("Player-1-Bob", {}), "accepted", "faD unassign Bob from Carol")
     assertNil(select(1, GI:GetCharacterRole("Player-1-Bob")), "faD Bob reusable after leave")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+---------------------------------------------------------------------------
+-- Shared-group lifecycle: independent Unassign vs offline Assign (lcA / lcB)
+---------------------------------------------------------------------------
+
+do
+    -- lcA: A unassigns last visible alt; B offline assigns Eve under same main.
+    -- Dissolving G1 from local emptiness must not erase B's accepted Eve.
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Bob-Garona", "Dave-Garona"),
+        "accepted", "lcA seed Dave under Bob")
+    syncAll(dbA, dbB, "Alice-Garona")
+    assertEq(select(2, peerRole(dbB, "Player-1-Dave")), "Player-1-Bob", "lcA B synced Dave")
+
+    -- Partition: A unassigns Dave only.
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "lcA A unassign Dave")
+    assertNil(select(1, GI:GetCharacterRole("Player-1-Dave")), "lcA Dave unassigned on A")
+    local recA = select(1, GI:GetCurrentRecord())
+    local bobGid
+    for gid, g in pairs(recA.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Bob" then
+            bobGid = gid
+        end
+    end
+    assertTrue(bobGid ~= nil, "lcA solo-main shell retained after last-alt Unassign")
+    assertTrue(recA.members["Player-1-Bob"] and recA.members["Player-1-Bob"].groupId == bobGid,
+        "lcA Bob membership remains on live shell")
+
+    -- B offline assigns Eve under Bob (same existing group id).
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(GI:AssignAlt("Bob-Garona", "Eve-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "lcA B assign Eve under Bob")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", "lcA B Eve under Bob")
+
+    local function lcASyncAndAssert(orderAB, label)
+        local a = deepCopy(dbA)
+        local b = deepCopy(dbB)
+        if orderAB then
+            syncAll(a, b, "Alice-Garona")
+            syncAll(b, a, "Carol-Garona")
+        else
+            syncAll(b, a, "Carol-Garona")
+            syncAll(a, b, "Alice-Garona")
+        end
+        assertEq(select(2, peerRole(a, "Player-1-Eve")), "Player-1-Bob", label .. " A Eve under Bob")
+        assertEq(select(2, peerRole(b, "Player-1-Eve")), "Player-1-Bob", label .. " B Eve under Bob")
+        assertNil(select(1, peerRole(a, "Player-1-Dave")), label .. " A Dave unassigned")
+        assertNil(select(1, peerRole(b, "Player-1-Dave")), label .. " B Dave unassigned")
+        local groups = nil
+        SpectrumFederationDB = a
+        GI:Initialize(a)
+        groups = GI:GetRelationshipGroups()
+        local eveVisible = false
+        for i = 1, #groups do
+            if groups[i].mainGuid == "Player-1-Bob" then
+                for j = 1, #(groups[i].altGuids or {}) do
+                    if groups[i].altGuids[j] == "Player-1-Eve" then
+                        eveVisible = true
+                    end
+                end
+            end
+        end
+        assertTrue(eveVisible, label .. " Eve visible in Bob's group")
+        local dbC = seedEmptyPeer()
+        syncAll(a, dbC, "Alice-Garona")
+        assertEq(select(2, peerRole(dbC, "Player-1-Eve")), "Player-1-Bob", label .. " C catch-up Eve")
+        local saved = deepCopy(a)
+        reloadModules(saved)
+        assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", label .. " reload Eve")
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+    end
+    lcASyncAndAssert(true, "lcA fwd")
+    lcASyncAndAssert(false, "lcA rev")
+    -- Duplicates after convergence stay idempotent.
+    syncAll(dbA, dbB, "Alice-Garona")
+    syncAll(dbB, dbA, "Carol-Garona")
+    syncAll(dbA, dbB, "Alice-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Bob", "lcA dupe Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- lcB: while B offline-assigns Eve under Bob, A moves solo Bob under Carol.
+    -- Eve must remain a visible relationship (under Carol via retired shell), not hidden.
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Bob-Garona", "Dave-Garona"),
+        "accepted", "lcB seed Dave under Bob")
+    syncAll(dbA, dbB, "Alice-Garona")
+
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "lcB A clear Dave")
+    local recA = select(1, GI:GetCurrentRecord())
+    local bobGid
+    for gid, g in pairs(recA.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Bob" then
+            bobGid = gid
+        end
+    end
+    assertTrue(bobGid ~= nil, "lcB solo shell before offline split")
+
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    -- B keeps Dave and adds Eve under Bob while partitioned.
+    assertEq(GI:AssignAlt("Bob-Garona", "Eve-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "lcB B assign Eve under Bob offline")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", "lcB B Eve under Bob")
+
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GI:AssignAlt("Carol-Garona", "Bob-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "lcB A move Bob under Carol")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol", "lcB Bob under Carol")
+    recA = select(1, GI:GetCurrentRecord())
+    -- New main had no group: solo Bob shell is repurposed (same group id, Carol main).
+    assertTrue(recA.groups[bobGid] and not recA.groups[bobGid].dissolved, "lcB shell stays live")
+    assertEq(recA.groups[bobGid].mainGuid, "Player-1-Carol", "lcB shell repurposed for Carol")
+
+    local function lcBSyncAndAssert(orderAB, label)
+        local a = deepCopy(dbA)
+        local b = deepCopy(dbB)
+        if orderAB then
+            syncAll(a, b, "Alice-Garona")
+            syncAll(b, a, "Carol-Garona")
+        else
+            syncAll(b, a, "Carol-Garona")
+            syncAll(a, b, "Alice-Garona")
+        end
+        -- Dave's unassign from A and Eve's assign from B are independent characters.
+        assertNil(select(1, peerRole(a, "Player-1-Dave")), label .. " A Dave unassigned")
+        assertNil(select(1, peerRole(b, "Player-1-Dave")), label .. " B Dave unassigned")
+        assertEq(select(2, peerRole(a, "Player-1-Eve")), "Player-1-Carol",
+            label .. " A Eve visible under Carol")
+        assertEq(select(2, peerRole(b, "Player-1-Eve")), "Player-1-Carol",
+            label .. " B Eve visible under Carol")
+        assertEq(select(2, peerRole(a, "Player-1-Bob")), "Player-1-Carol", label .. " A Bob under Carol")
+        SpectrumFederationDB = a
+        GI:Initialize(a)
+        local groups = GI:GetRelationshipGroups()
+        local eveVisible = false
+        for i = 1, #groups do
+            if groups[i].mainGuid == "Player-1-Carol" then
+                for j = 1, #(groups[i].altGuids or {}) do
+                    if groups[i].altGuids[j] == "Player-1-Eve" then
+                        eveVisible = true
+                    end
+                end
+            end
+        end
+        assertTrue(eveVisible, label .. " Eve in Carol's visible group")
+        local gShell = select(1, GI:GetCurrentRecord()).groups[bobGid]
+        assertTrue(gShell and not gShell.dissolved and gShell.mainGuid == "Player-1-Carol",
+            label .. " shared group id remains Carol's live group")
+        local dbC = seedEmptyPeer()
+        syncAll(a, dbC, "Alice-Garona")
+        assertEq(select(2, peerRole(dbC, "Player-1-Eve")), "Player-1-Carol", label .. " C catch-up")
+        local saved = deepCopy(a)
+        reloadModules(saved)
+        assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Carol", label .. " reload")
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+    end
+    lcBSyncAndAssert(true, "lcB fwd")
+    lcBSyncAndAssert(false, "lcB rev")
     setActor("Alice-Garona", "Player-1-Alice", 1)
 end
 
