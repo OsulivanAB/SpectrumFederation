@@ -3362,7 +3362,12 @@ function Controls:AddAutocomplete(section, opts)
 		end)
 
 		local function Refresh()
-			ignore = true
+			local focused = edit.HasFocus and edit:HasFocus()
+			local cursor = nil
+			if focused and edit.GetCursorPosition then
+				cursor = edit:GetCursorPosition()
+			end
+			local priorText = edit.GetText and (edit:GetText() or "") or ""
 			local text = ""
 			if bound then
 				text = tostring(get() or "")
@@ -3371,11 +3376,24 @@ function Controls:AddAutocomplete(section, opts)
 			elseif type(opts.get) == "function" then
 				text = tostring(opts.get() or "")
 			end
-			edit:SetText(text)
-			if edit.SetCursorPosition then
-				edit:SetCursorPosition(0)
+			-- Preserve caret/focus during typing: avoid rewriting identical text
+			-- and never force the cursor to the start while the box is focused.
+			if not (focused and text == priorText) then
+				ignore = true
+				edit:SetText(text)
+				if edit.SetCursorPosition then
+					if focused and cursor ~= nil then
+						local maxPos = #text
+						if cursor > maxPos then
+							cursor = maxPos
+						end
+						edit:SetCursorPosition(cursor)
+					elseif not focused then
+						edit:SetCursorPosition(0)
+					end
+				end
+				ignore = false
 			end
-			ignore = false
 			local _, enabled = self:_ApplyRowState(row, section, opts, { edit })
 			local c = enabled and 1 or 0.6
 			edit:SetTextColor(c, c, c)

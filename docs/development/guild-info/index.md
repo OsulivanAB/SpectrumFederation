@@ -63,9 +63,9 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 | `assign` | Place alt under main (idempotent if already there; move when confirmed) |
 | `unassign` | Remove one alt from its main |
 | `change_main` | Promote a rostered alt; previous main becomes an alt; other alts retained |
-| `snapshot` | Compaction marker replacing a full prior op log |
+| `snapshot` | Legacy compaction marker (fold-supported); new compaction emits checkpoint `assign` ops |
 
-Remote admission requires a transport-authenticated sender with rank ≤ min(3, rankCount). Payload `actorGuid` / rank claims are never trusted.
+Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Authorization is the transport sender only; payload `actorGuid` is provenance kept version-stable for editor-to-editor relay/catch-up and is never treated as authentication. Compaction rewrites a full log into officer-authored per-relationship assign checkpoints (each within Guild Gossip’s 2048-byte record cap) plus a durable watermark so superseded ops cannot resurrect removed links.
 
 ## Public read API
 

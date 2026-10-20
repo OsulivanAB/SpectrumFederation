@@ -708,6 +708,7 @@ local function EmptyRecord(guildKey, clubId)
         revision = 0,
         openConflicts = {},
         compactedIds = {}, -- op ids removed by compaction (duplicate detection)
+        compactWatermarkAt = 0, -- ops strictly older are superseded after compaction
     }
 end
 
@@ -832,14 +833,19 @@ local function MaxOpAt(record)
     return maxAt
 end
 
---- Compact the op log into an officer-authored snapshot when full.
+--- Compact a full op log into officer-authored per-relationship assign checkpoints.
+-- Single monolithic snapshots exceed Guild Gossip's 2048-byte CBOR record cap once
+-- a guild has many groups; checkpoint assigns stay individually transportable and
+-- reconstruct the graph for late joiners. Compacted IDs + watermark block resurrection.
 -- actorGuid/actorName must be a verified editor identity (never a synthetic marker).
--- Compacted op IDs are retained for duplicate detection so late redelivery cannot resurrect.
 local function CompactIfNeeded(record, actorGuid, actorName)
     if #record.order < GI.MAX_ACCEPTED_OPS then
         return false
     end
     if type(actorGuid) ~= "string" or actorGuid == "" or actorGuid == "compact" then
+        return false
+    end
+    if not ValidGuid(actorGuid) then
         return false
     end
     local groups = SnapshotGroupsFromRecord(record)
@@ -877,24 +883,54 @@ local function CompactIfNeeded(record, actorGuid, actorName)
     for i = 1, #digest do
         mix = (mix * 33 + digest:byte(i)) % 4294967296
     end
-    local snapId = string.format("gi1:%s:snap:%08x:%d", actorGuid, mix, tonumber(record.revision) or 0)
-    if #snapId > GI.MAX_OPERATION_ID then
-        snapId = string.format("gi1:snap:%08x:%d", mix, tonumber(record.revision) or 0)
+
+    local newOps = {}
+    local newOrder = {}
+    local seq = 0
+    local actorNameSafe = type(actorName) == "string" and actorName or ""
+    for i = 1, #groups do
+        local g = groups[i]
+        for j = 1, #(g.altGuids or {}) do
+            seq = seq + 1
+            local id = string.format("gi1:%s:ckpt:%08x:%d", actorGuid, mix, seq)
+            if #id > GI.MAX_OPERATION_ID then
+                id = string.format("gi1:ckpt:%08x:%d", mix, seq)
+            end
+            local altName = type(g.altNames) == "table" and g.altNames[j] or nil
+            local altClass = type(g.altClasses) == "table" and g.altClasses[j] or nil
+            newOps[id] = {
+                id = id,
+                kind = GI.KIND.ASSIGN,
+                at = maxAt,
+                actorGuid = actorGuid,
+                actorName = actorNameSafe,
+                guildKey = record.guildKey,
+                mainGuid = g.mainGuid,
+                mainName = g.mainName,
+                mainClass = g.mainClass,
+                altGuid = g.altGuids[j],
+                altName = altName,
+                altClass = altClass,
+            }
+            newOrder[#newOrder + 1] = id
+            compacted[id] = nil
+        end
     end
-    local snap = {
-        id = snapId,
-        kind = GI.KIND.SNAPSHOT,
-        at = maxAt,
-        actorGuid = actorGuid,
-        actorName = type(actorName) == "string" and actorName or "",
-        guildKey = record.guildKey,
-        groups = groups,
-    }
-    record.ops = { [snapId] = snap }
-    record.order = { snapId }
-    compacted[snapId] = nil -- snapshot itself remains live
+    -- Leave room for the triggering admit after compaction (characters ≤ 256).
+    if #newOrder > GI.MAX_ACCEPTED_OPS - 1 then
+        return false
+    end
+
+    record.ops = newOps
+    record.order = newOrder
+    record.compactWatermarkAt = math.max(tonumber(record.compactWatermarkAt) or 0, maxAt)
     RebuildDerived(record)
-    DebugInfo("compacted guildInfo ops into snapshot id=%s actor=%s", snapId, actorGuid)
+    DebugInfo(
+        "compacted guildInfo ops into %d checkpoint assigns actor=%s watermark=%s",
+        #newOrder,
+        actorGuid,
+        tostring(record.compactWatermarkAt)
+    )
     return true
 end
 
@@ -940,19 +976,28 @@ function GI:AdmitOperation(op, opts)
         return "duplicate", "compacted"
     end
 
-    -- Ops strictly older than the latest durable snapshot are superseded (C).
+    -- Ops strictly older than the compaction watermark (or a legacy snapshot) are
+    -- superseded so compacted history cannot resurrect removed links.
     if op.kind ~= GI.KIND.SNAPSHOT then
-        local latestSnapAt = nil
+        local watermark = tonumber(record.compactWatermarkAt) or 0
         for i = 1, #(record.order or {}) do
             local existing = record.ops[record.order[i]]
             if existing and existing.kind == GI.KIND.SNAPSHOT then
                 local at = tonumber(existing.at) or 0
-                if not latestSnapAt or at > latestSnapAt then
-                    latestSnapAt = at
+                if at > watermark then
+                    watermark = at
                 end
             end
         end
-        if latestSnapAt and (tonumber(op.at) or 0) < latestSnapAt then
+        if watermark > 0 and (tonumber(op.at) or 0) < watermark then
+            return "duplicate", "superseded"
+        end
+    else
+        -- Stale snapshots must not undo newer accepted relationships.
+        local watermark = tonumber(record.compactWatermarkAt) or 0
+        local maxLive = MaxOpAt(record)
+        local snapAt = tonumber(op.at) or 0
+        if (watermark > 0 and snapAt < watermark) or (maxLive > 0 and snapAt < maxLive) then
             return "duplicate", "superseded"
         end
     end
@@ -978,6 +1023,11 @@ function GI:AdmitOperation(op, opts)
             local altInfo = byGuid[op.altGuid]
             if not altInfo or altInfo.role ~= "alt" then
                 return "rejected", "alt_not_assigned"
+            end
+            if type(opts.expectedMainGuid) == "string" and opts.expectedMainGuid ~= "" then
+                if altInfo.mainGuid ~= opts.expectedMainGuid then
+                    return "rejected", "stale_unassign"
+                end
             end
             if type(op.mainGuid) == "string" and op.mainGuid ~= "" and altInfo.mainGuid ~= op.mainGuid then
                 return "rejected", "stale_unassign"

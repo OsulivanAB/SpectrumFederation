@@ -89,6 +89,44 @@ local function RecordIdForOp(opId)
     return "gi-op:" .. tostring(opId)
 end
 
+local function MaxRecordCbor()
+    local g = Gossip()
+    return tonumber(g and g.MAX_RECORD_CBOR) or 2048
+end
+
+--- Wire-shape body used by the engine (id + versionFp + body).
+local function WireRecordForOp(op)
+    if type(op) ~= "table" or type(op.id) ~= "string" then
+        return nil
+    end
+    local rid = RecordIdForOp(op.id)
+    local vfp = OpVersionFp(op)
+    return {
+        id = rid,
+        versionFp = vfp,
+        body = {
+            kind = "guildinfo-op",
+            op = op,
+        },
+    }
+end
+
+--- Whether a provider record fits Guild Gossip's serialized record cap.
+function GI.RecordWithinGossipCap(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    local enc = C_EncodingUtil
+    if not enc or type(enc.SerializeCBOR) ~= "function" then
+        return false
+    end
+    local ok, raw = pcall(enc.SerializeCBOR, record)
+    if not ok or type(raw) ~= "string" then
+        return false
+    end
+    return #raw <= MaxRecordCbor(), #raw
+end
+
 local function RebuildExportIndex()
     exportState.order = {}
     exportState.byId = {}
@@ -106,39 +144,66 @@ local function RebuildExportIndex()
         local opId = record.order[i]
         local op = record.ops and record.ops[opId]
         if type(op) == "table" then
-            local rid = RecordIdForOp(opId)
-            local vfp = OpVersionFp(op)
-            exportState.byId[rid] = {
-                id = rid,
-                versionFp = vfp,
-                body = {
-                    kind = "guildinfo-op",
-                    op = op,
-                },
-            }
-            exportState.order[#exportState.order + 1] = rid
+            local wire = WireRecordForOp(op)
+            if wire and GI.RecordWithinGossipCap(wire) then
+                exportState.byId[wire.id] = {
+                    id = wire.id,
+                    versionFp = wire.versionFp,
+                    body = wire.body,
+                }
+                exportState.order[#exportState.order + 1] = wire.id
+            else
+                DebugWarn("skipping oversize guildInfo export id=%s", tostring(opId))
+            end
         end
     end
 end
 
 local function UpsertExportOp(op)
-    if type(op) ~= "table" or type(op.id) ~= "string" then
+    local wire = WireRecordForOp(op)
+    if not wire then
         return
     end
-    local rid = RecordIdForOp(op.id)
-    local vfp = OpVersionFp(op)
+    if not GI.RecordWithinGossipCap(wire) then
+        DebugWarn("refusing oversize guildInfo export id=%s", tostring(op.id))
+        return
+    end
+    local rid = wire.id
     local existing = exportState.byId[rid]
     exportState.byId[rid] = {
         id = rid,
-        versionFp = vfp,
-        body = {
-            kind = "guildinfo-op",
-            op = op,
-        },
+        versionFp = wire.versionFp,
+        body = wire.body,
     }
     if not existing then
         exportState.order[#exportState.order + 1] = rid
     end
+end
+
+local function ProviderEntry()
+    local g = Gossip()
+    if not g or type(g.GetProvider) ~= "function" then
+        return nil
+    end
+    return g.GetProvider(GI.PROVIDER_ID)
+end
+
+--- Bump the physical Gossip index so vanished IDs and guild-scope changes
+-- invalidate active views/bookmarks (not merely local exportState).
+local function BumpPhysicalIndex(index)
+    local g = Gossip()
+    local idx = index
+    if not idx then
+        local entry = ProviderEntry()
+        idx = entry and entry.index
+    end
+    if not idx or not g or type(g.BumpIndexEpoch) ~= "function" then
+        return false
+    end
+    g.BumpIndexEpoch(idx)
+    idx.buildComplete = false
+    idx.dirty = true
+    return true
 end
 
 local function OnIndexInvalidated()
@@ -148,11 +213,16 @@ end
 local function EnsureIndex(index, limits)
     local g = Gossip()
     local budget = math.max(1, tonumber(limits and limits.indexEntries) or 8)
+    local guildKey = CurrentGuildKey()
+    -- Guild-scope transitions must invalidate before any completed-index fast path
+    -- so guild A bodies are never advertised under guild B's scope.
+    if exportState.guildKey ~= guildKey then
+        RebuildExportIndex()
+        BumpPhysicalIndex(index)
+        exportState.enumPos = 1
+    end
     if index.buildComplete and not index.dirty then
         return false, 0
-    end
-    if exportState.guildKey ~= CurrentGuildKey() then
-        RebuildExportIndex()
     end
     if not exportState.enumPos then
         exportState.enumPos = 1
@@ -184,8 +254,10 @@ end
 local function ListRecordIds(cursor, limit)
     cursor = math.max(1, tonumber(cursor) or 1)
     limit = math.max(1, tonumber(limit) or 32)
-    if exportState.guildKey ~= CurrentGuildKey() then
+    local guildKey = CurrentGuildKey()
+    if exportState.guildKey ~= guildKey then
         RebuildExportIndex()
+        BumpPhysicalIndex(nil)
     end
     local page = {}
     local i = cursor
@@ -200,25 +272,49 @@ local function ListRecordIds(cursor, limit)
 end
 
 local function GetRecordVersionFp(recordId)
+    local guildKey = CurrentGuildKey()
+    if exportState.guildKey ~= guildKey then
+        RebuildExportIndex()
+        BumpPhysicalIndex(nil)
+    end
     local r = exportState.byId[tostring(recordId)]
     return r and r.versionFp or nil
 end
 
 local function GetRecordBody(recordId)
+    local guildKey = CurrentGuildKey()
+    if exportState.guildKey ~= guildKey then
+        RebuildExportIndex()
+        BumpPhysicalIndex(nil)
+    end
     local r = exportState.byId[tostring(recordId)]
     if not r then
         return nil
     end
-    return { id = r.id, versionFp = r.versionFp, body = r.body }
+    local wire = { id = r.id, versionFp = r.versionFp, body = r.body }
+    if not GI.RecordWithinGossipCap(wire) then
+        return nil
+    end
+    return wire
+end
+
+local function ValidProvenanceGuid(guid)
+    return type(guid) == "string" and guid ~= "" and guid ~= "compact" and #guid <= (GI.MAX_GUID or 64)
 end
 
 --- Admit a remote gossip record. Only authenticated editor senders may introduce ops.
+-- Authorization is solely the transport-authenticated editor sender. Payload
+-- actorGuid is provenance (kept version-stable for relay/catch-up), never auth.
 local function ValidateAndApply(record, ctx)
     if type(record) ~= "table" or type(record.body) ~= "table" then
         return "rejected", "malformed"
     end
     if ctx and ctx.localWrite then
         return "rejected", "use_local_api"
+    end
+    -- Enforce the same serialized size bound the engine uses before mutation.
+    if not GI.RecordWithinGossipCap(record) then
+        return "rejected", "record_too_large"
     end
     local body = record.body
     if body.kind ~= "guildinfo-op" or type(body.op) ~= "table" then
@@ -237,26 +333,23 @@ local function ValidateAndApply(record, ctx)
     if type(op.guildKey) ~= "string" or op.guildKey ~= member.guildKey then
         return "rejected", "wrong_guild"
     end
-    -- Snapshots are officer-authored checkpoints. Any authenticated editor may
-    -- relay them; keep payload provenance when present (C). Mutable ops still
-    -- bind actor to the authenticated sender to prevent laundering.
-    if op.kind == GI.KIND.SNAPSHOT then
-        if type(op.actorGuid) ~= "string" or op.actorGuid == "" or op.actorGuid == "compact" then
-            op.actorGuid = member.guid
-            op.actorName = member.name
-        end
-    else
-        if type(op.actorGuid) == "string" and op.actorGuid ~= "" and op.actorGuid ~= member.guid then
-            return "rejected", "actor_mismatch"
-        end
+
+    -- Keep stable provenance when present so A→B→C catch-up does not rewrite
+    -- versionFp. Missing/synthetic actors bind to the authenticated editor.
+    if not ValidProvenanceGuid(op.actorGuid) then
         op.actorGuid = member.guid
         op.actorName = member.name
+    elseif type(op.actorName) ~= "string" or op.actorName == "" then
+        if op.actorGuid == member.guid then
+            op.actorName = member.name
+        end
     end
 
     local status, detail = GI:AdmitOperation(op, { remote = true })
     if status == "accepted" then
         if op.kind == GI.KIND.SNAPSHOT then
             RebuildExportIndex()
+            BumpPhysicalIndex(nil)
         else
             UpsertExportOp(op)
         end
@@ -358,9 +451,9 @@ function GI.NotifyLocalDurableChange(reason)
     reason = tostring(reason or "local")
     if providerRegistered then
         local guildKey = CurrentGuildKey()
-        -- Compaction / snapshot catch-up must drop export rows for ops no longer
-        -- retained by the provider so Gossip reconcile can prune them (C).
-        if reason == "compact" or exportState.guildKey ~= guildKey then
+        local prevOrder = exportState.order
+        local needEpoch = reason == "compact" or exportState.guildKey ~= guildKey
+        if needEpoch then
             RebuildExportIndex()
         else
             local record = guildKey and select(1, GI:GetRecordForGuildKey(guildKey)) or nil
@@ -373,7 +466,6 @@ function GI.NotifyLocalDurableChange(reason)
                         live[RecordIdForOp(op.id)] = true
                     end
                 end
-                -- Drop export entries that durable storage no longer retains.
                 local newOrder = {}
                 for i = 1, #exportState.order do
                     local rid = exportState.order[i]
@@ -381,14 +473,33 @@ function GI.NotifyLocalDurableChange(reason)
                         newOrder[#newOrder + 1] = rid
                     else
                         exportState.byId[rid] = nil
+                        needEpoch = true
                     end
                 end
                 if #newOrder ~= #exportState.order then
                     exportState.order = newOrder
                     exportState.enumPos = nil
+                    needEpoch = true
                 end
             else
                 RebuildExportIndex()
+                needEpoch = true
+            end
+        end
+        if needEpoch then
+            -- Vanish / scope / compaction: bump physical index so reconcile cannot
+            -- keep serving deleted IDs from a completed index forever.
+            local stale = reason == "compact"
+            if not stale then
+                for i = 1, #prevOrder do
+                    if not exportState.byId[prevOrder[i]] then
+                        stale = true
+                        break
+                    end
+                end
+            end
+            if stale or reason == "compact" or exportState.guildKey ~= guildKey then
+                BumpPhysicalIndex(nil)
             end
         end
         local g = Gossip()
@@ -400,6 +511,8 @@ function GI.NotifyLocalDurableChange(reason)
 end
 
 GI._NotifyLocalDurableChange = GI.NotifyLocalDurableChange
+GI._RebuildExportIndex = RebuildExportIndex
+GI._BumpPhysicalIndex = BumpPhysicalIndex
 
 -- Hook Initialize to register the provider after the durable root is ready.
 local _previousInitialize = GI.Initialize

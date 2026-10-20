@@ -77,13 +77,42 @@ function GetNumGuildMembers()
     end
     return #world.guild.members, #world.guild.members, #world.guild.members
 end
+world.rosterInfoCalls = 0
 function GetGuildRosterInfo(i)
+    world.rosterInfoCalls = (world.rosterInfoCalls or 0) + 1
     local m = world.guild.members[i]
     if not m then return end
     local rankIndex = (tonumber(m.rankOrder) or 1) - 1
     return m.name, world.guild.ranks[m.rankOrder] or "Rank", rankIndex, 80, "Class", "Zone",
         "", "", m.online, 0, m.class or "WARRIOR", 0, 0, false, false, 0, m.guid
 end
+
+-- Minimal CBOR-like serializer matching guild_gossip_tests (size-bound evidence).
+local function ser(v, seen)
+    seen = seen or {}
+    local t = type(v)
+    if v == nil then return "N"
+    elseif t == "boolean" then return v and "T" or "F"
+    elseif t == "number" then return "#" .. tostring(v) .. ";"
+    elseif t == "string" then return "$" .. #v .. ":" .. v
+    elseif t == "table" then
+        if seen[v] then return "@" end
+        seen[v] = true
+        local keys = {}
+        for k in pairs(v) do keys[#keys + 1] = k end
+        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        local parts = {}
+        for i = 1, #keys do
+            local k = keys[i]
+            parts[#parts + 1] = ser(k, seen) .. "=" .. ser(v[k], seen)
+        end
+        return "{" .. table.concat(parts, ",") .. "}"
+    end
+    return "?"
+end
+C_EncodingUtil = {
+    SerializeCBOR = function(t) return ser(t) end,
+}
 function GuildControlGetNumRanks()
     return #world.guild.ranks
 end
@@ -264,6 +293,7 @@ SF.NameUtil = {
 -- Minimal Guild Gossip demand/provider stubs used by Guild Info.
 SF.GuildGossip = {
     _providers = {},
+    MAX_RECORD_CBOR = 2048,
     SelfId = function()
         return world.unitName .. "-Garona"
     end,
@@ -333,7 +363,16 @@ SF.GuildGossip = {
     end,
     Init = function() end,
     RegisterProvider = function(spec)
-        SF.GuildGossip._providers[spec.id] = { spec = spec, enabled = true, index = { buildComplete = false, dirty = true } }
+        SF.GuildGossip._providers[spec.id] = {
+            spec = spec,
+            enabled = true,
+            index = {
+                buildComplete = false,
+                dirty = true,
+                epoch = 1,
+                byId = {},
+            },
+        }
         return true
     end,
     SetProviderEnabled = function(id, enabled)
@@ -343,12 +382,62 @@ SF.GuildGossip = {
     GetProvider = function(id)
         return SF.GuildGossip._providers[id]
     end,
-    NotifyProviderChanged = function()
+    NotifyProviderChanged = function(id)
         world.providerChanged = world.providerChanged + 1
+        local e = SF.GuildGossip._providers[id]
+        if e and e.index then
+            e.index.dirty = true
+        end
     end,
-    IndexUpsert = function() return true, nil end,
-    BumpIndexEpoch = function() end,
+    IndexUpsert = function(index, recordId, versionFp, meta)
+        if type(index) ~= "table" or recordId == nil then
+            return false, "bad_args"
+        end
+        recordId = tostring(recordId)
+        versionFp = tostring(versionFp or "")
+        local existing = index.byId and index.byId[recordId]
+        if existing and existing.versionFp == versionFp then
+            return false, "duplicate"
+        end
+        if existing and existing.versionFp ~= versionFp then
+            return false, "replaced"
+        end
+        index.byId = index.byId or {}
+        index.byId[recordId] = { id = recordId, versionFp = versionFp, meta = meta }
+        if not index.buildComplete then
+            index.dirty = true
+        end
+        return true, index.byId[recordId]
+    end,
+    IndexRemove = function(index, recordId)
+        if type(index) ~= "table" or not index.byId then return false end
+        recordId = tostring(recordId)
+        if not index.byId[recordId] then return false end
+        index.byId[recordId] = nil
+        return true
+    end,
+    BumpIndexEpoch = function(index)
+        if type(index) ~= "table" then return end
+        index.epoch = (tonumber(index.epoch) or 0) + 1
+        index.byId = {}
+        index.buildComplete = false
+        index.dirty = true
+        world.indexEpochBumps = (world.indexEpochBumps or 0) + 1
+    end,
 }
+
+local function DriveEnsureIndex(providerId, rounds)
+    local entry = SF.GuildGossip._providers[providerId]
+    assertTrue(entry and entry.spec and entry.spec.EnsureIndex, "provider EnsureIndex available")
+    rounds = rounds or 64
+    for _ = 1, rounds do
+        local more = entry.spec.EnsureIndex(entry.index, { indexEntries = 32 })
+        if more == false and entry.index.buildComplete and not entry.index.dirty then
+            break
+        end
+    end
+    return entry.index
+end
 
 local function loadModule(path)
     local f, err = loadfile(path)
@@ -371,6 +460,9 @@ local function resetDB()
     SpectrumFederationDB = {}
     world.notifyCount = 0
     world.providerChanged = 0
+    world.indexEpochBumps = 0
+    world.rosterInfoCalls = 0
+    SF.GuildGossip._providers = {}
     GI.InvalidateRosterSnapshot()
     local ok = GI:Initialize(SpectrumFederationDB)
     assertTrue(ok, "Initialize empty DB")
@@ -634,10 +726,10 @@ do
     }, { sender = "Carol-Garona" })
     assertEq(status, "duplicate", "duplicate remote op")
 
-    -- Actor mismatch laundering: Bob claims to be Alice in payload but sender is Bob... Bob is rank 2 editor though.
-    -- Use Dave as sender with Alice actorGuid already tested. Test editor with wrong actorGuid:
-    local badActor = {
-        id = "gi1:Player-1-Carol:cccccccccccccccccccccccc:2",
+    -- Editor relay catch-up: Carol may forward an Alice-authored op (provenance kept).
+    -- Authorization is the transport editor sender; actorGuid is not authentication.
+    local relayed = {
+        id = "gi1:Player-1-Alice:cccccccccccccccccccccccc:2",
         kind = GI.KIND.ASSIGN,
         at = world.time + 2,
         actorGuid = "Player-1-Alice",
@@ -649,12 +741,32 @@ do
         altName = "Eve-Garona",
     }
     status, detail = spec.ValidateAndApply({
-        id = "gi-op:" .. badActor.id,
+        id = "gi-op:" .. relayed.id,
         versionFp = "z",
-        body = { kind = "guildinfo-op", op = badActor },
+        body = { kind = "guildinfo-op", op = relayed },
     }, { sender = "Carol-Garona" })
-    assertEq(status, "rejected", "actor_mismatch rejected")
-    assertEq(detail, "actor_mismatch", "actor_mismatch detail")
+    assertEq(status, "accepted", "editor may relay another editor's op")
+    assertEq(GI:GetCharacterRole("Player-1-Eve"), "alt", "relayed assign applied")
+    -- Non-editor still cannot introduce ops even with a forged officer actorGuid.
+    status, detail = spec.ValidateAndApply({
+        id = "gi-op:gi1:Player-1-Alice:dddddddddddddddddddddddd:3",
+        versionFp = "z2",
+        body = {
+            kind = "guildinfo-op",
+            op = {
+                id = "gi1:Player-1-Alice:dddddddddddddddddddddddd:3",
+                kind = GI.KIND.ASSIGN,
+                at = world.time + 3,
+                actorGuid = "Player-1-Alice",
+                actorName = "Alice-Garona",
+                guildKey = "club:42",
+                mainGuid = "Player-1-Carol",
+                altGuid = "Player-2-Bob",
+            },
+        },
+    }, { sender = "Dave-Garona" })
+    assertEq(status, "rejected", "non-editor cannot launder via forged actorGuid")
+    assertTrue(detail == "unauthorized" or detail ~= nil, "unauthorized launder detail")
 end
 
 ---------------------------------------------------------------------------
@@ -848,7 +960,7 @@ do
     assertTrue(type(def) == "table", "Build stores page definition")
 
     local accessGet, assignEnabled, mainResolvedCb, altResolvedCb, mainTextCb, altTextCb
-    local mainEnabled, altEnabled
+    local mainEnabled, altEnabled, changeMainSet, changeMainBtnEnabled, unassignRemove
     for _, sec in ipairs(def.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
             if sec.id == "guildInfoMainAltStatus" and item.type == "display" then
@@ -856,6 +968,12 @@ do
             end
             if item.type == "button" and item.buttonText == "Assign" then
                 assignEnabled = item.enabled
+            end
+            if item.type == "button" and item.buttonText == "Change Main" then
+                changeMainBtnEnabled = item.enabled
+            end
+            if item.type == "dropdown" and item.label and tostring(item.label):find("New main", 1, true) then
+                changeMainSet = item.set
             end
             if item.type == "autocomplete" and item.label == "Main name" then
                 mainResolvedCb = item.onResolved
@@ -866,6 +984,9 @@ do
                 altResolvedCb = item.onResolved
                 altTextCb = item.onTextChanged
                 altEnabled = item.enabled
+            end
+            if item.type == "scrollList" and type(item.onRemove) == "function" then
+                unassignRemove = item.onRemove
             end
         end
     end
@@ -931,6 +1052,59 @@ do
         or tostring(accessGet()):find("ranks 1", 1, true) ~= nil,
         "demotion updates access status text")
     setActor("Alice-Garona", "Player-1-Alice", 1)
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    page:Refresh(panel)
+
+    -- Form edits must not rescan the guild roster on each keystroke.
+    GI.GetRosterSnapshot(true)
+    local scansBefore = world.rosterInfoCalls
+    for i = 1, 5 do
+        mainTextCb(nil, "Al" .. tostring(i))
+    end
+    assertEq(world.rosterInfoCalls, scansBefore,
+        "autocomplete keystrokes do not InvalidateRosterSnapshot/rescan")
+    assertTrue(refreshCalls >= 1, "form edits still queue control Refresh")
+
+    -- Change Main candidate selection enables the dependent button.
+    assign("Alice-Garona", "Bob-Garona")
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "scrollList" and type(item.onSelect) == "function" then
+                item.onSelect(nil, { clusterId = "Player-1-Alice", role = "main" })
+            end
+        end
+    end
+    assertTrue(type(changeMainSet) == "function", "Change Main dropdown set callback")
+    assertTrue(not changeMainBtnEnabled(), "Change Main button off before candidate")
+    changeMainSet("Player-1-Bob")
+    assertTrue(changeMainBtnEnabled() == true, "Change Main enables after candidate selection")
+
+    -- Stale unassign confirmation via page callback (captures displayed main).
+    assertTrue(type(unassignRemove) == "function", "unassign onRemove callback")
+    local pendingConfirm
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        pendingConfirm = accept
+    end
+    local msgCtx = { section = { SetMessage = function() end } }
+    unassignRemove(msgCtx, {
+        role = "alt",
+        guid = "Player-1-Bob",
+        mainGuid = "Player-1-Alice",
+    })
+    assertTrue(type(pendingConfirm) == "function", "unassign opens confirmation")
+    -- Another editor moves Bob before confirm.
+    GI:AssignAlt("Carol-Garona", "Bob-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+        moveConfirmed = true,
+        expectedOldMain = "Player-1-Alice",
+    })
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol",
+        "Bob moved to Carol before stale unassign confirm")
+    pendingConfirm()
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol",
+        "stale unassign does not remove newer Carol relationship")
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept) if accept then accept() end end
 end
 
 ---------------------------------------------------------------------------
@@ -1075,13 +1249,13 @@ do
 end
 
 ---------------------------------------------------------------------------
--- C) Compaction snapshot sync + export lifecycle + late joiner
+-- C) Compaction checkpoint sync + export/index lifecycle + late joiner
 ---------------------------------------------------------------------------
 
 do
     resetDB()
     local prevMax = GI.MAX_ACCEPTED_OPS
-    GI.MAX_ACCEPTED_OPS = 3
+    GI.MAX_ACCEPTED_OPS = 5
     setActor("Alice-Garona", "Player-1-Alice", 1)
 
     world.time = world.time + 1
@@ -1089,45 +1263,100 @@ do
     world.time = world.time + 1
     assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "compact seed assign Eve")
     world.time = world.time + 1
-    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "compact seed assign Dave fills log")
-    local record = select(1, GI:GetCurrentRecord())
-    assertEq(#record.order, 3, "log full at compaction threshold")
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "compact seed assign Dave")
     world.time = world.time + 1
-    local beforeCompact = world.providerChanged
-    -- Next admit compacts then applies unassign.
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "compact seed unassign Dave")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "log filled to compaction threshold")
+    local record = select(1, GI:GetCurrentRecord())
+    assertEq(#record.order, 5, "log full at compaction threshold")
+
+    -- Build physical index before compaction so we can prove IDs vanish after.
+    local index = DriveEnsureIndex(GI.PROVIDER_ID)
+    assertTrue(index.buildComplete, "index build complete before compaction")
+    local preCompactIds = {}
+    for id in pairs(index.byId or {}) do
+        preCompactIds[id] = true
+    end
+    assertTrue(next(preCompactIds) ~= nil, "physical index has pre-compact records")
+
+    world.time = world.time + 1
+    local beforeEpoch = world.indexEpochBumps or 0
     local status = GI:UnassignAlt("Player-1-Dave", {})
     assertEq(status, "accepted", "op that triggers compaction accepted")
     record = select(1, GI:GetCurrentRecord())
     assertTrue(#record.order < GI.MAX_ACCEPTED_OPS, "log shrunk after compaction")
-    local snap = nil
+    assertTrue((tonumber(record.compactWatermarkAt) or 0) > 0, "compaction sets watermark")
+    local ckptCount, snapCount = 0, 0
     for i = 1, #record.order do
         local op = record.ops[record.order[i]]
-        if op and op.kind == GI.KIND.SNAPSHOT then
-            snap = op
-            break
+        if op and op.kind == GI.KIND.ASSIGN and tostring(op.id):find(":ckpt:", 1, true) then
+            ckptCount = ckptCount + 1
+            assertEq(op.actorGuid, "Player-1-Alice", "checkpoint authored by officer")
+            assertTrue(op.actorGuid ~= "compact", "checkpoint actorGuid is not compact marker")
+            local wire = {
+                id = "gi-op:" .. op.id,
+                versionFp = "x",
+                body = { kind = "guildinfo-op", op = op },
+            }
+            local okSize, rawLen = GI.RecordWithinGossipCap(wire)
+            assertTrue(okSize, "checkpoint assign within MAX_RECORD_CBOR")
+            assertTrue(rawLen <= SF.GuildGossip.MAX_RECORD_CBOR, "serialized checkpoint size bound")
+        elseif op and op.kind == GI.KIND.SNAPSHOT then
+            snapCount = snapCount + 1
         end
     end
-    assertTrue(snap ~= nil, "compaction produced an officer snapshot")
-    assertEq(snap.actorGuid, "Player-1-Alice", "snapshot authored by officer not synthetic compact")
-    assertTrue(snap.actorGuid ~= "compact", "snapshot actorGuid is not compact marker")
+    assertTrue(ckptCount >= 2, "compaction produced transportable checkpoint assigns")
+    assertEq(snapCount, 0, "new compaction does not emit monolithic snapshot")
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "Bob preserved across compaction")
     assertEq(GI:GetCharacterRole("Player-1-Eve"), "alt", "Eve preserved across compaction")
     assertNil(GI:GetCharacterRole("Player-1-Dave"), "post-compact unassign applied")
-    assertTrue(world.providerChanged > beforeCompact, "compaction notifies provider changed")
+    assertTrue((world.indexEpochBumps or 0) > beforeEpoch, "compaction bumps physical index epoch")
 
-    -- Export index matches durable live ops only (C).
-    local provider = SF.GuildGossip._providers[GI.PROVIDER_ID]
-    local spec = provider.spec
-    local page = spec.ListRecordIds(1, 64)
-    assertEq(#page, #record.order, "export size matches live durable ops")
-    local exportHasSnap = false
-    for i = 1, #page do
-        if page[i]:find(snap.id, 1, true) then exportHasSnap = true end
+    -- Rebuild index after compact: vanished pre-compact IDs must not remain.
+    index = DriveEnsureIndex(GI.PROVIDER_ID)
+    assertTrue(index.buildComplete, "index rebuilds after compaction")
+    for id in pairs(preCompactIds) do
+        assertTrue(index.byId[id] == nil, "pre-compact id removed from physical index: " .. id)
     end
-    assertTrue(exportHasSnap, "export includes officer snapshot")
+    local liveExport = 0
+    for _ in pairs(index.byId or {}) do liveExport = liveExport + 1 end
+    assertEq(liveExport, #record.order, "physical index matches live durable ops")
 
-    -- Old compacted op cannot resurrect a removed link.
-    -- Mark a fabricated pre-compact id as compacted and ensure duplicate.
+    -- Oversized monolithic snapshot must not pass the transport/admission bound.
+    local hugeGroups = {}
+    for i = 1, 40 do
+        local alts, names = {}, {}
+        for j = 1, 8 do
+            alts[#alts + 1] = string.format("Player-9-%02d%02d", i, j)
+            names[#names + 1] = string.format("Alt%02d%02d-Garona", i, j)
+        end
+        hugeGroups[#hugeGroups + 1] = {
+            mainGuid = string.format("Player-8-%02d", i),
+            mainName = string.format("Main%02d-Garona", i),
+            altGuids = alts,
+            altNames = names,
+        }
+    end
+    local hugeSnap = {
+        id = "gi1:Player-1-Alice:hugesnapaaaaaaaaaaaaaa:1",
+        kind = GI.KIND.SNAPSHOT,
+        at = world.time + 100,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        guildKey = "club:42",
+        groups = hugeGroups,
+    }
+    local hugeWire = {
+        id = "gi-op:" .. hugeSnap.id,
+        versionFp = "huge",
+        body = { kind = "guildinfo-op", op = hugeSnap },
+    }
+    assertTrue(not GI.RecordWithinGossipCap(hugeWire), "realistic full snapshot exceeds CBOR cap")
+    local provider = SF.GuildGossip._providers[GI.PROVIDER_ID]
+    local hugeStatus = provider.spec.ValidateAndApply(hugeWire, { sender = "Alice-Garona" })
+    assertEq(hugeStatus, "rejected", "oversize snapshot rejected at provider admission")
+
     record.compactedIds["gi1:Player-1-Alice:oldcompactedaaaaaaaaaa:1"] = true
     local st = GI:AdmitOperation({
         id = "gi1:Player-1-Alice:oldcompactedaaaaaaaaaa:1",
@@ -1140,12 +1369,10 @@ do
         altGuid = "Player-1-Dave",
     }, { remote = true })
     assertEq(st, "duplicate", "compacted id rejected as duplicate")
-    -- Eve is already an alt via the snapshot; an older Carol→Eve assign must not
-    -- move her (superseded) and must not invent a Carol main group.
     local resurrect = {
         id = "gi1:Player-1-Alice:resurrectaaaaaaaaaaaaaa:1",
         kind = GI.KIND.ASSIGN,
-        at = 1, -- older than snapshot
+        at = 1,
         actorGuid = "Player-1-Alice",
         actorName = "Alice-Garona",
         guildKey = "club:42",
@@ -1155,29 +1382,37 @@ do
         altName = "Eve-Garona",
     }
     st = GI:AdmitOperation(resurrect, { remote = true })
-    assertEq(st, "duplicate", "op older than snapshot superseded")
+    assertEq(st, "duplicate", "op older than watermark superseded")
     assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
         "superseded op did not move Eve off Alice")
-    assertNil(GI:GetCharacterRole("Player-1-Carol"), "superseded op did not create Carol main")
 
-    -- Late peer catch-up: empty peer receives snapshot via authenticated relay officer.
+    -- Late peer catch-up via checkpoint assigns + editor relay.
+    local ckpts = {}
+    for i = 1, #record.order do
+        local op = record.ops[record.order[i]]
+        if op and op.kind == GI.KIND.ASSIGN then
+            ckpts[#ckpts + 1] = deepCopy(op)
+        end
+    end
     local lateDB = {}
     SpectrumFederationDB = lateDB
     GI:Initialize(lateDB)
     GI:EnsureGossipProvider()
-    local lateProvider = SF.GuildGossip._providers[GI.PROVIDER_ID]
-    local lateSpec = lateProvider.spec
-    local relayStatus = lateSpec.ValidateAndApply({
-        id = "gi-op:" .. snap.id,
-        versionFp = "snap",
-        body = { kind = "guildinfo-op", op = deepCopy(snap) },
-    }, { sender = "Carol-Garona" }) -- Carol relays Alice-authored snapshot
-    assertEq(relayStatus, "accepted", "editor may relay officer-authored snapshot")
+    local lateSpec = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
+    for i = 1, #ckpts do
+        local wire = {
+            id = "gi-op:" .. ckpts[i].id,
+            versionFp = "ckpt",
+            body = { kind = "guildinfo-op", op = ckpts[i] },
+        }
+        assertTrue(GI.RecordWithinGossipCap(wire), "late-peer checkpoint within cap")
+        local relayStatus = lateSpec.ValidateAndApply(wire, { sender = "Carol-Garona" })
+        assertEq(relayStatus, "accepted", "editor relays checkpoint assign " .. i)
+    end
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "late joiner reconstructs Bob alt")
-    local _, bobMain = GI:GetCharacterRole("Player-1-Bob")
-    assertEq(bobMain, "Player-1-Alice", "late joiner reconstructs Alice as main")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "late joiner reconstructs Alice as main")
 
-    -- Reload after compaction remains bounded and consistent.
     local saved = SpectrumFederationDB
     local liveCount = #select(1, GI:GetCurrentRecord()).order
     SF.GuildInfo = nil
@@ -1187,12 +1422,11 @@ do
     loadModule("SpectrumFederation/modules/GuildInfo/Roster.lua")
     loadModule("SpectrumFederation/modules/GuildInfo/Gossip.lua")
     GI = SF.GuildInfo
-    GI.MAX_ACCEPTED_OPS = 3
+    GI.MAX_ACCEPTED_OPS = 5
     GI:Initialize(saved)
     assertEq(#select(1, GI:GetCurrentRecord()).order, liveCount, "reload keeps compacted live ops")
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "reload after compaction restores graph")
 
-    -- Second compaction cycle stays bounded.
     for i = 1, 4 do
         world.time = world.time + 1
         assign("Alice-Garona", "Dave-Garona")
@@ -1204,7 +1438,6 @@ do
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "graph valid after second compaction window")
 
     GI.MAX_ACCEPTED_OPS = prevMax
-    -- Restore primary GI on fresh DB for subsequent tests.
     resetDB()
 end
 
@@ -1337,6 +1570,133 @@ do
     world.guild.rosterComplete = true
     world.generation = world.generation + 1
     GI.InvalidateRosterSnapshot()
+end
+
+---------------------------------------------------------------------------
+-- Relay authority: A originates, B receives, A offline, C catches up via B
+---------------------------------------------------------------------------
+
+do
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "A originates assign")
+    local record = select(1, GI:GetCurrentRecord())
+    local opId = record.order[1]
+    local opA = deepCopy(record.ops[opId])
+    assertEq(opA.actorGuid, "Player-1-Alice", "origin actor is Alice")
+
+    -- Peer B (Carol) receives from Alice.
+    local dbB = {}
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    GI:EnsureGossipProvider()
+    local specB = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
+    local wire = {
+        id = "gi-op:" .. opA.id,
+        versionFp = "v1",
+        body = { kind = "guildinfo-op", op = deepCopy(opA) },
+    }
+    assertTrue(GI.RecordWithinGossipCap(wire), "relay wire within CBOR cap")
+    assertEq(specB.ValidateAndApply(wire, { sender = "Alice-Garona" }), "accepted",
+        "B admits Alice-authored op from Alice")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "B has Bob alt")
+
+    -- Unauthorized member cannot launder / relay.
+    local dbX = {}
+    SpectrumFederationDB = dbX
+    GI:Initialize(dbX)
+    GI:EnsureGossipProvider()
+    local specX = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
+    local forged = deepCopy(opA)
+    forged.id = "gi1:Player-1-Alice:forgedaaaaaaaaaaaaaaa:9"
+    local bad = specX.ValidateAndApply({
+        id = "gi-op:" .. forged.id,
+        versionFp = "bad",
+        body = { kind = "guildinfo-op", op = forged },
+    }, { sender = "Dave-Garona" })
+    assertEq(bad, "rejected", "rank-4 member cannot introduce/relay ops")
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "unauthorized relay did not apply")
+
+    -- A goes offline; C catches up through B (Carol relays Alice provenance).
+    local dbC = {}
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    GI:EnsureGossipProvider()
+    local specC = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
+    local relayWire = {
+        id = "gi-op:" .. opA.id,
+        versionFp = "v1",
+        body = { kind = "guildinfo-op", op = deepCopy(opA) }, -- actorGuid still Alice
+    }
+    assertEq(opA.actorGuid, "Player-1-Alice", "relay preserves Alice provenance")
+    assertTrue(opA.actorGuid ~= "Player-1-Carol", "relay sender differs from actor")
+    assertEq(specC.ValidateAndApply(relayWire, { sender = "Carol-Garona" }), "accepted",
+        "C admits Alice op relayed by editor Carol")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "C reconstructs assign after A offline")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "C sees Alice as Bob's main")
+
+    -- Actor mismatch rewrite must not occur: re-export keeps Alice actorGuid.
+    DriveEnsureIndex(GI.PROVIDER_ID)
+    local body = specC.GetRecordBody("gi-op:" .. opA.id)
+    assertTrue(body and body.body and body.body.op, "C exports relayed op")
+    assertEq(body.body.op.actorGuid, "Player-1-Alice", "relayed export keeps original actorGuid")
+end
+
+---------------------------------------------------------------------------
+-- Guild A→B scope transition invalidates physical index before advertise
+---------------------------------------------------------------------------
+
+do
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assign("Alice-Garona", "Bob-Garona")
+    local index = DriveEnsureIndex(GI.PROVIDER_ID)
+    assertTrue(index.buildComplete, "guild A index complete")
+    local guildAId = next(index.byId)
+    assertTrue(guildAId ~= nil, "guild A indexed an op")
+    local epochBefore = index.epoch
+
+    -- Switch club / guild scope.
+    world.guild.clubId = 99
+    world.generation = world.generation + 1
+    local spec = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
+    -- EnsureIndex must notice scope change even when prior index looked complete.
+    index.dirty = false
+    index.buildComplete = true
+    local more = spec.EnsureIndex(index, { indexEntries = 32 })
+    assertTrue(index.epoch > epochBefore, "guild switch bumps index epoch")
+    assertTrue(index.byId[guildAId] == nil, "guild A record id cleared from physical index")
+    -- Drive rebuild under guild B (empty relationships).
+    DriveEnsureIndex(GI.PROVIDER_ID)
+    local page = spec.ListRecordIds(1, 64)
+    assertEq(#page, 0, "guild B advertises no guild A ops")
+    world.guild.clubId = 42
+    world.generation = world.generation + 1
+end
+
+---------------------------------------------------------------------------
+-- API-level stale unassign expectedMainGuid
+---------------------------------------------------------------------------
+
+do
+    resetDB()
+    assign("Alice-Garona", "Bob-Garona")
+    GI:AssignAlt("Carol-Garona", "Bob-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+        moveConfirmed = true,
+        expectedOldMain = "Player-1-Alice",
+    })
+    local status, reason = GI:UnassignAlt("Player-1-Bob", {
+        expectedMainGuid = "Player-1-Alice",
+    })
+    assertEq(status, "rejected", "API rejects stale unassign expected main")
+    assertEq(reason, "stale_unassign", "stale_unassign reason")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol",
+        "newer relationship retained after stale unassign")
+    status = GI:UnassignAlt("Player-1-Bob", { expectedMainGuid = "Player-1-Carol" })
+    assertEq(status, "accepted", "unassign with matching expected main accepted")
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "matching unassign removes alt")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

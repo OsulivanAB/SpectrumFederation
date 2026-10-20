@@ -237,6 +237,12 @@ function GI:UnassignAlt(altGuid, opts)
     if not info or info.role ~= "alt" then
         return "rejected", "alt_not_assigned"
     end
+    -- Stale confirmation: displayed main must still own this alt (D / #402).
+    if type(opts.expectedMainGuid) == "string" and opts.expectedMainGuid ~= "" then
+        if info.mainGuid ~= opts.expectedMainGuid then
+            return "rejected", "stale_unassign"
+        end
+    end
 
     local crow = record.characters and record.characters[altGuid]
     local mrow = record.characters and record.characters[info.mainGuid]
@@ -258,7 +264,10 @@ function GI:UnassignAlt(altGuid, opts)
         altName = crow and crow.nameRealm or nil,
         altClass = crow and crow.classFile or nil,
     }
-    return GI:AdmitOperation(op, { remote = false })
+    return GI:AdmitOperation(op, {
+        remote = false,
+        expectedMainGuid = opts.expectedMainGuid,
+    })
 end
 
 function GI:ChangeMain(oldMainGuid, newMainGuid, opts)

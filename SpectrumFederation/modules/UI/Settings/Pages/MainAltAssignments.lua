@@ -36,6 +36,7 @@ end
 
 local passCache = nil
 local refreshQueued = false
+local rosterInvalidatePending = false
 local rosterFrame = nil
 local uiHooked = false
 
@@ -95,30 +96,65 @@ local function RefreshPageControls()
 	end
 end
 
-local function QueueRefresh()
-	if refreshQueued then
-		return
-	end
+local function RunQueuedRefresh()
+	refreshQueued = false
+	local needRoster = rosterInvalidatePending
+	rosterInvalidatePending = false
 	if not PanelVisible() then
+		if needRoster then
+			local g = GI()
+			if g and g.InvalidateRosterSnapshot then
+				g.InvalidateRosterSnapshot()
+			end
+		end
 		return
 	end
-	refreshQueued = true
-	local function run()
-		refreshQueued = false
-		if not PanelVisible() then
-			return
-		end
+	if needRoster then
 		local g = GI()
 		if g and g.InvalidateRosterSnapshot then
 			g.InvalidateRosterSnapshot()
 		end
-		RefreshPageControls()
 	end
+	RefreshPageControls()
+end
+
+local function ScheduleRefresh()
+	if refreshQueued then
+		return
+	end
+	refreshQueued = true
 	if C_Timer and C_Timer.After then
-		C_Timer.After(0, run)
+		C_Timer.After(0, RunQueuedRefresh)
 	else
-		run()
+		RunQueuedRefresh()
 	end
+end
+
+--- Lightweight control refresh for local form-state (no roster rescan).
+local function QueueFormRefresh()
+	if not PanelVisible() then
+		return
+	end
+	ScheduleRefresh()
+end
+
+--- Roster/guild-driven refresh: invalidate cached roster once, then refresh controls.
+local function QueueRosterRefresh()
+	rosterInvalidatePending = true
+	if not PanelVisible() then
+		local g = GI()
+		if g and g.InvalidateRosterSnapshot then
+			g.InvalidateRosterSnapshot()
+		end
+		rosterInvalidatePending = false
+		return
+	end
+	ScheduleRefresh()
+end
+
+-- Durable UI listener uses roster-aware refresh.
+local function QueueRefresh()
+	QueueRosterRefresh()
 end
 
 local function ReportStatus(ctx, status, reason, extra)
@@ -390,12 +426,12 @@ local function Definition()
 							else
 								mainResolved = nil
 							end
-							QueueRefresh()
+							QueueFormRefresh()
 						end,
 						onTextChanged = function(_, text)
 							mainText = text or ""
 							mainResolved = nil
-							QueueRefresh()
+							QueueFormRefresh()
 						end,
 					},
 					{
@@ -425,12 +461,12 @@ local function Definition()
 							else
 								altResolved = nil
 							end
-							QueueRefresh()
+							QueueFormRefresh()
 						end,
 						onTextChanged = function(_, text)
 							altText = text or ""
 							altResolved = nil
-							QueueRefresh()
+							QueueFormRefresh()
 						end,
 					},
 					{
@@ -489,11 +525,15 @@ local function Definition()
 							if not gi or not gi.UnassignAlt then
 								return
 							end
+							-- Capture the displayed relationship for stale confirmation.
+							local expectedMainGuid = item.mainGuid
 							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 							local msg = Loc("GUILD_INFO_UNASSIGN_CONFIRM",
 								"Unassign this alt from its main?")
 							local function commit()
-								local status, reason = gi:UnassignAlt(item.guid, {})
+								local status, reason = gi:UnassignAlt(item.guid, {
+									expectedMainGuid = expectedMainGuid,
+								})
 								ReportStatus(ctx, status, reason)
 							end
 							if dialogs and dialogs.Confirm then
@@ -515,6 +555,7 @@ local function Definition()
 						end,
 						set = function(v)
 							changeMainCandidate = v
+							QueueFormRefresh()
 						end,
 						options = function()
 							return ChangeMainOptions()
@@ -632,6 +673,7 @@ end
 
 function Page:OnHide()
 	refreshQueued = false
+	rosterInvalidatePending = false
 end
 
 EnsureRosterListener()
