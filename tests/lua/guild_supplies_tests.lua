@@ -4910,7 +4910,7 @@ do
     assertTrue(configPanel.__sfPageBuilder ~= nil, "Configuration uses DefinitionRenderer:Build")
     local pageDef = configPanel.__sfPageDef
     assertTrue(type(pageDef) == "table", "Build stores page definition")
-    local foundBankCommit, foundGoalCommit, foundHelpGetText = false, false, false
+    local foundBankCommit, foundGoalCommit, foundStatusDisplay, foundNextStepHelp = false, false, false, false
     for _, sec in ipairs(pageDef.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
             if item.type == "editbox" and type(item.onCommit) == "function" then
@@ -4919,54 +4919,62 @@ do
             if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
                 foundGoalCommit = true
             end
-            if item.type == "help" and type(item.getText) == "function" then
-                foundHelpGetText = true
+            if sec.id == "gsStatus" and item.type == "display" and type(item.get) == "function" then
+                foundStatusDisplay = true
+            end
+            if sec.id == "gsStatus" and item.type == "help" and type(item.getText) == "function"
+                and type(item.visible) == "function" then
+                foundNextStepHelp = true
             end
         end
     end
     assertTrue(foundBankCommit, "bank tab uses onCommit")
     assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
-    assertTrue(foundHelpGetText, "status help uses getText")
+    assertTrue(foundStatusDisplay, "status area uses display rows")
+    assertTrue(foundNextStepHelp, "status next-step/warning help uses getText+visible")
 
-    -- Activation guidance in status help (bank sample states; no Chat).
-    local statusHelpGetText
+    -- Activation guidance in Next step help (bank sample states; no Chat).
+    local statusNextStepGetText
     for _, sec in ipairs(pageDef.sections or {}) do
-        for _, item in ipairs(sec.items or {}) do
-            if item.type == "help" and type(item.getText) == "function" then
-                statusHelpGetText = item.getText
-                break
+        if sec.id == "gsStatus" then
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "help" and type(item.getText) == "function" then
+                    statusNextStepGetText = item.getText
+                    break
+                end
             end
         end
-        if statusHelpGetText then break end
+        if statusNextStepGetText then break end
     end
-    assertTrue(type(statusHelpGetText) == "function", "status help getText captured")
+    assertTrue(type(statusNextStepGetText) == "function", "status next-step getText captured")
     -- Unset bank tab → actionable configure-tab guidance; campaign setup still available.
     local unsetOp = GS:NewConfigOperation("set-bank-tab", "bankTab", nil)
     if unsetOp then GS:ApplyStagedConfigOperation(unsetOp) end
     GS:GetCurrentRecord().accounting._consumables.bankTab = nil
-    local helpUnset = statusHelpGetText()
+    local helpUnset = statusNextStepGetText()
     assertTrue(type(helpUnset) == "string" and helpUnset:find("Configure a Guild Bank tab", 1, true),
-        "status help guides unset bank tab got=" .. tostring(helpUnset))
+        "status next-step guides unset bank tab got=" .. tostring(helpUnset))
+    assertTrue(helpUnset:find("Next step:", 1, true), "unset bank guidance uses Next step prefix")
     assertTrue(helpUnset:find("do not require the bank", 1, true)
         or helpUnset:find("campaign setup", 1, true),
-        "status help notes config without open bank")
+        "status next-step notes config without open bank")
     -- Restore tab; closed bank → open-bank guidance.
     local tabOpUi = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
     assertEq(GS:ApplyStagedConfigOperation(tabOpUi), "accepted", "UI test restore bank tab")
     GS._BankContextReadinessProbe = function() return false, "bank_closed" end
-    local helpClosed = statusHelpGetText()
+    local helpClosed = statusNextStepGetText()
     assertTrue(helpClosed:find("Open the Guild Bank", 1, true),
-        "status help guides closed bank got=" .. tostring(helpClosed))
+        "status next-step guides closed bank got=" .. tostring(helpClosed))
     GS._BankContextReadinessProbe = function() return false, "log_pending" end
-    local helpPending = statusHelpGetText()
+    local helpPending = statusNextStepGetText()
     assertTrue(helpPending:find("fresh transaction-log sample", 1, true)
         or helpPending:find("become available", 1, true),
-        "status help guides log pending got=" .. tostring(helpPending))
+        "status next-step guides log pending got=" .. tostring(helpPending))
     GS._BankContextReadinessProbe = function() return false, "tab_access_denied" end
-    local helpDenied = statusHelpGetText()
+    local helpDenied = statusNextStepGetText()
     assertTrue(helpDenied:find("permission to view", 1, true)
         or helpDenied:find("needs permission", 1, true),
-        "status help guides tab access denied got=" .. tostring(helpDenied))
+        "status next-step guides tab access denied got=" .. tostring(helpDenied))
     GS._BankContextReadinessProbe = nil
     assertEq(#world.chat, 0, "activation guidance emits no Chat")
 
@@ -5706,8 +5714,9 @@ do
         local status, itemCount
         for _, sec in ipairs((configPanel.__sfPageDef and configPanel.__sfPageDef.sections) or {}) do
             for _, item in ipairs(sec.items or {}) do
-                if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
-                    status = item.getText()
+                if item.type == "display" and type(item.get) == "function" and sec.id == "gsStatus"
+                    and (not status) then
+                    status = item.get()
                 end
                 if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
                     itemCount = #item.getItems()
@@ -6153,14 +6162,22 @@ do
             if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
                 overflowRows = #item.getItems()
             end
-            if item.type == "help" and type(item.getText) == "function" and sec.id == "gsStatus" then
-                overflowStatus = item.getText()
+            if item.type == "display" and type(item.get) == "function" and sec.id == "gsStatus"
+                and (not overflowStatus) then
+                overflowStatus = item.get()
             end
         end
     end
     assertEq(overflowRows, 0, "over-cap UI constructs no requested-item rows")
     assertTrue(type(overflowStatus) == "string" and overflowStatus ~= "",
         "over-cap presents unavailable status text")
+    -- Prefer Unavailable when membership canRead is available; otherwise membership
+    -- redaction may own the status row (shared details stay hidden).
+    assertTrue(overflowStatus:find("Unavailable", 1, true)
+        or overflowStatus:find("unavailable", 1, true)
+        or overflowStatus:find("overflow", 1, true)
+        or overflowStatus:find("membership", 1, true),
+        "over-cap status row marks unavailable/redacted got=" .. tostring(overflowStatus))
     -- Invalid-heavy map: non-table rows fail closed (malformed, not truncated).
     boundItems[tostring(1000 + maxItems + 1)] = nil
     for i = 1, maxItems do
@@ -6317,6 +6334,233 @@ do
     assertTrue(type(currentItems) == "table" and currentItems["99"] ~= nil,
         "usable current items survive bad archive")
     assertTrue(GS:GetCurrentRecord() ~= nil, "guild record still usable with bad archive")
+
+    -- Configuration status area hierarchy (compact rows; no concatenated paragraph).
+    local function statusAreaFrom(panel)
+        local area = {
+            statusGet = nil,
+            campaignGet = nil,
+            campaignVisible = nil,
+            nextStepGet = nil,
+            nextStepVisible = nil,
+            warningGet = nil,
+            warningVisible = nil,
+        }
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            if sec.id == "gsStatus" then
+                local helpIdx = 0
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "display" and type(item.get) == "function" then
+                        if not area.statusGet then
+                            area.statusGet = item.get
+                        elseif not area.campaignGet then
+                            area.campaignGet = item.get
+                            area.campaignVisible = item.visible
+                        end
+                    elseif item.type == "help" and type(item.getText) == "function" then
+                        helpIdx = helpIdx + 1
+                        if helpIdx == 1 then
+                            area.nextStepGet = item.getText
+                            area.nextStepVisible = item.visible
+                        elseif helpIdx == 2 then
+                            area.warningGet = item.getText
+                            area.warningVisible = item.visible
+                        end
+                    end
+                end
+            end
+        end
+        return area
+    end
+
+    local function readArea(area)
+        return {
+            status = area.statusGet and area.statusGet() or nil,
+            campaign = area.campaignGet and area.campaignGet() or nil,
+            campaignShown = area.campaignVisible and area.campaignVisible() or false,
+            nextStep = area.nextStepGet and area.nextStepGet() or nil,
+            nextStepShown = area.nextStepVisible and area.nextStepVisible() or false,
+            warning = area.warningGet and area.warningGet() or nil,
+            warningShown = area.warningVisible and area.warningVisible() or false,
+        }
+    end
+
+    local statusPanel = makeRegion("Frame", "GSStatusAreaPanel", nil)
+    statusPanel:SetSize(420, 800)
+
+    -- Not configured
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    configPage:Build(statusPanel)
+    local area = statusAreaFrom(statusPanel)
+    assertTrue(type(area.statusGet) == "function", "status UX: status display present")
+    assertTrue(type(area.nextStepGet) == "function", "status UX: next-step help present")
+    local view = readArea(area)
+    assertEq(view.status, "Not configured", "status UX: not configured label")
+    assertEq(view.campaignShown, false, "status UX: campaign hidden when not configured")
+    assertEq(view.nextStepShown, true, "status UX: initialize next step shown")
+    assertTrue(view.nextStep:find("Initialize Guild Supplies", 1, true),
+        "status UX: initialize next step got=" .. tostring(view.nextStep))
+    assertEq(view.warningShown, false, "status UX: no warning when not configured")
+
+    -- Staged, no campaign: one next-step instruction, no repeated campaign wording.
+    GS:CreateStagedRecord()
+    view = readArea(area)
+    assertEq(view.status, "Staged", "status UX: staged short label")
+    assertEq(view.campaignShown, true, "status UX: campaign row when staged")
+    assertEq(view.campaign, "Not started.", "status UX: campaign not started")
+    assertEq(view.nextStepShown, true, "status UX: new-campaign next step shown")
+    assertTrue(view.nextStep:find("Start a New Campaign", 1, true),
+        "status UX: new-campaign next step got=" .. tostring(view.nextStep))
+    assertTrue(not view.nextStep:find("Activation not ready", 1, true),
+        "status UX: no duplicate activation-blocked campaign wording")
+    assertTrue(not ((view.status or "") .. " " .. (view.nextStep or "")):find(
+        "Start a New Campaign before adding items", 1, true),
+        "status UX: no legacy no-campaign paragraph remnant")
+
+    -- Staged campaign, bank tab unset
+    startCampaign()
+    local campId = GS:GetCurrentRecord().currentCampaignId
+    GS:GetCurrentRecord().accounting._consumables.bankTab = nil
+    view = readArea(area)
+    assertEq(view.status, "Staged", "status UX: staged with campaign")
+    assertEq(view.campaign, campId, "status UX: campaign id shown")
+    assertTrue(view.nextStepShown and view.nextStep:find("Configure a Guild Bank tab", 1, true),
+        "status UX: bank tab next step got=" .. tostring(view.nextStep))
+
+    -- Bank log unavailable / pending / stale
+    local tabOpStatus = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOpStatus), "accepted", "status UX: set bank tab")
+    GS._BankContextReadinessProbe = function() return false, "log_pending" end
+    view = readArea(area)
+    assertTrue(view.nextStepShown and (
+        view.nextStep:find("become available", 1, true)
+        or view.nextStep:find("fresh transaction-log sample", 1, true)),
+        "status UX: log pending next step got=" .. tostring(view.nextStep))
+    GS._BankContextReadinessProbe = function() return false, "log_stale" end
+    view = readArea(area)
+    assertTrue(view.nextStepShown and view.nextStep:find("stale", 1, true),
+        "status UX: log stale next step got=" .. tostring(view.nextStep))
+    GS._BankContextReadinessProbe = function() return false, "bank_closed" end
+    view = readArea(area)
+    assertTrue(view.nextStepShown and view.nextStep:find("Open the Guild Bank", 1, true),
+        "status UX: bank closed next step got=" .. tostring(view.nextStep))
+
+    -- Ready to activate / successfully activated (inline bank sample; helpers are defined later).
+    GetNumGuildBankTransactions = function() return 0 end
+    GetGuildBankTransaction = function()
+        return "deposit", "Donor-Garona", "|Hitem:9100::::::::|h[Flask]|h", 2,
+            1, 1, 2026, 10, 19, 12
+    end
+    GS._BankContextReadinessProbe = function() return true end
+    view = readArea(area)
+    assertEq(view.status, "Staged", "status UX: still staged when ready")
+    assertTrue(view.nextStepShown and view.nextStep:find("Activate Guild Supplies", 1, true),
+        "status UX: activate-ready next step got=" .. tostring(view.nextStep))
+    assertTrue(view.nextStep:find("Guild Bank", 1, true),
+        "status UX: activate-ready mentions Guild Bank")
+    assertEq(view.warningShown, false, "status UX: no warning when ready")
+    local _, actStatusUx = GS:ActivateCanonicalDataset()
+    assertEq(actStatusUx, "accepted", "status UX: activate accepted")
+    view = readArea(area)
+    assertTrue(type(view.status) == "string" and view.status:find("Live", 1, true),
+        "status UX: live status got=" .. tostring(view.status))
+    assertTrue(view.status:find("cutover", 1, true),
+        "status UX: live status names cutover authority")
+    assertEq(view.nextStepShown, false, "status UX: no next step when live and healthy")
+    assertEq(view.warningShown, false, "status UX: no warning when live and healthy")
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+    GS._BankContextReadinessProbe = nil
+
+    -- Dataset conflict / adoption pending warnings stay distinct from next step.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    assertEq(select(2, GS:CreateStagedRecord()), "accepted", "status UX: mismatch fixture create")
+    startCampaign()
+    local tabOpMismatch = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(GS:ApplyStagedConfigOperation(tabOpMismatch), "accepted", "status UX: mismatch fixture tab")
+    statusPanel = makeRegion("Frame", "GSStatusAreaPanel2", nil)
+    statusPanel:SetSize(420, 800)
+    configPage:Build(statusPanel)
+    area = statusAreaFrom(statusPanel)
+    local priorMismatch = GS.GetDatasetMismatchState
+    GS.GetDatasetMismatchState = function()
+        return {
+            blocked = true,
+            peers = { { peerName = "Bob-Garona", datasetId = "peer-ds-1" } },
+        }
+    end
+    view = readArea(area)
+    assertEq(view.warningShown, true, "status UX: mismatch warning visible")
+    assertTrue(view.warning:find("Bob-Garona", 1, true) and view.warning:find("peer-ds-1", 1, true),
+        "status UX: mismatch warning names peer got=" .. tostring(view.warning))
+    assertTrue(not (view.nextStepShown and view.nextStep
+        and view.nextStep:find("different staged dataset", 1, true)),
+        "status UX: mismatch text is not duplicated into next step")
+    GS.GetDatasetMismatchState = priorMismatch
+
+    local priorAdop = GS.GetPendingAdoption
+    GS.GetPendingAdoption = function()
+        return { sourceDatasetId = "adopt-ds", sourcePeer = "Carol-Garona", ready = false }
+    end
+    view = readArea(area)
+    assertEq(view.warningShown, true, "status UX: adoption warning visible")
+    assertTrue(view.warning:find("Adoption in progress", 1, true)
+        and view.warning:find("Carol-Garona", 1, true),
+        "status UX: adoption warning got=" .. tostring(view.warning))
+    assertTrue(not (view.nextStepShown and view.nextStep
+        and view.nextStep:find("Adoption in progress", 1, true)),
+        "status UX: adoption pending not duplicated into next step")
+    GS.GetPendingAdoption = priorAdop
+
+    -- Membership / read access unavailable: redact campaign; hide next step/warnings.
+    local priorMembersUx = world.guild.members
+    world.guild.members = {}
+    settleRoster()
+    view = readArea(area)
+    assertTrue(type(view.status) == "string" and view.status:find("membership", 1, true),
+        "status UX: membership pending in status row got=" .. tostring(view.status))
+    assertEq(view.campaignShown, false, "status UX: campaign hidden without canRead")
+    assertEq(view.nextStepShown, false, "status UX: next step hidden without canRead")
+    assertEq(view.warningShown, false, "status UX: warnings hidden without canRead")
+    world.guild.members = priorMembersUx
+    settleRoster()
+
+    -- Narrow width + repeated Refresh remain stable.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    statusPanel = makeRegion("Frame", "GSStatusAreaPanel3", nil)
+    statusPanel:SetSize(280, 800)
+    configPage:Build(statusPanel)
+    area = statusAreaFrom(statusPanel)
+    local firstUx = readArea(area)
+    for _ = 1, 25 do
+        configPage:Refresh(statusPanel)
+    end
+    local lastUx = readArea(area)
+    assertEq(lastUx.status, firstUx.status, "status UX: status stable across refreshes")
+    assertEq(lastUx.campaign, firstUx.campaign, "status UX: campaign stable across refreshes")
+    assertEq(lastUx.nextStep, firstUx.nextStep, "status UX: next step stable across refreshes")
+    assertEq(lastUx.warningShown, firstUx.warningShown, "status UX: warning visibility stable")
+    assertTrue(type(lastUx.nextStep) == "string" and lastUx.nextStep:find("Next step:", 1, true),
+        "status UX: next step remains a single prefixed line")
+    local _, nextCountUx = lastUx.nextStep:gsub("Next step:", "Next step:")
+    assertEq(nextCountUx, 1, "status UX: next step prefix not multiplied by refresh")
+    assertEq(#world.chat, 0, "status UX: no chat")
+    GetNumGuildBankTransactions = nil
+    GetGuildBankTransaction = nil
+    GS._BankContextReadinessProbe = nil
 
     CreateFrame = priorCreateFrame
     C_Timer.After = priorAfter
@@ -23689,6 +23933,7 @@ do
     disarmFreshBankSample()
     assertEq(#world.chat, 0, "3C31: no chat")
 end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
