@@ -347,7 +347,9 @@ local function ValidateAndApply(record, ctx)
 
     local status, detail = GI:AdmitOperation(op, { remote = true })
     if status == "accepted" then
-        if op.kind == GI.KIND.SNAPSHOT then
+        -- Cutover / legacy snapshot rewrite the live set; rebuild export + bump epoch
+        -- so vanished pre-cutover IDs cannot keep circulating.
+        if op.kind == GI.KIND.SNAPSHOT or op.kind == GI.KIND.CUTOVER then
             RebuildExportIndex()
             BumpPhysicalIndex(nil)
         else

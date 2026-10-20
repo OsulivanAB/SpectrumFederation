@@ -63,9 +63,12 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 | `assign` | Place alt under main (idempotent if already there; move when confirmed) |
 | `unassign` | Remove one alt from its main |
 | `change_main` | Promote a rostered alt; previous main becomes an alt; other alts retained |
-| `snapshot` | Legacy compaction marker (fold-supported); new compaction emits checkpoint `assign` ops |
+| `cutover` | Replicated compaction boundary: clears prior graph; watermark is `op.at` |
+| `snapshot` | Legacy compaction marker (fold-supported); not emitted by new compaction |
 
-Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Authorization is the transport sender only; payload `actorGuid` is provenance kept version-stable for editor-to-editor relay/catch-up and is never treated as authentication. Compaction rewrites a full log into officer-authored per-relationship assign checkpoints (each within Guild Gossip’s 2048-byte record cap) plus a durable watermark so superseded ops cannot resurrect removed links.
+Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Authorization is the transport sender only; payload `actorGuid` is provenance kept version-stable for editor-to-editor relay/catch-up and is never treated as authentication.
+
+Compaction is a bounded replicated cutover: the editor replaces a full log with one small `cutover` op plus officer-authored per-relationship assign checkpoints (each within Guild Gossip’s 2048-byte record cap). Peers that receive the cutover purge superseded live ops (including missed Unassigns) and raise `compactWatermarkAt`. The pending edit that triggered compaction is folded into the checkpoint graph so same-second `(at,id)` ordering cannot acknowledge an Unassign while checkpoints recreate the removed link. Ops that sort at or before the live cutover are treated as superseded.
 
 ## Public read API
 

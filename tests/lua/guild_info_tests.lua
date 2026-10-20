@@ -1287,10 +1287,21 @@ do
     record = select(1, GI:GetCurrentRecord())
     assertTrue(#record.order < GI.MAX_ACCEPTED_OPS, "log shrunk after compaction")
     assertTrue((tonumber(record.compactWatermarkAt) or 0) > 0, "compaction sets watermark")
-    local ckptCount, snapCount = 0, 0
+    local ckptCount, cutCount, snapCount = 0, 0, 0
     for i = 1, #record.order do
         local op = record.ops[record.order[i]]
-        if op and op.kind == GI.KIND.ASSIGN and tostring(op.id):find(":ckpt:", 1, true) then
+        if op and op.kind == GI.KIND.CUTOVER then
+            cutCount = cutCount + 1
+            assertEq(op.actorGuid, "Player-1-Alice", "cutover authored by officer")
+            local wire = {
+                id = "gi-op:" .. op.id,
+                versionFp = "x",
+                body = { kind = "guildinfo-op", op = op },
+            }
+            local okSize, rawLen = GI.RecordWithinGossipCap(wire)
+            assertTrue(okSize, "cutover within MAX_RECORD_CBOR")
+            assertTrue(rawLen <= SF.GuildGossip.MAX_RECORD_CBOR, "serialized cutover size bound")
+        elseif op and op.kind == GI.KIND.ASSIGN and tostring(op.id):find("a1ckpt", 1, true) then
             ckptCount = ckptCount + 1
             assertEq(op.actorGuid, "Player-1-Alice", "checkpoint authored by officer")
             assertTrue(op.actorGuid ~= "compact", "checkpoint actorGuid is not compact marker")
@@ -1306,6 +1317,7 @@ do
             snapCount = snapCount + 1
         end
     end
+    assertEq(cutCount, 1, "compaction emits one replicated cutover")
     assertTrue(ckptCount >= 2, "compaction produced transportable checkpoint assigns")
     assertEq(snapCount, 0, "new compaction does not emit monolithic snapshot")
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "Bob preserved across compaction")
@@ -1386,12 +1398,12 @@ do
     assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
         "superseded op did not move Eve off Alice")
 
-    -- Late peer catch-up via checkpoint assigns + editor relay.
-    local ckpts = {}
+    -- Late peer catch-up via cutover + checkpoint assigns + editor relay.
+    local exportOps = {}
     for i = 1, #record.order do
         local op = record.ops[record.order[i]]
-        if op and op.kind == GI.KIND.ASSIGN then
-            ckpts[#ckpts + 1] = deepCopy(op)
+        if op then
+            exportOps[#exportOps + 1] = deepCopy(op)
         end
     end
     local lateDB = {}
@@ -1399,19 +1411,20 @@ do
     GI:Initialize(lateDB)
     GI:EnsureGossipProvider()
     local lateSpec = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
-    for i = 1, #ckpts do
+    for i = 1, #exportOps do
         local wire = {
-            id = "gi-op:" .. ckpts[i].id,
+            id = "gi-op:" .. exportOps[i].id,
             versionFp = "ckpt",
-            body = { kind = "guildinfo-op", op = ckpts[i] },
+            body = { kind = "guildinfo-op", op = exportOps[i] },
         }
-        assertTrue(GI.RecordWithinGossipCap(wire), "late-peer checkpoint within cap")
+        assertTrue(GI.RecordWithinGossipCap(wire), "late-peer export record within cap")
         local relayStatus = lateSpec.ValidateAndApply(wire, { sender = "Carol-Garona" })
-        assertEq(relayStatus, "accepted", "editor relays checkpoint assign " .. i)
+        assertEq(relayStatus, "accepted", "editor relays compact export " .. i)
     end
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "late joiner reconstructs Bob alt")
     assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
         "late joiner reconstructs Alice as main")
+    assertNil(GI:GetCharacterRole("Player-1-Dave"), "late joiner does not resurrect Dave")
 
     local saved = SpectrumFederationDB
     local liveCount = #select(1, GI:GetCurrentRecord()).order
@@ -1436,6 +1449,356 @@ do
     local rec2 = select(1, GI:GetCurrentRecord())
     assertTrue(#rec2.order <= GI.MAX_ACCEPTED_OPS, "repeated compaction stays bounded")
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "graph valid after second compaction window")
+
+    GI.MAX_ACCEPTED_OPS = prevMax
+    resetDB()
+end
+
+---------------------------------------------------------------------------
+-- C2) Cutover convergence: partial history, same-second pending, multi-peer
+---------------------------------------------------------------------------
+
+local function collectLiveExportOps()
+    local record = select(1, GI:GetCurrentRecord())
+    local ops = {}
+    for i = 1, #(record.order or {}) do
+        local op = record.ops[record.order[i]]
+        if type(op) == "table" then
+            ops[#ops + 1] = deepCopy(op)
+        end
+    end
+    return ops
+end
+
+local function admitExportBundle(db, ops, sender)
+    SpectrumFederationDB = db
+    GI:Initialize(db)
+    GI:EnsureGossipProvider()
+    local spec = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
+    for i = 1, #ops do
+        local wire = {
+            id = "gi-op:" .. ops[i].id,
+            versionFp = "exp",
+            body = { kind = "guildinfo-op", op = deepCopy(ops[i]) },
+        }
+        assertTrue(GI.RecordWithinGossipCap(wire), "export wire within CBOR cap id=" .. ops[i].id)
+        local status = spec.ValidateAndApply(wire, { sender = sender or "Carol-Garona" })
+        assertTrue(status == "accepted" or status == "duplicate",
+            "peer admits export id=" .. ops[i].id .. " status=" .. tostring(status))
+    end
+end
+
+local function relationshipFingerprint(db)
+    SpectrumFederationDB = db
+    GI:Initialize(db)
+    local groups = GI:GetRelationshipGroups() or {}
+    local rows = {}
+    for i = 1, #groups do
+        local g = groups[i]
+        local alts = {}
+        for j = 1, #(g.altGuids or {}) do
+            alts[#alts + 1] = g.altGuids[j]
+        end
+        table.sort(alts)
+        rows[#rows + 1] = tostring(g.mainGuid) .. ">" .. table.concat(alts, ",")
+    end
+    table.sort(rows)
+    return table.concat(rows, "|")
+end
+
+do
+    -- Failure 1: partial-history peer missed Unassign before source compaction.
+    resetDB()
+    local prevMax = GI.MAX_ACCEPTED_OPS
+    GI.MAX_ACCEPTED_OPS = 5
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "C2 seed assign Bob")
+    local assignBobOp = nil
+    do
+        local rec = select(1, GI:GetCurrentRecord())
+        for i = 1, #rec.order do
+            local op = rec.ops[rec.order[i]]
+            if op and op.kind == GI.KIND.ASSIGN and op.altGuid == "Player-1-Bob" then
+                assignBobOp = deepCopy(op)
+            end
+        end
+    end
+    assertTrue(assignBobOp ~= nil, "captured Bob assign for partial peer")
+
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "C2 seed assign Eve")
+    world.time = world.time + 1
+    assertEq(GI:UnassignAlt("Player-1-Bob", {}), "accepted", "C2 unassign Bob (missed by partial peer)")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "C2 seed assign Dave")
+    world.time = world.time + 1
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "C2 log full")
+    assertEq(#select(1, GI:GetCurrentRecord()).order, 5, "C2 log at compaction threshold")
+
+    local editorDB = deepCopy(SpectrumFederationDB)
+    local fullDB = deepCopy(editorDB)
+
+    -- Partial peer only ever saw Bob's assign (missed Unassign).
+    local partialDB = {}
+    SpectrumFederationDB = partialDB
+    GI:Initialize(partialDB)
+    GI:EnsureGossipProvider()
+    assertEq(SF.GuildGossip._providers[GI.PROVIDER_ID].spec.ValidateAndApply({
+        id = "gi-op:" .. assignBobOp.id,
+        versionFp = "partial",
+        body = { kind = "guildinfo-op", op = deepCopy(assignBobOp) },
+    }, { sender = "Alice-Garona" }), "accepted", "partial peer stored Bob assign")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "partial peer still has obsolete Bob link")
+
+    -- Editor triggers compaction (keep Eve).
+    SpectrumFederationDB = editorDB
+    GI:Initialize(editorDB)
+    GI:EnsureGossipProvider()
+    GI.MAX_ACCEPTED_OPS = 5
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "C2 compaction-triggering assign")
+    local editorRec = select(1, GI:GetCurrentRecord())
+    local hasCutover = false
+    for i = 1, #editorRec.order do
+        local op = editorRec.ops[editorRec.order[i]]
+        if op and op.kind == GI.KIND.CUTOVER then
+            hasCutover = true
+        end
+    end
+    assertTrue(hasCutover, "editor compaction emitted cutover")
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "editor has no Bob after compact")
+    assertEq(GI:GetCharacterRole("Player-1-Eve"), "alt", "editor keeps Eve")
+    assertEq(GI:GetCharacterRole("Player-1-Carol"), "alt", "editor keeps Carol")
+
+    DriveEnsureIndex(GI.PROVIDER_ID)
+    local exportOps = collectLiveExportOps()
+    assertTrue(#exportOps >= 2, "editor exports cutover+checkpoints")
+    for i = 1, #exportOps do
+        local wire = {
+            id = "gi-op:" .. exportOps[i].id,
+            versionFp = "x",
+            body = { kind = "guildinfo-op", op = exportOps[i] },
+        }
+        assertTrue(GI.RecordWithinGossipCap(wire), "C2 export within CBOR cap")
+    end
+
+    local editorFp = relationshipFingerprint(editorDB)
+    admitExportBundle(fullDB, exportOps, "Alice-Garona")
+    GI.MAX_ACCEPTED_OPS = 5
+    local fullFp = relationshipFingerprint(fullDB)
+    admitExportBundle(partialDB, exportOps, "Carol-Garona")
+    GI.MAX_ACCEPTED_OPS = 5
+    local partialFp = relationshipFingerprint(partialDB)
+    local lateDB = {}
+    admitExportBundle(lateDB, exportOps, "Carol-Garona")
+    GI.MAX_ACCEPTED_OPS = 5
+    local lateFp = relationshipFingerprint(lateDB)
+
+    assertEq(fullFp, editorFp, "full-history peer matches editor after cutover export")
+    assertEq(partialFp, editorFp, "partial-history peer converges (Bob removed)")
+    assertEq(lateFp, editorFp, "fresh late joiner matches editor")
+    SpectrumFederationDB = partialDB
+    GI:Initialize(partialDB)
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "partial peer dropped obsolete Bob link")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
+        "partial peer keeps Eve under Alice")
+
+    -- Delayed pre-cutover Assign must not resurrect Bob after cutover.
+    SpectrumFederationDB = partialDB
+    GI:Initialize(partialDB)
+    GI:EnsureGossipProvider()
+    local delayed = deepCopy(assignBobOp)
+    local stDelay = SF.GuildGossip._providers[GI.PROVIDER_ID].spec.ValidateAndApply({
+        id = "gi-op:" .. delayed.id,
+        versionFp = "delay",
+        body = { kind = "guildinfo-op", op = delayed },
+    }, { sender = "Alice-Garona" })
+    assertTrue(stDelay == "duplicate" or stDelay == "accepted",
+        "delayed Bob assign status=" .. tostring(stDelay))
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "delayed Assign does not resurrect Bob")
+
+    -- Reload without resurrection.
+    local savedPartial = deepCopy(SpectrumFederationDB)
+    SF.GuildInfo = nil
+    loadModule("SpectrumFederation/modules/GuildInfo/State.lua")
+    loadModule("SpectrumFederation/modules/GuildInfo/Authority.lua")
+    loadModule("SpectrumFederation/modules/GuildInfo/Operations.lua")
+    loadModule("SpectrumFederation/modules/GuildInfo/Roster.lua")
+    loadModule("SpectrumFederation/modules/GuildInfo/Gossip.lua")
+    GI = SF.GuildInfo
+    GI.MAX_ACCEPTED_OPS = 5
+    GI:Initialize(savedPartial)
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "reload keeps Bob unassigned")
+    assertEq(GI:GetCharacterRole("Player-1-Eve"), "alt", "reload keeps Eve")
+
+    GI.MAX_ACCEPTED_OPS = prevMax
+    resetDB()
+end
+
+do
+    -- Failure 2: same-second Unassign with id that sorts before a0cut/a1ckpt.
+    resetDB()
+    local prevMax = GI.MAX_ACCEPTED_OPS
+    GI.MAX_ACCEPTED_OPS = 4
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "C2s seed Bob")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "C2s seed Eve")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "C2s seed Dave")
+    world.time = world.time + 1
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "C2s log full")
+    assertEq(#select(1, GI:GetCurrentRecord()).order, 4, "C2s at threshold")
+
+    -- Do NOT advance time: same GetServerTime() as latest accepted ops.
+    local sameAt = world.time
+    local earlyUnassign = {
+        id = "gi1:Player-1-Alice:000earlyunassignaaaaaa:1", -- sorts before a0cut/a1ckpt
+        kind = GI.KIND.UNASSIGN,
+        at = sameAt,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        guildKey = "club:42",
+        mainGuid = "Player-1-Alice",
+        mainName = "Alice-Garona",
+        altGuid = "Player-1-Eve",
+        altName = "Eve-Garona",
+    }
+    assertTrue(earlyUnassign.id < "gi1:Player-1-Alice:a0cut:00000000",
+        "controlled Unassign id sorts before cutover pattern")
+    local st = GI:AdmitOperation(earlyUnassign, { remote = false })
+    assertEq(st, "accepted", "same-second compaction-triggering Unassign accepted")
+    assertNil(GI:GetCharacterRole("Player-1-Eve"), "Eve removed despite early id vs checkpoints")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "Bob retained after same-second Unassign compact")
+    local rec = select(1, GI:GetCurrentRecord())
+    local cut, ckpt, earlyLive = 0, 0, false
+    for i = 1, #rec.order do
+        local op = rec.ops[rec.order[i]]
+        if op and op.kind == GI.KIND.CUTOVER then cut = cut + 1 end
+        if op and op.kind == GI.KIND.ASSIGN and tostring(op.id):find("a1ckpt", 1, true) then
+            ckpt = ckpt + 1
+            assertTrue(op.altGuid ~= "Player-1-Eve", "checkpoint does not recreate Eve")
+        end
+        if op and op.id == earlyUnassign.id then earlyLive = true end
+    end
+    assertEq(cut, 1, "same-second compact emits cutover")
+    assertTrue(ckpt >= 1, "same-second compact emits checkpoints")
+    assertTrue(not earlyLive, "pending Unassign not re-appended after fold")
+
+    -- Provider export + remote re-admission preserves final assignments.
+    DriveEnsureIndex(GI.PROVIDER_ID)
+    local exportOps = collectLiveExportOps()
+    local peerDB = {}
+    admitExportBundle(peerDB, exportOps, "Carol-Garona")
+    SpectrumFederationDB = peerDB
+    GI:Initialize(peerDB)
+    assertNil(GI:GetCharacterRole("Player-1-Eve"), "remote peer: Eve stays unassigned")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "remote peer: Bob under Alice")
+
+    GI.MAX_ACCEPTED_OPS = prevMax
+    resetDB()
+end
+
+do
+    -- Same-second Change Main through compaction boundary.
+    resetDB()
+    local prevMax = GI.MAX_ACCEPTED_OPS
+    GI.MAX_ACCEPTED_OPS = 4
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "C2cm seed Bob")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "C2cm seed Eve")
+    world.time = world.time + 1
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "C2cm seed Dave")
+    world.time = world.time + 1
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "C2cm log full")
+
+    local sameAt = world.time
+    local earlyCm = {
+        id = "gi1:Player-1-Alice:000earlychangemainaaaa:1",
+        kind = GI.KIND.CHANGE_MAIN,
+        at = sameAt,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        guildKey = "club:42",
+        mainGuid = "Player-1-Alice",
+        mainName = "Alice-Garona",
+        newMainGuid = "Player-1-Bob",
+        newMainName = "Bob-Garona",
+    }
+    local st = GI:AdmitOperation(earlyCm, { remote = false })
+    assertEq(st, "accepted", "same-second Change Main compaction accepted")
+    assertEq(GI:GetCharacterRole("Player-1-Bob"), "main", "Bob is main after same-second CM compact")
+    assertEq(GI:GetCharacterRole("Player-1-Alice"), "alt", "Alice becomes alt")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Bob",
+        "Alice under Bob after CM compact")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob",
+        "Eve retained under new main after CM compact")
+
+    local editorAfterCm = deepCopy(SpectrumFederationDB)
+    local editorCmFp = relationshipFingerprint(editorAfterCm)
+    DriveEnsureIndex(GI.PROVIDER_ID)
+    SpectrumFederationDB = editorAfterCm
+    GI:Initialize(editorAfterCm)
+    GI:EnsureGossipProvider()
+    local exportOps = collectLiveExportOps()
+    local peerDB = {}
+    admitExportBundle(peerDB, exportOps, "Carol-Garona")
+    assertEq(relationshipFingerprint(peerDB), editorCmFp,
+        "Change Main compact converges on remote peer")
+
+    -- Conflicting assign after cutover: deterministic id order across peers.
+    local cutAt = 0
+    SpectrumFederationDB = peerDB
+    GI:Initialize(peerDB)
+    local rec = select(1, GI:GetCurrentRecord())
+    for i = 1, #rec.order do
+        local op = rec.ops[rec.order[i]]
+        if op and op.kind == GI.KIND.CUTOVER then
+            cutAt = tonumber(op.at) or 0
+        end
+    end
+    local postA = {
+        id = "gi1:Player-1-Alice:zzpostassignaaaaaaaaaa:1",
+        kind = GI.KIND.ASSIGN,
+        at = cutAt + 1,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        guildKey = "club:42",
+        mainGuid = "Player-1-Bob",
+        mainName = "Bob-Garona",
+        altGuid = "Player-1-Dave",
+        altName = "Dave-Garona",
+    }
+    local postB = {
+        id = "gi1:Player-1-Carol:aapostassignaaaaaaaaaa:1",
+        kind = GI.KIND.ASSIGN,
+        at = cutAt + 1,
+        actorGuid = "Player-1-Carol",
+        actorName = "Carol-Garona",
+        guildKey = "club:42",
+        mainGuid = "Player-1-Carol",
+        mainName = "Carol-Garona",
+        altGuid = "Player-1-Dave",
+        altName = "Dave-Garona",
+    }
+    local dbX, dbY = deepCopy(peerDB), deepCopy(peerDB)
+    peerAdmit(dbX, postA)
+    peerAdmit(dbX, postB)
+    peerAdmit(dbY, postB)
+    peerAdmit(dbY, postA)
+    local roleX, mainX = peerRole(dbX, "Player-1-Dave")
+    local roleY, mainY = peerRole(dbY, "Player-1-Dave")
+    assertEq(roleX, roleY, "post-cutover conflict roles converge")
+    assertEq(mainX, mainY, "post-cutover conflict mains converge")
+    -- Player-1-Alice < Player-1-Carol in the id string → Alice folds first, Carol wins.
+    assertEq(mainX, "Player-1-Carol", "later post-cutover assign wins by (at,id)")
 
     GI.MAX_ACCEPTED_OPS = prevMax
     resetDB()
