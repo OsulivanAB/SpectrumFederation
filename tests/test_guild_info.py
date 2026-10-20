@@ -65,6 +65,22 @@ def test_guild_info_provider_id_isolated():
         assert "EnableSynthetic" not in text
 
 
+def test_guild_info_state_based_schema_markers():
+    state = (GI_DIR / "State.lua").read_text(encoding="utf-8")
+    gossip = (GI_DIR / "Gossip.lua").read_text(encoding="utf-8")
+    docs = DOCS.read_text(encoding="utf-8")
+    assert "SCHEMA_VERSION = 2" in state
+    assert "PROVIDER_SCHEMA = 2" in state or "PROVIDER_SCHEMA = 2" in gossip
+    assert "guildinfo-member" in gossip
+    assert "guildinfo-group" in gossip
+    assert "MAX_MEMBERS = 256" in state
+    assert "MAX_GROUPS = 128" in state
+    assert "schemaVersion = 2" in docs
+    assert "versioned" in docs.lower()
+    assert "operation log" in docs.lower() or "op-log" in docs.lower() or "append-only" in docs.lower()
+    assert "guildinfo-op" not in gossip
+
+
 def test_guild_info_does_not_touch_supplies_or_loot_helper_identity():
     for path in GI_DIR.glob("*.lua"):
         text = path.read_text(encoding="utf-8")

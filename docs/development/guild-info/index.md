@@ -8,7 +8,7 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
 
 | Concern | Owner |
 | --- | --- |
-| Durable guild record / op log / derived graph | `SF.GuildInfo` (`State`) |
+| Durable guild record / membership+group state / derived graph | `SF.GuildInfo` (`State`) |
 | Verified ranks 1–3 (fixed; not GS policy) | `Authority` via demand-driven `GG.GetGuildIdentity` / `GetGuildMember` / `GetGuildRanks` |
 | Local assign / unassign / change-main | `Operations` |
 | Roster snapshot, suggestions, membership status | `Roster` |
@@ -21,63 +21,99 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
 - No cycles, nesting, or dual ownership.
 - One authorized officer edit is enough (no three-witness quorum).
 - Departed characters retain relationships; incomplete roster data is **unknown**, not departure.
-- Concurrent ops converge by deterministic fold ordered by `(at, opId)`.
+- Concurrent edits converge by deterministic version tuples `(n, w)` (logical revision + writer nonce), not wall-clock timestamps alone.
+- Storage scales with retained character/group identities, not lifetime edit count.
 
 ### Non-goals (this ticket)
 
 - Import/migrate from Loot Helper or Guild Supplies identity data.
 - Drive donation witness counting or Loot Helper profile permissions from Guild Info.
 - Configurable editor rank policies or multi-level family trees.
+- Append-only operation logs, cutovers, or compaction checkpoints.
 
-## Saved schema
+## Saved schema (`schemaVersion = 2`)
 
 ```lua
 SpectrumFederationDB.guildInfo = {
-  schemaVersion = 1,
+  schemaVersion = 2,
   localWriter = { nonce = "<24 hex>", nextSeq = 1 },
   guilds = {
     ["club:<actual club id>"] = {
-      schemaVersion = 1,
+      schemaVersion = 2,
       guildKey = "club:<id>",
       clubId = "<id>",
-      ops = { -- [opId] = operation body },
-      order = { "<opId>", ... }, -- admission order; fold sorts by (at, id)
-      characters = { -- [guid] = { guid, nameRealm, classFile } last-known display },
-      graph = { -- derived
-        mains = { [mainGuid] = { mainGuid, altGuids = { ... } } },
-        byGuid = { [guid] = { role = "main"|"alt", mainGuid = <guid> } },
+      members = {
+        -- [guid] = {
+        --   guid, groupId = "<id>" | false (unassigned tombstone),
+        --   ver = { n = <int>, w = "<writer nonce>" },
+        --   at = <server time>, nameRealm?, classFile?
+        -- }
       },
-      revision = <number of accepted ops>,
+      groups = {
+        -- [groupId] = {
+        --   groupId, mainGuid?, dissolved?,
+        --   ver = { n, w }, at = <server time>
+        -- }
+      },
+      characters = { -- display cache bounded to membership GUIDs
+        -- [guid] = { guid, nameRealm, classFile }
+      },
+      graph = { -- derived from members+groups; not independently authoritative
+        mains = { [mainGuid] = { mainGuid, groupId, altGuids = { ... } } },
+        byGuid = { [guid] = { role = "main"|"alt", mainGuid, groupId } },
+      },
+      revision = <members + groups count>,
       openConflicts = {},
     },
   },
 }
 ```
 
+**Migration:** Schema 1 was the unmerged op-log prototype. On load, Guild Info performs a **Guild Info-only hard reset** to an empty schema-2 root. Guild Supplies, Loot Helper, and unrelated SavedVariables are never touched.
+
 Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 
-## Operations
+## Versioning and merge
 
-| Kind | Effect |
-| --- | --- |
-| `assign` | Place alt under main (idempotent if already there; move when confirmed) |
-| `unassign` | Remove one alt from its main |
-| `change_main` | Promote a rostered alt; previous main becomes an alt; other alts retained |
-| `cutover` | Replicated compaction boundary: clears prior graph; `coveredIds` lists incorporated ops |
-| `snapshot` | Legacy compaction marker (fold-supported); not emitted by new compaction |
+- Each membership and group record carries `ver = { n, w }`.
+- Higher `n` wins; equal `n` ties break on lexicographic writer nonce `w`.
+- Wall-clock `at` is metadata/display only and never grants authority.
+- Independent characters merge independently. Conflicting assignments to the same GUID resolve to one winner; unrelated edits survive.
+- **Change Main** updates only the group’s `mainGuid` (and group version). Memberships keep the same stable `groupId`, so the logical promotion is atomic and does not rewrite every alt.
+- Unassign writes `groupId = false` (tombstone). Stale lower-version assignments cannot resurrect the link.
+- Empty groups (no remaining alts) dissolve: remaining solo main is tombstoned and the group is marked `dissolved`. Unreferenced dissolved groups may be reclaimed; membership tombstones are retained until the identity-capacity ceiling so offline peers cannot republish obsolete links.
 
-Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Authorization is the transport sender only; payload `actorGuid` is provenance kept version-stable for editor-to-editor relay/catch-up and is never treated as authentication.
+## Capacity and cleanup
 
-Compaction is a bounded replicated cutover produced only by a **local editor commit** (remote ingest never manufactures a cutover from a partial view). The editor replaces its incorporated log with one `cutover` (including explicit `coveredIds`) plus officer-authored per-relationship assign checkpoints (each within Guild Gossip’s 2048-byte record cap). Peers purge only ops listed in `coveredIds`; independent edits the compactor never observed are retained and applied after cutover/checkpoints. The pending edit that triggered compaction is folded into the checkpoint graph and listed in `coveredIds` so same-second `(at,id)` ordering cannot acknowledge an Unassign while checkpoints recreate the removed link. If `coveredIds` cannot fit the Gossip record cap, compaction fails closed and the admit is refused with `ops_overflow` (capacity limitation) rather than silently dropping accepted work.
+| Cap | Value | Behavior at limit |
+| --- | --- | --- |
+| `MAX_MEMBERS` | 256 | New GUID memberships fail closed (`members_overflow`) |
+| `MAX_GROUPS` | 128 | New groups fail closed; may reclaim unreferenced dissolved slots |
+| `MAX_ALTS_PER_MAIN` | 32 | Assign rejected (`group_full`) |
+| Gossip record | 2048 bytes CBOR | Oversize exports skipped / remote rejected |
+
+**Product tradeoff:** Indefinitely disconnected editors that never receive current tombstones cannot be given unbounded offline write-back without either unbounded tombstone retention or resurrection risk. This design keeps tombstones until the identity cap, then fails closed with Settings feedback rather than silently dropping protection or accepting unbounded growth.
+
+## Gossip provider
+
+Provider id: `sf.guildinfo.relationships` (`PROVIDER_SCHEMA = 2`).
+
+| Wire kind | Record id | Body |
+| --- | --- | --- |
+| `guildinfo-member` | `gi-m:<guid>` | versioned membership |
+| `guildinfo-group` | `gi-g:<groupId>` | versioned group |
+
+Remote admission requires a transport-authenticated editor sender (rank ≤ min(3, rankCount)). Payload versions/authors never grant editing authority. Ordinary members may receive/view state but cannot originate or launder mutations.
 
 ## Public read API
 
 | API | Contract |
 | --- | --- |
-| `GI:GetRelationshipGroups([guildKey])` | Sorted-ready group list; empty when unconfigured |
+| `GI:GetRelationshipGroups([guildKey])` | Sorted-ready group list; empty when unconfigured; hides mains-only rows |
 | `GI:GetCharacterRole(guid[, guildKey])` | `"main"` / `"alt"` / nil |
 | `GI:GetCapabilities()` | `canRead` / `canEdit` (UI hints; recheck at commit) |
 | `GI:GetAssignmentDisplayRows(roster)` | Settings list rows with membership status |
+| `GI.CountRetainedState([record])` | Bound diagnostics (members/groups/tombstones) |
 
 Future Loot Helper / Guild Supplies integration may **read** these APIs. They must not become the authority for those systems in this ticket.
 
@@ -93,6 +129,7 @@ Top-level **Guild Info** category → **Main / Alt Assignments** page:
 
 ```bash
 python -m pytest tests/test_guild_info.py
+lua5.1 tests/lua/guild_info_tests.lua
 python3 .github/scripts/lint_all.py
 python3 .github/scripts/validate_packaging.py
 ```

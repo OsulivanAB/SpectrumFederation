@@ -1,30 +1,30 @@
 -- Guild Info durable guild-keyed state (#402).
--- Independent of Loot Helper profiles and Guild Supplies witness links.
+-- Versioned current-state membership + group records (no append-only op log).
 local addonName, SF = ...
 
 SF.GuildInfo = SF.GuildInfo or {}
 local GI = SF.GuildInfo
 
-GI.SCHEMA_VERSION = 1
+GI.SCHEMA_VERSION = 2
 GI.PROVIDER_ID = "sf.guildinfo.relationships"
-GI.PROVIDER_SCHEMA = 1
+GI.PROVIDER_SCHEMA = 2
 GI.EDITOR_RANK_MAX = 3
 GI.MAX_OPERATION_ID = 192
 GI.MAX_EVENT_SEQ = 2147483647
-GI.MAX_ACCEPTED_OPS = 512
-GI.MAX_GROUPS = 128
+GI.MAX_MEMBERS = 256 -- active + tombstone memberships (identity churn cap)
+GI.MAX_GROUPS = 128 -- live + dissolved group records
 GI.MAX_ALTS_PER_MAIN = 32
-GI.MAX_CHARACTERS = 256
+GI.MAX_CHARACTERS = 256 -- alias for callers/tests
 GI.MAX_NAME_REALM = 96
 GI.MAX_GUID = 64
 GI.MAX_CLASS = 32
+GI.MAX_GROUP_ID = 128
+GI.UNASSIGNED = false -- membership.groupId sentinel for tombstones
 
+-- Legacy KIND table kept only so older tests/docs references fail closed cleanly.
 GI.KIND = {
-    ASSIGN = "assign",
-    UNASSIGN = "unassign",
-    CHANGE_MAIN = "change_main",
-    SNAPSHOT = "snapshot", -- legacy fold-supported full-state marker
-    CUTOVER = "cutover", -- replicated compaction boundary (clears prior graph)
+    MEMBER = "member",
+    GROUP = "group",
 }
 
 GI._db = nil
@@ -46,17 +46,25 @@ local function DebugWarn(fmt, ...)
     end
 end
 
-local function Rand31()
-    local n = math.random(0, 0x7fffffff)
-    if n < 0 then
-        n = -n
+--- Portable 8-digit lowercase hex (avoid %x sign-extension producing 16 chars on some Lua 5.1 builds).
+local function Hex8()
+    local n = math.random(0, 0xfffffff) -- 28-bit fits %08x without sign-extension blowups
+    local s = string.format("%08x", n)
+    if #s > 8 then
+        s = s:sub(-8)
+    elseif #s < 8 then
+        s = string.rep("0", 8 - #s) .. s
     end
-    return n % 0x80000000
+    return s
+end
+
+local function Rand31()
+    return math.random(0, 0xfffffff)
 end
 
 local function NewWriterState()
     return {
-        nonce = string.format("%08x%08x%08x", Rand31(), Rand31(), Rand31()),
+        nonce = Hex8() .. Hex8() .. Hex8(),
         nextSeq = 1,
     }
 end
@@ -70,70 +78,137 @@ local function IsValidWriterState(writer)
         return false
     end
     local seq = tonumber(writer.nextSeq)
-    return seq and seq == math.floor(seq) and seq >= 1 and seq <= GI.MAX_EVENT_SEQ
+    return seq and seq >= 1 and seq <= GI.MAX_EVENT_SEQ + 1
 end
 
-local function IsFiniteNonnegInt(value)
-    local n = tonumber(value)
-    return n and n == math.floor(n) and n >= 0 and n == n and n ~= math.huge
-end
-
-function GI.IsFiniteNonnegInt(value)
-    return IsFiniteNonnegInt(value)
-end
-
---- Parse durable guild key. Rejects name: transport fallbacks.
--- @return string|nil guildKey, string|nil clubId, string|nil reason
-function GI.ParseGuildKey(guildKey)
-    if type(guildKey) ~= "string" or guildKey == "" then
-        return nil, nil, "invalid_guild_key"
+function GI.IsFiniteNonnegInt(n)
+    n = tonumber(n)
+    if not n or n ~= n or n < 0 or n == math.huge then
+        return false
     end
-    local clubId = guildKey:match("^club:(.+)$")
-    if not clubId or clubId == "" or clubId == "0" then
-        return nil, nil, "unsupported_guild_key"
-    end
-    if clubId:match("^%s") or clubId:match("%s$") then
-        return nil, nil, "unsupported_guild_key"
-    end
-    return guildKey, clubId, nil
+    return math.floor(n) == n
 end
 
-function GI._BumpHandleGeneration(reason)
-    GI._handleGeneration = (tonumber(GI._handleGeneration) or 0) + 1
-    DebugInfo("handle generation=%d reason=%s", GI._handleGeneration, tostring(reason or "unknown"))
-end
-
-function GI.GetHandleGeneration()
-    return tonumber(GI._handleGeneration) or 0
-end
-
-function GI:_TrackGuildKey(guildKey)
-    if guildKey ~= GI._lastGuildKey then
-        GI._lastGuildKey = guildKey
-        GI._BumpHandleGeneration("guild_key_changed")
-    end
+local function IsFiniteNonnegInt(n)
+    return GI.IsFiniteNonnegInt(n)
 end
 
 local function ValidGuid(guid)
     return type(guid) == "string" and guid ~= "" and #guid <= GI.MAX_GUID
 end
 
-local function ValidNameRealm(name)
-    return type(name) == "string" and name ~= "" and #name <= GI.MAX_NAME_REALM
+local function ClampName(name)
+    if type(name) ~= "string" or name == "" then
+        return nil
+    end
+    if #name > GI.MAX_NAME_REALM then
+        return name:sub(1, GI.MAX_NAME_REALM)
+    end
+    return name
 end
 
-local function ValidClass(classFile)
-    if classFile == nil then
-        return true
+local function ClampClass(classFile)
+    if type(classFile) ~= "string" or classFile == "" then
+        return nil
     end
-    return type(classFile) == "string" and classFile ~= "" and #classFile <= GI.MAX_CLASS
+    if #classFile > GI.MAX_CLASS then
+        return classFile:sub(1, GI.MAX_CLASS)
+    end
+    return classFile
+end
+
+local function Now()
+    if GetServerTime then
+        local t = GetServerTime()
+        if type(t) == "number" then
+            return t
+        end
+    end
+    if time then
+        return time()
+    end
+    return 0
+end
+
+--- Compare version tuples. Higher n wins; tie-break on writer nonce string.
+-- @return number -1 if a<b, 0 if equal, 1 if a>b
+function GI.CompareVer(a, b)
+    local an = (type(a) == "table" and tonumber(a.n)) or 0
+    local bn = (type(b) == "table" and tonumber(b.n)) or 0
+    if an < bn then
+        return -1
+    end
+    if an > bn then
+        return 1
+    end
+    local aw = (type(a) == "table" and tostring(a.w or "")) or ""
+    local bw = (type(b) == "table" and tostring(b.w or "")) or ""
+    if aw < bw then
+        return -1
+    end
+    if aw > bw then
+        return 1
+    end
+    return 0
+end
+
+local function ValidVer(ver)
+    return type(ver) == "table"
+        and IsFiniteNonnegInt(ver.n)
+        and type(ver.w) == "string"
+        and ver.w ~= ""
+        and #ver.w <= 64
+end
+
+function GI.ParseGuildKey(guildKey)
+    if type(guildKey) ~= "string" or guildKey == "" then
+        return nil, nil, "invalid_guild_key"
+    end
+    local clubId = guildKey:match("^club:(%d+)$")
+    if not clubId then
+        return nil, nil, "invalid_guild_key"
+    end
+    return guildKey, clubId, nil
+end
+
+function GI.GetHandleGeneration()
+    return GI._handleGeneration or 0
+end
+
+function GI:_TrackGuildKey(guildKey)
+    local prev = GI._lastGuildKey
+    if prev ~= guildKey then
+        GI._lastGuildKey = guildKey
+        GI._handleGeneration = (GI._handleGeneration or 0) + 1
+    end
 end
 
 local function EmptyGraph()
+    return { mains = {}, byGuid = {} }
+end
+
+local function EmptyRecord(guildKey, clubId)
     return {
-        mains = {}, -- [mainGuid] = { mainGuid, altGuids = {ordered}, altSet = {} }
-        byGuid = {}, -- [guid] = { role = "main"|"alt", mainGuid = <guid> }
+        schemaVersion = GI.SCHEMA_VERSION,
+        guildKey = guildKey,
+        clubId = clubId,
+        members = {}, -- [guid] = membership
+        groups = {}, -- [groupId] = group
+        characters = {}, -- last-known display (subset; also mirrored on membership)
+        graph = EmptyGraph(),
+        revision = 0,
+        openConflicts = {},
     }
+end
+
+local function CountKeys(t)
+    local n = 0
+    if type(t) == "table" then
+        for _ in pairs(t) do
+            n = n + 1
+        end
+    end
+    return n
 end
 
 local function RememberCharacter(characters, guid, nameRealm, classFile)
@@ -146,398 +221,83 @@ local function RememberCharacter(characters, guid, nameRealm, classFile)
         row = { guid = guid }
         characters[guid] = row
     end
-    if ValidNameRealm(nameRealm) then
-        row.nameRealm = nameRealm
+    local n = ClampName(nameRealm)
+    local c = ClampClass(classFile)
+    if n then
+        row.nameRealm = n
     end
-    if ValidClass(classFile) and classFile then
-        row.classFile = classFile
+    if c then
+        row.classFile = c
     end
-    return characters
+    return row
 end
 
-local function EnsureMain(graph, mainGuid)
-    local group = graph.mains[mainGuid]
-    if not group then
-        group = { mainGuid = mainGuid, altGuids = {}, altSet = {} }
-        graph.mains[mainGuid] = group
-        graph.byGuid[mainGuid] = { role = "main", mainGuid = mainGuid }
-    end
-    return group
-end
+--- Derive mains/alts from membership + group records.
+local function RebuildDerived(record)
+    local graph = EmptyGraph()
+    local members = record.members or {}
+    local groups = record.groups or {}
 
-local function RemoveAltFromGroup(graph, altGuid)
-    local info = graph.byGuid[altGuid]
-    if not info or info.role ~= "alt" then
-        return false
-    end
-    local mainGuid = info.mainGuid
-    local group = graph.mains[mainGuid]
-    if group then
-        group.altSet[altGuid] = nil
-        local nextAlts = {}
-        for i = 1, #group.altGuids do
-            if group.altGuids[i] ~= altGuid then
-                nextAlts[#nextAlts + 1] = group.altGuids[i]
-            end
-        end
-        group.altGuids = nextAlts
-        if #group.altGuids == 0 then
-            graph.mains[mainGuid] = nil
-            graph.byGuid[mainGuid] = nil
-        end
-    end
-    graph.byGuid[altGuid] = nil
-    return true
-end
-
---- Apply one op onto a fold graph. Invalid ops are skipped (deterministic no-op).
--- @return boolean applied
-local function FoldApplyOp(graph, characters, op)
-    if type(op) ~= "table" or type(op.kind) ~= "string" then
-        return false
-    end
-    local kind = op.kind
-
-    -- Cutover clears prior relationships; checkpoint assigns that sort after it
-    -- rebuild the authoritative post-compaction graph.
-    if kind == GI.KIND.CUTOVER then
-        for k in pairs(graph.mains) do
-            graph.mains[k] = nil
-        end
-        for k in pairs(graph.byGuid) do
-            graph.byGuid[k] = nil
-        end
-        return true
-    end
-
-    if kind == GI.KIND.SNAPSHOT then
-        local snap = op.groups
-        if type(snap) ~= "table" then
-            return false
-        end
-        local fresh = EmptyGraph()
-        for i = 1, math.min(#snap, GI.MAX_GROUPS) do
-            local g = snap[i]
-            if type(g) == "table" and ValidGuid(g.mainGuid) then
-                local mainGuid = g.mainGuid
-                if not fresh.byGuid[mainGuid] then
-                    EnsureMain(fresh, mainGuid)
-                    RememberCharacter(characters, mainGuid, g.mainName, g.mainClass)
-                    local alts = g.altGuids
-                    if type(alts) == "table" then
-                        for j = 1, math.min(#alts, GI.MAX_ALTS_PER_MAIN) do
-                            local altGuid = alts[j]
-                            if ValidGuid(altGuid) and altGuid ~= mainGuid and not fresh.byGuid[altGuid] then
-                                local group = EnsureMain(fresh, mainGuid)
-                                group.altSet[altGuid] = true
-                                group.altGuids[#group.altGuids + 1] = altGuid
-                                fresh.byGuid[altGuid] = { role = "alt", mainGuid = mainGuid }
-                                local altNames = g.altNames
-                                local altClasses = g.altClasses
-                                RememberCharacter(
-                                    characters,
-                                    altGuid,
-                                    type(altNames) == "table" and altNames[j] or nil,
-                                    type(altClasses) == "table" and altClasses[j] or nil
-                                )
-                            end
-                        end
-                    end
+    -- Collect live members per groupId.
+    local byGroup = {}
+    for guid, m in pairs(members) do
+        if type(m) == "table" and ValidGuid(guid) then
+            local gid = m.groupId
+            if type(gid) == "string" and gid ~= "" then
+                local g = groups[gid]
+                if type(g) == "table" and not g.dissolved then
+                    byGroup[gid] = byGroup[gid] or {}
+                    byGroup[gid][#byGroup[gid] + 1] = guid
                 end
             end
         end
-        -- Replace graph contents in place.
-        for k in pairs(graph.mains) do
-            graph.mains[k] = nil
-        end
-        for k in pairs(graph.byGuid) do
-            graph.byGuid[k] = nil
-        end
-        for k, v in pairs(fresh.mains) do
-            graph.mains[k] = v
-        end
-        for k, v in pairs(fresh.byGuid) do
-            graph.byGuid[k] = v
-        end
-        return true
     end
 
-    if kind == GI.KIND.ASSIGN then
-        local mainGuid, altGuid = op.mainGuid, op.altGuid
-        if not ValidGuid(mainGuid) or not ValidGuid(altGuid) or mainGuid == altGuid then
-            return false
-        end
-        RememberCharacter(characters, mainGuid, op.mainName, op.mainClass)
-        RememberCharacter(characters, altGuid, op.altName, op.altClass)
-
-        local altInfo = graph.byGuid[altGuid]
-        local mainInfo = graph.byGuid[mainGuid]
-
-        -- Reject: alt is currently a main with dependents.
-        if altInfo and altInfo.role == "main" then
-            local group = graph.mains[altGuid]
-            if group and #group.altGuids > 0 then
-                return false
-            end
-            -- Lone main with no alts can become an alt: dissolve empty main first.
-            if group then
-                graph.mains[altGuid] = nil
-                graph.byGuid[altGuid] = nil
-                altInfo = nil
+    for gid, guids in pairs(byGroup) do
+        table.sort(guids)
+        local g = groups[gid]
+        local mainGuid = nil
+        if type(g.mainGuid) == "string" then
+            local mm = members[g.mainGuid]
+            if mm and mm.groupId == gid then
+                mainGuid = g.mainGuid
             end
         end
-
-        -- Reject: target main is itself an alt.
-        if mainInfo and mainInfo.role == "alt" then
-            return false
+        if not mainGuid then
+            -- Designated main missing/moved: deterministic fallback among members.
+            mainGuid = guids[1]
         end
-
-        -- Idempotent: already under this main (no mutation).
-        if altInfo and altInfo.role == "alt" and altInfo.mainGuid == mainGuid then
-            return true
-        end
-
-        -- Capacity checks BEFORE mutating the old relationship (D).
-        local wouldDissolveOld = false
-        if altInfo and altInfo.role == "alt" then
-            local oldGroup = graph.mains[altInfo.mainGuid]
-            if oldGroup and #oldGroup.altGuids == 1 and oldGroup.altGuids[1] == altGuid then
-                wouldDissolveOld = true
+        if mainGuid then
+            local altGuids = {}
+            for i = 1, #guids do
+                local guid = guids[i]
+                if guid == mainGuid then
+                    graph.byGuid[guid] = { role = "main", mainGuid = mainGuid, groupId = gid }
+                else
+                    altGuids[#altGuids + 1] = guid
+                    graph.byGuid[guid] = { role = "alt", mainGuid = mainGuid, groupId = gid }
+                end
             end
+            -- Keep groups that still have at least the main (solo main hidden in UI via display rows).
+            graph.mains[mainGuid] = {
+                mainGuid = mainGuid,
+                groupId = gid,
+                altGuids = altGuids,
+            }
         end
-        local groupCount = 0
-        for _ in pairs(graph.mains) do
-            groupCount = groupCount + 1
-        end
-        local effectiveGroupCount = groupCount - (wouldDissolveOld and 1 or 0)
-        if not graph.mains[mainGuid] and effectiveGroupCount >= GI.MAX_GROUPS then
-            return false
-        end
-        local destGroup = graph.mains[mainGuid]
-        if destGroup and #destGroup.altGuids >= GI.MAX_ALTS_PER_MAIN then
-            return false
-        end
-
-        -- All checks passed — mutate.
-        if altInfo and altInfo.role == "alt" then
-            RemoveAltFromGroup(graph, altGuid)
-        end
-        local group = EnsureMain(graph, mainGuid)
-        if #group.altGuids >= GI.MAX_ALTS_PER_MAIN then
-            -- Defensive: should be unreachable after pre-check.
-            return false
-        end
-        group.altSet[altGuid] = true
-        group.altGuids[#group.altGuids + 1] = altGuid
-        graph.byGuid[altGuid] = { role = "alt", mainGuid = mainGuid }
-        return true
     end
 
-    if kind == GI.KIND.UNASSIGN then
-        local altGuid = op.altGuid
-        if not ValidGuid(altGuid) then
-            return false
-        end
-        local info = graph.byGuid[altGuid]
-        if not info or info.role ~= "alt" then
-            return false
-        end
-        if type(op.mainGuid) == "string" and op.mainGuid ~= "" and info.mainGuid ~= op.mainGuid then
-            return false
-        end
-        return RemoveAltFromGroup(graph, altGuid)
-    end
-
-    if kind == GI.KIND.CHANGE_MAIN then
-        local oldMain = op.mainGuid
-        local newMain = op.newMainGuid
-        if not ValidGuid(oldMain) or not ValidGuid(newMain) or oldMain == newMain then
-            return false
-        end
-        local group = graph.mains[oldMain]
-        if not group or not group.altSet[newMain] then
-            return false
-        end
-        RememberCharacter(characters, oldMain, op.mainName, op.mainClass)
-        RememberCharacter(characters, newMain, op.newMainName, op.newMainClass)
-
-        local alts = {}
-        for i = 1, #group.altGuids do
-            local g = group.altGuids[i]
-            if g ~= newMain then
-                alts[#alts + 1] = g
-            end
-        end
-        alts[#alts + 1] = oldMain
-
-        graph.mains[oldMain] = nil
-        graph.byGuid[oldMain] = nil
-        graph.byGuid[newMain] = nil
-
-        local newGroup = {
-            mainGuid = newMain,
-            altGuids = alts,
-            altSet = {},
-        }
-        for i = 1, #alts do
-            newGroup.altSet[alts[i]] = true
-            graph.byGuid[alts[i]] = { role = "alt", mainGuid = newMain }
-        end
-        graph.mains[newMain] = newGroup
-        graph.byGuid[newMain] = { role = "main", mainGuid = newMain }
-        return true
-    end
-
-    return false
-end
-
-local function SortOpsByAtId(list)
-    table.sort(list, function(a, b)
-        local atA = tonumber(a.at) or 0
-        local atB = tonumber(b.at) or 0
-        if atA ~= atB then
-            return atA < atB
-        end
-        return tostring(a.id) < tostring(b.id)
-    end)
-end
-
-local function IsCutoverBoundaryOp(op)
-    if type(op) ~= "table" or type(op.kind) ~= "string" then
-        return false
-    end
-    if op.kind == GI.KIND.CUTOVER then
-        return true
-    end
-    -- Compaction checkpoints share the cutover timestamp; id marker is authoritative.
-    if op.kind == GI.KIND.ASSIGN and type(op.id) == "string" and op.id:find("a1ckpt", 1, true) then
-        return true
-    end
-    return false
-end
-
-local function CoveredIdSetFromCutover(cutover)
-    local set = {}
-    if type(cutover) ~= "table" or type(cutover.coveredIds) ~= "table" then
-        return set
-    end
-    for i = 1, #cutover.coveredIds do
-        local id = cutover.coveredIds[i]
-        if type(id) == "string" and id ~= "" then
-            set[id] = true
-        end
-    end
-    return set
-end
-
-local function BuildCoveredIdSet(opsById, order)
-    local covered = {}
-    if type(opsById) ~= "table" or type(order) ~= "table" then
-        return covered
-    end
-    for i = 1, #order do
-        local op = opsById[order[i]]
-        if type(op) == "table" and op.kind == GI.KIND.CUTOVER then
-            local set = CoveredIdSetFromCutover(op)
-            for id in pairs(set) do
-                covered[id] = true
-            end
-        end
-    end
-    return covered
-end
-
-local function RememberOpCharacters(characters, op)
-    if type(op.mainGuid) == "string" then
-        RememberCharacter(characters, op.mainGuid, op.mainName, op.mainClass)
-    end
-    if type(op.altGuid) == "string" then
-        RememberCharacter(characters, op.altGuid, op.altName, op.altClass)
-    end
-    if type(op.newMainGuid) == "string" then
-        RememberCharacter(characters, op.newMainGuid, op.newMainName, op.newMainClass)
-    end
-    if type(op.characters) == "table" then
-        for guid, row in pairs(op.characters) do
-            if type(row) == "table" then
-                RememberCharacter(characters, guid, row.nameRealm, row.classFile)
-            end
-        end
-    end
-end
-
---- Deterministic fold of accepted ops → relationship graph.
--- Cutover clears prior graph; checkpoints rebuild the incorporated state. Ops a cutover
--- lists in coveredIds are skipped. Uncovered ops (including independent edits the
--- compactor never observed) apply after all cutover/checkpoint boundaries so partition
--- survivors are not wiped by (at,id) ordering alone.
--- @return table graph, table characters
-function GI.FoldOperations(opsById, order)
-    local graph = EmptyGraph()
-    local characters = {}
-    if type(opsById) ~= "table" or type(order) ~= "table" then
-        return graph, characters
-    end
-
-    local covered = BuildCoveredIdSet(opsById, order)
-    local boundary = {}
-    local other = {}
-    for i = 1, #order do
-        local id = order[i]
-        local op = opsById[id]
-        if type(op) == "table" and type(op.id) == "string" then
-            RememberOpCharacters(characters, op)
-            if covered[op.id] then
-                -- Explicitly incorporated/superseded by a cutover: omit from fold.
-            elseif IsCutoverBoundaryOp(op) then
-                boundary[#boundary + 1] = op
-            else
-                other[#other + 1] = op
+    -- Bound display cache to membership GUIDs only (no lifetime roster accumulation).
+    if type(record.characters) == "table" then
+        for guid in pairs(record.characters) do
+            if members[guid] == nil then
+                record.characters[guid] = nil
             end
         end
     end
 
-    SortOpsByAtId(boundary)
-    SortOpsByAtId(other)
-    for i = 1, #boundary do
-        FoldApplyOp(graph, characters, boundary[i])
-    end
-    for i = 1, #other do
-        FoldApplyOp(graph, characters, other[i])
-    end
-    return graph, characters
-end
-
-GI._FoldApplyOp = FoldApplyOp
-GI._RememberCharacter = RememberCharacter
-
-local function RebuildDerived(record)
-    local graph, foldedChars = GI.FoldOperations(record.ops, record.order)
-    record.graph = {
-        mains = {},
-        byGuid = {},
-    }
-    for mainGuid, group in pairs(graph.mains) do
-        local altGuids = {}
-        for i = 1, #group.altGuids do
-            altGuids[i] = group.altGuids[i]
-        end
-        record.graph.mains[mainGuid] = {
-            mainGuid = mainGuid,
-            altGuids = altGuids,
-        }
-    end
-    for guid, info in pairs(graph.byGuid) do
-        record.graph.byGuid[guid] = {
-            role = info.role,
-            mainGuid = info.mainGuid,
-        }
-    end
-    record.characters = record.characters or {}
-    for guid, row in pairs(foldedChars) do
-        RememberCharacter(record.characters, guid, row.nameRealm, row.classFile)
-    end
-    record.revision = #(record.order or {})
+    record.graph = graph
+    record.revision = CountKeys(members) + CountKeys(groups)
     return record
 end
 
@@ -545,67 +305,56 @@ function GI.RebuildDerived(record)
     return RebuildDerived(record)
 end
 
-local function ValidateOpBody(op)
-    if type(op) ~= "table" then
-        return false, "invalid_op"
+local function ValidateMemberBody(m)
+    if type(m) ~= "table" then
+        return false, "invalid_member"
     end
-    if type(op.id) ~= "string" or op.id == "" or #op.id > GI.MAX_OPERATION_ID then
-        return false, "invalid_op_id"
+    if not ValidGuid(m.guid) then
+        return false, "invalid_member_guid"
     end
-    if type(op.kind) ~= "string" or op.kind == "" then
-        return false, "invalid_op_kind"
+    if not ValidVer(m.ver) then
+        return false, "invalid_member_ver"
     end
-    if not IsFiniteNonnegInt(op.at) then
-        return false, "invalid_op_at"
+    if not IsFiniteNonnegInt(m.at) then
+        return false, "invalid_member_at"
     end
-    if not ValidGuid(op.actorGuid) then
-        return false, "invalid_actor_guid"
-    end
-    if type(op.guildKey) ~= "string" or not GI.ParseGuildKey(op.guildKey) then
-        return false, "invalid_guild_key"
-    end
-    local kind = op.kind
-    if kind == GI.KIND.ASSIGN or kind == GI.KIND.UNASSIGN then
-        if not ValidGuid(op.altGuid) then
-            return false, "invalid_alt_guid"
+    local gid = m.groupId
+    if gid ~= GI.UNASSIGNED and gid ~= nil then
+        if type(gid) ~= "string" or gid == "" or #gid > GI.MAX_GROUP_ID then
+            return false, "invalid_member_group"
         end
-        if kind == GI.KIND.ASSIGN and not ValidGuid(op.mainGuid) then
-            return false, "invalid_main_guid"
-        end
-    elseif kind == GI.KIND.CHANGE_MAIN then
-        if not ValidGuid(op.mainGuid) or not ValidGuid(op.newMainGuid) then
-            return false, "invalid_main_guid"
-        end
-    elseif kind == GI.KIND.SNAPSHOT then
-        if type(op.groups) ~= "table" then
-            return false, "invalid_snapshot"
-        end
-    elseif kind == GI.KIND.CUTOVER then
-        -- Cutover must list every incorporated op id; receivers purge only that set.
-        if op.groups ~= nil then
-            return false, "invalid_cutover"
-        end
-        if type(op.coveredIds) ~= "table" or #op.coveredIds < 1 then
-            return false, "invalid_cutover"
-        end
-        -- May include the pending compacting op beyond the prior live-log bound.
-        if #op.coveredIds > GI.MAX_ACCEPTED_OPS + 1 then
-            return false, "invalid_cutover"
-        end
-        for i = 1, #op.coveredIds do
-            local cid = op.coveredIds[i]
-            if type(cid) ~= "string" or cid == "" or #cid > GI.MAX_OPERATION_ID then
-                return false, "invalid_cutover"
-            end
-        end
-    else
-        return false, "unsupported_op_kind"
     end
     return true
 end
 
-function GI.ValidateOpBody(op)
-    return ValidateOpBody(op)
+local function ValidateGroupBody(g)
+    if type(g) ~= "table" then
+        return false, "invalid_group"
+    end
+    if type(g.groupId) ~= "string" or g.groupId == "" or #g.groupId > GI.MAX_GROUP_ID then
+        return false, "invalid_group_id"
+    end
+    if not ValidVer(g.ver) then
+        return false, "invalid_group_ver"
+    end
+    if not IsFiniteNonnegInt(g.at) then
+        return false, "invalid_group_at"
+    end
+    if g.dissolved then
+        return true
+    end
+    if not ValidGuid(g.mainGuid) then
+        return false, "invalid_group_main"
+    end
+    return true
+end
+
+function GI.ValidateMemberBody(m)
+    return ValidateMemberBody(m)
+end
+
+function GI.ValidateGroupBody(g)
+    return ValidateGroupBody(g)
 end
 
 local function ValidateGuildRecord(guildKey, record)
@@ -625,26 +374,31 @@ local function ValidateGuildRecord(guildKey, record)
     if tostring(record.clubId) ~= tostring(clubId) then
         return false, "club_id_mismatch"
     end
-    if type(record.ops) ~= "table" or type(record.order) ~= "table" then
-        return false, "invalid_ops"
+    if type(record.members) ~= "table" or type(record.groups) ~= "table" then
+        return false, "invalid_state"
     end
-    if #record.order > GI.MAX_ACCEPTED_OPS then
-        return false, "ops_overflow"
+    if CountKeys(record.members) > GI.MAX_MEMBERS then
+        return false, "members_overflow"
     end
-    for i = 1, #record.order do
-        local id = record.order[i]
-        if type(id) ~= "string" or type(record.ops[id]) ~= "table" then
-            return false, "invalid_ops"
-        end
-        local ok, err = ValidateOpBody(record.ops[id])
+    if CountKeys(record.groups) > GI.MAX_GROUPS then
+        return false, "groups_overflow"
+    end
+    for guid, m in pairs(record.members) do
+        local ok, err = ValidateMemberBody(m)
         if not ok then
             return false, err
         end
-        if record.ops[id].id ~= id then
-            return false, "invalid_ops"
+        if m.guid ~= guid then
+            return false, "invalid_member"
         end
-        if record.ops[id].guildKey ~= key then
-            return false, "op_guild_mismatch"
+    end
+    for gid, g in pairs(record.groups) do
+        local ok, err = ValidateGroupBody(g)
+        if not ok then
+            return false, err
+        end
+        if g.groupId ~= gid then
+            return false, "invalid_group"
         end
     end
     if type(record.characters) ~= "table" then
@@ -693,6 +447,17 @@ local function EnsureEmptyRoot(db)
     return db.guildInfo
 end
 
+--- Hard-reset Guild Info only (feature unmerged; no published data to migrate).
+local function ResetGuildInfoRoot(db, reason)
+    db.guildInfo = {
+        schemaVersion = GI.SCHEMA_VERSION,
+        localWriter = NewWriterState(),
+        guilds = {},
+    }
+    DebugWarn("reset guildInfo root (%s) to schema %s", tostring(reason), tostring(GI.SCHEMA_VERSION))
+    return db.guildInfo
+end
+
 function GI:Initialize(db)
     db = db or (type(SpectrumFederationDB) == "table" and SpectrumFederationDB) or nil
     if type(db) ~= "table" then
@@ -712,24 +477,56 @@ function GI:Initialize(db)
         return true
     end
 
+    -- Schema 1 was the unmerged op-log prototype; replace with empty state-based root.
+    if tonumber(existing.schemaVersion) ~= GI.SCHEMA_VERSION then
+        GI._root = ResetGuildInfoRoot(db, "schema_upgrade")
+        GI._rootValid = true
+        GI._rootReason = nil
+        return true
+    end
+
     local ok, reason = ValidateRoot(existing)
     if not ok then
         if reason == "invalid_local_writer" then
-            local baseOk = ValidateRootBase(existing)
-            if baseOk then
-                existing.localWriter = NewWriterState()
-                GI._root = existing
-                GI._rootValid = true
-                GI._rootReason = nil
-                DebugWarn("reestablished localWriter nonce on initialize")
-                return true
+            -- Repair writer only; do not wipe guild relationship state.
+            existing.localWriter = NewWriterState()
+            ok, reason = ValidateRoot(existing)
+            if not ok and reason == "invalid_local_writer" then
+                existing.localWriter = {
+                    nonce = "0123456789abcdef01234567",
+                    nextSeq = 1,
+                }
+                ok, reason = ValidateRoot(existing)
+            end
+            if ok then
+                DebugWarn("repaired invalid localWriter nonce; guild records preserved")
             end
         end
-        GI._root = existing
-        GI._rootValid = false
-        GI._rootReason = reason or "unsupported_schema"
-        DebugWarn("guildInfo root unavailable: %s", tostring(GI._rootReason))
-        return false, GI._rootReason
+    end
+    if not ok then
+        GI._root = ResetGuildInfoRoot(db, reason or "invalid_root")
+        GI._rootValid = true
+        GI._rootReason = nil
+        return true
+    end
+
+    -- Drop any leftover op-log fields from partial upgrades.
+    if type(existing.guilds) == "table" then
+        for _, rec in pairs(existing.guilds) do
+            if type(rec) == "table" then
+                rec.ops = nil
+                rec.order = nil
+                rec.compactedIds = nil
+                rec.compactWatermarkAt = nil
+                if type(rec.members) ~= "table" then
+                    rec.members = {}
+                end
+                if type(rec.groups) ~= "table" then
+                    rec.groups = {}
+                end
+                RebuildDerived(rec)
+            end
+        end
     end
 
     GI._root = existing
@@ -770,23 +567,29 @@ function GI:_EnsureWritableWriter()
     return writer
 end
 
-function GI:_AllocateOperationId(actorGuid)
-    if type(actorGuid) ~= "string" or actorGuid == "" then
-        return nil, "missing_actor"
-    end
+function GI:_NextVer(prevVer)
     local writer, reason = GI:_EnsureWritableWriter()
     if not writer then
         return nil, reason
     end
-    local seq = tonumber(writer.nextSeq)
+    local prevN = (type(prevVer) == "table" and tonumber(prevVer.n)) or 0
+    return { n = prevN + 1, w = writer.nonce }
+end
+
+function GI:_AllocateGroupId()
+    local writer, reason = GI:_EnsureWritableWriter()
+    if not writer then
+        return nil, reason
+    end
+    local seq = tonumber(writer.nextSeq) or 1
     if seq > GI.MAX_EVENT_SEQ then
         writer = NewWriterState()
         GI._root.localWriter = writer
         seq = 1
     end
-    local id = string.format("gi1:%s:%s:%d", actorGuid, writer.nonce, seq)
-    if #id > GI.MAX_OPERATION_ID then
-        return nil, "id_too_long"
+    local id = string.format("gig:%s:%d", writer.nonce, seq)
+    if #id > GI.MAX_GROUP_ID then
+        id = string.format("gig:%08x:%d", Rand31(), seq)
     end
     writer.nextSeq = seq + 1
     if writer.nextSeq > GI.MAX_EVENT_SEQ then
@@ -795,23 +598,6 @@ function GI:_AllocateOperationId(actorGuid)
     return id
 end
 
-local function EmptyRecord(guildKey, clubId)
-    return {
-        schemaVersion = GI.SCHEMA_VERSION,
-        guildKey = guildKey,
-        clubId = clubId,
-        ops = {},
-        order = {},
-        characters = {},
-        graph = { mains = {}, byGuid = {} },
-        revision = 0,
-        openConflicts = {},
-        compactedIds = {}, -- op ids removed by compaction (duplicate detection)
-        compactWatermarkAt = 0, -- ops strictly older are superseded after compaction
-    }
-end
-
---- Ensure a durable guild record exists (empty relationship set). Never imports other systems.
 function GI:EnsureGuildRecord(guildKey)
     if not GI:IsRootReady() then
         return nil, GI:GetRootReason()
@@ -820,13 +606,11 @@ function GI:EnsureGuildRecord(guildKey)
     if not key then
         return nil, err
     end
-    local root = GI._root
-    local record = root.guilds[key]
+    local record = GI._root.guilds[key]
     if record == nil then
         record = EmptyRecord(key, clubId)
-        root.guilds[key] = record
+        GI._root.guilds[key] = record
         DebugInfo("created empty guildInfo record key=%s", key)
-        return record
     end
     local ok, reason = ValidateGuildRecord(key, record)
     if not ok then
@@ -888,478 +672,428 @@ function GI:GetCurrentRecord()
     return record, nil, identity
 end
 
-local function GroupsFromGraph(graph, characters)
-    local groups = {}
-    if type(graph) ~= "table" then
-        return groups
-    end
-    characters = characters or {}
-    for mainGuid, group in pairs(graph.mains or {}) do
-        local altGuids, altNames, altClasses = {}, {}, {}
-        for i = 1, #(group.altGuids or {}) do
-            local ag = group.altGuids[i]
-            altGuids[#altGuids + 1] = ag
-            local crow = characters[ag]
-            altNames[#altNames + 1] = crow and crow.nameRealm or nil
-            altClasses[#altClasses + 1] = crow and crow.classFile or nil
-        end
-        local mrow = characters[mainGuid]
-        groups[#groups + 1] = {
-            mainGuid = mainGuid,
-            mainName = mrow and mrow.nameRealm or nil,
-            mainClass = mrow and mrow.classFile or nil,
-            altGuids = altGuids,
-            altNames = altNames,
-            altClasses = altClasses,
-        }
-    end
-    table.sort(groups, function(a, b)
-        return tostring(a.mainGuid) < tostring(b.mainGuid)
-    end)
-    return groups
+local function MemberIsAssigned(m)
+    return type(m) == "table" and type(m.groupId) == "string" and m.groupId ~= ""
 end
 
-local function SnapshotGroupsFromRecord(record)
-    local graph = record.graph
-    if type(graph) ~= "table" then
-        RebuildDerived(record)
-        graph = record.graph
-    end
-    return GroupsFromGraph(graph, record.characters)
+local function GroupIsLive(g)
+    return type(g) == "table" and not g.dissolved and ValidGuid(g.mainGuid)
 end
 
---- Whether an existing op is explicitly covered by cutover.coveredIds.
--- Cutover must not supersede unobserved independent edits by (at,id) alone.
-local function OpSupersededByCutover(existing, cutover)
-    if type(existing) ~= "table" or type(cutover) ~= "table" then
-        return false
-    end
-    if existing.id == cutover.id then
-        return false
-    end
-    local set = CoveredIdSetFromCutover(cutover)
-    return set[existing.id] == true
-end
-
-local function OpCoveredByAnyLiveCutover(record, opId)
-    if type(opId) ~= "string" or opId == "" then
-        return false
-    end
-    for i = 1, #(record.order or {}) do
-        local existing = record.ops and record.ops[record.order[i]]
-        if type(existing) == "table" and existing.kind == GI.KIND.CUTOVER then
-            if CoveredIdSetFromCutover(existing)[opId] then
-                return true
-            end
-        end
-    end
-    return false
-end
-
---- Fail closed when the cutover (with coveredIds) cannot traverse Gossip.
-local function CutoverWithinTransportCap(cutover)
-    if type(cutover) ~= "table" then
-        return false
-    end
-    if type(GI.RecordWithinGossipCap) == "function" then
-        local wire = {
-            id = "gi-op:" .. tostring(cutover.id),
-            versionFp = "cut",
-            body = { kind = "guildinfo-op", op = cutover },
-        }
-        local ok = GI.RecordWithinGossipCap(wire)
-        return ok and true or false
-    end
-    -- Gossip module not loaded: keep coveredIds small enough for the 2048-byte cap.
-    return type(cutover.coveredIds) == "table" and #cutover.coveredIds <= 32
-end
-
-local function RetainCompactedId(record, opId)
-    local compacted = record.compactedIds
-    if type(compacted) ~= "table" then
-        compacted = {}
-        record.compactedIds = compacted
-    end
-    if type(opId) == "string" and opId ~= "" then
-        compacted[opId] = true
-    end
-end
-
-local function BoundCompactedIds(record, liveOrder)
-    local compacted = record.compactedIds
-    if type(compacted) ~= "table" then
-        return
-    end
-    local count = 0
-    for _ in pairs(compacted) do
-        count = count + 1
-    end
-    if count <= GI.MAX_ACCEPTED_OPS * 2 then
-        return
-    end
-    record.compactedIds = {}
-    compacted = record.compactedIds
-    for i = 1, #(liveOrder or {}) do
-        compacted[liveOrder[i]] = true
-    end
-end
-
---- Apply a replicated cutover: raise watermark and drop explicitly covered live ops.
-local function ApplyCutoverToRecord(record, cutover)
-    local wm = tonumber(cutover.at) or 0
-    record.compactWatermarkAt = math.max(tonumber(record.compactWatermarkAt) or 0, wm)
-    -- Tombstone every covered id (even if not present locally) so delayed copies
-    -- cannot resurrect after the peer already applied this cutover.
-    local covered = CoveredIdSetFromCutover(cutover)
-    for id in pairs(covered) do
-        RetainCompactedId(record, id)
-    end
-    local newOps = {}
-    local newOrder = {}
-    for i = 1, #(record.order or {}) do
-        local id = record.order[i]
-        local existing = record.ops and record.ops[id]
-        if type(existing) == "table" then
-            if covered[id] or OpSupersededByCutover(existing, cutover) then
-                -- already retained
-            else
-                newOps[id] = existing
-                newOrder[#newOrder + 1] = id
-            end
-        end
-    end
-    newOps[cutover.id] = cutover
-    local found = false
-    for i = 1, #newOrder do
-        if newOrder[i] == cutover.id then
-            found = true
-            break
-        end
-    end
-    if not found then
-        newOrder[#newOrder + 1] = cutover.id
-    end
-    record.ops = newOps
-    record.order = newOrder
-    BoundCompactedIds(record, newOrder)
-    RebuildDerived(record)
-end
-
-local function MaxOpAt(record)
-    local maxAt = 0
-    for i = 1, #(record.order or {}) do
-        local op = record.ops[record.order[i]]
-        local at = op and tonumber(op.at) or 0
-        if at > maxAt then
-            maxAt = at
-        end
-    end
-    return maxAt
-end
-
---- Compact a full op log into a replicated cutover + transport-sized checkpoints.
--- Cutover.coveredIds is the only supersession proof peers may apply. If that list
--- (plus cutover metadata) cannot fit Gossip's record cap, compaction fails closed
--- and the caller must refuse the admit with ops_overflow rather than drop edits.
--- Pending op is folded into checkpoint state so same-second triggers are not lost.
--- Returns: didCompact (bool), pendingIncluded (bool).
-local function CompactIfNeeded(record, actorGuid, actorName, pendingOp)
-    if #record.order < GI.MAX_ACCEPTED_OPS then
-        return false, false
-    end
-    if type(actorGuid) ~= "string" or actorGuid == "" or actorGuid == "compact" then
-        return false, false
-    end
-    if not ValidGuid(actorGuid) then
-        return false, false
-    end
-
-    local foldOps = {}
-    local foldOrder = {}
-    local coveredIds = {}
-    for i = 1, #record.order do
-        local id = record.order[i]
-        local body = record.ops[id]
-        if type(body) == "table" then
-            foldOps[id] = body
-            foldOrder[#foldOrder + 1] = id
-            coveredIds[#coveredIds + 1] = id
-        end
-    end
-    local pendingIncluded = false
-    if type(pendingOp) == "table" and type(pendingOp.id) == "string" then
-        local pok = ValidateOpBody(pendingOp)
-        if pok and not foldOps[pendingOp.id] then
-            foldOps[pendingOp.id] = pendingOp
-            foldOrder[#foldOrder + 1] = pendingOp.id
-            coveredIds[#coveredIds + 1] = pendingOp.id
-            pendingIncluded = true
-        end
-    end
-    local graph, characters = GI.FoldOperations(foldOps, foldOrder)
-    local groups = GroupsFromGraph(graph, characters)
-
-    local maxAt = MaxOpAt(record)
-    if pendingIncluded then
-        local pat = tonumber(pendingOp.at) or 0
-        if pat > maxAt then
-            maxAt = pat
-        end
-    end
-    local cutoverAt = maxAt
-
-    local parts = { tostring(record.guildKey), tostring(cutoverAt), tostring(record.revision or 0) }
-    for i = 1, #groups do
-        parts[#parts + 1] = groups[i].mainGuid
-        for j = 1, #groups[i].altGuids do
-            parts[#parts + 1] = groups[i].altGuids[j]
-        end
-    end
-    local digest = table.concat(parts, "\0")
-    local mix = 5381
-    for i = 1, #digest do
-        mix = (mix * 33 + digest:byte(i)) % 4294967296
-    end
-
-    -- IDs must sort cutover before checkpoints at the same timestamp:
-    -- "...:a0cut:..." < "...:a1ckpt:...".
-    local actorNameSafe = type(actorName) == "string" and actorName or ""
-    local cutId = string.format("gi1:%s:a0cut:%08x", actorGuid, mix)
-    if #cutId > GI.MAX_OPERATION_ID then
-        cutId = string.format("gi1:a0cut:%08x", mix)
-    end
-    local cutover = {
-        id = cutId,
-        kind = GI.KIND.CUTOVER,
-        at = cutoverAt,
-        actorGuid = actorGuid,
-        actorName = actorNameSafe,
-        guildKey = record.guildKey,
-        coveredIds = coveredIds,
-    }
-
-    -- Fail closed: never emit a cutover that cannot prove its covered set on the wire.
-    if not CutoverWithinTransportCap(cutover) then
-        DebugWarn(
-            "refusing guildInfo compaction: cutover coveredIds=%d exceeds Gossip record cap",
-            #coveredIds
-        )
-        return false, false
-    end
-
-    local newOps = { [cutId] = cutover }
-    local newOrder = { cutId }
-    local seq = 0
-    for i = 1, #groups do
-        local g = groups[i]
-        for j = 1, #(g.altGuids or {}) do
-            seq = seq + 1
-            local id = string.format("gi1:%s:a1ckpt:%08x:%d", actorGuid, mix, seq)
-            if #id > GI.MAX_OPERATION_ID then
-                id = string.format("gi1:a1ckpt:%08x:%d", mix, seq)
-            end
-            local altName = type(g.altNames) == "table" and g.altNames[j] or nil
-            local altClass = type(g.altClasses) == "table" and g.altClasses[j] or nil
-            newOps[id] = {
-                id = id,
-                kind = GI.KIND.ASSIGN,
-                at = cutoverAt,
-                actorGuid = actorGuid,
-                actorName = actorNameSafe,
-                guildKey = record.guildKey,
-                mainGuid = g.mainGuid,
-                mainName = g.mainName,
-                mainClass = g.mainClass,
-                altGuid = g.altGuids[j],
-                altName = altName,
-                altClass = altClass,
-            }
-            newOrder[#newOrder + 1] = id
-        end
-    end
-    -- Fail closed: do not mutate durable state when the cutover bundle cannot fit.
-    if #newOrder > GI.MAX_ACCEPTED_OPS then
-        return false, false
-    end
-
-    local oldOrder = record.order
-    for i = 1, #oldOrder do
-        RetainCompactedId(record, oldOrder[i])
-    end
-    if type(record.compactedIds) == "table" then
-        record.compactedIds[cutId] = nil
-        for i = 2, #newOrder do
-            record.compactedIds[newOrder[i]] = nil
-        end
-    end
-    if pendingIncluded then
-        -- Pending edit is represented by the checkpoint graph; do not re-append it.
-        RetainCompactedId(record, pendingOp.id)
-    end
-
-    record.ops = newOps
-    record.order = newOrder
-    record.compactWatermarkAt = math.max(tonumber(record.compactWatermarkAt) or 0, cutoverAt)
-    BoundCompactedIds(record, newOrder)
-    RebuildDerived(record)
-    DebugInfo(
-        "compacted guildInfo into cutover+%d checkpoints actor=%s covered=%d pendingIncluded=%s",
-        #newOrder - 1,
-        actorGuid,
-        #coveredIds,
-        tostring(pendingIncluded)
-    )
-    return true, pendingIncluded
-end
-
---- Whether admitting `op` into `record` would produce the intended assign effect.
-function GI.WouldAssignTakeEffect(record, op)
-    if type(record) ~= "table" or type(op) ~= "table" then
-        return false
-    end
-    local ops = {}
-    for id, body in pairs(record.ops or {}) do
-        ops[id] = body
-    end
-    ops[op.id] = op
-    local order = {}
-    for i = 1, #(record.order or {}) do
-        order[i] = record.order[i]
-    end
-    order[#order + 1] = op.id
-    local graph = GI.FoldOperations(ops, order)
-    local info = graph.byGuid and graph.byGuid[op.altGuid]
-    return info and info.role == "alt" and info.mainGuid == op.mainGuid
-end
-
---- Admit an authenticated operation into durable storage.
--- Remote path: store well-formed ops without racing on the local derived graph; effect
--- is determined solely by deterministic fold so peers converge (B).
--- Local path: UX preconditions (move confirm / stale confirm) still apply before store.
--- @return string status, string|nil detail
-function GI:AdmitOperation(op, opts)
+--- Merge a membership record if its version wins. Returns status, detail.
+function GI.MergeMember(record, member, opts)
     opts = opts or {}
-    local ok, err = ValidateOpBody(op)
+    if type(record) ~= "table" or type(record.members) ~= "table" then
+        return "rejected", "not_ready"
+    end
+    local ok, err = ValidateMemberBody(member)
     if not ok then
         return "rejected", err
     end
-    local record, recErr = GI:EnsureGuildRecord(op.guildKey)
-    if not record then
-        return "rejected", recErr or "not_ready"
-    end
-    if record.ops[op.id] then
-        return "duplicate", nil
-    end
-    if type(record.compactedIds) == "table" and record.compactedIds[op.id] then
-        return "duplicate", "compacted"
+    local existing = record.members[member.guid]
+    if existing and GI.CompareVer(member.ver, existing.ver) <= 0 then
+        if GI.CompareVer(member.ver, existing.ver) == 0 then
+            return "duplicate", nil
+        end
+        return "duplicate", "stale"
     end
 
-    -- Explicit cutover coverage / compacted ids supersede history. Do not reject by
-    -- watermark timestamp alone: that drops valid independent edits a compactor never saw.
-    if op.kind == GI.KIND.SNAPSHOT then
-        local watermark = tonumber(record.compactWatermarkAt) or 0
-        local maxLive = MaxOpAt(record)
-        local snapAt = tonumber(op.at) or 0
-        if (watermark > 0 and snapAt < watermark) or (maxLive > 0 and snapAt < maxLive) then
-            return "duplicate", "superseded"
-        end
-    elseif OpCoveredByAnyLiveCutover(record, op.id) then
-        RetainCompactedId(record, op.id)
-        return "duplicate", "superseded"
+    -- Capacity: new GUID only when under MAX_MEMBERS.
+    if not existing and CountKeys(record.members) >= GI.MAX_MEMBERS then
+        return "rejected", "members_overflow"
     end
 
-    -- Local-only confirmation / staleness gates (not used for remote sync admission).
-    if not opts.remote and op.kind ~= GI.KIND.SNAPSHOT and op.kind ~= GI.KIND.CUTOVER
-        and type(record.graph) == "table" then
-        local byGuid = record.graph.byGuid or {}
-        if op.kind == GI.KIND.ASSIGN then
-            local altInfo = byGuid[op.altGuid]
-            if opts.moveConfirmed and type(opts.expectedOldMain) == "string" and opts.expectedOldMain ~= "" then
-                if not altInfo or altInfo.role ~= "alt" or altInfo.mainGuid ~= opts.expectedOldMain then
-                    return "rejected", "stale_move_confirmation"
-                end
-            elseif opts.requireMoveConfirm then
-                if not altInfo or altInfo.role ~= "alt" then
-                    return "rejected", "stale_move_confirmation"
-                end
-                if not opts.moveConfirmed then
-                    return "rejected", "move_confirmation_required"
-                end
-            end
-        elseif op.kind == GI.KIND.UNASSIGN then
-            local altInfo = byGuid[op.altGuid]
-            if not altInfo or altInfo.role ~= "alt" then
-                return "rejected", "alt_not_assigned"
-            end
-            if type(opts.expectedMainGuid) == "string" and opts.expectedMainGuid ~= "" then
-                if altInfo.mainGuid ~= opts.expectedMainGuid then
-                    return "rejected", "stale_unassign"
-                end
-            end
-            if type(op.mainGuid) == "string" and op.mainGuid ~= "" and altInfo.mainGuid ~= op.mainGuid then
-                return "rejected", "stale_unassign"
-            end
-        elseif op.kind == GI.KIND.CHANGE_MAIN then
-            local group = record.graph.mains and record.graph.mains[op.mainGuid]
-            if not group then
-                return "rejected", "group_missing"
-            end
-            local found = false
-            for i = 1, #(group.altGuids or {}) do
-                if group.altGuids[i] == op.newMainGuid then
-                    found = true
-                    break
-                end
-            end
-            if not found then
-                return "rejected", "stale_change_main"
-            end
-        end
-    end
-
-    -- Replicated cutover: purge only explicitly covered live ops; keep unobserved edits.
-    if op.kind == GI.KIND.CUTOVER then
-        if not CutoverWithinTransportCap(op) then
-            return "rejected", "record_too_large"
-        end
-        ApplyCutoverToRecord(record, op)
-        if GI._NotifyLocalDurableChange then
-            GI._NotifyLocalDurableChange("compact")
-        end
-        return "accepted", nil
-    end
-
-    local compacted = false
-    local pendingIncluded = false
-    -- Only a local editor commit may manufacture a cutover. Remote ingest on a
-    -- full/partial log must not promote an incomplete view into an authoritative boundary.
-    if not opts.remote and #record.order >= GI.MAX_ACCEPTED_OPS then
-        compacted, pendingIncluded = CompactIfNeeded(record, op.actorGuid, op.actorName, op)
-        compacted = compacted and true or false
-        pendingIncluded = pendingIncluded and true or false
-    end
-    if pendingIncluded then
-        if GI._NotifyLocalDurableChange then
-            GI._NotifyLocalDurableChange("compact")
-        end
-        return "accepted", nil
-    end
-    if #record.order >= GI.MAX_ACCEPTED_OPS then
-        return "rejected", "ops_overflow"
-    end
-
-    record.ops[op.id] = op
-    record.order[#record.order + 1] = op.id
+    local stored = {
+        guid = member.guid,
+        groupId = member.groupId == nil and GI.UNASSIGNED or member.groupId,
+        ver = { n = member.ver.n, w = member.ver.w },
+        at = tonumber(member.at) or 0,
+        nameRealm = ClampName(member.nameRealm),
+        classFile = ClampClass(member.classFile),
+    }
+    record.members[member.guid] = stored
+    RememberCharacter(record.characters, stored.guid, stored.nameRealm, stored.classFile)
     RebuildDerived(record)
-
-    if GI._NotifyLocalDurableChange then
-        GI._NotifyLocalDurableChange(compacted and "compact" or (opts.remote and "remote" or "local"))
-    end
     return "accepted", nil
 end
 
---- Public read: relationship groups for a guild key (or current guild).
--- @return table|nil groups, string|nil reason
+--- Merge a group record if its version wins.
+function GI.MergeGroup(record, group, opts)
+    opts = opts or {}
+    if type(record) ~= "table" or type(record.groups) ~= "table" then
+        return "rejected", "not_ready"
+    end
+    local ok, err = ValidateGroupBody(group)
+    if not ok then
+        return "rejected", err
+    end
+    local existing = record.groups[group.groupId]
+    if existing and GI.CompareVer(group.ver, existing.ver) <= 0 then
+        if GI.CompareVer(group.ver, existing.ver) == 0 then
+            return "duplicate", nil
+        end
+        return "duplicate", "stale"
+    end
+    if not existing and CountKeys(record.groups) >= GI.MAX_GROUPS then
+        -- Allow replace of a dissolved slot only when at capacity by reclaiming
+        -- an unreferenced dissolved group with a strictly lower version.
+        local victim = nil
+        local victimVer = nil
+        for gid, g in pairs(record.groups) do
+            if g.dissolved then
+                local referenced = false
+                for _, m in pairs(record.members) do
+                    if m.groupId == gid then
+                        referenced = true
+                        break
+                    end
+                end
+                if not referenced then
+                    if not victim or GI.CompareVer(g.ver, victimVer) < 0 then
+                        victim = gid
+                        victimVer = g.ver
+                    end
+                end
+            end
+        end
+        if victim then
+            record.groups[victim] = nil
+        else
+            return "rejected", "groups_overflow"
+        end
+    end
+
+    local stored = {
+        groupId = group.groupId,
+        mainGuid = group.mainGuid,
+        ver = { n = group.ver.n, w = group.ver.w },
+        at = tonumber(group.at) or 0,
+        dissolved = group.dissolved and true or nil,
+    }
+    if stored.dissolved then
+        stored.mainGuid = nil
+    end
+    record.groups[group.groupId] = stored
+    RebuildDerived(record)
+    return "accepted", nil
+end
+
+local function NotifyDurable(reason)
+    if GI._NotifyLocalDurableChange then
+        GI._NotifyLocalDurableChange(reason or "local")
+    end
+end
+
+local function CountAltsInGroup(record, groupId)
+    local n = 0
+    for _, m in pairs(record.members) do
+        if m.groupId == groupId then
+            n = n + 1
+        end
+    end
+    return math.max(0, n - 1)
+end
+
+local function FindGroupIdForMain(record, mainGuid)
+    local info = record.graph and record.graph.byGuid and record.graph.byGuid[mainGuid]
+    if info and info.role == "main" and type(info.groupId) == "string" then
+        return info.groupId
+    end
+    -- Fallback: group record whose mainGuid matches and membership confirms.
+    for gid, g in pairs(record.groups) do
+        if GroupIsLive(g) and g.mainGuid == mainGuid then
+            local m = record.members[mainGuid]
+            if m and m.groupId == gid then
+                return gid
+            end
+        end
+    end
+    return nil
+end
+
+--- Dissolve a group with no remaining alts: tombstone members + mark group dissolved.
+local function DissolveEmptyGroup(record, groupId)
+    if type(groupId) ~= "string" or groupId == "" then
+        return
+    end
+    local oldG = record.groups[groupId]
+    if not oldG or oldG.dissolved then
+        return
+    end
+    local remaining = {}
+    for guid, m in pairs(record.members) do
+        if m.groupId == groupId then
+            remaining[#remaining + 1] = guid
+        end
+    end
+    for i = 1, #remaining do
+        local guid = remaining[i]
+        local mm = record.members[guid]
+        local mver = GI:_NextVer(mm and mm.ver)
+        if mver then
+            GI.MergeMember(record, {
+                guid = guid,
+                groupId = GI.UNASSIGNED,
+                ver = mver,
+                at = Now(),
+                nameRealm = mm and mm.nameRealm,
+                classFile = mm and mm.classFile,
+            })
+        end
+    end
+    -- Re-read: MergeMember may have replaced the group table only via membership rebuild.
+    oldG = record.groups[groupId]
+    if oldG and not oldG.dissolved then
+        local dVer = GI:_NextVer(oldG.ver)
+        if dVer then
+            GI.MergeGroup(record, {
+                groupId = groupId,
+                ver = dVer,
+                at = Now(),
+                dissolved = true,
+            })
+        end
+    end
+end
+
+--- Local assign/move implementation. Returns status, detail[, meta].
+function GI:ApplyAssign(mainGuid, altGuid, opts)
+    opts = opts or {}
+    if not ValidGuid(mainGuid) or not ValidGuid(altGuid) or mainGuid == altGuid then
+        return "rejected", "same_character"
+    end
+    local record, recErr = GI:EnsureGuildRecord(opts.guildKey)
+    if not record then
+        return "rejected", recErr or "not_ready"
+    end
+
+    local mainMem = record.members[mainGuid]
+    local altMem = record.members[altGuid]
+    local mainInfo = record.graph.byGuid and record.graph.byGuid[mainGuid]
+    local altInfo = record.graph.byGuid and record.graph.byGuid[altGuid]
+
+    -- Hierarchy gates (local).
+    if altInfo and altInfo.role == "main" then
+        local g = record.graph.mains[altGuid]
+        if g and #(g.altGuids or {}) > 0 then
+            return "rejected", "alt_is_main_with_alts"
+        end
+    end
+    if mainInfo and mainInfo.role == "alt" then
+        return "rejected", "main_is_alt"
+    end
+
+    local targetGroupId = FindGroupIdForMain(record, mainGuid)
+    if altInfo and altInfo.role == "alt" and altInfo.mainGuid == mainGuid then
+        return "accepted", "noop"
+    end
+    if altInfo and altInfo.role == "alt" and altInfo.mainGuid ~= mainGuid then
+        if opts.requireMoveConfirm and not opts.moveConfirmed then
+            return "rejected", "move_confirmation_required", { oldMainGuid = altInfo.mainGuid }
+        end
+        if opts.moveConfirmed and type(opts.expectedOldMain) == "string" and opts.expectedOldMain ~= "" then
+            if altInfo.mainGuid ~= opts.expectedOldMain then
+                return "rejected", "stale_move_confirmation"
+            end
+        elseif opts.requireMoveConfirm then
+            return "rejected", "move_confirmation_required", { oldMainGuid = altInfo.mainGuid }
+        end
+    end
+
+    if not targetGroupId then
+        -- Creating a new group: need room for group + possibly 2 memberships.
+        if CountKeys(record.groups) >= GI.MAX_GROUPS then
+            return "rejected", "groups_overflow"
+        end
+        if not mainMem and CountKeys(record.members) >= GI.MAX_MEMBERS then
+            return "rejected", "members_overflow"
+        end
+        if not altMem and CountKeys(record.members) >= GI.MAX_MEMBERS - (mainMem and 0 or 1) then
+            return "rejected", "members_overflow"
+        end
+        local gid, gErr = GI:_AllocateGroupId()
+        if not gid then
+            return "rejected", gErr
+        end
+        targetGroupId = gid
+        local gVer, gvErr = GI:_NextVer(nil)
+        if not gVer then
+            return "rejected", gvErr
+        end
+        local st = GI.MergeGroup(record, {
+            groupId = gid,
+            mainGuid = mainGuid,
+            ver = gVer,
+            at = Now(),
+        })
+        if st ~= "accepted" and st ~= "duplicate" then
+            return "rejected", st
+        end
+    else
+        if CountAltsInGroup(record, targetGroupId) >= GI.MAX_ALTS_PER_MAIN then
+            -- Moving within same group doesn't add; moving in from outside does.
+            if not (altInfo and altInfo.groupId == targetGroupId) then
+                if not (altInfo and altInfo.role == "alt" and altInfo.mainGuid == mainGuid) then
+                    -- count current alts; if alt already in group as something else
+                    local already = altMem and altMem.groupId == targetGroupId
+                    if not already then
+                        return "rejected", "group_full"
+                    end
+                end
+            end
+        end
+        -- Re-check capacity for brand-new alt identity.
+        if not altMem and CountKeys(record.members) >= GI.MAX_MEMBERS then
+            return "rejected", "members_overflow"
+        end
+    end
+
+    -- Ensure main membership points at the group.
+    local mainVer, mvErr = GI:_NextVer(mainMem and mainMem.ver)
+    if not mainVer then
+        return "rejected", mvErr
+    end
+    local stMain = GI.MergeMember(record, {
+        guid = mainGuid,
+        groupId = targetGroupId,
+        ver = mainVer,
+        at = Now(),
+        nameRealm = opts.mainName,
+        classFile = opts.mainClass,
+    })
+    if stMain ~= "accepted" and stMain ~= "duplicate" then
+        return "rejected", stMain
+    end
+
+    local altVer, avErr = GI:_NextVer(altMem and altMem.ver)
+    if not altVer then
+        return "rejected", avErr
+    end
+    local stAlt = GI.MergeMember(record, {
+        guid = altGuid,
+        groupId = targetGroupId,
+        ver = altVer,
+        at = Now(),
+        nameRealm = opts.altName,
+        classFile = opts.altClass,
+    })
+    if stAlt ~= "accepted" and stAlt ~= "duplicate" then
+        return "rejected", stAlt
+    end
+
+    -- Dissolve previous group when the move leaves it with no alts.
+    if altInfo and type(altInfo.groupId) == "string" and altInfo.groupId ~= targetGroupId then
+        RebuildDerived(record)
+        local oldGid = altInfo.groupId
+        local ginfo = nil
+        for _, g in pairs(record.graph.mains or {}) do
+            if g.groupId == oldGid then
+                ginfo = g
+                break
+            end
+        end
+        if not ginfo or #(ginfo.altGuids or {}) == 0 then
+            DissolveEmptyGroup(record, oldGid)
+        end
+    end
+
+    NotifyDurable("local")
+    return "accepted", nil
+end
+
+function GI:ApplyUnassign(altGuid, opts)
+    opts = opts or {}
+    if not ValidGuid(altGuid) then
+        return "rejected", "identity_unavailable"
+    end
+    local record, recErr = GI:EnsureGuildRecord(opts.guildKey)
+    if not record then
+        return "rejected", recErr or "not_ready"
+    end
+    local info = record.graph.byGuid and record.graph.byGuid[altGuid]
+    if not info or info.role ~= "alt" then
+        return "rejected", "alt_not_assigned"
+    end
+    if type(opts.expectedMainGuid) == "string" and opts.expectedMainGuid ~= "" then
+        if info.mainGuid ~= opts.expectedMainGuid then
+            return "rejected", "stale_unassign"
+        end
+    end
+
+    local mem = record.members[altGuid]
+    local ver, vErr = GI:_NextVer(mem and mem.ver)
+    if not ver then
+        return "rejected", vErr
+    end
+    local oldGid = info.groupId
+    local st = GI.MergeMember(record, {
+        guid = altGuid,
+        groupId = GI.UNASSIGNED,
+        ver = ver,
+        at = Now(),
+        nameRealm = mem and mem.nameRealm or nil,
+        classFile = mem and mem.classFile or nil,
+    })
+    if st ~= "accepted" and st ~= "duplicate" then
+        return "rejected", st
+    end
+
+    if type(oldGid) == "string" then
+        RebuildDerived(record)
+        local ginfo = nil
+        for _, g in pairs(record.graph.mains or {}) do
+            if g.groupId == oldGid then
+                ginfo = g
+                break
+            end
+        end
+        -- Dissolve when the group has no remaining alts (solo main is not a displayed relationship).
+        if not ginfo or #(ginfo.altGuids or {}) == 0 then
+            DissolveEmptyGroup(record, oldGid)
+        end
+    end
+
+    NotifyDurable("local")
+    return "accepted", nil
+end
+
+function GI:ApplyChangeMain(oldMainGuid, newMainGuid, opts)
+    opts = opts or {}
+    if not ValidGuid(oldMainGuid) or not ValidGuid(newMainGuid) or oldMainGuid == newMainGuid then
+        return "rejected", "same_character"
+    end
+    local record, recErr = GI:EnsureGuildRecord(opts.guildKey)
+    if not record then
+        return "rejected", recErr or "not_ready"
+    end
+    local groupId = FindGroupIdForMain(record, oldMainGuid)
+    if not groupId then
+        return "rejected", "group_missing"
+    end
+    local newInfo = record.graph.byGuid and record.graph.byGuid[newMainGuid]
+    if not newInfo or newInfo.role ~= "alt" or newInfo.mainGuid ~= oldMainGuid or newInfo.groupId ~= groupId then
+        return "rejected", "stale_change_main"
+    end
+
+    local g = record.groups[groupId]
+    local gVer, gErr = GI:_NextVer(g and g.ver)
+    if not gVer then
+        return "rejected", gErr
+    end
+    -- Single group record update — memberships keep the same groupId (atomic logical CM).
+    local st = GI.MergeGroup(record, {
+        groupId = groupId,
+        mainGuid = newMainGuid,
+        ver = gVer,
+        at = Now(),
+    })
+    if st ~= "accepted" and st ~= "duplicate" then
+        return "rejected", st
+    end
+    NotifyDurable("local")
+    return "accepted", nil
+end
+
 function GI:GetRelationshipGroups(guildKey)
     local record, reason
     if guildKey then
@@ -1383,16 +1117,18 @@ function GI:GetRelationshipGroups(guildKey)
         for i = 1, #(group.altGuids or {}) do
             alts[#alts + 1] = group.altGuids[i]
         end
-        groups[#groups + 1] = {
-            mainGuid = mainGuid,
-            altGuids = alts,
-        }
+        -- Hide mains-only (no alts) from the relationship list.
+        if #alts > 0 then
+            groups[#groups + 1] = {
+                mainGuid = mainGuid,
+                groupId = group.groupId,
+                altGuids = alts,
+            }
+        end
     end
     return groups, nil, record
 end
 
---- Public read: role for a character GUID.
--- @return string|nil role ("main"|"alt"|nil), string|nil mainGuid
 function GI:GetCharacterRole(guid, guildKey)
     if not ValidGuid(guid) then
         return nil
@@ -1410,6 +1146,13 @@ function GI:GetCharacterRole(guid, guildKey)
     if not info then
         return nil
     end
+    -- Solo main (no alts) is not a displayed relationship role.
+    if info.role == "main" then
+        local g = record.graph.mains[guid]
+        if not g or #(g.altGuids or {}) == 0 then
+            return nil
+        end
+    end
     return info.role, info.mainGuid
 end
 
@@ -1418,4 +1161,120 @@ function GI.UpdateCharacterDisplay(record, guid, nameRealm, classFile)
         return
     end
     RememberCharacter(record.characters, guid, nameRealm, classFile)
+    local m = record.members and record.members[guid]
+    if m then
+        local n = ClampName(nameRealm)
+        local c = ClampClass(classFile)
+        if n then
+            m.nameRealm = n
+        end
+        if c then
+            m.classFile = c
+        end
+    end
 end
+
+--- Enumerate exportable state bodies for Gossip.
+function GI.ListStateBodies(record)
+    local bodies = {}
+    if type(record) ~= "table" then
+        return bodies
+    end
+    for guid, m in pairs(record.members or {}) do
+        bodies[#bodies + 1] = {
+            kind = "guildinfo-member",
+            member = m,
+            _sort = "m:" .. guid,
+        }
+    end
+    for gid, g in pairs(record.groups or {}) do
+        bodies[#bodies + 1] = {
+            kind = "guildinfo-group",
+            group = g,
+            _sort = "g:" .. gid,
+        }
+    end
+    table.sort(bodies, function(a, b)
+        return a._sort < b._sort
+    end)
+    for i = 1, #bodies do
+        bodies[i]._sort = nil
+    end
+    return bodies
+end
+
+--- Count retained durable rows for bound checks / tests.
+function GI.CountRetainedState(record)
+    record = record or select(1, GI:GetCurrentRecord())
+    if type(record) ~= "table" then
+        return {
+            members = 0,
+            groups = 0,
+            assigned = 0,
+            unassigned = 0,
+            dissolved = 0,
+            liveGroups = 0,
+            characters = 0,
+        }
+    end
+    local assigned, unassigned, dissolved, live = 0, 0, 0, 0
+    for _, m in pairs(record.members or {}) do
+        if MemberIsAssigned(m) then
+            assigned = assigned + 1
+        else
+            unassigned = unassigned + 1
+        end
+    end
+    for _, g in pairs(record.groups or {}) do
+        if g.dissolved then
+            dissolved = dissolved + 1
+        elseif GroupIsLive(g) then
+            live = live + 1
+        end
+    end
+    return {
+        members = CountKeys(record.members),
+        groups = CountKeys(record.groups),
+        assigned = assigned,
+        unassigned = unassigned,
+        dissolved = dissolved,
+        liveGroups = live,
+        characters = CountKeys(record.characters),
+    }
+end
+
+--- Reclaim unreferenced dissolved groups (safe: no membership points at them).
+-- Unassigned membership tombstones are retained until capacity fail-closed so
+-- stale peers cannot resurrect deleted relationships by replaying old assigns.
+function GI.ReclaimUnreferencedDissolved(record)
+    if type(record) ~= "table" or type(record.groups) ~= "table" then
+        return 0
+    end
+    local removed = 0
+    local victims = {}
+    for gid, g in pairs(record.groups) do
+        if g.dissolved then
+            local referenced = false
+            for _, m in pairs(record.members or {}) do
+                if m.groupId == gid then
+                    referenced = true
+                    break
+                end
+            end
+            if not referenced then
+                victims[#victims + 1] = gid
+            end
+        end
+    end
+    for i = 1, #victims do
+        record.groups[victims[i]] = nil
+        removed = removed + 1
+    end
+    if removed > 0 then
+        RebuildDerived(record)
+    end
+    return removed
+end
+
+GI._RememberCharacter = RememberCharacter
+GI._DissolveEmptyGroup = DissolveEmptyGroup

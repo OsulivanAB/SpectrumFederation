@@ -11,31 +11,13 @@ local function Loc(key, default)
     return default or key
 end
 
-local function Now()
-    if GetServerTime then
-        local t = GetServerTime()
-        if type(t) == "number" then
-            return t
-        end
-    end
-    if time then
-        return time()
-    end
-    return 0
-end
-
-local function CharacterSnapshot(guid, nameRealm, classFile)
-    return {
-        guid = guid,
-        nameRealm = nameRealm,
-        classFile = classFile,
-    }
-end
-
 --- Format mutation feedback for Settings banners (never Chat).
 function GI.FormatMutationFeedback(status, reason)
     status = tostring(status or "rejected")
     reason = reason and tostring(reason) or ""
+    if status == "accepted" and reason == "noop" then
+        return Loc("GUILD_INFO_STATUS_DUPLICATE", "No change — that relationship was already recorded."), "info"
+    end
     if status == "accepted" then
         return Loc("GUILD_INFO_STATUS_ACCEPTED", "Assignment updated."), "success"
     end
@@ -46,9 +28,6 @@ function GI.FormatMutationFeedback(status, reason)
         return Loc("GUILD_INFO_STATUS_PENDING", "Change is pending (%s)."):format(reason ~= "" and reason or "wait"), "warn"
     end
 
-    if status == "accepted" and reason == "noop" then
-        return Loc("GUILD_INFO_STATUS_DUPLICATE", "No change — that relationship was already recorded."), "info"
-    end
     local map = {
         unauthorized = Loc("GUILD_INFO_ERR_UNAUTHORIZED", "Only guild ranks 1–3 may change main/alt assignments."),
         preview_non_admin = Loc("GUILD_INFO_ERR_PREVIEW", "Preview as Non-Admin is active; edits are disabled."),
@@ -75,6 +54,8 @@ function GI.FormatMutationFeedback(status, reason)
         actor_changed = Loc("GUILD_INFO_ERR_ACTOR_CHANGED", "Your character identity changed; the action was not applied."),
         not_in_guild = Loc("GUILD_INFO_ERR_NOT_IN_GUILD", "You are not currently in a guild."),
         target_not_rostered = Loc("GUILD_INFO_ERR_TARGET_NOT_ROSTERED", "New assignments require currently rostered guild members."),
+        members_overflow = Loc("GUILD_INFO_ERR_MEMBERS_OVERFLOW", "Too many retained character identities for Guild Info. Unassign inactive characters before adding new ones."),
+        groups_overflow = Loc("GUILD_INFO_ERR_GROUPS_OVERFLOW", "Too many relationship groups. Remove unused groups before creating new ones."),
         ops_overflow = Loc("GUILD_INFO_ERR_OPS_OVERFLOW", "Too many pending relationship operations."),
     }
     local msg = map[reason]
@@ -94,30 +75,7 @@ local function ResolveRosterTarget(nameOrGuid, roster)
     return roster:Resolve(nameOrGuid)
 end
 
-local function BuildAssignOp(ctx, mainRow, altRow)
-    local id, idErr = GI:_AllocateOperationId(ctx.actorGuid)
-    if not id then
-        return nil, idErr
-    end
-    return {
-        id = id,
-        kind = GI.KIND.ASSIGN,
-        at = Now(),
-        actorGuid = ctx.actorGuid,
-        actorName = ctx.actorName,
-        guildKey = ctx.guildKey,
-        mainGuid = mainRow.guid,
-        mainName = mainRow.nameRealm,
-        mainClass = mainRow.classFile,
-        altGuid = altRow.guid,
-        altName = altRow.nameRealm,
-        altClass = altRow.classFile,
-    }
-end
-
 --- Assign alt under main. Requires verified roster targets for new links.
--- opts.moveConfirmed / opts.expectedOldMain for confirmed moves.
--- opts.roster = Guild Info roster snapshot helper.
 function GI:AssignAlt(mainRef, altRef, opts)
     opts = opts or {}
     local okAuth, authReason, ctx = GI:_AuthorizeCommit({
@@ -139,11 +97,11 @@ function GI:AssignAlt(mainRef, altRef, opts)
 
     local mainRow, mainErr = ResolveRosterTarget(mainRef, roster)
     if not mainRow then
-        return "rejected", mainErr or "identity_unavailable"
+        return "rejected", mainErr or "not_a_member"
     end
     local altRow, altErr = ResolveRosterTarget(altRef, roster)
     if not altRow then
-        return "rejected", altErr or "identity_unavailable"
+        return "rejected", altErr or "not_a_member"
     end
     if mainRow.guid == altRow.guid then
         return "rejected", "same_character"
@@ -152,67 +110,23 @@ function GI:AssignAlt(mainRef, altRef, opts)
         return "rejected", "target_not_rostered"
     end
 
-    -- Ensure record exists.
-    local record, recErr = GI:EnsureGuildRecord(ctx.guildKey)
-    if not record then
-        return "rejected", recErr
-    end
-
-    local byGuid = record.graph and record.graph.byGuid or {}
-    local altInfo = byGuid[altRow.guid]
-    local mainInfo = byGuid[mainRow.guid]
-
-    -- Confirmed reassignment: verify expected previous main before noop/success (D.3).
-    if opts.moveConfirmed and type(opts.expectedOldMain) == "string" and opts.expectedOldMain ~= "" then
-        if not altInfo or altInfo.role ~= "alt" or altInfo.mainGuid ~= opts.expectedOldMain then
-            return "rejected", "stale_move_confirmation"
-        end
-    end
-
-    -- Genuine no-op: already under this main — do not append a durable op (D.4).
-    if altInfo and altInfo.role == "alt" and altInfo.mainGuid == mainRow.guid then
-        return "accepted", "noop"
-    end
-
-    if altInfo and altInfo.role == "main" then
-        local g = record.graph.mains and record.graph.mains[altRow.guid]
-        if g and type(g.altGuids) == "table" and #g.altGuids > 0 then
-            return "rejected", "alt_is_main_with_alts"
-        end
-    end
-    if mainInfo and mainInfo.role == "alt" then
-        return "rejected", "main_is_alt"
-    end
-
-    local isMove = altInfo and altInfo.role == "alt" and altInfo.mainGuid ~= mainRow.guid
-    if isMove and not opts.moveConfirmed then
-        return "rejected", "move_confirmation_required", {
-            oldMainGuid = altInfo.mainGuid,
-            newMainGuid = mainRow.guid,
-            altGuid = altRow.guid,
-        }
-    end
-
-    local op, opErr = BuildAssignOp(ctx, mainRow, altRow)
-    if not op then
-        return "rejected", opErr
-    end
-
-    -- Refuse local writes that the deterministic fold would ignore (capacity / hierarchy).
-    if GI.WouldAssignTakeEffect and not GI.WouldAssignTakeEffect(record, op) then
-        local dest = record.graph.mains and record.graph.mains[mainRow.guid]
-        if dest and #(dest.altGuids or {}) >= (GI.MAX_ALTS_PER_MAIN or 32) then
-            return "rejected", "group_full"
-        end
-        return "rejected", "no_effect"
-    end
-
-    return GI:AdmitOperation(op, {
-        requireMoveConfirm = isMove and true or false,
-        moveConfirmed = opts.moveConfirmed and true or false,
-        expectedOldMain = opts.expectedOldMain or (altInfo and altInfo.mainGuid) or nil,
-        remote = false,
+    local record = select(1, GI:EnsureGuildRecord(ctx.guildKey))
+    local altInfo = record and record.graph and record.graph.byGuid and record.graph.byGuid[altRow.guid]
+    local requireMove = altInfo and altInfo.role == "alt" and altInfo.mainGuid ~= mainRow.guid
+    local status, detail, meta = GI:ApplyAssign(mainRow.guid, altRow.guid, {
+        guildKey = ctx.guildKey,
+        mainName = mainRow.nameRealm,
+        mainClass = mainRow.classFile,
+        altName = altRow.nameRealm,
+        altClass = altRow.classFile,
+        requireMoveConfirm = requireMove and not opts.moveConfirmed,
+        moveConfirmed = opts.moveConfirmed,
+        expectedOldMain = opts.expectedOldMain,
     })
+    if status == "rejected" and detail == "move_confirmation_required" then
+        return status, detail, meta or { oldMainGuid = altInfo and altInfo.mainGuid }
+    end
+    return status, detail, meta
 end
 
 function GI:UnassignAlt(altGuid, opts)
@@ -228,44 +142,8 @@ function GI:UnassignAlt(altGuid, opts)
     if type(altGuid) ~= "string" or altGuid == "" then
         return "rejected", "identity_unavailable"
     end
-
-    local record, recErr = GI:EnsureGuildRecord(ctx.guildKey)
-    if not record then
-        return "rejected", recErr
-    end
-    local info = record.graph and record.graph.byGuid and record.graph.byGuid[altGuid]
-    if not info or info.role ~= "alt" then
-        return "rejected", "alt_not_assigned"
-    end
-    -- Stale confirmation: displayed main must still own this alt (D / #402).
-    if type(opts.expectedMainGuid) == "string" and opts.expectedMainGuid ~= "" then
-        if info.mainGuid ~= opts.expectedMainGuid then
-            return "rejected", "stale_unassign"
-        end
-    end
-
-    local crow = record.characters and record.characters[altGuid]
-    local mrow = record.characters and record.characters[info.mainGuid]
-    local id, idErr = GI:_AllocateOperationId(ctx.actorGuid)
-    if not id then
-        return "rejected", idErr
-    end
-    local op = {
-        id = id,
-        kind = GI.KIND.UNASSIGN,
-        at = Now(),
-        actorGuid = ctx.actorGuid,
-        actorName = ctx.actorName,
+    return GI:ApplyUnassign(altGuid, {
         guildKey = ctx.guildKey,
-        mainGuid = info.mainGuid,
-        mainName = mrow and mrow.nameRealm or nil,
-        mainClass = mrow and mrow.classFile or nil,
-        altGuid = altGuid,
-        altName = crow and crow.nameRealm or nil,
-        altClass = crow and crow.classFile or nil,
-    }
-    return GI:AdmitOperation(op, {
-        remote = false,
         expectedMainGuid = opts.expectedMainGuid,
     })
 end
@@ -287,7 +165,6 @@ function GI:ChangeMain(oldMainGuid, newMainGuid, opts)
         return "rejected", "same_character"
     end
 
-    -- New main must be currently rostered (ticket: Change Main candidates are rostered alts).
     local roster = opts.roster
     if not roster and GI.GetRosterSnapshot then
         roster = GI.GetRosterSnapshot()
@@ -300,29 +177,5 @@ function GI:ChangeMain(oldMainGuid, newMainGuid, opts)
         return "rejected", "target_not_rostered"
     end
 
-    local record, recErr = GI:EnsureGuildRecord(ctx.guildKey)
-    if not record then
-        return "rejected", recErr
-    end
-
-    local mrow = record.characters and record.characters[oldMainGuid]
-    local id, idErr = GI:_AllocateOperationId(ctx.actorGuid)
-    if not id then
-        return "rejected", idErr
-    end
-    local op = {
-        id = id,
-        kind = GI.KIND.CHANGE_MAIN,
-        at = Now(),
-        actorGuid = ctx.actorGuid,
-        actorName = ctx.actorName,
-        guildKey = ctx.guildKey,
-        mainGuid = oldMainGuid,
-        mainName = mrow and mrow.nameRealm or nil,
-        mainClass = mrow and mrow.classFile or nil,
-        newMainGuid = newMainGuid,
-        newMainName = newRow.nameRealm,
-        newMainClass = newRow.classFile,
-    }
-    return GI:AdmitOperation(op, { remote = false })
+    return GI:ApplyChangeMain(oldMainGuid, newMainGuid, { guildKey = ctx.guildKey })
 end

@@ -1,11 +1,11 @@
 -- Guild Info Guild Gossip provider (#402).
--- Own provider id; sync independent of Settings visibility and Guild Supplies.
+-- Exchanges versioned membership/group current-state records.
 local addonName, SF = ...
 
 SF.GuildInfo = SF.GuildInfo or {}
 local GI = SF.GuildInfo
 
-local GG = nil -- bound lazily
+local GG = nil
 
 local function Gossip()
     if not GG then
@@ -68,55 +68,80 @@ local function GetCapabilities()
     return { guildInfo = true }
 end
 
-local function OpVersionFp(op)
-    local g = Gossip()
-    if not g or not g.Hash32 then
-        return tostring(op and op.id or "")
-    end
-    local covered = ""
-    if type(op.coveredIds) == "table" then
-        covered = table.concat(op.coveredIds, ",")
-    end
-    local parts = {
-        tostring(op.id or ""),
-        tostring(op.kind or ""),
-        tostring(op.at or 0),
-        tostring(op.mainGuid or ""),
-        tostring(op.altGuid or ""),
-        tostring(op.newMainGuid or ""),
-        tostring(op.actorGuid or ""),
-        covered,
-    }
-    return string.format("%08x", g.Hash32(table.concat(parts, "\0")))
-end
-
-local function RecordIdForOp(opId)
-    return "gi-op:" .. tostring(opId)
-end
-
 local function MaxRecordCbor()
     local g = Gossip()
     return tonumber(g and g.MAX_RECORD_CBOR) or 2048
 end
 
---- Wire-shape body used by the engine (id + versionFp + body).
-local function WireRecordForOp(op)
-    if type(op) ~= "table" or type(op.id) ~= "string" then
+local function HashParts(...)
+    local g = Gossip()
+    if not g or not g.Hash32 then
+        return table.concat({ ... }, "\0")
+    end
+    return string.format("%08x", g.Hash32(table.concat({ ... }, "\0")))
+end
+
+local function MemberRecordId(guid)
+    return "gi-m:" .. tostring(guid)
+end
+
+local function GroupRecordId(groupId)
+    return "gi-g:" .. tostring(groupId)
+end
+
+local function MemberVersionFp(m)
+    return HashParts(
+        tostring(m.guid or ""),
+        tostring(m.groupId == false and "U" or m.groupId or ""),
+        tostring(m.ver and m.ver.n or 0),
+        tostring(m.ver and m.ver.w or ""),
+        tostring(m.at or 0),
+        tostring(m.nameRealm or ""),
+        tostring(m.classFile or "")
+    )
+end
+
+local function GroupVersionFp(g)
+    return HashParts(
+        tostring(g.groupId or ""),
+        tostring(g.mainGuid or ""),
+        tostring(g.ver and g.ver.n or 0),
+        tostring(g.ver and g.ver.w or ""),
+        tostring(g.at or 0),
+        g.dissolved and "1" or "0"
+    )
+end
+
+local function WireForMember(m)
+    if type(m) ~= "table" or type(m.guid) ~= "string" then
         return nil
     end
-    local rid = RecordIdForOp(op.id)
-    local vfp = OpVersionFp(op)
     return {
-        id = rid,
-        versionFp = vfp,
+        id = MemberRecordId(m.guid),
+        versionFp = MemberVersionFp(m),
         body = {
-            kind = "guildinfo-op",
-            op = op,
+            kind = "guildinfo-member",
+            schema = GI.PROVIDER_SCHEMA,
+            member = m,
         },
     }
 end
 
---- Whether a provider record fits Guild Gossip's serialized record cap.
+local function WireForGroup(g)
+    if type(g) ~= "table" or type(g.groupId) ~= "string" then
+        return nil
+    end
+    return {
+        id = GroupRecordId(g.groupId),
+        versionFp = GroupVersionFp(g),
+        body = {
+            kind = "guildinfo-group",
+            schema = GI.PROVIDER_SCHEMA,
+            group = g,
+        },
+    }
+end
+
 function GI.RecordWithinGossipCap(record)
     if type(record) ~= "table" then
         return false
@@ -142,35 +167,35 @@ local function RebuildExportIndex()
         return
     end
     local record = select(1, GI:GetRecordForGuildKey(guildKey))
-    if not record or type(record.order) ~= "table" then
+    if not record then
         return
     end
-    for i = 1, #record.order do
-        local opId = record.order[i]
-        local op = record.ops and record.ops[opId]
-        if type(op) == "table" then
-            local wire = WireRecordForOp(op)
-            if wire and GI.RecordWithinGossipCap(wire) then
-                exportState.byId[wire.id] = {
-                    id = wire.id,
-                    versionFp = wire.versionFp,
-                    body = wire.body,
-                }
-                exportState.order[#exportState.order + 1] = wire.id
-            else
-                DebugWarn("skipping oversize guildInfo export id=%s", tostring(opId))
-            end
+    local bodies = GI.ListStateBodies(record)
+    for i = 1, #bodies do
+        local wire
+        if bodies[i].kind == "guildinfo-member" then
+            wire = WireForMember(bodies[i].member)
+        else
+            wire = WireForGroup(bodies[i].group)
+        end
+        if wire and GI.RecordWithinGossipCap(wire) then
+            exportState.byId[wire.id] = {
+                id = wire.id,
+                versionFp = wire.versionFp,
+                body = wire.body,
+            }
+            exportState.order[#exportState.order + 1] = wire.id
+        else
+            DebugWarn("skipping oversize guildInfo export id=%s", wire and wire.id or "?")
         end
     end
 end
 
-local function UpsertExportOp(op)
-    local wire = WireRecordForOp(op)
-    if not wire then
-        return
-    end
-    if not GI.RecordWithinGossipCap(wire) then
-        DebugWarn("refusing oversize guildInfo export id=%s", tostring(op.id))
+local function UpsertExportWire(wire)
+    if not wire or not GI.RecordWithinGossipCap(wire) then
+        if wire then
+            DebugWarn("refusing oversize guildInfo export id=%s", tostring(wire.id))
+        end
         return
     end
     local rid = wire.id
@@ -193,8 +218,6 @@ local function ProviderEntry()
     return g.GetProvider(GI.PROVIDER_ID)
 end
 
---- Bump the physical Gossip index so vanished IDs and guild-scope changes
--- invalidate active views/bookmarks (not merely local exportState).
 local function BumpPhysicalIndex(index)
     local g = Gossip()
     local idx = index
@@ -219,8 +242,6 @@ local function EnsureIndex(index, limits)
     local g = Gossip()
     local budget = math.max(1, tonumber(limits and limits.indexEntries) or 8)
     local guildKey = CurrentGuildKey()
-    -- Guild-scope transitions must invalidate before any completed-index fast path
-    -- so guild A bodies are never advertised under guild B's scope.
     if exportState.guildKey ~= guildKey then
         RebuildExportIndex()
         BumpPhysicalIndex(index)
@@ -303,13 +324,7 @@ local function GetRecordBody(recordId)
     return wire
 end
 
-local function ValidProvenanceGuid(guid)
-    return type(guid) == "string" and guid ~= "" and guid ~= "compact" and #guid <= (GI.MAX_GUID or 64)
-end
-
---- Admit a remote gossip record. Only authenticated editor senders may introduce ops.
--- Authorization is solely the transport-authenticated editor sender. Payload
--- actorGuid is provenance (kept version-stable for relay/catch-up), never auth.
+--- Admit a remote gossip record. Only authenticated editor senders may introduce state.
 local function ValidateAndApply(record, ctx)
     if type(record) ~= "table" or type(record.body) ~= "table" then
         return "rejected", "malformed"
@@ -317,15 +332,18 @@ local function ValidateAndApply(record, ctx)
     if ctx and ctx.localWrite then
         return "rejected", "use_local_api"
     end
-    -- Enforce the same serialized size bound the engine uses before mutation.
     if not GI.RecordWithinGossipCap(record) then
         return "rejected", "record_too_large"
     end
     local body = record.body
-    if body.kind ~= "guildinfo-op" or type(body.op) ~= "table" then
+    local kind = body.kind
+    if kind ~= "guildinfo-member" and kind ~= "guildinfo-group" then
         return "rejected", "unsupported_kind"
     end
-    local op = body.op
+    if tonumber(body.schema) and tonumber(body.schema) ~= GI.PROVIDER_SCHEMA then
+        return "rejected", "unsupported_schema"
+    end
+
     local sender = ctx and ctx.sender
     local member, authReason = GI.AuthenticateTransportSender(sender)
     if not member then
@@ -335,30 +353,43 @@ local function ValidateAndApply(record, ctx)
     if not mayEdit then
         return "rejected", editReason or "unauthorized"
     end
-    if type(op.guildKey) ~= "string" or op.guildKey ~= member.guildKey then
-        return "rejected", "wrong_guild"
+
+    local guildRec = select(1, GI:EnsureGuildRecord(member.guildKey))
+    if not guildRec then
+        return "rejected", "not_ready"
     end
 
-    -- Keep stable provenance when present so A→B→C catch-up does not rewrite
-    -- versionFp. Missing/synthetic actors bind to the authenticated editor.
-    if not ValidProvenanceGuid(op.actorGuid) then
-        op.actorGuid = member.guid
-        op.actorName = member.name
-    elseif type(op.actorName) ~= "string" or op.actorName == "" then
-        if op.actorGuid == member.guid then
-            op.actorName = member.name
+    local status, detail
+    if kind == "guildinfo-member" then
+        local m = body.member
+        if type(m) ~= "table" then
+            return "rejected", "malformed"
+        end
+        status, detail = GI.MergeMember(guildRec, m, { remote = true })
+        if status == "accepted" then
+            UpsertExportWire(WireForMember(guildRec.members[m.guid]))
+        end
+    else
+        local g = body.group
+        if type(g) ~= "table" then
+            return "rejected", "malformed"
+        end
+        status, detail = GI.MergeGroup(guildRec, g, { remote = true })
+        if status == "accepted" then
+            local live = guildRec.groups[g.groupId]
+            if live then
+                UpsertExportWire(WireForGroup(live))
+            end
+            -- Dissolved groups still export so peers learn the tombstone.
+            if live and live.dissolved then
+                BumpPhysicalIndex(nil)
+            end
         end
     end
 
-    local status, detail = GI:AdmitOperation(op, { remote = true })
     if status == "accepted" then
-        -- Cutover / legacy snapshot rewrite the live set; rebuild export + bump epoch
-        -- so vanished pre-cutover IDs cannot keep circulating.
-        if op.kind == GI.KIND.SNAPSHOT or op.kind == GI.KIND.CUTOVER then
-            RebuildExportIndex()
-            BumpPhysicalIndex(nil)
-        else
-            UpsertExportOp(op)
+        if GI.NotifyUI then
+            GI.NotifyUI("remote")
         end
     end
     return status, detail
@@ -458,56 +489,10 @@ function GI.NotifyLocalDurableChange(reason)
     reason = tostring(reason or "local")
     if providerRegistered then
         local guildKey = CurrentGuildKey()
-        local prevOrder = exportState.order
-        local needEpoch = reason == "compact" or exportState.guildKey ~= guildKey
-        if needEpoch then
-            RebuildExportIndex()
-        else
-            local record = guildKey and select(1, GI:GetRecordForGuildKey(guildKey)) or nil
-            if record and type(record.order) == "table" then
-                local live = {}
-                for i = 1, #record.order do
-                    local op = record.ops[record.order[i]]
-                    if op then
-                        UpsertExportOp(op)
-                        live[RecordIdForOp(op.id)] = true
-                    end
-                end
-                local newOrder = {}
-                for i = 1, #exportState.order do
-                    local rid = exportState.order[i]
-                    if live[rid] then
-                        newOrder[#newOrder + 1] = rid
-                    else
-                        exportState.byId[rid] = nil
-                        needEpoch = true
-                    end
-                end
-                if #newOrder ~= #exportState.order then
-                    exportState.order = newOrder
-                    exportState.enumPos = nil
-                    needEpoch = true
-                end
-            else
-                RebuildExportIndex()
-                needEpoch = true
-            end
-        end
-        if needEpoch then
-            -- Vanish / scope / compaction: bump physical index so reconcile cannot
-            -- keep serving deleted IDs from a completed index forever.
-            local stale = reason == "compact"
-            if not stale then
-                for i = 1, #prevOrder do
-                    if not exportState.byId[prevOrder[i]] then
-                        stale = true
-                        break
-                    end
-                end
-            end
-            if stale or reason == "compact" or exportState.guildKey ~= guildKey then
-                BumpPhysicalIndex(nil)
-            end
+        local needEpoch = reason == "local" or reason == "remote" or exportState.guildKey ~= guildKey
+        RebuildExportIndex()
+        if needEpoch or reason == "remote" then
+            BumpPhysicalIndex(nil)
         end
         local g = Gossip()
         if g and g.NotifyProviderChanged then
@@ -521,13 +506,14 @@ GI._NotifyLocalDurableChange = GI.NotifyLocalDurableChange
 GI._RebuildExportIndex = RebuildExportIndex
 GI._BumpPhysicalIndex = BumpPhysicalIndex
 
--- Hook Initialize to register the provider after the durable root is ready.
 local _previousInitialize = GI.Initialize
 function GI:Initialize(db)
     local ok, reason = true, nil
     if _previousInitialize then
         ok, reason = _previousInitialize(self, db)
     end
-    GI:EnsureGossipProvider()
+    if ok then
+        GI:EnsureGossipProvider()
+    end
     return ok, reason
 end
