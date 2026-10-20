@@ -6047,80 +6047,6 @@ do
 end
 
 ---------------------------------------------------------------------------
--- F96: unavailable club IDs must not form shared club:0 transport scope
----------------------------------------------------------------------------
-do
-    reset()
-    world.autoRosterEvent = false
-    world.guild.name = "Spectrum"
-    world.guild.realm = "Garona"
-    world.guild.members = {
-        { name = "Alice-Garona", online = true },
-        { name = "Bob-Garona", online = true },
-    }
-    for _, raw in ipairs({ 0, "0", "" }) do
-        world.guild.clubId = raw
-        local A = makeClient("Alice")
-        A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f96-" .. tostring(raw) })
-        -- Deliver roster so readiness can complete if identity is otherwise valid.
-        local g = A.GuildGossip._guild
-        if g.frame and g.frame.OnEvent then
-            g.frame.OnEvent(g.frame, "GUILD_ROSTER_UPDATE")
-        end
-        world.time = world.time + 1
-        for _, h in ipairs(timers) do
-            if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
-                h.fired = true
-                h.fn()
-            end
-        end
-        local scope = A.GuildGossip.GetGuildScopeId()
-        assertTrue(scope ~= "club:0",
-            "F96: raw clubId=" .. tostring(raw) .. " must not yield club:0 got="
-                .. tostring(scope))
-        if scope then
-            assertTrue(tostring(scope):find("^name:", 1) ~= nil
-                    or tostring(scope):find("^club:", 1) == nil
-                    or tostring(scope) ~= "club:0",
-                "F96: unavailable club uses name fallback or nil, not club:0")
-        end
-        A.GuildGossip:DisableProvider("sf.synthetic.gossip")
-        reset()
-        world.autoRosterEvent = false
-        world.guild.name = "Spectrum"
-        world.guild.realm = "Garona"
-        world.guild.members = {
-            { name = "Alice-Garona", online = true },
-            { name = "Bob-Garona", online = true },
-        }
-    end
-
-    -- Recovery: real club ID binds club scope after verified roster.
-    world.guild.clubId = 77
-    local A = makeClient("Alice")
-    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f96-ok" })
-    local g = A.GuildGossip._guild
-    assertTrue(not A.GuildGossip.IsGuildReady() or g.rosterAwaitingUpdate,
-        "F96: cold activation awaits roster or is not yet ready")
-    if g.frame and g.frame.OnEvent then
-        g.frame.OnEvent(g.frame, "GUILD_ROSTER_UPDATE")
-    end
-    world.time = world.time + 1
-    for _, h in ipairs(timers) do
-        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
-            h.fired = true
-            h.fn()
-        end
-    end
-    assertTrue(A.GuildGossip.IsGuildReady(), "F96: ready after real club roster")
-    assertEq(A.GuildGossip.GetGuildScopeId(), "club:77", "F96: real club scope bound")
-    assertTrue(A.GuildGossip.IsGuildMember("Bob-Garona"), "F96: peer authorized on real club")
-    A.GuildGossip:DisableProvider("sf.synthetic.gossip")
-    world.autoRosterEvent = true
-    world.guild.clubId = 42
-end
-
----------------------------------------------------------------------------
 -- F91b: EnsureIndex continuous Notify (before paged to avoid A1 ordering flake)
 ---------------------------------------------------------------------------
 do
@@ -6683,6 +6609,82 @@ do
         { name = "Bob-Garona", online = true },
         { name = "Carol-Garona", online = true },
     }
+end
+
+
+---------------------------------------------------------------------------
+-- F96: unavailable club IDs must not form shared club:0 transport scope
+---------------------------------------------------------------------------
+do
+    reset()
+    world.autoRosterEvent = false
+    world.guild.name = "Spectrum"
+    world.guild.realm = "Garona"
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "Bob-Garona", online = true },
+    }
+    for _, raw in ipairs({ 0, "0", "" }) do
+        world.guild.clubId = raw
+        local A = makeClient("Alice")
+        A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f96-" .. tostring(raw) })
+        -- Deliver roster so readiness can complete if identity is otherwise valid.
+        local g = A.GuildGossip._guild
+        if g.frame and g.frame.OnEvent then
+            g.frame.OnEvent(g.frame, "GUILD_ROSTER_UPDATE")
+        end
+        world.time = world.time + 1
+        for _, h in ipairs(timers) do
+            if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+                h.fired = true
+                h.fn()
+            end
+        end
+        local scope = A.GuildGossip.GetGuildScopeId()
+        assertTrue(scope ~= "club:0",
+            "F96: raw clubId=" .. tostring(raw) .. " must not yield club:0 got="
+                .. tostring(scope))
+        if scope then
+            assertTrue(tostring(scope):find("^name:", 1) ~= nil
+                    or tostring(scope):find("^club:", 1) == nil
+                    or tostring(scope) ~= "club:0",
+                "F96: unavailable club uses name fallback or nil, not club:0")
+        end
+        A.GuildGossip:DisableProvider("sf.synthetic.gossip")
+        reset()
+        world.autoRosterEvent = false
+        world.guild.name = "Spectrum"
+        world.guild.realm = "Garona"
+        world.guild.members = {
+            { name = "Alice-Garona", online = true },
+            { name = "Bob-Garona", online = true },
+        }
+    end
+
+    -- Recovery: real club ID binds club scope after verified roster.
+    world.guild.clubId = 77
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f96-ok" })
+    local g = A.GuildGossip._guild
+    assertTrue(not A.GuildGossip.IsGuildReady() or g.rosterAwaitingUpdate,
+        "F96: cold activation awaits roster or is not yet ready")
+    if g.frame and g.frame.OnEvent then
+        g.frame.OnEvent(g.frame, "GUILD_ROSTER_UPDATE")
+    end
+    world.time = world.time + 1
+    for _, h in ipairs(timers) do
+        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+            h.fired = true
+            h.fn()
+        end
+    end
+    assertTrue(A.GuildGossip.IsGuildReady(), "F96: ready after real club roster")
+    assertEq(A.GuildGossip.GetGuildScopeId(), "club:77", "F96: real club scope bound")
+    assertTrue(A.GuildGossip.IsGuildMember("Bob-Garona"), "F96: peer authorized on real club")
+    A.GuildGossip:DisableProvider("sf.synthetic.gossip")
+    world.autoRosterEvent = true
+    world.guild.clubId = 42
+    reset()
 end
 
 
