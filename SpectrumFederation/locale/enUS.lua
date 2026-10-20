@@ -445,8 +445,8 @@ L["GUILD_INFO_ERR_ACTOR_CHANGED"] = "Your character identity changed; the action
 L["GUILD_INFO_ERR_NOT_IN_GUILD"] = "You are not currently in a guild."
 L["GUILD_INFO_ERR_TARGET_NOT_ROSTERED"] = "New assignments require currently rostered guild members."
 L["GUILD_INFO_ERR_OPS_OVERFLOW"] = "Too many pending relationship operations."
-L["GUILD_INFO_ERR_MEMBERS_OVERFLOW"] = "Too many retained character identities for Guild Info. Unassign inactive characters before adding new ones."
-L["GUILD_INFO_ERR_GROUPS_OVERFLOW"] = "Too many relationship groups. Remove unused groups before creating new ones."
+L["GUILD_INFO_ERR_MEMBERS_OVERFLOW"] = "Guild Info has reached its retained-character limit (active assignments plus unassigned history). New characters cannot be added until an existing retained identity is reused; unassigned history is not deleted automatically."
+L["GUILD_INFO_ERR_GROUPS_OVERFLOW"] = "Guild Info could not create another relationship group after reclaiming unused groups. Remove unused assignments and try again."
 
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)

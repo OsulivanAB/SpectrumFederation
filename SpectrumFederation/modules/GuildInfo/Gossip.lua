@@ -366,30 +366,30 @@ local function ValidateAndApply(record, ctx)
             return "rejected", "malformed"
         end
         status, detail = GI.MergeMember(guildRec, m, { remote = true })
-        if status == "accepted" then
-            UpsertExportWire(WireForMember(guildRec.members[m.guid]))
-        end
     else
         local g = body.group
         if type(g) ~= "table" then
             return "rejected", "malformed"
         end
         status, detail = GI.MergeGroup(guildRec, g, { remote = true })
-        if status == "accepted" then
-            local live = guildRec.groups[g.groupId]
-            if live then
-                UpsertExportWire(WireForGroup(live))
-            end
-            -- Dissolved groups still export so peers learn the tombstone.
-            if live and live.dissolved then
-                BumpPhysicalIndex(nil)
-            end
-        end
     end
 
     if status == "accepted" then
-        if GI.NotifyUI then
-            GI.NotifyUI("remote")
+        -- Rebuild export + invalidate the completed physical index so peers can
+        -- discover new/updated fingerprints via this editor's provider index.
+        -- Also drops reclaimed group record IDs from the physical index.
+        if GI.NotifyLocalDurableChange then
+            GI.NotifyLocalDurableChange("remote")
+        else
+            RebuildExportIndex()
+            BumpPhysicalIndex(nil)
+            local g = Gossip()
+            if g and g.NotifyProviderChanged then
+                g.NotifyProviderChanged(GI.PROVIDER_ID)
+            end
+            if GI.NotifyUI then
+                GI.NotifyUI("remote")
+            end
         end
     end
     return status, detail

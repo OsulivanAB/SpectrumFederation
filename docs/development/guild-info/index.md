@@ -88,11 +88,15 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 | Cap | Value | Behavior at limit |
 | --- | --- | --- |
 | `MAX_MEMBERS` | 256 | New GUID memberships fail closed (`members_overflow`) |
-| `MAX_GROUPS` | 128 | New groups fail closed; may reclaim unreferenced dissolved slots |
+| `MAX_GROUPS` | 128 | Dissolved unreferenced groups are reclaimed on dissolve and before create; overflow only if live groups fill the cap |
 | `MAX_ALTS_PER_MAIN` | 32 | Assign rejected (`group_full`) |
 | Gossip record | 2048 bytes CBOR | Oversize exports skipped / remote rejected |
 
-**Product tradeoff:** Indefinitely disconnected editors that never receive current tombstones cannot be given unbounded offline write-back without either unbounded tombstone retention or resurrection risk. This design keeps tombstones until the identity cap, then fails closed with Settings feedback rather than silently dropping protection or accepting unbounded growth.
+**Group lifecycle:** `Assign → Unassign` of the same identities dissolves the empty group and keeps a dissolved tombstone for Gossip peers. When a new group would exceed `MAX_GROUPS`, unreferenced dissolved slots are reclaimed automatically so churn of the same identities cannot permanently exhaust capacity. Physical Gossip indexes drop retired `gi-g:*` IDs on durable-change invalidation.
+
+**Concurrent first assign:** If two officers independently create groups for the same ungrouped main, merge absorbs alts from the losing group into the winner (by the main’s membership / group version) and dissolves the loser. Unrelated established groups with different mains are never merged.
+
+**Membership tombstones:** Unassigned membership rows are **not** deleted automatically. They remain until the 256-identity cap so stale peers cannot resurrect removed links. Hitting the cap surfaces truthful Settings feedback (`members_overflow`); recovery is to reuse an already-retained identity, not an unbounded offline history. Indefinitely disconnected editors that never receive current tombstones cannot be given unbounded write-back without either unbounded tombstone retention or resurrection risk.
 
 ## Gossip provider
 

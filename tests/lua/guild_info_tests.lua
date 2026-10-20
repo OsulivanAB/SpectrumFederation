@@ -1365,45 +1365,58 @@ do
     assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "stress seed Carol")
     local before = GI.CountRetainedState()
     local peakMembers, peakGroups = before.members, before.groups
+    local acceptedOps = 0
 
     for i = 1, 10000 do
         world.time = world.time + 1
         local phase = i % 6
+        local st
         if phase == 0 then
-            GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) })
-            -- normalize back when Bob is main
+            st = GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) })
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
             if GI:GetCharacterRole("Player-1-Bob") == "main" then
-                GI:ChangeMain("Player-1-Bob", "Player-1-Alice", { roster = GI.GetRosterSnapshot(true) })
+                st = GI:ChangeMain("Player-1-Bob", "Player-1-Alice", { roster = GI.GetRosterSnapshot(true) })
+                if st == "accepted" then acceptedOps = acceptedOps + 1 end
             end
         elseif phase == 1 then
-            GI:UnassignAlt("Player-1-Carol", { expectedMainGuid = select(2, GI:GetCharacterRole("Player-1-Carol")) })
-            assign("Alice-Garona", "Carol-Garona")
+            st = GI:UnassignAlt("Player-1-Carol", { expectedMainGuid = select(2, GI:GetCharacterRole("Player-1-Carol")) })
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
+            st = assign("Alice-Garona", "Carol-Garona")
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
         elseif phase == 2 then
-            GI:AssignAlt("Carol-Garona", "Bob-Garona", {
+            st = GI:AssignAlt("Carol-Garona", "Bob-Garona", {
                 roster = GI.GetRosterSnapshot(true),
                 moveConfirmed = true,
                 expectedOldMain = select(2, GI:GetCharacterRole("Player-1-Bob")),
             })
-            GI:AssignAlt("Alice-Garona", "Bob-Garona", {
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
+            st = GI:AssignAlt("Alice-Garona", "Bob-Garona", {
                 roster = GI.GetRosterSnapshot(true),
                 moveConfirmed = true,
                 expectedOldMain = select(2, GI:GetCharacterRole("Player-1-Bob")),
             })
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
         elseif phase == 3 then
-            assign("Alice-Garona", "Eve-Garona")
-            GI:UnassignAlt("Player-1-Eve", {})
+            st = assign("Alice-Garona", "Eve-Garona")
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
+            st = GI:UnassignAlt("Player-1-Eve", {})
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
         elseif phase == 4 then
-            assign("Alice-Garona", "Bob-Garona") -- noop / ensure
+            st = assign("Alice-Garona", "Bob-Garona")
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
         else
-            GI:ChangeMain("Player-1-Alice", "Player-1-Carol", { roster = GI.GetRosterSnapshot(true) })
+            st = GI:ChangeMain("Player-1-Alice", "Player-1-Carol", { roster = GI.GetRosterSnapshot(true) })
+            if st == "accepted" then acceptedOps = acceptedOps + 1 end
             if GI:GetCharacterRole("Player-1-Carol") == "main" then
-                GI:ChangeMain("Player-1-Carol", "Player-1-Alice", { roster = GI.GetRosterSnapshot(true) })
+                st = GI:ChangeMain("Player-1-Carol", "Player-1-Alice", { roster = GI.GetRosterSnapshot(true) })
+                if st == "accepted" then acceptedOps = acceptedOps + 1 end
             end
         end
         local c = GI.CountRetainedState()
         if c.members > peakMembers then peakMembers = c.members end
         if c.groups > peakGroups then peakGroups = c.groups end
     end
+    assertTrue(acceptedOps >= 5000, "10k loop accepted many mutations got=" .. acceptedOps)
 
     local after = GI.CountRetainedState()
     assertTrue(after.members <= 8, "10k edits: members stay near small identity set got=" .. after.members)
@@ -1476,24 +1489,330 @@ do
     GI.InvalidateRosterSnapshot()
 end
 
+---------------------------------------------------------------------------
+-- Repair A: >128 assign/unassign cycles of the same pair must succeed
+---------------------------------------------------------------------------
+
 do
-    -- Repeated group create/delete stays within MAX_GROUPS via dissolve + reclaim.
     resetDB()
     local savedMaxG = GI.MAX_GROUPS
     GI.MAX_GROUPS = 8
-    for i = 1, 30 do
-        assign("Alice-Garona", "Bob-Garona")
-        GI:UnassignAlt("Player-1-Bob", {})
-        local rec = select(1, GI:GetCurrentRecord())
-        GI.ReclaimUnreferencedDissolved(rec)
+    local successes = 0
+    local peakGroups = 0
+    for i = 1, 40 do
+        local st, reason = assign("Alice-Garona", "Bob-Garona")
+        assertEq(st, "accepted", "cycle " .. i .. " assign accepted (reason=" .. tostring(reason) .. ")")
+        local ust, ureason = GI:UnassignAlt("Player-1-Bob", {})
+        assertEq(ust, "accepted", "cycle " .. i .. " unassign accepted (reason=" .. tostring(ureason) .. ")")
+        successes = successes + 1
+        local c = GI.CountRetainedState()
+        if c.groups > peakGroups then peakGroups = c.groups end
+        assertTrue(c.groups <= GI.MAX_GROUPS, "capacity reclaim keeps groups <= MAX got=" .. c.groups)
+        assertTrue(c.liveGroups <= 1, "no live group after unassign got=" .. tostring(c.liveGroups))
     end
-    local counts = GI.CountRetainedState()
-    assertTrue(counts.groups <= GI.MAX_GROUPS, "group churn respects MAX_GROUPS got=" .. counts.groups)
+    assertEq(successes, 40, "40 successful assign/unassign cycles without manual reclaim")
+    assertTrue(peakGroups <= GI.MAX_GROUPS, "peak groups bounded by MAX got=" .. peakGroups)
+
+    -- Also exceed historical MAX_GROUPS=128 with production constant.
     GI.MAX_GROUPS = savedMaxG
+    resetDB()
+    local okCycles = 0
+    for i = 1, 140 do
+        local st = assign("Alice-Garona", "Bob-Garona")
+        local ust = GI:UnassignAlt("Player-1-Bob", {})
+        if st == "accepted" and ust == "accepted" then
+            okCycles = okCycles + 1
+        else
+            fail("production MAX_GROUPS cycle " .. i .. " failed st=" .. tostring(st) .. " ust=" .. tostring(ust))
+            break
+        end
+    end
+    assertEq(okCycles, 140, ">128 successful assign/unassign cycles of same pair")
+    local finalCounts = GI.CountRetainedState()
+    assertTrue(finalCounts.groups <= GI.MAX_GROUPS,
+        "after 140 cycles groups <= MAX_GROUPS got=" .. finalCounts.groups)
+    assertTrue(finalCounts.liveGroups == 0, "no live group after final unassign")
+    -- Capacity reclaim must have fired: dissolved alone cannot exceed MAX forever.
+    assertTrue(finalCounts.dissolved <= GI.MAX_GROUPS, "dissolved capped by reclaim")
+
+    -- Stale dissolved/live group replay must not resurrect Bob.
+    local staleGid = "gig:stale-resurrect-aaaaaaaaaa:1"
+    local rec = select(1, GI:EnsureGuildRecord("club:42"))
+    GI.MergeGroup(rec, {
+        groupId = staleGid,
+        mainGuid = "Player-1-Alice",
+        ver = { n = 1, w = "staleaaaaaaaaaaaaaaaaaaaa" },
+        at = 1,
+    })
+    GI.MergeMember(rec, {
+        guid = "Player-1-Bob",
+        groupId = staleGid,
+        ver = { n = 1, w = "staleaaaaaaaaaaaaaaaaaaaa" },
+        at = 1,
+    })
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "stale group replay cannot resurrect Bob")
 end
 
 ---------------------------------------------------------------------------
--- Gossip index rebuild + reconnect idle
+-- Repair B: remote merges invalidate physical Gossip index for peer C
+---------------------------------------------------------------------------
+
+do
+    resetDB()
+    -- Editor B starts empty, builds idle index.
+    local dbB = {}
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local indexB = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(indexB.buildComplete, "B index idle before remote updates")
+    assertTrue(not indexB.dirty, "B index not dirty before remote updates")
+    local bobId = "gi-m:Player-1-Bob"
+    assertTrue(indexB.byId[bobId] == nil, "B index lacks Bob before sync")
+
+    -- Editor A creates relationships and exports wires.
+    local dbA = {}
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "A assigns Bob")
+    local wires1 = exportWires(dbA)
+    assertTrue(#wires1 >= 3, "A exports member+group wires")
+
+    -- Deliver A's wires into B through ValidateAndApply (production admission).
+    for i = 1, #wires1 do
+        local st = admitWire(dbB, wires1[i], "Alice-Garona")
+        assertTrue(st == "accepted" or st == "duplicate", "B admits A wire " .. i)
+    end
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    indexB = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(indexB.buildComplete, "B index rebuilds after remote accept")
+    assertTrue(not indexB.dirty, "B index idle after remote rebuild")
+    assertTrue(indexB.byId[bobId] ~= nil, "B physical index contains Bob after remote")
+    local bobFp1 = indexB.byId[bobId].versionFp
+
+    -- A updates Bob (move to Carol) and sends newer membership/group versions.
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    assertEq(GI:AssignAlt("Carol-Garona", "Bob-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+        moveConfirmed = true,
+        expectedOldMain = "Player-1-Alice",
+    }), "accepted", "A moves Bob under Carol")
+    local wires2 = exportWires(dbA)
+    for i = 1, #wires2 do
+        admitWire(dbB, wires2[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    indexB = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(indexB.buildComplete and not indexB.dirty, "B index idle after version update")
+    assertTrue(indexB.byId[bobId] ~= nil, "B index still has Bob id")
+    local bobFp2 = indexB.byId[bobId].versionFp
+    assertTrue(bobFp2 ~= bobFp1, "B physical index fingerprint updated for Bob")
+
+    -- Peer C syncs exclusively from B's physical provider index (A unavailable).
+    local dbC = {}
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    local providerB = SF.GuildGossip._providers[GI.PROVIDER_ID]
+    -- Re-bind to B's DB/provider for serving.
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    providerB = SF.GuildGossip._providers[GI.PROVIDER_ID]
+    local specB = providerB.spec
+    local page, cursor = specB.ListRecordIds(1, 64)
+    assertTrue(#page >= 1, "B ListRecordIds serves page")
+    local served = 0
+    local function collectFromB()
+        SpectrumFederationDB = dbB
+        GI:Initialize(dbB)
+        DriveEnsureIndex(GI.PROVIDER_ID, 64)
+        specB = SF.GuildGossip._providers[GI.PROVIDER_ID].spec
+        local idx = SF.GuildGossip._providers[GI.PROVIDER_ID].index
+        assertTrue(idx.buildComplete and not idx.dirty, "B index idle before serve")
+        local out = {}
+        local c = 1
+        while c do
+            local ids, nextC = specB.ListRecordIds(c, 16)
+            for i = 1, #ids do
+                local rid = ids[i]
+                assertTrue(idx.byId[rid] ~= nil, "physical index contains listed id " .. tostring(rid))
+                local body = specB.GetRecordBody(rid)
+                assertTrue(body ~= nil, "B GetRecordBody serves " .. tostring(rid))
+                local fp = specB.GetRecordVersionFp(rid)
+                assertEq(fp, body.versionFp, "B versionFp matches body for " .. rid)
+                -- Deep-copy now; admitting into C rebinds exportState.
+                out[#out + 1] = deepCopy(body)
+            end
+            c = nextC
+        end
+        return out
+    end
+
+    local batch1 = collectFromB()
+    assertTrue(#batch1 >= 3, "B index serves >=3 records got=" .. #batch1)
+    for i = 1, #batch1 do
+        admitWire(dbC, batch1[i], "Carol-Garona")
+        served = served + 1
+    end
+    assertEq(select(2, peerRole(dbC, "Player-1-Bob")), "Player-1-Carol",
+        "C got latest Bob→Carol via B index only")
+
+    -- Second sync becomes idle / duplicate without epoch thrash.
+    local bumpsBefore = world.indexEpochBumps or 0
+    local batch2 = collectFromB()
+    for i = 1, #batch2 do
+        local st = admitWire(dbC, batch2[i], "Carol-Garona")
+        assertTrue(st == "accepted" or st == "duplicate", "C re-sync status for wire " .. i)
+    end
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local indexAfter = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(indexAfter.buildComplete and not indexAfter.dirty, "B remains idle after re-serve")
+    assertTrue((world.indexEpochBumps or 0) - bumpsBefore <= 2,
+        "re-sync does not thrash epochs delta=" .. tostring((world.indexEpochBumps or 0) - bumpsBefore))
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+---------------------------------------------------------------------------
+-- Repair C: concurrent first-assign to same main keeps both alts
+---------------------------------------------------------------------------
+
+local function seedEmptyPeer()
+    local db = {}
+    SpectrumFederationDB = db
+    GI:Initialize(db)
+    return db
+end
+
+local function applyLocalAssignOn(db, actorName, actorGuid, rank, mainName, altName)
+    SpectrumFederationDB = db
+    GI:Initialize(db)
+    setActor(actorName, actorGuid, rank)
+    return assign(mainName, altName)
+end
+
+do
+    -- Officer A: Alice←Bob. Officer B: Alice←Carol. No prior group.
+    local function runConcurrentFirstAssign(orderAB)
+        local dbA = seedEmptyPeer()
+        local dbB = seedEmptyPeer()
+        assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+            "accepted", "A assigns Bob under Alice")
+        assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+            "accepted", "B assigns Carol under Alice")
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+
+        local function exchange(first, second, senderFirst, senderSecond)
+            if orderAB then
+                syncAll(first, second, senderFirst)
+                syncAll(second, first, senderSecond)
+            else
+                syncAll(second, first, senderSecond)
+                syncAll(first, second, senderFirst)
+            end
+        end
+        exchange(dbA, dbB, "Alice-Garona", "Carol-Garona")
+        -- Catch-up second pass (duplicates / delayed).
+        exchange(dbA, dbB, "Alice-Garona", "Carol-Garona")
+
+        local function assertBothAlts(db, label)
+            assertEq(select(1, peerRole(db, "Player-1-Alice")), "main", label .. " Alice is main")
+            assertEq(select(2, peerRole(db, "Player-1-Bob")), "Player-1-Alice", label .. " Bob under Alice")
+            assertEq(select(2, peerRole(db, "Player-1-Carol")), "Player-1-Alice", label .. " Carol under Alice")
+            SpectrumFederationDB = db
+            GI:Initialize(db)
+            local groups = GI:GetRelationshipGroups()
+            assertEq(#groups, 1, label .. " single visible group")
+            assertEq(#groups[1].altGuids, 2, label .. " both alts visible")
+        end
+        assertBothAlts(dbA, orderAB and "orderAB-A" or "orderBA-A")
+        assertBothAlts(dbB, orderAB and "orderAB-B" or "orderBA-B")
+
+        -- Third peer catch-up + reload.
+        local dbC = seedEmptyPeer()
+        syncAll(dbA, dbC, "Alice-Garona")
+        assertBothAlts(dbC, "peerC")
+        local saved = deepCopy(dbA)
+        reloadModules(saved)
+        assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice", "reload keeps Bob")
+        assertEq(select(2, GI:GetCharacterRole("Player-1-Carol")), "Player-1-Alice", "reload keeps Carol")
+    end
+
+    runConcurrentFirstAssign(true)
+    runConcurrentFirstAssign(false)
+end
+
+do
+    -- Existing unrelated groups must not merge.
+    resetDB()
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "seed Alice-Bob")
+    assertEq(assign("Carol-Garona", "Dave-Garona"), "accepted", "seed Carol-Dave")
+    local groups = GI:GetRelationshipGroups()
+    assertEq(#groups, 2, "two unrelated groups remain distinct")
+    local record = select(1, GI:GetCurrentRecord())
+    GI.ReconcileSplitMains(record)
+    groups = GI:GetRelationshipGroups()
+    assertEq(#groups, 2, "reconcile does not merge unrelated groups")
+end
+
+---------------------------------------------------------------------------
+-- Long-running stress: successful create/dissolve without manual cleanup
+---------------------------------------------------------------------------
+
+do
+    resetDB()
+    local successes = 0
+    local peakGroups, peakMembers = 0, 0
+    local listenerProbeCount = 0
+    GI.RegisterUIListener(function()
+        listenerProbeCount = listenerProbeCount + 1
+    end)
+    local listenersAtStart = listenerProbeCount
+
+    for i = 1, 200 do
+        world.time = world.time + 1
+        local st = assign("Alice-Garona", "Bob-Garona")
+        assertEq(st, "accepted", "stress assign " .. i)
+        st = assign("Alice-Garona", "Carol-Garona")
+        assertEq(st, "accepted", "stress assign Carol " .. i)
+        st = GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) })
+        assertEq(st, "accepted", "stress change main " .. i)
+        st = GI:UnassignAlt("Player-1-Carol", {})
+        assertEq(st, "accepted", "stress unassign Carol " .. i)
+        st = GI:UnassignAlt("Player-1-Alice", {})
+        assertEq(st, "accepted", "stress unassign Alice " .. i)
+        successes = successes + 5
+        local c = GI.CountRetainedState()
+        if c.groups > peakGroups then peakGroups = c.groups end
+        if c.members > peakMembers then peakMembers = c.members end
+        assertTrue(c.groups <= GI.MAX_GROUPS, "stress groups <= MAX got=" .. c.groups .. " at i=" .. i)
+        assertTrue(c.liveGroups <= 2, "stress live groups small got=" .. c.liveGroups .. " at i=" .. i)
+    end
+    assertEq(successes, 1000, "1000 successful stress mutations")
+    assertTrue(peakGroups <= GI.MAX_GROUPS, "peak groups bounded by MAX got=" .. peakGroups)
+    assertTrue(peakMembers <= 8, "peak members bounded got=" .. peakMembers)
+    local endCounts = GI.CountRetainedState()
+    assertTrue(endCounts.liveGroups <= 1, "stress ends with at most one live group")
+
+    local index = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(index.buildComplete and not index.dirty, "stress index idle")
+    assertTrue(countKeys(index.byId) <= GI.MAX_MEMBERS + GI.MAX_GROUPS, "stress index bounded")
+
+    -- Listener set must not grow: one probe, one Notify fan-out.
+    local beforeNotify = listenerProbeCount
+    GI.NotifyUI("stress")
+    assertEq(listenerProbeCount, beforeNotify + 1, "single listener fan-out before reload")
+
+    local saved = SpectrumFederationDB
+    local membersBefore = GI.CountRetainedState().members
+    reloadModules(saved)
+    assertEq(GI.CountRetainedState().members, membersBefore, "stress reload preserves members")
+end
+
+---------------------------------------------------------------------------
+-- Gossip index rebuild + guild isolation (meaningful assertions)
 ---------------------------------------------------------------------------
 
 do
@@ -1501,7 +1820,11 @@ do
     assign("Alice-Garona", "Bob-Garona")
     local index = DriveEnsureIndex(GI.PROVIDER_ID, 64)
     local epoch1 = index.epoch
-    local count1 = countKeys(index.byId)
+    local club42Ids = {}
+    for id in pairs(index.byId) do
+        club42Ids[id] = index.byId[id].versionFp
+    end
+    assertTrue(next(club42Ids) ~= nil, "club:42 index has records")
     GI.NotifyLocalDurableChange("local")
     index = DriveEnsureIndex(GI.PROVIDER_ID, 64)
     assertTrue(index.buildComplete, "index rebuilds after durable change")
@@ -1509,16 +1832,27 @@ do
     assertTrue(index.epoch >= epoch1, "epoch advances or stays consistent")
     assertTrue(countKeys(index.byId) <= GI.MAX_MEMBERS + GI.MAX_GROUPS, "rebuilt index bounded")
     assertTrue(countKeys(index.byId) >= 1, "rebuilt index non-empty while relationships exist")
-    -- Guild switch clears export/index association.
+
+    -- Guild switch: export/index must not advertise prior guild's records.
     world.guild.clubId = 99
     world.generation = world.generation + 1
     GI.InvalidateRosterSnapshot()
     GI.NotifyLocalDurableChange("local")
     index = DriveEnsureIndex(GI.PROVIDER_ID, 64)
-    assertTrue(index.buildComplete or countKeys(index.byId) == 0 or true, "guild switch index path runs")
+    assertTrue(index.buildComplete, "guild-switch index build completes")
+    assertTrue(not index.dirty, "guild-switch index becomes idle")
+    for id in pairs(club42Ids) do
+        assertTrue(index.byId[id] == nil, "prior guild record absent after switch: " .. id)
+    end
+    assertEq(countKeys(index.byId), 0, "new guild has empty GI index until configured")
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "current guild isolation hides prior Bob")
+
     world.guild.clubId = 42
     world.generation = world.generation + 1
     GI.InvalidateRosterSnapshot()
+    GI.NotifyLocalDurableChange("local")
+    index = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(index.byId["gi-m:Player-1-Bob"] ~= nil, "return to club:42 restores Bob index id")
 end
 
 ---------------------------------------------------------------------------
