@@ -20,6 +20,11 @@ GG._guild = GG._guild or {
     coalesceGen = 0, -- invalidates deferred RefreshGuildState after shutdown
     listening = false, -- event/roster work only while an active provider needs it
     frame = nil,
+    -- Transport membership must not bind a nonempty native roster to a new club
+    -- until GUILD_ROSTER_UPDATE completes the requested refresh for that club.
+    rosterAwaitingUpdate = false,
+    rosterAwaitClubId = nil,
+    rosterEventSeen = false,
 }
 
 -- Demand-driven roster nudge for zero-provider authority (no permanent listeners
@@ -44,6 +49,31 @@ local function requestRoster()
         C_GuildInfo.GuildRoster()
     elseif GuildRoster then
         GuildRoster()
+    end
+end
+
+--- Begin waiting for a verified GUILD_ROSTER_UPDATE for the current club.
+-- Clears transport readiness immediately so a prior guild's nonempty native
+-- cache cannot authenticate peers against a new club scope.
+local function beginTransportRosterAwait()
+    local g = GG._guild
+    local clubId = nil
+    if C_Club and C_Club.GetGuildClubId then
+        local raw = C_Club.GetGuildClubId()
+        if raw ~= nil and raw ~= 0 and raw ~= "0" and raw ~= "" then
+            clubId = tostring(raw)
+        end
+    end
+    g.rosterAwaitingUpdate = true
+    g.rosterAwaitClubId = clubId
+    g.rosterEventSeen = false
+    -- Fail closed immediately. Do not bump generation here: the verified
+    -- RefreshGuildState that completes the await owns the generation bump.
+    -- An extra bump on await-start desynchronizes in-flight peer exchange.
+    if g.ready or (g.members and next(g.members) ~= nil) or g.scopeId then
+        g.ready = false
+        g.scopeId = nil
+        g.members = {}
     end
 end
 
@@ -287,6 +317,9 @@ function GG.RefreshGuildState()
     local g = GG._guild
     local inGuild = (IsInGuild and IsInGuild()) and true or false
     if not inGuild then
+        g.rosterAwaitingUpdate = false
+        g.rosterAwaitClubId = nil
+        g.rosterEventSeen = false
         if g.inGuild or g.ready or g.scopeId then
             g.inGuild = false
             g.ready = false
@@ -311,6 +344,10 @@ function GG.RefreshGuildState()
     if C_Club and C_Club.GetGuildClubId then
         clubId = C_Club.GetGuildClubId()
     end
+    local clubKey = nil
+    if clubId ~= nil and clubId ~= 0 and clubId ~= "0" and clubId ~= "" then
+        clubKey = tostring(clubId)
+    end
 
     local scopeId = computeScopeId(guildName, guildRealm, clubId)
     if not scopeId then
@@ -323,6 +360,36 @@ function GG.RefreshGuildState()
         g.scopeId = nil
         g.members = {}
         return
+    end
+
+    -- A requested roster refresh must complete via GUILD_ROSTER_UPDATE before a
+    -- nonempty native cache is bound to this club (same contract as demand-driven).
+    if g.rosterAwaitingUpdate then
+        if clubKey and g.rosterAwaitClubId and g.rosterAwaitClubId ~= clubKey then
+            -- Club changed while waiting: retarget and keep fail-closed.
+            g.rosterAwaitClubId = clubKey
+            g.rosterEventSeen = false
+            g.inGuild = true
+            g.ready = false
+            g.scopeId = nil
+            g.members = {}
+            requestRoster()
+            return
+        end
+        if not g.rosterEventSeen then
+            if g.ready and GG.OnGuildInvalidated then
+                GG.OnGuildInvalidated("roster_incomplete")
+            end
+            g.inGuild = true
+            g.ready = false
+            g.scopeId = nil
+            g.members = {}
+            return
+        end
+        -- Verified update observed for the awaited club; consume the event bit.
+        g.rosterEventSeen = false
+        g.rosterAwaitingUpdate = false
+        g.rosterAwaitClubId = nil
     end
 
     if not GetNumGuildMembers or not GetGuildRosterInfo then
@@ -348,6 +415,7 @@ function GG.RefreshGuildState()
         g.ready = false
         g.scopeId = nil
         g.members = {}
+        beginTransportRosterAwait()
         requestRoster()
         return
     end
@@ -427,9 +495,11 @@ function GG.InitGuildAdapter()
             return
         end
         if event == "PLAYER_GUILD_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+            beginTransportRosterAwait()
             requestRoster()
             coalesceRefresh()
         elseif event == "GUILD_ROSTER_UPDATE" then
+            GG._guild.rosterEventSeen = true
             coalesceRefresh()
         end
     end
@@ -446,12 +516,27 @@ function GG.InitGuildAdapter()
         if g.frame.SetScript then
             g.frame:SetScript("OnEvent", onEvent)
         end
+        -- Re-init after a prior verified scope (incl. Shutdown that preserved
+        -- lastVerifiedScopeId) must not bind a possibly-stale native cache.
+        -- Cold first activation may bind after requestRoster; PLAYER_GUILD
+        -- transitions always beginTransportRosterAwait.
+        if g.lastVerifiedScopeId then
+            beginTransportRosterAwait()
+        end
         requestRoster()
-        GG.RefreshGuildState()
+        if not g.ready then
+            GG.RefreshGuildState()
+        end
         return
     end
     if not CreateFrame then
-        GG.RefreshGuildState()
+        if g.lastVerifiedScopeId then
+            beginTransportRosterAwait()
+        end
+        requestRoster()
+        if not g.ready then
+            GG.RefreshGuildState()
+        end
         return
     end
     local frame = CreateFrame("Frame", "SFGuildGossipGuildAdapter")
@@ -460,8 +545,13 @@ function GG.InitGuildAdapter()
     frame:RegisterEvent("PLAYER_ENTERING_WORLD")
     frame:SetScript("OnEvent", onEvent)
     g.frame = frame
+    if g.lastVerifiedScopeId then
+        beginTransportRosterAwait()
+    end
     requestRoster()
-    GG.RefreshGuildState()
+    if not g.ready then
+        GG.RefreshGuildState()
+    end
 end
 
 function GG.ShutdownGuildAdapter()
@@ -475,6 +565,9 @@ function GG.ShutdownGuildAdapter()
     -- Invalidate any coalesced RefreshGuildState already scheduled via C_Timer.After.
     g.coalesceGen = (tonumber(g.coalesceGen) or 0) + 1
     g.coalescePending = false
+    g.rosterAwaitingUpdate = false
+    g.rosterAwaitClubId = nil
+    g.rosterEventSeen = false
     g.ready = false
     g.inGuild = false
     g.scopeId = nil

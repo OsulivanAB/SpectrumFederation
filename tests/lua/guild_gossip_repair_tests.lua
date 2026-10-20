@@ -93,34 +93,7 @@ function GetGuildRosterInfo(i)
     local m = world.guild.members[i]
     if m then return m.name, "R", 0, 80, "W", "Z", "", "", true, 0, "WARRIOR", 0, 0, false, false, 0 end
 end
-C_GuildInfo = {
-    GuildRoster = function()
-        world.rosterRequests = (world.rosterRequests or 0) + 1
-    end,
-}
-C_Club = { GetGuildClubId = function() return world.guild.clubId end }
-function GetRealmName() return "Garona" end
-function strtrim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
-function UnitFullName() return world._unitName, "Garona" end
-function UnitName() return world._unitName end
--- Named frames persist across Shutdown/Initialize (WoW cannot destroy them).
-local namedFrames = {}
-local frameCreateCount = 0
-function CreateFrame(_, name)
-    if name and namedFrames[name] then
-        return namedFrames[name]
-    end
-    frameCreateCount = frameCreateCount + 1
-    local f = { events = {}, name = name, createIndex = frameCreateCount }
-    function f:RegisterEvent(e) self.events[e] = true end
-    function f:UnregisterAllEvents() self.events = {} end
-    function f:SetScript(n, fn) self[n] = fn end
-    if name then
-        namedFrames[name] = f
-    end
-    return f
-end
-
+-- timers must be declared before GuildRoster closes over it (Lua local scope).
 local timers = {}
 local function installTimers()
     C_Timer = {
@@ -143,6 +116,53 @@ local function installTimers()
     }
 end
 installTimers()
+C_GuildInfo = {
+    GuildRoster = function()
+        world.rosterRequests = (world.rosterRequests or 0) + 1
+        -- Default harness: Retail eventually delivers GUILD_ROSTER_UPDATE after a
+        -- request. Tests that need a stale-cache window set world.autoRosterEvent=false.
+        -- Named adapter frames are shared across clients in this harness, so settle
+        -- each client's guild state directly instead of relying on one OnEvent closure.
+        if world.autoRosterEvent == false then
+            return
+        end
+        for _, SF in pairs(world.clients or {}) do
+            local GG = SF.GuildGossip
+            local g = GG and GG._guild
+            if g and g.listening then
+                -- Mark the verified event only. Init/coalesce call RefreshGuildState
+                -- so we never re-enter Refresh from inside requestRoster.
+                g.rosterEventSeen = true
+            end
+        end
+    end,
+}
+C_Club = { GetGuildClubId = function() return world.guild.clubId end }
+function GetRealmName() return "Garona" end
+function strtrim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+function UnitFullName() return world._unitName, "Garona" end
+function UnitName() return world._unitName end
+-- Named frames persist across Shutdown/Initialize (WoW cannot destroy them).
+-- Give each client its own guild-adapter frame so OnEvent closures are not shared.
+local namedFrames = {}
+local frameCreateCount = 0
+function CreateFrame(_, name)
+    if name == "SFGuildGossipGuildAdapter" then
+        name = name .. "-" .. tostring(world._unitName or "anon")
+    end
+    if name and namedFrames[name] then
+        return namedFrames[name]
+    end
+    frameCreateCount = frameCreateCount + 1
+    local f = { events = {}, name = name, createIndex = frameCreateCount }
+    function f:RegisterEvent(e) self.events[e] = true end
+    function f:UnregisterAllEvents() self.events = {} end
+    function f:SetScript(n, fn) self[n] = fn end
+    if name then
+        namedFrames[name] = f
+    end
+    return f
+end
 
 C_EncodingUtil = {
     SerializeCBOR = function(t) return ser(t) end,
@@ -251,9 +271,10 @@ local function makeClient(name)
         assert(loadfile(path))("SpectrumFederation", SF)
     end
     SF.LootHelperComm:Init()
-    SF.GuildGossip.Init()
-    SF.GuildGossip.RefreshGuildState()
+    -- Register before provider activation so GuildRoster auto-settle can see us.
     world.clients[name] = SF
+    SF.GuildGossip.Init()
+    -- Idle: do not bind transport readiness without an active provider.
     return SF
 end
 
@@ -316,6 +337,7 @@ local function reset()
     world.errors = {}
     world.rosterWalks = 0
     world.rosterRequests = 0
+    world.autoRosterEvent = true
     world._sendAs = nil
     timers = {}
     namedFrames = {}
@@ -1576,6 +1598,8 @@ do
         if origReady then origReady() end
     end
     -- Schedule a coalesced refresh, then shut down before it fires.
+    -- Disable auto roster settle so requestRoster does not immediately re-ready.
+    world.autoRosterEvent = false
     g.coalescePending = false
     world.guild.clubId = 1234
     if g.frame and g.frame.OnEvent then
@@ -1595,6 +1619,7 @@ do
     end
     assertTrue(not A.GuildGossip.IsGuildReady(), "F28: stale coalesce does not restore readiness")
     assertEq(readyCalls, 0, "F28: OnGuildReady not invoked after shutdown")
+    world.autoRosterEvent = true
 end
 
 ---------------------------------------------------------------------------
@@ -6008,6 +6033,90 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- F91b: EnsureIndex continuous Notify (before paged to avoid A1 ordering flake)
+---------------------------------------------------------------------------
+do
+    -- EnsureIndex / synthetic: continuous AppendLocal+Notify while peer exchanges.
+    reset()
+    local A = makeClient("Alice")
+    local B = makeClient("Bob")
+    local pA = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f91ens-a" })
+    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f91ens-b" })
+    for i = 1, 24 do
+        pA.AppendLocal("seed-" .. i, "f91-seed-" .. i)
+    end
+    local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
+    -- Force a multi-slice cold walk so Notify coalescing matters.
+    entryA.index.buildComplete = false
+    entryA.index.dirty = true
+    entryA._indexUsable = nil
+    pA.GetStore()._enumPos = nil
+    local limits = A.GuildGossip.GetStepLimits("NORMAL")
+    local producing = true
+    local liveN = 0
+    local sawUsableWhileProducing = false
+    local sawExchangeWhileProducing = false
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    for step = 1, 100 do
+        if producing then
+            liveN = liveN + 1
+            pA.AppendLocal("live-" .. liveN, "f91-live-" .. liveN)
+            A.GuildGossip.NotifyProviderChanged("sf.synthetic.gossip")
+        end
+        if step % 8 == 0 then
+            if A.GuildGossip._sched.changeDebounceAt then
+                world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
+            end
+            world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+            world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+            advance(0.2)
+        end
+        stepClient(A, limits)
+        stepClient(B, limits)
+        advance(0.05)
+        if producing and entryA._indexUsable == true then
+            sawUsableWhileProducing = true
+        end
+        if producing and pB.GetStore().records["f91-seed-1"] ~= nil then
+            sawExchangeWhileProducing = true
+        end
+        if sawUsableWhileProducing and sawExchangeWhileProducing and step >= 50 then
+            producing = false
+        end
+    end
+    assertTrue(sawUsableWhileProducing,
+        "F91: EnsureIndex becomes view-usable while Notify continues")
+    assertTrue(sawExchangeWhileProducing,
+        "F91: EnsureIndex peer exchange occurs while producer still running")
+    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
+    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
+    advance(0.3)
+    for _ = 1, 240 do
+        if A.GuildGossip._sched.changeDebounceAt then
+            world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
+        end
+        stepClient(A, limits)
+        stepClient(B, limits)
+        advance(0.05)
+        if entryA.index.buildComplete and not entryA.index.dirty
+            and not entryA._reconcileFollowUp and not pA.GetStore()._enumPos
+            and pB.GetStore().records["f91-live-" .. tostring(liveN)] ~= nil then
+            break
+        end
+    end
+    assertTrue(pB.GetStore().records["f91-seed-1"] ~= nil, "F91: EnsureIndex Bob has seed")
+    assertTrue(pB.GetStore().records["f91-live-" .. tostring(liveN)] ~= nil,
+        "F91: EnsureIndex Bob converges final live row")
+    assertTrue(entryA.index.buildComplete and not entryA.index.dirty
+        and not entryA._reconcileFollowUp and not pA.GetStore()._enumPos,
+        "F91: EnsureIndex Alice idles after producer stops")
+    A.GuildGossip.BumpIndexEpoch(entryA.index)
+    assertTrue(entryA._indexUsable ~= true, "F91: EnsureIndex BumpIndexEpoch clears usability")
+end
+
+---------------------------------------------------------------------------
 -- F91: continuous Notify keeps index view-usable; exchange while producing
 -- (4279189517 residual at cd19f3b)
 ---------------------------------------------------------------------------
@@ -6146,86 +6255,6 @@ do
     assertTrue(entryA._indexUsable ~= true, "F91: paged BumpIndexEpoch clears usability")
 end
 
-do
-    -- EnsureIndex / synthetic: continuous AppendLocal+Notify while peer exchanges.
-    reset()
-    local A = makeClient("Alice")
-    local B = makeClient("Bob")
-    local pA = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f91a" })
-    local pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f91b" })
-    for i = 1, 24 do
-        pA.AppendLocal("seed-" .. i, "f91-seed-" .. i)
-    end
-    local entryA = A.GuildGossip.GetProvider("sf.synthetic.gossip")
-    -- Force a multi-slice cold walk so Notify coalescing matters.
-    entryA.index.buildComplete = false
-    entryA.index.dirty = true
-    entryA._indexUsable = nil
-    pA.GetStore()._enumPos = nil
-    local limits = A.GuildGossip.GetStepLimits("NORMAL")
-    local producing = true
-    local liveN = 0
-    local sawUsableWhileProducing = false
-    local sawExchangeWhileProducing = false
-    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
-    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
-    advance(0.3)
-    for step = 1, 100 do
-        if producing then
-            liveN = liveN + 1
-            pA.AppendLocal("live-" .. liveN, "f91-live-" .. liveN)
-            A.GuildGossip.NotifyProviderChanged("sf.synthetic.gossip")
-        end
-        if step % 8 == 0 then
-            if A.GuildGossip._sched.changeDebounceAt then
-                world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
-            end
-            world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
-            world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
-            advance(0.2)
-        end
-        stepClient(A, limits)
-        stepClient(B, limits)
-        advance(0.05)
-        if producing and entryA._indexUsable == true then
-            sawUsableWhileProducing = true
-        end
-        if producing and pB.GetStore().records["f91-seed-1"] ~= nil then
-            sawExchangeWhileProducing = true
-        end
-        if sawUsableWhileProducing and sawExchangeWhileProducing and step >= 50 then
-            producing = false
-        end
-    end
-    assertTrue(sawUsableWhileProducing,
-        "F91: EnsureIndex becomes view-usable while Notify continues")
-    assertTrue(sawExchangeWhileProducing,
-        "F91: EnsureIndex peer exchange occurs while producer still running")
-    world._unitName = "Alice"; A.GuildGossip.SendDiscovery()
-    world._unitName = "Bob"; B.GuildGossip.SendDiscovery()
-    advance(0.3)
-    for _ = 1, 120 do
-        if A.GuildGossip._sched.changeDebounceAt then
-            world.time = A.GuildGossip._sched.changeDebounceAt + 0.05
-        end
-        stepClient(A, limits)
-        stepClient(B, limits)
-        advance(0.05)
-        if entryA.index.buildComplete and not entryA.index.dirty
-            and not entryA._reconcileFollowUp and not pA.GetStore()._enumPos
-            and pB.GetStore().records["f91-live-" .. tostring(liveN)] ~= nil then
-            break
-        end
-    end
-    assertTrue(pB.GetStore().records["f91-seed-1"] ~= nil, "F91: EnsureIndex Bob has seed")
-    assertTrue(pB.GetStore().records["f91-live-" .. tostring(liveN)] ~= nil,
-        "F91: EnsureIndex Bob converges final live row")
-    assertTrue(entryA.index.buildComplete and not entryA.index.dirty
-        and not entryA._reconcileFollowUp and not pA.GetStore()._enumPos,
-        "F91: EnsureIndex Alice idles after producer stops")
-    A.GuildGossip.BumpIndexEpoch(entryA.index)
-    assertTrue(entryA._indexUsable ~= true, "F91: EnsureIndex BumpIndexEpoch clears usability")
-end
 
 ---------------------------------------------------------------------------
 -- F92: capacity-style recovery reopens PENDING unresolved without TTL wait
@@ -6434,6 +6463,92 @@ do
     -- Keep synthetic store referenced so GC-friendly harness stays quiet.
     assertTrue(pA ~= nil, "F94: synthetic provider retained")
 end
+
+---------------------------------------------------------------------------
+-- F95: stale native roster must not authenticate against a new club (#400 A1)
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    -- Prime a verified transport scope, then shut down so re-init must await.
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f95prime" })
+    assertTrue(A.GuildGossip.IsGuildReady(), "F95: primed ready")
+    assertEq(A.GuildGossip._guild.lastVerifiedScopeId, "club:42", "F95: primed verified scope")
+    A.GuildGossip.ShutdownGuildAdapter()
+    world.autoRosterEvent = false
+    world.guild.clubId = 42
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "OldGuildPeer-Garona", online = true },
+    }
+    A.GuildGossip:EnableProvider("sf.synthetic.gossip")
+    local g = A.GuildGossip._guild
+    assertTrue(not A.GuildGossip.IsGuildReady(),
+        "F95: activation not ready before GUILD_ROSTER_UPDATE")
+    assertTrue(not A.GuildGossip.IsGuildMember("OldGuildPeer-Garona"),
+        "F95: stale peers not authorized before roster verify")
+    assertTrue(g.rosterAwaitingUpdate == true, "F95: awaiting verified roster update")
+    g.frame.OnEvent(g.frame, "GUILD_ROSTER_UPDATE")
+    world.time = world.time + 1
+    for _, h in ipairs(timers) do
+        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+            h.fired = true
+            h.fn()
+        end
+    end
+    assertTrue(A.GuildGossip.IsGuildReady(), "F95: ready after verified roster event")
+    assertTrue(A.GuildGossip.IsGuildMember("OldGuildPeer-Garona"),
+        "F95: club 42 peer authorized after verify")
+
+    world.autoRosterEvent = false
+    world.guild.clubId = 99
+    world.guild.name = "OtherGuild"
+    g.frame.OnEvent(g.frame, "PLAYER_GUILD_UPDATE")
+    assertTrue(not A.GuildGossip.IsGuildReady(),
+        "F95: new club not ready while awaiting roster")
+    assertTrue(not A.GuildGossip.IsGuildMember("OldGuildPeer-Garona"),
+        "F95: former guild peer never authorized on new club before verify")
+    assertEq(A.GuildGossip.GetGuildScopeId(), nil,
+        "F95: transport scope withheld until verified roster")
+
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "NewGuildPeer-Garona", online = true },
+    }
+    g.frame.OnEvent(g.frame, "GUILD_ROSTER_UPDATE")
+    world.time = world.time + 1
+    for _, h in ipairs(timers) do
+        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+            h.fired = true
+            h.fn()
+        end
+    end
+    assertTrue(A.GuildGossip.IsGuildReady(), "F95: ready after new-club roster event")
+    assertEq(A.GuildGossip.GetGuildScopeId(), "club:99", "F95: new club scope bound")
+    assertTrue(not A.GuildGossip.IsGuildMember("OldGuildPeer-Garona"),
+        "F95: old guild peer remains unauthorized on new club")
+    assertTrue(A.GuildGossip.IsGuildMember("NewGuildPeer-Garona"),
+        "F95: new guild peer authorized after verify")
+
+    local framesBefore = frameCreateCount
+    A.GuildGossip:DisableProvider("sf.synthetic.gossip")
+    A.GuildGossip:EnableProvider("sf.synthetic.gossip")
+    world.autoRosterEvent = true
+    A.GuildGossip:DisableProvider("sf.synthetic.gossip")
+    A.GuildGossip:EnableProvider("sf.synthetic.gossip")
+    assertTrue(frameCreateCount - framesBefore <= 1,
+        "F95: repeated init/shutdown does not accumulate adapter frames")
+    -- Restore shared world guild fixture for later suites.
+    world.autoRosterEvent = true
+    world.guild.clubId = 42
+    world.guild.name = "Spectrum"
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "Bob-Garona", online = true },
+        { name = "Carol-Garona", online = true },
+    }
+end
+
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then os.exit(1) end

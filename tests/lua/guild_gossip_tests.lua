@@ -136,13 +136,7 @@ function GetGuildRosterInfo(i)
     if not m then return end
     return m.name, "Rank", 0, 80, "Warrior", "Zone", "", "", m.online, 0, "WARRIOR", 0, 0, false, false, 0
 end
-C_GuildInfo = { GuildRoster = function() end }
-C_Club = { GetGuildClubId = function() return world.guild.clubId end }
-function GetRealmName() return "Garona" end
-function strtrim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
-function UnitFullName() return world._unitName, "Garona" end
-function UnitName() return world._unitName end
-
+-- timers must be declared before GuildRoster closes over it (Lua local scope).
 local timers = {}
 local function installTimers()
     C_Timer = {
@@ -182,6 +176,28 @@ local function installTimers()
     }
 end
 installTimers()
+C_GuildInfo = {
+    GuildRoster = function()
+        -- Default harness: Retail eventually delivers GUILD_ROSTER_UPDATE after a
+        -- request. Tests that need a stale-cache window set world.autoRosterEvent=false.
+        -- Settle each listening client directly (shared named frames share one OnEvent).
+        if world.autoRosterEvent == false then
+            return
+        end
+        for _, SF in pairs(world.clients or {}) do
+            local GG = SF.GuildGossip
+            local g = GG and GG._guild
+            if g and g.listening then
+                g.rosterEventSeen = true
+            end
+        end
+    end,
+}
+C_Club = { GetGuildClubId = function() return world.guild.clubId end }
+function GetRealmName() return "Garona" end
+function strtrim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+function UnitFullName() return world._unitName, "Garona" end
+function UnitName() return world._unitName end
 
 function CreateFrame()
     local f = { events = {} }

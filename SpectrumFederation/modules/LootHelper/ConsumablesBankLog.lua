@@ -230,7 +230,12 @@ function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
     local stats = { admitted = 0, pending = 0, rejected = 0, duplicate = 0 }
     local ctxAuth = GS:GetCurrentContext()
     if not ctxAuth or not ctxAuth.ready or type(ctxAuth.actorGuid) ~= "string" then
-        Debug("Warn", "guild supplies admit skipped: local actor not ready")
+        -- Roster/identity not ready yet: defer this complete snapshot for a
+        -- single event-driven re-evaluation (do not treat as permanent reject).
+        stats.deferred = true
+        stats.deferReason = (ctxAuth and ctxAuth.reason) or "roster_incomplete"
+        Debug("Warn", "guild supplies admit deferred: local actor not ready reason=%s",
+            tostring(stats.deferReason))
         return stats
     end
     local member = {
@@ -271,10 +276,53 @@ local function ClearFreshLogStamp(self)
     self.lastFreshLogGuild = nil
 end
 
+local function ClearPendingQuery(self)
+    self.pendingQuery = nil
+end
+
+local function ClearPendingAdmit(self)
+    self.pendingAdmit = nil
+end
+
+local function SnapshotQueryContext(ctx)
+    if type(ctx) ~= "table" then
+        return nil
+    end
+    return {
+        source = ctx.source,
+        sampleOnly = ctx.sampleOnly == true,
+        profileId = ctx.profileId,
+        guildGuid = ctx.guildGuid,
+        bankTab = ctx.bankTab,
+        generation = ctx.generation,
+        campaignId = ctx.campaignId,
+        datasetId = ctx.datasetId,
+        requestedSet = ctx.requestedSet,
+        observedBy = ctx.observedBy,
+        eligibility = ctx.eligibility,
+        profile = ctx.profile,
+        record = ctx.record,
+        cfg = ctx.cfg,
+    }
+end
+
+local function QueryContextMatchesLive(pending, live)
+    if type(pending) ~= "table" or type(live) ~= "table" then
+        return false
+    end
+    return pending.bankTab == live.bankTab
+        and tostring(pending.guildGuid or "") == tostring(live.guildGuid or "")
+        and tostring(pending.profileId or "") == tostring(live.profileId or "")
+        and tostring(pending.datasetId or "") == tostring(live.datasetId or "")
+        and tostring(pending.campaignId or "") == tostring(live.campaignId or "")
+        and tonumber(pending.generation) == tonumber(live.generation)
+end
+
 function BankLog:CancelTimers(reason)
     self.queryToken = (self.queryToken or 0) + 1
     self.queryRetries = 0
     self.awaitingLogUpdate = false
+    ClearPendingQuery(self)
     -- A cancelled/invalidated query cycle must not keep an older successful stamp.
     ClearFreshLogStamp(self)
     if reason then
@@ -316,6 +364,10 @@ function BankLog:RequestLog(reason)
     end
     -- Starting a new sample invalidates any prior successful freshness stamp.
     ClearFreshLogStamp(self)
+    -- Bind the outstanding query to this context. GUILDBANKLOG_UPDATE does not
+    -- identify which tab answered; ProcessLogUpdate must not stamp a different
+    -- live tab from this response.
+    self.pendingQuery = SnapshotQueryContext(ctx)
     self.awaitingLogUpdate = true
     self.lastQueryAt = now
     self.lastQueryReason = reason
@@ -396,12 +448,45 @@ end
 
 function BankLog:ProcessLogUpdate(reason)
     if not self.active then return end
-    local ctx = self:EligibleContext()
-    if not ctx or not ctx.profileId then
+    local live = self:EligibleContext()
+    if not live or not live.profileId then
+        self.awaitingLogUpdate = false
+        ClearPendingQuery(self)
+        ClearFreshLogStamp(self)
         Debug("Info", "log update ignored: no eligible consumables context")
         return
     end
-    self.activeContext = ctx
+
+    local pending = self.pendingQuery
+    local ctx = live
+    if self.awaitingLogUpdate and type(pending) == "table" then
+        if not QueryContextMatchesLive(pending, live) then
+            -- Late/uncorrelated update after tab/guild/dataset change: never stamp
+            -- the new live tab from a query started for a different context.
+            Debug("Info",
+                "log update discarded: query context mismatch pendingTab=%s liveTab=%s",
+                tostring(pending.bankTab), tostring(live.bankTab))
+            self.awaitingLogUpdate = false
+            ClearPendingQuery(self)
+            ClearPendingAdmit(self)
+            ClearFreshLogStamp(self)
+            self.queryRetries = 0
+            self.queryToken = (self.queryToken or 0) + 1
+            self.activeContext = live
+            self:RequestLog("context_mismatch")
+            return
+        end
+        -- Read and stamp the queried identity (pending), not a rebuilt live table.
+        ctx = pending
+        -- Keep live eligibility/requestedSet when the identity still matches.
+        ctx.eligibility = live.eligibility or ctx.eligibility
+        ctx.requestedSet = live.requestedSet or ctx.requestedSet
+        ctx.record = live.record or ctx.record
+        ctx.cfg = live.cfg or ctx.cfg
+        ctx.profile = live.profile or ctx.profile
+    end
+
+    self.activeContext = live
     self.queryRetries = 0
     -- Cancel outstanding retry callbacks for this update attempt.
     self.queryToken = (self.queryToken or 0) + 1
@@ -410,13 +495,15 @@ function BankLog:ProcessLogUpdate(reason)
     if not snapshot then
         -- Failed refresh must not keep awaiting=false with an older successful stamp.
         self.awaitingLogUpdate = false
+        ClearPendingQuery(self)
         ClearFreshLogStamp(self)
         Debug("Warn", "log update skipped: incomplete snapshot reason=%s", tostring(reason))
         return
     end
     self.awaitingLogUpdate = false
+    ClearPendingQuery(self)
     -- Freshness stamp for read-only bank-context adapters (Guild Supplies #386).
-    -- Restored only after a complete successful update.
+    -- Restored only after a complete successful update for the queried tab.
     self.lastFreshLogAt = WallNow()
     self.lastFreshLogTab = ctx.bankTab
     self.lastFreshLogGuild = ctx.guildGuid
@@ -426,6 +513,7 @@ function BankLog:ProcessLogUpdate(reason)
         self.lastVerifyStats = nil
         if ctx.sampleOnly then
             -- Staged preparation: freshness stamp only; never admit donations.
+            ClearPendingAdmit(self)
             self.lastStats = {
                 admitted = 0, pending = 0, rejected = 0, duplicate = 0, sampleOnly = true,
             }
@@ -439,13 +527,24 @@ function BankLog:ProcessLogUpdate(reason)
         snapshot.eligibility = ctx.eligibility
         local admitStats = self:AdmitGuildSuppliesSnapshot(ctx, snapshot)
         self.lastStats = admitStats
+        if admitStats and admitStats.deferred then
+            -- Retain one complete snapshot for roster-ready re-evaluation.
+            self.pendingAdmit = {
+                ctx = SnapshotQueryContext(ctx),
+                snapshot = snapshot,
+            }
+            self:EnsureRosterAdmitListener()
+        else
+            ClearPendingAdmit(self)
+        end
         Debug("Info",
-            "guild supplies bank admit reason=%s accepted=%s pending=%s duplicate=%s rejected=%s rows=%s",
+            "guild supplies bank admit reason=%s accepted=%s pending=%s duplicate=%s rejected=%s deferred=%s rows=%s",
             tostring(reason or "update"),
             tostring(admitStats.admitted),
             tostring(admitStats.pending),
             tostring(admitStats.duplicate),
             tostring(admitStats.rejected),
+            tostring(admitStats.deferred and true or false),
             tostring(#(snapshot.rows or {})))
         return
     end
@@ -544,10 +643,94 @@ function BankLog:OnBankOpened()
         tostring(self.activeContext.profileId), tostring(self.activeContext.bankTab))
 end
 
+--- Re-evaluate a snapshot that completed before demand-driven roster readiness.
+-- Event-driven only (GUILD_ROSTER_UPDATE); never polls. Revalidates live
+-- guild/tab/dataset/campaign before admission.
+function BankLog:TryAdmitPendingSnapshot()
+    local pending = self.pendingAdmit
+    if type(pending) ~= "table" or type(pending.ctx) ~= "table" or type(pending.snapshot) ~= "table" then
+        return false
+    end
+    if not self.bankOpen or not self.active then
+        ClearPendingAdmit(self)
+        return false
+    end
+    local live = self:EligibleContext()
+    if not live or live.source ~= "guildSupplies" or live.sampleOnly then
+        ClearPendingAdmit(self)
+        return false
+    end
+    if not QueryContextMatchesLive(pending.ctx, live) then
+        ClearPendingAdmit(self)
+        Debug("Info", "pending admit discarded: live context no longer matches snapshot")
+        return false
+    end
+    local admitStats = self:AdmitGuildSuppliesSnapshot(live, pending.snapshot)
+    self.lastStats = admitStats
+    if admitStats and admitStats.deferred then
+        -- Still not ready; keep the same snapshot for a later roster event.
+        return false
+    end
+    ClearPendingAdmit(self)
+    Debug("Info",
+        "guild supplies deferred admit recovered accepted=%s pending=%s duplicate=%s rejected=%s",
+        tostring(admitStats and admitStats.admitted),
+        tostring(admitStats and admitStats.pending),
+        tostring(admitStats and admitStats.duplicate),
+        tostring(admitStats and admitStats.rejected))
+    return true
+end
+
+function BankLog:EnsureRosterAdmitListener()
+    if self.rosterAdmitFrame or type(CreateFrame) ~= "function" then
+        return
+    end
+    if type(self.pendingAdmit) ~= "table" then
+        return
+    end
+    local frame = CreateFrame("Frame")
+    self.rosterAdmitFrame = frame
+    TryRegister(frame, "GUILD_ROSTER_UPDATE")
+    TryRegister(frame, "PLAYER_GUILD_UPDATE")
+    frame:SetScript("OnEvent", function(_, event)
+        if event == "PLAYER_GUILD_UPDATE" then
+            -- Guild identity may have changed; drop deferred evidence.
+            ClearPendingAdmit(self)
+            self:ReleaseRosterAdmitListener()
+            return
+        end
+        if type(self.pendingAdmit) ~= "table" then
+            self:ReleaseRosterAdmitListener()
+            return
+        end
+        self:TryAdmitPendingSnapshot()
+        if type(self.pendingAdmit) ~= "table" then
+            self:ReleaseRosterAdmitListener()
+        end
+    end)
+end
+
+function BankLog:ReleaseRosterAdmitListener()
+    local frame = self.rosterAdmitFrame
+    if not frame then
+        return
+    end
+    if frame.UnregisterAllEvents then
+        frame:UnregisterAllEvents()
+    end
+    if frame.SetScript then
+        frame:SetScript("OnEvent", nil)
+    end
+    self.rosterAdmitFrame = nil
+end
+
 function BankLog:OnBankClosed()
     self.bankOpen = false
     self.active = false
     self.activeContext = nil
+    ClearPendingAdmit(self)
+    ClearPendingQuery(self)
+    self:ReleaseRosterAdmitListener()
     ClearFreshLogStamp(self)
     self:CancelTimers("bank_closed")
     Debug("Info", "bank closed: observation idle")

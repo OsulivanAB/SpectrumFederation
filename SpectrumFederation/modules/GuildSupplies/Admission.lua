@@ -326,7 +326,12 @@ function GS.SenderHasEditorAuthority(member, opts)
         -- originate the first staged dataset; receivers still accept replication.
         if opts.allowBootstrapInstall then
             local defaultPos = GS.DEFAULT_EDITOR_RANK_POSITION or 3
-            if rankCount and rankCount > 0 and rankCount < defaultPos then
+            -- Fail closed while rank count is unknown: never treat a missing count
+            -- as an ordinary >=default-rank guild (small-guild GM-only must apply).
+            if not rankCount or rankCount < 1 then
+                return false, "not_ready"
+            end
+            if rankCount < defaultPos then
                 return member.rankOrder == 1, (member.rankOrder == 1) and nil or "unauthorized"
             end
             return member.rankOrder <= defaultPos, nil
@@ -1376,6 +1381,8 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
 
     local editorOk, editorReason = GS.SenderHasEditorAuthority(member, { allowBootstrapInstall = true })
     if not editorOk then
+        -- Preserve transient not_ready / rank_unavailable for later recovery; do not
+        -- permanentize them as unauthorized.
         return "rejected", editorReason or "unauthorized"
     end
 
@@ -1385,10 +1392,13 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
     -- later set-editor-rank history can replay. Advertised current policy revisions
     -- are not copied onto an empty record (State head/revision invariant).
     local ranks = GG() and GG().GetGuildRanks and GG().GetGuildRanks()
-    local rankCount = type(ranks) == "table" and tonumber(ranks.count) or 0
+    local rankCount = type(ranks) == "table" and tonumber(ranks.count) or nil
+    if not rankCount or rankCount < 1 then
+        return "rejected", "not_ready"
+    end
     local defaultPos = GS.DEFAULT_EDITOR_RANK_POSITION or 3
     local editorPos = defaultPos
-    if rankCount > 0 and rankCount < defaultPos then
+    if rankCount < defaultPos then
         -- Small-guild bootstrap: reuse complete positive-integral verified-rank validation.
         local advertised = tonumber(descriptor.bootstrapEditorRankPosition)
             or tonumber(descriptor.editorRankPosition)

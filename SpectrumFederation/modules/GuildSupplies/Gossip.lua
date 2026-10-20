@@ -1535,6 +1535,46 @@ local function CurrentGuildRecord()
     return raw, ctx.guildKey
 end
 
+--- Cheap export-scope check: club identity + demand-roster bind + dataset/epoch.
+-- Avoids GetCurrentContext / native roster scans on the per-record hot path.
+-- Fails closed when demand-roster trust is unbound or guild identity changed.
+local function ExportScopeStillValid()
+    if not exportState.guildKey or not exportState.datasetId then
+        return false
+    end
+    if exportState.dirtyRebuild then
+        return false
+    end
+    local epoch = tonumber(GS._adoptionEpoch) or 0
+    if exportState.epoch ~= epoch then
+        return false
+    end
+    if not GS:IsRootReady() then
+        return false
+    end
+    local GGAPI = GG or SF.GuildGossip
+    if not GGAPI or type(GGAPI.GetGuildIdentity) ~= "function" then
+        return false
+    end
+    local identity = select(1, GGAPI.GetGuildIdentity())
+    if type(identity) ~= "table" or identity.guildKey ~= exportState.guildKey then
+        return false
+    end
+    local clubId = identity.clubId and tostring(identity.clubId) or nil
+    local dr = GGAPI._demandRoster
+    if type(dr) ~= "table" or type(clubId) ~= "string" or dr.boundClubId ~= clubId then
+        return false
+    end
+    local raw = GS._root and GS._root.guilds and GS._root.guilds[exportState.guildKey]
+    if type(raw) ~= "table" or raw.datasetId ~= exportState.datasetId then
+        return false
+    end
+    if not (GS.IsSupportedActivation and GS.IsSupportedActivation(raw.activation)) then
+        return false
+    end
+    return true, raw
+end
+
 --- Authenticated local character only. Account-wide directExports must not vote
 -- as an alt after character switch.
 local function LocalExportWitnessGuid()
@@ -1779,6 +1819,15 @@ local function RebuildExportIndex()
 end
 
 local function EnsureExportFresh()
+    -- Hot path: reuse already-verified export scope without rescanning the
+    -- native guild roster for every GetRecordBody / GetRecordVersionFp call.
+    if exportState.guildKey and not exportState.dirtyRebuild and #exportState.order > 0 then
+        local ok = ExportScopeStillValid()
+        if ok then
+            return false
+        end
+        -- Scope/roster trust lost or dataset replaced: fall through to full resolve.
+    end
     local record, guildKey = CurrentGuildRecord()
     local datasetId = record and record.datasetId or nil
     local epoch = tonumber(GS._adoptionEpoch) or 0
