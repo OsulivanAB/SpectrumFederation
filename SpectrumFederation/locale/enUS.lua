@@ -466,6 +466,8 @@ L["GUILD_INFO_ERR_CLEANUP_FAILED"] = "Cleanup could not rebuild a valid baseline
 L["GUILD_INFO_ERR_CLEANUP_INVALID"] = "Cleanup produced an invalid relationship baseline and was aborted."
 L["GUILD_INFO_ERR_CLEANUP_SERIALIZE"] = "Cleanup could not serialize the new baseline for Guild Gossip and was aborted."
 L["GUILD_INFO_ERR_CLEANUP_ACTIVE_OVERFLOW"] = "Active relationships alone exceed Guild Info capacity; cleanup cannot proceed."
+L["GUILD_INFO_ERR_CLEANUP_INCOMPLETE"] = "Cleanup could not faithfully represent every active relationship and was aborted."
+L["GUILD_INFO_ERR_CLEANUP_MISMATCH"] = "Cleanup would omit an active relationship and was aborted."
 
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)

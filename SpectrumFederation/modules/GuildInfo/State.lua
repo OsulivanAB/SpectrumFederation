@@ -1050,6 +1050,9 @@ function GI.MergeMember(record, member, opts)
     if opts.remote and GI.TrySealBaseline then
         GI.TrySealBaseline(record)
     end
+    if GI.IsBaselineComplete and GI.IsBaselineComplete(record) and GI.RefreshBaselineSeal then
+        GI.RefreshBaselineSeal(record)
+    end
     return "accepted", nil
 end
 
@@ -1109,6 +1112,9 @@ function GI.MergeGroup(record, group, opts)
     RebuildDerived(record)
     if opts.remote and GI.TrySealBaseline then
         GI.TrySealBaseline(record)
+    end
+    if GI.IsBaselineComplete and GI.IsBaselineComplete(record) and GI.RefreshBaselineSeal then
+        GI.RefreshBaselineSeal(record)
     end
     return "accepted", nil
 end

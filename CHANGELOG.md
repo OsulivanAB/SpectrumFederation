@@ -16,6 +16,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Guild Info: Unassign keeps reusable solo-main shells; demotion repurposes the shell or retires it as `forwardTo` so offline independent edits are not erased (#402)
 - Guild Info: officer **Clean up retained Guild Info history** rebuilds a compact baseline under a guild-scoped sync generation so obsolete shells, tombstones, and aliases no longer permanently exhaust capacity (#402 Option B)
 - Guild Info: schema/provider 3 adds `guildinfo-epoch` Gossip meta; older-generation records are rejected; incomplete new baselines fail closed (`generation_syncing`) (#402)
+- Guild Info: history cleanup rebuilds onto canonical derived group ids so absorbed/forwarded alts are preserved; completed baselines refresh seal metadata after ordinary edits (#402)
 
 ## [1.5.12-beta.15] - 2026-10-20
 

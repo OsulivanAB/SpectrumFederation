@@ -71,6 +71,8 @@ function GI.FormatMutationFeedback(status, reason)
         cleanup_invalid = Loc("GUILD_INFO_ERR_CLEANUP_INVALID", "Cleanup produced an invalid relationship baseline and was aborted."),
         cleanup_serialize = Loc("GUILD_INFO_ERR_CLEANUP_SERIALIZE", "Cleanup could not serialize the new baseline for Guild Gossip and was aborted."),
         cleanup_active_overflow = Loc("GUILD_INFO_ERR_CLEANUP_ACTIVE_OVERFLOW", "Active relationships alone exceed Guild Info capacity; cleanup cannot proceed."),
+        cleanup_incomplete_member = Loc("GUILD_INFO_ERR_CLEANUP_INCOMPLETE", "Cleanup could not faithfully represent every active relationship and was aborted."),
+        cleanup_relationship_mismatch = Loc("GUILD_INFO_ERR_CLEANUP_MISMATCH", "Cleanup would omit an active relationship and was aborted."),
     }
     local msg = map[reason]
     if msg then

@@ -133,7 +133,61 @@ local function RebuildIfNeeded(record)
     end
 end
 
+--- Snapshot of visible active relationships: mainGuid -> sorted altGuid list.
+function GI.LogicalRelationshipSnapshot(record)
+    local snap = {}
+    if type(record) ~= "table" then
+        return snap
+    end
+    RebuildIfNeeded(record)
+    local mains = record.graph and record.graph.mains or {}
+    for mainGuid, ginfo in pairs(mains) do
+        local alts = {}
+        for i = 1, #(ginfo.altGuids or {}) do
+            alts[#alts + 1] = ginfo.altGuids[i]
+        end
+        if #alts > 0 then
+            table.sort(alts)
+            snap[mainGuid] = {
+                groupId = ginfo.groupId,
+                alts = alts,
+            }
+        end
+    end
+    return snap
+end
+
+local function SnapshotsEqual(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    local nA, nB = 0, 0
+    for mainGuid, infoA in pairs(a) do
+        nA = nA + 1
+        local infoB = b[mainGuid]
+        if type(infoB) ~= "table" then
+            return false
+        end
+        if #(infoA.alts or {}) ~= #(infoB.alts or {}) then
+            return false
+        end
+        for i = 1, #(infoA.alts or {}) do
+            if infoA.alts[i] ~= infoB.alts[i] then
+                return false
+            end
+        end
+    end
+    for _ in pairs(b) do
+        nB = nB + 1
+    end
+    return nA == nB
+end
+
 --- Classify current record for cleanup preview / rebuild.
+-- Also returns:
+--   keepMember[guid] = true
+--   keepGroup[canonicalGroupId] = mainGuid
+--   memberGroup[guid] = canonicalGroupId (logical home for every retained character)
 function GI.ClassifyRetainedState(record)
     record = record or select(1, GI:GetCurrentRecord())
     local out = {
@@ -154,8 +208,9 @@ function GI.ClassifyRetainedState(record)
     out.totalMembers = CountKeys(record.members)
     out.totalGroups = CountKeys(record.groups)
 
-    local keepGroup = {}
+    local keepGroup = {} -- [canonicalGid] = mainGuid
     local keepMember = {}
+    local memberGroup = {} -- [guid] = canonicalGid
     local mains = record.graph and record.graph.mains or {}
     for mainGuid, ginfo in pairs(mains) do
         local alts = ginfo.altGuids or {}
@@ -163,25 +218,28 @@ function GI.ClassifyRetainedState(record)
             out.relationships = out.relationships + 1
             local gid = ginfo.groupId
             if type(gid) == "string" then
-                keepGroup[gid] = true
-            end
-            keepMember[mainGuid] = true
-            for i = 1, #alts do
-                keepMember[alts[i]] = true
+                keepGroup[gid] = mainGuid
+                keepMember[mainGuid] = true
+                memberGroup[mainGuid] = gid
+                for i = 1, #alts do
+                    keepMember[alts[i]] = true
+                    memberGroup[alts[i]] = gid
+                end
             end
         end
     end
 
+    out.retainedMembers = CountKeys(keepMember)
     for guid, m in pairs(record.members or {}) do
-        if keepMember[guid] then
-            out.retainedMembers = out.retainedMembers + 1
-        elseif not MemberIsAssigned(m) then
+        if not keepMember[guid] and not MemberIsAssigned(m) then
             out.tombstones = out.tombstones + 1
         end
     end
+    -- Count retained groups from the logical set (canonical ids only).
+    out.retainedGroups = CountKeys(keepGroup)
     for gid, g in pairs(record.groups or {}) do
         if keepGroup[gid] then
-            out.retainedGroups = out.retainedGroups + 1
+            -- counted above
         elseif type(g) == "table" and g.dissolved and type(g.forwardTo) == "string" and g.forwardTo ~= "" then
             out.aliases = out.aliases + 1
         elseif type(g) == "table" and not g.dissolved then
@@ -191,7 +249,7 @@ function GI.ClassifyRetainedState(record)
             out.otherLiveEmpty = out.otherLiveEmpty + 1
         end
     end
-    return out, keepMember, keepGroup
+    return out, keepMember, keepGroup, memberGroup
 end
 
 function GI.PreviewCleanupHistory(record)
@@ -222,9 +280,11 @@ function GI.PreviewCleanupHistory(record)
     }
 end
 
---- Build compact baseline tables from currently known active relationships.
+--- Build compact baseline from *logical* derived relationships (not raw physical ids).
+-- Absorbed / forwarded alts are rewritten onto their canonical groupId.
 local function BuildCleanupBaseline(record)
-    local c, keepMember, keepGroup = GI.ClassifyRetainedState(record)
+    local expectedSnap = GI.LogicalRelationshipSnapshot(record)
+    local c, keepMember, keepGroup, memberGroup = GI.ClassifyRetainedState(record)
     local writer, wErr = GI:_EnsureWritableWriter()
     if not writer then
         return nil, wErr or "not_ready"
@@ -234,62 +294,58 @@ local function BuildCleanupBaseline(record)
     local newGroups = {}
     local newCharacters = {}
 
-    for guid in pairs(keepMember) do
-        local old = record.members[guid]
-        if type(old) == "table" then
-            local ver = { n = 1, w = writer.nonce }
-            newMembers[guid] = {
-                guid = guid,
-                groupId = old.groupId,
-                ver = ver,
-                at = at,
-                nameRealm = old.nameRealm,
-                classFile = old.classFile,
-            }
-            if old.nameRealm or old.classFile then
-                newCharacters[guid] = {
-                    nameRealm = old.nameRealm,
-                    classFile = old.classFile,
-                }
-            end
-        end
+    -- Canonical live groups from the derived graph (mainGuid is authoritative).
+    for gid, mainGuid in pairs(keepGroup) do
+        newGroups[gid] = {
+            groupId = gid,
+            mainGuid = mainGuid,
+            ver = { n = 1, w = writer.nonce },
+            at = at,
+        }
     end
-    for gid in pairs(keepGroup) do
-        local old = record.groups[gid]
-        if type(old) == "table" and not old.dissolved and type(old.mainGuid) == "string" then
-            newGroups[gid] = {
-                groupId = gid,
-                mainGuid = old.mainGuid,
-                ver = { n = 1, w = writer.nonce },
-                at = at,
+
+    for guid in pairs(keepMember) do
+        local canonicalGid = memberGroup and memberGroup[guid]
+        if type(canonicalGid) ~= "string" or not newGroups[canonicalGid] then
+            return nil, "cleanup_incomplete_member"
+        end
+        local old = record.members and record.members[guid]
+        local char = record.characters and record.characters[guid]
+        local nameRealm = (old and old.nameRealm) or (char and char.nameRealm)
+        local classFile = (old and old.classFile) or (char and char.classFile)
+        if not old and not nameRealm then
+            -- Visible active assignment without any durable identity row — abort.
+            return nil, "cleanup_incomplete_member"
+        end
+        newMembers[guid] = {
+            guid = guid,
+            groupId = canonicalGid,
+            ver = { n = 1, w = writer.nonce },
+            at = at,
+            nameRealm = nameRealm,
+            classFile = classFile,
+        }
+        if nameRealm or classFile then
+            newCharacters[guid] = {
+                nameRealm = nameRealm,
+                classFile = classFile,
             }
         end
     end
 
-    -- Ensure every retained member's group exists and mains are members.
-    for guid, m in pairs(newMembers) do
-        local gid = m.groupId
-        if type(gid) == "string" and not newGroups[gid] then
-            -- Drop orphan membership that lost its group during classify race.
-            newMembers[guid] = nil
-            newCharacters[guid] = nil
-        end
-    end
+    -- Every canonical group must retain its main membership.
     for gid, g in pairs(newGroups) do
         if not newMembers[g.mainGuid] then
-            -- Main missing: drop the group and its alts.
-            for guid, m in pairs(newMembers) do
-                if m.groupId == gid then
-                    newMembers[guid] = nil
-                    newCharacters[guid] = nil
-                end
-            end
-            newGroups[gid] = nil
+            return nil, "cleanup_incomplete_member"
         end
     end
 
     if CountKeys(newMembers) > GI.MAX_MEMBERS or CountKeys(newGroups) > GI.MAX_GROUPS then
         return nil, "cleanup_active_overflow"
+    end
+    if CountKeys(newMembers) ~= c.retainedMembers then
+        -- Preview promised these identities; refuse silent omission.
+        return nil, "cleanup_relationship_mismatch"
     end
 
     local contentFp = GI.ComputeBaselineContentFp(newMembers, newGroups)
@@ -301,12 +357,32 @@ local function BuildCleanupBaseline(record)
         groupCount = CountKeys(newGroups),
         contentFp = contentFp,
         relationships = c.relationships,
+        expectedSnap = expectedSnap,
         discarded = {
             soloShells = c.soloShells,
             tombstones = c.tombstones,
             aliases = c.aliases,
         },
     }
+end
+
+--- Refresh advertised current-generation seal from durable rows.
+-- Only valid for a completed baseline writer/follower. Incomplete sync keeps
+-- epoch-expected counts/fingerprint until TrySealBaseline succeeds.
+function GI.RefreshBaselineSeal(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    if not GI.IsBaselineComplete(record) then
+        return false
+    end
+    record.baseline = record.baseline or {}
+    record.baseline.complete = true
+    record.baseline.memberCount = CountKeys(record.members)
+    record.baseline.groupCount = CountKeys(record.groups)
+    record.baseline.contentFp = GI.ComputeBaselineContentFp(record.members, record.groups)
+    record.revision = record.baseline.memberCount + record.baseline.groupCount
+    return true
 end
 
 --- Install a fully built baseline under a new sync generation (local cleanup).
@@ -363,6 +439,11 @@ function GI:ApplyCleanupHistory(opts)
     local okVal, valErr = GI.ValidateGuildRecord(record.guildKey, probe)
     if not okVal then
         return "rejected", valErr or "cleanup_invalid"
+    end
+    -- Semantic gate: every confirmed visible relationship must survive unchanged.
+    local probeSnap = GI.LogicalRelationshipSnapshot(probe)
+    if not SnapshotsEqual(built.expectedSnap, probeSnap) then
+        return "rejected", "cleanup_relationship_mismatch"
     end
 
     -- Serialization gate: epoch + every retained wire must fit Gossip CBOR cap.
@@ -469,15 +550,17 @@ function GI.AdoptSyncGeneration(record, epochBody)
         return false, "stale_generation"
     end
     if cmp == 0 then
-        -- Same generation identity: ignore duplicate epoch.
-        if GI.IsBaselineComplete(record) then
+        -- Same generation: refresh expected seal while incomplete so mid-sync
+        -- writer edits (updated contentFp) remain discoverable.
+        if not GI.IsBaselineComplete(record) then
+            record.baseline = record.baseline or {}
+            record.baseline.memberCount = memberCount
+            record.baseline.groupCount = groupCount
+            record.baseline.contentFp = contentFp
+            GI.TrySealBaseline(record)
             return true, "duplicate"
         end
-        -- Refresh expected seal metadata while still syncing.
-        record.baseline = record.baseline or {}
-        record.baseline.memberCount = memberCount
-        record.baseline.groupCount = groupCount
-        record.baseline.contentFp = contentFp
+        -- Complete peers keep their seal from durable rows (RefreshBaselineSeal).
         return true, "duplicate"
     end
 

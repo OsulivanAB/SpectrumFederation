@@ -115,10 +115,11 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 
 Ranks 1–3 may run **Clean up retained Guild Info history** in Settings. This is not Delete All Assignments.
 
-- **Retains:** currently known valid main/alt relationships (including departed characters’ last-known display identity).
+- **Retains:** currently known valid main/alt relationships (including departed characters’ last-known display identity). Cleanup rebuilds memberships onto **canonical derived group ids** so absorbed/forwarded alts are not dropped when their physical `groupId` differs from the displayed home.
 - **Discards:** empty solo-main shells, unassign tombstones, forwarding aliases, and other obsolete groups that are not part of a visible relationship.
 - **Generation:** commits a new guild-scoped `syncGen` and sealed `baseline` (`memberCount` / `groupCount` / `contentFp`). Older-generation member/group wires are rejected even with higher individual `ver.n`. Competing cleanups at the same `n` tie-break on lexicographic writer nonce `w`.
-- **Incomplete sync:** a follower that adopts a newer epoch wipes prior relationships and stays `baseline.complete = false` until the sealed counts/fingerprint match. Relationship APIs report `generation_syncing` rather than an authoritative empty finished state. While incomplete, Gossip export advertises only the epoch meta record.
+- **Seal freshness:** after ordinary Assign/Unassign/Change Main (local or accepted remote) on a completed baseline, seal metadata is refreshed to match durable rows so fresh peers can finish sync without the writer reloading.
+- **Incomplete sync:** a follower that adopts a newer epoch wipes prior relationships and stays `baseline.complete = false` until the sealed counts/fingerprint match. Relationship APIs report `generation_syncing` rather than an authoritative empty finished state. While incomplete, Gossip export advertises only the epoch meta record (never a partial completed baseline).
 - **Tradeoff:** the confirming officer’s known view becomes the new guild-wide baseline. Offline edits that never entered that baseline are intentionally invalidated. Cleanup works at capacity; if every slot is a genuine active relationship, Settings explains that no capacity can be recovered.
 
 ## Gossip provider

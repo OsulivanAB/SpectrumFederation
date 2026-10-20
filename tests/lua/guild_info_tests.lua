@@ -3388,7 +3388,8 @@ do
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "E Bob present after seal")
 
     -- Duplicate epoch/members are idempotent.
-    assertTrue(admitWire(dbFresh, epochWire, "Alice-Garona") ~= "rejected" or true, "E duplicate epoch ok")
+    local dupSt = admitWire(dbFresh, epochWire, "Alice-Garona")
+    assertTrue(dupSt == "accepted" or dupSt == "duplicate", "E duplicate epoch ok got=" .. tostring(dupSt))
     admitWire(dbFresh, memberWires[1], "Alice-Garona")
     assertEq(GI:GetCharacterRole("Player-1-Bob"), "alt", "E still Bob after duplicates")
 
@@ -3416,8 +3417,8 @@ do
         GI.InvalidateRosterSnapshot()
         assign(string.format("CycMain%02d-Garona", cycle), string.format("CycAlt%02d-Garona", cycle))
         GI:UnassignAlt(string.format("Player-1-CycAlt%02d", cycle), {})
-        local st = GI:CleanupHistory({})
-        assertTrue(st == "accepted" or st == "accepted", "F cleanup cycle " .. cycle)
+        local st, why = GI:CleanupHistory({})
+        assertEq(st, "accepted", "F cleanup cycle " .. cycle .. " why=" .. tostring(why))
         -- Keep one active relationship so cleanup is meaningful next rounds.
         assign("Alice-Garona", "Bob-Garona")
         local c = GI.CountRetainedState()
@@ -3441,6 +3442,245 @@ do
     for i = 1, #wires do
         assertTrue(GI.RecordWithinGossipCap(wires[i]), "F wire within 2048 id=" .. tostring(wires[i].id))
     end
+end
+
+---------------------------------------------------------------------------
+-- Option B integrity: logical cleanup + live seal freshness
+---------------------------------------------------------------------------
+
+--- Export via live provider callbacks without GI:Initialize (masks seal bugs).
+local function exportProviderWiresLive()
+    DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    local provider = SF.GuildGossip._providers[GI.PROVIDER_ID]
+    assertTrue(provider and provider.spec, "live provider available")
+    local wires = {}
+    local cursor = 1
+    while cursor do
+        local page, nextCursor = provider.spec.ListRecordIds(cursor, 32)
+        for i = 1, #(page or {}) do
+            local body = provider.spec.GetRecordBody(page[i])
+            if body then
+                wires[#wires + 1] = body
+            end
+        end
+        cursor = nextCursor
+    end
+    return wires
+end
+
+local function admitWiresInOrder(db, wires, sender, order)
+    for i = 1, #order do
+        local kind = order[i]
+        for j = 1, #wires do
+            if wires[j].body and wires[j].body.kind == kind then
+                admitWire(db, wires[j], sender)
+            end
+        end
+    end
+end
+
+local function altsUnderMain(mainGuid)
+    local groups = GI:GetRelationshipGroups() or {}
+    for i = 1, #groups do
+        if groups[i].mainGuid == mainGuid then
+            local alts = {}
+            for j = 1, #(groups[i].altGuids or {}) do
+                alts[groups[i].altGuids[j]] = true
+            end
+            return alts, groups[i].altGuids
+        end
+    end
+    return {}, {}
+end
+
+do
+    -- G1 — Absorbed concurrent groups: cleanup must keep Bob AND Carol
+    restoreBaseRoster()
+    resetDB()
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "G1 A Alice/Bob")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "G1 B Alice/Carol")
+    syncAll(dbA, dbB, "Alice-Garona")
+    syncAll(dbB, dbA, "Carol-Garona")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local altsBefore = altsUnderMain("Player-1-Alice")
+    assertTrue(altsBefore["Player-1-Bob"], "G1 before: Bob visible")
+    assertTrue(altsBefore["Player-1-Carol"], "G1 before: Carol visible")
+    local preview = GI:PreviewCleanup()
+    assertTrue(preview.retainedMembers >= 3, "G1 preview retains Alice+Bob+Carol got=" .. tostring(preview.retainedMembers))
+    -- Create obsolete shell so cleanup is not a noop.
+    ensureRosterGuid("ShellG-Garona", "Player-1-ShellG", 4)
+    GI.InvalidateRosterSnapshot()
+    assign("ShellG-Garona", "Dave-Garona")
+    GI:UnassignAlt("Player-1-Dave", {})
+    local cst, cwhy = GI:CleanupHistory({})
+    assertEq(cst, "accepted", "G1 cleanup accepted why=" .. tostring(cwhy))
+    local altsAfter = altsUnderMain("Player-1-Alice")
+    assertTrue(altsAfter["Player-1-Bob"], "G1 after cleanup: Bob retained")
+    assertTrue(altsAfter["Player-1-Carol"], "G1 after cleanup: Carol retained (absorbed physical G2)")
+    local roleC, mainC = GI:GetCharacterRole("Player-1-Carol")
+    assertEq(roleC, "alt", "G1 Carol role alt")
+    assertEq(mainC, "Player-1-Alice", "G1 Carol under Alice")
+    -- Reload + fresh peer converge.
+    local saved = SpectrumFederationDB
+    reloadModules(saved)
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "G1 reload keeps Carol")
+    local dbFresh = seedEmptyPeer()
+    syncAll(saved, dbFresh, "Alice-Garona")
+    SpectrumFederationDB = dbFresh
+    GI:Initialize(dbFresh)
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "G1 fresh Bob")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "G1 fresh Carol")
+end
+
+do
+    -- G2 — Late alt on forwardTo alias survives cleanup onto canonical group
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assign("Alice-Garona", "Bob-Garona")
+    local record = select(1, GI:GetCurrentRecord())
+    local g1 = record.graph.byGuid["Player-1-Alice"].groupId
+    -- Synthetic sibling group G2 retired as forwardTo G1 with Carol membership on G2.
+    local g2 = "gig:forward:g2"
+    GI.MergeGroup(record, {
+        groupId = g2,
+        mainGuid = "Player-1-Alice",
+        ver = { n = 1, w = "ffffffffffffffffffffffff" },
+        at = 1,
+    })
+    GI.MergeMember(record, {
+        guid = "Player-1-Carol",
+        groupId = g2,
+        ver = { n = 1, w = "ffffffffffffffffffffffff" },
+        at = 1,
+        nameRealm = "Carol-Garona",
+        classFile = "PRIEST",
+    })
+    GI.MergeGroup(record, {
+        groupId = g2,
+        ver = { n = 2, w = "ffffffffffffffffffffffff" },
+        at = 2,
+        dissolved = true,
+        forwardTo = g1,
+    })
+    GI.RebuildDerived(record)
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "G2 before: Carol visible via forward")
+    assertEq(record.members["Player-1-Carol"].groupId, g2, "G2 Carol durable id still G2")
+    ensureRosterGuid("ShellG2-Garona", "Player-1-ShellG2", 4)
+    GI.InvalidateRosterSnapshot()
+    assign("ShellG2-Garona", "Dave-Garona")
+    GI:UnassignAlt("Player-1-Dave", {})
+    assertEq(GI:CleanupHistory({}), "accepted", "G2 cleanup")
+    local role, main = GI:GetCharacterRole("Player-1-Carol")
+    assertEq(role, "alt", "G2 Carol retained")
+    assertEq(main, "Player-1-Alice", "G2 Carol under Alice")
+    record = select(1, GI:GetCurrentRecord())
+    assertEq(record.members["Player-1-Carol"].groupId, g1, "G2 Carol rewritten onto canonical G1")
+    assertNil(record.groups[g2], "G2 alias discarded after cleanup")
+end
+
+do
+    -- H — Post-cleanup edits refresh seal; fresh peer seals without writer Initialize
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assign("Alice-Garona", "Bob-Garona")
+    ensureRosterGuid("ShellH-Garona", "Player-1-ShellH", 4)
+    GI.InvalidateRosterSnapshot()
+    assign("ShellH-Garona", "Dave-Garona")
+    GI:UnassignAlt("Player-1-Dave", {})
+    assertEq(GI:CleanupHistory({}), "accepted", "H cleanup to gen>=2")
+    local rec = select(1, GI:GetCurrentRecord())
+    local genN = rec.syncGen.n
+    local sealBefore = {
+        mc = rec.baseline.memberCount,
+        gc = rec.baseline.groupCount,
+        fp = rec.baseline.contentFp,
+    }
+    -- Ordinary edit WITHOUT re-Initialize.
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "H assign Carol after cleanup")
+    rec = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(rec), "H writer still complete")
+    assertTrue(rec.baseline.memberCount > sealBefore.mc
+        or rec.baseline.contentFp ~= sealBefore.fp,
+        "H seal refreshed after edit")
+    assertEq(rec.baseline.memberCount, countKeys(rec.members), "H seal memberCount matches durable")
+    assertEq(rec.baseline.contentFp, GI.ComputeBaselineContentFp(rec.members, rec.groups),
+        "H seal contentFp matches durable")
+
+    -- Live provider export (no Initialize).
+    GI.NotifyLocalDurableChange("local")
+    local wires = exportProviderWiresLive()
+    local epochBody
+    for i = 1, #wires do
+        if wires[i].body and wires[i].body.kind == "guildinfo-epoch" then
+            epochBody = wires[i].body
+        end
+    end
+    assertTrue(epochBody ~= nil, "H live export has epoch")
+    assertEq(tonumber(epochBody.gen.n), tonumber(genN), "H epoch same generation")
+    assertEq(tonumber(epochBody.memberCount), countKeys(rec.members), "H live epoch memberCount current")
+    assertEq(tostring(epochBody.contentFp), tostring(rec.baseline.contentFp), "H live epoch contentFp matches seal")
+    assertEq(tostring(epochBody.contentFp),
+        tostring(GI.ComputeBaselineContentFp(rec.members, rec.groups)),
+        "H live epoch contentFp matches durable rows")
+
+    local dbFresh = seedEmptyPeer()
+    -- Reordered delivery: members/groups before epoch, then epoch, plus duplicates.
+    admitWiresInOrder(dbFresh, wires, "Alice-Garona", {
+        "guildinfo-member", "guildinfo-group", "guildinfo-epoch",
+    })
+    -- Second pass full order including duplicates.
+    for i = 1, #wires do
+        admitWire(dbFresh, wires[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbFresh
+    GI:Initialize(dbFresh)
+    local fresh = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(fresh), "H fresh peer sealed without writer Initialize")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "H fresh Bob")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "H fresh Carol")
+end
+
+do
+    -- H2 — Multiple post-cleanup edits + third-peer relay; index becomes idle
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assign("Alice-Garona", "Bob-Garona")
+    ensureRosterGuid("ShellH2-Garona", "Player-1-ShellH2", 4)
+    GI.InvalidateRosterSnapshot()
+    assign("ShellH2-Garona", "Dave-Garona")
+    GI:UnassignAlt("Player-1-Dave", {})
+    assertEq(GI:CleanupHistory({}), "accepted", "H2 cleanup")
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "H2 Carol")
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "H2 Eve second edit")
+    GI.NotifyLocalDurableChange("local")
+    local wires = exportProviderWiresLive()
+    local dbB = seedEmptyPeer()
+    local dbC = seedEmptyPeer()
+    for i = 1, #wires do
+        admitWire(dbB, wires[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "H2 B sealed")
+    local wiresB = exportWires(dbB)
+    for i = 1, #wiresB do
+        admitWire(dbC, wiresB[i], "Carol-Garona")
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "H2 C sealed via relay")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Eve"], "H2 C has Eve")
+    local index = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(index.buildComplete and not index.dirty, "H2 index idle")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
