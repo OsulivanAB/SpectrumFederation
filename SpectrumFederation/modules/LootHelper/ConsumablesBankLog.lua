@@ -961,7 +961,28 @@ function BankLog:OnEvent(event, arg1)
             self:ProcessLogUpdate("event")
         end
     elseif event == "GUILDBANKBAGSLOTS_CHANGED" then
-        if self.active then
+        -- Retail GuildBankTab_OnClick selects a tab via SetCurrentGuildBankTab
+        -- then QueryGuildBankTab; the response fires GUILDBANKBAGSLOTS_CHANGED.
+        -- There is no dedicated Guild Bank tab-selection event. Re-evaluate the
+        -- eligible observation context so a deliberate switch onto the Guild
+        -- Supplies tab can retarget sampling. Overlapping uncorrelated queries
+        -- still fail closed and require a clean bank reopen.
+        if not self.bankOpen then
+            return
+        end
+        local prev = self.activeContext
+        if not self:BeginObservation("tab_selected") then
+            return
+        end
+        -- BeginObservation RequestLogs only when identity changes (non-throttled
+        -- "tab_selected"). Same-tab slot churn still needs the throttled path.
+        local cur = self.activeContext
+        local sameIdentity = type(prev) == "table" and type(cur) == "table"
+            and prev.profileId == cur.profileId
+            and prev.guildGuid == cur.guildGuid
+            and prev.bankTab == cur.bankTab
+            and tonumber(prev.generation) == tonumber(cur.generation)
+        if sameIdentity then
             self:RequestLog("slots_changed")
         end
     end

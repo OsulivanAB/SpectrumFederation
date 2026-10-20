@@ -25700,41 +25700,63 @@ do
         "A2: disabled legacy mid-query does not append stale observations")
     profile._consumables.requestedItems = savedItems
 
-    -- Different tabs: legacy tab selected → prefer legacy; GS tab never stamped.
+    -- Different tabs via production Guild Bank events (no manual observer clears).
+    -- Legacy Tab 2 remains authoritative; GS Tab 3 is sampled by selecting that tab
+    -- (Retail: GuildBankTab_OnClick → QueryGuildBankTab → GUILDBANKBAGSLOTS_CHANGED).
     local tabOp3 = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 3))
     assertEq(GS:ApplyStagedConfigOperation(tabOp3), "accepted", "A2: GS tab 3")
     profile._consumables.bankTab = 2
-    world.currentGuildBankTab = 2
-    BankLog.lastFreshLogTab = nil
-    BankLog.lastFreshLogAt = nil
-    BankLog.lastFreshLogGuild = nil
-    BankLog.requireBankReopenForFreshness = false
-    BankLog.pendingQuery = nil
-    BankLog.awaitingLogUpdate = false
-    BankLog.active = false
-    local split = BankLog:EligibleContext()
-    assertTrue(split ~= nil and split.source == "legacyProfile",
-        "A2: different tabs on legacy selection prefer legacy")
-    assertNil(split.sampleOnly, "A2: no sample-only when viewing legacy tab")
-    assertEq(BankLog:BeginObservation("open"), true, "A2: begin legacy-tab observation")
-    BankLog:ProcessLogUpdate("a2-legacy-tab")
-    assertEq(BankLog.lastFreshLogTab, 2, "A2: legacy-tab query stamps tab 2")
+    world.bankTxnCounts[3] = 0
+    world.bankTxnRows[3] = {}
+    world.logQueries = {}
+    function QueryGuildBankLog(tab)
+        world.logQueries[#world.logQueries + 1] = tab
+    end
     GS._BankContextReadinessProbe = nil
+
+    -- Fresh bank open on legacy Tab 2 through the production open event.
+    BankLog:OnEvent("GUILDBANKFRAME_CLOSED")
+    world.currentGuildBankTab = 2
+    BankLog:OnEvent("GUILDBANKFRAME_OPENED")
+    assertTrue(BankLog.active, "A2: observer active after open on legacy tab")
+    assertEq(BankLog.activeContext and BankLog.activeContext.source, "legacyProfile",
+        "A2: open on tab 2 prefers legacy")
+    assertEq(BankLog.activeContext.bankTab, 2, "A2: observing legacy tab 2")
+    assertTrue(#world.logQueries >= 1 and world.logQueries[#world.logQueries] == 2,
+        "A2: open queries legacy tab 2")
+    local legacyObsBefore = #(scope and scope.observations or {})
+    BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+    assertEq(BankLog.lastFreshLogTab, 2, "A2: legacy-tab query stamps tab 2")
+    assertEq(BankLog.awaitingLogUpdate, false, "A2: legacy query completed")
     local gsReady, gsReadyReason = GS.IsBankContextSampleReady(3)
     assertEq(gsReady, false,
         "A2: legacy-tab never stamps GS tab 3 reason=" .. tostring(gsReadyReason))
+    assertTrue(#(scope and scope.observations or {}) >= legacyObsBefore,
+        "A2: legacy observation remains operational on tab 2")
 
-    -- Viewing the configured GS tab acquires the activation sample (close/reopen first).
-    BankLog.requireBankReopenForFreshness = true
-    BankLog:OnBankClosed()
-    BankLog:OnBankOpened()
+    -- Outstanding Tab 2 response must not satisfy Tab 3: start a new Tab 2 cycle,
+    -- then select Tab 3 while that query is still awaiting → reopen gate.
+    world.time = (world.time or 0) + 2
+    local queriesBeforeOverlap = #world.logQueries
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(BankLog.awaitingLogUpdate, "A2: same-tab slots_changed re-arms tab 2 query")
+    assertEq(world.logQueries[#world.logQueries], 2, "A2: slots_changed still queries tab 2")
     world.currentGuildBankTab = 3
-    world.bankTxnCounts[3] = 0
-    world.bankTxnRows[3] = {}
-    local gsSampleCtx = BankLog:EligibleContext()
-    assertTrue(gsSampleCtx and gsSampleCtx.sampleOnly == true and gsSampleCtx.bankTab == 3,
-        "A2: viewing GS tab selects sample-only")
-    assertNil(gsSampleCtx.legacy, "A2: different-tab sample has no legacy companion")
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(BankLog.requireBankReopenForFreshness, true,
+        "A2: selecting GS tab during outstanding tab-2 query requires reopen")
+    assertTrue(BankLog.awaitingLogUpdate == false,
+        "A2: overlap clears awaiting until reopen")
+    local queriesAfterOverlap = #world.logQueries
+    assertEq(queriesAfterOverlap, queriesBeforeOverlap + 1,
+        "A2: overlap does not issue an uncorrelated tab-3 query")
+    -- Late GUILDBANKLOG_UPDATE for the abandoned Tab 2 query must not stamp Tab 3.
+    BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+    assertTrue(BankLog.lastFreshLogTab ~= 3,
+        "A2: late tab-2 response does not stamp GS tab 3")
+    assertEq(GS.IsBankContextSampleReady(3), false,
+        "A2: Tab 3 readiness unavailable until clean reopen sample")
+
     local guide = GS.FormatActivationGuidance({
         reason = "tab_not_ready",
         configuredBankTab = 3,
@@ -25743,27 +25765,205 @@ do
         "A2: Settings guide names GS tab for split-tab sample")
     assertTrue(guide:find("tab 2", 1, true),
         "A2: Settings guide names legacy tab for split-tab sample")
-    BankLog.requireBankReopenForFreshness = false
-    BankLog.pendingQuery = nil
-    BankLog.awaitingLogUpdate = false
-    BankLog.active = false
-    assertEq(BankLog:BeginObservation("open"), true, "A2: begin GS-tab sample")
-    BankLog:ProcessLogUpdate("a2-gs-tab-sample")
-    assertEq(BankLog.lastFreshLogTab, 3, "A2: GS tab sample stamped")
+    assertTrue(guide:find("close and reopen", 1, true) or guide:find("reopen", 1, true),
+        "A2: Settings guide explains reopen when a query was interrupted")
+
+    -- Documented mandatory reopen with GS Tab 3 selected.
+    world.currentGuildBankTab = 3
+    BankLog:OnEvent("GUILDBANKFRAME_CLOSED")
+    assertEq(BankLog.requireBankReopenForFreshness, false,
+        "A2: bank close clears freshness reopen gate")
+    assertEq(BankLog.active, false, "A2: observer idle after close")
+    BankLog:OnEvent("GUILDBANKFRAME_OPENED")
+    assertTrue(BankLog.active, "A2: observer active after reopen on GS tab")
+    local gsSampleCtx = BankLog.activeContext
+    assertTrue(gsSampleCtx and gsSampleCtx.sampleOnly == true and gsSampleCtx.bankTab == 3,
+        "A2: reopen on GS tab selects sample-only")
+    assertNil(gsSampleCtx.legacy, "A2: different-tab sample has no legacy companion")
+    assertEq(world.logQueries[#world.logQueries], 3,
+        "A2: reopen issues authentic Tab 3 QueryGuildBankLog")
+    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 3,
+        "A2: pending query bound to Tab 3")
+    BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+    assertEq(BankLog.lastFreshLogTab, 3, "A2: GS tab sample stamped via production log update")
     assertEq(GS.IsBankContextSampleReady(3), true, "A2: GS activation sample ready on tab 3")
     assertTrue(BankLog.lastStats and BankLog.lastStats.sampleOnly == true,
         "A2: empty GS sample admits nothing")
+    assertEq(C.LegacyWritersAllowed(profile), true,
+        "A2: legacy writers still allowed until activation")
 
-    -- Post-activation: live GS only; legacy companion disabled.
-    armFreshBankSample(true)
-    local _, stAct = GS:ActivateCanonicalDataset()
-    assertEq(stAct, "accepted", "A2: activate after GS sample")
+    -- Completed Tab 3 sample → ActivateCanonicalDataset without readiness probe.
+    GS._BankContextReadinessProbe = nil
+    local _, stAct, actReason = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted",
+        "A2: activate after real GS sample reason=" .. tostring(actReason))
     local liveCtx = BankLog:EligibleContext()
     assertTrue(liveCtx and liveCtx.source == "guildSupplies" and not liveCtx.sampleOnly,
         "A2: post-activation live GS context")
     assertNil(liveCtx.legacy, "A2: no legacy companion after activation")
     assertEq(C.LegacyWritersAllowed(profile), false, "A2: legacy writers disabled")
-    disarmFreshBankSample()
+
+    -- After activation, selecting the old legacy tab must not resume legacy observation.
+    world.currentGuildBankTab = 2
+    world.time = (world.time or 0) + 2
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(BankLog.activeContext and BankLog.activeContext.source == "guildSupplies"
+        and not BankLog.activeContext.sampleOnly,
+        "A2: post-activation slots_changed stays on live GS")
+    assertEq(BankLog.activeContext.bankTab, 3,
+        "A2: live GS still targets configured tab 3 after selecting legacy tab")
+    BankLog:OnEvent("GUILDBANKFRAME_CLOSED")
+
+    SF.GetActiveProfile = priorGetActive
+    SF.ConsumablesRuntime = priorRuntime
+    GetGuildBankTabInfo = nil
+    GetGuildBankTransaction = nil
+    GetNumGuildBankTransactions = nil
+    GetCurrentGuildBankTab = nil
+    QueryGuildBankLog = nil
+end
+
+do
+    -- A2-event) Completed legacy Tab 2 query then select GS Tab 3 via
+    -- GUILDBANKBAGSLOTS_CHANGED (no reopen needed when no outstanding query).
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS._BankContextReadinessProbe = nil
+    GS:CreateStagedRecord()
+    startCampaign()
+    local tabOp = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 3))
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "A2-event: GS bank tab 3")
+    local itemOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 100 }, {
+        itemId = 100, goal = 5, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "A2-event: GS item 100")
+
+    loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesVerification.lua")
+    local C = SF.Consumables
+    local selfId = SF.NameUtil.GetSelfId()
+    local profile = {
+        _profileId = "profile-a2-event",
+        _adminUsers = { selfId },
+        _consumables = {
+            guild = { guid = "42", name = "Spectrum", realm = "Garona" },
+            bankTab = 2,
+            requestedItems = { ["200"] = { itemId = 200, goal = 5 } },
+            generation = 5,
+            configSeq = 0,
+            itemSeq = 0,
+            eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
+            txnRegistry = {},
+        },
+        _consumableEvents = {},
+        _consumableEventArchive = {},
+    }
+    function profile:GetProfileId() return self._profileId end
+    function profile:IsAdminMemberId(memberId) return memberId == selfId end
+    local priorGetActive = SF.GetActiveProfile
+    local priorRuntime = SF.ConsumablesRuntime
+    SF.GetActiveProfile = function() return profile end
+    SF.ConsumablesRuntime = {
+        AccountingProfile = function() return profile end,
+        CurrentGuild = function()
+            return { guid = "42", name = "Spectrum", realm = "Garona" }
+        end,
+    }
+    SF.lootHelperDB = { profiles = { [profile._profileId] = profile } }
+
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    -- Isolate from prior A2 bank-open / activation residue via production close.
+    BankLog:OnEvent("GUILDBANKFRAME_CLOSED")
+    world.bankTxnRows = {
+        [2] = {
+            { "deposit", "Alice-Garona", "|cffffffff|Hitem:200::::::::|h[Legacy]|h|r", 2, nil, nil, 0, 0, 0, 0 },
+        },
+        [3] = {},
+    }
+    world.bankTxnCounts = { [2] = 1, [3] = 0 }
+    world.bankTabInfo = {
+        [2] = { name = "Legacy", isViewable = true },
+        [3] = { name = "Supplies", isViewable = true },
+    }
+    world.currentGuildBankTab = 2
+    world.logQueries = {}
+    function GetCurrentGuildBankTab() return world.currentGuildBankTab end
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction(tab, index)
+        local rows = world.bankTxnRows[tab]
+        local row = rows and rows[index]
+        if not row then return nil end
+        return unpack(row)
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    function QueryGuildBankLog(tab)
+        world.logQueries[#world.logQueries + 1] = tab
+    end
+
+    BankLog:OnEvent("GUILDBANKFRAME_OPENED")
+    assertEq(BankLog.activeContext and BankLog.activeContext.bankTab, 2,
+        "A2-event: open observes legacy tab 2")
+    assertEq(BankLog.requireBankReopenForFreshness, false,
+        "A2-event: clean open has no reopen gate")
+    BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+    assertEq(BankLog.awaitingLogUpdate, false, "A2-event: tab 2 query completed")
+    assertEq(BankLog.lastFreshLogTab, 2, "A2-event: tab 2 stamped")
+    assertEq(C.LegacyWritersAllowed(profile), true, "A2-event: legacy writers before sample")
+
+    -- Select GS Tab 3 after the Tab 2 cycle completed: no reopen required.
+    world.currentGuildBankTab = 3
+    world.time = (world.time or 0) + 2
+    local qBefore = #world.logQueries
+    BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(BankLog.requireBankReopenForFreshness, false,
+        "A2-event: completed prior query allows in-session retarget")
+    assertTrue(BankLog.activeContext and BankLog.activeContext.sampleOnly
+        and BankLog.activeContext.bankTab == 3,
+        "A2-event: slots_changed retargets to GS sample tab 3")
+    assertEq(#world.logQueries, qBefore + 1, "A2-event: one new query after tab select")
+    assertEq(world.logQueries[#world.logQueries], 3,
+        "A2-event: QueryGuildBankLog(3) after selecting GS tab")
+    BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+    assertEq(BankLog.lastFreshLogTab, 3, "A2-event: Tab 3 sample stamped")
+    assertEq(GS.IsBankContextSampleReady(3), true, "A2-event: Tab 3 readiness from real sample")
+    GS._BankContextReadinessProbe = nil
+    local _, stAct = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted", "A2-event: activate from slots_changed sample")
+    assertEq(C.LegacyWritersAllowed(profile), false, "A2-event: legacy writers stop after activation")
+
+    -- Repeated tab selections / close-reopen stay bounded (no loops).
+    local qMark = #world.logQueries
+    for _ = 1, 5 do
+        world.currentGuildBankTab = 2
+        world.time = (world.time or 0) + 2
+        BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+        world.currentGuildBankTab = 3
+        world.time = (world.time or 0) + 2
+        BankLog:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+        if BankLog.awaitingLogUpdate then
+            BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+        end
+    end
+    BankLog:OnEvent("GUILDBANKFRAME_CLOSED")
+    world.currentGuildBankTab = 3
+    BankLog:OnEvent("GUILDBANKFRAME_OPENED")
+    if BankLog.awaitingLogUpdate then
+        BankLog:OnEvent("GUILDBANKLOG_UPDATE")
+    end
+    assertTrue(#world.logQueries < qMark + 40,
+        "A2-event: repeated selections stay bounded queries=" .. tostring(#world.logQueries - qMark))
+    assertTrue(BankLog.activeContext and BankLog.activeContext.source == "guildSupplies",
+        "A2-event: still live GS after churn")
+    BankLog:OnEvent("GUILDBANKFRAME_CLOSED")
+
     SF.GetActiveProfile = priorGetActive
     SF.ConsumablesRuntime = priorRuntime
     GetGuildBankTabInfo = nil

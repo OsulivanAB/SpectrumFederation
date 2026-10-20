@@ -717,12 +717,12 @@ function GS.FormatActivationGuidance(readiness)
         end
         if cfgTab and legacyTab and cfgTab ~= legacyTab then
             local tmpl = Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_OTHER_TAB",
-                "Guild Supplies uses Guild Bank tab %d, while your Raid Consumables profile uses tab %d. Select the Guild Supplies tab in the Guild Bank to take the activation sample (close and reopen the bank if a previous query was interrupted). Legacy observation continues on its own tab until activation.")
+                "Guild Supplies uses Guild Bank tab %d, while your Raid Consumables profile uses tab %d. Select the Guild Supplies tab in the Guild Bank to take the activation sample. If a previous bank-log query was interrupted, close and reopen the bank with that tab selected. Legacy observation continues on its own tab until activation.")
             return string.format(tmpl, cfgTab, legacyTab)
         end
         if cfgTab then
             local tmpl = Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_SELECT_GS_TAB",
-                "Guild Supplies uses Guild Bank tab %d. Select that tab in the Guild Bank to take the activation sample (close and reopen the bank if a previous query was interrupted).")
+                "Guild Supplies uses Guild Bank tab %d. Select that tab in the Guild Bank to take the activation sample. If a previous bank-log query was interrupted, close and reopen the bank with that tab selected.")
             return string.format(tmpl, cfgTab)
         end
         return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_NOT_OBSERVING",
