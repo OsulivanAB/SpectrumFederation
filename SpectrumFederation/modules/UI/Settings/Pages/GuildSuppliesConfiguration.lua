@@ -923,7 +923,7 @@ local function CommitNewCampaign(ctx)
 		return
 	end
 	-- Bind the intended operation to the original guild/campaign/policy context
-	-- before showing confirmation. Do not rebuild on accept.
+	-- before confirmation (or immediate apply). Do not rebuild on accept.
 	local op, prepStatus, prepReason = g:NewCampaignOperation()
 	if not op then
 		ReportStatus(ctx, prepStatus or "rejected", prepReason)
@@ -932,7 +932,7 @@ local function CommitNewCampaign(ctx)
 	local boundOp = op
 	local accept = function()
 		ctx.section:ClearMessage()
-		-- Finalize startedAt once at confirmation accept; keep bound scope/bases.
+		-- Finalize startedAt once at apply time; keep bound scope/bases.
 		if g.FinalizeCampaignStartTime then
 			local okFinal, finalReason = g:FinalizeCampaignStartTime(boundOp)
 			if not okFinal then
@@ -943,10 +943,18 @@ local function CommitNewCampaign(ctx)
 		local status, reason = g:ApplyStagedCampaignOperation(boundOp)
 		ReportStatus(ctx, status, reason)
 	end
+	-- First campaign: create immediately. Subsequent campaigns archive the
+	-- current one and need an explicit confirmation.
+	local requiresConfirm = type(boundOp.baseCampaignId) == "string"
+		and boundOp.baseCampaignId ~= ""
+	if not requiresConfirm then
+		accept()
+		return
+	end
 	if dialogs and dialogs.Confirm then
 		dialogs:Confirm(
 			Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_CONFIRM",
-				"Start a New Campaign? The current campaign keeps its items, goals, and history for Logs inspection. The new campaign starts empty."),
+				"Start a new campaign? The current campaign will be archived, and the new campaign will start with empty goals and progress."),
 			Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_BUTTON", "New Campaign"),
 			accept
 		)
@@ -1527,6 +1535,8 @@ local function Definition()
 						adminOnly = true,
 						buttonText = Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_BUTTON", "New Campaign"),
 						width = 160,
+						tooltip = Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_TIP",
+							"Starts a fresh campaign with empty goals and progress. Previous campaigns are archived and can be viewed in Logs."),
 						enabled = function()
 							return Caps().canEdit and CurrentRecord() ~= nil
 						end,

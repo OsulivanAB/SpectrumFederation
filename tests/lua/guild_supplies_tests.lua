@@ -5394,29 +5394,123 @@ do
         configPage:Refresh(configPanel)
     end
 
-    -- New Campaign: bind before confirm; cancel leaves state; accept applies bound op.
-    local buttons = findButtons(configPanel)
-    local newCampaignBtn
-    for i = 1, #buttons do
-        if buttons[i].text == "New Campaign" then
-            newCampaignBtn = buttons[i]
-            break
+    -- New Campaign UX: first campaign applies immediately; later campaigns confirm.
+    local function findNewCampaignButton(panel)
+        local buttons = findButtons(panel)
+        for i = 1, #buttons do
+            if buttons[i].text == "New Campaign" then
+                return buttons[i]
+            end
         end
+        return nil
     end
+    local function findNewCampaignDef(panel)
+        local pageDefLocal = panel and panel.__sfPageDef
+        for _, sec in ipairs((pageDefLocal and pageDefLocal.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "button" and item.buttonText == "New Campaign" then
+                    return item
+                end
+            end
+        end
+        return nil
+    end
+
+    -- (1) No existing campaign → apply immediately without a dialog.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    assertNil(GS:GetCurrentRecord().currentCampaignId, "UX: fixture has no campaign")
+    configPage:Refresh(configPanel)
+    local newCampaignBtn = findNewCampaignButton(configPanel)
     assertTrue(newCampaignBtn ~= nil, "New Campaign button present")
-    local beforeCampaign = GS:GetCurrentRecord().currentCampaignId
+    local ncDef = findNewCampaignDef(configPanel)
+    assertTrue(ncDef ~= nil, "New Campaign definition present")
+    assertTrue(type(ncDef.tooltip) == "string"
+            and ncDef.tooltip:find("archived and can be viewed in Logs", 1, true),
+        "enabled New Campaign tooltip explains archive/Logs got=" .. tostring(ncDef and ncDef.tooltip))
+    assertTrue(type(ncDef.getDisabledTooltip) == "function",
+        "New Campaign keeps getDisabledTooltip")
     pendingConfirm = nil
     newCampaignBtn:Click()
-    assertTrue(pendingConfirm ~= nil, "New Campaign shows confirmation")
-    -- Cancel: do not invoke accept.
-    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeCampaign, "cancel leaves campaign")
-    -- Accept bound op.
+    assertNil(pendingConfirm, "first New Campaign skips confirmation dialog")
+    local firstCampaignId = GS:GetCurrentRecord().currentCampaignId
+    assertTrue(type(firstCampaignId) == "string" and firstCampaignId ~= "",
+        "first New Campaign applies immediately")
+
+    -- Seed items/progress so a subsequent campaign can prove empty goals + retained history.
+    local seedItem = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 4242 }, {
+        itemId = 4242, goal = 5, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(seedItem), "accepted", "UX: seed prior campaign item")
+    local priorCampaignId = GS:GetCurrentRecord().currentCampaignId
+    local priorItemCount = 0
+    for _ in pairs(GS:GetCurrentRecord().accounting._consumables.requestedItems or {}) do
+        priorItemCount = priorItemCount + 1
+    end
+    assertTrue(priorItemCount >= 1, "UX: prior campaign has items")
+
+    -- (2/3) Existing campaign → confirmation; Cancel performs no operation.
+    configPage:Refresh(configPanel)
+    newCampaignBtn = findNewCampaignButton(configPanel)
+    pendingConfirm = nil
+    newCampaignBtn:Click()
+    assertTrue(pendingConfirm ~= nil, "subsequent New Campaign shows confirmation")
+    assertTrue((pendingConfirm.message or ""):find("will be archived", 1, true),
+        "confirm copy mentions archive got=" .. tostring(pendingConfirm.message))
+    assertTrue(not (pendingConfirm.message or ""):find("overwritten", 1, true),
+        "confirm copy does not say overwritten")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, priorCampaignId,
+        "cancel (no accept) leaves campaign unchanged")
+
+    -- (6) Confirmation unavailable with existing campaign → no operation.
+    local priorDialogsConfirm = SF.SettingsUI.Dialogs.Confirm
+    SF.SettingsUI.Dialogs.Confirm = nil
+    pendingConfirm = nil
+    local beforeUnavailable = GS:GetCurrentRecord().currentCampaignId
+    newCampaignBtn:Click()
+    assertNil(pendingConfirm, "confirm unavailable: no dialog shown")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeUnavailable,
+        "confirm unavailable: no campaign operation applied")
+    SF.SettingsUI.Dialogs.Confirm = priorDialogsConfirm
+
+    -- (4/5) Confirm archives previous campaign; new campaign empty; history inspectable.
+    pendingConfirm = nil
+    newCampaignBtn:Click()
+    assertTrue(pendingConfirm ~= nil, "confirm shown before accept")
     local acceptFn = pendingConfirm.data
     assertTrue(type(acceptFn) == "function", "confirm binds accept function")
     acceptFn()
-    assertTrue(GS:GetCurrentRecord().currentCampaignId ~= beforeCampaign, "accept starts new campaign")
+    local afterCampaign = GS:GetCurrentRecord().currentCampaignId
+    assertTrue(afterCampaign ~= priorCampaignId, "accept starts new campaign")
+    local newItemCount = 0
+    for _ in pairs(GS:GetCurrentRecord().accounting._consumables.requestedItems or {}) do
+        newItemCount = newItemCount + 1
+    end
+    assertEq(newItemCount, 0, "new campaign starts with empty goals")
+    local campArchives = GS:GetCurrentRecord().campaignArchives or {}
+    assertTrue(type(campArchives[priorCampaignId]) == "table",
+        "previous campaign configuration archived for Logs inspection")
+    assertTrue(GS:GetCurrentRecord().campaigns[priorCampaignId] ~= nil,
+        "prior campaign record retained for Logs")
 
-    -- Concurrent campaign change while the dialog is open keeps the bound op from applying.
+    -- (8) Repeated clicks do not create multiple campaigns without confirm.
+    local midId = GS:GetCurrentRecord().currentCampaignId
+    pendingConfirm = nil
+    newCampaignBtn:Click()
+    newCampaignBtn:Click()
+    assertTrue(pendingConfirm ~= nil, "repeat click still requires confirmation")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, midId,
+        "repeat click without accept creates no extra campaign")
+    -- Dismiss without accepting.
+    pendingConfirm = nil
+    assertEq(GS:GetCurrentRecord().currentCampaignId, midId,
+        "dismissed confirm leaves single campaign")
+
+    -- (7) Concurrent campaign change while the dialog is open rejects the stale bound op.
     pendingConfirm = nil
     newCampaignBtn:Click()
     local boundAccept = pendingConfirm.data
@@ -7350,6 +7444,16 @@ do
         assertEq(ncOverlay.mouseEnabled, false,
             "disabled tip: enabled control overlay EnableMouse(false)")
     end
+    local ncItem = findDefItem(refreshTipPanel, function(item)
+        return item.type == "button" and item.buttonText == "New Campaign"
+    end)
+    assertTrue(ncItem ~= nil, "disabled tip: New Campaign def present")
+    assertTrue(type(ncItem.tooltip) == "string"
+            and ncItem.tooltip:find("archived and can be viewed in Logs", 1, true),
+        "disabled tip: enabled New Campaign keeps explanatory tooltip got="
+            .. tostring(ncItem and ncItem.tooltip))
+    assertNil(ncItem.getDisabledTooltip(),
+        "disabled tip: enabled New Campaign getDisabledTooltip is nil")
     -- Static enabled tooltip on Activate row (when tip assigned) remains on definition.
     activateItem = findDefItem(refreshTipPanel, function(item)
         return item.type == "button" and item.buttonText
@@ -24750,3 +24854,316 @@ if failures > 0 then
     os.exit(1)
 end
 os.exit(0)
+
+---------------------------------------------------------------------------
+-- Codex PR #400 repair batch: A2 / B1 / B2 / C regressions
+---------------------------------------------------------------------------
+
+do
+    -- A2) Bootstrap fails closed when rank count is unavailable; recovers later.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer" } -- small guild (2 ranks)
+    settleRoster()
+
+    local priorNumRanks = GuildControlGetNumRanks
+    GuildControlGetNumRanks = function() return 0 end -- ranks unavailable
+    local member = GS.AuthenticateTransportSender("Alice-Garona")
+    -- Member may still resolve from roster; authority must fail closed.
+    local okAuth, authReason = GS.SenderHasEditorAuthority(member, { allowBootstrapInstall = true })
+    assertEq(okAuth, false, "A2: bootstrap denied while rank count unavailable")
+    assertTrue(authReason == "not_ready" or authReason == "rank_unavailable",
+        "A2: transient reason got=" .. tostring(authReason))
+    local stMiss, reasonMiss = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = "a2-missing-ranks",
+        activation = "staged",
+        acceptedOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
+    }, member)
+    assertEq(stMiss, "rejected", "A2: install rejected without ranks")
+    assertTrue(reasonMiss == "not_ready" or reasonMiss == "rank_unavailable",
+        "A2: install reason not permanent unauthorized got=" .. tostring(reasonMiss))
+    assertNil(select(1, GS:GetCurrentRecord()), "A2: no dataset installed without ranks")
+
+    -- Small guild: rank-2 must not bootstrap even when ranks become known.
+    GuildControlGetNumRanks = priorNumRanks
+    settleRoster()
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    local bob = GS.AuthenticateTransportSender("Bob-Garona")
+    local okBob, bobReason = GS.SenderHasEditorAuthority(bob, { allowBootstrapInstall = true })
+    assertEq(okBob, false, "A2: small-guild rank-2 bootstrap denied")
+    assertEq(bobReason, "unauthorized", "A2: small-guild rank-2 unauthorized")
+    local stBob = select(1, GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a2-rank2", activation = "staged",
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, bob))
+    assertEq(stBob, "rejected", "A2: rank-2 install rejected")
+
+    -- Verified GM bootstrap succeeds in the small guild.
+    local gm = GS.AuthenticateTransportSender("Alice-Garona")
+    local stGm, reasonGm = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a2-gm", activation = "staged",
+        bootstrapEditorRankPosition = 1,
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, gm)
+    assertEq(stGm, "accepted", "A2: GM bootstrap accepted reason=" .. tostring(reasonGm))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
+        "A2: small-guild bootstrap threshold is GM-only")
+
+    -- Ordinary guild (>=3 ranks): authorized editor may bootstrap.
+    resetDb()
+    initGS()
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+    }
+    settleRoster()
+    local carol = GS.AuthenticateTransportSender("Carol-Garona")
+    local stCarol, reasonCarol = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a2-ordinary", activation = "staged",
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, carol)
+    assertEq(stCarol, "accepted", "A2: ordinary-guild rank-3 bootstrap accepted r="
+        .. tostring(reasonCarol))
+end
+
+do
+    -- B1) Late log update for tab A must not stamp newly configured tab B.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local tabOpA = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 1))
+    assertEq(GS:ApplyStagedConfigOperation(tabOpA), "accepted", "B1: set tab A")
+    local itemOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 100 }, {
+        itemId = 100, goal = 1, removed = false,
+    }))
+    if itemOp then GS:ApplyStagedConfigOperation(itemOp) end
+
+    world.bankTxnCounts = { [1] = 0, [2] = 0 }
+    world.bankTabInfo = {
+        [1] = { name = "TabA", isViewable = true },
+        [2] = { name = "TabB", isViewable = true },
+    }
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction()
+        return "deposit", "Donor-Garona", nil, 1, nil, nil, 0, 1, 1, 1
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    local queriedTabs = {}
+    function QueryGuildBankLog(tab)
+        queriedTabs[#queriedTabs + 1] = tab
+    end
+
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    BankLog.bankOpen = true
+    BankLog.active = false
+    BankLog.awaitingLogUpdate = false
+    BankLog.queryRetries = 0
+    BankLog.queryToken = 0
+    BankLog.activeContext = nil
+    BankLog.pendingQuery = nil
+    BankLog.pendingAdmit = nil
+    BankLog.lastFreshLogAt = nil
+    BankLog.lastFreshLogTab = nil
+    BankLog.lastFreshLogGuild = nil
+
+    assertEq(BankLog:BeginObservation("open"), true, "B1: begin observation on tab A")
+    assertEq(BankLog.activeContext.bankTab, 1, "B1: querying tab A")
+    assertEq(BankLog.awaitingLogUpdate, true, "B1: awaiting tab A response")
+    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 1, "B1: pending bound to A")
+
+    -- Switch configured tab to B before A's response arrives.
+    local tabOpB = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
+    assertEq(GS:ApplyStagedConfigOperation(tabOpB), "accepted", "B1: switch to tab B")
+    BankLog:OnProfileMaybeChanged()
+    -- Outstanding A response (uncorrelated GUILDBANKLOG_UPDATE).
+    local queriesBeforeLate = #queriedTabs
+    BankLog:ProcessLogUpdate("late-A")
+    assertTrue(BankLog.lastFreshLogTab ~= 2,
+        "B1: late A update must not stamp tab B got=" .. tostring(BankLog.lastFreshLogTab))
+    assertEq(GS.IsBankContextSampleReady(2), false,
+        "B1: tab B not ready after late A response")
+    -- A fresh query for B should have been re-armed.
+    assertTrue(#queriedTabs > queriesBeforeLate, "B1: re-armed query for new context")
+    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 2,
+        "B1: pending rebound to tab B")
+
+    -- Authentic B completion.
+    BankLog:ProcessLogUpdate("B-ok")
+    assertEq(BankLog.lastFreshLogTab, 2, "B1: authentic B sample stamps tab B")
+    assertEq(GS.IsBankContextSampleReady(2), true, "B1: tab B ready after own sample")
+
+    GetGuildBankTabInfo = nil
+    QueryGuildBankLog = nil
+end
+
+do
+    -- B2) Snapshot deferred for roster readiness recovers on GUILD_ROSTER_UPDATE.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    local record = seedActivatableCampaign(9402, 5)
+    local _, stAct = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted", "B2: activate for live observation")
+
+    world.bankTxnCounts = { [2] = 1 }
+    world.bankTabInfo = { [2] = { name = "Supplies", isViewable = true } }
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction()
+        return "deposit", "Donor-Garona", "|cffffffff|Hitem:100::::::::|h[Item]|h|r",
+            1, nil, nil, 0, 0, 0, 0
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    function QueryGuildBankLog() end
+
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    BankLog.bankOpen = true
+    BankLog.active = false
+    BankLog.awaitingLogUpdate = false
+    BankLog.pendingAdmit = nil
+    BankLog.rosterAdmitFrame = nil
+    BankLog.lastFreshLogTab = nil
+
+    -- Force GetCurrentContext to report not ready during first admit.
+    local priorGetCtx = GS.GetCurrentContext
+    local ctxBlocked = true
+    function GS:GetCurrentContext()
+        if ctxBlocked then
+            return {
+                ready = false,
+                reason = "roster_incomplete",
+                guildKey = "club:42",
+                handleGeneration = 1,
+            }
+        end
+        return priorGetCtx(self)
+    end
+
+    assertEq(BankLog:BeginObservation("open"), true, "B2: begin live observation")
+    BankLog:ProcessLogUpdate("early")
+    assertEq(BankLog.lastFreshLogTab, 2, "B2: stamp still recorded for activation freshness")
+    assertTrue(type(BankLog.pendingAdmit) == "table", "B2: snapshot retained while roster incomplete")
+    assertTrue(BankLog.lastStats and BankLog.lastStats.deferred == true,
+        "B2: admit deferred")
+    local eventsBefore = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+
+    -- Roster becomes ready; listener re-evaluates once.
+    ctxBlocked = false
+    assertTrue(BankLog.rosterAdmitFrame ~= nil, "B2: roster admit listener armed")
+    local frame = BankLog.rosterAdmitFrame
+    assertTrue(frame.scripts and frame.scripts.OnEvent, "B2: roster listener has OnEvent")
+    frame.scripts.OnEvent(frame, "GUILD_ROSTER_UPDATE")
+    assertNil(BankLog.pendingAdmit, "B2: pending admit cleared after recovery")
+    assertTrue(BankLog.rosterAdmitFrame == nil, "B2: roster listener released")
+    local eventsAfter = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    assertTrue(eventsAfter >= eventsBefore, "B2: recovery did not shrink ledger")
+    -- Second roster event must not duplicate when pending is gone.
+    if frame.scripts and frame.scripts.OnEvent then
+        frame.scripts.OnEvent(frame, "GUILD_ROSTER_UPDATE")
+    end
+    assertEq(#(GS:GetCurrentRecord().accounting._consumableEvents or {}), eventsAfter,
+        "B2: no duplicate admit after pending cleared")
+
+    GS.GetCurrentContext = priorGetCtx
+    GetGuildBankTabInfo = nil
+    QueryGuildBankLog = nil
+    disarmFreshBankSample()
+end
+
+do
+    -- C) Export GetRecordBody must not rescan the native roster per record.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    for i = 1, 12 do
+        local op = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 1000 + i }, {
+            itemId = 1000 + i, goal = i, removed = false,
+        }))
+        assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "C: seed item " .. i)
+    end
+    -- Ensure provider export index is built.
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("test-c-export")
+    end
+    local provider = GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(provider and provider.api and provider.api.GetRecordBody,
+        "C: provider GetRecordBody available")
+    local ids = {}
+    if provider.api.ListRecordIds then
+        local page = select(1, provider.api.ListRecordIds(1, 64))
+        for i = 1, #(page or {}) do
+            ids[#ids + 1] = page[i]
+        end
+    end
+    assertTrue(#ids >= 8, "C: export has multiple record ids got=" .. tostring(#ids))
+
+    local walksBefore = 0
+    local priorGetRoster = GetGuildRosterInfo
+    GetGuildRosterInfo = function(i)
+        walksBefore = walksBefore + 1
+        return priorGetRoster(i)
+    end
+    -- Warm demand-roster bind once.
+    assertTrue(GS:GetCurrentContext().ready == true, "C: context ready before export hot path")
+    local baselineWalks = walksBefore
+    walksBefore = 0
+    for i = 1, math.min(8, #ids) do
+        local body = provider.api.GetRecordBody(ids[i])
+        assertTrue(type(body) == "table", "C: body " .. tostring(ids[i]))
+        if provider.api.GetRecordVersionFp then
+            assertTrue(type(provider.api.GetRecordVersionFp(ids[i])) == "string",
+                "C: versionFp " .. tostring(ids[i]))
+        end
+    end
+    assertTrue(walksBefore <= 2,
+        "C: roster walks must not scale with GetRecordBody count walks="
+            .. tostring(walksBefore) .. " baselineWarm=" .. tostring(baselineWalks))
+
+    -- Guild switch invalidates export scope (fail closed; no stale bodies).
+    world.guild.clubId = 88
+    settleRoster()
+    fireEvent("GUILD_ROSTER_UPDATE")
+    local staleBody = provider.api.GetRecordBody(ids[1])
+    assertNil(staleBody, "C: stale export body withheld after guild switch")
+    GetGuildRosterInfo = priorGetRoster
+    world.guild.clubId = 42
+    settleRoster()
+    fireEvent("GUILD_ROSTER_UPDATE")
+end
+
