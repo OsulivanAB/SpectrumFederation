@@ -1938,6 +1938,146 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- Partial-sync lifecycle: incomplete concurrent shells (regressions A/B)
+---------------------------------------------------------------------------
+
+do
+    -- Regression A: Change Main before a late alt arrives.
+    -- A: G1 Alice+Bob+Dave. B: G2 Alice+Carol+Eve.
+    -- A receives G2+Carol only, promotes Bob, then Eve arrives.
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "psA A Bob")
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Dave-Garona"),
+        "accepted", "psA A Dave")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "psA B Carol")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Eve-Garona"),
+        "accepted", "psA B Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local recB = select(1, GI:GetCurrentRecord())
+    local gB, eveMem, carolMem
+    for _, g in pairs(recB.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            gB = g
+        end
+    end
+    eveMem = recB.members["Player-1-Eve"]
+    carolMem = recB.members["Player-1-Carol"]
+    assertTrue(gB and eveMem and carolMem, "psA captured B cohort")
+
+    -- Partial admit: G2 + Carol only (not Eve, not B's Alice membership).
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    admitWire(dbA, wireMember(carolMem), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Carol")), "Player-1-Alice", "psA Carol visible")
+    assertNil(select(1, peerRole(dbA, "Player-1-Eve")), "psA Eve not yet present")
+
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    assertEq(GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "psA promote Bob with incomplete G2")
+    assertEq(select(1, GI:GetCharacterRole("Player-1-Bob")), "main", "psA Bob main")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Carol")), "Player-1-Bob", "psA Carol under Bob")
+
+    -- Late Eve; B offline afterward.
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Bob",
+        "psA late Eve under Bob (not orphaned)")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    local groups = GI:GetRelationshipGroups()
+    assertEq(#groups, 1, "psA one logical group")
+    assertEq(groups[1].mainGuid, "Player-1-Bob", "psA Bob remains main")
+    local seen = {}
+    for i = 1, #groups[1].altGuids do seen[groups[1].altGuids[i]] = true end
+    assertTrue(seen["Player-1-Alice"], "psA Alice alt")
+    assertTrue(seen["Player-1-Dave"], "psA Dave alt")
+    assertTrue(seen["Player-1-Carol"], "psA Carol alt")
+    assertTrue(seen["Player-1-Eve"], "psA Eve alt after late delivery")
+
+    -- Reverse catch-up + third peer + reload.
+    syncAll(dbA, dbB, "Alice-Garona")
+    syncAll(dbB, dbA, "Carol-Garona")
+    assertEq(select(2, peerRole(dbB, "Player-1-Eve")), "Player-1-Bob", "psA B Eve under Bob")
+    local dbC = seedEmptyPeer()
+    syncAll(dbA, dbC, "Alice-Garona")
+    assertEq(select(2, peerRole(dbC, "Player-1-Eve")), "Player-1-Bob", "psA C Eve under Bob")
+    local saved = deepCopy(dbA)
+    reloadModules(saved)
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", "psA reload Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- Regression B: Unassign with G2 shell only (Carol membership not yet arrived).
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "psB A Bob")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "psB B Carol")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local recB = select(1, GI:GetCurrentRecord())
+    local gB, carolMem, aliceMemB
+    for _, g in pairs(recB.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            gB = g
+        end
+    end
+    carolMem = recB.members["Player-1-Carol"]
+    aliceMemB = recB.members["Player-1-Alice"]
+    assertTrue(gB and carolMem, "psB captured B group+Carol")
+
+    -- Group-first only on A.
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    local recA = select(1, GI:GetCurrentRecord())
+    assertTrue(recA.groups[gB.groupId] ~= nil and not recA.groups[gB.groupId].dissolved,
+        "psB G2 shell live before Unassign")
+    assertNil(recA.members["Player-1-Carol"], "psB Carol membership absent")
+
+    assertEq(GI:UnassignAlt("Player-1-Bob", {}), "accepted", "psB unassign Bob with shell sibling")
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "psB Bob gone")
+    -- Alice must remain (not tombstoned); Carol arrives next.
+    local aliceAfter = select(1, GI:GetCurrentRecord()).members["Player-1-Alice"]
+    assertTrue(aliceAfter and type(aliceAfter.groupId) == "string",
+        "psB Alice membership still assigned after Unassign Bob")
+
+    admitWire(dbA, wireMember(carolMem), "Carol-Garona")
+    if aliceMemB then
+        admitWire(dbA, wireMember(aliceMemB), "Carol-Garona")
+    end
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Carol")), "Player-1-Alice",
+        "psB Carol survives Unassign-during-shell")
+    assertNil(select(1, peerRole(dbA, "Player-1-Bob")), "psB Bob stays unassigned")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    local groups = GI:GetRelationshipGroups()
+    assertEq(#groups, 1, "psB one visible group")
+    assertEq(groups[1].mainGuid, "Player-1-Alice", "psB Alice main")
+    assertEq(#groups[1].altGuids, 1, "psB only Carol alt")
+    assertEq(groups[1].altGuids[1], "Player-1-Carol", "psB Carol is the alt")
+
+    syncAll(dbA, dbB, "Alice-Garona")
+    syncAll(dbB, dbA, "Carol-Garona")
+    assertEq(select(2, peerRole(dbB, "Player-1-Carol")), "Player-1-Alice", "psB B Carol under Alice")
+    local saved = deepCopy(dbA)
+    reloadModules(saved)
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Carol")), "Player-1-Alice", "psB reload Carol")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+---------------------------------------------------------------------------
 -- Scenario A: genuine later move must survive synthetic reconcile versions
 ---------------------------------------------------------------------------
 

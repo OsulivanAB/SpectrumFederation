@@ -10,6 +10,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 ### Fixed
 - Guild Info: concurrent same-main groups use derived-view absorption (no synthetic versions / loser dissolve) so genuine offline moves and late member records survive (#402)
 - Guild Info: Unassign / Change Main operate on the logical absorbed group so unrelated concurrent alts are not dropped (#402)
+- Guild Info: incomplete concurrent group shells survive Change Main / Unassign via `forwardTo` aliases and sibling-shell guards so late members are not orphaned (#402)
 
 ## [1.5.12-beta.15] - 2026-10-20
 

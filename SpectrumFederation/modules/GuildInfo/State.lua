@@ -255,10 +255,39 @@ local function PickCanonicalClaimGroup(record, mainGuid, claimantGids)
     return winner
 end
 
+--- Resolve membership groupId through a bounded dissolved forwardTo chain.
+-- Incomplete concurrent shells retired by Change Main keep late members visible.
+local function ResolveEffectiveGroupId(groups, gid)
+    local seen = {}
+    local cur = gid
+    for _ = 1, 8 do
+        if type(cur) ~= "string" or cur == "" then
+            return nil
+        end
+        if seen[cur] then
+            return nil
+        end
+        seen[cur] = true
+        local g = groups and groups[cur]
+        if type(g) ~= "table" then
+            return nil
+        end
+        if type(g.forwardTo) == "string" and g.forwardTo ~= "" then
+            cur = g.forwardTo
+        elseif g.dissolved then
+            return nil
+        else
+            return cur
+        end
+    end
+    return nil
+end
+
 --- Build derived display graph. Concurrent groups that claim the same main are
 -- absorbed into one canonical view without rewriting durable membership/group
 -- versions (no BeatVers / dissolve). Loser shells stay stored until genuine
--- user edits move their members away.
+-- user edits move their members away. Dissolved groups may carry forwardTo so
+-- late memberships remain resolvable after Change Main consolidation.
 local function RebuildDerived(record)
     local graph = EmptyGraph()
     local members = record.members or {}
@@ -291,15 +320,15 @@ local function RebuildDerived(record)
         end
     end
 
-    -- Collect members per effective (post-absorb) groupId.
+    -- Collect members per effective (forward + absorb) groupId.
     local byGroup = {}
     for guid, m in pairs(members) do
         if type(m) == "table" and ValidGuid(guid) then
             local gid = m.groupId
             if type(gid) == "string" and gid ~= "" then
-                local src = groups[gid]
-                if type(src) == "table" and not src.dissolved then
-                    local effective = absorbTo[gid] or gid
+                local resolved = ResolveEffectiveGroupId(groups, gid)
+                if resolved then
+                    local effective = absorbTo[resolved] or resolved
                     local g = groups[effective]
                     if type(g) == "table" and not g.dissolved then
                         byGroup[effective] = byGroup[effective] or {}
@@ -317,11 +346,11 @@ local function RebuildDerived(record)
         local mainMovedAway = false
         if type(g.mainGuid) == "string" then
             local mm = members[g.mainGuid]
-            local mmGid = mm and mm.groupId
-            local mmEffective = (type(mmGid) == "string" and mmGid ~= "") and (absorbTo[mmGid] or mmGid) or nil
+            local mmResolved = mm and ResolveEffectiveGroupId(groups, mm.groupId) or nil
+            local mmEffective = mmResolved and (absorbTo[mmResolved] or mmResolved) or nil
             if mm and mmEffective == gid then
                 mainGuid = g.mainGuid
-            elseif mm and type(mmGid) == "string" and mmGid ~= "" and mmEffective ~= gid then
+            elseif mm and mmResolved and mmEffective ~= gid then
                 -- Designated main lives in another non-absorbed live group.
                 mainMovedAway = true
             end
@@ -402,8 +431,21 @@ local function ValidateGroupBody(g)
     if not IsFiniteNonnegInt(g.at) then
         return false, "invalid_group_at"
     end
+    local fwd = g.forwardTo
+    if fwd ~= nil then
+        if type(fwd) ~= "string" or fwd == "" or #fwd > GI.MAX_GROUP_ID then
+            return false, "invalid_group_forward"
+        end
+        if fwd == g.groupId then
+            return false, "invalid_group_forward"
+        end
+    end
     if g.dissolved then
         return true
+    end
+    if fwd ~= nil then
+        -- Live groups do not carry forward aliases.
+        return false, "invalid_group_forward"
     end
     if not ValidGuid(g.mainGuid) then
         return false, "invalid_group_main"
@@ -787,13 +829,18 @@ local function StoreMemberDirect(record, guid, groupId, ver, at, nameRealm, clas
     return stored
 end
 
-local function StoreGroupDirect(record, groupId, mainGuid, ver, at, dissolved)
+local function StoreGroupDirect(record, groupId, mainGuid, ver, at, dissolved, forwardTo)
+    local fwd = nil
+    if dissolved and type(forwardTo) == "string" and forwardTo ~= "" and forwardTo ~= groupId then
+        fwd = forwardTo
+    end
     local stored = {
         groupId = groupId,
         mainGuid = dissolved and nil or mainGuid,
         ver = { n = ver.n, w = ver.w },
         at = tonumber(at) or 0,
         dissolved = dissolved and true or nil,
+        forwardTo = fwd,
     }
     record.groups[groupId] = stored
     return stored
@@ -951,7 +998,8 @@ function GI.MergeGroup(record, group, opts)
         group.mainGuid,
         group.ver,
         group.at,
-        group.dissolved and true or false
+        group.dissolved and true or false,
+        group.forwardTo
     )
     RebuildDerived(record)
     return "accepted", nil
@@ -1021,8 +1069,9 @@ local function LogicalMainHasOtherAlts(record, mainGuid, excludeGuid)
 end
 
 --- Dissolve a physical group only when doing so cannot hide logical-group alts.
--- Empty shells: always dissolvable. Solo designated main: keep while sibling
--- claimant groups still hold other durable alts (derived absorb partners).
+-- Empty live shells are NOT dissolved here: absence of memberships means
+-- incomplete Gossip, not proof the group is empty. Solo designated main: keep
+-- while any sibling live claimant exists (shell or populated).
 local function ShouldDissolvePhysicalGroup(record, groupId)
     local g = record.groups and record.groups[groupId]
     if not GroupIsLive(g) then
@@ -1039,13 +1088,22 @@ local function ShouldDissolvePhysicalGroup(record, groupId)
         end
     end
     if n == 0 then
-        return true
+        return false
     end
     if hasAlt then
         return false
     end
-    if ValidGuid(g.mainGuid) and LogicalMainHasOtherAlts(record, g.mainGuid, nil) then
-        return false
+    -- Solo main: keep while a sibling claimant shell/group may still deliver alts.
+    if ValidGuid(g.mainGuid) then
+        local siblings = ClaimantGroupIds(record, g.mainGuid)
+        for i = 1, #siblings do
+            if siblings[i] ~= groupId then
+                return false
+            end
+        end
+        if LogicalMainHasOtherAlts(record, g.mainGuid, nil) then
+            return false
+        end
     end
     return true
 end
@@ -1114,10 +1172,40 @@ local function DissolveEmptyGroup(record, groupId)
     end
 end
 
---- Officer-authorized consolidate: move every durable member of groups claiming
--- mainGuid into targetGroupId using genuine local _NextVer writes, then dissolve
--- emptied sibling shells. Used by Change Main so the logical displayed group is
--- one physical group before mainGuid flips.
+--- Officer-authorized: retire a concurrent physical group as a dissolved forward
+-- alias to the canonical group so late memberships remain resolvable.
+local function RetireGroupAsForward(record, fromGid, toGid)
+    if type(fromGid) ~= "string" or fromGid == "" or fromGid == toGid then
+        return true
+    end
+    local g = record.groups and record.groups[fromGid]
+    if not g then
+        return true
+    end
+    if g.dissolved and g.forwardTo == toGid then
+        return true
+    end
+    local ver, vErr = GI:_NextVer(g.ver)
+    if not ver then
+        return false, vErr or "no_effect"
+    end
+    local st = GI.MergeGroup(record, {
+        groupId = fromGid,
+        ver = ver,
+        at = Now(),
+        dissolved = true,
+        forwardTo = toGid,
+    }, { skipReconcile = true })
+    if st ~= "accepted" and st ~= "duplicate" then
+        return false, st
+    end
+    return true
+end
+
+--- Officer-authorized consolidate: move every currently known durable member of
+-- groups claiming mainGuid into targetGroupId, then retire emptied/sibling
+-- claimants as forward aliases (not hard-delete). Incomplete shells must keep
+-- late-arriving members resolvable after Change Main.
 local function ConsolidateLogicalGroupTo(record, mainGuid, targetGroupId)
     if type(targetGroupId) ~= "string" or targetGroupId == "" then
         return false, "group_missing"
@@ -1151,12 +1239,10 @@ local function ConsolidateLogicalGroupTo(record, mainGuid, targetGroupId)
                     return false, st
                 end
             end
-        end
-    end
-    for i = 1, #claimants do
-        local gid = claimants[i]
-        if gid ~= targetGroupId and ShouldDissolvePhysicalGroup(record, gid) then
-            DissolveEmptyGroup(record, gid)
+            local okFwd, fwdErr = RetireGroupAsForward(record, gid, targetGroupId)
+            if not okFwd then
+                return false, fwdErr or "no_effect"
+            end
         end
     end
     RebuildDerived(record)
