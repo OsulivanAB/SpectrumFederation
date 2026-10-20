@@ -41,6 +41,11 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.GuildSupplies:Initialize(SpectrumFederationDB)
         end
 
+        -- Guild Info main/alt relationships (independent of Loot Helper and Guild Supplies).
+        if SF.GuildInfo and SF.GuildInfo.Initialize then
+            SF.GuildInfo:Initialize(SpectrumFederationDB)
+        end
+
         -- Enable Loot Helper Sync system (registers slash commands and event handlers)
         if SF.LootHelperSync and SF.LootHelperSync.Enable then
             SF.LootHelperSync:Enable()
