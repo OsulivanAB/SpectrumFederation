@@ -2078,6 +2078,301 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- Forward-alias lifecycle: destination + reclaim retention (faA / faB)
+---------------------------------------------------------------------------
+
+do
+    -- faA: destination must stay usable after visible alts are unassigned.
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "faA A Bob")
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Dave-Garona"),
+        "accepted", "faA A Dave")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "faA B Carol")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Eve-Garona"),
+        "accepted", "faA B Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local recB = select(1, GI:GetCurrentRecord())
+    local gB, eveMem, carolMem
+    for _, g in pairs(recB.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            gB = g
+        end
+    end
+    eveMem = recB.members["Player-1-Eve"]
+    carolMem = recB.members["Player-1-Carol"]
+    assertTrue(gB and eveMem and carolMem, "faA captured B cohort")
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    admitWire(dbA, wireMember(carolMem), "Carol-Garona")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    assertEq(GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faA promote Bob")
+    local recA = select(1, GI:GetCurrentRecord())
+    assertTrue(recA.groups[gB.groupId] and recA.groups[gB.groupId].forwardTo,
+        "faA G2 is forward alias after CM")
+
+    -- Unassign every currently visible alt; destination must not dissolve.
+    assertEq(GI:UnassignAlt("Player-1-Alice", {}), "accepted", "faA unassign Alice")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "faA unassign Dave")
+    assertEq(GI:UnassignAlt("Player-1-Carol", {}), "accepted", "faA unassign Carol")
+    recA = select(1, GI:GetCurrentRecord())
+    local destLive, destGid = false, nil
+    for gid, g in pairs(recA.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Bob" then
+            destLive = true
+            destGid = gid
+        end
+    end
+    assertTrue(destLive, "faA Bob destination still live for inbound forward")
+    assertTrue(recA.groups[gB.groupId] ~= nil, "faA alias row retained")
+    assertEq(recA.groups[gB.groupId].forwardTo, destGid, "faA alias still forwards to live destination")
+
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Bob",
+        "faA late Eve under Bob after destination kept")
+    -- Reverse delivery + duplicate Eve wire must stay idempotent.
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Bob",
+        "faA duplicate Eve/group wires stay under Bob")
+    syncAll(dbA, dbB, "Alice-Garona")
+    assertEq(select(2, peerRole(dbB, "Player-1-Eve")), "Player-1-Bob", "faA B converges Eve")
+    local dbC = seedEmptyPeer()
+    syncAll(dbA, dbC, "Alice-Garona")
+    assertEq(select(2, peerRole(dbC, "Player-1-Eve")), "Player-1-Bob", "faA C catch-up Eve")
+    local saved = deepCopy(dbA)
+    reloadModules(saved)
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", "faA reload Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    -- Later genuine edits after late membership must still apply.
+    assertEq(GI:UnassignAlt("Player-1-Eve", {}), "accepted", "faA later unassign Eve")
+    assertNil(select(1, GI:GetCharacterRole("Player-1-Eve")), "faA Eve unassigned")
+    assertEq(GI:AssignAlt("Bob-Garona", "Eve-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faA reassign Eve under Bob")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", "faA Eve reassigned")
+    assertEq(GI:ChangeMain("Player-1-Bob", "Player-1-Eve", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faA later Change Main Bob→Eve")
+    assertEq(select(1, GI:GetCharacterRole("Player-1-Eve")), "main",
+        "faA Eve becomes main after later Change Main")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Eve",
+        "faA Bob becomes alt under Eve")
+    local counts = GI.CountRetainedState()
+    assertTrue(counts.groups <= GI.MAX_GROUPS,
+        "faA retained groups bounded got=" .. tostring(counts.groups))
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- faB: forward alias must survive capacity reclaim before late membership.
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "faB A Bob")
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Dave-Garona"),
+        "accepted", "faB A Dave")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "faB B Carol")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Eve-Garona"),
+        "accepted", "faB B Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local recB = select(1, GI:GetCurrentRecord())
+    local gB, eveMem, carolMem
+    for _, g in pairs(recB.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            gB = g
+        end
+    end
+    eveMem = recB.members["Player-1-Eve"]
+    carolMem = recB.members["Player-1-Carol"]
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    admitWire(dbA, wireMember(carolMem), "Carol-Garona")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    assertEq(GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faB promote Bob")
+    local recA = select(1, GI:GetCurrentRecord())
+    assertTrue(recA.groups[gB.groupId] and recA.groups[gB.groupId].forwardTo,
+        "faB alias present before reclaim pressure")
+
+    -- Synthetic roster extras for churned groups that produce reclaimable dissolved rows.
+    local extras = {}
+    for i = 1, 12 do
+        local name = "Extra" .. i .. "-Garona"
+        local guid = "Player-9-Extra" .. i
+        extras[#extras + 1] = { name = name, guid = guid }
+        table.insert(world.guild.members, {
+            name = name, guid = guid, rankOrder = 5, online = false, class = "WARRIOR",
+        })
+    end
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+
+    local savedMax = GI.MAX_GROUPS
+    GI.MAX_GROUPS = 6
+    -- Churn unrelated pairs to create dissolved tombstones and force reclaim attempts.
+    for i = 1, 20 do
+        local a = extras[((i - 1) % #extras) + 1]
+        local b = extras[(i % #extras) + 1]
+        if a.guid ~= b.guid then
+            GI:AssignAlt(a.name, b.name, { roster = GI.GetRosterSnapshot(true) })
+            GI:UnassignAlt(b.guid, {})
+        end
+        GI.EnsureGroupCapacity(select(1, GI:GetCurrentRecord()))
+        GI.ReclaimUnreferencedDissolved(select(1, GI:GetCurrentRecord()))
+    end
+    GI.MAX_GROUPS = savedMax
+    recA = select(1, GI:GetCurrentRecord())
+    local aliasG = recA.groups[gB.groupId]
+    assertTrue(aliasG ~= nil, "faB forward alias not GC'd under reclaim pressure")
+    assertTrue(aliasG and aliasG.forwardTo ~= nil, "faB forwardTo metadata retained")
+
+    local countsBeforeEve = GI.CountRetainedState()
+    assertTrue(countsBeforeEve.groups <= 6,
+        "faB retained groups stay within lowered cap got=" .. tostring(countsBeforeEve.groups))
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Bob",
+        "faB late Eve resolves after alias retained through reclaim")
+    -- Reverse order: re-admit alias group then Eve duplicate.
+    if aliasG then
+        admitWire(dbA, wireGroup(aliasG), "Carol-Garona")
+    end
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Bob",
+        "faB reverse/duplicate admission keeps Eve")
+    local dbC = seedEmptyPeer()
+    syncAll(dbA, dbC, "Alice-Garona")
+    assertEq(select(2, peerRole(dbC, "Player-1-Eve")), "Player-1-Bob", "faB C catch-up Eve")
+    local saved = deepCopy(dbA)
+    reloadModules(saved)
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", "faB reload Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    assertEq(GI:UnassignAlt("Player-1-Eve", {}), "accepted", "faB later unassign Eve")
+    assertEq(GI:AssignAlt("Bob-Garona", "Eve-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faB later reassign Eve")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Bob", "faB Eve after later edits")
+
+    -- Cleanup synthetic roster rows.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if not tostring(m.guid):match("^Player%-9%-Extra") then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- faC: intermediate alias in a forward chain must survive reclaim.
+    local dbA = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "faC seed Bob")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    local recA = select(1, GI:GetCurrentRecord())
+    local destGid
+    for gid, g in pairs(recA.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            destGid = gid
+        end
+    end
+    assertTrue(destGid ~= nil, "faC destination present")
+    -- Inject G-mid → dest and G-leaf → G-mid (transitive forward chain).
+    local midId = "gi-fwd-mid"
+    local leafId = "gi-fwd-leaf"
+    local midG = {
+        groupId = midId,
+        mainGuid = "Player-1-Alice",
+        ver = { n = 1, w = "Player-1-Carol" },
+        at = 9001,
+        dissolved = true,
+        forwardTo = destGid,
+    }
+    local leafG = {
+        groupId = leafId,
+        mainGuid = "Player-1-Alice",
+        ver = { n = 1, w = "Player-1-Carol" },
+        at = 9002,
+        dissolved = true,
+        forwardTo = midId,
+    }
+    assertEq(admitWire(dbA, wireGroup(midG), "Carol-Garona"), "accepted", "faC admit mid alias")
+    assertEq(admitWire(dbA, wireGroup(leafG), "Carol-Garona"), "accepted", "faC admit leaf alias")
+    local eveMem = {
+        guid = "Player-1-Eve",
+        groupId = leafId,
+        ver = { n = 1, w = "Player-1-Carol" },
+        at = 9003,
+        nameRealm = "Eve-Garona",
+        classFile = "HUNTER",
+    }
+    -- Capacity reclaim must not drop mid or leaf before Eve arrives.
+    local extras = {}
+    for i = 1, 10 do
+        local name = "Chain" .. i .. "-Garona"
+        local guid = "Player-8-Chain" .. i
+        extras[#extras + 1] = { name = name, guid = guid }
+        table.insert(world.guild.members, {
+            name = name, guid = guid, rankOrder = 5, online = false, class = "WARRIOR",
+        })
+    end
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    local savedMax = GI.MAX_GROUPS
+    GI.MAX_GROUPS = 5
+    for i = 1, 16 do
+        local a = extras[((i - 1) % #extras) + 1]
+        local b = extras[(i % #extras) + 1]
+        if a.guid ~= b.guid then
+            GI:AssignAlt(a.name, b.name, { roster = GI.GetRosterSnapshot(true) })
+            GI:UnassignAlt(b.guid, {})
+        end
+        GI.EnsureGroupCapacity(select(1, GI:GetCurrentRecord()))
+        GI.ReclaimUnreferencedDissolved(select(1, GI:GetCurrentRecord()))
+    end
+    GI.MAX_GROUPS = savedMax
+    recA = select(1, GI:GetCurrentRecord())
+    local leafGNow = recA.groups[leafId]
+    local midGNow = recA.groups[midId]
+    local destGNow = recA.groups[destGid]
+    assertTrue(leafGNow ~= nil, "faC leaf alias retained under reclaim")
+    assertTrue(midGNow ~= nil, "faC mid alias retained under reclaim")
+    assertEq(leafGNow and leafGNow.forwardTo, midId, "faC leaf still points at mid")
+    assertEq(midGNow and midGNow.forwardTo, destGid, "faC mid still points at destination")
+    assertTrue(destGNow and not destGNow.dissolved, "faC destination live while inbound chain exists")
+    assertEq(admitWire(dbA, wireMember(eveMem), "Carol-Garona"), "accepted", "faC late Eve via leaf")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Alice",
+        "faC Eve resolves through leaf→mid→dest")
+    local counts = GI.CountRetainedState()
+    assertTrue(counts.groups <= GI.MAX_GROUPS,
+        "faC groups bounded got=" .. tostring(counts.groups))
+    -- Cleanup synthetic roster rows.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if not tostring(m.guid):match("^Player%-8%-Chain") then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
+---------------------------------------------------------------------------
 -- Scenario A: genuine later move must survive synthetic reconcile versions
 ---------------------------------------------------------------------------
 

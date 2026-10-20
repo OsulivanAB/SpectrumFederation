@@ -846,9 +846,28 @@ local function StoreGroupDirect(record, groupId, mainGuid, ver, at, dissolved, f
     return stored
 end
 
+--- True when any group record forwards into groupId (direct inbound dependency).
+local function GroupHasInboundForwards(record, groupId)
+    if type(groupId) ~= "string" or groupId == "" then
+        return false
+    end
+    for _, g in pairs(record.groups or {}) do
+        if type(g) == "table" and g.forwardTo == groupId then
+            return true
+        end
+    end
+    return false
+end
+
+local function IsRetainedForwardAlias(g)
+    return type(g) == "table" and type(g.forwardTo) == "string" and g.forwardTo ~= ""
+end
+
 --- Reclaim unreferenced dissolved groups (safe: no membership points at them).
 -- Membership tombstones are NOT auto-deleted; they remain until MAX_MEMBERS
 -- fail-closed so stale peers cannot resurrect deleted relationships.
+-- Forward aliases and their destinations are retained while incomplete Gossip may
+-- still deliver memberships that depend on them (absence ≠ complete).
 function GI.ReclaimUnreferencedDissolved(record)
     if type(record) ~= "table" or type(record.groups) ~= "table" then
         return 0, {}
@@ -857,7 +876,13 @@ function GI.ReclaimUnreferencedDissolved(record)
     local victims = {}
     for gid, g in pairs(record.groups) do
         if g.dissolved and not GroupIsReferenced(record, gid) then
-            victims[#victims + 1] = gid
+            if IsRetainedForwardAlias(g) then
+                -- Keep alias metadata for late members still in flight.
+            elseif GroupHasInboundForwards(record, gid) then
+                -- Keep destination/intermediate while inbound aliases exist.
+            else
+                victims[#victims + 1] = gid
+            end
         end
     end
     for i = 1, #victims do
@@ -1071,10 +1096,14 @@ end
 --- Dissolve a physical group only when doing so cannot hide logical-group alts.
 -- Empty live shells are NOT dissolved here: absence of memberships means
 -- incomplete Gossip, not proof the group is empty. Solo designated main: keep
--- while any sibling live claimant exists (shell or populated).
+-- while any sibling live claimant exists (shell or populated), or while any
+-- inbound forward alias may still deliver late members to this destination.
 local function ShouldDissolvePhysicalGroup(record, groupId)
     local g = record.groups and record.groups[groupId]
     if not GroupIsLive(g) then
+        return false
+    end
+    if GroupHasInboundForwards(record, groupId) then
         return false
     end
     local n = 0
@@ -1135,6 +1164,11 @@ local function DissolveEmptyGroup(record, groupId)
     end
     local oldG = record.groups[groupId]
     if not oldG or oldG.dissolved then
+        return
+    end
+    -- Destinations with unresolved inbound forward aliases stay live so late
+    -- memberships can still resolve into a usable group.
+    if GroupHasInboundForwards(record, groupId) then
         return
     end
     local remaining = {}
