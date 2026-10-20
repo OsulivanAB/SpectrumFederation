@@ -2,6 +2,18 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.15] - 2026-10-20
+
+### Changed
+- Raid consumables migration out of loot helper
+- Guild Supplies 3B: donation ledger gossip (#388)
+- Guild Supplies 3A: Staged Configuration Gossip (#387)
+- Guild Supplies 2B: Fresh Start, Campaigns, and Settings UI (#386)
+- Guild Supplies Part 2A: dormant staged foundation (#385)
+- Phase 1: Decentralized Guild Gossip infrastructure (#378)
+- Improve Guild Supplies Configuration status UX hierarchy
+- Guild Supplies 3C: Guarded Activation and Legacy Cutover (#389)
+
 ## [1.5.11] - 2026-10-16
 
 ### Changed
