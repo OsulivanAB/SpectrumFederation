@@ -266,7 +266,7 @@ local function FoldApplyOp(graph, characters, op)
             if group and #group.altGuids > 0 then
                 return false
             end
-            -- Lone main with no alts can be reassigned as an alt: dissolve empty main.
+            -- Lone main with no alts can become an alt: dissolve empty main first.
             if group then
                 graph.mains[altGuid] = nil
                 graph.byGuid[altGuid] = nil
@@ -279,26 +279,39 @@ local function FoldApplyOp(graph, characters, op)
             return false
         end
 
-        -- Idempotent: already under this main.
+        -- Idempotent: already under this main (no mutation).
         if altInfo and altInfo.role == "alt" and altInfo.mainGuid == mainGuid then
             return true
         end
 
-        -- Move from another main.
+        -- Capacity checks BEFORE mutating the old relationship (D).
+        local wouldDissolveOld = false
         if altInfo and altInfo.role == "alt" then
-            RemoveAltFromGroup(graph, altGuid)
+            local oldGroup = graph.mains[altInfo.mainGuid]
+            if oldGroup and #oldGroup.altGuids == 1 and oldGroup.altGuids[1] == altGuid then
+                wouldDissolveOld = true
+            end
         end
-
         local groupCount = 0
         for _ in pairs(graph.mains) do
             groupCount = groupCount + 1
         end
-        if not graph.mains[mainGuid] and groupCount >= GI.MAX_GROUPS then
+        local effectiveGroupCount = groupCount - (wouldDissolveOld and 1 or 0)
+        if not graph.mains[mainGuid] and effectiveGroupCount >= GI.MAX_GROUPS then
+            return false
+        end
+        local destGroup = graph.mains[mainGuid]
+        if destGroup and #destGroup.altGuids >= GI.MAX_ALTS_PER_MAIN then
             return false
         end
 
+        -- All checks passed — mutate.
+        if altInfo and altInfo.role == "alt" then
+            RemoveAltFromGroup(graph, altGuid)
+        end
         local group = EnsureMain(graph, mainGuid)
         if #group.altGuids >= GI.MAX_ALTS_PER_MAIN then
+            -- Defensive: should be unreachable after pre-check.
             return false
         end
         group.altSet[altGuid] = true
@@ -694,6 +707,7 @@ local function EmptyRecord(guildKey, clubId)
         graph = { mains = {}, byGuid = {} },
         revision = 0,
         openConflicts = {},
+        compactedIds = {}, -- op ids removed by compaction (duplicate detection)
     }
 end
 
@@ -774,11 +788,7 @@ function GI:GetCurrentRecord()
     return record, nil, identity
 end
 
---- Compact oldest ops into a snapshot when the log is full.
-local function CompactIfNeeded(record)
-    if #record.order < GI.MAX_ACCEPTED_OPS then
-        return
-    end
+local function SnapshotGroupsFromRecord(record)
     local graph = record.graph
     if type(graph) ~= "table" then
         RebuildDerived(record)
@@ -786,9 +796,7 @@ local function CompactIfNeeded(record)
     end
     local groups = {}
     for mainGuid, group in pairs(graph.mains or {}) do
-        local altGuids = {}
-        local altNames = {}
-        local altClasses = {}
+        local altGuids, altNames, altClasses = {}, {}, {}
         for i = 1, #(group.altGuids or {}) do
             local ag = group.altGuids[i]
             altGuids[#altGuids + 1] = ag
@@ -809,23 +817,111 @@ local function CompactIfNeeded(record)
     table.sort(groups, function(a, b)
         return tostring(a.mainGuid) < tostring(b.mainGuid)
     end)
-    local snapId = "gi1:compact:" .. tostring(record.revision or 0) .. ":" .. tostring(#record.order)
+    return groups
+end
+
+local function MaxOpAt(record)
+    local maxAt = 0
+    for i = 1, #(record.order or {}) do
+        local op = record.ops[record.order[i]]
+        local at = op and tonumber(op.at) or 0
+        if at > maxAt then
+            maxAt = at
+        end
+    end
+    return maxAt
+end
+
+--- Compact the op log into an officer-authored snapshot when full.
+-- actorGuid/actorName must be a verified editor identity (never a synthetic marker).
+-- Compacted op IDs are retained for duplicate detection so late redelivery cannot resurrect.
+local function CompactIfNeeded(record, actorGuid, actorName)
+    if #record.order < GI.MAX_ACCEPTED_OPS then
+        return false
+    end
+    if type(actorGuid) ~= "string" or actorGuid == "" or actorGuid == "compact" then
+        return false
+    end
+    local groups = SnapshotGroupsFromRecord(record)
+    local maxAt = MaxOpAt(record)
+    local compacted = record.compactedIds
+    if type(compacted) ~= "table" then
+        compacted = {}
+        record.compactedIds = compacted
+    end
+    for i = 1, #record.order do
+        compacted[record.order[i]] = true
+    end
+    -- Bound compacted-id retention to one full log window.
+    local count = 0
+    for _ in pairs(compacted) do
+        count = count + 1
+    end
+    if count > GI.MAX_ACCEPTED_OPS * 2 then
+        record.compactedIds = {}
+        compacted = record.compactedIds
+        for i = 1, #record.order do
+            compacted[record.order[i]] = true
+        end
+    end
+
+    local parts = { tostring(record.guildKey), tostring(maxAt), tostring(record.revision or 0) }
+    for i = 1, #groups do
+        parts[#parts + 1] = groups[i].mainGuid
+        for j = 1, #groups[i].altGuids do
+            parts[#parts + 1] = groups[i].altGuids[j]
+        end
+    end
+    local digest = table.concat(parts, "\0")
+    local mix = 5381
+    for i = 1, #digest do
+        mix = (mix * 33 + digest:byte(i)) % 4294967296
+    end
+    local snapId = string.format("gi1:%s:snap:%08x:%d", actorGuid, mix, tonumber(record.revision) or 0)
+    if #snapId > GI.MAX_OPERATION_ID then
+        snapId = string.format("gi1:snap:%08x:%d", mix, tonumber(record.revision) or 0)
+    end
     local snap = {
         id = snapId,
         kind = GI.KIND.SNAPSHOT,
-        at = 0,
-        actorGuid = "compact",
-        actorName = "",
+        at = maxAt,
+        actorGuid = actorGuid,
+        actorName = type(actorName) == "string" and actorName or "",
         guildKey = record.guildKey,
         groups = groups,
     }
     record.ops = { [snapId] = snap }
     record.order = { snapId }
+    compacted[snapId] = nil -- snapshot itself remains live
     RebuildDerived(record)
-    DebugInfo("compacted guildInfo ops into snapshot id=%s", snapId)
+    DebugInfo("compacted guildInfo ops into snapshot id=%s actor=%s", snapId, actorGuid)
+    return true
+end
+
+--- Whether admitting `op` into `record` would produce the intended assign effect.
+function GI.WouldAssignTakeEffect(record, op)
+    if type(record) ~= "table" or type(op) ~= "table" then
+        return false
+    end
+    local ops = {}
+    for id, body in pairs(record.ops or {}) do
+        ops[id] = body
+    end
+    ops[op.id] = op
+    local order = {}
+    for i = 1, #(record.order or {}) do
+        order[i] = record.order[i]
+    end
+    order[#order + 1] = op.id
+    local graph = GI.FoldOperations(ops, order)
+    local info = graph.byGuid and graph.byGuid[op.altGuid]
+    return info and info.role == "alt" and info.mainGuid == op.mainGuid
 end
 
 --- Admit an authenticated operation into durable storage.
+-- Remote path: store well-formed ops without racing on the local derived graph; effect
+-- is determined solely by deterministic fold so peers converge (B).
+-- Local path: UX preconditions (move confirm / stale confirm) still apply before store.
 -- @return string status, string|nil detail
 function GI:AdmitOperation(op, opts)
     opts = opts or {}
@@ -840,28 +936,42 @@ function GI:AdmitOperation(op, opts)
     if record.ops[op.id] then
         return "duplicate", nil
     end
+    if type(record.compactedIds) == "table" and record.compactedIds[op.id] then
+        return "duplicate", "compacted"
+    end
 
-    -- Preconditions against current derived graph for non-snapshot ops.
-    if op.kind ~= GI.KIND.SNAPSHOT and type(record.graph) == "table" then
+    -- Ops strictly older than the latest durable snapshot are superseded (C).
+    if op.kind ~= GI.KIND.SNAPSHOT then
+        local latestSnapAt = nil
+        for i = 1, #(record.order or {}) do
+            local existing = record.ops[record.order[i]]
+            if existing and existing.kind == GI.KIND.SNAPSHOT then
+                local at = tonumber(existing.at) or 0
+                if not latestSnapAt or at > latestSnapAt then
+                    latestSnapAt = at
+                end
+            end
+        end
+        if latestSnapAt and (tonumber(op.at) or 0) < latestSnapAt then
+            return "duplicate", "superseded"
+        end
+    end
+
+    -- Local-only confirmation / staleness gates (not used for remote sync admission).
+    if not opts.remote and op.kind ~= GI.KIND.SNAPSHOT and type(record.graph) == "table" then
         local byGuid = record.graph.byGuid or {}
         if op.kind == GI.KIND.ASSIGN then
             local altInfo = byGuid[op.altGuid]
-            local mainInfo = byGuid[op.mainGuid]
-            if altInfo and altInfo.role == "main" then
-                local g = record.graph.mains and record.graph.mains[op.altGuid]
-                if g and type(g.altGuids) == "table" and #g.altGuids > 0 then
-                    return "rejected", "alt_is_main_with_alts"
+            if opts.moveConfirmed and type(opts.expectedOldMain) == "string" and opts.expectedOldMain ~= "" then
+                if not altInfo or altInfo.role ~= "alt" or altInfo.mainGuid ~= opts.expectedOldMain then
+                    return "rejected", "stale_move_confirmation"
                 end
-            end
-            if mainInfo and mainInfo.role == "alt" then
-                return "rejected", "main_is_alt"
-            end
-            if opts.requireMoveConfirm and altInfo and altInfo.role == "alt" and altInfo.mainGuid ~= op.mainGuid then
+            elseif opts.requireMoveConfirm then
+                if not altInfo or altInfo.role ~= "alt" then
+                    return "rejected", "stale_move_confirmation"
+                end
                 if not opts.moveConfirmed then
                     return "rejected", "move_confirmation_required"
-                end
-                if opts.expectedOldMain and altInfo.mainGuid ~= opts.expectedOldMain then
-                    return "rejected", "stale_move_confirmation"
                 end
             end
         elseif op.kind == GI.KIND.UNASSIGN then
@@ -890,9 +1000,9 @@ function GI:AdmitOperation(op, opts)
         end
     end
 
-    CompactIfNeeded(record)
+    local compacted = false
     if #record.order >= GI.MAX_ACCEPTED_OPS then
-        CompactIfNeeded(record)
+        compacted = CompactIfNeeded(record, op.actorGuid, op.actorName) and true or false
     end
     if #record.order >= GI.MAX_ACCEPTED_OPS then
         return "rejected", "ops_overflow"
@@ -903,7 +1013,7 @@ function GI:AdmitOperation(op, opts)
     RebuildDerived(record)
 
     if GI._NotifyLocalDurableChange then
-        GI._NotifyLocalDurableChange(opts.remote and "remote" or "local")
+        GI._NotifyLocalDurableChange(compacted and "compact" or (opts.remote and "remote" or "local"))
     end
     return "accepted", nil
 end

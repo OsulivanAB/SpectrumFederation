@@ -302,26 +302,50 @@ local function ChangeMainOptions()
 	return opts
 end
 
-local function Definition()
+local function AccessStatusText()
 	local caps = Caps()
 	local roster = Roster()
-	local g = GI()
-
-	local statusText
 	if not caps.canRead then
-		statusText = Loc("GUILD_INFO_STATUS_MEMBERSHIP_PENDING",
+		return Loc("GUILD_INFO_STATUS_MEMBERSHIP_PENDING",
 			"Guild membership is still being verified. Shared Guild Info stays hidden until then.")
-	elseif not roster or not roster.complete then
-		statusText = Loc("GUILD_INFO_STATUS_ROSTER_WAIT",
-			"Guild roster is loading or unavailable. Existing assignments remain; new targets stay disabled.")
-	elseif caps.canEdit then
-		statusText = Loc("GUILD_INFO_STATUS_EDITOR",
-			"You can assign, move, unassign, and change mains (guild ranks 1–3).")
-	else
-		statusText = Loc("GUILD_INFO_STATUS_READONLY",
-			"View only. Guild ranks 1–3 may change assignments.")
 	end
+	if not roster or not roster.complete then
+		return Loc("GUILD_INFO_STATUS_ROSTER_WAIT",
+			"Guild roster is loading or unavailable. Existing assignments remain; new targets stay disabled.")
+	end
+	if caps.canEdit then
+		return Loc("GUILD_INFO_STATUS_EDITOR",
+			"You can assign, move, unassign, and change mains (guild ranks 1–3).")
+	end
+	return Loc("GUILD_INFO_STATUS_READONLY",
+		"View only. Guild ranks 1–3 may change assignments.")
+end
 
+local function FieldsEnabled()
+	local caps = Caps()
+	local roster = Roster()
+	return caps.canEdit and roster and roster.complete
+end
+
+local function AssignButtonEnabled()
+	if not FieldsEnabled() then
+		return false
+	end
+	if BothResolvedDistinct() then
+		return true
+	end
+	-- Exact unique typed matches also enable Assign without a suggestion click.
+	local m = select(1, TryResolveField(mainText, mainResolved))
+	local a = select(1, TryResolveField(altText, altResolved))
+	if m and a and m.guid ~= a.guid then
+		return true
+	end
+	return false
+end
+
+local function Definition()
+	-- Closures must call Caps()/Roster() live so Page:Refresh() sees current
+	-- authority and roster completeness without rebuilding the page (A).
 	return {
 		sections = {
 			{
@@ -331,9 +355,7 @@ local function Definition()
 					{
 						type = "display",
 						label = Loc("GUILD_INFO_STATUS_ROW_LABEL", "Access"),
-						get = function()
-							return statusText
-						end,
+						get = AccessStatusText,
 					},
 				},
 			},
@@ -347,9 +369,7 @@ local function Definition()
 						hint = Loc("GUILD_INFO_NAME_HINT", "Type a guild member name"),
 						width = 240,
 						maxLetters = 96,
-						enabled = function()
-							return caps.canEdit and roster and roster.complete
-						end,
+						enabled = FieldsEnabled,
 						get = function()
 							return mainText
 						end,
@@ -370,10 +390,12 @@ local function Definition()
 							else
 								mainResolved = nil
 							end
+							QueueRefresh()
 						end,
 						onTextChanged = function(_, text)
 							mainText = text or ""
 							mainResolved = nil
+							QueueRefresh()
 						end,
 					},
 					{
@@ -382,9 +404,7 @@ local function Definition()
 						hint = Loc("GUILD_INFO_NAME_HINT", "Type a guild member name"),
 						width = 240,
 						maxLetters = 96,
-						enabled = function()
-							return caps.canEdit and roster and roster.complete
-						end,
+						enabled = FieldsEnabled,
 						get = function()
 							return altText
 						end,
@@ -405,28 +425,19 @@ local function Definition()
 							else
 								altResolved = nil
 							end
+							QueueRefresh()
 						end,
 						onTextChanged = function(_, text)
 							altText = text or ""
 							altResolved = nil
+							QueueRefresh()
 						end,
 					},
 					{
 						type = "button",
 						label = Loc("GUILD_INFO_ASSIGN_LABEL", "Assign alt to main"),
 						buttonText = Loc("GUILD_INFO_ASSIGN_BUTTON", "Assign"),
-						enabled = function()
-							-- Also allow exact unique typed matches resolved at click.
-							if not caps.canEdit or not roster or not roster.complete then
-								return false
-							end
-							if BothResolvedDistinct() then
-								return true
-							end
-							local m = select(1, TryResolveField(mainText, mainResolved))
-							local a = select(1, TryResolveField(altText, altResolved))
-							return m and a and m.guid ~= a.guid
-						end,
+						enabled = AssignButtonEnabled,
 						onClick = function(ctx)
 							-- Resolve exact unique typed names if suggestions were not clicked.
 							if not mainResolved then
@@ -450,13 +461,14 @@ local function Definition()
 						height = 220,
 						border = true,
 						enabled = function()
-							return caps.canRead
+							return Caps().canRead
 						end,
 						getItems = function()
-							if not g or not g.GetAssignmentDisplayRows then
+							local gi = GI()
+							if not gi or not gi.GetAssignmentDisplayRows then
 								return {}
 							end
-							local rows = g:GetAssignmentDisplayRows(roster)
+							local rows = gi:GetAssignmentDisplayRows(Roster())
 							return rows or {}
 						end,
 						getSelectedKey = function()
@@ -496,7 +508,7 @@ local function Definition()
 						label = Loc("GUILD_INFO_CHANGE_MAIN_FIELD", "New main (selected group)"),
 						defaultText = Loc("GUILD_INFO_CHANGE_MAIN_DEFAULT", "Select a rostered alt"),
 						enabled = function()
-							return caps.canEdit and selectedGroupMainGuid ~= nil and #ChangeMainOptions() > 0
+							return Caps().canEdit and selectedGroupMainGuid ~= nil and #ChangeMainOptions() > 0
 						end,
 						get = function()
 							return changeMainCandidate
@@ -513,7 +525,7 @@ local function Definition()
 						label = Loc("GUILD_INFO_CHANGE_MAIN_LABEL", "Change Main"),
 						buttonText = Loc("GUILD_INFO_CHANGE_MAIN_BUTTON", "Change Main"),
 						enabled = function()
-							return caps.canEdit
+							return Caps().canEdit
 								and selectedGroupMainGuid ~= nil
 								and changeMainCandidate ~= nil
 						end,

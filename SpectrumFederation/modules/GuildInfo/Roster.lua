@@ -86,6 +86,7 @@ function GI.BuildRosterSnapshot()
     local members = {}
     local byGuid = {}
     local nameCounts = {}
+    local skippedRows = 0
 
     for i = 1, total do
         local a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17 =
@@ -121,9 +122,19 @@ function GI.BuildRosterSnapshot()
             byGuid[guid] = row
             local lower = string.lower(nameRealm)
             nameCounts[lower] = (nameCounts[lower] or 0) + 1
+        else
+            -- Nonzero member count with a missing GUID/name row is incomplete:
+            -- absence must not be treated as verified departure (E).
+            skippedRows = skippedRows + 1
         end
     end
-    -- An empty-but-complete roster is valid (no candidates). Do not treat it as incomplete.
+    if skippedRows > 0 then
+        snap.reason = "roster_incomplete"
+        snap.complete = false
+        return snap
+    end
+    -- An empty-but-complete roster is valid only when GetNumGuildMembers was 0
+    -- (handled above). Here every reported row produced a usable member.
 
     local byNameLower = {}
     for i = 1, #members do

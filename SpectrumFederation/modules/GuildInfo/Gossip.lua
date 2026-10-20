@@ -234,20 +234,32 @@ local function ValidateAndApply(record, ctx)
     if not mayEdit then
         return "rejected", editReason or "unauthorized"
     end
-    -- Bind actor from authenticated sender; reject laundering via payload claims.
-    if type(op.actorGuid) == "string" and op.actorGuid ~= "" and op.actorGuid ~= member.guid then
-        return "rejected", "actor_mismatch"
-    end
     if type(op.guildKey) ~= "string" or op.guildKey ~= member.guildKey then
         return "rejected", "wrong_guild"
     end
-    -- Ensure actor fields reflect authenticated sender for durable storage.
-    op.actorGuid = member.guid
-    op.actorName = member.name
+    -- Snapshots are officer-authored checkpoints. Any authenticated editor may
+    -- relay them; keep payload provenance when present (C). Mutable ops still
+    -- bind actor to the authenticated sender to prevent laundering.
+    if op.kind == GI.KIND.SNAPSHOT then
+        if type(op.actorGuid) ~= "string" or op.actorGuid == "" or op.actorGuid == "compact" then
+            op.actorGuid = member.guid
+            op.actorName = member.name
+        end
+    else
+        if type(op.actorGuid) == "string" and op.actorGuid ~= "" and op.actorGuid ~= member.guid then
+            return "rejected", "actor_mismatch"
+        end
+        op.actorGuid = member.guid
+        op.actorName = member.name
+    end
 
     local status, detail = GI:AdmitOperation(op, { remote = true })
     if status == "accepted" then
-        UpsertExportOp(op)
+        if op.kind == GI.KIND.SNAPSHOT then
+            RebuildExportIndex()
+        else
+            UpsertExportOp(op)
+        end
     end
     return status, detail
 end
@@ -346,17 +358,34 @@ function GI.NotifyLocalDurableChange(reason)
     reason = tostring(reason or "local")
     if providerRegistered then
         local guildKey = CurrentGuildKey()
-        if exportState.guildKey ~= guildKey then
+        -- Compaction / snapshot catch-up must drop export rows for ops no longer
+        -- retained by the provider so Gossip reconcile can prune them (C).
+        if reason == "compact" or exportState.guildKey ~= guildKey then
             RebuildExportIndex()
         else
-            -- Incremental: re-read record and upsert missing ops.
             local record = guildKey and select(1, GI:GetRecordForGuildKey(guildKey)) or nil
             if record and type(record.order) == "table" then
+                local live = {}
                 for i = 1, #record.order do
                     local op = record.ops[record.order[i]]
                     if op then
                         UpsertExportOp(op)
+                        live[RecordIdForOp(op.id)] = true
                     end
+                end
+                -- Drop export entries that durable storage no longer retains.
+                local newOrder = {}
+                for i = 1, #exportState.order do
+                    local rid = exportState.order[i]
+                    if live[rid] then
+                        newOrder[#newOrder + 1] = rid
+                    else
+                        exportState.byId[rid] = nil
+                    end
+                end
+                if #newOrder ~= #exportState.order then
+                    exportState.order = newOrder
+                    exportState.enumPos = nil
                 end
             else
                 RebuildExportIndex()

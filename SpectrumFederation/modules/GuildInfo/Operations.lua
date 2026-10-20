@@ -46,6 +46,9 @@ function GI.FormatMutationFeedback(status, reason)
         return Loc("GUILD_INFO_STATUS_PENDING", "Change is pending (%s)."):format(reason ~= "" and reason or "wait"), "warn"
     end
 
+    if status == "accepted" and reason == "noop" then
+        return Loc("GUILD_INFO_STATUS_DUPLICATE", "No change — that relationship was already recorded."), "info"
+    end
     local map = {
         unauthorized = Loc("GUILD_INFO_ERR_UNAUTHORIZED", "Only guild ranks 1–3 may change main/alt assignments."),
         preview_non_admin = Loc("GUILD_INFO_ERR_PREVIEW", "Preview as Non-Admin is active; edits are disabled."),
@@ -65,6 +68,8 @@ function GI.FormatMutationFeedback(status, reason)
         stale_change_main = Loc("GUILD_INFO_ERR_STALE_CHANGE_MAIN", "That Change Main candidate is no longer eligible."),
         alt_not_assigned = Loc("GUILD_INFO_ERR_ALT_NOT_ASSIGNED", "That character is not currently an assigned alt."),
         group_missing = Loc("GUILD_INFO_ERR_GROUP_MISSING", "That main/alt group no longer exists."),
+        group_full = Loc("GUILD_INFO_ERR_GROUP_FULL", "That main already has the maximum number of alts."),
+        no_effect = Loc("GUILD_INFO_ERR_NO_EFFECT", "That change could not be applied to the current relationships."),
         wrong_guild = Loc("GUILD_INFO_ERR_WRONG_GUILD", "Guild context changed; the action was not applied."),
         stale_handle = Loc("GUILD_INFO_ERR_STALE_HANDLE", "Guild context changed; the action was not applied."),
         actor_changed = Loc("GUILD_INFO_ERR_ACTOR_CHANGED", "Your character identity changed; the action was not applied."),
@@ -155,6 +160,30 @@ function GI:AssignAlt(mainRef, altRef, opts)
 
     local byGuid = record.graph and record.graph.byGuid or {}
     local altInfo = byGuid[altRow.guid]
+    local mainInfo = byGuid[mainRow.guid]
+
+    -- Confirmed reassignment: verify expected previous main before noop/success (D.3).
+    if opts.moveConfirmed and type(opts.expectedOldMain) == "string" and opts.expectedOldMain ~= "" then
+        if not altInfo or altInfo.role ~= "alt" or altInfo.mainGuid ~= opts.expectedOldMain then
+            return "rejected", "stale_move_confirmation"
+        end
+    end
+
+    -- Genuine no-op: already under this main — do not append a durable op (D.4).
+    if altInfo and altInfo.role == "alt" and altInfo.mainGuid == mainRow.guid then
+        return "accepted", "noop"
+    end
+
+    if altInfo and altInfo.role == "main" then
+        local g = record.graph.mains and record.graph.mains[altRow.guid]
+        if g and type(g.altGuids) == "table" and #g.altGuids > 0 then
+            return "rejected", "alt_is_main_with_alts"
+        end
+    end
+    if mainInfo and mainInfo.role == "alt" then
+        return "rejected", "main_is_alt"
+    end
+
     local isMove = altInfo and altInfo.role == "alt" and altInfo.mainGuid ~= mainRow.guid
     if isMove and not opts.moveConfirmed then
         return "rejected", "move_confirmation_required", {
@@ -167,6 +196,15 @@ function GI:AssignAlt(mainRef, altRef, opts)
     local op, opErr = BuildAssignOp(ctx, mainRow, altRow)
     if not op then
         return "rejected", opErr
+    end
+
+    -- Refuse local writes that the deterministic fold would ignore (capacity / hierarchy).
+    if GI.WouldAssignTakeEffect and not GI.WouldAssignTakeEffect(record, op) then
+        local dest = record.graph.mains and record.graph.mains[mainRow.guid]
+        if dest and #(dest.altGuids or {}) >= (GI.MAX_ALTS_PER_MAIN or 32) then
+            return "rejected", "group_full"
+        end
+        return "rejected", "no_effect"
     end
 
     return GI:AdmitOperation(op, {
