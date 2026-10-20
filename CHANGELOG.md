@@ -12,6 +12,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Guild Info: Unassign / Change Main operate on the logical absorbed group so unrelated concurrent alts are not dropped (#402)
 - Guild Info: incomplete concurrent group shells survive Change Main / Unassign via `forwardTo` aliases and sibling-shell guards so late members are not orphaned (#402)
 - Guild Info: forward aliases and their destinations are retained through ordinary Unassign and capacity reclaim so late Gossip memberships stay resolvable (#402)
+- Guild Info: moving a solo main with unresolved inbound `forwardTo` aliases retargets those aliases onto the new group so late members stay visible (#402)
 
 ## [1.5.12-beta.15] - 2026-10-20
 

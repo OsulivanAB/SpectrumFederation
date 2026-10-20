@@ -2372,6 +2372,104 @@ do
     setActor("Alice-Garona", "Player-1-Alice", 1)
 end
 
+do
+    -- faD: moving a solo forwarded destination main must not orphan late Eve.
+    -- After G2→G1 and visible alts cleared, Assign Bob under Carol (new G3).
+    -- Late Eve→G2 must remain a visible relationship (under Carol with Bob).
+    local dbA = seedEmptyPeer()
+    local dbB = seedEmptyPeer()
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Bob-Garona"),
+        "accepted", "faD A Bob")
+    assertEq(applyLocalAssignOn(dbA, "Alice-Garona", "Player-1-Alice", 1, "Alice-Garona", "Dave-Garona"),
+        "accepted", "faD A Dave")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Carol-Garona"),
+        "accepted", "faD B Carol")
+    assertEq(applyLocalAssignOn(dbB, "Carol-Garona", "Player-1-Carol", 3, "Alice-Garona", "Eve-Garona"),
+        "accepted", "faD B Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local recB = select(1, GI:GetCurrentRecord())
+    local gB, eveMem, carolMem
+    for _, g in pairs(recB.groups) do
+        if not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            gB = g
+        end
+    end
+    eveMem = recB.members["Player-1-Eve"]
+    carolMem = recB.members["Player-1-Carol"]
+    assertTrue(gB and eveMem and carolMem, "faD captured B cohort")
+    admitWire(dbA, wireGroup(gB), "Carol-Garona")
+    admitWire(dbA, wireMember(carolMem), "Carol-Garona")
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    assertEq(GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faD promote Bob")
+    assertEq(GI:UnassignAlt("Player-1-Alice", {}), "accepted", "faD unassign Alice")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "faD unassign Dave")
+    assertEq(GI:UnassignAlt("Player-1-Carol", {}), "accepted", "faD unassign Carol")
+    local recA = select(1, GI:GetCurrentRecord())
+    local destBefore = recA.groups[gB.groupId] and recA.groups[gB.groupId].forwardTo
+    assertTrue(type(destBefore) == "string" and destBefore ~= "", "faD alias present before Bob move")
+    assertTrue(recA.groups[destBefore] and not recA.groups[destBefore].dissolved,
+        "faD Bob destination live before move")
+    assertTrue(recA.graph.mains["Player-1-Bob"] ~= nil, "faD Bob is designated solo main")
+
+    -- Ordinary successful Assign: Bob becomes Carol's alt in a new group.
+    assertEq(GI:AssignAlt("Carol-Garona", "Bob-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faD move Bob under Carol")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol",
+        "faD Bob is Carol's alt")
+    recA = select(1, GI:GetCurrentRecord())
+    local bobInfo = recA.graph.byGuid["Player-1-Bob"]
+    local carolGid = bobInfo and bobInfo.groupId
+    assertTrue(type(carolGid) == "string" and carolGid ~= "", "faD Carol/Bob group id")
+    assertEq(recA.groups[gB.groupId] and recA.groups[gB.groupId].forwardTo, carolGid,
+        "faD alias retargeted to Carol/Bob group")
+
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    -- User-visible relationship: Eve must appear as Carol's alt (not invisible).
+    assertEq(select(1, GI:GetCharacterRole("Player-1-Eve")), "alt", "faD Eve role visible")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Carol",
+        "faD late Eve under Carol after Bob move")
+    local groups = GI:GetRelationshipGroups()
+    local eveVisible = false
+    for i = 1, #groups do
+        if groups[i].mainGuid == "Player-1-Carol" then
+            for j = 1, #(groups[i].altGuids or {}) do
+                if groups[i].altGuids[j] == "Player-1-Eve" then
+                    eveVisible = true
+                end
+            end
+        end
+    end
+    assertTrue(eveVisible, "faD Eve listed in Carol's visible relationship group")
+
+    -- Reverse/dupe + catch-up + reload.
+    admitWire(dbA, wireMember(eveMem), "Carol-Garona")
+    admitWire(dbA, wireGroup(recA.groups[gB.groupId]), "Carol-Garona")
+    assertEq(select(2, peerRole(dbA, "Player-1-Eve")), "Player-1-Carol", "faD dupe keeps Eve")
+    syncAll(dbA, dbB, "Alice-Garona")
+    assertEq(select(2, peerRole(dbB, "Player-1-Eve")), "Player-1-Carol", "faD B converges Eve")
+    local dbC = seedEmptyPeer()
+    syncAll(dbA, dbC, "Alice-Garona")
+    assertEq(select(2, peerRole(dbC, "Player-1-Eve")), "Player-1-Carol", "faD C catch-up Eve")
+    local saved = deepCopy(dbA)
+    reloadModules(saved)
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Carol", "faD reload Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    -- Later reuse: unassign Eve, reassign under Dave — characters are not locked forever.
+    assertEq(GI:UnassignAlt("Player-1-Eve", {}), "accepted", "faD later unassign Eve")
+    assertEq(GI:AssignAlt("Dave-Garona", "Eve-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "faD reuse Eve under Dave")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Dave", "faD Eve reused")
+    assertEq(GI:UnassignAlt("Player-1-Bob", {}), "accepted", "faD unassign Bob from Carol")
+    assertNil(select(1, GI:GetCharacterRole("Player-1-Bob")), "faD Bob reusable after leave")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+end
+
 ---------------------------------------------------------------------------
 -- Scenario A: genuine later move must survive synthetic reconcile versions
 ---------------------------------------------------------------------------

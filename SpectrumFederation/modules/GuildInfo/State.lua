@@ -1236,6 +1236,52 @@ local function RetireGroupAsForward(record, fromGid, toGid)
     return true
 end
 
+--- Retarget every forward alias that points at fromGid onto toGid.
+-- When a solo main of a still-referenced destination moves into another group,
+-- late memberships must follow into a live visible relationship rather than
+-- resolving into a designated-main-moved-away shell (which hides them).
+-- Rejecting the move while inbound aliases exist would permanently freeze the
+-- character under indefinite alias retention (no sync-completeness proof).
+local function RetargetInboundForwards(record, fromGid, toGid)
+    if type(fromGid) ~= "string" or fromGid == "" or fromGid == toGid then
+        return true
+    end
+    if type(toGid) ~= "string" or toGid == "" then
+        return false, "group_missing"
+    end
+    local ids = {}
+    for gid, g in pairs(record.groups or {}) do
+        if type(g) == "table" and g.forwardTo == fromGid then
+            ids[#ids + 1] = gid
+        end
+    end
+    table.sort(ids)
+    for i = 1, #ids do
+        local gid = ids[i]
+        -- Avoid creating an immediate self-forward or a trivial no-op.
+        if gid ~= toGid then
+            local g = record.groups[gid]
+            if g and g.forwardTo ~= toGid then
+                local ver, vErr = GI:_NextVer(g.ver)
+                if not ver then
+                    return false, vErr or "no_effect"
+                end
+                local st = GI.MergeGroup(record, {
+                    groupId = gid,
+                    ver = ver,
+                    at = Now(),
+                    dissolved = true,
+                    forwardTo = toGid,
+                }, { skipReconcile = true })
+                if st ~= "accepted" and st ~= "duplicate" then
+                    return false, st
+                end
+            end
+        end
+    end
+    return true
+end
+
 --- Officer-authorized consolidate: move every currently known durable member of
 -- groups claiming mainGuid into targetGroupId, then retire emptied/sibling
 -- claimants as forward aliases (not hard-delete). Incomplete shells must keep
@@ -1300,6 +1346,8 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
     local altInfo = record.graph.byGuid and record.graph.byGuid[altGuid]
     -- Durable home before mutation (derived groupId may differ under absorb).
     local durablePrevGid = altMem and type(altMem.groupId) == "string" and altMem.groupId or nil
+    -- Solo-main claimant homes vacated when this character becomes someone else's alt.
+    local vacatedMainGroups = nil
 
     -- Hierarchy gates (local).
     if altInfo and altInfo.role == "main" then
@@ -1307,6 +1355,9 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         if g and #(g.altGuids or {}) > 0 then
             return "rejected", "alt_is_main_with_alts"
         end
+        -- Visible alts are empty, but inbound forward aliases may still deliver
+        -- late members into this main's physical group(s).
+        vacatedMainGroups = ClaimantGroupIds(record, altGuid)
     end
     if mainInfo and mainInfo.role == "alt" then
         return "rejected", "main_is_alt"
@@ -1412,12 +1463,36 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         return "rejected", stAlt
     end
 
+    -- Solo main moved into another group: retarget unresolved inbound forwards
+    -- onto the new live group so delayed Gossip memberships stay visible.
+    if vacatedMainGroups then
+        for i = 1, #vacatedMainGroups do
+            local vacated = vacatedMainGroups[i]
+            if vacated ~= targetGroupId and GroupHasInboundForwards(record, vacated) then
+                local okR, errR = RetargetInboundForwards(record, vacated, targetGroupId)
+                if not okR then
+                    return "rejected", errR or "no_effect"
+                end
+            end
+        end
+    end
+
     -- Dissolve previous durable home when safe for the logical group.
     if durablePrevGid and durablePrevGid ~= targetGroupId then
         RebuildDerived(record)
         if ShouldDissolvePhysicalGroup(record, durablePrevGid) then
             DissolveEmptyGroup(record, durablePrevGid)
         end
+    end
+    if vacatedMainGroups then
+        RebuildDerived(record)
+        for i = 1, #vacatedMainGroups do
+            local vacated = vacatedMainGroups[i]
+            if vacated ~= targetGroupId and ShouldDissolvePhysicalGroup(record, vacated) then
+                DissolveEmptyGroup(record, vacated)
+            end
+        end
+        RebuildDerived(record)
     end
 
     NotifyDurable("local")
