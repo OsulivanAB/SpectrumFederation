@@ -761,6 +761,22 @@ local function minimalValidBankTabBody(id, datasetId, value)
     }
 end
 
+--- Rebind guild operations onto a new table identity after test-only SV edits.
+-- Production writers bump the ephemeral validation gen; harness corruption must
+-- not call that private hook — a new ops table mimics reload/replacement.
+local function rebindOperations(raw)
+    local old = raw.operations
+    raw.operations = {
+        records = old.records,
+        order = old.order,
+        heads = old.heads,
+        pending = old.pending,
+        conflicts = old.conflicts,
+        openConflicts = old.openConflicts,
+    }
+    return raw.operations
+end
+
 --- Build an authoritative candidate body for NewConfirmationOperation embedding.
 -- Does not write pending (avoids invalidating GetCurrentRecord structure checks).
 local function seedConfirmCandidate(recordId, overrides)
@@ -2113,6 +2129,7 @@ do
     GS:CreateStagedRecord()
     local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
     raw.operations.pending["bad"] = true
+    rebindOperations(raw)
     local exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "pending=true keeps record unavailable")
     assertEq(reason, "invalid_operations", "invalid_operations for pending=true")
@@ -2126,6 +2143,7 @@ do
     -- Short order + large records map: structurally inconsistent
     raw.operations.records["only"] = { id = "only", kind = "set-bank-tab" }
     raw.operations.order = {}
+    rebindOperations(raw)
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "records/order mismatch unavailable")
     assertEq(reason, "invalid_operations", "invalid_operations for order mismatch")
@@ -2272,6 +2290,7 @@ do
 
     -- Ghost head
     raw.operations.heads["item:1"] = "ghost"
+    rebindOperations(raw)
     local exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "ghost head keeps record unavailable")
     assertEq(reason, "invalid_operations", "invalid_operations for ghost head")
@@ -2285,6 +2304,7 @@ do
     local op = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
     assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "bank tab for wrong-target head fixture")
     raw.operations.heads["item:99"] = op.id
+    rebindOperations(raw)
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "wrong-target head unavailable")
     assertEq(reason, "invalid_operations", "invalid_operations for wrong-target head")
@@ -2295,6 +2315,7 @@ do
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
     raw.operations.heads["config:bankTab"] = true
+    rebindOperations(raw)
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "non-string head unavailable")
     assertEq(reason, "invalid_operations", "invalid_operations for non-string head")
@@ -2307,6 +2328,7 @@ do
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
     raw.operations.records["acc-1"] = { kind = "set-bank-tab", target = "bankTab", value = 1 }
     raw.operations.order[1] = "acc-1"
+    rebindOperations(raw)
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "missing accepted body.id unavailable")
     assertEq(reason, "invalid_operations", "invalid_operations for missing body.id")
@@ -2324,6 +2346,7 @@ do
         body = { id = "other", kind = "set-bank-tab" },
         at = 1,
     }
+    rebindOperations(raw)
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "mismatched pending body.id unavailable")
     assertEq(reason, "invalid_operations", "invalid_operations for pending body.id")
@@ -3092,14 +3115,17 @@ do
     local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
 
     -- Malformed confirmation body (kind only) stays preserved but unavailable.
-    raw.operations.records["bad-conf"] = { id = "bad-conf", kind = "confirm-candidate" }
-    raw.operations.order = { "bad-conf" }
-    raw.operations.heads = {}
+    -- Replace the ops table (new identity) so validation cannot rely on a private
+    -- cache-invalidation hook; production writers never mutate accepted bodies
+    -- in place on an already-validated ops object.
+    raw.operations = {
+        records = { ["bad-conf"] = { id = "bad-conf", kind = "confirm-candidate" } },
+        order = { "bad-conf" },
+        heads = {},
+        pending = {},
+        conflicts = {},
+    }
     raw.confirmationRefs = { "bad-conf" }
-    -- In-place body corruption is not a controlled writer; bump so body walks run.
-    if GS._BumpOpsValidationGen then
-        GS._BumpOpsValidationGen(raw.operations)
-    end
     local exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "malformed confirmation body unavailable")
     assertTrue(reason == "invalid_operations" or reason == "invalid_fingerprint"
@@ -3117,19 +3143,22 @@ do
     GS:CreateStagedRecord()
     raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
     datasetId = raw.datasetId
-    raw.operations.records["bad-cfg"] = {
-        id = "bad-cfg",
-        kind = "set-bank-tab",
-        target = "bankTab",
-        value = 2,
-        -- missing required envelope fields
+    raw.operations = {
+        records = {
+            ["bad-cfg"] = {
+                id = "bad-cfg",
+                kind = "set-bank-tab",
+                target = "bankTab",
+                value = 2,
+                -- missing required envelope fields
+            },
+        },
+        order = { "bad-cfg" },
+        heads = {},
+        pending = {},
+        conflicts = {},
     }
-    raw.operations.order = { "bad-cfg" }
-    raw.operations.heads = {}
     raw.confirmationRefs = {}
-    if GS._BumpOpsValidationGen then
-        GS._BumpOpsValidationGen(raw.operations)
-    end
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "malformed config body unavailable")
     assertTrue(reason == "invalid_operations" or reason == "unsupported_schema"
@@ -3426,20 +3455,37 @@ do
     assertBadTs("negative", -1)
 
     -- Historical accepted body with non-finite timestamp: preserved, unavailable.
+    -- New ops table identity (reload/replacement class) — do not call private bump.
     local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
     local storedId = op.id
     local savedTs = raw.operations.records[storedId].timestamp
     raw.operations.records[storedId].timestamp = math.huge
-    if GS._BumpOpsValidationGen then
-        GS._BumpOpsValidationGen(raw.operations)
+    do
+        local old = raw.operations
+        raw.operations = {
+            records = old.records,
+            order = old.order,
+            heads = old.heads,
+            pending = old.pending,
+            conflicts = old.conflicts,
+            openConflicts = old.openConflicts,
+        }
     end
     local exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "huge historical timestamp unavailable")
     assertEq(reason, "invalid_timestamp", "historical invalid_timestamp")
     assertEq(raw.operations.records[storedId].timestamp, math.huge, "malformed timestamp preserved")
     raw.operations.records[storedId].timestamp = savedTs
-    if GS._BumpOpsValidationGen then
-        GS._BumpOpsValidationGen(raw.operations)
+    do
+        local old = raw.operations
+        raw.operations = {
+            records = old.records,
+            order = old.order,
+            heads = old.heads,
+            pending = old.pending,
+            conflicts = old.conflicts,
+            openConflicts = old.openConflicts,
+        }
     end
     assertTrue(GS:GetCurrentRecord() ~= nil, "restored finite timestamp usable")
 
@@ -3516,6 +3562,7 @@ do
     local savedBody = raw.operations.records[rankOp.id]
     raw.operations.records[rankOp.id] = minimalValidBankTabBody(rankOp.id, datasetId, 1)
     raw.operations.heads[headKey] = rankOp.id
+    rebindOperations(raw)
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "wrong-kind head body unavailable")
     assertEq(reason, "invalid_operations", "wrong-kind is structural invalid_operations")
@@ -3523,6 +3570,7 @@ do
     assertEq(caps.canRecoverPolicy, false, "structural corruption not GM policy recovery")
     assertEq(caps.canEdit, false, "no edit on structural corruption")
     raw.operations.records[rankOp.id] = savedBody
+    rebindOperations(raw)
 
     -- Explicit GM recovery after permission-only mismatch.
     raw.permission.editorRankPosition = 5
@@ -3605,6 +3653,7 @@ do
 
     -- Hole with an entry beyond the contiguous prefix (do not assert #order).
     raw.operations.order = { [1] = op1.id, [3] = ghostId }
+    rebindOperations(raw)
     local exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "hole beyond contiguous prefix unavailable")
     assertEq(reason, "invalid_operations", "hole invalid_operations")
@@ -3614,6 +3663,7 @@ do
 
     local function assertBadOrderKeys(label, orderTable)
         raw.operations.order = orderTable
+        rebindOperations(raw)
         local ex, rs = GS:GetCurrentRecord()
         assertNil(ex, label .. " unavailable")
         assertEq(rs, "invalid_operations", label .. " invalid_operations")
@@ -3631,6 +3681,7 @@ do
     -- Restore a valid dense order; record becomes usable again.
     raw.operations.order = { op1.id, op2.id }
     raw.operations.records[ghostId] = nil
+    rebindOperations(raw)
     exposed, reason = GS:GetCurrentRecord()
     assertTrue(exposed ~= nil, "restored dense order readable: " .. tostring(reason))
     local op3 = GS:NewConfigOperation("set-bank-tab", "bankTab", 3)
@@ -25499,31 +25550,37 @@ do
 end
 
 do
-    -- A2) Staged sample-only must not suppress same-tab legacy observation.
+    -- A2) Legacy observation isolation + different-tab GS sample acquisition.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     settleRoster()
+    GS._BankContextReadinessProbe = nil
     GS:CreateStagedRecord()
     startCampaign()
     local tabOp = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
     assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "A2: GS bank tab 2")
+    -- GS requests item 100 only; legacy will request a different item at a higher generation.
     local itemOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 100 }, {
         itemId = 100, goal = 5, removed = false,
     }))
-    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "A2: GS item")
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "A2: GS item 100")
 
-    -- Legacy profile on the same guild/tab with a requested item.
+    loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesVerification.lua")
     local C = SF.Consumables
     assertTrue(C and C.Ensure, "A2: Consumables API present")
+    local selfId = SF.NameUtil.GetSelfId()
+    assertTrue(type(selfId) == "string" and selfId ~= "", "A2: self id available")
     local profile = {
         _profileId = "profile-a2-legacy",
+        _adminUsers = { selfId },
         _consumables = {
             guild = { guid = "42", name = "Spectrum", realm = "Garona" },
             bankTab = 2,
-            requestedItems = { ["100"] = { itemId = 100, goal = 5 } },
-            generation = 1,
+            requestedItems = { ["200"] = { itemId = 200, goal = 5 } },
+            generation = 5,
             configSeq = 0,
             itemSeq = 0,
             eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
@@ -25532,6 +25589,8 @@ do
         _consumableEvents = {},
         _consumableEventArchive = {},
     }
+    function profile:GetProfileId() return self._profileId end
+    function profile:IsAdminMemberId(memberId) return memberId == selfId end
     local priorGetActive = SF.GetActiveProfile
     local priorRuntime = SF.ConsumablesRuntime
     SF.GetActiveProfile = function() return profile end
@@ -25550,14 +25609,30 @@ do
     assertTrue(ctx ~= nil and ctx.sampleOnly == true, "A2: sample-only context selected")
     assertTrue(type(ctx.legacy) == "table" and ctx.legacy.source == "legacyProfile",
         "A2: same-tab legacy companion attached")
-    assertEq(ctx.bankTab, ctx.legacy.bankTab, "A2: shared bank tab")
+    assertEq(ctx.legacy.generation, 5, "A2: companion carries legacy generation")
+    assertTrue(ctx.legacy.requestedSet[200] or ctx.legacy.requestedSet["200"],
+        "A2: companion requests legacy item 200")
 
-    world.bankTxnCounts = { [2] = 1 }
-    world.bankTabInfo = { [2] = { name = "Supplies", isViewable = true } }
+    -- Filler (non-requested) + legacy-only deposit so the eligible row has neighbors.
+    world.bankTxnRows = {
+        [2] = {
+            { "deposit", "Alice-Garona", "|cffffffff|Hitem:50::::::::|h[Filler]|h|r", 1, nil, nil, 0, 0, 0, 0 },
+            { "deposit", "Alice-Garona", "|cffffffff|Hitem:200::::::::|h[Legacy]|h|r", 3, nil, nil, 0, 0, 0, 0 },
+        },
+    }
+    world.bankTxnCounts = { [2] = 2, [3] = 0 }
+    world.bankTabInfo = {
+        [2] = { name = "Supplies", isViewable = true },
+        [3] = { name = "Other", isViewable = true },
+    }
+    world.currentGuildBankTab = 2
+    function GetCurrentGuildBankTab() return world.currentGuildBankTab end
     function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
-    function GetGuildBankTransaction()
-        return "deposit", "Alice-Garona", "|cffffffff|Hitem:100::::::::|h[Item]|h|r",
-            1, nil, nil, 0, 0, 0, 0
+    function GetGuildBankTransaction(tab, index)
+        local rows = world.bankTxnRows[tab]
+        local row = rows and rows[index]
+        if not row then return nil end
+        return unpack(row)
     end
     function GetGuildBankTabInfo(tab)
         local info = world.bankTabInfo[tab]
@@ -25573,31 +25648,116 @@ do
     BankLog.awaitingLogUpdate = false
     BankLog.lastLegacyStats = nil
     assertEq(BankLog:BeginObservation("open"), true, "A2: begin observation")
-    BankLog:ProcessLogUpdate("a2-same-tab")
+    BankLog:ProcessLogUpdate("a2-disjoint-items")
     assertEq(BankLog.lastFreshLogTab, 2, "A2: GS sample stamped")
     assertEq(GS.IsBankContextSampleReady(2), true, "A2: GS sample ready")
     assertTrue(BankLog.lastStats and BankLog.lastStats.sampleOnly == true,
         "A2: no staged GS donation admission")
-    assertTrue(SF.ConsumablesObservation and SF.ConsumablesObservation.ReconcileSnapshot,
-        "A2: observation reconcile API present")
-    assertTrue(type(BankLog.lastLegacyStats) == "table",
-        "A2: legacy reconcile ran alongside sample")
+    assertTrue(type(BankLog.lastLegacyStats) == "table"
+        and (BankLog.lastLegacyStats.created or 0) >= 1,
+        "A2: legacy created observation for disjoint item")
+    local store = SF.ConsumablesObservation.EnsureProfileStore(SF.lootHelperDB, profile._profileId)
+    local scope = store and SF.ConsumablesObservation.EnsureScope(store, "42", 2)
+    local foundLegacyObs = false
+    for i = 1, #(scope and scope.observations or {}) do
+        local obs = scope.observations[i]
+        if type(obs) == "table" and tonumber(obs.itemId) == 200
+            and tonumber(obs.generation) == 5 then
+            foundLegacyObs = true
+            break
+        end
+    end
+    assertTrue(foundLegacyObs, "A2: legacy observation uses item 200 generation 5")
+    assertTrue(profile._consumables.eligibility.baselineEstablished == true,
+        "A2: legacy baseline established")
+    assertTrue(type(BankLog.lastVerifyStats) == "table"
+        and (BankLog.lastVerifyStats.trusted or 0) >= 1,
+        "A2: legacy admin trust credited donation")
+    assertTrue(#(profile._consumableEvents or {}) >= 1,
+        "A2: legacy ledger received credited event")
+    -- GS must not have admitted the legacy-only deposit into staged accounting.
+    local gsRec = GS:GetCurrentRecord()
+    assertEq(#(gsRec.accounting._consumableEvents or {}), 0,
+        "A2: staged GS ledger empty")
 
-    -- Different tabs: prefer legacy; do not stamp GS from legacy-tab query.
+    -- Mid-query: disable legacy eligibility so live.legacy is nil. Must not fall
+    -- back to a pending companion and write the prior profile.
+    BankLog.pendingQuery = nil
+    BankLog.awaitingLogUpdate = false
+    BankLog.requireBankReopenForFreshness = false
+    BankLog.active = false
+    BankLog.lastLegacyStats = nil
+    local priorObsCount = #(scope and scope.observations or {})
+    assertEq(BankLog:BeginObservation("open"), true, "A2: begin before legacy disable")
+    assertTrue(type(BankLog.pendingQuery) == "table", "A2: query outstanding before disable")
+    local savedItems = profile._consumables.requestedItems
+    profile._consumables.requestedItems = {}
+    BankLog:ProcessLogUpdate("a2-stale-legacy-disabled")
+    assertTrue(BankLog.lastLegacyStats == nil,
+        "A2: disabled legacy mid-query skips companion reconcile")
+    local afterDisableCount = #(scope and scope.observations or {})
+    assertEq(afterDisableCount, priorObsCount,
+        "A2: disabled legacy mid-query does not append stale observations")
+    profile._consumables.requestedItems = savedItems
+
+    -- Different tabs: legacy tab selected → prefer legacy; GS tab never stamped.
     local tabOp3 = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 3))
     assertEq(GS:ApplyStagedConfigOperation(tabOp3), "accepted", "A2: GS tab 3")
     profile._consumables.bankTab = 2
+    world.currentGuildBankTab = 2
+    BankLog.lastFreshLogTab = nil
+    BankLog.lastFreshLogAt = nil
+    BankLog.lastFreshLogGuild = nil
+    BankLog.requireBankReopenForFreshness = false
+    BankLog.pendingQuery = nil
+    BankLog.awaitingLogUpdate = false
+    BankLog.active = false
     local split = BankLog:EligibleContext()
     assertTrue(split ~= nil and split.source == "legacyProfile",
-        "A2: different tabs prefer legacy")
-    assertNil(split.sampleOnly, "A2: no sample-only when tabs differ")
+        "A2: different tabs on legacy selection prefer legacy")
+    assertNil(split.sampleOnly, "A2: no sample-only when viewing legacy tab")
+    assertEq(BankLog:BeginObservation("open"), true, "A2: begin legacy-tab observation")
+    BankLog:ProcessLogUpdate("a2-legacy-tab")
+    assertEq(BankLog.lastFreshLogTab, 2, "A2: legacy-tab query stamps tab 2")
+    GS._BankContextReadinessProbe = nil
+    local gsReady, gsReadyReason = GS.IsBankContextSampleReady(3)
+    assertEq(gsReady, false,
+        "A2: legacy-tab never stamps GS tab 3 reason=" .. tostring(gsReadyReason))
+
+    -- Viewing the configured GS tab acquires the activation sample (close/reopen first).
+    BankLog.requireBankReopenForFreshness = true
+    BankLog:OnBankClosed()
+    BankLog:OnBankOpened()
+    world.currentGuildBankTab = 3
+    world.bankTxnCounts[3] = 0
+    world.bankTxnRows[3] = {}
+    local gsSampleCtx = BankLog:EligibleContext()
+    assertTrue(gsSampleCtx and gsSampleCtx.sampleOnly == true and gsSampleCtx.bankTab == 3,
+        "A2: viewing GS tab selects sample-only")
+    assertNil(gsSampleCtx.legacy, "A2: different-tab sample has no legacy companion")
+    local guide = GS.FormatActivationGuidance({
+        reason = "tab_not_ready",
+        configuredBankTab = 3,
+    })
+    assertTrue(type(guide) == "string" and guide:find("tab 3", 1, true),
+        "A2: Settings guide names GS tab for split-tab sample")
+    assertTrue(guide:find("tab 2", 1, true),
+        "A2: Settings guide names legacy tab for split-tab sample")
+    BankLog.requireBankReopenForFreshness = false
+    BankLog.pendingQuery = nil
+    BankLog.awaitingLogUpdate = false
+    BankLog.active = false
+    assertEq(BankLog:BeginObservation("open"), true, "A2: begin GS-tab sample")
+    BankLog:ProcessLogUpdate("a2-gs-tab-sample")
+    assertEq(BankLog.lastFreshLogTab, 3, "A2: GS tab sample stamped")
+    assertEq(GS.IsBankContextSampleReady(3), true, "A2: GS activation sample ready on tab 3")
+    assertTrue(BankLog.lastStats and BankLog.lastStats.sampleOnly == true,
+        "A2: empty GS sample admits nothing")
 
     -- Post-activation: live GS only; legacy companion disabled.
-    local tabOp2 = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
-    assertEq(GS:ApplyStagedConfigOperation(tabOp2), "accepted", "A2: restore GS tab 2")
     armFreshBankSample(true)
     local _, stAct = GS:ActivateCanonicalDataset()
-    assertEq(stAct, "accepted", "A2: activate")
+    assertEq(stAct, "accepted", "A2: activate after GS sample")
     local liveCtx = BankLog:EligibleContext()
     assertTrue(liveCtx and liveCtx.source == "guildSupplies" and not liveCtx.sampleOnly,
         "A2: post-activation live GS context")
@@ -25607,11 +25767,14 @@ do
     SF.GetActiveProfile = priorGetActive
     SF.ConsumablesRuntime = priorRuntime
     GetGuildBankTabInfo = nil
+    GetGuildBankTransaction = nil
+    GetNumGuildBankTransactions = nil
+    GetCurrentGuildBankTab = nil
     QueryGuildBankLog = nil
 end
 
 do
-    -- B3) Repeated GetCurrentRecord must not rescan unchanged ops store.
+    -- B3) Ops-store validation fast path: measure + immutability + invalidation.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -25619,37 +25782,123 @@ do
     settleRoster()
     GS:CreateStagedRecord()
     startCampaign()
-    -- Seed a moderate accepted-ops set.
-    for i = 1, 40 do
-        local op = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 8000 + i }, {
-            itemId = 8000 + i, goal = i, removed = false,
-        }))
-        assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "B3: seed op " .. i)
+    local record = GS:GetCurrentRecord()
+    local datasetId = record.datasetId
+    local raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local function seedAccepted(n)
+        local ops = raw.operations
+        for i = 1, n do
+            local id = "perf-" .. i
+            ops.records[id] = minimalValidBankTabBody(id, datasetId, (i % 8) + 1)
+            ops.order[#ops.order + 1] = id
+        end
+        ops.heads = {}
+        if GS._BumpOpsValidationGen then
+            GS._BumpOpsValidationGen(ops)
+        end
     end
-    GS._opsValidationBodyScans = 0
-    local r1 = GS:GetCurrentRecord()
-    assertTrue(r1 ~= nil, "B3: first read ok")
-    local scansAfterFirst = GS._opsValidationBodyScans
-    assertTrue(scansAfterFirst >= 1, "B3: first read performs body validation walk")
-    for _ = 1, 20 do
-        assertTrue(GS:GetCurrentRecord() ~= nil, "B3: repeated read")
+    local function measureReads(label, reps)
+        GS._opsValidationFullScans = 0
+        GS._opsValidationBodyScans = 0
+        GS._opsValidationOrderIters = 0
+        -- Prime cache.
+        assertTrue(GS:GetCurrentRecord() ~= nil, label .. " prime read")
+        local fullAfterPrime = GS._opsValidationFullScans
+        local itersAfterPrime = GS._opsValidationOrderIters
+        local t0 = os.clock()
+        for _ = 1, reps do
+            assertTrue(GS:GetCurrentRecord() ~= nil, label .. " repeated read")
+        end
+        local elapsed = os.clock() - t0
+        assertEq(GS._opsValidationFullScans, fullAfterPrime,
+            label .. " repeated reads skip full scans scans="
+                .. tostring(GS._opsValidationFullScans))
+        assertEq(GS._opsValidationOrderIters, itersAfterPrime,
+            label .. " repeated reads skip order iters iters="
+                .. tostring(GS._opsValidationOrderIters))
+        return elapsed, fullAfterPrime, itersAfterPrime
     end
-    assertEq(GS._opsValidationBodyScans, scansAfterFirst,
-        "B3: repeated reads skip body validation walks scans="
-            .. tostring(GS._opsValidationBodyScans))
-    -- Mutation must invalidate and revalidate bodies.
+
+    seedAccepted(1000)
+    local elapsed1k = measureReads("B3-1k", 50)
+    assertTrue(elapsed1k < 1.0, "B3: 50 reads at 1k ops stay bounded got=" .. tostring(elapsed1k))
+
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    datasetId = record.datasetId
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    seedAccepted(4000)
+    local elapsed4k = measureReads("B3-4k", 50)
+    assertTrue(elapsed4k < 2.0, "B3: 50 reads at 4k ops stay bounded got=" .. tostring(elapsed4k))
+
+    -- Controlled mutation invalidates; next read rescans once.
+    local beforeMutFull = GS._opsValidationFullScans
     local mut = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 8999 }, {
         itemId = 8999, goal = 1, removed = false,
     }))
     assertEq(GS:ApplyStagedConfigOperation(mut), "accepted", "B3: mutating write")
-    local beforeMutRead = GS._opsValidationBodyScans
     assertTrue(GS:GetCurrentRecord() ~= nil, "B3: read after mutation")
-    assertTrue(GS._opsValidationBodyScans > beforeMutRead,
-        "B3: mutation invalidates body-validation cache")
-    local afterMut = GS._opsValidationBodyScans
+    assertTrue(GS._opsValidationFullScans > beforeMutFull,
+        "B3: mutation forces full revalidation")
+    local afterMutFull = GS._opsValidationFullScans
     assertTrue(GS:GetCurrentRecord() ~= nil, "B3: second post-mutation read")
-    assertEq(GS._opsValidationBodyScans, afterMut,
-        "B3: post-mutation body cache hits again")
+    assertEq(GS._opsValidationFullScans, afterMutFull,
+        "B3: post-mutation cache hits again")
+
+    -- Accepted bodies are snapshot copies: mutating the prepared op must not
+    -- alter the retained accepted body (immutability invariant).
+    local prepared = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 4))
+    assertTrue(prepared ~= nil, "B3: prepare bank tab")
+    assertEq(GS:ApplyStagedConfigOperation(prepared), "accepted", "B3: admit bank tab")
+    local stored = GS:GetCurrentRecord().operations.records[prepared.id]
+    assertTrue(stored ~= nil and stored ~= prepared,
+        "B3: accepted body is a distinct snapshot table")
+    prepared.timestamp = math.huge
+    assertTrue(stored.timestamp ~= math.huge,
+        "B3: mutating prepared op does not corrupt accepted body")
+
+    -- Malformed retained body via new ops-table identity (no private bump).
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local oldOps = raw.operations
+    local badId = prepared.id
+    oldOps.records[badId].timestamp = math.huge
+    raw.operations = {
+        records = oldOps.records,
+        order = oldOps.order,
+        heads = oldOps.heads,
+        pending = oldOps.pending,
+        conflicts = oldOps.conflicts,
+        openConflicts = oldOps.openConflicts,
+    }
+    local exposed, reason = GS:GetCurrentRecord()
+    assertNil(exposed, "B3: malformed retained body unavailable after replacement")
+    assertEq(reason, "invalid_timestamp", "B3: malformed reason invalid_timestamp")
+    -- Pending mutation path still invalidates via new ops-table identity.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    assertTrue(GS:GetCurrentRecord() ~= nil, "B3: pending-case prime")
+    raw = SpectrumFederationDB.guildSupplies.guilds["club:42"]
+    local fullBeforePending = GS._opsValidationFullScans
+    raw.operations.pending["p-b3"] = {
+        id = "p-b3",
+        reason = "stale_base",
+        body = { id = "other", kind = "set-bank-tab" },
+        at = 1,
+    }
+    rebindOperations(raw)
+    assertNil(select(1, GS:GetCurrentRecord()), "B3: bad pending unavailable")
+    assertTrue(GS._opsValidationFullScans > fullBeforePending,
+        "B3: pending mutation revalidates")
 end
 
 do

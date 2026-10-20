@@ -5544,6 +5544,9 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
             GS._StoreAccepted(ops, chosen, GS.CAMPAIGN_TARGET_KEY)
         elseif ops.heads then
             ops.heads[GS.CAMPAIGN_TARGET_KEY] = chosen.id
+            if GS._BumpOpsValidationGen then
+                GS._BumpOpsValidationGen(ops)
+            end
         end
         return true
     end
@@ -5647,6 +5650,9 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
                 end
             end
         end
+        if GS._BumpOpsValidationGen then
+            GS._BumpOpsValidationGen(ops)
+        end
     end
 
     -- Preflight headers before any durable writes.
@@ -5717,6 +5723,9 @@ local function ActivateChosenCampaignProjection(record, chosen, boundary)
         end
     elseif ops.heads then
         ops.heads[GS.CAMPAIGN_TARGET_KEY] = chosen.id
+        if GS._BumpOpsValidationGen then
+            GS._BumpOpsValidationGen(ops)
+        end
     end
 
     -- Store promotions first; defer retention cleanup until post-validation
@@ -7174,6 +7183,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                         end
                     end
                 end
+                if GS._BumpOpsValidationGen then
+                    GS._BumpOpsValidationGen(ops)
+                end
                 -- Fast-path still mutates durable history (envelope + losers).
                 if GS._NotifyLocalDurableChange and not admissionCtx.adoptionReplay then
                     GS._NotifyLocalDurableChange("remote-resolve")
@@ -7335,6 +7347,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                 end
             elseif ops.heads then
                 ops.heads[targetKey] = applyId
+                if GS._BumpOpsValidationGen then
+                    GS._BumpOpsValidationGen(ops)
+                end
             end
         end
         -- Retain resolution identity/causal ancestry without making the envelope
@@ -7352,9 +7367,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         end
         if ops.openConflicts then
             ops.openConflicts[targetKey] = nil
-            if GS._BumpOpsValidationGen then
-                GS._BumpOpsValidationGen(ops)
-            end
+        end
+        if GS._BumpOpsValidationGen then
+            GS._BumpOpsValidationGen(ops)
         end
         for i = 1, #retainPlan do
             local step = retainPlan[i]

@@ -662,6 +662,7 @@ function GS:GetActivationReadiness()
     local ready, readyReason = GS.IsBankContextSampleReady(tab)
     result.bankReady = ready and true or false
     result.bankReason = readyReason
+    result.configuredBankTab = tab
     if not ready then
         result.reason = readyReason or "log_not_updated"
         return result
@@ -699,6 +700,31 @@ function GS.FormatActivationGuidance(readiness)
             "Open the Guild Bank and select the configured tab so a fresh transaction-log sample can be verified. Only live activation requires this sample.")
     end
     if reason == "not_observing" or reason == "tab_not_ready" then
+        -- When an eligible legacy profile uses a different bank tab, guide the
+        -- editor to open the configured Guild Supplies tab (event-driven via
+        -- GetCurrentGuildBankTab); never auto-query both tabs.
+        local BankLog = SF.ConsumablesBankLog
+        local cfgTab = tonumber(readiness.configuredBankTab)
+        if not cfgTab and type(BankLog) == "table" then
+            local sample = BankLog.GuildSuppliesSampleOnlyContext
+                and BankLog:GuildSuppliesSampleOnlyContext()
+            cfgTab = sample and tonumber(sample.bankTab) or nil
+        end
+        local legacyTab = nil
+        if type(BankLog) == "table" and BankLog.LegacyEligibleContext then
+            local legacy = BankLog:LegacyEligibleContext()
+            legacyTab = legacy and tonumber(legacy.bankTab) or nil
+        end
+        if cfgTab and legacyTab and cfgTab ~= legacyTab then
+            local tmpl = Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_OTHER_TAB",
+                "Guild Supplies uses Guild Bank tab %d, while your Raid Consumables profile uses tab %d. Select the Guild Supplies tab in the Guild Bank to take the activation sample (close and reopen the bank if a previous query was interrupted). Legacy observation continues on its own tab until activation.")
+            return string.format(tmpl, cfgTab, legacyTab)
+        end
+        if cfgTab then
+            local tmpl = Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_SELECT_GS_TAB",
+                "Guild Supplies uses Guild Bank tab %d. Select that tab in the Guild Bank to take the activation sample (close and reopen the bank if a previous query was interrupted).")
+            return string.format(tmpl, cfgTab)
+        end
         return Loc("GUILD_SUPPLIES_ACTIVATION_GUIDE_NOT_OBSERVING",
             "Open the Guild Bank and select the configured tab so a fresh transaction-log sample can be taken for activation.")
     end

@@ -229,13 +229,96 @@ function BankLog:EligibleContext()
             return sampleCtx
         end
         -- Different tabs: never issue overlapping uncorrelated queries. Prefer
-        -- legacy (still the production writer) and leave GS sample unstamped.
+        -- the tab the player currently has selected so an editor can take the
+        -- GS activation sample by opening that tab (legacy stays primary on its
+        -- own tab). Unknown current tab → legacy production writer.
+        local currentTab = nil
+        if type(GetCurrentGuildBankTab) == "function" then
+            currentTab = tonumber(GetCurrentGuildBankTab())
+        end
+        if currentTab and currentTab == sampleCtx.bankTab then
+            return sampleCtx
+        end
         return legacyCtx
     end
     if sampleCtx then
         return sampleCtx
     end
     return legacyCtx
+end
+
+--- Independent legacy view over the same authenticated raw bank rows.
+-- Reuses rows/provenance from a completed query but never inherits Guild Supplies
+-- requestedSet / generation / eligibility / observer identity.
+function BankLog:BuildLegacySnapshotView(legacyCtx, rawSnapshot)
+    if type(legacyCtx) ~= "table" or legacyCtx.source ~= "legacyProfile"
+        or type(rawSnapshot) ~= "table" then
+        return nil
+    end
+    if tonumber(legacyCtx.bankTab) ~= tonumber(rawSnapshot.bankTab) then
+        return nil
+    end
+    if tostring(legacyCtx.guildGuid or "") ~= tostring(rawSnapshot.guildGuid or "") then
+        return nil
+    end
+    local C = SF.Consumables
+    local eligibility = nil
+    if C and C.EligibilitySnapshot and legacyCtx.profile then
+        eligibility = C.EligibilitySnapshot(legacyCtx.profile)
+    end
+    return {
+        authoritative = rawSnapshot.authoritative ~= false,
+        guildGuid = legacyCtx.guildGuid,
+        bankTab = legacyCtx.bankTab,
+        generation = legacyCtx.generation,
+        observedBy = legacyCtx.observedBy,
+        observedAt = rawSnapshot.observedAt,
+        requestedSet = legacyCtx.requestedSet,
+        eligibility = eligibility,
+        rows = rawSnapshot.rows,
+    }
+end
+
+--- Live companion legacy context for a completed GS sample query, or nil.
+-- Never falls back to a pending/stale legacy identity after profile/guild/tab
+-- or writer eligibility changes mid-query.
+function BankLog:LiveLegacyCompanionForQuery(pendingCtx, liveCtx)
+    if type(pendingCtx) ~= "table" or type(liveCtx) ~= "table" then
+        return nil
+    end
+    if pendingCtx.source ~= "guildSupplies" or pendingCtx.sampleOnly ~= true then
+        return nil
+    end
+    local legacy = liveCtx.legacy
+    if type(legacy) ~= "table" or legacy.source ~= "legacyProfile" then
+        return nil
+    end
+    if tonumber(legacy.bankTab) ~= tonumber(pendingCtx.bankTab) then
+        return nil
+    end
+    if tostring(legacy.guildGuid or "") ~= tostring(pendingCtx.guildGuid or "") then
+        return nil
+    end
+    local C = SF.Consumables
+    if C and type(C.LegacyWritersAllowed) == "function"
+        and not C.LegacyWritersAllowed(legacy.profile) then
+        return nil
+    end
+    -- Require the live EligibleContext still author the same companion profile.
+    local fresh = self:LegacyEligibleContext()
+    if type(fresh) ~= "table" then
+        return nil
+    end
+    if tostring(fresh.profileId or "") ~= tostring(legacy.profileId or "") then
+        return nil
+    end
+    if tonumber(fresh.bankTab) ~= tonumber(legacy.bankTab) then
+        return nil
+    end
+    if tostring(fresh.guildGuid or "") ~= tostring(legacy.guildGuid or "") then
+        return nil
+    end
+    return fresh
 end
 
 function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
@@ -325,8 +408,8 @@ local function SnapshotQueryContext(ctx)
         profile = ctx.profile,
         record = ctx.record,
         cfg = ctx.cfg,
-        -- Same-tab staged companion: one QueryGuildBankLog also feeds legacy.
-        legacy = ctx.legacy,
+        -- Legacy companion is resolved live at ProcessLogUpdate time (never
+        -- snapshotted onto pending query identity).
     }
 end
 
@@ -548,9 +631,8 @@ function BankLog:ProcessLogUpdate(reason)
     ctx.record = live.record or ctx.record
     ctx.cfg = live.cfg or ctx.cfg
     ctx.profile = live.profile or ctx.profile
-    -- Companion legacy context is live-authored (not query identity); refresh it
-    -- so sample-only stamps still reconcile the pre-activation production writer.
-    ctx.legacy = live.legacy or ctx.legacy
+    -- Companion legacy is live-only (never pending fallback — avoids stale writes).
+    ctx.legacy = nil
 
     self.activeContext = live
     self.queryRetries = 0
@@ -588,12 +670,14 @@ function BankLog:ProcessLogUpdate(reason)
                 tostring(reason or "update"),
                 tostring(ctx.bankTab),
                 tostring(#(snapshot.rows or {})))
-            -- Same-tab legacy companion: keep production legacy observation alive
-            -- until activation (do not query a second tab).
-            local legacy = ctx.legacy
-            if type(legacy) == "table" and legacy.source == "legacyProfile"
-                and legacy.bankTab == ctx.bankTab then
-                self:ProcessLegacySnapshot(legacy, snapshot, reason)
+            -- Same-tab live legacy companion: independent snapshot view over the
+            -- same authenticated rows (GS requestedSet/generation never applied).
+            local legacy = self:LiveLegacyCompanionForQuery(ctx, live)
+            if legacy then
+                local legacySnap = self:BuildLegacySnapshotView(legacy, snapshot)
+                if legacySnap then
+                    self:ProcessLegacySnapshot(legacy, legacySnap, reason)
+                end
             end
             return
         end
@@ -631,7 +715,9 @@ function BankLog:ProcessLegacySnapshot(ctx, snapshot, reason)
         return
     end
     local C = SF.Consumables
-    if C and C.EligibilitySnapshot and ctx.profile then
+    -- Prefer a caller-built legacy view; otherwise stamp eligibility onto the
+    -- dedicated legacy snapshot (never mutate a shared GS sample table in place).
+    if snapshot.eligibility == nil and C and C.EligibilitySnapshot and ctx.profile then
         snapshot.eligibility = C.EligibilitySnapshot(ctx.profile)
     end
 

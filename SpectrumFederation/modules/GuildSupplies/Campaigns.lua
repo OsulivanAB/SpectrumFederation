@@ -1718,6 +1718,9 @@ function GS:ApplyStagedCampaignOperation(op, context)
         if ops.pending then
             ops.pending[stored.id] = nil
         end
+        if GS._BumpOpsValidationGen then
+            GS._BumpOpsValidationGen(ops)
+        end
     end
 
     -- Post-condition validation: if the guild record would become unusable, roll back.
@@ -1750,6 +1753,9 @@ function GS:ApplyStagedCampaignOperation(op, context)
             ops.pending[stored.id] = previousPending
         elseif ops.pending then
             ops.pending[stored.id] = nil
+        end
+        if GS._BumpOpsValidationGen then
+            GS._BumpOpsValidationGen(ops)
         end
         DebugWarn("campaign apply rolled back: %s", tostring(postErr))
         return "rejected", postErr or "invalid_record"
