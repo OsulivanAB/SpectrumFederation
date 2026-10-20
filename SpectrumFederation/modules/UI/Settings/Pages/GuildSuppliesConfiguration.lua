@@ -1906,7 +1906,8 @@ local function Definition()
 							if attributed == "" then attributed = nil end
 							if not itemId or not quantity then
 								ctx.section:SetMessage(
-									Loc("GUILD_SUPPLIES_ERR_ITEM", "Enter an item ID or paste an item link."),
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
+										"Enter an item ID, a signed quantity, and an optional character name."),
 									"error")
 								return
 							end
@@ -2001,7 +2002,7 @@ local function Definition()
 						end,
 						getDisabledTooltip = function()
 							return DisabledNeedRecordTip(
-								Loc("GUILD_SUPPLIES_DISABLED_ACTION_LINKS", "unlinking characters"))
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_UNLINK", "unlinking characters"))
 						end,
 						onSubmit = function(ctx, text)
 							local g = GS()

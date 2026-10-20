@@ -488,6 +488,9 @@ function GS._MarkTargetConflict(ops, targetKey, candidateIds, at, meta)
             end
         end
     end
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(ops)
+    end
     return true
 end
 
@@ -7349,6 +7352,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         end
         if ops.openConflicts then
             ops.openConflicts[targetKey] = nil
+            if GS._BumpOpsValidationGen then
+                GS._BumpOpsValidationGen(ops)
+            end
         end
         for i = 1, #retainPlan do
             local step = retainPlan[i]

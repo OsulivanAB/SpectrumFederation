@@ -257,6 +257,10 @@ function GG.NotifyProviderChanged(providerId)
     if type(GG.ReopenUnresolvedEnumeration) == "function" then
         GG.ReopenUnresolvedEnumeration(providerId)
     end
+    -- Capture walk-in-progress BEFORE marking dirty. indexWalkInProgress treats
+    -- EnsureIndex providers with index.dirty as still walking; setting dirty
+    -- first would always coalesce and skip OnIndexInvalidated on idle completes.
+    local walkActive = indexWalkInProgress(entry)
     -- Provider-owned storage changed outside the engine's append path. Retain
     -- dirty/changeGen even while disabled so re-enable reconciles durable writes
     -- without starting transport. Enabled providers keep the live index usable
@@ -272,7 +276,7 @@ function GG.NotifyProviderChanged(providerId)
     -- follow-up reconcile after the current cursor/enum finishes. Genuine
     -- epoch/replacement invalidation still goes through BumpIndexEpoch, which
     -- clears continuation state itself.
-    if indexWalkInProgress(entry) then
+    if walkActive then
         entry._reconcileFollowUp = true
     else
         entry._buildList = nil

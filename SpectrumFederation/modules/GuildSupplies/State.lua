@@ -305,6 +305,26 @@ local function ValidateOperationsOrderDense(order)
     return true, counted, nil
 end
 
+-- Ephemeral weak cache for ValidateOperationsStore. Keyed by ops table identity
+-- (reload allocates new tables → automatic miss). Gen is runtime-only and bumped
+-- by every controlled ops writer; never trust a persisted gen across reload.
+local opsStoreValidationCache = setmetatable({}, { __mode = "k" })
+
+--- Advance the ops structural-validation generation after a controlled mutation.
+-- Safe to call with nil; does not persist. Failed prior cache entries are dropped
+-- so the next read revalidates.
+function GS._BumpOpsValidationGen(ops)
+    if type(ops) ~= "table" then
+        return
+    end
+    local n = tonumber(ops._opsValidationGen) or 0
+    ops._opsValidationGen = n + 1
+    opsStoreValidationCache[ops] = nil
+end
+
+--- Test/diagnostic: expensive ValidateAcceptedOperationBody walks only.
+GS._opsValidationBodyScans = 0
+
 --- @param ops table
 -- @param guildKey string|nil owning guild key for body consistency
 -- @param datasetId string|nil owning dataset id for body consistency
@@ -318,32 +338,50 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
         return false, "invalid_operations"
     end
 
+    -- Structural checks always run so in-place corruption cannot bypass validation.
+    -- The gen cache only skips the expensive per-body ValidateAcceptedOperationBody
+    -- walk after a controlled writer bumped `_opsValidationGen`.
+    local gen = tonumber(ops._opsValidationGen) or 0
+    local cached = opsStoreValidationCache[ops]
+    local skipBodyWalk = cached
+        and cached.gen == gen
+        and cached.guildKey == (guildKey or false)
+        and cached.datasetId == (datasetId or false)
+        and cached.ok == true
+
     local denseOk, orderCount, denseErr = ValidateOperationsOrderDense(ops.order)
     if not denseOk then
+        opsStoreValidationCache[ops] = nil
         return false, denseErr or "invalid_operations"
     end
     local seenOrder = {}
+    if not skipBodyWalk then
+        GS._opsValidationBodyScans = (tonumber(GS._opsValidationBodyScans) or 0) + 1
+    end
     for i = 1, orderCount do
         local id = ops.order[i]
         if type(id) ~= "string" or id == "" or #id > GS.MAX_OPERATION_ID then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
         if seenOrder[id] then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
         seenOrder[id] = true
         local body = ops.records[id]
         if type(body) ~= "table" then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
         if type(body.id) ~= "string" or body.id ~= id then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
-        -- Kind-specific historical shape (Operations registers the pure validator).
-        -- Avoids current-authority / current-revision admission and GetCurrentRecord.
-        if type(GS.ValidateAcceptedOperationBody) == "function" then
+        if not skipBodyWalk and type(GS.ValidateAcceptedOperationBody) == "function" then
             local bodyOk, bodyErr = GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
             if not bodyOk then
+                opsStoreValidationCache[ops] = nil
                 return false, bodyErr or "invalid_operations"
             end
         end
@@ -353,13 +391,16 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
     for id, body in pairs(ops.records) do
         recordCount = recordCount + 1
         if recordCount > GS.MAX_ACCEPTED_OPERATIONS then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
         if type(id) ~= "string" or not seenOrder[id] or type(body) ~= "table" then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
     end
     if recordCount ~= orderCount then
+        opsStoreValidationCache[ops] = nil
         return false, "invalid_operations"
     end
 
@@ -367,10 +408,12 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
     for id, entry in pairs(ops.pending) do
         pendingCount = pendingCount + 1
         if pendingCount > GS.MAX_PENDING_OPERATIONS then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
         local ok, err = ValidateRetainedAdmissionEntry(id, entry)
         if not ok then
+            opsStoreValidationCache[ops] = nil
             return false, err
         end
     end
@@ -379,19 +422,23 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
     for id, entry in pairs(ops.conflicts) do
         conflictCount = conflictCount + 1
         if conflictCount > GS.MAX_PENDING_OPERATIONS then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
         local ok, err = ValidateRetainedAdmissionEntry(id, entry)
         if not ok then
+            opsStoreValidationCache[ops] = nil
             return false, err
         end
     end
     if pendingCount + conflictCount > GS.MAX_PENDING_OPERATIONS then
+        opsStoreValidationCache[ops] = nil
         return false, "invalid_operations"
     end
 
     local headsOk, headsErr = ValidateOperationsHeads(ops)
     if not headsOk then
+        opsStoreValidationCache[ops] = nil
         return false, headsErr
     end
 
@@ -399,6 +446,7 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
     -- dense unique refs to retained/accepted bodies (no invented candidates).
     if ops.openConflicts ~= nil then
         if type(ops.openConflicts) ~= "table" then
+            opsStoreValidationCache[ops] = nil
             return false, "invalid_operations"
         end
         local openCount = 0
@@ -406,17 +454,21 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
         for targetKey, entry in pairs(ops.openConflicts) do
             openCount = openCount + 1
             if openCount > maxOpen then
+                opsStoreValidationCache[ops] = nil
                 return false, "invalid_operations"
             end
             if type(targetKey) ~= "string" or targetKey == "" or type(entry) ~= "table" then
+                opsStoreValidationCache[ops] = nil
                 return false, "invalid_operations"
             end
             if type(entry.candidateIds) ~= "table" then
+                opsStoreValidationCache[ops] = nil
                 return false, "invalid_operations"
             end
             local n = #entry.candidateIds
             local maxCand = GS.MAX_CONFLICT_CANDIDATES or 16
             if n < 2 or n > maxCand then
+                opsStoreValidationCache[ops] = nil
                 return false, "invalid_operations"
             end
             local seen = {}
@@ -424,9 +476,11 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
             for k, id in pairs(entry.candidateIds) do
                 dense = dense + 1
                 if type(k) ~= "number" or k ~= math.floor(k) or k < 1 or k > n then
+                    opsStoreValidationCache[ops] = nil
                     return false, "invalid_operations"
                 end
                 if type(id) ~= "string" or id == "" or seen[id] then
+                    opsStoreValidationCache[ops] = nil
                     return false, "invalid_operations"
                 end
                 seen[id] = true
@@ -434,15 +488,21 @@ local function ValidateOperationsStore(ops, guildKey, datasetId)
                     or (ops.pending and ops.pending[id] and ops.pending[id].body)
                     or (ops.conflicts and ops.conflicts[id] and ops.conflicts[id].body)
                 if type(body) ~= "table" then
+                    opsStoreValidationCache[ops] = nil
                     return false, "invalid_operations"
                 end
             end
             if dense ~= n then
+                opsStoreValidationCache[ops] = nil
                 return false, "invalid_operations"
             end
         end
     end
 
+    opsStoreValidationCache[ops] = {
+        gen = gen, ok = true,
+        guildKey = guildKey or false, datasetId = datasetId or false,
+    }
     return true
 end
 

@@ -349,7 +349,8 @@ function GG.RefreshGuildState()
         clubKey = tostring(clubId)
     end
 
-    local scopeId = computeScopeId(guildName, guildRealm, clubId)
+    -- Use normalized clubKey so raw 0 / "0" / "" never form a shared club:0 scope.
+    local scopeId = computeScopeId(guildName, guildRealm, clubKey)
     if not scopeId then
         -- Guild claimed but identity incomplete — wait/fail closed.
         if g.ready and GG.OnGuildInvalidated then

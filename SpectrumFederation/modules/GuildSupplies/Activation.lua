@@ -936,7 +936,14 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
     record.activation = GS.ACTIVATION_ACTIVE
     record.liveCutover = copy
     if type(cfg) == "table" then
-        ApplyLiveEligibilityBoundary(cfg, copy)
+        -- Same-dataset remote catch-up: preserve staged item/tab cutoffs already
+        -- rebuilt by operation replay (refreshOnly floors to the cutover). Local
+        -- ActivateCanonicalDataset still uses full replacement intentionally.
+        local elig = cfg.eligibility
+        local refreshOnly = type(elig) == "table"
+            and elig.baselineEstablished == true
+            and type(elig.items) == "table"
+        ApplyLiveEligibilityBoundary(cfg, copy, refreshOnly and { refreshOnly = true } or nil)
     end
     if opts.quarantinePending ~= false then
         QuarantinePreActivationPending(record)

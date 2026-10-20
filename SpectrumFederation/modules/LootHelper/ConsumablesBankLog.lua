@@ -169,15 +169,9 @@ function BankLog:GuildSuppliesSampleOnlyContext()
     return self:BuildGuildSuppliesContext(record, { sampleOnly = true })
 end
 
-function BankLog:EligibleContext()
-    local gsCtx = self:GuildSuppliesEligibleContext()
-    if gsCtx then
-        return gsCtx
-    end
-    local sampleCtx = self:GuildSuppliesSampleOnlyContext()
-    if sampleCtx then
-        return sampleCtx
-    end
+--- Eligible legacy (Loot Helper profile) bank observation context, or nil.
+-- Used before Guild Supplies activation while legacy remains the production writer.
+function BankLog:LegacyEligibleContext()
     local C = SF.Consumables
     local O = SF.ConsumablesObservation
     local GS = SF.GuildSupplies
@@ -218,6 +212,30 @@ function BankLog:EligibleContext()
         requestedSet = requestedSet,
         observedBy = self:ObserverId(),
     }
+end
+
+function BankLog:EligibleContext()
+    -- Live Guild Supplies is the sole production observer after activation.
+    local gsCtx = self:GuildSuppliesEligibleContext()
+    if gsCtx then
+        return gsCtx
+    end
+    local sampleCtx = self:GuildSuppliesSampleOnlyContext()
+    local legacyCtx = self:LegacyEligibleContext()
+    if sampleCtx and legacyCtx then
+        if sampleCtx.bankTab == legacyCtx.bankTab then
+            -- Same tab: one QueryGuildBankLog serves GS freshness + legacy reconcile.
+            sampleCtx.legacy = legacyCtx
+            return sampleCtx
+        end
+        -- Different tabs: never issue overlapping uncorrelated queries. Prefer
+        -- legacy (still the production writer) and leave GS sample unstamped.
+        return legacyCtx
+    end
+    if sampleCtx then
+        return sampleCtx
+    end
+    return legacyCtx
 end
 
 function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
@@ -307,6 +325,8 @@ local function SnapshotQueryContext(ctx)
         profile = ctx.profile,
         record = ctx.record,
         cfg = ctx.cfg,
+        -- Same-tab staged companion: one QueryGuildBankLog also feeds legacy.
+        legacy = ctx.legacy,
     }
 end
 
@@ -528,6 +548,9 @@ function BankLog:ProcessLogUpdate(reason)
     ctx.record = live.record or ctx.record
     ctx.cfg = live.cfg or ctx.cfg
     ctx.profile = live.profile or ctx.profile
+    -- Companion legacy context is live-authored (not query identity); refresh it
+    -- so sample-only stamps still reconcile the pre-activation production writer.
+    ctx.legacy = live.legacy or ctx.legacy
 
     self.activeContext = live
     self.queryRetries = 0
@@ -565,6 +588,13 @@ function BankLog:ProcessLogUpdate(reason)
                 tostring(reason or "update"),
                 tostring(ctx.bankTab),
                 tostring(#(snapshot.rows or {})))
+            -- Same-tab legacy companion: keep production legacy observation alive
+            -- until activation (do not query a second tab).
+            local legacy = ctx.legacy
+            if type(legacy) == "table" and legacy.source == "legacyProfile"
+                and legacy.bankTab == ctx.bankTab then
+                self:ProcessLegacySnapshot(legacy, snapshot, reason)
+            end
             return
         end
         snapshot.eligibility = ctx.eligibility
@@ -592,6 +622,14 @@ function BankLog:ProcessLogUpdate(reason)
         return
     end
 
+    self:ProcessLegacySnapshot(ctx, snapshot, reason)
+end
+
+--- Reconcile a legacy profile bank snapshot (pre-activation production writer).
+function BankLog:ProcessLegacySnapshot(ctx, snapshot, reason)
+    if type(ctx) ~= "table" or ctx.source ~= "legacyProfile" or type(snapshot) ~= "table" then
+        return
+    end
     local C = SF.Consumables
     if C and C.EligibilitySnapshot and ctx.profile then
         snapshot.eligibility = C.EligibilitySnapshot(ctx.profile)
@@ -604,7 +642,12 @@ function BankLog:ProcessLogUpdate(reason)
     if not store then return end
 
     local stats = O.ReconcileSnapshot(store, ctx.profileId, snapshot)
-    self.lastStats = stats
+    -- Preserve sampleOnly lastStats when this is a companion pass.
+    if not (self.lastStats and self.lastStats.sampleOnly) then
+        self.lastStats = stats
+    else
+        self.lastLegacyStats = stats
+    end
     Debug("Info",
         "reconcile reason=%s created=%s updated=%s ambiguous=%s suppressed=%s rows=%s",
         tostring(reason or "update"),

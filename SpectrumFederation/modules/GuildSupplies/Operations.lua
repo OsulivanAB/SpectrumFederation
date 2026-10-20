@@ -937,6 +937,9 @@ local function RetainConflict(ops, op)
                 at = pendingEntry.at or ServerTime() or op.timestamp,
             }
             ops.pending[op.id] = nil
+            if GS._BumpOpsValidationGen then
+                GS._BumpOpsValidationGen(ops)
+            end
             return true
         end
     end
@@ -950,6 +953,9 @@ local function RetainConflict(ops, op)
         body = op,
         at = ServerTime() or op.timestamp,
     }
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(ops)
+    end
     return true
 end
 
@@ -963,6 +969,9 @@ local function RetainPending(ops, op, reason)
         body = op,
         at = ServerTime() or op.timestamp,
     }
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(ops)
+    end
     return true
 end
 
@@ -1005,6 +1014,9 @@ local function StoreAccepted(ops, stored, targetKey)
         ops.heads[targetKey] = stored.id
     end
     ops.pending[stored.id] = nil
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(ops)
+    end
 end
 
 local function ApplyMutations(record, op, opts)

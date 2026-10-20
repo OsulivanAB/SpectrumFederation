@@ -3096,6 +3096,10 @@ do
     raw.operations.order = { "bad-conf" }
     raw.operations.heads = {}
     raw.confirmationRefs = { "bad-conf" }
+    -- In-place body corruption is not a controlled writer; bump so body walks run.
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(raw.operations)
+    end
     local exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "malformed confirmation body unavailable")
     assertTrue(reason == "invalid_operations" or reason == "invalid_fingerprint"
@@ -3123,6 +3127,9 @@ do
     raw.operations.order = { "bad-cfg" }
     raw.operations.heads = {}
     raw.confirmationRefs = {}
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(raw.operations)
+    end
     exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "malformed config body unavailable")
     assertTrue(reason == "invalid_operations" or reason == "unsupported_schema"
@@ -3423,11 +3430,17 @@ do
     local storedId = op.id
     local savedTs = raw.operations.records[storedId].timestamp
     raw.operations.records[storedId].timestamp = math.huge
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(raw.operations)
+    end
     local exposed, reason = GS:GetCurrentRecord()
     assertNil(exposed, "huge historical timestamp unavailable")
     assertEq(reason, "invalid_timestamp", "historical invalid_timestamp")
     assertEq(raw.operations.records[storedId].timestamp, math.huge, "malformed timestamp preserved")
     raw.operations.records[storedId].timestamp = savedTs
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(raw.operations)
+    end
     assertTrue(GS:GetCurrentRecord() ~= nil, "restored finite timestamp usable")
 
     -- Confirmation shape rejects non-finite timestamps at prepare/admission.
@@ -25378,6 +25391,325 @@ do
     world.guild.clubId = 42
     settleRoster()
     fireEvent("GUILD_ROSTER_UPDATE")
+end
+
+---------------------------------------------------------------------------
+-- CodeRabbit PR #400 repair batch: A1 / A2 / B3 / C2 / C3
+---------------------------------------------------------------------------
+
+do
+    -- A1) Remote InstallRemoteLiveCutover preserves later item cutoffs (refreshOnly).
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    local record = seedActivatableCampaign(9201, 5)
+    local cfg = record.accounting._consumables
+    local cutoverAt = 5000000
+    local laterItemCutoff = cutoverAt + 3600
+    cfg.eligibility = {
+        items = { ["9201"] = laterItemCutoff },
+        tabEligibleFrom = cutoverAt - 100,
+        baselineEstablished = true,
+        baselineAt = cutoverAt - 100,
+    }
+    local cutover = {
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        activatedAt = cutoverAt,
+        activatedByGuid = "Player-1-Alice",
+        activatedByName = "Alice-Garona",
+        bankTab = 2,
+        contextStatus = "empty",
+        contextObservedAt = cutoverAt,
+        contextRecordCount = 0,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = cutoverAt,
+        },
+    }
+    cutover.cutoverMarker = GS.BuildCutoverMarker(cutover.datasetId, cutover.activatedAt, cutover.bankTab)
+    local st, reason = GS.InstallRemoteLiveCutover(record, cutover, "club:42", {
+        quarantinePending = true,
+    })
+    assertEq(st, "accepted", "A1: remote cutover accepted r=" .. tostring(reason))
+    assertEq(record.activation, GS.ACTIVATION_ACTIVE, "A1: record active")
+    assertEq(cfg.eligibility.items["9201"], laterItemCutoff,
+        "A1: later item re-add cutoff preserved through remote cutover")
+    assertTrue((tonumber(cfg.eligibility.tabEligibleFrom) or 0) >= cutoverAt,
+        "A1: tab floor raised to cutover")
+    assertEq(cfg.eligibility.baselineEstablished, true, "A1: baseline remains established")
+
+    -- Local activation still fully replaces eligibility (intentional).
+    resetDb()
+    initGS()
+    record = seedActivatableCampaign(9202, 5)
+    cfg = record.accounting._consumables
+    cfg.eligibility.items = cfg.eligibility.items or {}
+    cfg.eligibility.items["9202"] = 9999999
+    armFreshBankSample(true)
+    local _, stAct = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted", "A1: local activation accepted")
+    cfg = GS:GetCurrentRecord().accounting._consumables
+    local nItems = 0
+    for _ in pairs(cfg.eligibility.items or {}) do nItems = nItems + 1 end
+    assertEq(nItems, 0, "A1: local activation replaces eligibility.items")
+    disarmFreshBankSample()
+end
+
+do
+    -- A1b) Item cutoff earlier than cutover is floored, never left below boundary.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    local record = seedActivatableCampaign(9203, 5)
+    local cfg = record.accounting._consumables
+    local cutoverAt = 6000000
+    cfg.eligibility = {
+        items = { ["9203"] = cutoverAt - 500 },
+        tabEligibleFrom = cutoverAt - 500,
+        baselineEstablished = true,
+        baselineAt = cutoverAt - 500,
+    }
+    local cutover = {
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        activatedAt = cutoverAt,
+        activatedByGuid = "Player-1-Alice",
+        activatedByName = "Alice-Garona",
+        bankTab = 2,
+        contextStatus = "empty",
+        contextObservedAt = cutoverAt,
+        contextRecordCount = 0,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = cutoverAt,
+        },
+    }
+    cutover.cutoverMarker = GS.BuildCutoverMarker(cutover.datasetId, cutover.activatedAt, cutover.bankTab)
+    assertEq(GS.InstallRemoteLiveCutover(record, cutover, "club:42"), "accepted",
+        "A1b: remote cutover accepted")
+    assertEq(cfg.eligibility.items["9203"], cutoverAt,
+        "A1b: pre-cutover item cutoff floored to boundary")
+end
+
+do
+    -- A2) Staged sample-only must not suppress same-tab legacy observation.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local tabOp = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
+    assertEq(GS:ApplyStagedConfigOperation(tabOp), "accepted", "A2: GS bank tab 2")
+    local itemOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 100 }, {
+        itemId = 100, goal = 5, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "A2: GS item")
+
+    -- Legacy profile on the same guild/tab with a requested item.
+    local C = SF.Consumables
+    assertTrue(C and C.Ensure, "A2: Consumables API present")
+    local profile = {
+        _profileId = "profile-a2-legacy",
+        _consumables = {
+            guild = { guid = "42", name = "Spectrum", realm = "Garona" },
+            bankTab = 2,
+            requestedItems = { ["100"] = { itemId = 100, goal = 5 } },
+            generation = 1,
+            configSeq = 0,
+            itemSeq = 0,
+            eligibility = { items = {}, tabEligibleFrom = nil, baselineEstablished = false },
+            txnRegistry = {},
+        },
+        _consumableEvents = {},
+        _consumableEventArchive = {},
+    }
+    local priorGetActive = SF.GetActiveProfile
+    local priorRuntime = SF.ConsumablesRuntime
+    SF.GetActiveProfile = function() return profile end
+    SF.ConsumablesRuntime = {
+        AccountingProfile = function() return profile end,
+        CurrentGuild = function()
+            return { guid = "42", name = "Spectrum", realm = "Garona" }
+        end,
+    }
+    SF.lootHelperDB = { profiles = { [profile._profileId] = profile } }
+    assertEq(C.LegacyWritersAllowed(profile), true, "A2: legacy writers allowed while staged")
+
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    local ctx = BankLog:EligibleContext()
+    assertTrue(ctx ~= nil and ctx.sampleOnly == true, "A2: sample-only context selected")
+    assertTrue(type(ctx.legacy) == "table" and ctx.legacy.source == "legacyProfile",
+        "A2: same-tab legacy companion attached")
+    assertEq(ctx.bankTab, ctx.legacy.bankTab, "A2: shared bank tab")
+
+    world.bankTxnCounts = { [2] = 1 }
+    world.bankTabInfo = { [2] = { name = "Supplies", isViewable = true } }
+    function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
+    function GetGuildBankTransaction()
+        return "deposit", "Alice-Garona", "|cffffffff|Hitem:100::::::::|h[Item]|h|r",
+            1, nil, nil, 0, 0, 0, 0
+    end
+    function GetGuildBankTabInfo(tab)
+        local info = world.bankTabInfo[tab]
+        if not info then return nil end
+        return info.name, nil, info.isViewable
+    end
+    function QueryGuildBankLog() end
+
+    BankLog.bankOpen = true
+    BankLog.active = false
+    BankLog.requireBankReopenForFreshness = false
+    BankLog.pendingQuery = nil
+    BankLog.awaitingLogUpdate = false
+    BankLog.lastLegacyStats = nil
+    assertEq(BankLog:BeginObservation("open"), true, "A2: begin observation")
+    BankLog:ProcessLogUpdate("a2-same-tab")
+    assertEq(BankLog.lastFreshLogTab, 2, "A2: GS sample stamped")
+    assertEq(GS.IsBankContextSampleReady(2), true, "A2: GS sample ready")
+    assertTrue(BankLog.lastStats and BankLog.lastStats.sampleOnly == true,
+        "A2: no staged GS donation admission")
+    assertTrue(SF.ConsumablesObservation and SF.ConsumablesObservation.ReconcileSnapshot,
+        "A2: observation reconcile API present")
+    assertTrue(type(BankLog.lastLegacyStats) == "table",
+        "A2: legacy reconcile ran alongside sample")
+
+    -- Different tabs: prefer legacy; do not stamp GS from legacy-tab query.
+    local tabOp3 = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 3))
+    assertEq(GS:ApplyStagedConfigOperation(tabOp3), "accepted", "A2: GS tab 3")
+    profile._consumables.bankTab = 2
+    local split = BankLog:EligibleContext()
+    assertTrue(split ~= nil and split.source == "legacyProfile",
+        "A2: different tabs prefer legacy")
+    assertNil(split.sampleOnly, "A2: no sample-only when tabs differ")
+
+    -- Post-activation: live GS only; legacy companion disabled.
+    local tabOp2 = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
+    assertEq(GS:ApplyStagedConfigOperation(tabOp2), "accepted", "A2: restore GS tab 2")
+    armFreshBankSample(true)
+    local _, stAct = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted", "A2: activate")
+    local liveCtx = BankLog:EligibleContext()
+    assertTrue(liveCtx and liveCtx.source == "guildSupplies" and not liveCtx.sampleOnly,
+        "A2: post-activation live GS context")
+    assertNil(liveCtx.legacy, "A2: no legacy companion after activation")
+    assertEq(C.LegacyWritersAllowed(profile), false, "A2: legacy writers disabled")
+    disarmFreshBankSample()
+    SF.GetActiveProfile = priorGetActive
+    SF.ConsumablesRuntime = priorRuntime
+    GetGuildBankTabInfo = nil
+    QueryGuildBankLog = nil
+end
+
+do
+    -- B3) Repeated GetCurrentRecord must not rescan unchanged ops store.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    -- Seed a moderate accepted-ops set.
+    for i = 1, 40 do
+        local op = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 8000 + i }, {
+            itemId = 8000 + i, goal = i, removed = false,
+        }))
+        assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "B3: seed op " .. i)
+    end
+    GS._opsValidationBodyScans = 0
+    local r1 = GS:GetCurrentRecord()
+    assertTrue(r1 ~= nil, "B3: first read ok")
+    local scansAfterFirst = GS._opsValidationBodyScans
+    assertTrue(scansAfterFirst >= 1, "B3: first read performs body validation walk")
+    for _ = 1, 20 do
+        assertTrue(GS:GetCurrentRecord() ~= nil, "B3: repeated read")
+    end
+    assertEq(GS._opsValidationBodyScans, scansAfterFirst,
+        "B3: repeated reads skip body validation walks scans="
+            .. tostring(GS._opsValidationBodyScans))
+    -- Mutation must invalidate and revalidate bodies.
+    local mut = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 8999 }, {
+        itemId = 8999, goal = 1, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(mut), "accepted", "B3: mutating write")
+    local beforeMutRead = GS._opsValidationBodyScans
+    assertTrue(GS:GetCurrentRecord() ~= nil, "B3: read after mutation")
+    assertTrue(GS._opsValidationBodyScans > beforeMutRead,
+        "B3: mutation invalidates body-validation cache")
+    local afterMut = GS._opsValidationBodyScans
+    assertTrue(GS:GetCurrentRecord() ~= nil, "B3: second post-mutation read")
+    assertEq(GS._opsValidationBodyScans, afterMut,
+        "B3: post-mutation body cache hits again")
+end
+
+do
+    -- C2/C3) Adjustment format locale + unlink disabled action string.
+    resetDb()
+    initGS()
+    setPlayer("Bob-Garona", "Player-1-Bob", 5) -- unauthorized
+    world.guild.clubId = 42
+    settleRoster()
+    -- Locale keys must ship accurate copy (not link-paste / linking).
+    local L = (SF.Locale and SF.Locale.GetDictionary and SF.Locale:GetDictionary())
+        or (_G.SpectrumFederationLocale)
+    if type(L) ~= "table" then
+        -- Fall back to raw enUS table loaded with the addon.
+        L = ns and ns.L
+    end
+    -- Production Loc path uses SF.LocaleText / enUS keys.
+    local adjKey = "GUILD_SUPPLIES_ERR_ADJUST_FORMAT"
+    local unlinkKey = "GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"
+    local adjMsg = SF.LocaleText and SF.LocaleText(adjKey)
+        or (SF.L and SF.L[adjKey])
+    local unlinkMsg = SF.LocaleText and SF.LocaleText(unlinkKey)
+        or (SF.L and SF.L[unlinkKey])
+    -- Read directly from locale module table when helpers differ in harness.
+    if (not adjMsg or adjMsg == adjKey) and type(_G) == "table" then
+        -- Loaded via locales in test harness as part of addon.
+        local en = nil
+        if SF.GetLocaleTable then en = SF.GetLocaleTable() end
+        if type(en) == "table" then
+            adjMsg = en[adjKey] or adjMsg
+            unlinkMsg = en[unlinkKey] or unlinkMsg
+        end
+    end
+    -- Source-backed assertion: enUS.lua must define both keys accurately.
+    local enUS = io.open("SpectrumFederation/locale/enUS.lua", "r")
+    assertTrue(enUS ~= nil, "C2/C3: enUS.lua readable")
+    local enBody = enUS:read("*a")
+    enUS:close()
+    assertTrue(enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT', 1, true),
+        "C2: adjust format locale key present")
+    assertTrue(enBody:find("item ID, a signed quantity", 1, true),
+        "C2: adjust format message states expected syntax")
+    assertTrue(not (enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT.-item link')),
+        "C2: adjust format must not suggest item links")
+    assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK', 1, true),
+        "C3: unlink action locale key present")
+    assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"].-=.-"unlinking characters"', 1, true)
+            or enBody:find('DISABLED_ACTION_UNLINK"] = "unlinking characters"', 1, true),
+        "C3: unlink locale says unlinking characters")
+
+    -- UI definition uses the unlink-specific key.
+    local confSrc = io.open(
+        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r")
+    assertTrue(confSrc ~= nil, "C2/C3: configuration page readable")
+    local confBody = confSrc:read("*a")
+    confSrc:close()
+    assertTrue(confBody:find("GUILD_SUPPLIES_ERR_ADJUST_FORMAT", 1, true),
+        "C2: adjustment onSubmit uses adjust-format locale")
+    assertTrue(confBody:find("GUILD_SUPPLIES_DISABLED_ACTION_UNLINK", 1, true),
+        "C3: unlink disabled tip uses unlink action key")
 end
 
 
