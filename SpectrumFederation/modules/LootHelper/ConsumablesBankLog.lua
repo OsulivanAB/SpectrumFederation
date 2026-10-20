@@ -284,6 +284,10 @@ local function ClearPendingAdmit(self)
     self.pendingAdmit = nil
 end
 
+local function ClearFreshnessGate(self)
+    self.requireBankReopenForFreshness = false
+end
+
 local function SnapshotQueryContext(ctx)
     if type(ctx) ~= "table" then
         return nil
@@ -347,6 +351,16 @@ function BankLog:RequestLog(reason)
         Debug("Warn", "QueryGuildBankLog unavailable")
         return
     end
+    -- Overlapping tab/guild queries cannot be correlated to GUILDBANKLOG_UPDATE.
+    -- Fail closed: abandon the outstanding query and require a clean bank
+    -- close/reopen before any freshness stamp may be established.
+    if self.requireBankReopenForFreshness then
+        ClearFreshLogStamp(self)
+        ClearPendingQuery(self)
+        self.awaitingLogUpdate = false
+        Debug("Info", "bank-log query suppressed: reopen required for freshness")
+        return
+    end
     local now = WallNow()
     -- Slot churn can be frequent; coalesce while a query is already outstanding
     -- or a recent query just completed successfully. Invalidate the prior
@@ -364,6 +378,23 @@ function BankLog:RequestLog(reason)
     end
     -- Starting a new sample invalidates any prior successful freshness stamp.
     ClearFreshLogStamp(self)
+    local prev = self.pendingQuery
+    if self.awaitingLogUpdate and type(prev) == "table" then
+        local same = QueryContextMatchesLive(prev, ctx)
+        if not same then
+            -- A response for the old query may still arrive and would otherwise
+            -- match the new pending identity. Retail events carry no query id.
+            self.requireBankReopenForFreshness = true
+            ClearPendingQuery(self)
+            ClearPendingAdmit(self)
+            self.awaitingLogUpdate = false
+            self.queryToken = (self.queryToken or 0) + 1
+            Debug("Warn",
+                "bank-log query overlap tab %s→%s; require bank reopen for freshness",
+                tostring(prev.bankTab), tostring(ctx.bankTab))
+            return
+        end
+    end
     -- Bind the outstanding query to this context. GUILDBANKLOG_UPDATE does not
     -- identify which tab answered; ProcessLogUpdate must not stamp a different
     -- live tab from this response.
@@ -457,34 +488,43 @@ function BankLog:ProcessLogUpdate(reason)
         return
     end
 
-    local pending = self.pendingQuery
-    local ctx = live
-    if self.awaitingLogUpdate and type(pending) == "table" then
-        if not QueryContextMatchesLive(pending, live) then
-            -- Late/uncorrelated update after tab/guild/dataset change: never stamp
-            -- the new live tab from a query started for a different context.
-            Debug("Info",
-                "log update discarded: query context mismatch pendingTab=%s liveTab=%s",
-                tostring(pending.bankTab), tostring(live.bankTab))
-            self.awaitingLogUpdate = false
-            ClearPendingQuery(self)
-            ClearPendingAdmit(self)
-            ClearFreshLogStamp(self)
-            self.queryRetries = 0
-            self.queryToken = (self.queryToken or 0) + 1
-            self.activeContext = live
-            self:RequestLog("context_mismatch")
-            return
-        end
-        -- Read and stamp the queried identity (pending), not a rebuilt live table.
-        ctx = pending
-        -- Keep live eligibility/requestedSet when the identity still matches.
-        ctx.eligibility = live.eligibility or ctx.eligibility
-        ctx.requestedSet = live.requestedSet or ctx.requestedSet
-        ctx.record = live.record or ctx.record
-        ctx.cfg = live.cfg or ctx.cfg
-        ctx.profile = live.profile or ctx.profile
+    -- Unsolicited or post-overlap updates must never establish activation freshness.
+    -- GUILDBANKLOG_UPDATE does not identify which QueryGuildBankLog completed.
+    if self.requireBankReopenForFreshness then
+        ClearFreshLogStamp(self)
+        Debug("Info", "log update discarded: bank reopen required for freshness")
+        return
     end
+    local pending = self.pendingQuery
+    if not (self.awaitingLogUpdate and type(pending) == "table") then
+        ClearFreshLogStamp(self)
+        Debug("Info", "log update discarded: no outstanding query provenance")
+        return
+    end
+    if not QueryContextMatchesLive(pending, live) then
+        -- Late/uncorrelated update after tab/guild/dataset change: never stamp
+        -- the new live tab from a query started for a different context.
+        Debug("Info",
+            "log update discarded: query context mismatch pendingTab=%s liveTab=%s",
+            tostring(pending.bankTab), tostring(live.bankTab))
+        self.awaitingLogUpdate = false
+        ClearPendingQuery(self)
+        ClearPendingAdmit(self)
+        ClearFreshLogStamp(self)
+        self.queryRetries = 0
+        self.queryToken = (self.queryToken or 0) + 1
+        self.activeContext = live
+        self:RequestLog("context_mismatch")
+        return
+    end
+    -- Read and stamp the queried identity (pending), not a rebuilt live table.
+    local ctx = pending
+    -- Keep live eligibility/requestedSet when the identity still matches.
+    ctx.eligibility = live.eligibility or ctx.eligibility
+    ctx.requestedSet = live.requestedSet or ctx.requestedSet
+    ctx.record = live.record or ctx.record
+    ctx.cfg = live.cfg or ctx.cfg
+    ctx.profile = live.profile or ctx.profile
 
     self.activeContext = live
     self.queryRetries = 0
@@ -703,9 +743,29 @@ function BankLog:EnsureRosterAdmitListener()
             self:ReleaseRosterAdmitListener()
             return
         end
-        self:TryAdmitPendingSnapshot()
-        if type(self.pendingAdmit) ~= "table" then
-            self:ReleaseRosterAdmitListener()
+        -- Defer past other GUILD_ROSTER_UPDATE handlers (Guild Gossip demand bind)
+        -- so GetCurrentContext can observe the settled roster. Bounded: one
+        -- After(0) per event generation; still-deferred snapshots wait for the
+        -- next roster event (no polling).
+        self.rosterAdmitGen = (tonumber(self.rosterAdmitGen) or 0) + 1
+        local gen = self.rosterAdmitGen
+        local function evaluate()
+            if (tonumber(self.rosterAdmitGen) or 0) ~= gen then
+                return
+            end
+            if type(self.pendingAdmit) ~= "table" then
+                self:ReleaseRosterAdmitListener()
+                return
+            end
+            self:TryAdmitPendingSnapshot()
+            if type(self.pendingAdmit) ~= "table" then
+                self:ReleaseRosterAdmitListener()
+            end
+        end
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0, evaluate)
+        else
+            evaluate()
         end
     end)
 end
@@ -730,6 +790,7 @@ function BankLog:OnBankClosed()
     self.activeContext = nil
     ClearPendingAdmit(self)
     ClearPendingQuery(self)
+    ClearFreshnessGate(self)
     self:ReleaseRosterAdmitListener()
     ClearFreshLogStamp(self)
     self:CancelTimers("bank_closed")

@@ -516,13 +516,9 @@ function GG.InitGuildAdapter()
         if g.frame.SetScript then
             g.frame:SetScript("OnEvent", onEvent)
         end
-        -- Re-init after a prior verified scope (incl. Shutdown that preserved
-        -- lastVerifiedScopeId) must not bind a possibly-stale native cache.
-        -- Cold first activation may bind after requestRoster; PLAYER_GUILD
-        -- transitions always beginTransportRosterAwait.
-        if g.lastVerifiedScopeId then
-            beginTransportRosterAwait()
-        end
+        -- Cold first activation and re-init alike: never bind a nonempty native
+        -- cache to the current club until GUILD_ROSTER_UPDATE verifies it.
+        beginTransportRosterAwait()
         requestRoster()
         if not g.ready then
             GG.RefreshGuildState()
@@ -530,9 +526,7 @@ function GG.InitGuildAdapter()
         return
     end
     if not CreateFrame then
-        if g.lastVerifiedScopeId then
-            beginTransportRosterAwait()
-        end
+        beginTransportRosterAwait()
         requestRoster()
         if not g.ready then
             GG.RefreshGuildState()
@@ -545,9 +539,7 @@ function GG.InitGuildAdapter()
     frame:RegisterEvent("PLAYER_ENTERING_WORLD")
     frame:SetScript("OnEvent", onEvent)
     g.frame = frame
-    if g.lastVerifiedScopeId then
-        beginTransportRosterAwait()
-    end
+    beginTransportRosterAwait()
     requestRoster()
     if not g.ready then
         GG.RefreshGuildState()

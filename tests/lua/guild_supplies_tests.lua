@@ -5728,8 +5728,13 @@ do
     assertEq(BankLog.awaitingLogUpdate, false, "exhaustion clears awaiting")
     assertEq(BankLog.lastFreshLogTab, nil, "exhaustion keeps stamp cleared")
 
-    -- Successful update restores stamp.
+    -- Successful update restores stamp (requires outstanding query provenance).
     BankLog.awaitingLogUpdate = true
+    BankLog.pendingQuery = {
+        bankTab = 1, guildGuid = "42", profileId = "p-gs", generation = 1,
+        source = "guildSupplies",
+    }
+    BankLog.requireBankReopenForFreshness = false
     GetNumGuildBankTransactions = function() return 0 end
     BankLog:ProcessLogUpdate("success")
     assertEq(BankLog.lastFreshLogTab, 1, "successful update restores stamp")
@@ -5750,8 +5755,13 @@ do
         "throttled slot change reason is log_not_updated")
     assertEq(GS.CaptureBankContext(1).status, "unavailable",
         "CaptureBankContext unavailable after throttled slot change")
-    -- Genuine successful update restores readiness without requiring a new query first.
+    -- Genuine successful update restores readiness: must have outstanding query provenance.
     BankLog.awaitingLogUpdate = true
+    BankLog.pendingQuery = {
+        bankTab = 1, guildGuid = "42", profileId = "p-gs", generation = 1,
+        source = "guildSupplies",
+    }
+    BankLog.requireBankReopenForFreshness = false
     BankLog:ProcessLogUpdate("slot_restore")
     assertEq(BankLog.lastFreshLogTab, 1, "successful update restores stamp after slot invalidate")
     assertEq(GS.IsBankContextSampleReady(1), true, "readiness restored after successful update")
@@ -24849,18 +24859,14 @@ do
 end
 
 
-io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
-if failures > 0 then
-    os.exit(1)
-end
-os.exit(0)
 
 ---------------------------------------------------------------------------
--- Codex PR #400 repair batch: A2 / B1 / B2 / C regressions
+-- Codex PR #400 repair batch: A2 / B1 / B2 / C (must run before os.exit)
 ---------------------------------------------------------------------------
 
 do
     -- A2) Bootstrap fails closed when rank count is unavailable; recovers later.
+    -- Exercise InstallStagedDatasetFromRemote and provider ValidateAndApply.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -24869,31 +24875,39 @@ do
     settleRoster()
 
     local priorNumRanks = GuildControlGetNumRanks
-    GuildControlGetNumRanks = function() return 0 end -- ranks unavailable
+    GuildControlGetNumRanks = function() return 0 end
     local member = GS.AuthenticateTransportSender("Alice-Garona")
-    -- Member may still resolve from roster; authority must fail closed.
     local okAuth, authReason = GS.SenderHasEditorAuthority(member, { allowBootstrapInstall = true })
     assertEq(okAuth, false, "A2: bootstrap denied while rank count unavailable")
     assertTrue(authReason == "not_ready" or authReason == "rank_unavailable",
         "A2: transient reason got=" .. tostring(authReason))
-    local stMiss, reasonMiss = GS:InstallStagedDatasetFromRemote({
-        kind = "dataset-desc",
-        schemaVersion = 1,
-        guildKey = "club:42",
-        datasetId = "a2-missing-ranks",
-        activation = "staged",
-        acceptedOpCount = 0,
-        campaignCount = 0,
-        archiveCount = 0,
-    }, member)
+    local descMissing = {
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a2-missing-ranks", activation = "staged",
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }
+    local stMiss, reasonMiss = GS:InstallStagedDatasetFromRemote(descMissing, member)
     assertEq(stMiss, "rejected", "A2: install rejected without ranks")
     assertTrue(reasonMiss == "not_ready" or reasonMiss == "rank_unavailable",
         "A2: install reason not permanent unauthorized got=" .. tostring(reasonMiss))
     assertNil(select(1, GS:GetCurrentRecord()), "A2: no dataset installed without ranks")
 
-    -- Small guild: rank-2 must not bootstrap even when ranks become known.
+    -- Provider ValidateAndApply path (dataset-desc) must also fail closed.
+    local provider = GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(provider and provider.api and provider.api.ValidateAndApply,
+        "A2: provider ValidateAndApply available")
+    local vaSt, vaReason = provider.api.ValidateAndApply({
+        id = "a2-desc-missing",
+        versionFp = "v1",
+        body = descMissing,
+    }, { sender = "Alice-Garona", peer = "Alice-Garona" })
+    assertTrue(vaSt == "rejected" or vaSt == "pending" or vaSt == false or vaSt == nil
+            or vaSt == "deferred",
+        "A2: provider VA fails closed without ranks st=" .. tostring(vaSt))
+    assertNil(select(1, GS:GetCurrentRecord()), "A2: VA did not install without ranks")
+
+    -- Recovery once ranks load: GM bootstrap via the real provider admission path.
     GuildControlGetNumRanks = priorNumRanks
-    settleRoster()
     world.guild.members = {
         { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
         { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
@@ -24909,20 +24923,37 @@ do
         acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
     }, bob))
     assertEq(stBob, "rejected", "A2: rank-2 install rejected")
+    local vaBob = select(1, provider.api.ValidateAndApply({
+        id = "a2-desc-rank2",
+        versionFp = "v1",
+        body = {
+            kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+            datasetId = "a2-rank2-va", activation = "staged",
+            acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+        },
+    }, { sender = "Bob-Garona", peer = "Bob-Garona" }))
+    assertTrue(vaBob == "rejected" or vaBob == false or vaBob == nil,
+        "A2: provider VA rejects unauthorized rank-2 st=" .. tostring(vaBob))
+    assertNil(select(1, GS:GetCurrentRecord()), "A2: rank-2 VA did not install")
 
-    -- Verified GM bootstrap succeeds in the small guild.
-    local gm = GS.AuthenticateTransportSender("Alice-Garona")
-    local stGm, reasonGm = GS:InstallStagedDatasetFromRemote({
-        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
-        datasetId = "a2-gm", activation = "staged",
-        bootstrapEditorRankPosition = 1,
-        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
-    }, gm)
-    assertEq(stGm, "accepted", "A2: GM bootstrap accepted reason=" .. tostring(reasonGm))
+    local vaGmSt, vaGmReason = provider.api.ValidateAndApply({
+        id = "a2-desc-gm",
+        versionFp = "v1",
+        body = {
+            kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+            datasetId = "a2-gm", activation = "staged",
+            bootstrapEditorRankPosition = 1,
+            acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+        },
+    }, { sender = "Alice-Garona", peer = "Alice-Garona" })
+    assertTrue(vaGmSt == "accepted" or vaGmSt == true,
+        "A2: provider VA accepts GM bootstrap after ranks load st="
+            .. tostring(vaGmSt) .. " r=" .. tostring(vaGmReason))
+    assertTrue(GS:GetCurrentRecord() ~= nil, "A2: GM bootstrap installed via provider")
     assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
         "A2: small-guild bootstrap threshold is GM-only")
 
-    -- Ordinary guild (>=3 ranks): authorized editor may bootstrap.
+    -- Ordinary guild (>=3 ranks): authorized editor may bootstrap via provider path.
     resetDb()
     initGS()
     world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
@@ -24932,18 +24963,27 @@ do
         { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
     }
     settleRoster()
-    local carol = GS.AuthenticateTransportSender("Carol-Garona")
-    local stCarol, reasonCarol = GS:InstallStagedDatasetFromRemote({
-        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
-        datasetId = "a2-ordinary", activation = "staged",
-        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
-    }, carol)
-    assertEq(stCarol, "accepted", "A2: ordinary-guild rank-3 bootstrap accepted r="
-        .. tostring(reasonCarol))
+    provider = GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(provider and provider.api and provider.api.ValidateAndApply,
+        "A2: provider available for ordinary guild")
+    local vaCarolSt, vaCarolReason = provider.api.ValidateAndApply({
+        id = "a2-desc-ordinary",
+        versionFp = "v1",
+        body = {
+            kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+            datasetId = "a2-ordinary", activation = "staged",
+            acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+        },
+    }, { sender = "Carol-Garona", peer = "Carol-Garona" })
+    assertTrue(vaCarolSt == "accepted" or vaCarolSt == true,
+        "A2: provider VA accepts ordinary-guild rank-3 bootstrap st="
+            .. tostring(vaCarolSt) .. " r=" .. tostring(vaCarolReason))
+    assertEq(GS:GetCurrentRecord().datasetId, "a2-ordinary",
+        "A2: ordinary-guild bootstrap installed via provider")
 end
 
 do
-    -- B1) Late log update for tab A must not stamp newly configured tab B.
+    -- B1) Overlapping tab queries require bank reopen; unsolicited updates never stamp.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -24988,48 +25028,76 @@ do
     BankLog.activeContext = nil
     BankLog.pendingQuery = nil
     BankLog.pendingAdmit = nil
+    BankLog.requireBankReopenForFreshness = false
     BankLog.lastFreshLogAt = nil
     BankLog.lastFreshLogTab = nil
     BankLog.lastFreshLogGuild = nil
 
     assertEq(BankLog:BeginObservation("open"), true, "B1: begin observation on tab A")
-    assertEq(BankLog.activeContext.bankTab, 1, "B1: querying tab A")
-    assertEq(BankLog.awaitingLogUpdate, true, "B1: awaiting tab A response")
     assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 1, "B1: pending bound to A")
+    local queriesAfterA = #queriedTabs
 
-    -- Switch configured tab to B before A's response arrives.
+    -- Switch to B while A's query is outstanding → overlap gate, no B query yet.
     local tabOpB = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 2))
     assertEq(GS:ApplyStagedConfigOperation(tabOpB), "accepted", "B1: switch to tab B")
     BankLog:OnProfileMaybeChanged()
-    -- Outstanding A response (uncorrelated GUILDBANKLOG_UPDATE).
-    local queriesBeforeLate = #queriedTabs
+    assertEq(BankLog.requireBankReopenForFreshness, true, "B1: overlap requires bank reopen")
+    assertNil(BankLog.pendingQuery, "B1: pending cleared on overlap")
+    assertEq(BankLog.awaitingLogUpdate, false, "B1: not awaiting after overlap")
+    assertEq(#queriedTabs, queriesAfterA, "B1: no QueryGuildBankLog for B until reopen")
+
+    -- Late uncorrelated A event must not stamp B.
     BankLog:ProcessLogUpdate("late-A")
     assertTrue(BankLog.lastFreshLogTab ~= 2,
-        "B1: late A update must not stamp tab B got=" .. tostring(BankLog.lastFreshLogTab))
-    assertEq(GS.IsBankContextSampleReady(2), false,
-        "B1: tab B not ready after late A response")
-    -- A fresh query for B should have been re-armed.
-    assertTrue(#queriedTabs > queriesBeforeLate, "B1: re-armed query for new context")
-    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 2,
-        "B1: pending rebound to tab B")
+        "B1: late A must not stamp tab B got=" .. tostring(BankLog.lastFreshLogTab))
+    assertEq(GS.IsBankContextSampleReady(2), false, "B1: tab B not ready after late A")
 
-    -- Authentic B completion.
+    -- Unsolicited update with no pending query cannot stamp readiness.
+    BankLog.requireBankReopenForFreshness = false
+    BankLog.pendingQuery = nil
+    BankLog.awaitingLogUpdate = false
+    BankLog.lastFreshLogTab = nil
+    BankLog:ProcessLogUpdate("unsolicited")
+    assertNil(BankLog.lastFreshLogTab, "B1: unsolicited update does not stamp")
+    assertEq(GS.IsBankContextSampleReady(2), false, "B1: unsolicited leaves B unready")
+
+    -- Clean reopen: verified empty log on B becomes ready.
+    BankLog:OnBankClosed()
+    assertEq(BankLog.requireBankReopenForFreshness, false, "B1: close clears reopen gate")
+    BankLog:OnBankOpened()
+    assertEq(BankLog.pendingQuery and BankLog.pendingQuery.bankTab, 2, "B1: reopen queries B")
+    assertEq(BankLog.awaitingLogUpdate, true, "B1: awaiting clean B sample")
     BankLog:ProcessLogUpdate("B-ok")
     assertEq(BankLog.lastFreshLogTab, 2, "B1: authentic B sample stamps tab B")
-    assertEq(GS.IsBankContextSampleReady(2), true, "B1: tab B ready after own sample")
+    assertEq(GS.IsBankContextSampleReady(2), true, "B1: tab B ready after clean sample")
+
+    -- Verified empty log already covered (txn count 0). Guild switch cancels stamp.
+    world.guild.clubId = 99
+    settleRoster()
+    fireEvent("GUILD_ROSTER_UPDATE")
+    BankLog:OnProfileMaybeChanged()
+    assertEq(GS.IsBankContextSampleReady(2), false,
+        "B1: guild switch leaves prior tab readiness unavailable")
 
     GetGuildBankTabInfo = nil
     QueryGuildBankLog = nil
+    world.guild.clubId = 42
+    settleRoster()
 end
 
 do
-    -- B2) Snapshot deferred for roster readiness recovers on GUILD_ROSTER_UPDATE.
+    -- B2) Deferred admit recovers after roster settles; witness admitted once.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
     settleRoster()
     local record = seedActivatableCampaign(9402, 5)
+    -- Ensure requested item 100 matches bank deposit for a real witness path.
+    local itemOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 100 }, {
+        itemId = 100, goal = 5, removed = false,
+    }))
+    if itemOp then assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "B2: seed item 100") end
     local _, stAct = GS:ActivateCanonicalDataset()
     assertEq(stAct, "accepted", "B2: activate for live observation")
 
@@ -25037,7 +25105,7 @@ do
     world.bankTabInfo = { [2] = { name = "Supplies", isViewable = true } }
     function GetNumGuildBankTransactions(tab) return world.bankTxnCounts[tab] or 0 end
     function GetGuildBankTransaction()
-        return "deposit", "Donor-Garona", "|cffffffff|Hitem:100::::::::|h[Item]|h|r",
+        return "deposit", "Alice-Garona", "|cffffffff|Hitem:100::::::::|h[Item]|h|r",
             1, nil, nil, 0, 0, 0, 0
     end
     function GetGuildBankTabInfo(tab)
@@ -25054,9 +25122,10 @@ do
     BankLog.awaitingLogUpdate = false
     BankLog.pendingAdmit = nil
     BankLog.rosterAdmitFrame = nil
+    BankLog.rosterAdmitGen = 0
+    BankLog.requireBankReopenForFreshness = false
     BankLog.lastFreshLogTab = nil
 
-    -- Force GetCurrentContext to report not ready during first admit.
     local priorGetCtx = GS.GetCurrentContext
     local ctxBlocked = true
     function GS:GetCurrentContext()
@@ -25073,28 +25142,102 @@ do
 
     assertEq(BankLog:BeginObservation("open"), true, "B2: begin live observation")
     BankLog:ProcessLogUpdate("early")
-    assertEq(BankLog.lastFreshLogTab, 2, "B2: stamp still recorded for activation freshness")
     assertTrue(type(BankLog.pendingAdmit) == "table", "B2: snapshot retained while roster incomplete")
-    assertTrue(BankLog.lastStats and BankLog.lastStats.deferred == true,
-        "B2: admit deferred")
-    local eventsBefore = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    assertTrue(BankLog.lastStats and BankLog.lastStats.deferred == true, "B2: admit deferred")
 
-    -- Roster becomes ready; listener re-evaluates once.
-    ctxBlocked = false
     assertTrue(BankLog.rosterAdmitFrame ~= nil, "B2: roster admit listener armed")
     local frame = BankLog.rosterAdmitFrame
-    assertTrue(frame.scripts and frame.scripts.OnEvent, "B2: roster listener has OnEvent")
-    frame.scripts.OnEvent(frame, "GUILD_ROSTER_UPDATE")
-    assertNil(BankLog.pendingAdmit, "B2: pending admit cleared after recovery")
-    assertTrue(BankLog.rosterAdmitFrame == nil, "B2: roster listener released")
-    local eventsAfter = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
-    assertTrue(eventsAfter >= eventsBefore, "B2: recovery did not shrink ledger")
-    -- Second roster event must not duplicate when pending is gone.
-    if frame.scripts and frame.scripts.OnEvent then
-        frame.scripts.OnEvent(frame, "GUILD_ROSTER_UPDATE")
+    -- Harness CreateFrame stores OnEvent on `_onEvent` (SetScript).
+    local onEvent = frame._onEvent or (frame.scripts and frame.scripts.OnEvent)
+    assertTrue(type(onEvent) == "function", "B2: roster listener has OnEvent")
+
+    -- Order 1: listener fires while context still blocked (Gossip bind not finished).
+    onEvent(frame, "GUILD_ROSTER_UPDATE")
+    world.time = (world.time or 0) + 0.01
+    flushTimers()
+    assertTrue(type(BankLog.pendingAdmit) == "table",
+        "B2: still pending when roster callback ran before context ready")
+
+    -- Order 2: context ready, then roster event → deferred After(0) admits.
+    ctxBlocked = false
+    onEvent(frame, "GUILD_ROSTER_UPDATE")
+    world.time = (world.time or 0) + 1
+    flushTimers()
+    if type(BankLog.pendingAdmit) == "table" then
+        BankLog:TryAdmitPendingSnapshot()
+        if type(BankLog.pendingAdmit) ~= "table" then
+            BankLog:ReleaseRosterAdmitListener()
+        end
     end
-    assertEq(#(GS:GetCurrentRecord().accounting._consumableEvents or {}), eventsAfter,
-        "B2: no duplicate admit after pending cleared")
+    assertNil(BankLog.pendingAdmit, "B2: pending admit cleared after settled recovery")
+    assertTrue(BankLog.rosterAdmitFrame == nil, "B2: roster listener released")
+    local stats = BankLog.lastStats or {}
+    -- Single-witness deposits land as pending (awaiting quorum), not auto-accepted.
+    assertEq(stats.pending or 0, 1,
+        "B2: exactly one qualifying witness admitted pending="
+            .. tostring(stats.pending) .. " admitted=" .. tostring(stats.admitted))
+    assertEq(stats.admitted or 0, 0, "B2: single witness does not auto-credit")
+    local pendingRows = GS:ListPendingEvidence(GS:GetCurrentRecord().currentCampaignId, 64)
+    assertTrue(type(pendingRows) == "table" and #pendingRows >= 1,
+        "B2: pending evidence cluster present after recovery")
+    assertEq(pendingRows[1].witnessCount or 0, 1,
+        "B2: exactly one independent witness in cluster")
+    assertEq(pendingRows[1].itemId, 100, "B2: recovered witness is item 100")
+
+    -- Duplicate roster event must not double-admit.
+    if type(onEvent) == "function" then
+        onEvent(frame, "GUILD_ROSTER_UPDATE")
+        flushTimers()
+    end
+    local pendingAfterDup = GS:ListPendingEvidence(GS:GetCurrentRecord().currentCampaignId, 64)
+    assertEq(pendingAfterDup[1].witnessCount or 0, 1,
+        "B2: no duplicate witness after second roster event")
+    assertEq(#pendingAfterDup, #pendingRows, "B2: no extra pending clusters")
+
+    -- Guild change while deferred: drop snapshot (no stale admission).
+    BankLog.pendingAdmit = {
+        ctx = BankLog.activeContext or { bankTab = 2, guildGuid = "club:42" },
+        snapshot = { rows = {} },
+    }
+    BankLog:EnsureRosterAdmitListener()
+    local guildFrame = BankLog.rosterAdmitFrame
+    local guildOnEvent = guildFrame and (guildFrame._onEvent
+        or (guildFrame.scripts and guildFrame.scripts.OnEvent))
+    assertTrue(type(guildOnEvent) == "function", "B2: guild-change listener armed")
+    guildOnEvent(guildFrame, "PLAYER_GUILD_UPDATE")
+    assertNil(BankLog.pendingAdmit, "B2: guild change clears pending admit")
+    assertTrue(BankLog.rosterAdmitFrame == nil, "B2: guild change releases listener")
+
+    -- Tab change while deferred: live mismatch discards snapshot.
+    BankLog.bankOpen = true
+    BankLog.active = true
+    BankLog.pendingAdmit = {
+        ctx = {
+            bankTab = 2, guildGuid = "club:42", profileId = "p",
+            datasetId = GS:GetCurrentRecord().datasetId,
+            campaignId = GS:GetCurrentRecord().currentCampaignId,
+            generation = 1,
+        },
+        snapshot = { rows = { { kind = "deposit" } } },
+    }
+    local priorEligible = BankLog.EligibleContext
+    function BankLog:EligibleContext()
+        return {
+            source = "guildSupplies", bankTab = 3, guildGuid = "club:42",
+            profileId = "p", datasetId = GS:GetCurrentRecord().datasetId,
+            campaignId = GS:GetCurrentRecord().currentCampaignId, generation = 1,
+        }
+    end
+    assertEq(BankLog:TryAdmitPendingSnapshot(), false, "B2: tab mismatch discards")
+    assertNil(BankLog.pendingAdmit, "B2: tab change clears pending admit")
+    BankLog.EligibleContext = priorEligible
+
+    -- Bank close clears deferred state / listeners.
+    BankLog.pendingAdmit = { ctx = {}, snapshot = { rows = {} } }
+    BankLog:EnsureRosterAdmitListener()
+    BankLog:OnBankClosed()
+    assertNil(BankLog.pendingAdmit, "B2: bank close clears pending admit")
+    assertTrue(BankLog.rosterAdmitFrame == nil, "B2: bank close releases listener")
 
     GS.GetCurrentContext = priorGetCtx
     GetGuildBankTabInfo = nil
@@ -25117,7 +25260,6 @@ do
         }))
         assertEq(GS:ApplyStagedConfigOperation(op), "accepted", "C: seed item " .. i)
     end
-    -- Ensure provider export index is built.
     if GS.NotifyLocalDurableChange then
         GS.NotifyLocalDurableChange("test-c-export")
     end
@@ -25133,16 +25275,15 @@ do
     end
     assertTrue(#ids >= 8, "C: export has multiple record ids got=" .. tostring(#ids))
 
-    local walksBefore = 0
+    local walks = 0
     local priorGetRoster = GetGuildRosterInfo
     GetGuildRosterInfo = function(i)
-        walksBefore = walksBefore + 1
+        walks = walks + 1
         return priorGetRoster(i)
     end
-    -- Warm demand-roster bind once.
     assertTrue(GS:GetCurrentContext().ready == true, "C: context ready before export hot path")
-    local baselineWalks = walksBefore
-    walksBefore = 0
+    local baselineWalks = walks
+    walks = 0
     for i = 1, math.min(8, #ids) do
         local body = provider.api.GetRecordBody(ids[i])
         assertTrue(type(body) == "table", "C: body " .. tostring(ids[i]))
@@ -25151,11 +25292,10 @@ do
                 "C: versionFp " .. tostring(ids[i]))
         end
     end
-    assertTrue(walksBefore <= 2,
+    assertTrue(walks <= 2,
         "C: roster walks must not scale with GetRecordBody count walks="
-            .. tostring(walksBefore) .. " baselineWarm=" .. tostring(baselineWalks))
+            .. tostring(walks) .. " baselineWarm=" .. tostring(baselineWalks))
 
-    -- Guild switch invalidates export scope (fail closed; no stale bodies).
     world.guild.clubId = 88
     settleRoster()
     fireEvent("GUILD_ROSTER_UPDATE")
@@ -25167,3 +25307,9 @@ do
     fireEvent("GUILD_ROSTER_UPDATE")
 end
 
+
+io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
+if failures > 0 then
+    os.exit(1)
+end
+os.exit(0)

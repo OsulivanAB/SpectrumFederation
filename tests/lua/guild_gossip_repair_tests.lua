@@ -6468,9 +6468,58 @@ end
 -- F95: stale native roster must not authenticate against a new club (#400 A1)
 ---------------------------------------------------------------------------
 do
+    ------------------------------------------------------------------
+    -- Cold first activation: fresh module instance, no lastVerifiedScopeId,
+    -- current club B, native cache still listing guild A members.
+    ------------------------------------------------------------------
+    reset()
+    world.autoRosterEvent = false
+    world.guild.clubId = 99
+    world.guild.name = "GuildB"
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "StaleGuildAPeer-Garona", online = true },
+    }
+    local Cold = makeClient("Alice")
+    assertEq(Cold.GuildGossip._guild.lastVerifiedScopeId, nil,
+        "F95-cold: no prior verified scope on fresh instance")
+    Cold.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f95cold" })
+    local cg = Cold.GuildGossip._guild
+    assertTrue(not Cold.GuildGossip.IsGuildReady(),
+        "F95-cold: not ready before GUILD_ROSTER_UPDATE")
+    assertTrue(cg.rosterAwaitingUpdate == true, "F95-cold: awaiting verified roster")
+    assertTrue(not Cold.GuildGossip.IsGuildMember("StaleGuildAPeer-Garona"),
+        "F95-cold: stale guild-A peer not authorized before verify")
+    assertEq(Cold.GuildGossip.GetGuildScopeId(), nil,
+        "F95-cold: scope withheld until verified roster")
+    -- Deliver the true guild-B roster (drop stale A peer).
+    world.guild.members = {
+        { name = "Alice-Garona", online = true },
+        { name = "GuildBPeer-Garona", online = true },
+    }
+    cg.frame.OnEvent(cg.frame, "GUILD_ROSTER_UPDATE")
+    world.time = world.time + 1
+    for _, h in ipairs(timers) do
+        if h.kind == "after" and h.at and world.time >= h.at and not h.fired then
+            h.fired = true
+            h.fn()
+        end
+    end
+    assertTrue(Cold.GuildGossip.IsGuildReady(), "F95-cold: ready after verified roster")
+    assertEq(Cold.GuildGossip.GetGuildScopeId(), "club:99", "F95-cold: club B scope bound")
+    assertTrue(not Cold.GuildGossip.IsGuildMember("StaleGuildAPeer-Garona"),
+        "F95-cold: stale A peer never authorized on club B")
+    assertTrue(Cold.GuildGossip.IsGuildMember("GuildBPeer-Garona"),
+        "F95-cold: guild B peer authorized after verify")
+    Cold.GuildGossip:DisableProvider("sf.synthetic.gossip")
+    assertTrue(not Cold.GuildGossip._guild.listening,
+        "F95-cold: idle without providers stops listening")
+
+    ------------------------------------------------------------------
+    -- Re-init / guild transition (primed lastVerifiedScopeId).
+    ------------------------------------------------------------------
     reset()
     local A = makeClient("Alice")
-    -- Prime a verified transport scope, then shut down so re-init must await.
     A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f95prime" })
     assertTrue(A.GuildGossip.IsGuildReady(), "F95: primed ready")
     assertEq(A.GuildGossip._guild.lastVerifiedScopeId, "club:42", "F95: primed verified scope")
@@ -6538,7 +6587,6 @@ do
     A.GuildGossip:EnableProvider("sf.synthetic.gossip")
     assertTrue(frameCreateCount - framesBefore <= 1,
         "F95: repeated init/shutdown does not accumulate adapter frames")
-    -- Restore shared world guild fixture for later suites.
     world.autoRosterEvent = true
     world.guild.clubId = 42
     world.guild.name = "Spectrum"
