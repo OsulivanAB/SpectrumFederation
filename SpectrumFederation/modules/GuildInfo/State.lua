@@ -866,11 +866,32 @@ function GI.MergeMember(record, member, opts)
         return "rejected", err
     end
     local existing = record.members[member.guid]
-    if existing and GI.CompareVer(member.ver, existing.ver) <= 0 then
-        if GI.CompareVer(member.ver, existing.ver) == 0 then
-            return "duplicate", nil
+    local incomingGid = member.groupId == nil and GI.UNASSIGNED or member.groupId
+    if existing then
+        local inN = tonumber(member.ver and member.ver.n) or 0
+        local exN = tonumber(existing.ver and existing.ver.n) or 0
+        -- A string groupId is a positive assignment (group shell may arrive later).
+        local incomingAssigned = type(incomingGid) == "string" and incomingGid ~= ""
+        local existingAssigned = type(existing.groupId) == "string" and existing.groupId ~= ""
+        local incomingUn = incomingGid == GI.UNASSIGNED or incomingGid == nil
+        local existingUn = existing.groupId == GI.UNASSIGNED or existing.groupId == nil
+
+        -- At equal logical revision, a live-group membership beats an unassign
+        -- tombstone regardless of writer nonce. Concurrent dissolve of a solo-main
+        -- shell on one peer must not hide another peer's still-populated group.
+        if inN == exN and incomingAssigned and existingUn then
+            -- accept (fall through)
+        elseif inN == exN and incomingUn and existingAssigned then
+            return "duplicate", "stale"
+        else
+            local cmp = GI.CompareVer(member.ver, existing.ver)
+            if cmp <= 0 then
+                if cmp == 0 then
+                    return "duplicate", nil
+                end
+                return "duplicate", "stale"
+            end
         end
-        return "duplicate", "stale"
     end
 
     -- Capacity: new GUID only when under MAX_MEMBERS.
@@ -881,7 +902,7 @@ function GI.MergeMember(record, member, opts)
     StoreMemberDirect(
         record,
         member.guid,
-        member.groupId == nil and GI.UNASSIGNED or member.groupId,
+        incomingGid,
         member.ver,
         member.at,
         member.nameRealm,
@@ -972,6 +993,63 @@ local function GroupHasNoDurableAlts(record, groupId)
     return true -- empty or solo main only
 end
 
+local function ClaimantGroupIds(record, mainGuid)
+    local gids = {}
+    for gid, g in pairs(record.groups or {}) do
+        if GroupIsLive(g) and g.mainGuid == mainGuid then
+            gids[#gids + 1] = gid
+        end
+    end
+    table.sort(gids)
+    return gids
+end
+
+--- True when any durable alt remains across all physical groups that claim mainGuid.
+local function LogicalMainHasOtherAlts(record, mainGuid, excludeGuid)
+    if not ValidGuid(mainGuid) then
+        return false
+    end
+    local gids = ClaimantGroupIds(record, mainGuid)
+    for i = 1, #gids do
+        for guid, m in pairs(record.members or {}) do
+            if m.groupId == gids[i] and guid ~= mainGuid and guid ~= excludeGuid then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--- Dissolve a physical group only when doing so cannot hide logical-group alts.
+-- Empty shells: always dissolvable. Solo designated main: keep while sibling
+-- claimant groups still hold other durable alts (derived absorb partners).
+local function ShouldDissolvePhysicalGroup(record, groupId)
+    local g = record.groups and record.groups[groupId]
+    if not GroupIsLive(g) then
+        return false
+    end
+    local n = 0
+    local hasAlt = false
+    for guid, m in pairs(record.members or {}) do
+        if m.groupId == groupId then
+            n = n + 1
+            if guid ~= g.mainGuid then
+                hasAlt = true
+            end
+        end
+    end
+    if n == 0 then
+        return true
+    end
+    if hasAlt then
+        return false
+    end
+    if ValidGuid(g.mainGuid) and LogicalMainHasOtherAlts(record, g.mainGuid, nil) then
+        return false
+    end
+    return true
+end
+
 local function FindGroupIdForMain(record, mainGuid)
     local info = record.graph and record.graph.byGuid and record.graph.byGuid[mainGuid]
     if info and info.role == "main" and type(info.groupId) == "string" then
@@ -1034,6 +1112,55 @@ local function DissolveEmptyGroup(record, groupId)
             }, { skipReconcile = true })
         end
     end
+end
+
+--- Officer-authorized consolidate: move every durable member of groups claiming
+-- mainGuid into targetGroupId using genuine local _NextVer writes, then dissolve
+-- emptied sibling shells. Used by Change Main so the logical displayed group is
+-- one physical group before mainGuid flips.
+local function ConsolidateLogicalGroupTo(record, mainGuid, targetGroupId)
+    if type(targetGroupId) ~= "string" or targetGroupId == "" then
+        return false, "group_missing"
+    end
+    local claimants = ClaimantGroupIds(record, mainGuid)
+    for i = 1, #claimants do
+        local gid = claimants[i]
+        if gid ~= targetGroupId then
+            local moveGuids = {}
+            for guid, m in pairs(record.members or {}) do
+                if m.groupId == gid then
+                    moveGuids[#moveGuids + 1] = guid
+                end
+            end
+            for j = 1, #moveGuids do
+                local guid = moveGuids[j]
+                local mm = record.members[guid]
+                local ver, vErr = GI:_NextVer(mm and mm.ver)
+                if not ver then
+                    return false, vErr or "no_effect"
+                end
+                local st = GI.MergeMember(record, {
+                    guid = guid,
+                    groupId = targetGroupId,
+                    ver = ver,
+                    at = Now(),
+                    nameRealm = mm and mm.nameRealm,
+                    classFile = mm and mm.classFile,
+                }, { skipReconcile = true })
+                if st ~= "accepted" and st ~= "duplicate" then
+                    return false, st
+                end
+            end
+        end
+    end
+    for i = 1, #claimants do
+        local gid = claimants[i]
+        if gid ~= targetGroupId and ShouldDissolvePhysicalGroup(record, gid) then
+            DissolveEmptyGroup(record, gid)
+        end
+    end
+    RebuildDerived(record)
+    return true
 end
 
 --- Local assign/move implementation. Returns status, detail[, meta].
@@ -1165,10 +1292,10 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         return "rejected", stAlt
     end
 
-    -- Dissolve previous durable home when the move leaves it with no alts.
+    -- Dissolve previous durable home when safe for the logical group.
     if durablePrevGid and durablePrevGid ~= targetGroupId then
         RebuildDerived(record)
-        if GroupHasNoDurableAlts(record, durablePrevGid) then
+        if ShouldDissolvePhysicalGroup(record, durablePrevGid) then
             DissolveEmptyGroup(record, durablePrevGid)
         end
     end
@@ -1196,6 +1323,7 @@ function GI:ApplyUnassign(altGuid, opts)
         end
     end
 
+    local logicalMain = info.mainGuid
     local mem = record.members[altGuid]
     local ver, vErr = GI:_NextVer(mem and mem.ver)
     if not ver then
@@ -1215,10 +1343,23 @@ function GI:ApplyUnassign(altGuid, opts)
         return "rejected", st
     end
 
-    if type(oldGid) == "string" then
-        RebuildDerived(record)
-        if GroupHasNoDurableAlts(record, oldGid) then
-            DissolveEmptyGroup(record, oldGid)
+    if type(oldGid) == "string" and ShouldDissolvePhysicalGroup(record, oldGid) then
+        DissolveEmptyGroup(record, oldGid)
+    end
+
+    -- When the logical main has no remaining alts, dissolve leftover solo-main
+    -- claimant shells (same outcome as unassigning the last alt of a single group).
+    RebuildDerived(record)
+    if ValidGuid(logicalMain) then
+        local ginfo = record.graph.mains and record.graph.mains[logicalMain]
+        if not ginfo or #(ginfo.altGuids or {}) == 0 then
+            local claimants = ClaimantGroupIds(record, logicalMain)
+            for i = 1, #claimants do
+                if ShouldDissolvePhysicalGroup(record, claimants[i]) then
+                    DissolveEmptyGroup(record, claimants[i])
+                end
+            end
+            RebuildDerived(record)
         end
     end
 
@@ -1244,12 +1385,30 @@ function GI:ApplyChangeMain(oldMainGuid, newMainGuid, opts)
         return "rejected", "stale_change_main"
     end
 
+    -- Bring absorbed concurrent shells into the canonical physical group with
+    -- genuine officer versions before flipping mainGuid.
+    local okConsol, consolErr = ConsolidateLogicalGroupTo(record, oldMainGuid, groupId)
+    if not okConsol then
+        return "rejected", consolErr or "no_effect"
+    end
+    groupId = FindGroupIdForMain(record, oldMainGuid)
+    if not groupId then
+        return "rejected", "group_missing"
+    end
+    newInfo = record.graph.byGuid and record.graph.byGuid[newMainGuid]
+    if not newInfo or newInfo.role ~= "alt" or newInfo.mainGuid ~= oldMainGuid or newInfo.groupId ~= groupId then
+        return "rejected", "stale_change_main"
+    end
+    local newMem = record.members[newMainGuid]
+    if not newMem or newMem.groupId ~= groupId then
+        return "rejected", "stale_change_main"
+    end
+
     local g = record.groups[groupId]
     local gVer, gErr = GI:_NextVer(g and g.ver)
     if not gVer then
         return "rejected", gErr
     end
-    -- Single group record update — memberships keep the same groupId (atomic logical CM).
     local st = GI.MergeGroup(record, {
         groupId = groupId,
         mainGuid = newMainGuid,
