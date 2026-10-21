@@ -589,8 +589,62 @@ do
     end
 end
 
+loadModule("SpectrumFederation/modules/GuildOfficer/Policy.lua")
+loadModule("SpectrumFederation/modules/GuildOfficer/Gossip.lua")
+
 local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
+local officerBootstrapping = false
+
+local function ensureDefaultOfficerPolicy()
+    if world.skipOfficerBootstrap or officerBootstrapping then
+        return
+    end
+    local GO = SF.GuildOfficer
+    if not GO or type(GO.Initialize) ~= "function" then
+        return
+    end
+    officerBootstrapping = true
+    local savedName, savedGuid = world.unitName, world.unitGuid
+    local function tryBootstrap()
+        GO:Initialize(SpectrumFederationDB)
+        local view = GO:GetView()
+        if view and view.status == "unknown" and view.canBootstrap then
+            GO:Bootstrap()
+        end
+    end
+    pcall(tryBootstrap)
+    local view = SF.GuildOfficer:GetView()
+    if view and view.status == "unknown" then
+        local gm = nil
+        for _, m in ipairs(world.guild.members or {}) do
+            if m.rankOrder == 1 and type(m.name) == "string" then
+                gm = m
+                break
+            end
+        end
+        if gm then
+            world.unitName = gm.name:match("^([^-]+)") or gm.name
+            world.unitGuid = gm.guid
+            pcall(tryBootstrap)
+        end
+    end
+    world.unitName = savedName
+    world.unitGuid = savedGuid
+    officerBootstrapping = false
+end
+
+local realGetCapabilities = GS.GetCapabilities
+function GS:GetCapabilities(...)
+    ensureDefaultOfficerPolicy()
+    return realGetCapabilities(self, ...)
+end
+
+local realSenderHasEditorAuthority = GS.SenderHasEditorAuthority
+function GS.SenderHasEditorAuthority(...)
+    ensureDefaultOfficerPolicy()
+    return realSenderHasEditorAuthority(...)
+end
 
 local function resetDemandRoster()
     world.rosterRequests = 0
@@ -1097,12 +1151,12 @@ do
     record.permission.editorRankPosition = 99
     setPlayer("Bob-Garona", "Player-1-Bob", 2)
     local caps = GS:GetCapabilities()
-    assertEq(caps.canEdit, false, "officer cannot edit invalid policy")
-    assertEq(caps.canRecoverPolicy, false, "non-GM no recovery")
-    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(caps.canEdit, true, "historical out-of-range rank is not live authorization")
+    assertEq(select(1, GS:GetCurrentRecord()) ~= nil, true, "structurally valid historical rank stays readable")
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
     caps = GS:GetCapabilities()
-    assertEq(caps.canRecoverPolicy, true, "GM can recover policy")
-    assertEq(caps.canEdit, false, "GM recovery is not silent full edit under invalid policy")
+    assertEq(caps.canEdit, false, "historical 99 does not grant a non-officer edit")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
 end
 
 -- 8) Guild with fewer than three ranks
@@ -1116,22 +1170,13 @@ do
         { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
     }
     setPlayer("Bob-Garona", "Player-1-Bob", 2)
-    local _, st, err = GS:CreateStagedRecord()
-    assertEq(st, "rejected", "non-GM cannot init short rank list")
-    assertEq(err, "policy_requires_gm", "non-GM policy_requires_gm")
+    local rec, st, err = GS:CreateStagedRecord()
+    assertEq(st, "accepted", "last native rank can init from capped officer policy: " .. tostring(err))
+    assertEq(rec and rec.permission.editorRankPosition, 2, "capped shared threshold stored")
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     _, st, err = GS:CreateStagedRecord()
-    assertEq(st, "rejected", "GM cannot invent missing default position 3")
-    assertEq(err, "threshold_unselected", "threshold_unselected without selection")
-    _, st, err = GS:CreateStagedRecord(3)
-    assertEq(st, "rejected", "GM cannot select missing rank 3")
-    assertEq(err, "invalid_editor_rank_position", "invalid_editor_rank_position for missing rank")
-    _, st, err = GS:CreateStagedRecord(0)
-    assertEq(st, "rejected", "GM cannot select rank 0")
-    local rec
-    rec, st, err = GS:CreateStagedRecord(2)
-    assertEq(st, "accepted", "GM selects existing threshold 2: " .. tostring(err))
-    assertEq(rec.permission.editorRankPosition, 2, "selected threshold stored")
+    assertEq(st, "rejected", "second init does not replace the dataset")
+    assertEq(err, "already_configured", "already_configured after shared-policy init")
     -- restore default roster
     world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
     world.guild.members = {
@@ -1226,10 +1271,12 @@ do
     GS:CreateStagedRecord()
     local op = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
     local status = GS:ApplyStagedConfigOperation(op)
-    assertEq(status, "accepted", "rank 3 can tighten threshold to 2")
+    assertEq(status, "accepted", "historical set-editor-rank still records")
     local caps = GS:GetCapabilities()
-    assertEq(caps.canEdit, false, "rank 3 loses edit after threshold 2")
-    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2, "threshold stored")
+    assertEq(caps.canEdit, true, "historical supplies rank does not remove shared officer edit")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2, "historical threshold stored")
+    assertEq(select(1, SF.GuildOfficer:GetEstablishedThreshold()), 3,
+        "supplies rank change does not alter the shared officer policy")
 end
 
 -- 12) Prepare then rank revocation / guild change at commit
@@ -2052,7 +2099,8 @@ do
     -- Demote Carol below threshold
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local demote = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
-    assertEq(GS:ApplyStagedConfigOperation(demote), "accepted", "GM demotes threshold")
+    assertEq(GS:ApplyStagedConfigOperation(demote), "accepted", "historical supplies rank recorded")
+    assertEq(SF.GuildOfficer:CommitThreshold(2), "accepted", "shared officer threshold tightened to 2")
     setPlayer("Carol-Garona", "Player-1-Carol", 3)
     status, reason = GS:ApplyStagedConfirmationOperation(conf)
     assertEq(status, "duplicate", "demoted confirm exact retry is duplicate")
@@ -2769,8 +2817,8 @@ do
 
     local rec
     rec, st, err = GS:CreateStagedRecord(1)
-    assertEq(st, "accepted", "GM selects threshold 1: " .. tostring(err))
-    assertEq(rec.permission.editorRankPosition, 1, "threshold 1 stored")
+    assertEq(st, "accepted", "small guild uses capped shared officer threshold: " .. tostring(err))
+    assertEq(rec.permission.editorRankPosition, 2, "capped threshold 2 stored")
     assertNil(GS:CreateStagedRecord(1), "no allocate on second create / already configured")
 
     -- Ordinary ≥3 ranks still defaults to 3 and ignores selection
@@ -3523,7 +3571,7 @@ do
     assertEq(record.operations.heads["permission:editorRankPosition"], rankOp.id, "policy head set")
     setPlayer("Carol-Garona", "Player-1-Carol", 3)
     local caps = GS:GetCapabilities()
-    assertEq(caps.canEdit, false, "rank 3 cannot edit under threshold 2")
+    assertEq(caps.canEdit, true, "rank 3 still edits under the shared officer policy")
     setPlayer("Bob-Garona", "Player-1-Bob", 2)
     caps = GS:GetCapabilities()
     assertEq(caps.canEdit, true, "rank 2 can edit under valid edited policy")
@@ -5663,12 +5711,9 @@ do
     world.guild.clubId = 42
     world.guild.ranks = { "Guild Master", "Member" }
     settleRoster()
-    local _, stInit, errInit = GS:CreateStagedRecord()
-    assertEq(stInit, "rejected", "small guild without threshold rejected")
-    assertEq(errInit, "threshold_unselected", "threshold_unselected")
-    local recInit, stOk = GS:CreateStagedRecord(2)
-    assertEq(stOk, "accepted", "small guild with explicit threshold accepted")
-    assertEq(recInit.permission.editorRankPosition, 2, "selected threshold stored")
+    local recInit, stOk, errInit = GS:CreateStagedRecord()
+    assertEq(stOk, "accepted", "small guild initializes from shared officer policy: " .. tostring(errInit))
+    assertEq(recInit.permission.editorRankPosition, 2, "capped officer threshold stored")
     world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
     settleRoster()
 
@@ -6489,7 +6534,24 @@ do
         for _, child in ipairs(node.children or {}) do findDrops(child) end
     end
     findDrops(recoverPanel)
+    local function repairControlVisible(panel)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "dropdown" and item.label
+                    and tostring(item.label):find("Repair", 1, true)
+                    and type(item.visible) == "function" then
+                    return item.visible() and true or false
+                end
+            end
+        end
+        return nil
+    end
     assertTrue(#recoverDrops >= 1, "recovery rank dropdown present")
+    assertEq(repairControlVisible(recoverPanel), true,
+        "corrupt historical permission shows the repair control")
+    assertTrue(recoverDrops[1].parent and recoverDrops[1].parent.parent
+        and recoverDrops[1].parent.parent.shown ~= false,
+        "repair control row is shown while permission is corrupt")
     recoverDrops[1]:GenerateMenu()
     local picked
     for i = 1, #(recoverDrops[1].menuOptions or {}) do
@@ -6563,20 +6625,8 @@ do
     local ordinaryInitPanel = makeRegion("Frame", "GSOrdinaryInit", nil)
     ordinaryInitPanel:SetSize(600, 800)
     configPage:Build(ordinaryInitPanel)
-    local function rankDropdownEnabled(panel)
-        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
-            for _, item in ipairs(sec.items or {}) do
-                if item.type == "dropdown" and item.label
-                    and tostring(item.label):find("Editor", 1, true)
-                    and type(item.enabled) == "function" then
-                    return item.enabled() and true or false
-                end
-            end
-        end
-        return nil
-    end
-    assertEq(rankDropdownEnabled(ordinaryInitPanel), false,
-        "ordinary not_configured disables editor-rank edits")
+    assertEq(repairControlVisible(ordinaryInitPanel), false,
+        "ordinary not_configured hides historical permission repair")
     assertEq(select(2, GS:GetCurrentRecord()), "not_configured", "ordinary guild not_configured")
     local ordinaryInitBtn
     local function findOrdinaryInit(node)
@@ -6596,8 +6646,18 @@ do
     assertEq(ordinaryRec.permission.editorRankPosition, GS.DEFAULT_EDITOR_RANK_POSITION or 3,
         "ordinary Initialize admits default editor rank policy")
     configPage:Refresh(ordinaryInitPanel)
-    assertEq(rankDropdownEnabled(ordinaryInitPanel), true,
-        "editor-rank edits enabled after ordinary Initialize")
+    assertEq(repairControlVisible(ordinaryInitPanel), false,
+        "configured Guild Supplies does not show an editor-rank control")
+    world.skipOfficerBootstrap = true
+    if SpectrumFederationDB.guildOfficer and SpectrumFederationDB.guildOfficer.guilds then
+        SpectrumFederationDB.guildOfficer.guilds["club:42"] = nil
+    end
+    configPage:Refresh(ordinaryInitPanel)
+    assertEq(GS:GetCapabilities().reason, "policy_unknown",
+        "valid dataset with no officer policy reports policy_unknown")
+    assertEq(repairControlVisible(ordinaryInitPanel), false,
+        "policy unknown does not show historical permission repair")
+    world.skipOfficerBootstrap = false
 
     -- Pending init rank bound to guild context; click Initialize and assert dataset/policy.
     resetDb()
@@ -6696,9 +6756,10 @@ do
     configPage:Refresh(initPanel)
     findInitBtn(initPanel)
     local stillEnabled = initBtn and initBtn.enabled
-    -- After guild change, needs reselection (Initialize disabled until new pending).
-    assertTrue(stillEnabled == false or stillEnabled == nil,
-        "guild change requires init rank reselection")
+    -- The test harness establishes the shared officer policy for a settled guild.
+    -- Initialize follows that policy instead of a pending supplies rank selection.
+    assertTrue(stillEnabled ~= false and stillEnabled ~= nil,
+        "settled guild with an officer policy can initialize")
 
     -- Requested-item bounds: over-cap/invalid fixtures stay unavailable; valid max renders.
     world.guild.clubId = 42
@@ -7398,11 +7459,12 @@ do
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Initialize", 1, true)
     end)
-    assertEq(initItem.enabled and initItem.enabled(), false,
-        "disabled tip: small-guild Initialize disabled until rank")
-    assertTrue(initItem.getDisabledTooltip():find("editor rank", 1, true),
-        "disabled tip: small-guild Initialize asks for rank got="
-            .. tostring(initItem.getDisabledTooltip()))
+    assertEq(initItem.enabled and initItem.enabled(), true,
+        "disabled tip: small-guild Initialize uses the shared officer policy")
+    local smallTip = initItem.getDisabledTooltip()
+    assertTrue(smallTip == nil or not tostring(smallTip):find("editor rank", 1, true),
+        "disabled tip: small-guild Initialize does not ask for an editor rank got="
+            .. tostring(smallTip))
 
     -- Already initialized: Initialize tip says already done.
     assertEq(select(2, GS:CreateStagedRecord(2)), "accepted", "disabled tip: small init")
@@ -7549,6 +7611,77 @@ do
     settleRoster()
     end
     runDisabledTooltipTests()
+
+    -- C1 runtime: officer-policy listener lifecycle on the real Settings page harness.
+    do
+        local GO = SF.GuildOfficer
+        if GO.ClearUIListeners then
+            GO.ClearUIListeners()
+        end
+        local regCount = 0
+        local realReg = GO.RegisterUIListener
+        GO.RegisterUIListener = function(fn)
+            regCount = regCount + 1
+            return realReg(fn)
+        end
+        -- Reload page module so officerHooked / Page.__sfOfficerHook start clean.
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+        configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+        assertTrue(configPage ~= nil, "C1: configuration page reloaded")
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+
+        local refreshCount = 0
+        local realRefresh = configPage.Refresh
+        configPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+
+        local listenPanel = makeRegion("Frame", "GSOfficerListenPanel", nil)
+        listenPanel:SetSize(600, 800)
+        listenPanel.shown = true
+        configPage:Build(listenPanel)
+        local listenPanel2 = makeRegion("Frame", "GSOfficerListenPanel2", nil)
+        listenPanel2:SetSize(600, 800)
+        listenPanel2.shown = true
+        configPage:Build(listenPanel2)
+        for _ = 1, 5 do
+            configPage:Refresh(listenPanel)
+        end
+        assertEq(regCount, 1, "C1: repeated Build/Refresh registers one officer listener")
+
+        timers = {}
+        local beforeRefresh = refreshCount
+        GO.NotifyUI("remote-policy")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertTrue(refreshCount > beforeRefresh,
+            "C1: officer policy notify refreshes a visible Settings page")
+
+        listenPanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        timers = {}
+        beforeRefresh = refreshCount
+        GO.NotifyUI("remote-policy-hidden")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertEq(refreshCount, beforeRefresh,
+            "C1: hidden Settings do not refresh on officer policy notify")
+
+        GO.RegisterUIListener = realReg
+        configPage.Refresh = realRefresh
+        if GO.ClearUIListeners then
+            GO.ClearUIListeners()
+        end
+    end
 
     CreateFrame = priorCreateFrame
     C_Timer.After = priorAfter
@@ -7893,7 +8026,8 @@ do
 
     -- Rank revocation: demote below threshold then reject remote from Bob.
     local rankOp = select(1, GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 1))
-    assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted", "3A4: tighten rank to GM only")
+    assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted", "3A4: historical rank recorded")
+    assertEq(SF.GuildOfficer:CommitThreshold(1), "accepted", "3A4: shared officer threshold tightened to GM")
     switchPlayer("Bob", "Player-1-Bob", 2)
     local bobOp = {
         schemaVersion = 1,
@@ -8442,11 +8576,11 @@ do
         "3A8: concurrent rank conflict reason: " .. tostring(reasonRankB))
     assertTrue(#GS:ListOpenConflicts() >= 1, "3A8: open rank conflict retained")
 
-    -- Out-of-range rank rejected; policy unchanged.
-    local policyBefore = GS:GetCurrentRecord().permission.editorRankPosition
-    local rankBad = {
+    -- Historical rank above today's list is retained metadata (#405); live edit
+    -- still follows the shared officer policy. Nonintegral values stay rejected.
+    local rankHist = {
         schemaVersion = 1,
-        id = "rank-oor",
+        id = "rank-hist-oor",
         guildKey = "club:42",
         datasetId = datasetId,
         campaignId = campId,
@@ -8475,13 +8609,42 @@ do
             end
         end
     end
-    policyBefore = GS:GetCurrentRecord().permission.editorRankPosition
-    local stBad, reasonBad = GS:AdmitRemoteOperation(rankBad, { sender = "Alice-Garona" })
-    assertEq(stBad, "rejected", "3A8: out-of-range rank rejected")
-    assertEq(reasonBad, "invalid_editor_rank_position",
-        "3A8: OOR rank reason: " .. tostring(reasonBad))
-    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, policyBefore,
-        "3A8: OOR rank left policy unchanged")
+    rankHist.baseTargetRevision = GS:GetCurrentRecord().permission.revisionId
+    rankHist.basePolicyRevision = GS:GetCurrentRecord().permission.revisionId
+    local stHist, reasonHist = GS:AdmitRemoteOperation(rankHist, { sender = "Alice-Garona" })
+    assertEq(stHist, "accepted",
+        "3A8: historical rank above today's list accepted: " .. tostring(reasonHist))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 999,
+        "3A8: historical out-of-range rank retained as metadata")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(GS:GetCapabilities().canEdit, true,
+        "3A8: shared officer policy still authorizes after historical OOR metadata")
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS:GetCapabilities().canEdit, false,
+        "3A8: historical OOR metadata does not grant non-officer edit")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local rankFrac = {
+        schemaVersion = 1,
+        id = "rank-frac",
+        guildKey = "club:42",
+        datasetId = datasetId,
+        campaignId = campId,
+        kind = "set-editor-rank",
+        target = "editorRankPosition",
+        value = 2.5,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 15201,
+        baseTargetRevision = GS:GetCurrentRecord().permission.revisionId,
+        basePolicyRevision = GS:GetCurrentRecord().permission.revisionId,
+        baseCampaignId = campId,
+    }
+    local stFrac, reasonFrac = GS:AdmitRemoteOperation(rankFrac, { sender = "Alice-Garona" })
+    assertEq(stFrac, "rejected", "3A8: nonintegral historical rank rejected")
+    assertEq(reasonFrac, "invalid_editor_rank_position",
+        "3A8: nonintegral rank reason: " .. tostring(reasonFrac))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 999,
+        "3A8: rejected nonintegral rank left metadata unchanged")
 
     -- Malformed relay (bankTab=9) must not consume capacity.
     GS._pendingRelay = {}
@@ -22271,7 +22434,9 @@ do
     GS._root = nil
     GS._rootValid = false
     switchPlayer("Carol", "Player-1-Carol", 3)
-    -- Alice demoted below editor threshold (policy position 2 ⇒ need rank <= 2).
+    -- Establish the shared officer policy while a Guild Master still exists.
+    GS:GetCapabilities()
+    -- Alice demoted below the shared officer threshold.
     for _, m in ipairs(world.guild.members) do
         if m.guid == "Player-1-Alice" then m.rankOrder = 4 end
     end
@@ -24979,26 +25144,10 @@ do
     settleRoster()
     local bob = GS.AuthenticateTransportSender("Bob-Garona")
     local okBob, bobReason = GS.SenderHasEditorAuthority(bob, { allowBootstrapInstall = true })
-    assertEq(okBob, false, "A2: small-guild rank-2 bootstrap denied")
-    assertEq(bobReason, "unauthorized", "A2: small-guild rank-2 unauthorized")
-    local stBob = select(1, GS:InstallStagedDatasetFromRemote({
-        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
-        datasetId = "a2-rank2", activation = "staged",
-        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
-    }, bob))
-    assertEq(stBob, "rejected", "A2: rank-2 install rejected")
-    local vaBob = select(1, provider.api.ValidateAndApply({
-        id = "a2-desc-rank2",
-        versionFp = "v1",
-        body = {
-            kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
-            datasetId = "a2-rank2-va", activation = "staged",
-            acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
-        },
-    }, { sender = "Bob-Garona", peer = "Bob-Garona" }))
-    assertTrue(vaBob == "rejected" or vaBob == false or vaBob == nil,
-        "A2: provider VA rejects unauthorized rank-2 st=" .. tostring(vaBob))
-    assertNil(select(1, GS:GetCurrentRecord()), "A2: rank-2 VA did not install")
+    assertEq(okBob, true, "A2: last native rank meets the capped officer policy")
+    assertEq(bobReason, nil, "A2: capped rank-2 is authorized: " .. tostring(bobReason))
+    -- Leave installation to the Guild Master descriptor below so the stored
+    -- historical position can be checked without a second dataset.
 
     local vaGmSt, vaGmReason = provider.api.ValidateAndApply({
         id = "a2-desc-gm",
@@ -25015,7 +25164,11 @@ do
             .. tostring(vaGmSt) .. " r=" .. tostring(vaGmReason))
     assertTrue(GS:GetCurrentRecord() ~= nil, "A2: GM bootstrap installed via provider")
     assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
-        "A2: small-guild bootstrap threshold is GM-only")
+        "A2: advertised historical bootstrap rank is stored as metadata")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(GS:GetCapabilities().canEdit, true,
+        "A2: live edit follows the capped shared officer policy")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
 
     -- Ordinary guild (>=3 ranks): authorized editor may bootstrap via provider path.
     resetDb()
@@ -26887,6 +27040,306 @@ do
     assertEq(#world.chat, 0, "B-life: no Chat from lifecycle repair")
 end
 
+---------------------------------------------------------------------------
+-- PR #408 repair: historical rank shrink, unknown officer policy, GS refresh
+-- (#4340670266 / #4340670277 / #4340670301 / #4340669099)
+---------------------------------------------------------------------------
+
+do
+    -- A) Dataset created under five ranks remains editable/installable after shrink.
+    resetDb()
+    initGS()
+    world.guild.clubId = 42
+    world.guild.ranks = {
+        "Guild Master", "Officer", "Veteran", "Member", "Initiate",
+    }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    settleRoster()
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local created, createSt, createErr = GS:CreateStagedRecord()
+    assertEq(createSt, "accepted", "A-shrink: create under five ranks: " .. tostring(createErr))
+    assertEq(created.permission.editorRankPosition, 3, "A-shrink: historical metadata stores rank 3")
+    local histOp, histPrep = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 5)
+    assertEq(histPrep, "accepted", "A-shrink: historical set-editor-rank to 5 prepares")
+    assertEq(GS:ApplyStagedConfigOperation(histOp), "accepted", "A-shrink: historical rank 5 recorded")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 5,
+        "A-shrink: retained metadata is 5 before shrink")
+
+    world.guild.ranks = { "Guild Master", "Officer" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, true, "A-shrink: authorized non-GM still edits after shrink")
+    local member = GS.AuthenticateTransportSender("Bob-Garona")
+    local okAuth, authReason = GS.SenderHasEditorAuthority(member)
+    assertEq(okAuth, true, "A-shrink: remote sender auth uses shared officer policy")
+    assertEq(authReason, nil, "A-shrink: auth reason nil got=" .. tostring(authReason))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 5,
+        "A-shrink: historical metadata 5 retained after shrink")
+    local bankOp, bankPrep = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(bankPrep, "accepted", "A-shrink: ordinary edit prepares after shrink")
+    assertEq(GS:ApplyStagedConfigOperation(bankOp), "accepted", "A-shrink: ordinary edit admits after shrink")
+    local rankOp, rankPrep = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
+    assertEq(rankPrep, "accepted", "A-shrink: new in-range historical rank prepares without GM recovery")
+    assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted",
+        "A-shrink: new historical rank records after shrink")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2,
+        "A-shrink: live historical metadata updated to 2")
+
+    -- Fresh empty client installs advertised historical rank 5 under two ranks.
+    resetDb()
+    initGS()
+    world.guild.ranks = { "Guild Master", "Officer" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    member = GS.AuthenticateTransportSender("Bob-Garona")
+    local stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a-shrink-ds", activation = "staged",
+        bootstrapEditorRankPosition = 5,
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, member)
+    assertEq(stInst, "accepted", "A-shrink: install accepts historical rank 5: " .. tostring(reasonInst))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 5,
+        "A-shrink: installed historical metadata keeps rank 5")
+    assertEq(GS:GetCapabilities().canEdit, true,
+        "A-shrink: live edit follows shared officer policy after install")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Malformed historical metadata still rejected.
+    resetDb()
+    initGS()
+    world.guild.ranks = { "Guild Master", "Officer" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    member = GS.AuthenticateTransportSender("Bob-Garona")
+    stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a-shrink-bad", activation = "staged",
+        bootstrapEditorRankPosition = 2.5,
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, member)
+    assertEq(stInst, "rejected", "A-shrink: nonintegral historical rank rejected")
+    assertEq(reasonInst, "invalid_editor_rank_position",
+        "A-shrink: nonintegral reason got=" .. tostring(reasonInst))
+end
+
+do
+    -- C4) Unknown shared officer policy fails closed for init and sender admission.
+    resetDb()
+    world.skipOfficerBootstrap = true
+    local GO = SF.GuildOfficer
+    GO:Initialize(SpectrumFederationDB)
+    initGS()
+    world.guild.clubId = 42
+    world.guild.ranks = {
+        "Guild Master", "Officer", "Veteran", "Member", "Initiate",
+    }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+    }
+    settleRoster()
+    assertNil(select(1, GO:GetEstablishedThreshold()),
+        "C4: no established officer policy before negative checks")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "C4: non-GM cannot edit without officer policy")
+    assertEq(caps.reason, "policy_unknown", "C4: capabilities report policy_unknown")
+    local _, st, err = GS:CreateStagedRecord()
+    assertEq(st, "rejected", "C4: non-GM cannot initialize without officer policy")
+    assertTrue(err == "policy_unknown" or err == "unauthorized",
+        "C4: init reason fail-closed got=" .. tostring(err))
+    local member = GS.AuthenticateTransportSender("Bob-Garona")
+    local okAuth, authReason = GS.SenderHasEditorAuthority(member, { allowBootstrapInstall = true })
+    assertEq(okAuth, false, "C4: incoming sender admission fails closed")
+    assertEq(authReason, "policy_unknown",
+        "C4: sender reason policy_unknown got=" .. tostring(authReason))
+    local stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "c4-denied", activation = "staged",
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, member)
+    assertEq(stInst, "rejected", "C4: remote install denied without officer policy")
+    assertEq(reasonInst, "policy_unknown",
+        "C4: install reason policy_unknown got=" .. tostring(reasonInst))
+    assertNil(select(1, GS:GetCurrentRecord()), "C4: no dataset installed without officer policy")
+
+    -- Verified GM establishes the default policy; previously authorized actions succeed.
+    world.skipOfficerBootstrap = false
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GO:Initialize(SpectrumFederationDB)
+    assertEq(select(1, GO:Bootstrap()), "accepted", "C4: verified GM establishes default policy")
+    assertEq(select(1, GO:GetEstablishedThreshold()), 3, "C4: default officer threshold is 3")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, true, "C4: officer can edit after policy exists")
+    local created, createSt, createErr = GS:CreateStagedRecord()
+    assertEq(createSt, "accepted", "C4: officer initializes after policy: " .. tostring(createErr))
+    assertTrue(created ~= nil, "C4: dataset created after policy")
+    member = GS.AuthenticateTransportSender("Carol-Garona")
+    okAuth, authReason = GS.SenderHasEditorAuthority(member)
+    assertEq(okAuth, true, "C4: rank-3 officer sender auth succeeds after policy")
+    assertEq(authReason, nil, "C4: post-policy auth reason nil got=" .. tostring(authReason))
+    world.skipOfficerBootstrap = false
+end
+
+do
+    -- Catch-up admission uses shared officer policy, not historical rank metadata.
+    resetDb()
+    initGS()
+    world.guild.clubId = 42
+    world.guild.ranks = {
+        "Guild Master", "Officer", "Veteran", "Member", "Initiate",
+    }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    settleRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local GO = SF.GuildOfficer
+    GO:Initialize(SpectrumFederationDB)
+    GO:Bootstrap()
+    GO:CommitThreshold(1)
+    assertEq(select(1, GO:GetEstablishedThreshold()), 1, "catch-up: officer threshold tightened to 1")
+
+    local member = GS.AuthenticateTransportSender("Alice-Garona")
+    local stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = "catchup-hist",
+        editorRankPosition = 3,
+        permissionRevisionId = "catchup-policy",
+        bootstrapEditorRankPosition = 3,
+        activation = "staged",
+        acceptedOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
+    }, member)
+    assertEq(stInst, "accepted", "catch-up: descriptor install: " .. tostring(reasonInst))
+    assertEq(GS.IsBootstrapEditLocked("club:42"), true, "catch-up: bootstrap lock armed")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 3,
+        "catch-up: historical metadata remains rank 3")
+
+    local carol = GS.AuthenticateTransportSender("Carol-Garona")
+    local okCarol, reasonCarol = GS.SenderHasEditorAuthority(carol, { allowPolicyCatchUp = true })
+    assertEq(okCarol, false, "catch-up: historical rank 3 cannot authorize under threshold 1")
+    assertEq(reasonCarol, "unauthorized",
+        "catch-up: revoked sender reason unauthorized got=" .. tostring(reasonCarol))
+    local rankForged = {
+        schemaVersion = 1, id = "catchup-policy", guildKey = "club:42",
+        datasetId = "catchup-hist", campaignId = nil,
+        kind = "set-editor-rank", target = "editorRankPosition", value = 2,
+        actorGuid = "Player-1-Carol", actorName = "Carol-Garona", timestamp = 19000,
+        baseTargetRevision = "catchup-hist", basePolicyRevision = "catchup-hist",
+        baseCampaignId = nil,
+    }
+    local stForged, reasonForged = GS:AdmitRemoteOperation(rankForged, { sender = "Carol-Garona" })
+    assertTrue(stForged == "pending" or stForged == "rejected",
+        "catch-up: revoked sender does not apply authoritative catch-up st=" .. tostring(stForged))
+    assertTrue(reasonForged == "untrusted_relay" or reasonForged == "unauthorized"
+            or reasonForged == "awaiting_policy",
+        "catch-up: forged catch-up reason fail-closed got=" .. tostring(reasonForged))
+    assertEq(GS:GetCurrentRecord().permission.revisionId, "catchup-hist",
+        "catch-up: forged catch-up did not advance permission revision")
+
+    local priorNumRanks = GuildControlGetNumRanks
+    GuildControlGetNumRanks = function() return 0 end
+    local okRanks, reasonRanks = GS.SenderHasEditorAuthority(member, { allowPolicyCatchUp = true })
+    assertEq(okRanks, false, "catch-up: missing native ranks fail closed")
+    assertTrue(reasonRanks == "not_ready" or reasonRanks == "rank_unavailable"
+            or reasonRanks == "ranks_unavailable" or reasonRanks == "policy_unknown",
+        "catch-up: missing ranks reason got=" .. tostring(reasonRanks))
+    GuildControlGetNumRanks = priorNumRanks
+    settleRoster()
+
+    local rankOk = {
+        schemaVersion = 1, id = "catchup-policy", guildKey = "club:42",
+        datasetId = "catchup-hist", campaignId = nil,
+        kind = "set-editor-rank", target = "editorRankPosition", value = 1,
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 19001,
+        baseTargetRevision = "catchup-hist", basePolicyRevision = "catchup-hist",
+        baseCampaignId = nil,
+    }
+    assertEq(GS:AdmitRemoteOperation(rankOk, { sender = "Alice-Garona" }), "accepted",
+        "catch-up: currently eligible editor completes legitimate catch-up")
+    assertEq(GS.IsBootstrapEditLocked("club:42"), false, "catch-up: lock cleared after eligible catch-up")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
+        "catch-up: historical metadata updated by eligible catch-up")
+    assertEq(GS:GetCapabilities().canEdit, true, "catch-up: GM can edit after catch-up")
+end
+
+do
+    -- canRecoverPolicy only for genuine corrupt historical permission.
+    resetDb()
+    initGS()
+    world.skipOfficerBootstrap = true
+    local GO = SF.GuildOfficer
+    GO:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    assertNil(select(1, GO:GetEstablishedThreshold()), "recover-caps: no officer policy")
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "recover-caps: unknown policy denies edit")
+    assertEq(caps.canRecoverPolicy, false,
+        "recover-caps: unknown policy does not grant historical recovery")
+    assertEq(caps.reason, "policy_unknown", "recover-caps: reason policy_unknown")
+    local _, st, err = GS:CreateStagedRecord()
+    assertEq(st, "rejected", "recover-caps: init requires established officer policy")
+    assertTrue(err == "policy_unknown" or err == "unauthorized",
+        "recover-caps: init reason got=" .. tostring(err))
+    local beginSt = select(2, GS:BeginDatasetAdoption("Bob-Garona", "foreign-ds"))
+    assertEq(beginSt, "rejected", "recover-caps: adoption denied without canEdit")
+
+    world.skipOfficerBootstrap = false
+    GO:Initialize(SpectrumFederationDB)
+    assertEq(select(1, GO:Bootstrap()), "accepted", "recover-caps: GM establishes officer policy")
+    local created, createSt = GS:CreateStagedRecord()
+    assertEq(createSt, "accepted", "recover-caps: authorized initialization succeeds")
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, true, "recover-caps: configured dataset canEdit")
+    assertEq(caps.canRecoverPolicy, false,
+        "recover-caps: healthy historical permission is not recoverable")
+
+    created.permission.revisionId = "gs1:broken-recover-caps:1"
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "recover-caps: corrupt permission denies ordinary edit")
+    assertEq(caps.canRecoverPolicy, true, "recover-caps: GM recovers genuine corrupt permission")
+    beginSt = select(2, GS:BeginDatasetAdoption("Bob-Garona", "foreign-ds-2"))
+    assertEq(beginSt, "rejected",
+        "recover-caps: permission recovery does not authorize adoption")
+    world.skipOfficerBootstrap = false
+end
+
+do
+    -- C1 runtime listener lifecycle is exercised in the 2B15 Settings page harness
+    -- (repeated Build/Refresh, visible refresh, hidden no-op, ClearUIListeners cleanup).
+    assertTrue(type(SF.GuildOfficer.ClearUIListeners) == "function",
+        "C1: ClearUIListeners available to isolate officer UI listeners")
+    assertTrue(type(SF.GuildOfficer.RegisterUIListener) == "function",
+        "C1: RegisterUIListener available")
+end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

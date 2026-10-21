@@ -11,6 +11,7 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Concern | Owner |
 | --- | --- |
 | Durable guild record / schema validation | `SF.GuildSupplies` (`State`) |
+| Live edit authority | Shared officer rank (`SF.GuildOfficer`), rechecked at commit and remote admission |
 | Verified current guild/rank capabilities | `Authority` via demand-driven `GG.GetGuildIdentity` / `GetGuildMember` / `GetGuildRanks` |
 | Operation IDs, typed validation, staged/live local admission | `Operations` (`ApplyStaged*`) |
 | Authenticated remote admission / adoption / conflicts | `Admission` (`AdmitRemote*`, adoption APIs) |
@@ -50,7 +51,7 @@ SpectrumFederationDB.guildSupplies = {
         cutoverMarker = "gsc1:<datasetId>:<activatedAt>:<bankTab>",
         eligibilityBoundary = { baselineEstablished = true, tabEligibleFrom = <contextObservedAt> },
       },
-      permission = { editorRankPosition = 3, revisionId = "<datasetId or op id>" },
+      permission = { editorRankPosition = 3, revisionId = "<datasetId or op id>" }, -- historical metadata; not live auth
       currentCampaignId = "<campaignId or nil>",
       campaigns = { -- [campaignId] = immutable boundary header },
       campaignArchives = { -- [campaignId] = frozen requestedItems + generation },
@@ -71,6 +72,7 @@ SpectrumFederationDB.guildSupplies = {
 ```
 
 - Durable key is only `club:<nonzero club id>`. Transport `name:` scopes are never persisted.
+- `permission.editorRankPosition` and `set-editor-rank` history remain so existing datasets, revisions, and operation ancestry still validate. They are not a second live authorization source. Current edits use the shared officer rank. A corrupt permission record can still be repaired by the Guild Master without resetting campaigns, donation logs, or accounting. The old editor-rank setting is not migrated.
 - Absent root → empty defaults. Unsupported/malformed root or guild records are retained read-only.
 - Active records without a valid `liveCutover` fail closed (unavailable), never silently rewritten.
 
@@ -91,7 +93,7 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 
 | Area | Access |
 | --- | --- |
-| **Guild Supplies → Configuration** | Initialize, editor rank, bank tab, New Campaign, items/goals, character links, adjustments, adoption, conflict resolution, **Activate Guild Supplies** |
+| **Guild Supplies → Configuration** | Initialize, bank tab, New Campaign, items/goals, character links, adjustments, adoption, conflict resolution, **Activate Guild Supplies**. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. |
 | **Guild Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history |
 | **Personal preferences** | Account-local reminder checkbox |
 | **Loot Helper → Consumables / Consumable Logs** | Hidden from navigation after live activation (`page.available`) |

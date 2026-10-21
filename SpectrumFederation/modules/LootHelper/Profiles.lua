@@ -4280,16 +4280,87 @@ function LootProfile:_InsertLog(lootLog, opts)
     return true
 end
 
+-- True when this profile already recorded an admin grant or removal for memberId.
+-- A later roster add must not grant admin again.
+function LootProfile:_HasPriorAdminHistory(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return false
+    end
+    local logs = self.GetLootLogs and self:GetLootLogs() or self._lootLogs or {}
+    if type(logs) ~= "table" then
+        return false
+    end
+    local types = SF.LootLogEventTypes or {}
+    local added = types.ADMIN_ADDED or "ADMIN_ADDED"
+    local removed = types.ADMIN_REMOVED or "ADMIN_REMOVED"
+    local roleChange = types.ROLE_CHANGE or "ROLE_CHANGE"
+    for i = 1, #logs do
+        local log = logs[i]
+        if type(log) == "table" then
+            local eventType = (log.GetEventType and log:GetEventType()) or log._eventType
+            local data = (log.GetEventData and log:GetEventData()) or log._data
+            if type(data) == "table" and type(data.member) == "string" then
+                local same = false
+                if SF.NameUtil and SF.NameUtil.SamePlayer then
+                    same = SF.NameUtil.SamePlayer(data.member, memberId) and true or false
+                else
+                    same = data.member == memberId
+                end
+                if same and (eventType == added or eventType == removed or eventType == roleChange) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- One-time shared-officer grant for a character that was not already on the profile.
+-- Unknown or ineligible guild rank leaves the character as a regular member.
+function LootProfile:_MaybeGrantSharedOfficerAdmin(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return
+    end
+    if self:IsAdminMemberId(memberId) then
+        return
+    end
+    if self:_HasPriorAdminHistory(memberId) then
+        return
+    end
+    local GO = SF.GuildOfficer
+    if not GO or type(GO.EvaluateCharacter) ~= "function" then
+        return
+    end
+    local eligible = GO:EvaluateCharacter(memberId)
+    if eligible ~= true then
+        if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+            SF.Debug:Info("GUILD_OFFICER", "loot helper member %s stays non-admin", tostring(memberId))
+        end
+        return
+    end
+    if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
+        SF.Debug:Info("GUILD_OFFICER", "one-time loot helper admin grant for %s", tostring(memberId))
+    end
+    self:AddAdminMemberId(memberId)
+end
+
 -- Function to add a member to this profile
 -- @param Member member Instance of Member to add
+-- @param table|nil opts skipOfficerGrant/import/replay suppress the one-time officer grant
 -- @return boolean success
-function LootProfile:AddMember(member)
+function LootProfile:AddMember(member, opts)
+    opts = opts or {}
     local mt = getmetatable(member)
     if mt == SF.Member or mt == SF.LootProfileMember then
+        local id = member.GetFullIdentifier and member:GetFullIdentifier() or member.identifier
+        local already = (type(id) == "string" and self.getMemberByID) and self:getMemberByID(id) or nil
         self._members = self._members or {}
         table.insert(self._members, member)
         self._memberById = nil
         self:_NoteSnapshotMutation()
+        if not already and not opts.skipOfficerGrant and not opts.import and not opts.replay then
+            self:_MaybeGrantSharedOfficerAdmin(id)
+        end
         return true
     else
         if SF.Debug then

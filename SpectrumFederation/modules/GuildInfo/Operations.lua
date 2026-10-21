@@ -35,7 +35,9 @@ function GI.FormatMutationFeedback(status, reason)
     end
 
     local map = {
-        unauthorized = Loc("GUILD_INFO_ERR_UNAUTHORIZED", "Only guild ranks 1–3 may change main/alt assignments."),
+        unauthorized = Loc("GUILD_INFO_ERR_UNAUTHORIZED", "Your guild rank cannot change main/alt assignments."),
+        policy_unknown = Loc("GUILD_INFO_ERR_POLICY_UNKNOWN", "Officer rank is not available yet, so Guild Info edits are disabled."),
+        policy_invalid = Loc("GUILD_INFO_ERR_POLICY_INVALID", "Officer rank needs Guild Master recovery before Guild Info can be edited."),
         preview_non_admin = Loc("GUILD_INFO_ERR_PREVIEW", "Preview as Non-Admin is active; edits are disabled."),
         not_ready = Loc("GUILD_INFO_ERR_NOT_READY", "Guild membership or rank information is not ready yet."),
         roster_incomplete = Loc("GUILD_INFO_ERR_ROSTER_INCOMPLETE", "Guild roster is incomplete. Try again when the roster finishes loading."),

@@ -1,5 +1,6 @@
--- Guild Supplies rank/capability authority (#385 Part 2A).
--- Demand-driven native identity/rank; Preview as Non-Admin respected.
+-- Guild Supplies rank/capability authority (#385 Part 2A, #405).
+-- Current edits use the shared guild officer threshold. Historical
+-- permission.editorRankPosition remains for dataset validation only.
 local addonName, SF = ...
 
 SF.GuildSupplies = SF.GuildSupplies or {}
@@ -103,6 +104,15 @@ function GS:GetCurrentContext()
         ctx.reason = rankReason or memberReason or "rank_unavailable"
     end
     return ctx
+end
+
+--- Effective officer threshold. Nil when the shared policy is unknown or unusable.
+function GS.SharedOfficerThreshold()
+    local GO = SF.GuildOfficer
+    if not GO or type(GO.GetEstablishedThreshold) ~= "function" then
+        return nil, "policy_unknown"
+    end
+    return GO:GetEstablishedThreshold()
 end
 
 local function PolicyPosition(record)
@@ -219,54 +229,46 @@ function GS:GetCapabilities()
 
     if ctx.ready and type(ctx.rankOrder) == "number" then
         local isGM = (ctx.rankOrder == 1)
-        -- Verified Guild Master recovery capability is retained under the accepted
-        -- policy contract; Preview as Non-Admin still hides/denies it.
-        result.canRecoverPolicy = isGM and true or false
+        -- Historical permission repair is GM-only and only when that record is
+        -- actually corrupt. It must not authorize ordinary edits, initialization,
+        -- or adoption while the shared officer policy is unknown.
+        result.canRecoverPolicy = false
+        local sharedPos, sharedReason = GS.SharedOfficerThreshold()
+        local permissionBroken = recordReason
+            and GS._IsPermissionOnlyFailure
+            and GS._IsPermissionOnlyFailure(recordReason)
 
         if PreviewNonAdminActive() then
             result.canEdit = false
-            result.canRecoverPolicy = false
             result.reason = "preview_non_admin"
         elseif GS.IsBootstrapEditLocked and GS.IsBootstrapEditLocked(ctx.guildKey) then
             -- Descriptor-first install: replication continues, local edits blocked
-            -- until the advertised policy revision is reconstructed.
+            -- until the advertised dataset revision is reconstructed.
             result.canEdit = false
             result.reason = "awaiting_policy"
-        elseif policyValid and policyInRange and policyPos and ctx.rankOrder <= policyPos then
+        elseif permissionBroken then
+            result.canEdit = false
+            result.canRecoverPolicy = isGM and true or false
+            result.reason = isGM and "policy_requires_gm" or "unauthorized"
+        elseif not sharedPos then
+            result.canEdit = false
+            result.reason = sharedReason or "policy_unknown"
+            result.editorRankPosition = nil
+        elseif ctx.rankOrder <= sharedPos
+            and (recordReason == "not_configured" or record ~= nil) then
             result.canEdit = true
             result.reason = nil
-        elseif (not policyValid or not policyInRange) and isGM then
-            -- Invalid/missing/out-of-range policy: GM recovery only.
-            -- For permission-only failures, structure was verified above.
-            result.canEdit = false
-            result.canRecoverPolicy = true
-            result.reason = "policy_requires_gm"
-        elseif not ctx.ready then
-            result.canEdit = false
-            result.reason = ctx.reason or "rank_unavailable"
+            result.editorRankPosition = sharedPos
         else
             result.canEdit = false
-            if not result.reason then
-                result.reason = "unauthorized"
-            end
+            result.reason = "unauthorized"
+            result.editorRankPosition = sharedPos
         end
     else
         result.canEdit = false
         result.canRecoverPolicy = false
         if not result.reason then
             result.reason = "rank_unavailable"
-        end
-    end
-
-    -- For not_configured with enough ranks, verified editors under default threshold may create.
-    if recordReason == "not_configured" and ctx.ready and not PreviewNonAdminActive() then
-        if policyValid and policyPos and ctx.rankOrder and ctx.rankOrder <= policyPos then
-            result.canEdit = true
-            result.reason = nil
-        elseif ctx.rankCount and ctx.rankCount < GS.DEFAULT_EDITOR_RANK_POSITION and ctx.rankOrder == 1 then
-            result.canRecoverPolicy = true
-            result.canEdit = false
-            result.reason = "threshold_unselected"
         end
     end
 

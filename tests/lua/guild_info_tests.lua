@@ -447,6 +447,8 @@ local function loadModule(path)
     f(addonName, SF)
 end
 
+loadModule("SpectrumFederation/modules/GuildOfficer/Policy.lua")
+loadModule("SpectrumFederation/modules/GuildOfficer/Gossip.lua")
 loadModule("SpectrumFederation/modules/GuildInfo/State.lua")
 loadModule("SpectrumFederation/modules/GuildInfo/Cleanup.lua")
 loadModule("SpectrumFederation/modules/GuildInfo/Authority.lua")
@@ -455,7 +457,45 @@ loadModule("SpectrumFederation/modules/GuildInfo/Roster.lua")
 loadModule("SpectrumFederation/modules/GuildInfo/Gossip.lua")
 
 local GI = SF.GuildInfo
+local GO = SF.GuildOfficer
 assertTrue(GI ~= nil, "SF.GuildInfo namespace exists")
+assertTrue(GO ~= nil, "SF.GuildOfficer namespace exists")
+
+local function ensureDefaultOfficerPolicy()
+    GO:Initialize(SpectrumFederationDB)
+    local savedName, savedGuid = world.unitName, world.unitGuid
+    local savedRank = nil
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Alice" then
+            savedRank = m.rankOrder
+            m.rankOrder = 1
+            break
+        end
+    end
+    world.unitName = "Alice"
+    world.unitGuid = "Player-1-Alice"
+    local view = GO:GetView()
+    if view and view.status == "unknown" and view.canBootstrap then
+        GO:Bootstrap()
+    end
+    world.unitName = savedName
+    world.unitGuid = savedGuid
+    if savedRank ~= nil then
+        for _, m in ipairs(world.guild.members) do
+            if m.guid == "Player-1-Alice" then
+                m.rankOrder = savedRank
+                break
+            end
+        end
+    end
+end
+
+local realGuildInfoInitialize = GI.Initialize
+function GI:Initialize(db, ...)
+    local ok, reason = realGuildInfoInitialize(self, db, ...)
+    ensureDefaultOfficerPolicy()
+    return ok, reason
+end
 
 local function resetDB()
     SpectrumFederationDB = {}
@@ -467,6 +507,7 @@ local function resetDB()
     GI.InvalidateRosterSnapshot()
     local ok = GI:Initialize(SpectrumFederationDB)
     assertTrue(ok, "Initialize empty DB")
+    ensureDefaultOfficerPolicy()
 end
 
 local function setActor(name, guid, rankOrder)
@@ -610,7 +651,15 @@ local function reloadModules(saved)
     loadModule("SpectrumFederation/modules/GuildInfo/Roster.lua")
     loadModule("SpectrumFederation/modules/GuildInfo/Gossip.lua")
     GI = SF.GuildInfo
+    realGuildInfoInitialize = GI.Initialize
+    function GI:Initialize(db, ...)
+        local ok, reason = realGuildInfoInitialize(self, db, ...)
+        ensureDefaultOfficerPolicy()
+        return ok, reason
+    end
     GI:Initialize(saved)
+    GO = SF.GuildOfficer
+    GO:Initialize(saved)
 end
 
 ---------------------------------------------------------------------------
