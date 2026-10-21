@@ -270,11 +270,17 @@ end
 -- Reciprocal/cyclic forward aliases break deterministically onto the lexicographically
 -- minimum group id in the cycle (second return true) so assigned members stay
 -- visible without inventing synthetic membership versions.
+-- Traversal is bounded by MAX_GROUPS (+1 to inspect a live sink or detect a
+-- full-capacity cycle); the visited set keeps walks cycle-safe.
+local function ForwardAliasMaxHops()
+    return (GI.MAX_GROUPS or 128) + 1
+end
+
 local function ResolveEffectiveGroupId(groups, gid)
     local seen = {}
     local path = {}
     local cur = gid
-    for _ = 1, 8 do
+    for _ = 1, ForwardAliasMaxHops() do
         if type(cur) ~= "string" or cur == "" then
             return nil, false
         end
@@ -314,11 +320,44 @@ function GI.HasForwardAliasCycle(record)
     if type(groups) ~= "table" then
         return false
     end
+    local maxHops = ForwardAliasMaxHops()
     for startId, g0 in pairs(groups) do
         if type(g0) == "table" and type(g0.forwardTo) == "string" and g0.forwardTo ~= "" then
             local seen = {}
             local cur = startId
-            for _ = 1, 8 do
+            for _ = 1, maxHops do
+                if type(cur) ~= "string" or cur == "" then
+                    break
+                end
+                if seen[cur] then
+                    return true
+                end
+                seen[cur] = true
+                local g = groups[cur]
+                if type(g) ~= "table" or type(g.forwardTo) ~= "string" or g.forwardTo == "" then
+                    break
+                end
+                cur = g.forwardTo
+            end
+        end
+    end
+    return false
+end
+
+--- True when a forwardTo cycle is reachable from any assigned membership.
+-- Wholly unreferenced cycles are ignored here so Option B cleanup can reclaim them.
+function GI.HasReferencedForwardAliasCycle(record)
+    local groups = record and record.groups
+    local members = record and record.members
+    if type(groups) ~= "table" or type(members) ~= "table" then
+        return false
+    end
+    local maxHops = ForwardAliasMaxHops()
+    for _, m in pairs(members) do
+        if type(m) == "table" and type(m.groupId) == "string" and m.groupId ~= "" then
+            local seen = {}
+            local cur = m.groupId
+            for _ = 1, maxHops do
                 if type(cur) ~= "string" or cur == "" then
                     break
                 end
@@ -1568,6 +1607,15 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
     local durablePrevGid = altMem and type(altMem.groupId) == "string" and altMem.groupId or nil
     -- Solo-main claimant homes vacated when this character becomes someone else's alt.
     local vacatedMainGroups = nil
+
+    -- Confirmed moves must still see the original alt→main relationship. Validate
+    -- before hierarchy gates, no-ops, or any membership/group mutation so an
+    -- intervening Unassign/Move cannot be overwritten by a stale dialog confirm.
+    if opts.moveConfirmed and type(opts.expectedOldMain) == "string" and opts.expectedOldMain ~= "" then
+        if not (altInfo and altInfo.role == "alt" and altInfo.mainGuid == opts.expectedOldMain) then
+            return "rejected", "stale_move_confirmation"
+        end
+    end
 
     -- Hierarchy gates (local).
     if altInfo and altInfo.role == "main" then

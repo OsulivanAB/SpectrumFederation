@@ -2,6 +2,13 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.23] - 2026-10-21
+
+### Fixed
+- Guild Info: confirmed Move rejects with `stale_move_confirmation` when the alt was unassigned or reassigned before the Settings dialog is accepted (#402)
+- Guild Info: forward-alias resolution walks up to `MAX_GROUPS` so long valid chains keep late members visible (#402)
+- Guild Info: Option B cleanup discards wholly unreferenced forward cycles to reclaim capacity while still failing closed on cycles reachable from assigned memberships (#402)
+
 ## [1.5.12-beta.22] - 2026-10-21
 
 ### Fixed

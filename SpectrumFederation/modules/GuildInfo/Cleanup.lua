@@ -490,7 +490,11 @@ function GI:ApplyCleanupHistory(opts)
         return "rejected", "generation_syncing"
     end
 
-    if GI.HasForwardAliasCycle and GI.HasForwardAliasCycle(record) then
+    -- Referenced forward cycles (reachable from assigned memberships) fail closed.
+    -- Wholly unreferenced cycles are obsolete alias history and may be discarded
+    -- by the Option B rebuild below; automatic ReclaimUnreferencedDissolved still
+    -- retains every forward alias.
+    if GI.HasReferencedForwardAliasCycle and GI.HasReferencedForwardAliasCycle(record) then
         return "rejected", "cleanup_forward_cycle"
     end
     -- Missing-group orphans are explicitly reclaimable by Option B cleanup.

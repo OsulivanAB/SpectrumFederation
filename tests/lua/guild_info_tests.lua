@@ -4118,15 +4118,12 @@ do
         assertEq(assign("ShellCycle-Garona", "Dave-Garona"), "accepted", "cycle cleanup bait")
         assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "cycle cleanup bait unassign")
         local cst, cwhy = GI:CleanupHistory({})
-        assertTrue(cst == "accepted" or cwhy == "cleanup_forward_cycle",
-            "cycle cleanup accepted or fail-closed why=" .. tostring(cwhy))
-        if cst == "accepted" then
-            assertTrue(GI.CountHiddenAssignedMembers(select(1, GI:GetCurrentRecord())) == 0,
-                "post-cleanup no hidden assigned")
-            local roleA = GI:GetCharacterRole("Player-1-Alice")
-            local roleB = GI:GetCharacterRole("Player-1-Bob")
-            assertTrue(roleA ~= nil and roleB ~= nil, "post-cleanup Alice+Bob still visible")
-        end
+        -- Referenced reciprocal cycle must fail closed (not discard Alice/Bob).
+        assertEq(cst, "rejected", "referenced cycle cleanup rejected")
+        assertEq(cwhy, "cleanup_forward_cycle", "referenced cycle reason")
+        local roleA = GI:GetCharacterRole("Player-1-Alice")
+        local roleB = GI:GetCharacterRole("Player-1-Bob")
+        assertTrue(roleA ~= nil and roleB ~= nil, "post-reject Alice+Bob still visible")
         -- Ordinary one-way forward still works afterward on a clean db.
         restoreBaseRoster()
         resetDB()
@@ -5790,6 +5787,551 @@ do
     assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Carol",
         "cm success Alice under Carol")
     pass("Change Main confirm revalidates roster")
+end
+
+---------------------------------------------------------------------------
+-- Final Codex repairs at 6b900b83: stale Move, MAX_GROUPS forward walk,
+-- unreferenced forward-cycle cleanup (#402 / PR #403)
+---------------------------------------------------------------------------
+
+do
+    -- Fail-before: confirmed move after intervening Unassign recreated the link.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "stale-unassign fail-before seed")
+    local fixedApply = GI.ApplyAssign
+    function GI:ApplyAssign(mainGuid, altGuid, opts)
+        -- Residual pre-fix: expectedOldMain only checked while still an alt.
+        -- Clear expectedOldMain before delegating so the fixed early gate cannot
+        -- mask the old skip-when-unassigned behavior.
+        opts = opts or {}
+        local record = select(1, GI:EnsureGuildRecord(opts.guildKey))
+        if not record then
+            return "rejected", "not_ready"
+        end
+        local altInfo = record.graph and record.graph.byGuid and record.graph.byGuid[altGuid]
+        if altInfo and altInfo.role == "alt" and altInfo.mainGuid ~= mainGuid then
+            if opts.requireMoveConfirm and not opts.moveConfirmed then
+                return "rejected", "move_confirmation_required", { oldMainGuid = altInfo.mainGuid }
+            end
+            if opts.moveConfirmed and type(opts.expectedOldMain) == "string" and opts.expectedOldMain ~= "" then
+                if altInfo.mainGuid ~= opts.expectedOldMain then
+                    return "rejected", "stale_move_confirmation"
+                end
+            elseif opts.requireMoveConfirm then
+                return "rejected", "move_confirmation_required", { oldMainGuid = altInfo.mainGuid }
+            end
+        end
+        local bypass = {}
+        for k, v in pairs(opts) do bypass[k] = v end
+        bypass.expectedOldMain = nil
+        return fixedApply(self, mainGuid, altGuid, bypass)
+    end
+    assertEq(GI:UnassignAlt("Player-1-Bob", {}), "accepted", "stale-unassign fail-before unassign")
+    local st, why = GI:AssignAlt("Carol-Garona", "Bob-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+        moveConfirmed = true,
+        expectedOldMain = "Player-1-Alice",
+    })
+    assertEq(st, "accepted", "fail-before stale confirm after unassign accepted")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol",
+        "fail-before unassign overwritten by stale move")
+    GI.ApplyAssign = fixedApply
+    pass("fail-before stale move after unassign")
+end
+
+do
+    -- Settings confirmation: intervening Unassign → stale_move_confirmation.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "stale-unassign seed")
+    local page = ensureSettingsPageLoaded()
+    local panel = CreateFrame()
+    panel.IsVisible = function() return true end
+    page:Build(panel)
+    local def = panel.__sfPageDef
+    local assignClick, mainResolvedCb, altResolvedCb
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Assign" then
+                assignClick = item.onClick
+            end
+            if item.type == "autocomplete" and item.label == "Main name" then
+                mainResolvedCb = item.onResolved
+            end
+            if item.type == "autocomplete" and item.label == "Alt name" then
+                altResolvedCb = item.onResolved
+            end
+        end
+    end
+    mainResolvedCb(nil, { guid = "Player-1-Carol", nameRealm = "Carol-Garona", classFile = "PRIEST" })
+    altResolvedCb(nil, { guid = "Player-1-Bob", nameRealm = "Bob-Garona", classFile = "WARRIOR" })
+    local pendingConfirm
+    local statusMsg
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        pendingConfirm = accept
+    end
+    local ctx = {
+        section = {
+            SetMessage = function(_, msg)
+                statusMsg = msg
+            end,
+        },
+    }
+    assignClick(ctx)
+    assertTrue(type(pendingConfirm) == "function", "move dialog opened")
+    assertEq(GI:UnassignAlt("Player-1-Bob", {}), "accepted", "intervening authorized Unassign")
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "Bob unassigned before confirm")
+    pendingConfirm()
+    assertNil(GI:GetCharacterRole("Player-1-Bob"), "Bob stays unassigned after stale confirm")
+    assertTrue(statusMsg == nil or tostring(statusMsg):find("no longer valid", 1, true)
+        or tostring(statusMsg):find("stale", 1, true)
+        or tostring(statusMsg):find("changed", 1, true),
+        "stale move surfaces Settings feedback got=" .. tostring(statusMsg))
+
+    -- Conflicting move (Bob already under Dave) still rejects.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "conflict seed Alice")
+    page:Build(panel)
+    def = panel.__sfPageDef
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Assign" then
+                assignClick = item.onClick
+            end
+            if item.type == "autocomplete" and item.label == "Main name" then
+                mainResolvedCb = item.onResolved
+            end
+            if item.type == "autocomplete" and item.label == "Alt name" then
+                altResolvedCb = item.onResolved
+            end
+        end
+    end
+    mainResolvedCb(nil, { guid = "Player-1-Carol", nameRealm = "Carol-Garona", classFile = "PRIEST" })
+    altResolvedCb(nil, { guid = "Player-1-Bob", nameRealm = "Bob-Garona", classFile = "WARRIOR" })
+    pendingConfirm = nil
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        pendingConfirm = accept
+    end
+    assignClick(ctx)
+    assertTrue(type(pendingConfirm) == "function", "conflict move dialog opened")
+    assertEq(GI:AssignAlt("Dave-Garona", "Bob-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+        moveConfirmed = true,
+        expectedOldMain = "Player-1-Alice",
+    }), "accepted", "intervening move to Dave")
+    pendingConfirm()
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Dave",
+        "stale Carol confirm did not override Dave")
+
+    -- Unchanged confirmation still succeeds.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "success seed")
+    page:Build(panel)
+    def = panel.__sfPageDef
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Assign" then
+                assignClick = item.onClick
+            end
+            if item.type == "autocomplete" and item.label == "Main name" then
+                mainResolvedCb = item.onResolved
+            end
+            if item.type == "autocomplete" and item.label == "Alt name" then
+                altResolvedCb = item.onResolved
+            end
+        end
+    end
+    mainResolvedCb(nil, { guid = "Player-1-Carol", nameRealm = "Carol-Garona", classFile = "PRIEST" })
+    altResolvedCb(nil, { guid = "Player-1-Bob", nameRealm = "Bob-Garona", classFile = "WARRIOR" })
+    pendingConfirm = nil
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        pendingConfirm = accept
+    end
+    assignClick(ctx)
+    pendingConfirm()
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Carol",
+        "unchanged confirm moves Bob under Carol")
+    pass("Settings stale Move after Unassign / conflict / success")
+end
+
+do
+    -- Fail-before: 8-hop walk hides the 9th live destination.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "fwd-chain fail-before seed")
+    local record = select(1, GI:GetCurrentRecord())
+    local destGid
+    for gid, g in pairs(record.groups) do
+        if type(g) == "table" and not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            destGid = gid
+        end
+    end
+    assertTrue(destGid ~= nil, "fwd-chain fail-before dest")
+    local gen = { n = record.syncGen.n, w = record.syncGen.w }
+    local writer = "cccccccccccccccccccccccc"
+    local prev = destGid
+    local leafId
+    for i = 8, 1, -1 do
+        local id = string.format("gi-fwd-fail-%02d", i)
+        leafId = id
+        assertEq(admitWire(SpectrumFederationDB, wireGroup({
+            groupId = id,
+            mainGuid = "Player-1-Alice",
+            ver = { n = 1, w = writer },
+            at = 1000 + i,
+            dissolved = true,
+            forwardTo = prev,
+        }, gen), "Carol-Garona"), "accepted", "fwd-chain fail-before admit " .. id)
+        prev = id
+    end
+    local eveMem = {
+        guid = "Player-1-Eve",
+        groupId = leafId,
+        ver = { n = 1, w = writer },
+        at = 1100,
+        nameRealm = "Eve-Garona",
+        classFile = "HUNTER",
+    }
+    assertEq(admitWire(SpectrumFederationDB, wireMember(eveMem, gen), "Carol-Garona"),
+        "accepted", "fwd-chain fail-before Eve")
+    -- Residual: an 8-iteration walk never inspects the live 9th group.
+    local function resolveOldEightHop(groups, gid)
+        local seen, path, cur = {}, {}, gid
+        for _ = 1, 8 do
+            if type(cur) ~= "string" or cur == "" then return nil end
+            if seen[cur] then return cur end
+            seen[cur] = true
+            path[#path + 1] = cur
+            local g = groups and groups[cur]
+            if type(g) ~= "table" then return nil end
+            if type(g.forwardTo) == "string" and g.forwardTo ~= "" then
+                cur = g.forwardTo
+            elseif g.dissolved then
+                return nil
+            else
+                return cur
+            end
+        end
+        return nil
+    end
+    record = select(1, GI:GetCurrentRecord())
+    assertNil(resolveOldEightHop(record.groups, leafId),
+        "fail-before 8-hop walk misses live destination")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
+        "fixed MAX_GROUPS walk resolves Eve through 8 forwards")
+    assertEq(GI.CountHiddenAssignedMembers(record), 0, "Eve not hidden after fix")
+    pass("fail-before / fix forward chain past 8 hops")
+end
+
+do
+    -- Long valid forward chain + late member: visible, reload, sync, cleanup.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "fwd-chain seed")
+    local record = select(1, GI:GetCurrentRecord())
+    local destGid
+    for gid, g in pairs(record.groups) do
+        if type(g) == "table" and not g.dissolved and g.mainGuid == "Player-1-Alice" then
+            destGid = gid
+        end
+    end
+    local gen = { n = record.syncGen.n, w = record.syncGen.w }
+    local writer = "dddddddddddddddddddddddd"
+    local prev = destGid
+    local leafId
+    -- 12-link chain (well above the old 8-hop limit).
+    for i = 12, 1, -1 do
+        local id = string.format("gi-fwd-ok-%02d", i)
+        leafId = id
+        assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+            groupId = id,
+            mainGuid = "Player-1-Alice",
+            ver = { n = 1, w = writer },
+            at = 2000 + i,
+            dissolved = true,
+            forwardTo = prev,
+        }, gen), "Carol-Garona"), "accepted", "fwd-chain admit " .. id)
+        prev = id
+    end
+    assertEq(admitWireLive(SpectrumFederationDB, wireMember({
+        guid = "Player-1-Eve",
+        groupId = leafId,
+        ver = { n = 1, w = writer },
+        at = 2100,
+        nameRealm = "Eve-Garona",
+        classFile = "HUNTER",
+    }, gen), "Carol-Garona"), "accepted", "fwd-chain late Eve")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
+        "Eve visible through 12-link chain")
+    assertEq(GI.CountHiddenAssignedMembers(select(1, GI:GetCurrentRecord())), 0,
+        "no hidden after long chain")
+
+    local dbA = deepCopy(SpectrumFederationDB)
+    local saved = deepCopy(dbA)
+    reloadModules(saved)
+    SpectrumFederationDB = saved
+    GI:Initialize(saved)
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
+        "Eve survives reload through long chain")
+
+    local dbC = seedEmptyPeer()
+    syncAll(dbA, dbC, "Alice-Garona")
+    assertEq(select(2, peerRole(dbC, "Player-1-Eve")), "Player-1-Alice",
+        "Eve visible on fresh peer after sync")
+
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    -- Referenced chain (not a cycle): cleanup may discard aliases while keeping Eve.
+    local cst, cwhy = GI:CleanupHistory({})
+    assertEq(cst, "accepted", "cleanup after long chain accepted why=" .. tostring(cwhy))
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
+        "Eve retained after cleanup onto canonical group")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "Bob retained after cleanup")
+
+    -- Longer cycle detection (9+ nodes) and near-capacity traversal.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "cycle9 seed")
+    record = select(1, GI:GetCurrentRecord())
+    gen = { n = record.syncGen.n, w = record.syncGen.w }
+    local ids = {}
+    for i = 1, 9 do
+        ids[i] = string.format("gi-cyc9-%02d", i)
+    end
+    for i = 1, 9 do
+        local nxt = ids[(i % 9) + 1]
+        assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+            groupId = ids[i],
+            mainGuid = "Player-1-Alice",
+            ver = { n = 1, w = writer },
+            at = 3000 + i,
+            dissolved = true,
+            forwardTo = nxt,
+        }, gen), "Carol-Garona"), "accepted", "cycle9 admit " .. ids[i])
+    end
+    assertTrue(GI.HasForwardAliasCycle(select(1, GI:GetCurrentRecord())),
+        "9-node forward cycle detected")
+    assertTrue(not GI.HasReferencedForwardAliasCycle(select(1, GI:GetCurrentRecord())),
+        "unreferenced 9-cycle not referenced")
+
+    -- Near-capacity acyclic chain under reduced MAX_GROUPS.
+    local savedMax = GI.MAX_GROUPS
+    GI.MAX_GROUPS = 16
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "cap-chain seed")
+    record = select(1, GI:GetCurrentRecord())
+    destGid = nil
+    for gid, g in pairs(record.groups) do
+        if type(g) == "table" and not g.dissolved then destGid = gid end
+    end
+    gen = { n = record.syncGen.n, w = record.syncGen.w }
+    prev = destGid
+    leafId = nil
+    -- Fill almost all remaining slots with a single forward chain to dest.
+    for i = GI.MAX_GROUPS - 1, 1, -1 do
+        local id = string.format("gi-cap-%03d", i)
+        leafId = id
+        local st = admitWireLive(SpectrumFederationDB, wireGroup({
+            groupId = id,
+            mainGuid = "Player-1-Alice",
+            ver = { n = 1, w = writer },
+            at = 4000 + i,
+            dissolved = true,
+            forwardTo = prev,
+        }, gen), "Carol-Garona")
+        assertEq(st, "accepted", "cap-chain admit " .. id)
+        prev = id
+    end
+    assertEq(admitWireLive(SpectrumFederationDB, wireMember({
+        guid = "Player-1-Eve",
+        groupId = leafId,
+        ver = { n = 1, w = writer },
+        at = 4100,
+        nameRealm = "Eve-Garona",
+        classFile = "HUNTER",
+    }, gen), "Carol-Garona"), "accepted", "cap-chain Eve")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Eve")), "Player-1-Alice",
+        "Eve visible at near-capacity chain length")
+    GI.MAX_GROUPS = savedMax
+    pass("forward chain MAX_GROUPS walk / cycle detection")
+end
+
+do
+    -- Fail-before: any forward cycle blocked cleanup (unreferenced cycles stranded).
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "unref-cycle fail-before seed")
+    local record = select(1, GI:GetCurrentRecord())
+    local gen = { n = record.syncGen.n, w = record.syncGen.w }
+    local writer = "eeeeeeeeeeeeeeeeeeeeeeee"
+    assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+        groupId = "gi-uc-a", mainGuid = "Player-1-Alice",
+        ver = { n = 1, w = writer }, at = 5001, dissolved = true, forwardTo = "gi-uc-b",
+    }, gen), "Carol-Garona"), "accepted", "unref-cycle fail-before A")
+    assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+        groupId = "gi-uc-b", mainGuid = "Player-1-Alice",
+        ver = { n = 1, w = writer }, at = 5002, dissolved = true, forwardTo = "gi-uc-a",
+    }, gen), "Carol-Garona"), "accepted", "unref-cycle fail-before B")
+    assertTrue(GI.HasForwardAliasCycle(select(1, GI:GetCurrentRecord())),
+        "unref-cycle fail-before present")
+    assertTrue(not GI.HasReferencedForwardAliasCycle(select(1, GI:GetCurrentRecord())),
+        "unref-cycle fail-before not referenced")
+    local fixedApply = GI.ApplyCleanupHistory
+    function GI:ApplyCleanupHistory(opts)
+        local rec = select(1, GI:EnsureGuildRecord(opts and opts.guildKey))
+        if GI.HasForwardAliasCycle and GI.HasForwardAliasCycle(rec) then
+            return "rejected", "cleanup_forward_cycle"
+        end
+        return fixedApply(self, opts)
+    end
+    local st, why = GI:CleanupHistory({})
+    assertEq(st, "rejected", "fail-before unref cycle cleanup rejected")
+    assertEq(why, "cleanup_forward_cycle", "fail-before unref cycle reason")
+    GI.ApplyCleanupHistory = fixedApply
+    pass("fail-before unreferenced cycle blocked cleanup")
+end
+
+do
+    -- Unreferenced reciprocal cycles at capacity: cleanup reclaims; referenced fails closed.
+    local savedMax = GI.MAX_GROUPS
+    GI.MAX_GROUPS = 8
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "capacity-cycle seed Alice/Bob")
+    local record = select(1, GI:GetCurrentRecord())
+    local genBefore = { n = record.syncGen.n, w = record.syncGen.w }
+    local writer = "ffffffffffffffffffffffff"
+    -- Fill remaining slots with unreferenced reciprocal pairs (3 pairs = 6 groups + 1 live = 7;
+    -- one more pair would need 2 slots — add one singleton pair to reach MAX).
+    local pair = 0
+    while true do
+        local counts = GI.CountRetainedState()
+        if counts.groups + 2 > GI.MAX_GROUPS then
+            break
+        end
+        pair = pair + 1
+        local a = string.format("gi-capcyc-a-%02d", pair)
+        local b = string.format("gi-capcyc-b-%02d", pair)
+        assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+            groupId = a, mainGuid = "Player-1-Alice",
+            ver = { n = 1, w = writer }, at = 6000 + pair,
+            dissolved = true, forwardTo = b,
+        }, genBefore), "Carol-Garona"), "accepted", "capacity-cycle admit " .. a)
+        assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+            groupId = b, mainGuid = "Player-1-Alice",
+            ver = { n = 1, w = writer }, at = 6100 + pair,
+            dissolved = true, forwardTo = a,
+        }, genBefore), "Carol-Garona"), "accepted", "capacity-cycle admit " .. b)
+    end
+    -- Fill any remaining slot with an unreferenced alias into an existing cycle
+    -- so ordinary Assign cannot allocate another live group.
+    record = select(1, GI:GetCurrentRecord())
+    local pad = 0
+    while countKeys(record.groups) < GI.MAX_GROUPS do
+        pad = pad + 1
+        local id = string.format("gi-capcyc-pad-%02d", pad)
+        assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+            groupId = id, mainGuid = "Player-1-Alice",
+            ver = { n = 1, w = writer }, at = 6200 + pad,
+            dissolved = true, forwardTo = "gi-capcyc-a-01",
+        }, genBefore), "Carol-Garona"), "accepted", "capacity-cycle pad " .. id)
+        record = select(1, GI:GetCurrentRecord())
+    end
+    local groupCount = countKeys(record.groups)
+    assertEq(groupCount, GI.MAX_GROUPS,
+        "full capacity with unref cycles got=" .. groupCount)
+    assertTrue(GI.HasForwardAliasCycle(record), "capacity unref cycles present")
+    assertTrue(not GI.HasReferencedForwardAliasCycle(record),
+        "capacity cycles wholly unreferenced")
+
+    ensureRosterGuid("PadMain-Garona", "Player-1-PadMain", 4)
+    ensureRosterGuid("PadAlt-Garona", "Player-1-PadAlt", 4)
+    GI.InvalidateRosterSnapshot()
+    local ost, owhy = assign("PadMain-Garona", "PadAlt-Garona")
+    assertEq(ost, "rejected", "ordinary assign blocked at capacity")
+    assertEq(owhy, "groups_overflow", "capacity reason groups_overflow")
+
+    local preview = GI.PreviewCleanupHistory(record)
+    assertTrue(preview.discardAliases >= 2, "preview counts discardable cycle aliases")
+    assertTrue(preview.capacityRecovered, "preview reports capacity recovery")
+
+    local cst, cwhy, cmeta = GI:CleanupHistory({})
+    assertEq(cst, "accepted", "cleanup reclaims unref cycles why=" .. tostring(cwhy))
+    record = select(1, GI:GetCurrentRecord())
+    assertTrue(countKeys(record.groups) < GI.MAX_GROUPS, "groups reclaimed after cleanup")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "Alice/Bob relationship preserved")
+    assertTrue(not GI.HasForwardAliasCycle(record), "unreferenced cycles discarded")
+
+    assertEq(assign("PadMain-Garona", "PadAlt-Garona"), "accepted",
+        "assign succeeds after cleanup reclaimed capacity")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-PadAlt")), "Player-1-PadMain",
+        "new relationship after reclaim")
+
+    -- Stale-generation replay of an old cycle group must be rejected.
+    local genAfter = { n = record.syncGen.n, w = record.syncGen.w }
+    assertTrue(genAfter.n > genBefore.n, "cleanup advanced sync generation")
+    local staleSt = admitWireLive(SpectrumFederationDB, wireGroup({
+        groupId = "gi-capcyc-a-01", mainGuid = "Player-1-Alice",
+        ver = { n = 99, w = writer }, at = 9999,
+        dissolved = true, forwardTo = "gi-capcyc-b-01",
+    }, genBefore), "Carol-Garona")
+    assertTrue(staleSt == "rejected" or staleSt == "stale" or staleSt == "duplicate"
+        or select(1, GI:GetCurrentRecord()).groups["gi-capcyc-a-01"] == nil,
+        "stale-generation cycle replay does not restore alias st=" .. tostring(staleSt))
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "Alice/Bob intact after stale replay")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-PadAlt")), "Player-1-PadMain",
+        "Pad relationship intact after stale replay")
+    GI.MAX_GROUPS = savedMax
+
+    -- Referenced cycle (member points into reciprocal pair): cleanup fail-closed.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "ref-cycle seed")
+    record = select(1, GI:GetCurrentRecord())
+    genBefore = { n = record.syncGen.n, w = record.syncGen.w }
+    assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+        groupId = "gi-ref-a", mainGuid = "Player-1-Carol",
+        ver = { n = 1, w = writer }, at = 7001, dissolved = true, forwardTo = "gi-ref-b",
+    }, genBefore), "Carol-Garona"), "accepted", "ref-cycle A")
+    assertEq(admitWireLive(SpectrumFederationDB, wireGroup({
+        groupId = "gi-ref-b", mainGuid = "Player-1-Carol",
+        ver = { n = 1, w = writer }, at = 7002, dissolved = true, forwardTo = "gi-ref-a",
+    }, genBefore), "Carol-Garona"), "accepted", "ref-cycle B")
+    assertEq(admitWireLive(SpectrumFederationDB, wireMember({
+        guid = "Player-1-Eve",
+        groupId = "gi-ref-a",
+        ver = { n = 1, w = writer },
+        at = 7003,
+        nameRealm = "Eve-Garona",
+        classFile = "HUNTER",
+    }, genBefore), "Carol-Garona"), "accepted", "ref-cycle Eve in cycle")
+    assertTrue(GI.HasReferencedForwardAliasCycle(select(1, GI:GetCurrentRecord())),
+        "Eve makes cycle referenced")
+    cst, cwhy = GI:CleanupHistory({})
+    assertEq(cst, "rejected", "referenced cycle cleanup rejected")
+    assertEq(cwhy, "cleanup_forward_cycle", "referenced cycle reason")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "Alice/Bob intact when referenced cleanup fails")
+    pass("unreferenced cycle cleanup reclaim / referenced fail-closed")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
