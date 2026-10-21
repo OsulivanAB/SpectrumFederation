@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.25] - 2026-10-21
+
+### Added
+- Add a shared guild officer rank for Guild Info, Guild Supplies, and Loot Helper
+
 ## [1.5.12-beta.24] - 2026-10-21
 
 ### Fixed
