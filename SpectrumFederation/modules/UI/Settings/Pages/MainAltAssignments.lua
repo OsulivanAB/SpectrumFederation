@@ -152,9 +152,10 @@ local function QueueRosterRefresh()
 	ScheduleRefresh()
 end
 
--- Durable UI listener uses roster-aware refresh.
+-- Durable relationship updates refresh controls only; roster invalidation stays
+-- on GUILD_ROSTER_UPDATE / PLAYER_GUILD_UPDATE via EnsureRosterListener.
 local function QueueRefresh()
-	QueueRosterRefresh()
+	QueueFormRefresh()
 end
 
 local function ReportStatus(ctx, status, reason, extra)
@@ -672,10 +673,23 @@ local function Definition()
 							if not gi or not gi.CleanupHistory then
 								return
 							end
+							local currentCtx = gi.GetCurrentContext and gi:GetCurrentContext() or nil
+							if not currentCtx or not currentCtx.ready then
+								ReportStatus(ctx, "rejected", currentCtx and currentCtx.reason or "not_ready")
+								return
+							end
+							-- Bind confirmation to the guild/handle/actor that was previewed.
+							local expectedGuildKey = currentCtx.guildKey
+							local expectedHandleGeneration = currentCtx.handleGeneration
+							local expectedActorGuid = currentCtx.actorGuid
 							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 							local msg = CleanupConfirmMessage()
 							local function commit()
-								local status, reason = gi:CleanupHistory({})
+								local status, reason = gi:CleanupHistory({
+									expectedGuildKey = expectedGuildKey,
+									expectedHandleGeneration = expectedHandleGeneration,
+									expectedActorGuid = expectedActorGuid,
+								})
 								ReportStatus(ctx, status, reason)
 							end
 							if dialogs and dialogs.Confirm then

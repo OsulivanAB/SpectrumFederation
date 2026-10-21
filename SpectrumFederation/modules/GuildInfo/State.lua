@@ -19,6 +19,8 @@ GI.MAX_NAME_REALM = 96
 GI.MAX_GUID = 64
 GI.MAX_CLASS = 32
 GI.MAX_GROUP_ID = 128
+-- Sync-generation counters must remain safely incrementable in Lua-number arithmetic.
+GI.MAX_SYNC_GEN_N = 9007199254740990 -- 2^53 - 2; next counter stays exactly representable
 GI.UNASSIGNED = false -- membership.groupId sentinel for tombstones
 
 -- Legacy KIND table kept only so older tests/docs references fail closed cleanly.
@@ -265,30 +267,94 @@ end
 
 --- Resolve membership groupId through a bounded dissolved forwardTo chain.
 -- Incomplete concurrent shells retired by Change Main keep late members visible.
+-- Reciprocal/cyclic forward aliases break deterministically onto the lexicographically
+-- minimum group id in the cycle (second return true) so assigned members stay
+-- visible without inventing synthetic membership versions.
 local function ResolveEffectiveGroupId(groups, gid)
     local seen = {}
+    local path = {}
     local cur = gid
     for _ = 1, 8 do
         if type(cur) ~= "string" or cur == "" then
-            return nil
+            return nil, false
         end
         if seen[cur] then
-            return nil
+            local sink = nil
+            local inCycle = false
+            for i = 1, #path do
+                if path[i] == cur then
+                    inCycle = true
+                end
+                if inCycle and (sink == nil or path[i] < sink) then
+                    sink = path[i]
+                end
+            end
+            return sink, sink ~= nil
         end
         seen[cur] = true
+        path[#path + 1] = cur
         local g = groups and groups[cur]
         if type(g) ~= "table" then
-            return nil
+            return nil, false
         end
         if type(g.forwardTo) == "string" and g.forwardTo ~= "" then
             cur = g.forwardTo
         elseif g.dissolved then
-            return nil
+            return nil, false
         else
-            return cur
+            return cur, false
         end
     end
-    return nil
+    return nil, false
+end
+
+--- True when the forwardTo graph contains a cycle (bounded walk).
+function GI.HasForwardAliasCycle(record)
+    local groups = record and record.groups
+    if type(groups) ~= "table" then
+        return false
+    end
+    for startId, g0 in pairs(groups) do
+        if type(g0) == "table" and type(g0.forwardTo) == "string" and g0.forwardTo ~= "" then
+            local seen = {}
+            local cur = startId
+            for _ = 1, 8 do
+                if type(cur) ~= "string" or cur == "" then
+                    break
+                end
+                if seen[cur] then
+                    return true
+                end
+                seen[cur] = true
+                local g = groups[cur]
+                if type(g) ~= "table" or type(g.forwardTo) ~= "string" or g.forwardTo == "" then
+                    break
+                end
+                cur = g.forwardTo
+            end
+        end
+    end
+    return false
+end
+
+--- Assigned memberships that do not appear in the derived graph (hidden).
+function GI.CountHiddenAssignedMembers(record)
+    if type(record) ~= "table" or type(record.members) ~= "table" then
+        return 0
+    end
+    if type(record.graph) ~= "table" or type(record.graph.byGuid) ~= "table" then
+        RebuildDerived(record)
+    end
+    local byGuid = record.graph and record.graph.byGuid or {}
+    local n = 0
+    for guid, m in pairs(record.members) do
+        if type(m) == "table" and type(m.groupId) == "string" and m.groupId ~= "" then
+            if byGuid[guid] == nil then
+                n = n + 1
+            end
+        end
+    end
+    return n
 end
 
 --- Build derived display graph. Concurrent groups that claim the same main are
@@ -329,16 +395,21 @@ local function RebuildDerived(record)
     end
 
     -- Collect members per effective (forward + absorb) groupId.
+    -- Cycle-break sinks may be dissolved; they still host a derived relationship.
     local byGroup = {}
+    local cycleSink = {}
     for guid, m in pairs(members) do
         if type(m) == "table" and ValidGuid(guid) then
             local gid = m.groupId
             if type(gid) == "string" and gid ~= "" then
-                local resolved = ResolveEffectiveGroupId(groups, gid)
+                local resolved, brokeCycle = ResolveEffectiveGroupId(groups, gid)
                 if resolved then
                     local effective = absorbTo[resolved] or resolved
                     local g = groups[effective]
-                    if type(g) == "table" and not g.dissolved then
+                    if type(g) == "table" and (not g.dissolved or brokeCycle) then
+                        if brokeCycle then
+                            cycleSink[effective] = true
+                        end
                         byGroup[effective] = byGroup[effective] or {}
                         byGroup[effective][#byGroup[effective] + 1] = guid
                     end
@@ -352,7 +423,7 @@ local function RebuildDerived(record)
         local g = groups[gid]
         local mainGuid = nil
         local mainMovedAway = false
-        if type(g.mainGuid) == "string" then
+        if type(g.mainGuid) == "string" and not cycleSink[gid] then
             local mm = members[g.mainGuid]
             local mmResolved = mm and ResolveEffectiveGroupId(groups, mm.groupId) or nil
             local mmEffective = mmResolved and (absorbTo[mmResolved] or mmResolved) or nil
@@ -364,7 +435,7 @@ local function RebuildDerived(record)
             end
         end
         if not mainGuid and not mainMovedAway then
-            -- Designated main missing/unassigned: deterministic fallback among members.
+            -- Designated main missing/unassigned/cycle-break: deterministic fallback.
             mainGuid = guids[1]
         end
         if mainGuid then
@@ -516,7 +587,11 @@ local function ValidateGuildRecord(guildKey, record)
     if type(record.characters) ~= "table" then
         return false, "invalid_characters"
     end
-    if type(record.syncGen) ~= "table"
+    if GI.ValidSyncGen then
+        if not GI.ValidSyncGen(record.syncGen) then
+            return false, "invalid_sync_gen"
+        end
+    elseif type(record.syncGen) ~= "table"
         or not IsFiniteNonnegInt(record.syncGen.n)
         or type(record.syncGen.w) ~= "string"
         or record.syncGen.w == ""
@@ -600,6 +675,15 @@ function GI:Initialize(db)
     end
 
     local existingSchema = tonumber(existing.schemaVersion)
+    -- Newer/unknown future schemas must fail closed without mutating SavedVariables.
+    if existingSchema ~= nil and existingSchema > GI.SCHEMA_VERSION then
+        GI._root = nil
+        GI._rootValid = false
+        GI._rootReason = "unsupported_schema"
+        DebugWarn("guildInfo schema %s is newer than supported %s; refusing mutation",
+            tostring(existingSchema), tostring(GI.SCHEMA_VERSION))
+        return false, GI._rootReason
+    end
     -- Schema 1 was the unmerged op-log prototype; replace with empty state-based root.
     -- Schema 2 (pre-epoch) migrates in place to schema 3 with bootstrap syncGen.
     if existingSchema == 1 then
@@ -1789,22 +1873,13 @@ function GI:GetCharacterRole(guid, guildKey)
     return info.role, info.mainGuid
 end
 
+--- Refresh bounded local presentation cache only. Never mutates versioned
+-- membership rows (nameRealm/classFile participate in Gossip fingerprints).
 function GI.UpdateCharacterDisplay(record, guid, nameRealm, classFile)
     if type(record) ~= "table" then
         return
     end
     RememberCharacter(record.characters, guid, nameRealm, classFile)
-    local m = record.members and record.members[guid]
-    if m then
-        local n = ClampName(nameRealm)
-        local c = ClampClass(classFile)
-        if n then
-            m.nameRealm = n
-        end
-        if c then
-            m.classFile = c
-        end
-    end
 end
 
 --- Enumerate exportable state bodies for Gossip.
@@ -1820,12 +1895,14 @@ function GI.ListStateBodies(record)
     end
     local syncGen = record.syncGen or (GI.DefaultSyncGen and GI.DefaultSyncGen())
     local baseline = record.baseline or {}
+    local sealRev = baseline.sealRev
     bodies[#bodies + 1] = {
         kind = "guildinfo-epoch",
         gen = syncGen,
         memberCount = tonumber(baseline.memberCount) or CountKeys(record.members),
         groupCount = tonumber(baseline.groupCount) or CountKeys(record.groups),
         contentFp = tostring(baseline.contentFp or ""),
+        sealRev = type(sealRev) == "table" and { n = sealRev.n, w = sealRev.w } or nil,
         _sort = "a:epoch",
     }
     if GI.IsBaselineComplete and not GI.IsBaselineComplete(record) then

@@ -73,6 +73,10 @@ function GI.FormatMutationFeedback(status, reason)
         cleanup_active_overflow = Loc("GUILD_INFO_ERR_CLEANUP_ACTIVE_OVERFLOW", "Active relationships alone exceed Guild Info capacity; cleanup cannot proceed."),
         cleanup_incomplete_member = Loc("GUILD_INFO_ERR_CLEANUP_INCOMPLETE", "Cleanup could not faithfully represent every active relationship and was aborted."),
         cleanup_relationship_mismatch = Loc("GUILD_INFO_ERR_CLEANUP_MISMATCH", "Cleanup would omit an active relationship and was aborted."),
+        cleanup_forward_cycle = Loc("GUILD_INFO_ERR_CLEANUP_FORWARD_CYCLE", "Cleanup aborted: concurrent forwarding aliases still conflict. Resolve the overlapping assignments first."),
+        generation_exhausted = Loc("GUILD_INFO_ERR_GENERATION_EXHAUSTED", "Guild Info cannot advance its history generation further on this client."),
+        invalid_generation = Loc("GUILD_INFO_ERR_INVALID_GENERATION", "That Guild Info history generation is invalid and was rejected."),
+        unsupported_schema = Loc("GUILD_INFO_ERR_UNSUPPORTED_SCHEMA", "Saved Guild Info data uses a newer schema this version cannot safely read."),
     }
     local msg = map[reason]
     if msg then

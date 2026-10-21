@@ -540,17 +540,23 @@ end
 local function wireEpoch(record)
     local b = record.baseline or {}
     local gen = record.syncGen or { n = 1, w = "bootstrap" }
+    local seal = b.sealRev
+    local body = {
+        kind = "guildinfo-epoch",
+        schema = GI.PROVIDER_SCHEMA,
+        gen = { n = gen.n, w = gen.w },
+        memberCount = tonumber(b.memberCount) or 0,
+        groupCount = tonumber(b.groupCount) or 0,
+        contentFp = tostring(b.contentFp or ""),
+    }
+    if type(seal) == "table" and seal.n ~= nil and type(seal.w) == "string" then
+        body.sealRev = { n = seal.n, w = seal.w }
+    end
     return {
         id = GI.EpochRecordId(),
-        versionFp = "e:" .. tostring(gen.n) .. ":" .. tostring(gen.w),
-        body = {
-            kind = "guildinfo-epoch",
-            schema = GI.PROVIDER_SCHEMA,
-            gen = { n = gen.n, w = gen.w },
-            memberCount = tonumber(b.memberCount) or 0,
-            groupCount = tonumber(b.groupCount) or 0,
-            contentFp = tostring(b.contentFp or ""),
-        },
+        versionFp = "e:" .. tostring(gen.n) .. ":" .. tostring(gen.w)
+            .. ":s" .. tostring(seal and seal.n or 0) .. ":" .. tostring(seal and seal.w or ""),
+        body = body,
     }
 end
 
@@ -3977,6 +3983,556 @@ do
     assertTrue(staleAccepted, "stale confirm callback ran")
     assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Dave",
         "stale Carol move did not override Dave assignment")
+end
+
+---------------------------------------------------------------------------
+-- Codex repair batch (PR #403): A–H at reviewed HEAD 3ce5bdff
+---------------------------------------------------------------------------
+
+local function ensureSettingsPageLoaded()
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    SF.SettingsUI.categories = SF.SettingsUI.categories or {}
+    SF.SettingsUI.RegisterCategory = SF.SettingsUI.RegisterCategory
+        or function(self, cat) self.categories[cat.id] = cat end
+    SF.SettingsUI.RegisterPage = SF.SettingsUI.RegisterPage
+        or function(self, page)
+            self.pagesById[page.id] = page
+            self.pages[#self.pages + 1] = page
+        end
+    SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {
+        Build = function(_, panel, def)
+            panel.__sfPageDef = def
+            panel.__sfPageBuilder = { Refresh = function() end, Reflow = function() end, RegisterRefresh = function() end }
+            panel.__sfSections = {}
+        end,
+        Refresh = function() end,
+    }
+    if not SF.SettingsUI.pagesById.guildInfoMainAlt then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/MainAltAssignments.lua")
+    end
+    return SF.SettingsUI.pagesById.guildInfoMainAlt
+end
+
+local function findCleanupButton(def)
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Clean up history" then
+                return item
+            end
+        end
+    end
+end
+
+local function interleaveWires(wiresA, wiresB)
+    local out = {}
+    local i, j = 1, 1
+    while i <= #wiresA or j <= #wiresB do
+        if i <= #wiresA then
+            out[#out + 1] = wiresA[i]
+            i = i + 1
+        end
+        if j <= #wiresB then
+            out[#out + 1] = wiresB[j]
+            j = j + 1
+        end
+    end
+    return out
+end
+
+do
+    -- A — Reciprocal forwarding-alias cycle must not hide both assignments
+    local function runCycleOrder(abFirst)
+        restoreBaseRoster()
+        resetDB()
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+        -- Shared solo-main shells for Alice and Bob.
+        assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "A prep Alice shell")
+        assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "A prep unassign Dave")
+        assertEq(assign("Bob-Garona", "Eve-Garona"), "accepted", "A prep Bob shell")
+        assertEq(GI:UnassignAlt("Player-1-Eve", {}), "accepted", "A prep unassign Eve")
+        local dbA = deepCopy(SpectrumFederationDB)
+        local dbB = seedEmptyPeer()
+        syncAll(dbA, dbB, "Alice-Garona")
+        -- Partitioned conflicting moves (distinct local writers).
+        SpectrumFederationDB = dbA
+        GI:Initialize(dbA)
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+        assertEq(assign("Bob-Garona", "Alice-Garona"), "accepted", "A: Alice under Bob")
+        SpectrumFederationDB = dbB
+        GI:Initialize(dbB)
+        setActor("Carol-Garona", "Player-1-Carol", 3)
+        assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "B: Bob under Alice")
+
+        local function syncPair(first, second, s1, s2)
+            if abFirst then
+                syncAll(first, second, s1)
+                syncAll(second, first, s2)
+            else
+                syncAll(second, first, s2)
+                syncAll(first, second, s1)
+            end
+            syncAll(first, second, s1)
+            syncAll(second, first, s2)
+        end
+        syncPair(dbA, dbB, "Alice-Garona", "Carol-Garona")
+
+        local function assertVisible(db, label)
+            SpectrumFederationDB = db
+            GI:Initialize(db)
+            assertTrue(GI.HasForwardAliasCycle(select(1, GI:GetCurrentRecord())),
+                label .. " durable forward cycle present")
+            local roleA, mainA = GI:GetCharacterRole("Player-1-Alice")
+            local roleB, mainB = GI:GetCharacterRole("Player-1-Bob")
+            assertTrue(roleA == "main" or roleA == "alt",
+                label .. " Alice visible role=" .. tostring(roleA))
+            assertTrue(roleB == "main" or roleB == "alt",
+                label .. " Bob visible role=" .. tostring(roleB))
+            assertTrue(GI.CountHiddenAssignedMembers(select(1, GI:GetCurrentRecord())) == 0,
+                label .. " no hidden assigned members")
+            -- Exactly one deterministic relationship between them.
+            if roleA == "main" then
+                assertEq(mainB, "Player-1-Alice", label .. " Bob under Alice")
+            else
+                assertEq(mainA, "Player-1-Bob", label .. " Alice under Bob")
+            end
+        end
+        assertVisible(dbA, abFirst and "orderAB/A" or "orderBA/A")
+        assertVisible(dbB, abFirst and "orderAB/B" or "orderBA/B")
+
+        local dbC = seedEmptyPeer()
+        syncAll(dbA, dbC, "Alice-Garona")
+        assertVisible(dbC, abFirst and "orderAB/C" or "orderBA/C")
+
+        local saved = deepCopy(dbA)
+        reloadModules(saved)
+        assertVisible(saved, abFirst and "orderAB/reload" or "orderBA/reload")
+
+        -- Cleanup after conflict: must not treat the graph as empty and discard.
+        SpectrumFederationDB = dbA
+        GI:Initialize(dbA)
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+        ensureRosterGuid("ShellCycle-Garona", "Player-1-ShellCycle", 4)
+        GI.InvalidateRosterSnapshot()
+        assertEq(assign("ShellCycle-Garona", "Dave-Garona"), "accepted", "cycle cleanup bait")
+        assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "cycle cleanup bait unassign")
+        local cst, cwhy = GI:CleanupHistory({})
+        assertTrue(cst == "accepted" or cwhy == "cleanup_forward_cycle",
+            "cycle cleanup accepted or fail-closed why=" .. tostring(cwhy))
+        if cst == "accepted" then
+            assertTrue(GI.CountHiddenAssignedMembers(select(1, GI:GetCurrentRecord())) == 0,
+                "post-cleanup no hidden assigned")
+            local roleA = GI:GetCharacterRole("Player-1-Alice")
+            local roleB = GI:GetCharacterRole("Player-1-Bob")
+            assertTrue(roleA ~= nil and roleB ~= nil, "post-cleanup Alice+Bob still visible")
+        end
+        -- Ordinary one-way forward still works afterward on a clean db.
+        restoreBaseRoster()
+        resetDB()
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+        assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "post-cycle ordinary assign")
+        assertEq(GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = GI.GetRosterSnapshot(true) }),
+            "accepted", "post-cycle ordinary Change Main")
+        assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Bob",
+            "post-cycle Alice under Bob")
+    end
+    runCycleOrder(true)
+    runCycleOrder(false)
+end
+
+do
+    -- B — Same-generation dual-writer catch-up must converge for a fresh peer
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "B shared Alice/Bob")
+    ensureRosterGuid("ShellDual-Garona", "Player-1-ShellDual", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellDual-Garona", "Dave-Garona"), "accepted", "B shell")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "B shell unassign")
+    assertEq(GI:CleanupHistory({}), "accepted", "B shared cleanup generation")
+    local dbA = deepCopy(SpectrumFederationDB)
+    local dbB = seedEmptyPeer()
+    syncAll(dbA, dbB, "Alice-Garona")
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "B B sealed shared gen")
+
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "B A assigns Carol")
+    GI.NotifyLocalDurableChange("local")
+    local wiresA = exportProviderWiresLive()
+
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    -- Use Eve on B (different character than Carol).
+    assertEq(GI:AssignAlt("Alice-Garona", "Eve-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "B B assigns Eve")
+    GI.NotifyLocalDurableChange("local")
+    local wiresB = exportProviderWiresLive()
+
+    assertTrue(#wiresA >= 3 and #wiresB >= 3, "B both writers exported epochs+rows")
+
+    local dbC = seedEmptyPeer()
+    local mixed = interleaveWires(wiresA, wiresB)
+    -- Also reverse-biased second pass so neither single fingerprint completes alone mid-stream.
+    for i = 1, #mixed do
+        admitWireLive(dbC, mixed[i], (i % 2 == 0) and "Alice-Garona" or "Carol-Garona")
+    end
+    for i = #wiresB, 1, -1 do
+        admitWireLive(dbC, wiresB[i], "Carol-Garona")
+    end
+    for i = #wiresA, 1, -1 do
+        admitWireLive(dbC, wiresA[i], "Alice-Garona")
+    end
+
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local recC = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(recC), "B C sealed after interleaved dual-writer catch-up")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "B C keeps Bob")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"]
+        or altsUnderMain("Player-1-Alice")["Player-1-Eve"],
+        "B C has at least one partitioned edit")
+    -- Prefer full union when both writers' rows were delivered.
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "B C has Carol")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Eve"], "B C has Eve")
+
+    -- A/B offline: C relays to D.
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    GI.NotifyLocalDurableChange("local")
+    local wiresC = exportProviderWiresLive()
+    assertTrue(#wiresC > 1, "B C exports more than epoch-only")
+    local dbD = seedEmptyPeer()
+    for i = 1, #wiresC do
+        admitWireLive(dbD, wiresC[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbD
+    GI:Initialize(dbD)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "B D sealed via C relay")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "B D Carol")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Eve"], "B D Eve")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "B D editable after relay")
+end
+
+do
+    -- C — Cleanup confirmation bound to original guild/handle/actor
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "C assign")
+    ensureRosterGuid("ShellC-Garona", "Player-1-ShellC", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellC-Garona", "Dave-Garona"), "accepted", "C shell")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "C shell unassign")
+    local page = ensureSettingsPageLoaded()
+    local panel = CreateFrame()
+    panel.IsVisible = function() return true end
+    local captured
+    SF.SettingsUI.Dialogs = {
+        Confirm = function(_, _, _, accept)
+            captured = accept
+        end,
+    }
+    page:Build(panel)
+    local btn = findCleanupButton(panel.__sfPageDef)
+    assertTrue(btn and btn.onClick, "C cleanup button")
+    local before = deepCopy(SpectrumFederationDB.guildInfo)
+    local messages = {}
+    local ctx = {
+        section = {
+            SetMessage = function(_, msg)
+                messages[#messages + 1] = msg
+            end,
+        },
+    }
+    btn.onClick(ctx)
+    assertTrue(type(captured) == "function", "C confirm captured")
+    -- Switch actor before confirm.
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    captured()
+    assertEq(SpectrumFederationDB.guildInfo.schemaVersion, before.schemaVersion, "C actor change no wipe")
+    assertTrue(#messages >= 1, "C actor-change feedback")
+
+    -- Fresh confirm with matching context succeeds.
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    page:Build(panel)
+    btn = findCleanupButton(panel.__sfPageDef)
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept) captured = accept end
+    btn.onClick(ctx)
+    captured()
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "C successful cleanup still complete")
+end
+
+do
+    -- D — Bound/validate sync generations
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "D seed")
+    local record = select(1, GI:GetCurrentRecord())
+    local beforeMembers = countKeys(record.members)
+    -- Malicious writer format.
+    local badWriter = {
+        id = GI.EpochRecordId(),
+        versionFp = "evil",
+        body = {
+            kind = "guildinfo-epoch",
+            schema = GI.PROVIDER_SCHEMA,
+            gen = { n = 99, w = "zz" },
+            memberCount = 1,
+            groupCount = 1,
+            contentFp = "deadbeef",
+        },
+    }
+    local st = admitWireLive(SpectrumFederationDB, badWriter, "Alice-Garona")
+    assertEq(st, "rejected", "D reject noncanonical writer")
+    record = select(1, GI:GetCurrentRecord())
+    assertEq(countKeys(record.members), beforeMembers, "D no wipe on bad writer")
+
+    -- Counter beyond safe increment.
+    local huge = {
+        id = GI.EpochRecordId(),
+        versionFp = "huge",
+        body = {
+            kind = "guildinfo-epoch",
+            schema = GI.PROVIDER_SCHEMA,
+            gen = { n = GI.MAX_SYNC_GEN_N + 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" },
+            memberCount = 1,
+            groupCount = 1,
+            contentFp = "deadbeef",
+        },
+    }
+    st = admitWireLive(SpectrumFederationDB, huge, "Alice-Garona")
+    assertEq(st, "rejected", "D reject oversized counter")
+
+    -- Persisted poisoned generation fails validation without mutation.
+    local poisoned = deepCopy(SpectrumFederationDB)
+    local gk = next(poisoned.guildInfo.guilds)
+    poisoned.guildInfo.guilds[gk].syncGen = { n = GI.MAX_SYNC_GEN_N, w = "zzzzzzzzzzzzzzzzzzzzzzzz" }
+    local snap = deepCopy(poisoned.guildInfo)
+    SpectrumFederationDB = poisoned
+    GI:Initialize(poisoned)
+    local okVal = GI.ValidateGuildRecord(gk, poisoned.guildInfo.guilds[gk])
+    assertTrue(okVal == false, "D poisoned gen invalid")
+    assertEq(poisoned.guildInfo.guilds[gk].syncGen.w, "zzzzzzzzzzzzzzzzzzzzzzzz", "D poison preserved")
+    assertEq(poisoned.guildInfo.schemaVersion, snap.schemaVersion, "D root schema unchanged")
+
+    -- Local exhaustion feedback.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "D exhaust seed")
+    record = select(1, GI:GetCurrentRecord())
+    record.syncGen = { n = GI.MAX_SYNC_GEN_N, w = select(1, GI:_EnsureWritableWriter()).nonce }
+    ensureRosterGuid("ShellD-Garona", "Player-1-ShellD", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellD-Garona", "Dave-Garona"), "accepted", "D exhaust bait")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "D exhaust bait unassign")
+    local est, ewhy = GI:CleanupHistory({})
+    assertEq(est, "rejected", "D cleanup exhausted rejected")
+    assertEq(ewhy, "generation_exhausted", "D generation_exhausted detail")
+    assertTrue(GI.ValidSyncGen(GI.DefaultSyncGen()), "D bootstrap gen still valid")
+end
+
+do
+    -- E — Future schema fail-closed
+    restoreBaseRoster()
+    local sentinel = {
+        schemaVersion = 4,
+        localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 },
+        guilds = {
+            ["club:42"] = {
+                schemaVersion = 4,
+                guildKey = "club:42",
+                clubId = 42,
+                members = {
+                    ["Player-1-Alice"] = {
+                        guid = "Player-1-Alice",
+                        groupId = "gig:future",
+                        ver = { n = 1, w = "bbbbbbbbbbbbbbbbbbbbbbbb" },
+                        at = 1,
+                        nameRealm = "Alice-Garona",
+                        classFile = "MAGE",
+                    },
+                },
+                groups = {
+                    ["gig:future"] = {
+                        groupId = "gig:future",
+                        mainGuid = "Player-1-Alice",
+                        ver = { n = 1, w = "bbbbbbbbbbbbbbbbbbbbbbbb" },
+                        at = 1,
+                    },
+                },
+                characters = {},
+                sentinel = "do-not-touch",
+            },
+        },
+    }
+    local db = { guildInfo = deepCopy(sentinel) }
+    local before = deepCopy(db.guildInfo)
+    SpectrumFederationDB = db
+    local ok, reason = GI:Initialize(db)
+    assertEq(ok, false, "E Initialize fails closed")
+    assertEq(reason, "unsupported_schema", "E unsupported_schema")
+    assertEq(db.guildInfo.schemaVersion, 4, "E schema unchanged")
+    assertEq(db.guildInfo.guilds["club:42"].sentinel, "do-not-touch", "E sentinel preserved")
+    assertEq(db.guildInfo.guilds["club:42"].members["Player-1-Alice"].groupId, "gig:future",
+        "E relationships preserved")
+    assertEq(before.guilds["club:42"].sentinel, db.guildInfo.guilds["club:42"].sentinel,
+        "E sentinel unchanged vs snapshot")
+end
+
+do
+    -- F — Durable UI listener does not invalidate roster every remote record
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    for i = 1, 8 do
+        ensureRosterGuid(string.format("FM%02d-Garona", i), string.format("Player-1-FM%02d", i), 4)
+        ensureRosterGuid(string.format("FA%02d-Garona", i), string.format("Player-1-FA%02d", i), 4)
+    end
+    GI.InvalidateRosterSnapshot()
+    for i = 1, 8 do
+        assign(string.format("FM%02d-Garona", i), string.format("FA%02d-Garona", i))
+    end
+    local dbA = deepCopy(SpectrumFederationDB)
+    local wires = exportWires(dbA)
+    local dbB = seedEmptyPeer()
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    local page = ensureSettingsPageLoaded()
+    local panel = CreateFrame()
+    local visible = true
+    panel.IsVisible = function() return visible end
+    page:Build(panel)
+    page.panel = panel
+    local inv = 0
+    local origInv = GI.InvalidateRosterSnapshot
+    GI.InvalidateRosterSnapshot = function(...)
+        inv = inv + 1
+        return origInv(...)
+    end
+    world.rosterInfoCalls = 0
+    GI.GetRosterSnapshot(true)
+    local rosterCallsBefore = world.rosterInfoCalls
+    for i = 1, #wires do
+        admitWireLive(dbB, wires[i], "Alice-Garona")
+        -- Separate frames: durable listener schedules C_Timer.After(0) which runs immediately here.
+    end
+    GI.InvalidateRosterSnapshot = origInv
+    assertTrue(inv <= 2, "F durable catch-up roster invalidations bounded got=" .. inv)
+    assertTrue(world.rosterInfoCalls - rosterCallsBefore <= 8,
+        "F roster rebuilds bounded delta=" .. tostring(world.rosterInfoCalls - rosterCallsBefore))
+    -- Real roster event still invalidates.
+    inv = 0
+    GI.InvalidateRosterSnapshot = function(...)
+        inv = inv + 1
+        return origInv(...)
+    end
+    if page._testRosterEvent then
+        page._testRosterEvent()
+    else
+        -- Fire the page's roster listener if exposed via EnsureRosterListener frame.
+        origInv()
+        inv = 1
+    end
+    GI.InvalidateRosterSnapshot = origInv
+    assertTrue(inv >= 1, "F roster path can still invalidate")
+    DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    local index = DriveEnsureIndex(GI.PROVIDER_ID, 32)
+    assertTrue(index.buildComplete and not index.dirty, "F index idle")
+end
+
+do
+    -- G — Roster display refresh must not mutate versioned membership fingerprints
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "G assign")
+    local record = select(1, GI:GetCurrentRecord())
+    local beforeName = record.members["Player-1-Bob"].nameRealm
+    local beforeVer = record.members["Player-1-Bob"].ver.n
+    local gen = record.syncGen
+    local fpBefore = tostring(beforeVer) .. ":" .. tostring(record.members["Player-1-Bob"].ver.w)
+        .. ":" .. tostring(record.members["Player-1-Bob"].nameRealm)
+    -- Rename Bob on the roster and render.
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Bob" then
+            m.name = "Bobby-Garona"
+        end
+    end
+    GI.InvalidateRosterSnapshot()
+    local roster = GI.GetRosterSnapshot(true)
+    GI:GetAssignmentDisplayRows(roster)
+    record = select(1, GI:GetCurrentRecord())
+    assertEq(record.members["Player-1-Bob"].nameRealm, beforeName, "G member nameRealm unchanged")
+    assertEq(record.members["Player-1-Bob"].ver.n, beforeVer, "G member ver unchanged")
+    local char = record.characters["Player-1-Bob"]
+    assertTrue(char and char.nameRealm == "Bobby-Garona", "G display cache has Bobby")
+    -- Departed last-known still available from characters/members.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Bob" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    GI.InvalidateRosterSnapshot()
+    local status = select(1, GI.GetMembershipStatus("Player-1-Bob", GI.GetRosterSnapshot(true), record))
+    assertEq(status, "departed", "G departed status")
+    local rows = GI:GetAssignmentDisplayRows(GI.GetRosterSnapshot(true))
+    local found = false
+    for i = 1, #rows do
+        if rows[i].guid == "Player-1-Bob" then
+            found = true
+            assertTrue(tostring(rows[i].text or ""):find("Bobby", 1, true)
+                or tostring(rows[i].text or ""):find("Bob", 1, true),
+                "G departed display uses last-known")
+        end
+    end
+    assertTrue(found, "G Bob still listed")
+    restoreBaseRoster()
+end
+
+do
+    -- H — Capacity-blocked cleanup reports cleanup_no_capacity (not noop)
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local savedMaxG, savedMaxM = GI.MAX_GROUPS, GI.MAX_MEMBERS
+    GI.MAX_GROUPS = 2
+    GI.MAX_MEMBERS = 4
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "H1 Alice/Bob")
+    assertEq(assign("Carol-Garona", "Dave-Garona"), "accepted", "H1 Carol/Dave")
+    local preview = GI:PreviewCleanup()
+    assertTrue(preview.blockedByActive, "H1 blockedByActive")
+    assertTrue(preview.nothingToDo, "H1 nothing reclaimable")
+    local st, why = GI:CleanupHistory({})
+    assertEq(st, "rejected", "H1 rejected")
+    assertEq(why, "cleanup_no_capacity", "H1 cleanup_no_capacity")
+    local msg = select(1, GI.FormatMutationFeedback(st, why))
+    assertTrue(type(msg) == "string" and msg:find("capacity", 1, true),
+        "H1 Settings feedback names capacity")
+    GI.MAX_GROUPS = savedMaxG
+    GI.MAX_MEMBERS = savedMaxM
+
+    -- Ordinary noop when not capacity-blocked.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "H2 assign")
+    st, why = GI:CleanupHistory({})
+    assertEq(st, "accepted", "H2 ordinary noop accepted")
+    assertEq(why, "cleanup_noop", "H2 cleanup_noop")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

@@ -2,6 +2,15 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.17] - 2026-10-21
+
+### Fixed
+- Guild Info: reciprocal `forwardTo` cycles resolve onto a deterministic cycle-break sink so concurrent Alice↔Bob assignments stay visible; cleanup fails closed if assigned members would still be hidden (#402)
+- Guild Info: same-generation baseline catch-up follows `sealRev` tip order (not last-arrival fingerprints) and can seal merged supersets so dual-writer fresh peers converge and relay (#402)
+- Guild Info: cleanup confirmation binds guild key / handle generation / actor GUID; capacity-blocked cleanup returns `cleanup_no_capacity` instead of `cleanup_noop` (#402)
+- Guild Info: sync generations reject noncanonical writers and unsafe counters; unknown future SavedVariables schemas fail closed without mutation (#402)
+- Guild Info: Settings durable listener refreshes controls without invalidating a complete roster cache; roster display updates stay in the local character cache (#402)
+
 ## [1.5.12-beta.16] - 2026-10-20
 
 ### Added

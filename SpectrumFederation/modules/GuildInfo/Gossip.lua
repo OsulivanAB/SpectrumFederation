@@ -125,13 +125,16 @@ local function GroupVersionFp(g, gen)
 end
 
 local function EpochVersionFp(body)
+    local seal = body and body.sealRev
     return HashParts(
         "epoch",
         tostring(body.gen and body.gen.n or 0),
         tostring(body.gen and body.gen.w or ""),
         tostring(body.memberCount or 0),
         tostring(body.groupCount or 0),
-        tostring(body.contentFp or "")
+        tostring(body.contentFp or ""),
+        tostring(seal and seal.n or 0),
+        tostring(seal and seal.w or "")
     )
 end
 
@@ -139,17 +142,22 @@ local function WireForEpoch(body)
     if type(body) ~= "table" or type(body.gen) ~= "table" then
         return nil
     end
+    local seal = body.sealRev
+    local wireBody = {
+        kind = "guildinfo-epoch",
+        schema = GI.PROVIDER_SCHEMA,
+        gen = { n = body.gen.n, w = body.gen.w },
+        memberCount = tonumber(body.memberCount) or 0,
+        groupCount = tonumber(body.groupCount) or 0,
+        contentFp = tostring(body.contentFp or ""),
+    }
+    if type(seal) == "table" and seal.n ~= nil and type(seal.w) == "string" then
+        wireBody.sealRev = { n = seal.n, w = seal.w }
+    end
     return {
         id = GI.EpochRecordId and GI.EpochRecordId() or "gi-e:current",
         versionFp = EpochVersionFp(body),
-        body = {
-            kind = "guildinfo-epoch",
-            schema = GI.PROVIDER_SCHEMA,
-            gen = { n = body.gen.n, w = body.gen.w },
-            memberCount = tonumber(body.memberCount) or 0,
-            groupCount = tonumber(body.groupCount) or 0,
-            contentFp = tostring(body.contentFp or ""),
-        },
+        body = wireBody,
     }
 end
 
