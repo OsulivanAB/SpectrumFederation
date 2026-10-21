@@ -210,6 +210,7 @@ their focused suite without re-listing the whole repository map.
 - Raid Consumables runtime and synchronization: also run `python -m pytest tests/test_consumables.py`
 - Guild Gossip transport: also run `python -m pytest tests/test_guild_gossip.py`
 - Guild Supplies staged foundation: also run `python -m pytest tests/test_guild_supplies.py`
+- Guild Info main/alt assignments: also run `python -m pytest tests/test_guild_info.py`
 - Changelog update automation: also run `python -m pytest tests/test_update_changelog.py`
 - UI layout, timers, listeners, queues, inspection, or sync: prefer the existing Lua 5.1 suite for that area, with assertions that execution stays bounded and converges. See Client Stability in `SpectrumFederation/AGENTS.md`.
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
