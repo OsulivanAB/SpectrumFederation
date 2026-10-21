@@ -121,6 +121,33 @@ for _ = 2, CheckRun.PER_TARGET_ATTEMPT_CAP do
 end
 assertTrue(not CheckRun.PlayerNeedsMoreInspects(unresolvedLocal), "local incomplete retries stop at the attempt cap")
 
+-- Still-loading link stubs must not burn the technical attempt cap or mark
+-- technicalFailure; budget / no_progress still bound the run.
+assertEq(CheckRun.AttemptKindForIncompleteReason("incomplete_link"), "pending", "incomplete_link is pending")
+assertEq(CheckRun.AttemptKindForIncompleteReason("pending_link"), "pending", "pending_link is pending")
+assertEq(CheckRun.AttemptKindForIncompleteReason("unresolved_item_level"), "incomplete", "item level stays incomplete")
+assertEq(CheckRun.AttemptKindForIncompleteReason("unresolved_enchant"), "incomplete", "unresolved enchant stays incomplete")
+
+local pendingPlayer = CheckRun.NewPlayer("P")
+for _ = 1, 12 do
+    CheckRun.MarkAttempt(pendingPlayer, "pending", true)
+end
+assertEq(pendingPlayer.attemptCount or 0, 0, "pending attempts do not increment attemptCount")
+assertEq(pendingPlayer.pendingAttemptCount, 12, "pending attempts are counted separately")
+assertTrue(not pendingPlayer.technicalFailure, "pending does not set technicalFailure")
+assertTrue(pendingPlayer.inspectableAtLeastOnce, "pending still marks inspectable")
+assertTrue(CheckRun.PlayerNeedsMoreInspects(pendingPlayer), "pending-only player still needs inspects")
+local pendingClass = CheckRun.ClassifyPlayer(pendingPlayer, 10)
+assertEq(pendingClass.class, CheckRun.CLASS.INSPECTION_FAILED, "pending-only without complete obs is Inspection Failed at settle")
+assertTrue(not pendingClass.countsForPot, "pending-only Inspection Failed does not count for Reward Pot")
+
+CheckRun.MarkAttempt(pendingPlayer, "complete", true)
+pendingPlayer.freshObservation = { complete = true, policy = { prepared = true, missing = {} }, capturedAt = 10 }
+pendingPlayer.technicalFailure = false
+local pendingThenReady = CheckRun.ClassifyPlayer(pendingPlayer, 10)
+assertEq(pendingThenReady.class, CheckRun.CLASS.PREPARED, "complete after pending classifies Prepared")
+assertTrue(not pendingThenReady.countsForPot, "Prepared after pending does not count for Reward Pot")
+
 failed.currentlyInspectable = false
 failed.rangeOnlyFailure = true
 local failedLaterOor = CheckRun.ClassifyPlayer(failed, 50, {

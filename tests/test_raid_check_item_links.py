@@ -155,6 +155,9 @@ def test_raid_check_lua_keeps_stub_gems_pending():
     assert "numBonusIDs" in incomplete_fn
     assert "itemContext" in incomplete_fn
     assert "itemLevel and itemLevel > 0 and #fields >= 9" not in incomplete_fn
+    # Local GetInventoryItemLink captures are never inspect stubs.
+    assert "slotData.authoritative == true" in incomplete_fn
+    assert 'authoritative = IsSelfUnit(unit) and true or nil' in source
     snapshot_fn = source.split("local function BuildMissingForSlotSnapshot", 1)[1]
     snapshot_fn = snapshot_fn.split("local function HasEquippedMetaGemInSnapshot", 1)[0]
     assert "return {}, true" in snapshot_fn
@@ -191,6 +194,28 @@ def test_raid_check_lua_keeps_admin_summary_ungated():
     assert "EmitAdminMissingSummary" in source
     assert "if not ShouldWhisper(" not in source
     assert source.count("EmitAdminMissingSummary") >= 1
+
+
+def test_pending_incomplete_reasons_do_not_burn_attempt_cap():
+    """Loading stubs are pending; genuine unresolved policy stays incomplete."""
+    check_run = (
+        Path(__file__).resolve().parents[1]
+        / "SpectrumFederation"
+        / "modules"
+        / "RaidEquipment"
+        / "CheckRun.lua"
+    ).read_text(encoding="utf-8")
+    assert "function CheckRun.IsPendingIncompleteReason" in check_run
+    assert 'reason == "incomplete_link"' in check_run
+    assert 'reason == "pending_link"' in check_run
+    assert "function CheckRun.AttemptKindForIncompleteReason" in check_run
+    assert 'kind == "pending"' in check_run
+    assert "pendingAttemptCount" in check_run
+    raid_check = RAID_CHECK_LUA.read_text(encoding="utf-8")
+    assert "AttemptKindForIncompleteReason" in raid_check
+    assert "lastIncompleteReason" in raid_check
+    assert "PER_INSPECT_ACTIVE_WAIT" in raid_check
+    assert "lastLocalCaptureAt" in raid_check
 
 
 def test_raid_check_lua_checks_each_socket_for_a_gem():

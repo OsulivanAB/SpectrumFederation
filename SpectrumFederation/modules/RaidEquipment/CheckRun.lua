@@ -225,16 +225,34 @@ function CheckRun.NoteProgress(run, now)
 	end
 end
 
+-- pending = inspect/link data still loading. Counts for inspectability and
+-- progress, but does not burn PER_TARGET_ATTEMPT_CAP or set technicalFailure.
+-- Budget / no_progress still settle the run if loading never completes.
+function CheckRun.IsPendingAttemptKind(kind)
+	return kind == "pending"
+end
+
+function CheckRun.IsPendingIncompleteReason(reason)
+	return reason == "pending_link"
+		or reason == "incomplete_link"
+		or reason == "empty_flag_with_item_evidence"
+		or reason == "missing_slot_table"
+end
+
 function CheckRun.MarkAttempt(player, kind, inspectable)
 	if type(player) ~= "table" then
 		return
 	end
-	player.attemptCount = (player.attemptCount or 0) + 1
 	player.lastAttemptKind = kind
 	if inspectable then
 		player.inspectableAtLeastOnce = true
 		player.currentlyInspectable = true
 	end
+	if CheckRun.IsPendingAttemptKind(kind) then
+		player.pendingAttemptCount = (player.pendingAttemptCount or 0) + 1
+		return
+	end
+	player.attemptCount = (player.attemptCount or 0) + 1
 	if kind == "timeout" or kind == "incomplete" or kind == "api_failure" then
 		player.technicalFailure = true
 	elseif kind == "range" then
@@ -251,6 +269,13 @@ function CheckRun.PlayerNeedsMoreInspects(player)
 		return false
 	end
 	return (player.attemptCount or 0) < CheckRun.PER_TARGET_ATTEMPT_CAP
+end
+
+function CheckRun.AttemptKindForIncompleteReason(reason)
+	if CheckRun.IsPendingIncompleteReason(reason) then
+		return "pending"
+	end
+	return "incomplete"
 end
 
 function CheckRun.ShouldSettle(run, now)

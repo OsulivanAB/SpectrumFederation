@@ -106,7 +106,9 @@ def test_item_level_capture_uses_blizzard_equipped_value():
     inspect_ready = inspect_ready.split("\nfunction RC:", 1)[0]
     local_capture = raid_check.split("elseif player and IsSelfUnit(unit) then", 1)[1]
     local_capture = local_capture.split("function RC:_ApplyCheckConsequences", 1)[0]
-    assert 'CheckRun.MarkAttempt(player, "incomplete", true)' in local_capture
+    assert "AttemptKindForIncompleteReason" in local_capture
+    assert "CheckRun.MarkAttempt(player, kind, true)" in local_capture
+    assert "lastLocalCaptureAt" in local_capture
     assert "_InvalidateLocalTroubleshootingSnapshot()" in local_capture
     assert "PlayerNeedsMoreInspects(player)" in local_capture
     assert "KeepKnownOverallItemLevel(" in inspect_ready

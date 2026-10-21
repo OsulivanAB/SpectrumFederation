@@ -430,6 +430,143 @@ assertEq(setCalls[1].path, "lootHelper.minimizedHeaderOpacity", "Reset All Sets 
 assertEq(setCalls[1].value, 100, "Reset All Sets opacity to the schema default")
 assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "SettingsStore reset path restores full overall alpha")
 
+-- Reward Pot header must keep Content-relative horizontal anchors when the
+-- supply reminder is hidden (Retail: reminder-anchored width collapsed to 0).
+do
+    local function makeRegion(name, parent)
+        local region = {
+            name = name,
+            parent = parent,
+            shown = true,
+            height = 22,
+            width = 300,
+            points = {},
+        }
+        function region:IsShown()
+            return self.shown
+        end
+        function region:SetShown(v)
+            self.shown = v and true or false
+        end
+        function region:GetHeight()
+            return self.height
+        end
+        function region:GetWidth()
+            return self.width
+        end
+        function region:SetHeight(h)
+            self.height = h
+        end
+        function region:ClearAllPoints()
+            self.points = {}
+        end
+        function region:SetPoint(point, relativeTo, relativePoint, x, y)
+            self.points[#self.points + 1] = {
+                point = point,
+                relativeTo = relativeTo,
+                relativePoint = relativePoint,
+                x = x or 0,
+                y = y or 0,
+            }
+        end
+        function region:GetPoint(i)
+            local p = self.points[i]
+            if not p then
+                return nil
+            end
+            return p.point, p.relativeTo, p.relativePoint, p.x, p.y
+        end
+        return region
+    end
+
+    local function findPoint(region, pointName)
+        for i = 1, #region.points do
+            if region.points[i].point == pointName then
+                return region.points[i]
+            end
+        end
+        return nil
+    end
+
+    resetWindowState()
+    local frame = makeFrame(480, 520)
+    local content = makeRegion("Content", frame)
+    content.width = 460
+    local reminder = makeRegion("SupplyReminder", content)
+    local potHeader = makeRegion("PotHeader", content)
+    local scroll = makeRegion("Scroll", content)
+    function scroll:GetVerticalScrollRange()
+        return 0
+    end
+    function scroll:SetVerticalScroll()
+    end
+    function scroll:GetVerticalScroll()
+        return 0
+    end
+    scroll.ScrollBar = nil
+    content.SupplyReminder = reminder
+    content.PotHeader = potHeader
+    content.Scroll = scroll
+    frame.Content = content
+    frame.ResizeHandle = nil
+    frame.__sfMinimized = false
+    Window._frame = frame
+
+    reminder.shown = false
+    reminder.height = 0
+    potHeader.shown = true
+    Window:_UpdateHeaderStackAnchors(content)
+    local left = findPoint(potHeader, "TOPLEFT")
+    local right = findPoint(potHeader, "TOPRIGHT")
+    assertTrue(left and right, "pot header has both horizontal anchors")
+    assertEq(left.relativeTo, content, "hidden reminder: pot TOPLEFT anchors to Content")
+    assertEq(right.relativeTo, content, "hidden reminder: pot TOPRIGHT anchors to Content")
+    assertAlmost(left.y, 0, 1e-6, "hidden reminder: pot sits at Content top")
+    assertAlmost(right.y, 0, 1e-6, "hidden reminder: pot right edge matches top offset")
+
+    reminder.shown = true
+    reminder.height = C.POT_HEADER_HEIGHT or 22
+    Window:_UpdateHeaderStackAnchors(content)
+    left = findPoint(potHeader, "TOPLEFT")
+    right = findPoint(potHeader, "TOPRIGHT")
+    assertEq(left.relativeTo, content, "visible reminder: pot still anchors horizontally to Content")
+    assertEq(right.relativeTo, content, "visible reminder: pot still anchors horizontally to Content")
+    assertAlmost(left.y, -(C.POT_HEADER_HEIGHT or 22), 1e-6, "visible reminder: pot stacks below reminder height")
+
+    local source = assert(io.open("SpectrumFederation/modules/UI/LootHelper/Window.lua", "r")):read("*a")
+    assertTrue(
+        source:find('potHeader:SetPoint%("TOPLEFT", reminder, "BOTTOMLEFT"', 1, true) == nil,
+        "Create no longer pins pot horizontal edges to the reminder"
+    )
+    assertTrue(source:find("_UpdateHeaderStackAnchors", 1, true) ~= nil, "header stack helper exists")
+
+    -- UpdateScrollInsets reserves reminder + pot and keeps pot on Content.
+    potHeader.shown = true
+    reminder.shown = true
+    reminder.height = 22
+    potHeader.height = 22
+    Window:UpdateScrollInsets()
+    local scrollTop = findPoint(scroll, "TOPLEFT")
+    assertTrue(scrollTop ~= nil, "scroll receives TOPLEFT after insets update")
+    assertAlmost(scrollTop.y, -44, 1e-6, "scroll top inset includes reminder + pot heights")
+    left = findPoint(potHeader, "TOPLEFT")
+    assertEq(left.relativeTo, content, "UpdateScrollInsets keeps pot on Content")
+
+    reminder.shown = false
+    reminder.height = 0
+    Window:SetSupplyReminder(false)
+    left = findPoint(potHeader, "TOPLEFT")
+    assertEq(left.relativeTo, content, "SetSupplyReminder(false) keeps pot on Content")
+    assertAlmost(left.y, 0, 1e-6, "hiding reminder moves pot back to Content top")
+
+    Window:SetRewardPotHeader(true, "Reward Pot: 340000g 0s 0c")
+    assertTrue(potHeader:IsShown(), "SetRewardPotHeader shows the pot frame")
+    left = findPoint(potHeader, "TOPLEFT")
+    right = findPoint(potHeader, "TOPRIGHT")
+    assertEq(left.relativeTo, content, "SetRewardPotHeader keeps Content left anchor")
+    assertEq(right.relativeTo, content, "SetRewardPotHeader keeps Content right anchor")
+end
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

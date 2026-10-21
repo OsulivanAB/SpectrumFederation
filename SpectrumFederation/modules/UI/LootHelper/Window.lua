@@ -794,12 +794,15 @@ function Window:Create()
 
     reminderText:SetPoint("RIGHT", mobileAnchor, "LEFT", -6, 0)
 
+    -- Anchor the pot header to Content horizontally. Anchoring left/right to
+    -- SupplyReminder collapses width to 0 when that reminder is hidden (Retail:
+    -- shown text, height ~22, width 0). Vertical stacking still follows the
+    -- reminder when it is visible; see Window:_UpdateHeaderStackAnchors.
     local potHeader = CreateFrame("Frame", nil, content)
     potHeader:SetHeight(C.POT_HEADER_HEIGHT or 22)
-    potHeader:SetPoint("TOPLEFT", reminder, "BOTTOMLEFT", 0, 0)
-    potHeader:SetPoint("TOPRIGHT", reminder, "BOTTOMRIGHT", 0, 0)
     potHeader:Hide()
     content.PotHeader = potHeader
+    self:_UpdateHeaderStackAnchors(content)
 
     local potText = potHeader:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     potText:SetPoint("LEFT", potHeader, "LEFT", 4, 0)
@@ -937,6 +940,27 @@ function Window:SetPointName(name)
     end
 end
 
+-- Keep optional Supply Reminder + Reward Pot header stacked under Content with
+-- a stable nonzero width, independent of reminder visibility.
+function Window:_UpdateHeaderStackAnchors(content)
+    content = content or (self._frame and self._frame.Content)
+    if not content then return end
+
+    local reminder = content.SupplyReminder
+    local potHeader = content.PotHeader
+    if not potHeader then return end
+
+    local reminderShown = reminder and reminder:IsShown()
+    local topOffset = 0
+    if reminderShown then
+        topOffset = -(reminder:GetHeight() or (C.POT_HEADER_HEIGHT or 22))
+    end
+
+    potHeader:ClearAllPoints()
+    potHeader:SetPoint("TOPLEFT", content, "TOPLEFT", 0, topOffset)
+    potHeader:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, topOffset)
+end
+
 function Window:SetSupplyReminder(isVisible, mobileState)
     local f = self._frame
     if not f or not f.Content or not f.Content.SupplyReminder then return end
@@ -958,6 +982,7 @@ function Window:SetSupplyReminder(isVisible, mobileState)
         end
     end
 
+    self:_UpdateHeaderStackAnchors(f.Content)
     self:RequestScrollInsetsUpdate()
 end
 
@@ -975,6 +1000,7 @@ function Window:SetRewardPotHeader(isVisible, text)
             header.Text:SetText("")
         end
     end
+    self:_UpdateHeaderStackAnchors(f.Content)
     self:RequestScrollInsetsUpdate()
 end
 
@@ -1084,6 +1110,8 @@ function Window:UpdateScrollInsets()
 	end
 
 	-- Reserve top inset for the supply reminder and Reward Pot header when shown.
+	-- Re-apply pot-header anchors so reminder show/hide and resizes keep width.
+	self:_UpdateHeaderStackAnchors(content)
 	local topInset = 0
 	local reminder = content.SupplyReminder
 	if reminder and reminder:IsShown() then
