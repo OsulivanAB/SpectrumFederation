@@ -534,9 +534,14 @@ do
     assertAlmost(left.y, -(C.POT_HEADER_HEIGHT or 22), 1e-6, "visible reminder: pot stacks below reminder height")
 
     local source = assert(io.open("SpectrumFederation/modules/UI/LootHelper/Window.lua", "r")):read("*a")
+    -- plain=true: search the literal Create-time anchors, not a Lua pattern.
     assertTrue(
-        source:find('potHeader:SetPoint%("TOPLEFT", reminder, "BOTTOMLEFT"', 1, true) == nil,
-        "Create no longer pins pot horizontal edges to the reminder"
+        source:find('potHeader:SetPoint("TOPLEFT", reminder, "BOTTOMLEFT"', 1, true) == nil,
+        "Create no longer pins pot TOPLEFT to the reminder"
+    )
+    assertTrue(
+        source:find('potHeader:SetPoint("TOPRIGHT", reminder, "BOTTOMRIGHT"', 1, true) == nil,
+        "Create no longer pins pot TOPRIGHT to the reminder"
     )
     assertTrue(source:find("_UpdateHeaderStackAnchors", 1, true) ~= nil, "header stack helper exists")
 
