@@ -1,5 +1,7 @@
--- Guild Supplies Phase 3B — Donation evidence, three-witness ledger, identity links (#388).
--- Staged accounting only. Live bank/helper writers remain legacy Consumables until #389.
+-- Guild Supplies donation evidence, ledger, and identity links (#388, #411).
+-- One current officer's direct Guild Bank observation verifies a donation.
+-- Otherwise three independent witnesses do. Accepted officer provenance is
+-- durable guild history and may be relayed by a later guildmate (#411).
 -- Reuses ConsumablesObservation matching; does not call profile AreSameIdentity or
 -- ConsumablesVerification admin/session commit paths as guild authority.
 local addonName, SF = ...
@@ -41,7 +43,16 @@ GS.LEDGER_EVENT = {
 
 GS.VERIFICATION = {
     WITNESSES = "witnesses",
+    OFFICER = "officer",
 }
+
+--- Durable verification label. Unknown values stay on the three-witness mode.
+function GS.CanonicalVerificationMode(mode)
+    if mode == GS.VERIFICATION.OFFICER then
+        return GS.VERIFICATION.OFFICER
+    end
+    return GS.VERIFICATION.WITNESSES
+end
 
 local function Debug(level, message, ...)
     if SF.Debug and SF.Debug[level] then
@@ -1617,6 +1628,7 @@ local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
         neighborsOlder = CopyStringList(evidence.neighborsOlder, 3),
         neighborsNewer = CopyStringList(evidence.neighborsNewer, 3),
         campaignId = evidence.campaignId,
+        ageHours = tonumber(evidence.ageHours),
     }
 end
 
@@ -1784,7 +1796,7 @@ local function IsEvidenceEligible(record, evidence)
     return true
 end
 
-local function CommitVerifiedCluster(record, cluster, writerGuid)
+local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMode, provenance)
     local cfg = record.accounting._consumables
     local evidence = cluster.evidence
     if type(evidence) ~= "table" then
@@ -1837,7 +1849,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
                 occurrenceIndex = evidence.occurrenceIndex,
                 neighborsOlder = evidence.neighborsOlder,
                 neighborsNewer = evidence.neighborsNewer,
-                verification = GS.VERIFICATION.WITNESSES,
+                verification = GS.CanonicalVerificationMode(ledHit.verification),
             })
             return true, "duplicate"
         elseif ledRelation == "uncertain" then
@@ -1955,9 +1967,17 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         cluster.txnId = txnId
     end
 
-    local event = BuildDonationEvent(evidence, writerGuid, txnId, GS.VERIFICATION.WITNESSES)
+    local mode = GS.CanonicalVerificationMode(verificationMode)
+    local event = BuildDonationEvent(evidence, writerGuid, txnId, mode)
     if not event then
         return false, "invalid_event"
+    end
+    if mode == GS.VERIFICATION.OFFICER then
+        event.verifierGuid = writerGuid
+        local rankSnap = provenance and tonumber(provenance.rankOrder)
+        if rankSnap and rankSnap >= 1 and rankSnap <= 20 and rankSnap == math.floor(rankSnap) then
+            event.verifierRankOrder = rankSnap
+        end
     end
     -- Preserve validated evidence campaign provenance (historical late quorum
     -- must not rewrite archived campaignId onto the current campaign).
@@ -1984,7 +2004,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
         occurrenceIndex = evidence.occurrenceIndex,
         neighborsOlder = evidence.neighborsOlder,
         neighborsNewer = evidence.neighborsNewer,
-        verification = GS.VERIFICATION.WITNESSES,
+        verification = mode,
         decidedBy = writerGuid,
         decidedAt = Now(),
     })
@@ -2023,11 +2043,13 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
             CompactVerifiedPending(camp.pending)
         end
     end
-    Debug("Info", "three-witness donation committed txn=%s witnesses=%s",
-        tostring(txnId), tostring(GS.CountIndependentWitnesses(record, cluster.witnesses)))
+    Debug("Info", "donation committed txn=%s mode=%s witnesses=%s",
+        tostring(txnId), tostring(mode),
+        tostring(GS.CountIndependentWitnesses(record, cluster.witnesses)))
     return true, "accepted"
 end
 
+--- Three-witness quorum only. Rank changes do not upgrade pending reports here.
 local function TryAutoVerify(record, cluster)
     if type(cluster) ~= "table" or cluster.status == "verified" then
         return false
@@ -2056,7 +2078,47 @@ local function TryAutoVerify(record, cluster)
     return ok and true or false
 end
 
+--- Roster member for this sender. Payload rank/isAdmin/verification are ignored.
+local function FreshRosterMember(name, expectedGuid)
+    local gossip = SF.GuildGossip
+    if not gossip or type(gossip.GetGuildMember) ~= "function" then
+        return nil
+    end
+    if type(name) ~= "string" or name == "" then
+        return nil
+    end
+    local roster = gossip.GetGuildMember(name)
+    if type(roster) ~= "table" or type(roster.guid) ~= "string" or roster.guid == "" then
+        return nil
+    end
+    if expectedGuid and roster.guid ~= expectedGuid then
+        return nil
+    end
+    return roster
+end
+
+--- Current shared Guild Info threshold, evaluated at observation admission.
+-- Unknown policy, rank, or guild fails closed (no officer fast path).
+local function ObserverQualifiesForOfficerCredit(rosterMember)
+    if type(rosterMember) ~= "table" or type(rosterMember.rankOrder) ~= "number" then
+        return false
+    end
+    local gossip = SF.GuildGossip
+    local identity = gossip and gossip.GetGuildIdentity and gossip.GetGuildIdentity()
+    if not identity or rosterMember.guildKey ~= identity.guildKey then
+        return false
+    end
+    local GO = SF.GuildOfficer
+    if not GO or type(GO.RankMeetsThreshold) ~= "function" then
+        return false
+    end
+    local ranks = gossip.GetGuildRanks and gossip.GetGuildRanks()
+    local rankCount = type(ranks) == "table" and tonumber(ranks.count) or nil
+    return GO:RankMeetsThreshold(rosterMember.rankOrder, rankCount) and true or false
+end
+
 --- Admit one directly authenticated Guild Bank observation as a witness vote.
+-- A qualifying officer's own direct observation verifies immediately (#411).
 -- Relayed witness maps are not accepted here; only the transport sender GUID votes.
 -- @param evidence table deposit evidence (SerializeEvidence shape)
 -- @param admissionCtx { sender, member?, localWrite?, campaignId? }
@@ -2278,11 +2340,46 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     if type(cluster.witnesses) ~= "table" then
         cluster.witnesses = {}
     end
+    -- Rank is the authenticated roster at admission, not a stored witness claim.
+    -- Promotion does not upgrade an old report until this character observes again.
+    local rosterMember = FreshRosterMember(admissionCtx.sender or member.name, witnessGuid)
+    local function TryOfficerCredit()
+        -- Dataset adoption replays stored witness exports as the source peer.
+        -- That is not a new Guild Bank log observation, so officer rank must not
+        -- turn one transferred vote into a credit. Accepted totals travel as
+        -- gs-ledger-event rows. Live gossip and local bank reads still qualify.
+        if admissionCtx.adoptionReplay then
+            return false
+        end
+        if cluster.status == "verified" or cluster.status == "ambiguous" then
+            return false
+        end
+        if not ObserverQualifiesForOfficerCredit(rosterMember) then
+            return false
+        end
+        local ok, err = CommitVerifiedCluster(record, cluster, witnessGuid,
+            GS.VERIFICATION.OFFICER, { rankOrder = rosterMember.rankOrder })
+        if not ok and (err == "ambiguous" or err == "ambiguous_boundary") then
+            cluster.status = "ambiguous"
+        end
+        return cluster.status == "verified"
+    end
     if GS.WitnessAlreadyCounted(record, cluster.witnesses, witnessGuid) then
-        local n = GS.CountIndependentWitnesses(record, cluster.witnesses)
-        if n >= (GS.WITNESS_THRESHOLD or 3) and cluster.status ~= "verified"
-            and cluster.status ~= "ambiguous" then
-            TryAutoVerify(record, cluster)
+        local creditedNow = false
+        if cluster.status ~= "verified" and cluster.status ~= "ambiguous" then
+            creditedNow = TryOfficerCredit()
+            if not creditedNow and cluster.status ~= "ambiguous" then
+                local n = GS.CountIndependentWitnesses(record, cluster.witnesses)
+                if n >= (GS.WITNESS_THRESHOLD or 3) then
+                    creditedNow = TryAutoVerify(record, cluster) and true or false
+                end
+            end
+        end
+        if creditedNow then
+            if GS._NotifyLocalDurableChange then
+                GS._NotifyLocalDurableChange("ledger")
+            end
+            return "accepted", nil, cluster
         end
         if cluster.status == "verified" then
             return "duplicate", "duplicate"
@@ -2316,7 +2413,10 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
 
     local verified = false
     if cluster.status ~= "ambiguous" then
-        verified = TryAutoVerify(record, cluster)
+        verified = TryOfficerCredit()
+        if not verified and cluster.status ~= "ambiguous" then
+            verified = TryAutoVerify(record, cluster) and true or false
+        end
     end
     if GS._NotifyLocalDurableChange then
         GS._NotifyLocalDurableChange(verified and "ledger" or "evidence")
@@ -2463,6 +2563,130 @@ function GS.ValidateLedgerEventBody(event, guildKey, datasetId)
         return false, "invalid_generation"
     end
     return true
+end
+
+--- Writer GUID for an officer-trusted accepted row. Payload rank is not read.
+local function OfficerHistoryWriter(event)
+    if type(event) ~= "table" or event.verification ~= GS.VERIFICATION.OFFICER then
+        return nil
+    end
+    local writer = ValidGuid(event.writer)
+    if not writer then
+        return nil
+    end
+    if event.verifierGuid ~= nil and ValidGuid(event.verifierGuid) ~= writer then
+        return nil
+    end
+    return writer
+end
+
+--- Ordinary Guild Gossip catch-up of an already accepted officer-trusted donation.
+-- The transport sender must be an authenticated same-guild member. The verification
+-- field, writer, rank, or isAdmin claim is not authority by itself: occurrence,
+-- eligibility, cutover, dataset, and a complete officer provenance row are required.
+-- v1 cannot prove the named writer saw Blizzard's bank log. That limit is documented
+-- in GuildSupplies/AGENTS.md. Returns nil when the row must stay an unverified candidate.
+local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cfg, senderName)
+    local writer = OfficerHistoryWriter(event)
+    if not writer or not ValidTxnId(txnId) or type(cfg) ~= "table" then
+        return nil
+    end
+    if type(GS.AuthenticateTransportSender) ~= "function" then
+        return nil
+    end
+    local authed = GS.AuthenticateTransportSender(senderName)
+    if type(authed) ~= "table" or not ValidGuid(authed.guid) then
+        return nil
+    end
+    local gossip = SF.GuildGossip
+    local identity = gossip and gossip.GetGuildIdentity and gossip.GetGuildIdentity()
+    if not identity or authed.guildKey ~= identity.guildKey then
+        return nil
+    end
+    local shapeOk, _, row = GS.ValidateEvidencePayload({
+        donor = candidate.donor or candidate.actor,
+        itemId = candidate.itemId,
+        quantity = candidate.quantity,
+        guildGuid = candidate.guildGuid,
+        bankTab = candidate.bankTab,
+        generation = candidate.generation,
+        approxTxnTime = candidate.approxTxnTime or candidate.timestamp,
+        ageHours = event.ageHours,
+        coreSignature = candidate.coreSignature,
+        occurrenceIndex = candidate.occurrenceIndex,
+        neighborsOlder = candidate.neighborsOlder,
+        neighborsNewer = candidate.neighborsNewer,
+        observedAt = candidate.timestamp,
+        campaignId = candidate.campaignId,
+    })
+    if not shapeOk or type(row) ~= "table" or tonumber(row.ageHours) == nil then
+        return nil
+    end
+    if GS.IsLiveActive and GS.IsLiveActive(record) and GS.IsEvidenceAfterLiveCutover then
+        local afterOk = select(1, GS.IsEvidenceAfterLiveCutover(record, row))
+        if not afterOk then
+            return nil
+        end
+    end
+    local eligOk = IsEvidenceEligible(record, row)
+    if not eligOk then
+        return nil
+    end
+    local stored = {
+        type = GS.LEDGER_EVENT.DONATION,
+        id = txnId,
+        txnId = txnId,
+        generation = tonumber(row.generation),
+        timestamp = tonumber(row.approxTxnTime) or Now(),
+        actor = row.donor,
+        itemId = row.itemId,
+        quantity = row.quantity,
+        source = "guildbank",
+        writer = writer,
+        verifierGuid = writer,
+        verification = GS.VERIFICATION.OFFICER,
+        coreSignature = row.coreSignature,
+        occurrenceIndex = row.occurrenceIndex,
+        guildGuid = row.guildGuid,
+        bankTab = row.bankTab,
+        neighborsOlder = row.neighborsOlder,
+        neighborsNewer = row.neighborsNewer,
+        campaignId = row.campaignId or candidate.campaignId or record.currentCampaignId,
+        datasetId = record.datasetId,
+        ageHours = tonumber(row.ageHours),
+    }
+    local rankSnap = tonumber(event.verifierRankOrder)
+    if rankSnap and rankSnap >= 1 and rankSnap <= 20 and rankSnap == math.floor(rankSnap) then
+        stored.verifierRankOrder = rankSnap
+    end
+    local appendOk = AppendLedgerEvent(record, stored)
+    if not appendOk then
+        return nil
+    end
+    RegisterTxn(cfg, {
+        txnId = txnId,
+        status = "verified",
+        committed = true,
+        coreSignature = stored.coreSignature,
+        approxTxnTime = stored.timestamp,
+        donor = stored.actor,
+        itemId = stored.itemId,
+        quantity = stored.quantity,
+        guildGuid = stored.guildGuid,
+        bankTab = stored.bankTab,
+        generation = stored.generation,
+        occurrenceIndex = stored.occurrenceIndex,
+        neighborsOlder = stored.neighborsOlder,
+        neighborsNewer = stored.neighborsNewer,
+        verification = stored.verification,
+        decidedBy = writer,
+    })
+    if GS._NotifyLocalDurableChange then
+        GS._NotifyLocalDurableChange("ledger")
+    end
+    Debug("Info", "officer-trusted history accepted txn=%s writer=%s sender=%s",
+        tostring(txnId), tostring(writer), tostring(authed.name or senderName))
+    return "accepted", "officer_history"
 end
 
 --- Admit an already-minted ledger event (gossip catch-up). Occurrence-aware dedupe.
@@ -2761,7 +2985,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 quantity = candidate.quantity,
                 source = "guildbank",
                 writer = candidate.writer,
-                verification = GS.VERIFICATION.WITNESSES,
+                verification = (event.verification == GS.VERIFICATION.OFFICER
+                    and ValidGuid(candidate.writer))
+                    and GS.VERIFICATION.OFFICER or GS.VERIFICATION.WITNESSES,
                 coreSignature = candidate.coreSignature,
                 occurrenceIndex = candidate.occurrenceIndex,
                 guildGuid = candidate.guildGuid,
@@ -2770,7 +2996,16 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 neighborsNewer = candidate.neighborsNewer,
                 campaignId = campId,
                 datasetId = record.datasetId,
+                ageHours = tonumber(event.ageHours),
             }
+            if stored.verification == GS.VERIFICATION.OFFICER then
+                stored.verifierGuid = ValidGuid(candidate.writer)
+                local rankSnap = tonumber(event.verifierRankOrder)
+                if rankSnap and rankSnap >= 1 and rankSnap <= 20
+                    and rankSnap == math.floor(rankSnap) then
+                    stored.verifierRankOrder = rankSnap
+                end
+            end
             if type(admissionCtx.sourceCutoverMarker) == "string"
                 and admissionCtx.sourceCutoverMarker ~= "" then
                 stored.gsSourceCutoverMarker = admissionCtx.sourceCutoverMarker
@@ -2797,6 +3032,14 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 verification = stored.verification,
             })
             return "accepted", "adoption_transfer"
+        end
+
+        -- Accepted officer-trusted history may propagate through any authenticated
+        -- guildmate. Incomplete or ineligible officer claims stay candidates.
+        local histStatus, histReason = TryAdmitOfficerTrustedHistory(
+            record, event, candidate, txnId, cfg, admissionCtx.sender)
+        if histStatus then
+            return histStatus, histReason
         end
 
         -- Retain as unverified candidate for ID convergence; do not credit.

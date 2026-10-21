@@ -17,7 +17,7 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 | Local-action commits | `ApplyStaged*` + `_AuthorizeCommit` (local player only) |
 | Authenticated remote admission | `AdmitRemote*` — transport sender + verified guild/rank policy |
 | Dataset adoption | Explicit authorized editor confirmation; replace, never merge |
-| Donation evidence / three-witness ledger / identity links | `Ledger.lua` |
+| Donation evidence / officer or three-witness ledger / identity links | `Ledger.lua` |
 | Deposit matching helpers | Reuse `SF.ConsumablesObservation` MatchScore / BuildEvidence / ListEligibleEvidenceFromSnapshot |
 
 ## Guarantees
@@ -33,8 +33,9 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 9. **3C:** Pre-activation bank rows / staged pending evidence / staged accepted ledger rows never become live credit (`gsProductionCredit`). Compatible peers adopt cutover without reopening the bank. Authenticated divergent live markers fail closed on production writers.
 10. **3C:** After activation, `ShouldUseLegacyConsumablesWriters()` is false; profile ApplyOp/CommitEvents/MergeSnapshot and legacy sync handlers cannot mutate production accounting for that guild.
 11. **3C:** Staged sample-only bank observation lets an authorized editor stamp the configured GS tab without admitting donations or requiring a legacy profile. Remote live cutover install requires verified editor authority.
-12. **3B:** Exactly three independent authenticated witness identities automatically credit one donation. No manual donation approve/reject.
-13. **3A:** Independently initialized dataset IDs never silently merge; explicit adoption replaces.
+12. **3B / #411:** A current officer's direct completed Guild Bank observation credits one eligible donation with durable `verification = "officer"` provenance. Otherwise exactly three independent authenticated witness identities credit it with `verification = "witnesses"`. Officer rank is the established Guild Info threshold at admission time (`rankOrder <= effectiveThreshold`), not a payload claim and not a later promotion of an old report. No manual donation approve/reject.
+13. **#411 catch-up:** An accepted officer-trusted row propagates through ordinary `gs-ledger-event` gossip, including A → B → C while A is offline. The receiver accepts it only from an authenticated same-guild sender, with matching dataset/campaign/cutover/occurrence and a complete officer provenance row (`verification`, verifier GUID). Three-witness ledger rows stay unverified candidates until local quorum. Dataset adoption replays stored `gs-evidence` as witness votes only; it does not officer-credit that replay. The accepted ledger row carries the credit. **v1 limit:** addon messages are not cryptographic proof that the named officer saw Blizzard's bank log. A guild member who can send a well-formed officer-provenance row is indistinguishable from a peer relaying accepted history. Do not treat a bare `verification` / `writer` / `rankOrder` / `isAdmin` claim as authority, and do not require the original officer to stay online.
+14. **3A:** Independently initialized dataset IDs never silently merge; explicit adoption replaces.
 
 ## Lifecycle
 
@@ -46,7 +47,8 @@ config ops / gossip / adoption (staged)
 sample-only bank observation (editor, no admit) → fresh stamp
 ActivateCanonicalDataset (editor + fresh bank sample) → active + liveCutover
   + ClassifyPreActivationAccounting (staged ledger retained, not live credit)
-bank observation → AdmitDirectObservation → 3 witnesses → production credit
+bank observation → AdmitDirectObservation → officer direct credit OR 3 witnesses → production credit
+accepted officer row → gs-ledger-event catch-up (original officer may be offline)
 compatible editor peers InstallRemoteLiveCutover (no bank; editor auth required)
 legacy profile writers isolated for that guild
 ```

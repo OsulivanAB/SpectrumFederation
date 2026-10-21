@@ -430,7 +430,7 @@ local function Definition()
 						indent = "label",
 						getText = function()
 							return Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_HELP",
-								"Read-only. Deposits become verified automatically when three independent authenticated Guild Bank observers agree. There is no manual approval.")
+								"Read-only. A deposit is verified automatically when a current officer directly observes it in the Guild Bank log, or when three independent authenticated Guild Bank observers agree. There is no manual approval.")
 						end,
 					},
 					{

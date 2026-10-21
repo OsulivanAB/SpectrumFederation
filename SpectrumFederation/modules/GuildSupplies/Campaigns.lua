@@ -907,6 +907,13 @@ local function FormatCampaignHistoryText(event, itemName, markUncredited)
         local who = BoundedActorName(event.actor) or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
         body = Loc("GUILD_SUPPLIES_HISTORY_DONATION", "%s donated %d %s.")
             :format(who, qty, name)
+        if event.verification == "officer" then
+            body = body .. " " .. Loc("GUILD_SUPPLIES_HISTORY_VERIFIED_OFFICER",
+                "Verified by one officer Guild Bank observation.")
+        elseif event.verification == "witnesses" then
+            body = body .. " " .. Loc("GUILD_SUPPLIES_HISTORY_VERIFIED_WITNESSES",
+                "Verified by three Guild Bank observers.")
+        end
     elseif IsAdjustmentEvent(event) then
         local who = BoundedActorName(event.actor)
             or Loc("GUILD_SUPPLIES_HISTORY_ADMIN", "An admin")
