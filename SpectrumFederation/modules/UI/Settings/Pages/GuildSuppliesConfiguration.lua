@@ -10,12 +10,12 @@ end
 
 SF.SettingsUI:RegisterCategory({
 	id = "guildSupplies",
-	name = Loc("GUILD_SUPPLIES_CATEGORY_NAME", "Guild Supplies"),
-	navLabel = Loc("GUILD_SUPPLIES_CATEGORY_NAV", "Guild Supplies"),
-	group = "Loot Tools", -- stable navigation group id (display owned by chrome)
+	name = Loc("GUILD_SUPPLIES_CATEGORY_NAME", "Raid Supplies"),
+	navLabel = Loc("GUILD_SUPPLIES_CATEGORY_NAV", "Raid Supplies"),
+	group = "Raid Tools", -- sidebar heading; chrome displays this string
 	description = Loc("GUILD_SUPPLIES_CATEGORY_DESC",
 		"Guild-owned raid supply campaigns, configuration, and logs."),
-	order = 19,
+	order = 32,
 })
 
 local Page = {
@@ -23,8 +23,8 @@ local Page = {
 	categoryId = "guildSupplies",
 	name = Loc("GUILD_SUPPLIES_CONFIG_NAME", "Configuration"),
 	navLabel = Loc("GUILD_SUPPLIES_CONFIG_NAV", "Configuration"),
-	contentHeading = Loc("GUILD_SUPPLIES_CONFIG_HEADING", "Guild Supplies Configuration"),
-	group = "Loot Tools",
+	contentHeading = Loc("GUILD_SUPPLIES_CONFIG_HEADING", "Raid Supplies Configuration"),
+	group = "Raid Tools",
 	description = Loc("GUILD_SUPPLIES_CONFIG_DESC",
 		"Fresh guild setup, bank tab, requested items, and New Campaign."),
 	order = 19.1,

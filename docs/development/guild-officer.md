@@ -11,7 +11,7 @@ Guild Info, Guild Supplies, and the one-time Loot Helper admin grant read this p
 | Stored threshold, bootstrap, and commit | `SF.GuildOfficer` (`Policy`) |
 | Gossip record | `Gossip` provider `sf.guildofficer.policy` |
 | Native rank and guild identity | Guild Gossip `GetGuildIdentity` / `GetGuildMember` / `GetGuildRanks` |
-| Settings selector | Guild Info → Main / Alt Assignments, top of the page |
+| Settings selector | Guild Settings → Main / Alt Assignments, top of the page |
 
 - Positions are 1-based. Guild Master is rank 1. A member is an officer when `rankOrder <= threshold`.
 - The default is rank 3, capped to the last existing native rank. A shorter rank list caps checks and display. It does not rewrite the stored value and it does not widen who qualifies.

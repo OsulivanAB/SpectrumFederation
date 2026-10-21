@@ -6,7 +6,7 @@ Only an admin of the selected loot profile can run a check. Enchant and gem rule
 
 ## Where to look
 
-- **Raid Equipment** is a top-level Loot Tools category. It works with no loot profile and no Loot Helper session.
+- **Raid Equipment** is a top-level Raid Tools category. It works with no loot profile and no Loot Helper session.
 - **Pre-Raid Check** and **Raid Check** remain on **Loot Helper → Session**.
 - Point awards, whispers, and Reward Pot deduction settings also remain on **Loot Helper → Session**.
 

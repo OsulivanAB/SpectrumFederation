@@ -4983,7 +4983,7 @@ do
         "Configuration exposes Build/Refresh")
     assertTrue(type(logsPage.Build) == "function" and type(logsPage.Refresh) == "function",
         "Logs exposes Build/Refresh")
-    assertEq(SF.SettingsUI.categories.guildSupplies.name, "Guild Supplies",
+    assertEq(SF.SettingsUI.categories.guildSupplies.name, "Raid Supplies",
         "category name localized through Loc default")
 
     local function findEditBoxes(node, out)
@@ -26802,7 +26802,7 @@ do
             enabled = true,
             enablementResolved = true,
             order = 20,
-            group = "Loot Tools",
+            group = "Raid Tools",
         }
         ui.categoriesById.lootHelper = cat
         -- Categories must be an array for BuildSidebarItems ipairs traversal.
