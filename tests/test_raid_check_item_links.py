@@ -215,6 +215,8 @@ def test_pending_incomplete_reasons_do_not_burn_attempt_cap():
     assert "nextPendingRetryAt" in check_run
     assert "PENDING_RETRY_SECONDS" in check_run
     assert "function CheckRun.AttemptCountsAsProgress" in check_run
+    assert "function CheckRun.InitialAcquisitionIncomplete" in check_run
+    assert "initial_acquisition" in check_run
     raid_check = RAID_CHECK_LUA.read_text(encoding="utf-8")
     assert "AttemptKindForIncompleteReason" in raid_check
     assert "lastIncompleteReason" in raid_check
@@ -226,6 +228,7 @@ def test_pending_incomplete_reasons_do_not_burn_attempt_cap():
     queue_fn = queue_fn.split("function RC:_ApplyCheckConsequences", 1)[0]
     # Pending/timeout backoff must survive frozen-queue rebuilds: only expired gates clear.
     assert "PlayerMayQueueInspect" in queue_fn
+    assert "PlayerMayQueueInspect(player, now, run)" in queue_fn
     assert "cacheEntry.nextRetryAt and cacheEntry.nextRetryAt <= now" in queue_fn
     # Unconditional clear of nextRetryAt before every queue must stay gone.
     assert "if type(cacheEntry) == \"table\" then\n\t\t\t\t\tcacheEntry.nextRetryAt = nil\n\t\t\t\tend" not in queue_fn

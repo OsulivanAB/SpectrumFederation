@@ -161,7 +161,32 @@ assertTrue(not pendingThenReady.countsForPot, "Prepared after pending does not c
 assertTrue(CheckRun.AttemptCountsAsProgress("complete"), "complete counts as progress")
 assertTrue(CheckRun.AttemptCountsAsProgress("incomplete"), "incomplete counts as progress")
 assertTrue(CheckRun.AttemptCountsAsProgress("timeout"), "timeout counts as progress")
-assertTrue(not CheckRun.AttemptCountsAsProgress("pending"), "pending does not count as progress")
+local firstPendingProbe = CheckRun.NewPlayer("FP")
+assertTrue(
+    CheckRun.AttemptCountsAsProgress("pending", firstPendingProbe),
+    "first pending for an unvisited player counts as progress"
+)
+firstPendingProbe.inspectableAtLeastOnce = true
+assertTrue(
+    not CheckRun.AttemptCountsAsProgress("pending", firstPendingProbe),
+    "repeated pending does not count as progress"
+)
+
+local unvisitedReachable = CheckRun.NewPlayer("UR")
+unvisitedReachable.currentlyInspectable = true
+local unvisitedClass = CheckRun.ClassifyPlayer(unvisitedReachable, 10)
+assertEq(
+    unvisitedClass.class,
+    CheckRun.CLASS.INSPECTION_FAILED,
+    "reachable but never-visited target is Inspection Failed, not availability Unprepared"
+)
+assertTrue(not unvisitedClass.countsForPot, "reachable unvisited target does not count for Reward Pot")
+
+local genuineUnavailable = CheckRun.NewPlayer("GU")
+genuineUnavailable.currentlyInspectable = false
+local genuineClass = CheckRun.ClassifyPlayer(genuineUnavailable, 10)
+assertEq(genuineClass.class, CheckRun.CLASS.UNPREPARED_AVAILABILITY, "never-inspectable stays availability Unprepared")
+assertTrue(genuineClass.countsForPot, "genuine availability Unprepared still counts for Reward Pot")
 
 local gated = CheckRun.NewPlayer("G")
 local t0 = 1000
@@ -203,8 +228,11 @@ local function SimulatePendingAcquisition(opts)
 
     local function applyPending()
         pendingResults = pendingResults + 1
+        local counts = CheckRun.AttemptCountsAsProgress("pending", player)
         CheckRun.MarkAttempt(player, "pending", true, clock)
-        -- Intentionally do not NoteProgress for pending (mirrors production).
+        if counts then
+            CheckRun.NoteProgress(run, clock)
+        end
     end
 
     local function applyComplete()
@@ -284,6 +312,205 @@ assertEq(resolves.pendingResults, 2, "two pending results precede the successful
 assertEq(resolves.class, CheckRun.CLASS.PREPARED, "eventual complete observation classifies Prepared")
 assertTrue(not resolves.run.classifiedResults.A.countsForPot, "Prepared after pending still does not deduct pot")
 assertTrue(resolves.player.nextPendingRetryAt == nil, "success clears pending retry gate")
+
+-- Multi-target serial acquisition: first sweep may exceed NO_PROGRESS_SECONDS without
+-- charging Reward Pot for reachable players the queue has not visited yet.
+local function SimulateSerialRaidAcquisition(opts)
+    opts = opts or {}
+    local targetCount = opts.targetCount or 14
+    local targetIds = {}
+    for i = 1, targetCount do
+        targetIds[i] = string.format("T%02d", i)
+    end
+    local run = CheckRun.NewRun({ targetIds = targetIds, now = 0 })
+    for _, id in ipairs(targetIds) do
+        run.players[id].currentlyInspectable = true
+    end
+    local clock = 0
+    local tick = opts.tick or 0.25
+    local readyDelay = opts.readyDelay or CheckRun.PER_INSPECT_ACTIVE_WAIT
+    local maxTicks = opts.maxTicks or 2000
+    local inspectRequests = 0
+    local activeId = nil
+    local activeIssuedAt = nil
+    local resolveAllAfterSweep = opts.resolveAllAfterSweep == true
+    local keepPendingForever = opts.keepPendingForever ~= false
+
+    local function queueNext()
+        -- Match production: pass run so pending retries defer until every
+        -- reachable target has received a first inspect opportunity.
+        for _, id in ipairs(targetIds) do
+            local player = run.players[id]
+            if CheckRun.PlayerMayQueueInspect(player, clock, run) then
+                inspectRequests = inspectRequests + 1
+                activeId = id
+                activeIssuedAt = clock
+                return true
+            end
+        end
+        return false
+    end
+
+    queueNext()
+    for _ = 1, maxTicks do
+        clock = clock + tick
+        CheckRun.AdvanceClock(run, clock)
+        if activeId and activeIssuedAt and (clock - activeIssuedAt) + 1e-9 >= readyDelay then
+            local player = run.players[activeId]
+            local sweepDone = true
+            for _, id in ipairs(targetIds) do
+                if not run.players[id].inspectableAtLeastOnce and id ~= activeId then
+                    sweepDone = false
+                    break
+                end
+            end
+            if resolveAllAfterSweep and sweepDone then
+                CheckRun.MarkAttempt(player, "complete", true, clock)
+                player.freshObservation = {
+                    complete = true,
+                    policy = { prepared = true, missing = {} },
+                    capturedAt = clock,
+                }
+                player.policyResult = player.freshObservation.policy
+                player.technicalFailure = false
+                CheckRun.NoteProgress(run, clock)
+            else
+                local counts = CheckRun.AttemptCountsAsProgress("pending", player)
+                CheckRun.MarkAttempt(player, "pending", true, clock)
+                if counts then
+                    CheckRun.NoteProgress(run, clock)
+                end
+            end
+            activeId = nil
+            activeIssuedAt = nil
+        end
+
+        local settle, why = CheckRun.ShouldSettle(run, clock)
+        if settle then
+            CheckRun.ClassifyRun(run, clock, {})
+            local potHits = 0
+            local failedNoPot = 0
+            local prepared = 0
+            local unvisited = 0
+            for _, id in ipairs(targetIds) do
+                local result = run.classifiedResults[id]
+                local player = run.players[id]
+                if not player.inspectableAtLeastOnce then
+                    unvisited = unvisited + 1
+                end
+                if result and result.countsForPot then
+                    potHits = potHits + 1
+                end
+                if result and result.class == CheckRun.CLASS.INSPECTION_FAILED and not result.countsForPot then
+                    failedNoPot = failedNoPot + 1
+                end
+                if result and result.class == CheckRun.CLASS.PREPARED then
+                    prepared = prepared + 1
+                end
+            end
+            return {
+                run = run,
+                clock = clock,
+                why = why,
+                inspectRequests = inspectRequests,
+                potHits = potHits,
+                failedNoPot = failedNoPot,
+                prepared = prepared,
+                unvisited = unvisited,
+                anyUnpreparedForPot = CheckRun.AnyUnpreparedForPot(run.classifiedResults),
+            }
+        end
+
+        if not activeId then
+            queueNext()
+        end
+        if not keepPendingForever and resolveAllAfterSweep then
+            -- continue until settle
+        end
+    end
+    return {
+        run = run,
+        clock = clock,
+        why = "max_ticks",
+        inspectRequests = inspectRequests,
+        potHits = -1,
+        failedNoPot = -1,
+        prepared = -1,
+        unvisited = -1,
+        anyUnpreparedForPot = true,
+    }
+end
+
+local earlyStall = CheckRun.NewRun({
+    targetIds = { "A", "B", "C" },
+    now = 0,
+})
+earlyStall.players.A.currentlyInspectable = true
+earlyStall.players.B.currentlyInspectable = true
+earlyStall.players.C.currentlyInspectable = true
+CheckRun.MarkAttempt(earlyStall.players.A, "pending", true, 0)
+CheckRun.NoteProgress(earlyStall, 0)
+CheckRun.AdvanceClock(earlyStall, 11)
+local settleEarly, whyEarly = CheckRun.ShouldSettle(earlyStall, 11)
+assertTrue(not settleEarly, "no_progress waits while reachable targets remain unvisited")
+assertEq(whyEarly, "initial_acquisition", "unfinished first sweep reports initial_acquisition")
+assertTrue(CheckRun.InitialAcquisitionIncomplete(earlyStall), "B/C still need a first inspect")
+assertTrue(
+    not CheckRun.PlayerMayQueueInspect(earlyStall.players.A, 11, earlyStall),
+    "visited pending target defers while the first sweep is incomplete"
+)
+assertTrue(
+    CheckRun.PlayerMayQueueInspect(earlyStall.players.B, 11, earlyStall),
+    "unvisited reachable target may queue during the first sweep"
+)
+
+local multiPending = SimulateSerialRaidAcquisition({
+    targetCount = 14,
+    keepPendingForever = true,
+    resolveAllAfterSweep = false,
+})
+assertTrue(multiPending.clock > CheckRun.NO_PROGRESS_SECONDS, "14-target serial sweep runs past 10s")
+assertTrue(multiPending.unvisited == 0, "every reachable target receives at least one inspect before idle settle")
+assertEq(multiPending.why, "no_progress", "after the first sweep, repeated pending settles via no_progress")
+assertTrue(not multiPending.anyUnpreparedForPot, "multi-target pending settle does not deduct Reward Pot")
+assertEq(multiPending.potHits, 0, "no classified target counts for Reward Pot after pending-only settle")
+assertTrue(multiPending.failedNoPot == 14, "all fourteen pending targets are Inspection Failed without pot")
+
+local multiResolve = SimulateSerialRaidAcquisition({
+    targetCount = 14,
+    keepPendingForever = false,
+    resolveAllAfterSweep = true,
+})
+assertEq(multiResolve.why, "targets_resolved", "serial sweep can still resolve every target within budget")
+assertEq(multiResolve.prepared, 14, "all fourteen targets classify Prepared after resolution")
+assertTrue(not multiResolve.anyUnpreparedForPot, "resolved Prepared run does not deduct Reward Pot")
+assertTrue(multiResolve.unvisited == 0, "resolved path still visits every target")
+
+-- Budget settlement with an unvisited reachable target must not charge the pot.
+local budgetRun = CheckRun.NewRun({ targetIds = { "A", "B" }, now = 0 })
+budgetRun.budgetSeconds = 5
+budgetRun.players.A.currentlyInspectable = true
+budgetRun.players.B.currentlyInspectable = true
+CheckRun.MarkAttempt(budgetRun.players.A, "pending", true, 0)
+CheckRun.NoteProgress(budgetRun, 0)
+CheckRun.AdvanceClock(budgetRun, 6)
+local settleBudget, whyBudget = CheckRun.ShouldSettle(budgetRun, 6)
+assertTrue(settleBudget, "budget still settles when elapsed exceeds budgetSeconds")
+assertEq(whyBudget, "budget", "budget settlement reason is preserved")
+CheckRun.ClassifyRun(budgetRun, 6, {})
+assertEq(
+    budgetRun.classifiedResults.B.class,
+    CheckRun.CLASS.INSPECTION_FAILED,
+    "budget-unvisited reachable target is Inspection Failed"
+)
+assertTrue(
+    not budgetRun.classifiedResults.B.countsForPot,
+    "budget-unvisited reachable target does not count for Reward Pot"
+)
+assertTrue(
+    not CheckRun.AnyUnpreparedForPot(budgetRun.classifiedResults),
+    "budget settle with unvisited reachable targets does not trigger pot deduction"
+)
 
 failed.currentlyInspectable = false
 failed.rangeOnlyFailure = true

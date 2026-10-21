@@ -2354,10 +2354,14 @@ function RC:_HandleInspectReady(guid)
 					local kind = CheckRun.AttemptKindForIncompleteReason
 						and CheckRun.AttemptKindForIncompleteReason(reason)
 						or "incomplete"
+					-- Evaluate progress before MarkAttempt so first-time pending
+					-- still counts as acquisition evidence.
+					local countsAsProgress = not CheckRun.AttemptCountsAsProgress
+						or CheckRun.AttemptCountsAsProgress(kind, player)
 					CheckRun.MarkAttempt(player, kind, true, now)
-					-- Pending/link-loading must not refresh no-progress or clear
-					-- the per-player retry gate on the next 0.25s queue rebuild.
-					if CheckRun.AttemptCountsAsProgress and CheckRun.AttemptCountsAsProgress(kind) then
+					-- Repeated pending/link-loading must not refresh no-progress.
+					-- Preserve the per-player retry gate across queue rebuilds.
+					if countsAsProgress then
 						CheckRun.NoteProgress(state.adhocRun, now)
 					elseif player.nextPendingRetryAt then
 						entry.nextRetryAt = player.nextPendingRetryAt
@@ -2365,12 +2369,13 @@ function RC:_HandleInspectReady(guid)
 					if SF.Debug and SF.Debug.Verbose then
 						SF.Debug:Verbose(
 							"RAID_CHECK",
-							"Inspect attempt %s for %s (reason=%s blended=%s nextRetry=%s)",
+							"Inspect attempt %s for %s (reason=%s blended=%s nextRetry=%s progress=%s)",
 							tostring(kind),
 							tostring(active.id),
 							tostring(reason),
 							tostring(entry.blended == true),
-							tostring(player.nextPendingRetryAt)
+							tostring(player.nextPendingRetryAt),
+							tostring(countsAsProgress)
 						)
 					end
 				end
@@ -3535,7 +3540,7 @@ local function QueueFrozenInspectTargets(self, run)
 			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 			local mayQueue = CheckRun
 				and (
-					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now))
+					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now, run))
 					or (
 						not CheckRun.PlayerMayQueueInspect
 						and CheckRun.PlayerNeedsMoreInspects
@@ -3543,7 +3548,8 @@ local function QueueFrozenInspectTargets(self, run)
 					)
 				)
 			if not mayQueue then
-				-- Complete, attempt-capped, or still inside the pending retry gate.
+				-- Complete, attempt-capped, pending gate, or deferred until the
+				-- first inspect sweep finishes for every reachable target.
 				-- Do not clear cache nextRetryAt while rebuilding the frozen queue.
 			else
 				local info = BuildUnitInfo(unit)
@@ -3561,7 +3567,7 @@ local function QueueFrozenInspectTargets(self, run)
 			local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
 			local mayQueue = CheckRun
 				and (
-					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now))
+					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now, run))
 					or (
 						not CheckRun.PlayerMayQueueInspect
 						and CheckRun.PlayerNeedsMoreInspects
@@ -3569,7 +3575,8 @@ local function QueueFrozenInspectTargets(self, run)
 					)
 				)
 			if not mayQueue then
-				-- Already complete, attempt-capped, or pending/local capture backoff.
+				-- Already complete, attempt-capped, pending gate, or deferred
+				-- until the first inspect sweep finishes.
 			elseif CheckRun and Policy then
 				-- Space local captures like a remote inspect wait so a single
 				-- unresolved item-level or socket read cannot burn the attempt
@@ -3617,18 +3624,21 @@ local function QueueFrozenInspectTargets(self, run)
 							local kind = CheckRun.AttemptKindForIncompleteReason
 								and CheckRun.AttemptKindForIncompleteReason(reason)
 								or "incomplete"
+							local countsAsProgress = not CheckRun.AttemptCountsAsProgress
+								or CheckRun.AttemptCountsAsProgress(kind, player)
 							CheckRun.MarkAttempt(player, kind, true, now)
-							if CheckRun.AttemptCountsAsProgress and CheckRun.AttemptCountsAsProgress(kind) then
+							if countsAsProgress then
 								CheckRun.NoteProgress(run, now)
 							end
 							self:_InvalidateLocalTroubleshootingSnapshot()
 							if SF.Debug and SF.Debug.Verbose then
 								SF.Debug:Verbose(
 									"RAID_CHECK",
-									"Local capture attempt %s for %s (reason=%s)",
+									"Local capture attempt %s for %s (reason=%s progress=%s)",
 									tostring(kind),
 									tostring(memberId),
-									tostring(reason)
+									tostring(reason),
+									tostring(countsAsProgress)
 								)
 							end
 						end

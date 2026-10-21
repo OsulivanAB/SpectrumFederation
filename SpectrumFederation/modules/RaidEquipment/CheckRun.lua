@@ -248,9 +248,35 @@ function CheckRun.PendingRetryDelaySeconds()
 end
 
 -- True when this attempt kind should refresh the run's no-progress clock.
--- Unchanged pending/link-loading results must not keep the run alive forever.
-function CheckRun.AttemptCountsAsProgress(kind)
-	return not CheckRun.IsPendingAttemptKind(kind)
+-- Call before MarkAttempt so first-time pending still counts as acquisition
+-- evidence. Repeated pending/link-loading must not keep the run alive forever.
+function CheckRun.AttemptCountsAsProgress(kind, player)
+	if not CheckRun.IsPendingAttemptKind(kind) then
+		return true
+	end
+	-- First pending result for a never-visited player is first-time evidence.
+	return type(player) == "table" and not player.inspectableAtLeastOnce
+end
+
+-- True while a reachable target has not yet received any inspect/capture attempt.
+-- Serial NotifyInspect across a large group can exceed NO_PROGRESS_SECONDS; the
+-- run must finish that first sweep (or hit budget) before settling on idle.
+function CheckRun.InitialAcquisitionIncomplete(run)
+	if type(run) ~= "table" then
+		return false
+	end
+	for _, id in ipairs(run.targetIds or {}) do
+		local player = run.players and run.players[id]
+		if player
+			and not player.inspectableAtLeastOnce
+			and not player.leftGroup
+			and player.currentlyInspectable
+			and not player.rangeOnlyFailure
+		then
+			return true
+		end
+	end
+	return false
 end
 
 function CheckRun.MarkAttempt(player, kind, inspectable, now)
@@ -292,8 +318,17 @@ end
 
 -- Whether acquisition may queue another inspect/capture right now.
 -- Preserves the attempt cap and the pending retry gate across queue rebuilds.
-function CheckRun.PlayerMayQueueInspect(player, now)
+-- When run is provided and the first inspect sweep is incomplete, already-visited
+-- players defer so serial NotifyInspect slots finish never-visited targets first.
+function CheckRun.PlayerMayQueueInspect(player, now, run)
 	if not CheckRun.PlayerNeedsMoreInspects(player) then
+		return false
+	end
+	if type(run) == "table"
+		and CheckRun.InitialAcquisitionIncomplete(run)
+		and type(player) == "table"
+		and player.inspectableAtLeastOnce
+	then
 		return false
 	end
 	now = tonumber(now) or 0
@@ -340,6 +375,11 @@ function CheckRun.ShouldSettle(run, now)
 
 	local sinceProgress = (run.activeElapsed or 0) - (run.lastProgressActiveElapsed or 0)
 	if sinceProgress >= CheckRun.NO_PROGRESS_SECONDS then
+		-- Do not treat an unfinished first inspect sweep as idle. Repeated
+		-- pending after every reachable target has been visited still settles.
+		if CheckRun.InitialAcquisitionIncomplete(run) then
+			return false, "initial_acquisition"
+		end
 		return true, "no_progress"
 	end
 
@@ -402,6 +442,18 @@ function CheckRun.ClassifyPlayer(player, now, lastGood)
 	end
 
 	if not player.inspectableAtLeastOnce then
+		-- Reachable targets skipped only because the run settled before the
+		-- serial inspect queue reached them are Inspection Failed, not
+		-- availability Unprepared. Otherwise Reward Pot would deduct for
+		-- players who were never given an inspect opportunity.
+		if player.currentlyInspectable and not player.leftGroup and not player.rangeOnlyFailure then
+			return {
+				class = CheckRun.CLASS.INSPECTION_FAILED,
+				verified = nil,
+				missing = {},
+				countsForPot = false,
+			}
+		end
 		return {
 			class = CheckRun.CLASS.UNPREPARED_AVAILABILITY,
 			verified = nil,
