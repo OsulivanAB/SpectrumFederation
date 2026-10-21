@@ -232,6 +232,9 @@ local function ValidateAndApply(record, ctx)
     if ctx and ctx.localWrite then
         return "rejected", "use_local_api"
     end
+    if tostring(record.id) ~= tostring(GO.RECORD_ID) then
+        return "rejected", "invalid_record_id"
+    end
     if not GO.RecordWithinGossipCap(record) then
         return "rejected", "record_too_large"
     end
@@ -241,6 +244,15 @@ local function ValidateAndApply(record, ctx)
     end
     if tonumber(body.schema) and tonumber(body.schema) ~= GO.PROVIDER_SCHEMA then
         return "rejected", "unsupported_schema"
+    end
+    local normalized, normErr = GO.NormalizePolicy(body)
+    if not normalized then
+        return "rejected", normErr or "malformed"
+    end
+    local expectedFp = GO.PolicyVersionFp(normalized)
+    if type(expectedFp) ~= "string" or expectedFp == ""
+        or tostring(record.versionFp or "") ~= expectedFp then
+        return "rejected", "invalid_version_fp"
     end
     local g = Gossip()
     if not g or type(g.GetGuildMember) ~= "function" then

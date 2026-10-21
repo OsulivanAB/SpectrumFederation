@@ -19,7 +19,8 @@ Guild Info, Guild Supplies, and the one-time Loot Helper admin grant read this p
 - Any verified member can view the effective policy. An officer may change it. Authority is rechecked when the change is committed and when a remote record is admitted.
 - A self-restricting edit is authorized against the previous threshold. After it lands, that officer loses further edit rights.
 - Same-revision concurrent edits keep the lower (more restrictive) threshold. A later revision replaces it, including a deliberate widen by someone who still qualifies. A lower revision is stale.
-- When this client already has a valid policy, a remote sender must meet that known threshold. The predecessor claimed in the incoming record does not grant authority. Same-revision edits are still checked against the shared predecessor. A client with no stored policy can only validate the claimed predecessor, so a cold join can accept a first record it cannot independently verify.
+- When this client already has a valid policy, a remote sender must meet that known threshold. The predecessor claimed in the incoming record does not grant authority. Same-revision edits are still checked against the shared predecessor.
+- A client with no stored policy authorizes the transport sender against the approved default officer cap (`min(3, rankCount)`). That lets an eligible officer relay a GM-created bootstrap after the GM logs off, and it rejects a non-officer who only claims a more permissive predecessor. Local bootstrap and recovery still require a verified Guild Master. Ordinary Gossip fields cannot prove original authorship, so an eligible-by-default officer can still install any valid first-record content.
 - The policy is independent of Guild Supplies datasets, Loot Helper profiles, and Guild Info relationship cleanup.
 
 Disconnected clients may briefly use an older threshold. That limitation is accepted. This is not a consensus log.
@@ -44,7 +45,7 @@ SpectrumFederationDB.guildOfficer = {
 }
 ```
 
-Gossip publishes one current record, `go-p:current`, kind `guild-officer-policy`. A changed fingerprint bumps the Guild Gossip index and the next index pass inserts that current record. A guild switch clears the previous guild's row. There is no per-frame roster poll and no operation history.
+Gossip publishes one current record, `go-p:current`, kind `guild-officer-policy`. Incoming envelopes must use that canonical id and a fingerprint that matches the normalized policy body. A changed fingerprint bumps the Guild Gossip index and the next index pass inserts that current record. A guild switch clears the previous guild's row. There is no per-frame roster poll and no operation history.
 
 ## Consumers
 

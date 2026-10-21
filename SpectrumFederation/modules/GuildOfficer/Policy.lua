@@ -689,11 +689,25 @@ function GO:CommitThreshold(position, opts)
     return "accepted", nil
 end
 
--- Remote admission. A known local policy authorizes the sender against that
--- policy, not against the predecessor claimed in the incoming record.
--- Same-revision edits still authorize against the shared predecessor so a
--- more restrictive concurrent edit is admitted. An empty client can only
--- check the claimed predecessor; that cold-join limitation is accepted.
+-- Approved default officer cap for first-record catch-up. Local bootstrap and
+-- recovery still require a verified Guild Master through Bootstrap().
+local function DefaultOfficerCap(rankCount)
+    rankCount = tonumber(rankCount)
+    if not rankCount or rankCount < 1 then
+        return nil
+    end
+    return math.min(GO.DEFAULT_THRESHOLD, rankCount)
+end
+
+-- Remote admission. The transport sender is a relay, not the original author.
+-- A known local policy authorizes the sender against that policy. Same-revision
+-- edits still authorize against the shared predecessor so a more restrictive
+-- concurrent edit is admitted. An empty client authorizes the sender against
+-- the approved default officer cap so a GM-created record can be relayed by an
+-- eligible officer after the GM logs off, while a non-officer cannot install a
+-- first policy by claiming a permissive predecessor. Ordinary Gossip fields
+-- cannot prove original authorship; an eligible-by-default officer can still
+-- install any valid first-record content.
 local function RemoteSenderAuthorized(remote, member, localPolicy, rankCount)
     if localPolicy then
         local sameGeneration = remote.revN == localPolicy.revN
@@ -723,17 +737,11 @@ local function RemoteSenderAuthorized(remote, member, localPolicy, rankCount)
         end
         return true
     end
-    local authBase = remote.baseThreshold
-    if authBase == GO.BOOTSTRAP_BASE then
-        if member.rankOrder ~= 1 then
-            return false, "policy_requires_gm"
-        end
-        return true
+    local defaultCap = DefaultOfficerCap(rankCount)
+    if not defaultCap then
+        return false, "rank_unavailable"
     end
-    if rankCount and authBase > rankCount then
-        authBase = rankCount
-    end
-    if member.rankOrder > authBase then
+    if member.rankOrder > defaultCap then
         return false, "unauthorized"
     end
     return true

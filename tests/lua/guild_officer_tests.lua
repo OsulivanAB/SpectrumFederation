@@ -292,6 +292,24 @@ local function policy()
     return select(1, GO:GetStoredPolicy("club:42"))
 end
 
+local function wireFor(body)
+    local normalized = assert(GO.NormalizePolicy(body))
+    return {
+        id = GO.RECORD_ID,
+        versionFp = GO.PolicyVersionFp(normalized),
+        body = {
+            kind = "guild-officer-policy",
+            schema = GO.PROVIDER_SCHEMA,
+            guildKey = normalized.guildKey,
+            threshold = normalized.threshold,
+            baseThreshold = normalized.baseThreshold,
+            revN = normalized.revN,
+            revW = normalized.revW,
+            at = normalized.at,
+        },
+    }
+end
+
 ---------------------------------------------------------------------------
 -- Bootstrap, pending sync, and Guild Master recovery
 ---------------------------------------------------------------------------
@@ -456,20 +474,15 @@ do
     status = select(1, GO:ApplyRemotePolicy(widen, alice))
     assertEq(status, "accepted", "Guild Master remote widen is accepted")
     local provider = SF.GuildGossip.GetProvider(GO.PROVIDER_ID)
-    local wireStatus = select(1, provider.spec.ValidateAndApply({
-        id = GO.RECORD_ID,
-        versionFp = "x",
-        body = {
-            kind = "guild-officer-policy",
-            schema = 1,
-            guildKey = "club:42",
-            threshold = 1,
-            baseThreshold = 3,
-            revN = policy().revN + 1,
-            revW = "222222222222222222222222",
-            at = 6,
-        },
-    }, { sender = "Dave-Garona" }))
+    local daveWire = wireFor({
+        guildKey = "club:42",
+        threshold = 1,
+        baseThreshold = 3,
+        revN = policy().revN + 1,
+        revW = "222222222222222222222222",
+        at = 6,
+    })
+    local wireStatus = select(1, provider.spec.ValidateAndApply(daveWire, { sender = "Dave-Garona" }))
     assertEq(wireStatus, "rejected", "gossip rejects an unauthorized sender")
 end
 
@@ -531,7 +544,60 @@ do
     assertEq(status, "accepted", "empty client accepts a normal officer catch-up")
     assertEq(select(1, GO:GetStoredPolicy("club:99")).threshold, 3, "catch-up threshold is stored")
     assertEq(select(1, GO:GetStoredPolicy("club:42")).threshold, 1, "catch-up does not replace the other guild")
+    local forgedCold = {
+        guildKey = "club:99",
+        threshold = 4,
+        baseThreshold = 4,
+        revN = 99,
+        revW = "888888888888888888888888",
+        at = 12,
+    }
+    status = select(1, GO:ApplyRemotePolicy(forgedCold, dave))
+    assertEq(status, "rejected", "empty client rejects a rank-4 fabricated first policy")
+    assertEq(select(1, GO:GetStoredPolicy("club:99")).threshold, 3,
+        "cold-join forgery does not replace the officer catch-up")
+    assertEq(select(1, GO:GetStoredPolicy("club:99")).revN, 4,
+        "cold-join forgery does not advance the revision")
     world.guild.clubId = 42
+end
+
+do
+    -- GM bootstraps, officer holds the record, empty client learns it from the officer.
+    resetDB()
+    GO:Bootstrap()
+    local boot = policy()
+    assertEq(boot.baseThreshold, 0, "bootstrap base is zero")
+    assertEq(boot.threshold, 3, "bootstrap uses the default threshold")
+    local relayBody = {
+        guildKey = boot.guildKey,
+        threshold = boot.threshold,
+        baseThreshold = boot.baseThreshold,
+        revN = boot.revN,
+        revW = boot.revW,
+        at = boot.at,
+    }
+    resetDB()
+    assertNil(policy(), "fresh client starts without a policy")
+    setActor("Bob-Garona", "Player-1-Bob", 2)
+    local bob = SF.GuildGossip.GetGuildMember("Bob-Garona")
+    local status = select(1, GO:ApplyRemotePolicy(relayBody, bob))
+    assertEq(status, "accepted", "officer relays a GM bootstrap while the GM is offline")
+    assertEq(policy().threshold, 3, "relayed bootstrap threshold is stored")
+    assertEq(policy().baseThreshold, 0, "relayed bootstrap base is preserved")
+    assertEq(policy().revN, boot.revN, "relayed bootstrap revision is preserved")
+    setActor("Dave-Garona", "Player-1-Dave", 4)
+    local dave = SF.GuildGossip.GetGuildMember("Dave-Garona")
+    status = select(1, GO:ApplyRemotePolicy({
+        guildKey = "club:42",
+        threshold = 4,
+        baseThreshold = 0,
+        revN = boot.revN + 1,
+        revW = "999999999999999999999999",
+        at = 13,
+    }, dave))
+    assertEq(status, "rejected", "rank 4 cannot replace a known relayed policy")
+    assertEq(policy().threshold, 3, "relayed policy survives a non-officer attempt")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
 end
 
 do
@@ -849,6 +915,130 @@ do
     world.guild.clubId = 42
     drive()
     assertCurrent("return to original guild")
+end
+
+---------------------------------------------------------------------------
+-- Canonical envelope validation through production ApplyRecordToProvider
+---------------------------------------------------------------------------
+
+do
+    SF.GuildGossip._providers = nil
+    loadModule("SpectrumFederation/modules/GuildGossip/01_Constants.lua")
+    loadModule("SpectrumFederation/modules/GuildGossip/02_Util.lua")
+    loadModule("SpectrumFederation/modules/GuildGossip/07_Index.lua")
+    loadModule("SpectrumFederation/modules/GuildGossip/08_Providers.lua")
+    local GG = SF.GuildGossip
+    GG.NotifyMeaningfulChange = GG.NotifyMeaningfulChange or function() end
+    GG.MarkWorkPending = GG.MarkWorkPending or function() end
+    GG.SyncGuildAdapterLifecycle = nil
+    GG.IsGuildReady = function() return false end
+
+    local function resetProviderDB()
+        SpectrumFederationDB = {}
+        world.providerChanged = 0
+        world.timers = 0
+        world.impersonationActive = false
+        world.guild.inGuild = true
+        world.guild.clubId = 42
+        world.guild.rosterComplete = true
+        world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
+        world.guild.members = {
+            { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+            { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+            { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+            { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+        }
+        setActor("Alice-Garona", "Player-1-Alice", 1)
+        SF.GuildGossip._providers = { byId = {}, order = {}, activeCount = 0, discRotate = 0 }
+        GO:Initialize(SpectrumFederationDB)
+        GI:Initialize(SpectrumFederationDB)
+    end
+
+    resetProviderDB()
+    assertTrue(type(GG.RegisterProvider) == "function", "production RegisterProvider is loaded")
+    assertTrue(type(GG.ApplyRecordToProvider) == "function", "production ApplyRecordToProvider is loaded")
+    local okReg = select(1, GO:EnsureGossipProvider())
+    assertEq(okReg, true, "officer provider registers with production Gossip")
+    local entry = GG.GetProvider(GO.PROVIDER_ID)
+    assertTrue(entry ~= nil and entry.index ~= nil, "provider entry has an index")
+    entry.index = GG.CreateIndex()
+
+    local function indexCount()
+        local n = 0
+        for _ in pairs(entry.index.byId or {}) do
+            n = n + 1
+        end
+        return n
+    end
+
+    local function driveExport()
+        local more = true
+        local steps = 0
+        while more do
+            steps = steps + 1
+            if steps > 6 then
+                fail("export index did not converge after ApplyRecordToProvider")
+                return
+            end
+            more = entry.api.EnsureIndex(entry.index, { indexEntries = 8 }) and true or false
+        end
+    end
+
+    GO:Bootstrap()
+    driveExport()
+    local before = policy()
+    local beforeFp = GO.PolicyVersionFp(before)
+    assertEq(indexCount(), 1, "bootstrap export has one indexed row")
+
+    local badId = wireFor({
+        guildKey = "club:42",
+        threshold = 2,
+        baseThreshold = before.threshold,
+        revN = before.revN + 1,
+        revW = "cccccccccccccccccccccccc",
+        at = 30,
+    })
+    badId.id = "go-p:forged"
+    local st = select(1, GG.ApplyRecordToProvider(entry, badId, { sender = "Carol-Garona" }))
+    assertEq(st, "rejected", "ApplyRecordToProvider rejects a noncanonical id")
+    assertEq(policy().revN, before.revN, "bad id does not mutate the policy")
+    assertNil(entry.index.byId["go-p:forged"], "bad id is not indexed")
+    assertEq(indexCount(), 1, "bad id leaves the canonical index alone")
+
+    local badFp = wireFor({
+        guildKey = "club:42",
+        threshold = 2,
+        baseThreshold = before.threshold,
+        revN = before.revN + 1,
+        revW = "dddddddddddddddddddddddd",
+        at = 31,
+    })
+    badFp.versionFp = "deadbeef"
+    st = select(1, GG.ApplyRecordToProvider(entry, badFp, { sender = "Carol-Garona" }))
+    assertEq(st, "rejected", "ApplyRecordToProvider rejects a mismatched fingerprint")
+    assertEq(policy().revN, before.revN, "bad fingerprint does not mutate the policy")
+    assertEq(entry.index.byId[GO.RECORD_ID].versionFp, beforeFp,
+        "bad fingerprint does not replace the indexed version")
+    assertEq(indexCount(), 1, "bad fingerprint leaves one index row")
+
+    local good = wireFor({
+        guildKey = "club:42",
+        threshold = 2,
+        baseThreshold = before.threshold,
+        revN = before.revN + 1,
+        revW = "eeeeeeeeeeeeeeeeeeeeeeee",
+        at = 32,
+    })
+    st = select(1, GG.ApplyRecordToProvider(entry, good, { sender = "Carol-Garona" }))
+    assertEq(st, "accepted", "ApplyRecordToProvider accepts a canonical officer update")
+    assertEq(policy().threshold, 2, "canonical update mutates the stored threshold")
+    driveExport()
+    assertEq(indexCount(), 1, "accepted update keeps one canonical index row")
+    assertEq(entry.index.byId[GO.RECORD_ID].versionFp, GO.PolicyVersionFp(policy()),
+        "accepted update indexes the durable fingerprint")
+    local export = entry.api.GetRecordBody(GO.RECORD_ID)
+    assertEq(export and export.body and export.body.threshold, 2, "export body matches the update")
+    assertEq(export and export.id, GO.RECORD_ID, "export keeps the canonical id")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
