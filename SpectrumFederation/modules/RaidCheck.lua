@@ -691,6 +691,13 @@ local function IsSlotLinkPotentiallyIncomplete(slotsByInventory, inventorySlot)
 		return false
 	end
 
+	-- Player inventory links from GetInventoryItemLink("player") are authoritative.
+	-- The inspect-stub heuristic must not treat an unenchanted local item without
+	-- bonus IDs as still-loading; that falsely burned Raid Check attempt caps.
+	if slotData.authoritative == true then
+		return false
+	end
+
 	local link = slotData.link
 	local itemString = link:match("item:([%-%d:]+)")
 	if not itemString then
@@ -1044,6 +1051,8 @@ local function CaptureTroubleshootingInventory(unit)
 				itemId = itemId,
 				texture = texture,
 				itemLevel = itemLevel,
+				-- Local player captures are never inspect stubs.
+				authoritative = IsSelfUnit(unit) and true or nil,
 			}
 			slotData.hasItem = SlotHasAnyItemData(slotData)
 			slotsByInventory[inventorySlot] = slotData
@@ -1890,6 +1899,7 @@ function RC:_ReconcileFrozenTargets()
 		return
 	end
 
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 	for _, memberId in ipairs(run.targetIds) do
 		local player = run.players and run.players[memberId]
 		if player then
@@ -1900,6 +1910,14 @@ function RC:_ReconcileFrozenTargets()
 				local guid = GetAccessibleUnitGUID(unit)
 				if guid then
 					player.guid = guid
+				end
+				-- Keep currentlyInspectable live so OOR unvisited targets do not
+				-- stall InitialAcquisitionIncomplete / starve pending retries.
+				local canInspectNow = CanInspectUnitNow(unit) and true or false
+				if CheckRun and CheckRun.UpdateReachability then
+					CheckRun.UpdateReachability(player, canInspectNow)
+				else
+					player.currentlyInspectable = canInspectNow
 				end
 			else
 				player.leftGroup = true
@@ -1939,7 +1957,16 @@ function RC:_HandleInspectTimeout(key, requestedAt)
 	if state.adhocRun and CheckRun then
 		local player = active.id and state.adhocRun.players and state.adhocRun.players[active.id]
 		if player then
+			player.lastIncompleteReason = "timeout"
 			CheckRun.MarkAttempt(player, "timeout", true)
+			if SF.Debug and SF.Debug.Verbose then
+				SF.Debug:Verbose(
+					"RAID_CHECK",
+					"Inspect attempt timeout for %s (generation=%s)",
+					tostring(active.id),
+					tostring(active.generation)
+				)
+			end
 		end
 	end
 	if ClearInspectPlayer then
@@ -2317,9 +2344,9 @@ function RC:_HandleInspectReady(guid)
 		if state.adhocRun and CheckRun and active.id then
 			local player = state.adhocRun.players and state.adhocRun.players[active.id]
 			if player then
-				CheckRun.NoteProgress(state.adhocRun, now)
 				if policyResult and policyResult.complete then
-					CheckRun.MarkAttempt(player, "complete", true)
+					CheckRun.MarkAttempt(player, "complete", true, now)
+					player.lastIncompleteReason = nil
 					player.freshObservation = {
 						complete = true,
 						policy = policyResult,
@@ -2329,8 +2356,37 @@ function RC:_HandleInspectReady(guid)
 					player.policyResult = policyResult
 					player.technicalFailure = false
 					player.lastGood = state.lastGood[active.id]
+					CheckRun.NoteProgress(state.adhocRun, now)
 				else
-					CheckRun.MarkAttempt(player, "incomplete", true)
+					local reason = (policyResult and policyResult.incompleteReason) or "incomplete"
+					player.lastIncompleteReason = reason
+					local kind = CheckRun.AttemptKindForIncompleteReason
+						and CheckRun.AttemptKindForIncompleteReason(reason)
+						or "incomplete"
+					-- Evaluate progress before MarkAttempt so first-time pending
+					-- still counts as acquisition evidence.
+					local countsAsProgress = not CheckRun.AttemptCountsAsProgress
+						or CheckRun.AttemptCountsAsProgress(kind, player)
+					CheckRun.MarkAttempt(player, kind, true, now)
+					-- Repeated pending/link-loading must not refresh no-progress.
+					-- Preserve the per-player retry gate across queue rebuilds.
+					if countsAsProgress then
+						CheckRun.NoteProgress(state.adhocRun, now)
+					elseif player.nextPendingRetryAt then
+						entry.nextRetryAt = player.nextPendingRetryAt
+					end
+					if SF.Debug and SF.Debug.Verbose then
+						SF.Debug:Verbose(
+							"RAID_CHECK",
+							"Inspect attempt %s for %s (reason=%s blended=%s nextRetry=%s progress=%s)",
+							tostring(kind),
+							tostring(active.id),
+							tostring(reason),
+							tostring(entry.blended == true),
+							tostring(player.nextPendingRetryAt),
+							tostring(countsAsProgress)
+						)
+					end
 				end
 			end
 		end
@@ -2362,7 +2418,15 @@ function RC:_HandleInspectReady(guid)
 			local player = state.adhocRun.players and state.adhocRun.players[active.id]
 			if player then
 				CheckRun.NoteProgress(state.adhocRun, now)
+				player.lastIncompleteReason = "no_capture_data"
 				CheckRun.MarkAttempt(player, "incomplete", true)
+				if SF.Debug and SF.Debug.Verbose then
+					SF.Debug:Verbose(
+						"RAID_CHECK",
+						"Inspect attempt incomplete for %s (reason=no_capture_data)",
+						tostring(active.id)
+					)
+				end
 			end
 		end
 	end
@@ -3477,19 +3541,32 @@ local function ModeLabel(mode)
 end
 
 local function QueueFrozenInspectTargets(self, run)
+	local now = GetTime and GetTime() or 0
 	for _, memberId in ipairs(run.targetIds or {}) do
 		local player = run.players and run.players[memberId]
 		local unit = (player and player.unitHint) or FindUnitByGuidOrId(player and player.guid, memberId)
 		if unit and not IsSelfUnit(unit) then
 			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
-			if CheckRun and CheckRun.PlayerNeedsMoreInspects and not CheckRun.PlayerNeedsMoreInspects(player) then
-				-- Already complete, or this target has used its inspect attempt cap.
+			local mayQueue = CheckRun
+				and (
+					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now, run))
+					or (
+						not CheckRun.PlayerMayQueueInspect
+						and CheckRun.PlayerNeedsMoreInspects
+						and CheckRun.PlayerNeedsMoreInspects(player)
+					)
+				)
+			if not mayQueue then
+				-- Complete, attempt-capped, pending gate, or deferred until the
+				-- first inspect sweep finishes for every reachable target.
+				-- Do not clear cache nextRetryAt while rebuilding the frozen queue.
 			else
 				local info = BuildUnitInfo(unit)
 				info.id = memberId
 				local aliases = self:_GetInspectAliases(unit, info)
 				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
-				if type(cacheEntry) == "table" then
+				-- Preserve timeout/pending backoff. Only drop a gate that has expired.
+				if type(cacheEntry) == "table" and cacheEntry.nextRetryAt and cacheEntry.nextRetryAt <= now then
 					cacheEntry.nextRetryAt = nil
 				end
 				self:_QueueInspectForUnit(unit, info, cacheEntry)
@@ -3497,42 +3574,83 @@ local function QueueFrozenInspectTargets(self, run)
 		elseif player and IsSelfUnit(unit) then
 			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 			local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
-			if CheckRun and CheckRun.PlayerNeedsMoreInspects and not CheckRun.PlayerNeedsMoreInspects(player) then
-				-- Already complete, or this target has used its local capture cap.
+			local mayQueue = CheckRun
+				and (
+					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now, run))
+					or (
+						not CheckRun.PlayerMayQueueInspect
+						and CheckRun.PlayerNeedsMoreInspects
+						and CheckRun.PlayerNeedsMoreInspects(player)
+					)
+				)
+			if not mayQueue then
+				-- Already complete, attempt-capped, pending gate, or deferred
+				-- until the first inspect sweep finishes.
 			elseif CheckRun and Policy then
-				local captured = self:_GetLocalTroubleshootingSnapshot()
-				if captured then
-					local now = GetTime and GetTime() or 0
-					local observation = BuildPolicyObservation(captured)
-					local policyResult = Policy.EvaluateObservation(observation, run.cfg)
-					if policyResult and policyResult.complete then
-						CheckRun.MarkAttempt(player, "complete", true)
-						player.freshObservation = {
-							complete = true,
-							policy = policyResult,
-							observation = observation,
-							capturedAt = now,
-						}
-						player.policyResult = policyResult
-						player.technicalFailure = false
-						local state = self:_GetInspectState()
-						state.lastGood = state.lastGood or {}
-						state.lastGood[memberId] = {
-							capturedAt = now,
-							complete = true,
-							policy = policyResult,
-							observation = observation,
-						}
-						player.lastGood = state.lastGood[memberId]
-						CheckRun.NoteProgress(run, now)
-					else
-						-- Incomplete local data, including a missing equipped item
-						-- level while the requirement is active, is an inspect
-						-- failure. Drop the cached capture so a later tick can
-						-- read a usable Blizzard value. The attempt cap bounds it.
-						CheckRun.MarkAttempt(player, "incomplete", true)
-						CheckRun.NoteProgress(run, now)
-						self:_InvalidateLocalTroubleshootingSnapshot()
+				-- Space local captures like a remote inspect wait so a single
+				-- unresolved item-level or socket read cannot burn the attempt
+				-- cap across consecutive 0.25s ad-hoc ticks.
+				local minGap = CheckRun.PER_INSPECT_ACTIVE_WAIT or 2.0
+				local lastAt = tonumber(player.lastLocalCaptureAt)
+				if lastAt and (now - lastAt) < minGap then
+					-- Wait for the next spaced capture.
+				else
+					player.lastLocalCaptureAt = now
+					local captured = self:_GetLocalTroubleshootingSnapshot()
+					if captured then
+						local observation = BuildPolicyObservation(captured)
+						local policyResult = Policy.EvaluateObservation(observation, run.cfg)
+						if policyResult and policyResult.complete then
+							CheckRun.MarkAttempt(player, "complete", true, now)
+							player.lastIncompleteReason = nil
+							player.freshObservation = {
+								complete = true,
+								policy = policyResult,
+								observation = observation,
+								capturedAt = now,
+							}
+							player.policyResult = policyResult
+							player.technicalFailure = false
+							local state = self:_GetInspectState()
+							state.lastGood = state.lastGood or {}
+							state.lastGood[memberId] = {
+								capturedAt = now,
+								complete = true,
+								policy = policyResult,
+								observation = observation,
+							}
+							player.lastGood = state.lastGood[memberId]
+							CheckRun.NoteProgress(run, now)
+						else
+							-- Incomplete local data, including a missing equipped item
+							-- level while the requirement is active, is an inspect
+							-- failure (or pending when links are still loading).
+							-- Drop the cached capture so a later spaced tick can
+							-- read a usable Blizzard value. The attempt cap bounds
+							-- non-pending failures; pending does not refresh progress.
+							local reason = (policyResult and policyResult.incompleteReason) or "incomplete"
+							player.lastIncompleteReason = reason
+							local kind = CheckRun.AttemptKindForIncompleteReason
+								and CheckRun.AttemptKindForIncompleteReason(reason)
+								or "incomplete"
+							local countsAsProgress = not CheckRun.AttemptCountsAsProgress
+								or CheckRun.AttemptCountsAsProgress(kind, player)
+							CheckRun.MarkAttempt(player, kind, true, now)
+							if countsAsProgress then
+								CheckRun.NoteProgress(run, now)
+							end
+							self:_InvalidateLocalTroubleshootingSnapshot()
+							if SF.Debug and SF.Debug.Verbose then
+								SF.Debug:Verbose(
+									"RAID_CHECK",
+									"Local capture attempt %s for %s (reason=%s progress=%s)",
+									tostring(kind),
+									tostring(memberId),
+									tostring(reason),
+									tostring(countsAsProgress)
+								)
+							end
+						end
 					end
 				end
 			end
@@ -3609,10 +3727,34 @@ function RC:_ApplyCheckConsequences(run)
 		local classId = classified and classified.class or nil
 
 		if classId == CheckRun.CLASS.INSPECTION_FAILED then
+			local failDetail = "Inspect attempt failed"
+			if player then
+				local kind = player.lastAttemptKind
+				local reason = player.lastIncompleteReason
+				if kind or reason then
+					failDetail = string.format(
+						"Inspect attempt failed (%s%s%s)",
+						tostring(kind or "unknown"),
+						reason and "/" or "",
+						reason and tostring(reason) or ""
+					)
+				end
+				if SF.Debug and SF.Debug.Info then
+					SF.Debug:Info(
+						"RAID_CHECK",
+						"Inspection Failed detail member=%s kind=%s reason=%s attempts=%s pending=%s",
+						tostring(memberId),
+						tostring(kind),
+						tostring(reason),
+						tostring(player.attemptCount or 0),
+						tostring(player.pendingAttemptCount or 0)
+					)
+				end
+			end
 			summaryFailed[#summaryFailed + 1] = {
 				name = info.short or ShortName(memberId),
 				displayName = displayName,
-				inspectFailed = "Inspect attempt failed",
+				inspectFailed = failDetail,
 			}
 		elseif classId == CheckRun.CLASS.UNPREPARED or classId == CheckRun.CLASS.UNPREPARED_AVAILABILITY then
 			local missing = classified.missing
@@ -3997,7 +4139,10 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 		if player then
 			player.unitHint = unit
 			player.guid = unit and GetAccessibleUnitGUID(unit) or nil
-			if unit and CanInspectUnitNow(unit) then
+			local canInspectNow = unit and CanInspectUnitNow(unit) and true or false
+			if CheckRun.UpdateReachability then
+				CheckRun.UpdateReachability(player, canInspectNow)
+			elseif canInspectNow then
 				player.currentlyInspectable = true
 			end
 		end
