@@ -1469,7 +1469,7 @@ local function Definition()
 						set = function() end,
 						enabled = function()
 							local c = Caps()
-							return (c.canEdit or c.canRecoverPolicy) and #AdoptionSourceOptions() > 0
+							return c.canEdit == true and #AdoptionSourceOptions() > 0
 						end,
 						getDisabledTooltip = DisabledAdoptionSourceTip,
 						onValueChanged = function(ctx, value)
@@ -1497,7 +1497,7 @@ local function Definition()
 							local c = Caps()
 							local g = GS()
 							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-							return (c.canEdit or c.canRecoverPolicy)
+							return c.canEdit == true
 								and pendingAdoptionPeer ~= nil
 								and pendingAdoptionDataset ~= nil
 								and type(adop) ~= "table"
@@ -1517,7 +1517,7 @@ local function Definition()
 							local c = Caps()
 							local g = GS()
 							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-							return (c.canEdit or c.canRecoverPolicy)
+							return c.canEdit == true
 								and type(adop) == "table"
 								and adop.ready == true
 								and type(adop.replayTemp) ~= "table"

@@ -55,6 +55,9 @@ local world = {
     impersonationActive = false,
     providerChanged = 0,
     timers = 0,
+    reopenUnresolved = {},
+    reopenCoverage = {},
+    meaningfulChange = 0,
 }
 
 function GetTime() return world.time end
@@ -218,6 +221,27 @@ SF.GuildGossip = {
     NotifyProviderChanged = function()
         world.providerChanged = world.providerChanged + 1
     end,
+    ReopenUnresolvedEnumeration = function(providerId)
+        world.reopenUnresolved[#world.reopenUnresolved + 1] = providerId
+        -- Mirror production reopen: clear matching unresolved obligations so a
+        -- later pull can retry without waiting for the unresolved TTL.
+        if type(world.unresolved) == "table" then
+            for key, item in pairs(world.unresolved) do
+                if not providerId or (item and item.providerId == providerId) then
+                    world.unresolved[key] = nil
+                end
+            end
+        end
+    end,
+    ReopenProviderCoverage = function(providerId)
+        world.reopenCoverage[#world.reopenCoverage + 1] = providerId
+        if type(world.covered) == "table" and providerId then
+            world.covered[providerId] = nil
+        end
+    end,
+    NotifyMeaningfulChange = function()
+        world.meaningfulChange = world.meaningfulChange + 1
+    end,
     IndexUpsert = function(index, recordId, versionFp)
         index.byId = index.byId or {}
         index.byId[tostring(recordId)] = { versionFp = tostring(versionFp or "") }
@@ -272,6 +296,11 @@ local function resetDB()
     world.providerChanged = 0
     world.timers = 0
     world.impersonationActive = false
+    world.reopenUnresolved = {}
+    world.reopenCoverage = {}
+    world.meaningfulChange = 0
+    world.unresolved = {}
+    world.covered = {}
     world.guild.inGuild = true
     world.guild.clubId = 42
     world.guild.rosterComplete = true
@@ -284,6 +313,9 @@ local function resetDB()
     }
     setActor("Alice-Garona", "Player-1-Alice", 1)
     SF.GuildGossip._providers = {}
+    if GO.ClearUIListeners then
+        GO.ClearUIListeners()
+    end
     GO:Initialize(SpectrumFederationDB)
     GI:Initialize(SpectrumFederationDB)
 end
@@ -503,7 +535,9 @@ do
     assertEq(status, "rejected", "rank 4 fabricated predecessor is rejected")
     assertEq(policy().threshold, 3, "fabricated predecessor does not change the threshold")
     assertEq(policy().revN, established.revN, "fabricated predecessor does not advance the revision")
-    local alice = SF.GuildGossip.GetGuildMember("Alice-Garona")
+    -- Non-GM bootstrap/recovery against an established policy stays rejected.
+    -- Verified GM recovery with a newer revision is covered by a dedicated case.
+    local carolRelay = SF.GuildGossip.GetGuildMember("Carol-Garona")
     local replay = {
         guildKey = "club:42",
         threshold = 1,
@@ -512,9 +546,9 @@ do
         revW = "777777777777777777777777",
         at = 9,
     }
-    status = select(1, GO:ApplyRemotePolicy(replay, alice))
-    assertEq(status, "rejected", "bootstrap replay does not replace a known policy")
-    assertEq(policy().threshold, 3, "known policy survives a bootstrap replay")
+    status = select(1, GO:ApplyRemotePolicy(replay, carolRelay))
+    assertEq(status, "rejected", "non-GM bootstrap replay does not replace a known policy")
+    assertEq(policy().threshold, 3, "known policy survives a non-GM bootstrap replay")
     setActor("Carol-Garona", "Player-1-Carol", 3)
     assertEq(select(1, GO:CommitThreshold(2)), "accepted", "rank 3 officer can still tighten locally")
     local afterLocal = policy()
@@ -959,7 +993,14 @@ end
 
 do
     -- C2) Listener errors restore the latch and forward to geterrorhandler.
-    resetDB()
+    -- Isolate Gossip delivery so a failing listener cannot leak into later tests.
+    local ns = { GuildOfficer = {} }
+    for k, v in pairs(GO) do
+        ns.GuildOfficer[k] = v
+    end
+    assert(loadfile("SpectrumFederation/modules/GuildOfficer/Gossip.lua"))(
+        "SpectrumFederation", ns)
+    local G = ns.GuildOfficer
     local handled = {}
     local priorHandler = geterrorhandler
     geterrorhandler = function()
@@ -968,20 +1009,23 @@ do
         end
     end
     local calls = 0
-    GO.RegisterUIListener(function()
+    G.RegisterUIListener(function()
         error("listener-boom")
     end)
-    GO.RegisterUIListener(function()
+    G.RegisterUIListener(function()
         calls = calls + 1
     end)
-    GO.NotifyUI("probe")
+    G.NotifyUI("probe")
     assertEq(#handled, 1, "first listener error reaches geterrorhandler")
     assertTrue(tostring(handled[1]):find("listener-boom", 1, true) ~= nil,
         "geterrorhandler receives the listener error text")
     assertEq(calls, 1, "later listeners still run after a failing listener")
-    GO.NotifyUI("probe-2")
+    G.NotifyUI("probe-2")
     assertEq(calls, 2, "notification latch is not wedged after a listener error")
     geterrorhandler = priorHandler
+    if G.ClearUIListeners then
+        G.ClearUIListeners()
+    end
 end
 
 do
@@ -996,6 +1040,139 @@ do
     msg = select(1, GO.FormatFeedback("rejected", "revision_exhausted"))
     assertEq(msg, "That officer-rank update is too far ahead to apply safely.",
         "revision_exhausted uses revision Loc text")
+end
+
+---------------------------------------------------------------------------
+-- PR #408 repair: reopen dependents, GM recovery converge
+---------------------------------------------------------------------------
+
+do
+    -- Dependent Guild Info / Guild Supplies obligations reopen when policy lands.
+    resetDB()
+    SF.GuildSupplies = SF.GuildSupplies or {}
+    SF.GuildSupplies.PROVIDER_ID = "sf.guildsupplies.config"
+    world.reopenUnresolved = {}
+    world.reopenCoverage = {}
+    world.meaningfulChange = 0
+    world.providerChanged = 0
+    world.unresolved = {
+        ["gi-before-policy"] = {
+            providerId = GI.PROVIDER_ID,
+            recordId = "gi-rel-1",
+            result = "rejected",
+            reason = "policy_unknown",
+        },
+    }
+    world.covered = { [GI.PROVIDER_ID] = true }
+
+    local function admitDependent()
+        if not select(1, GO:GetStoredPolicy("club:42")) then
+            return "rejected", "policy_unknown"
+        end
+        return "accepted", nil
+    end
+    assertEq(select(1, admitDependent()), "rejected",
+        "dependent record rejected before officer policy")
+    assertTrue(world.unresolved["gi-before-policy"] ~= nil,
+        "rejected dependent retained as unresolved before policy")
+
+    assertEq(select(1, GO:Bootstrap()), "accepted", "policy establish triggers dependent reopen")
+    local function contains(list, want)
+        for i = 1, #list do
+            if list[i] == want then return true end
+        end
+        return false
+    end
+    assertTrue(contains(world.reopenUnresolved, GI.PROVIDER_ID),
+        "bootstrap reopens Guild Info unresolved enumeration")
+    assertTrue(contains(world.reopenUnresolved, "sf.guildsupplies.config"),
+        "bootstrap reopens Guild Supplies unresolved enumeration")
+    assertTrue(contains(world.reopenCoverage, GI.PROVIDER_ID),
+        "bootstrap reopens Guild Info provider coverage")
+    assertTrue(contains(world.reopenCoverage, "sf.guildsupplies.config"),
+        "bootstrap reopens Guild Supplies provider coverage")
+    assertNil(world.unresolved["gi-before-policy"],
+        "policy arrival clears unresolved dependent obligation for retry")
+    assertNil(world.covered[GI.PROVIDER_ID],
+        "policy arrival clears dependent coverage for retry")
+    assertEq(select(1, admitDependent()), "accepted",
+        "retried dependent record admits after policy without TTL wait")
+    assertTrue(world.meaningfulChange >= 1, "bootstrap notifies meaningful gossip work")
+    assertTrue(world.providerChanged >= 1, "bootstrap still notifies the officer provider")
+    assertTrue(next(world.unresolved) == nil, "processing has no unresolved obligations")
+
+    world.reopenUnresolved = {}
+    world.reopenCoverage = {}
+    world.meaningfulChange = 0
+    assertEq(select(1, GO:CommitThreshold(2)), "accepted", "commit also reopens dependents")
+    assertTrue(contains(world.reopenUnresolved, GI.PROVIDER_ID),
+        "commit reopens Guild Info unresolved enumeration")
+    assertTrue(contains(world.reopenUnresolved, "sf.guildsupplies.config"),
+        "commit reopens Guild Supplies unresolved enumeration")
+    assertTrue(world.meaningfulChange >= 1, "commit notifies meaningful gossip work")
+end
+
+do
+    -- Verified GM recovery converges with established replicas; non-GM forgery fails.
+    resetDB()
+    GO:Bootstrap()
+    setActor("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(select(1, GO:CommitThreshold(2)), "accepted", "establish a non-bootstrap policy")
+    local established = policy()
+    assertEq(established.threshold, 2, "established threshold 2")
+    assertTrue(established.baseThreshold ~= 0, "established base is not bootstrap")
+
+    local alice = SF.GuildGossip.GetGuildMember("Alice-Garona")
+    local recovery = {
+        guildKey = "club:42",
+        threshold = 3,
+        baseThreshold = 0,
+        revN = established.revN + 1,
+        revW = "ffffffffffffffffffffffff",
+        at = 80,
+    }
+    local st, reason = GO:ApplyRemotePolicy(recovery, alice)
+    assertEq(st, "accepted", "verified GM recovery reaches an established replica")
+    assertEq(policy().threshold, 3, "GM recovery stores the recovered threshold")
+    assertEq(policy().baseThreshold, 0, "GM recovery keeps bootstrap base")
+    assertEq(policy().revN, established.revN + 1, "GM recovery advances revision")
+
+    -- Reset to established and reject non-GM forged recovery.
+    resetDB()
+    GO:Bootstrap()
+    setActor("Bob-Garona", "Player-1-Bob", 2)
+    GO:CommitThreshold(2)
+    established = policy()
+    local carol = SF.GuildGossip.GetGuildMember("Carol-Garona")
+    local forged = {
+        guildKey = "club:42",
+        threshold = 4,
+        baseThreshold = 0,
+        revN = established.revN + 1,
+        revW = "111111111111111111111111",
+        at = 81,
+    }
+    st, reason = GO:ApplyRemotePolicy(forged, carol)
+    assertEq(st, "rejected", "non-GM forged recovery is rejected")
+    assertEq(reason, "already_established",
+        "non-GM recovery reason already_established got=" .. tostring(reason))
+    assertEq(policy().threshold, 2, "forged recovery does not replace established state")
+    assertEq(policy().revN, established.revN, "forged recovery does not advance revision")
+
+    -- Stale lower-revision GM recovery stays rejected.
+    local stale = {
+        guildKey = "club:42",
+        threshold = 1,
+        baseThreshold = 0,
+        revN = established.revN,
+        revW = "222222222222222222222222",
+        at = 82,
+    }
+    st, reason = GO:ApplyRemotePolicy(stale, alice)
+    assertEq(st, "rejected", "same-or-lower revision GM recovery is rejected")
+    assertTrue(reason == "already_established" or reason == "stale" or reason == "duplicate",
+        "stale recovery reason fail-closed got=" .. tostring(reason))
+    assertEq(policy().threshold, 2, "stale recovery leaves established threshold")
 end
 
 ---------------------------------------------------------------------------

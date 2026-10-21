@@ -772,6 +772,16 @@ local function RemoteSenderAuthorized(remote, member, localPolicy, rankCount)
             return true
         end
         if remote.baseThreshold == GO.BOOTSTRAP_BASE then
+            -- Verified Guild Master recovery writes baseThreshold=0 with a newer
+            -- revision. Established peers must accept that authenticated recovery
+            -- so a corrupt local SV entry can converge again. Non-GM forgery and
+            -- non-newer recovery records stay rejected.
+            if member.rankOrder == 1
+                and tonumber(remote.revN)
+                and tonumber(localPolicy.revN)
+                and remote.revN > localPolicy.revN then
+                return true
+            end
             return false, "already_established"
         end
         local effective = EffectiveThreshold(localPolicy, rankCount)

@@ -229,9 +229,10 @@ function GS:GetCapabilities()
 
     if ctx.ready and type(ctx.rankOrder) == "number" then
         local isGM = (ctx.rankOrder == 1)
-        -- GM may still repair a corrupt historical permission record. That does
-        -- not grant ordinary edits, and it is not the shared officer threshold.
-        result.canRecoverPolicy = isGM and true or false
+        -- Historical permission repair is GM-only and only when that record is
+        -- actually corrupt. It must not authorize ordinary edits, initialization,
+        -- or adoption while the shared officer policy is unknown.
+        result.canRecoverPolicy = false
         local sharedPos, sharedReason = GS.SharedOfficerThreshold()
         local permissionBroken = recordReason
             and GS._IsPermissionOnlyFailure
@@ -239,7 +240,6 @@ function GS:GetCapabilities()
 
         if PreviewNonAdminActive() then
             result.canEdit = false
-            result.canRecoverPolicy = false
             result.reason = "preview_non_admin"
         elseif GS.IsBootstrapEditLocked and GS.IsBootstrapEditLocked(ctx.guildKey) then
             -- Descriptor-first install: replication continues, local edits blocked
@@ -253,9 +253,7 @@ function GS:GetCapabilities()
         elseif not sharedPos then
             result.canEdit = false
             result.reason = sharedReason or "policy_unknown"
-            if sharedPos == nil then
-                result.editorRankPosition = nil
-            end
+            result.editorRankPosition = nil
         elseif ctx.rankOrder <= sharedPos
             and (recordReason == "not_configured" or record ~= nil) then
             result.canEdit = true

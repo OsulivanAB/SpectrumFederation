@@ -383,18 +383,18 @@ function GS.SenderHasEditorAuthority(member, opts)
         end
         return false, "policy_requires_gm"
     end
-    -- Descriptor catch-up still checks the historical predecessor when it fits the
-    -- current rank list. Out-of-range retained metadata is not live authority.
+    -- Descriptor catch-up may proceed while bootstrap-locked, but current
+    -- admission still uses the shared officer policy and verified native ranks.
+    -- Historical editorRankPosition is ancestry metadata only.
     if opts.allowPolicyCatchUp then
-        local catchUpPos = policyPos
-        if rankCount and catchUpPos and catchUpPos > rankCount then
-            local sharedPos, sharedReason = GS.SharedOfficerThreshold and GS.SharedOfficerThreshold()
-            if not sharedPos then
-                return false, sharedReason or "policy_unknown"
-            end
-            catchUpPos = sharedPos
+        if not rankCount or rankCount < 1 then
+            return false, "not_ready"
         end
-        if catchUpPos and member.rankOrder <= catchUpPos then
+        local sharedPos, sharedReason = GS.SharedOfficerThreshold and GS.SharedOfficerThreshold()
+        if not sharedPos then
+            return false, sharedReason or "policy_unknown"
+        end
+        if member.rankOrder <= sharedPos then
             return true, nil
         end
         return false, "unauthorized"
@@ -1996,7 +1996,10 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         return nil, "rejected", (ctx and ctx.reason) or "not_ready"
     end
     local caps = GS:GetCapabilities()
-    if not caps.canEdit and not caps.canRecoverPolicy then
+    -- Adoption is ordinary editor work. Historical permission recovery must not
+    -- unlock adoption while the shared officer policy is unknown or while the
+    -- local dataset only needs permission repair.
+    if not caps.canEdit then
         return nil, "rejected", caps.reason or "unauthorized"
     end
     local member, mReason = GS.AuthenticateTransportSender(sourcePeer)
@@ -6855,8 +6858,8 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
     -- Descriptor-first catch-up: while bootstrap-locked, a SET_EDITOR_RANK whose
     -- basePolicyRevision equals the current predecessor policy may admit under
     -- allowPolicyCatchUp. Matching the final advertised ID alone is not authority;
-    -- SenderHasEditorAuthority still validates the sender under the predecessor
-    -- policy position. Ordinary non-rank mutations stay locked / relay-retained.
+    -- SenderHasEditorAuthority still validates the sender under the shared officer
+    -- policy. Ordinary non-rank mutations stay locked / relay-retained.
     local bootstrapLocked = GS.IsBootstrapEditLocked
         and GS.IsBootstrapEditLocked(member.guildKey, record)
     local currentPolicy = record.permission and record.permission.revisionId

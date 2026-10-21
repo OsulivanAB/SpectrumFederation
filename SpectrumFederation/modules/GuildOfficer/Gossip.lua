@@ -333,6 +333,14 @@ function GO.RegisterUIListener(fn)
     return fn
 end
 
+--- Drop all UI listeners. Production pages keep lifelong hooks; tests use this
+-- to isolate notification delivery between cases.
+function GO.ClearUIListeners()
+    for i = #uiListeners, 1, -1 do
+        uiListeners[i] = nil
+    end
+end
+
 local function DeliverUINotify(reason)
     if uiNotifying then
         uiNotifyQueued = true
@@ -363,12 +371,49 @@ function GO.NotifyUI(reason)
     DeliverUINotify(reason)
 end
 
+local function DependentProviderIds()
+    local ids = {}
+    local gi = SF.GuildInfo
+    if gi and type(gi.PROVIDER_ID) == "string" and gi.PROVIDER_ID ~= "" then
+        ids[#ids + 1] = gi.PROVIDER_ID
+    end
+    local gs = SF.GuildSupplies
+    if gs and type(gs.PROVIDER_ID) == "string" and gs.PROVIDER_ID ~= "" then
+        ids[#ids + 1] = gs.PROVIDER_ID
+    end
+    return ids
+end
+
+--- Guild Info / Guild Supplies may have been rejected with policy_unknown before
+-- this policy existed. Reopen their unresolved pull obligations so admission can
+-- retry without waiting for the normal unresolved TTL.
+local function ReopenDependentProviderObligations()
+    local g = Gossip()
+    if not g then
+        return
+    end
+    local ids = DependentProviderIds()
+    for i = 1, #ids do
+        local pid = ids[i]
+        if type(g.ReopenUnresolvedEnumeration) == "function" then
+            g.ReopenUnresolvedEnumeration(pid)
+        end
+        if type(g.ReopenProviderCoverage) == "function" then
+            g.ReopenProviderCoverage(pid)
+        end
+    end
+    if #ids > 0 and type(g.NotifyMeaningfulChange) == "function" then
+        g.NotifyMeaningfulChange()
+    end
+end
+
 function GO.NotifyLocalChange(reason)
     exportDirty = true
     local g = Gossip()
     if g and g.NotifyProviderChanged then
         g.NotifyProviderChanged(GO.PROVIDER_ID)
     end
+    ReopenDependentProviderObligations()
     GO.NotifyUI(reason)
 end
 

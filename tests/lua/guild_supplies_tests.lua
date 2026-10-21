@@ -7612,6 +7612,77 @@ do
     end
     runDisabledTooltipTests()
 
+    -- C1 runtime: officer-policy listener lifecycle on the real Settings page harness.
+    do
+        local GO = SF.GuildOfficer
+        if GO.ClearUIListeners then
+            GO.ClearUIListeners()
+        end
+        local regCount = 0
+        local realReg = GO.RegisterUIListener
+        GO.RegisterUIListener = function(fn)
+            regCount = regCount + 1
+            return realReg(fn)
+        end
+        -- Reload page module so officerHooked / Page.__sfOfficerHook start clean.
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+        configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+        assertTrue(configPage ~= nil, "C1: configuration page reloaded")
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+
+        local refreshCount = 0
+        local realRefresh = configPage.Refresh
+        configPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+
+        local listenPanel = makeRegion("Frame", "GSOfficerListenPanel", nil)
+        listenPanel:SetSize(600, 800)
+        listenPanel.shown = true
+        configPage:Build(listenPanel)
+        local listenPanel2 = makeRegion("Frame", "GSOfficerListenPanel2", nil)
+        listenPanel2:SetSize(600, 800)
+        listenPanel2.shown = true
+        configPage:Build(listenPanel2)
+        for _ = 1, 5 do
+            configPage:Refresh(listenPanel)
+        end
+        assertEq(regCount, 1, "C1: repeated Build/Refresh registers one officer listener")
+
+        timers = {}
+        local beforeRefresh = refreshCount
+        GO.NotifyUI("remote-policy")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertTrue(refreshCount > beforeRefresh,
+            "C1: officer policy notify refreshes a visible Settings page")
+
+        listenPanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        timers = {}
+        beforeRefresh = refreshCount
+        GO.NotifyUI("remote-policy-hidden")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertEq(refreshCount, beforeRefresh,
+            "C1: hidden Settings do not refresh on officer policy notify")
+
+        GO.RegisterUIListener = realReg
+        configPage.Refresh = realRefresh
+        if GO.ClearUIListeners then
+            GO.ClearUIListeners()
+        end
+    end
+
     CreateFrame = priorCreateFrame
     C_Timer.After = priorAfter
     world.guild.ranks = { "Guild Master", "Officer", "Veteran", "Member", "Initiate" }
@@ -27130,21 +27201,144 @@ do
 end
 
 do
-    -- C1) Guild Supplies configuration registers one officer-policy UI listener.
-    local src = assert(io.open(
-        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r"))
-    local body = src:read("*a")
-    src:close()
-    assertTrue(body:find("EnsureOfficerListener", 1, true) ~= nil,
-        "C1: EnsureOfficerListener present")
-    assertTrue(body:find("GO.RegisterUIListener(function", 1, true) ~= nil,
-        "C1: RegisterUIListener used for officer policy")
-    assertTrue(body:find("officerHooked", 1, true) ~= nil,
-        "C1: lifecycle guard prevents duplicate officer listeners")
-    assertTrue(body:find("Page.__sfOfficerHook", 1, true) ~= nil,
-        "C1: page-level guard prevents duplicate officer listeners")
-    local _, callCount = body:gsub("GO%.RegisterUIListener%(function", "")
-    assertEq(callCount, 1, "C1: exactly one RegisterUIListener registration call")
+    -- Catch-up admission uses shared officer policy, not historical rank metadata.
+    resetDb()
+    initGS()
+    world.guild.clubId = 42
+    world.guild.ranks = {
+        "Guild Master", "Officer", "Veteran", "Member", "Initiate",
+    }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    settleRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local GO = SF.GuildOfficer
+    GO:Initialize(SpectrumFederationDB)
+    GO:Bootstrap()
+    GO:CommitThreshold(1)
+    assertEq(select(1, GO:GetEstablishedThreshold()), 1, "catch-up: officer threshold tightened to 1")
+
+    local member = GS.AuthenticateTransportSender("Alice-Garona")
+    local stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = "catchup-hist",
+        editorRankPosition = 3,
+        permissionRevisionId = "catchup-policy",
+        bootstrapEditorRankPosition = 3,
+        activation = "staged",
+        acceptedOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
+    }, member)
+    assertEq(stInst, "accepted", "catch-up: descriptor install: " .. tostring(reasonInst))
+    assertEq(GS.IsBootstrapEditLocked("club:42"), true, "catch-up: bootstrap lock armed")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 3,
+        "catch-up: historical metadata remains rank 3")
+
+    local carol = GS.AuthenticateTransportSender("Carol-Garona")
+    local okCarol, reasonCarol = GS.SenderHasEditorAuthority(carol, { allowPolicyCatchUp = true })
+    assertEq(okCarol, false, "catch-up: historical rank 3 cannot authorize under threshold 1")
+    assertEq(reasonCarol, "unauthorized",
+        "catch-up: revoked sender reason unauthorized got=" .. tostring(reasonCarol))
+    local rankForged = {
+        schemaVersion = 1, id = "catchup-policy", guildKey = "club:42",
+        datasetId = "catchup-hist", campaignId = nil,
+        kind = "set-editor-rank", target = "editorRankPosition", value = 2,
+        actorGuid = "Player-1-Carol", actorName = "Carol-Garona", timestamp = 19000,
+        baseTargetRevision = "catchup-hist", basePolicyRevision = "catchup-hist",
+        baseCampaignId = nil,
+    }
+    local stForged, reasonForged = GS:AdmitRemoteOperation(rankForged, { sender = "Carol-Garona" })
+    assertTrue(stForged == "pending" or stForged == "rejected",
+        "catch-up: revoked sender does not apply authoritative catch-up st=" .. tostring(stForged))
+    assertTrue(reasonForged == "untrusted_relay" or reasonForged == "unauthorized"
+            or reasonForged == "awaiting_policy",
+        "catch-up: forged catch-up reason fail-closed got=" .. tostring(reasonForged))
+    assertEq(GS:GetCurrentRecord().permission.revisionId, "catchup-hist",
+        "catch-up: forged catch-up did not advance permission revision")
+
+    local priorNumRanks = GuildControlGetNumRanks
+    GuildControlGetNumRanks = function() return 0 end
+    local okRanks, reasonRanks = GS.SenderHasEditorAuthority(member, { allowPolicyCatchUp = true })
+    assertEq(okRanks, false, "catch-up: missing native ranks fail closed")
+    assertTrue(reasonRanks == "not_ready" or reasonRanks == "rank_unavailable"
+            or reasonRanks == "ranks_unavailable" or reasonRanks == "policy_unknown",
+        "catch-up: missing ranks reason got=" .. tostring(reasonRanks))
+    GuildControlGetNumRanks = priorNumRanks
+    settleRoster()
+
+    local rankOk = {
+        schemaVersion = 1, id = "catchup-policy", guildKey = "club:42",
+        datasetId = "catchup-hist", campaignId = nil,
+        kind = "set-editor-rank", target = "editorRankPosition", value = 1,
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona", timestamp = 19001,
+        baseTargetRevision = "catchup-hist", basePolicyRevision = "catchup-hist",
+        baseCampaignId = nil,
+    }
+    assertEq(GS:AdmitRemoteOperation(rankOk, { sender = "Alice-Garona" }), "accepted",
+        "catch-up: currently eligible editor completes legitimate catch-up")
+    assertEq(GS.IsBootstrapEditLocked("club:42"), false, "catch-up: lock cleared after eligible catch-up")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 1,
+        "catch-up: historical metadata updated by eligible catch-up")
+    assertEq(GS:GetCapabilities().canEdit, true, "catch-up: GM can edit after catch-up")
+end
+
+do
+    -- canRecoverPolicy only for genuine corrupt historical permission.
+    resetDb()
+    initGS()
+    world.skipOfficerBootstrap = true
+    local GO = SF.GuildOfficer
+    GO:Initialize(SpectrumFederationDB)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    assertNil(select(1, GO:GetEstablishedThreshold()), "recover-caps: no officer policy")
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "recover-caps: unknown policy denies edit")
+    assertEq(caps.canRecoverPolicy, false,
+        "recover-caps: unknown policy does not grant historical recovery")
+    assertEq(caps.reason, "policy_unknown", "recover-caps: reason policy_unknown")
+    local _, st, err = GS:CreateStagedRecord()
+    assertEq(st, "rejected", "recover-caps: init requires established officer policy")
+    assertTrue(err == "policy_unknown" or err == "unauthorized",
+        "recover-caps: init reason got=" .. tostring(err))
+    local beginSt = select(2, GS:BeginDatasetAdoption("Bob-Garona", "foreign-ds"))
+    assertEq(beginSt, "rejected", "recover-caps: adoption denied without canEdit")
+
+    world.skipOfficerBootstrap = false
+    GO:Initialize(SpectrumFederationDB)
+    assertEq(select(1, GO:Bootstrap()), "accepted", "recover-caps: GM establishes officer policy")
+    local created, createSt = GS:CreateStagedRecord()
+    assertEq(createSt, "accepted", "recover-caps: authorized initialization succeeds")
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, true, "recover-caps: configured dataset canEdit")
+    assertEq(caps.canRecoverPolicy, false,
+        "recover-caps: healthy historical permission is not recoverable")
+
+    created.permission.revisionId = "gs1:broken-recover-caps:1"
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "recover-caps: corrupt permission denies ordinary edit")
+    assertEq(caps.canRecoverPolicy, true, "recover-caps: GM recovers genuine corrupt permission")
+    beginSt = select(2, GS:BeginDatasetAdoption("Bob-Garona", "foreign-ds-2"))
+    assertEq(beginSt, "rejected",
+        "recover-caps: permission recovery does not authorize adoption")
+    world.skipOfficerBootstrap = false
+end
+
+do
+    -- C1 runtime listener lifecycle is exercised in the 2B15 Settings page harness
+    -- (repeated Build/Refresh, visible refresh, hidden no-op, ClearUIListeners cleanup).
+    assertTrue(type(SF.GuildOfficer.ClearUIListeners) == "function",
+        "C1: ClearUIListeners available to isolate officer UI listeners")
+    assertTrue(type(SF.GuildOfficer.RegisterUIListener) == "function",
+        "C1: RegisterUIListener available")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

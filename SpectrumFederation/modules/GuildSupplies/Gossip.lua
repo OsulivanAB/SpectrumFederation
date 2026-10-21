@@ -2713,8 +2713,8 @@ local function ValidateAndApply(record, ctx)
         end
         -- Policy catch-up: while bootstrap-locked, evaluate authority with
         -- allowPolicyCatchUp when the body is a causal policy successor under
-        -- the current predecessor policy. Do not mark those as relay — Admit
-        -- validates each transition under the predecessor policy.
+        -- the current predecessor revision. Do not mark those as relay — Admit
+        -- still authorizes the sender under the shared officer policy.
         local bootstrapLocked = localRecord and GS.IsBootstrapEditLocked
             and GS.IsBootstrapEditLocked(member.guildKey, localRecord)
         local currentPolicy = localRecord and localRecord.permission
