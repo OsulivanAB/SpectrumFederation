@@ -8,6 +8,9 @@ SF.RaidEquipment.CheckRun = CheckRun
 CheckRun.RECENT_GOOD_SECONDS = 120
 CheckRun.PER_TARGET_ATTEMPT_CAP = 4
 CheckRun.PER_INSPECT_ACTIVE_WAIT = 2.0
+-- Minimum gap between remote/local retries after a still-loading (pending) result.
+-- Reuses the per-inspect active wait so pending cannot re-queue on the 0.25s ticker.
+CheckRun.PENDING_RETRY_SECONDS = CheckRun.PER_INSPECT_ACTIVE_WAIT
 CheckRun.PER_TARGET_SLOT_SECONDS = 3.5
 CheckRun.BASE_OVERALL_SECONDS = 8
 CheckRun.SAFETY_CEILING_SECONDS = 180
@@ -225,9 +228,10 @@ function CheckRun.NoteProgress(run, now)
 	end
 end
 
--- pending = inspect/link data still loading. Counts for inspectability and
--- progress, but does not burn PER_TARGET_ATTEMPT_CAP or set technicalFailure.
--- Budget / no_progress still settle the run if loading never completes.
+-- pending = inspect/link data still loading. Counts for inspectability, but does
+-- not burn PER_TARGET_ATTEMPT_CAP, set technicalFailure, or count as run progress.
+-- A per-player nextPendingRetryAt gate spaces retries. Budget / no_progress still
+-- settle the run if loading never completes.
 function CheckRun.IsPendingAttemptKind(kind)
 	return kind == "pending"
 end
@@ -239,7 +243,17 @@ function CheckRun.IsPendingIncompleteReason(reason)
 		or reason == "missing_slot_table"
 end
 
-function CheckRun.MarkAttempt(player, kind, inspectable)
+function CheckRun.PendingRetryDelaySeconds()
+	return tonumber(CheckRun.PENDING_RETRY_SECONDS) or tonumber(CheckRun.PER_INSPECT_ACTIVE_WAIT) or 2.0
+end
+
+-- True when this attempt kind should refresh the run's no-progress clock.
+-- Unchanged pending/link-loading results must not keep the run alive forever.
+function CheckRun.AttemptCountsAsProgress(kind)
+	return not CheckRun.IsPendingAttemptKind(kind)
+end
+
+function CheckRun.MarkAttempt(player, kind, inspectable, now)
 	if type(player) ~= "table" then
 		return
 	end
@@ -250,8 +264,13 @@ function CheckRun.MarkAttempt(player, kind, inspectable)
 	end
 	if CheckRun.IsPendingAttemptKind(kind) then
 		player.pendingAttemptCount = (player.pendingAttemptCount or 0) + 1
+		now = tonumber(now)
+		if now then
+			player.nextPendingRetryAt = now + CheckRun.PendingRetryDelaySeconds()
+		end
 		return
 	end
+	player.nextPendingRetryAt = nil
 	player.attemptCount = (player.attemptCount or 0) + 1
 	if kind == "timeout" or kind == "incomplete" or kind == "api_failure" then
 		player.technicalFailure = true
@@ -269,6 +288,20 @@ function CheckRun.PlayerNeedsMoreInspects(player)
 		return false
 	end
 	return (player.attemptCount or 0) < CheckRun.PER_TARGET_ATTEMPT_CAP
+end
+
+-- Whether acquisition may queue another inspect/capture right now.
+-- Preserves the attempt cap and the pending retry gate across queue rebuilds.
+function CheckRun.PlayerMayQueueInspect(player, now)
+	if not CheckRun.PlayerNeedsMoreInspects(player) then
+		return false
+	end
+	now = tonumber(now) or 0
+	local gate = type(player) == "table" and tonumber(player.nextPendingRetryAt) or nil
+	if gate and now < gate then
+		return false
+	end
+	return true
 end
 
 function CheckRun.AttemptKindForIncompleteReason(reason)

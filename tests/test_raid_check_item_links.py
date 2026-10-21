@@ -211,11 +211,24 @@ def test_pending_incomplete_reasons_do_not_burn_attempt_cap():
     assert "function CheckRun.AttemptKindForIncompleteReason" in check_run
     assert 'kind == "pending"' in check_run
     assert "pendingAttemptCount" in check_run
+    assert "function CheckRun.PlayerMayQueueInspect" in check_run
+    assert "nextPendingRetryAt" in check_run
+    assert "PENDING_RETRY_SECONDS" in check_run
+    assert "function CheckRun.AttemptCountsAsProgress" in check_run
     raid_check = RAID_CHECK_LUA.read_text(encoding="utf-8")
     assert "AttemptKindForIncompleteReason" in raid_check
     assert "lastIncompleteReason" in raid_check
     assert "PER_INSPECT_ACTIVE_WAIT" in raid_check
     assert "lastLocalCaptureAt" in raid_check
+    assert "PlayerMayQueueInspect" in raid_check
+    assert "AttemptCountsAsProgress" in raid_check
+    queue_fn = raid_check.split("local function QueueFrozenInspectTargets", 1)[1]
+    queue_fn = queue_fn.split("function RC:_ApplyCheckConsequences", 1)[0]
+    # Pending/timeout backoff must survive frozen-queue rebuilds: only expired gates clear.
+    assert "PlayerMayQueueInspect" in queue_fn
+    assert "cacheEntry.nextRetryAt and cacheEntry.nextRetryAt <= now" in queue_fn
+    # Unconditional clear of nextRetryAt before every queue must stay gone.
+    assert "if type(cacheEntry) == \"table\" then\n\t\t\t\t\tcacheEntry.nextRetryAt = nil\n\t\t\t\tend" not in queue_fn
 
 
 def test_raid_check_lua_checks_each_socket_for_a_gem():

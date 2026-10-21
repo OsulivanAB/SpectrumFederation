@@ -30,6 +30,14 @@ local function assertEq(actual, expected, message)
     end
 end
 
+local function assertAlmost(actual, expected, epsilon, message)
+    if type(actual) == "number" and type(expected) == "number" and math.abs(actual - expected) <= epsilon then
+        pass(message)
+    else
+        fail(string.format("%s (expected %s ± %s, got %s)", message, tostring(expected), tostring(epsilon), tostring(actual)))
+    end
+end
+
 local SF = {}
 assert(loadfile("SpectrumFederation/modules/RaidEquipment/CheckRun.lua"))("SpectrumFederation", SF)
 assert(loadfile("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua"))("SpectrumFederation", SF)
@@ -130,7 +138,7 @@ assertEq(CheckRun.AttemptKindForIncompleteReason("unresolved_enchant"), "incompl
 
 local pendingPlayer = CheckRun.NewPlayer("P")
 for _ = 1, 12 do
-    CheckRun.MarkAttempt(pendingPlayer, "pending", true)
+    CheckRun.MarkAttempt(pendingPlayer, "pending", true, 100)
 end
 assertEq(pendingPlayer.attemptCount or 0, 0, "pending attempts do not increment attemptCount")
 assertEq(pendingPlayer.pendingAttemptCount, 12, "pending attempts are counted separately")
@@ -141,12 +149,141 @@ local pendingClass = CheckRun.ClassifyPlayer(pendingPlayer, 10)
 assertEq(pendingClass.class, CheckRun.CLASS.INSPECTION_FAILED, "pending-only without complete obs is Inspection Failed at settle")
 assertTrue(not pendingClass.countsForPot, "pending-only Inspection Failed does not count for Reward Pot")
 
-CheckRun.MarkAttempt(pendingPlayer, "complete", true)
+CheckRun.MarkAttempt(pendingPlayer, "complete", true, 200)
+assertTrue(pendingPlayer.nextPendingRetryAt == nil, "complete clears the pending retry gate")
 pendingPlayer.freshObservation = { complete = true, policy = { prepared = true, missing = {} }, capturedAt = 10 }
 pendingPlayer.technicalFailure = false
 local pendingThenReady = CheckRun.ClassifyPlayer(pendingPlayer, 10)
 assertEq(pendingThenReady.class, CheckRun.CLASS.PREPARED, "complete after pending classifies Prepared")
 assertTrue(not pendingThenReady.countsForPot, "Prepared after pending does not count for Reward Pot")
+
+-- Pending retries must be rate-limited and must not refresh no-progress forever.
+assertTrue(CheckRun.AttemptCountsAsProgress("complete"), "complete counts as progress")
+assertTrue(CheckRun.AttemptCountsAsProgress("incomplete"), "incomplete counts as progress")
+assertTrue(CheckRun.AttemptCountsAsProgress("timeout"), "timeout counts as progress")
+assertTrue(not CheckRun.AttemptCountsAsProgress("pending"), "pending does not count as progress")
+
+local gated = CheckRun.NewPlayer("G")
+local t0 = 1000
+CheckRun.MarkAttempt(gated, "pending", true, t0)
+assertTrue(gated.nextPendingRetryAt ~= nil, "pending schedules nextPendingRetryAt")
+assertAlmost(
+    gated.nextPendingRetryAt,
+    t0 + CheckRun.PendingRetryDelaySeconds(),
+    1e-6,
+    "pending retry gate uses PENDING_RETRY_SECONDS"
+)
+assertTrue(not CheckRun.PlayerMayQueueInspect(gated, t0 + 0.25), "0.25s later pending still blocks queueing")
+assertTrue(not CheckRun.PlayerMayQueueInspect(gated, gated.nextPendingRetryAt - 0.01), "just before the gate still blocks")
+assertTrue(CheckRun.PlayerMayQueueInspect(gated, gated.nextPendingRetryAt), "at the gate pending may queue again")
+assertTrue(CheckRun.PlayerNeedsMoreInspects(gated), "pending gate does not consume the attempt cap")
+
+-- Simulate acquisition: fast pending responses must not issue per-ticker inspects,
+-- must settle via no_progress when nothing resolves, and must recover on complete.
+local function SimulatePendingAcquisition(opts)
+    opts = opts or {}
+    local run = CheckRun.NewRun({ targetIds = { "A" }, now = 0 })
+    local player = run.players.A
+    local inspectRequests = 0
+    local pendingResults = 0
+    local clock = 0
+    local tick = opts.tick or 0.25
+    local pendingReadyDelay = opts.pendingReadyDelay or 0.05
+    local resolveAfterRequests = opts.resolveAfterRequests
+    local maxTicks = opts.maxTicks or 500
+
+    local function maybeQueue()
+        if CheckRun.PlayerMayQueueInspect(player, clock) then
+            inspectRequests = inspectRequests + 1
+            player.__sfActiveRequestedAt = clock
+            return true
+        end
+        return false
+    end
+
+    local function applyPending()
+        pendingResults = pendingResults + 1
+        CheckRun.MarkAttempt(player, "pending", true, clock)
+        -- Intentionally do not NoteProgress for pending (mirrors production).
+    end
+
+    local function applyComplete()
+        CheckRun.MarkAttempt(player, "complete", true, clock)
+        player.freshObservation = {
+            complete = true,
+            policy = { prepared = true, missing = {} },
+            capturedAt = clock,
+        }
+        player.policyResult = player.freshObservation.policy
+        player.technicalFailure = false
+        CheckRun.NoteProgress(run, clock)
+    end
+
+    maybeQueue()
+    for _ = 1, maxTicks do
+        clock = clock + tick
+        CheckRun.AdvanceClock(run, clock)
+        if player.__sfActiveRequestedAt then
+            local issuedAt = player.__sfActiveRequestedAt
+            if (clock - issuedAt) + 1e-9 >= pendingReadyDelay then
+                player.__sfActiveRequestedAt = nil
+                if resolveAfterRequests and inspectRequests >= resolveAfterRequests then
+                    applyComplete()
+                else
+                    applyPending()
+                end
+            end
+        end
+        local settle, why = CheckRun.ShouldSettle(run, clock)
+        if settle then
+            CheckRun.ClassifyRun(run, clock, {})
+            return {
+                run = run,
+                player = player,
+                inspectRequests = inspectRequests,
+                pendingResults = pendingResults,
+                clock = clock,
+                why = why,
+                class = run.classifiedResults.A and run.classifiedResults.A.class or nil,
+            }
+        end
+        if not player.__sfActiveRequestedAt then
+            maybeQueue()
+        end
+    end
+    return {
+        run = run,
+        player = player,
+        inspectRequests = inspectRequests,
+        pendingResults = pendingResults,
+        clock = clock,
+        why = "max_ticks",
+        class = nil,
+    }
+end
+
+local neverResolves = SimulatePendingAcquisition({})
+assertEq(neverResolves.why, "no_progress", "unchanged pending settles via no_progress, not ticker storms")
+assertTrue(neverResolves.inspectRequests >= 1, "at least one inspect was issued")
+assertTrue(
+    neverResolves.inspectRequests <= 1 + math.ceil(CheckRun.NO_PROGRESS_SECONDS / CheckRun.PendingRetryDelaySeconds()) + 1,
+    "pending inspects stay near the pending-retry cadence, not 0.25s ticker cadence"
+)
+assertTrue(
+    neverResolves.pendingResults <= neverResolves.inspectRequests,
+    "each pending result corresponds to an issued inspect"
+)
+assertEq(neverResolves.player.attemptCount or 0, 0, "unresolved pending never burns technical attempts")
+assertEq(neverResolves.class, CheckRun.CLASS.INSPECTION_FAILED, "unresolved pending classifies Inspection Failed")
+assertTrue(not neverResolves.run.classifiedResults.A.countsForPot, "unresolved pending does not deduct Reward Pot")
+
+local resolves = SimulatePendingAcquisition({ resolveAfterRequests = 3 })
+assertEq(resolves.why, "targets_resolved", "complete observation settles targets_resolved")
+assertEq(resolves.inspectRequests, 3, "resolved path issued exactly three inspects before success")
+assertEq(resolves.pendingResults, 2, "two pending results precede the successful inspect")
+assertEq(resolves.class, CheckRun.CLASS.PREPARED, "eventual complete observation classifies Prepared")
+assertTrue(not resolves.run.classifiedResults.A.countsForPot, "Prepared after pending still does not deduct pot")
+assertTrue(resolves.player.nextPendingRetryAt == nil, "success clears pending retry gate")
 
 failed.currentlyInspectable = false
 failed.rangeOnlyFailure = true

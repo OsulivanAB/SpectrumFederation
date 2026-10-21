@@ -2335,9 +2335,8 @@ function RC:_HandleInspectReady(guid)
 		if state.adhocRun and CheckRun and active.id then
 			local player = state.adhocRun.players and state.adhocRun.players[active.id]
 			if player then
-				CheckRun.NoteProgress(state.adhocRun, now)
 				if policyResult and policyResult.complete then
-					CheckRun.MarkAttempt(player, "complete", true)
+					CheckRun.MarkAttempt(player, "complete", true, now)
 					player.lastIncompleteReason = nil
 					player.freshObservation = {
 						complete = true,
@@ -2348,21 +2347,30 @@ function RC:_HandleInspectReady(guid)
 					player.policyResult = policyResult
 					player.technicalFailure = false
 					player.lastGood = state.lastGood[active.id]
+					CheckRun.NoteProgress(state.adhocRun, now)
 				else
 					local reason = (policyResult and policyResult.incompleteReason) or "incomplete"
 					player.lastIncompleteReason = reason
 					local kind = CheckRun.AttemptKindForIncompleteReason
 						and CheckRun.AttemptKindForIncompleteReason(reason)
 						or "incomplete"
-					CheckRun.MarkAttempt(player, kind, true)
+					CheckRun.MarkAttempt(player, kind, true, now)
+					-- Pending/link-loading must not refresh no-progress or clear
+					-- the per-player retry gate on the next 0.25s queue rebuild.
+					if CheckRun.AttemptCountsAsProgress and CheckRun.AttemptCountsAsProgress(kind) then
+						CheckRun.NoteProgress(state.adhocRun, now)
+					elseif player.nextPendingRetryAt then
+						entry.nextRetryAt = player.nextPendingRetryAt
+					end
 					if SF.Debug and SF.Debug.Verbose then
 						SF.Debug:Verbose(
 							"RAID_CHECK",
-							"Inspect attempt %s for %s (reason=%s blended=%s)",
+							"Inspect attempt %s for %s (reason=%s blended=%s nextRetry=%s)",
 							tostring(kind),
 							tostring(active.id),
 							tostring(reason),
-							tostring(entry.blended == true)
+							tostring(entry.blended == true),
+							tostring(player.nextPendingRetryAt)
 						)
 					end
 				end
@@ -3519,19 +3527,31 @@ local function ModeLabel(mode)
 end
 
 local function QueueFrozenInspectTargets(self, run)
+	local now = GetTime and GetTime() or 0
 	for _, memberId in ipairs(run.targetIds or {}) do
 		local player = run.players and run.players[memberId]
 		local unit = (player and player.unitHint) or FindUnitByGuidOrId(player and player.guid, memberId)
 		if unit and not IsSelfUnit(unit) then
 			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
-			if CheckRun and CheckRun.PlayerNeedsMoreInspects and not CheckRun.PlayerNeedsMoreInspects(player) then
-				-- Already complete, or this target has used its inspect attempt cap.
+			local mayQueue = CheckRun
+				and (
+					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now))
+					or (
+						not CheckRun.PlayerMayQueueInspect
+						and CheckRun.PlayerNeedsMoreInspects
+						and CheckRun.PlayerNeedsMoreInspects(player)
+					)
+				)
+			if not mayQueue then
+				-- Complete, attempt-capped, or still inside the pending retry gate.
+				-- Do not clear cache nextRetryAt while rebuilding the frozen queue.
 			else
 				local info = BuildUnitInfo(unit)
 				info.id = memberId
 				local aliases = self:_GetInspectAliases(unit, info)
 				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
-				if type(cacheEntry) == "table" then
+				-- Preserve timeout/pending backoff. Only drop a gate that has expired.
+				if type(cacheEntry) == "table" and cacheEntry.nextRetryAt and cacheEntry.nextRetryAt <= now then
 					cacheEntry.nextRetryAt = nil
 				end
 				self:_QueueInspectForUnit(unit, info, cacheEntry)
@@ -3539,13 +3559,21 @@ local function QueueFrozenInspectTargets(self, run)
 		elseif player and IsSelfUnit(unit) then
 			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 			local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
-			if CheckRun and CheckRun.PlayerNeedsMoreInspects and not CheckRun.PlayerNeedsMoreInspects(player) then
-				-- Already complete, or this target has used its local capture cap.
+			local mayQueue = CheckRun
+				and (
+					(CheckRun.PlayerMayQueueInspect and CheckRun.PlayerMayQueueInspect(player, now))
+					or (
+						not CheckRun.PlayerMayQueueInspect
+						and CheckRun.PlayerNeedsMoreInspects
+						and CheckRun.PlayerNeedsMoreInspects(player)
+					)
+				)
+			if not mayQueue then
+				-- Already complete, attempt-capped, or pending/local capture backoff.
 			elseif CheckRun and Policy then
 				-- Space local captures like a remote inspect wait so a single
 				-- unresolved item-level or socket read cannot burn the attempt
 				-- cap across consecutive 0.25s ad-hoc ticks.
-				local now = GetTime and GetTime() or 0
 				local minGap = CheckRun.PER_INSPECT_ACTIVE_WAIT or 2.0
 				local lastAt = tonumber(player.lastLocalCaptureAt)
 				if lastAt and (now - lastAt) < minGap then
@@ -3557,7 +3585,7 @@ local function QueueFrozenInspectTargets(self, run)
 						local observation = BuildPolicyObservation(captured)
 						local policyResult = Policy.EvaluateObservation(observation, run.cfg)
 						if policyResult and policyResult.complete then
-							CheckRun.MarkAttempt(player, "complete", true)
+							CheckRun.MarkAttempt(player, "complete", true, now)
 							player.lastIncompleteReason = nil
 							player.freshObservation = {
 								complete = true,
@@ -3583,14 +3611,16 @@ local function QueueFrozenInspectTargets(self, run)
 							-- failure (or pending when links are still loading).
 							-- Drop the cached capture so a later spaced tick can
 							-- read a usable Blizzard value. The attempt cap bounds
-							-- non-pending failures.
+							-- non-pending failures; pending does not refresh progress.
 							local reason = (policyResult and policyResult.incompleteReason) or "incomplete"
 							player.lastIncompleteReason = reason
 							local kind = CheckRun.AttemptKindForIncompleteReason
 								and CheckRun.AttemptKindForIncompleteReason(reason)
 								or "incomplete"
-							CheckRun.MarkAttempt(player, kind, true)
-							CheckRun.NoteProgress(run, now)
+							CheckRun.MarkAttempt(player, kind, true, now)
+							if CheckRun.AttemptCountsAsProgress and CheckRun.AttemptCountsAsProgress(kind) then
+								CheckRun.NoteProgress(run, now)
+							end
 							self:_InvalidateLocalTroubleshootingSnapshot()
 							if SF.Debug and SF.Debug.Verbose then
 								SF.Debug:Verbose(
