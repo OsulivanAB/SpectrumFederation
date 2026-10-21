@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.24] - 2026-10-21
+
+### Fixed
+- Fix Reward Pot header width and Raid Check inspection failures (#406)
+
 ## [1.5.12-beta.23] - 2026-10-21
 
 ### Fixed
