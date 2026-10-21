@@ -36,6 +36,21 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             end
         end
 
+        -- Guild officer rank (independent of Guild Supplies datasets and Guild Info history).
+        if SF.GuildOfficer and SF.GuildOfficer.Initialize then
+            SF.GuildOfficer:Initialize(SpectrumFederationDB)
+        end
+
+        -- Guild Supplies staged root (independent of Loot Helper enablement/profile).
+        if SF.GuildSupplies and SF.GuildSupplies.Initialize then
+            SF.GuildSupplies:Initialize(SpectrumFederationDB)
+        end
+
+        -- Guild Info main/alt relationships (independent of Loot Helper and Guild Supplies).
+        if SF.GuildInfo and SF.GuildInfo.Initialize then
+            SF.GuildInfo:Initialize(SpectrumFederationDB)
+        end
+
         -- Enable Loot Helper Sync system (registers slash commands and event handlers)
         if SF.LootHelperSync and SF.LootHelperSync.Enable then
             SF.LootHelperSync:Enable()

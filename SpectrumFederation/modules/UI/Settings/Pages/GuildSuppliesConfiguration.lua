@@ -1,0 +1,2136 @@
+-- Guild Supplies → Configuration (#386/#389). Guild setup, campaigns, and live activation.
+local _, SF = ...
+
+local function Loc(key, default)
+	if SF.LocaleText then
+		return SF.LocaleText(key, default)
+	end
+	return default or key
+end
+
+SF.SettingsUI:RegisterCategory({
+	id = "guildSupplies",
+	name = Loc("GUILD_SUPPLIES_CATEGORY_NAME", "Raid Supplies"),
+	navLabel = Loc("GUILD_SUPPLIES_CATEGORY_NAV", "Raid Supplies"),
+	group = "Raid Tools", -- sidebar heading; chrome displays this string
+	description = Loc("GUILD_SUPPLIES_CATEGORY_DESC",
+		"Guild-owned raid supply campaigns, configuration, and logs."),
+	order = 32,
+})
+
+local Page = {
+	id = "guildSuppliesConfiguration",
+	categoryId = "guildSupplies",
+	name = Loc("GUILD_SUPPLIES_CONFIG_NAME", "Configuration"),
+	navLabel = Loc("GUILD_SUPPLIES_CONFIG_NAV", "Configuration"),
+	contentHeading = Loc("GUILD_SUPPLIES_CONFIG_HEADING", "Raid Supplies Configuration"),
+	group = "Raid Tools",
+	description = Loc("GUILD_SUPPLIES_CONFIG_DESC",
+		"Fresh guild setup, bank tab, requested items, and New Campaign."),
+	order = 19.1,
+}
+
+local function GS()
+	return SF.GuildSupplies
+end
+
+-- Per build/refresh pass only: reuse validated read context across controls.
+-- Cleared after the pass so mutations always recheck authority/base freshly.
+local passCache = nil
+
+local function BeginRenderPass()
+	passCache = {}
+end
+
+local function EndRenderPass()
+	passCache = nil
+end
+
+local function CurrentRecord()
+	if passCache and passCache.recordChecked then
+		return passCache.record, passCache.recordReason
+	end
+	local g = GS()
+	local record, reason
+	if g and g.GetCurrentRecord then
+		record, reason = g:GetCurrentRecord()
+	else
+		reason = "not_ready"
+	end
+	if passCache then
+		passCache.recordChecked = true
+		passCache.record = record
+		passCache.recordReason = reason
+	end
+	return record, reason
+end
+
+local function Caps()
+	if passCache and passCache.caps then
+		return passCache.caps
+	end
+	local g = GS()
+	local caps
+	if not g or not g.GetCapabilities then
+		caps = { canEdit = false, canRead = false, canRecoverPolicy = false, reason = "not_ready" }
+	else
+		caps = g:GetCapabilities()
+	end
+	if passCache then
+		passCache.caps = caps
+	end
+	return caps
+end
+
+local refreshQueued = false
+local rosterFrame = nil
+local bankFrame = nil
+
+-- Session-local Guild Bank tab name catalog (never SavedVariables / Gossip).
+-- Authority: Retail GetNumGuildBankTabs / GetGuildBankTabInfo while the bank is open.
+-- Scope: keyed by guildKey so names never cross guilds. Not proof of a fresh log sample.
+local BANK_TAB_UNSET = false -- UI-only clear sentinel; schema still stores nil.
+local bankTabCatalog = {
+	guildKey = nil,
+	loaded = false,
+	-- [tabIndex] = { name = string, viewable = boolean }
+	entries = {},
+}
+local guildBankOpen = false
+
+--- Refresh controls through Page:Refresh so passCache bounds the render.
+local function RefreshPageControls()
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
+local function ReportStatus(ctx, status, reason)
+	local g = GS()
+	local message, severity
+	if g and g.FormatMutationFeedback then
+		message, severity = g.FormatMutationFeedback(status, reason)
+	else
+		message = tostring(status or "rejected")
+		severity = (status == "accepted" and "success")
+			or (status == "duplicate" and "info")
+			or (status == "pending" and "warn")
+			or "error"
+	end
+	ctx.section:SetMessage(message, severity)
+	RefreshPageControls()
+end
+
+local function ItemLabel(itemId)
+	local name = nil
+	if C_Item and C_Item.GetItemInfo then
+		name = C_Item.GetItemInfo(itemId)
+	end
+	if type(name) ~= "string" and GetItemInfo then
+		name = GetItemInfo(itemId)
+	end
+	if type(name) == "string" and name ~= "" then
+		return string.format("%s (%d)", name, itemId)
+	end
+	return Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId))
+end
+
+--- True only for first-time setup (no dataset). Permission-only nil records are recovery.
+local function IsNotConfigured()
+	local _, reason = CurrentRecord()
+	return reason == "not_configured"
+end
+
+local function CurrentBankTab()
+	if not Caps().canRead then
+		return nil
+	end
+	local rec = CurrentRecord()
+	local tab = rec and rec.accounting and rec.accounting._consumables
+		and rec.accounting._consumables.bankTab
+	return tab ~= nil and tonumber(tab) or nil
+end
+
+local function CurrentGuildKey()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	if ctx and type(ctx.guildKey) == "string" and ctx.guildKey ~= "" then
+		return ctx.guildKey
+	end
+	return nil
+end
+
+local function ClearBankTabCatalog()
+	bankTabCatalog.guildKey = nil
+	bankTabCatalog.loaded = false
+	bankTabCatalog.entries = {}
+end
+
+--- Drop catalog entries when the player changes guilds.
+local function SyncBankTabCatalogGuild()
+	local key = CurrentGuildKey()
+	if key == nil then
+		if bankTabCatalog.guildKey ~= nil or bankTabCatalog.loaded then
+			ClearBankTabCatalog()
+		end
+		return
+	end
+	if bankTabCatalog.guildKey ~= nil and bankTabCatalog.guildKey ~= key then
+		ClearBankTabCatalog()
+	end
+end
+
+--- Read purchased, named Guild Bank tabs. Only marks loaded when the API returns
+-- coherent names; never invents labels. Caches viewable names for Settings.
+-- @return boolean true when the catalog was refreshed from live API data
+local function ObserveGuildBankTabs()
+	SyncBankTabCatalogGuild()
+	local key = CurrentGuildKey()
+	if key == nil then
+		return false
+	end
+	if type(GetNumGuildBankTabs) ~= "function" or type(GetGuildBankTabInfo) ~= "function" then
+		return false
+	end
+	local okNum, num = pcall(GetNumGuildBankTabs)
+	if not okNum or type(num) ~= "number" or num ~= math.floor(num) or num < 0 then
+		return false
+	end
+	local maxTab = 8
+	local g = GS()
+	if g and tonumber(g.MAX_BANK_TAB) then
+		maxTab = tonumber(g.MAX_BANK_TAB)
+	end
+	num = math.min(num, maxTab)
+	local nextEntries = {}
+	for i = 1, num do
+		local ok, name, _, isViewable = pcall(GetGuildBankTabInfo, i)
+		if not ok then
+			return false
+		end
+		-- Purchased tabs must expose a non-empty name; empty means data not ready.
+		if type(name) ~= "string" or name == "" then
+			return false
+		end
+		nextEntries[i] = {
+			name = name,
+			viewable = isViewable == true,
+		}
+	end
+	bankTabCatalog.guildKey = key
+	bankTabCatalog.entries = nextEntries
+	bankTabCatalog.loaded = true
+	return true
+end
+
+local function BankTabCatalogLoaded()
+	SyncBankTabCatalogGuild()
+	return bankTabCatalog.loaded == true
+		and bankTabCatalog.guildKey ~= nil
+		and bankTabCatalog.guildKey == CurrentGuildKey()
+end
+
+local function FormatBankTabLabel(index, name)
+	if type(name) == "string" and name ~= "" then
+		return Loc("GUILD_SUPPLIES_BANK_TAB_OPTION_FMT", "Tab %d — %s")
+			:format(index, name)
+	end
+	return Loc("GUILD_SUPPLIES_BANK_TAB_NUMBER_FMT", "Tab %d"):format(index)
+end
+
+--- Dropdown options: clear sentinel + purchased viewable tabs only.
+local function BankTabOptions()
+	local opts = {}
+	if not BankTabCatalogLoaded() then
+		return opts
+	end
+	opts[#opts + 1] = {
+		value = BANK_TAB_UNSET,
+		label = Loc("GUILD_SUPPLIES_BANK_TAB_CLEAR", "Not configured"),
+	}
+	local indices = {}
+	for index, entry in pairs(bankTabCatalog.entries) do
+		if entry and entry.viewable and type(entry.name) == "string" and entry.name ~= "" then
+			indices[#indices + 1] = index
+		end
+	end
+	table.sort(indices)
+	for i = 1, #indices do
+		local index = indices[i]
+		local entry = bankTabCatalog.entries[index]
+		opts[#opts + 1] = {
+			value = index,
+			label = FormatBankTabLabel(index, entry.name),
+		}
+	end
+	return opts
+end
+
+--- Default button text when the configured value is not among selectable options.
+local function BankTabDefaultText()
+	local tab = CurrentBankTab()
+	if tab == nil then
+		if BankTabCatalogLoaded() then
+			return Loc("GUILD_SUPPLIES_BANK_TAB_CLEAR", "Not configured")
+		end
+		return Loc("GUILD_SUPPLIES_BANK_TAB_SELECT", "Select a bank tab")
+	end
+	SyncBankTabCatalogGuild()
+	local entry = bankTabCatalog.entries[tab]
+	if entry and type(entry.name) == "string" and entry.name ~= "" then
+		if entry.viewable then
+			return FormatBankTabLabel(tab, entry.name)
+		end
+		-- Known but not selectable for this character: show number only, no private name.
+		return Loc("GUILD_SUPPLIES_BANK_TAB_UNAVAILABLE_FMT", "Tab %d — unavailable")
+			:format(tab)
+	end
+	-- Configured value preserved without inventing a name.
+	return Loc("GUILD_SUPPLIES_BANK_TAB_NUMBER_FMT", "Tab %d"):format(tab)
+end
+
+local function BankTabDropdownValue()
+	local tab = CurrentBankTab()
+	if tab == nil then
+		return BANK_TAB_UNSET
+	end
+	return tab
+end
+
+local function RequestedItemRows()
+	local rows = {}
+	-- Shared campaign/item data stays redacted until membership canRead is verified.
+	if not Caps().canRead then
+		return rows
+	end
+	local record = CurrentRecord()
+	if not record or type(record.currentCampaignId) ~= "string" then
+		return rows
+	end
+	local items = record.accounting and record.accounting._consumables
+		and record.accounting._consumables.requestedItems
+	if type(items) ~= "table" then
+		return rows
+	end
+	-- Cap before constructing controls. Count every raw entry, including invalid;
+	-- over-cap maps stay unavailable rather than becoming a truncated UI list.
+	local C = SF.Consumables
+	local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
+	local inspected = 0
+	local canEdit = Caps().canEdit
+	for _, row in pairs(items) do
+		inspected = inspected + 1
+		if inspected > maxItems then
+			return {}
+		end
+		if type(row) == "table" and tonumber(row.itemId) then
+			rows[#rows + 1] = {
+				text = ItemLabel(row.itemId),
+				itemId = row.itemId,
+				goal = tonumber(row.goal) or 0,
+				canRemove = canEdit,
+				canEditGoal = canEdit,
+			}
+		end
+	end
+	table.sort(rows, function(a, b)
+		return (a.itemId or 0) < (b.itemId or 0)
+	end)
+	return rows
+end
+
+local pendingAdoptionPeer = nil
+local pendingAdoptionDataset = nil
+local pendingConflictTarget = nil
+local pendingConflictChosen = nil
+
+local function ClearPendingAdoptionChoice()
+	pendingAdoptionPeer = nil
+	pendingAdoptionDataset = nil
+end
+
+local function ClearPendingConflictChoice()
+	pendingConflictTarget = nil
+	pendingConflictChosen = nil
+end
+
+--- Compact Configuration status area: status / campaign / next step / warnings.
+-- One snapshot per render pass so display/help rows stay consistent without
+-- repeating activation or campaign guidance across rows.
+local function BuildStatusSnapshot()
+	local snap = {
+		status = "",
+		showCampaign = false,
+		campaign = "",
+		nextStep = nil,
+		warning = nil,
+	}
+	local caps = Caps()
+	local g = GS()
+	local formatReason = g and g.FormatReasonText or function(r)
+		return tostring(r or "unknown")
+	end
+
+	local function SetNextStep(body)
+		if type(body) ~= "string" or body == "" then
+			return
+		end
+		snap.nextStep = Loc("GUILD_SUPPLIES_NEXT_STEP_FMT", "Next step: %s"):format(body)
+	end
+
+	local function AppendWarning(text)
+		if type(text) ~= "string" or text == "" then
+			return
+		end
+		if snap.warning and snap.warning ~= "" then
+			snap.warning = snap.warning .. " " .. text
+		else
+			snap.warning = text
+		end
+	end
+
+	if not caps.canRead then
+		snap.status = Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
+			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
+		return snap
+	end
+
+	local record, recReason = CurrentRecord()
+	if not record then
+		if caps.reason == "not_configured" or recReason == "not_configured" then
+			snap.status = Loc("GUILD_SUPPLIES_STATUS_VALUE_NOT_CONFIGURED", "Not configured")
+			SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_INITIALIZE",
+				"Use Initialize Guild Supplies to create a staged dataset for this guild."))
+			return snap
+		end
+		snap.status = Loc("GUILD_SUPPLIES_STATUS_VALUE_UNAVAILABLE", "Unavailable (%s)")
+			:format(formatReason(caps.reason or recReason or "unknown"))
+		return snap
+	end
+
+	snap.showCampaign = true
+	local campaignId = record.currentCampaignId
+	if type(campaignId) == "string" and campaignId ~= "" then
+		snap.campaign = campaignId
+	else
+		snap.campaign = Loc("GUILD_SUPPLIES_CAMPAIGN_NOT_STARTED", "Not started.")
+	end
+
+	local warningCoversReason = {}
+	local mismatch = g and g.GetDatasetMismatchState and g:GetDatasetMismatchState() or nil
+	if mismatch and mismatch.blocked and mismatch.peers and mismatch.peers[1] then
+		local p = mismatch.peers[1]
+		AppendWarning(Loc("GUILD_SUPPLIES_ADOPTION_BLOCKED",
+			"A different staged dataset was advertised by %s (%s). Choose a source below to replace this client's local staged dataset, or cancel to keep the current one.")
+			:format(tostring(p.peerName), tostring(p.datasetId)))
+		warningCoversReason.dataset_mismatch = true
+	end
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption() or nil
+	if type(adop) == "table" then
+		AppendWarning(Loc("GUILD_SUPPLIES_ADOPTION_PENDING",
+			"Adoption in progress for dataset %s from %s. Waiting for a complete validated transfer before switching.")
+			:format(tostring(adop.sourceDatasetId), tostring(adop.sourcePeer)))
+		warningCoversReason.adoption_in_progress = true
+	end
+
+	if record.activation == (g and g.ACTIVATION_ACTIVE) then
+		local marker = record.liveCutover and record.liveCutover.cutoverMarker or "?"
+		snap.status = Loc("GUILD_SUPPLIES_STATUS_ACTIVE",
+			"Live — Guild Supplies owns guild bank accounting for this guild (cutover %s).")
+			:format(tostring(marker))
+		local liveConflict = g and g.GetLiveActivationConflictState and g:GetLiveActivationConflictState() or nil
+		if liveConflict and liveConflict.blocked then
+			AppendWarning(Loc("GUILD_SUPPLIES_STATUS_LIVE_CONFLICT",
+				"Blocked: a peer advertised a conflicting live cutover marker. Adopt one canonical source before continuing."))
+			warningCoversReason.live_activation_conflict = true
+			SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_RESOLVE_CUTOVER",
+				"Adopt one canonical live source below before continuing."))
+		end
+		return snap
+	end
+
+	snap.status = Loc("GUILD_SUPPLIES_STATUS_VALUE_STAGED", "Staged")
+	local readiness = g and g.GetActivationReadiness and g:GetActivationReadiness() or nil
+	if type(campaignId) ~= "string" or campaignId == "" then
+		SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_NEW_CAMPAIGN",
+			"Start a New Campaign to begin configuring Guild Supplies."))
+		return snap
+	end
+	if readiness and readiness.canActivate then
+		SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_ACTIVATE_READY",
+			"Configuration is ready. Use Activate Guild Supplies at the Guild Bank."))
+		return snap
+	end
+	if readiness and readiness.reason and not warningCoversReason[readiness.reason] then
+		local guide = g.FormatActivationGuidance and g.FormatActivationGuidance(readiness) or nil
+		if type(guide) == "string" and guide ~= "" then
+			SetNextStep(guide)
+		else
+			SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_ACTIVATION_BLOCKED",
+				"Activation not ready: %s."):format(formatReason(readiness.reason)))
+		end
+	end
+	return snap
+end
+
+local function StatusSnapshot()
+	if passCache and passCache.statusSnapshot then
+		return passCache.statusSnapshot
+	end
+	local snap = BuildStatusSnapshot()
+	if passCache then
+		passCache.statusSnapshot = snap
+	end
+	return snap
+end
+
+local function StatusRowText()
+	return StatusSnapshot().status
+end
+
+local function CampaignRowVisible()
+	return StatusSnapshot().showCampaign == true
+end
+
+local function CampaignRowText()
+	return StatusSnapshot().campaign
+end
+
+local function NextStepVisible()
+	local step = StatusSnapshot().nextStep
+	return type(step) == "string" and step ~= ""
+end
+
+local function NextStepText()
+	return StatusSnapshot().nextStep or ""
+end
+
+local function WarningVisible()
+	local warning = StatusSnapshot().warning
+	return type(warning) == "string" and warning ~= ""
+end
+
+local function WarningText()
+	return StatusSnapshot().warning or ""
+end
+
+local function AdoptionSourceOptions()
+	local opts = {}
+	local g = GS()
+	if not g or not g.ListPeerDatasets then
+		return opts
+	end
+	local localRecord = g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
+	local localMarker = localRecord and localRecord.liveCutover
+		and localRecord.liveCutover.cutoverMarker or nil
+	local conflict = g.GetLiveActivationConflictState
+		and g:GetLiveActivationConflictState() or nil
+	local conflictMarkers = {}
+	if conflict and conflict.blocked then
+		for i = 1, #(conflict.peers or {}) do
+			local cp = conflict.peers[i]
+			if cp and type(cp.peerName) == "string" and type(cp.cutoverMarker) == "string" then
+				conflictMarkers[cp.peerName] = cp.cutoverMarker
+			end
+		end
+	end
+	local peers = g:ListPeerDatasets()
+	for i = 1, #peers do
+		local p = peers[i]
+		if p then
+			local cutoverResolve = p.sameAsLocal
+				and conflictMarkers[p.peerName]
+				and conflictMarkers[p.peerName] ~= localMarker
+			if (not p.sameAsLocal) or cutoverResolve then
+				local label
+				if cutoverResolve then
+					label = Loc("GUILD_SUPPLIES_ADOPTION_CUTOVER_SOURCE_FMT",
+						"%s — resolve live cutover to %s")
+						:format(tostring(p.peerName), tostring(conflictMarkers[p.peerName]))
+				else
+					label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE_FMT", "%s — %s")
+						:format(tostring(p.peerName), tostring(p.datasetId))
+				end
+				opts[#opts + 1] = {
+					value = tostring(p.peerName) .. "\0" .. tostring(p.datasetId),
+					label = label,
+					peerName = p.peerName,
+					datasetId = p.datasetId,
+					cutoverResolution = cutoverResolve and true or false,
+				}
+			end
+		end
+	end
+	return opts
+end
+
+local function ConflictHelpText()
+	local g = GS()
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	if #conflicts == 0 then
+		return Loc("GUILD_SUPPLIES_CONFLICT_NONE", "No open configuration conflicts.")
+	end
+	return Loc("GUILD_SUPPLIES_CONFLICT_HELP",
+		"Both candidates are preserved. Choosing one creates a new authenticated resolution without rewriting the original operations.")
+end
+
+local function ConflictTargetOptions()
+	local opts = {}
+	local g = GS()
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	for i = 1, #conflicts do
+		local entry = conflicts[i]
+		if entry and type(entry.targetKey) == "string" then
+			opts[#opts + 1] = {
+				value = entry.targetKey,
+				label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_FMT", "Conflict: %s (%d candidates)")
+					:format(entry.targetKey, entry.candidates and #entry.candidates or 0),
+			}
+		end
+	end
+	return opts
+end
+
+local function ConflictCandidateOptions()
+	local opts = {}
+	local g = GS()
+	if not pendingConflictTarget then
+		return opts
+	end
+	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
+	local entry = nil
+	for i = 1, #conflicts do
+		if conflicts[i].targetKey == pendingConflictTarget then
+			entry = conflicts[i]
+			break
+		end
+	end
+	if not entry or type(entry.candidates) ~= "table" then
+		return opts
+	end
+	for i = 1, #entry.candidates do
+		local c = entry.candidates[i]
+		if c and type(c.id) == "string" then
+			local body = c.body
+			local summary = tostring(c.id)
+			if type(body) == "table" then
+				local author = body.actorName or "?"
+				local value = body.value
+				if type(value) == "table" then
+					value = value.goal or value.itemId or "?"
+				end
+				summary = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_FMT", "%s — %s (by %s)")
+					:format(tostring(c.id), tostring(value), tostring(author))
+			end
+			opts[#opts + 1] = {
+				value = c.id,
+				label = summary,
+			}
+		end
+	end
+	return opts
+end
+
+local function CommitConflictChoice(ctx, targetKey, chosenOpId, competingOpIds)
+	local g = GS()
+	if not g or not g.NewConflictResolutionOperation then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	-- Revalidate the open conflict and chosen id before preparing resolution.
+	local conflicts = g:ListOpenConflicts() or {}
+	local entry = nil
+	for i = 1, #conflicts do
+		if conflicts[i].targetKey == targetKey then
+			entry = conflicts[i]
+			break
+		end
+	end
+	if not entry or type(entry.candidates) ~= "table" then
+		ReportStatus(ctx, "rejected", "no_open_conflict")
+		ClearPendingConflictChoice()
+		return
+	end
+	local ids = competingOpIds
+	if type(ids) ~= "table" then
+		ids = {}
+		for i = 1, #entry.candidates do
+			ids[#ids + 1] = entry.candidates[i].id
+		end
+	end
+	local found = false
+	for i = 1, #ids do
+		if ids[i] == chosenOpId then
+			found = true
+			break
+		end
+	end
+	if not found then
+		ReportStatus(ctx, "rejected", "invalid_resolution")
+		return
+	end
+	local op, prepStatus, prepReason = g:NewConflictResolutionOperation(targetKey, chosenOpId, ids)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local status, reason = g:ApplyStagedConflictResolution(op)
+	if status == "accepted" then
+		ClearPendingConflictChoice()
+	end
+	ReportStatus(ctx, status, reason)
+end
+
+--- Begin adoption transfer (does not commit). Commit is a separate control once ready.
+local function BeginAdoptionTransfer(ctx)
+	local g = GS()
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not g or not pendingAdoptionPeer or not pendingAdoptionDataset then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	local peer = pendingAdoptionPeer
+	local datasetId = pendingAdoptionDataset
+	local cutoverResolution = false
+	do
+		local opts = AdoptionSourceOptions()
+		for i = 1, #opts do
+			if opts[i].peerName == peer and opts[i].datasetId == datasetId
+				and opts[i].cutoverResolution then
+				cutoverResolution = true
+				break
+			end
+		end
+	end
+	local accept = function()
+		ctx.section:ClearMessage()
+		local session, status, reason = g:BeginDatasetAdoption(peer, datasetId)
+		if status ~= "accepted" then
+			ReportStatus(ctx, status or "rejected", reason)
+			return
+		end
+		ReportStatus(ctx, "pending", "incomplete_transfer")
+		RefreshPageControls()
+	end
+	if dialogs and dialogs.Confirm then
+		local confirmText = cutoverResolution
+			and Loc("GUILD_SUPPLIES_ADOPTION_CUTOVER_CONFIRM",
+				"Replace this client's live Guild Supplies cutover with the selected peer's authenticated complete dataset and cutover marker? Local divergent live state is not merged. Cancel leaves the current blocked state unchanged.")
+			or Loc("GUILD_SUPPLIES_ADOPTION_CONFIRM",
+				"Replace this client's local staged Guild Supplies configuration/dataset with the selected source dataset? The two datasets are not merged. Cancel leaves local state unchanged. This does not activate live bank accounting.")
+		dialogs:Confirm(
+			confirmText,
+			Loc("GUILD_SUPPLIES_ADOPTION_BUTTON", "Adopt selected dataset"),
+			accept
+		)
+	else
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
+	end
+end
+
+local function CommitAdoptionTransfer(ctx)
+	local g = GS()
+	if not g or not g.CommitDatasetAdoption then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local adop = g:GetPendingAdoption()
+	if type(adop) ~= "table" then
+		ReportStatus(ctx, "rejected", "no_adoption")
+		return
+	end
+	-- Overlapping commits while replay is already running are rejected.
+	if type(adop.replayTemp) == "table" then
+		ReportStatus(ctx, "pending", "replay_in_progress")
+		RefreshPageControls()
+		return
+	end
+	if not adop.ready then
+		ReportStatus(ctx, "pending", "incomplete_transfer")
+		return
+	end
+	local commitStatus, commitReason = g:CommitDatasetAdoption()
+	if commitStatus == "accepted" then
+		ClearPendingAdoptionChoice()
+	end
+	ReportStatus(ctx, commitStatus or "rejected", commitReason)
+	RefreshPageControls()
+end
+
+local function ItemsHelpText()
+	if not Caps().canRead then
+		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
+			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
+	end
+	local record = CurrentRecord()
+	local hasCampaign = record and type(record.currentCampaignId) == "string" and record.currentCampaignId ~= ""
+	if hasCampaign then
+		return Loc("GUILD_SUPPLIES_ITEMS_HELP",
+			"Add exact item IDs for the current campaign. Goal edits keep contribution history.")
+	end
+	return Loc("GUILD_SUPPLIES_ITEMS_NEED_CAMPAIGN",
+		"Start a New Campaign before adding requested items.")
+end
+
+local function CommitConfig(ctx, kind, target, value)
+	local g = GS()
+	if not g then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local op, prepStatus, prepReason = g:NewConfigOperation(kind, target, value)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local status, reason = g:ApplyStagedConfigOperation(op)
+	ReportStatus(ctx, status, reason)
+end
+
+local function CommitNewCampaign(ctx)
+	local g = GS()
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not g or not g.NewCampaignOperation then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	-- Bind the intended operation to the original guild/campaign/policy context
+	-- before confirmation (or immediate apply). Do not rebuild on accept.
+	local op, prepStatus, prepReason = g:NewCampaignOperation()
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local boundOp = op
+	local accept = function()
+		ctx.section:ClearMessage()
+		-- Finalize startedAt once at apply time; keep bound scope/bases.
+		if g.FinalizeCampaignStartTime then
+			local okFinal, finalReason = g:FinalizeCampaignStartTime(boundOp)
+			if not okFinal then
+				ReportStatus(ctx, "rejected", finalReason or "server_time_unavailable")
+				return
+			end
+		end
+		local status, reason = g:ApplyStagedCampaignOperation(boundOp)
+		ReportStatus(ctx, status, reason)
+	end
+	-- First campaign: create immediately. Subsequent campaigns archive the
+	-- current one and need an explicit confirmation.
+	local requiresConfirm = type(boundOp.baseCampaignId) == "string"
+		and boundOp.baseCampaignId ~= ""
+	if not requiresConfirm then
+		accept()
+		return
+	end
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(
+			Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_CONFIRM",
+				"Start a new campaign? The current campaign will be archived, and the new campaign will start with empty goals and progress."),
+			Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_BUTTON", "New Campaign"),
+			accept
+		)
+	else
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
+	end
+end
+
+--- Native rank names. Used only to repair a corrupt historical permission record.
+local function RecoveryRankOptions()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local opts = {}
+	if not ctx or type(ctx.ranks) ~= "table" then
+		return opts
+	end
+	local count = tonumber(ctx.rankCount) or 0
+	for i = 1, count do
+		local name = ctx.ranks[i]
+		if type(name) == "string" and name ~= "" then
+			opts[#opts + 1] = { value = i, label = name }
+		end
+	end
+	return opts
+end
+
+--- Historical permission repair only. A missing officer policy is not corruption.
+local function CanRepairHistoricalPermission()
+	if IsNotConfigured() then
+		return false
+	end
+	local c = Caps()
+	if c.canRecoverPolicy ~= true or c.canEdit == true then
+		return false
+	end
+	if c.reason == "policy_unknown" or c.reason == "policy_invalid" then
+		return false
+	end
+	local g = GS()
+	if not g or type(g.GetCurrentRecord) ~= "function"
+		or type(g._IsPermissionOnlyFailure) ~= "function" then
+		return false
+	end
+	local _, reason = g:GetCurrentRecord()
+	return g._IsPermissionOnlyFailure(reason) and true or false
+end
+
+local function CommitEditorRank(ctx, position)
+	local g = GS()
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local pos = tonumber(position)
+	if not g or not pos then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	if not CanRepairHistoricalPermission() then
+		ReportStatus(ctx, "rejected", "unauthorized")
+		return
+	end
+	local op, prepStatus, prepReason = g:NewConfigOperation("set-editor-rank", "editorRankPosition", pos)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local boundOp = op
+	local accept = function()
+		ctx.section:ClearMessage()
+		local status, reason = g:ApplyStagedConfigOperation(boundOp)
+		ReportStatus(ctx, status, reason)
+	end
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(
+			Loc("GUILD_SUPPLIES_EDITOR_RANK_RECOVER_CONFIRM",
+				"Repair the stored Guild Supplies permission record to this rank? This does not change who can edit. Editing follows the shared officer rank."),
+			Loc("GUILD_SUPPLIES_EDITOR_RANK_APPLY", "Repair record"),
+			accept)
+	else
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
+	end
+end
+
+-- Disabled-control tips: derive from the same Caps/record/readiness predicates
+-- that gate enabled. Prefer the immediate blocker; never invent prerequisites.
+-- Unverified membership must not learn guild-owned configuration details.
+
+local function DisabledMembershipTip()
+	return Loc("GUILD_SUPPLIES_DISABLED_MEMBERSHIP",
+		"Join a guild with a verified membership before using Guild Supplies.")
+end
+
+local function DisabledUnauthorizedTip(action)
+	return Loc("GUILD_SUPPLIES_DISABLED_UNAUTHORIZED_FMT",
+		"Your guild rank does not permit %s."):format(action)
+end
+
+--- Permission/membership gate shared by privileged Configuration controls.
+-- @param action string short action phrase for unauthorized copy
+-- @param allowRecover boolean|nil also accept canRecoverPolicy
+-- @return string|nil tip when blocked, else nil
+local function DisabledAuthTip(action, allowRecover)
+	local c = Caps()
+	if not c.canRead then
+		return DisabledMembershipTip()
+	end
+	if c.canEdit then
+		return nil
+	end
+	if allowRecover and c.canRecoverPolicy then
+		return nil
+	end
+	return DisabledUnauthorizedTip(action)
+end
+
+local function DisabledNeedRecordTip(actionNoun)
+	local auth = DisabledAuthTip(actionNoun, false)
+	if auth then
+		return auth
+	end
+	if CurrentRecord() ~= nil then
+		return nil
+	end
+	if IsNotConfigured() then
+		return Loc("GUILD_SUPPLIES_DISABLED_NEED_INIT",
+			"Initialize Guild Supplies for this guild first.")
+	end
+	-- canRead but record unavailable (permission-only / redacted): no guild detail.
+	return Loc("GUILD_SUPPLIES_DISABLED_DATA_UNAVAILABLE",
+		"Guild Supplies data is unavailable right now.")
+end
+
+local function DisabledNeedCampaignTip(actionNoun)
+	local tip = DisabledNeedRecordTip(actionNoun)
+	if tip then
+		return tip
+	end
+	local rec = CurrentRecord()
+	if rec and type(rec.currentCampaignId) == "string" then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_NEED_CAMPAIGN",
+		"Start a New Campaign before continuing.")
+end
+
+local function DisabledBankTabTip()
+	-- Auth / init blockers take precedence over "open the Guild Bank".
+	local tip = DisabledNeedRecordTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_BANK_TAB", "configuring the bank tab"))
+	if tip then
+		return tip
+	end
+	if BankTabCatalogLoaded() then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_BANK_TAB_OPEN",
+		"Open your Guild Bank to load the available tabs.")
+end
+
+local function DisabledInitializeTip()
+	local c = Caps()
+	if not c.canEdit and not c.canRecoverPolicy then
+		if not c.canRead then
+			return DisabledMembershipTip()
+		end
+		if c.reason == "policy_unknown" or c.reason == "policy_invalid" then
+			return Loc("GUILD_SUPPLIES_DISABLED_POLICY_UNKNOWN",
+				"Officer rank is not available yet, so Guild Supplies setup stays disabled.")
+		end
+		return DisabledUnauthorizedTip(
+			Loc("GUILD_SUPPLIES_DISABLED_ACTION_INITIALIZE", "initializing Guild Supplies"))
+	end
+	if not IsNotConfigured() then
+		-- Already have a dataset (or recovery path); do not claim init is incomplete.
+		return Loc("GUILD_SUPPLIES_DISABLED_ALREADY_INITIALIZED",
+			"Guild Supplies has already been initialized for this guild.")
+	end
+	return nil
+end
+
+local function DisabledActivateTip()
+	local mod = GS()
+	local c = Caps()
+	if not c.canEdit then
+		if not c.canRead then
+			return DisabledMembershipTip()
+		end
+		return DisabledUnauthorizedTip(
+			Loc("GUILD_SUPPLIES_DISABLED_ACTION_ACTIVATE", "activating Guild Supplies"))
+	end
+	if not mod or not mod.GetActivationReadiness then
+		return Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable.")
+	end
+	local ready = mod:GetActivationReadiness()
+	if ready and ready.canActivate then
+		return nil
+	end
+	if ready and ready.alreadyActive then
+		return Loc("GUILD_SUPPLIES_DISABLED_ALREADY_ACTIVE",
+			"Guild Supplies is already active for this guild.")
+	end
+	local reason = ready and ready.reason or nil
+	if reason == "no_campaign" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_NEED_CAMPAIGN",
+			"Start a New Campaign before activating Guild Supplies.")
+	end
+	if reason == "divergent_edit" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_CONFLICTS",
+			"Resolve open configuration conflicts before activating Guild Supplies.")
+	end
+	if reason == "dataset_mismatch" or reason == "live_activation_conflict" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_DATASET",
+			"Resolve the conflicting dataset (adoption) before activating Guild Supplies.")
+	end
+	if reason == "adoption_in_progress" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_ADOPTION",
+			"Finish or cancel dataset adoption before activating Guild Supplies.")
+	end
+	if reason == "not_configured" then
+		return Loc("GUILD_SUPPLIES_DISABLED_NEED_INIT",
+			"Initialize Guild Supplies for this guild first.")
+	end
+	local guide = mod.FormatActivationGuidance and mod.FormatActivationGuidance(ready) or nil
+	if type(guide) == "string" and guide ~= "" then
+		return guide
+	end
+	local formatReason = mod.FormatReasonText or function(r)
+		return tostring(r or "unknown")
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_ACTIVATE_FMT",
+		"Cannot activate yet: %s."):format(formatReason(reason or "not_ready"))
+end
+
+local function DisabledAdoptionSourceTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
+	if auth then
+		return auth
+	end
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) == "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_IN_PROGRESS",
+			"Finish or cancel the current dataset adoption before selecting a new source.")
+	end
+	if #AdoptionSourceOptions() > 0 then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NO_SOURCES",
+		"No eligible peer datasets are currently available for adoption.")
+end
+
+local function DisabledAdoptionBeginTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
+	if auth then
+		return auth
+	end
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) == "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_IN_PROGRESS",
+			"Finish or cancel the current dataset adoption before selecting a new source.")
+	end
+	if pendingAdoptionPeer == nil or pendingAdoptionDataset == nil then
+		if #AdoptionSourceOptions() == 0 then
+			return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NO_SOURCES",
+				"No eligible peer datasets are currently available for adoption.")
+		end
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_SELECT_SOURCE",
+			"Select a source dataset first.")
+	end
+	return nil
+end
+
+local function DisabledAdoptionCommitTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
+	if auth then
+		return auth
+	end
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) ~= "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NONE_COMMIT",
+			"There is no adoption ready to commit.")
+	end
+	if type(adop.replayTemp) == "table" then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_REPLAY",
+			"Wait for the dataset transfer to finish applying before committing.")
+	end
+	if adop.ready ~= true then
+		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_WAIT_TRANSFER",
+			"Wait for the dataset transfer to finish before committing.")
+	end
+	return nil
+end
+
+local function DisabledAdoptionCancelTip()
+	local g = GS()
+	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+	if type(adop) == "table" then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NONE_CANCEL",
+		"There is no adoption in progress.")
+end
+
+local function DisabledConflictTargetTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
+	if auth then
+		return auth
+	end
+	if #ConflictTargetOptions() > 0 then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
+		"There are no unresolved configuration conflicts.")
+end
+
+local function DisabledConflictCandidateTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
+	if auth then
+		return auth
+	end
+	if pendingConflictTarget == nil then
+		if #ConflictTargetOptions() == 0 then
+			return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
+				"There are no unresolved configuration conflicts.")
+		end
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_SELECT",
+			"Select an open configuration conflict first.")
+	end
+	if #ConflictCandidateOptions() < 2 then
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_CANDIDATES",
+			"Select a conflict that still has competing candidate values.")
+	end
+	return nil
+end
+
+local function DisabledConflictChooseTip()
+	local auth = DisabledAuthTip(
+		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
+	if auth then
+		return auth
+	end
+	if pendingConflictTarget == nil then
+		if #ConflictTargetOptions() == 0 then
+			return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
+				"There are no unresolved configuration conflicts.")
+		end
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_SELECT",
+			"Select an open configuration conflict first.")
+	end
+	if pendingConflictChosen == nil or #ConflictCandidateOptions() < 2 then
+		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_CHOOSE",
+			"Select a conflict and a candidate value before resolving it.")
+	end
+	return nil
+end
+
+local function Definition()
+	return {
+		isAdmin = function()
+			return Caps().canEdit or Caps().canRecoverPolicy
+		end,
+		sections = {
+			{
+				id = "gsStatus",
+				title = Loc("GUILD_SUPPLIES_CONFIG_TITLE", "Guild Supplies"),
+				tooltip = Loc("GUILD_SUPPLIES_CONFIG_TOOLTIP",
+					"Guild-keyed staged configuration. Does not depend on Loot Helper profiles."),
+				items = {
+					{
+						type = "display",
+						label = Loc("GUILD_SUPPLIES_STATUS_ROW_LABEL", "Current Status"),
+						get = StatusRowText,
+					},
+					{
+						type = "display",
+						label = Loc("GUILD_SUPPLIES_CAMPAIGN_ROW_LABEL", "Campaign"),
+						get = CampaignRowText,
+						visible = CampaignRowVisible,
+					},
+					{
+						type = "help",
+						indent = "label",
+						padTop = 4,
+						getText = NextStepText,
+						visible = NextStepVisible,
+					},
+					{
+						type = "help",
+						indent = "label",
+						padTop = 2,
+						getText = WarningText,
+						visible = WarningVisible,
+					},
+					{
+						type = "spacer",
+						height = 4,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_INIT_LABEL", "Guild setup"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_INIT_BUTTON", "Initialize Guild Supplies"),
+						width = 200,
+						enabled = function()
+							local c = Caps()
+							if not c.canEdit and not c.canRecoverPolicy then
+								return false
+							end
+							-- Only true first-time setup; existing unusable records use recovery.
+							if not IsNotConfigured() then
+								return false
+							end
+							return true
+						end,
+						getDisabledTooltip = DisabledInitializeTip,
+						onClick = function(ctx)
+							local mod = GS()
+							ctx.section:ClearMessage()
+							if not mod or not mod.CreateStagedRecord then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							if not IsNotConfigured() then
+								ReportStatus(ctx, "rejected", "already_configured")
+								return
+							end
+							local _, status, reason = mod:CreateStagedRecord()
+							ReportStatus(ctx, status or "rejected", reason)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ACTIVATE_LABEL", "Live activation"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ACTIVATE_BUTTON", "Activate Guild Supplies"),
+						width = 200,
+						tooltip = Loc("GUILD_SUPPLIES_ACTIVATE_TIP",
+							"Any authorized editor may activate. Requires a fresh Guild Bank log sample for the configured tab. Idempotent after success."),
+						enabled = function()
+							local mod = GS()
+							if not Caps().canEdit or not mod or not mod.GetActivationReadiness then
+								return false
+							end
+							local ready = mod:GetActivationReadiness()
+							return ready and ready.canActivate == true
+						end,
+						getDisabledTooltip = DisabledActivateTip,
+						onClick = function(ctx)
+							local mod = GS()
+							ctx.section:ClearMessage()
+							if not mod or not mod.ActivateCanonicalDataset then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+							local function commit()
+								local _, status, reason = mod:ActivateCanonicalDataset()
+								ReportStatus(ctx, status or "rejected", reason)
+								-- Rebuild navigation so retired Raid Consumables pages disappear.
+								local win = SF.SettingsUI and SF.SettingsUI.StandaloneWindow
+								if win and win.BuildNavItemsFromRegistry then
+									win:BuildNavItemsFromRegistry()
+								end
+							end
+							if dialogs and dialogs.Confirm then
+								dialogs:Confirm(
+									Loc("GUILD_SUPPLIES_ACTIVATE_CONFIRM",
+										"Activate Guild Supplies as the live guild-owned writer? Pre-activation bank rows will not be credited. This cannot silently fall back to Raid Consumables profiles."),
+									Loc("GUILD_SUPPLIES_ACTIVATE_CONFIRM_OK", "Activate"),
+									commit)
+							else
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+										"Confirmation is required and is unavailable right now."),
+									"error")
+							end
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_PERMISSION_REPAIR", "Repair stored permission"),
+						tooltip = Loc("GUILD_SUPPLIES_PERMISSION_REPAIR_TIP",
+							"Repairs a corrupt historical permission record. It does not choose who can edit Guild Supplies."),
+						adminOnly = true,
+						visible = function()
+							return CanRepairHistoricalPermission()
+						end,
+						defaultText = Loc("GUILD_SUPPLIES_EDITOR_RANK_UNKNOWN", "Unavailable"),
+						options = RecoveryRankOptions,
+						get = function()
+							if not CanRepairHistoricalPermission() then
+								return nil
+							end
+							return Caps().editorRankPosition
+						end,
+						set = function() end,
+						enabled = function()
+							return CanRepairHistoricalPermission()
+						end,
+						getDisabledTooltip = function()
+							if CanRepairHistoricalPermission() then
+								return nil
+							end
+							return Loc("GUILD_SUPPLIES_EDITOR_RANK_DISABLED",
+								"Who can edit follows the shared officer rank. This control only repairs a corrupt stored permission record.")
+						end,
+						onValueChanged = function(ctx, value)
+							CommitEditorRank(ctx, value)
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_BANK_TAB", "Bank Tab"),
+						adminOnly = true,
+						width = 220,
+						tooltip = Loc("GUILD_SUPPLIES_BANK_TAB_TIP",
+							"Shared across campaigns. Changing the tab establishes a new eligibility cutoff."),
+						defaultText = BankTabDefaultText,
+						options = BankTabOptions,
+						get = BankTabDropdownValue,
+						set = function() end,
+						enabled = function()
+							return Caps().canEdit
+								and CurrentRecord() ~= nil
+								and BankTabCatalogLoaded()
+						end,
+						getDisabledTooltip = DisabledBankTabTip,
+						onValueChanged = function(ctx, value)
+							local current = CurrentBankTab()
+							if value == BANK_TAB_UNSET or value == nil then
+								if current == nil then
+									return
+								end
+								CommitConfig(ctx, "set-bank-tab", "bankTab", nil)
+								return
+							end
+							local tab = tonumber(value)
+							if not tab or tab < 1 or tab > 8 or tab ~= math.floor(tab) then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_BANK_TAB",
+										"Choose a Guild Bank tab from the list, or clear the selection."),
+									"error")
+								return
+							end
+							-- Only accept tabs currently offered as viewable; never invent.
+							local entry = BankTabCatalogLoaded() and bankTabCatalog.entries[tab] or nil
+							if not entry or entry.viewable ~= true then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_BANK_TAB",
+										"Choose a Guild Bank tab from the list, or clear the selection."),
+									"error")
+								return
+							end
+							if current == tab then
+								return
+							end
+							CommitConfig(ctx, "set-bank-tab", "bankTab", tab)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_LABEL", "Campaign"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_BUTTON", "New Campaign"),
+						width = 160,
+						tooltip = Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_TIP",
+							"Starts a fresh campaign with empty goals and progress. Previous campaigns are archived and can be viewed in Logs."),
+						enabled = function()
+							return Caps().canEdit and CurrentRecord() ~= nil
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedRecordTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_NEW_CAMPAIGN", "starting a New Campaign"))
+						end,
+						onClick = function(ctx)
+							CommitNewCampaign(ctx)
+						end,
+					},
+				},
+			},
+			{
+				id = "gsAdoption",
+				title = Loc("GUILD_SUPPLIES_ADOPTION_TITLE", "Staged dataset adoption"),
+				tooltip = Loc("GUILD_SUPPLIES_ADOPTION_TIP",
+					"When another authorized editor has a different staged dataset, choose one source. Adoption replaces this client's local staged Guild Supplies configuration; datasets are never merged."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = function()
+							local opts = AdoptionSourceOptions()
+							if #opts == 0 then
+								local g = GS()
+								local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+								if type(adop) == "table" then
+									return Loc("GUILD_SUPPLIES_ADOPTION_PENDING",
+										"Adoption in progress for dataset %s from %s. Waiting for a complete validated transfer before switching.")
+										:format(tostring(adop.sourceDatasetId), tostring(adop.sourcePeer))
+								end
+								return Loc("GUILD_SUPPLIES_ADOPTION_EMPTY",
+									"No conflicting peer datasets are available right now. Empty clients wait for an authenticated editor source.")
+							end
+							return Loc("GUILD_SUPPLIES_ADOPTION_HELP",
+								"Adoption is a local staged-development action. It does not activate live bank accounting or establish guild-wide production authority.")
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE", "Source dataset"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_ADOPTION_NONE", "Select a source"),
+						options = AdoptionSourceOptions,
+						get = function()
+							if pendingAdoptionPeer and pendingAdoptionDataset then
+								return tostring(pendingAdoptionPeer) .. "\0" .. tostring(pendingAdoptionDataset)
+							end
+							return nil
+						end,
+						set = function() end,
+						enabled = function()
+							local c = Caps()
+							return c.canEdit == true and #AdoptionSourceOptions() > 0
+						end,
+						getDisabledTooltip = DisabledAdoptionSourceTip,
+						onValueChanged = function(ctx, value)
+							if type(value) ~= "string" then
+								ClearPendingAdoptionChoice()
+								return
+							end
+							local peer, datasetId = value:match("^(.-)\0(.+)$")
+							if peer and datasetId then
+								pendingAdoptionPeer = peer
+								pendingAdoptionDataset = datasetId
+							else
+								ClearPendingAdoptionChoice()
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_TITLE", "Staged dataset adoption"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_BEGIN", "Start adoption transfer"),
+						width = 220,
+						enabled = function()
+							local c = Caps()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+							return c.canEdit == true
+								and pendingAdoptionPeer ~= nil
+								and pendingAdoptionDataset ~= nil
+								and type(adop) ~= "table"
+						end,
+						getDisabledTooltip = DisabledAdoptionBeginTip,
+						onClick = function(ctx)
+							BeginAdoptionTransfer(ctx)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
+						width = 180,
+						enabled = function()
+							local c = Caps()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+							return c.canEdit == true
+								and type(adop) == "table"
+								and adop.ready == true
+								and type(adop.replayTemp) ~= "table"
+						end,
+						getDisabledTooltip = DisabledAdoptionCommitTip,
+						onClick = function(ctx)
+							CommitAdoptionTransfer(ctx)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_ADOPTION_CANCEL", "Cancel adoption"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_CANCEL", "Cancel adoption"),
+						width = 160,
+						enabled = function()
+							local g = GS()
+							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
+							return type(adop) == "table"
+						end,
+						getDisabledTooltip = DisabledAdoptionCancelTip,
+						onClick = function(ctx)
+							local g = GS()
+							ctx.section:ClearMessage()
+							if g and g.CancelDatasetAdoption then
+								g:CancelDatasetAdoption()
+							end
+							ClearPendingAdoptionChoice()
+							ctx.section:SetMessage(
+								Loc("GUILD_SUPPLIES_STATUS_ADOPTION_CANCELLED",
+									"Dataset adoption cancelled. Local staged configuration was left unchanged."),
+								"info")
+							RefreshPageControls()
+						end,
+					},
+				},
+			},
+			{
+				id = "gsConflicts",
+				title = Loc("GUILD_SUPPLIES_CONFLICT_TITLE", "Configuration conflicts"),
+				tooltip = Loc("GUILD_SUPPLIES_CONFLICT_TIP",
+					"Same-field or concurrent campaign edits stay unresolved until an authorized editor chooses a result."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = ConflictHelpText,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET", "Open conflict"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_NONE", "Select a conflict"),
+						options = ConflictTargetOptions,
+						get = function()
+							return pendingConflictTarget
+						end,
+						set = function() end,
+						enabled = function()
+							return Caps().canEdit and #ConflictTargetOptions() > 0
+						end,
+						getDisabledTooltip = DisabledConflictTargetTip,
+						onValueChanged = function(ctx, value)
+							if type(value) == "string" and value ~= "" then
+								pendingConflictTarget = value
+								pendingConflictChosen = nil
+							else
+								ClearPendingConflictChoice()
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE", "Candidate"),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_NONE", "Select a candidate"),
+						options = ConflictCandidateOptions,
+						get = function()
+							return pendingConflictChosen
+						end,
+						set = function() end,
+						enabled = function()
+							return Caps().canEdit
+								and pendingConflictTarget ~= nil
+								and #ConflictCandidateOptions() >= 2
+						end,
+						getDisabledTooltip = DisabledConflictCandidateTip,
+						onValueChanged = function(ctx, value)
+							if type(value) == "string" and value ~= "" then
+								pendingConflictChosen = value
+							else
+								pendingConflictChosen = nil
+							end
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_SUPPLIES_CONFLICT_TITLE", "Configuration conflicts"),
+						adminOnly = true,
+						buttonText = Loc("GUILD_SUPPLIES_CONFLICT_CHOOSE", "Use this value"),
+						width = 160,
+						enabled = function()
+							return Caps().canEdit
+								and pendingConflictTarget ~= nil
+								and pendingConflictChosen ~= nil
+								and #ConflictCandidateOptions() >= 2
+						end,
+						getDisabledTooltip = DisabledConflictChooseTip,
+						onClick = function(ctx)
+							CommitConflictChoice(ctx, pendingConflictTarget, pendingConflictChosen, nil)
+						end,
+					},
+				},
+			},
+			{
+				id = "gsItems",
+				title = Loc("GUILD_SUPPLIES_ITEMS_TITLE", "Requested items"),
+				tooltip = Loc("GUILD_SUPPLIES_ITEMS_TIP",
+					"Campaign-owned. A New Campaign starts with an empty list."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = ItemsHelpText,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_ADD_ITEM", "Add item"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_ADD_ITEM_HINT", "Item ID or link"),
+						buttonText = Loc("GUILD_SUPPLIES_ADD_ITEM_BUTTON", "Add"),
+						buttonWidth = 90,
+						editWidth = 170,
+						enabled = function()
+							local rec = CurrentRecord()
+							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ITEMS", "editing requested items"))
+						end,
+						onSubmit = function(ctx, text)
+							local C = SF.Consumables
+							local itemId = C and C.ItemIdFromText and C.ItemIdFromText(text) or tonumber(text)
+							if not itemId then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ITEM", "Enter an item ID or paste an item link."),
+									"error")
+								return
+							end
+							-- Fresh mutation-time read (not the render pass cache).
+							local g = GS()
+							local live = g and select(1, g:GetCurrentRecord())
+							local items = live and live.accounting and live.accounting._consumables
+								and live.accounting._consumables.requestedItems
+							if type(items) == "table" and type(items[tostring(itemId)]) == "table" then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ITEM_EXISTS",
+										"That item is already requested. Change its goal in the list instead of adding it again."),
+									"warn")
+								return
+							end
+							CommitConfig(ctx, "set-requested-item", { itemId = itemId }, {
+								itemId = itemId,
+								goal = 0,
+								removed = false,
+							})
+						end,
+					},
+					{
+						type = "consumableRequestedList",
+						label = Loc("GUILD_SUPPLIES_ITEM_LIST", "Current campaign items"),
+						adminOnly = true,
+						height = 180,
+						getItems = RequestedItemRows,
+						enabled = function()
+							local rec = CurrentRecord()
+							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ITEMS", "editing requested items"))
+						end,
+						onRemove = function(ctx, item)
+							if not item or not item.itemId then return end
+							CommitConfig(ctx, "set-requested-item", { itemId = item.itemId }, { removed = true })
+						end,
+						onGoalCommit = function(ctx, item, goal)
+							if not item or not item.itemId then return end
+							local C = SF.Consumables
+							local gnum = C and C.ValidGoal and C.ValidGoal(goal) or nil
+							if gnum == nil then
+								local maxGoal = (C and tonumber(C.MAX_GOAL)) or 100000
+								local raw = tonumber(goal)
+								if raw and raw == math.floor(raw) and raw >= 0 and raw > maxGoal then
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_ERR_GOAL_RANGE",
+											"Enter a whole-number goal from 0 to %d."):format(maxGoal),
+										"error")
+								else
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_ERR_GOAL", "Enter a non-negative whole-number goal."),
+										"error")
+								end
+								return
+							end
+							CommitConfig(ctx, "set-requested-item", { itemId = item.itemId }, {
+								itemId = item.itemId,
+								goal = gnum,
+								removed = false,
+							})
+						end,
+					},
+				},
+			},
+			{
+				id = "gsAdjust",
+				title = Loc("GUILD_SUPPLIES_ADJUST_TITLE", "Quantity adjustment"),
+				tooltip = Loc("GUILD_SUPPLIES_ADJUST_TIP",
+					"Authenticated editors may adjust item totals. Adjustments never verify Guild Bank deposits."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = function()
+							return Loc("GUILD_SUPPLIES_ADJUST_HELP",
+								"Signed quantity changes apply to the guild-owned Guild Supplies ledger. Attribution may name a guild character or stay unattributed. Adjustments never verify Guild Bank deposits.")
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_ADJUST_ITEM", "Item ID")
+							.. " / " .. Loc("GUILD_SUPPLIES_ADJUST_QTY", "Signed quantity")
+							.. " / " .. Loc("GUILD_SUPPLIES_ADJUST_ATTR", "Credit to (optional)"),
+						buttonText = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
+						buttonWidth = 140,
+						editWidth = 220,
+						enabled = function()
+							local rec = CurrentRecord()
+							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
+						end,
+						onSubmit = function(ctx, text)
+							local g = GS()
+							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+							if not g or not g.NewAdjustmentOperation then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local itemPart, qtyPart, attrPart = tostring(text or "")
+								:match("^%s*(%S+)%s+([%-%+]?%d+)%s*(.-)%s*$")
+							local itemId = tonumber(itemPart)
+							local quantity = tonumber(qtyPart)
+							local attributed = attrPart
+							if attributed == "" then attributed = nil end
+							if not itemId or not quantity then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
+										"Enter an item ID, a signed quantity, and an optional character name."),
+									"error")
+								return
+							end
+							local op, prepStatus, prepReason = g:NewAdjustmentOperation(itemId, quantity, attributed)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason)
+								return
+							end
+							local boundOp = op
+							local accept = function()
+								ctx.section:ClearMessage()
+								local status, reason = g:ApplyStagedConfigOperation(boundOp)
+								ReportStatus(ctx, status, reason)
+								RefreshPageControls()
+							end
+							local confirmMsg = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM",
+								"Adjust item %s by %+d on the Guild Supplies ledger?")
+								:format(tostring(itemId), quantity)
+							if dialogs and dialogs.Confirm then
+								dialogs:Confirm(confirmMsg,
+									Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"), accept)
+							else
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+										"Confirmation is required and is unavailable right now."),
+									"error")
+							end
+						end,
+					},
+				},
+			},
+			{
+				id = "gsLinks",
+				title = Loc("GUILD_SUPPLIES_LINKS_TITLE", "Witness character links"),
+				tooltip = Loc("GUILD_SUPPLIES_LINKS_TIP",
+					"Link known alternate characters so they count as one witness identity for donation quorum."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = function()
+							return Loc("GUILD_SUPPLIES_LINKS_HELP",
+								"Guild-owned links only. Linking does not rewrite accepted donations. Unlinked characters remain separate witnesses. Does not use Loot Helper profiles.")
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_LINKS_APPLY", "Link characters"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_LINKS_GUID_A", "Character GUID A")
+							.. " " .. Loc("GUILD_SUPPLIES_LINKS_GUID_B", "Character GUID B"),
+						buttonText = Loc("GUILD_SUPPLIES_LINKS_APPLY", "Link characters"),
+						buttonWidth = 140,
+						editWidth = 260,
+						enabled = function()
+							return Caps().canEdit and CurrentRecord() ~= nil
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedRecordTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_LINKS", "linking characters"))
+						end,
+						onSubmit = function(ctx, text)
+							local g = GS()
+							if not g or not g.NewLinkCharactersOperation then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local a, b = tostring(text or ""):match("^%s*(%S+)%s+(%S+)%s*$")
+							local op, prepStatus, prepReason = g:NewLinkCharactersOperation(a, b)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason)
+								return
+							end
+							ctx.section:ClearMessage()
+							local status, reason = g:ApplyStagedConfigOperation(op)
+							ReportStatus(ctx, status, reason)
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_LINKS_UNLINK", "Unlink character"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_LINKS_UNLINK_GUID", "Character GUID to unlink"),
+						buttonText = Loc("GUILD_SUPPLIES_LINKS_UNLINK", "Unlink character"),
+						buttonWidth = 140,
+						editWidth = 260,
+						enabled = function()
+							return Caps().canEdit and CurrentRecord() ~= nil
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedRecordTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_UNLINK", "unlinking characters"))
+						end,
+						onSubmit = function(ctx, text)
+							local g = GS()
+							if not g or not g.NewUnlinkCharacterOperation then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							local guid = tostring(text or ""):match("^%s*(%S+)%s*$")
+							local op, prepStatus, prepReason = g:NewUnlinkCharacterOperation(guid)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason)
+								return
+							end
+							ctx.section:ClearMessage()
+							local status, reason = g:ApplyStagedConfigOperation(op)
+							ReportStatus(ctx, status, reason)
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "display",
+						label = Loc("GUILD_SUPPLIES_LINKS_TITLE", "Witness character links"),
+						get = function()
+							local rec = CurrentRecord()
+							local links = rec and rec.identityLinks
+							if type(links) ~= "table" or type(links.groups) ~= "table" then
+								return Loc("GUILD_SUPPLIES_LINKS_EMPTY", "No character links yet.")
+							end
+							local n = 0
+							for _ in pairs(links.groups) do n = n + 1 end
+							if n == 0 then
+								return Loc("GUILD_SUPPLIES_LINKS_EMPTY", "No character links yet.")
+							end
+							return Loc("GUILD_SUPPLIES_LINKS_COUNT", "%d link group(s)"):format(n)
+						end,
+					},
+				},
+			},
+			{
+				id = "gsPersonal",
+				title = Loc("GUILD_SUPPLIES_PERSONAL_TITLE", "Personal preferences"),
+				tooltip = Loc("GUILD_SUPPLIES_PERSONAL_TIP",
+					"Account-local. Available to ordinary members; never guild policy."),
+				items = {
+					{
+						type = "checkbox",
+						label = Loc("GUILD_SUPPLIES_REMINDERS", "Show raid supply reminders"),
+						tooltip = Loc("GUILD_SUPPLIES_REMINDERS_TIP",
+							"Personal reminder preference for raid supply deposits."),
+						get = function()
+							local store = SF.SettingsStore
+							if not store or not store.Get then return true end
+							return store:Get("lootHelper.showRaidSupplyReminders") and true or false
+						end,
+						set = function(value)
+							local store = SF.SettingsStore
+							if store and store.Set then
+								store:Set("lootHelper.showRaidSupplyReminders", value and true or false)
+							end
+						end,
+					},
+				},
+			},
+		},
+	}
+end
+
+-- Standalone Settings can hide the parent while the page panel stays IsShown.
+-- Prefer IsVisible so roster-driven work does not run against a closed window.
+local function PanelVisible(panel)
+	if not panel then return false end
+	if panel.IsVisible then
+		return panel:IsVisible() and true or false
+	end
+	if panel.IsShown then
+		return panel:IsShown() and true or false
+	end
+	return false
+end
+
+local function QueueRefresh()
+	local panel = Page.panel
+	if not panel or not Page.Refresh then return end
+	if not PanelVisible(panel) then return end
+	if refreshQueued then return end
+	refreshQueued = true
+	local function run()
+		refreshQueued = false
+		if not Page.panel or not Page.Refresh then return end
+		if not PanelVisible(Page.panel) then return end
+		SyncBankTabCatalogGuild()
+		-- Re-read names while the bank is open so delayed API responses surface Settings.
+		if guildBankOpen then
+			ObserveGuildBankTabs()
+		end
+		Page:Refresh(Page.panel)
+	end
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, run)
+	else
+		run()
+	end
+end
+
+local function EnsureRosterListener()
+	if rosterFrame or type(CreateFrame) ~= "function" then
+		return
+	end
+	local frame = CreateFrame("Frame")
+	rosterFrame = frame
+	frame:RegisterEvent("GUILD_ROSTER_UPDATE")
+	if frame.RegisterEvent then
+		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
+	end
+	frame:SetScript("OnEvent", function()
+		SyncBankTabCatalogGuild()
+		QueueRefresh()
+	end)
+end
+
+--- Event-driven refresh when bank open/close/log/tab updates change readiness or names.
+-- No continuous polling; coalesced via QueueRefresh while the page is visible.
+local function EnsureBankListener()
+	if bankFrame or type(CreateFrame) ~= "function" then
+		return
+	end
+	local frame = CreateFrame("Frame")
+	bankFrame = frame
+	local events = {
+		"GUILDBANKFRAME_OPENED",
+		"GUILDBANKFRAME_CLOSED",
+		"GUILDBANKLOG_UPDATE",
+		"GUILDBANK_UPDATE_TABS",
+		"PLAYER_INTERACTION_MANAGER_FRAME_SHOW",
+		"PLAYER_INTERACTION_MANAGER_FRAME_HIDE",
+	}
+	for i = 1, #events do
+		if frame.RegisterEvent then
+			pcall(frame.RegisterEvent, frame, events[i])
+		end
+	end
+	frame:SetScript("OnEvent", function(_, event, arg1)
+		if event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW"
+			or event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+			if not (Enum and Enum.PlayerInteractionType
+				and arg1 == Enum.PlayerInteractionType.GuildBanker) then
+				return
+			end
+			if event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" then
+				guildBankOpen = true
+				ObserveGuildBankTabs()
+			else
+				guildBankOpen = false
+			end
+		elseif event == "GUILDBANKFRAME_OPENED" then
+			guildBankOpen = true
+			ObserveGuildBankTabs()
+		elseif event == "GUILDBANKFRAME_CLOSED" then
+			guildBankOpen = false
+		elseif event == "GUILDBANK_UPDATE_TABS" then
+			-- Renames / newly purchased tabs; keep session cache fresh while open.
+			if guildBankOpen then
+				ObserveGuildBankTabs()
+			end
+		end
+		-- GUILDBANKLOG_UPDATE only drives activation-readiness refresh (not names).
+		QueueRefresh()
+	end)
+end
+
+--- Coalesced refresh when adoption ready/expiry flips asynchronously (Settings open).
+local adoptionHooked = false
+local function EnsureAdoptionListener()
+	if adoptionHooked then
+		return
+	end
+	local g = GS()
+	if not g then
+		return
+	end
+	adoptionHooked = true
+	local previous = g.OnAdoptionStateChanged
+	g.OnAdoptionStateChanged = function(reason)
+		if previous then
+			pcall(previous, reason)
+		end
+		QueueRefresh()
+	end
+end
+
+--- Shared officer-policy changes can grant or revoke edit rights without roster events.
+local officerHooked = false
+local function EnsureOfficerListener()
+	if officerHooked or Page.__sfOfficerHook then
+		return
+	end
+	local GO = SF.GuildOfficer
+	if not GO or type(GO.RegisterUIListener) ~= "function" then
+		return
+	end
+	officerHooked = true
+	Page.__sfOfficerHook = true
+	GO.RegisterUIListener(function()
+		QueueRefresh()
+	end)
+end
+
+function Page:Build(panel)
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if not renderer or not renderer.Build then
+		return
+	end
+	EnsureRosterListener()
+	EnsureBankListener()
+	EnsureAdoptionListener()
+	EnsureOfficerListener()
+	BeginRenderPass()
+	renderer:Build(panel, Definition())
+	EndRenderPass()
+	self.panel = panel
+	if panel.HookScript and not panel.__sfGuildSuppliesConfigHook then
+		panel.__sfGuildSuppliesConfigHook = true
+		panel:HookScript("OnShow", function()
+			QueueRefresh()
+		end)
+	end
+end
+
+function Page:Refresh(panel)
+	panel = panel or self.panel
+	if not PanelVisible(panel) then
+		return
+	end
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if renderer and renderer.Refresh then
+		BeginRenderPass()
+		renderer:Refresh(panel)
+		EndRenderPass()
+	end
+end
+
+function Page:OnHide()
+	refreshQueued = false
+	-- Do not rely on OnHide for visibility gating; PanelVisible uses IsVisible.
+end
+
+EnsureRosterListener()
+EnsureBankListener()
+EnsureAdoptionListener()
+
+SF.SettingsUI:RegisterPage(Page)

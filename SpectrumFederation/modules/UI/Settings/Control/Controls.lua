@@ -117,6 +117,143 @@ local function HasAdminOnlyItems(items)
 	return false
 end
 
+-- Resolve a stable tooltip title for a control definition.
+local function ResolveTooltipTitle(opts)
+	opts = opts or {}
+	local title = opts.buttonText or opts.label or opts.defaultText or ""
+	if type(title) == "function" then
+		local ok, res = pcall(title)
+		if ok and type(res) == "string" then
+			return res
+		end
+		return opts.label or ""
+	end
+	return tostring(title)
+end
+
+-- Disabled WoW widgets often swallow mouse enter without firing scripts.
+-- A transparent overlay covers the widget only while it is disabled so the
+-- explanatory tooltip still appears; the overlay never enables the action.
+-- @param widget Region Interactive control widget
+-- @param enabled boolean Current enabled state after EvalEnabled
+-- @param opts table Control options (may include getDisabledTooltip)
+-- @return nil
+local function SyncDisabledTooltipOverlay(widget, enabled, opts)
+	if not widget then
+		return
+	end
+	opts = opts or {}
+	local getDisabled = opts.getDisabledTooltip
+	local overlay = widget.__sfDisabledTipOverlay
+
+	if type(getDisabled) ~= "function" then
+		if overlay then
+			local wasCatching = overlay.__sfMouseCatching
+			overlay.__sfMouseCatching = false
+			if overlay.EnableMouse then
+				overlay:EnableMouse(false)
+			end
+			if overlay.Hide then
+				overlay:Hide()
+			end
+			if wasCatching and GameTooltip and GameTooltip.Hide then
+				GameTooltip:Hide()
+			end
+		end
+		return
+	end
+
+	if not overlay then
+		local parent = (widget.GetParent and widget:GetParent()) or widget
+		overlay = CreateFrame("Frame", nil, parent)
+		local baseLevel = (widget.GetFrameLevel and widget:GetFrameLevel()) or 0
+		if overlay.SetFrameLevel then
+			overlay:SetFrameLevel(baseLevel + 5)
+		end
+		if overlay.SetAllPoints then
+			overlay:SetAllPoints(widget)
+		end
+		if overlay.EnableMouse then
+			overlay:EnableMouse(false)
+		end
+		if overlay.Hide then
+			overlay:Hide()
+		end
+		overlay.__sfMouseCatching = false
+		overlay:SetScript("OnEnter", function(self)
+			local fn = self.__sfGetDisabledTooltip
+			local text = type(fn) == "function" and fn() or nil
+			if type(text) ~= "string" or text == "" then
+				return
+			end
+			if not GameTooltip then
+				return
+			end
+			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			GameTooltip:SetText(
+				FormatTooltipTitle(self.__sfTipTitle, self.__sfAdminOnly, self.__sfOwnerOnly),
+				1, 1, 1)
+			GameTooltip:AddLine(text, nil, nil, nil, true)
+			GameTooltip:Show()
+		end)
+		overlay:SetScript("OnLeave", function()
+			if GameTooltip and GameTooltip.Hide then
+				GameTooltip:Hide()
+			end
+		end)
+		widget.__sfDisabledTipOverlay = overlay
+	end
+
+	overlay.__sfGetDisabledTooltip = getDisabled
+	overlay.__sfTipTitle = ResolveTooltipTitle(opts)
+	overlay.__sfAdminOnly = opts.adminOnly and true or false
+	overlay.__sfOwnerOnly = opts.ownerOnly and true or false
+
+	if enabled then
+		local wasCatching = overlay.__sfMouseCatching
+		overlay.__sfMouseCatching = false
+		if overlay.EnableMouse then
+			overlay:EnableMouse(false)
+		end
+		if overlay.Hide then
+			overlay:Hide()
+		end
+		if wasCatching and GameTooltip and GameTooltip.Hide then
+			GameTooltip:Hide()
+		end
+		return
+	end
+
+	-- Decide whether a tip is available before intercepting the mouse.
+	local text = getDisabled()
+	if type(text) ~= "string" or text == "" then
+		local wasCatching = overlay.__sfMouseCatching
+		overlay.__sfMouseCatching = false
+		if overlay.EnableMouse then
+			overlay:EnableMouse(false)
+		end
+		if overlay.Hide then
+			overlay:Hide()
+		end
+		if wasCatching and GameTooltip and GameTooltip.Hide then
+			GameTooltip:Hide()
+		end
+		return
+	end
+
+	if overlay.ClearAllPoints and overlay.SetAllPoints then
+		overlay:ClearAllPoints()
+		overlay:SetAllPoints(widget)
+	end
+	if overlay.Show then
+		overlay:Show()
+	end
+	if overlay.EnableMouse then
+		overlay:EnableMouse(true)
+	end
+	overlay.__sfMouseCatching = true
+end
+
 -- Apply visibility/enabled state to a row and its widgets
 -- @param row Frame Row frame to update
 -- @param section table Section containing the row
@@ -150,6 +287,9 @@ function Controls:_ApplyRowState(row, section, opts, widgets)
 				elseif w.EnableMouse then
 					w:EnableMouse(enabled)
 				end
+				-- Optional disabled-state tip: overlay catches hover without
+				-- enabling the widget. No-op when getDisabledTooltip is absent.
+				SyncDisabledTooltipOverlay(w, enabled, opts)
 			end
 		end
 	end
@@ -929,7 +1069,16 @@ function Controls:AddDropdown(section, opts)
 		local dropdown = CreateFrame("DropdownButton", nil, control, "WowStyle1DropdownTemplate")
 		dropdown:SetPoint("LEFT", control, "LEFT", 0, 0)
 		dropdown:SetWidth(opts.width or CONTROL_WIDTH)
-		dropdown:SetDefaultText(opts.defaultText or "Select...")
+
+		local function ResolveDefaultText()
+			local d = opts.defaultText
+			if type(d) == "function" then
+				return d()
+			end
+			return d or "Select..."
+		end
+
+		dropdown:SetDefaultText(ResolveDefaultText())
 
 		local function GetOptions()
 			local o = opts.options
@@ -972,6 +1121,7 @@ function Controls:AddDropdown(section, opts)
 		dropdown:SetupMenu(Generator)
 
 		local function Refresh()
+			dropdown:SetDefaultText(ResolveDefaultText())
 			self:_ApplyRowState(row, section, opts, {dropdown})
 			if dropdown.GenerateMenu then
 				dropdown:GenerateMenu()
@@ -3005,6 +3155,255 @@ function Controls:AddEquipmentBoard(section, opts)
 			self:_ApplyRowState(row, section, opts)
 		end
 
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
+-- ---------------------------------------
+-- Roster autocomplete (Settings-local typeahead; #402)
+-- Filters an in-memory suggestion list — callers must not rescan the guild
+-- roster inside getSuggestions on every keystroke.
+-- ---------------------------------------
+-- @param section table Section to add row into
+-- @param opts table Options: label, get/set or unbound getText/setText,
+--   getSuggestions(prefix)->[{value,label,text}], onResolved(item|nil),
+--   maxSuggestions, width, visible/enabled
+-- @return Frame The created row
+function Controls:AddAutocomplete(section, opts)
+	opts = opts or {}
+	local maxSuggestions = math.max(1, math.min(tonumber(opts.maxSuggestions) or 8, 16))
+	local bound = false
+	local get, set
+	if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
+		bound = true
+		get, set = ResolveGetSet(opts)
+	end
+
+	return section:AddRow(26, function(row)
+		local _, control = self:InitRow(row, opts)
+
+		local edit = CreateFrame("EditBox", nil, control, "InputBoxTemplate")
+		edit:SetAutoFocus(false)
+		edit:SetSize(opts.width or CONTROL_WIDTH, 22)
+		edit:SetPoint("LEFT", control, "LEFT", 0, 0)
+		edit:SetTextColor(1, 1, 1)
+		if edit.SetHighlightColor then
+			edit:SetHighlightColor(0.25, 0.5, 1, 0.35)
+		end
+		if opts.maxLetters then
+			edit:SetMaxLetters(opts.maxLetters)
+		end
+		if opts.hint and edit.Instructions then
+			edit.Instructions:SetText(opts.hint)
+		end
+
+		local drop = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
+		drop:SetFrameStrata("TOOLTIP")
+		drop:SetClampedToScreen(true)
+		drop:Hide()
+		if drop.SetBackdrop then
+			drop:SetBackdrop({
+				bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+				edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+				tile = true,
+				tileSize = 8,
+				edgeSize = 12,
+				insets = { left = 3, right = 3, top = 3, bottom = 3 },
+			})
+			drop:SetBackdropColor(0, 0, 0, 0.92)
+			drop:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+		end
+
+		local suggestionButtons = {}
+		local ignore = false
+		local resolvedValue = nil
+
+		local function HideDrop()
+			drop:Hide()
+		end
+
+		local function NotifyResolved(item)
+			resolvedValue = item and (item.value or item.id or item.guid) or nil
+			if type(opts.onResolved) == "function" then
+				opts.onResolved(item)
+			end
+		end
+
+		local function SelectItem(item)
+			if not item then
+				return
+			end
+			ignore = true
+			local text = item.text or item.label or tostring(item.value or "")
+			edit:SetText(text)
+			if edit.SetCursorPosition then
+				edit:SetCursorPosition(0)
+			end
+			ignore = false
+			if bound then
+				set(text)
+			end
+			NotifyResolved(item)
+			HideDrop()
+			edit:ClearFocus()
+		end
+
+		local function EnsureSuggestionButton(i)
+			if suggestionButtons[i] then
+				return suggestionButtons[i]
+			end
+			local btn = CreateFrame("Button", nil, drop)
+			btn:SetHeight(20)
+			local fs = btn:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			fs:SetPoint("LEFT", btn, "LEFT", 6, 0)
+			fs:SetPoint("RIGHT", btn, "RIGHT", -6, 0)
+			fs:SetJustifyH("LEFT")
+			btn.Text = fs
+			local hl = btn:CreateTexture(nil, "BACKGROUND")
+			hl:SetAllPoints()
+			hl:SetColorTexture(0.2, 0.55, 1.0, 0.25)
+			hl:Hide()
+			btn.Highlight = hl
+			btn:SetScript("OnEnter", function()
+				hl:Show()
+			end)
+			btn:SetScript("OnLeave", function()
+				hl:Hide()
+			end)
+			suggestionButtons[i] = btn
+			return btn
+		end
+
+		local function ShowSuggestions(prefix)
+			local getSuggestions = opts.getSuggestions
+			if type(getSuggestions) ~= "function" then
+				HideDrop()
+				return
+			end
+			local items = getSuggestions(prefix) or {}
+			if #items == 0 then
+				HideDrop()
+				return
+			end
+			local width = edit:GetWidth() or CONTROL_WIDTH
+			local y = 4
+			local count = math.min(#items, maxSuggestions)
+			for i = 1, count do
+				local item = items[i]
+				local btn = EnsureSuggestionButton(i)
+				btn:ClearAllPoints()
+				btn:SetPoint("TOPLEFT", drop, "TOPLEFT", 4, -y)
+				btn:SetPoint("TOPRIGHT", drop, "TOPRIGHT", -4, -y)
+				btn.Text:SetText(item.label or item.text or tostring(item.value or ""))
+				btn:SetScript("OnClick", function()
+					SelectItem(item)
+				end)
+				btn:Show()
+				y = y + 20
+			end
+			for i = count + 1, #suggestionButtons do
+				suggestionButtons[i]:Hide()
+			end
+			drop:SetSize(width + 8, y + 4)
+			drop:ClearAllPoints()
+			drop:SetPoint("TOPLEFT", edit, "BOTTOMLEFT", -4, -2)
+			drop:Show()
+		end
+
+		edit:SetScript("OnTextChanged", function(selfEdit, userInput)
+			if ignore or not userInput then
+				return
+			end
+			-- Typing invalidates any prior resolved selection.
+			NotifyResolved(nil)
+			local text = selfEdit:GetText() or ""
+			if bound then
+				set(text)
+			end
+			if type(opts.onTextChanged) == "function" then
+				opts.onTextChanged(text, selfEdit)
+			end
+			ShowSuggestions(text)
+		end)
+
+		edit:SetScript("OnEditFocusGained", function(selfEdit)
+			ShowSuggestions(selfEdit:GetText() or "")
+		end)
+
+		edit:SetScript("OnEditFocusLost", function()
+			-- Delay hide so suggestion clicks register.
+			if C_Timer and C_Timer.After then
+				C_Timer.After(0.15, function()
+					if not edit:HasFocus() then
+						HideDrop()
+					end
+				end)
+			else
+				HideDrop()
+			end
+			if bound then
+				local text = edit:GetText() or ""
+				set(text)
+			end
+		end)
+
+		edit:SetScript("OnEnterPressed", function(selfEdit)
+			HideDrop()
+			selfEdit:ClearFocus()
+			if type(opts.onEnterPressed) == "function" then
+				opts.onEnterPressed(selfEdit:GetText() or "", selfEdit)
+			end
+		end)
+
+		edit:SetScript("OnEscapePressed", function(selfEdit)
+			HideDrop()
+			selfEdit:ClearFocus()
+		end)
+
+		local function Refresh()
+			local focused = edit.HasFocus and edit:HasFocus()
+			local cursor = nil
+			if focused and edit.GetCursorPosition then
+				cursor = edit:GetCursorPosition()
+			end
+			local priorText = edit.GetText and (edit:GetText() or "") or ""
+			local text = ""
+			if bound then
+				text = tostring(get() or "")
+			elseif type(opts.getText) == "function" then
+				text = tostring(opts.getText() or "")
+			elseif type(opts.get) == "function" then
+				text = tostring(opts.get() or "")
+			end
+			-- Preserve caret/focus during typing: avoid rewriting identical text
+			-- and never force the cursor to the start while the box is focused.
+			if not (focused and text == priorText) then
+				ignore = true
+				edit:SetText(text)
+				if edit.SetCursorPosition then
+					if focused and cursor ~= nil then
+						local maxPos = #text
+						if cursor > maxPos then
+							cursor = maxPos
+						end
+						edit:SetCursorPosition(cursor)
+					elseif not focused then
+						edit:SetCursorPosition(0)
+					end
+				end
+				ignore = false
+			end
+			local _, enabled = self:_ApplyRowState(row, section, opts, { edit })
+			local c = enabled and 1 or 0.6
+			edit:SetTextColor(c, c, c)
+			if not enabled then
+				HideDrop()
+			end
+		end
+
+		row.__sfAutocompleteEdit = edit
+		row.__sfAutocompleteHide = HideDrop
 		Refresh()
 		RegisterRefresh(section, Refresh)
 	end)

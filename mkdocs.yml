@@ -104,6 +104,10 @@ nav:
     - Settings System: development/settings-ui/index.md
     - Mouse Tracer: development/mouse-tracer.md
     - Loot Helper Internals: development/loot-helper/index.md
+    - Guild Gossip: development/guild-gossip/index.md
+    - Guild Supplies: development/guild-supplies/index.md
+    - Guild Info: development/guild-info/index.md
+    - Guild officer rank: development/guild-officer.md
     - RC Loot Council Integration: development/rc-loot-council-integration.md
     - Automation and Releases: development/automation.md
 

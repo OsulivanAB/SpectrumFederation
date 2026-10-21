@@ -29,6 +29,9 @@ local addonName, SF = ...
 | `modules/UI/Settings/` | Page/category registry, navigation model, standalone window, controls, dialogs, and page definitions. |
 | `modules/LootHelper/` | Profile, member, log, and linked-identity domain models plus serialization, the current communication adapter, and runtime-only local impersonation. |
 | `modules/LootHelperSync/` | Session state, validation, requests, convergence, heartbeat, routing, bulk handlers, and public API. |
+| `modules/GuildGossip/` | Decentralized guild gossip transport (Phase 1): provider contract, discovery, C1 seek paging, D1 scheduling, synthetic test provider. Independent of raid/session state. |
+| `modules/GuildSupplies/` | Guild-owned raid supply campaigns, staged/live activation, donation ledger, and witness identity groups. |
+| `modules/GuildInfo/` | Guild-owned directed main/alt relationships (#402). Own Gossip provider; independent of Loot Helper and Guild Supplies. |
 | `modules/UI/LootHelper/` | Roster/equipment presentation and controller logic. |
 | `modules/RaidCheck.lua` | Inspection cache, equipment evaluation, whispers, snapshots, and point awards. |
 | `modules/VersionCheck.lua` | Raid/party addon-version query, roster snapshot, and `/sf version` window. |

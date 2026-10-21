@@ -286,6 +286,40 @@ function R:Build(panel, pageDef)
 				end
 				controls:AddEditBoxWithButton(sec, opts)
 
+			elseif t == "autocomplete" then
+				local opts = item
+				if type(opts.onResolved) == "function"
+					or type(opts.onTextChanged) == "function"
+					or type(opts.onEnterPressed) == "function"
+					or type(opts.getSuggestions) == "function" then
+					opts = CopyTable(opts)
+					if type(opts.onResolved) == "function" then
+						local fn = opts.onResolved
+						opts.onResolved = function(itemResolved)
+							return fn(ctx, itemResolved)
+						end
+					end
+					if type(opts.onTextChanged) == "function" then
+						local fn = opts.onTextChanged
+						opts.onTextChanged = function(text, editBox)
+							return fn(ctx, text, editBox)
+						end
+					end
+					if type(opts.onEnterPressed) == "function" then
+						local fn = opts.onEnterPressed
+						opts.onEnterPressed = function(text, editBox)
+							return fn(ctx, text, editBox)
+						end
+					end
+					if type(opts.getSuggestions) == "function" then
+						local fn = opts.getSuggestions
+						opts.getSuggestions = function(prefix)
+							return fn(ctx, prefix)
+						end
+					end
+				end
+				controls:AddAutocomplete(sec, opts)
+
 			elseif t == "scrollableText" then
 				controls:AddScrollableText(sec, item)
 

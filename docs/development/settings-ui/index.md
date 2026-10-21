@@ -37,7 +37,7 @@ The sidebar shows **top-level categories only**. Nested sidebar children are not
 
 Pages may set optional `contentHeading`. When present, the window keeps the category name as the primary title and shows that string as a secondary heading above the page description. Pages without `contentHeading` keep the existing header layout. Do not set it on Loot Helper pages; that category title must remain **Loot Helper**.
 
-Discovered child addons default to group **Optional**. Parent-owned categories keep Core / Loot Tools / Advanced.
+Discovered child addons default to group **Optional**. Parent-owned categories keep Core / Raid Tools / Advanced. Core order is General, Guild Settings, Gameplay. Raid Tools order is Loot Helper, Loot Logs, Raid Equipment, Raid Supplies.
 
 `ShowPage(id)` is deterministic and ignores last-tab. `ShowPage("lootHelper")` opens `lootHelperGeneral`. Sidebar clicks restore last-tab for that category when it is still valid. `/sf` may restore this session; `/reload` does not.
 

@@ -2,7 +2,7 @@
 
 Enter `/sf` to toggle Spectrum Federation's standalone settings window. Changes are saved immediately; there is no Apply button.
 
-The left sidebar lists **categories** grouped as Core, Loot Tools, Advanced, and Optional. Categories with more than one page show **tabs** in the content area. Categories with a single page have no tab bar. The first `/sf` open in a session starts on **General**. Later `/sf` toggles restore the category and tab from this session; that restoration is not saved across a reload.
+The left sidebar lists **categories** grouped as Core, Raid Tools, Advanced, and Optional. **Core** is General, Guild Settings, then Gameplay. **Raid Tools** is Loot Helper, Loot Logs, Raid Equipment, then Raid Supplies. Categories with more than one page show **tabs** in the content area. Categories with a single page have no tab bar. The first `/sf` open in a session starts on **General**. Later `/sf` toggles restore the category and tab from this session; that restoration is not saved across a reload.
 
 **Quick Find** matches category and page names, descriptions, and group labels. With a search query, choosing a category opens the best matching page in that category.
 
@@ -94,7 +94,7 @@ The visible **Trigger Raid-Wide Sync** control is currently a placeholder. It do
 
 ## Raid Equipment
 
-**Raid Equipment** is a top-level Loot Tools category. It does not require a Loot Helper profile or session. Auto refresh is off by default and remains stored as `lootHelper.raidCheckAuditAutoRefresh`; enable it or select **Refresh Snapshot** when you need current data.
+**Raid Equipment** is a top-level Raid Tools category. It does not require a Loot Helper profile or session. Auto refresh is off by default and remains stored as `lootHelper.raidCheckAuditAutoRefresh`; enable it or select **Refresh Snapshot** when you need current data.
 
 See [Raid Check](features/raid-check.md) for interpretation and inspection limitations.
 
@@ -117,6 +117,8 @@ This tab appears only when the optional `SpectrumFederation_RCLootCouncilIntegra
 During a Loot Helper session, while RC award recording is on, admins also get a local warning if a player selects one of those BiS responses after that opportunity is already used. The Master Looter gets an informational popup if the item is awarded anyway. Neither message changes RC Loot Council or the tracked BiS state. See [RC Loot Council Integration](development/rc-loot-council-integration.md).
 
 ## Loot Logs
+
+**Loot Logs** is its own Raid Tools sidebar category, immediately after Loot Helper. It is not a Loot Helper tab.
 
 Filter the active profile's history by event type, author, or member. These filters are temporary UI state and are not saved.
 
