@@ -862,13 +862,25 @@ local function RecoveryRankOptions()
 	return opts
 end
 
---- Historical permission repair only. Live authorization is the shared officer policy.
+--- Historical permission repair only. A missing officer policy is not corruption.
 local function CanRepairHistoricalPermission()
-	local c = Caps()
 	if IsNotConfigured() then
 		return false
 	end
-	return c.canRecoverPolicy == true and c.canEdit ~= true
+	local c = Caps()
+	if c.canRecoverPolicy ~= true or c.canEdit == true then
+		return false
+	end
+	if c.reason == "policy_unknown" or c.reason == "policy_invalid" then
+		return false
+	end
+	local g = GS()
+	if not g or type(g.GetCurrentRecord) ~= "function"
+		or type(g._IsPermissionOnlyFailure) ~= "function" then
+		return false
+	end
+	local _, reason = g:GetCurrentRecord()
+	return g._IsPermissionOnlyFailure(reason) and true or false
 end
 
 local function CommitEditorRank(ctx, position)
@@ -1316,10 +1328,13 @@ local function Definition()
 					},
 					{
 						type = "dropdown",
-						label = Loc("GUILD_SUPPLIES_EDITOR_RANK", "Editor ranks"),
-						tooltip = Loc("GUILD_SUPPLIES_EDITOR_RANK_RECOVER_TIP",
-							"Repairs a corrupt stored permission record. It does not choose who can edit Guild Supplies."),
+						label = Loc("GUILD_SUPPLIES_PERMISSION_REPAIR", "Repair stored permission"),
+						tooltip = Loc("GUILD_SUPPLIES_PERMISSION_REPAIR_TIP",
+							"Repairs a corrupt historical permission record. It does not choose who can edit Guild Supplies."),
 						adminOnly = true,
+						visible = function()
+							return CanRepairHistoricalPermission()
+						end,
 						defaultText = Loc("GUILD_SUPPLIES_EDITOR_RANK_UNKNOWN", "Unavailable"),
 						options = RecoveryRankOptions,
 						get = function()

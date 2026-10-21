@@ -93,7 +93,7 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 
 | Area | Access |
 | --- | --- |
-| **Guild Supplies → Configuration** | Initialize, bank tab, New Campaign, items/goals, character links, adjustments, adoption, conflict resolution, **Activate Guild Supplies**. Who can edit follows the shared officer rank. The old editor-rank selector is only a repair control for a corrupt stored permission record. |
+| **Guild Supplies → Configuration** | Initialize, bank tab, New Campaign, items/goals, character links, adjustments, adoption, conflict resolution, **Activate Guild Supplies**. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. |
 | **Guild Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history |
 | **Personal preferences** | Account-local reminder checkbox |
 | **Loot Helper → Consumables / Consumable Logs** | Hidden from navigation after live activation (`page.available`) |

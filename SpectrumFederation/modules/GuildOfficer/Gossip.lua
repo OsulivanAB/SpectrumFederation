@@ -139,64 +139,45 @@ local function RebuildExport()
     end
 end
 
-local function ProviderEntry()
-    local g = Gossip()
-    if not g or type(g.GetProvider) ~= "function" then
-        return nil
-    end
-    return g.GetProvider(GO.PROVIDER_ID)
-end
-
-local function BumpPhysicalIndex(index)
-    local g = Gossip()
-    local idx = index
-    if not idx then
-        local entry = ProviderEntry()
-        idx = entry and entry.index
-    end
-    if not idx or not g or type(g.BumpIndexEpoch) ~= "function" then
-        return false
-    end
-    g.BumpIndexEpoch(idx)
-    idx.buildComplete = false
-    idx.dirty = true
-    return true
-end
-
-local function EnsureExportFresh()
-    if not exportDirty then
-        return
-    end
-    RebuildExport()
-    BumpPhysicalIndex(nil)
-end
-
 local function OnIndexInvalidated()
 end
 
+-- One current policy row. IndexUpsert refuses a fingerprint replacement and
+-- tells the caller to bump. BumpIndexEpoch clears the index, so the current
+-- row is inserted on the following pass. A guild-scope change clears first,
+-- then inserts only the new guild's current record.
 local function EnsureIndex(index, limits)
     limits = limits or {}
-    local guildKey = CurrentGuildKey()
-    if exportState.guildKey ~= guildKey or exportDirty then
-        RebuildExport()
-        if exportState.guildKey ~= guildKey then
-            BumpPhysicalIndex(index)
-        end
-    end
-    if index.buildComplete and not index.dirty then
+    if type(index) ~= "table" then
         return false, 0
     end
+    local guildKey = CurrentGuildKey()
+    local scopeChanged = exportState.guildKey ~= guildKey
+    local refreshed = false
+    if scopeChanged or exportDirty then
+        RebuildExport()
+        refreshed = true
+    end
     local g = Gossip()
+    if scopeChanged and g and g.BumpIndexEpoch then
+        g.BumpIndexEpoch(index)
+    end
+    if not refreshed and index.buildComplete and not index.dirty then
+        return false, 0
+    end
     local budget = math.max(1, tonumber(limits.indexEntries) or 8)
     local examined = 0
     if exportState.record and g and g.IndexUpsert then
         local wire = exportState.record
         local _, detail = g.IndexUpsert(index, wire.id, wire.versionFp, wire)
         examined = 1
-        if detail == "replaced" and g.BumpIndexEpoch then
-            g.BumpIndexEpoch(index)
+        if detail == "replaced" then
+            if g.BumpIndexEpoch then
+                g.BumpIndexEpoch(index)
+            end
+            return true, examined
         end
-    elseif g and g.IndexRemove then
+    elseif g and g.IndexRemove and index.byId and index.byId[GO.RECORD_ID] then
         g.IndexRemove(index, GO.RECORD_ID)
         examined = 1
     end

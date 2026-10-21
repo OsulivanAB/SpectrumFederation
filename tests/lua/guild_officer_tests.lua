@@ -476,6 +476,67 @@ end
 do
     resetDB()
     GO:Bootstrap()
+    local established = policy()
+    local dave = SF.GuildGossip.GetGuildMember("Dave-Garona")
+    local forged = {
+        guildKey = "club:42",
+        threshold = 4,
+        baseThreshold = 4,
+        revN = established.revN + 1,
+        revW = "444444444444444444444444",
+        at = 9,
+    }
+    local status = select(1, GO:ApplyRemotePolicy(forged, dave))
+    assertEq(status, "rejected", "rank 4 fabricated predecessor is rejected")
+    assertEq(policy().threshold, 3, "fabricated predecessor does not change the threshold")
+    assertEq(policy().revN, established.revN, "fabricated predecessor does not advance the revision")
+    local alice = SF.GuildGossip.GetGuildMember("Alice-Garona")
+    local replay = {
+        guildKey = "club:42",
+        threshold = 1,
+        baseThreshold = 0,
+        revN = established.revN + 3,
+        revW = "777777777777777777777777",
+        at = 9,
+    }
+    status = select(1, GO:ApplyRemotePolicy(replay, alice))
+    assertEq(status, "rejected", "bootstrap replay does not replace a known policy")
+    assertEq(policy().threshold, 3, "known policy survives a bootstrap replay")
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GO:CommitThreshold(2)), "accepted", "rank 3 officer can still tighten locally")
+    local afterLocal = policy()
+    local bob = SF.GuildGossip.GetGuildMember("Bob-Garona")
+    local concurrent = {
+        guildKey = "club:42",
+        threshold = 1,
+        baseThreshold = afterLocal.baseThreshold,
+        revN = afterLocal.revN,
+        revW = "555555555555555555555555",
+        at = 10,
+    }
+    status = select(1, GO:ApplyRemotePolicy(concurrent, bob))
+    assertEq(status, "accepted", "same-base concurrent edit keeps the more restrictive threshold")
+    assertEq(policy().threshold, 1, "restrictive concurrent threshold is stored")
+    world.guild.clubId = 99
+    local carol = SF.GuildGossip.GetGuildMember("Carol-Garona")
+    local catchup = {
+        guildKey = "club:99",
+        threshold = 3,
+        baseThreshold = 3,
+        revN = 4,
+        revW = "666666666666666666666666",
+        at = 11,
+    }
+    status = select(1, GO:ApplyRemotePolicy(catchup, carol))
+    assertEq(status, "accepted", "empty client accepts a normal officer catch-up")
+    assertEq(select(1, GO:GetStoredPolicy("club:99")).threshold, 3, "catch-up threshold is stored")
+    assertEq(select(1, GO:GetStoredPolicy("club:42")).threshold, 1, "catch-up does not replace the other guild")
+    world.guild.clubId = 42
+end
+
+do
+    resetDB()
+    GO:Bootstrap()
     local saved = policy().threshold
     world.guild.clubId = 99
     local view = GO:GetView()
@@ -685,6 +746,109 @@ do
     GO:CommitThreshold(1)
     assertEq(later:IsAdminMemberId("Dave-Garona"), false, "threshold change does not scan existing members")
     assertEq(profile:IsAdminMemberId("Alice-Garona"), true, "owner admin is preserved")
+end
+
+---------------------------------------------------------------------------
+-- Real Guild Gossip index: replacement must keep the current policy exported
+---------------------------------------------------------------------------
+
+do
+    loadModule("SpectrumFederation/modules/GuildGossip/01_Constants.lua")
+    loadModule("SpectrumFederation/modules/GuildGossip/02_Util.lua")
+    loadModule("SpectrumFederation/modules/GuildGossip/07_Index.lua")
+    resetDB()
+    local GG = SF.GuildGossip
+    local provider = GG.GetProvider(GO.PROVIDER_ID)
+    local index = GG.CreateIndex()
+    provider.index = index
+    local spec = provider.spec
+
+    local function countRows()
+        local n = 0
+        for _ in pairs(index.byId or {}) do
+            n = n + 1
+        end
+        return n
+    end
+
+    local function drive()
+        local steps = 0
+        local more = true
+        while more do
+            steps = steps + 1
+            if steps > 6 then
+                fail("officer index did not converge")
+                return steps
+            end
+            more = spec.EnsureIndex(index, { indexEntries = 8 }) and true or false
+        end
+        assertEq(index.buildComplete, true, "converged index is complete")
+        assertEq(index.dirty and true or false, false, "converged index is idle")
+        return steps
+    end
+
+    local function assertCurrent(message)
+        local stored = select(1, GO:GetStoredPolicy("club:" .. tostring(world.guild.clubId)))
+        local row = index.byId[GO.RECORD_ID]
+        if not stored then
+            assertNil(row, message .. " has no export row")
+            assertNil(spec.GetRecordBody(GO.RECORD_ID), message .. " has no export body")
+            assertEq(countRows(), 0, message .. " exports nothing")
+            return
+        end
+        assertTrue(row ~= nil, message .. " row present")
+        assertEq(row.versionFp, GO.PolicyVersionFp(stored), message .. " fingerprint")
+        local body = spec.GetRecordBody(GO.RECORD_ID)
+        assertEq(body and body.body and body.body.threshold, stored.threshold, message .. " export threshold")
+        assertEq(body and body.versionFp, row.versionFp, message .. " export fingerprint")
+        assertEq(countRows(), 1, message .. " exports one row")
+    end
+
+    GO:Bootstrap()
+    local steps = drive()
+    assertTrue(steps <= 3, "bootstrap index converges quickly: " .. tostring(steps))
+    assertCurrent("bootstrap")
+
+    assertEq(select(1, GO:CommitThreshold(2)), "accepted", "index edit 1")
+    steps = drive()
+    assertTrue(steps >= 2, "a revision rebuilds through the real replacement pass: " .. tostring(steps))
+    assertCurrent("one edit")
+
+    assertEq(select(1, GO:CommitThreshold(1)), "accepted", "index edit 2")
+    drive()
+    assertCurrent("second edit")
+    assertEq(select(1, GO:CommitThreshold(3)), "accepted", "index edit 3")
+    drive()
+    assertCurrent("third edit")
+
+    local localPolicy = select(1, GO:GetStoredPolicy("club:42"))
+    local carol = GG.GetGuildMember("Carol-Garona")
+    local remote = {
+        guildKey = "club:42",
+        threshold = 2,
+        baseThreshold = localPolicy.threshold,
+        revN = localPolicy.revN + 1,
+        revW = "abababababababababababab",
+        at = 20,
+    }
+    assertEq(select(1, GO:ApplyRemotePolicy(remote, carol)), "accepted", "remote adoption accepted")
+    drive()
+    assertCurrent("remote adoption")
+
+    local epoch = index.epoch
+    for _ = 1, 5 do
+        local more = spec.EnsureIndex(index, { indexEntries = 8 })
+        assertEq(more and true or false, false, "idle EnsureIndex does no further work")
+    end
+    assertEq(index.epoch, epoch, "idle EnsureIndex does not bump the epoch")
+    assertCurrent("idle")
+
+    world.guild.clubId = 99
+    drive()
+    assertCurrent("guild switch")
+    world.guild.clubId = 42
+    drive()
+    assertCurrent("return to original guild")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

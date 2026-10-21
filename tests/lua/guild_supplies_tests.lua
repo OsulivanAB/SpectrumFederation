@@ -6534,7 +6534,24 @@ do
         for _, child in ipairs(node.children or {}) do findDrops(child) end
     end
     findDrops(recoverPanel)
+    local function repairControlVisible(panel)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "dropdown" and item.label
+                    and tostring(item.label):find("Repair", 1, true)
+                    and type(item.visible) == "function" then
+                    return item.visible() and true or false
+                end
+            end
+        end
+        return nil
+    end
     assertTrue(#recoverDrops >= 1, "recovery rank dropdown present")
+    assertEq(repairControlVisible(recoverPanel), true,
+        "corrupt historical permission shows the repair control")
+    assertTrue(recoverDrops[1].parent and recoverDrops[1].parent.parent
+        and recoverDrops[1].parent.parent.shown ~= false,
+        "repair control row is shown while permission is corrupt")
     recoverDrops[1]:GenerateMenu()
     local picked
     for i = 1, #(recoverDrops[1].menuOptions or {}) do
@@ -6608,20 +6625,8 @@ do
     local ordinaryInitPanel = makeRegion("Frame", "GSOrdinaryInit", nil)
     ordinaryInitPanel:SetSize(600, 800)
     configPage:Build(ordinaryInitPanel)
-    local function rankDropdownEnabled(panel)
-        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
-            for _, item in ipairs(sec.items or {}) do
-                if item.type == "dropdown" and item.label
-                    and tostring(item.label):find("Editor", 1, true)
-                    and type(item.enabled) == "function" then
-                    return item.enabled() and true or false
-                end
-            end
-        end
-        return nil
-    end
-    assertEq(rankDropdownEnabled(ordinaryInitPanel), false,
-        "ordinary not_configured disables editor-rank edits")
+    assertEq(repairControlVisible(ordinaryInitPanel), false,
+        "ordinary not_configured hides historical permission repair")
     assertEq(select(2, GS:GetCurrentRecord()), "not_configured", "ordinary guild not_configured")
     local ordinaryInitBtn
     local function findOrdinaryInit(node)
@@ -6641,8 +6646,18 @@ do
     assertEq(ordinaryRec.permission.editorRankPosition, GS.DEFAULT_EDITOR_RANK_POSITION or 3,
         "ordinary Initialize admits default editor rank policy")
     configPage:Refresh(ordinaryInitPanel)
-    assertEq(rankDropdownEnabled(ordinaryInitPanel), false,
-        "editor-rank configuration stays disabled after Initialize")
+    assertEq(repairControlVisible(ordinaryInitPanel), false,
+        "configured Guild Supplies does not show an editor-rank control")
+    world.skipOfficerBootstrap = true
+    if SpectrumFederationDB.guildOfficer and SpectrumFederationDB.guildOfficer.guilds then
+        SpectrumFederationDB.guildOfficer.guilds["club:42"] = nil
+    end
+    configPage:Refresh(ordinaryInitPanel)
+    assertEq(GS:GetCapabilities().reason, "policy_unknown",
+        "valid dataset with no officer policy reports policy_unknown")
+    assertEq(repairControlVisible(ordinaryInitPanel), false,
+        "policy unknown does not show historical permission repair")
+    world.skipOfficerBootstrap = false
 
     -- Pending init rank bound to guild context; click Initialize and assert dataset/policy.
     resetDb()

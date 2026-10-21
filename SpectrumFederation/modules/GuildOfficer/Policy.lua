@@ -689,6 +689,56 @@ function GO:CommitThreshold(position, opts)
     return "accepted", nil
 end
 
+-- Remote admission. A known local policy authorizes the sender against that
+-- policy, not against the predecessor claimed in the incoming record.
+-- Same-revision edits still authorize against the shared predecessor so a
+-- more restrictive concurrent edit is admitted. An empty client can only
+-- check the claimed predecessor; that cold-join limitation is accepted.
+local function RemoteSenderAuthorized(remote, member, localPolicy, rankCount)
+    if localPolicy then
+        local sameGeneration = remote.revN == localPolicy.revN
+            and remote.baseThreshold == localPolicy.baseThreshold
+        if sameGeneration then
+            local pred = localPolicy.baseThreshold
+            if pred == GO.BOOTSTRAP_BASE then
+                if member.rankOrder ~= 1 then
+                    return false, "unauthorized"
+                end
+                return true
+            end
+            if rankCount and pred > rankCount then
+                pred = rankCount
+            end
+            if member.rankOrder > pred then
+                return false, "unauthorized"
+            end
+            return true
+        end
+        if remote.baseThreshold == GO.BOOTSTRAP_BASE then
+            return false, "already_established"
+        end
+        local effective = EffectiveThreshold(localPolicy, rankCount)
+        if not effective or member.rankOrder > effective then
+            return false, "unauthorized"
+        end
+        return true
+    end
+    local authBase = remote.baseThreshold
+    if authBase == GO.BOOTSTRAP_BASE then
+        if member.rankOrder ~= 1 then
+            return false, "policy_requires_gm"
+        end
+        return true
+    end
+    if rankCount and authBase > rankCount then
+        authBase = rankCount
+    end
+    if member.rankOrder > authBase then
+        return false, "unauthorized"
+    end
+    return true
+end
+
 --- Apply one authenticated remote policy record.
 function GO:ApplyRemotePolicy(body, member)
     if GO._applyingRemote then
@@ -720,25 +770,16 @@ function GO:ApplyRemotePolicy(body, member)
     if member.rankOrder < 1 or member.rankOrder > rankCount then
         return "rejected", "unauthorized"
     end
-    local authBase = remote.baseThreshold
-    if authBase == GO.BOOTSTRAP_BASE then
-        if member.rankOrder ~= 1 then
-            return "rejected", "policy_requires_gm"
-        end
-    else
-        if rankCount and authBase > rankCount then
-            authBase = rankCount
-        end
-        if member.rankOrder > authBase then
-            return "rejected", "unauthorized"
-        end
-    end
-    -- A stored threshold above this client's rank count is kept. The predecessor
-    -- check above already capped authorization. The shorter list does not rewrite it.
     if not GO:IsRootReady() then
         return "rejected", GO:GetRootReason() or "not_ready"
     end
     local localPolicy = select(1, GO:GetStoredPolicy(remote.guildKey))
+    local allowed, authReason = RemoteSenderAuthorized(remote, member, localPolicy, rankCount)
+    if not allowed then
+        return "rejected", authReason or "unauthorized"
+    end
+    -- A stored threshold above this client's rank count is kept. Authorization
+    -- above already capped a known policy. The shorter list does not rewrite it.
     local status, merged, detail = GO.MergePolicies(localPolicy, remote)
     if status ~= "accepted" then
         return status, detail

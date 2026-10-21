@@ -19,6 +19,7 @@ Guild Info, Guild Supplies, and the one-time Loot Helper admin grant read this p
 - Any verified member can view the effective policy. An officer may change it. Authority is rechecked when the change is committed and when a remote record is admitted.
 - A self-restricting edit is authorized against the previous threshold. After it lands, that officer loses further edit rights.
 - Same-revision concurrent edits keep the lower (more restrictive) threshold. A later revision replaces it, including a deliberate widen by someone who still qualifies. A lower revision is stale.
+- When this client already has a valid policy, a remote sender must meet that known threshold. The predecessor claimed in the incoming record does not grant authority. Same-revision edits are still checked against the shared predecessor. A client with no stored policy can only validate the claimed predecessor, so a cold join can accept a first record it cannot independently verify.
 - The policy is independent of Guild Supplies datasets, Loot Helper profiles, and Guild Info relationship cleanup.
 
 Disconnected clients may briefly use an older threshold. That limitation is accepted. This is not a consensus log.
@@ -43,10 +44,10 @@ SpectrumFederationDB.guildOfficer = {
 }
 ```
 
-Gossip publishes one current record, `go-p:current`, kind `guild-officer-policy`. There is no per-frame roster poll and no operation history.
+Gossip publishes one current record, `go-p:current`, kind `guild-officer-policy`. A changed fingerprint bumps the Guild Gossip index and the next index pass inserts that current record. A guild switch clears the previous guild's row. There is no per-frame roster poll and no operation history.
 
 ## Consumers
 
 - **Guild Info.** Assign, move, unassign, Change Main, and history cleanup use the shared threshold for local commits and authenticated remote mutations. Cleanup does not replace the threshold.
-- **Guild Supplies.** Configuration, initialization, campaigns, and maintenance use the shared threshold. `permission.editorRankPosition` stays on existing records so historical validation and replica ancestry still work. It does not decide who can edit. The Settings editor-rank control only repairs a corrupt stored permission record.
+- **Guild Supplies.** Configuration, initialization, campaigns, and maintenance use the shared threshold. `permission.editorRankPosition` stays on existing records so historical validation and replica ancestry still work. It does not decide who can edit. Settings shows a historical permission repair control only when that stored permission record is actually corrupt. An unknown officer policy does not show it, and ordinary configured or unconfigured use does not show an editor-rank selector.
 - **Loot Helper.** Adding a new character to an existing profile may grant profile admin once, through the existing admin log, when that character's native guild rank meets the policy. Profile creation, import, hydration, snapshot replay, and remote rebuilds do not grant. Unknown or ambiguous verification adds a regular member. Later demotion, threshold changes, and manual admin removal do not scan or regrant.
