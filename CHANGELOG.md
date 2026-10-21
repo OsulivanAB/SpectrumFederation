@@ -2,6 +2,12 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.18] - 2026-10-21
+
+### Fixed
+- Guild Info: same-generation higher `sealRev` tips park already-accepted rows and re-merge them after exact tip seal (or a bounded tip-subset witness); count supersets alone no longer complete baselines (#402)
+- Guild Info: `syncGen` / `sealRev` share canonical writer + exclusive numeric ceiling validation; seal refresh fails closed when the revision cannot advance (#402)
+
 ## [1.5.12-beta.17] - 2026-10-21
 
 ### Fixed

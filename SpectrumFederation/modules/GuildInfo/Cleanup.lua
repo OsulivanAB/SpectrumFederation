@@ -39,13 +39,19 @@ local function IsCanonicalGenWriter(w)
     return #w == 24 and w:match("^[0-9a-fA-F]+$") ~= nil
 end
 
+local function MaxAdvancableN()
+    -- Exclusive ceiling: n must stay strictly below this so n+1 remains a
+    -- finite, exact Lua number and ordinary cleanup can still advance.
+    return tonumber(GI.MAX_SYNC_GEN_N) or 9007199254740990
+end
+
 --- Bound, canonical sync-generation tuple (bootstrap or 24-hex writer).
+-- Rejects terminal counters that cannot be advanced by _NextSyncGen.
 local function ValidGen(gen)
     if type(gen) ~= "table" or not GI.IsFiniteNonnegInt(gen.n) then
         return false
     end
-    local maxN = tonumber(GI.MAX_SYNC_GEN_N) or 9007199254740990
-    if gen.n > maxN then
+    if gen.n >= MaxAdvancableN() then
         return false
     end
     return IsCanonicalGenWriter(gen.w)
@@ -63,12 +69,19 @@ function GI.DefaultSyncGen()
     return { n = 1, w = "bootstrap" }
 end
 
+--- Seal revisions use the same writer canon and exclusive numeric ceiling as syncGen.
 local function ValidSealRev(rev)
-    return type(rev) == "table"
-        and GI.IsFiniteNonnegInt(rev.n)
-        and type(rev.w) == "string"
-        and rev.w ~= ""
-        and #rev.w <= 64
+    if type(rev) ~= "table" or not GI.IsFiniteNonnegInt(rev.n) then
+        return false
+    end
+    if rev.n >= MaxAdvancableN() then
+        return false
+    end
+    return IsCanonicalGenWriter(rev.w)
+end
+
+function GI.ValidSealRev(rev)
+    return ValidSealRev(rev)
 end
 
 local function CompareSealRev(a, b)
@@ -78,7 +91,7 @@ end
 --- Bump baseline.sealRev using the local writable writer (complete peers / cleanup).
 function GI._BumpSealRev(record)
     if type(record) ~= "table" then
-        return nil
+        return nil, "not_ready"
     end
     record.baseline = record.baseline or {}
     local writer, reason = GI:_EnsureWritableWriter()
@@ -86,9 +99,12 @@ function GI._BumpSealRev(record)
         return nil, reason
     end
     local prev = record.baseline.sealRev
-    local prevN = (ValidSealRev(prev) and tonumber(prev.n)) or 0
-    local maxN = tonumber(GI.MAX_SYNC_GEN_N) or 9007199254740990
-    if prevN >= maxN then
+    local prevN = 0
+    if type(prev) == "table" and GI.IsFiniteNonnegInt(prev.n) then
+        prevN = tonumber(prev.n) or 0
+    end
+    local maxN = MaxAdvancableN()
+    if prevN + 1 >= maxN then
         return nil, "generation_exhausted"
     end
     record.baseline.sealRev = { n = prevN + 1, w = writer.nonce }
@@ -166,12 +182,10 @@ function GI:_NextSyncGen(prevGen)
         return nil, reason
     end
     local prevN = (type(prevGen) == "table" and tonumber(prevGen.n)) or 0
-    local maxN = tonumber(GI.MAX_SYNC_GEN_N) or 9007199254740990
-    if prevN >= maxN then
-        return nil, "generation_exhausted"
-    end
+    local maxN = MaxAdvancableN()
     local nextN = prevN + 1
-    if nextN > maxN or nextN <= prevN then
+    -- nextN must itself be ValidGen (strictly below the exclusive ceiling).
+    if nextN >= maxN or nextN <= prevN then
         return nil, "generation_exhausted"
     end
     return { n = nextN, w = writer.nonce }
@@ -429,7 +443,8 @@ end
 -- Only valid for a completed baseline writer/follower. Incomplete sync keeps
 -- epoch-expected counts/fingerprint until TrySealBaseline succeeds.
 -- Each refresh bumps sealRev so same-generation catch-up follows a tip order
--- instead of last-arrival fingerprint replacement.
+-- instead of last-arrival fingerprint replacement. If the revision cannot
+-- advance, leave the prior advertised tip untouched (no stale-rev content swap).
 function GI.RefreshBaselineSeal(record)
     if type(record) ~= "table" then
         return false
@@ -438,16 +453,14 @@ function GI.RefreshBaselineSeal(record)
         return false
     end
     record.baseline = record.baseline or {}
+    local bumped, bumpErr = GI._BumpSealRev(record)
+    if not bumped then
+        return false, bumpErr or "generation_exhausted"
+    end
     record.baseline.complete = true
     record.baseline.memberCount = CountKeys(record.members)
     record.baseline.groupCount = CountKeys(record.groups)
     record.baseline.contentFp = GI.ComputeBaselineContentFp(record.members, record.groups)
-    if not GI._BumpSealRev(record) then
-        -- Keep prior sealRev if the writer cannot advance; still refresh content.
-        if not ValidSealRev(record.baseline.sealRev) then
-            record.baseline.sealRev = { n = 1, w = "bootstrap" }
-        end
-    end
     record.revision = record.baseline.memberCount + record.baseline.groupCount
     return true
 end
@@ -608,7 +621,91 @@ local function SealRevFromEpoch(epochBody)
         return { n = rev.n, w = rev.w }
     end
     -- Legacy epochs without sealRev sort as the generation-entry tip.
-    return { n = 0, w = "" }
+    -- Empty writer is only for this synthetic sort key, never admitted on wire.
+    return { n = 0, w = "bootstrap" }
+end
+
+local function CompareVerSafe(a, b)
+    if GI.CompareVer then
+        return GI.CompareVer(a, b)
+    end
+    return 0
+end
+
+--- Park already-accepted same-gen rows before restarting tip catch-up.
+-- Bounded by MAX_MEMBERS / MAX_GROUPS; version merge keeps the winning row.
+local function HoldSameGenRows(record)
+    record._sameGenHold = record._sameGenHold or {
+        members = {},
+        groups = {},
+        characters = {},
+    }
+    local hold = record._sameGenHold
+    for guid, m in pairs(record.members or {}) do
+        local prev = hold.members[guid]
+        if not prev or CompareVerSafe(m.ver, prev.ver) > 0 then
+            hold.members[guid] = m
+        end
+    end
+    for gid, g in pairs(record.groups or {}) do
+        local prev = hold.groups[gid]
+        if not prev or CompareVerSafe(g.ver, prev.ver) > 0 then
+            hold.groups[gid] = g
+        end
+    end
+    for guid, c in pairs(record.characters or {}) do
+        if type(c) == "table" then
+            hold.characters[guid] = c
+        end
+    end
+end
+
+local function ClearDurableRows(record)
+    record.members = {}
+    record.groups = {}
+    record.characters = {}
+    record.revision = 0
+end
+
+--- Re-merge held same-gen rows after an exact tip seal so concurrent officer
+-- edits survive without requiring Gossip retransmission.
+function GI.ReapplySameGenHold(record)
+    if type(record) ~= "table" then
+        return false
+    end
+    local hold = record._sameGenHold
+    if type(hold) ~= "table" then
+        return false
+    end
+    record._sameGenHold = nil
+    local gen = record.syncGen
+    local applied = false
+    for _, m in pairs(hold.members or {}) do
+        local st = GI.MergeMember(record, m, { remote = true, gen = gen, skipReconcile = true })
+        if st == "accepted" then
+            applied = true
+        end
+    end
+    for _, g in pairs(hold.groups or {}) do
+        local st = GI.MergeGroup(record, g, { remote = true, gen = gen })
+        if st == "accepted" then
+            applied = true
+        end
+    end
+    if type(hold.characters) == "table" and GI._RememberCharacter then
+        for guid, c in pairs(hold.characters) do
+            if type(c) == "table" then
+                GI._RememberCharacter(record.characters, guid, c.nameRealm, c.classFile)
+            end
+        end
+    end
+    if GI.RebuildDerived then
+        GI.RebuildDerived(record)
+    end
+    if applied and GI.IsBaselineComplete(record) and GI.RefreshBaselineSeal then
+        GI.RefreshBaselineSeal(record)
+    end
+    return applied
 end
 
 --- Adopt a newer remote sync generation (wipe old baseline; await sealed content).
@@ -632,10 +729,10 @@ function GI.AdoptSyncGeneration(record, epochBody)
     if #contentFp > 128 then
         return false, "invalid_generation"
     end
-    local incomingSeal = SealRevFromEpoch(epochBody)
     if epochBody.sealRev ~= nil and not ValidSealRev(epochBody.sealRev) then
         return false, "invalid_generation"
     end
+    local incomingSeal = SealRevFromEpoch(epochBody)
 
     local localGen = GI.GetSyncGen(record) or { n = 0, w = "" }
     local cmp = GI.CompareGen(epochBody.gen, localGen)
@@ -650,22 +747,19 @@ function GI.AdoptSyncGeneration(record, epochBody)
         end
         record.baseline = record.baseline or {}
         local localSeal = ValidSealRev(record.baseline.sealRev) and record.baseline.sealRev
-            or { n = 0, w = "" }
+            or { n = 0, w = "bootstrap" }
         local sealCmp = CompareSealRev(incomingSeal, localSeal)
         if sealCmp < 0 then
             return true, "duplicate"
         end
         if sealCmp == 0 then
-            -- Same tip: keep expected seal; try seal / merged finalize.
             GI.TrySealBaseline(record)
             return true, "duplicate"
         end
-        -- Higher same-gen tip: follow it. Wipe so an interleaved union cannot
-        -- permanently mismatch every single-writer fingerprint, then refill
-        -- from the winning writer's snapshot (loser edits merge afterward).
-        record.members = {}
-        record.groups = {}
-        record.characters = {}
+        -- Higher same-gen tip: restart tip catch-up but park already-accepted
+        -- rows so concurrent officer edits are not silently discarded.
+        HoldSameGenRows(record)
+        ClearDurableRows(record)
         record.baseline = {
             complete = false,
             memberCount = memberCount,
@@ -677,15 +771,13 @@ function GI.AdoptSyncGeneration(record, epochBody)
         if GI.RebuildDerived then
             GI.RebuildDerived(record)
         end
-        record.revision = 0
         GI.TrySealBaseline(record)
         return true, "accepted"
     end
 
     -- Newer generation wins: discard previous-generation durable relationship state.
-    record.members = {}
-    record.groups = {}
-    record.characters = {}
+    record._sameGenHold = nil
+    ClearDurableRows(record)
     record.syncGen = { n = epochBody.gen.n, w = epochBody.gen.w }
     record.baseline = {
         complete = false,
@@ -698,14 +790,73 @@ function GI.AdoptSyncGeneration(record, epochBody)
     if GI.RebuildDerived then
         GI.RebuildDerived(record)
     end
-    record.revision = 0
     GI.TrySealBaseline(record)
     return true, "accepted"
 end
 
---- After admitting new-gen member/group rows, seal when counts + contentFp match.
--- Also finalizes a concurrent same-generation merge when durable rows form a
--- strict superset of the adopted tip (independent partitioned edits).
+local function SortedKeys(t)
+    local keys = {}
+    for k in pairs(t or {}) do
+        keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    return keys
+end
+
+local function ComputeFpExcluding(members, groups, dropMembers, dropGroups)
+    local mview, gview = {}, {}
+    for guid, m in pairs(members or {}) do
+        if not (dropMembers and dropMembers[guid]) then
+            mview[guid] = m
+        end
+    end
+    for gid, g in pairs(groups or {}) do
+        if not (dropGroups and dropGroups[gid]) then
+            gview[gid] = g
+        end
+    end
+    return GI.ComputeBaselineContentFp(mview, gview)
+end
+
+--- True when durable rows contain some tip-sized subset whose contentFp matches.
+-- Bounded: at most 2 extra members and 2 extra groups (C(n,2) style trials).
+local function TipSubsetWitnessed(record, tipMc, tipGc, tipFp)
+    local members, groups = record.members or {}, record.groups or {}
+    local mc, gc = CountKeys(members), CountKeys(groups)
+    local extraM, extraG = mc - tipMc, gc - tipGc
+    if extraM < 0 or extraG < 0 or extraM > 2 or extraG > 2 then
+        return false
+    end
+    local mids, gids = SortedKeys(members), SortedKeys(groups)
+    local function tryDrops(dropMCount, dropGCount, startM, startG, dropMembers, dropGroups)
+        if dropMCount == 0 and dropGCount == 0 then
+            return ComputeFpExcluding(members, groups, dropMembers, dropGroups) == tipFp
+        end
+        if dropMCount > 0 then
+            for i = startM, #mids do
+                dropMembers[mids[i]] = true
+                if tryDrops(dropMCount - 1, dropGCount, i + 1, startG, dropMembers, dropGroups) then
+                    return true
+                end
+                dropMembers[mids[i]] = nil
+            end
+            return false
+        end
+        for j = startG, #gids do
+            dropGroups[gids[j]] = true
+            if tryDrops(0, dropGCount - 1, startM, j + 1, dropMembers, dropGroups) then
+                return true
+            end
+            dropGroups[gids[j]] = nil
+        end
+        return false
+    end
+    return tryDrops(extraM, extraG, 1, 1, {}, {})
+end
+
+--- After admitting rows, seal on exact tip match, or when durable rows contain a
+-- bounded tip-subset witness (concurrent extras present) whose contentFp matches
+-- the adopted tip. Count supersets alone are never enough.
 function GI.TrySealBaseline(record)
     if type(record) ~= "table" or type(record.baseline) ~= "table" then
         return false
@@ -717,31 +868,30 @@ function GI.TrySealBaseline(record)
     local gc = CountKeys(record.groups)
     local tipMc = tonumber(record.baseline.memberCount) or -1
     local tipGc = tonumber(record.baseline.groupCount) or -1
+    local tipFp = tostring(record.baseline.contentFp or "")
     local fp = GI.ComputeBaselineContentFp(record.members, record.groups)
-    if mc == tipMc and gc == tipGc and fp == tostring(record.baseline.contentFp or "") then
-        record.baseline.complete = true
-        if GI.RebuildDerived then
-            GI.RebuildDerived(record)
-        end
-        return true
+    local matched = (mc == tipMc and gc == tipGc and fp == tipFp)
+        or (tipMc >= 0 and tipGc >= 0 and tipFp ~= ""
+            and TipSubsetWitnessed(record, tipMc, tipGc, tipFp))
+    if not matched then
+        return false
     end
-    -- Concurrent same-gen catch-up: local durable state exceeded the adopted
-    -- single-writer tip (merged independent edits). Seal the merged snapshot
-    -- so a fresh peer can relay after source writers go offline.
-    if (mc > tipMc or gc > tipGc) and mc > 0 and gc > 0 and tipMc >= 0 and tipGc >= 0 then
-        record.baseline.complete = true
-        record.baseline.memberCount = mc
-        record.baseline.groupCount = gc
-        record.baseline.contentFp = fp
-        if not ValidSealRev(record.baseline.sealRev) then
-            record.baseline.sealRev = { n = 1, w = "bootstrap" }
-        end
-        if GI.RebuildDerived then
-            GI.RebuildDerived(record)
-        end
-        return true
+    record.baseline.complete = true
+    if GI.RebuildDerived then
+        GI.RebuildDerived(record)
     end
-    return false
+    if record._sameGenHold then
+        GI.ReapplySameGenHold(record)
+    end
+    -- Advertise the full durable union (tip + concurrent extras), not the tip alone.
+    if GI.RefreshBaselineSeal then
+        GI.RefreshBaselineSeal(record)
+    else
+        record.baseline.memberCount = CountKeys(record.members)
+        record.baseline.groupCount = CountKeys(record.groups)
+        record.baseline.contentFp = GI.ComputeBaselineContentFp(record.members, record.groups)
+    end
+    return true
 end
 
 --- Gate remote/local merge against the active sync generation.

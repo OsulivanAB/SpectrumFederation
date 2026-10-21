@@ -4141,8 +4141,37 @@ do
     runCycleOrder(false)
 end
 
-do
-    -- B — Same-generation dual-writer catch-up must converge for a fresh peer
+local function splitEpochAndRows(wires)
+    local epochs, rows = {}, {}
+    for i = 1, #wires do
+        local kind = wires[i].body and wires[i].body.kind
+        if kind == "guildinfo-epoch" then
+            epochs[#epochs + 1] = wires[i]
+        else
+            rows[#rows + 1] = wires[i]
+        end
+    end
+    return epochs, rows
+end
+
+local function findWire(wires, kind, needle)
+    for i = 1, #wires do
+        local b = wires[i].body
+        if b and b.kind == kind then
+            if kind == "guildinfo-member" and b.member and b.member.guid == needle then
+                return wires[i]
+            end
+            if kind == "guildinfo-group" and b.group and b.group.groupId == needle then
+                return wires[i]
+            end
+            if kind == "guildinfo-epoch" then
+                return wires[i]
+            end
+        end
+    end
+end
+
+local function prepareDualWriterBaseline()
     restoreBaseRoster()
     resetDB()
     setActor("Alice-Garona", "Player-1-Alice", 1)
@@ -4169,57 +4198,241 @@ do
     SpectrumFederationDB = dbB
     GI:Initialize(dbB)
     setActor("Carol-Garona", "Player-1-Carol", 3)
-    -- Use Eve on B (different character than Carol).
+    -- Two independent B edits so B's snapshot is a strict count-superset of A's tip.
     assertEq(GI:AssignAlt("Alice-Garona", "Eve-Garona", { roster = GI.GetRosterSnapshot(true) }),
         "accepted", "B B assigns Eve")
+    assertEq(GI:AssignAlt("Alice-Garona", "Dave-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "B B assigns Dave")
     GI.NotifyLocalDurableChange("local")
     local wiresB = exportProviderWiresLive()
+    return dbA, dbB, wiresA, wiresB
+end
 
-    assertTrue(#wiresA >= 3 and #wiresB >= 3, "B both writers exported epochs+rows")
+do
+    -- Fail-before (b4064e02 residuals): hard wipe + count-superset seal.
+    local fixedAdopt, fixedSeal = GI.AdoptSyncGeneration, GI.TrySealBaseline
+    local function countKeysLocal(t)
+        local n = 0
+        if type(t) == "table" then for _ in pairs(t) do n = n + 1 end end
+        return n
+    end
+    function GI.AdoptSyncGeneration(record, epochBody)
+        -- Legacy same-gen higher tip: wipe durable rows (b4064e02 residual).
+        local ok, detail = fixedAdopt(record, epochBody)
+        return ok, detail
+    end
+    -- Replace with explicit wipe clone of the residual behavior for demo.
+    function GI.AdoptSyncGeneration(record, epochBody)
+        if type(record) ~= "table" or type(epochBody) ~= "table" then
+            return false, "malformed"
+        end
+        if not GI.ValidSyncGen(epochBody.gen) then
+            return false, "invalid_generation"
+        end
+        local localGen = GI.GetSyncGen(record) or { n = 0, w = "" }
+        local cmp = GI.CompareGen(epochBody.gen, localGen)
+        if cmp < 0 then return false, "stale_generation" end
+        if cmp == 0 then
+            if GI.IsBaselineComplete(record) then return true, "duplicate" end
+            local incoming = epochBody.sealRev or { n = 0, w = "bootstrap" }
+            local localSeal = record.baseline and record.baseline.sealRev or { n = 0, w = "bootstrap" }
+            local sealCmp = GI.CompareVer(incoming, localSeal)
+            if sealCmp > 0 then
+                record.members, record.groups, record.characters = {}, {}, {}
+                record.baseline = {
+                    complete = false,
+                    memberCount = tonumber(epochBody.memberCount) or 0,
+                    groupCount = tonumber(epochBody.groupCount) or 0,
+                    contentFp = tostring(epochBody.contentFp or ""),
+                    sealRev = { n = incoming.n, w = incoming.w },
+                }
+                if GI.RebuildDerived then GI.RebuildDerived(record) end
+                GI.TrySealBaseline(record)
+                return true, "accepted"
+            end
+            GI.TrySealBaseline(record)
+            return true, "duplicate"
+        end
+        return fixedAdopt(record, epochBody)
+    end
+    function GI.TrySealBaseline(record)
+        if type(record) ~= "table" or type(record.baseline) ~= "table" then return false end
+        if record.baseline.complete then return true end
+        local mc, gc = countKeysLocal(record.members), countKeysLocal(record.groups)
+        local tipMc = tonumber(record.baseline.memberCount) or -1
+        local tipGc = tonumber(record.baseline.groupCount) or -1
+        local fp = GI.ComputeBaselineContentFp(record.members, record.groups)
+        if mc == tipMc and gc == tipGc and fp == tostring(record.baseline.contentFp or "") then
+            record.baseline.complete = true
+            return true
+        end
+        if (mc > tipMc or gc > tipGc) and mc > 0 and gc > 0 then
+            record.baseline.complete = true
+            record.baseline.memberCount, record.baseline.groupCount = mc, gc
+            record.baseline.contentFp = fp
+            return true
+        end
+        return false
+    end
+
+    local _, _, wiresA, wiresB = prepareDualWriterBaseline()
+    local epochA = findWire(wiresA, "guildinfo-epoch")
+    local carol = findWire(wiresA, "guildinfo-member", "Player-1-Carol")
+    local epochB = findWire(wiresB, "guildinfo-epoch")
+    local dbBroken = seedEmptyPeer()
+    admitWireLive(dbBroken, epochA, "Alice-Garona")
+    admitWireLive(dbBroken, carol, "Alice-Garona")
+    admitWireLive(dbBroken, epochB, "Carol-Garona")
+    for i = 1, #wiresB do
+        if wiresB[i] ~= epochB then
+            admitWireLive(dbBroken, wiresB[i], "Carol-Garona")
+        end
+    end
+    SpectrumFederationDB = dbBroken
+    GI:Initialize(dbBroken)
+    assertNil(select(1, GI:GetCurrentRecord()).members["Player-1-Carol"],
+        "fail-before B1: hard wipe drops Carol without A replay")
+
+    local dbBroken2 = seedEmptyPeer()
+    local _, rowsB = splitEpochAndRows(wiresB)
+    admitWireLive(dbBroken2, epochA, "Alice-Garona")
+    for i = 1, #rowsB do
+        admitWireLive(dbBroken2, rowsB[i], "Carol-Garona")
+    end
+    SpectrumFederationDB = dbBroken2
+    GI:Initialize(dbBroken2)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())),
+        "fail-before B2: count superset falsely completes")
+
+    GI.AdoptSyncGeneration, GI.TrySealBaseline = fixedAdopt, fixedSeal
+    pass("fail-before B1/B2 residuals reproduced under b4064e02 monkeypatch")
+end
+
+do
+    -- B1 — Carol accepted before higher same-gen seal must survive without A replay
+    local _, _, wiresA, wiresB = prepareDualWriterBaseline()
+    local epochA = findWire(wiresA, "guildinfo-epoch")
+    local carol = findWire(wiresA, "guildinfo-member", "Player-1-Carol")
+    local epochB = findWire(wiresB, "guildinfo-epoch")
+    assertTrue(epochA and carol and epochB, "B1 captured A epoch/Carol and B epoch")
+    local sealA = epochA.body.sealRev and tonumber(epochA.body.sealRev.n) or 0
+    local sealB = epochB.body.sealRev and tonumber(epochB.body.sealRev.n) or 0
+    -- Ensure B tip sorts higher; if not, swap labels conceptually by using max tip last.
+    local firstEpoch, secondEpoch, secondRows, secondSender = epochA, epochB, wiresB, "Carol-Garona"
+    if sealB < sealA or (sealB == sealA and tostring(epochB.body.sealRev and epochB.body.sealRev.w or "")
+        < tostring(epochA.body.sealRev and epochA.body.sealRev.w or "")) then
+        firstEpoch, secondEpoch, secondRows, secondSender = epochB, epochA, wiresA, "Alice-Garona"
+        carol = findWire(wiresB, "guildinfo-member", "Player-1-Eve") or carol
+    end
 
     local dbC = seedEmptyPeer()
-    local mixed = interleaveWires(wiresA, wiresB)
-    -- Also reverse-biased second pass so neither single fingerprint completes alone mid-stream.
-    for i = 1, #mixed do
-        admitWireLive(dbC, mixed[i], (i % 2 == 0) and "Alice-Garona" or "Carol-Garona")
-    end
-    for i = #wiresB, 1, -1 do
-        admitWireLive(dbC, wiresB[i], "Carol-Garona")
-    end
-    for i = #wiresA, 1, -1 do
-        admitWireLive(dbC, wiresA[i], "Alice-Garona")
-    end
-
+    admitWireLive(dbC, firstEpoch, "Alice-Garona")
+    admitWireLive(dbC, carol, "Alice-Garona")
     SpectrumFederationDB = dbC
     GI:Initialize(dbC)
-    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    assertTrue(select(1, GI:GetCurrentRecord()).members[carol.body.member.guid] ~= nil,
+        "B1 pre-higher-tip unique member accepted")
+
+    admitWireLive(dbC, secondEpoch, secondSender)
+    -- Deliver only the higher tip's full snapshot. Do NOT replay the first writer's wires.
+    for i = 1, #secondRows do
+        if secondRows[i] ~= secondEpoch then
+            admitWireLive(dbC, secondRows[i], secondSender)
+        end
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    DriveEnsureIndex(GI.PROVIDER_ID, 64)
     local recC = select(1, GI:GetCurrentRecord())
-    assertTrue(GI.IsBaselineComplete(recC), "B C sealed after interleaved dual-writer catch-up")
-    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "B C keeps Bob")
+    assertTrue(GI.IsBaselineComplete(recC), "B1 C sealed from higher tip without wipe-loss")
+    assertTrue(recC.members[carol.body.member.guid] ~= nil,
+        "B1 unique member survived higher same-gen seal without retransmission")
     assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"]
         or altsUnderMain("Player-1-Alice")["Player-1-Eve"],
-        "B C has at least one partitioned edit")
-    -- Prefer full union when both writers' rows were delivered.
-    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "B C has Carol")
-    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Eve"], "B C has Eve")
+        "B1 unique alt visible after seal")
 
-    -- A/B offline: C relays to D.
-    SpectrumFederationDB = dbC
-    GI:Initialize(dbC)
+    -- A offline: C relays preserved member to D.
     GI.NotifyLocalDurableChange("local")
     local wiresC = exportProviderWiresLive()
-    assertTrue(#wiresC > 1, "B C exports more than epoch-only")
     local dbD = seedEmptyPeer()
     for i = 1, #wiresC do
         admitWireLive(dbD, wiresC[i], "Alice-Garona")
     end
     SpectrumFederationDB = dbD
     GI:Initialize(dbD)
-    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "B D sealed via C relay")
-    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "B D Carol")
-    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Eve"], "B D Eve")
+    assertTrue(select(1, GI:GetCurrentRecord()).members[carol.body.member.guid] ~= nil,
+        "B1 D received preserved member via C relay")
+end
+
+do
+    -- B2 — Count superset alone must not mark baseline complete
+    local _, _, wiresA, wiresB = prepareDualWriterBaseline()
+    local epochA = findWire(wiresA, "guildinfo-epoch")
+    local _, rowsB = splitEpochAndRows(wiresB)
+    assertTrue(epochA ~= nil and #rowsB > 0, "B2 fixtures")
+
+    local dbC = seedEmptyPeer()
+    admitWireLive(dbC, epochA, "Alice-Garona")
+    -- Deliver B's rows (more members than A's tip) but never A's Carol and never B's epoch tip.
+    for i = 1, #rowsB do
+        admitWireLive(dbC, rowsB[i], "Carol-Garona")
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    local recC = select(1, GI:GetCurrentRecord())
+    local tipMc = tonumber(recC.baseline.memberCount) or -1
+    local mc = 0
+    for _ in pairs(recC.members or {}) do mc = mc + 1 end
+    assertTrue(mc > tipMc, "B2 local member count exceeds A's tip")
+    assertTrue(not GI.IsBaselineComplete(recC),
+        "B2 count superset does not falsely complete A's claimed baseline")
+    assertNil(recC.members["Player-1-Carol"], "B2 never received Carol")
+end
+
+do
+    -- B3 — Full dual-writer catch-up still converges and relays (no forced A replay)
+    local _, _, wiresA, wiresB = prepareDualWriterBaseline()
+    local dbC = seedEmptyPeer()
+    local epochsA, rowsA = splitEpochAndRows(wiresA)
+    local epochsB, rowsB = splitEpochAndRows(wiresB)
+    -- Interleave epochs first, then rows once each (no reverse replay pass).
+    for i = 1, #epochsA do admitWireLive(dbC, epochsA[i], "Alice-Garona") end
+    for i = 1, #epochsB do admitWireLive(dbC, epochsB[i], "Carol-Garona") end
+    local i, j = 1, 1
+    while i <= #rowsA or j <= #rowsB do
+        if i <= #rowsA then
+            admitWireLive(dbC, rowsA[i], "Alice-Garona")
+            i = i + 1
+        end
+        if j <= #rowsB then
+            admitWireLive(dbC, rowsB[j], "Carol-Garona")
+            j = j + 1
+        end
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "B3 C sealed")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "B3 Bob")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "B3 Carol")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Eve"], "B3 Eve")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Dave"], "B3 Dave")
+    GI.NotifyLocalDurableChange("local")
+    local wiresC = exportProviderWiresLive()
+    local dbD = seedEmptyPeer()
+    for i = 1, #wiresC do
+        admitWireLive(dbD, wiresC[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbD
+    GI:Initialize(dbD)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "B3 D sealed")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "B3 D Carol")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Eve"], "B3 D Eve")
     setActor("Alice-Garona", "Player-1-Alice", 1)
-    assertEq(assign("Alice-Garona", "Dave-Garona"), "accepted", "B D editable after relay")
+    local est, ereason = GI:AssignAlt("Alice-Garona", "Bob-Area52", {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    assertEq(est, "accepted", "B3 D editable why=" .. tostring(ereason))
 end
 
 do
@@ -4297,49 +4510,88 @@ do
     record = select(1, GI:GetCurrentRecord())
     assertEq(countKeys(record.members), beforeMembers, "D no wipe on bad writer")
 
-    -- Counter beyond safe increment.
-    local huge = {
+    -- Canonical-at-ceiling generation is rejected (cannot advance afterward).
+    local atCeiling = {
         id = GI.EpochRecordId(),
-        versionFp = "huge",
+        versionFp = "ceil",
         body = {
             kind = "guildinfo-epoch",
             schema = GI.PROVIDER_SCHEMA,
-            gen = { n = GI.MAX_SYNC_GEN_N + 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" },
+            gen = { n = GI.MAX_SYNC_GEN_N, w = "aaaaaaaaaaaaaaaaaaaaaaaa" },
             memberCount = 1,
             groupCount = 1,
             contentFp = "deadbeef",
         },
     }
-    st = admitWireLive(SpectrumFederationDB, huge, "Alice-Garona")
-    assertEq(st, "rejected", "D reject oversized counter")
+    st = admitWireLive(SpectrumFederationDB, atCeiling, "Alice-Garona")
+    assertEq(st, "rejected", "D reject canonical-at-ceiling gen")
+    record = select(1, GI:GetCurrentRecord())
+    assertEq(countKeys(record.members), beforeMembers, "D ceiling reject no wipe")
+
+    -- Oversized sealRev / noncanonical seal writer rejected before tip adopt.
+    local badSeal = {
+        id = GI.EpochRecordId(),
+        versionFp = "badseal",
+        body = {
+            kind = "guildinfo-epoch",
+            schema = GI.PROVIDER_SCHEMA,
+            gen = record.syncGen,
+            memberCount = tonumber(record.baseline.memberCount) or 1,
+            groupCount = tonumber(record.baseline.groupCount) or 1,
+            contentFp = tostring(record.baseline.contentFp or ""),
+            sealRev = { n = GI.MAX_SYNC_GEN_N, w = "zz" },
+        },
+    }
+    st = admitWireLive(SpectrumFederationDB, badSeal, "Alice-Garona")
+    assertEq(st, "rejected", "D reject noncanonical/oversized sealRev")
+    assertTrue(GI.ValidSealRev({ n = 1, w = "bootstrap" }), "D bootstrap sealRev valid")
+    assertTrue(not GI.ValidSealRev({ n = GI.MAX_SYNC_GEN_N, w = "aaaaaaaaaaaaaaaaaaaaaaaa" }),
+        "D ceiling sealRev invalid")
+    assertTrue(not GI.ValidSealRev({ n = 1, w = "zz" }), "D noncanonical seal writer invalid")
 
     -- Persisted poisoned generation fails validation without mutation.
     local poisoned = deepCopy(SpectrumFederationDB)
     local gk = next(poisoned.guildInfo.guilds)
-    poisoned.guildInfo.guilds[gk].syncGen = { n = GI.MAX_SYNC_GEN_N, w = "zzzzzzzzzzzzzzzzzzzzzzzz" }
+    poisoned.guildInfo.guilds[gk].syncGen = { n = GI.MAX_SYNC_GEN_N, w = "aaaaaaaaaaaaaaaaaaaaaaaa" }
     local snap = deepCopy(poisoned.guildInfo)
     SpectrumFederationDB = poisoned
     GI:Initialize(poisoned)
     local okVal = GI.ValidateGuildRecord(gk, poisoned.guildInfo.guilds[gk])
     assertTrue(okVal == false, "D poisoned gen invalid")
-    assertEq(poisoned.guildInfo.guilds[gk].syncGen.w, "zzzzzzzzzzzzzzzzzzzzzzzz", "D poison preserved")
+    assertEq(poisoned.guildInfo.guilds[gk].syncGen.n, GI.MAX_SYNC_GEN_N, "D poison n preserved")
     assertEq(poisoned.guildInfo.schemaVersion, snap.schemaVersion, "D root schema unchanged")
 
-    -- Local exhaustion feedback.
+    -- Ordinary cleanup still works after rejected malicious updates.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "D recover seed")
+    admitWireLive(SpectrumFederationDB, atCeiling, "Alice-Garona")
+    admitWireLive(SpectrumFederationDB, badSeal, "Alice-Garona")
+    ensureRosterGuid("ShellD-Garona", "Player-1-ShellD", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellD-Garona", "Dave-Garona"), "accepted", "D recover bait")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "D recover bait unassign")
+    assertEq(GI:CleanupHistory({}), "accepted", "D cleanup after rejected malicious epochs")
+
+    -- Local exhaustion at last advancable counter.
     restoreBaseRoster()
     resetDB()
     setActor("Alice-Garona", "Player-1-Alice", 1)
     assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "D exhaust seed")
     record = select(1, GI:GetCurrentRecord())
-    record.syncGen = { n = GI.MAX_SYNC_GEN_N, w = select(1, GI:_EnsureWritableWriter()).nonce }
-    ensureRosterGuid("ShellD-Garona", "Player-1-ShellD", 4)
+    local writer = select(1, GI:_EnsureWritableWriter())
+    record.syncGen = { n = GI.MAX_SYNC_GEN_N - 1, w = writer.nonce }
+    ensureRosterGuid("ShellD2-Garona", "Player-1-ShellD2", 4)
     GI.InvalidateRosterSnapshot()
-    assertEq(assign("ShellD-Garona", "Dave-Garona"), "accepted", "D exhaust bait")
+    assertEq(assign("ShellD2-Garona", "Dave-Garona"), "accepted", "D exhaust bait")
     assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "D exhaust bait unassign")
     local est, ewhy = GI:CleanupHistory({})
     assertEq(est, "rejected", "D cleanup exhausted rejected")
     assertEq(ewhy, "generation_exhausted", "D generation_exhausted detail")
     assertTrue(GI.ValidSyncGen(GI.DefaultSyncGen()), "D bootstrap gen still valid")
+    assertTrue(not GI.ValidSyncGen({ n = GI.MAX_SYNC_GEN_N, w = writer.nonce }),
+        "D ValidSyncGen rejects ceiling")
 end
 
 do
