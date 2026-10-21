@@ -2,75 +2,38 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.12-beta.26] - 2026-10-21
-
-### Changed
-- Rearrange Settings sidebar categories
-
-## [1.5.12-beta.25] - 2026-10-21
+## [1.5.12] - 2026-10-21
 
 ### Added
 - Add a shared guild officer rank for Guild Info, Guild Supplies, and Loot Helper
+- Guild Info: guild-wide Main/Alt Assignments (#402) — versioned current-state membership/group records (no append-only op log)
 
-## [1.5.12-beta.24] - 2026-10-21
+### Changed
+- Guild Info: Option B cleanup reclaims missing-group orphan memberships while still failing closed on ambiguous hidden assignments; Settings confirm lists orphan discards (#402)
+- Guild Info: document deferred residual that a trusted rank 1–3 editor can publish terminal `MAX_SYNC_GEN_N - 1` / `sealRev` values that exhaust ordinary cleanup advancement (#402)
+- Guild Supplies 3B: donation ledger gossip (#388)
+- Guild Supplies 3A: Staged Configuration Gossip (#387)
+- Guild Supplies Part 2A: dormant staged foundation (#385)
+- Phase 1: Decentralized Guild Gossip infrastructure (#378)
+- Improve Guild Supplies Configuration status UX hierarchy
+- Guild Supplies 3C: Guarded Activation and Legacy Cutover (#389)
 
 ### Fixed
 - Fix Reward Pot header width and Raid Check inspection failures (#406)
-
-## [1.5.12-beta.23] - 2026-10-21
-
-### Fixed
-- Guild Info: confirmed Move rejects with `stale_move_confirmation` when the alt was unassigned or reassigned before the Settings dialog is accepted (#402)
 - Guild Info: forward-alias resolution walks up to `MAX_GROUPS` so long valid chains keep late members visible (#402)
 - Guild Info: Option B cleanup discards wholly unreferenced forward cycles to reclaim capacity while still failing closed on cycles reachable from assigned memberships (#402)
-
-## [1.5.12-beta.22] - 2026-10-21
-
-### Fixed
-- Guild Info: Option B cleanup reclaims missing-group orphan memberships while still failing closed on ambiguous hidden assignments; Settings confirm lists orphan discards (#402)
 - Guild Info: Change Main confirmation revalidates the guild roster so departed candidates are rejected (#402)
 - Guild Info: `CountHiddenAssignedMembers` rebuilds via `GI.RebuildDerived` when `graph.byGuid` is absent (#402)
 - Guild Info: `TrySealBaseline` skips fingerprint work when tip member/group counts already mismatch (#402)
-
-## [1.5.12-beta.21] - 2026-10-21
-
-### Fixed
 - Guild Info: Gossip provider notifies on incomplete→complete baseline transitions even when the triggering admit is duplicate/stale, so peers discover sealed relationships without a later local mutation (#402)
-
-## [1.5.12-beta.20] - 2026-10-21
-
-### Fixed
 - Guild Info: same-gen tip windows keep per-admit record bodies so overlapping GUID versions (e.g. advanced main membership) still match an advertised tip fingerprint before reapplying winning rows (#402)
-
-## [1.5.12-beta.19] - 2026-10-21
-
-### Fixed
 - Guild Info: same-generation catch-up seals via exact tip match or bounded chronological tip windows from `_sameGenHold` (global + per-sender; no combinatorial subset search); three or more concurrent extras converge and relay (#402)
-
-### Changed
-- Guild Info: document deferred residual that a trusted rank 1–3 editor can publish terminal `MAX_SYNC_GEN_N - 1` / `sealRev` values that exhaust ordinary cleanup advancement (#402)
-
-## [1.5.12-beta.18] - 2026-10-21
-
-### Fixed
 - Guild Info: same-generation higher `sealRev` tips park already-accepted rows and re-merge them after exact tip seal (or a bounded tip-subset witness); count supersets alone no longer complete baselines (#402)
 - Guild Info: `syncGen` / `sealRev` share canonical writer + exclusive numeric ceiling validation; seal refresh fails closed when the revision cannot advance (#402)
-
-## [1.5.12-beta.17] - 2026-10-21
-
-### Fixed
 - Guild Info: reciprocal `forwardTo` cycles resolve onto a deterministic cycle-break sink so concurrent Alice↔Bob assignments stay visible; cleanup fails closed if assigned members would still be hidden (#402)
 - Guild Info: same-generation baseline catch-up follows `sealRev` tip order (not last-arrival fingerprints) and can seal merged supersets so dual-writer fresh peers converge and relay (#402)
 - Guild Info: cleanup confirmation binds guild key / handle generation / actor GUID; capacity-blocked cleanup returns `cleanup_no_capacity` instead of `cleanup_noop` (#402)
 - Guild Info: sync generations reject noncanonical writers and unsafe counters; unknown future SavedVariables schemas fail closed without mutation (#402)
-- Guild Info: Settings durable listener refreshes controls without invalidating a complete roster cache; roster display updates stay in the local character cache (#402)
-
-## [1.5.12-beta.16] - 2026-10-20
-
-### Added
-- Guild Info: guild-wide Main/Alt Assignments (#402) — versioned current-state membership/group records (no append-only op log)
-
-### Fixed
 - Guild Info: concurrent same-main groups use derived-view absorption (no synthetic versions / loser dissolve) so genuine offline moves and late member records survive (#402)
 - Guild Info: Unassign / Change Main operate on the logical absorbed group so unrelated concurrent alts are not dropped (#402)
 - Guild Info: incomplete concurrent group shells survive Change Main / Unassign via `forwardTo` aliases and sibling-shell guards so late members are not orphaned (#402)
@@ -81,18 +44,6 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Guild Info: schema/provider 3 adds `guildinfo-epoch` Gossip meta; older-generation records are rejected; incomplete new baselines fail closed (`generation_syncing`) (#402)
 - Guild Info: history cleanup rebuilds onto canonical derived group ids so absorbed/forwarded alts are preserved; completed baselines refresh seal metadata after ordinary edits (#402)
 - Guild Info: coalesce remote Gossip export rebuild/index resets; reuse validated record in assignment display; preserve merge rejection details; fix move-confirm character names (#402)
-
-## [1.5.12-beta.15] - 2026-10-20
-
-### Changed
-- Raid consumables migration out of loot helper
-- Guild Supplies 3B: donation ledger gossip (#388)
-- Guild Supplies 3A: Staged Configuration Gossip (#387)
-- Guild Supplies 2B: Fresh Start, Campaigns, and Settings UI (#386)
-- Guild Supplies Part 2A: dormant staged foundation (#385)
-- Phase 1: Decentralized Guild Gossip infrastructure (#378)
-- Improve Guild Supplies Configuration status UX hierarchy
-- Guild Supplies 3C: Guarded Activation and Legacy Cutover (#389)
 
 ## [1.5.11] - 2026-10-16
 
