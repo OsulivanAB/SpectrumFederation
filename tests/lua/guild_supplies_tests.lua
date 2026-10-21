@@ -8505,11 +8505,11 @@ do
         "3A8: concurrent rank conflict reason: " .. tostring(reasonRankB))
     assertTrue(#GS:ListOpenConflicts() >= 1, "3A8: open rank conflict retained")
 
-    -- Out-of-range rank rejected; policy unchanged.
-    local policyBefore = GS:GetCurrentRecord().permission.editorRankPosition
-    local rankBad = {
+    -- Historical rank above today's list is retained metadata (#405); live edit
+    -- still follows the shared officer policy. Nonintegral values stay rejected.
+    local rankHist = {
         schemaVersion = 1,
-        id = "rank-oor",
+        id = "rank-hist-oor",
         guildKey = "club:42",
         datasetId = datasetId,
         campaignId = campId,
@@ -8538,13 +8538,42 @@ do
             end
         end
     end
-    policyBefore = GS:GetCurrentRecord().permission.editorRankPosition
-    local stBad, reasonBad = GS:AdmitRemoteOperation(rankBad, { sender = "Alice-Garona" })
-    assertEq(stBad, "rejected", "3A8: out-of-range rank rejected")
-    assertEq(reasonBad, "invalid_editor_rank_position",
-        "3A8: OOR rank reason: " .. tostring(reasonBad))
-    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, policyBefore,
-        "3A8: OOR rank left policy unchanged")
+    rankHist.baseTargetRevision = GS:GetCurrentRecord().permission.revisionId
+    rankHist.basePolicyRevision = GS:GetCurrentRecord().permission.revisionId
+    local stHist, reasonHist = GS:AdmitRemoteOperation(rankHist, { sender = "Alice-Garona" })
+    assertEq(stHist, "accepted",
+        "3A8: historical rank above today's list accepted: " .. tostring(reasonHist))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 999,
+        "3A8: historical out-of-range rank retained as metadata")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(GS:GetCapabilities().canEdit, true,
+        "3A8: shared officer policy still authorizes after historical OOR metadata")
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS:GetCapabilities().canEdit, false,
+        "3A8: historical OOR metadata does not grant non-officer edit")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local rankFrac = {
+        schemaVersion = 1,
+        id = "rank-frac",
+        guildKey = "club:42",
+        datasetId = datasetId,
+        campaignId = campId,
+        kind = "set-editor-rank",
+        target = "editorRankPosition",
+        value = 2.5,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 15201,
+        baseTargetRevision = GS:GetCurrentRecord().permission.revisionId,
+        basePolicyRevision = GS:GetCurrentRecord().permission.revisionId,
+        baseCampaignId = campId,
+    }
+    local stFrac, reasonFrac = GS:AdmitRemoteOperation(rankFrac, { sender = "Alice-Garona" })
+    assertEq(stFrac, "rejected", "3A8: nonintegral historical rank rejected")
+    assertEq(reasonFrac, "invalid_editor_rank_position",
+        "3A8: nonintegral rank reason: " .. tostring(reasonFrac))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 999,
+        "3A8: rejected nonintegral rank left metadata unchanged")
 
     -- Malformed relay (bankTab=9) must not consume capacity.
     GS._pendingRelay = {}
@@ -26940,6 +26969,183 @@ do
     assertEq(#world.chat, 0, "B-life: no Chat from lifecycle repair")
 end
 
+---------------------------------------------------------------------------
+-- PR #408 repair: historical rank shrink, unknown officer policy, GS refresh
+-- (#4340670266 / #4340670277 / #4340670301 / #4340669099)
+---------------------------------------------------------------------------
+
+do
+    -- A) Dataset created under five ranks remains editable/installable after shrink.
+    resetDb()
+    initGS()
+    world.guild.clubId = 42
+    world.guild.ranks = {
+        "Guild Master", "Officer", "Veteran", "Member", "Initiate",
+    }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+        { name = "Dave-Garona", guid = "Player-1-Dave", rankOrder = 4, online = true },
+    }
+    settleRoster()
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local created, createSt, createErr = GS:CreateStagedRecord()
+    assertEq(createSt, "accepted", "A-shrink: create under five ranks: " .. tostring(createErr))
+    assertEq(created.permission.editorRankPosition, 3, "A-shrink: historical metadata stores rank 3")
+    local histOp, histPrep = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 5)
+    assertEq(histPrep, "accepted", "A-shrink: historical set-editor-rank to 5 prepares")
+    assertEq(GS:ApplyStagedConfigOperation(histOp), "accepted", "A-shrink: historical rank 5 recorded")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 5,
+        "A-shrink: retained metadata is 5 before shrink")
+
+    world.guild.ranks = { "Guild Master", "Officer" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, true, "A-shrink: authorized non-GM still edits after shrink")
+    local member = GS.AuthenticateTransportSender("Bob-Garona")
+    local okAuth, authReason = GS.SenderHasEditorAuthority(member)
+    assertEq(okAuth, true, "A-shrink: remote sender auth uses shared officer policy")
+    assertEq(authReason, nil, "A-shrink: auth reason nil got=" .. tostring(authReason))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 5,
+        "A-shrink: historical metadata 5 retained after shrink")
+    local bankOp, bankPrep = GS:NewConfigOperation("set-bank-tab", "bankTab", 2)
+    assertEq(bankPrep, "accepted", "A-shrink: ordinary edit prepares after shrink")
+    assertEq(GS:ApplyStagedConfigOperation(bankOp), "accepted", "A-shrink: ordinary edit admits after shrink")
+    local rankOp, rankPrep = GS:NewConfigOperation("set-editor-rank", "editorRankPosition", 2)
+    assertEq(rankPrep, "accepted", "A-shrink: new in-range historical rank prepares without GM recovery")
+    assertEq(GS:ApplyStagedConfigOperation(rankOp), "accepted",
+        "A-shrink: new historical rank records after shrink")
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 2,
+        "A-shrink: live historical metadata updated to 2")
+
+    -- Fresh empty client installs advertised historical rank 5 under two ranks.
+    resetDb()
+    initGS()
+    world.guild.ranks = { "Guild Master", "Officer" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    member = GS.AuthenticateTransportSender("Bob-Garona")
+    local stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a-shrink-ds", activation = "staged",
+        bootstrapEditorRankPosition = 5,
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, member)
+    assertEq(stInst, "accepted", "A-shrink: install accepts historical rank 5: " .. tostring(reasonInst))
+    assertEq(GS:GetCurrentRecord().permission.editorRankPosition, 5,
+        "A-shrink: installed historical metadata keeps rank 5")
+    assertEq(GS:GetCapabilities().canEdit, true,
+        "A-shrink: live edit follows shared officer policy after install")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Malformed historical metadata still rejected.
+    resetDb()
+    initGS()
+    world.guild.ranks = { "Guild Master", "Officer" }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+    }
+    settleRoster()
+    member = GS.AuthenticateTransportSender("Bob-Garona")
+    stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "a-shrink-bad", activation = "staged",
+        bootstrapEditorRankPosition = 2.5,
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, member)
+    assertEq(stInst, "rejected", "A-shrink: nonintegral historical rank rejected")
+    assertEq(reasonInst, "invalid_editor_rank_position",
+        "A-shrink: nonintegral reason got=" .. tostring(reasonInst))
+end
+
+do
+    -- C4) Unknown shared officer policy fails closed for init and sender admission.
+    resetDb()
+    world.skipOfficerBootstrap = true
+    local GO = SF.GuildOfficer
+    GO:Initialize(SpectrumFederationDB)
+    initGS()
+    world.guild.clubId = 42
+    world.guild.ranks = {
+        "Guild Master", "Officer", "Veteran", "Member", "Initiate",
+    }
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+    }
+    settleRoster()
+    assertNil(select(1, GO:GetEstablishedThreshold()),
+        "C4: no established officer policy before negative checks")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, false, "C4: non-GM cannot edit without officer policy")
+    assertEq(caps.reason, "policy_unknown", "C4: capabilities report policy_unknown")
+    local _, st, err = GS:CreateStagedRecord()
+    assertEq(st, "rejected", "C4: non-GM cannot initialize without officer policy")
+    assertTrue(err == "policy_unknown" or err == "unauthorized",
+        "C4: init reason fail-closed got=" .. tostring(err))
+    local member = GS.AuthenticateTransportSender("Bob-Garona")
+    local okAuth, authReason = GS.SenderHasEditorAuthority(member, { allowBootstrapInstall = true })
+    assertEq(okAuth, false, "C4: incoming sender admission fails closed")
+    assertEq(authReason, "policy_unknown",
+        "C4: sender reason policy_unknown got=" .. tostring(authReason))
+    local stInst, reasonInst = GS:InstallStagedDatasetFromRemote({
+        kind = "dataset-desc", schemaVersion = 1, guildKey = "club:42",
+        datasetId = "c4-denied", activation = "staged",
+        acceptedOpCount = 0, campaignCount = 0, archiveCount = 0,
+    }, member)
+    assertEq(stInst, "rejected", "C4: remote install denied without officer policy")
+    assertEq(reasonInst, "policy_unknown",
+        "C4: install reason policy_unknown got=" .. tostring(reasonInst))
+    assertNil(select(1, GS:GetCurrentRecord()), "C4: no dataset installed without officer policy")
+
+    -- Verified GM establishes the default policy; previously authorized actions succeed.
+    world.skipOfficerBootstrap = false
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GO:Initialize(SpectrumFederationDB)
+    assertEq(select(1, GO:Bootstrap()), "accepted", "C4: verified GM establishes default policy")
+    assertEq(select(1, GO:GetEstablishedThreshold()), 3, "C4: default officer threshold is 3")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    caps = GS:GetCapabilities()
+    assertEq(caps.canEdit, true, "C4: officer can edit after policy exists")
+    local created, createSt, createErr = GS:CreateStagedRecord()
+    assertEq(createSt, "accepted", "C4: officer initializes after policy: " .. tostring(createErr))
+    assertTrue(created ~= nil, "C4: dataset created after policy")
+    member = GS.AuthenticateTransportSender("Carol-Garona")
+    okAuth, authReason = GS.SenderHasEditorAuthority(member)
+    assertEq(okAuth, true, "C4: rank-3 officer sender auth succeeds after policy")
+    assertEq(authReason, nil, "C4: post-policy auth reason nil got=" .. tostring(authReason))
+    world.skipOfficerBootstrap = false
+end
+
+do
+    -- C1) Guild Supplies configuration registers one officer-policy UI listener.
+    local src = assert(io.open(
+        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r"))
+    local body = src:read("*a")
+    src:close()
+    assertTrue(body:find("EnsureOfficerListener", 1, true) ~= nil,
+        "C1: EnsureOfficerListener present")
+    assertTrue(body:find("GO.RegisterUIListener(function", 1, true) ~= nil,
+        "C1: RegisterUIListener used for officer policy")
+    assertTrue(body:find("officerHooked", 1, true) ~= nil,
+        "C1: lifecycle guard prevents duplicate officer listeners")
+    assertTrue(body:find("Page.__sfOfficerHook", 1, true) ~= nil,
+        "C1: page-level guard prevents duplicate officer listeners")
+    local _, callCount = body:gsub("GO%.RegisterUIListener%(function", "")
+    assertEq(callCount, 1, "C1: exactly one RegisterUIListener registration call")
+end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

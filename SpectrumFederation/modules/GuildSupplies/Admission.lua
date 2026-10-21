@@ -257,6 +257,17 @@ local function ValidateEditorRankValue(pos)
     return true, nil, pos
 end
 
+-- Retained permission metadata / historical set-editor-rank values. Positive
+-- integral only (same shape as State.ValidatePermission); today's rankCount is
+-- not a live authorization bound.
+local function ValidateHistoricalEditorRankValue(pos)
+    pos = tonumber(pos)
+    if not pos or pos ~= math.floor(pos) or pos < 1 then
+        return false, "invalid_editor_rank_position"
+    end
+    return true, nil, pos
+end
+
 ---------------------------------------------------------------------------
 -- Sender authentication (transport name → verified roster member + rank)
 ---------------------------------------------------------------------------
@@ -346,22 +357,16 @@ function GS.SenderHasEditorAuthority(member, opts)
     end
     local perm = record.permission
     -- Fractional / non-integral retained policy is not ordinary editor authority.
-    -- Reuse positive-integral validation when ranks are available; always reject
-    -- non-integral thresholds. GM recovery remains verified-GM-only.
+    -- A historically valid position above today's rankCount stays structurally OK;
+    -- live authorization uses the shared officer policy below.
     local rawPos = type(perm) == "table" and tonumber(perm.editorRankPosition) or nil
-    local integralPos = rawPos and rawPos == math.floor(rawPos) and rawPos >= 1
+    local histOk, _, histNorm = ValidateHistoricalEditorRankValue(rawPos)
     local policyPos = nil
     local policyOk = false
     if type(perm) == "table" and type(perm.revisionId) == "string" and perm.revisionId ~= "" then
-        if rankCount and rankCount >= 1 then
-            local rankOk, _, policyNorm = ValidateEditorRankValue(rawPos)
-            if rankOk then
-                policyOk = true
-                policyPos = policyNorm
-            end
-        elseif integralPos then
+        if histOk then
             policyOk = true
-            policyPos = rawPos
+            policyPos = histNorm
         end
     end
 
@@ -378,10 +383,18 @@ function GS.SenderHasEditorAuthority(member, opts)
         end
         return false, "policy_requires_gm"
     end
-    -- Descriptor catch-up still checks the historical predecessor position.
-    -- It does not become a second live authorization source.
+    -- Descriptor catch-up still checks the historical predecessor when it fits the
+    -- current rank list. Out-of-range retained metadata is not live authority.
     if opts.allowPolicyCatchUp then
-        if policyPos and member.rankOrder <= policyPos then
+        local catchUpPos = policyPos
+        if rankCount and catchUpPos and catchUpPos > rankCount then
+            local sharedPos, sharedReason = GS.SharedOfficerThreshold and GS.SharedOfficerThreshold()
+            if not sharedPos then
+                return false, sharedReason or "policy_unknown"
+            end
+            catchUpPos = sharedPos
+        end
+        if catchUpPos and member.rankOrder <= catchUpPos then
             return true, nil
         end
         return false, "unauthorized"
@@ -1422,7 +1435,9 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
     local advertised = tonumber(descriptor.bootstrapEditorRankPosition)
         or tonumber(descriptor.editorRankPosition)
     if advertised ~= nil then
-        local bootOk, bootErr, bootNorm = ValidateEditorRankValue(advertised)
+        -- Keep older historical ranks after a rank-list shrink. Shared officer
+        -- policy already authorized the sender; this field is metadata only.
+        local bootOk, bootErr, bootNorm = ValidateHistoricalEditorRankValue(advertised)
         if not bootOk then
             return "rejected", bootErr or "invalid_editor_rank_position"
         end
@@ -5115,19 +5130,11 @@ function GS:CommitDatasetAdoption()
     local bootstrapPos = tonumber(desc.bootstrapEditorRankPosition)
         or tonumber(desc.editorRankPosition)
         or defaultPos
-    local bootOk, bootErr, bootNorm = ValidateEditorRankValue(bootstrapPos)
+    local bootOk, bootErr, bootNorm = ValidateHistoricalEditorRankValue(bootstrapPos)
     if not bootOk then
-        -- When guild ranks are unavailable, still reject non-integral/non-positive.
-        bootstrapPos = tonumber(bootstrapPos)
-        if not bootstrapPos or bootstrapPos ~= math.floor(bootstrapPos) or bootstrapPos < 1 then
-            return "rejected", bootErr or "invalid_editor_rank_position"
-        end
-        if rankCount and rankCount > 0 and bootstrapPos > rankCount then
-            return "rejected", "invalid_editor_rank_position"
-        end
-    else
-        bootstrapPos = bootNorm
+        return "rejected", bootErr or "invalid_editor_rank_position"
     end
+    bootstrapPos = bootNorm
 
     local temp = NewBootstrapRecord(adop.sourceDatasetId, adop.guildKey, identity, bootstrapPos)
     -- Active source descriptors install their authenticated liveCutover onto the
@@ -5944,7 +5951,7 @@ local function ApplyPreservedAttributionCandidate(record, candidate, boundary, a
     end
 
     if stored.kind == GS.KIND.SET_EDITOR_RANK then
-        local rankOk, rankErr = ValidateEditorRankValue(stored.value)
+        local rankOk, rankErr = ValidateHistoricalEditorRankValue(stored.value)
         if not rankOk then
             return "rejected", rankErr or "invalid_editor_rank_position"
         end
@@ -6830,15 +6837,16 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
     end
 
     -- Valid-policy rank changes replicate from ordinary authenticated editors.
-    -- GM recovery is required only when the current policy is incoherent.
+    -- GM recovery is required only when retained permission metadata is corrupt.
+    -- A historically valid position above today's rankCount stays ordinary.
     local requireRecover = false
     if op.kind == GS.KIND.SET_EDITOR_RANK then
         local perm = record.permission
-        local policyPos = type(perm) == "table" and tonumber(perm.editorRankPosition) or nil
-        local ranks = GG() and GG().GetGuildRanks and GG().GetGuildRanks()
-        local rankCount = type(ranks) == "table" and tonumber(ranks.count) or nil
-        local policyOk = policyPos and policyPos >= 1
-            and (not rankCount or policyPos <= rankCount)
+        local histOk = false
+        if type(perm) == "table" then
+            histOk = select(1, ValidateHistoricalEditorRankValue(perm.editorRankPosition))
+        end
+        local policyOk = histOk
             and type(perm) == "table"
             and type(perm.revisionId) == "string" and perm.revisionId ~= ""
         requireRecover = not policyOk
@@ -7335,7 +7343,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             end
         else
             if chosen.kind == GS.KIND.SET_EDITOR_RANK then
-                local rankOk, rankErr = ValidateEditorRankValue(chosen.value)
+                local rankOk, rankErr = ValidateHistoricalEditorRankValue(chosen.value)
                 if not rankOk then
                     return "rejected", rankErr or "invalid_editor_rank_position"
                 end
@@ -7508,7 +7516,7 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
 
     -- Apply path.
     if stored.kind == GS.KIND.SET_EDITOR_RANK then
-        local rankOk, rankErr = ValidateEditorRankValue(stored.value)
+        local rankOk, rankErr = ValidateHistoricalEditorRankValue(stored.value)
         if not rankOk then
             return "rejected", rankErr or "invalid_editor_rank_position"
         end

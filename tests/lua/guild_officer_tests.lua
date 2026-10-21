@@ -815,6 +815,190 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- PR #408 repair: terminal revision, catch-up gap, guild-key, fingerprint,
+-- listener error forwarding (#4340647262 / #4340670287 / #4340670292 / #4340669070)
+---------------------------------------------------------------------------
+
+do
+    -- B1) Terminal remote revision is rejected; GM can recover an unusable terminal.
+    resetDB()
+    GO:Bootstrap()
+    local before = policy()
+    local carol = SF.GuildGossip.GetGuildMember("Carol-Garona")
+    local terminal = {
+        guildKey = "club:42",
+        threshold = 1,
+        baseThreshold = before.threshold,
+        revN = GO.MAX_REV,
+        revW = "aaaaaaaaaaaaaaaaaaaaaaaa",
+        at = 40,
+    }
+    local st, reason = GO:ApplyRemotePolicy(terminal, carol)
+    assertEq(st, "rejected", "terminal remote revision is rejected")
+    assertEq(reason, "implausible_revision", "terminal remote reports implausible_revision")
+    assertEq(policy().revN, before.revN, "terminal attack does not mutate storage")
+    assertEq(policy().threshold, before.threshold, "terminal attack does not change threshold")
+
+    -- Legitimate catch-up may skip several missed revisions within the gap.
+    local catchup = {
+        guildKey = "club:42",
+        threshold = 2,
+        baseThreshold = before.threshold,
+        revN = before.revN + 7,
+        revW = "bbbbbbbbbbbbbbbbbbbbbbbb",
+        at = 41,
+    }
+    st, reason = GO:ApplyRemotePolicy(catchup, carol)
+    assertEq(st, "accepted", "skipped-revision catch-up within the gap is accepted")
+    assertEq(policy().revN, before.revN + 7, "catch-up advances to the remote revision")
+    assertEq(policy().threshold, 2, "catch-up stores the remote threshold")
+
+    local gap = tonumber(GO.MAX_REV_CATCHUP) or 10000
+    local alice = SF.GuildGossip.GetGuildMember("Alice-Garona")
+    local tooFar = {
+        guildKey = "club:42",
+        threshold = 1,
+        baseThreshold = 2,
+        revN = policy().revN + gap + 1,
+        revW = "cccccccccccccccccccccccc",
+        at = 42,
+    }
+    st, reason = GO:ApplyRemotePolicy(tooFar, alice)
+    assertEq(st, "rejected", "implausibly forward revision is rejected")
+    assertEq(reason, "implausible_revision", "forward leap reports implausible_revision")
+
+    -- Plant a terminal stored revision and recover through verified GM bootstrap.
+    SpectrumFederationDB.guildOfficer.guilds["club:42"].revN = GO.MAX_REV
+    assertNil(select(1, GO:GetStoredPolicy("club:42")), "terminal stored policy is unusable")
+    assertEq(select(2, GO:GetStoredPolicy("club:42")), "policy_invalid",
+        "terminal stored policy reports policy_invalid")
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GO:Bootstrap()), "rejected", "non-GM cannot recover a terminal policy")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GO:Bootstrap()), "accepted", "Guild Master recovers a terminal policy")
+    assertEq(policy().revN, 1, "terminal recovery restarts the revision")
+    assertTrue(policy().threshold >= 1, "terminal recovery stores a usable threshold")
+end
+
+do
+    -- B2) Map-key / body guild mismatch is corrupt; no cross-guild threshold apply.
+    resetDB()
+    GO:Bootstrap()
+    SpectrumFederationDB.guildOfficer.guilds["club:42"] = {
+        schemaVersion = GO.SCHEMA_VERSION,
+        guildKey = "club:99",
+        threshold = 4,
+        baseThreshold = 0,
+        revN = 3,
+        revW = "dddddddddddddddddddddddd",
+        at = 50,
+    }
+    local stored, storedReason = GO:GetStoredPolicy("club:42")
+    assertNil(stored, "mismatched guildKey body is not returned")
+    assertEq(storedReason, "policy_invalid", "mismatched guildKey reports policy_invalid")
+    local view = GO:GetView()
+    assertEq(view.status, "invalid", "mismatched guildKey surfaces as invalid")
+    assertEq(view.canBootstrap, true, "Guild Master can recover a mismatched guild entry")
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GO:Bootstrap()), "rejected", "non-GM cannot recover mismatched guild entry")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GO:Bootstrap()), "accepted", "Guild Master recovers mismatched guild entry")
+    assertEq(policy().guildKey, "club:42", "recovery writes the requested guild key")
+    assertEq(policy().threshold, 3, "recovery establishes the default threshold, not club:99's 4")
+    assertEq(policy().revN, 4, "recovery advances past the corrupt entry's revision")
+end
+
+do
+    -- B3) Same-revision concurrent update invalidates a confirmation fingerprint.
+    resetDB()
+    GO:Bootstrap()
+    -- Advance past bootstrap so same-revision concurrent edits authorize against
+    -- the shared predecessor threshold (not Guild-Master-only bootstrap base).
+    setActor("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(select(1, GO:CommitThreshold(2)), "accepted", "officer tightens before concurrent race")
+    local established = policy()
+    assertEq(established.threshold, 2, "race starts from threshold 2")
+    local fp = GO.PolicyVersionFp(established)
+    assertTrue(type(fp) == "string" and fp ~= "", "policy fingerprint is available")
+    local view = GO:GetView()
+    assertEq(view.policyFp, fp, "GetView exposes the policy fingerprint")
+
+    local bob = SF.GuildGossip.GetGuildMember("Bob-Garona")
+    local concurrent = {
+        guildKey = "club:42",
+        threshold = 1,
+        baseThreshold = established.baseThreshold,
+        revN = established.revN,
+        revW = "eeeeeeeeeeeeeeeeeeeeeeee",
+        at = 60,
+    }
+    local remoteSt, remoteReason = GO:ApplyRemotePolicy(concurrent, bob)
+    assertEq(remoteSt, "accepted",
+        "same-revision restrictive remote update is accepted: " .. tostring(remoteReason))
+    assertEq(policy().threshold, 1, "concurrent update tightened the threshold")
+    assertEq(policy().revN, established.revN, "same-revision update keeps revN")
+    assertTrue(GO.PolicyVersionFp(policy()) ~= fp, "fingerprint changes with threshold/revW")
+
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local st, reason = GO:CommitThreshold(2, {
+        expectedRevN = established.revN,
+        expectedPolicyFp = fp,
+    })
+    assertEq(st, "rejected", "stale confirmation fingerprint is rejected")
+    assertEq(reason, "stale_policy", "stale fingerprint reports stale_policy")
+    assertEq(policy().threshold, 1, "stale dialog does not overwrite the concurrent winner")
+
+    local freshFp = GO.PolicyVersionFp(policy())
+    st, reason = GO:CommitThreshold(2, {
+        expectedRevN = policy().revN,
+        expectedPolicyFp = freshFp,
+    })
+    assertEq(st, "accepted", "fresh fingerprint confirmation is accepted")
+    assertEq(policy().threshold, 2, "fresh confirmation widens under current fingerprint")
+end
+
+do
+    -- C2) Listener errors restore the latch and forward to geterrorhandler.
+    resetDB()
+    local handled = {}
+    local priorHandler = geterrorhandler
+    geterrorhandler = function()
+        return function(err)
+            handled[#handled + 1] = err
+        end
+    end
+    local calls = 0
+    GO.RegisterUIListener(function()
+        error("listener-boom")
+    end)
+    GO.RegisterUIListener(function()
+        calls = calls + 1
+    end)
+    GO.NotifyUI("probe")
+    assertEq(#handled, 1, "first listener error reaches geterrorhandler")
+    assertTrue(tostring(handled[1]):find("listener-boom", 1, true) ~= nil,
+        "geterrorhandler receives the listener error text")
+    assertEq(calls, 1, "later listeners still run after a failing listener")
+    GO.NotifyUI("probe-2")
+    assertEq(calls, 2, "notification latch is not wedged after a listener error")
+    geterrorhandler = priorHandler
+end
+
+do
+    -- C3) Generic fallback and revision reasons route through Loc keys.
+    resetDB()
+    local msg, sev = GO.FormatFeedback("rejected", "no_such_reason")
+    assertEq(msg, "The officer rank could not be changed.", "generic fallback uses Loc default")
+    assertEq(sev, "error", "generic fallback severity is error")
+    msg = select(1, GO.FormatFeedback("rejected", "implausible_revision"))
+    assertEq(msg, "That officer-rank update is too far ahead to apply safely.",
+        "implausible_revision uses revision Loc text")
+    msg = select(1, GO.FormatFeedback("rejected", "revision_exhausted"))
+    assertEq(msg, "That officer-rank update is too far ahead to apply safely.",
+        "revision_exhausted uses revision Loc text")
+end
+
+---------------------------------------------------------------------------
 -- Real Guild Gossip index: replacement must keep the current policy exported
 ---------------------------------------------------------------------------
 

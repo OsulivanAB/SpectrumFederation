@@ -339,13 +339,20 @@ local function DeliverUINotify(reason)
         return
     end
     uiNotifying = true
+    local firstErr = nil
     for i = 1, #uiListeners do
         local fn = uiListeners[i]
         if type(fn) == "function" then
-            pcall(fn, reason)
+            local ok, err = pcall(fn, reason)
+            if not ok and firstErr == nil then
+                firstErr = err
+            end
         end
     end
     uiNotifying = false
+    if firstErr ~= nil and geterrorhandler then
+        pcall(geterrorhandler(), firstErr)
+    end
     if uiNotifyQueued then
         uiNotifyQueued = false
         DeliverUINotify(reason)

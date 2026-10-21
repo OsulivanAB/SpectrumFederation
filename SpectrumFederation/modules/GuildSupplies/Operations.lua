@@ -708,8 +708,8 @@ function GS:NewConfigOperation(kind, target, value)
     if kind == KIND.SET_EDITOR_RANK then
         local policyPos = type(record.permission) == "table"
             and tonumber(record.permission.editorRankPosition) or nil
-        local rankCount = ctx.rankCount
-        local policyOk = policyPos and rankCount and policyPos >= 1 and policyPos <= rankCount
+        -- Retained historical ranks may exceed today's list; that is not corrupt.
+        local policyOk = policyPos and policyPos == math.floor(policyPos) and policyPos >= 1
             and type(record.permission) == "table"
             and type(record.permission.revisionId) == "string"
             and record.permission.revisionId ~= ""
@@ -876,12 +876,15 @@ function GS:ValidateConfigOperation(op, context)
     if op.kind == KIND.SET_EDITOR_RANK then
         local pos = tonumber(op.value)
         local rankCount = context.rankCount
-        if not rankCount or not pos or pos > rankCount then
+        -- New live values must fit today's rank list; retained predecessor
+        -- metadata above that list does not force Guild Master recovery.
+        if not rankCount or not pos or pos ~= math.floor(pos) or pos < 1 or pos > rankCount then
             return false, "invalid_editor_rank_position"
         end
         local policyPos = type(record.permission) == "table"
             and tonumber(record.permission.editorRankPosition) or nil
-        local policyOk = (not recovery) and policyPos and policyPos >= 1 and policyPos <= rankCount
+        local policyOk = (not recovery) and policyPos and policyPos == math.floor(policyPos)
+            and policyPos >= 1
             and type(record.permission.revisionId) == "string" and record.permission.revisionId ~= ""
         if recovery or not policyOk then
             if not caps.canRecoverPolicy then

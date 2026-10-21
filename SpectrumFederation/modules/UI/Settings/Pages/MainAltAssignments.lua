@@ -459,7 +459,7 @@ end
 
 local function ReportOfficer(ctx, status, reason)
 	local GO = SF.GuildOfficer
-	local message, severity = "Officer rank could not be changed.", "error"
+	local message, severity = Loc("GUILD_OFFICER_ERR_GENERIC", "The officer rank could not be changed."), "error"
 	if GO and GO.FormatFeedback then
 		message, severity = GO.FormatFeedback(status, reason)
 	end
@@ -500,6 +500,7 @@ local function CommitOfficerRank(ctx, position)
 		expectedHandleGeneration = view.handleGeneration,
 		expectedActorGuid = view.actorGuid,
 		expectedRevN = view.revN,
+		expectedPolicyFp = view.policyFp,
 	}
 	local function accept()
 		local status, reason = GO:CommitThreshold(bound.position, bound)

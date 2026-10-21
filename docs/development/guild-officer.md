@@ -21,6 +21,7 @@ Guild Info, Guild Supplies, and the one-time Loot Helper admin grant read this p
 - Same-revision concurrent edits keep the lower (more restrictive) threshold. A later revision replaces it, including a deliberate widen by someone who still qualifies. A lower revision is stale.
 - When this client already has a valid policy, a remote sender must meet that known threshold. The predecessor claimed in the incoming record does not grant authority. Same-revision edits are still checked against the shared predecessor.
 - A client with no stored policy authorizes the transport sender against the approved default officer cap (`min(3, rankCount)`). That lets an eligible officer relay a GM-created bootstrap after the GM logs off, and it rejects a non-officer who only claims a more permissive predecessor. Local bootstrap and recovery still require a verified Guild Master. Ordinary Gossip fields cannot prove original authorship, so an eligible-by-default officer can still install any valid first-record content.
+- Remote revisions must stay below the terminal revision and within a bounded catch-up gap of the known local revision. A stored terminal or map-key/body guild mismatch is unusable so a verified Guild Master can recover. Confirmations bind the complete policy fingerprint, not only `revN`.
 - The policy is independent of Guild Supplies datasets, Loot Helper profiles, and Guild Info relationship cleanup.
 
 Disconnected clients may briefly use an older threshold. That limitation is accepted. This is not a consensus log.

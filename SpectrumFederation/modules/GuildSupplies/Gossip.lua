@@ -2704,12 +2704,11 @@ local function ValidateAndApply(record, ctx)
             local perm = localRecord.permission
             local rawPos = type(perm) == "table" and tonumber(perm.editorRankPosition) or nil
             local integralPos = rawPos and rawPos == math.floor(rawPos) and rawPos >= 1
-            local ranks = GG and GG.GetGuildRanks and GG.GetGuildRanks()
-            local rankCount = type(ranks) == "table" and tonumber(ranks.count) or nil
+            -- Historical metadata above today's rankCount is not corrupt; live
+            -- authorization still uses the shared officer policy.
             local policyOk = type(perm) == "table"
                 and type(perm.revisionId) == "string" and perm.revisionId ~= ""
                 and integralPos
-                and (not rankCount or rawPos <= rankCount)
             requireRecover = not policyOk
         end
         -- Policy catch-up: while bootstrap-locked, evaluate authority with

@@ -2073,6 +2073,23 @@ local function EnsureAdoptionListener()
 	end
 end
 
+--- Shared officer-policy changes can grant or revoke edit rights without roster events.
+local officerHooked = false
+local function EnsureOfficerListener()
+	if officerHooked or Page.__sfOfficerHook then
+		return
+	end
+	local GO = SF.GuildOfficer
+	if not GO or type(GO.RegisterUIListener) ~= "function" then
+		return
+	end
+	officerHooked = true
+	Page.__sfOfficerHook = true
+	GO.RegisterUIListener(function()
+		QueueRefresh()
+	end)
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
@@ -2081,6 +2098,7 @@ function Page:Build(panel)
 	EnsureRosterListener()
 	EnsureBankListener()
 	EnsureAdoptionListener()
+	EnsureOfficerListener()
 	BeginRenderPass()
 	renderer:Build(panel, Definition())
 	EndRenderPass()

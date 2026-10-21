@@ -27,6 +27,9 @@ GO.DEFAULT_THRESHOLD = 3
 GO.BOOTSTRAP_BASE = 0
 GO.MAX_THRESHOLD = 20
 GO.MAX_REV = 9007199254740990
+-- Ordinary remote catch-up may skip missed revisions, but not leap to a
+-- terminal or implausibly forward revision that strands future edits.
+GO.MAX_REV_CATCHUP = 10000
 
 GO._db = nil
 GO._root = nil
@@ -321,7 +324,34 @@ function GO:GetStoredPolicy(guildKey)
     if not policy then
         return nil, err or "policy_invalid"
     end
+    if policy.guildKey ~= key then
+        return nil, "policy_invalid"
+    end
+    -- A terminal revision cannot accept further commits; treat it as unusable so
+    -- a verified Guild Master can recover through Bootstrap.
+    if policy.revN >= GO.MAX_REV then
+        return nil, "policy_invalid"
+    end
     return policy, nil
+end
+
+local function RemoteRevisionPlausible(localPolicy, remoteRev)
+    remoteRev = tonumber(remoteRev)
+    if not remoteRev then
+        return false, "invalid_revision"
+    end
+    if remoteRev >= GO.MAX_REV then
+        return false, "implausible_revision"
+    end
+    local localRev = 0
+    if localPolicy and tonumber(localPolicy.revN) then
+        localRev = tonumber(localPolicy.revN)
+    end
+    local gap = tonumber(GO.MAX_REV_CATCHUP) or 10000
+    if remoteRev > localRev + gap then
+        return false, "implausible_revision"
+    end
+    return true
 end
 
 --- Current guild context. Missing ranks are unknown, not permission.
@@ -512,6 +542,7 @@ function GO:GetView()
     end
     view.threshold = policy.threshold
     view.revN = policy.revN
+    view.policyFp = GO.PolicyVersionFp and GO.PolicyVersionFp(policy) or nil
     view.effectiveThreshold = EffectiveThreshold(policy, ctx.rankCount)
     view.capped = view.effectiveThreshold ~= policy.threshold
     view.thresholdName = RankName(ctx.ranks, view.effectiveThreshold)
@@ -603,9 +634,15 @@ function GO:Bootstrap(opts)
     local revN = 1
     local raw = GO._root.guilds[ctx.guildKey]
     if type(raw) == "table" and tonumber(raw.revN) and tonumber(raw.revN) >= 1 then
-        revN = math.floor(tonumber(raw.revN)) + 1
-        if revN > GO.MAX_REV then
-            return "rejected", "revision_exhausted"
+        local prior = math.floor(tonumber(raw.revN))
+        if prior >= GO.MAX_REV then
+            -- Terminal/unusable stored revision: verified GM recovery restarts.
+            revN = 1
+        else
+            revN = prior + 1
+            if revN > GO.MAX_REV then
+                return "rejected", "revision_exhausted"
+            end
         end
     end
     local policy = {
@@ -654,7 +691,13 @@ function GO:CommitThreshold(position, opts)
     if not existing then
         return "rejected", existingReason or "policy_unknown"
     end
-    if opts.expectedRevN ~= nil and tonumber(opts.expectedRevN) ~= tonumber(existing.revN) then
+    if opts.expectedPolicyFp ~= nil then
+        local fp = GO.PolicyVersionFp and GO.PolicyVersionFp(existing) or nil
+        if type(opts.expectedPolicyFp) ~= "string" or opts.expectedPolicyFp == ""
+            or opts.expectedPolicyFp ~= fp then
+            return "rejected", "stale_policy"
+        end
+    elseif opts.expectedRevN ~= nil and tonumber(opts.expectedRevN) ~= tonumber(existing.revN) then
         return "rejected", "stale_policy"
     end
     local effective = EffectiveThreshold(existing, ctx.rankCount)
@@ -786,6 +829,10 @@ function GO:ApplyRemotePolicy(body, member)
     if not allowed then
         return "rejected", authReason or "unauthorized"
     end
+    local revOk, revReason = RemoteRevisionPlausible(localPolicy, remote.revN)
+    if not revOk then
+        return "rejected", revReason or "implausible_revision"
+    end
     -- A stored threshold above this client's rank count is kept. Authorization
     -- above already capped a known policy. The shorter list does not rewrite it.
     local status, merged, detail = GO.MergePolicies(localPolicy, remote)
@@ -911,6 +958,8 @@ function GO.FormatFeedback(status, reason)
         rank_unavailable = Loc("GUILD_OFFICER_ERR_RANKS", "Guild rank information is unavailable."),
         not_ready = Loc("GUILD_OFFICER_ERR_NOT_READY", "Guild membership or rank information is not ready yet."),
         not_in_guild = Loc("GUILD_OFFICER_ERR_NOT_IN_GUILD", "You are not currently in a guild."),
+        implausible_revision = Loc("GUILD_OFFICER_ERR_REVISION", "That officer-rank update is too far ahead to apply safely."),
+        revision_exhausted = Loc("GUILD_OFFICER_ERR_REVISION", "That officer-rank update is too far ahead to apply safely."),
     }
     return map[reason] or Loc("GUILD_OFFICER_ERR_GENERIC", "The officer rank could not be changed."), "error"
 end
