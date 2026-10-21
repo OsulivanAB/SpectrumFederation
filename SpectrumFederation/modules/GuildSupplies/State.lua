@@ -990,9 +990,9 @@ function GS:GetRecordForGuildKey(guildKey)
     return record, nil
 end
 
---- Explicit local staged creation. Requires verified current guild + authority.
--- @param editorRankPosition number|nil GM-selected threshold when fewer than 3 ranks exist.
---   Ordinary guilds (≥3 ranks) ignore this and use default position 3.
+--- Explicit local staged creation. Requires the shared officer policy.
+-- editorRankPosition is ignored. Historical permission metadata stores the
+-- effective shared threshold and is not a second authorization source.
 function GS:CreateStagedRecord(editorRankPosition)
     if not GS:IsRootReady() then
         return nil, "rejected", GS:GetRootReason() or "not_ready"
@@ -1018,41 +1018,21 @@ function GS:CreateStagedRecord(editorRankPosition)
         return nil, "rejected", "unsupported_schema"
     end
 
-    local ranks = ctx.ranks
-    local rankCount = ranks and tonumber(ranks.count) or 0
-    local initialPosition = GS.DEFAULT_EDITOR_RANK_POSITION
+    local rankCount = ctx.ranks and tonumber(ctx.ranks.count) or 0
     local caps = GS:GetCapabilities()
-    if not caps then
-        return nil, "rejected", "unauthorized"
+    if not caps or not caps.canEdit then
+        return nil, "rejected", (caps and caps.reason) or "unauthorized"
     end
-
-    if rankCount > 0 and rankCount < GS.DEFAULT_EDITOR_RANK_POSITION then
-        -- Fewer than three ranks: verified GM must select an existing threshold.
-        -- Do not invent/widen a default position that does not exist.
-        if ctx.previewNonAdmin then
-            return nil, "rejected", "preview_non_admin"
-        end
-        if ctx.rankOrder ~= 1 then
-            return nil, "rejected", "policy_requires_gm"
-        end
-        if editorRankPosition == nil then
-            return nil, "rejected", "threshold_unselected"
-        end
-        local selected = tonumber(editorRankPosition)
-        if not selected or selected ~= math.floor(selected) or selected < 1
-            or selected > rankCount then
-            return nil, "rejected", "invalid_editor_rank_position"
-        end
-        if not caps.canRecoverPolicy then
-            return nil, "rejected", caps.reason or "policy_requires_gm"
-        end
-        initialPosition = selected
-    else
-        if not caps.canEdit then
-            return nil, "rejected", caps.reason or "unauthorized"
-        end
-        -- Ordinary path keeps default rank 3; caller selection is not applied.
+    local initialPosition = GS.SharedOfficerThreshold and select(1, GS.SharedOfficerThreshold()) or nil
+    initialPosition = tonumber(initialPosition)
+    if not initialPosition or initialPosition ~= math.floor(initialPosition) or initialPosition < 1 then
+        return nil, "rejected", "policy_unknown"
     end
+    if rankCount >= 1 and initialPosition > rankCount then
+        initialPosition = rankCount
+    end
+    -- editorRankPosition is obsolete. Shared officer policy chooses the
+    -- historical metadata value stored below.
 
     local datasetId, idErr = GS:_NewDatasetId(ctx.actorGuid)
     if not datasetId then

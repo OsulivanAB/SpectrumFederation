@@ -364,12 +364,26 @@ local function AccessStatusText()
 		return Loc("GUILD_INFO_STATUS_ROSTER_WAIT",
 			"Guild roster is loading or unavailable. Existing assignments remain; new targets stay disabled.")
 	end
+	local view = SF.GuildOfficer and SF.GuildOfficer.GetView and SF.GuildOfficer:GetView() or nil
+	local rankName = view and view.thresholdName
 	if caps.canEdit then
+		if type(rankName) == "string" and rankName ~= "" then
+			return Loc("GUILD_INFO_STATUS_EDITOR_NAMED",
+				"You can assign, move, unassign, and change mains (%s and higher)."):format(rankName)
+		end
 		return Loc("GUILD_INFO_STATUS_EDITOR",
-			"You can assign, move, unassign, and change mains (guild ranks 1–3).")
+			"You can assign, move, unassign, and change mains.")
+	end
+	if view and (view.status == "unknown" or view.status == "invalid") then
+		return Loc("GUILD_INFO_STATUS_POLICY_UNKNOWN",
+			"View only until the guild officer rank is available. A Guild Master can establish it.")
+	end
+	if type(rankName) == "string" and rankName ~= "" then
+		return Loc("GUILD_INFO_STATUS_READONLY_NAMED",
+			"View only. %s and higher may change assignments."):format(rankName)
 	end
 	return Loc("GUILD_INFO_STATUS_READONLY",
-		"View only. Guild ranks 1–3 may change assignments.")
+		"View only. Officers may change assignments.")
 end
 
 local function CleanupConfirmMessage()
@@ -429,11 +443,184 @@ local function AssignButtonEnabled()
 	return false
 end
 
+local function OfficerView()
+	local GO = SF.GuildOfficer
+	if not GO or type(GO.GetView) ~= "function" then
+		return {
+			status = "unavailable",
+			canRead = false,
+			canEdit = false,
+			canBootstrap = false,
+			rankOptions = {},
+		}
+	end
+	return GO:GetView()
+end
+
+local function ReportOfficer(ctx, status, reason)
+	local GO = SF.GuildOfficer
+	local message, severity = "Officer rank could not be changed.", "error"
+	if GO and GO.FormatFeedback then
+		message, severity = GO.FormatFeedback(status, reason)
+	end
+	if ctx and ctx.section and ctx.section.SetMessage then
+		ctx.section:SetMessage(message, severity)
+	end
+	if QueueRefresh then
+		QueueRefresh()
+	end
+end
+
+local function CommitOfficerRank(ctx, position)
+	local GO = SF.GuildOfficer
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not GO or type(GO.CommitThreshold) ~= "function" then
+		ReportOfficer(ctx, "rejected", "not_ready")
+		return
+	end
+	local view = OfficerView()
+	local pos = tonumber(position)
+	if not view.canEdit or not pos then
+		ReportOfficer(ctx, "rejected", view.reason or "unauthorized")
+		return
+	end
+	if view.threshold and pos == tonumber(view.threshold) then
+		return
+	end
+	local selfRestricts = type(view.rankOrder) == "number" and view.rankOrder > pos
+	local confirmMsg = Loc("GUILD_OFFICER_CONFIRM",
+		"Change the officer rank so this rank and higher can administer the guild?")
+	if selfRestricts then
+		confirmMsg = Loc("GUILD_OFFICER_CONFIRM_SELF",
+			"Change the officer rank? Your character would no longer meet it and would lose edit rights.")
+	end
+	local bound = {
+		position = pos,
+		expectedGuildKey = view.guildKey,
+		expectedHandleGeneration = view.handleGeneration,
+		expectedActorGuid = view.actorGuid,
+		expectedRevN = view.revN,
+	}
+	local function accept()
+		local status, reason = GO:CommitThreshold(bound.position, bound)
+		ReportOfficer(ctx, status, reason)
+	end
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(confirmMsg, Loc("GUILD_OFFICER_APPLY", "Change officer rank"), accept)
+	else
+		ReportOfficer(ctx, "rejected", "not_ready")
+	end
+end
+
+local function CommitOfficerBootstrap(ctx)
+	local GO = SF.GuildOfficer
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not GO or type(GO.Bootstrap) ~= "function" then
+		ReportOfficer(ctx, "rejected", "not_ready")
+		return
+	end
+	local view = OfficerView()
+	if not view.canBootstrap then
+		ReportOfficer(ctx, "rejected", view.reason or "policy_requires_gm")
+		return
+	end
+	local bound = {
+		expectedGuildKey = view.guildKey,
+		expectedHandleGeneration = view.handleGeneration,
+		expectedActorGuid = view.actorGuid,
+	}
+	local function accept()
+		local fresh = OfficerView()
+		if not fresh.canBootstrap or fresh.guildKey ~= bound.expectedGuildKey then
+			ReportOfficer(ctx, "rejected", "stale_policy")
+			return
+		end
+		local status, reason = GO:Bootstrap(bound)
+		ReportOfficer(ctx, status, reason)
+	end
+	local msg = Loc("GUILD_OFFICER_BOOTSTRAP_CONFIRM",
+		"Establish the default officer rank for this guild? Rank 3 is used when that rank exists; otherwise the lowest guild rank is used.")
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(msg, Loc("GUILD_OFFICER_BOOTSTRAP_BUTTON", "Establish default"), accept)
+	else
+		ReportOfficer(ctx, "rejected", "not_ready")
+	end
+end
+
 local function Definition()
 	-- Closures must call Caps()/Roster() live so Page:Refresh() sees current
 	-- authority and roster completeness without rebuilding the page (A).
 	return {
 		sections = {
+			{
+				id = "guildInfoOfficerRank",
+				title = Loc("GUILD_OFFICER_SECTION", "Officer rank"),
+				items = {
+					{
+						type = "display",
+						label = Loc("GUILD_OFFICER_STATUS_LABEL", "Current officer rank"),
+						get = function()
+							local view = OfficerView()
+							if not view.canRead then
+								return Loc("GUILD_OFFICER_STATUS_MEMBERSHIP",
+									"Guild membership is still being verified.")
+							end
+							if view.status == "established" and type(view.thresholdName) == "string" then
+								return Loc("GUILD_OFFICER_STATUS_NAMED", "%s and higher"):format(view.thresholdName)
+							end
+							if view.status == "unknown" then
+								return Loc("GUILD_OFFICER_STATUS_UNKNOWN",
+									"Not available yet. Waiting for synchronization, or a Guild Master can establish the default.")
+							end
+							if view.status == "invalid" then
+								return Loc("GUILD_OFFICER_STATUS_INVALID",
+									"Officer rank needs Guild Master recovery.")
+							end
+							return Loc("GUILD_OFFICER_STATUS_UNAVAILABLE",
+								"Guild rank information is unavailable.")
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_OFFICER_RANK_LABEL", "Officer rank"),
+						tooltip = Loc("GUILD_OFFICER_RANK_TIP",
+							"Guild members at this rank and higher can administer Guild Info and Guild Supplies."),
+						defaultText = Loc("GUILD_OFFICER_RANK_UNKNOWN", "Unavailable"),
+						options = function()
+							return OfficerView().rankOptions or {}
+						end,
+						get = function()
+							local view = OfficerView()
+							if not view.canRead then
+								return nil
+							end
+							return view.effectiveThreshold
+						end,
+						set = function() end,
+						enabled = function()
+							return OfficerView().canEdit == true
+						end,
+						onValueChanged = function(ctx, value)
+							CommitOfficerRank(ctx, value)
+						end,
+					},
+					{
+						type = "button",
+						label = Loc("GUILD_OFFICER_BOOTSTRAP_LABEL", "Establish officer rank"),
+						buttonText = Loc("GUILD_OFFICER_BOOTSTRAP_BUTTON", "Establish default"),
+						width = 180,
+						visible = function()
+							return OfficerView().canBootstrap == true
+						end,
+						enabled = function()
+							return OfficerView().canBootstrap == true
+						end,
+						onClick = function(ctx)
+							CommitOfficerBootstrap(ctx)
+						end,
+					},
+				},
+			},
 			{
 				id = "guildInfoMainAltStatus",
 				title = Loc("GUILD_INFO_SECTION_STATUS", "Status"),
@@ -759,6 +946,13 @@ local function EnsureUIListener()
 	g.RegisterUIListener(function()
 		QueueRefresh()
 	end)
+	local GO = SF.GuildOfficer
+	if GO and GO.RegisterUIListener and not Page.__sfOfficerHook then
+		Page.__sfOfficerHook = true
+		GO.RegisterUIListener(function()
+			QueueRefresh()
+		end)
+	end
 end
 
 function Page:Build(panel)

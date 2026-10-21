@@ -322,19 +322,20 @@ function GS.SenderHasEditorAuthority(member, opts)
     end
 
     if recordReason == "not_configured" or record == nil then
-        -- Empty client: only a verified member at default (or GM) threshold may
-        -- originate the first staged dataset; receivers still accept replication.
+        -- Empty client: the shared officer policy authorizes the first dataset.
+        -- A missing rank list stays fail-closed. Receivers still accept replication.
         if opts.allowBootstrapInstall then
-            local defaultPos = GS.DEFAULT_EDITOR_RANK_POSITION or 3
-            -- Fail closed while rank count is unknown: never treat a missing count
-            -- as an ordinary >=default-rank guild (small-guild GM-only must apply).
             if not rankCount or rankCount < 1 then
                 return false, "not_ready"
             end
-            if rankCount < defaultPos then
-                return member.rankOrder == 1, (member.rankOrder == 1) and nil or "unauthorized"
+            local sharedPos, sharedReason = GS.SharedOfficerThreshold and GS.SharedOfficerThreshold()
+            if not sharedPos then
+                return false, sharedReason or "policy_unknown"
             end
-            return member.rankOrder <= defaultPos, nil
+            if member.rankOrder <= sharedPos then
+                return true, nil
+            end
+            return false, "unauthorized"
         end
         return false, "not_configured"
     end
@@ -377,7 +378,19 @@ function GS.SenderHasEditorAuthority(member, opts)
         end
         return false, "policy_requires_gm"
     end
-    if member.rankOrder <= policyPos then
+    -- Descriptor catch-up still checks the historical predecessor position.
+    -- It does not become a second live authorization source.
+    if opts.allowPolicyCatchUp then
+        if policyPos and member.rankOrder <= policyPos then
+            return true, nil
+        end
+        return false, "unauthorized"
+    end
+    local sharedPos, sharedReason = GS.SharedOfficerThreshold and GS.SharedOfficerThreshold()
+    if not sharedPos then
+        return false, sharedReason or "policy_unknown"
+    end
+    if member.rankOrder <= sharedPos then
         return true, nil
     end
     return false, "unauthorized"
@@ -1399,29 +1412,21 @@ function GS:InstallStagedDatasetFromRemote(descriptor, member)
     if not rankCount or rankCount < 1 then
         return "rejected", "not_ready"
     end
-    local defaultPos = GS.DEFAULT_EDITOR_RANK_POSITION or 3
-    local editorPos = defaultPos
-    if rankCount < defaultPos then
-        -- Small-guild bootstrap: reuse complete positive-integral verified-rank validation.
-        local advertised = tonumber(descriptor.bootstrapEditorRankPosition)
-            or tonumber(descriptor.editorRankPosition)
+    -- Historical metadata only. Authorization already used the shared officer policy.
+    -- A valid advertised position is kept so older replicas stay consistent.
+    local sharedPos = GS.SharedOfficerThreshold and select(1, GS.SharedOfficerThreshold()) or nil
+    local editorPos = tonumber(sharedPos) or (GS.DEFAULT_EDITOR_RANK_POSITION or 3)
+    if editorPos > rankCount then
+        editorPos = rankCount
+    end
+    local advertised = tonumber(descriptor.bootstrapEditorRankPosition)
+        or tonumber(descriptor.editorRankPosition)
+    if advertised ~= nil then
         local bootOk, bootErr, bootNorm = ValidateEditorRankValue(advertised)
         if not bootOk then
             return "rejected", bootErr or "invalid_editor_rank_position"
         end
         editorPos = bootNorm
-    elseif descriptor.bootstrapEditorRankPosition ~= nil
-        or descriptor.editorRankPosition ~= nil then
-        -- Ordinary guilds: when a threshold is advertised, require integrality too.
-        local advertised = tonumber(descriptor.bootstrapEditorRankPosition)
-            or tonumber(descriptor.editorRankPosition)
-        if advertised ~= nil then
-            local bootOk, bootErr, bootNorm = ValidateEditorRankValue(advertised)
-            if not bootOk then
-                return "rejected", bootErr or "invalid_editor_rank_position"
-            end
-            editorPos = bootNorm
-        end
     end
 
     local installActivation = GS.ACTIVATION_STAGED

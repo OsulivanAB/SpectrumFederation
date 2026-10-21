@@ -26,7 +26,7 @@ local Page = {
 	contentHeading = Loc("GUILD_SUPPLIES_CONFIG_HEADING", "Guild Supplies Configuration"),
 	group = "Loot Tools",
 	description = Loc("GUILD_SUPPLIES_CONFIG_DESC",
-		"Fresh guild setup, bank tab, editor ranks, requested items, and New Campaign."),
+		"Fresh guild setup, bank tab, requested items, and New Campaign."),
 	order = 19.1,
 }
 
@@ -82,11 +82,6 @@ local function Caps()
 	return caps
 end
 
--- Ephemeral small-guild threshold choice for Initialize; never persisted.
--- Bound to the originating guild/rank-count context (not a bare scalar).
-local pendingInitRank = nil
-local pendingInitGuildKey = nil
-local pendingInitRankCount = nil
 local refreshQueued = false
 local rosterFrame = nil
 local bankFrame = nil
@@ -108,42 +103,6 @@ local function RefreshPageControls()
 	if Page.Refresh and Page.panel then
 		Page:Refresh(Page.panel)
 	end
-end
-
-local function ClearPendingInitRank()
-	pendingInitRank = nil
-	pendingInitGuildKey = nil
-	pendingInitRankCount = nil
-end
-
---- Drop a stale initialization choice only when guild/rank context actually changes.
-local function SyncPendingInitContext()
-	if pendingInitRank == nil then
-		return
-	end
-	local g = GS()
-	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
-	if not ctx or type(ctx.guildKey) ~= "string" or ctx.guildKey == "" then
-		ClearPendingInitRank()
-		return
-	end
-	local count = tonumber(ctx.rankCount) or 0
-	if ctx.guildKey ~= pendingInitGuildKey or count ~= pendingInitRankCount then
-		ClearPendingInitRank()
-	end
-end
-
-local function SetPendingInitRank(value)
-	local g = GS()
-	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
-	local pos = tonumber(value)
-	if not pos or not ctx or type(ctx.guildKey) ~= "string" then
-		ClearPendingInitRank()
-		return
-	end
-	pendingInitRank = pos
-	pendingInitGuildKey = ctx.guildKey
-	pendingInitRankCount = tonumber(ctx.rankCount) or 0
 end
 
 local function ReportStatus(ctx, status, reason)
@@ -176,42 +135,10 @@ local function ItemLabel(itemId)
 	return Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId))
 end
 
-local function RankOptions()
-	local g = GS()
-	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
-	local opts = {}
-	if not ctx or type(ctx.ranks) ~= "table" then
-		return opts
-	end
-	local count = tonumber(ctx.rankCount) or 0
-	for i = 1, count do
-		local name = ctx.ranks[i]
-		if type(name) == "string" and name ~= "" then
-			opts[#opts + 1] = { value = i, label = name }
-		end
-	end
-	return opts
-end
-
 --- True only for first-time setup (no dataset). Permission-only nil records are recovery.
 local function IsNotConfigured()
 	local _, reason = CurrentRecord()
 	return reason == "not_configured"
-end
-
-local function NeedsExplicitInitThreshold()
-	SyncPendingInitContext()
-	local g = GS()
-	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
-	if not ctx or not ctx.ready then
-		return false
-	end
-	local count = tonumber(ctx.rankCount) or 0
-	local defaultPos = (g and g.DEFAULT_EDITOR_RANK_POSITION) or 3
-	if count <= 0 or count >= defaultPos then
-		return false
-	end
-	return IsNotConfigured()
 end
 
 local function CurrentBankTab()
@@ -866,55 +793,6 @@ local function CommitConfig(ctx, kind, target, value)
 	ReportStatus(ctx, status, reason)
 end
 
-local function CommitEditorRank(ctx, position)
-	local g = GS()
-	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
-	local caps = Caps()
-	local pos = tonumber(position)
-	if not g or not pos then
-		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
-		return
-	end
-	if not caps.canEdit and not caps.canRecoverPolicy then
-		ReportStatus(ctx, "rejected", caps.reason or "unauthorized")
-		return
-	end
-	if caps.editorRankPosition and tonumber(caps.editorRankPosition) == pos then
-		return
-	end
-
-	local ctxNow = g.GetCurrentContext and g:GetCurrentContext() or nil
-	local selfRestricts = ctxNow and type(ctxNow.rankOrder) == "number" and ctxNow.rankOrder > pos
-	local confirmMsg = Loc("GUILD_SUPPLIES_EDITOR_RANK_CONFIRM",
-		"Change the editor rank threshold to this rank and higher?")
-	if selfRestricts then
-		confirmMsg = Loc("GUILD_SUPPLIES_EDITOR_RANK_CONFIRM_SELF",
-			"Change the editor rank threshold? Your character would no longer meet it and would lose edit rights.")
-	end
-
-	-- Bind the intended operation before confirmation so guild/policy churn cannot
-	-- silently rebuild against a different context on accept.
-	local op, prepStatus, prepReason = g:NewConfigOperation("set-editor-rank", "editorRankPosition", pos)
-	if not op then
-		ReportStatus(ctx, prepStatus or "rejected", prepReason)
-		return
-	end
-	local boundOp = op
-	local accept = function()
-		ctx.section:ClearMessage()
-		local status, reason = g:ApplyStagedConfigOperation(boundOp)
-		ReportStatus(ctx, status, reason)
-	end
-	if dialogs and dialogs.Confirm then
-		dialogs:Confirm(confirmMsg, Loc("GUILD_SUPPLIES_EDITOR_RANK_APPLY", "Change rank"), accept)
-	else
-		ctx.section:SetMessage(
-			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
-				"Confirmation is required and is unavailable right now."),
-			"error")
-	end
-end
-
 local function CommitNewCampaign(ctx)
 	local g = GS()
 	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
@@ -958,6 +836,70 @@ local function CommitNewCampaign(ctx)
 			Loc("GUILD_SUPPLIES_NEW_CAMPAIGN_BUTTON", "New Campaign"),
 			accept
 		)
+	else
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+				"Confirmation is required and is unavailable right now."),
+			"error")
+	end
+end
+
+--- Native rank names. Used only to repair a corrupt historical permission record.
+local function RecoveryRankOptions()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	local opts = {}
+	if not ctx or type(ctx.ranks) ~= "table" then
+		return opts
+	end
+	local count = tonumber(ctx.rankCount) or 0
+	for i = 1, count do
+		local name = ctx.ranks[i]
+		if type(name) == "string" and name ~= "" then
+			opts[#opts + 1] = { value = i, label = name }
+		end
+	end
+	return opts
+end
+
+--- Historical permission repair only. Live authorization is the shared officer policy.
+local function CanRepairHistoricalPermission()
+	local c = Caps()
+	if IsNotConfigured() then
+		return false
+	end
+	return c.canRecoverPolicy == true and c.canEdit ~= true
+end
+
+local function CommitEditorRank(ctx, position)
+	local g = GS()
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	local pos = tonumber(position)
+	if not g or not pos then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	if not CanRepairHistoricalPermission() then
+		ReportStatus(ctx, "rejected", "unauthorized")
+		return
+	end
+	local op, prepStatus, prepReason = g:NewConfigOperation("set-editor-rank", "editorRankPosition", pos)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local boundOp = op
+	local accept = function()
+		ctx.section:ClearMessage()
+		local status, reason = g:ApplyStagedConfigOperation(boundOp)
+		ReportStatus(ctx, status, reason)
+	end
+	if dialogs and dialogs.Confirm then
+		dialogs:Confirm(
+			Loc("GUILD_SUPPLIES_EDITOR_RANK_RECOVER_CONFIRM",
+				"Repair the stored Guild Supplies permission record to this rank? This does not change who can edit. Editing follows the shared officer rank."),
+			Loc("GUILD_SUPPLIES_EDITOR_RANK_APPLY", "Repair record"),
+			accept)
 	else
 		ctx.section:SetMessage(
 			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
@@ -1042,48 +984,15 @@ local function DisabledBankTabTip()
 		"Open your Guild Bank to load the available tabs.")
 end
 
-local function DisabledEditorRankTip()
-	local c = Caps()
-	if NeedsExplicitInitThreshold() then
-		if c.canRecoverPolicy then
-			return nil
-		end
-		if not c.canRead then
-			return DisabledMembershipTip()
-		end
-		return DisabledUnauthorizedTip(
-			Loc("GUILD_SUPPLIES_DISABLED_ACTION_EDITOR_RANK", "changing editor ranks"))
-	end
-	if IsNotConfigured() then
-		if not c.canRead then
-			return DisabledMembershipTip()
-		end
-		if not c.canEdit and not c.canRecoverPolicy then
-			return DisabledUnauthorizedTip(
-				Loc("GUILD_SUPPLIES_DISABLED_ACTION_EDITOR_RANK", "changing editor ranks"))
-		end
-		return Loc("GUILD_SUPPLIES_DISABLED_RANK_BEFORE_INIT",
-			"Initialize Guild Supplies before changing the editor rank.")
-	end
-	if c.canRecoverPolicy or (CurrentRecord() ~= nil and c.canEdit) then
-		return nil
-	end
-	if not c.canRead then
-		return DisabledMembershipTip()
-	end
-	if not c.canEdit then
-		return DisabledUnauthorizedTip(
-			Loc("GUILD_SUPPLIES_DISABLED_ACTION_EDITOR_RANK", "changing editor ranks"))
-	end
-	return Loc("GUILD_SUPPLIES_DISABLED_DATA_UNAVAILABLE",
-		"Guild Supplies data is unavailable right now.")
-end
-
 local function DisabledInitializeTip()
 	local c = Caps()
 	if not c.canEdit and not c.canRecoverPolicy then
 		if not c.canRead then
 			return DisabledMembershipTip()
+		end
+		if c.reason == "policy_unknown" or c.reason == "policy_invalid" then
+			return Loc("GUILD_SUPPLIES_DISABLED_POLICY_UNKNOWN",
+				"Officer rank is not available yet, so Guild Supplies setup stays disabled.")
 		end
 		return DisabledUnauthorizedTip(
 			Loc("GUILD_SUPPLIES_DISABLED_ACTION_INITIALIZE", "initializing Guild Supplies"))
@@ -1092,11 +1001,6 @@ local function DisabledInitializeTip()
 		-- Already have a dataset (or recovery path); do not claim init is incomplete.
 		return Loc("GUILD_SUPPLIES_DISABLED_ALREADY_INITIALIZED",
 			"Guild Supplies has already been initialized for this guild.")
-	end
-	SyncPendingInitContext()
-	if NeedsExplicitInitThreshold() and pendingInitRank == nil then
-		return Loc("GUILD_SUPPLIES_DISABLED_INIT_NEED_RANK",
-			"Choose an editor rank threshold before initializing Guild Supplies.")
 	end
 	return nil
 end
@@ -1326,60 +1230,6 @@ local function Definition()
 						height = 4,
 					},
 					{
-						type = "dropdown",
-						label = Loc("GUILD_SUPPLIES_EDITOR_RANK", "Editor ranks"),
-						tooltip = Loc("GUILD_SUPPLIES_EDITOR_RANK_TIP",
-							"Native guild ranks at or above this threshold may edit. Guild Masters can recover an invalid policy."),
-						adminOnly = true,
-						defaultText = Loc("GUILD_SUPPLIES_EDITOR_RANK_UNKNOWN", "Unavailable"),
-						options = RankOptions,
-						get = function()
-							SyncPendingInitContext()
-							if NeedsExplicitInitThreshold() then
-								return pendingInitRank
-							end
-							-- Redact shared policy display until membership canRead; recovery
-							-- enablement still uses Caps().canRecoverPolicy below.
-							if not Caps().canRead and not Caps().canRecoverPolicy then
-								return nil
-							end
-							return Caps().editorRankPosition
-						end,
-						set = function(value)
-							if NeedsExplicitInitThreshold() then
-								SetPendingInitRank(value)
-							end
-						end,
-						enabled = function()
-							local c = Caps()
-							-- Small-guild first setup: select an explicit init threshold.
-							if NeedsExplicitInitThreshold() then
-								return c.canRecoverPolicy == true
-							end
-							-- Ordinary not_configured: Initialize uses the default rank.
-							-- Do not enable CommitEditorRank before a dataset exists.
-							if IsNotConfigured() then
-								return false
-							end
-							-- Permission-only recovery: GetCurrentRecord may be nil while
-							-- canRecoverPolicy is true; NewConfigOperation still resolves it.
-							if c.canRecoverPolicy then
-								return true
-							end
-							local rec = CurrentRecord()
-							return rec ~= nil and c.canEdit == true
-						end,
-						getDisabledTooltip = DisabledEditorRankTip,
-						onValueChanged = function(ctx, value)
-							if NeedsExplicitInitThreshold() then
-								SetPendingInitRank(value)
-								RefreshPageControls()
-								return
-							end
-							CommitEditorRank(ctx, value)
-						end,
-					},
-					{
 						type = "button",
 						label = Loc("GUILD_SUPPLIES_INIT_LABEL", "Guild setup"),
 						adminOnly = true,
@@ -1393,10 +1243,6 @@ local function Definition()
 							-- Only true first-time setup; existing unusable records use recovery.
 							if not IsNotConfigured() then
 								return false
-							end
-							SyncPendingInitContext()
-							if NeedsExplicitInitThreshold() then
-								return pendingInitRank ~= nil
 							end
 							return true
 						end,
@@ -1414,19 +1260,7 @@ local function Definition()
 								ReportStatus(ctx, "rejected", "already_configured")
 								return
 							end
-							local threshold = nil
-							SyncPendingInitContext()
-							if NeedsExplicitInitThreshold() then
-								threshold = pendingInitRank
-								if threshold == nil then
-									ReportStatus(ctx, "rejected", "threshold_unselected")
-									return
-								end
-							end
-							local _, status, reason = mod:CreateStagedRecord(threshold)
-							if status == "accepted" then
-								ClearPendingInitRank()
-							end
+							local _, status, reason = mod:CreateStagedRecord()
 							ReportStatus(ctx, status or "rejected", reason)
 						end,
 					},
@@ -1478,6 +1312,35 @@ local function Definition()
 										"Confirmation is required and is unavailable right now."),
 									"error")
 							end
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_EDITOR_RANK", "Editor ranks"),
+						tooltip = Loc("GUILD_SUPPLIES_EDITOR_RANK_RECOVER_TIP",
+							"Repairs a corrupt stored permission record. It does not choose who can edit Guild Supplies."),
+						adminOnly = true,
+						defaultText = Loc("GUILD_SUPPLIES_EDITOR_RANK_UNKNOWN", "Unavailable"),
+						options = RecoveryRankOptions,
+						get = function()
+							if not CanRepairHistoricalPermission() then
+								return nil
+							end
+							return Caps().editorRankPosition
+						end,
+						set = function() end,
+						enabled = function()
+							return CanRepairHistoricalPermission()
+						end,
+						getDisabledTooltip = function()
+							if CanRepairHistoricalPermission() then
+								return nil
+							end
+							return Loc("GUILD_SUPPLIES_EDITOR_RANK_DISABLED",
+								"Who can edit follows the shared officer rank. This control only repairs a corrupt stored permission record.")
+						end,
+						onValueChanged = function(ctx, value)
+							CommitEditorRank(ctx, value)
 						end,
 					},
 					{
@@ -2095,7 +1958,6 @@ local function QueueRefresh()
 		refreshQueued = false
 		if not Page.panel or not Page.Refresh then return end
 		if not PanelVisible(Page.panel) then return end
-		SyncPendingInitContext()
 		SyncBankTabCatalogGuild()
 		-- Re-read names while the bank is open so delayed API responses surface Settings.
 		if guildBankOpen then
@@ -2121,7 +1983,6 @@ local function EnsureRosterListener()
 		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
 	end
 	frame:SetScript("OnEvent", function()
-		SyncPendingInitContext()
 		SyncBankTabCatalogGuild()
 		QueueRefresh()
 	end)

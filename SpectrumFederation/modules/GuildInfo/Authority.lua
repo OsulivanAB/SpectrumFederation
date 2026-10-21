@@ -1,5 +1,5 @@
--- Guild Info rank/capability authority (#402).
--- Fixed editor threshold: verified ranks 1–3. Not Guild Supplies policy.
+-- Guild Info rank/capability authority (#402, #405).
+-- Editing uses the shared guild officer threshold, not a Guild Info-local rank.
 local addonName, SF = ...
 
 SF.GuildInfo = SF.GuildInfo or {}
@@ -97,18 +97,14 @@ function GI:GetCurrentContext()
     return ctx
 end
 
---- Whether a verified rank order may edit Guild Info (ranks 1–3, capped by count).
+--- Whether a verified rank order may edit Guild Info under the shared officer policy.
+-- @return boolean ok, string|nil reason
 function GI.RankMayEdit(rankOrder, rankCount)
-    rankOrder = tonumber(rankOrder)
-    rankCount = tonumber(rankCount)
-    if not rankOrder or rankOrder ~= math.floor(rankOrder) or rankOrder < 1 then
-        return false
+    local GO = SF.GuildOfficer
+    if not GO or type(GO.RankMeetsThreshold) ~= "function" then
+        return false, "policy_unknown"
     end
-    if not rankCount or rankCount < 1 then
-        return false
-    end
-    local maxEditable = math.min(GI.EDITOR_RANK_MAX or 3, rankCount)
-    return rankOrder <= maxEditable
+    return GO:RankMeetsThreshold(rankOrder, rankCount)
 end
 
 --- Current capabilities. UI visibility is not security; recheck at commit.
@@ -151,12 +147,13 @@ function GI:GetCapabilities()
         return result
     end
 
-    if GI.RankMayEdit(ctx.rankOrder, ctx.rankCount) then
+    local mayEdit, editReason = GI.RankMayEdit(ctx.rankOrder, ctx.rankCount)
+    if mayEdit then
         result.canEdit = true
         result.reason = nil
     else
         result.canEdit = false
-        result.reason = "unauthorized"
+        result.reason = editReason or "unauthorized"
     end
     return result
 end
@@ -227,8 +224,9 @@ function GI.SenderHasEditorAuthority(member)
     if not rankCount or rankCount < 1 then
         return false, "rank_unavailable"
     end
-    if GI.RankMayEdit(member.rankOrder, rankCount) then
+    local mayEdit, editReason = GI.RankMayEdit(member.rankOrder, rankCount)
+    if mayEdit then
         return true, nil
     end
-    return false, "unauthorized"
+    return false, editReason or "unauthorized"
 end
