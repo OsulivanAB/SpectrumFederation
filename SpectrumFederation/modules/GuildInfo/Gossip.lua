@@ -34,6 +34,13 @@ local exportState = {
     guildKey = nil,
 }
 
+-- Remote catch-up coalescing: mark dirty during ValidateAndApply batches and
+-- rebuild/bump once on the next export/index read (not per accepted record).
+local exportDirty = false
+local exportDirtyNeedsBump = false
+local exportRebuildCount = 0
+local exportBumpCount = 0
+
 local uiListeners = {}
 local uiNotifying = false
 local uiNotifyQueued = false
@@ -199,6 +206,7 @@ local function RebuildExportIndex()
     exportState.enumPos = nil
     local guildKey = CurrentGuildKey()
     exportState.guildKey = guildKey
+    exportDirty = false
     if not guildKey or not GI:IsRootReady() then
         return
     end
@@ -228,6 +236,7 @@ local function RebuildExportIndex()
             DebugWarn("skipping oversize guildInfo export id=%s", wire and wire.id or "?")
         end
     end
+    exportRebuildCount = exportRebuildCount + 1
 end
 
 local function UpsertExportWire(wire)
@@ -273,6 +282,25 @@ local function BumpPhysicalIndex(index)
     return true
 end
 
+--- Materialize a dirty export before serving/indexing. One rebuild+bump covers an
+-- entire remote admission batch instead of O(N) synchronous full resets.
+local function EnsureExportFresh()
+    if not exportDirty then
+        return false
+    end
+    local needBump = exportDirtyNeedsBump
+    RebuildExportIndex()
+    if needBump then
+        exportDirtyNeedsBump = false
+        if BumpPhysicalIndex(nil) then
+            exportBumpCount = exportBumpCount + 1
+        end
+    else
+        exportDirtyNeedsBump = false
+    end
+    return true
+end
+
 local function OnIndexInvalidated()
     exportState.enumPos = nil
 end
@@ -282,9 +310,15 @@ local function EnsureIndex(index, limits)
     local budget = math.max(1, tonumber(limits and limits.indexEntries) or 8)
     local guildKey = CurrentGuildKey()
     if exportState.guildKey ~= guildKey then
+        exportDirty = false
+        exportDirtyNeedsBump = false
         RebuildExportIndex()
-        BumpPhysicalIndex(index)
+        if BumpPhysicalIndex(index) then
+            exportBumpCount = exportBumpCount + 1
+        end
         exportState.enumPos = 1
+    else
+        EnsureExportFresh()
     end
     if index.buildComplete and not index.dirty then
         return false, 0
@@ -301,6 +335,7 @@ local function EnsureIndex(index, limits)
             local _, detail = g.IndexUpsert(index, rid, r.versionFp, r)
             if detail == "replaced" then
                 g.BumpIndexEpoch(index)
+                exportBumpCount = exportBumpCount + 1
                 exportState.enumPos = 1
                 return true, n + 1
             end
@@ -321,8 +356,14 @@ local function ListRecordIds(cursor, limit)
     limit = math.max(1, tonumber(limit) or 32)
     local guildKey = CurrentGuildKey()
     if exportState.guildKey ~= guildKey then
+        exportDirty = false
+        exportDirtyNeedsBump = false
         RebuildExportIndex()
-        BumpPhysicalIndex(nil)
+        if BumpPhysicalIndex(nil) then
+            exportBumpCount = exportBumpCount + 1
+        end
+    else
+        EnsureExportFresh()
     end
     local page = {}
     local i = cursor
@@ -339,8 +380,14 @@ end
 local function GetRecordVersionFp(recordId)
     local guildKey = CurrentGuildKey()
     if exportState.guildKey ~= guildKey then
+        exportDirty = false
+        exportDirtyNeedsBump = false
         RebuildExportIndex()
-        BumpPhysicalIndex(nil)
+        if BumpPhysicalIndex(nil) then
+            exportBumpCount = exportBumpCount + 1
+        end
+    else
+        EnsureExportFresh()
     end
     local r = exportState.byId[tostring(recordId)]
     return r and r.versionFp or nil
@@ -349,8 +396,14 @@ end
 local function GetRecordBody(recordId)
     local guildKey = CurrentGuildKey()
     if exportState.guildKey ~= guildKey then
+        exportDirty = false
+        exportDirtyNeedsBump = false
         RebuildExportIndex()
-        BumpPhysicalIndex(nil)
+        if BumpPhysicalIndex(nil) then
+            exportBumpCount = exportBumpCount + 1
+        end
+    else
+        EnsureExportFresh()
     end
     local r = exportState.byId[tostring(recordId)]
     if not r then
@@ -536,22 +589,56 @@ function GI.NotifyLocalDurableChange(reason)
     reason = tostring(reason or "local")
     if providerRegistered then
         local guildKey = CurrentGuildKey()
-        local needEpoch = reason == "local" or reason == "remote" or exportState.guildKey ~= guildKey
-        RebuildExportIndex()
-        if needEpoch or reason == "remote" then
-            BumpPhysicalIndex(nil)
-        end
-        local g = Gossip()
-        if g and g.NotifyProviderChanged then
-            g.NotifyProviderChanged(GI.PROVIDER_ID)
+        if reason == "remote" then
+            -- Coalesce: accept durable state immediately, defer full export rebuild
+            -- and physical-index reset until the next index/export read.
+            exportDirty = true
+            exportDirtyNeedsBump = true
+            local g = Gossip()
+            if g and g.NotifyProviderChanged then
+                g.NotifyProviderChanged(GI.PROVIDER_ID)
+            end
+        else
+            exportDirty = false
+            exportDirtyNeedsBump = false
+            local needEpoch = reason == "local" or exportState.guildKey ~= guildKey
+            RebuildExportIndex()
+            if needEpoch then
+                if BumpPhysicalIndex(nil) then
+                    exportBumpCount = exportBumpCount + 1
+                end
+            end
+            local g = Gossip()
+            if g and g.NotifyProviderChanged then
+                g.NotifyProviderChanged(GI.PROVIDER_ID)
+            end
         end
     end
     GI.NotifyUI(reason)
 end
 
+function GI.ResetExportPerfCounters()
+    exportRebuildCount = 0
+    exportBumpCount = 0
+end
+
+function GI.GetExportPerfCounters()
+    return {
+        rebuilds = exportRebuildCount,
+        bumps = exportBumpCount,
+        dirty = exportDirty and true or false,
+    }
+end
+
+--- Test/helper: force any coalesced remote export flush now.
+function GI.FlushPendingExport()
+    return EnsureExportFresh()
+end
+
 GI._NotifyLocalDurableChange = GI.NotifyLocalDurableChange
 GI._RebuildExportIndex = RebuildExportIndex
 GI._BumpPhysicalIndex = BumpPhysicalIndex
+GI._EnsureExportFresh = EnsureExportFresh
 
 local _previousInitialize = GI.Initialize
 function GI:Initialize(db)

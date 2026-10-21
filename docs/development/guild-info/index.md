@@ -87,8 +87,8 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 - Wall-clock `at` is metadata/display only and never grants authority.
 - Independent characters merge independently. Conflicting assignments to the same GUID resolve to one winner; unrelated edits survive.
 - **Change Main** updates only the group’s `mainGuid` (and group version). Memberships keep the same stable `groupId`, so the logical promotion is atomic and does not rewrite every alt.
-- Unassign writes `groupId = false` (tombstone). Stale lower-version assignments cannot resurrect the link.
-- Empty groups (no remaining alts) dissolve: remaining solo main is tombstoned and the group is marked `dissolved`. Unreferenced dissolved groups may be reclaimed; membership tombstones are retained until the identity-capacity ceiling so offline peers cannot republish obsolete links.
+- Unassign writes `groupId = false` (tombstone) for the alt. Stale lower-version assignments cannot resurrect the link.
+- Unassigning the last alt does **not** dissolve the group: the solo-main shell stays live and reusable for offline synchronization (see Shared-group lifecycle). Unreferenced dissolved groups without forward dependencies may be reclaimed; membership tombstones are retained until the identity-capacity ceiling or officer history cleanup.
 
 ## Capacity and cleanup
 
@@ -99,7 +99,7 @@ Durable keys are only `club:<id>`. Transport `name:` scopes are never persisted.
 | `MAX_ALTS_PER_MAIN` | 32 | Assign rejected (`group_full`) |
 | Gossip record | 2048 bytes CBOR | Oversize exports skipped / remote rejected |
 
-**Group lifecycle:** `Assign → Unassign` of the same identities dissolves the empty group and keeps a dissolved tombstone for Gossip peers. When a new group would exceed `MAX_GROUPS`, unreferenced dissolved slots are reclaimed automatically so churn of the same identities cannot permanently exhaust capacity. Live group shells admitted group-first (memberships not yet arrived) are retained; capacity fails closed rather than discarding them. Physical Gossip indexes drop retired `gi-g:*` IDs on durable-change invalidation.
+**Group lifecycle:** `Assign → Unassign` keeps a reusable solo-main shell (hidden from the mains-only Settings list) so offline peers can still assign to the same group id. Dissolved `forwardTo` aliases appear when a solo main is demoted into an *existing* other group (or when concurrent shells are retired), not from ordinary last-alt Unassign. Obsolete shells, aliases, and unassign tombstones are reclaimed through authorized officer history cleanup (sync generation), not automatic dissolve-on-empty. When a new group would exceed `MAX_GROUPS`, unreferenced dissolved slots without forward dependencies may be reclaimed automatically; live empty shells and forward aliases are never evicted this way — overflow fails closed. Physical Gossip indexes drop retired `gi-g:*` IDs on durable-change invalidation.
 
 **Shared-group lifecycle (emptiness is not global):** Unassigning the last *locally visible* alt does **not** dissolve the group or tombstone the main. A reusable solo-main shell stays live (hidden from the mains-only Settings list) so an offline peer can still assign another alt to the same group id. Legitimate independent edits to different characters therefore survive Gossip in either delivery order.
 

@@ -288,8 +288,16 @@ local function DoAssign(ctx, moveConfirmed, expectedOldMain)
 		local record = select(1, g:GetCurrentRecord())
 		local roster = Roster()
 		local oldLabel = CharacterLabel(meta.oldMainGuid, record, roster)
-		local newLabel = CharacterLabel(meta.newMainGuid, record, roster)
-		local altLabel = CharacterLabel(meta.altGuid, record, roster)
+		local newLabel = CharacterLabel(
+			meta.newMainGuid or (mainResolved and mainResolved.guid),
+			record,
+			roster
+		)
+		local altLabel = CharacterLabel(
+			meta.altGuid or (altResolved and altResolved.guid),
+			record,
+			roster
+		)
 		local msg = Loc("GUILD_INFO_MOVE_CONFIRM",
 			"Move %s from %s to %s?"):format(altLabel, oldLabel, newLabel)
 		if dialogs and dialogs.Confirm then

@@ -1307,7 +1307,7 @@ local function RetireGroupAsForward(record, fromGid, toGid)
     if not ver then
         return false, vErr or "no_effect"
     end
-    local st = GI.MergeGroup(record, {
+    local st, detail = GI.MergeGroup(record, {
         groupId = fromGid,
         ver = ver,
         at = Now(),
@@ -1315,7 +1315,7 @@ local function RetireGroupAsForward(record, fromGid, toGid)
         forwardTo = toGid,
     }, { skipReconcile = true })
     if st ~= "accepted" and st ~= "duplicate" then
-        return false, st
+        return false, detail or "no_effect"
     end
     return true
 end
@@ -1350,7 +1350,7 @@ local function RetargetInboundForwards(record, fromGid, toGid)
                 if not ver then
                     return false, vErr or "no_effect"
                 end
-                local st = GI.MergeGroup(record, {
+                local st, detail = GI.MergeGroup(record, {
                     groupId = gid,
                     ver = ver,
                     at = Now(),
@@ -1358,7 +1358,7 @@ local function RetargetInboundForwards(record, fromGid, toGid)
                     forwardTo = toGid,
                 }, { skipReconcile = true })
                 if st ~= "accepted" and st ~= "duplicate" then
-                    return false, st
+                    return false, detail or "no_effect"
                 end
             end
         end
@@ -1391,7 +1391,7 @@ local function ConsolidateLogicalGroupTo(record, mainGuid, targetGroupId)
                 if not ver then
                     return false, vErr or "no_effect"
                 end
-                local st = GI.MergeMember(record, {
+                local st, detail = GI.MergeMember(record, {
                     guid = guid,
                     groupId = targetGroupId,
                     ver = ver,
@@ -1400,7 +1400,7 @@ local function ConsolidateLogicalGroupTo(record, mainGuid, targetGroupId)
                     classFile = mm and mm.classFile,
                 }, { skipReconcile = true })
                 if st ~= "accepted" and st ~= "duplicate" then
-                    return false, st
+                    return false, detail or "no_effect"
                 end
             end
             local okFwd, fwdErr = RetireGroupAsForward(record, gid, targetGroupId)
@@ -1491,14 +1491,14 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
             if not gVer then
                 return "rejected", gvErr
             end
-            local st = GI.MergeGroup(record, {
+            local st, detail = GI.MergeGroup(record, {
                 groupId = repurposedShell,
                 mainGuid = mainGuid,
                 ver = gVer,
                 at = Now(),
             })
             if st ~= "accepted" and st ~= "duplicate" then
-                return "rejected", st
+                return "rejected", detail or "no_effect"
             end
             targetGroupId = repurposedShell
             vacatedMainGroups = nil
@@ -1517,14 +1517,14 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
             if not gVer then
                 return "rejected", gvErr
             end
-            local st = GI.MergeGroup(record, {
+            local st, detail = GI.MergeGroup(record, {
                 groupId = gid,
                 mainGuid = mainGuid,
                 ver = gVer,
                 at = Now(),
             })
             if st ~= "accepted" and st ~= "duplicate" then
-                return "rejected", st
+                return "rejected", detail or "no_effect"
             end
         end
     else
@@ -1552,7 +1552,7 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
     if not mainVer then
         return "rejected", mvErr
     end
-    local stMain = GI.MergeMember(record, {
+    local stMain, stMainDetail = GI.MergeMember(record, {
         guid = mainGuid,
         groupId = targetGroupId,
         ver = mainVer,
@@ -1561,14 +1561,14 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         classFile = opts.mainClass,
     })
     if stMain ~= "accepted" and stMain ~= "duplicate" then
-        return "rejected", stMain
+        return "rejected", stMainDetail or "no_effect"
     end
 
     local altVer, avErr = GI:_NextVer(altMem and altMem.ver)
     if not altVer then
         return "rejected", avErr
     end
-    local stAlt = GI.MergeMember(record, {
+    local stAlt, stAltDetail = GI.MergeMember(record, {
         guid = altGuid,
         groupId = targetGroupId,
         ver = altVer,
@@ -1577,7 +1577,7 @@ function GI:ApplyAssign(mainGuid, altGuid, opts)
         classFile = opts.altClass,
     })
     if stAlt ~= "accepted" and stAlt ~= "duplicate" then
-        return "rejected", stAlt
+        return "rejected", stAltDetail or "no_effect"
     end
 
     -- Solo main moved into a *different* existing group: retire the vacated
@@ -1639,7 +1639,7 @@ function GI:ApplyUnassign(altGuid, opts)
     end
     -- Prefer durable membership home; derived absorb groupId may differ.
     local oldGid = (mem and type(mem.groupId) == "string" and mem.groupId) or info.groupId
-    local st = GI.MergeMember(record, {
+    local st, detail = GI.MergeMember(record, {
         guid = altGuid,
         groupId = GI.UNASSIGNED,
         ver = ver,
@@ -1648,7 +1648,7 @@ function GI:ApplyUnassign(altGuid, opts)
         classFile = mem and mem.classFile or nil,
     })
     if st ~= "accepted" and st ~= "duplicate" then
-        return "rejected", st
+        return "rejected", detail or "no_effect"
     end
 
     -- Do not dissolve on Unassign. Local absence of alts is not agreement that
@@ -1709,14 +1709,14 @@ function GI:ApplyChangeMain(oldMainGuid, newMainGuid, opts)
     if not gVer then
         return "rejected", gErr
     end
-    local st = GI.MergeGroup(record, {
+    local st, detail = GI.MergeGroup(record, {
         groupId = groupId,
         mainGuid = newMainGuid,
         ver = gVer,
         at = Now(),
     })
     if st ~= "accepted" and st ~= "duplicate" then
-        return "rejected", st
+        return "rejected", detail or "no_effect"
     end
     NotifyDurable("local")
     return "accepted", nil

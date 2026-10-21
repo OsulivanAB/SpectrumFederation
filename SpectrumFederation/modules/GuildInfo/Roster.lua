@@ -271,7 +271,8 @@ end
 
 --- Membership presentation status for a stored character.
 -- complete roster absent → departed; incomplete → unknown.
-function GI.GetMembershipStatus(guid, roster)
+--- @param record optional already-validated guild record (avoids ValidateGuildRecord per row)
+function GI.GetMembershipStatus(guid, roster, record)
     roster = roster or GI.GetRosterSnapshot()
     if type(guid) ~= "string" or guid == "" then
         return "unknown", "identity_unavailable"
@@ -285,7 +286,7 @@ function GI.GetMembershipStatus(guid, roster)
     if roster.byGuid and roster.byGuid[guid] then
         local row = roster.byGuid[guid]
         -- Refresh last-known display from trustworthy roster.
-        local record = select(1, GI:GetCurrentRecord())
+        record = record or select(1, GI:GetCurrentRecord())
         if record then
             GI.UpdateCharacterDisplay(record, guid, row.nameRealm, row.classFile)
         end
@@ -329,7 +330,7 @@ function GI:GetAssignmentDisplayRows(roster)
         local mainChar = record and record.characters and record.characters[g.mainGuid]
         local mainName = (mainChar and mainChar.nameRealm) or g.mainGuid
         local mainClass = mainChar and mainChar.classFile or nil
-        local mainStatus = select(1, GI.GetMembershipStatus(g.mainGuid, roster))
+        local mainStatus = select(1, GI.GetMembershipStatus(g.mainGuid, roster, record))
         if roster and roster.complete and roster.byGuid and roster.byGuid[g.mainGuid] then
             mainClass = roster.byGuid[g.mainGuid].classFile or mainClass
             mainName = roster.byGuid[g.mainGuid].nameRealm or mainName
@@ -341,7 +342,7 @@ function GI:GetAssignmentDisplayRows(roster)
             local achar = record and record.characters and record.characters[ag]
             local aname = (achar and achar.nameRealm) or ag
             local aclass = achar and achar.classFile or nil
-            local astatus = select(1, GI.GetMembershipStatus(ag, roster))
+            local astatus = select(1, GI.GetMembershipStatus(ag, roster, record))
             if roster and roster.complete and roster.byGuid and roster.byGuid[ag] then
                 aclass = roster.byGuid[ag].classFile or aclass
                 aname = roster.byGuid[ag].nameRealm or aname

@@ -3683,6 +3683,302 @@ do
     assertTrue(index.buildComplete and not index.dirty, "H2 index idle")
 end
 
+---------------------------------------------------------------------------
+-- CodeRabbit repair batch: gossip coalesce, roster record reuse,
+-- merge rejection detail, move-confirm names
+---------------------------------------------------------------------------
+
+local function admitWireLive(db, wire, sender)
+    SpectrumFederationDB = db
+    if GI._db ~= db then
+        GI:Initialize(db)
+    end
+    local provider = SF.GuildGossip._providers[GI.PROVIDER_ID]
+    return provider.spec.ValidateAndApply(deepCopy(wire), { sender = sender or "Carol-Garona" })
+end
+
+do
+    -- Gossip: remote batch coalesces export rebuild / index bump
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    -- Build a moderately large relationship set on A.
+    for i = 1, 24 do
+        ensureRosterGuid(string.format("BulkM%02d-Garona", i), string.format("Player-1-BulkM%02d", i), 4)
+        ensureRosterGuid(string.format("BulkA%02d-Garona", i), string.format("Player-1-BulkA%02d", i), 4)
+    end
+    GI.InvalidateRosterSnapshot()
+    for i = 1, 24 do
+        assertEq(assign(string.format("BulkM%02d-Garona", i), string.format("BulkA%02d-Garona", i)),
+            "accepted", "bulk assign " .. i)
+    end
+    local dbA = deepCopy(SpectrumFederationDB)
+    local wires = exportWires(dbA)
+    assertTrue(#wires >= 48, "bulk export has many wires got=" .. #wires)
+
+    local dbB = seedEmptyPeer()
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    GI.ResetExportPerfCounters()
+    local accepted = 0
+    for i = 1, #wires do
+        local st = admitWireLive(dbB, wires[i], "Alice-Garona")
+        if st == "accepted" or st == "duplicate" then
+            accepted = accepted + 1
+        end
+    end
+    assertTrue(accepted >= 40, "bulk remote accepted got=" .. accepted)
+    local mid = GI.GetExportPerfCounters()
+    -- During admission, rebuilds must not scale with every accepted record.
+    assertTrue(mid.rebuilds <= 2, "coalesced rebuilds during batch got=" .. tostring(mid.rebuilds))
+    assertTrue(mid.bumps <= 2, "coalesced bumps during batch got=" .. tostring(mid.bumps))
+
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local after = GI.GetExportPerfCounters()
+    assertTrue(after.rebuilds <= mid.rebuilds + 2, "flush rebuild bounded got=" .. after.rebuilds)
+    assertTrue(after.bumps <= mid.bumps + 2, "flush bump bounded got=" .. after.bumps)
+    assertTrue(not after.dirty, "export not dirty after EnsureIndex")
+    local index = DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    assertTrue(index.buildComplete and not index.dirty, "bulk index idle")
+    assertEq(GI:GetCharacterRole("Player-1-BulkA01"), "alt", "bulk catch-up BulkA01")
+    assertEq(GI:GetCharacterRole("Player-1-BulkA24"), "alt", "bulk catch-up BulkA24")
+
+    -- A offline: B relays to C.
+    local dbC = seedEmptyPeer()
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    local wiresB = exportProviderWiresLive()
+    for i = 1, #wiresB do
+        admitWireLive(dbC, wiresB[i], "Carol-Garona")
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    assertEq(GI:GetCharacterRole("Player-1-BulkA12"), "alt", "B→C relay BulkA12")
+end
+
+do
+    -- Roster: GetAssignmentDisplayRows does not ValidateGuildRecord per character
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    for i = 1, 20 do
+        ensureRosterGuid(string.format("RowM%02d-Garona", i), string.format("Player-1-RowM%02d", i), 4)
+        ensureRosterGuid(string.format("RowA%02d-Garona", i), string.format("Player-1-RowA%02d", i), 4)
+    end
+    GI.InvalidateRosterSnapshot()
+    for i = 1, 20 do
+        assign(string.format("RowM%02d-Garona", i), string.format("RowA%02d-Garona", i))
+    end
+    -- Departed character in an active relationship.
+    assign("Alice-Garona", "Eve-Garona")
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Eve" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    GI.InvalidateRosterSnapshot()
+
+    local origGet = GI.GetCurrentRecord
+    local getCalls = 0
+    function GI.GetCurrentRecord(...)
+        getCalls = getCalls + 1
+        return origGet(...)
+    end
+    local roster = GI.GetRosterSnapshot(true)
+    getCalls = 0
+    local rows1, _, displayGroups = GI:GetAssignmentDisplayRows(roster)
+    local calls1 = getCalls
+    local rows2 = GI:GetAssignmentDisplayRows(roster)
+    local calls2 = getCalls - calls1
+    GI.GetCurrentRecord = origGet
+    assertTrue(#rows1 >= 40, "display rows near capacity got=" .. #rows1)
+    -- One GetCurrentRecord (via GetRelationshipGroups) per render is fine;
+    -- per-character validation would be >= number of displayed characters.
+    assertTrue(calls1 <= 4, "first render GetCurrentRecord bounded got=" .. calls1)
+    assertTrue(calls2 <= 4, "second render GetCurrentRecord bounded got=" .. calls2)
+    assertTrue(calls1 < 20, "not one GetCurrentRecord per main got=" .. calls1)
+    local eveStatus = select(1, GI.GetMembershipStatus("Player-1-Eve", roster, select(1, GI:GetCurrentRecord())))
+    assertEq(eveStatus, "departed", "Eve membership status departed with shared record")
+    local foundEve = false
+    for i = 1, #(displayGroups or {}) do
+        for j = 1, #(displayGroups[i].alts or {}) do
+            local a = displayGroups[i].alts[j]
+            if a.guid == "Player-1-Eve" then
+                foundEve = true
+                assertEq(a.status, "departed", "displayGroups Eve status")
+            end
+        end
+    end
+    if not foundEve then
+        -- Fallback: row text encodes the departed suffix when LocaleText is unavailable.
+        for i = 1, #rows1 do
+            if rows1[i].guid == "Player-1-Eve" then
+                foundEve = true
+                assertTrue(tostring(rows1[i].text or ""):find("No longer", 1, true) ~= nil,
+                    "Eve row departed text=" .. tostring(rows1[i].text))
+            end
+        end
+    end
+    assertTrue(foundEve, "departed Eve still listed under Alice")
+    assertTrue(#rows2 == #rows1, "repeated refresh same row count")
+end
+
+do
+    -- Merge rejection detail reaches Settings feedback (generation_syncing)
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assign("Alice-Garona", "Bob-Garona")
+    ensureRosterGuid("ShellR-Garona", "Player-1-ShellR", 4)
+    GI.InvalidateRosterSnapshot()
+    assign("ShellR-Garona", "Dave-Garona")
+    GI:UnassignAlt("Player-1-Dave", {})
+    assertEq(GI:CleanupHistory({}), "accepted", "reject-detail cleanup")
+    local record = select(1, GI:GetCurrentRecord())
+    -- Force incomplete baseline while keeping syncGen current.
+    record.baseline.complete = false
+    record.baseline.memberCount = 99
+    record.baseline.groupCount = 99
+    record.baseline.contentFp = "not-yet"
+    local st, reason = GI:AssignAlt("Alice-Garona", "Carol-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    assertEq(st, "rejected", "assign rejected while syncing")
+    assertEq(reason, "generation_syncing", "specific generation_syncing detail")
+    local msg, sev = GI.FormatMutationFeedback(st, reason)
+    assertTrue(type(msg) == "string" and msg:find("synchron", 1, true) ~= nil,
+        "Settings feedback names syncing got=" .. tostring(msg))
+    assertEq(sev, "error", "syncing feedback is error severity")
+    -- Successful path still works when baseline complete.
+    record.baseline.complete = true
+    record.baseline.memberCount = countKeys(record.members)
+    record.baseline.groupCount = countKeys(record.groups)
+    record.baseline.contentFp = GI.ComputeBaselineContentFp(record.members, record.groups)
+    assertEq(GI:AssignAlt("Alice-Garona", "Carol-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+    }), "accepted", "assign succeeds after baseline complete")
+end
+
+do
+    -- Move confirmation dialog includes old main, new main, and alt names
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assign("Alice-Garona", "Bob-Garona")
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    SF.SettingsUI.categories = SF.SettingsUI.categories or {}
+    SF.SettingsUI.RegisterCategory = SF.SettingsUI.RegisterCategory
+        or function(self, cat) self.categories[cat.id] = cat end
+    SF.SettingsUI.RegisterPage = SF.SettingsUI.RegisterPage
+        or function(self, page)
+            self.pagesById[page.id] = page
+            self.pages[#self.pages + 1] = page
+        end
+    SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {
+        Build = function(_, panel, def)
+            panel.__sfPageDef = def
+            panel.__sfPageBuilder = { Refresh = function() end, Reflow = function() end, RegisterRefresh = function() end }
+            panel.__sfSections = {}
+        end,
+        Refresh = function() end,
+    }
+    local confirmMsg
+    SF.SettingsUI.Dialogs = {
+        Confirm = function(_, msg, _, _accept)
+            confirmMsg = msg
+            -- Do not auto-accept: we only assert the prompt text here.
+        end,
+    }
+    if not SF.SettingsUI.pagesById.guildInfoMainAlt then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/MainAltAssignments.lua")
+    end
+    local page = SF.SettingsUI.pagesById.guildInfoMainAlt
+    assertTrue(page ~= nil, "move-confirm page present")
+    local panel = CreateFrame()
+    panel.IsVisible = function() return true end
+    page:Build(panel)
+    local def = panel.__sfPageDef
+    local assignClick, mainResolvedCb, altResolvedCb
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Assign" then
+                assignClick = item.onClick
+            end
+            if item.type == "autocomplete" and item.label == "Main name" then
+                mainResolvedCb = item.onResolved
+            end
+            if item.type == "autocomplete" and item.label == "Alt name" then
+                altResolvedCb = item.onResolved
+            end
+        end
+    end
+    assertTrue(type(assignClick) == "function", "Assign onClick")
+    mainResolvedCb(nil, { guid = "Player-1-Carol", nameRealm = "Carol-Garona", classFile = "PRIEST" })
+    altResolvedCb(nil, { guid = "Player-1-Bob", nameRealm = "Bob-Garona", classFile = "WARRIOR" })
+    local ctx = { section = { SetMessage = function() end } }
+    assignClick(ctx)
+    assertTrue(type(confirmMsg) == "string" and confirmMsg ~= "", "move confirm message captured")
+    assertTrue(confirmMsg:find("Bob", 1, true) ~= nil, "confirm includes alt Bob got=" .. confirmMsg)
+    assertTrue(confirmMsg:find("Alice", 1, true) ~= nil, "confirm includes old main Alice got=" .. confirmMsg)
+    assertTrue(confirmMsg:find("Carol", 1, true) ~= nil, "confirm includes new main Carol got=" .. confirmMsg)
+    -- Stale confirm still protected when relationship changes before accept.
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        if accept then
+            -- Mutate before accepting: Bob already under Carol somehow via API.
+            GI:AssignAlt("Carol-Garona", "Bob-Garona", {
+                roster = GI.GetRosterSnapshot(true),
+                moveConfirmed = true,
+                expectedOldMain = "Player-1-Alice",
+            })
+            accept()
+        end
+    end
+    -- Re-open: Bob may already be under Carol from above; reset to Alice first.
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assign("Alice-Garona", "Bob-Garona")
+    page:Build(panel)
+    def = panel.__sfPageDef
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Assign" then
+                assignClick = item.onClick
+            end
+            if item.type == "autocomplete" and item.label == "Main name" then
+                mainResolvedCb = item.onResolved
+            end
+            if item.type == "autocomplete" and item.label == "Alt name" then
+                altResolvedCb = item.onResolved
+            end
+        end
+    end
+    mainResolvedCb(nil, { guid = "Player-1-Carol", nameRealm = "Carol-Garona", classFile = "PRIEST" })
+    altResolvedCb(nil, { guid = "Player-1-Bob", nameRealm = "Bob-Garona", classFile = "WARRIOR" })
+    local staleAccepted = false
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        -- Move Bob to Dave before confirming the Alice→Carol move.
+        GI:AssignAlt("Dave-Garona", "Bob-Garona", {
+            roster = GI.GetRosterSnapshot(true),
+            moveConfirmed = true,
+            expectedOldMain = "Player-1-Alice",
+        })
+        if accept then
+            accept()
+            staleAccepted = true
+        end
+    end
+    assignClick(ctx)
+    assertTrue(staleAccepted, "stale confirm callback ran")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Dave",
+        "stale Carol move did not override Dave assignment")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
