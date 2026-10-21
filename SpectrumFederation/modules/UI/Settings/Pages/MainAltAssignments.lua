@@ -10,12 +10,12 @@ end
 
 SF.SettingsUI:RegisterCategory({
 	id = "guildInfo",
-	name = Loc("GUILD_INFO_CATEGORY_NAME", "Guild Info"),
-	navLabel = Loc("GUILD_INFO_CATEGORY_NAV", "Guild Info"),
-	group = "Loot Tools",
+	name = Loc("GUILD_INFO_CATEGORY_NAME", "Guild Settings"),
+	navLabel = Loc("GUILD_INFO_CATEGORY_NAV", "Guild Settings"),
+	group = "Core",
 	description = Loc("GUILD_INFO_CATEGORY_DESC",
 		"Guild-wide character relationships maintained by officers."),
-	order = 17,
+	order = 12,
 })
 
 local Page = {
@@ -24,7 +24,7 @@ local Page = {
 	name = Loc("GUILD_INFO_MAIN_ALT_NAME", "Main / Alt Assignments"),
 	navLabel = Loc("GUILD_INFO_MAIN_ALT_NAV", "Main / Alt Assignments"),
 	contentHeading = Loc("GUILD_INFO_MAIN_ALT_HEADING", "Main / Alt Assignments"),
-	group = "Loot Tools",
+	group = "Core",
 	description = Loc("GUILD_INFO_MAIN_ALT_DESC",
 		"Guild-owned main and alt relationships. Independent of Loot Helper and Guild Supplies."),
 	order = 17.1,

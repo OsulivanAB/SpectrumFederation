@@ -91,7 +91,7 @@ local function productionFixture()
             id = "lootHelper",
             name = "Loot Helper",
             navLabel = "Loot Helper",
-            group = "Loot Tools",
+            group = "Raid Tools",
             description = "Configure loot profiles, sessions, raid check tools, and admin workflows.",
             defaultChildId = "lootHelperGeneral",
             order = 20,
@@ -126,7 +126,7 @@ local function productionFixture()
             name = "Raid Equipment",
             navLabel = "Raid Equipment",
             contentHeading = "Raid Equipment",
-            group = "Loot Tools",
+            group = "Raid Tools",
             description = "Inspect current group equipment, refresh snapshots, and review missing enchants or gems.",
             order = 18,
             layout = { windowWidth = 1280, disablePageScroll = true },
@@ -151,9 +151,9 @@ local function productionFixture()
             id = "lootLogs",
             name = "Loot Logs",
             navLabel = "Loot Logs",
-            group = "Loot Tools",
+            group = "Raid Tools",
             description = "Review loot history, filter activity, and audit profile changes.",
-            order = 30,
+            order = 26,
             layout = { windowWidth = 1350, disablePageScroll = true },
         }),
         page({
@@ -165,6 +165,36 @@ local function productionFixture()
             group = "Core",
             description = "Optional on-screen enhancements for this character, including Mouse Tracer.",
             order = 15,
+        }),
+        page({
+            id = "guildInfoMainAlt",
+            categoryId = "guildInfo",
+            name = "Main / Alt Assignments",
+            navLabel = "Main / Alt Assignments",
+            contentHeading = "Main / Alt Assignments",
+            group = "Core",
+            description = "Guild-owned main and alt relationships. Independent of Loot Helper and Guild Supplies.",
+            order = 17.1,
+        }),
+        page({
+            id = "guildSuppliesConfiguration",
+            categoryId = "guildSupplies",
+            name = "Configuration",
+            navLabel = "Configuration",
+            contentHeading = "Raid Supplies Configuration",
+            group = "Raid Tools",
+            description = "Fresh guild setup, bank tab, requested items, and New Campaign.",
+            order = 19.1,
+        }),
+        page({
+            id = "guildSuppliesLogs",
+            categoryId = "guildSupplies",
+            name = "Logs",
+            navLabel = "Logs",
+            contentHeading = "Raid Supplies Logs",
+            group = "Raid Tools",
+            description = "Inspect current and archived campaign goals, progress, and history.",
+            order = 19.2,
         }),
         page({
             id = "debugging",
@@ -211,9 +241,9 @@ local function productionFixture()
         id = "raidEquipment",
         name = "Raid Equipment",
         navLabel = "Raid Equipment",
-        group = "Loot Tools",
+        group = "Raid Tools",
         description = "Inspect current group equipment against current-Retail enchant, gem, and item-level rules.",
-        order = 18,
+        order = 28,
         enabled = true,
         enablementResolved = true,
     })
@@ -230,6 +260,30 @@ local function productionFixture()
         enablementResolved = true,
     })
     categoriesById.nicheFeatures = categories[#categories]
+
+    table.insert(categories, {
+        id = "guildInfo",
+        name = "Guild Settings",
+        navLabel = "Guild Settings",
+        group = "Core",
+        description = "Guild-wide character relationships maintained by officers.",
+        order = 12,
+        enabled = true,
+        enablementResolved = true,
+    })
+    categoriesById.guildInfo = categories[#categories]
+
+    table.insert(categories, {
+        id = "guildSupplies",
+        name = "Raid Supplies",
+        navLabel = "Raid Supplies",
+        group = "Raid Tools",
+        description = "Guild-owned raid supply campaigns, configuration, and logs.",
+        order = 32,
+        enabled = true,
+        enablementResolved = true,
+    })
+    categoriesById.guildSupplies = categories[#categories]
 
     for _, item in ipairs(pages) do
         item.categoryId = Model.NormalizePageRelationship(item)
@@ -412,7 +466,7 @@ local firstOpen = Model.ResolveShowPage(registry, {}, nil)
 assertEq(firstOpen.pageId, "general", "first open with no id is general")
 
 -- Search fields
-assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "Loot Tools"), "search matches category group")
+assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "Raid Tools"), "search matches category group")
 assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "raid check tools"), "search matches category description")
 assertTrue(Model.CategoryMatchesQuery(registry, "raidEquipment", "Raid Equipment"), "search matches Raid Equipment category")
 assertTrue(Model.CategoryMatchesQuery(registry, "raidEquipment", "Equipment"), "search matches Raid Equipment navLabel")
@@ -448,7 +502,7 @@ assertEq(equipmentHits[1].categoryId, "raidEquipment", "Equipment query opens th
 
 local searchClick = Model.ResolveSearchCategoryClick(registry, session, "raidEquipment", "Equipment")
 assertEq(searchClick.pageId, "raidEquipmentAudit", "search category click opens Raid Equipment")
-local groupClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "Loot Tools")
+local groupClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "Raid Tools")
 assertEq(groupClick.pageId, "lootHelperGeneral", "category-only search click opens the default page, not a blank category")
 local descClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "admin workflows")
 assertEq(descClick.pageId, "lootHelperGeneral", "description-only search click opens the default Loot Helper page")
@@ -485,21 +539,126 @@ assertDeepEq(
     "content page order does not follow pairs/insertion order"
 )
 local sorted = Model.SortedCategories(reverseRegistry)
-assertEq(sorted[1].id, "general", "category sort starts with General")
-assertEq(sorted[2].id, "nicheFeatures", "category sort keeps Gameplay after General")
-assertEq(sorted[3].id, "raidEquipment", "category sort keeps Raid Equipment after Gameplay")
-assertEq(sorted[4].id, "lootHelper", "category sort keeps Loot Helper after Raid Equipment")
+assertDeepEq(
+    idsOf(sorted),
+    {
+        "general",
+        "guildInfo",
+        "nicheFeatures",
+        "lootHelper",
+        "lootLogs",
+        "raidEquipment",
+        "guildSupplies",
+        "debugging",
+        "widgets",
+        "SpectrumFederation_CursedSurgeTracker",
+        "emptyAddon",
+    },
+    "category sort follows Core, then Raid Tools, then Advanced and Optional"
+)
 
 local sidebarItems = Model.BuildSidebarItems(registry)
 assertEq(sidebarItems[1].type, "group", "sidebar starts with a group header")
 assertEq(sidebarItems[1].label, "Core", "first group is Core")
 local groups = {}
+local sidebarLabels = {}
 for _, item in ipairs(sidebarItems) do
     if item.type == "group" then
         table.insert(groups, item.label)
+        table.insert(sidebarLabels, "group:" .. item.label)
+    else
+        table.insert(sidebarLabels, item.id .. ":" .. item.label)
     end
 end
-assertDeepEq(groups, { "Core", "Loot Tools", "Advanced", "Optional" }, "group headers follow sorted category appearance")
+assertDeepEq(groups, { "Core", "Raid Tools", "Advanced", "Optional" }, "group headers follow sorted category appearance")
+assertDeepEq(sidebarLabels, {
+    "group:Core",
+    "general:General",
+    "guildInfo:Guild Settings",
+    "nicheFeatures:Gameplay",
+    "group:Raid Tools",
+    "lootHelper:Loot Helper",
+    "lootLogs:Loot Logs",
+    "raidEquipment:Raid Equipment",
+    "guildSupplies:Raid Supplies",
+    "group:Advanced",
+    "debugging:Debugging",
+    "group:Optional",
+    "widgets:Widgets",
+    "SpectrumFederation_CursedSurgeTracker:Cursed Surge Tracker",
+    "emptyAddon:Empty Addon",
+}, "sidebar labels and order match the Settings organization")
+
+assertDeepEq(
+    idsOf(Model.GetContentPages(registry, "guildInfo")),
+    { "guildInfoMainAlt" },
+    "Guild Settings keeps the original main/alt page id"
+)
+assertEq(registry.categoriesById.guildInfo.id, "guildInfo", "Guild Settings keeps category id guildInfo")
+local showGuildSettings = Model.ResolveShowPage(registry, {}, "guildInfo")
+assertEq(showGuildSettings.categoryId, "guildInfo", "ShowPage(guildInfo) stays on the original category")
+assertEq(showGuildSettings.pageId, "guildInfoMainAlt", "ShowPage(guildInfo) opens Main / Alt Assignments")
+local showGuildSettingsPage = Model.ResolveShowPage(registry, {}, "guildInfoMainAlt")
+assertEq(showGuildSettingsPage.categoryId, "guildInfo", "ShowPage(guildInfoMainAlt) stays on Guild Settings")
+assertEq(showGuildSettingsPage.pageId, "guildInfoMainAlt", "ShowPage(guildInfoMainAlt) opens the original page")
+
+assertDeepEq(
+    idsOf(Model.GetContentPages(registry, "guildSupplies")),
+    { "guildSuppliesConfiguration", "guildSuppliesLogs" },
+    "Raid Supplies keeps Configuration then Logs"
+)
+assertEq(registry.categoriesById.guildSupplies.id, "guildSupplies", "Raid Supplies keeps category id guildSupplies")
+assertEq(
+    Model.GetPageContentHeading(registry.pagesById.guildSuppliesConfiguration),
+    "Raid Supplies Configuration",
+    "Raid Supplies Configuration heading follows the category rename"
+)
+assertEq(
+    Model.GetPageContentHeading(registry.pagesById.guildSuppliesLogs),
+    "Raid Supplies Logs",
+    "Raid Supplies Logs heading follows the category rename"
+)
+local showRaidSupplies = Model.ResolveShowPage(registry, {}, "guildSupplies")
+assertEq(showRaidSupplies.categoryId, "guildSupplies", "ShowPage(guildSupplies) stays on the original category")
+assertEq(showRaidSupplies.pageId, "guildSuppliesConfiguration", "ShowPage(guildSupplies) opens Configuration")
+local showRaidSuppliesLogs = Model.ResolveShowPage(registry, session, "guildSuppliesLogs")
+assertEq(showRaidSuppliesLogs.categoryId, "guildSupplies", "ShowPage(guildSuppliesLogs) stays on Raid Supplies")
+assertEq(showRaidSuppliesLogs.pageId, "guildSuppliesLogs", "ShowPage(guildSuppliesLogs) opens Logs")
+local raidSuppliesTabs = Model.ResolveSidebarSelect(registry, {
+    lastPageByCategory = { guildSupplies = "guildSuppliesLogs" },
+}, "guildSupplies")
+assertEq(raidSuppliesTabs.pageId, "guildSuppliesLogs", "Raid Supplies sidebar restores the Logs tab")
+
+assertEq(Model.GetPage(registry, "lootLogs").categoryId, "lootLogs", "Loot Logs page belongs to its own category")
+local lootHelperIds = idsOf(Model.GetContentPages(registry, "lootHelper"))
+local lootLogsIsHelperTab = false
+for _, pageId in ipairs(lootHelperIds) do
+    if pageId == "lootLogs" then
+        lootLogsIsHelperTab = true
+    end
+end
+assertTrue(not lootLogsIsHelperTab, "Loot Logs is not a Loot Helper content tab")
+local showLootLogs = Model.ResolveShowPage(registry, session, "lootLogs")
+assertEq(showLootLogs.categoryId, "lootLogs", "ShowPage(lootLogs) uses the Loot Logs category")
+assertEq(showLootLogs.pageId, "lootLogs", "ShowPage(lootLogs) opens Loot Logs itself")
+local lootLogsSidebar = Model.ResolveSidebarSelect(registry, {}, "lootLogs")
+assertEq(lootLogsSidebar.categoryId, "lootLogs", "Loot Logs sidebar selection stays on lootLogs")
+assertEq(lootLogsSidebar.pageId, "lootLogs", "Loot Logs sidebar opens the Loot Logs page")
+
+assertTrue(Model.CategoryMatchesQuery(registry, "guildInfo", "Guild Settings"), "Quick Find matches Guild Settings")
+assertTrue(Model.CategoryMatchesQuery(registry, "guildInfo", "Core"), "Quick Find matches Guild Settings in Core")
+assertTrue(not Model.CategoryMatchesQuery(registry, "guildInfo", "Raid Tools"), "Guild Settings is not in Raid Tools")
+assertTrue(Model.CategoryMatchesQuery(registry, "guildSupplies", "Raid Supplies"), "Quick Find matches Raid Supplies")
+assertTrue(Model.CategoryMatchesQuery(registry, "guildSupplies", "Configuration"), "Quick Find matches the Configuration tab")
+assertTrue(Model.CategoryMatchesQuery(registry, "guildSupplies", "Logs"), "Quick Find matches the Logs tab")
+assertTrue(Model.CategoryMatchesQuery(registry, "lootLogs", "Loot Logs"), "Quick Find matches Loot Logs")
+local lootLogsEnter = Model.ResolveSearchEnter(registry, session, "Loot Logs")
+assertEq(lootLogsEnter.categoryId, "lootLogs", "Quick Find Enter opens Loot Logs as its own category")
+assertEq(lootLogsEnter.pageId, "lootLogs", "Quick Find Enter opens the Loot Logs page")
+local guildSettingsEnter = Model.ResolveSearchEnter(registry, {}, "Guild Settings")
+assertEq(guildSettingsEnter.pageId, "guildInfoMainAlt", "Quick Find Enter opens the Guild Settings page")
+local raidSuppliesClick = Model.ResolveSearchCategoryClick(registry, {}, "guildSupplies", "Logs")
+assertEq(raidSuppliesClick.pageId, "guildSuppliesLogs", "Quick Find click opens the Raid Supplies Logs tab")
 
 -- Title prefix strip
 assertEq(
@@ -618,7 +777,7 @@ UI:RegisterPage(page({
     id = "lootHelper",
     name = "Loot Helper",
     navLabel = "Loot Helper",
-    group = "Loot Tools",
+    group = "Raid Tools",
     defaultChildId = "lootHelperGeneral",
     order = 20,
 }))

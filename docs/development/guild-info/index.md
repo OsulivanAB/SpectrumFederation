@@ -151,7 +151,7 @@ Future Loot Helper / Guild Supplies integration may **read** these APIs. They mu
 
 ## Settings
 
-Top-level **Guild Info** category → **Main / Alt Assignments** page:
+**Guild Settings** in **Core**, between General and Gameplay → **Main / Alt Assignments** page. The category id remains `guildInfo`:
 
 - Class-colored roster autocomplete (offline-inclusive), snapshot refreshed on roster/guild events while visible.
 - Grouped list with remove controls for editors; Change Main for the selected group.

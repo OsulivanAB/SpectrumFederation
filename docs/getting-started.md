@@ -26,12 +26,12 @@ Restart World of Warcraft or run `/reload`, then enable the addon for the charac
 
 Enter `/sf` to toggle the addon's standalone settings window. The left sidebar lists categories grouped into:
 
-- **Core** — appearance and Gameplay, including the optional Mouse Tracer on **UI Enhancements**.
-- **Loot Tools** — Loot Helper configuration, profiles, sessions, Raid Equipment, and logs.
+- **Core** — General, Guild Settings, and Gameplay. Gameplay includes the optional Mouse Tracer on **UI Enhancements**.
+- **Raid Tools** — Loot Helper, Loot Logs, Raid Equipment, and Raid Supplies, in that order.
 - **Advanced** — diagnostic logging.
 - **Optional** — installed child addons, such as Cursed Surge Tracker when it is present.
 
-Loot Helper's General, Profile, Session, Admin, Character, and temporary RC Loot Council pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab. **Raid Equipment** is its own sidebar category.
+Loot Helper's General, Profile, Session, Admin, Character, and temporary RC Loot Council pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab. **Loot Logs**, **Raid Equipment**, and **Raid Supplies** are their own sidebar categories. Raid Supplies keeps **Configuration** and **Logs** as content tabs.
 
 The Loot Helper window appears automatically when all of these conditions are true:
 

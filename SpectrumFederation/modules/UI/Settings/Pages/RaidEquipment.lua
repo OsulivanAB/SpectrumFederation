@@ -7,9 +7,9 @@ SF.SettingsUI:RegisterCategory({
 	id = "raidEquipment",
 	name = "Raid Equipment",
 	navLabel = "Raid Equipment",
-	group = "Loot Tools",
+	group = "Raid Tools",
 	description = "Inspect current group equipment against current-Retail enchant, gem, and item-level rules.",
-	order = 18,
+	order = 28,
 })
 
 local EQUIPMENT_PAGE_WINDOW_WIDTH = 1280
@@ -26,7 +26,7 @@ local Page = {
 	name = "Raid Equipment",
 	navLabel = "Raid Equipment",
 	contentHeading = "Raid Equipment",
-	group = "Loot Tools",
+	group = "Raid Tools",
 	description = "Inspect current group equipment, refresh snapshots, and review missing enchants or gems.",
 	order = 18,
 	layout = {
