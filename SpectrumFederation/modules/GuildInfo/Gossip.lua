@@ -473,13 +473,13 @@ local function ValidateAndApply(record, ctx)
         if type(m) ~= "table" then
             return "rejected", "malformed"
         end
-        status, detail = GI.MergeMember(guildRec, m, { remote = true, gen = body.gen })
+        status, detail = GI.MergeMember(guildRec, m, { remote = true, gen = body.gen, sender = sender })
     else
         local g = body.group
         if type(g) ~= "table" then
             return "rejected", "malformed"
         end
-        status, detail = GI.MergeGroup(guildRec, g, { remote = true, gen = body.gen })
+        status, detail = GI.MergeGroup(guildRec, g, { remote = true, gen = body.gen, sender = sender })
     end
 
     if status == "accepted" then

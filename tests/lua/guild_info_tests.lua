@@ -4211,6 +4211,8 @@ end
 do
     -- Fail-before (b4064e02 residuals): hard wipe + count-superset seal.
     local fixedAdopt, fixedSeal = GI.AdoptSyncGeneration, GI.TrySealBaseline
+    local fixedNote = GI.NoteIncompleteAdmit
+    GI.NoteIncompleteAdmit = nil -- residual path had no hold/tip-window helper
     local function countKeysLocal(t)
         local n = 0
         if type(t) == "table" then for _ in pairs(t) do n = n + 1 end end
@@ -4305,6 +4307,7 @@ do
         "fail-before B2: count superset falsely completes")
 
     GI.AdoptSyncGeneration, GI.TrySealBaseline = fixedAdopt, fixedSeal
+    GI.NoteIncompleteAdmit = fixedNote
     pass("fail-before B1/B2 residuals reproduced under b4064e02 monkeypatch")
 end
 
@@ -4433,6 +4436,418 @@ do
         roster = GI.GetRosterSnapshot(true),
     })
     assertEq(est, "accepted", "B3 D editable why=" .. tostring(ereason))
+end
+
+local function prepareTripleExtraBaseline()
+    -- Post-cleanup A/B share baseline; A adds three unique alts; B adds one independent alt.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "B4 shared Alice/Bob")
+    ensureRosterGuid("ShellTriple-Garona", "Player-1-ShellTriple", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellTriple-Garona", "Dave-Garona"), "accepted", "B4 shell")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "B4 shell unassign")
+    assertEq(GI:CleanupHistory({}), "accepted", "B4 shared cleanup generation")
+    local dbA = deepCopy(SpectrumFederationDB)
+    local dbB = seedEmptyPeer()
+    syncAll(dbA, dbB, "Alice-Garona")
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "B4 B sealed shared gen")
+
+    SpectrumFederationDB = dbA
+    GI:Initialize(dbA)
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "B4 A Carol")
+    assertEq(assign("Alice-Garona", "Eve-Garona"), "accepted", "B4 A Eve")
+    ensureRosterGuid("Frank-Garona", "Player-1-Frank", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("Alice-Garona", "Frank-Garona"), "accepted", "B4 A Frank")
+    GI.NotifyLocalDurableChange("local")
+    local wiresA = exportProviderWiresLive()
+
+    SpectrumFederationDB = dbB
+    GI:Initialize(dbB)
+    setActor("Carol-Garona", "Player-1-Carol", 3)
+    ensureRosterGuid("Gina-Garona", "Player-1-Gina", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(GI:AssignAlt("Alice-Garona", "Gina-Garona", { roster = GI.GetRosterSnapshot(true) }),
+        "accepted", "B4 B Gina")
+    GI.NotifyLocalDurableChange("local")
+    local wiresB = exportProviderWiresLive()
+    return dbA, dbB, wiresA, wiresB
+end
+
+do
+    -- Fail-before: TipSubsetWitnessed extraM>2 strands C despite a complete trailing tip.
+    local fixedSeal = GI.TrySealBaseline
+    local fixedNote = GI.NoteIncompleteAdmit
+    GI.NoteIncompleteAdmit = nil -- residual path: seal only via TrySealBaseline/TipSubset
+    local function countKeysLocal(t)
+        local n = 0
+        if type(t) == "table" then for _ in pairs(t) do n = n + 1 end end
+        return n
+    end
+    function GI.TrySealBaseline(record)
+        if type(record) ~= "table" or type(record.baseline) ~= "table" then return false end
+        if record.baseline.complete then return true end
+        local mc, gc = countKeysLocal(record.members), countKeysLocal(record.groups)
+        local tipMc = tonumber(record.baseline.memberCount) or -1
+        local tipGc = tonumber(record.baseline.groupCount) or -1
+        local tipFp = tostring(record.baseline.contentFp or "")
+        local fp = GI.ComputeBaselineContentFp(record.members, record.groups)
+        if mc == tipMc and gc == tipGc and fp == tipFp then
+            record.baseline.complete = true
+            return true
+        end
+        -- Residual TipSubsetWitnessed guard: more than two extras never seal.
+        if (mc - tipMc) > 2 or (gc - tipGc) > 2 then
+            return false
+        end
+        return false
+    end
+
+    local _, _, wiresA, wiresB = prepareTripleExtraBaseline()
+    local epochB = findWire(wiresB, "guildinfo-epoch")
+    local _, rowsB = splitEpochAndRows(wiresB)
+    local carol = findWire(wiresA, "guildinfo-member", "Player-1-Carol")
+    local eve = findWire(wiresA, "guildinfo-member", "Player-1-Eve")
+    local frank = findWire(wiresA, "guildinfo-member", "Player-1-Frank")
+    assertTrue(epochB and carol and eve and frank, "B4 fail-before fixtures")
+
+    local dbBroken = seedEmptyPeer()
+    admitWireLive(dbBroken, epochB, "Carol-Garona")
+    admitWireLive(dbBroken, carol, "Alice-Garona")
+    admitWireLive(dbBroken, eve, "Alice-Garona")
+    admitWireLive(dbBroken, frank, "Alice-Garona")
+    for i = 1, #rowsB do
+        admitWireLive(dbBroken, rowsB[i], "Carol-Garona")
+    end
+    SpectrumFederationDB = dbBroken
+    GI:Initialize(dbBroken)
+    assertTrue(not GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())),
+        "fail-before B4: extraM>2 strands C despite complete B tip")
+
+    GI.TrySealBaseline = fixedSeal
+    GI.NoteIncompleteAdmit = fixedNote
+    pass("fail-before B4 TipSubsetWitnessed extraM>2 stranding reproduced")
+end
+
+do
+    -- B4 — Three concurrent A extras + B tip: C seals, retains edits, relays without A replay
+    local _, _, wiresA, wiresB = prepareTripleExtraBaseline()
+    local epochB = findWire(wiresB, "guildinfo-epoch")
+    local _, rowsB = splitEpochAndRows(wiresB)
+    local carol = findWire(wiresA, "guildinfo-member", "Player-1-Carol")
+    local eve = findWire(wiresA, "guildinfo-member", "Player-1-Eve")
+    local frank = findWire(wiresA, "guildinfo-member", "Player-1-Frank")
+    assertTrue(epochB and carol and eve and frank and #rowsB > 0, "B4 fixtures")
+
+    local dbC = seedEmptyPeer()
+    -- Production-shaped order: B epoch, A's three unique members, then B's complete tip rows.
+    admitWireLive(dbC, epochB, "Carol-Garona")
+    admitWireLive(dbC, carol, "Alice-Garona")
+    admitWireLive(dbC, eve, "Alice-Garona")
+    admitWireLive(dbC, frank, "Alice-Garona")
+    for i = 1, #rowsB do
+        admitWireLive(dbC, rowsB[i], "Carol-Garona")
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local recC = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(recC), "B4 C sealed with three concurrent extras")
+    assertTrue(recC.members["Player-1-Carol"] ~= nil, "B4 C retained Carol")
+    assertTrue(recC.members["Player-1-Eve"] ~= nil, "B4 C retained Eve")
+    assertTrue(recC.members["Player-1-Frank"] ~= nil, "B4 C retained Frank")
+    assertTrue(recC.members["Player-1-Gina"] ~= nil, "B4 C retained Gina from B tip")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], "B4 Carol visible")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Frank"], "B4 Frank visible")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Gina"], "B4 Gina visible")
+
+    -- A and B offline: C relays preserved extras to D (no A retransmission).
+    GI.NotifyLocalDurableChange("local")
+    local wiresC = exportProviderWiresLive()
+    local dbD = seedEmptyPeer()
+    for i = 1, #wiresC do
+        admitWireLive(dbD, wiresC[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbD
+    GI:Initialize(dbD)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local recD = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(recD), "B4 D sealed via C relay")
+    assertTrue(recD.members["Player-1-Carol"] ~= nil, "B4 D Carol via relay")
+    assertTrue(recD.members["Player-1-Eve"] ~= nil, "B4 D Eve via relay")
+    assertTrue(recD.members["Player-1-Frank"] ~= nil, "B4 D Frank via relay")
+    assertTrue(recD.members["Player-1-Gina"] ~= nil, "B4 D Gina via relay")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local est, ereason = GI:AssignAlt("Alice-Garona", "Bob-Area52", {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    assertEq(est, "accepted", "B4 D editable why=" .. tostring(ereason))
+end
+
+do
+    -- Fail-before: combinatorial TipSubsetWitnessed fp storm at modest extras.
+    local function sortedKeys(t)
+        local keys = {}
+        for k in pairs(t or {}) do keys[#keys + 1] = k end
+        table.sort(keys)
+        return keys
+    end
+    local function computeFpExcluding(members, groups, dropMembers, dropGroups)
+        local mview, gview = {}, {}
+        for guid, m in pairs(members or {}) do
+            if not (dropMembers and dropMembers[guid]) then mview[guid] = m end
+        end
+        for gid, g in pairs(groups or {}) do
+            if not (dropGroups and dropGroups[gid]) then gview[gid] = g end
+        end
+        return GI.ComputeBaselineContentFp(mview, gview)
+    end
+    local function tipSubsetWitnessed(members, groups, tipMc, tipGc, tipFp)
+        local function countKeysLocal(t)
+            local n = 0
+            if type(t) == "table" then for _ in pairs(t) do n = n + 1 end end
+            return n
+        end
+        local mc, gc = countKeysLocal(members), countKeysLocal(groups)
+        local extraM, extraG = mc - tipMc, gc - tipGc
+        if extraM < 0 or extraG < 0 or extraM > 2 or extraG > 2 then
+            return false
+        end
+        local mids, gids = sortedKeys(members), sortedKeys(groups)
+        local function tryDrops(dropMCount, dropGCount, startM, startG, dropMembers, dropGroups)
+            if dropMCount == 0 and dropGCount == 0 then
+                return computeFpExcluding(members, groups, dropMembers, dropGroups) == tipFp
+            end
+            if dropMCount > 0 then
+                for i = startM, #mids do
+                    dropMembers[mids[i]] = true
+                    if tryDrops(dropMCount - 1, dropGCount, i + 1, startG, dropMembers, dropGroups) then
+                        return true
+                    end
+                    dropMembers[mids[i]] = nil
+                end
+                return false
+            end
+            for j = startG, #gids do
+                dropGroups[gids[j]] = true
+                if tryDrops(0, dropGCount - 1, startM, j + 1, dropMembers, dropGroups) then
+                    return true
+                end
+                dropGroups[gids[j]] = nil
+            end
+            return false
+        end
+        return tryDrops(extraM, extraG, 1, 1, {}, {})
+    end
+
+    -- Modest size still proves combinatorial amplification (C(14,2)*C(10,2)=4095).
+    local tipMc, tipGc = 12, 8
+    local members, groups = {}, {}
+    for i = 1, tipMc + 2 do
+        local guid = string.format("Player-1-FpM%02d", i)
+        members[guid] = { guid = guid, groupId = "gig:fp", ver = { n = 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" }, at = 1 }
+    end
+    for i = 1, tipGc + 2 do
+        local gid = string.format("gig:fp%02d", i)
+        groups[gid] = { groupId = gid, mainGuid = "Player-1-FpM01", ver = { n = 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" }, at = 1 }
+    end
+    local tipMembers, tipGroups = {}, {}
+    local mi, gi = 0, 0
+    for guid, m in pairs(members) do
+        if mi < tipMc then tipMembers[guid] = m; mi = mi + 1 end
+    end
+    for gid, g in pairs(groups) do
+        if gi < tipGc then tipGroups[gid] = g; gi = gi + 1 end
+    end
+    -- Non-matching tipFp forces full enumeration of drop combinations.
+    GI.ResetFpEvalCount()
+    tipSubsetWitnessed(members, groups, tipMc, tipGc, "never-matches-any-subset")
+    local comboEvals = GI._fpEvalCount or 0
+    assertTrue(comboEvals >= 4000,
+        "fail-before B4 work: combinatorial TipSubsetWitnessed fp evals got=" .. tostring(comboEvals))
+    pass("fail-before B4 combinatorial fp storm at modest size evals=" .. tostring(comboEvals))
+end
+
+do
+    -- Pass-after: near-capacity tip-window seals with bounded fingerprint work.
+    -- Totals 256/128 with two extras ⇒ combinatorial floor C(256,2)*C(128,2)≈265M.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local tipMc = (GI.MAX_MEMBERS or 256) - 2
+    local tipGc = (GI.MAX_GROUPS or 128) - 2
+    local tipMembers, tipGroups = {}, {}
+    local holdMembers, holdGroups = {}, {}
+    local order = {}
+    local writer = "aaaaaaaaaaaaaaaaaaaaaaaa"
+    for i = 1, tipMc do
+        local guid = string.format("Player-1-CapM%03d", i)
+        local m = { guid = guid, groupId = "gig:cap", ver = { n = 1, w = writer }, at = 1 }
+        tipMembers[guid] = m
+        holdMembers[guid] = m
+    end
+    for i = 1, tipGc do
+        local gid = string.format("gig:cap%03d", i)
+        local g = { groupId = gid, mainGuid = "Player-1-CapM001", ver = { n = 1, w = writer }, at = 1 }
+        tipGroups[gid] = g
+        holdGroups[gid] = g
+    end
+    -- Two extras of each type admitted before the tip batch (chronological order).
+    for i = 1, 2 do
+        local guid = string.format("Player-1-CapX%02d", i)
+        local m = { guid = guid, groupId = "gig:cap", ver = { n = 1, w = writer }, at = 1 }
+        holdMembers[guid] = m
+        order[#order + 1] = { k = "m", id = guid }
+    end
+    for i = 1, 2 do
+        local gid = string.format("gig:capX%02d", i)
+        local g = { groupId = gid, mainGuid = "Player-1-CapM001", ver = { n = 1, w = writer }, at = 1 }
+        holdGroups[gid] = g
+        order[#order + 1] = { k = "g", id = gid }
+    end
+    for i = 1, tipMc do
+        order[#order + 1] = { k = "m", id = string.format("Player-1-CapM%03d", i) }
+    end
+    for i = 1, tipGc do
+        order[#order + 1] = { k = "g", id = string.format("gig:cap%03d", i) }
+    end
+    local tipFp = GI.ComputeBaselineContentFp(tipMembers, tipGroups)
+    -- Durable buffer polluted with tip + extras (no exact match).
+    local durableM, durableG = {}, {}
+    for guid, m in pairs(holdMembers) do durableM[guid] = m end
+    for gid, g in pairs(holdGroups) do durableG[gid] = g end
+    local record = {
+        members = durableM,
+        groups = durableG,
+        characters = {},
+        syncGen = { n = 2, w = writer },
+        baseline = {
+            complete = false,
+            memberCount = tipMc,
+            groupCount = tipGc,
+            contentFp = tipFp,
+            sealRev = { n = 1, w = writer },
+        },
+        _sameGenHold = {
+            members = holdMembers,
+            groups = holdGroups,
+            characters = {},
+            order = order,
+        },
+    }
+    GI.ResetFpEvalCount()
+    assertTrue(GI.NoteIncompleteAdmit(record, {}), "B4 near-cap tip-window seals")
+    assertTrue(record.baseline.complete, "B4 near-cap baseline complete")
+    local evals = GI._fpEvalCount or 0
+    -- Exact attempt + tip-window check + seal confirm + optional refresh: tiny constant.
+    assertTrue(evals <= 16, "B4 near-cap fp evals bounded got=" .. tostring(evals))
+    assertTrue(record.members["Player-1-CapX01"] ~= nil, "B4 near-cap reapplied extra member")
+    assertTrue(record.groups["gig:capX01"] ~= nil, "B4 near-cap reapplied extra group")
+    -- Combinatorial lower bound at this size is astronomical; we never approach it.
+    local comboLower = 265000000
+    assertTrue(evals < comboLower, "B4 near-cap far below combinatorial floor")
+    pass("B4 near-cap tip-window fp evals=" .. tostring(evals) .. " (combo floor>" .. tostring(comboLower) .. ")")
+end
+
+do
+    -- D2 / P2 DEFER evidence: canonical MAX-1 admits via provider; cleanup cannot advance.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "D2 seed")
+    ensureRosterGuid("ShellD2b-Garona", "Player-1-ShellD2b", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellD2b-Garona", "Dave-Garona"), "accepted", "D2 bait")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "D2 bait unassign")
+    local writer = select(1, GI:_EnsureWritableWriter())
+    local terminalN = GI.MAX_SYNC_GEN_N - 1
+    assertTrue(GI.ValidSyncGen({ n = terminalN, w = writer.nonce }), "D2 MAX-1 syncGen valid")
+    assertTrue(GI.ValidSealRev({ n = terminalN, w = writer.nonce }), "D2 MAX-1 sealRev valid")
+    GI.NotifyLocalDurableChange("local")
+    local seedWires = exportProviderWiresLive()
+    local seedEpoch = findWire(seedWires, "guildinfo-epoch")
+    local _, seedRows = splitEpochAndRows(seedWires)
+    assertTrue(seedEpoch ~= nil and #seedRows > 0, "D2 seed export")
+    local poisonGen = deepCopy(seedEpoch)
+    poisonGen.versionFp = "term-gen"
+    poisonGen.body.gen = { n = terminalN, w = writer.nonce }
+    poisonGen.body.sealRev = { n = 1, w = writer.nonce }
+
+    local dbTerm = seedEmptyPeer()
+    local st = admitWireLive(dbTerm, poisonGen, "Alice-Garona")
+    assertEq(st, "accepted", "D2 provider admits canonical MAX-1 generation")
+    for i = 1, #seedRows do
+        local row = deepCopy(seedRows[i])
+        if row.body then
+            row.body.gen = { n = terminalN, w = writer.nonce }
+        end
+        admitWireLive(dbTerm, row, "Alice-Garona")
+    end
+    SpectrumFederationDB = dbTerm
+    GI:Initialize(dbTerm)
+    DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    local record = select(1, GI:GetCurrentRecord())
+    assertEq(tonumber(record.syncGen.n), terminalN, "D2 adopted terminal generation")
+    assertTrue(GI.IsBaselineComplete(record), "D2 sealed under MAX-1 generation")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    -- Post-admit editing still mutates rows before seal refresh may fail closed.
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "D2 post-MAX-1 edit accepted")
+    ensureRosterGuid("ShellD2c-Garona", "Player-1-ShellD2c", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellD2c-Garona", "Eve-Garona"), "accepted", "D2 cleanup bait")
+    assertEq(GI:UnassignAlt("Player-1-Eve", {}), "accepted", "D2 cleanup bait unassign")
+    local est, ewhy = GI:CleanupHistory({})
+    assertEq(est, "rejected", "D2 cleanup blocked at MAX-1")
+    assertEq(ewhy, "generation_exhausted", "D2 generation_exhausted at MAX-1")
+
+    -- Highest-accepted sealRev likewise blocks versioned seal publication.
+    -- Use a post-cleanup generation so a fresh complete bootstrap peer treats it as newer.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "D2 seal seed")
+    ensureRosterGuid("ShellD2s-Garona", "Player-1-ShellD2s", 4)
+    GI.InvalidateRosterSnapshot()
+    assertEq(assign("ShellD2s-Garona", "Dave-Garona"), "accepted", "D2 seal shell")
+    assertEq(GI:UnassignAlt("Player-1-Dave", {}), "accepted", "D2 seal shell unassign")
+    assertEq(GI:CleanupHistory({}), "accepted", "D2 seal cleanup advances gen")
+    writer = select(1, GI:_EnsureWritableWriter())
+    GI.NotifyLocalDurableChange("local")
+    seedWires = exportProviderWiresLive()
+    seedEpoch = findWire(seedWires, "guildinfo-epoch")
+    _, seedRows = splitEpochAndRows(seedWires)
+    assertTrue(seedEpoch ~= nil and tonumber(seedEpoch.body.gen.n) > 1, "D2 seal seed gen advanced")
+    local poisonSeal = deepCopy(seedEpoch)
+    poisonSeal.versionFp = "term-seal"
+    poisonSeal.body.sealRev = { n = terminalN, w = writer.nonce }
+    local dbSeal = seedEmptyPeer()
+    st = admitWireLive(dbSeal, poisonSeal, "Alice-Garona")
+    assertEq(st, "accepted", "D2 provider admits MAX-1 sealRev tip")
+    for i = 1, #seedRows do
+        admitWireLive(dbSeal, seedRows[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbSeal
+    GI:Initialize(dbSeal)
+    DriveEnsureIndex(GI.PROVIDER_ID, 64)
+    record = select(1, GI:GetCurrentRecord())
+    assertEq(tonumber(record.baseline.sealRev.n), terminalN, "D2 terminal sealRev stored")
+    assertTrue(GI.IsBaselineComplete(record), "D2 sealed with terminal sealRev")
+    local bumped, br = GI._BumpSealRev(record)
+    assertNil(bumped, "D2 seal bump exhausted")
+    assertEq(br, "generation_exhausted", "D2 sealRev generation_exhausted")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local editSt, editWhy = GI:AssignAlt("Alice-Garona", "Carol-Garona", {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    assertEq(editSt, "accepted", "D2 post-terminal-seal edit still accepts rows why=" .. tostring(editWhy))
+    -- DEFER: no ahead-limit/off-by-one policy without rejecting long-offline catch-up;
+    -- residual trusted-officer disruption at MAX-1 is inherent to rank 1–3 admission.
+    pass("D2 DEFER: MAX-1 gen/sealRev admit exhausts ordinary cleanup/seal bumps")
 end
 
 do

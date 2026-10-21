@@ -134,7 +134,14 @@ function GI.GetSyncGen(record)
 end
 
 --- Deterministic fingerprint of retained member/group identity set for baseline sealing.
+-- Tests may read GI._fpEvalCount for work-bound evidence (reset via ResetFpEvalCount).
+GI._fpEvalCount = 0
+function GI.ResetFpEvalCount()
+    GI._fpEvalCount = 0
+end
+
 function GI.ComputeBaselineContentFp(members, groups)
+    GI._fpEvalCount = (GI._fpEvalCount or 0) + 1
     local parts = {}
     local mids = {}
     for guid in pairs(members or {}) do
@@ -632,15 +639,63 @@ local function CompareVerSafe(a, b)
     return 0
 end
 
---- Park already-accepted same-gen rows before restarting tip catch-up.
--- Bounded by MAX_MEMBERS / MAX_GROUPS; version merge keeps the winning row.
-local function HoldSameGenRows(record)
+-- Max distinct Gossip senders whose admit streams are retained for tip windows.
+local MAX_HOLD_SENDERS = 8
+
+local function EnsureSameGenHold(record)
     record._sameGenHold = record._sameGenHold or {
         members = {},
         groups = {},
         characters = {},
+        order = {}, -- chronological admit ids (all senders)
+        bySender = {}, -- sender -> { order = {..} } contiguous per-peer export streams
+        senderOrder = {}, -- recent sender names for bounded per-sender trials
     }
     local hold = record._sameGenHold
+    if type(hold.order) ~= "table" then
+        hold.order = {}
+    end
+    if type(hold.bySender) ~= "table" then
+        hold.bySender = {}
+    end
+    if type(hold.senderOrder) ~= "table" then
+        hold.senderOrder = {}
+    end
+    return hold
+end
+
+local function TrimOrder(order, maxOrder)
+    while #order > maxOrder do
+        table.remove(order, 1)
+    end
+end
+
+local function HoldOrderAppend(hold, kind, id, sender)
+    -- Bound chronological buffer: tip reconstruction only needs the trailing
+    -- tip-sized unique ids, but keep a small headroom for concurrent extras.
+    local maxOrder = (GI.MAX_MEMBERS or 256) + (GI.MAX_GROUPS or 128) + 8
+    hold.order[#hold.order + 1] = { k = kind, id = id }
+    TrimOrder(hold.order, maxOrder)
+    if type(sender) == "string" and sender ~= "" then
+        local slot = hold.bySender[sender]
+        if not slot then
+            slot = { order = {} }
+            hold.bySender[sender] = slot
+            hold.senderOrder[#hold.senderOrder + 1] = sender
+            while #hold.senderOrder > MAX_HOLD_SENDERS do
+                local drop = table.remove(hold.senderOrder, 1)
+                hold.bySender[drop] = nil
+            end
+        end
+        slot.order[#slot.order + 1] = { k = kind, id = id }
+        TrimOrder(slot.order, maxOrder)
+    end
+end
+
+--- Park already-accepted same-gen rows before restarting tip catch-up.
+-- Bounded by MAX_MEMBERS / MAX_GROUPS; version merge keeps the winning row.
+local function HoldSameGenRows(record)
+    local hold = EnsureSameGenHold(record)
     for guid, m in pairs(record.members or {}) do
         local prev = hold.members[guid]
         if not prev or CompareVerSafe(m.ver, prev.ver) > 0 then
@@ -658,6 +713,30 @@ local function HoldSameGenRows(record)
             hold.characters[guid] = c
         end
     end
+end
+
+local function HoldOneMember(record, member, sender)
+    if type(member) ~= "table" or type(member.guid) ~= "string" then
+        return
+    end
+    local hold = EnsureSameGenHold(record)
+    local prev = hold.members[member.guid]
+    if not prev or CompareVerSafe(member.ver, prev.ver) > 0 then
+        hold.members[member.guid] = member
+    end
+    HoldOrderAppend(hold, "m", member.guid, sender)
+end
+
+local function HoldOneGroup(record, group, sender)
+    if type(group) ~= "table" or type(group.groupId) ~= "string" then
+        return
+    end
+    local hold = EnsureSameGenHold(record)
+    local prev = hold.groups[group.groupId]
+    if not prev or CompareVerSafe(group.ver, prev.ver) > 0 then
+        hold.groups[group.groupId] = group
+    end
+    HoldOrderAppend(hold, "g", group.groupId, sender)
 end
 
 local function ClearDurableRows(record)
@@ -794,69 +873,121 @@ function GI.AdoptSyncGeneration(record, epochBody)
     return true, "accepted"
 end
 
-local function SortedKeys(t)
-    local keys = {}
-    for k in pairs(t or {}) do
-        keys[#keys + 1] = k
+--- Build a tip-sized member/group set from the most recent unique ids in `order`.
+-- One O(#order) scan; caller performs at most one fingerprint compare.
+local function TipSetFromOrder(hold, order, tipMc, tipGc)
+    if type(order) ~= "table" then
+        return nil
     end
-    table.sort(keys)
-    return keys
-end
-
-local function ComputeFpExcluding(members, groups, dropMembers, dropGroups)
-    local mview, gview = {}, {}
-    for guid, m in pairs(members or {}) do
-        if not (dropMembers and dropMembers[guid]) then
-            mview[guid] = m
+    local members, groups = {}, {}
+    local mc, gc = 0, 0
+    for i = #order, 1, -1 do
+        local e = order[i]
+        if type(e) == "table" then
+            if e.k == "m" and mc < tipMc and hold.members[e.id] and not members[e.id] then
+                members[e.id] = hold.members[e.id]
+                mc = mc + 1
+            elseif e.k == "g" and gc < tipGc and hold.groups[e.id] and not groups[e.id] then
+                groups[e.id] = hold.groups[e.id]
+                gc = gc + 1
+            end
+        end
+        if mc >= tipMc and gc >= tipGc then
+            break
         end
     end
-    for gid, g in pairs(groups or {}) do
-        if not (dropGroups and dropGroups[gid]) then
-            gview[gid] = g
-        end
+    if mc ~= tipMc or gc ~= tipGc then
+        return nil
     end
-    return GI.ComputeBaselineContentFp(mview, gview)
+    return members, groups
 end
 
---- True when durable rows contain some tip-sized subset whose contentFp matches.
--- Bounded: at most 2 extra members and 2 extra groups (C(n,2) style trials).
-local function TipSubsetWitnessed(record, tipMc, tipGc, tipFp)
-    local members, groups = record.members or {}, record.groups or {}
-    local mc, gc = CountKeys(members), CountKeys(groups)
-    local extraM, extraG = mc - tipMc, gc - tipGc
-    if extraM < 0 or extraG < 0 or extraM > 2 or extraG > 2 then
+--- Seal from a chronological tip window: global trailing batch, then each recent
+-- sender's contiguous export stream (≤ MAX_HOLD_SENDERS fingerprint trials).
+-- No combinatorial subset search across extras.
+local function TrySealFromRecentHoldWindow(record)
+    local hold = record._sameGenHold
+    if type(hold) ~= "table" then
         return false
     end
-    local mids, gids = SortedKeys(members), SortedKeys(groups)
-    local function tryDrops(dropMCount, dropGCount, startM, startG, dropMembers, dropGroups)
-        if dropMCount == 0 and dropGCount == 0 then
-            return ComputeFpExcluding(members, groups, dropMembers, dropGroups) == tipFp
-        end
-        if dropMCount > 0 then
-            for i = startM, #mids do
-                dropMembers[mids[i]] = true
-                if tryDrops(dropMCount - 1, dropGCount, i + 1, startG, dropMembers, dropGroups) then
-                    return true
-                end
-                dropMembers[mids[i]] = nil
-            end
+    local tipMc = tonumber(record.baseline.memberCount) or -1
+    local tipGc = tonumber(record.baseline.groupCount) or -1
+    local tipFp = tostring(record.baseline.contentFp or "")
+    if tipMc < 0 or tipGc < 0 or tipFp == "" then
+        return false
+    end
+
+    local function tryOrder(order)
+        local members, groups = TipSetFromOrder(hold, order, tipMc, tipGc)
+        if not members then
             return false
         end
-        for j = startG, #gids do
-            dropGroups[gids[j]] = true
-            if tryDrops(0, dropGCount - 1, startM, j + 1, dropMembers, dropGroups) then
+        if GI.ComputeBaselineContentFp(members, groups) ~= tipFp then
+            return false
+        end
+        ClearDurableRows(record)
+        record.members = members
+        record.groups = groups
+        if GI.RebuildDerived then
+            GI.RebuildDerived(record)
+        end
+        return GI.TrySealBaseline(record)
+    end
+
+    if tryOrder(hold.order) then
+        return true
+    end
+    local senderOrder = hold.senderOrder
+    if type(senderOrder) == "table" then
+        -- Newest senders first (most likely tip author).
+        for i = #senderOrder, 1, -1 do
+            local slot = hold.bySender and hold.bySender[senderOrder[i]]
+            if slot and tryOrder(slot.order) then
                 return true
             end
-            dropGroups[gids[j]] = nil
         end
-        return false
     end
-    return tryDrops(extraM, extraG, 1, 1, {}, {})
+    return false
 end
 
---- After admitting rows, seal on exact tip match, or when durable rows contain a
--- bounded tip-subset witness (concurrent extras present) whose contentFp matches
--- the adopted tip. Count supersets alone are never enough.
+--- After a remote admit while incomplete: park the row, try exact durable seal,
+-- then bounded tip windows (global + per-sender). Polluted durable tip buffers
+-- are cleared (rows remain in hold) so a complete tip batch can seal without search.
+function GI.NoteIncompleteAdmit(record, keep)
+    if type(record) ~= "table" or type(record.baseline) ~= "table" then
+        return false
+    end
+    if record.baseline.complete then
+        return true
+    end
+    keep = keep or {}
+    local sender = keep.sender
+    -- Prefer the incoming wire body when provided so tip-author versions land in
+    -- hold even when durable already has an equal/winning duplicate row.
+    if type(keep.member) == "table" and type(keep.member.guid) == "string" then
+        HoldOneMember(record, keep.member, sender)
+    elseif type(keep.group) == "table" and type(keep.group.groupId) == "string" then
+        HoldOneGroup(record, keep.group, sender)
+    elseif type(keep.memberGuid) == "string" and record.members[keep.memberGuid] then
+        HoldOneMember(record, record.members[keep.memberGuid], sender)
+    elseif type(keep.groupId) == "string" and record.groups[keep.groupId] then
+        HoldOneGroup(record, record.groups[keep.groupId], sender)
+    else
+        HoldSameGenRows(record)
+    end
+    -- Always keep a full park of current durable rows as well.
+    HoldSameGenRows(record)
+
+    if GI.TrySealBaseline(record) then
+        return true
+    end
+    -- Tip windows rebuild from hold without wiping a still-incomplete durable
+    -- buffer (count supersets must remain visible and incomplete).
+    return TrySealFromRecentHoldWindow(record)
+end
+
+--- Seal only on exact tip counts + contentFp. Concurrent edits live in
+-- _sameGenHold and are re-merged after seal (see NoteIncompleteAdmit).
 function GI.TrySealBaseline(record)
     if type(record) ~= "table" or type(record.baseline) ~= "table" then
         return false
@@ -870,10 +1001,7 @@ function GI.TrySealBaseline(record)
     local tipGc = tonumber(record.baseline.groupCount) or -1
     local tipFp = tostring(record.baseline.contentFp or "")
     local fp = GI.ComputeBaselineContentFp(record.members, record.groups)
-    local matched = (mc == tipMc and gc == tipGc and fp == tipFp)
-        or (tipMc >= 0 and tipGc >= 0 and tipFp ~= ""
-            and TipSubsetWitnessed(record, tipMc, tipGc, tipFp))
-    if not matched then
+    if not (mc == tipMc and gc == tipGc and fp == tipFp) then
         return false
     end
     record.baseline.complete = true
@@ -883,13 +1011,8 @@ function GI.TrySealBaseline(record)
     if record._sameGenHold then
         GI.ReapplySameGenHold(record)
     end
-    -- Advertise the full durable union (tip + concurrent extras), not the tip alone.
     if GI.RefreshBaselineSeal then
         GI.RefreshBaselineSeal(record)
-    else
-        record.baseline.memberCount = CountKeys(record.members)
-        record.baseline.groupCount = CountKeys(record.groups)
-        record.baseline.contentFp = GI.ComputeBaselineContentFp(record.members, record.groups)
     end
     return true
 end

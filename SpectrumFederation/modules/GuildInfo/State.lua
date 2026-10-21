@@ -1101,10 +1101,17 @@ function GI.MergeMember(record, member, opts)
         if inN == exN and incomingAssigned and existingUn then
             -- accept (fall through)
         elseif inN == exN and incomingUn and existingAssigned then
+            if opts.remote and GI.NoteIncompleteAdmit and not GI.IsBaselineComplete(record) then
+                -- Still record the sender stream so tip windows see contiguous exports.
+                GI.NoteIncompleteAdmit(record, { member = member, sender = opts.sender })
+            end
             return "duplicate", "stale"
         else
             local cmp = GI.CompareVer(member.ver, existing.ver)
             if cmp <= 0 then
+                if opts.remote and GI.NoteIncompleteAdmit and not GI.IsBaselineComplete(record) then
+                    GI.NoteIncompleteAdmit(record, { member = member, sender = opts.sender })
+                end
                 if cmp == 0 then
                     return "duplicate", nil
                 end
@@ -1131,10 +1138,14 @@ function GI.MergeMember(record, member, opts)
         ReconcileSplitMains(record)
     end
     RebuildDerived(record)
-    if opts.remote and GI.TrySealBaseline then
-        GI.TrySealBaseline(record)
+    if opts.remote then
+        if GI.NoteIncompleteAdmit and not GI.IsBaselineComplete(record) then
+            GI.NoteIncompleteAdmit(record, { member = member, sender = opts.sender })
+        elseif GI.TrySealBaseline then
+            GI.TrySealBaseline(record)
+        end
     end
-    if GI.IsBaselineComplete and GI.IsBaselineComplete(record) and GI.RefreshBaselineSeal then
+    if GI.IsBaselineComplete(record) and GI.RefreshBaselineSeal then
         GI.RefreshBaselineSeal(record)
     end
     return "accepted", nil
@@ -1168,6 +1179,9 @@ function GI.MergeGroup(record, group, opts)
     end
     local existing = record.groups[group.groupId]
     if existing and GI.CompareVer(group.ver, existing.ver) <= 0 then
+        if opts.remote and GI.NoteIncompleteAdmit and not GI.IsBaselineComplete(record) then
+            GI.NoteIncompleteAdmit(record, { group = group, sender = opts.sender })
+        end
         if GI.CompareVer(group.ver, existing.ver) == 0 then
             return "duplicate", nil
         end
@@ -1180,6 +1194,9 @@ function GI.MergeGroup(record, group, opts)
         end
         existing = record.groups[group.groupId]
         if existing and GI.CompareVer(group.ver, existing.ver) <= 0 then
+            if opts.remote and GI.NoteIncompleteAdmit and not GI.IsBaselineComplete(record) then
+                GI.NoteIncompleteAdmit(record, { group = group, sender = opts.sender })
+            end
             return "duplicate", "stale"
         end
     end
@@ -1194,10 +1211,14 @@ function GI.MergeGroup(record, group, opts)
         group.forwardTo
     )
     RebuildDerived(record)
-    if opts.remote and GI.TrySealBaseline then
-        GI.TrySealBaseline(record)
+    if opts.remote then
+        if GI.NoteIncompleteAdmit and not GI.IsBaselineComplete(record) then
+            GI.NoteIncompleteAdmit(record, { group = group, sender = opts.sender })
+        elseif GI.TrySealBaseline then
+            GI.TrySealBaseline(record)
+        end
     end
-    if GI.IsBaselineComplete and GI.IsBaselineComplete(record) and GI.RefreshBaselineSeal then
+    if GI.IsBaselineComplete(record) and GI.RefreshBaselineSeal then
         GI.RefreshBaselineSeal(record)
     end
     return "accepted", nil

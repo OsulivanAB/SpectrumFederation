@@ -2,6 +2,14 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.19] - 2026-10-21
+
+### Fixed
+- Guild Info: same-generation catch-up seals via exact tip match or bounded chronological tip windows from `_sameGenHold` (global + per-sender; no combinatorial subset search); three or more concurrent extras converge and relay (#402)
+
+### Changed
+- Guild Info: document deferred residual that a trusted rank 1–3 editor can publish terminal `MAX_SYNC_GEN_N - 1` / `sealRev` values that exhaust ordinary cleanup advancement (#402)
+
 ## [1.5.12-beta.18] - 2026-10-21
 
 ### Fixed
