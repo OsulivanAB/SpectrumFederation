@@ -4730,6 +4730,134 @@ do
     pass("B5a A-tip after B extras sealed/relayed")
 end
 
+local function countExportKinds(wires)
+    local kinds = {}
+    for i = 1, #(wires or {}) do
+        local k = wires[i].body and wires[i].body.kind
+        if k then
+            kinds[k] = (kinds[k] or 0) + 1
+        end
+    end
+    return kinds
+end
+
+local function prepareB5cIncompletePeer()
+    -- B tip adopted; A's newer Alice + alts present; B snapshot minus older Alice.
+    local _, _, wiresA, wiresB = prepareTripleExtraBaseline()
+    local epochB = findWire(wiresB, "guildinfo-epoch")
+    local _, rowsB = splitEpochAndRows(wiresB)
+    local aliceA = findWire(wiresA, "guildinfo-member", "Player-1-Alice")
+    local aliceB = findWire(wiresB, "guildinfo-member", "Player-1-Alice")
+    local carol = findWire(wiresA, "guildinfo-member", "Player-1-Carol")
+    local eve = findWire(wiresA, "guildinfo-member", "Player-1-Eve")
+    local frank = findWire(wiresA, "guildinfo-member", "Player-1-Frank")
+    assertTrue(epochB and aliceA and aliceB and carol and eve and frank, "B5c fixtures")
+    local dbC = seedEmptyPeer()
+    admitWireLive(dbC, epochB, "Carol-Garona")
+    admitWireLive(dbC, aliceA, "Alice-Garona")
+    admitWireLive(dbC, carol, "Alice-Garona")
+    admitWireLive(dbC, eve, "Alice-Garona")
+    admitWireLive(dbC, frank, "Alice-Garona")
+    for i = 1, #rowsB do
+        local guid = rowsB[i].body and rowsB[i].body.member and rowsB[i].body.member.guid
+        if guid ~= "Player-1-Alice" then
+            admitWireLive(dbC, rowsB[i], "Carol-Garona")
+        end
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    assertTrue(not GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())),
+        "B5c C incomplete before final Alice")
+    return dbC, aliceB
+end
+
+do
+    -- Fail-before: duplicate Alice completes baseline but old provider gate skips export notify.
+    local dbC, aliceB = prepareB5cIncompletePeer()
+    GI.FlushPendingExport()
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local pre = countExportKinds(exportProviderWiresLive())
+    assertEq(pre["guildinfo-epoch"] or 0, 1, "B5c fail-before incomplete exports epoch")
+    assertEq(pre["guildinfo-member"] or 0, 0, "B5c fail-before incomplete exports no members")
+
+    local realNotify = GI.NotifyLocalDurableChange
+    GI.NotifyLocalDurableChange = function(reason)
+        if reason == "remote" then
+            -- Residual ValidateAndApply: notify only on accepted, not duplicate completion.
+            if GI.NotifyUI then
+                GI.NotifyUI(reason)
+            end
+            return
+        end
+        return realNotify(reason)
+    end
+    local st = admitWireLive(dbC, aliceB, "Carol-Garona")
+    assertEq(st, "duplicate", "B5c fail-before final Alice is duplicate/stale")
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())),
+        "B5c fail-before baseline completed by duplicate Alice")
+    GI.NotifyLocalDurableChange = realNotify
+
+    -- No NotifyLocalDurableChange("local"): residual leaves export epoch-only.
+    GI.FlushPendingExport()
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local stuck = countExportKinds(exportProviderWiresLive())
+    assertEq(stuck["guildinfo-member"] or 0, 0,
+        "fail-before B5c: duplicate completion does not advertise members without notify")
+    assertEq(stuck["guildinfo-epoch"] or 0, 1, "fail-before B5c: still epoch-only export")
+    pass("fail-before B5c duplicate-completion skipped export notify")
+end
+
+do
+    -- B5c — duplicate/stale Alice completes tip; provider index becomes discoverable without local notify
+    local dbC, aliceB = prepareB5cIncompletePeer()
+    GI.FlushPendingExport()
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local pre = countExportKinds(exportProviderWiresLive())
+    assertEq(pre["guildinfo-epoch"] or 0, 1, "B5c incomplete exports epoch")
+    assertEq(pre["guildinfo-member"] or 0, 0, "B5c incomplete exports no members")
+    assertEq(pre["guildinfo-group"] or 0, 0, "B5c incomplete exports no groups")
+
+    local st = admitWireLive(dbC, aliceB, "Carol-Garona")
+    assertEq(st, "duplicate", "B5c final Alice duplicate/stale")
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    local recC = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(recC), "B5c baseline complete after duplicate Alice")
+    assertTrue(recC.members["Player-1-Carol"] ~= nil, "B5c retained Carol")
+    assertTrue(recC.members["Player-1-Gina"] ~= nil, "B5c retained Gina")
+
+    -- Critical: do NOT call NotifyLocalDurableChange("local") or re-init source.
+    GI.FlushPendingExport()
+    local idx = DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    assertTrue(idx.buildComplete and not idx.dirty, "B5c physical index idle after duplicate completion")
+    local wiresC = exportProviderWiresLive()
+    local kinds = countExportKinds(wiresC)
+    assertTrue((kinds["guildinfo-member"] or 0) >= 5,
+        "B5c provider advertises members after duplicate completion got=" .. tostring(kinds["guildinfo-member"]))
+    assertTrue((kinds["guildinfo-group"] or 0) >= 1, "B5c provider advertises groups")
+    assertWiresWithinCborCap(wiresC, "B5c export")
+
+    local dbD = seedEmptyPeer()
+    for i = 1, #wiresC do
+        admitWireLive(dbD, wiresC[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbD
+    GI:Initialize(dbD)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local recD = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(recD), "B5c D sealed from C provider export")
+    assertTrue(recD.members["Player-1-Carol"] ~= nil and recD.members["Player-1-Gina"] ~= nil,
+        "B5c D retained concurrent extras via index")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local est, ereason = GI:AssignAlt("Alice-Garona", "Bob-Area52", {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    assertEq(est, "accepted", "B5c D editable why=" .. tostring(ereason))
+    pass("B5c duplicate Alice completion refreshes provider index without local notify")
+end
+
 do
     -- Fail-before: combinatorial TipSubsetWitnessed fp storm at modest extras.
     local function sortedKeys(t)

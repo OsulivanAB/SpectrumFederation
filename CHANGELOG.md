@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.21] - 2026-10-21
+
+### Fixed
+- Guild Info: Gossip provider notifies on incomplete→complete baseline transitions even when the triggering admit is duplicate/stale, so peers discover sealed relationships without a later local mutation (#402)
+
 ## [1.5.12-beta.20] - 2026-10-21
 
 ### Fixed

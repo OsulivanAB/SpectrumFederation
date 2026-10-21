@@ -460,6 +460,10 @@ local function ValidateAndApply(record, ctx)
         return "rejected", "not_ready"
     end
 
+    -- Duplicate/stale admits can still complete an incomplete baseline via
+    -- NoteIncompleteAdmit tip windows; export must refresh on that transition.
+    local beforeComplete = GI.IsBaselineComplete and GI.IsBaselineComplete(guildRec)
+
     local status, detail
     if kind == "guildinfo-epoch" then
         local okAdopt, adoptDetail = GI.AdoptSyncGeneration(guildRec, body)
@@ -482,10 +486,13 @@ local function ValidateAndApply(record, ctx)
         status, detail = GI.MergeGroup(guildRec, g, { remote = true, gen = body.gen, sender = sender })
     end
 
-    if status == "accepted" then
+    local afterComplete = GI.IsBaselineComplete and GI.IsBaselineComplete(guildRec)
+    local becameComplete = (not beforeComplete) and afterComplete and true or false
+    if status == "accepted" or becameComplete then
         -- Rebuild export + invalidate the completed physical index so peers can
         -- discover new/updated fingerprints via this editor's provider index.
         -- Also drops reclaimed group record IDs from the physical index.
+        -- Harmless duplicates on an already-complete baseline do not notify.
         if GI.NotifyLocalDurableChange then
             GI.NotifyLocalDurableChange("remote")
         else
