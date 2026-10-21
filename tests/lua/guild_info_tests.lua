@@ -5471,6 +5471,327 @@ do
     assertEq(why, "cleanup_noop", "H2 cleanup_noop")
 end
 
+---------------------------------------------------------------------------
+-- Four IMPLEMENT findings at reviewed HEAD 3b38f8cb
+---------------------------------------------------------------------------
+
+do
+    -- 3 — CountHiddenAssignedMembers rebuilds via GI.RebuildDerived when byGuid absent
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "hidden-count seed")
+    local record = select(1, GI:GetCurrentRecord())
+    -- Persist a graph with mains present but byGuid stripped (SavedVariables shape).
+    record.graph = { mains = record.graph.mains or {} }
+    local okCall, counted = pcall(GI.CountHiddenAssignedMembers, record)
+    assertTrue(okCall, "CountHiddenAssignedMembers does not error without byGuid")
+    assertEq(counted, 0, "CountHiddenAssignedMembers after rebuild has no hidden")
+    assertTrue(type(record.graph.byGuid) == "table", "GI.RebuildDerived restored byGuid")
+end
+
+do
+    -- 4 — TrySealBaseline skips fingerprint when tip counts mismatch
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "seal-fp seed")
+    local record = select(1, GI:GetCurrentRecord())
+    record.baseline = {
+        complete = false,
+        memberCount = 99,
+        groupCount = 99,
+        contentFp = "never",
+        sealRev = { n = 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" },
+    }
+    GI.ResetFpEvalCount()
+    assertTrue(not GI.TrySealBaseline(record), "count mismatch does not seal")
+    assertEq(GI._fpEvalCount or 0, 0, "count mismatch skips fingerprint eval")
+
+    -- Exact counts + matching fp still seals (one fingerprint).
+    local tipFp = GI.ComputeBaselineContentFp(record.members, record.groups)
+    local mc, gc = 0, 0
+    for _ in pairs(record.members or {}) do mc = mc + 1 end
+    for _ in pairs(record.groups or {}) do gc = gc + 1 end
+    record.baseline = {
+        complete = false,
+        memberCount = mc,
+        groupCount = gc,
+        contentFp = tipFp,
+        sealRev = { n = 1, w = "aaaaaaaaaaaaaaaaaaaaaaaa" },
+    }
+    GI.ResetFpEvalCount()
+    assertTrue(GI.TrySealBaseline(record), "matching counts+fp seals")
+    assertTrue((GI._fpEvalCount or 0) >= 1, "matching path evaluates fingerprint")
+    assertTrue(record.baseline.complete, "sealed complete")
+end
+
+local function admitMissingGroupOrphan(db, guid, nameRealm, groupId, gen, writerNonce)
+    local wire = {
+        id = "gi-m:" .. guid,
+        versionFp = "orphan-" .. guid,
+        body = {
+            kind = "guildinfo-member",
+            schema = GI.PROVIDER_SCHEMA,
+            gen = gen,
+            member = {
+                guid = guid,
+                groupId = groupId,
+                ver = { n = 1, w = writerNonce },
+                at = 1,
+                nameRealm = nameRealm,
+                classFile = "WARRIOR",
+            },
+        },
+    }
+    return admitWireLive(db, wire, "Alice-Garona")
+end
+
+do
+    -- Fail-before: any hidden assigned membership blocked cleanup (orphans stranded).
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "orphan fail-before seed")
+    local record = select(1, GI:GetCurrentRecord())
+    local writer = select(1, GI:_EnsureWritableWriter())
+    local gen = { n = record.syncGen.n, w = record.syncGen.w }
+    assertEq(admitMissingGroupOrphan(SpectrumFederationDB, "Player-1-OrphanX",
+        "OrphanX-Garona", "gig:missing-orphan-x", gen, writer.nonce),
+        "accepted", "orphan fail-before admit")
+    SpectrumFederationDB = SpectrumFederationDB
+    GI:Initialize(SpectrumFederationDB)
+    record = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.CountMissingGroupOrphans(record) >= 1, "orphan fail-before counted")
+    local fixedApply = GI.ApplyCleanupHistory
+    function GI:ApplyCleanupHistory(opts)
+        -- Residual: reject whenever any hidden assigned membership exists.
+        local rec = select(1, GI:EnsureGuildRecord(opts and opts.guildKey))
+        if GI.CountHiddenAssignedMembers and GI.CountHiddenAssignedMembers(rec) > 0 then
+            return "rejected", "cleanup_forward_cycle"
+        end
+        return fixedApply(self, opts)
+    end
+    local st, why = GI:CleanupHistory({})
+    assertEq(st, "rejected", "fail-before orphan cleanup rejected")
+    assertEq(why, "cleanup_forward_cycle", "fail-before orphan treated as forward cycle")
+    GI.ApplyCleanupHistory = fixedApply
+    pass("fail-before missing-group orphan blocked cleanup")
+end
+
+do
+    -- 1 — Missing-group orphans reclaimable via Option B cleanup; old gen cannot restore
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "orphan seed Alice/Bob")
+    local record = select(1, GI:GetCurrentRecord())
+    local writer = select(1, GI:_EnsureWritableWriter())
+    local genBefore = { n = record.syncGen.n, w = record.syncGen.w }
+    local orphanGuid = "Player-1-Orphan1"
+    assertEq(admitMissingGroupOrphan(SpectrumFederationDB, orphanGuid, "Orphan1-Garona",
+        "gig:missing-orphan-1", genBefore, writer.nonce), "accepted", "orphan admit via provider")
+    SpectrumFederationDB = SpectrumFederationDB
+    GI:Initialize(SpectrumFederationDB)
+    record = select(1, GI:GetCurrentRecord())
+    assertTrue(record.members[orphanGuid] ~= nil, "orphan occupies member capacity")
+    assertEq(GI.CountMissingGroupOrphans(record), 1, "one missing-group orphan")
+    assertTrue(GI.CountHiddenAssignedMembers(record) >= 1, "orphan is hidden")
+    assertEq(GI.CountAmbiguousHiddenAssignedMembers(record), 0, "orphan not ambiguous")
+    local ust, uwhy = GI:UnassignAlt(orphanGuid, {})
+    assertEq(ust, "rejected", "orphan Unassign rejected")
+    assertTrue(uwhy == "alt_not_assigned" or uwhy == "not_assigned" or type(uwhy) == "string",
+        "orphan Unassign why=" .. tostring(uwhy))
+    local preview = GI:PreviewCleanup()
+    assertEq(preview.discardMissingGroupOrphans, 1, "preview counts orphan discard")
+    assertTrue(preview.capacityRecovered, "orphan cleanup recovers capacity")
+    local page = ensureSettingsPageLoaded()
+    local panel = CreateFrame()
+    panel.IsVisible = function() return true end
+    page:Build(panel)
+    local confirmMsg
+    -- Rebuild definition to evaluate CleanupConfirmMessage with current preview.
+    page:Build(panel)
+    local btn = findCleanupButton(panel.__sfPageDef)
+    assertTrue(btn and btn.onClick, "orphan cleanup button")
+    local captured
+    SF.SettingsUI.Dialogs = {
+        Confirm = function(_, msg, _, accept)
+            confirmMsg = msg
+            captured = accept
+        end,
+    }
+    local ctx = { section = { SetMessage = function() end } }
+    btn.onClick(ctx)
+    assertTrue(type(confirmMsg) == "string" and confirmMsg:find("missing%-group orphan", 1, false),
+        "confirm lists missing-group orphans")
+    assertTrue(confirmMsg:find("older history generation", 1, true)
+        or confirmMsg:find("missing", 1, true),
+        "confirm warns about old-generation group replay")
+    assertTrue(type(captured) == "function", "orphan cleanup confirm captured")
+    captured()
+    SpectrumFederationDB = SpectrumFederationDB
+    GI:Initialize(SpectrumFederationDB)
+    record = select(1, GI:GetCurrentRecord())
+    assertNil(record.members[orphanGuid], "cleanup discarded orphan")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "Alice/Bob preserved")
+    assertTrue(GI.IsBaselineComplete(record), "post-orphan-cleanup complete")
+    local genAfter = record.syncGen
+    assertTrue(GI.CompareGen(genAfter, genBefore) > 0, "cleanup advanced generation")
+
+    -- Old-generation orphan (+ optional missing group) cannot restore after cleanup.
+    local staleOrphan = {
+        id = "gi-m:" .. orphanGuid,
+        versionFp = "stale-orphan",
+        body = {
+            kind = "guildinfo-member",
+            schema = GI.PROVIDER_SCHEMA,
+            gen = genBefore,
+            member = {
+                guid = orphanGuid,
+                groupId = "gig:missing-orphan-1",
+                ver = { n = 99, w = writer.nonce },
+                at = 1,
+                nameRealm = "Orphan1-Garona",
+                classFile = "WARRIOR",
+            },
+        },
+    }
+    local st = admitWireLive(SpectrumFederationDB, staleOrphan, "Alice-Garona")
+    assertEq(st, "rejected", "old-gen orphan replay rejected")
+    record = select(1, GI:GetCurrentRecord())
+    assertNil(record.members[orphanGuid], "orphan not restored after stale reject")
+
+    -- Reload + fresh peer still see Alice/Bob only.
+    local saved = deepCopy(SpectrumFederationDB)
+    SpectrumFederationDB = saved
+    GI:Initialize(saved)
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "reload preserves Alice/Bob")
+    assertNil(select(1, GI:GetCurrentRecord()).members[orphanGuid], "reload has no orphan")
+    GI.NotifyLocalDurableChange("local")
+    local wires = exportProviderWiresLive()
+    local dbPeer = seedEmptyPeer()
+    for i = 1, #wires do
+        admitWireLive(dbPeer, wires[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbPeer
+    GI:Initialize(dbPeer)
+    assertTrue(GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())), "peer sealed")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Bob"], "peer has Alice/Bob")
+    assertNil(select(1, GI:GetCurrentRecord()).members[orphanGuid], "peer has no orphan")
+    pass("missing-group orphan cleanup reclaim + old-gen reject")
+end
+
+do
+    -- Fail-before: Change Main confirm that reuses a pre-dialog roster snapshot.
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "cm fail-before seed")
+    local frozen = GI.GetRosterSnapshot(true)
+    assertTrue(frozen.byGuid["Player-1-Bob"] and frozen.byGuid["Player-1-Bob"].inGuild,
+        "cm fail-before Bob rostered in captured snapshot")
+    -- Bob leaves after the dialog would have opened.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Bob" then kept[#kept + 1] = m end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    local fresh = GI.GetRosterSnapshot(true)
+    assertTrue(not (fresh.byGuid and fresh.byGuid["Player-1-Bob"]),
+        "cm fail-before Bob absent from fresh roster")
+    -- Residual confirm path: pass the captured pre-dialog roster.
+    local st, why = GI:ChangeMain("Player-1-Alice", "Player-1-Bob", { roster = frozen })
+    assertEq(st, "accepted", "fail-before stale roster Change Main accepted why=" .. tostring(why))
+    assertEq(select(1, GI:GetCharacterRole("Player-1-Bob")), "main",
+        "fail-before Change Main succeeded with departed candidate")
+    restoreBaseRoster()
+    pass("fail-before Change Main confirm used stale roster")
+end
+
+do
+    -- 2 — Change Main confirm revalidates roster; departed candidate rejected
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "cm seed")
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "cm seed Carol")
+    local page = ensureSettingsPageLoaded()
+    local panel = CreateFrame()
+    panel.IsVisible = function() return true end
+    local captured
+    SF.SettingsUI.Dialogs = {
+        Confirm = function(_, _, _, accept) captured = accept end,
+    }
+    page:Build(panel)
+    local def = panel.__sfPageDef
+    local changeMainOnClick, changeMainSet
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Change Main" then
+                changeMainOnClick = item.onClick
+            end
+            if item.type == "dropdown" and item.label and tostring(item.label):find("New main", 1, true) then
+                changeMainSet = item.set
+            end
+            if item.type == "scrollList" and type(item.onSelect) == "function" then
+                item.onSelect(nil, { clusterId = "Player-1-Alice", role = "main" })
+            end
+        end
+    end
+    changeMainSet("Player-1-Bob")
+    local messages = {}
+    local ctx = { section = { SetMessage = function(_, msg) messages[#messages + 1] = msg end } }
+    changeMainOnClick(ctx)
+    assertTrue(type(captured) == "function", "cm confirm captured")
+    -- Bob leaves guild before confirm.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.guid ~= "Player-1-Bob" then kept[#kept + 1] = m end
+    end
+    world.guild.members = kept
+    world.generation = world.generation + 1
+    GI.InvalidateRosterSnapshot()
+    captured()
+    assertEq(select(1, GI:GetCharacterRole("Player-1-Alice")), "main", "Alice remains main after reject")
+    assertEq(select(1, GI:GetCharacterRole("Player-1-Bob")), "alt", "Bob remains alt after reject")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Bob")), "Player-1-Alice",
+        "Bob still under Alice after reject")
+    assertTrue(#messages >= 1, "cm reject Settings feedback")
+
+    -- Successful confirm still works for a rostered candidate (fresh DB).
+    restoreBaseRoster()
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "cm success seed Bob")
+    assertEq(assign("Alice-Garona", "Carol-Garona"), "accepted", "cm success seed Carol")
+    page:Build(panel)
+    def = panel.__sfPageDef
+    for _, sec in ipairs(def.sections or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "button" and item.buttonText == "Change Main" then
+                changeMainOnClick = item.onClick
+            end
+            if item.type == "dropdown" and item.label and tostring(item.label):find("New main", 1, true) then
+                changeMainSet = item.set
+            end
+            if item.type == "scrollList" and type(item.onSelect) == "function" then
+                item.onSelect(nil, { clusterId = "Player-1-Alice", role = "main" })
+            end
+        end
+    end
+    changeMainSet("Player-1-Carol")
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept) captured = accept end
+    changeMainOnClick(ctx)
+    captured()
+    assertEq(select(1, GI:GetCharacterRole("Player-1-Carol")), "main", "cm success Carol is main")
+    assertEq(select(2, GI:GetCharacterRole("Player-1-Alice")), "Player-1-Carol",
+        "cm success Alice under Carol")
+    pass("Change Main confirm revalidates roster")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

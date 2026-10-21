@@ -278,6 +278,7 @@ function GI.ClassifyRetainedState(record)
         tombstones = 0,
         aliases = 0,
         otherLiveEmpty = 0,
+        missingGroupOrphans = 0,
         totalMembers = 0,
         totalGroups = 0,
     }
@@ -310,14 +311,19 @@ function GI.ClassifyRetainedState(record)
     end
 
     out.retainedMembers = CountKeys(keepMember)
+    local groups = record.groups or {}
     for guid, m in pairs(record.members or {}) do
         if not keepMember[guid] and not MemberIsAssigned(m) then
             out.tombstones = out.tombstones + 1
+        elseif not keepMember[guid] and MemberIsAssigned(m)
+            and type(m.groupId) == "string" and groups[m.groupId] == nil then
+            -- Assigned to a group row that does not exist — Option B may discard.
+            out.missingGroupOrphans = out.missingGroupOrphans + 1
         end
     end
     -- Count retained groups from the logical set (canonical ids only).
     out.retainedGroups = CountKeys(keepGroup)
-    for gid, g in pairs(record.groups or {}) do
+    for gid, g in pairs(groups) do
         if keepGroup[gid] then
             -- counted above
         elseif type(g) == "table" and g.dissolved and type(g.forwardTo) == "string" and g.forwardTo ~= "" then
@@ -336,7 +342,7 @@ function GI.PreviewCleanupHistory(record)
     record = record or select(1, GI:GetCurrentRecord())
     local c = GI.ClassifyRetainedState(record)
     local discardGroups = c.soloShells + c.aliases + c.otherLiveEmpty
-    local discardMembers = c.tombstones
+    local discardMembers = c.tombstones + (c.missingGroupOrphans or 0)
     local recoverGroups = discardGroups
     local recoverMembers = discardMembers
     local nothingToDo = discardGroups == 0 and discardMembers == 0
@@ -350,6 +356,7 @@ function GI.PreviewCleanupHistory(record)
         retainedGroups = c.retainedGroups,
         discardSoloShells = c.soloShells,
         discardTombstones = c.tombstones,
+        discardMissingGroupOrphans = c.missingGroupOrphans or 0,
         discardAliases = c.aliases,
         discardGroups = discardGroups,
         discardMembers = discardMembers,
@@ -486,7 +493,10 @@ function GI:ApplyCleanupHistory(opts)
     if GI.HasForwardAliasCycle and GI.HasForwardAliasCycle(record) then
         return "rejected", "cleanup_forward_cycle"
     end
-    if GI.CountHiddenAssignedMembers and GI.CountHiddenAssignedMembers(record) > 0 then
+    -- Missing-group orphans are explicitly reclaimable by Option B cleanup.
+    -- Other hidden assigned memberships (group present but unresolved) stay fail-closed.
+    if GI.CountAmbiguousHiddenAssignedMembers
+        and GI.CountAmbiguousHiddenAssignedMembers(record) > 0 then
         return "rejected", "cleanup_forward_cycle"
     end
 
@@ -1020,8 +1030,12 @@ function GI.TrySealBaseline(record)
     local tipMc = tonumber(record.baseline.memberCount) or -1
     local tipGc = tonumber(record.baseline.groupCount) or -1
     local tipFp = tostring(record.baseline.contentFp or "")
+    -- Count mismatch already rules out an exact tip seal; skip fingerprint work.
+    if mc ~= tipMc or gc ~= tipGc then
+        return false
+    end
     local fp = GI.ComputeBaselineContentFp(record.members, record.groups)
-    if not (mc == tipMc and gc == tipGc and fp == tipFp) then
+    if fp ~= tipFp then
         return false
     end
     record.baseline.complete = true

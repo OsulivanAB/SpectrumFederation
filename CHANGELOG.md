@@ -2,6 +2,14 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.22] - 2026-10-21
+
+### Fixed
+- Guild Info: Option B cleanup reclaims missing-group orphan memberships while still failing closed on ambiguous hidden assignments; Settings confirm lists orphan discards (#402)
+- Guild Info: Change Main confirmation revalidates the guild roster so departed candidates are rejected (#402)
+- Guild Info: `CountHiddenAssignedMembers` rebuilds via `GI.RebuildDerived` when `graph.byGuid` is absent (#402)
+- Guild Info: `TrySealBaseline` skips fingerprint work when tip member/group counts already mismatch (#402)
+
 ## [1.5.12-beta.21] - 2026-10-21
 
 ### Fixed

@@ -378,18 +378,28 @@ local function CleanupConfirmMessage()
 	local recover = preview.capacityRecovered
 		and Loc("GUILD_INFO_CLEANUP_RECOVER_YES", "Yes — obsolete history will free capacity.")
 		or Loc("GUILD_INFO_CLEANUP_RECOVER_NO", "No meaningful capacity recovery (active relationships fill the limits, or nothing obsolete remains).")
-	return Loc(
+	local msg = Loc(
 		"GUILD_INFO_CLEANUP_CONFIRM",
-		"Clean up retained Guild Info history?\n\nPreserve %d active relationship group(s) (%d characters, %d groups).\nRemove approximately %d solo-main shell(s), %d unassign tombstone(s), and %d forwarding alias/obsolete group(s).\nCapacity recovery: %s\n\nWarning: your currently known relationships become the new guild-wide baseline. Offline or unsynchronized edits from the previous generation will not be imported."
+		"Clean up retained Guild Info history?\n\nPreserve %d active relationship group(s) (%d characters, %d groups).\nRemove approximately %d solo-main shell(s), %d unassign tombstone(s), %d missing-group orphan membership(s), and %d forwarding alias/obsolete group(s).\nCapacity recovery: %s\n\nWarning: your currently known relationships become the new guild-wide baseline. Offline or unsynchronized edits from the previous generation will not be imported."
 	):format(
 		tonumber(preview.relationships) or 0,
 		tonumber(preview.retainedMembers) or 0,
 		tonumber(preview.retainedGroups) or 0,
 		tonumber(preview.discardSoloShells) or 0,
 		tonumber(preview.discardTombstones) or 0,
+		tonumber(preview.discardMissingGroupOrphans) or 0,
 		tonumber(preview.discardAliases) or 0,
 		recover
 	)
+	if (tonumber(preview.discardMissingGroupOrphans) or 0) > 0 then
+		msg = msg
+			.. "\n\n"
+			.. Loc(
+				"GUILD_INFO_CLEANUP_ORPHAN_WARN",
+				"Also discarding %d membership(s) whose group record is missing. If those groups arrive later from an older history generation they will be rejected."
+			):format(tonumber(preview.discardMissingGroupOrphans) or 0)
+	end
+	return msg
 end
 
 local function FieldsEnabled()
@@ -626,7 +636,20 @@ local function Definition()
 							)
 							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 							local function commit()
-								local status, reason = gi:ChangeMain(oldMain, newMain, { roster = r })
+								-- Revalidate roster at confirm time; the dialog may outlive
+								-- the render-pass snapshot if the candidate leaves the guild.
+								if gi.InvalidateRosterSnapshot then
+									gi.InvalidateRosterSnapshot()
+								end
+								local freshRoster = gi.GetRosterSnapshot and gi.GetRosterSnapshot(true) or nil
+								if not freshRoster or not freshRoster.complete then
+									ReportStatus(ctx, "rejected",
+										(freshRoster and freshRoster.reason) or "roster_incomplete")
+									return
+								end
+								local status, reason = gi:ChangeMain(oldMain, newMain, {
+									roster = freshRoster,
+								})
 								if status == "accepted" then
 									selectedGroupMainGuid = newMain
 									changeMainCandidate = nil
@@ -652,7 +675,7 @@ local function Definition()
 						get = function()
 							return Loc(
 								"GUILD_INFO_CLEANUP_HELP",
-								"Removes obsolete solo-main shells, unassign tombstones, and forwarding aliases while keeping currently known active relationships. This is not Delete All Assignments."
+								"Removes obsolete solo-main shells, unassign tombstones, forwarding aliases, and memberships whose group record is missing, while keeping currently known active relationships. This is not Delete All Assignments."
 							)
 						end,
 					},

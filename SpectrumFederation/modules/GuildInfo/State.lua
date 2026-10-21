@@ -343,7 +343,10 @@ function GI.CountHiddenAssignedMembers(record)
         return 0
     end
     if type(record.graph) ~= "table" or type(record.graph.byGuid) ~= "table" then
-        RebuildDerived(record)
+        -- Use the exported binder; the local RebuildDerived is declared later.
+        if GI.RebuildDerived then
+            GI.RebuildDerived(record)
+        end
     end
     local byGuid = record.graph and record.graph.byGuid or {}
     local n = 0
@@ -355,6 +358,34 @@ function GI.CountHiddenAssignedMembers(record)
         end
     end
     return n
+end
+
+--- Assigned memberships whose groupId is absent from durable groups.
+-- These are safe for Option B cleanup to discard (not forwarding conflicts).
+function GI.CountMissingGroupOrphans(record)
+    if type(record) ~= "table" or type(record.members) ~= "table" then
+        return 0
+    end
+    local groups = record.groups or {}
+    local n = 0
+    for _, m in pairs(record.members) do
+        if type(m) == "table" and type(m.groupId) == "string" and m.groupId ~= "" then
+            if groups[m.groupId] == nil then
+                n = n + 1
+            end
+        end
+    end
+    return n
+end
+
+--- Hidden assigned memberships that are not missing-group orphans (fail closed).
+function GI.CountAmbiguousHiddenAssignedMembers(record)
+    local hidden = GI.CountHiddenAssignedMembers(record)
+    local orphans = GI.CountMissingGroupOrphans(record)
+    if hidden > orphans then
+        return hidden - orphans
+    end
+    return 0
 end
 
 --- Build derived display graph. Concurrent groups that claim the same main are
