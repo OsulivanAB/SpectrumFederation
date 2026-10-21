@@ -4589,6 +4589,147 @@ do
     assertEq(est, "accepted", "B4 D editable why=" .. tostring(ereason))
 end
 
+local function assertWiresWithinCborCap(wires, label)
+    local maxBytes = (SF.GuildGossip and SF.GuildGossip.MAX_RECORD_CBOR) or 2048
+    for i = 1, #(wires or {}) do
+        assertTrue(GI.RecordWithinGossipCap(wires[i]),
+            label .. " wire within " .. tostring(maxBytes) .. "B id=" .. tostring(wires[i].id))
+    end
+end
+
+local function runAliceVersionConflictCatchup(tipFirstIsB)
+    -- Shared post-cleanup baseline; A advances Alice membership 3× via Carol/Eve/Frank;
+    -- B advances Alice once via Gina. Tip author's older Alice must still reconstruct.
+    local _, _, wiresA, wiresB = prepareTripleExtraBaseline()
+    assertWiresWithinCborCap(wiresA, "B5 wiresA")
+    assertWiresWithinCborCap(wiresB, "B5 wiresB")
+    local epochA = findWire(wiresA, "guildinfo-epoch")
+    local epochB = findWire(wiresB, "guildinfo-epoch")
+    local _, rowsA = splitEpochAndRows(wiresA)
+    local _, rowsB = splitEpochAndRows(wiresB)
+    local aliceA = findWire(wiresA, "guildinfo-member", "Player-1-Alice")
+    local aliceB = findWire(wiresB, "guildinfo-member", "Player-1-Alice")
+    local carol = findWire(wiresA, "guildinfo-member", "Player-1-Carol")
+    local eve = findWire(wiresA, "guildinfo-member", "Player-1-Eve")
+    local frank = findWire(wiresA, "guildinfo-member", "Player-1-Frank")
+    local gina = findWire(wiresB, "guildinfo-member", "Player-1-Gina")
+    assertTrue(epochA and epochB and aliceA and aliceB and carol and eve and frank and gina,
+        "B5 alice-conflict fixtures")
+    local verA = tonumber(aliceA.body.member.ver and aliceA.body.member.ver.n) or 0
+    local verB = tonumber(aliceB.body.member.ver and aliceB.body.member.ver.n) or 0
+    assertTrue(verA > verB, "B5 A's Alice membership version ahead of B tip Alice")
+
+    local tipEpoch, tipRows, tipSender, extraSender
+    local newerAlice, extras
+    if tipFirstIsB then
+        tipEpoch, tipRows, tipSender = epochB, rowsB, "Carol-Garona"
+        extraSender = "Alice-Garona"
+        newerAlice = aliceA
+        extras = { carol, eve, frank }
+    else
+        tipEpoch, tipRows, tipSender = epochA, rowsA, "Alice-Garona"
+        extraSender = "Carol-Garona"
+        newerAlice = aliceB -- B's Alice is older than A's tip; still a conflicting shared GUID
+        -- For A-as-tip, deliver B's Gina (and B Alice) before A's complete tip.
+        extras = { gina, aliceB }
+    end
+
+    local dbC = seedEmptyPeer()
+    admitWireLive(dbC, tipEpoch, tipSender)
+    if tipFirstIsB then
+        -- B tip: deliver A's newer Alice + three alts, then B's full snapshot (older Alice).
+        admitWireLive(dbC, newerAlice, extraSender)
+        for i = 1, #extras do
+            admitWireLive(dbC, extras[i], extraSender)
+        end
+    else
+        -- A tip: deliver B's Gina (+ B Alice), then A's full snapshot.
+        for i = 1, #extras do
+            admitWireLive(dbC, extras[i], extraSender)
+        end
+    end
+    for i = 1, #tipRows do
+        admitWireLive(dbC, tipRows[i], tipSender)
+    end
+    SpectrumFederationDB = dbC
+    GI:Initialize(dbC)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local recC = select(1, GI:GetCurrentRecord())
+    local tag = tipFirstIsB and "B5b" or "B5a"
+    assertTrue(GI.IsBaselineComplete(recC), tag .. " C sealed despite shared-GUID version conflict")
+    assertTrue(recC.members["Player-1-Carol"] ~= nil, tag .. " retained Carol")
+    assertTrue(recC.members["Player-1-Eve"] ~= nil, tag .. " retained Eve")
+    assertTrue(recC.members["Player-1-Frank"] ~= nil, tag .. " retained Frank")
+    assertTrue(recC.members["Player-1-Gina"] ~= nil, tag .. " retained Gina")
+    -- Winning Alice version must survive reapply after tip seal.
+    local aliceVer = tonumber(recC.members["Player-1-Alice"] and recC.members["Player-1-Alice"].ver
+        and recC.members["Player-1-Alice"].ver.n) or 0
+    assertTrue(aliceVer >= verA, tag .. " winning Alice version retained after seal")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Carol"], tag .. " Carol visible")
+    assertTrue(altsUnderMain("Player-1-Alice")["Player-1-Gina"], tag .. " Gina visible")
+
+    GI.NotifyLocalDurableChange("local")
+    local wiresC = exportProviderWiresLive()
+    assertWiresWithinCborCap(wiresC, tag .. " relay")
+    local dbD = seedEmptyPeer()
+    for i = 1, #wiresC do
+        admitWireLive(dbD, wiresC[i], "Alice-Garona")
+    end
+    SpectrumFederationDB = dbD
+    GI:Initialize(dbD)
+    DriveEnsureIndex(GI.PROVIDER_ID, 128)
+    local recD = select(1, GI:GetCurrentRecord())
+    assertTrue(GI.IsBaselineComplete(recD), tag .. " D sealed via C relay")
+    assertTrue(recD.members["Player-1-Carol"] ~= nil and recD.members["Player-1-Gina"] ~= nil,
+        tag .. " D retained concurrent extras")
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    local est, ereason = GI:AssignAlt("Alice-Garona", "Bob-Area52", {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    assertEq(est, "accepted", tag .. " D editable why=" .. tostring(ereason))
+end
+
+do
+    -- Fail-before: tip windows using only winning hold bodies cannot match B's older Alice tip.
+    GI._sameGenTipUseWinningBodiesOnly = true
+    local _, _, wiresA, wiresB = prepareTripleExtraBaseline()
+    local epochB = findWire(wiresB, "guildinfo-epoch")
+    local _, rowsB = splitEpochAndRows(wiresB)
+    local aliceA = findWire(wiresA, "guildinfo-member", "Player-1-Alice")
+    local carol = findWire(wiresA, "guildinfo-member", "Player-1-Carol")
+    local eve = findWire(wiresA, "guildinfo-member", "Player-1-Eve")
+    local frank = findWire(wiresA, "guildinfo-member", "Player-1-Frank")
+    assertTrue(epochB and aliceA and carol and eve and frank, "B5 fail-before fixtures")
+
+    local dbBroken = seedEmptyPeer()
+    admitWireLive(dbBroken, epochB, "Carol-Garona")
+    admitWireLive(dbBroken, aliceA, "Alice-Garona")
+    admitWireLive(dbBroken, carol, "Alice-Garona")
+    admitWireLive(dbBroken, eve, "Alice-Garona")
+    admitWireLive(dbBroken, frank, "Alice-Garona")
+    for i = 1, #rowsB do
+        admitWireLive(dbBroken, rowsB[i], "Carol-Garona")
+    end
+    SpectrumFederationDB = dbBroken
+    GI:Initialize(dbBroken)
+    assertTrue(not GI.IsBaselineComplete(select(1, GI:GetCurrentRecord())),
+        "fail-before B5: winning-body tip window strands C after Alice version conflict")
+    GI._sameGenTipUseWinningBodiesOnly = nil
+    pass("fail-before B5 winning-body-only tip window stranding reproduced")
+end
+
+do
+    -- B5 — overlapping Alice membership versions: B tip after A's newer Alice (+ alts)
+    runAliceVersionConflictCatchup(true)
+    pass("B5b B-tip after A's newer Alice sealed/relayed")
+end
+
+do
+    -- B5 — reversed tip author: A tip after B's Gina/Alice extras
+    runAliceVersionConflictCatchup(false)
+    pass("B5a A-tip after B extras sealed/relayed")
+end
+
 do
     -- Fail-before: combinatorial TipSubsetWitnessed fp storm at modest extras.
     local function sortedKeys(t)

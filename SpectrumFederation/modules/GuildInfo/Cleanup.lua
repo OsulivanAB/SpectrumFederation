@@ -670,11 +670,13 @@ local function TrimOrder(order, maxOrder)
     end
 end
 
-local function HoldOrderAppend(hold, kind, id, sender)
+local function HoldOrderAppend(hold, kind, id, sender, body)
     -- Bound chronological buffer: tip reconstruction only needs the trailing
     -- tip-sized unique ids, but keep a small headroom for concurrent extras.
+    -- Each entry carries the admitted body so a tip window can rebuild the
+    -- advertised snapshot versions, not only the eventual merge winners.
     local maxOrder = (GI.MAX_MEMBERS or 256) + (GI.MAX_GROUPS or 128) + 8
-    hold.order[#hold.order + 1] = { k = kind, id = id }
+    hold.order[#hold.order + 1] = { k = kind, id = id, body = body }
     TrimOrder(hold.order, maxOrder)
     if type(sender) == "string" and sender ~= "" then
         local slot = hold.bySender[sender]
@@ -687,7 +689,7 @@ local function HoldOrderAppend(hold, kind, id, sender)
                 hold.bySender[drop] = nil
             end
         end
-        slot.order[#slot.order + 1] = { k = kind, id = id }
+        slot.order[#slot.order + 1] = { k = kind, id = id, body = body }
         TrimOrder(slot.order, maxOrder)
     end
 end
@@ -720,11 +722,13 @@ local function HoldOneMember(record, member, sender)
         return
     end
     local hold = EnsureSameGenHold(record)
+    -- Winning body for post-seal reapply (eventual merge authority).
     local prev = hold.members[member.guid]
     if not prev or CompareVerSafe(member.ver, prev.ver) > 0 then
         hold.members[member.guid] = member
     end
-    HoldOrderAppend(hold, "m", member.guid, sender)
+    -- Snapshot witness: order entry keeps *this admit's* body for tip FP match.
+    HoldOrderAppend(hold, "m", member.guid, sender, member)
 end
 
 local function HoldOneGroup(record, group, sender)
@@ -736,7 +740,7 @@ local function HoldOneGroup(record, group, sender)
     if not prev or CompareVerSafe(group.ver, prev.ver) > 0 then
         hold.groups[group.groupId] = group
     end
-    HoldOrderAppend(hold, "g", group.groupId, sender)
+    HoldOrderAppend(hold, "g", group.groupId, sender, group)
 end
 
 local function ClearDurableRows(record)
@@ -874,6 +878,8 @@ function GI.AdoptSyncGeneration(record, epochBody)
 end
 
 --- Build a tip-sized member/group set from the most recent unique ids in `order`.
+-- Prefer each order entry's admitted body (snapshot witness) so an older tip
+-- author's versions are not replaced by a later higher-version merge winner.
 -- One O(#order) scan; caller performs at most one fingerprint compare.
 local function TipSetFromOrder(hold, order, tipMc, tipGc)
     if type(order) ~= "table" then
@@ -884,12 +890,26 @@ local function TipSetFromOrder(hold, order, tipMc, tipGc)
     for i = #order, 1, -1 do
         local e = order[i]
         if type(e) == "table" then
-            if e.k == "m" and mc < tipMc and hold.members[e.id] and not members[e.id] then
-                members[e.id] = hold.members[e.id]
-                mc = mc + 1
-            elseif e.k == "g" and gc < tipGc and hold.groups[e.id] and not groups[e.id] then
-                groups[e.id] = hold.groups[e.id]
-                gc = gc + 1
+            if e.k == "m" and mc < tipMc and not members[e.id] then
+                -- Tests may set GI._sameGenTipUseWinningBodiesOnly to reproduce the
+                -- pre-fix "latest hold body only" fingerprint mismatch.
+                local body = (not GI._sameGenTipUseWinningBodiesOnly) and e.body or nil
+                if type(body) ~= "table" then
+                    body = hold.members and hold.members[e.id]
+                end
+                if type(body) == "table" then
+                    members[e.id] = body
+                    mc = mc + 1
+                end
+            elseif e.k == "g" and gc < tipGc and not groups[e.id] then
+                local body = (not GI._sameGenTipUseWinningBodiesOnly) and e.body or nil
+                if type(body) ~= "table" then
+                    body = hold.groups and hold.groups[e.id]
+                end
+                if type(body) == "table" then
+                    groups[e.id] = body
+                    gc = gc + 1
+                end
             end
         end
         if mc >= tipMc and gc >= tipGc then

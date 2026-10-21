@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.20] - 2026-10-21
+
+### Fixed
+- Guild Info: same-gen tip windows keep per-admit record bodies so overlapping GUID versions (e.g. advanced main membership) still match an advertised tip fingerprint before reapplying winning rows (#402)
+
 ## [1.5.12-beta.19] - 2026-10-21
 
 ### Fixed
