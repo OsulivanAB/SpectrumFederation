@@ -52,7 +52,7 @@ Do not treat `nil` as `0`.
 ## Rules for new work
 
 - Keep TSM optional. No hard dependency, no load failure, no chat message when it is missing, disabled, unfinished, or empty.
-- Stay read-only. Do not change TSM settings, groups, operations, prices, or SavedVariables, and do not copy prices into Spectrum SavedVariables.
+- Stay read-only. Do not change TSM settings, groups, operations, prices, or SavedVariables, and do not copy TSM prices into Spectrum SavedVariables. Narrow exception for Guild Supplies issue #397: an eligible officer may persist the accepted integer-copper DBMarket unit and total for one verified production donation. That snapshot is not a general price cache. Guild Supplies still reads prices only through `SF.TSM.GetMarketValue`.
 - Put new shared TSM reads on `SF.TSM`, delegating to `EvaluatePriceSource` when they are another source or expression. Keep one-off logic out of feature modules.
 - Do not poll, scan, or query TSM from `OnUpdate`, login, or a timer. Call the adapter when a feature actually needs a value, and reuse that result.
 - Expected misses stay quiet. Unexpected TSM failures are caught, returned as `api_error`, and logged with `SF.Debug:Error` under category `TSM` when debug logging is enabled.

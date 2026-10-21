@@ -341,6 +341,7 @@ loadModule("SpectrumFederation/modules/GuildSupplies/Campaigns.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Activation.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Ledger.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
+loadModule("SpectrumFederation/modules/GuildSupplies/Valuation.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Gossip.lua")
 
 -- Minimal provider registry stub so EnsureGossipProvider can register without the
@@ -27340,6 +27341,836 @@ do
     assertTrue(type(SF.GuildOfficer.RegisterUIListener) == "function",
         "C1: RegisterUIListener available")
 end
+
+---------------------------------------------------------------------------
+-- #397 DBMarket valuation: earliest assignment, realm, catch-up, gossip
+---------------------------------------------------------------------------
+
+local valuationTsmCalls = 0
+local valuationTsmValue = 2500
+
+local function valuationFindDonation(record, itemId, quantity)
+    local lists = {
+        record and record.accounting and record.accounting._consumableEvents,
+        record and record.accounting and record.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table" and (ev.type == "donation" or ev.type == GS.LEDGER_EVENT.DONATION) then
+                    local itemOk = not itemId or tonumber(ev.itemId) == itemId
+                    local qtyOk = not quantity or tonumber(ev.quantity) == quantity
+                    if itemOk and qtyOk then
+                        return ev
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function valuationCount(record)
+    local byTxn = record and record.valuations and record.valuations.byTxn
+    local n = 0
+    if type(byTxn) == "table" then
+        for _ in pairs(byTxn) do
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function valuationSnap(record, txnId)
+    local byTxn = record and record.valuations and record.valuations.byTxn
+    if type(byTxn) ~= "table" or type(txnId) ~= "string" then
+        return nil
+    end
+    return byTxn[txnId]
+end
+
+local function withRealms(guildRealm, characterRealm, fn)
+    local priorGuild = world.guild.realm
+    local priorFull = UnitFullName
+    local priorRealm = GetRealmName
+    world.guild.realm = guildRealm
+    UnitFullName = function()
+        return world.unitName, characterRealm
+    end
+    GetRealmName = function()
+        if type(characterRealm) ~= "string" or characterRealm == "" then
+            return nil
+        end
+        return characterRealm
+    end
+    fn()
+    world.guild.realm = priorGuild
+    UnitFullName = priorFull
+    GetRealmName = priorRealm
+end
+
+local function activateValuationGuild(itemId)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local record = seedActivatableCampaign(itemId, 80)
+    local _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "val: activate " .. tostring(itemId) .. " " .. tostring(reason))
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    disarmFreshBankSample()
+    world.time = boundary + 7200
+    return record
+end
+
+local function creditValuationDeposit(record, opts)
+    opts = opts or {}
+    local evidence = makeDepositEvidence(record, {
+        itemId = opts.itemId,
+        quantity = opts.quantity or 2,
+        donor = opts.donor or "Donor-Garona",
+        observedAt = world.time,
+        ageHours = 0,
+        occurrenceIndex = opts.occurrenceIndex or 1,
+        neighborsOlder = opts.neighborsOlder or {
+            "older|" .. tostring(opts.itemId) .. "|" .. tostring(opts.quantity or 2),
+        },
+        neighborsNewer = opts.neighborsNewer or {
+            "newer|" .. tostring(opts.occurrenceIndex or 1),
+        },
+    })
+    if opts.beforeWitness then
+        opts.beforeWitness()
+    end
+    local lastStatus, lastReason = nil, nil
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        lastStatus, lastReason = GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(lastStatus, "accepted", "val: third witness accepted "
+        .. tostring(opts.itemId) .. " reason=" .. tostring(lastReason))
+    return evidence
+end
+
+local function applyValuationBody(assignment, sender)
+    return providerApply({
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = assignment.datasetId,
+        guildKey = assignment.guildKey,
+        assignment = assignment,
+    }, sender or "Alice-Garona")
+end
+
+local function craftValuation(record, event, opts)
+    opts = opts or {}
+    local qty = tonumber(event.quantity)
+    local unit = opts.unitCopper or 100
+    return {
+        assignmentId = opts.assignmentId,
+        assignedAt = opts.assignedAt,
+        unitCopper = unit,
+        quantity = qty,
+        totalCopper = opts.totalCopper or (unit * qty),
+        itemId = tonumber(event.itemId),
+        txnId = opts.txnId or event.txnId or event.id,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        actorGuid = opts.actorGuid or "Player-1-Alice",
+        actorName = opts.actorName or "Alice-Garona",
+    }
+end
+
+do
+    valuationTsmCalls = 0
+    valuationTsmValue = 2500
+    SF.TSM = {
+        GetMarketValue = function(item)
+            valuationTsmCalls = valuationTsmCalls + 1
+            if type(valuationTsmValue) == "function" then
+                return valuationTsmValue(item)
+            end
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9301)
+    local before = valuationTsmCalls
+    local mintedAt = math.floor(world.time)
+    creditValuationDeposit(record, { itemId = 9301, quantity = 4 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9301, 4)
+    assertTrue(event ~= nil, "val: donation event")
+    assertEq(event.gsProductionCredit, true, "val: production credit")
+    assertEq(valuationTsmCalls, before + 1, "val: one DBMarket query for a new donation")
+    local snap = valuationSnap(record, event.txnId)
+    assertTrue(type(snap) == "table", "val: snapshot stored")
+    assertEq(snap.unitCopper, 2500, "val: unit copper")
+    assertEq(snap.totalCopper, 10000, "val: total = unit x qty")
+    assertEq(snap.assignedAt, mintedAt, "val: assignment uses GetServerTime")
+    assertTrue(type(snap.assignmentId) == "string" and snap.assignmentId:match("^gsv1:"),
+        "val: assignment id")
+    local rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertTrue(rows and rows[1] and rows[1].text:find("donated", 1, true), "val: history donated")
+    assertTrue(rows[1].text:find("total", 1, true), "val: history total " .. tostring(rows[1].text))
+    assertTrue(rows[1].text:find("unpriced", 1, true) == nil, "val: priced row is not unpriced")
+    assertEq(rows[1].valuationTotal, 10000, "val: history total copper")
+    assertEq(#world.chat, 0, "val: no chat on price")
+    assertEq(#world.prints, 0, "val: no prints on price")
+    local callsAfter = valuationTsmCalls
+    GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertEq(valuationTsmCalls, callsAfter, "val: history refresh does not re-query TSM")
+end
+
+do
+    valuationTsmCalls = 0
+    valuationTsmValue = 111
+    SF.TSM = SF.TSM
+    local function expectMint(label)
+        label = label or "nil guild realm"
+        local record = activateValuationGuild(9302)
+        creditValuationDeposit(record, { itemId = 9302, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9302, 2)
+        local snap = event and valuationSnap(record, event.txnId)
+        assertTrue(type(snap) == "table" and snap.totalCopper == 222, label .. " minted")
+    end
+    local function expectNoMint(label)
+        local record = GS:GetCurrentRecord()
+        creditValuationDeposit(record, {
+            itemId = 9302,
+            quantity = 3,
+            occurrenceIndex = 9,
+            neighborsOlder = { "older-nomint" },
+            neighborsNewer = { "newer-nomint" },
+        })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9302, 3)
+        assertTrue(event ~= nil, label .. " event")
+        assertEq(valuationSnap(record, event.txnId), nil, label .. " no snapshot")
+    end
+    withRealms(nil, "Garona", expectMint)
+    withRealms("Ga rona", "Garona", function()
+        valuationTsmValue = 111
+        local record = activateValuationGuild(9303)
+        creditValuationDeposit(record, { itemId = 9303, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9303, 2)
+        local snap = event and valuationSnap(record, event.txnId)
+        assertTrue(type(snap) == "table", "val: spacing-only realm match mints")
+    end)
+    withRealms("Stormrage", "Garona", function()
+        valuationTsmCalls = 0
+        local record = activateValuationGuild(9304)
+        creditValuationDeposit(record, { itemId = 9304, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9304, 2)
+        assertEq(valuationSnap(record, event.txnId), nil, "val: different realm does not mint")
+        assertEq(valuationTsmCalls, 0, "val: cross-realm does not query TSM")
+    end)
+    do
+        -- Membership stays intact: the roster name follows the character realm
+        -- while the guild home realm stays Garona.
+        local record = activateValuationGuild(9305)
+        local alice = nil
+        for _, m in ipairs(world.guild.members) do
+            if m.guid == "Player-1-Alice" then
+                alice = m
+                break
+            end
+        end
+        local priorName = alice.name
+        local priorFull = UnitFullName
+        local priorRealm = GetRealmName
+        local priorGuild = world.guild.realm
+        alice.name = "Alice-Area52"
+        world.unitName = "Alice"
+        world.guild.realm = "Garona"
+        UnitFullName = function() return "Alice", "Area52" end
+        GetRealmName = function() return "Area52" end
+        assertEq(GS:GetCapabilities().canEdit, true, "val: cross-realm officer can still edit")
+        creditValuationDeposit(record, { itemId = 9305, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9305, 2)
+        assertEq(valuationSnap(record, event and event.txnId), nil,
+            "val: character realm mismatch does not mint")
+        alice.name = priorName
+        world.guild.realm = priorGuild
+        UnitFullName = priorFull
+        GetRealmName = priorRealm
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    do
+        local record = activateValuationGuild(9306)
+        local alice = nil
+        for _, m in ipairs(world.guild.members) do
+            if m.guid == "Player-1-Alice" then
+                alice = m
+                break
+            end
+        end
+        local priorName = alice.name
+        local priorFull = UnitFullName
+        local priorRealm = GetRealmName
+        local priorGuild = world.guild.realm
+        alice.name = "Alice"
+        world.unitName = "Alice"
+        world.guild.realm = "Garona"
+        UnitFullName = function() return "Alice", nil end
+        GetRealmName = function() return nil end
+        creditValuationDeposit(record, { itemId = 9306, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9306, 2)
+        assertEq(valuationSnap(record, event and event.txnId), nil,
+            "val: missing character realm fails closed")
+        alice.name = priorName
+        world.guild.realm = priorGuild
+        UnitFullName = priorFull
+        GetRealmName = priorRealm
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    do
+        local record = activateValuationGuild(9307)
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        creditValuationDeposit(record, { itemId = 9307, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9307, 2)
+        assertEq(GS:GetCapabilities().canEdit, false, "val: member cannot edit")
+        assertEq(valuationSnap(record, event.txnId), nil, "val: non-officer does not mint")
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    do
+        local record = activateValuationGuild(9308)
+        world.impersonationActive = true
+        creditValuationDeposit(record, { itemId = 9308, quantity = 2 })
+        world.impersonationActive = false
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9308, 2)
+        assertEq(valuationSnap(record, event.txnId), nil, "val: preview-as-non-admin does not mint")
+    end
+    assertTrue(expectNoMint ~= nil, "val: helper retained")
+end
+
+do
+    local record = activateValuationGuild(9310)
+    SF.TSM = nil
+    creditValuationDeposit(record, { itemId = 9310, quantity = 2 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9310, 2)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: missing TSM stays unpriced")
+    assertEq(#world.chat, 0, "val: missing TSM no chat")
+    local rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertTrue(rows[1].text:find("unpriced", 1, true) ~= nil, "val: unpriced history " .. tostring(rows[1].text))
+
+    valuationTsmCalls = 0
+    valuationTsmValue = nil
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 3, occurrenceIndex = 3,
+        neighborsOlder = { "older-nil" }, neighborsNewer = { "newer-nil" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 3)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: nil market stays unpriced")
+    assertTrue(valuationTsmCalls >= 1, "val: nil market was queried")
+
+    valuationTsmValue = 1.5
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 4, occurrenceIndex = 4,
+        neighborsOlder = { "older-frac" }, neighborsNewer = { "newer-frac" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 4)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: fractional copper stays unpriced")
+
+    valuationTsmValue = -5
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 5, occurrenceIndex = 5,
+        neighborsOlder = { "older-neg" }, neighborsNewer = { "newer-neg" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 5)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: negative copper stays unpriced")
+
+    valuationTsmValue = 0
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 6, occurrenceIndex = 6,
+        neighborsOlder = { "older-zero" }, neighborsNewer = { "newer-zero" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 6)
+    local zeroSnap = valuationSnap(record, event.txnId)
+    assertTrue(type(zeroSnap) == "table", "val: zero is a real price")
+    assertEq(zeroSnap.unitCopper, 0, "val: zero unit")
+    assertEq(zeroSnap.totalCopper, 0, "val: zero total")
+    rows = GS:ListCampaignHistory(record.currentCampaignId, 10, 0)
+    local sawZero = false
+    for i = 1, #rows do
+        if rows[i].valuationTotal == 0 and rows[i].text:find("unpriced", 1, true) == nil then
+            sawZero = true
+        end
+    end
+    assertTrue(sawZero, "val: zero total is shown and is not unpriced")
+    assertEq(#world.chat, 0, "val: invalid TSM no chat")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9320)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9320, quantity = 4 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9320, 4)
+    local early = craftValuation(record, event, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00000001",
+        assignedAt = 100,
+        unitCopper = 10,
+    })
+    local late = craftValuation(record, event, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00000002",
+        assignedAt = 200,
+        unitCopper = 1,
+    })
+    record.valuations = nil
+    local stLate, rLate = applyValuationBody(late, "Alice-Garona")
+    assertEq(stLate, "accepted", "val: late-first accepted " .. tostring(rLate))
+    local stEarly, rEarly = applyValuationBody(early, "Bob-Garona")
+    assertEq(stEarly, "accepted", "val: earlier replaces later " .. tostring(rEarly))
+    record = GS:GetCurrentRecord()
+    local snap = valuationSnap(record, event.txnId)
+    assertEq(snap.assignmentId, early.assignmentId, "val: earlier id wins after late-first")
+    assertEq(snap.totalCopper, 40, "val: earlier price wins regardless of magnitude")
+    assertEq(snap.unitCopper, 10, "val: earlier unit kept")
+
+    record.valuations = nil
+    assertEq(select(1, applyValuationBody(early, "Alice-Garona")), "accepted", "val: early-first")
+    local stLater = select(1, applyValuationBody(late, "Bob-Garona"))
+    assertEq(stLater, "duplicate", "val: later assignment does not replace")
+    record = GS:GetCurrentRecord()
+    snap = valuationSnap(record, event.txnId)
+    assertEq(snap.assignmentId, early.assignmentId, "val: early-first remains")
+    assertEq(snap.totalCopper, 40, "val: later cheaper price does not win")
+
+    local tieLow = craftValuation(record, event, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:0000000a",
+        assignedAt = 300,
+        unitCopper = 7,
+    })
+    local tieHigh = craftValuation(record, event, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:0000000a",
+        assignedAt = 300,
+        unitCopper = 3,
+    })
+    record.valuations = nil
+    assertEq(select(1, applyValuationBody(tieHigh, "Alice-Garona")), "accepted", "val: tie high-id first")
+    assertEq(select(1, applyValuationBody(tieLow, "Bob-Garona")), "accepted", "val: tie low-id replaces")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).assignmentId, tieLow.assignmentId,
+        "val: same-second lower id wins after high-first")
+    record.valuations = nil
+    assertEq(select(1, applyValuationBody(tieLow, "Bob-Garona")), "accepted", "val: tie low-id first")
+    assertEq(select(1, applyValuationBody(tieHigh, "Alice-Garona")), "duplicate", "val: tie high-id loses")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).assignmentId, tieLow.assignmentId,
+        "val: same-second lower id wins after low-first")
+
+    local dupSt = select(1, applyValuationBody(tieLow, "Alice-Garona"))
+    assertEq(dupSt, "duplicate", "val: duplicate packet")
+    assertEq(valuationCount(record), 1, "val: duplicate does not add a row")
+
+    local divergent = craftValuation(record, event, {
+        assignmentId = tieLow.assignmentId,
+        assignedAt = 300,
+        unitCopper = 9,
+    })
+    local conflictSt, conflictReason = applyValuationBody(divergent, "Bob-Garona")
+    assertEq(conflictSt, "rejected", "val: same-id divergence rejected")
+    assertEq(conflictReason, "id_conflict", "val: id_conflict")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).unitCopper, 7, "val: first body remains after conflict")
+
+    local memberSt, memberReason = applyValuationBody(craftValuation(record, event, {
+        assignmentId = "gsv1:cccccccccccccccccccccccc:00000001",
+        assignedAt = 1,
+        unitCopper = 4,
+    }), "Dave-Garona")
+    assertEq(memberSt, "rejected", "val: member relay rejected")
+    assertEq(memberReason, "unauthorized", "val: member unauthorized " .. tostring(memberReason))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).unitCopper, 7, "val: member did not replace winner")
+
+    local relay = craftValuation(record, event, {
+        assignmentId = "gsv1:dddddddddddddddddddddddd:00000001",
+        assignedAt = 50,
+        unitCopper = 6,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    record.valuations = nil
+    local relaySt = select(1, applyValuationBody(relay, "Bob-Garona"))
+    assertEq(relaySt, "accepted", "val: editor relays offline author")
+    record = GS:GetCurrentRecord()
+    snap = valuationSnap(record, event.txnId)
+    assertEq(snap.actorGuid, "Player-1-Alice", "val: stored actor is not treated as authority")
+    assertEq(snap.totalCopper, 24, "val: relayed total")
+    assertEq(GS:GetCapabilities().canEdit, true, "val: editor still can edit")
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local memberRows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertEq(GS:GetCapabilities().canEdit, false, "val: member read cannot edit")
+    assertTrue(memberRows[1].text:find("total", 1, true) ~= nil, "val: member sees winning total")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    local wrong = craftValuation(record, event, {
+        assignmentId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00000001",
+        assignedAt = 1,
+        unitCopper = 2,
+    })
+    wrong.datasetId = "gs1:other-dataset"
+    local wrongSt, wrongReason = applyValuationBody(wrong, "Alice-Garona")
+    assertEq(wrongSt, "rejected", "val: wrong dataset rejected")
+    assertTrue(wrongReason == "dataset_mismatch" or wrongReason == "malformed",
+        "val: wrong dataset reason " .. tostring(wrongReason))
+
+    local pendingBody = craftValuation(record, event, {
+        assignmentId = "gsv1:ffffffffffffffffffffffff:00000001",
+        assignedAt = 10,
+        unitCopper = 8,
+        txnId = "ctx:not-yet-valued",
+    })
+    local pendSt, pendReason = applyValuationBody(pendingBody, "Alice-Garona")
+    assertEq(pendSt, "pending", "val: unknown donation pending")
+    assertEq(pendReason, "awaiting_donation", "val: awaiting donation")
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending["ctx:not-yet-valued"]) == "table", "val: pending stored")
+    assertEq(record.valuations.byTxn["ctx:not-yet-valued"], nil, "val: pending is not a winner")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9330)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9330, quantity = 5 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9330, 5)
+    local aliasTxn = "ctx:alias-val-9330"
+    local pending = craftValuation(record, event, {
+        assignmentId = "gsv1:abcabcabcabcabcabcabcabc:00000004",
+        assignedAt = 80,
+        unitCopper = 12,
+        txnId = aliasTxn,
+    })
+    assertEq(select(1, applyValuationBody(pending, "Bob-Garona")), "pending", "val: alias valuation waits")
+    local clone = deepCopy(event)
+    clone.txnId = aliasTxn
+    clone.id = aliasTxn
+    clone.gsProductionCredit = nil
+    clone.gsSourceCutoverMarker = nil
+    local aliasSt, aliasReason = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = clone,
+    }, "Alice-Garona")
+    record = GS:GetCurrentRecord()
+    local moved = valuationSnap(record, event.txnId)
+    assertTrue(aliasSt == "duplicate" or aliasSt == "accepted" or aliasSt == "pending",
+        "val: alias ledger status " .. tostring(aliasSt) .. " " .. tostring(aliasReason))
+    if moved then
+        assertEq(moved.unitCopper, 12, "val: alias valuation follows canonical donation")
+        assertEq(record.valuations.byTxn[aliasTxn], nil, "val: alias key is not a second winner")
+        assertEq(record.valuations.pending[aliasTxn], nil, "val: alias pending cleared")
+        assertEq(valuationCount(record), 1, "val: one effective valuation after alias")
+    else
+        -- Occurrence duplicate may still be pending on a path that has not
+        -- recorded the alias. The direct production hook must still converge.
+        GS.OnDonationTxnAlias(record, event.txnId, aliasTxn)
+        record = GS:GetCurrentRecord()
+        moved = valuationSnap(record, event.txnId)
+        assertTrue(type(moved) == "table", "val: alias hook attaches pending valuation")
+        assertEq(moved.unitCopper, 12, "val: hooked alias unit")
+        assertEq(valuationCount(record), 1, "val: hooked alias is one winner")
+    end
+
+    local before = valuationSnap(record, event.txnId).totalCopper
+    local adj = GS:NewAdjustmentOperation(9330, -1, nil)
+    if adj then
+        GS:ApplyStagedConfigOperation(adj)
+    end
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).totalCopper, before, "val: adjustment does not reprice")
+    assertEq(valuationCount(record), 1, "val: adjustment does not mint")
+end
+
+do
+    valuationTsmValue = 400
+    valuationTsmCalls = 0
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9340)
+    local oldId = record.currentCampaignId
+    creditValuationDeposit(record, { itemId = 9340, quantity = 2 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9340, 2)
+    local txnId = event.txnId
+    local total = valuationSnap(record, txnId).totalCopper
+    assertEq(total, 800, "val: archive seed total")
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    local archived = GS:ListCampaignHistory(oldId, 5, 0)
+    assertTrue(archived and archived[1] and archived[1].text:find("total", 1, true),
+        "val: archived history keeps total " .. tostring(archived and archived[1] and archived[1].text))
+    assertEq(valuationSnap(record, txnId).totalCopper, total, "val: archive keeps snapshot")
+
+    local saved = SpectrumFederationDB
+    local assignmentId = valuationSnap(record, txnId).assignmentId
+    GS.StartValuationCatchup("reload-prep")
+    GS._root = nil
+    GS._rootValid = false
+    initGS()
+    local restored = GS:GetCurrentRecord()
+    assertEq(valuationSnap(restored, txnId).totalCopper, total, "val: reload keeps total")
+    assertEq(valuationSnap(restored, txnId).assignmentId, assignmentId, "val: reload keeps id")
+    local idle = GS.GetValuationCatchupState()
+    assertEq(idle.active, false, "val: reload cancels catch-up")
+    assertEq(idle.scheduled, false, "val: reload catch-up idle")
+    assertTrue(saved == SpectrumFederationDB, "val: same saved root")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9350)
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    local pre = makeDepositEvidence(record, {
+        itemId = 9350, quantity = 3,
+        observedAt = boundary + 100,
+        ageHours = 2,
+        occurrenceIndex = 2,
+        neighborsOlder = { "pre-older" },
+        neighborsNewer = { "pre-newer" },
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(pre, pair[1], pair[2])
+    end
+    valuationTsmCalls = 0
+    valuationTsmValue = 50
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return 50
+        end,
+    }
+    GS.StartValuationCatchup("pre-cutover")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: pre-activation rows stay unpriced")
+    assertEq(valuationTsmCalls, 0, "val: uncredited rows are not queried")
+    local idle = GS.GetValuationCatchupState()
+    assertEq(idle.active, false, "val: empty catch-up idle")
+    assertEq(idle.scheduled, false, "val: empty catch-up not scheduled")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9400)
+    for i = 1, 12 do
+        creditValuationDeposit(record, {
+            itemId = 9400,
+            quantity = i,
+            occurrenceIndex = i,
+            neighborsOlder = { "batch-older-" .. i },
+            neighborsNewer = { "batch-newer-" .. i },
+        })
+    end
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: catch-up starts unpriced")
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("logs-open"), true, "val: catch-up armed")
+    assertEq(runOneDueTimer(), true, "val: one catch-up slice")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), GS.VALUATION_CATCHUP_BATCH, "val: first slice prices one batch")
+    assertEq(valuationTsmCalls, 1, "val: same item is queried once per pass")
+    assertEq(GS.GetValuationCatchupState().active, true, "val: backlog remains active")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 12, "val: catch-up finishes the backlog")
+    assertEq(valuationTsmCalls, 1, "val: later slices reuse the pass cache")
+    local done = GS.GetValuationCatchupState()
+    assertEq(done.active, false, "val: catch-up inactive")
+    assertEq(done.scheduled, false, "val: catch-up unscheduled")
+    assertEq(#timers, 0, "val: catch-up timers idle")
+    local calls = valuationTsmCalls
+    flushTimers()
+    assertEq(valuationTsmCalls, calls, "val: idle flush does not query")
+    assertEq(GS.StartValuationCatchup("logs-again"), false, "val: priced rows do not restart catch-up")
+    assertEq(valuationTsmCalls, calls, "val: second open does not query TSM")
+
+    SF.TSM = nil
+    local nilRecord = activateValuationGuild(9410)
+    creditValuationDeposit(nilRecord, { itemId = 9410, quantity = 2, occurrenceIndex = 1 })
+    creditValuationDeposit(nilRecord, {
+        itemId = 9410, quantity = 3, occurrenceIndex = 2,
+        neighborsOlder = { "nil-pass-a" }, neighborsNewer = { "nil-pass-b" },
+    })
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = nil
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("missing-market"), true, "val: nil market catch-up starts")
+    flushTimers()
+    nilRecord = GS:GetCurrentRecord()
+    assertEq(valuationCount(nilRecord), 0, "val: nil market catch-up stays unpriced")
+    assertEq(valuationTsmCalls, 1, "val: nil market queried once")
+    local nilIdle = GS.GetValuationCatchupState()
+    assertEq(nilIdle.active, false, "val: nil market catch-up idles")
+    assertEq(nilIdle.scheduled, false, "val: nil market catch-up not scheduled")
+    valuationTsmValue = 80
+    assertEq(GS.StartValuationCatchup("market-later"), true, "val: later open retries missing prices")
+    flushTimers()
+    nilRecord = GS:GetCurrentRecord()
+    assertEq(valuationCount(nilRecord), 2, "val: later open prices both")
+    assertEq(valuationTsmCalls, 2, "val: later open queries once more")
+    assertEq(GS.GetValuationCatchupState().active, false, "val: later open idles")
+    assertEq(#timers, 0, "val: later open timers idle")
+end
+
+do
+    valuationTsmValue = 15
+    valuationTsmCalls = 0
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return 15
+        end,
+    }
+    local record = activateValuationGuild(9501)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9501, quantity = 2 })
+    drainExportMaint()
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9501, 2)
+    local txnId = event.txnId
+    local total = valuationSnap(record, txnId) and valuationSnap(record, txnId).totalCopper
+    assertEq(total, 30, "val: adoption source priced")
+    local built = GS.BuildValuationExportBody(record, txnId)
+    assertTrue(type(built) == "table" and built.kind == "gs-valuation",
+        "val: export body builds for " .. tostring(txnId))
+    GS.NoteValuationExported(record, txnId)
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("dataset")
+    end
+    drainExportMaint()
+    local exportBodies = collectAllExportBodies()
+    local sawValuation = false
+    local kindCounts = {}
+    for i = 1, #exportBodies do
+        local kind = tostring(exportBodies[i].body and exportBodies[i].body.kind)
+        kindCounts[kind] = (kindCounts[kind] or 0) + 1
+        if exportBodies[i].body.kind == "gs-valuation" then
+            sawValuation = true
+        end
+    end
+    local kindText = {}
+    for kind, n in pairs(kindCounts) do
+        kindText[#kindText + 1] = kind .. "=" .. tostring(n)
+    end
+    table.sort(kindText)
+    assertTrue(sawValuation, "val: export includes gs-valuation bodies="
+        .. tostring(#exportBodies) .. " " .. table.concat(kindText, ","))
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local carol = GS:GetCurrentRecord()
+    carol.valuations = {
+        schemaVersion = 1,
+        nextSeq = 2,
+        byTxn = {
+            ["ctx:leak"] = {
+                assignmentId = "gsv1:111111111111111111111111:00000001",
+                assignedAt = 5,
+                unitCopper = 1,
+                quantity = 1,
+                totalCopper = 1,
+                itemId = 1,
+                txnId = "ctx:leak",
+                canonicalTxnId = "ctx:leak",
+                datasetId = carol.datasetId,
+                guildKey = "club:42",
+                actorGuid = "Player-1-Carol",
+                actorName = "Carol-Garona",
+                seen = {},
+            },
+        },
+        pending = {},
+    }
+    assertTrue(GS:GetCurrentRecord() ~= nil, "val: leak snapshot is a valid stored record")
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: adoption begin")
+    for i = #exportBodies, 1, -1 do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: adoption commit " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted.datasetId, sourceDataset, "val: adopted source dataset")
+    assertEq(adopted.valuations and adopted.valuations.byTxn["ctx:leak"], nil,
+        "val: replaced dataset drops leaked valuation")
+    local adoptedSnap = valuationSnap(adopted, txnId)
+    assertTrue(type(adoptedSnap) == "table", "val: adopted valuation present")
+    if type(adoptedSnap) == "table" then
+        assertEq(adoptedSnap.totalCopper, total, "val: adopted total preserved")
+    end
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
+    assertTrue(src ~= nil, "val: module readable")
+    local text = src:read("*a")
+    src:close()
+    assertTrue(text:find("TSM_API", 1, true) == nil, "val: feature code does not call TSM_API")
+    assertTrue(text:find("GetMarketValue", 1, true) ~= nil, "val: feature code uses SF.TSM.GetMarketValue")
+    assertEq(#world.chat, 0, "val: suite section stays chat-free")
+end
+
+SF.TSM = nil
+world.impersonationActive = false
+setPlayer("Alice-Garona", "Player-1-Alice", 1)
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

@@ -66,6 +66,12 @@ SpectrumFederationDB.guildSupplies = {
       operations = { records = {}, order = {}, heads = {}, pending = {}, conflicts = {}, openConflicts = {} },
       confirmationRefs = {},
       migration = nil,
+      valuations = nil | { -- #397 accepted DBMarket snapshots only; absent on older saves
+        schemaVersion = 1,
+        nextSeq = 1,
+        byTxn = {}, -- [canonicalTxnId] = immutable winner + local seen fingerprints
+        pending = {}, -- bounded assignments waiting for the donation to verify
+      },
     },
   },
 }
@@ -75,6 +81,10 @@ SpectrumFederationDB.guildSupplies = {
 - `permission.editorRankPosition` and `set-editor-rank` history remain so existing datasets, revisions, and operation ancestry still validate. They are not a second live authorization source. Current edits use the shared officer rank. A corrupt permission record can still be repaired by the Guild Master without resetting campaigns, donation logs, or accounting. The old editor-rank setting is not migrated.
 - Absent root → empty defaults. Unsupported/malformed root or guild records are retained read-only.
 - Active records without a valid `liveCutover` fail closed (unavailable), never silently rewritten.
+
+## Donation valuation (#397)
+
+Eligible officers on the exact guild home realm assign one TSM DBMarket snapshot when a live, production-credited donation is verified. Logs open runs a bounded catch-up for rows that are still unpriced. Earliest assignment time wins, with the assignment id breaking same-second ties. The donation ledger itself is not edited. Values travel as `gs-valuation` records on the existing Guild Supplies gossip provider. A current editor may relay an offline author's accepted assignment; claimed author fields are not proof. Ordinary members can read the winning total and cannot mint one. Missing TSM leaves the row unpriced. Zero is a real price. Only the accepted snapshot is stored — not a general TSM price cache.
 
 ## Public API (`SF.GuildSupplies`) — activation (#389)
 
@@ -127,3 +137,4 @@ Automated production-Lua tests do **not** replace Retail QA.
 11. Profile switch/delete, snapshot import, and old-client `CONSUMABLES_*` session traffic must not mutate canonical Guild Supplies or double-credit.
 12. New Campaign after activation archives prior goals and starts empty; shared tab/editor policy/cutover identity remain.
 13. Disconnect/rejoin, rank demotion, combat/FPS, and normal Loot Helper raid loot behavior remain intact; no game Chat from Guild Supplies paths.
+14. **Valuation:** a same-realm officer with TSM prices a new donation; a different-realm officer and an ordinary member do not. Two disconnected officers converge on the earlier assignment after reconnect, in either arrival order. Missing TSM stays unpriced. Archived campaigns and `/reload` keep the winning total. No game Chat and no continuous pricing work while Logs is closed.

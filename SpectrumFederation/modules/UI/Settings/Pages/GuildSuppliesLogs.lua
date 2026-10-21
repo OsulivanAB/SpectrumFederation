@@ -584,6 +584,23 @@ local function PanelVisible(panel)
 	return false
 end
 
+local function MaybeStartValuationCatchup(panel)
+	if not PanelVisible(panel) then
+		return
+	end
+	local supplies = GS()
+	if supplies and supplies.StartValuationCatchup then
+		supplies.StartValuationCatchup("logs-show")
+	end
+end
+
+local function CancelValuationCatchup()
+	local supplies = GS()
+	if supplies and supplies.CancelValuationCatchup then
+		supplies.CancelValuationCatchup("logs-hide")
+	end
+end
+
 local function QueueRefresh()
 	local panel = Page.panel
 	if not panel or not Page.Refresh then return end
@@ -651,8 +668,13 @@ function Page:Build(panel)
 		panel.__sfGuildSuppliesLogsHook = true
 		panel:HookScript("OnShow", function()
 			QueueRefresh()
+			MaybeStartValuationCatchup(panel)
+		end)
+		panel:HookScript("OnHide", function()
+			CancelValuationCatchup()
 		end)
 	end
+	MaybeStartValuationCatchup(panel)
 end
 
 function Page:Refresh(panel)
@@ -674,6 +696,7 @@ end
 function Page:OnHide()
 	refreshQueued = false
 	cachedHistoryItems = nil
+	CancelValuationCatchup()
 end
 
 EnsureRosterListener()

@@ -1216,7 +1216,7 @@ local function RegisterTxn(cfg, entry)
     return true
 end
 
-local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId)
+local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record)
     primaryTxnId, aliasTxnId = ValidTxnId(primaryTxnId), ValidTxnId(aliasTxnId)
     if not primaryTxnId or not aliasTxnId or primaryTxnId == aliasTxnId then
         return false
@@ -1253,6 +1253,9 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId)
         neighborsOlder = row.neighborsOlder,
         neighborsNewer = row.neighborsNewer,
     })
+    if type(record) == "table" and GS.OnDonationTxnAlias then
+        GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
+    end
     return true
 end
 
@@ -1466,10 +1469,17 @@ local function TrimEventArchive(record)
         return false
     end
     local removedIds = {}
+    local removedTxn = {}
     for i = 1, overflow do
         local ev = archive[i]
         if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
             removedIds[#removedIds + 1] = "gs:le:" .. ev.id
+        end
+        if type(ev) == "table" then
+            local txn = ev.txnId or ev.id
+            if type(txn) == "string" and txn ~= "" then
+                removedTxn[#removedTxn + 1] = txn
+            end
         end
     end
     local kept = {}
@@ -1479,6 +1489,9 @@ local function TrimEventArchive(record)
     record.accounting._consumableEventArchive = kept
     BumpAccountingMutation(record)
     RemoveEvictedLedgerExportIds(removedIds)
+    if GS.ForgetDonationValuations then
+        GS.ForgetDonationValuations(record, removedTxn)
+    end
     -- Length may match the prior warm watermark after shelve+trim; still force
     -- archive paced rebuild so newly retained rows are exported and descriptor
     -- counts cannot exceed GetRecord coverage.
@@ -2004,7 +2017,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
                     status = "pending",
                 }, evidence)
                 if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
-                    AddTxnAlias(cfg, txnId, candId)
+                    AddTxnAlias(cfg, txnId, candId, record)
                     pendingCands[candId] = nil
                 end
             elseif candId == txnId then
@@ -2025,6 +2038,12 @@ local function CommitVerifiedCluster(record, cluster, writerGuid)
     end
     Debug("Info", "three-witness donation committed txn=%s witnesses=%s",
         tostring(txnId), tostring(GS.CountIndependentWitnesses(record, cluster.witnesses)))
+    if GS.ReconcilePendingValuations then
+        GS.ReconcilePendingValuations(record, txnId)
+    end
+    if GS.TryAssignDonationValuation then
+        GS.TryAssignDonationValuation(record, event, evidence)
+    end
     return true, "accepted"
 end
 
@@ -2685,7 +2704,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             if regHit and ValidTxnId(regHit.txnId) and regHit.txnId ~= txnId then
                 -- Same occurrence, competing ID: alias without second credit.
                 if regHit.status == "verified" then
-                    AddTxnAlias(cfg, regHit.txnId, txnId)
+                    AddTxnAlias(cfg, regHit.txnId, txnId, record)
                     return "duplicate", "occurrence_duplicate"
                 end
             end
@@ -2694,7 +2713,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "pending", "ambiguous"
             end
             if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
-                AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId)
+                AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record)
                 return "duplicate", "occurrence_duplicate"
             end
             if ledHit and (ledHit.txnId or ledHit.id) == txnId then
@@ -2796,6 +2815,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 neighborsNewer = stored.neighborsNewer,
                 verification = stored.verification,
             })
+            if GS.ReconcilePendingValuations then
+                GS.ReconcilePendingValuations(record, txnId)
+            end
             return "accepted", "adoption_transfer"
         end
 

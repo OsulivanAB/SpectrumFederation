@@ -52,12 +52,13 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     activation = toc.find("modules/GuildSupplies/Activation.lua")
     ledger = toc.find("modules/GuildSupplies/Ledger.lua")
     admission = toc.find("modules/GuildSupplies/Admission.lua")
+    valuation = toc.find("modules/GuildSupplies/Valuation.lua")
     gs_gossip = toc.find("modules/GuildSupplies/Gossip.lua")
     config_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     logs_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
     obs = toc.find("modules/LootHelper/ConsumablesObservation.lua")
     assert 0 <= obs
-    assert 0 <= gossip < state < authority < operations < campaigns < activation < ledger < admission < gs_gossip
+    assert 0 <= gossip < state < authority < operations < campaigns < activation < ledger < admission < valuation < gs_gossip
     assert 0 <= config_page < logs_page
 
 

@@ -3838,6 +3838,40 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     unsettledSeen = true
                 end
             end
+        elseif body.kind == "gs-valuation" and type(body.assignment) == "table" then
+            -- One attempt per immutable assignment. A later scan that reports
+            -- duplicate must not keep the replay wave alive (earliest-wins is
+            -- settled on the first admit; donation admit reconciles pending).
+            state.valuationSeen = state.valuationSeen or {}
+            local asg = body.assignment
+            local seenKey = tostring(asg.assignmentId or "")
+                .. "\0" .. tostring(asg.txnId or "")
+            if not state.valuationSeen[seenKey] then
+                if sliceUsed >= sliceBudget then
+                    state.cursor = (i - 1)
+                    if state.cursor < 1 then
+                        state.cursor = #adop.order
+                    end
+                    state.admissions = (tonumber(state.admissions) or 0) + admissions
+                    state.sliceUsed = sliceUsed
+                    return true, nil, progress
+                end
+                local stVal = "rejected"
+                if GS.AdmitValuationAssignment then
+                    stVal = select(1, GS:AdmitValuationAssignment(body, {
+                        sender = adop.sourcePeer,
+                        member = member,
+                        offlineRecord = temp,
+                        adoptionReplay = true,
+                    }))
+                end
+                state.valuationSeen[seenKey] = true
+                admissions = admissions + 1
+                sliceUsed = sliceUsed + 1
+                if stVal == "accepted" or stVal == "pending" then
+                    progress = true
+                end
+            end
         end
     end
     state.cursor = i

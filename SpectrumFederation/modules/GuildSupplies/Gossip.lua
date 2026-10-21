@@ -64,6 +64,9 @@ local exportState = {
     ledgerArchiveWarmPos = 0,
     donationEvidenceBuildNeeded = false,
     donationEvidenceBuildCursor = nil,
+    -- #397 paced cold construction for accepted donation valuations.
+    valuationBuildNeeded = false,
+    valuationBuildCursor = nil,
     -- Invalidates queued maint closures after disable/replacement.
     maintGeneration = 0,
 }
@@ -1780,6 +1783,14 @@ local function RebuildExportIndex()
     exportState.ledgerArchiveWarmPos = 0
     exportState.donationEvidenceBuildNeeded = donationEvidenceExportCount > 0
     exportState.donationEvidenceBuildCursor = nil
+    local valuationExportCount = 0
+    if type(record.valuations) == "table" and type(record.valuations.byTxn) == "table" then
+        for _ in pairs(record.valuations.byTxn) do
+            valuationExportCount = valuationExportCount + 1
+        end
+    end
+    exportState.valuationBuildNeeded = valuationExportCount > 0
+    exportState.valuationBuildCursor = nil
 
     local descId = "gs:desc:" .. record.datasetId
     local descEntry = exportState.byId[descId]
@@ -1809,6 +1820,7 @@ local function RebuildExportIndex()
         or exportState.evidenceBuildNeeded
         or exportState.ledgerBuildNeeded
         or exportState.donationEvidenceBuildNeeded
+        or exportState.valuationBuildNeeded
     exportState.maintIdle = not needsMaint
     exportState.maintScheduled = false
     -- Cold registration /reload must drain deferred construction without an
@@ -1883,6 +1895,51 @@ local function UpsertExportBody(id, body)
             prov.index.dirty = true
             prov.index.buildComplete = false
         end
+    end
+end
+
+--- Publish one accepted valuation without rebuilding the whole Guild Supplies export.
+-- Losers and pending rows are not exported. Cold rebuild drains any that this
+-- call cannot see yet (dataset mismatch).
+function GS.NoteValuationExported(record, canonicalTxnId)
+    if type(record) ~= "table" or type(canonicalTxnId) ~= "string" or canonicalTxnId == "" then
+        return
+    end
+    if not providerRegistered then
+        if GS.NotifyUI then
+            GS.NotifyUI("valuation")
+        end
+        return
+    end
+    local body = GS.BuildValuationExportBody and GS.BuildValuationExportBody(record, canonicalTxnId)
+    if type(body) ~= "table" then
+        return
+    end
+    local exportId = "gs:val:" .. canonicalTxnId
+    if exportState.datasetId ~= record.datasetId or exportState.guildKey == nil then
+        exportState.valuationBuildNeeded = true
+        exportState.maintIdle = false
+        if ScheduleExportMaintContinuation then
+            ScheduleExportMaintContinuation()
+        end
+    else
+        local existing = exportState.byId[exportId]
+        local prev = existing and existing.body and existing.body.assignment
+        local nextA = body.assignment
+        local unchanged = type(prev) == "table" and type(nextA) == "table"
+            and prev.assignmentId == nextA.assignmentId
+            and prev.assignedAt == nextA.assignedAt
+            and prev.totalCopper == nextA.totalCopper
+            and prev.txnId == nextA.txnId
+        if not unchanged then
+            UpsertExportBody(exportId, body)
+        end
+    end
+    if GG and GG.NotifyProviderChanged then
+        GG.NotifyProviderChanged(GS.PROVIDER_ID)
+    end
+    if GS.NotifyUI then
+        GS.NotifyUI("valuation")
     end
 end
 
@@ -2146,6 +2203,7 @@ local function ValidateAndApply(record, ctx)
                 or (body.header and body.header.datasetId)
                 or (body.event and body.event.datasetId)
                 or (body.evidence and body.evidence.datasetId)
+                or (body.assignment and body.assignment.datasetId)
             if ds == adop.sourceDatasetId or body.kind == "dataset-desc" then
                 local st, reason = GS:BufferAdoptionRecord(tostring(record.id), body)
                 return st, reason
@@ -2818,6 +2876,24 @@ local function ValidateAndApply(record, ctx)
         })
     end
 
+    -- #397 immutable DBMarket assignment bound to one production donation.
+    if body.kind == "gs-valuation" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if body.datasetId and body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        if type(body.assignment) ~= "table" then
+            return "rejected", "malformed"
+        end
+        return GS:AdmitValuationAssignment(body, {
+            sender = sender,
+            member = member,
+            offlineRecord = localRecord,
+        })
+    end
+
     return "rejected", "unsupported_kind"
 end
 
@@ -2889,6 +2965,8 @@ function GS:DisableGossipProvider()
     exportState.archiveBuildNeeded = false
     exportState.ledgerBuildNeeded = false
     exportState.donationEvidenceBuildNeeded = false
+    exportState.valuationBuildNeeded = false
+    exportState.valuationBuildCursor = nil
     exportState.opBuildCursor = nil
     exportState.archiveBuildCursor = nil
     exportState.ledgerBuildCursor = nil
@@ -3139,7 +3217,8 @@ function GS.NotifyLocalDurableChange(reason)
             or exportState.opBuildNeeded
             or exportState.evidenceBuildNeeded
             or exportState.ledgerBuildNeeded
-            or exportState.donationEvidenceBuildNeeded then
+            or exportState.donationEvidenceBuildNeeded
+            or exportState.valuationBuildNeeded then
             exportState.maintIdle = false
             ScheduleExportMaintContinuation()
         end
@@ -3801,12 +3880,49 @@ function GS.NotifyLocalDurableChange(reason)
             end
         end
 
+        -- #397 cold/reload: pace accepted valuation snapshots. Updates to an
+        -- existing winner go through NoteValuationExported; this drain fills gaps.
+        if exportState.valuationBuildNeeded and used < slice then
+            local byTxn = record.valuations and record.valuations.byTxn
+            if type(byTxn) == "table" then
+                local keys = sortedKeys(byTxn)
+                local startK = resumeAfterKey(keys, exportState.valuationBuildCursor, function(k)
+                    return "gs:val:" .. tostring(k)
+                end)
+                for ki = startK, #keys do
+                    if used >= slice then
+                        exportState.valuationBuildCursor = keys[math.max(1, ki - 1)]
+                        break
+                    end
+                    local txnId = keys[ki]
+                    used = used + 1
+                    local exportId = "gs:val:" .. tostring(txnId)
+                    if type(txnId) == "string" and not exportState.byId[exportId]
+                        and GS.BuildValuationExportBody then
+                        local valBody = GS.BuildValuationExportBody(record, txnId)
+                        if valBody then
+                            UpsertExportBody(exportId, valBody)
+                        end
+                    end
+                    exportState.valuationBuildCursor = txnId
+                end
+                if used < slice then
+                    exportState.valuationBuildCursor = nil
+                    exportState.valuationBuildNeeded = false
+                end
+            else
+                exportState.valuationBuildCursor = nil
+                exportState.valuationBuildNeeded = false
+            end
+        end
+
         exportState.maintIdle = used < slice
             and not exportState.opBuildNeeded
             and not exportState.evidenceBuildNeeded
             and not exportState.archiveBuildNeeded
             and not exportState.ledgerBuildNeeded
             and not exportState.donationEvidenceBuildNeeded
+            and not exportState.valuationBuildNeeded
             and exportState.pendingCursor == nil
             and exportState.conflictCursor == nil
             and exportState.openConflictCursor == nil
@@ -3815,6 +3931,7 @@ function GS.NotifyLocalDurableChange(reason)
             and exportState.archiveBuildCursor == nil
             and exportState.ledgerBuildCursor == nil
             and exportState.donationEvidenceBuildCursor == nil
+            and exportState.valuationBuildCursor == nil
 
         -- Descriptor counts stay logical (durable store), not emitted-body counts.
         local acceptedOpCount = 0

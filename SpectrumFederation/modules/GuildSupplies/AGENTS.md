@@ -18,6 +18,7 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 | Authenticated remote admission | `AdmitRemote*` — transport sender + verified guild/rank policy |
 | Dataset adoption | Explicit authorized editor confirmation; replace, never merge |
 | Donation evidence / three-witness ledger / identity links | `Ledger.lua` |
+| Donation DBMarket valuation (#397) | `Valuation.lua` on the guild record; gossip kind `gs-valuation` |
 | Deposit matching helpers | Reuse `SF.ConsumablesObservation` MatchScore / BuildEvidence / ListEligibleEvidenceFromSnapshot |
 
 ## Guarantees
@@ -35,6 +36,7 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical schema/API docs: `docs/developm
 11. **3C:** Staged sample-only bank observation lets an authorized editor stamp the configured GS tab without admitting donations or requiring a legacy profile. Remote live cutover install requires verified editor authority.
 12. **3B:** Exactly three independent authenticated witness identities automatically credit one donation. No manual donation approve/reject.
 13. **3A:** Independently initialized dataset IDs never silently merge; explicit adoption replaces.
+14. **#397:** One effective DBMarket snapshot per canonical production donation. Earliest `(assignedAt, assignmentId)` wins. Local mint requires current officer edit plus an exact guild-home realm match. Ingress accepts an immutable assignment only from a current editor on the authenticated transport sender; claimed actor fields are not authority. Ordinary members cannot mint. Missing TSM stays unpriced, including zero as a real price. The snapshot is the only TSM value copied into SavedVariables.
 
 ## Lifecycle
 

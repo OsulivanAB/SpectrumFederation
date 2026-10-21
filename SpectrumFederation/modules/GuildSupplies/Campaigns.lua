@@ -895,7 +895,7 @@ local function FormatHistoryTimestamp(event)
     return tostring(math.floor(ts))
 end
 
-local function FormatCampaignHistoryText(event, itemName, markUncredited)
+local function FormatCampaignHistoryText(record, event, itemName, markUncredited)
     local itemId = tonumber(event.itemId)
     local qty = tonumber(event.quantity) or 0
     local name = itemName
@@ -905,8 +905,16 @@ local function FormatCampaignHistoryText(event, itemName, markUncredited)
     local body
     if IsDonationEvent(event) then
         local who = BoundedActorName(event.actor) or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
-        body = Loc("GUILD_SUPPLIES_HISTORY_DONATION", "%s donated %d %s.")
-            :format(who, qty, name)
+        local described = GS.DescribeDonationValuation and GS.DescribeDonationValuation(record, event)
+        if described and described.priced and described.totalText and described.unitText then
+            body = Loc("GUILD_SUPPLIES_HISTORY_DONATION_VALUED",
+                "%s donated %d %s — %s total (%s each).")
+                :format(who, qty, name, described.totalText, described.unitText)
+        else
+            body = Loc("GUILD_SUPPLIES_HISTORY_DONATION_UNPRICED",
+                "%s donated %d %s — unpriced.")
+                :format(who, qty, name)
+        end
     elseif IsAdjustmentEvent(event) then
         local who = BoundedActorName(event.actor)
             or Loc("GUILD_SUPPLIES_HISTORY_ADMIN", "An admin")
@@ -1012,8 +1020,9 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         end
         local markUncredited = isArchived and GS.IsLiveActive(record)
             and event.gsProductionCredit ~= true
-        local text = FormatCampaignHistoryText(event, itemName, markUncredited)
+        local text = FormatCampaignHistoryText(record, event, itemName, markUncredited)
         if text and text ~= "" then
+            local described = GS.DescribeDonationValuation and GS.DescribeDonationValuation(record, event)
             rows[#rows + 1] = {
                 text = text,
                 id = event.id,
@@ -1025,6 +1034,8 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 timestamp = event.timestamp,
                 generation = event.generation,
                 uncredited = markUncredited and true or nil,
+                valuationTotal = described and described.priced and described.totalCopper or nil,
+                valuationUnit = described and described.priced and described.unitCopper or nil,
             }
         end
     end

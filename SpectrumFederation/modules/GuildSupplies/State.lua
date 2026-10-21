@@ -676,6 +676,17 @@ local function ValidateGuildRecordStructure(guildKey, record)
             return false, "invalid_identity_links"
         end
     end
+    -- Optional #397 valuation snapshots: absent on older saves; wrong shape fails closed.
+    if record.valuations ~= nil then
+        if GS.ValidateValuationStore then
+            local valOk, valErr = GS.ValidateValuationStore(record.valuations)
+            if not valOk then
+                return false, valErr or "invalid_valuations"
+            end
+        elseif type(record.valuations) ~= "table" then
+            return false, "invalid_valuations"
+        end
+    end
     if GS.CountCampaignHeaders and GS.CountCampaignHeaders(record) > (GS.MAX_CAMPAIGNS or 64) then
         return false, "full"
     end
@@ -811,6 +822,9 @@ end
 
 --- Idempotently validate/load the separate root. No guild bootstrap or network.
 function GS:Initialize(db)
+    if GS.CancelValuationCatchup then
+        GS.CancelValuationCatchup("initialize")
+    end
     db = db or (type(SpectrumFederationDB) == "table" and SpectrumFederationDB) or nil
     if type(db) ~= "table" then
         GS._db = nil
