@@ -217,6 +217,8 @@ def test_pending_incomplete_reasons_do_not_burn_attempt_cap():
     assert "function CheckRun.AttemptCountsAsProgress" in check_run
     assert "function CheckRun.InitialAcquisitionIncomplete" in check_run
     assert "initial_acquisition" in check_run
+    assert "function CheckRun.UpdateReachability" in check_run
+    assert "wasReachable" in check_run
     raid_check = RAID_CHECK_LUA.read_text(encoding="utf-8")
     assert "AttemptKindForIncompleteReason" in raid_check
     assert "lastIncompleteReason" in raid_check
@@ -224,6 +226,11 @@ def test_pending_incomplete_reasons_do_not_burn_attempt_cap():
     assert "lastLocalCaptureAt" in raid_check
     assert "PlayerMayQueueInspect" in raid_check
     assert "AttemptCountsAsProgress" in raid_check
+    assert "UpdateReachability" in raid_check
+    reconcile_fn = raid_check.split("function RC:_ReconcileFrozenTargets", 1)[1]
+    reconcile_fn = reconcile_fn.split("function RC:_HandleInspectTimeout", 1)[0]
+    assert "UpdateReachability" in reconcile_fn
+    assert "CanInspectUnitNow" in reconcile_fn
     queue_fn = raid_check.split("local function QueueFrozenInspectTargets", 1)[1]
     queue_fn = queue_fn.split("function RC:_ApplyCheckConsequences", 1)[0]
     # Pending/timeout backoff must survive frozen-queue rebuilds: only expired gates clear.

@@ -146,11 +146,29 @@ function CheckRun.NewPlayer(memberId)
 		freshObservation = nil,
 		policyResult = nil,
 		leftGroup = false,
+		-- Live: can we inspect this player right now?
 		currentlyInspectable = false,
+		-- Sticky: observed reachable at least once this run (start or later).
+		-- Distinct from currentlyInspectable so OOR unvisited targets do not
+		-- block the first sweep, yet still avoid Reward Pot availability charges.
+		wasReachable = false,
 		rangeOnlyFailure = false,
 		terminal = nil,
 		verified = nil,
 	}
+end
+
+-- Refresh live inspectability. Sticky wasReachable records historical reachability.
+function CheckRun.UpdateReachability(player, canInspectNow)
+	if type(player) ~= "table" then
+		return
+	end
+	if canInspectNow then
+		player.currentlyInspectable = true
+		player.wasReachable = true
+	else
+		player.currentlyInspectable = false
+	end
 end
 
 function CheckRun.NewRun(opts)
@@ -287,6 +305,7 @@ function CheckRun.MarkAttempt(player, kind, inspectable, now)
 	if inspectable then
 		player.inspectableAtLeastOnce = true
 		player.currentlyInspectable = true
+		player.wasReachable = true
 	end
 	if CheckRun.IsPendingAttemptKind(kind) then
 		player.pendingAttemptCount = (player.pendingAttemptCount or 0) + 1
@@ -442,11 +461,10 @@ function CheckRun.ClassifyPlayer(player, now, lastGood)
 	end
 
 	if not player.inspectableAtLeastOnce then
-		-- Reachable targets skipped only because the run settled before the
-		-- serial inspect queue reached them are Inspection Failed, not
-		-- availability Unprepared. Otherwise Reward Pot would deduct for
-		-- players who were never given an inspect opportunity.
-		if player.currentlyInspectable and not player.leftGroup and not player.rangeOnlyFailure then
+		-- Never-inspected but reachable now, or previously reachable this run
+		-- (scheduling skip / range loss), must not charge Reward Pot as if the
+		-- player were genuinely unavailable for the whole check.
+		if player.currentlyInspectable or player.wasReachable then
 			return {
 				class = CheckRun.CLASS.INSPECTION_FAILED,
 				verified = nil,

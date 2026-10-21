@@ -1899,6 +1899,7 @@ function RC:_ReconcileFrozenTargets()
 		return
 	end
 
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 	for _, memberId in ipairs(run.targetIds) do
 		local player = run.players and run.players[memberId]
 		if player then
@@ -1909,6 +1910,14 @@ function RC:_ReconcileFrozenTargets()
 				local guid = GetAccessibleUnitGUID(unit)
 				if guid then
 					player.guid = guid
+				end
+				-- Keep currentlyInspectable live so OOR unvisited targets do not
+				-- stall InitialAcquisitionIncomplete / starve pending retries.
+				local canInspectNow = CanInspectUnitNow(unit) and true or false
+				if CheckRun and CheckRun.UpdateReachability then
+					CheckRun.UpdateReachability(player, canInspectNow)
+				else
+					player.currentlyInspectable = canInspectNow
 				end
 			else
 				player.leftGroup = true
@@ -4130,7 +4139,10 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 		if player then
 			player.unitHint = unit
 			player.guid = unit and GetAccessibleUnitGUID(unit) or nil
-			if unit and CanInspectUnitNow(unit) then
+			local canInspectNow = unit and CanInspectUnitNow(unit) and true or false
+			if CheckRun.UpdateReachability then
+				CheckRun.UpdateReachability(player, canInspectNow)
+			elseif canInspectNow then
 				player.currentlyInspectable = true
 			end
 		end

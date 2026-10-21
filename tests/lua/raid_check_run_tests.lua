@@ -173,7 +173,7 @@ assertTrue(
 )
 
 local unvisitedReachable = CheckRun.NewPlayer("UR")
-unvisitedReachable.currentlyInspectable = true
+CheckRun.UpdateReachability(unvisitedReachable, true)
 local unvisitedClass = CheckRun.ClassifyPlayer(unvisitedReachable, 10)
 assertEq(
     unvisitedClass.class,
@@ -182,8 +182,21 @@ assertEq(
 )
 assertTrue(not unvisitedClass.countsForPot, "reachable unvisited target does not count for Reward Pot")
 
+local staleReachable = CheckRun.NewPlayer("SR")
+CheckRun.UpdateReachability(staleReachable, true)
+CheckRun.UpdateReachability(staleReachable, false)
+assertTrue(staleReachable.wasReachable, "wasReachable stays sticky after leaving inspect range")
+assertTrue(not staleReachable.currentlyInspectable, "currentlyInspectable clears when out of range")
+local staleClass = CheckRun.ClassifyPlayer(staleReachable, 10)
+assertEq(
+    staleClass.class,
+    CheckRun.CLASS.INSPECTION_FAILED,
+    "previously reachable but now OOR unvisited target is Inspection Failed"
+)
+assertTrue(not staleClass.countsForPot, "stale-reachability unvisited target does not count for Reward Pot")
+
 local genuineUnavailable = CheckRun.NewPlayer("GU")
-genuineUnavailable.currentlyInspectable = false
+CheckRun.UpdateReachability(genuineUnavailable, false)
 local genuineClass = CheckRun.ClassifyPlayer(genuineUnavailable, 10)
 assertEq(genuineClass.class, CheckRun.CLASS.UNPREPARED_AVAILABILITY, "never-inspectable stays availability Unprepared")
 assertTrue(genuineClass.countsForPot, "genuine availability Unprepared still counts for Reward Pot")
@@ -324,7 +337,7 @@ local function SimulateSerialRaidAcquisition(opts)
     end
     local run = CheckRun.NewRun({ targetIds = targetIds, now = 0 })
     for _, id in ipairs(targetIds) do
-        run.players[id].currentlyInspectable = true
+        CheckRun.UpdateReachability(run.players[id], true)
     end
     local clock = 0
     local tick = opts.tick or 0.25
@@ -445,9 +458,9 @@ local earlyStall = CheckRun.NewRun({
     targetIds = { "A", "B", "C" },
     now = 0,
 })
-earlyStall.players.A.currentlyInspectable = true
-earlyStall.players.B.currentlyInspectable = true
-earlyStall.players.C.currentlyInspectable = true
+CheckRun.UpdateReachability(earlyStall.players.A, true)
+CheckRun.UpdateReachability(earlyStall.players.B, true)
+CheckRun.UpdateReachability(earlyStall.players.C, true)
 CheckRun.MarkAttempt(earlyStall.players.A, "pending", true, 0)
 CheckRun.NoteProgress(earlyStall, 0)
 CheckRun.AdvanceClock(earlyStall, 11)
@@ -489,8 +502,8 @@ assertTrue(multiResolve.unvisited == 0, "resolved path still visits every target
 -- Budget settlement with an unvisited reachable target must not charge the pot.
 local budgetRun = CheckRun.NewRun({ targetIds = { "A", "B" }, now = 0 })
 budgetRun.budgetSeconds = 5
-budgetRun.players.A.currentlyInspectable = true
-budgetRun.players.B.currentlyInspectable = true
+CheckRun.UpdateReachability(budgetRun.players.A, true)
+CheckRun.UpdateReachability(budgetRun.players.B, true)
 CheckRun.MarkAttempt(budgetRun.players.A, "pending", true, 0)
 CheckRun.NoteProgress(budgetRun, 0)
 CheckRun.AdvanceClock(budgetRun, 6)
@@ -510,6 +523,70 @@ assertTrue(
 assertTrue(
     not CheckRun.AnyUnpreparedForPot(budgetRun.classifiedResults),
     "budget settle with unvisited reachable targets does not trigger pot deduction"
+)
+
+-- Stale reachability: A was in range at start, leaves before first inspect.
+-- B already pending must retry / settle via no_progress, not wait for budget.
+-- A must not charge Reward Pot; returning to range still allows capture.
+local staleRun = CheckRun.NewRun({ targetIds = { "A", "B" }, now = 0 })
+staleRun.budgetSeconds = 60
+CheckRun.UpdateReachability(staleRun.players.A, true)
+CheckRun.UpdateReachability(staleRun.players.B, true)
+CheckRun.MarkAttempt(staleRun.players.B, "pending", true, 0)
+CheckRun.NoteProgress(staleRun, 0)
+-- A moves out of inspect range before any attempt (reconcile refreshes live flag).
+CheckRun.UpdateReachability(staleRun.players.A, false)
+assertTrue(staleRun.players.A.wasReachable, "A retains wasReachable after leaving range")
+assertTrue(not CheckRun.InitialAcquisitionIncomplete(staleRun), "OOR unvisited A does not block first sweep")
+assertTrue(
+    CheckRun.PlayerMayQueueInspect(staleRun.players.B, CheckRun.PendingRetryDelaySeconds(), staleRun),
+    "pending B may retry once A is no longer currently inspectable"
+)
+CheckRun.AdvanceClock(staleRun, CheckRun.NO_PROGRESS_SECONDS + 1)
+local settleStale, whyStale = CheckRun.ShouldSettle(staleRun, CheckRun.NO_PROGRESS_SECONDS + 1)
+assertTrue(settleStale, "stale OOR unvisited target allows no_progress settle")
+assertEq(whyStale, "no_progress", "settles on no_progress rather than waiting for budget")
+assertTrue(
+    staleRun.activeElapsed < (staleRun.budgetSeconds or CheckRun.SAFETY_CEILING_SECONDS),
+    "stale-reachability settle happens before overall budget exhaustion"
+)
+CheckRun.ClassifyRun(staleRun, CheckRun.NO_PROGRESS_SECONDS + 1, {})
+assertEq(
+    staleRun.classifiedResults.A.class,
+    CheckRun.CLASS.INSPECTION_FAILED,
+    "OOR-before-inspect A is Inspection Failed"
+)
+assertTrue(not staleRun.classifiedResults.A.countsForPot, "OOR-before-inspect A does not deduct Reward Pot")
+assertTrue(not staleRun.classifiedResults.B.countsForPot, "pending B does not deduct Reward Pot")
+assertTrue(
+    not CheckRun.AnyUnpreparedForPot(staleRun.classifiedResults),
+    "stale-reachability settle does not trigger Reward Pot deduction"
+)
+
+-- Range recovery during an active run re-admits A into the first sweep.
+local recoverRun = CheckRun.NewRun({ targetIds = { "A", "B" }, now = 0 })
+CheckRun.UpdateReachability(recoverRun.players.A, true)
+CheckRun.UpdateReachability(recoverRun.players.B, true)
+CheckRun.MarkAttempt(recoverRun.players.B, "pending", true, 0)
+CheckRun.NoteProgress(recoverRun, 0)
+CheckRun.UpdateReachability(recoverRun.players.A, false)
+assertTrue(not CheckRun.InitialAcquisitionIncomplete(recoverRun), "A OOR clears first-sweep block")
+CheckRun.UpdateReachability(recoverRun.players.A, true)
+assertTrue(CheckRun.InitialAcquisitionIncomplete(recoverRun), "A returning to range resumes first sweep")
+assertTrue(
+    CheckRun.PlayerMayQueueInspect(recoverRun.players.A, 1, recoverRun),
+    "A may queue after returning to inspect range"
+)
+assertTrue(
+    not CheckRun.PlayerMayQueueInspect(recoverRun.players.B, CheckRun.PendingRetryDelaySeconds(), recoverRun),
+    "pending B defers again while recovered A still needs a first inspect"
+)
+CheckRun.MarkAttempt(recoverRun.players.A, "pending", true, 2)
+CheckRun.NoteProgress(recoverRun, 2)
+assertTrue(not CheckRun.InitialAcquisitionIncomplete(recoverRun), "first sweep completes after recovered A is visited")
+assertTrue(
+    CheckRun.PlayerMayQueueInspect(recoverRun.players.B, 2 + CheckRun.PendingRetryDelaySeconds(), recoverRun),
+    "pending B retries after recovered A receives a first attempt"
 )
 
 failed.currentlyInspectable = false
