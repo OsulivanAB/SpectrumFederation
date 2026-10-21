@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.26] - 2026-10-21
+
+### Changed
+- Rearrange Settings sidebar categories
+
 ## [1.5.12-beta.25] - 2026-10-21
 
 ### Added
