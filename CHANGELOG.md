@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.2] - 2026-10-22
+
+### Removed
+- Remove legacy Loot Helper consumables settings pages
+
 ## [1.5.12-beta.1] - 2026-10-22
 
 ### Added
