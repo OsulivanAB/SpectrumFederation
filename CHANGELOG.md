@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.12-beta.3] - 2026-10-22
+
+### Changed
+- Show Raid Supplies items by icon and name
+
 ## [1.5.12-beta.2] - 2026-10-22
 
 ### Removed
