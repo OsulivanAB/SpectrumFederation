@@ -1,6 +1,6 @@
 # Guild Supplies Foundation (Phase 2A + 2B + 3A + 3B + 3C)
 
-Part **2A** (#385) delivers a **dormant, guild-keyed staged foundation**. Part **2B** (#386) adds **fresh-start campaigns**, local eligibility cutoffs, and **visible standalone Settings**. Part **3A** (#387) connects staged configuration to the Guild Gossip provider for authenticated exchange, conflict resolution, and explicit dataset adoption. Part **3B** (#388) adds **staged donation evidence**, automatic **three-witness** verification, guild-owned **character links**, and **ledger gossip** (including editor quantity adjustments). Part **3C** (#389) performs **guarded live activation**, publishes the agreed bank cutover boundary, rewires production bank/helper consumers to guild-owned state, and retires legacy profile Consumables writers for the activated guild.
+Part **2A** (#385) delivers a **dormant, guild-keyed staged foundation**. Part **2B** (#386) adds **fresh-start campaigns**, local eligibility cutoffs, and **visible standalone Settings**. Part **3A** (#387) connects staged configuration to the Guild Gossip provider for authenticated exchange, conflict resolution, and explicit dataset adoption. Part **3B** (#388) adds **staged donation evidence**, automatic verification, guild-owned **character links**, and **ledger gossip** (including editor quantity adjustments). **#411** verifies a donation from one current officer's direct Guild Bank observation, and otherwise keeps the three-witness quorum. Part **3C** (#389) performs **guarded live activation**, publishes the agreed bank cutover boundary, rewires production bank/helper consumers to guild-owned state, and retires legacy profile Consumables writers for the activated guild.
 
 Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/385), [#386](https://github.com/OsulivanAB/SpectrumFederation/issues/386), [#387](https://github.com/OsulivanAB/SpectrumFederation/issues/387), [#388](https://github.com/OsulivanAB/SpectrumFederation/issues/388), [#389](https://github.com/OsulivanAB/SpectrumFederation/issues/389). Parent roadmap: [#384](https://github.com/OsulivanAB/SpectrumFederation/issues/384) / [#379](https://github.com/OsulivanAB/SpectrumFederation/issues/379). Transport dependency: [#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378).
 
@@ -18,7 +18,7 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
 | Guarded live activation + cutover marker | `Activation` (`ActivateCanonicalDataset`, `InstallRemoteLiveCutover`) |
 | Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`) via Guild Gossip API |
-| Donation evidence / three-witness ledger / identity links | `Ledger` |
+| Donation evidence / officer or three-witness ledger / identity links | `Ledger` |
 | Configuration / Logs Settings pages | `UI/Settings/Pages/GuildSupplies*.lua` |
 | Live bank observation after activation | `ConsumablesBankLog` → `AdmitDirectObservation` |
 | Legacy profile writer isolation | `Consumables.LegacyWritersAllowed` + sync handler gates |
@@ -98,13 +98,19 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 | **Personal preferences** | Account-local reminder checkbox |
 | **Loot Helper → Consumables / Consumable Logs** | Hidden from navigation after live activation (`page.available`) |
 
+## Donation verification (#411)
+
+Officer eligibility is the established Guild Info threshold at the moment a new local Guild Bank snapshot is admitted: verified `rankOrder <= effectiveThreshold`. One such local observation commits a single canonical credit with `verification = "officer"`, the observer's GUID, and an explicit `verifierGuid` equal to that writer. Remote `gs-evidence` remains a witness. One or two non-officer observations stay pending until a third independent witness or a later local officer snapshot of the same deposit. Rank or policy changes do not revoke an accepted credit and do not upgrade an old report until a newer local snapshot while the character qualifies.
+
+Accepted officer-trusted rows sync through the existing Guild Gossip ledger export. A guildmate who already has the row can serve a late peer after the original officer logs off. Live receivers credit that relay only when the authenticated canonical cutover marker matches. A staged receiver keeps marked accepted history so installing that same marker later classifies it. Competing authenticated markers for one occurrence are retained without last-writer-wins (primary plus one bounded alternate); the established cutover selects the canonical marker. Only a complete officer-history duplicate may attach those markers. A missing or different marker alone is not promoted into live credit. An unverified ledger candidate does not block a later valid officer row for the same occurrence, and that admission clears the matching pending cluster and candidate without dropping unrelated ambiguous or repeated deposits. Catch-up and adoption do not invent a missing `verifierGuid`. Three-witness ledger rows still do not self-credit from gossip. Dataset adoption replays stored witness exports as votes and does not turn one of them into an officer credit. A bare `verification`, `writer`, `rankOrder`, `isAdmin`, or `observedBy` claim is not authority. **v1 limit:** there is no cryptographic proof of which officer saw Blizzard's bank log. An authenticated guild member who sends a complete, eligible officer-provenance row is treated as relaying accepted history.
+
 ## Chat-free policy
 
 No normal game Chat from Guild Supplies or rewired live Consumables paths. Diagnostics only through enabled `SF.Debug`. User action feedback uses contextual Settings banners via `FormatMutationFeedback`.
 
 ## Evidence
 
-- Production-Lua suite: `tests/lua/guild_supplies_tests.lua` via `tests/test_guild_supplies.py` (includes 3A–3C paths)
+- Production-Lua suite: `tests/lua/guild_supplies_tests.lua` via `tests/test_guild_supplies.py` (includes 3A–3C and #411 officer-trusted paths)
 - Gossip idle/repair regressions: `tests/test_guild_gossip.py`
 - Consumables regressions: `tests/test_consumables.py`
 - Settings navigation/layout when pages change: `tests/test_settings_navigation.py`, `tests/test_settings_window_layout.py`
@@ -122,7 +128,7 @@ Automated production-Lua tests do **not** replace Retail QA.
 6. **Activation at a real Guild Bank (A):** open the configured tab, wait for a fresh log sample, Activate Guild Supplies. Confirm Settings banner success and that Raid Consumables pages disappear from navigation.
 7. **Catch-up without bank (B/C):** `/reload` or late join; confirm active cutover marker is adopted without reopening the bank.
 8. **Conflicting staged roots:** two independently initialized datasets must stay blocked until explicit adoption; never auto-activate on timestamps/counts.
-9. **Donation eligibility:** pre-activation bank rows do not credit; post-activation deposits require three independent witnesses and credit exactly once.
+9. **Donation eligibility:** pre-activation bank rows do not credit. After activation, one current officer's direct Guild Bank observation credits an eligible deposit once. Without that observation, three independent witnesses credit it once. A guildmate who already has the accepted officer credit can catch a late member up while the original officer is offline.
 10. Deposit assistant / reminders work with **no raid session** and **no Loot Helper profile** after activation.
 11. Profile switch/delete, snapshot import, and old-client `CONSUMABLES_*` session traffic must not mutate canonical Guild Supplies or double-credit.
 12. New Campaign after activation archives prior goals and starts empty; shared tab/editor policy/cutover identity remain.
