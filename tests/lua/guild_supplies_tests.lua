@@ -28345,6 +28345,258 @@ do
         "411 staged: local activation leaves the row uncredited")
 end
 
+local function buildRemoteCutover(record, evidence, activatedAt)
+    local tab = tonumber(record.accounting._consumables.bankTab)
+    activatedAt = math.floor(tonumber(activatedAt)
+        or ((tonumber(evidence.approxTxnTime) or 0) - 50))
+    local marker = GS.BuildCutoverMarker(record.datasetId, activatedAt, tab)
+    return {
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        activatedAt = activatedAt,
+        activatedByGuid = "Player-1-Alice",
+        activatedByName = "Alice-Garona",
+        bankTab = tab,
+        contextStatus = "empty",
+        contextObservedAt = activatedAt,
+        contextRecordCount = 0,
+        cutoverMarker = marker,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = activatedAt,
+        },
+    }, marker
+end
+
+do
+    -- Repair: same-occurrence unmarked/divergent staged rows must not permanently
+    -- block a later canonical marked officer history from becoming live credit.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local function findByTxn(rec, txnId)
+        local events = rec.accounting and rec.accounting._consumableEvents or {}
+        for i = 1, #events do
+            if events[i] and (events[i].txnId == txnId or events[i].id == txnId) then
+                return events[i]
+            end
+        end
+        return nil
+    end
+
+    -- 1) Unmarked staged → canonical marked → cutover.
+    local unmarked = seedStagedCampaignWithItem(9440, 20)
+    local umEvidence = makeDepositEvidence(unmarked, { itemId = 9440, quantity = 7 })
+    local umCutover, umMarker = buildRemoteCutover(unmarked, umEvidence)
+    local umTxn = "ctx:gs:reconcile-unmarked:9440"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local umEvent = officerLedgerEvent(unmarked, umEvidence, umTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = unmarked.datasetId, event = umEvent,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: unmarked staged accepted")
+    assertEq(findByTxn(unmarked, umTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: unmarked has no marker yet")
+    assertEq(campaignTotal(unmarked, 9440), 7, "411 reconcile: staged prep counts unmarked")
+    local stUmMark, rUmMark = providerApply({
+        kind = "gs-ledger-event", datasetId = unmarked.datasetId, event = umEvent,
+        cutoverMarker = umMarker,
+    }, "Eve-Garona")
+    assertEq(stUmMark, "duplicate", "411 reconcile: marked duplicate " .. tostring(rUmMark))
+    assertEq(findByTxn(unmarked, umTxn).gsSourceCutoverMarker, umMarker,
+        "411 reconcile: unmarked repaired to canonical marker")
+    assertEq(findByTxn(unmarked, umTxn).gsProductionCredit, false,
+        "411 reconcile: staged repair is not live credit")
+    assertEq(campaignTotal(unmarked, 9440), 7, "411 reconcile: still one staged credit")
+    assertEq(GS.InstallRemoteLiveCutover(unmarked, umCutover, "club:42", {}),
+        "accepted", "411 reconcile: unmarked path cutover")
+    assertEq(findByTxn(unmarked, umTxn).gsProductionCredit, true,
+        "411 reconcile: unmarked→marked becomes live after cutover")
+    assertEq(campaignTotal(unmarked, 9440), 7, "411 reconcile: unmarked path live total once")
+
+    -- 2) Divergent staged marker → canonical marked → cutover.
+    local divergent = seedStagedCampaignWithItem(9441, 20)
+    local dvEvidence = makeDepositEvidence(divergent, { itemId = 9441, quantity = 5 })
+    local dvCutover, dvMarker = buildRemoteCutover(divergent, dvEvidence)
+    local dvTxn = "ctx:gs:reconcile-divergent:9441"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local dvEvent = officerLedgerEvent(divergent, dvEvidence, dvTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = divergent.datasetId, event = dvEvent,
+        cutoverMarker = dvMarker .. ":other",
+    }, "Dave-Garona")), "officer_history", "411 reconcile: divergent staged accepted")
+    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker .. ":other",
+        "411 reconcile: divergent marker stored")
+    local stDvMark, rDvMark = providerApply({
+        kind = "gs-ledger-event", datasetId = divergent.datasetId, event = dvEvent,
+        cutoverMarker = dvMarker,
+    }, "Eve-Garona")
+    assertEq(stDvMark, "duplicate", "411 reconcile: divergent repaired via duplicate "
+        .. tostring(rDvMark))
+    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker,
+        "411 reconcile: divergent replaced with canonical while staged")
+    assertEq(findByTxn(divergent, dvTxn).gsProductionCredit, false,
+        "411 reconcile: divergent staged repair not live")
+    assertEq(GS.InstallRemoteLiveCutover(divergent, dvCutover, "club:42", {}),
+        "accepted", "411 reconcile: divergent path cutover")
+    assertEq(findByTxn(divergent, dvTxn).gsProductionCredit, true,
+        "411 reconcile: divergent→canonical becomes live after cutover")
+    assertEq(campaignTotal(divergent, 9441), 5, "411 reconcile: divergent path live total once")
+
+    -- 3) Canonical marked row arriving after cutover installation.
+    local after = seedStagedCampaignWithItem(9442, 20)
+    local afEvidence = makeDepositEvidence(after, { itemId = 9442, quantity = 4 })
+    local afCutover, afMarker = buildRemoteCutover(after, afEvidence)
+    local afTxn = "ctx:gs:reconcile-after:9442"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local afEvent = officerLedgerEvent(after, afEvidence, afTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = after.datasetId, event = afEvent,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: after path unmarked first")
+    assertEq(GS.InstallRemoteLiveCutover(after, afCutover, "club:42", {}),
+        "accepted", "411 reconcile: after path cutover before marked")
+    assertEq(findByTxn(after, afTxn).gsProductionCredit, false,
+        "411 reconcile: unmarked stays uncredited after cutover alone")
+    assertEq(campaignTotal(after, 9442), 0, "411 reconcile: no live total before marked repair")
+    local stAfter, rAfter = providerApply({
+        kind = "gs-ledger-event", datasetId = after.datasetId, event = afEvent,
+        cutoverMarker = afMarker,
+    }, "Eve-Garona")
+    assertEq(stAfter, "duplicate", "411 reconcile: post-cutover marked duplicate "
+        .. tostring(rAfter))
+    assertEq(findByTxn(after, afTxn).gsSourceCutoverMarker, afMarker,
+        "411 reconcile: post-cutover attaches canonical marker")
+    assertEq(findByTxn(after, afTxn).gsProductionCredit, true,
+        "411 reconcile: post-cutover marked becomes live credit")
+    assertEq(campaignTotal(after, 9442), 4, "411 reconcile: after path live total once")
+    local stAfterDup = select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = after.datasetId, event = afEvent,
+        cutoverMarker = afMarker,
+    }, "Eve-Garona"))
+    assertEq(stAfterDup, "duplicate", "411 reconcile: post-cutover replay duplicate")
+    assertEq(campaignTotal(after, 9442), 4, "411 reconcile: post-cutover replay no second credit")
+
+    -- 4/5) Same-ID conflict and a distinct occurrence stay separate.
+    local conflict = seedStagedCampaignWithItem(9443, 20)
+    local cfEvidence = makeDepositEvidence(conflict, { itemId = 9443, quantity = 3 })
+    local cfCutover, cfMarker = buildRemoteCutover(conflict, cfEvidence)
+    local cfTxn = "ctx:gs:reconcile-conflict:9443"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local cfEvent = officerLedgerEvent(conflict, cfEvidence, cfTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = conflict.datasetId, event = cfEvent,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: conflict base accepted")
+    local bad = {}
+    for k, v in pairs(cfEvent) do bad[k] = v end
+    bad.quantity = 99
+    local stBad, rBad = providerApply({
+        kind = "gs-ledger-event", datasetId = conflict.datasetId, event = bad,
+        cutoverMarker = cfMarker,
+    }, "Eve-Garona")
+    assertEq(stBad, "rejected", "411 reconcile: conflicting body rejected " .. tostring(rBad))
+    assertEq(rBad, "id_conflict", "411 reconcile: id_conflict preserved")
+    assertEq(findByTxn(conflict, cfTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: conflict does not attach marker")
+    local otherEvidence = makeDepositEvidence(conflict, {
+        itemId = 9443, quantity = 2, donor = "Other-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "other-old" }, neighborsNewer = { "other-new" },
+        observedAt = (world.time or 0) + 12000,
+    })
+    local otherTxn = "ctx:gs:reconcile-other:9443"
+    local otherEvent = officerLedgerEvent(conflict, otherEvidence, otherTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = conflict.datasetId, event = otherEvent,
+        cutoverMarker = cfMarker,
+    }, "Eve-Garona")), "officer_history", "411 reconcile: distinct occurrence kept separate")
+    assertEq(GS.InstallRemoteLiveCutover(conflict, cfCutover, "club:42", {}),
+        "accepted", "411 reconcile: conflict fixture cutover")
+    assertEq(findByTxn(conflict, cfTxn).gsProductionCredit, false,
+        "411 reconcile: conflict base still unmarked after cutover")
+    assertEq(findByTxn(conflict, otherTxn).gsProductionCredit, true,
+        "411 reconcile: distinct marked occurrence credits")
+    assertEq(campaignTotal(conflict, 9443), 2, "411 reconcile: only distinct marked credits")
+
+    -- 6/7) No retroactive staged credit; re-export and offline A→B→C keep one credit.
+    local origin = seedActivatableCampaign(9444, 30)
+    local stagedRoot = snapshotConfigRoot()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "411 reconcile: abc activate")
+    disarmFreshBankSample()
+    origin = GS:GetCurrentRecord()
+    local originMarker = origin.liveCutover.cutoverMarker
+    local originCutover = origin.liveCutover
+    world.time = (tonumber(origin.liveCutover.contextObservedAt) or world.time) + 7200
+    local abcEvidence = makeDepositEvidence(origin, {
+        itemId = 9444, quantity = 6, observedAt = world.time, ageHours = 0,
+    })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    GS:EnsureGossipProvider()
+    assertEq(select(1, GS:_AdmitObservationForTests(abcEvidence, "Player-1-Carol", "Carol-Garona")),
+        "accepted", "411 reconcile: abc carol commits")
+    local aliceBody = exportDonationBody(9444)
+    assertEq(aliceBody and aliceBody.cutoverMarker, originMarker, "411 reconcile: abc export marker")
+
+    local bob = loadClientFromConfigRoot(stagedRoot, "Bob-Garona", "Player-1-Bob", 4)
+    assertEq(bob.activation, GS.ACTIVATION_STAGED, "411 reconcile: bob starts staged")
+    local unmarkedBody = {
+        kind = "gs-ledger-event",
+        datasetId = aliceBody.datasetId,
+        event = {},
+    }
+    for k, v in pairs(aliceBody.event) do
+        unmarkedBody.event[k] = v
+    end
+    assertEq(select(2, applyExportBody(unmarkedBody, "Carol-Garona")),
+        "officer_history", "411 reconcile: bob accepts unmarked first")
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, nil,
+        "411 reconcile: bob unmarked has no marker")
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob staged prep counts unmarked")
+    local stBobMark, rBobMark = applyExportBody(aliceBody, "Carol-Garona")
+    assertEq(stBobMark, "duplicate", "411 reconcile: bob marked repairs " .. tostring(rBobMark))
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, originMarker,
+        "411 reconcile: bob stores canonical marker")
+    assertEq(findDonation(bob, 9444).gsProductionCredit, false,
+        "411 reconcile: bob staged repair is not live credit")
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob still one staged credit")
+    assertEq(GS.InstallRemoteLiveCutover(bob, originCutover, "club:42", {}),
+        "accepted", "411 reconcile: bob installs alice cutover")
+    assertEq(findDonation(bob, 9444).gsProductionCredit, true,
+        "411 reconcile: bob live after cutover")
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob one live credit")
+    local bobBody = exportDonationBody(9444)
+    assertEq(bobBody and bobBody.cutoverMarker, originMarker,
+        "411 reconcile: bob re-exports canonical marker")
+    assertEq(bobBody.event.verification, "officer", "411 reconcile: bob re-exports officer")
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Carol" or m.guid == "Player-1-Alice" then
+            m.online = false
+        end
+    end
+    local dave = loadClientFromConfigRoot(stagedRoot, "Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS.InstallRemoteLiveCutover(dave, originCutover, "club:42", {}),
+        "accepted", "411 reconcile: dave installs cutover")
+    local stDave, rDave = applyExportBody(bobBody, "Bob-Garona")
+    assertEq(stDave, "accepted", "411 reconcile: dave catch-up " .. tostring(rDave))
+    assertEq(rDave, "officer_history", "411 reconcile: dave officer history")
+    assertEq(campaignTotal(dave, 9444), 6, "411 reconcile: dave one credit")
+    assertEq(select(1, applyExportBody(bobBody, "Bob-Garona")), "duplicate",
+        "411 reconcile: dave replay duplicate")
+    assertEq(campaignTotal(dave, 9444), 6, "411 reconcile: dave replay no second credit")
+end
+
 do
     -- Repair: candidate-first A → B → C while A is offline. One credit, then replay.
     ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
