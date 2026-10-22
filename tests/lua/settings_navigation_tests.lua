@@ -607,6 +607,25 @@ assertDeepEq(
     { "guildSuppliesConfiguration", "guildSuppliesLogs" },
     "Raid Supplies keeps Configuration then Logs"
 )
+assertEq(registry.pagesById.lootHelperConsumables, nil,
+    "legacy Loot Helper Consumables page is not registered")
+assertEq(registry.pagesById.lootHelperConsumableLogs, nil,
+    "legacy Loot Helper Consumable Logs page is not registered")
+local showRemovedConsumables = Model.ResolveShowPage(registry, session, "lootHelperConsumables")
+assertTrue(showRemovedConsumables.pageId ~= "lootHelperConsumables",
+    "ShowPage of the removed Consumables id does not select it")
+assertEq(showRemovedConsumables.pageId, session.currentPageId,
+    "unknown legacy Consumables id keeps the current selection")
+local showRemovedLogs = Model.ResolveShowPage(registry, session, "lootHelperConsumableLogs")
+assertTrue(showRemovedLogs.pageId ~= "lootHelperConsumableLogs",
+    "ShowPage of the removed Consumable Logs id does not select it")
+local staleLegacyTab = Model.ResolveSidebarSelect(registry, {
+    currentCategoryId = "lootHelper",
+    currentPageId = "lootHelperConsumables",
+    lastPageByCategory = { lootHelper = "lootHelperConsumables" },
+}, "lootHelper")
+assertEq(staleLegacyTab.pageId, "lootHelperGeneral",
+    "a stale legacy Consumables tab falls back to Loot Helper General")
 assertEq(registry.categoriesById.guildSupplies.id, "guildSupplies", "Raid Supplies keeps category id guildSupplies")
 assertEq(
     Model.GetPageContentHeading(registry.pagesById.guildSuppliesConfiguration),
