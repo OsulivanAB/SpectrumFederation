@@ -56,6 +56,38 @@ local catchup = {
     cache = nil,
 }
 
+-- Ephemeral validation cache keyed by the valuation store table (not SavedVariables).
+-- Declared before the writers so Lua 5.1 closures see the upvalue. Controlled
+-- writes advance an already-ok entry. A new store, a dataset/guild miss, or a
+-- prior failure deep-scans. GS._onValuationDeepValidation is nil in production.
+local valuationStoreRev = setmetatable({}, { __mode = "k" })
+local valuationValidationCache = setmetatable({}, { __mode = "k" })
+
+function GS.ValuationStoreRevision(store)
+    if type(store) ~= "table" then
+        return 0
+    end
+    return valuationStoreRev[store] or 0
+end
+
+local function NoteValuationStoreMutation(store, record)
+    if type(store) ~= "table" then
+        return
+    end
+    local rev = (valuationStoreRev[store] or 0) + 1
+    if rev > 4294967295 then
+        rev = 1
+    end
+    valuationStoreRev[store] = rev
+    local cached = valuationValidationCache[store]
+    local datasetId = type(record) == "table" and record.datasetId or nil
+    if cached and cached.ok and type(datasetId) == "string" and cached.datasetId == datasetId then
+        cached.rev = rev
+    else
+        valuationValidationCache[store] = nil
+    end
+end
+
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
         SF.Debug:Info("GUILD_SUPPLIES", fmt, ...)
@@ -362,6 +394,25 @@ local function PriceableDonation(record, event)
     return true
 end
 
+--- Staged same-dataset credit can still change when the canonical cutover arrives.
+-- A well-formed donation that is not yet live stays unresolved. Once live, a
+-- non-priceable row is definitive and must be dropped.
+local function CreditStillUnresolved(record, event)
+    if GS.IsLiveActive and GS.IsLiveActive(record) then
+        return false
+    end
+    if not IsDonationEvent(event) then
+        return false
+    end
+    if not NormalizeInteger(tonumber(event.quantity), 1, MAX_QTY) then
+        return false
+    end
+    if not NormalizeInteger(tonumber(event.itemId), 1, MAX_EXACT - 1) then
+        return false
+    end
+    return true
+end
+
 local function DonationMatches(assignment, event)
     local qty = NormalizeInteger(tonumber(event.quantity), 1, MAX_QTY)
     local itemId = NormalizeInteger(tonumber(event.itemId), 1, MAX_EXACT - 1)
@@ -500,21 +551,21 @@ local function ApplyIncoming(bucket, key, incoming)
     local fp = Fingerprint(incoming)
     if type(snap) ~= "table" then
         bucket[key] = CopySnap(incoming, key)
-        return "accepted", true, nil
+        return "accepted", true, nil, true
     end
     local winnerFp = Fingerprint(snap)
     if incoming.assignmentId == snap.assignmentId then
         if fp == winnerFp then
-            return "duplicate", false, "duplicate"
+            return "duplicate", false, "duplicate", false
         end
-        return "rejected", false, "id_conflict"
+        return "rejected", false, "id_conflict", false
     end
     local seenRow = SeenHas(snap.seen, incoming.assignmentId)
     if seenRow then
         if seenRow.fp == fp then
-            return "duplicate", false, "duplicate"
+            return "duplicate", false, "duplicate", false
         end
-        return "rejected", false, "id_conflict"
+        return "rejected", false, "id_conflict", false
     end
     local earlier = incoming.assignedAt < snap.assignedAt
         or (incoming.assignedAt == snap.assignedAt and incoming.assignmentId < snap.assignmentId)
@@ -525,15 +576,16 @@ local function ApplyIncoming(bucket, key, incoming)
         replacement.seen = type(seen) == "table" and seen or {}
         RememberLoser(replacement, oldId, winnerFp)
         bucket[key] = replacement
-        return "accepted", true, "earlier_assignment"
+        return "accepted", true, "earlier_assignment", true
     end
     if type(snap.seen) ~= "table" then
         snap.seen = {}
     end
     if #snap.seen < MAX_SEEN then
         snap.seen[#snap.seen + 1] = { id = incoming.assignmentId, fp = fp }
+        return "duplicate", false, "later_assignment", true
     end
-    return "duplicate", false, "later_assignment"
+    return "duplicate", false, "later_assignment", false
 end
 
 local function LookupSnap(record, txnId)
@@ -722,16 +774,40 @@ function GS.ValidateValuationStore(store, record, guildKey)
     if store.pending ~= nil and type(store.pending) ~= "table" then
         return false, "invalid_valuations"
     end
+    local rev = valuationStoreRev[store] or 0
+    local cached = valuationValidationCache[store]
+    if cached and cached.rev == rev and cached.datasetId == record.datasetId
+        and cached.guildKey == guildKey then
+        if cached.ok then
+            return true
+        end
+        return false, cached.err or "invalid_valuations"
+    end
+    if type(GS._onValuationDeepValidation) == "function" then
+        GS._onValuationDeepValidation(store)
+    end
     local maxEvents = (GS.MAX_LEDGER_EVENTS or 4096) + (GS.MAX_ARCHIVED_EVENTS or 4096)
     if CountKeys(store.byTxn) > maxEvents or CountKeys(store.pending) > MAX_PENDING then
+        valuationValidationCache[store] = {
+            rev = rev, ok = false, err = "invalid_valuations",
+            datasetId = record.datasetId, guildKey = guildKey,
+        }
         return false, "invalid_valuations"
     end
     if type(store.byTxn) == "table" then
         for key, snap in pairs(store.byTxn) do
             if not ValidTxnId(key) or not ValidateSnapFields(snap, key, false) then
+                valuationValidationCache[store] = {
+                    rev = rev, ok = false, err = "invalid_valuations",
+                    datasetId = record.datasetId, guildKey = guildKey,
+                }
                 return false, "invalid_valuations"
             end
             if snap.datasetId ~= record.datasetId or snap.guildKey ~= guildKey then
+                valuationValidationCache[store] = {
+                    rev = rev, ok = false, err = "invalid_valuations",
+                    datasetId = record.datasetId, guildKey = guildKey,
+                }
                 return false, "invalid_valuations"
             end
         end
@@ -739,26 +815,46 @@ function GS.ValidateValuationStore(store, record, guildKey)
     if type(store.pending) == "table" then
         for key, snap in pairs(store.pending) do
             if not ValidTxnId(key) or not ValidateSnapFields(snap, key, true) then
+                valuationValidationCache[store] = {
+                    rev = rev, ok = false, err = "invalid_valuations",
+                    datasetId = record.datasetId, guildKey = guildKey,
+                }
                 return false, "invalid_valuations"
             end
             if snap.datasetId ~= record.datasetId or snap.guildKey ~= guildKey then
+                valuationValidationCache[store] = {
+                    rev = rev, ok = false, err = "invalid_valuations",
+                    datasetId = record.datasetId, guildKey = guildKey,
+                }
                 return false, "invalid_valuations"
             end
         end
     end
+    valuationValidationCache[store] = {
+        rev = rev, ok = true, datasetId = record.datasetId, guildKey = guildKey,
+    }
     return true
 end
 
 local function DropKeys(bucket, ids)
+    local removed = false
     if type(bucket) ~= "table" then
-        return
+        return false
     end
     for key in pairs(ids) do
-        bucket[key] = nil
+        if bucket[key] ~= nil then
+            bucket[key] = nil
+            removed = true
+        end
     end
+    return removed
 end
 
-local function RemoveValuationExports(ids)
+local function RemoveValuationExports(record, ids)
+    -- Temporary adoption records must not edit the active dataset's exports.
+    if not ShouldPublish(record) then
+        return
+    end
     if not GS.RemoveGossipExportBodies then
         return
     end
@@ -797,6 +893,7 @@ function GS.ForgetDonationValuations(record, txnIds)
             end
         end
     end
+    local removedAny = false
     local function consider(bucket)
         if type(bucket) ~= "table" then
             return
@@ -813,10 +910,16 @@ function GS.ForgetDonationValuations(record, txnIds)
         for i = 1, #remove do
             bucket[remove[i]] = nil
         end
+        if #remove > 0 then
+            removedAny = true
+        end
     end
     consider(store.byTxn)
     consider(store.pending)
-    RemoveValuationExports(drop)
+    if removedAny then
+        NoteValuationStoreMutation(store, record)
+    end
+    RemoveValuationExports(record, drop)
 end
 
 local function MergeOntoCanonical(record, canonical, incoming, changed)
@@ -829,7 +932,10 @@ local function MergeOntoCanonical(record, canonical, incoming, changed)
         return changed
     end
     local store = EnsureStore(record)
-    local _, did = ApplyIncoming(store.byTxn, canonical, incoming)
+    local _, did, _, wrote = ApplyIncoming(store.byTxn, canonical, incoming)
+    if wrote then
+        NoteValuationStoreMutation(store, record)
+    end
     return changed or did == true
 end
 
@@ -847,31 +953,70 @@ function GS.ReconcilePendingValuations(record, txnId)
     end
     local event = FindEventForIds(record, ids)
     if event and not PriceableDonation(record, event) then
-        DropKeys(store.pending, ids)
+        if CreditStillUnresolved(record, event) then
+            return false
+        end
+        if DropKeys(store.pending, ids) then
+            NoteValuationStoreMutation(store, record)
+        end
         return false
     end
     if not event then
         return false
     end
     local changed = false
+    local removed = false
     for key in pairs(ids) do
         local fromWinner = nil
         if key ~= canonical and type(store.byTxn) == "table" then
             fromWinner = store.byTxn[key]
-            store.byTxn[key] = nil
+            if fromWinner ~= nil then
+                store.byTxn[key] = nil
+                removed = true
+            end
         end
         local fromPending = type(store.pending) == "table" and store.pending[key] or nil
-        if type(store.pending) == "table" then
+        if fromPending ~= nil and type(store.pending) == "table" then
             store.pending[key] = nil
+            removed = true
         end
         changed = MergeOntoCanonical(record, canonical, fromWinner, changed)
         changed = MergeOntoCanonical(record, canonical, fromPending, changed)
+    end
+    if removed then
+        NoteValuationStoreMutation(store, record)
     end
     if changed and ShouldPublish(record) then
         PublishWinner(record, canonical)
         DebugInfo("valuation reconciled txn=%s", tostring(canonical))
     end
     return changed
+end
+
+--- After a cutover classifies retained rows, fold still-pending assignments.
+-- One bounded pass. Priceable rows merge with earliest-wins. Rows that are
+-- now definitively unpriceable are discarded. Not a timer.
+function GS.ReconcileValuationsAfterCreditChange(record)
+    if type(record) ~= "table" then
+        return
+    end
+    local store = record.valuations
+    local pending = type(store) == "table" and store.pending or nil
+    if type(pending) ~= "table" then
+        return
+    end
+    local keys = {}
+    for key in pairs(pending) do
+        if #keys >= MAX_PENDING then
+            break
+        end
+        keys[#keys + 1] = key
+    end
+    for i = 1, #keys do
+        if type(store.pending) == "table" and store.pending[keys[i]] ~= nil then
+            GS.ReconcilePendingValuations(record, keys[i])
+        end
+    end
 end
 
 function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
@@ -900,18 +1045,29 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     push(store.byTxn, alias)
     push(store.pending, canonical)
     push(store.pending, alias)
-    if type(store.byTxn) == "table" then
+    local removed = false
+    if type(store.byTxn) == "table" and store.byTxn[alias] ~= nil then
         store.byTxn[alias] = nil
+        removed = true
     end
     if type(store.pending) == "table" then
-        store.pending[alias] = nil
-        store.pending[canonical] = nil
+        if store.pending[alias] ~= nil then
+            store.pending[alias] = nil
+            removed = true
+        end
+        if store.pending[canonical] ~= nil then
+            store.pending[canonical] = nil
+            removed = true
+        end
+    end
+    if removed then
+        NoteValuationStoreMutation(store, record)
     end
     local changed = false
     for i = 1, #candidates do
         changed = MergeOntoCanonical(record, canonical, candidates[i], changed)
     end
-    RemoveValuationExports({ [alias] = true })
+    RemoveValuationExports(record, { [alias] = true })
     if changed and ShouldPublish(record) then
         PublishWinner(record, canonical)
         DebugInfo("valuation alias txn=%s alias=%s", tostring(canonical), tostring(alias))
@@ -965,29 +1121,54 @@ function GS:AdmitValuationAssignment(body, opts)
         return "rejected", "invalid_txn"
     end
     local event = FindEventForIds(record, ids)
+    local holdForCredit = false
     if event and not PriceableDonation(record, event) then
-        return "rejected", "not_priceable"
+        if not DonationMatches(assignment, event) then
+            return "rejected", "inconsistent_donation"
+        end
+        if not CreditStillUnresolved(record, event) then
+            return "rejected", "not_priceable"
+        end
+        -- Same-dataset staged cutover can still classify this donation. Keep the
+        -- authorized assignment pending. Do not publish or export it yet.
+        holdForCredit = true
     end
-    if event and not DonationMatches(assignment, event) then
+    if event and not holdForCredit and not DonationMatches(assignment, event) then
         return "rejected", "inconsistent_donation"
     end
     local store = EnsureStore(record)
-    if not event then
+    if not event or holdForCredit then
         local pendingCount = CountKeys(store.pending)
         local existing = store.pending[assignment.txnId]
         if not existing and pendingCount >= MAX_PENDING then
             return "rejected", "full"
         end
-        local status, _, detail = ApplyIncoming(store.pending, assignment.txnId, assignment)
+        local status, _, detail, wrote = ApplyIncoming(store.pending, assignment.txnId, assignment)
+        if wrote then
+            NoteValuationStoreMutation(store, record)
+        end
         if status == "rejected" then
             return "rejected", detail or "id_conflict"
         end
+        if holdForCredit then
+            return "pending", "awaiting_credit"
+        end
         return "pending", "awaiting_donation"
     end
-    local status, changed, detail = ApplyIncoming(store.byTxn, canonical, assignment)
+    local status, changed, detail, wrote = ApplyIncoming(store.byTxn, canonical, assignment)
+    local clearedPending = false
     if type(store.pending) == "table" then
-        store.pending[assignment.txnId] = nil
-        store.pending[canonical] = nil
+        if store.pending[assignment.txnId] ~= nil then
+            store.pending[assignment.txnId] = nil
+            clearedPending = true
+        end
+        if store.pending[canonical] ~= nil then
+            store.pending[canonical] = nil
+            clearedPending = true
+        end
+    end
+    if wrote or clearedPending then
+        NoteValuationStoreMutation(store, record)
     end
     if status == "rejected" then
         return "rejected", detail or "id_conflict"
@@ -1066,6 +1247,9 @@ local function QueryMarket(item)
     end
     local ok, value = pcall(TSM.GetMarketValue, item)
     if not ok then
+        if SF.Debug and SF.Debug.Error then
+            SF.Debug:Error("GUILD_SUPPLIES", "TSM market value failed: %s", tostring(value))
+        end
         return nil
     end
     -- Qty 1 is the widest legal unit. MintWithCopper rejects a total that the

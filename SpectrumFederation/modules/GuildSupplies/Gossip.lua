@@ -1625,6 +1625,61 @@ local function TakeValuationManifest(byTxn)
     return count
 end
 
+local function StampValuationManifest(record)
+    local store = type(record) == "table" and record.valuations or nil
+    exportState.valuationManifestStore = store
+    exportState.valuationManifestDataset = type(record) == "table" and record.datasetId or nil
+    local rev = 0
+    if type(store) == "table" and GS.ValuationStoreRevision then
+        rev = GS.ValuationStoreRevision(store)
+    end
+    exportState.valuationManifestRev = rev
+end
+
+local function ValuationManifestIsCurrent(record)
+    if type(exportState.valuationManifest) ~= "table" or type(record) ~= "table" then
+        return false
+    end
+    if exportState.valuationManifestDataset ~= record.datasetId then
+        return false
+    end
+    local store = record.valuations
+    if exportState.valuationManifestStore ~= store then
+        return false
+    end
+    local rev = 0
+    if type(store) == "table" and GS.ValuationStoreRevision then
+        rev = GS.ValuationStoreRevision(store)
+    end
+    return exportState.valuationManifestRev == rev
+end
+
+--- Full winner-map rebuild only when the tracked manifest is stale.
+-- GS._onValuationManifestRebuild is nil in production; tests count real rebuilds.
+local function ResolveValuationExportCount(record)
+    if ValuationManifestIsCurrent(record) then
+        return tonumber(exportState.cachedValuationCount) or 0
+    end
+    local byTxn = record and record.valuations and record.valuations.byTxn
+    local count = TakeValuationManifest(byTxn)
+    StampValuationManifest(record)
+    if type(GS._onValuationManifestRebuild) == "function" then
+        GS._onValuationManifestRebuild(record)
+    end
+    return count
+end
+
+local function StampCurrentValuationManifest()
+    if type(exportState.valuationManifest) ~= "table" then
+        return
+    end
+    local record = select(1, CurrentGuildRecord())
+    if type(record) ~= "table" or record.datasetId ~= exportState.datasetId then
+        return
+    end
+    StampValuationManifest(record)
+end
+
 --- Patch the already-exported dataset descriptor. O(1); does not rebuild.
 local function PublishValuationManifest()
     local count = tonumber(exportState.cachedValuationCount) or 0
@@ -1659,11 +1714,13 @@ local function NoteValuationManifestId(txnId)
         exportState.valuationManifest = manifest
     end
     if manifest[txnId] then
+        StampCurrentValuationManifest()
         return
     end
     manifest[txnId] = true
     exportState.cachedValuationCount = (tonumber(exportState.cachedValuationCount) or 0) + 1
     PublishValuationManifest()
+    StampCurrentValuationManifest()
 end
 
 local function DropValuationManifestId(txnId)
@@ -1678,6 +1735,7 @@ local function DropValuationManifestId(txnId)
         count = 0
     end
     exportState.cachedValuationCount = count
+    StampCurrentValuationManifest()
     return true
 end
 
@@ -1862,8 +1920,7 @@ local function RebuildExportIndex()
     exportState.ledgerArchiveWarmPos = 0
     exportState.donationEvidenceBuildNeeded = donationEvidenceExportCount > 0
     exportState.donationEvidenceBuildCursor = nil
-    local valuationExportCount = TakeValuationManifest(
-        record.valuations and record.valuations.byTxn)
+    local valuationExportCount = ResolveValuationExportCount(record)
     exportState.valuationBuildNeeded = valuationExportCount > 0
     exportState.valuationBuildCursor = nil
 
@@ -4087,8 +4144,7 @@ function GS.NotifyLocalDurableChange(reason)
         exportState.cachedCampaignCount = campaignCount
         exportState.cachedArchiveCount = archiveCount
         exportState.cachedAcceptedLedgerCount = acceptedLedgerCount
-        local valuationCount = TakeValuationManifest(
-            record.valuations and record.valuations.byTxn)
+        local valuationCount = ResolveValuationExportCount(record)
         exportState.cachedDonationEvidenceCount = donationEvidenceCount
         exportState.countsDirty = false
         local desc = {
