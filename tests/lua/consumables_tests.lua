@@ -4750,13 +4750,100 @@ local function checkClassColoredDisplayNames()
     SF.NameUtil.SamePlayer = priorSame
 end
 
-local function checkConsumableLogsHiddenParentRefresh()
-    -- Issue #348 follow-up: GUILD_ROSTER_UPDATE must not refresh history while the
-    -- standalone settings parent is hidden (panel IsShown, not IsVisible).
+local function readFile(path)
+    local handle = io.open(path, "r")
+    if not handle then
+        return nil
+    end
+    local text = handle:read("*a")
+    handle:close()
+    return text
+end
+
+local function checkLegacyConsumablesSettingsPagesRemoved()
+    -- #415: the two legacy Loot Helper settings pages are not loaded. Raid
+    -- Supplies Configuration and Logs still register. Writer modules stay.
+    local toc = readFile("SpectrumFederation/SpectrumFederation.toc")
+    assertTrue(type(toc) == "string", "parent TOC is readable")
+    assertFalse(toc:find("modules/UI/Settings/Pages/Consumables.lua", 1, true) ~= nil,
+        "TOC does not load the legacy Consumables settings page")
+    assertFalse(toc:find("modules/UI/Settings/Pages/RaidConsumableLogs.lua", 1, true) ~= nil,
+        "TOC does not load the legacy Consumable Logs settings page")
+    assertTrue(toc:find("modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", 1, true) ~= nil,
+        "TOC still loads Raid Supplies Configuration")
+    assertTrue(toc:find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua", 1, true) ~= nil,
+        "TOC still loads Raid Supplies Logs")
+    assertTrue(toc:find("modules/LootHelper/Consumables.lua", 1, true) ~= nil,
+        "TOC still loads the Consumables backend")
+    assertTrue(readFile("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua") == nil,
+        "legacy Consumables settings page file is removed")
+    assertTrue(readFile("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua") == nil,
+        "legacy Consumable Logs settings page file is removed")
+
+    SF.SettingsUI = {
+        pagesById = {},
+        pages = {},
+        categoriesById = {},
+        categories = {},
+        DefinitionRenderer = { Build = function() end, Refresh = function() end },
+    }
+    function SF.SettingsUI:RegisterCategory(category)
+        self.categoriesById[category.id] = category
+        self.categories[#self.categories + 1] = category
+    end
+    function SF.SettingsUI:RegisterPage(page)
+        self.pagesById[page.id] = page
+        self.pages[#self.pages + 1] = page
+    end
+    if not SF.SettingsNavigationModel then
+        load("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
+    end
+    load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+
+    local ui = SF.SettingsUI
+    local Nav = SF.SettingsNavigationModel
+    assertTrue(ui.pagesById.guildSuppliesConfiguration ~= nil,
+        "Raid Supplies Configuration registers")
+    assertTrue(ui.pagesById.guildSuppliesLogs ~= nil,
+        "Raid Supplies Logs registers")
+    assertTrue(ui.pagesById.lootHelperConsumables == nil,
+        "legacy Consumables page does not register")
+    assertTrue(ui.pagesById.lootHelperConsumableLogs == nil,
+        "legacy Consumable Logs page does not register")
+    assertEq(Nav.IsPageAvailable(ui.pagesById.guildSuppliesConfiguration), true,
+        "Raid Supplies Configuration stays available")
+    assertEq(Nav.IsPageAvailable(ui.pagesById.guildSuppliesLogs), true,
+        "Raid Supplies Logs stays available")
+    assertEq(Nav.IsContentPage(ui, "lootHelperConsumables"), false,
+        "legacy Consumables id is not a content page")
+    assertEq(Nav.IsContentPage(ui, "lootHelperConsumableLogs"), false,
+        "legacy Consumable Logs id is not a content page")
+    local ids = Nav.GetContentPageIds(ui, "guildSupplies")
+    assertEq(#ids, 2, "Raid Supplies registers exactly two content pages")
+    assertEq(ids[1], "guildSuppliesConfiguration",
+        "Configuration remains the first Raid Supplies page")
+    assertEq(ids[2], "guildSuppliesLogs",
+        "Logs remains the second Raid Supplies page")
+    local showRemoved = Nav.ResolveShowPage(ui, {
+        currentCategoryId = "lootHelper",
+        currentPageId = "lootHelperGeneral",
+    }, "lootHelperConsumables")
+    assertTrue(showRemoved.pageId ~= "lootHelperConsumables",
+        "ShowPage of the removed Consumables id does not select it")
+    assertEq(showRemoved.pageId, "lootHelperGeneral",
+        "unknown legacy Consumables id keeps the current selection")
+end
+
+local function checkGuildSuppliesLogsHiddenParentRefresh()
+    -- Roster refresh stays on Raid Supplies Logs. A hidden standalone settings
+    -- parent (panel IsShown, not IsVisible) must not refresh history.
     local refreshCount = 0
     SF.SettingsUI = {
         pagesById = {},
         pages = {},
+        categoriesById = {},
+        categories = {},
         DefinitionRenderer = {
             Build = function() end,
             Refresh = function()
@@ -4764,15 +4851,19 @@ local function checkConsumableLogsHiddenParentRefresh()
             end,
         },
     }
+    function SF.SettingsUI:RegisterCategory(category)
+        self.categoriesById[category.id] = category
+        self.categories[#self.categories + 1] = category
+    end
     function SF.SettingsUI:RegisterPage(page)
         self.pagesById[page.id] = page
         self.pages[#self.pages + 1] = page
     end
 
     local framesBefore = #createdFrames
-    load("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
-    local page = SF.SettingsUI.pagesById.lootHelperConsumableLogs
-    assertTrue(page ~= nil, "Consumable Logs page registers with SettingsUI")
+    load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    local page = SF.SettingsUI.pagesById.guildSuppliesLogs
+    assertTrue(page ~= nil, "Raid Supplies Logs page registers with SettingsUI")
 
     local rosterFrame
     for i = framesBefore + 1, #createdFrames do
@@ -4782,20 +4873,20 @@ local function checkConsumableLogsHiddenParentRefresh()
             break
         end
     end
-    assertTrue(rosterFrame ~= nil, "Consumable Logs installs a single GUILD_ROSTER_UPDATE listener")
+    assertTrue(rosterFrame ~= nil, "Raid Supplies Logs installs a single GUILD_ROSTER_UPDATE listener")
 
     local panel = FrameMock("Frame")
     panel.shown = true
     panel.visible = false
     page:Build(panel)
     assertEq(Page and true or true, true, "page build keeps a panel reference")
-    assertTrue(page.panel == panel, "Build stores the Consumable Logs panel")
+    assertTrue(page.panel == panel, "Build stores the Raid Supplies Logs panel")
 
     refreshCount = 0
     world.after = {}
     rosterFrame.scripts.OnEvent(rosterFrame, "GUILD_ROSTER_UPDATE")
     assertEq(#world.after, 0, "hidden parent does not queue a roster-driven refresh")
-    assertEq(refreshCount, 0, "hidden parent does not refresh Consumable Logs history")
+    assertEq(refreshCount, 0, "hidden parent does not refresh Raid Supplies Logs history")
 
     -- Queue while visible, then hide before the delayed callback runs.
     panel.visible = true
@@ -4815,7 +4906,9 @@ local function checkConsumableLogsHiddenParentRefresh()
     for i = 1, #onShowHooks do
         onShowHooks[i](panel)
     end
-    assertTrue(refreshCount >= 1, "OnShow refreshes Consumable Logs when the page becomes visible")
+    assertEq(#world.after, 1, "OnShow queues one refresh while Raid Supplies Logs is visible")
+    drainAfter()
+    assertTrue(refreshCount >= 1, "OnShow refreshes Raid Supplies Logs when the page stays visible")
 
     -- A second Build must not accumulate another guild-roster listener.
     local rosterListeners = 0
@@ -4848,7 +4941,8 @@ checkAuthorizeAndConfigSync()
 checkRemoteEvents()
 checkManualAdjustments()
 checkClassColoredDisplayNames()
-checkConsumableLogsHiddenParentRefresh()
+checkLegacyConsumablesSettingsPagesRemoved()
+checkGuildSuppliesLogsHiddenParentRefresh()
 checkCatchUpRules()
 checkSessionTransport()
 checkPeerHistoryRecoveryServePath()
