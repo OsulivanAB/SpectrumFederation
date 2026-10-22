@@ -1385,11 +1385,39 @@ local function FindLedgerEventByTxnId(record, txnId)
     return nil
 end
 
+--- Complete officer-history shape for catch-up / duplicate provenance repair.
+-- Same rule as OfficerHistoryWriter: explicit verifierGuid == writer.
+local function IsCompleteOfficerHistoryEvent(event)
+    if type(event) ~= "table" or event.verification ~= GS.VERIFICATION.OFFICER then
+        return false
+    end
+    local writer = ValidGuid(event.writer)
+    local verifier = ValidGuid(event.verifierGuid)
+    return writer and verifier and verifier == writer and true or false
+end
+
+--- Collapse retained staged marker candidates onto the established canonical marker.
+local function CollapseDonationCutoverMarkers(existing, canonical)
+    if type(existing) ~= "table" or type(canonical) ~= "string" or canonical == "" then
+        return false
+    end
+    local changed = false
+    if existing.gsSourceCutoverMarker ~= canonical then
+        existing.gsSourceCutoverMarker = canonical
+        changed = true
+    end
+    if existing.gsAltSourceCutoverMarker ~= nil then
+        existing.gsAltSourceCutoverMarker = nil
+        changed = true
+    end
+    return changed
+end
+
 --- Attach authenticated cutover provenance to an already-retained immutable
--- donation without a second credit. Staged peers may repair missing or
--- provisional divergent markers from a later marked export; live peers only
--- accept the installed canonical marker and may then classify production credit.
--- Never trusts self-declared event.gsProductionCredit / event.gsSourceCutoverMarker.
+-- donation without a second credit. Staged peers retain up to two competing
+-- authenticated markers without last-writer-wins; the installed cutover later
+-- selects the canonical one. Live peers only accept that installed marker and
+-- may then classify production credit. Never trusts self-declared credit flags.
 local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx)
     if type(existing) ~= "table" or type(admissionCtx) ~= "table" then
         return false
@@ -1408,23 +1436,11 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             return false
         end
     end
-    local prior = existing.gsSourceCutoverMarker
-    if type(prior) == "string" and prior ~= "" and prior ~= marker then
-        -- Divergent prior: replace only with the established live canonical
-        -- marker, or provisionally while still staged (no production credit).
-        if live then
-            if marker ~= liveMarker then
-                return false
-            end
-        end
-        -- staged: allow authenticated provisional marker repair below
-    end
     local changed = false
-    if prior ~= marker then
-        existing.gsSourceCutoverMarker = marker
-        changed = true
-    end
-    if live and existing.gsSourceCutoverMarker == liveMarker then
+    if live then
+        if CollapseDonationCutoverMarkers(existing, liveMarker) then
+            changed = true
+        end
         local approx = tonumber(existing.approxTxnTime) or tonumber(existing.timestamp)
         local afterOk = true
         if GS.IsEvidenceAfterLiveCutover then
@@ -1437,10 +1453,26 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             existing.gsProductionCredit = credit
             changed = true
         end
-    elseif not live and existing.gsProductionCredit == true then
-        -- Staged repair must never mint live credit.
-        existing.gsProductionCredit = false
-        changed = true
+    else
+        -- Staged: never mint live credit. Missing primary attaches; a different
+        -- authenticated marker is retained as one bounded alternate so M→D and
+        -- D→M both survive until the established cutover chooses.
+        if existing.gsProductionCredit == true then
+            existing.gsProductionCredit = false
+            changed = true
+        end
+        local prior = existing.gsSourceCutoverMarker
+        if type(prior) ~= "string" or prior == "" then
+            existing.gsSourceCutoverMarker = marker
+            changed = true
+        elseif prior ~= marker then
+            local alt = existing.gsAltSourceCutoverMarker
+            if type(alt) ~= "string" or alt == "" then
+                existing.gsAltSourceCutoverMarker = marker
+                changed = true
+            end
+            -- A third distinct marker is ignored while staged (bounded).
+        end
     end
     if changed then
         BumpAccountingMutation(record)
@@ -1452,12 +1484,16 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
 end
 
 --- Same-occurrence verified donation duplicate: repair cutover provenance when a
--- later authenticated marked export arrives. Never appends a second credit.
-local function ReconcileVerifiedDonationDuplicate(record, existing, candidate, admissionCtx)
-    if type(existing) ~= "table" or type(candidate) ~= "table" then
+-- later complete officer-history marked export arrives. Never appends a second
+-- credit. Witness-only or incomplete officer claims cannot attach markers.
+local function ReconcileVerifiedDonationDuplicate(record, existing, candidate, admissionCtx, event)
+    if type(existing) ~= "table" or type(candidate) ~= "table" or type(event) ~= "table" then
         return false
     end
     if DonationBodiesConflict(existing, candidate) then
+        return false
+    end
+    if not IsCompleteOfficerHistoryEvent(event) then
         return false
     end
     return ReconcileDonationCutoverProvenance(record, existing, admissionCtx)
@@ -2683,15 +2719,10 @@ end
 -- verifierGuid must be present and equal the writer. Absent provenance is not
 -- synthesized from writer during catch-up or adoption.
 local function OfficerHistoryWriter(event)
-    if type(event) ~= "table" or event.verification ~= GS.VERIFICATION.OFFICER then
+    if not IsCompleteOfficerHistoryEvent(event) then
         return nil
     end
-    local writer = ValidGuid(event.writer)
-    local verifier = ValidGuid(event.verifierGuid)
-    if not writer or not verifier or verifier ~= writer then
-        return nil
-    end
-    return writer, verifier
+    return ValidGuid(event.writer), ValidGuid(event.verifierGuid)
 end
 
 --- Drop the pending cluster and unverified candidates for one accepted occurrence.
@@ -3033,7 +3064,8 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 end
                 local led = FindLedgerEventByTxnId(record, txnId)
                 if led then
-                    ReconcileVerifiedDonationDuplicate(record, led, candidate, admissionCtx)
+                    ReconcileVerifiedDonationDuplicate(
+                        record, led, candidate, admissionCtx, event)
                 end
                 return "duplicate", "duplicate"
             elseif relation == "distinct" then
@@ -3054,7 +3086,8 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 local primaryId = ValidTxnId(existingReg.aliasOf) or txnId
                 local led = FindLedgerEventByTxnId(record, primaryId)
                 if led then
-                    ReconcileVerifiedDonationDuplicate(record, led, candidate, admissionCtx)
+                    ReconcileVerifiedDonationDuplicate(
+                        record, led, candidate, admissionCtx, event)
                 end
                 return "duplicate", "duplicate"
             elseif relation == "distinct" then
@@ -3114,7 +3147,8 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                     AddTxnAlias(cfg, regHit.txnId, txnId)
                     local led = FindLedgerEventByTxnId(record, regHit.txnId)
                     if led then
-                        ReconcileVerifiedDonationDuplicate(record, led, candidate, admissionCtx)
+                        ReconcileVerifiedDonationDuplicate(
+                            record, led, candidate, admissionCtx, event)
                     end
                     return "duplicate", "occurrence_duplicate"
                 end
@@ -3125,7 +3159,8 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             end
             if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
                 AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId)
-                ReconcileVerifiedDonationDuplicate(record, ledHit, candidate, admissionCtx)
+                ReconcileVerifiedDonationDuplicate(
+                    record, ledHit, candidate, admissionCtx, event)
                 return "duplicate", "occurrence_duplicate"
             end
             if ledHit and (ledHit.txnId or ledHit.id) == txnId then
@@ -3145,7 +3180,8 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                         QuarantineConflictBody(cfg, txnId, candidate)
                         return "rejected", "id_conflict"
                     end
-                    ReconcileVerifiedDonationDuplicate(record, ledHit, candidate, admissionCtx)
+                    ReconcileVerifiedDonationDuplicate(
+                        record, ledHit, candidate, admissionCtx, event)
                     return "duplicate", "duplicate"
                 elseif relation == "distinct" then
                     local reminted = AllocateCollisionRemintTxnId(

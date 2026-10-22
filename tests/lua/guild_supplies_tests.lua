@@ -28415,7 +28415,7 @@ do
         "411 reconcile: unmarked→marked becomes live after cutover")
     assertEq(campaignTotal(unmarked, 9440), 7, "411 reconcile: unmarked path live total once")
 
-    -- 2) Divergent staged marker → canonical marked → cutover.
+    -- 2) Divergent staged marker → canonical marked → cutover (D → M).
     local divergent = seedStagedCampaignWithItem(9441, 20)
     local dvEvidence = makeDepositEvidence(divergent, { itemId = 9441, quantity = 5 })
     local dvCutover, dvMarker = buildRemoteCutover(divergent, dvEvidence)
@@ -28430,22 +28430,64 @@ do
         cutoverMarker = dvMarker .. ":other",
     }, "Dave-Garona")), "officer_history", "411 reconcile: divergent staged accepted")
     assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker .. ":other",
-        "411 reconcile: divergent marker stored")
+        "411 reconcile: divergent marker stored as primary")
     local stDvMark, rDvMark = providerApply({
         kind = "gs-ledger-event", datasetId = divergent.datasetId, event = dvEvent,
         cutoverMarker = dvMarker,
     }, "Eve-Garona")
-    assertEq(stDvMark, "duplicate", "411 reconcile: divergent repaired via duplicate "
+    assertEq(stDvMark, "duplicate", "411 reconcile: divergent retains canonical as alternate "
         .. tostring(rDvMark))
-    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker,
-        "411 reconcile: divergent replaced with canonical while staged")
+    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker .. ":other",
+        "411 reconcile: D→M keeps divergent primary (no last-writer-wins)")
+    assertEq(findByTxn(divergent, dvTxn).gsAltSourceCutoverMarker, dvMarker,
+        "411 reconcile: D→M retains canonical as alternate")
     assertEq(findByTxn(divergent, dvTxn).gsProductionCredit, false,
         "411 reconcile: divergent staged repair not live")
     assertEq(GS.InstallRemoteLiveCutover(divergent, dvCutover, "club:42", {}),
         "accepted", "411 reconcile: divergent path cutover")
+    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker,
+        "411 reconcile: cutover collapses alternate to canonical")
+    assertEq(findByTxn(divergent, dvTxn).gsAltSourceCutoverMarker, nil,
+        "411 reconcile: alternate cleared after cutover")
     assertEq(findByTxn(divergent, dvTxn).gsProductionCredit, true,
         "411 reconcile: divergent→canonical becomes live after cutover")
     assertEq(campaignTotal(divergent, 9441), 5, "411 reconcile: divergent path live total once")
+
+    -- 2b) Canonical → divergent while staged must not lose credit (M → D).
+    local md = seedStagedCampaignWithItem(9445, 20)
+    local mdEvidence = makeDepositEvidence(md, { itemId = 9445, quantity = 8 })
+    local mdCutover, mdMarker = buildRemoteCutover(md, mdEvidence)
+    local mdTxn = "ctx:gs:reconcile-md:9445"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local mdEvent = officerLedgerEvent(md, mdEvidence, mdTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = md.datasetId, event = mdEvent,
+        cutoverMarker = mdMarker,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: M→D canonical first")
+    assertEq(findByTxn(md, mdTxn).gsSourceCutoverMarker, mdMarker,
+        "411 reconcile: M→D primary is canonical")
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = md.datasetId, event = mdEvent,
+        cutoverMarker = mdMarker .. ":other",
+    }, "Eve-Garona")), "duplicate", "411 reconcile: M→D divergent duplicate")
+    assertEq(findByTxn(md, mdTxn).gsSourceCutoverMarker, mdMarker,
+        "411 reconcile: M→D keeps canonical primary")
+    assertEq(findByTxn(md, mdTxn).gsAltSourceCutoverMarker, mdMarker .. ":other",
+        "411 reconcile: M→D retains divergent as alternate")
+    assertEq(findByTxn(md, mdTxn).gsProductionCredit, false,
+        "411 reconcile: M→D staged not live")
+    assertEq(GS.InstallRemoteLiveCutover(md, mdCutover, "club:42", {}),
+        "accepted", "411 reconcile: M→D cutover")
+    assertEq(findByTxn(md, mdTxn).gsSourceCutoverMarker, mdMarker,
+        "411 reconcile: M→D still canonical after cutover")
+    assertEq(findByTxn(md, mdTxn).gsAltSourceCutoverMarker, nil,
+        "411 reconcile: M→D alternate cleared")
+    assertEq(findByTxn(md, mdTxn).gsProductionCredit, true,
+        "411 reconcile: M→D live credit once")
+    assertEq(campaignTotal(md, 9445), 8, "411 reconcile: M→D live total once")
 
     -- 3) Canonical marked row arriving after cutover installation.
     local after = seedStagedCampaignWithItem(9442, 20)
@@ -28482,6 +28524,58 @@ do
     }, "Eve-Garona"))
     assertEq(stAfterDup, "duplicate", "411 reconcile: post-cutover replay duplicate")
     assertEq(campaignTotal(after, 9442), 4, "411 reconcile: post-cutover replay no second credit")
+
+    -- 3b) Witness-only / incomplete officer marked duplicates cannot attach provenance.
+    local shape = seedStagedCampaignWithItem(9446, 20)
+    local shEvidence = makeDepositEvidence(shape, { itemId = 9446, quantity = 3 })
+    local shCutover, shMarker = buildRemoteCutover(shape, shEvidence)
+    local shTxn = "ctx:gs:reconcile-shape:9446"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local shOfficer = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = shOfficer,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: shape base unmarked officer")
+    local witnessDup = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verification = "witnesses",
+        writer = "Player-1-Carol",
+        verifierGuid = "Player-1-Carol",
+    })
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = witnessDup,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: witness-only marked is duplicate")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: witness-only does not attach marker")
+    local missingVer = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verifierRankOrder = 3,
+    })
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = missingVer,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: missing verifier marked is duplicate")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: missing verifier does not attach marker")
+    local mismatchVer = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verifierGuid = "Player-1-Dave", verifierRankOrder = 3,
+    })
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = mismatchVer,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: mismatched verifier marked is duplicate")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: mismatched verifier does not attach marker")
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = shOfficer,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: complete officer marked attaches")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, shMarker,
+        "411 reconcile: complete officer attaches canonical marker")
+    assertEq(GS.InstallRemoteLiveCutover(shape, shCutover, "club:42", {}),
+        "accepted", "411 reconcile: shape cutover")
+    assertEq(campaignTotal(shape, 9446), 3, "411 reconcile: shape live total once")
 
     -- 4/5) Same-ID conflict and a distinct occurrence stay separate.
     local conflict = seedStagedCampaignWithItem(9443, 20)
@@ -28571,11 +28665,38 @@ do
     assertEq(findDonation(bob, 9444).gsProductionCredit, false,
         "411 reconcile: bob staged repair is not live credit")
     assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob still one staged credit")
+    local divergentBody = {
+        kind = "gs-ledger-event",
+        datasetId = aliceBody.datasetId,
+        event = {},
+        cutoverMarker = originMarker .. ":other",
+    }
+    for k, v in pairs(aliceBody.event) do
+        divergentBody.event[k] = v
+    end
+    assertEq(select(1, applyExportBody(divergentBody, "Eve-Garona")), "duplicate",
+        "411 reconcile: bob M→D divergent after canonical")
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, originMarker,
+        "411 reconcile: bob keeps canonical after divergent")
+    assertEq(findDonation(bob, 9444).gsAltSourceCutoverMarker, originMarker .. ":other",
+        "411 reconcile: bob retains divergent alternate")
     assertEq(GS.InstallRemoteLiveCutover(bob, originCutover, "club:42", {}),
         "accepted", "411 reconcile: bob installs alice cutover")
     assertEq(findDonation(bob, 9444).gsProductionCredit, true,
         "411 reconcile: bob live after cutover")
+    assertEq(findDonation(bob, 9444).gsAltSourceCutoverMarker, nil,
+        "411 reconcile: bob alternate cleared after cutover")
     assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob one live credit")
+    -- Reload keeps the collapsed canonical credit.
+    local savedBob = SpectrumFederationDB
+    GS._root = nil
+    GS._rootValid = false
+    initGS()
+    bob = GS:GetCurrentRecord()
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob reload keeps credit")
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, originMarker,
+        "411 reconcile: bob reload keeps canonical marker")
+    assertTrue(savedBob == SpectrumFederationDB, "411 reconcile: bob reload same db")
     local bobBody = exportDonationBody(9444)
     assertEq(bobBody and bobBody.cutoverMarker, originMarker,
         "411 reconcile: bob re-exports canonical marker")
