@@ -940,6 +940,75 @@ local function FormatCampaignHistoryText(event, itemName, markUncredited)
     return body
 end
 
+local function WholeQuantity(value)
+    local qty = tonumber(value) or 0
+    if qty ~= qty or qty == math.huge or qty == -math.huge then
+        return 0
+    end
+    return math.floor(qty)
+end
+
+--- Compact history label for the Logs list. Display only; ledger rows are unchanged.
+-- Donation lines stay actor × quantity. Adjustments keep a signed quantity and
+-- are labeled as adjustments so they are not presented as donations.
+-- @param event table Structured history row or ledger event
+-- @param itemName string|nil Localized name, loading placeholder, or unknown fallback
+-- @return string|nil
+function GS.FormatCampaignHistoryCompact(event, itemName)
+    if type(event) ~= "table" then
+        return nil
+    end
+    local name = itemName
+    if type(name) ~= "string" or name == "" then
+        name = Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item")
+    end
+    local qty = WholeQuantity(event.quantity)
+    local body
+    local details = {}
+    if IsDonationEvent(event) then
+        local who = BoundedActorName(event.actor)
+            or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
+        body = Loc("GUILD_SUPPLIES_HISTORY_COMPACT_DONATION", "%s ×%d — %s")
+            :format(who, math.abs(qty), name)
+        if event.verification == "officer" then
+            details[#details + 1] = Loc("GUILD_SUPPLIES_HISTORY_COMPACT_OFFICER", "officer")
+        elseif event.verification == "witnesses" then
+            details[#details + 1] = Loc("GUILD_SUPPLIES_HISTORY_COMPACT_WITNESSES", "3 witnesses")
+        end
+    elseif IsAdjustmentEvent(event) then
+        local who = BoundedActorName(event.actor)
+            or Loc("GUILD_SUPPLIES_HISTORY_ADMIN", "An admin")
+        body = Loc("GUILD_SUPPLIES_HISTORY_COMPACT_ADJUST", "%s %+d — %s")
+            :format(who, qty, name)
+        details[#details + 1] = Loc("GUILD_SUPPLIES_HISTORY_COMPACT_ADJUSTMENT", "adjustment")
+        local credit = BoundedActorName(event.attributed)
+        if credit then
+            details[#details + 1] = Loc(
+                "GUILD_SUPPLIES_HISTORY_COMPACT_CREDITED",
+                "credited to %s"
+            ):format(credit)
+        else
+            details[#details + 1] = Loc(
+                "GUILD_SUPPLIES_HISTORY_COMPACT_UNATTRIBUTED",
+                "unattributed"
+            )
+        end
+    else
+        return nil
+    end
+    if event.uncredited then
+        details[#details + 1] = Loc("GUILD_SUPPLIES_HISTORY_COMPACT_UNCREDITED", "uncredited")
+    end
+    if #details > 0 then
+        body = body .. " · " .. table.concat(details, " · ")
+    end
+    local when = FormatHistoryTimestamp(event)
+    if when then
+        return Loc("GUILD_SUPPLIES_HISTORY_WITH_TIME", "%s — %s"):format(when, body)
+    end
+    return body
+end
+
 --- Bounded read-only donation/adjustment history for one campaign.
 -- Newest first. Does not mutate state or invent live verification.
 -- Current live campaigns hide uncredited rows (aligned with progress). Archived
@@ -1032,6 +1101,7 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 timestamp = event.timestamp,
                 generation = event.generation,
                 uncredited = markUncredited and true or nil,
+                verification = type(event.verification) == "string" and event.verification or nil,
             }
         end
     end
