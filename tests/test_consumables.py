@@ -159,7 +159,13 @@ def test_consumables_goal_editor_guards_are_present():
         REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Control" / "Controls.lua"
     ).read_text(encoding="utf-8")
     page = (
-        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "Consumables.lua"
+        REPO_ROOT
+        / "SpectrumFederation"
+        / "modules"
+        / "UI"
+        / "Settings"
+        / "Pages"
+        / "GuildSuppliesConfiguration.lua"
     ).read_text(encoding="utf-8")
     assert "function Controls.ShouldCommitConsumableGoal" in controls
     assert "__sfLastCommittedText" in controls
@@ -175,6 +181,7 @@ def test_consumables_goal_editor_guards_are_present():
     assert "ApplyScrollAndColumns" in controls
     assert "nameColumnWidth" in controls
     assert "C.ValidGoal" in page
+    assert 'type = "consumableRequestedList"' in page
     # Enter must clear focus only; focus-loss is the sole goal-commit path.
     enter_at = controls.find('r.GoalEdit:SetScript("OnEnterPressed"')
     lost_at = controls.find('r.GoalEdit:SetScript("OnEditFocusLost"')
@@ -214,6 +221,25 @@ def test_consumable_requested_list_layout_production_lua():
     assert re.search(r"(?m)^\d+ passed, 0 failed$", result.stdout), result.stdout
 
 
+def test_legacy_consumables_settings_pages_are_not_packaged():
+    """#415: legacy Loot Helper pages are gone; Raid Supplies pages stay loaded."""
+    toc = (REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc").read_text(encoding="utf-8")
+    pages = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages"
+    assert "modules/UI/Settings/Pages/Consumables.lua" not in toc
+    assert "modules/UI/Settings/Pages/RaidConsumableLogs.lua" not in toc
+    assert not (pages / "Consumables.lua").exists()
+    assert not (pages / "RaidConsumableLogs.lua").exists()
+    assert "modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua" in toc
+    assert "modules/UI/Settings/Pages/GuildSuppliesLogs.lua" in toc
+    assert (pages / "GuildSuppliesConfiguration.lua").exists()
+    assert (pages / "GuildSuppliesLogs.lua").exists()
+    # Backend, sync, and the personal reminder stay packaged.
+    assert "modules/LootHelper/Consumables.lua" in toc
+    assert "modules/LootHelperSync/19_Consumables.lua" in toc
+    general = (pages / "LootHelper.lua").read_text(encoding="utf-8")
+    assert 'path = "lootHelper.showRaidSupplyReminders"' in general
+
+
 def test_consumables_snapshot_merge_is_inside_import():
     profiles = (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "Profiles.lua"
@@ -245,34 +271,34 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
     assert locale_at < domain_at < runtime_at
     assert domain_at < observation_at < verification_at < bank_log_at < runtime_at
 
-    logs_page = (
-        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidConsumableLogs.lua"
+    supplies_logs = (
+        REPO_ROOT
+        / "SpectrumFederation"
+        / "modules"
+        / "UI"
+        / "Settings"
+        / "Pages"
+        / "GuildSuppliesLogs.lua"
     ).read_text(encoding="utf-8")
     for key in (
         "RAID_SUPPLIES_OVERALL_PROGRESS",
         "RAID_SUPPLIES_NO_GOALS_CONFIGURED",
         "RAID_SUPPLIES_NO_GOAL",
         "RAID_SUPPLIES_GOAL_ALREADY_MET",
-        "RAID_CONSUMABLE_LOGS_HELP",
-        "RAID_CONSUMABLE_LOGS_TITLE",
-        "RAID_CONSUMABLE_REVIEW_TITLE",
-        "RAID_CONSUMABLE_REVIEW_HELP",
-        "RAID_CONSUMABLE_REVIEW_APPROVE",
-        "RAID_CONSUMABLE_REVIEW_REJECT",
-        "RAID_CONSUMABLE_REVIEW_CORRECT",
-        "RAID_CONSUMABLE_REVIEW_SELECTED",
-        "RAID_CONSUMABLE_REVIEW_ROW",
-        "RAID_CONSUMABLE_ADJUST_TITLE",
-        "RAID_CONSUMABLE_ADJUST_HELP",
+    ):
+        assert f'L["{key}"]' in locale, key
+        assert key in domain or key in runtime, key
+    for key in (
         "RAID_CONSUMABLE_ADJUST_UNATTRIBUTED",
         "RAID_CONSUMABLE_ADJUST_CONFIRM_HEADER",
         "RAID_CONSUMABLE_ADJUST_CONFIRM_RECEIVED",
+        "RAID_CONSUMABLE_ADJUST_HISTORY_ATTRIBUTED",
+        "RAID_CONSUMABLE_ADJUST_ERR_NOT_MEMBER",
     ):
         assert f'L["{key}"]' in locale, key
-        assert key in domain or key in runtime or key in logs_page, key
+        assert key in domain, key
     assert "CONSUMABLE_ADJUSTMENT" in domain
     assert "CommitConsumablesManualAdjustment" in SYNC_TRANSPORT.read_text(encoding="utf-8")
-    assert "Manual adjustment" in logs_page or "RAID_CONSUMABLE_ADJUST_TITLE" in logs_page
     assert "RetractEvent" in domain
     assert "AdjustmentFloorOk" in domain
     transport = SYNC_TRANSPORT.read_text(encoding="utf-8")
@@ -285,25 +311,18 @@ def test_consumables_donation_helper_locale_keys_and_toc_order():
     assert "PROTO_VERSION = 9" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
     ).read_text(encoding="utf-8")
-    assert "getText" in logs_page
-    # Admin review selected-details must be dynamic: DefinitionRenderer:Refresh does
+    # Raid Supplies Logs keeps dynamic help text. DefinitionRenderer:Refresh does
     # not rebuild the page, and AddHelpText only updates via getText.
-    assert "getText = SelectedReviewHelpText" in logs_page
-    assert "text = selectedHelp" not in logs_page
-    assert "local function SelectedReviewHelpText" in logs_page
-    assert "RAID_CONSUMABLE_REVIEW_SELECTED" in logs_page
-    # Roster-driven refreshes must use effective visibility; index invalidation
-    # still runs while the standalone settings parent is hidden.
-    assert "local function PanelEffectivelyVisible" in logs_page
-    assert "panel.IsVisible" in logs_page
-    assert "if not PanelEffectivelyVisible(panel) then return end" in logs_page
-    assert "if not PanelEffectivelyVisible(Page.panel) then return end" in logs_page
-    roster_handler = logs_page.split("RegisterEvent(\"GUILD_ROSTER_UPDATE\")", 1)[1]
-    invalidate_at = roster_handler.find("InvalidateGuildClassIndex()")
-    queue_at = roster_handler.find("QueueRefresh()")
-    assert 0 <= invalidate_at < queue_at, "roster update invalidates class index before QueueRefresh"
-    assert "RAID_CONSUMABLE_ADJUST_HISTORY_ATTRIBUTED" in locale
-    assert "RAID_CONSUMABLE_ADJUST_ERR_NOT_MEMBER" in locale
+    assert "getText = MembershipHelpText" in supplies_logs
+    assert "getText = HistoryHelpText" in supplies_logs
+    # Roster-driven refreshes must use effective visibility while the standalone
+    # settings parent is hidden.
+    assert "local function PanelVisible" in supplies_logs
+    assert "panel:IsVisible" in supplies_logs
+    assert "if not PanelVisible(panel) then return end" in supplies_logs
+    assert "if not PanelVisible(Page.panel) then return end" in supplies_logs
+    roster_handler = supplies_logs.split('RegisterEvent("GUILD_ROSTER_UPDATE")', 1)[1]
+    assert "QueueRefresh()" in roster_handler, "roster update queues a visibility-gated refresh"
 
     assert "function ns.LocaleText" in locale
     assert 'Loc("RAID_SUPPLIES_OVERALL_PROGRESS"' in runtime

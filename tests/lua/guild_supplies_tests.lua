@@ -23748,13 +23748,12 @@ do
 end
 
 do
-    -- 3C24) Activation requires confirmation; history hides uncredited staged rows;
-    -- legacy Settings pages follow the active profile's guild.
+    -- 3C24) Activation requires confirmation; history hides uncredited staged rows.
+    -- Legacy writer eligibility still follows the profile guild (#389).
+    -- The legacy Settings pages are not registered (#415).
     loadModule("SpectrumFederation/locale/enUS.lua")
     loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
     loadModule("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
     local C = SF.Consumables
     local Sync = SF.LootHelperSync
 
@@ -23916,16 +23915,23 @@ do
     assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE,
         "3C24: explicit confirmation activates")
 
-    -- Multi-guild page availability follows active profile, not login guild.
-    local Nav = SF.SettingsNavigationModel
-    if not Nav then
-        loadModule("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
-        Nav = SF.SettingsNavigationModel
+    -- Multi-guild writer eligibility follows the profile guild. The removed
+    -- settings pages stay unregistered for both guilds and both profiles.
+    if not SF.SettingsUI.pagesById.guildSuppliesLogs then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
     end
-    local consumablesPage = SF.SettingsUI.pagesById.lootHelperConsumables
-    local logsPage = SF.SettingsUI.pagesById.lootHelperConsumableLogs
-    assertTrue(consumablesPage and logsPage, "3C24: legacy pages registered")
     assertEq(GS:IsLiveActiveForCurrentGuild(), true, "3C24: guild A live before multi-guild nav")
+    local function assertLegacyPagesAbsent(label)
+        assertEq(SF.SettingsUI.pagesById.lootHelperConsumables, nil,
+            label .. ": legacy Consumables page is not registered")
+        assertEq(SF.SettingsUI.pagesById.lootHelperConsumableLogs, nil,
+            label .. ": legacy Consumable Logs page is not registered")
+        assertTrue(SF.SettingsUI.pagesById.guildSuppliesConfiguration ~= nil,
+            label .. ": Raid Supplies Configuration remains registered")
+        assertTrue(SF.SettingsUI.pagesById.guildSuppliesLogs ~= nil,
+            label .. ": Raid Supplies Logs remains registered")
+    end
+    assertLegacyPagesAbsent("3C24: before profile switch")
     -- Create staged guild B while A remains live.
     world.guild.clubId = 99
     world.guild.name = "OtherGuild"
@@ -23959,19 +23965,14 @@ do
     }
     assertEq(C.LegacyWritersAllowed(profileA), false, "3C24: profile A retired")
     assertEq(C.LegacyWritersAllowed(profileB), true, "3C24: profile B writable")
-    -- Logged into B; active profile A (live guild) → pages hidden.
+    -- Logged into B. Pages stay absent whether the active profile's guild is live or staged.
     SF.GetActiveProfile = function() return profileA end
-    assertEq(Nav.IsPageAvailable(consumablesPage), false,
-        "3C24: on B, active profile A hides Consumables")
-    assertEq(Nav.IsPageAvailable(logsPage), false,
-        "3C24: on B, active profile A hides Logs")
-    -- Active profile B (staged) → pages available while on B.
+    assertLegacyPagesAbsent("3C24: on B, active profile A")
+    assertEq(C.LegacyWritersAllowed(profileA), false, "3C24: profile A stays retired on B login")
     SF.GetActiveProfile = function() return profileB end
-    assertEq(Nav.IsPageAvailable(consumablesPage), true,
-        "3C24: on B, active profile B shows Consumables")
-    assertEq(Nav.IsPageAvailable(logsPage), true,
-        "3C24: on B, active profile B shows Logs")
-    -- Logged into A (live); active profile B still shows pages.
+    assertLegacyPagesAbsent("3C24: on B, active profile B")
+    assertEq(C.LegacyWritersAllowed(profileB), true, "3C24: profile B stays writable on B login")
+    -- Logged into A (live). Staged profile B is still writable, and the pages stay absent.
     world.guild.clubId = 42
     world.guild.name = "Spectrum"
     world.guild.members = {
@@ -23982,11 +23983,11 @@ do
     }
     fireEvent("GUILD_ROSTER_UPDATE")
     SF.GetActiveProfile = function() return profileB end
-    assertEq(Nav.IsPageAvailable(consumablesPage), true,
-        "3C24: on A, active profile B shows Consumables")
+    assertLegacyPagesAbsent("3C24: on A, active profile B")
+    assertEq(C.LegacyWritersAllowed(profileB), true, "3C24: profile B stays writable on A login")
     SF.GetActiveProfile = function() return profileA end
-    assertEq(Nav.IsPageAvailable(consumablesPage), false,
-        "3C24: on A, active profile A hides Consumables")
+    assertLegacyPagesAbsent("3C24: on A, active profile A")
+    assertEq(C.LegacyWritersAllowed(profileA), false, "3C24: profile A stays retired on A login")
     -- Sync wrappers use localized retirement string.
     local okSync, errSync = Sync:CommitConsumablesOp(profileA, { name = "set_bank_tab", bankTab = 3 },
         "Alice-Garona", { asAdmin = true })
@@ -26515,18 +26516,26 @@ do
         for _ = 1, 4 do GS.EndLocalDurableNotifyBatch() end
     end
     loadModule("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    if not (SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesConfiguration) then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    end
     local Nav = SF.SettingsNavigationModel
     local ui = SF.SettingsUI
     assertTrue(Nav and ui and ui.pagesById, "B-ui: settings registry present")
 
-    local consumablesPage = ui.pagesById.lootHelperConsumables
-    assertTrue(consumablesPage and type(consumablesPage.available) == "function",
-        "B-ui: legacy consumables page registered")
-    assertEq(Nav.IsPageAvailable(consumablesPage), true,
-        "B-ui: legacy page available while staged")
+    assertEq(ui.pagesById.lootHelperConsumables, nil,
+        "B-ui: legacy Consumables page is not registered while staged")
+    assertEq(ui.pagesById.lootHelperConsumableLogs, nil,
+        "B-ui: legacy Consumable Logs page is not registered while staged")
+    assertTrue(ui.pagesById.guildSuppliesConfiguration ~= nil,
+        "B-ui: Raid Supplies Configuration remains registered while staged")
+    assertTrue(ui.pagesById.guildSuppliesLogs ~= nil,
+        "B-ui: Raid Supplies Logs remains registered while staged")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesConfiguration"), true,
+        "B-ui: Configuration is a content page while staged")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
+        "B-ui: Logs is a content page while staged")
 
     local uiReasons = {}
     assertTrue(type(GS.RegisterUIListener) == "function", "B-ui: RegisterUIListener present")
@@ -26555,16 +26564,21 @@ do
             "B-ui: export-maint must not reach UI listeners")
     end
     assertTrue(sawActivation, "B-ui: activation reason delivered")
-    assertEq(Nav.IsPageAvailable(consumablesPage), false,
-        "B-ui: legacy page unavailable after activation")
+    assertEq(ui.pagesById.lootHelperConsumables, nil,
+        "B-ui: legacy Consumables page stays unregistered after activation")
+    assertEq(ui.pagesById.lootHelperConsumableLogs, nil,
+        "B-ui: legacy Consumable Logs page stays unregistered after activation")
     assertEq(Nav.IsContentPage(ui, "lootHelperConsumables"), false,
-        "B-ui: retired page excluded from content pages")
+        "B-ui: unknown legacy id is not a content page")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesConfiguration"), true,
+        "B-ui: Configuration remains a content page after activation")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
+        "B-ui: Logs remains a content page after activation")
 
     -- Earlier suite stubs may RegisterPage without UpsertCategoryFromPage.
     -- Mirror production Loot Helper category + always-available General fallback
-    -- so ResolveSidebarSelect can leave the retired Consumables tab.
-    local categoryId = consumablesPage.parentId or "lootHelper"
-    consumablesPage.categoryId = consumablesPage.categoryId or categoryId
+    -- so ResolveSidebarSelect leaves an unknown legacy tab id.
+    local categoryId = "lootHelper"
     ui.categoriesById = ui.categoriesById or {}
     ui.categories = ui.categories or {}
     ui.pages = ui.pages or {}

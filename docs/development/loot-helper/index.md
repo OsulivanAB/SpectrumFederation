@@ -81,7 +81,7 @@ Profiles are keyed by stable ID and `activeProfileId` stores the local selection
 
 ## Raid Consumables
 
-Configure needed raid materials, help members deposit them into the configured Guild Bank tab, and record successful contributions.
+Configure needed raid materials, help members deposit them into the configured Guild Bank tab, and record successful contributions. The Settings UI for that work is **Raid Supplies → Configuration** and **Raid Supplies → Logs**. The legacy Loot Helper Consumables and Consumable Logs pages are not part of the addon. Profile-scoped `SF.Consumables` storage, writer gates, sync, reminders, and the deposit assistant remain.
 
 `modules/LootHelper/Consumables.lua` owns profile configuration, the append-only ledger, and contribution projections. State lives on the profile as `_consumables` (guild, bank tab, `requestedItems` with per-item `goal`, generation/configSeq) plus `_consumableEvents` / archive. Raw per-actor contribution totals and raw per-item donated totals are derived together from current-generation `CONSUMABLE_DONATION` events. They are not saved as separate counters. Goal progress uses the raw per-item totals (never identity-aware member totals). Goal `0` means No Goal / unlimited donations and is excluded from overall progress; positive goals use `floor(100 × donated / goal)` per item and capped overall `floor(100 × Σ min(donated, goal) / Σ goal)`.
 
