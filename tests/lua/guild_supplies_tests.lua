@@ -30207,6 +30207,122 @@ do
 end
 
 do
+    -- Late Logs catch-up must refresh the already-exported descriptor. A forced
+    -- dataset notification would hide a stale valuationCount.
+    SF.TSM = nil
+    local record = activateValuationGuild(9611)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9611, quantity = 2 })
+    drainExportMaint()
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9611, 2)
+    assertTrue(event ~= nil, "val: manifest donation credited")
+    local txnId = event and event.txnId
+    assertEq(valuationSnap(record, txnId), nil, "val: manifest donation starts unpriced")
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, valuations = nil, 0
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                valuations = valuations + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            end
+        end
+        return descCount, valuations
+    end
+    local sourceDataset = record.datasetId
+    local beforeDesc, beforeVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(beforeDesc, 0, "val: exported descriptor starts at zero valuations")
+    assertEq(beforeVals, 0, "val: unpriced donation exports no valuation body")
+
+    local durableNotifies = 0
+    local origNotify = GS.NotifyLocalDurableChange
+    GS.NotifyLocalDurableChange = function(reason)
+        durableNotifies = durableNotifies + 1
+        return origNotify(reason)
+    end
+    valuationTsmCalls = 0
+    valuationTsmValue = 21
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    timers = {}
+    assertEq(GS.StartValuationCatchup("logs-manifest"), true, "val: manifest catch-up starts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local snap = valuationSnap(record, txnId)
+    assertEq(snap and snap.totalCopper, 42, "val: catch-up assigns unit x quantity")
+    local caught = GS.GetValuationCatchupState()
+    assertEq(caught.active, false, "val: manifest catch-up idles")
+    assertEq(caught.scheduled, false, "val: manifest catch-up unschedules")
+    assertEq(#timers, 0, "val: manifest catch-up timers idle")
+    assertEq(valuationTsmCalls, 1, "val: manifest catch-up queries once")
+    local pricedDesc, pricedVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(pricedDesc, 1, "val: catch-up descriptor advertises the new valuation")
+    assertEq(pricedVals, 1, "val: catch-up exports the valuation body")
+    assertEq(durableNotifies, 0, "val: catch-up does not rely on a dataset notification")
+
+    GS.ForgetDonationValuations(record, { txnId })
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnId), nil, "val: forgotten valuation leaves the donation")
+    local removedDesc, removedVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(removedDesc, 0, "val: removing a winner clears the advertised count")
+    assertEq(removedVals, 0, "val: removing a winner drops its export body")
+    assertEq(durableNotifies, 0, "val: removal does not rely on a dataset notification")
+
+    timers = {}
+    assertEq(GS.StartValuationCatchup("logs-manifest-again"), true, "val: removal catch-up restarts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    snap = valuationSnap(record, txnId)
+    assertEq(snap and snap.totalCopper, 42, "val: second catch-up restores the price")
+    local restored = GS.GetValuationCatchupState()
+    assertEq(restored.active, false, "val: second catch-up idles")
+    assertEq(restored.scheduled, false, "val: second catch-up unschedules")
+    assertEq(#timers, 0, "val: second catch-up timers idle")
+    local exportBodies = collectAllExportBodies()
+    local adoptedDesc, adoptedVals = valuationExportSummary(exportBodies, sourceDataset)
+    assertEq(adoptedDesc, 1, "val: restored descriptor advertises one valuation")
+    assertEq(adoptedVals, 1, "val: restored export has one valuation body")
+    assertEq(durableNotifies, 0, "val: restored export had no durable notification")
+    GS.NotifyLocalDurableChange = origNotify
+    assertEq(#world.chat, 0, "val: manifest catch-up stays chat-free")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginSt, beginReason = select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset))
+    assertEq(beginSt, "accepted", "val: late-valuation adoption begins " .. tostring(beginReason))
+    for i = #exportBodies, 1, -1 do
+        local st, reason = GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: late-valuation buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: late-valuation adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: late-valuation adopted dataset")
+    local adoptedSnap = valuationSnap(adopted, txnId)
+    assertEq(adoptedSnap and adoptedSnap.totalCopper, 42, "val: complete adoption keeps the catch-up price")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
     local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
     assertTrue(src ~= nil, "val: module readable")
     local text = src:read("*a")

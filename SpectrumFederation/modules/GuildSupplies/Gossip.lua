@@ -71,6 +71,10 @@ local exportState = {
     maintGeneration = 0,
 }
 
+-- Declared before the export mutators that consult it. A later `local` would
+-- leave those closures bound to a nil global and skip valuation publication.
+local providerRegistered = false
+
 -- Runtime reassembly buffer for paged campaign archives and operation manifests
 -- (not SavedVariables). Scoped by datasetId; aggregate caps + TTL reclaim.
 local archivePageBuffer = {} -- [campaignId] = { meta, pages, datasetId, pageCount, at, sourcePeer }
@@ -1603,6 +1607,80 @@ end
 -- Forward-declared: cold registration and Notify both schedule archive drain.
 local ScheduleExportMaintContinuation
 
+--- Replace the advertised valuation set from the winner map. One pass, used by
+-- cold rebuild and an already-running durable notification. Not used per price.
+local function TakeValuationManifest(byTxn)
+    local manifest = {}
+    local count = 0
+    if type(byTxn) == "table" then
+        for txnId in pairs(byTxn) do
+            if type(txnId) == "string" and txnId ~= "" then
+                manifest[txnId] = true
+                count = count + 1
+            end
+        end
+    end
+    exportState.valuationManifest = manifest
+    exportState.cachedValuationCount = count
+    return count
+end
+
+--- Patch the already-exported dataset descriptor. O(1); does not rebuild.
+local function PublishValuationManifest()
+    local count = tonumber(exportState.cachedValuationCount) or 0
+    if count < 0 then
+        count = 0
+        exportState.cachedValuationCount = 0
+    end
+    local datasetId = exportState.datasetId
+    if type(datasetId) ~= "string" or datasetId == "" then
+        return
+    end
+    local entry = exportState.byId["gs:desc:" .. datasetId]
+    if type(entry) ~= "table" or type(entry.body) ~= "table" then
+        return
+    end
+    if entry.body.valuationCount == count and entry.needsFp ~= true
+        and type(entry.versionFp) == "string" then
+        return
+    end
+    entry.body.valuationCount = count
+    entry.needsFp = true
+    entry.versionFp = nil
+end
+
+local function NoteValuationManifestId(txnId)
+    if type(txnId) ~= "string" or txnId == "" then
+        return
+    end
+    local manifest = exportState.valuationManifest
+    if type(manifest) ~= "table" then
+        manifest = {}
+        exportState.valuationManifest = manifest
+    end
+    if manifest[txnId] then
+        return
+    end
+    manifest[txnId] = true
+    exportState.cachedValuationCount = (tonumber(exportState.cachedValuationCount) or 0) + 1
+    PublishValuationManifest()
+end
+
+local function DropValuationManifestId(txnId)
+    local manifest = exportState.valuationManifest
+    if type(manifest) ~= "table" or type(txnId) ~= "string" or txnId == ""
+        or not manifest[txnId] then
+        return false
+    end
+    manifest[txnId] = nil
+    local count = (tonumber(exportState.cachedValuationCount) or 1) - 1
+    if count < 0 then
+        count = 0
+    end
+    exportState.cachedValuationCount = count
+    return true
+end
+
 local function RebuildExportIndex()
     exportState.order = {}
     exportState.byId = {}
@@ -1784,12 +1862,8 @@ local function RebuildExportIndex()
     exportState.ledgerArchiveWarmPos = 0
     exportState.donationEvidenceBuildNeeded = donationEvidenceExportCount > 0
     exportState.donationEvidenceBuildCursor = nil
-    local valuationExportCount = 0
-    if type(record.valuations) == "table" and type(record.valuations.byTxn) == "table" then
-        for _ in pairs(record.valuations.byTxn) do
-            valuationExportCount = valuationExportCount + 1
-        end
-    end
+    local valuationExportCount = TakeValuationManifest(
+        record.valuations and record.valuations.byTxn)
     exportState.valuationBuildNeeded = valuationExportCount > 0
     exportState.valuationBuildCursor = nil
 
@@ -1937,6 +2011,9 @@ function GS.NoteValuationExported(record, canonicalTxnId)
         if not unchanged then
             UpsertExportBody(exportId, body)
         end
+        -- The winner set grew or this id was not yet advertised. Replacing an
+        -- existing id does not change the count. No history scan.
+        NoteValuationManifestId(canonicalTxnId)
     end
     if GG and GG.NotifyProviderChanged then
         GG.NotifyProviderChanged(GS.PROVIDER_ID)
@@ -2012,6 +2089,7 @@ function GS.RemoveGossipExportBodies(ids)
     end
     local removed = 0
     local drop = {}
+    local droppedValuation = false
     local limit = math.min(#ids, 64)
     for i = 1, limit do
         local id = ids[i]
@@ -2019,6 +2097,9 @@ function GS.RemoveGossipExportBodies(ids)
             exportState.byId[id] = nil
             drop[id] = true
             removed = removed + 1
+            if id:sub(1, 7) == "gs:val:" and DropValuationManifestId(id:sub(8)) then
+                droppedValuation = true
+            end
         end
     end
     if removed < 1 then
@@ -2040,11 +2121,17 @@ function GS.RemoveGossipExportBodies(ids)
     end
     exportState.countsDirty = true
     exportState.maintIdle = false
+    if droppedValuation then
+        PublishValuationManifest()
+    end
     if GG and GG.GetProvider and providerRegistered then
         local prov = GG.GetProvider(GS.PROVIDER_ID)
         if prov and prov.index then
             prov.index.dirty = true
             prov.index.buildComplete = false
+        end
+        if droppedValuation and GG.NotifyProviderChanged then
+            GG.NotifyProviderChanged(GS.PROVIDER_ID)
         end
     end
     return removed
@@ -2904,8 +2991,6 @@ end
 ---------------------------------------------------------------------------
 -- Registration / notification
 ---------------------------------------------------------------------------
-
-local providerRegistered = false
 
 local function BuildProviderSpec()
     return {
@@ -3906,6 +3991,7 @@ function GS.NotifyLocalDurableChange(reason)
                         local valBody = GS.BuildValuationExportBody(record, txnId)
                         if valBody then
                             UpsertExportBody(exportId, valBody)
+                            NoteValuationManifestId(txnId)
                         end
                     end
                     exportState.valuationBuildCursor = txnId
@@ -4001,14 +4087,9 @@ function GS.NotifyLocalDurableChange(reason)
         exportState.cachedCampaignCount = campaignCount
         exportState.cachedArchiveCount = archiveCount
         exportState.cachedAcceptedLedgerCount = acceptedLedgerCount
-        local valuationCount = 0
-        if type(record.valuations) == "table" and type(record.valuations.byTxn) == "table" then
-            for _ in pairs(record.valuations.byTxn) do
-                valuationCount = valuationCount + 1
-            end
-        end
+        local valuationCount = TakeValuationManifest(
+            record.valuations and record.valuations.byTxn)
         exportState.cachedDonationEvidenceCount = donationEvidenceCount
-        exportState.cachedValuationCount = valuationCount
         exportState.countsDirty = false
         local desc = {
             kind = "dataset-desc",
