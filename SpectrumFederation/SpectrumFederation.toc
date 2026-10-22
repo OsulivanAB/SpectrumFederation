@@ -128,8 +128,6 @@ modules/UI/Settings/DefinitionRenderer.lua
 modules/UI/Settings/Pages/General.lua
 modules/UI/Settings/Pages/NicheFeatures.lua
 modules/UI/Settings/Pages/LootHelper.lua
-modules/UI/Settings/Pages/Consumables.lua
-modules/UI/Settings/Pages/RaidConsumableLogs.lua
 modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua
 modules/UI/Settings/Pages/GuildSuppliesLogs.lua
 modules/UI/Settings/Pages/MainAltAssignments.lua

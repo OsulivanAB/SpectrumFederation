@@ -106,7 +106,7 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 | **Raid Supplies → Configuration** | Initialize, bank tab, New Campaign, items/goals, character links, adjustments, adoption, conflict resolution, **Activate Guild Supplies**. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
 | **Raid Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history |
 | **Personal preferences** | Account-local reminder checkbox |
-| **Loot Helper → Consumables / Consumable Logs** | Hidden from navigation after live activation (`page.available`) |
+| **Loot Helper → Consumables / Consumable Logs** | Removed from the packaged addon (#415). They are not registered before or after activation, including across profile switches. Legacy profile writers, SavedVariables, and the #389 eligibility gates stay in place. |
 
 ## Donation verification (#411)
 
@@ -135,7 +135,7 @@ Automated production-Lua tests do **not** replace Retail QA.
 3. On A: Initialize Guild Supplies → New Campaign → set bank tab → add an item/goal.
 4. On B and C: confirm the same staged dataset appears via gossip without a raid/session.
 5. Resolve any open conflicts / adopt a single staged source before activation.
-6. **Activation at a real Guild Bank (A):** open the configured tab, wait for a fresh log sample, Activate Guild Supplies. Confirm Settings banner success and that Raid Consumables pages disappear from navigation.
+6. **Activation at a real Guild Bank (A):** open the configured tab, wait for a fresh log sample, Activate Guild Supplies. Confirm Settings banner success. Loot Helper has no Consumables or Consumable Logs tabs before or after activation. **Raid Supplies → Configuration** and **Raid Supplies → Logs** remain.
 7. **Catch-up without bank (B/C):** `/reload` or late join; confirm active cutover marker is adopted without reopening the bank.
 8. **Conflicting staged roots:** two independently initialized datasets must stay blocked until explicit adoption; never auto-activate on timestamps/counts.
 9. **Donation eligibility:** pre-activation bank rows do not credit. After activation, one current officer's direct Guild Bank observation credits an eligible deposit once. Without that observation, three independent witnesses credit it once. A guildmate who already has the accepted officer credit can catch a late member up while the original officer is offline.
