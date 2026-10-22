@@ -520,6 +520,7 @@ load("SpectrumFederation/modules/LootHelper/ConsumablesVerification.lua")
 load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
 load("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
 load("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
+load("SpectrumFederation/modules/UI/Settings/ItemDisplay.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
 
 local C = SF.Consumables
@@ -4178,6 +4179,191 @@ local function checkFocusedEditRowReuse()
     unchanged(p, "focused edit row reuse")
 end
 
+local function checkDepositAssistantItemIcons()
+    local savedGetItemIcon = GetItemIcon
+    local savedById = C_Item.GetItemIconByID
+    local savedInstant = C_Item.GetItemInfoInstant
+    SF.ItemDisplay.ResetSession()
+    GetItemIcon = nil
+    C_Item.GetItemIconByID = nil
+    C_Item.GetItemInfoInstant = nil
+
+    local p = runtimeFixture("rt-icon-api")
+    assertTrue(select(1, C.AddRequestedItem(p, admin, flask)), "icon fixture requests a second item")
+    world.bags[0] = {
+        [1] = { itemId = aqirite, count = 10 },
+        [2] = { itemId = flask, count = 8 },
+    }
+    world.bags[5] = {}
+    world.bankOpen = true
+    local warnBefore = #world.warnings
+    local infoBefore = #world.infos
+
+    C_Item.GetItemIconByID = function(itemId)
+        if itemId == aqirite then return 454545 end
+        if itemId == flask then return 454546 end
+        return nil
+    end
+    local loadsBefore = #world.loadRequests
+    RT:OnBankOpened()
+    drainAfter(8)
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(), "icon fixture opens the deposit assistant")
+    assertEq(review.Rows[2].Icon.texture, 454545,
+        "GetItemIconByID supplies the aqirite icon when GetItemIcon is absent")
+    assertEq(review.Rows[3].Icon.texture, 454546,
+        "GetItemIconByID supplies the flask icon when GetItemIcon is absent")
+    assertEq(#world.loadRequests, loadsBefore, "a resolved C_Item icon does not request item data")
+
+    C_Item.GetItemIconByID = function() return nil end
+    C_Item.GetItemInfoInstant = function(itemId)
+        local icon = itemId == flask and 565657 or 565656
+        return itemId, "Consumable", "Other", "", icon
+    end
+    loadsBefore = #world.loadRequests
+    RT:RebuildReview()
+    assertEq(review.Rows[2].Icon.texture, 565656,
+        "GetItemInfoInstant supplies the icon when GetItemIconByID is empty")
+    assertEq(review.Rows[3].Icon.texture, 565657, "GetItemInfoInstant supplies the second row icon")
+    assertEq(#world.loadRequests, loadsBefore, "an instant icon does not request item data")
+
+    C_Item.GetItemInfoInstant = nil
+    C_Item.GetItemIconByID = function()
+        return "Interface\\Icons\\INV_Misc_QuestionMark"
+    end
+    SF.ItemDisplay.ResetSession()
+    loadsBefore = #world.loadRequests
+    RT:RebuildReview()
+    assertEq(review.Rows[2].Icon.texture, SF.ItemDisplay.QUESTION_MARK,
+        "a question-mark GetItemIconByID result is not treated as a resolved icon")
+    assertEq(#world.loadRequests, loadsBefore + 2, "missing real icons request each visible item once")
+    local watch = SF.ItemDisplay._watchFrame
+    assertTrue(watch and watch.scripts and type(watch.scripts.OnEvent) == "function",
+        "one item-data watch frame is registered")
+    assertTrue(watch.registeredEvents and watch.registeredEvents.ITEM_DATA_LOAD_RESULT,
+        "the watch frame listens for ITEM_DATA_LOAD_RESULT")
+    local afterBefore = #world.after
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 42, true)
+    assertEq(#world.after, afterBefore, "an unrelated item completion does not queue a refresh")
+    assertEq(#world.loadRequests, loadsBefore + 2, "an unrelated completion does not request again")
+
+    C_Item.GetItemIconByID = function(itemId)
+        if itemId == aqirite then return 111001 end
+        if itemId == flask then return 111002 end
+        return nil
+    end
+    local aqRow = review.Rows[2]
+    aqRow.Edit:SetText("9")
+    aqRow.Edit:SetFocus()
+    assertEq(aqRow.boundItemId, aqirite, "focus setup stays on aqirite")
+    local listeners = SF.ItemDisplay.ListenerCount()
+    local frames = SF.ItemDisplay.WatchFrameCount()
+    afterBefore = #world.after
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", aqirite, true)
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", flask, true)
+    assertEq(#world.after, afterBefore + 1, "two item completions coalesce to one refresh")
+    local ran = drainAfter(8)
+    assertTrue(ran >= 1 and ran <= 4, "coalesced icon refresh drains in a bounded number of steps")
+    assertEq(#world.after, 0, "icon refresh leaves no queued callbacks")
+    aqRow = review.Rows[2]
+    assertEq(aqRow.boundItemId, aqirite, "icon refresh keeps the aqirite row binding")
+    assertEq(aqRow.Edit.text, "9", "focused quantity survives the icon refresh")
+    assertTrue(aqRow.Edit:HasFocus(), "icon refresh leaves the quantity edit focused")
+    assertEq(aqRow.Icon.texture, 111001, "aqirite icon updates when item data completes")
+    assertEq(review.Rows[3].Icon.texture, 111002, "flask icon updates when item data completes")
+    assertEq(#world.loadRequests, loadsBefore + 2, "completion does not request the items again")
+    assertEq(SF.ItemDisplay.ListenerCount(), listeners, "icon refresh does not add listeners")
+    assertEq(SF.ItemDisplay.WatchFrameCount(), frames, "icon refresh does not add watch frames")
+
+    SF.ItemDisplay.ResetSession()
+    C_Item.GetItemIconByID = nil
+    review:Show()
+    loadsBefore = #world.loadRequests
+    RT:RebuildReview()
+    assertEq(#world.loadRequests, loadsBefore + 2, "a shown review with missing icons requests once per item")
+    local hiddenTexture = review.Rows[2].Icon.texture
+    review:Hide()
+    C_Item.GetItemIconByID = function(itemId)
+        if itemId == aqirite then return 222001 end
+        return 222002
+    end
+    afterBefore = #world.after
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", aqirite, true)
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", flask, true)
+    assertTrue(#world.after - afterBefore <= 1, "hidden review completions queue at most one coalesced notify")
+    drainAfter(8)
+    assertEq(#world.after, 0, "hidden review completion drains idle")
+    assertEq(review.Rows[2].Icon.texture, hiddenTexture, "a hidden review does not repaint icons")
+    assertFalse(review:IsShown(), "icon completion does not reopen a hidden review")
+
+    review:Show()
+    SF.ItemDisplay.ResetSession()
+    C_Item.GetItemIconByID = nil
+    C_Item.GetItemInfoInstant = nil
+    world.unknownItems[aqirite] = true
+    world.unknownItems[flask] = true
+    loadsBefore = #world.loadRequests
+    RT:RebuildReview()
+    assertEq(#world.loadRequests, loadsBefore + 2, "uncached names and icons request each visible item once")
+    assertEq(review.Rows[2].Icon.texture, SF.ItemDisplay.QUESTION_MARK, "a cache miss shows the neutral icon")
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", aqirite, false)
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", flask, false)
+    drainAfter(8)
+    local loadsFailed = #world.loadRequests
+    for _ = 1, 5 do
+        RT:RebuildReview()
+    end
+    assertEq(#world.loadRequests, loadsFailed, "a failed load is not requested again")
+    C_Item.GetItemIconByID = function(itemId)
+        if itemId == aqirite then return 333001 end
+        if itemId == flask then return 333002 end
+        return nil
+    end
+    RT:RebuildReview()
+    assertEq(review.Rows[2].Icon.texture, 333001, "a later icon API result paints without another request")
+    assertEq(review.Rows[3].Icon.texture, 333002, "the second row paints the later icon")
+    assertEq(#world.loadRequests, loadsFailed, "painting a recovered icon does not request item data")
+
+    world.inCombat = true
+    SF.ItemDisplay.ResetSession()
+    C_Item.GetItemIconByID = nil
+    RT:RebuildReview()
+    afterBefore = #world.after
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", aqirite, true)
+    watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", flask, true)
+    assertEq(#world.after, afterBefore + 1, "combat still coalesces item completion to one notify")
+    drainAfter(8)
+    assertTrue(RT.reviewRefreshPending == true, "combat defers the review repaint")
+    assertEq(#world.after, 0, "combat icon completion does not leave a refresh queued")
+    world.inCombat = false
+    RT.reviewRefreshPending = nil
+
+    local listenersAfter = SF.ItemDisplay.ListenerCount()
+    local framesAfter = SF.ItemDisplay.WatchFrameCount()
+    -- #415 loads Raid Supplies Configuration and Logs before this check.
+    -- Each page keeps one refresh listener. The assistant adds exactly one.
+    assertEq(listenersAfter, 3,
+        "Raid Supplies pages and the deposit assistant each keep one item-display listener")
+    assertEq(framesAfter, 1, "the deposit assistant registers one item-data watch frame")
+    for _ = 1, 20 do
+        RT:RebuildReview()
+    end
+    assertEq(SF.ItemDisplay.ListenerCount(), listenersAfter, "repeated review rebuilds do not accumulate item listeners")
+    assertEq(SF.ItemDisplay.WatchFrameCount(), framesAfter, "repeated review rebuilds keep a single item watch frame")
+    assertEq(SF.ItemDisplay.InFlightCount(), 0, "repeated review rebuilds leave no in-flight item loads")
+    assertEq(#world.warnings, warnBefore, "icon lookup stays out of warning chat")
+    assertEq(#world.infos, infoBefore, "icon lookup stays out of info chat")
+
+    world.unknownItems[aqirite] = nil
+    world.unknownItems[flask] = nil
+    world.inCombat = false
+    GetItemIcon = savedGetItemIcon
+    C_Item.GetItemIconByID = savedById
+    C_Item.GetItemInfoInstant = savedInstant
+    SF.ItemDisplay.ResetSession()
+    unchanged(p, "deposit assistant icons")
+end
+
 local function checkSmartDonationHelper()
     local p = runtimeFixture("rt-smart-donation")
     C.AddRequestedItem(p, admin, flask)
@@ -4784,6 +4970,7 @@ checkGoalCommitGate()
 checkSessionProfileNoticeRemoved()
 checkFocusedEditRowReuse()
 checkSmartDonationHelper()
+checkDepositAssistantItemIcons()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

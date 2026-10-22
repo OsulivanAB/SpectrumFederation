@@ -121,18 +121,17 @@ local function ReportStatus(ctx, status, reason)
 	RefreshPageControls()
 end
 
-local function ItemLabel(itemId)
-	local name = nil
-	if C_Item and C_Item.GetItemInfo then
-		name = C_Item.GetItemInfo(itemId)
+local function DescribeItem(itemId)
+	local display = SF.ItemDisplay
+	if display and type(display.Describe) == "function" then
+		return display.Describe(itemId)
 	end
-	if type(name) ~= "string" and GetItemInfo then
-		name = GetItemInfo(itemId)
-	end
-	if type(name) == "string" and name ~= "" then
-		return string.format("%s (%d)", name, itemId)
-	end
-	return Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId))
+	return {
+		itemId = itemId,
+		status = "unknown",
+		name = Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item"),
+		icon = nil,
+	}
 end
 
 --- True only for first-time setup (no dataset). Permission-only nil records are recovery.
@@ -324,8 +323,10 @@ local function RequestedItemRows()
 			return {}
 		end
 		if type(row) == "table" and tonumber(row.itemId) then
+			local described = DescribeItem(row.itemId)
 			rows[#rows + 1] = {
-				text = ItemLabel(row.itemId),
+				text = described.name,
+				icon = described.icon,
 				itemId = row.itemId,
 				goal = tonumber(row.goal) or 0,
 				canRemove = canEdit,
@@ -1694,6 +1695,7 @@ local function Definition()
 						label = Loc("GUILD_SUPPLIES_ITEM_LIST", "Current campaign items"),
 						adminOnly = true,
 						height = 180,
+						showItemIcons = true,
 						getItems = RequestedItemRows,
 						enabled = function()
 							local rec = CurrentRecord()
@@ -1987,6 +1989,16 @@ local function QueueRefresh()
 	end
 end
 
+local function EnsureItemDisplayListener()
+	local display = SF.ItemDisplay
+	if not display or type(display.RegisterRefresh) ~= "function" then
+		return
+	end
+	display.RegisterRefresh("guildSuppliesConfiguration", function()
+		QueueRefresh()
+	end)
+end
+
 local function EnsureRosterListener()
 	if rosterFrame or type(CreateFrame) ~= "function" then
 		return
@@ -2099,6 +2111,7 @@ function Page:Build(panel)
 	EnsureBankListener()
 	EnsureAdoptionListener()
 	EnsureOfficerListener()
+	EnsureItemDisplayListener()
 	BeginRenderPass()
 	renderer:Build(panel, Definition())
 	EndRenderPass()
@@ -2132,5 +2145,6 @@ end
 EnsureRosterListener()
 EnsureBankListener()
 EnsureAdoptionListener()
+EnsureItemDisplayListener()
 
 SF.SettingsUI:RegisterPage(Page)
