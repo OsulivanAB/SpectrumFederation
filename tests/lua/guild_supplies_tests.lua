@@ -6013,7 +6013,7 @@ do
         function region:GetStringWidth() return 40 end
         function region:GetStringHeight() return 12 end
         function region:SetColorTexture() end
-        function region:SetTexture() end
+        function region:SetTexture(value) self.texture = value end
         function region:SetAtlas() end
         function region:SetTexCoord() end
         function region:SetVertexColor() end
@@ -7850,8 +7850,27 @@ do
         assertEq(#historyLists, 1, "414: history list present")
         assertEq(#configLists, 1, "414: campaign item list present")
         assertTrue(goalLists[1].showItemIcons == true, "414: goals icons are opt-in on that list")
-        assertTrue(historyLists[1].showItemIcons == true, "414: history icons are opt-in on that list")
+        assertTrue(historyLists[1].showItemIcons ~= true, "414: history does not use a leading icon column")
+        assertTrue(historyLists[1].showDetailTooltip == true, "414: history details use an opt-in tooltip")
+        assertTrue(historyLists[1].singleLine == true, "414: history stays on one line")
         assertTrue(configLists[1].showItemIcons == true, "414: campaign items opt into icons")
+        local sawLogsHelp = false
+        local helpItems = findDefItems(logsUi, function(item)
+            return type(item.getText) == "function"
+        end)
+        for i = 1, #helpItems do
+            local okHelp, helpValue = pcall(helpItems[i].getText)
+            if okHelp and type(helpValue) == "string" then
+                assertTrue(helpValue:find("pending evidence", 1, true) == nil,
+                    "414: logs help does not promise pending evidence")
+                if helpValue:find("Privileged edits", 1, true) then
+                    sawLogsHelp = true
+                    assertTrue(helpValue:find("history", 1, true) ~= nil,
+                        "414: logs help still mentions history")
+                end
+            end
+        end
+        assertTrue(sawLogsHelp, "414: membership help is present")
 
         icons[13467] = 200067
         icons[13468] = 200068
@@ -7945,32 +7964,74 @@ do
         assertEq(goalById[13468].icon, 200068, "414: goals row keeps its icon")
 
         hist = historyLists[1].getItems()
-        local donationText, adjustText
+        local donationText, donationTip, adjustText, adjustTip
         for i = 1, #hist do
             if hist[i].id == "414-don" then
                 donationText = hist[i].text
-                assertEq(hist[i].icon, 200067, "414: history donation icon")
+                donationTip = hist[i].tooltip
+                assertTrue(hist[i].icon == nil, "414: history row has no leading icon field")
                 assertEq(hist[i].itemId, 13467, "414: history keeps item id")
             elseif hist[i].id == "414-adj" then
                 adjustText = hist[i].text
+                adjustTip = hist[i].tooltip
             end
         end
         assertTrue(type(donationText) == "string", "414: donation history row visible")
-        assertTrue(donationText:find("Ursully-Garona", 1, true) ~= nil, "414: donation actor preserved")
-        assertTrue(donationText:find("×40", 1, true) ~= nil, "414: donation quantity preserved")
-        assertTrue(donationText:find("Dreamleaf", 1, true) ~= nil, "414: donation uses the item name")
-        assertTrue(donationText:find("officer", 1, true) ~= nil, "414: officer verification preserved")
+        assertTrue(donationText:find("Ursully-Garona ×40 — |T200067:16|t Dreamleaf", 1, true) ~= nil,
+            "414: donation icon sits on the item name: " .. tostring(donationText))
         assertTrue(donationText:find("donated", 1, true) == nil, "414: compact donation is not the long sentence")
         assertTrue(donationText:find("13467", 1, true) == nil, "414: history hides the item id")
-        assertTrue(donationText:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
-            "414: history keeps a timestamp: " .. donationText)
+        assertTrue(donationText:find("%d%d%d%d%-%d%d%-%d%d", 1) == nil,
+            "414: one-line donation leaves the timestamp in the tooltip")
+        assertTrue(type(donationTip) == "string", "414: donation tooltip present")
+        assertTrue(donationTip:find("officer", 1, true) ~= nil, "414: officer verification stays in the tooltip")
+        assertTrue(donationTip:find("donated", 1, true) ~= nil, "414: tooltip keeps donation wording")
+        assertTrue(donationTip:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
+            "414: tooltip keeps a timestamp: " .. donationTip)
         assertTrue(type(adjustText) == "string", "414: adjustment history row visible")
-        assertTrue(adjustText:find("adjustment", 1, true) ~= nil, "414: adjustment is not labeled as a donation")
+        assertTrue(adjustText:find("Alice-Garona -2 — |T200068:16|t Starlight Rose", 1, true) ~= nil,
+            "414: adjustment icon sits on the item name: " .. tostring(adjustText))
         assertTrue(adjustText:find("donated", 1, true) == nil, "414: adjustment avoids donation wording")
-        assertTrue(adjustText:find("-2", 1, true) ~= nil, "414: adjustment keeps the signed quantity")
-        assertTrue(adjustText:find("credited to Bob-Garona", 1, true) ~= nil,
-            "414: adjustment credit preserved")
-        assertTrue(adjustText:find("Starlight Rose", 1, true) ~= nil, "414: adjustment uses the item name")
+        assertTrue(type(adjustTip) == "string", "414: adjustment tooltip present")
+        assertTrue(adjustTip:find("adjusted", 1, true) ~= nil, "414: tooltip labels the adjustment")
+        assertTrue(adjustTip:find("-2", 1, true) ~= nil, "414: tooltip keeps the signed quantity")
+        assertTrue(adjustTip:find("credited to Bob-Garona", 1, true) ~= nil,
+            "414: tooltip keeps adjustment credit")
+        local renderedDonation
+        local function walkRegion(node)
+            if type(node.text) == "string" and node.text:find("|T200067:16|t Dreamleaf", 1, true)
+                and node.text:find("Ursully-Garona", 1, true) then
+                renderedDonation = node
+            end
+            for _, child in ipairs(node.children or {}) do
+                walkRegion(child)
+            end
+        end
+        walkRegion(logsUi)
+        assertTrue(renderedDonation ~= nil, "414: history font string renders the inline icon")
+        assertTrue(renderedDonation.parent and renderedDonation.parent.Icon == nil,
+            "414: rendered history row has no leading icon texture")
+        assertTrue(type(renderedDonation.parent.scripts.OnEnter) == "function",
+            "414: rendered history row has a detail hover")
+        local savedSetText = GameTooltip and GameTooltip.SetText
+        local savedShow = GameTooltip and GameTooltip.Show
+        local savedHide = GameTooltip and GameTooltip.Hide
+        local tipText
+        if GameTooltip then
+            GameTooltip.SetText = function(_, text)
+                tipText = text
+            end
+            GameTooltip.Show = function() end
+            GameTooltip.Hide = function() end
+            renderedDonation.parent.scripts.OnEnter(renderedDonation.parent)
+            assertTrue(type(tipText) == "string" and tipText:find("donated", 1, true) ~= nil,
+                "414: rendered hover shows the donation detail")
+            assertTrue(tipText:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
+                "414: rendered hover keeps the timestamp")
+            GameTooltip.SetText = savedSetText
+            GameTooltip.Show = savedShow
+            GameTooltip.Hide = savedHide
+        end
 
         local ledgerRows = GS:ListCampaignHistory(camp.id, 10, 0)
         local ledgerDonation
@@ -7986,25 +8047,36 @@ do
         assertEq(ledgerDonation.quantity, 40, "414: ledger quantity unchanged")
         assertEq(ledgerDonation.actor, "Ursully-Garona", "414: ledger actor unchanged")
 
-        local uncredited = GS.FormatCampaignHistoryCompact({
+        local uncreditedEvent = {
             type = "donation",
             quantity = 6,
             actor = "ArchStaged-Garona",
             timestamp = 1700000000,
             verification = "witnesses",
             uncredited = true,
-        }, "Dreamleaf")
-        assertTrue(uncredited:find("uncredited", 1, true) ~= nil, "414: archived uncredited label preserved")
-        assertTrue(uncredited:find("3 witnesses", 1, true) ~= nil, "414: witness verification preserved")
-        assertTrue(uncredited:find("ArchStaged-Garona", 1, true) ~= nil, "414: uncredited actor preserved")
-        local plainAdjust = GS.FormatCampaignHistoryCompact({
+        }
+        local uncredited = GS.FormatCampaignHistoryCompact(uncreditedEvent, "Dreamleaf", 9)
+        assertTrue(uncredited:find("ArchStaged-Garona ×6 — |T9:16|t Dreamleaf", 1, true) ~= nil,
+            "414: uncredited line keeps actor, quantity, and adjacent icon")
+        assertTrue(uncredited:find("uncredited", 1, true) == nil,
+            "414: one-line label leaves uncredited status for the tooltip")
+        local uncreditedDetail = GS.FormatCampaignHistoryDetail(uncreditedEvent, "Dreamleaf")
+        assertTrue(uncreditedDetail:find("uncredited", 1, true) ~= nil, "414: archived uncredited label preserved")
+        assertTrue(uncreditedDetail:find("three Guild Bank", 1, true) ~= nil, "414: witness verification preserved")
+        assertTrue(uncreditedDetail:find("ArchStaged-Garona", 1, true) ~= nil, "414: uncredited actor preserved")
+        local plainEvent = {
             type = "adjustment",
             quantity = 5,
             actor = "Alice-Garona",
             timestamp = 1700000000,
-        }, "Dreamleaf")
-        assertTrue(plainAdjust:find("unattributed", 1, true) ~= nil, "414: missing credit stays unattributed")
+        }
+        local plainAdjust = GS.FormatCampaignHistoryCompact(plainEvent, "Dreamleaf")
         assertTrue(plainAdjust:find("+5", 1, true) ~= nil, "414: positive adjustment stays signed")
+        assertTrue(plainAdjust:find("unattributed", 1, true) == nil,
+            "414: one-line adjustment leaves attribution for the tooltip")
+        local plainDetail = GS.FormatCampaignHistoryDetail(plainEvent, "Dreamleaf")
+        assertTrue(plainDetail:find("unattributed", 1, true) ~= nil, "414: missing credit stays unattributed")
+        assertEq(GS.FormatHistoryInlineIcon("|bad|"), "", "414: unsafe icon markup is omitted")
 
         -- Failed metadata becomes Unknown item and does not retry.
         assertEq(GS:ApplyStagedConfigOperation(GS:NewConfigOperation("set-requested-item", {
@@ -8036,6 +8108,58 @@ do
         drainQueued()
         assertEq(#loads, loadsAtFailure, "414: failed item data does not retry")
         assertTrue(loadsAtFailure >= beforeFailLoads, "414: failure accounting stays finite")
+
+        local function findRendered(node, needle, found)
+            found = found or {}
+            if type(node.text) == "string" and node.text:find(needle, 1, true) then
+                found[#found + 1] = node
+            end
+            for _, child in ipairs(node.children or {}) do
+                findRendered(child, needle, found)
+            end
+            return found
+        end
+        local unknownWidgets = findRendered(configUi, "Unknown item")
+        assertTrue(#unknownWidgets >= 1, "414: unknown item is visible before the later success")
+        names[424242] = "Laterleaf"
+        icons[424242] = 424001
+        for i = 1, #unknownWidgets do
+            assertTrue(unknownWidgets[i].text:find("Unknown item", 1, true) ~= nil,
+                "414: a cached name does not repaint until item data succeeds")
+        end
+        local queuedBeforeLate = #queued
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 42, true)
+        assertEq(#queued, queuedBeforeLate, "414: an unrelated success stays idle")
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, false)
+        assertEq(#queued, queuedBeforeLate, "414: another failure of a failed item stays idle")
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, true)
+        assertEq(#queued, queuedBeforeLate + 1, "414: a later success refreshes the failed item")
+        drainQueued()
+        local lateWidgets = findRendered(configUi, "Laterleaf")
+        assertTrue(#lateWidgets >= 1, "414: visible row shows the name from the later success")
+        local lateIcon = false
+        local function findIcon(node)
+            if node.texture == 424001 then
+                lateIcon = true
+            end
+            for _, child in ipairs(node.children or {}) do
+                findIcon(child)
+            end
+        end
+        findIcon(configUi)
+        assertTrue(lateIcon, "414: visible row shows the icon from the later success")
+        configRows = configLists[1].getItems()
+        for i = 1, #configRows do
+            if configRows[i].itemId == 424242 then
+                assertEq(configRows[i].text, "Laterleaf", "414: campaign row uses the recovered name")
+                assertEq(configRows[i].icon, 424001, "414: campaign row uses the recovered icon")
+                assertEq(configRows[i].itemId, 424242, "414: recovered row keeps its item id")
+            end
+        end
+        assertEq(#loads, loadsAtFailure, "414: later success does not request the item again")
+        queuedBeforeLate = #queued
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, true)
+        assertEq(#queued, queuedBeforeLate, "414: a resolved item stays idle")
 
         -- Instant icon is used when GetItemIconByID returns nothing.
         icons[13467] = nil
@@ -8114,6 +8238,26 @@ do
         assertEq(SF.ItemDisplay.WatchFrameCount(), framesBefore, "414: reopen does not add item-data frames")
         assertEq(listenersBefore > 0, true, "414: listeners were installed with the pages")
         assertEq(#(world.chat or {}), chatBefore, "414: item display emits no chat")
+
+        local function checkDispatchResumes()
+            SF.ItemDisplay.RegisterRefresh("414-dispatch-guard", function()
+                error("414-dispatch-boom")
+            end)
+            SF.ItemDisplay.Notify()
+            local okBoom = pcall(drainQueued)
+            assertTrue(okBoom == false, "414: a refresh callback error still surfaces")
+            local resumed = false
+            SF.ItemDisplay.RegisterRefresh("414-dispatch-guard", function()
+                resumed = true
+            end)
+            if logsPage.OnHide then logsPage:OnHide() end
+            if configPage.OnHide then configPage:OnHide() end
+            SF.ItemDisplay.Notify()
+            drainQueued()
+            assertTrue(resumed, "414: item refresh resumes after a callback error")
+            SF.ItemDisplay.RegisterRefresh("414-dispatch-guard", function() end)
+        end
+        checkDispatchResumes()
 
         C_Timer.After = savedAfter
         C_Item = priorCItem

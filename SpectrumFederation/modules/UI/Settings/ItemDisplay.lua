@@ -4,9 +4,12 @@
 -- Guarantee: a visible row shows the localized name and icon when the client can
 -- resolve them. Until then it shows "Loading item…". After one load fails, or the
 -- client cannot request data, it shows "Unknown item" and does not invent a name.
+-- A later successful ITEM_DATA_LOAD_RESULT for that same item refreshes visible
+-- rows when a name is now readable. It does not request the item again.
 -- Lifecycle: one ITEM_DATA_LOAD_RESULT frame. Each item is requested at most once
 -- per session. Completion coalesces a single refresh for registered consumers.
--- Hidden pages and unrelated item ids do no follow-up work.
+-- Hidden pages and unrelated item ids do no follow-up work. A callback error
+-- restores the dispatch guard before it propagates.
 local _, SF = ...
 
 local ItemDisplay = {}
@@ -213,20 +216,31 @@ function ItemDisplay.Describe(itemId)
 end
 
 -- True when a consumer should refresh. Unrelated item ids stay idle.
+-- A failed item stays failed across further failures. A later success with a
+-- readable name clears that failure and refreshes once, without another request.
 function ItemDisplay.ConsumeLoadResult(itemId, success)
     local id = ItemDisplay.NormalizeItemId(itemId)
-    if not id or not inflight[id] then
+    if not id then
+        return false
+    end
+    local wasInflight = inflight[id] and true or false
+    local wasFailed = failed[id] and true or false
+    if not wasInflight and not wasFailed then
         return false
     end
     inflight[id] = nil
-    resolved[id] = true
     local name = ItemDisplay.ReadCachedName(id)
-    if success == false or not name then
-        failed[id] = true
-    else
+    if success ~= false and name then
         failed[id] = nil
+        resolved[id] = true
+        return true
     end
-    return true
+    if wasInflight then
+        resolved[id] = true
+        failed[id] = true
+        return true
+    end
+    return false
 end
 
 function ItemDisplay.IconOrFallback(itemId)
@@ -269,23 +283,28 @@ Dispatch = function()
         return
     end
     notifyDepth = notifyDepth + 1
-    local passes = 0
-    while passes < 2 do
-        passes = passes + 1
-        notifyQueued = false
-        local snapshot = {}
-        for _, callback in pairs(listeners) do
-            snapshot[#snapshot + 1] = callback
+    local ok, err = pcall(function()
+        local passes = 0
+        while passes < 2 do
+            passes = passes + 1
+            notifyQueued = false
+            local snapshot = {}
+            for _, callback in pairs(listeners) do
+                snapshot[#snapshot + 1] = callback
+            end
+            for i = 1, #snapshot do
+                snapshot[i]()
+            end
+            if not notifyQueued then
+                break
+            end
         end
-        for i = 1, #snapshot do
-            snapshot[i]()
-        end
-        if not notifyQueued then
-            break
-        end
-    end
+    end)
     notifyQueued = false
     notifyDepth = notifyDepth - 1
+    if not ok then
+        error(err, 0)
+    end
 end
 
 function ItemDisplay.Notify()

@@ -206,13 +206,15 @@ local function makeRegion(kind, name, parent, template)
     function region:SetJustifyV()
     end
 
-    function region:SetWordWrap()
+    function region:SetWordWrap(wrap)
+        self.wordWrap = wrap
     end
 
     function region:SetNonSpaceWrap()
     end
 
-    function region:SetMaxLines()
+    function region:SetMaxLines(lines)
+        self.maxLines = lines
     end
 
     function region:SetAutoFocus()
@@ -743,6 +745,112 @@ do
     assertEq(iconRows[1].Icon.texture, 556, "scroll row refresh replaces the icon")
     assertEq(iconRows[1].Text.text, "Dreamleaf — 2 / 10", "scroll row refresh replaces the label")
     assertTrue(iconCalls <= 80 and plainCalls <= 80, "scroll refreshes stay bounded")
+end
+
+do
+    local panel = CreateFrame("Frame")
+    panel:SetSize(700, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("History")
+    section.Content:SetWidth(640)
+    local items = {
+        {
+            text = "Ursully-Garona ×40 — |T200067:16|t Dreamleaf",
+            tooltip = "2023-11-14 22:13 — Ursully-Garona donated 40 Dreamleaf. Verified by one officer Guild Bank observation.",
+            id = "414-don",
+            itemId = 13467,
+        },
+    }
+    local calls = 0
+    Controls:AddScrollList(section, {
+        label = "Campaign history",
+        height = 80,
+        singleLine = true,
+        showDetailTooltip = true,
+        getItems = function()
+            calls = calls + 1
+            if calls > 80 then
+                error("history scroll list exceeded 80 getItems calls")
+            end
+            return items
+        end,
+    })
+    local scroll = findScroll(section)
+    scroll:SetSize(360, 80)
+    fireEvent(scroll, "OnSizeChanged", 360, 80)
+    local function scrollRows(target)
+        local found = {}
+        for _, child in ipairs((target.scrollChild and target.scrollChild.children) or {}) do
+            if child.Text and child.Remove and not child.GoalEdit then
+                found[#found + 1] = child
+            end
+        end
+        return found
+    end
+    local row = scrollRows(scroll)[1]
+    assertTrue(row ~= nil, "history row renders")
+    assertTrue(row.Icon == nil, "history does not add a leading icon column")
+    assertEq(leftAnchor(row.Text).x, 0, "history text starts at the row edge")
+    assertEq(row.Text.wordWrap, false, "history text stays on one line")
+    assertEq(row.Text.maxLines, 1, "history text does not wrap under the row")
+    local rendered = row.Text.text
+    local iconAt = rendered:find("|T200067:16|t Dreamleaf", 1, true)
+    local dashAt = rendered:find("×40 — ", 1, true)
+    assertTrue(dashAt ~= nil and iconAt ~= nil and iconAt > dashAt,
+        "rendered history places the icon immediately before the item name")
+    assertTrue(rendered:find("2023", 1, true) == nil, "the one-line label leaves the timestamp for the tooltip")
+    assertTrue(rendered:find("officer", 1, true) == nil, "the one-line label leaves verification for the tooltip")
+
+    local tip, shown
+    local savedSetText = GameTooltip.SetText
+    local savedShow = GameTooltip.Show
+    local savedHide = GameTooltip.Hide
+    local savedSetOwner = GameTooltip.SetOwner
+    GameTooltip.SetOwner = function() end
+    GameTooltip.SetText = function(_, text)
+        tip = text
+    end
+    GameTooltip.Show = function()
+        shown = true
+    end
+    GameTooltip.Hide = function()
+        shown = false
+    end
+    assertTrue(type(row.scripts.OnEnter) == "function", "history row exposes one enter handler")
+    assertTrue(type(row.scripts.OnLeave) == "function", "history row exposes one leave handler")
+    row.scripts.OnEnter(row)
+    assertTrue(shown == true, "history hover shows the detail tooltip")
+    assertTrue(type(tip) == "string" and tip:find("Verified by one officer", 1, true) ~= nil,
+        "history tooltip keeps officer verification")
+    assertTrue(tip:find("2023-11-14", 1, true) ~= nil, "history tooltip keeps the timestamp")
+    assertTrue(tip:find("donated 40", 1, true) ~= nil, "history tooltip keeps donation wording")
+    row.scripts.OnLeave(row)
+    assertTrue(shown == false, "history leave hides the tooltip")
+
+    items[1].tooltip = "2023-11-14 22:13 — Alice-Garona adjusted Starlight Rose by -2 (credited to Bob-Garona)."
+    items[1].text = "Alice-Garona -2 — |T200068:16|t Starlight Rose"
+    local enterBefore = row.scripts.OnEnter
+    fireEvent(scroll, "OnSizeChanged", 360, 80)
+    row = scrollRows(scroll)[1]
+    assertTrue(row.scripts.OnEnter ~= enterBefore, "refresh replaces the tooltip handler")
+    assertEq(row.Text.text, items[1].text, "refresh replaces the inline history label")
+    row.scripts.OnEnter(row)
+    assertTrue(tip:find("adjusted", 1, true) ~= nil, "refreshed tooltip shows the adjustment")
+    assertTrue(tip:find("credited to Bob-Garona", 1, true) ~= nil, "refreshed tooltip keeps attribution")
+    assertTrue(tip:find("-2", 1, true) ~= nil, "refreshed tooltip keeps the signed quantity")
+    row.scripts.OnLeave(row)
+
+    items[1].tooltip = nil
+    fireEvent(scroll, "OnSizeChanged", 360, 80)
+    row = scrollRows(scroll)[1]
+    assertTrue(row.scripts.OnEnter == nil, "a row without detail clears the enter handler")
+    assertTrue(row.scripts.OnLeave == nil, "a row without detail clears the leave handler")
+    assertTrue(calls <= 80, "history tooltip refreshes stay bounded")
+    GameTooltip.SetText = savedSetText
+    GameTooltip.Show = savedShow
+    GameTooltip.Hide = savedHide
+    GameTooltip.SetOwner = savedSetOwner
 end
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))

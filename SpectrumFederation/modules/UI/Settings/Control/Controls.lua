@@ -1462,6 +1462,9 @@ function Controls:AddScrollList(section, opts)
 	local itemIconSize = opts.itemIconSize or 16
 	local itemIconGap = opts.itemIconGap or 4
 	local iconReserve = showItemIcons and (itemIconSize + itemIconGap) or 0
+	-- History uses an inline texture and a tooltip instead of a leading icon column.
+	local singleLine = opts.singleLine and true or false
+	local showDetailTooltip = opts.showDetailTooltip and true or false
 
 	local resize = (opts.resize ~= false)	-- Default to true
 	local border = (opts.border == true)	-- Default to false
@@ -1535,11 +1538,13 @@ function Controls:AddScrollList(section, opts)
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetPoint("LEFT", r, "LEFT", 0, 0)
 			fs:SetJustifyH("LEFT")
-			if showItemIcons then
+			if showItemIcons or singleLine then
 				if fs.SetWordWrap then fs:SetWordWrap(false) end
 				if fs.SetNonSpaceWrap then fs:SetNonSpaceWrap(false) end
 				if fs.SetMaxLines then fs:SetMaxLines(1) end
 				if fs.SetJustifyV then fs:SetJustifyV("MIDDLE") end
+			end
+			if showItemIcons then
 				local icon = r:CreateTexture(nil, "ARTWORK")
 				icon:SetSize(itemIconSize, itemIconSize)
 				r.Icon = icon
@@ -1660,6 +1665,32 @@ function Controls:AddScrollList(section, opts)
 						r.Icon:Show()
 					else
 						r.Icon:Hide()
+					end
+				end
+
+				if showDetailTooltip then
+					local tip = item.tooltip
+					if type(tip) == "string" and tip ~= "" then
+						r.tooltipText = tip
+						r:SetScript("OnEnter", function(self)
+							if not GameTooltip or not GameTooltip.SetOwner or not GameTooltip.SetText then
+								return
+							end
+							GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+							GameTooltip:SetText(self.tooltipText, 1, 1, 1, 1, true)
+							if GameTooltip.Show then
+								GameTooltip:Show()
+							end
+						end)
+						r:SetScript("OnLeave", function()
+							if GameTooltip and GameTooltip.Hide then
+								GameTooltip:Hide()
+							end
+						end)
+					else
+						r.tooltipText = nil
+						r:SetScript("OnEnter", nil)
+						r:SetScript("OnLeave", nil)
 					end
 				end
 

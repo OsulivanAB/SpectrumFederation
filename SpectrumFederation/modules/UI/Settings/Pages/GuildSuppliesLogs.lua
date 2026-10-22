@@ -171,7 +171,7 @@ local function MembershipHelpText()
 	end
 	if caps.canRead then
 		return Loc("GUILD_SUPPLIES_LOGS_HELP",
-			"Members can inspect current and archived campaign goals and progress. Privileged edits live on Configuration.")
+			"Members can inspect current and archived campaign goals, progress, and history. Privileged edits live on Configuration.")
 	end
 	return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
 		"Join a guild with a verified membership to inspect Guild Supplies logs.")
@@ -278,10 +278,12 @@ local function EnsureHistoryState()
 			local row = rows[i]
 			local described = DescribeItem(row.itemId)
 			local compact = g.FormatCampaignHistoryCompact
-				and g.FormatCampaignHistoryCompact(row, described.name)
+				and g.FormatCampaignHistoryCompact(row, described.name, described.icon)
+			local detail = g.FormatCampaignHistoryDetail
+				and g.FormatCampaignHistoryDetail(row, described.name)
 			items[#items + 1] = {
 				text = compact or row.text,
-				icon = described.icon,
+				tooltip = detail or row.text,
 				itemId = row.itemId,
 				id = row.id,
 				canRemove = false,
@@ -453,7 +455,8 @@ local function Definition()
 						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY", "Campaign history"),
 						height = 180,
 						rowHeight = 20,
-						showItemIcons = true,
+						singleLine = true,
+						showDetailTooltip = true,
 						getItems = function()
 							if not Caps().canRead then
 								return {}
