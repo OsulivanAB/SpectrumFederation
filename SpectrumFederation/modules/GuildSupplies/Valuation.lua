@@ -35,6 +35,7 @@ GS.VALUATION_SCHEMA = 1
 GS.MAX_PENDING_VALUATIONS = 256
 GS.MAX_VALUATION_SEEN = 16
 GS.VALUATION_CATCHUP_BATCH = 8
+GS.VALUATION_CATCHUP_SCAN = 32
 
 local MAX_EXACT = 9007199254740992 -- 2^53; totals must stay strictly below this
 local MAX_QTY = GS.MAX_OBS_QUANTITY or 100000
@@ -42,6 +43,7 @@ local MAX_UNIT = math.floor((MAX_EXACT - 1) / MAX_QTY)
 local MAX_SEEN = GS.MAX_VALUATION_SEEN
 local MAX_PENDING = GS.MAX_PENDING_VALUATIONS
 local BATCH = GS.VALUATION_CATCHUP_BATCH
+local SCAN = GS.VALUATION_CATCHUP_SCAN or 32
 local MAX_ALIAS_HOPS = 8
 
 local catchup = {
@@ -99,6 +101,14 @@ local function NormalizeInteger(value, minValue, maxValue)
     if value ~= value or value == math.huge or value == -math.huge then
         return nil
     end
+    -- Exact integers must not go through the +0.5 tolerance. At 2^52 and above
+    -- that addition is not representable and would reject the legal maximum.
+    if value == math.floor(value) then
+        if value < minValue or value > maxValue then
+            return nil
+        end
+        return value
+    end
     local nearest = math.floor(value + 0.5)
     if math.abs(value - nearest) > 1e-6 then
         return nil
@@ -113,9 +123,19 @@ local function NormalizeCopper(value, maxValue)
     return NormalizeInteger(value, 0, maxValue)
 end
 
-local function SafeTotal(unit, qty)
-    unit = NormalizeCopper(unit, MAX_UNIT)
+--- Largest unit whose total with this quantity stays strictly below 2^53.
+local function MaxUnitForQuantity(qty)
     qty = NormalizeInteger(qty, 1, MAX_QTY)
+    if not qty then
+        return nil
+    end
+    return math.floor((MAX_EXACT - 1) / qty)
+end
+
+local function SafeTotal(unit, qty)
+    qty = NormalizeInteger(qty, 1, MAX_QTY)
+    local maxUnit = qty and MaxUnitForQuantity(qty)
+    unit = maxUnit and NormalizeCopper(unit, maxUnit) or nil
     if not unit or not qty then
         return nil
     end
@@ -564,8 +584,9 @@ local function NormalizeAssignment(body, record)
         return nil, "invalid_assignment"
     end
     local assignedAt = NormalizeInteger(raw.assignedAt, 0, MAX_EXACT - 1)
-    local unit = NormalizeCopper(raw.unitCopper, MAX_UNIT)
     local qty = NormalizeInteger(raw.quantity, 1, MAX_QTY)
+    local maxUnit = qty and MaxUnitForQuantity(qty)
+    local unit = maxUnit and NormalizeCopper(raw.unitCopper, maxUnit) or nil
     local itemId = NormalizeInteger(raw.itemId, 1, MAX_EXACT - 1)
     local total = NormalizeCopper(raw.totalCopper, MAX_EXACT - 1)
     if not assignedAt or not unit or not qty or not itemId or not total then
@@ -624,10 +645,9 @@ local function ValidateSnapFields(snap, key, pending)
     if not NormalizeInteger(snap.assignedAt, 0, MAX_EXACT - 1) then
         return false
     end
-    if not NormalizeCopper(snap.unitCopper, MAX_UNIT) then
-        return false
-    end
-    if not NormalizeInteger(snap.quantity, 1, MAX_QTY) then
+    local qty = NormalizeInteger(snap.quantity, 1, MAX_QTY)
+    local maxUnit = qty and MaxUnitForQuantity(qty)
+    if not qty or not maxUnit or not NormalizeCopper(snap.unitCopper, maxUnit) then
         return false
     end
     if not NormalizeInteger(snap.itemId, 1, MAX_EXACT - 1) then
@@ -636,7 +656,7 @@ local function ValidateSnapFields(snap, key, pending)
     if not NormalizeCopper(snap.totalCopper, MAX_EXACT - 1) then
         return false
     end
-    if SafeTotal(snap.unitCopper, snap.quantity) ~= snap.totalCopper then
+    if SafeTotal(snap.unitCopper, qty) ~= snap.totalCopper then
         return false
     end
     if not ValidTxnId(snap.txnId) then
@@ -674,11 +694,17 @@ local function ValidateSnapFields(snap, key, pending)
     return true
 end
 
-function GS.ValidateValuationStore(store)
+function GS.ValidateValuationStore(store, record, guildKey)
     if store == nil then
         return true
     end
     if type(store) ~= "table" then
+        return false, "invalid_valuations"
+    end
+    if type(record) ~= "table" or type(record.datasetId) ~= "string" or record.datasetId == "" then
+        return false, "invalid_valuations"
+    end
+    if type(guildKey) ~= "string" or guildKey == "" then
         return false, "invalid_valuations"
     end
     if store.schemaVersion ~= nil and tonumber(store.schemaVersion) ~= GS.VALUATION_SCHEMA then
@@ -705,11 +731,17 @@ function GS.ValidateValuationStore(store)
             if not ValidTxnId(key) or not ValidateSnapFields(snap, key, false) then
                 return false, "invalid_valuations"
             end
+            if snap.datasetId ~= record.datasetId or snap.guildKey ~= guildKey then
+                return false, "invalid_valuations"
+            end
         end
     end
     if type(store.pending) == "table" then
         for key, snap in pairs(store.pending) do
             if not ValidTxnId(key) or not ValidateSnapFields(snap, key, true) then
+                return false, "invalid_valuations"
+            end
+            if snap.datasetId ~= record.datasetId or snap.guildKey ~= guildKey then
                 return false, "invalid_valuations"
             end
         end
@@ -855,9 +887,19 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     if type(store) ~= "table" then
         return
     end
-    local incoming = (type(store.byTxn) == "table" and store.byTxn[alias])
-        or (type(store.pending) == "table" and store.pending[alias])
-        or nil
+    -- Read every candidate before deleting a key. The earlier assignment may
+    -- already sit on the canonical id while a later one sits on the alias.
+    local candidates = {}
+    local function push(bucket, key)
+        local snap = type(bucket) == "table" and bucket[key] or nil
+        if type(snap) == "table" then
+            candidates[#candidates + 1] = snap
+        end
+    end
+    push(store.byTxn, canonical)
+    push(store.byTxn, alias)
+    push(store.pending, canonical)
+    push(store.pending, alias)
     if type(store.byTxn) == "table" then
         store.byTxn[alias] = nil
     end
@@ -865,7 +907,10 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
         store.pending[alias] = nil
         store.pending[canonical] = nil
     end
-    local changed = MergeOntoCanonical(record, canonical, incoming, false)
+    local changed = false
+    for i = 1, #candidates do
+        changed = MergeOntoCanonical(record, canonical, candidates[i], changed)
+    end
     RemoveValuationExports({ [alias] = true })
     if changed and ShouldPublish(record) then
         PublishWinner(record, canonical)
@@ -1023,7 +1068,9 @@ local function QueryMarket(item)
     if not ok then
         return nil
     end
-    return NormalizeCopper(value, MAX_UNIT)
+    -- Qty 1 is the widest legal unit. MintWithCopper rejects a total that the
+    -- actual donation quantity cannot represent exactly.
+    return NormalizeCopper(value, MAX_EXACT - 1)
 end
 
 local function PriceQueryItem(evidence, event)
@@ -1212,22 +1259,101 @@ function GS.DescribeDonationValuation(record, event)
     return result
 end
 
-local function ListUnpriced(record)
-    local backlog = {}
-    local seen = {}
-    VisitEvents(record, function(event)
+local function RetainedEventCount(record)
+    local accounting = record and record.accounting
+    if type(accounting) ~= "table" then
+        return 0
+    end
+    local n = 0
+    if type(accounting._consumableEvents) == "table" then
+        n = n + #accounting._consumableEvents
+    end
+    if type(accounting._consumableEventArchive) == "table" then
+        n = n + #accounting._consumableEventArchive
+    end
+    return n
+end
+
+local function ResetCatchupWork()
+    catchup.queue = {}
+    catchup.queued = {}
+    catchup.scanPhase = "live"
+    catchup.scanIndex = 1
+    catchup.scanDone = false
+    catchup.lastVisits = 0
+    catchup.cache = {}
+end
+
+--- One forward step across the live list, then the archive. Nil means the
+-- scan is exhausted. Index movement is O(1); callers bound how many steps run.
+local function NextScanEvent(record)
+    while true do
+        local accounting = record and record.accounting
+        local list = nil
+        if type(accounting) == "table" then
+            if catchup.scanPhase == "archive" then
+                list = accounting._consumableEventArchive
+            else
+                list = accounting._consumableEvents
+            end
+        end
+        if type(list) ~= "table" then
+            if catchup.scanPhase ~= "archive" then
+                catchup.scanPhase = "archive"
+                catchup.scanIndex = 1
+            else
+                catchup.scanDone = true
+                return nil
+            end
+        else
+            local index = tonumber(catchup.scanIndex) or 1
+            if index < 1 then
+                index = 1
+            end
+            if index > #list then
+                if catchup.scanPhase ~= "archive" then
+                    catchup.scanPhase = "archive"
+                    catchup.scanIndex = 1
+                else
+                    catchup.scanDone = true
+                    return nil
+                end
+            else
+                local event = list[index]
+                catchup.scanIndex = index + 1
+                return event
+            end
+        end
+    end
+end
+
+local function DiscoverUnpriced(record, gen)
+    local visits = 0
+    local queue = catchup.queue or {}
+    local queued = catchup.queued or {}
+    catchup.queue = queue
+    catchup.queued = queued
+    while visits < SCAN do
+        if gen ~= catchup.generation then
+            break
+        end
+        local event = NextScanEvent(record)
+        if not event then
+            break
+        end
+        visits = visits + 1
         if PriceableDonation(record, event) then
             local txn = EventTxn(event)
             local _, canonical = AliasSet(record, txn)
             canonical = canonical or txn
-            if canonical and not seen[canonical] and not LookupSnap(record, canonical) then
-                seen[canonical] = true
-                backlog[#backlog + 1] = canonical
+            if canonical and not queued[canonical] and not LookupSnap(record, canonical) then
+                queued[canonical] = true
+                queue[#queue + 1] = canonical
             end
         end
-        return false
-    end)
-    return backlog
+    end
+    catchup.lastVisits = visits
+    return visits
 end
 
 local function CacheKey(item)
@@ -1258,29 +1384,17 @@ local function CachedCopper(item)
     return copper
 end
 
-local function ProcessCatchupBatch(gen)
-    if gen ~= catchup.generation then
-        return false
-    end
-    if not GS.ValuationOfficerEligible() then
-        return false
-    end
-    local record = select(1, GS:GetCurrentRecord())
-    if type(record) ~= "table" or record.datasetId ~= catchup.datasetId
-        or not (GS.IsLiveActive and GS.IsLiveActive(record)) then
-        return false
-    end
-    local backlog = catchup.backlog or {}
-    local startAt = tonumber(catchup.index) or 1
-    if startAt < 1 then
-        startAt = 1
-    end
-    local last = math.min(#backlog, startAt + BATCH - 1)
-    for i = startAt, last do
+local function PriceQueued(record, gen)
+    local queue = catchup.queue or {}
+    local pos = 1
+    local attempts = 0
+    while attempts < BATCH and pos <= #queue do
         if gen ~= catchup.generation then
-            return false
+            return
         end
-        local txnId = backlog[i]
+        local txnId = queue[pos]
+        pos = pos + 1
+        attempts = attempts + 1
         if not LookupSnap(record, txnId) then
             local ids = AliasSet(record, txnId)
             local event = FindEventForIds(record, ids)
@@ -1292,8 +1406,48 @@ local function ProcessCatchupBatch(gen)
             end
         end
     end
-    catchup.index = last + 1
-    return catchup.index <= #backlog
+    if pos > 1 then
+        local rest = {}
+        for i = pos, #queue do
+            rest[#rest + 1] = queue[i]
+        end
+        catchup.queue = rest
+    end
+end
+
+local function ProcessCatchupSlice(gen)
+    if gen ~= catchup.generation then
+        return false
+    end
+    if not GS.ValuationOfficerEligible() then
+        return false
+    end
+    local record = select(1, GS:GetCurrentRecord())
+    if type(record) ~= "table" or record.datasetId ~= catchup.datasetId
+        or not (GS.IsLiveActive and GS.IsLiveActive(record)) then
+        return false
+    end
+    catchup.lastVisits = 0
+    local queued = #(catchup.queue or {})
+    if queued < BATCH and not catchup.scanDone then
+        DiscoverUnpriced(record, gen)
+    end
+    if gen ~= catchup.generation then
+        return false
+    end
+    PriceQueued(record, gen)
+    if gen ~= catchup.generation then
+        return false
+    end
+    return #(catchup.queue or {}) > 0 or catchup.scanDone ~= true
+end
+
+local function IdleCatchup()
+    catchup.active = false
+    catchup.scheduled = false
+    catchup.queue = nil
+    catchup.queued = nil
+    catchup.cache = nil
 end
 
 local function ScheduleCatchup(gen)
@@ -1301,11 +1455,8 @@ local function ScheduleCatchup(gen)
         return
     end
     if not (C_Timer and C_Timer.After) then
-        ProcessCatchupBatch(gen)
-        catchup.active = false
-        catchup.scheduled = false
-        catchup.backlog = nil
-        catchup.cache = nil
+        ProcessCatchupSlice(gen)
+        IdleCatchup()
         return
     end
     catchup.scheduled = true
@@ -1314,26 +1465,23 @@ local function ScheduleCatchup(gen)
             return
         end
         catchup.scheduled = false
-        local more = ProcessCatchupBatch(gen)
+        local more = ProcessCatchupSlice(gen)
         if more and gen == catchup.generation then
             ScheduleCatchup(gen)
         elseif gen == catchup.generation then
-            catchup.active = false
-            catchup.scheduled = false
-            catchup.backlog = nil
-            catchup.cache = nil
+            IdleCatchup()
         end
     end)
 end
 
 function GS.CancelValuationCatchup(reason)
     catchup.generation = (tonumber(catchup.generation) or 0) + 1
-    catchup.active = false
-    catchup.scheduled = false
     catchup.datasetId = nil
-    catchup.backlog = nil
-    catchup.index = 1
-    catchup.cache = nil
+    catchup.scanPhase = "live"
+    catchup.scanIndex = 1
+    catchup.scanDone = true
+    catchup.lastVisits = 0
+    IdleCatchup()
     if reason and reason ~= "restart" then
         DebugInfo("valuation catch-up cancelled reason=%s", tostring(reason))
     end
@@ -1349,16 +1497,15 @@ function GS.StartValuationCatchup(reason)
     if type(record) ~= "table" or not (GS.IsLiveActive and GS.IsLiveActive(record)) then
         return false
     end
-    local backlog = ListUnpriced(record)
-    if #backlog < 1 then
+    -- Counting retained rows is O(1). Discovering which of them are unpriced
+    -- walks the ledger and resolves aliases, so that work stays on the timer.
+    if RetainedEventCount(record) < 1 then
         return false
     end
     catchup.active = true
     catchup.datasetId = record.datasetId
-    catchup.backlog = backlog
-    catchup.index = 1
-    catchup.cache = {}
-    DebugInfo("valuation catch-up start reason=%s rows=%d", tostring(reason or "logs"), #backlog)
+    ResetCatchupWork()
+    DebugInfo("valuation catch-up start reason=%s", tostring(reason or "logs"))
     ScheduleCatchup(gen)
     return true
 end
@@ -1369,7 +1516,9 @@ function GS.GetValuationCatchupState()
         scheduled = catchup.scheduled and true or false,
         generation = catchup.generation,
         datasetId = catchup.datasetId,
-        index = catchup.index,
-        backlog = catchup.backlog and #catchup.backlog or 0,
+        index = tonumber(catchup.scanIndex) or 1,
+        backlog = catchup.queue and #catchup.queue or 0,
+        lastVisits = tonumber(catchup.lastVisits) or 0,
+        scanDone = catchup.scanDone == true,
     }
 end

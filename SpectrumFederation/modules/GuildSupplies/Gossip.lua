@@ -1673,6 +1673,7 @@ local function RebuildExportIndex()
         -- #388: immutable accounting manifest for adoption completeness.
         acceptedLedgerCount = 0,
         donationEvidenceCount = 0,
+        valuationCount = 0,
         -- Pin effective config head for adoption binding (nil is meaningful).
         bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil,
@@ -1801,6 +1802,7 @@ local function RebuildExportIndex()
         descEntry.body.archiveCount = archiveExportCount
         descEntry.body.acceptedLedgerCount = ledgerExportCount
         descEntry.body.donationEvidenceCount = donationEvidenceExportCount
+        descEntry.body.valuationCount = valuationExportCount
         descEntry.body.bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil
         descEntry.body.hasBankTab = true
@@ -1813,6 +1815,7 @@ local function RebuildExportIndex()
     exportState.cachedArchiveCount = archiveExportCount
     exportState.cachedAcceptedLedgerCount = ledgerExportCount
     exportState.cachedDonationEvidenceCount = donationEvidenceExportCount
+    exportState.cachedValuationCount = valuationExportCount
     exportState.countsDirty = false
     exportState.appendPos = 0
     local needsMaint = exportState.archiveBuildNeeded
@@ -2860,6 +2863,7 @@ local function ValidateAndApply(record, ctx)
         -- Never trust self-declared credit/provenance on the event payload.
         event.gsProductionCredit = nil
         event.gsSourceCutoverMarker = nil
+        event.gsAltSourceCutoverMarker = nil
         -- Transport-level marker from an authenticated active exporter only.
         local sourceMarker = nil
         if type(body.cutoverMarker) == "string" and body.cutoverMarker ~= "" then
@@ -3997,7 +4001,14 @@ function GS.NotifyLocalDurableChange(reason)
         exportState.cachedCampaignCount = campaignCount
         exportState.cachedArchiveCount = archiveCount
         exportState.cachedAcceptedLedgerCount = acceptedLedgerCount
+        local valuationCount = 0
+        if type(record.valuations) == "table" and type(record.valuations.byTxn) == "table" then
+            for _ in pairs(record.valuations.byTxn) do
+                valuationCount = valuationCount + 1
+            end
+        end
         exportState.cachedDonationEvidenceCount = donationEvidenceCount
+        exportState.cachedValuationCount = valuationCount
         exportState.countsDirty = false
         local desc = {
             kind = "dataset-desc",
@@ -4020,6 +4031,7 @@ function GS.NotifyLocalDurableChange(reason)
             archiveCount = archiveCount,
             acceptedLedgerCount = acceptedLedgerCount,
             donationEvidenceCount = donationEvidenceCount,
+            valuationCount = valuationCount,
             bankTab = record.accounting and record.accounting._consumables
                 and record.accounting._consumables.bankTab or nil,
             hasBankTab = true,

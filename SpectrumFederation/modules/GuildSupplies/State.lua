@@ -679,7 +679,7 @@ local function ValidateGuildRecordStructure(guildKey, record)
     -- Optional #397 valuation snapshots: absent on older saves; wrong shape fails closed.
     if record.valuations ~= nil then
         if GS.ValidateValuationStore then
-            local valOk, valErr = GS.ValidateValuationStore(record.valuations)
+            local valOk, valErr = GS.ValidateValuationStore(record.valuations, record, guildKey)
             if not valOk then
                 return false, valErr or "invalid_valuations"
             end

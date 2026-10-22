@@ -42,12 +42,15 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- Must fit a full legal accepted export: ops + headers + archive meta/pages +
 -- conflict evidence + operation-manifest pages + descriptor. Archive and
 -- confirm/resolve paging multiply bodies beyond logical operation counts.
--- Logical adoption buffer: accepted ops + live/archived ledger + donation
--- evidence + campaigns/archives + headroom. Ledger and ops are independently
--- capped; the shared buffer must hold both at once.
+-- Logical adoption buffer: accepted ops + live/archived ledger + one valuation
+-- per retained ledger row + donation evidence + campaigns/archives + headroom.
+-- Ledger and ops are independently capped; the shared buffer must hold both,
+-- plus the valuation class, at once.
 -- Wire pages for incomplete paged manifests live in a separate assembly arena so
 -- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
 GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+    + (GS.MAX_LEDGER_EVENTS or 4096)
+    + (GS.MAX_ARCHIVED_EVENTS or 4096)
     + (GS.MAX_LEDGER_EVENTS or 4096)
     + (GS.MAX_ARCHIVED_EVENTS or 4096)
     + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
@@ -70,7 +73,8 @@ GS.FRAGMENT_BUFFER_TTL_SECONDS = GS.MAX_ADOPTION_SECONDS or 600
 -- Per-slice admission / export maintenance (same order as confirmation redrive).
 GS.MAX_ADMISSION_WORK_PER_SLICE = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
 GS.MAX_EXPORT_MAINT_PER_SLICE = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
--- Aggregate adoption admissions bounded by buffered body count (no silent truncate).
+-- Aggregate adoption admissions bounded by buffered body count, including the
+-- valuation class inside MAX_ADOPTION_PENDING_RECORDS (no silent truncate).
 GS.MAX_ADOPTION_AGGREGATE_ADMISSIONS = GS.MAX_ADOPTION_PENDING_RECORDS
     + (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0)
 
@@ -1614,6 +1618,7 @@ local function NoteBufferedKindInsert(adop, body)
             archives = 0,
             ledgerEvents = 0,
             donationEvidence = 0,
+            valuations = 0,
             descId = nil,
         }
         adop._bufCounts = c
@@ -1634,6 +1639,8 @@ local function NoteBufferedKindInsert(adop, body)
         c.ledgerEvents = (tonumber(c.ledgerEvents) or 0) + 1
     elseif body.kind == "gs-evidence" then
         c.donationEvidence = (tonumber(c.donationEvidence) or 0) + 1
+    elseif body.kind == "gs-valuation" then
+        c.valuations = (tonumber(c.valuations) or 0) + 1
     end
 end
 
@@ -1641,7 +1648,7 @@ local function CountBufferedKinds(adop)
     -- Prefer session-owned incremental counters; fall back to a one-shot recount
     -- only when legacy sessions lack _bufCounts (should not happen after begin).
     local acceptedOps, transferOps, headers, archives, desc = 0, 0, 0, 0, nil
-    local ledgerEvents, donationEvidence = 0, 0
+    local ledgerEvents, donationEvidence, valuations = 0, 0, 0
     local archivePages = {} -- campaignId → { meta, pages = {}, pageCount }
     local opPages = {} -- opId → { shell, pages = {}, pageCount }
     local c = adop._bufCounts
@@ -1652,6 +1659,7 @@ local function CountBufferedKinds(adop)
         archives = tonumber(c.archives) or 0
         ledgerEvents = tonumber(c.ledgerEvents) or 0
         donationEvidence = tonumber(c.donationEvidence) or 0
+        valuations = tonumber(c.valuations) or 0
         if type(c.descId) == "string" then
             desc = adop.records and adop.records[c.descId]
         end
@@ -1682,6 +1690,8 @@ local function CountBufferedKinds(adop)
                     ledgerEvents = ledgerEvents + 1
                 elseif body.kind == "gs-evidence" then
                     donationEvidence = donationEvidence + 1
+                elseif body.kind == "gs-valuation" then
+                    valuations = valuations + 1
                 end
             end
         end
@@ -1710,7 +1720,7 @@ local function CountBufferedKinds(adop)
         end
     end
     return desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
-        ledgerEvents, donationEvidence
+        ledgerEvents, donationEvidence, valuations
 end
 
 --- Assemble paged archive bodies into a single canonical archive table.
@@ -1830,7 +1840,7 @@ function GS:IsAdoptionTransferComplete()
         return false, "no_adoption"
     end
     local desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
-        ledgerEvents, donationEvidence =
+        ledgerEvents, donationEvidence, valuations =
         CountBufferedKinds(adop)
     if not desc then
         return false, "incomplete_transfer"
@@ -1856,6 +1866,8 @@ function GS:IsAdoptionTransferComplete()
     local expectLedger = tonumber(desc.acceptedLedgerCount)
     local hasEvidenceManifest = desc.donationEvidenceCount ~= nil
     local expectDonationEvidence = tonumber(desc.donationEvidenceCount)
+    local hasValuationManifest = desc.valuationCount ~= nil
+    local expectValuations = tonumber(desc.valuationCount)
     if not expectAccepted or not expectTransfer or not expectHeaders or not expectArchives
         or expectAccepted ~= math.floor(expectAccepted) or expectAccepted < 0
         or expectTransfer ~= math.floor(expectTransfer) or expectTransfer < 0
@@ -1876,6 +1888,15 @@ function GS:IsAdoptionTransferComplete()
             return false, "incomplete_transfer"
         end
     end
+    if hasValuationManifest then
+        if expectValuations == nil
+            or expectValuations ~= math.floor(expectValuations)
+            or expectValuations < 0 then
+            return false, "incomplete_transfer"
+        end
+    elseif (tonumber(valuations) or 0) ~= 0 then
+        return false, "incomplete_transfer"
+    end
     if acceptedOps ~= expectAccepted or transferOps ~= expectTransfer
         or headers ~= expectHeaders or archives ~= expectArchives then
         return false, "incomplete_transfer"
@@ -1884,6 +1905,9 @@ function GS:IsAdoptionTransferComplete()
         return false, "incomplete_transfer"
     end
     if hasEvidenceManifest and donationEvidence ~= expectDonationEvidence then
+        return false, "incomplete_transfer"
+    end
+    if hasValuationManifest and (tonumber(valuations) or 0) ~= expectValuations then
         return false, "incomplete_transfer"
     end
     -- Exact accepted snapshot size must match descriptor (evidenceOnly excluded).
@@ -1899,6 +1923,10 @@ function GS:IsAdoptionTransferComplete()
     end
     if hasEvidenceManifest and adop.pinnedDonationEvidenceCount ~= nil
         and adop.pinnedDonationEvidenceCount ~= expectDonationEvidence then
+        return false, "source_changed"
+    end
+    if hasValuationManifest and adop.pinnedValuationCount ~= nil
+        and adop.pinnedValuationCount ~= expectValuations then
         return false, "source_changed"
     end
     if #(adop.sourceAcceptedIds or {}) ~= expectAccepted then
@@ -2123,6 +2151,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
             archives = 0,
             ledgerEvents = 0,
             donationEvidence = 0,
+            valuations = 0,
             descId = nil,
         },
         _workStats = {
@@ -2145,6 +2174,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedArchiveCount = nil,
         pinnedAcceptedLedgerCount = nil,
         pinnedDonationEvidenceCount = nil,
+        pinnedValuationCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2637,6 +2667,7 @@ function GS:BufferAdoptionRecord(recordId, body)
         local arch = tonumber(descBody.archiveCount)
         local ledger = tonumber(descBody.acceptedLedgerCount)
         local donEv = tonumber(descBody.donationEvidenceCount)
+        local valuations = tonumber(descBody.valuationCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -2693,6 +2724,15 @@ function GS:BufferAdoptionRecord(recordId, body)
             adop.pinnedDonationEvidenceCount = donEv
         elseif donEv ~= nil and adop.pinnedDonationEvidenceCount ~= nil
             and donEv ~= adop.pinnedDonationEvidenceCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
+        if adop.pinnedValuationCount == nil and valuations ~= nil then
+            adop.pinnedValuationCount = valuations
+        elseif valuations ~= nil and adop.pinnedValuationCount ~= nil
+            and valuations ~= adop.pinnedValuationCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
             InvalidateAdoptionDeliveryOutcomes("source_changed")
@@ -4154,6 +4194,18 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     if start < 1 then
         start = 1
     end
+    if type(opts.valuationIds) ~= "table" then
+        local valuationIds = {}
+        local byTxn = temp.valuations and temp.valuations.byTxn
+        if type(byTxn) == "table" then
+            for _, snap in pairs(byTxn) do
+                if type(snap) == "table" and type(snap.assignmentId) == "string" then
+                    valuationIds[snap.assignmentId] = true
+                end
+            end
+        end
+        opts.valuationIds = valuationIds
+    end
     local function publishCompletenessStats()
         local finiteBudget = budget
         if finiteBudget == math.huge then
@@ -4177,6 +4229,16 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
         local body = adop.records[adop.order[i]]
         visited = visited + 1
         adop._workStats.completenessVisited = (adop._workStats.completenessVisited or 0) + 1
+        if type(body) == "table" and body.kind == "gs-valuation"
+            and type(body.assignment) == "table" then
+            local assignmentId = body.assignment.assignmentId
+            if type(assignmentId) ~= "string" or not opts.valuationIds[assignmentId] then
+                opts.cursor = nil
+                opts.budgetExhausted = false
+                publishCompletenessStats()
+                return false, "incomplete_transfer"
+            end
+        end
         if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
             local oid = body.op.id
             local sourceAuthored = ActorMatchesMember(body.op, member)

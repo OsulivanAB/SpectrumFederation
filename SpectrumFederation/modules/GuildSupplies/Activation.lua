@@ -394,15 +394,23 @@ function GS.ClassifyPreActivationAccounting(record)
 end
 
 --- Reclassify retained rows when a remote live cutover installs on a staged peer.
--- Never trusts self-declared gsProductionCredit. Only rows admitted from an
--- authenticated active exporter (gsSourceCutoverMarker matches the installed
--- cutover) and after the cutover boundary may become production credit. All
--- other retained staged/synthetic rows stay uncredited (#389 order convergence).
+-- Never trusts self-declared gsProductionCredit. Only rows that retained the
+-- installed canonical marker (primary or one bounded staged alternate) and are
+-- after the cutover boundary may become production credit. Competing staged
+-- markers collapse onto that canonical marker. All other retained staged or
+-- synthetic rows stay uncredited (#389 / #411 order convergence).
 function GS.ClassifyAccountingForRemoteCutover(record)
     if type(record) ~= "table" or type(record.accounting) ~= "table" then
         return
     end
     local marker = record.liveCutover and record.liveCutover.cutoverMarker
+    local function retainsMarker(event)
+        if type(event) ~= "table" or type(marker) ~= "string" or marker == "" then
+            return false
+        end
+        return event.gsSourceCutoverMarker == marker
+            or event.gsAltSourceCutoverMarker == marker
+    end
     local function classifyList(list)
         if type(list) ~= "table" then
             return
@@ -411,14 +419,16 @@ function GS.ClassifyAccountingForRemoteCutover(record)
             local event = list[i]
             if type(event) == "table" then
                 local credit = false
-                if type(marker) == "string" and marker ~= ""
-                    and event.gsSourceCutoverMarker == marker
-                    and GS.IsEvidenceAfterLiveCutover then
+                if retainsMarker(event) and GS.IsEvidenceAfterLiveCutover then
                     local approx = tonumber(event.approxTxnTime) or tonumber(event.timestamp)
                     local afterOk = select(1, GS.IsEvidenceAfterLiveCutover(record, {
                         approxTxnTime = approx,
                     }))
                     credit = afterOk and true or false
+                    if credit then
+                        event.gsSourceCutoverMarker = marker
+                        event.gsAltSourceCutoverMarker = nil
+                    end
                 end
                 event.gsProductionCredit = credit
             end
