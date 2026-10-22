@@ -905,11 +905,22 @@ local function FormatCampaignHistoryText(record, event, itemName, markUncredited
     local body
     if IsDonationEvent(event) then
         local who = BoundedActorName(event.actor) or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
-        local described = GS.DescribeDonationValuation and GS.DescribeDonationValuation(record, event)
-        if described and described.priced and described.totalText and described.unitText then
+        local described = type(record) == "table" and GS.DescribeDonationValuation
+            and GS.DescribeDonationValuation(record, event) or nil
+        local totalText = described and described.priced and described.totalText or nil
+        local unitText = described and described.priced and described.unitText or nil
+        if (type(totalText) ~= "string" or type(unitText) ~= "string")
+            and type(event.valuationTotalText) == "string"
+            and type(event.valuationUnitText) == "string"
+            and #event.valuationTotalText > 0 and #event.valuationTotalText <= 120
+            and #event.valuationUnitText > 0 and #event.valuationUnitText <= 120 then
+            totalText = event.valuationTotalText
+            unitText = event.valuationUnitText
+        end
+        if type(totalText) == "string" and type(unitText) == "string" then
             body = Loc("GUILD_SUPPLIES_HISTORY_DONATION_VALUED",
                 "%s donated %d %s — %s total (%s each).")
-                :format(who, qty, name, described.totalText, described.unitText)
+                :format(who, qty, name, totalText, unitText)
         else
             body = Loc("GUILD_SUPPLIES_HISTORY_DONATION_UNPRICED",
                 "%s donated %d %s — unpriced.")
@@ -1024,7 +1035,9 @@ function GS.FormatCampaignHistoryDetail(event, itemName)
     if type(event) ~= "table" then
         return nil
     end
-    return FormatCampaignHistoryText(event, itemName, event.uncredited == true)
+    -- The row already carries any priced text from ListCampaignHistory. Do not
+    -- read the guild record again; history paging must stay bounded.
+    return FormatCampaignHistoryText(nil, event, itemName, event.uncredited == true)
 end
 
 --- Bounded read-only donation/adjustment history for one campaign.
@@ -1122,6 +1135,8 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 uncredited = markUncredited and true or nil,
                 valuationTotal = described and described.priced and described.totalCopper or nil,
                 valuationUnit = described and described.priced and described.unitCopper or nil,
+                valuationTotalText = described and described.priced and described.totalText or nil,
+                valuationUnitText = described and described.priced and described.unitText or nil,
                 verification = type(event.verification) == "string" and event.verification or nil,
             }
         end

@@ -29594,6 +29594,10 @@ do
     assertTrue(rows[1].text:find("total", 1, true), "val: history total " .. tostring(rows[1].text))
     assertTrue(rows[1].text:find("unpriced", 1, true) == nil, "val: priced row is not unpriced")
     assertEq(rows[1].valuationTotal, 10000, "val: history total copper")
+    local historyDetail = GS.FormatCampaignHistoryDetail(rows[1], "Dreamleaf")
+    assertTrue(type(historyDetail) == "string" and historyDetail:find("total", 1, true) ~= nil,
+        "val: history tooltip keeps the price " .. tostring(historyDetail))
+    assertTrue(historyDetail:find("unpriced", 1, true) == nil, "val: history tooltip is not unpriced")
     assertEq(#world.chat, 0, "val: no chat on price")
     assertEq(#world.prints, 0, "val: no prints on price")
     local callsAfter = valuationTsmCalls
