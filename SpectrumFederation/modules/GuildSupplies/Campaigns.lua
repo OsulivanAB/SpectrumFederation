@@ -940,6 +940,85 @@ local function FormatCampaignHistoryText(event, itemName, markUncredited)
     return body
 end
 
+local function WholeQuantity(value)
+    local qty = tonumber(value) or 0
+    if qty ~= qty or qty == math.huge or qty == -math.huge then
+        return 0
+    end
+    return math.floor(qty)
+end
+
+--- Inline item texture placed immediately before the item name.
+-- Display only. Rejects values that would break font-string markup.
+-- @param icon number|string|nil File id or texture path
+-- @return string Empty when no safe icon is available
+function GS.FormatHistoryInlineIcon(icon)
+    local size = 16
+    if type(icon) == "number" then
+        if icon ~= icon or icon <= 0 or icon == math.huge or icon ~= math.floor(icon) then
+            return ""
+        end
+        return string.format("|T%d:%d|t", icon, size)
+    end
+    if type(icon) ~= "string" or icon == "" then
+        return ""
+    end
+    if icon:find("|", 1, true) or icon:find("\n", 1, true) or icon:find("\r", 1, true) then
+        return ""
+    end
+    return string.format("|T%s:%d|t", icon, size)
+end
+
+local function NameWithAdjacentIcon(name, icon)
+    local markup = GS.FormatHistoryInlineIcon(icon)
+    if markup == "" then
+        return name
+    end
+    return markup .. " " .. name
+end
+
+--- One-line history label. Actor and quantity come first; the icon sits on the name.
+-- Timestamp, verification, attribution, and uncredited status stay on the detail tooltip.
+-- @param event table Structured history row or ledger event
+-- @param itemName string|nil Localized name, loading placeholder, or unknown fallback
+-- @param icon number|string|nil Item texture file id or path
+-- @return string|nil
+function GS.FormatCampaignHistoryCompact(event, itemName, icon)
+    if type(event) ~= "table" then
+        return nil
+    end
+    local name = itemName
+    if type(name) ~= "string" or name == "" then
+        name = Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item")
+    end
+    name = NameWithAdjacentIcon(name, icon)
+    local qty = WholeQuantity(event.quantity)
+    if IsDonationEvent(event) then
+        local who = BoundedActorName(event.actor)
+            or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
+        return Loc("GUILD_SUPPLIES_HISTORY_COMPACT_DONATION", "%s ×%d — %s")
+            :format(who, math.abs(qty), name)
+    end
+    if IsAdjustmentEvent(event) then
+        local who = BoundedActorName(event.actor)
+            or Loc("GUILD_SUPPLIES_HISTORY_ADMIN", "An admin")
+        return Loc("GUILD_SUPPLIES_HISTORY_COMPACT_ADJUST", "%s %+d — %s")
+            :format(who, qty, name)
+    end
+    return nil
+end
+
+--- Full history sentence for the row tooltip. Ledger text is unchanged.
+-- @param event table Structured history row or ledger event
+-- @param itemName string|nil Localized name
+-- @return string|nil
+function GS.FormatCampaignHistoryDetail(event, itemName)
+    if type(event) ~= "table" then
+        return nil
+    end
+    return FormatCampaignHistoryText(event, itemName, event.uncredited == true)
+end
+
 --- Bounded read-only donation/adjustment history for one campaign.
 -- Newest first. Does not mutate state or invent live verification.
 -- Current live campaigns hide uncredited rows (aligned with progress). Archived
@@ -1032,6 +1111,7 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 timestamp = event.timestamp,
                 generation = event.generation,
                 uncredited = markUncredited and true or nil,
+                verification = type(event.verification) == "string" and event.verification or nil,
             }
         end
     end

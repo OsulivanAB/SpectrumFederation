@@ -1142,10 +1142,78 @@ function Runtime:SyncBannerMobileButton(mobileState)
     end
 end
 
+function Runtime:QueueReviewIconRefresh()
+    local frame = self.review
+    if not (frame and frame.IsShown and frame:IsShown()) then
+        return
+    end
+    if InCombat() then
+        self.reviewRefreshPending = true
+        return
+    end
+    if self.reviewIconRefreshQueued then
+        return
+    end
+    self.reviewIconRefreshQueued = true
+    local function run()
+        self.reviewIconRefreshQueued = false
+        local shown = self.review and self.review.IsShown and self.review:IsShown()
+        if not shown then
+            return
+        end
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
+        end
+        self:RebuildReview()
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, run)
+    else
+        run()
+    end
+end
+
+function Runtime:EnsureItemIconWatch()
+    if self.itemIconWatchReady then
+        return
+    end
+    local display = SF.ItemDisplay
+    if not display or type(display.RegisterRefresh) ~= "function" then
+        return
+    end
+    self.itemIconWatchReady = true
+    display.RegisterRefresh("consumablesRuntimeReview", function()
+        self:QueueReviewIconRefresh()
+    end)
+end
+
+-- Question marks came from consulting only the deprecated global GetItemIcon.
+-- That global is missing on current Retail, and when it still exists it can
+-- return nil until item info is cached. C_Item.GetItemIconByID and
+-- GetItemInfoInstant read the local item database without that cache.
 function Runtime:ItemIcon(itemId)
+    local display = SF.ItemDisplay
+    if display and type(display.IconOrFallback) == "function" then
+        return display.IconOrFallback(itemId)
+    end
+    if C_Item and itemId and type(C_Item.GetItemIconByID) == "function" then
+        local ok, tex = pcall(C_Item.GetItemIconByID, itemId)
+        if ok and tex and tex ~= 0 and tex ~= "" then
+            return tex
+        end
+    end
+    if C_Item and itemId and type(C_Item.GetItemInfoInstant) == "function" then
+        local ok, _, _, _, _, icon = pcall(C_Item.GetItemInfoInstant, itemId)
+        if ok and icon and icon ~= 0 and icon ~= "" then
+            return icon
+        end
+    end
     if GetItemIcon and itemId then
         local ok, tex = pcall(GetItemIcon, itemId)
-        if ok and tex then return tex end
+        if ok and tex and tex ~= 0 and tex ~= "" then
+            return tex
+        end
     end
     return "Interface\\Icons\\INV_Misc_QuestionMark"
 end
@@ -1541,6 +1609,7 @@ end
 function Runtime:RebuildReview()
     local frame = self:EnsureReview()
     if not frame:IsShown() then return end
+    self:EnsureItemIconWatch()
     local collected = self:Collect()
     self:ClearRows()
     if not collected then return end
@@ -2406,6 +2475,7 @@ function Runtime:Init()
     TryRegister(frame, "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
     TryRegister(frame, "PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
     TryRegister(frame, "PLAYER_REGEN_ENABLED")
+    self:EnsureItemIconWatch()
     if SF.Consumables and SF.Consumables.RegisterUIListener then
         local reviewUiQueued = false
         SF.Consumables.RegisterUIListener(function()

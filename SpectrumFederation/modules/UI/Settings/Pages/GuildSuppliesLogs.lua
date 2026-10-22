@@ -171,11 +171,24 @@ local function MembershipHelpText()
 	end
 	if caps.canRead then
 		return Loc("GUILD_SUPPLIES_LOGS_HELP",
-			"Members can inspect current and archived campaign goals and progress. Privileged edits live on Configuration.")
+			"Members can inspect current and archived campaign goals, progress, and history. Privileged edits live on Configuration.")
 	end
 	return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
 		"Join a guild with a verified membership to inspect Guild Supplies logs.")
 		.. " (" .. formatReason(caps.reason or "not_ready") .. ")"
+end
+
+local function DescribeItem(itemId)
+	local display = SF.ItemDisplay
+	if display and type(display.Describe) == "function" then
+		return display.Describe(itemId)
+	end
+	return {
+		itemId = itemId,
+		status = "unknown",
+		name = Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item"),
+		icon = nil,
+	}
 end
 
 local function ItemRowsForSelected()
@@ -199,17 +212,15 @@ local function ItemRowsForSelected()
 			local itemId = row.itemId
 			local goal = tonumber(row.goal) or 0
 			local got = tonumber(totals[itemId]) or 0
-			local name = nil
-			if C_Item and C_Item.GetItemInfo then
-				name = C_Item.GetItemInfo(itemId)
-			end
-			if type(name) ~= "string" and GetItemInfo then
-				name = GetItemInfo(itemId)
-			end
-			local label = (type(name) == "string" and name ~= "" and name)
-				or Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(itemId))
+			local described = DescribeItem(itemId)
 			rows[#rows + 1] = {
-				text = string.format("%s — %d / %s", label, got, goal > 0 and tostring(goal) or "—"),
+				text = string.format(
+					"%s — %d / %s",
+					described.name,
+					got,
+					goal > 0 and tostring(goal) or "—"
+				),
+				icon = described.icon,
 				itemId = itemId,
 				goal = goal,
 				progress = got,
@@ -264,9 +275,17 @@ local function EnsureHistoryState()
 	local items = {}
 	if type(rows) == "table" then
 		for i = 1, #rows do
+			local row = rows[i]
+			local described = DescribeItem(row.itemId)
+			local compact = g.FormatCampaignHistoryCompact
+				and g.FormatCampaignHistoryCompact(row, described.name, described.icon)
+			local detail = g.FormatCampaignHistoryDetail
+				and g.FormatCampaignHistoryDetail(row, described.name)
 			items[#items + 1] = {
-				text = rows[i].text,
-				id = rows[i].id,
+				text = compact or row.text,
+				tooltip = detail or row.text,
+				itemId = row.itemId,
+				id = row.id,
 				canRemove = false,
 			}
 		end
@@ -414,75 +433,12 @@ local function Definition()
 						label = Loc("GUILD_SUPPLIES_LOGS_ITEMS", "Goals and progress"),
 						height = 160,
 						rowHeight = 20,
+						showItemIcons = true,
 						getItems = function()
 							if not Caps().canRead then
 								return {}
 							end
 							return ItemRowsForSelected()
-						end,
-						enabled = function()
-							return Caps().canRead
-						end,
-						getDisabledTooltip = DisabledLogsListTip,
-					},
-					{
-						type = "help",
-						indent = "label",
-						getText = function()
-							return Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_HELP",
-								"Read-only. A deposit is verified automatically when a current officer directly observes it in the Guild Bank log, or when three independent authenticated Guild Bank observers agree. There is no manual approval.")
-						end,
-					},
-					{
-						type = "scrollList",
-						label = Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_TITLE", "Pending deposit evidence"),
-						height = 100,
-						rowHeight = 20,
-						getItems = function()
-							if not Caps().canRead then
-								return {}
-							end
-							local g = GS()
-							local campaignId = ResolveSelectedCampaign()
-							if not g or not campaignId or not g.ListPendingEvidence then
-								return {}
-							end
-							local pending = g:ListPendingEvidence(campaignId, 20)
-							local items = {}
-							if type(pending) == "table" then
-								for i = 1, #pending do
-									local row = pending[i]
-									local donor = row.donor or "?"
-									local qty = tonumber(row.quantity) or 0
-									local itemId = tostring(row.itemId or "?")
-									local statusKey = tostring(row.status or "pending")
-									local statusText
-									if statusKey == "ambiguous" then
-										statusText = Loc("GUILD_SUPPLIES_PENDING_STATUS_AMBIGUOUS",
-											"ambiguous")
-									else
-										statusText = Loc("GUILD_SUPPLIES_PENDING_STATUS_PENDING",
-											"pending")
-									end
-									items[#items + 1] = {
-										text = Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_ROW",
-											"%s ×%d — %s (%d/%d witnesses) [%s]")
-											:format(donor, qty, itemId,
-												tonumber(row.witnessCount) or 0,
-												tonumber(row.threshold) or 3,
-												statusText),
-										canRemove = false,
-									}
-								end
-							end
-							if #items == 0 then
-								items[1] = {
-									text = Loc("GUILD_SUPPLIES_PENDING_EVIDENCE_NONE",
-										"No pending deposit evidence."),
-									canRemove = false,
-								}
-							end
-							return items
 						end,
 						enabled = function()
 							return Caps().canRead
@@ -499,6 +455,8 @@ local function Definition()
 						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY", "Campaign history"),
 						height = 180,
 						rowHeight = 20,
+						singleLine = true,
+						showDetailTooltip = true,
 						getItems = function()
 							if not Caps().canRead then
 								return {}
@@ -603,6 +561,16 @@ local function QueueRefresh()
 	end
 end
 
+local function EnsureItemDisplayListener()
+	local display = SF.ItemDisplay
+	if not display or type(display.RegisterRefresh) ~= "function" then
+		return
+	end
+	display.RegisterRefresh("guildSuppliesLogs", function()
+		QueueRefresh()
+	end)
+end
+
 local function EnsureRosterListener()
 	if rosterFrame or type(CreateFrame) ~= "function" then
 		return
@@ -637,6 +605,7 @@ end
 function Page:Build(panel)
 	EnsureRosterListener()
 	EnsureDurableListener()
+	EnsureItemDisplayListener()
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
 		self.panel = panel
@@ -678,5 +647,6 @@ end
 
 EnsureRosterListener()
 EnsureDurableListener()
+EnsureItemDisplayListener()
 
 SF.SettingsUI:RegisterPage(Page)
