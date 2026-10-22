@@ -4340,7 +4340,10 @@ local function checkDepositAssistantItemIcons()
 
     local listenersAfter = SF.ItemDisplay.ListenerCount()
     local framesAfter = SF.ItemDisplay.WatchFrameCount()
-    assertEq(listenersAfter, 1, "the deposit assistant registers one item-display listener")
+    -- #415 loads Raid Supplies Configuration and Logs before this check.
+    -- Each page keeps one refresh listener. The assistant adds exactly one.
+    assertEq(listenersAfter, 3,
+        "Raid Supplies pages and the deposit assistant each keep one item-display listener")
     assertEq(framesAfter, 1, "the deposit assistant registers one item-data watch frame")
     for _ = 1, 20 do
         RT:RebuildReview()
