@@ -1925,6 +1925,10 @@ function GS:IsAdoptionTransferComplete()
         and adop.pinnedDonationEvidenceCount ~= expectDonationEvidence then
         return false, "source_changed"
     end
+    -- A once-pinned valuation manifest must remain on the current descriptor.
+    if adop.pinnedValuationCount ~= nil and not hasValuationManifest then
+        return false, "source_changed"
+    end
     if hasValuationManifest and adop.pinnedValuationCount ~= nil
         and adop.pinnedValuationCount ~= expectValuations then
         return false, "source_changed"
@@ -2729,10 +2733,13 @@ function GS:BufferAdoptionRecord(recordId, body)
             InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
-        if adop.pinnedValuationCount == nil and valuations ~= nil then
-            adop.pinnedValuationCount = valuations
-        elseif valuations ~= nil and adop.pinnedValuationCount ~= nil
-            and valuations ~= adop.pinnedValuationCount then
+        -- Once valuationCount is pinned, omission or change is source_changed.
+        -- Genuinely old descriptors that never advertised a count stay unpinned.
+        if adop.pinnedValuationCount == nil then
+            if valuations ~= nil then
+                adop.pinnedValuationCount = valuations
+            end
+        elseif valuations == nil or valuations ~= adop.pinnedValuationCount then
             GS._adoption = nil
             NotifyAdoptionStateChanged("source_changed")
             InvalidateAdoptionDeliveryOutcomes("source_changed")
@@ -2857,6 +2864,13 @@ function GS:BufferAdoptionRecord(recordId, body)
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
         adop._archiveIndex[body.campaignId] = info
+    end
+
+    -- Reject malformed gs-valuation before buffering/counting. Replay and the
+    -- final completeness scan skip non-table assignments; counting them here
+    -- would let a pinned valuationCount complete without a usable body.
+    if body.kind == "gs-valuation" and type(body.assignment) ~= "table" then
+        return "rejected", "malformed"
     end
 
     local wasReady = adop.ready == true
@@ -3903,6 +3917,9 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         member = member,
                         offlineRecord = temp,
                         adoptionReplay = true,
+                        -- Adoption buffer key is the provider export id
+                        -- `gs:val:<canonical>`; carry that binding into admit.
+                        exportRecordId = tostring(adop.order[i]),
                     })
                 end
                 admissions = admissions + 1

@@ -75,6 +75,13 @@ local exportState = {
 -- leave those closures bound to a nil global and skip valuation publication.
 local providerRegistered = false
 
+-- Bank-snapshot (and similar) notify batch. Forward-declared so
+-- NoteValuationExported can coalesce outward notifies without a later `local`
+-- shadowing the upvalue as a nil global.
+local durableNotifyBatchDepth = 0
+local durableNotifyBatchPending = nil
+local PreferDurableNotifyReason
+
 -- Runtime reassembly buffer for paged campaign archives and operation manifests
 -- (not SavedVariables). Scoped by datasetId; aggregate caps + TTL reclaim.
 local archivePageBuffer = {} -- [campaignId] = { meta, pages, datasetId, pageCount, at, sourcePeer }
@@ -2035,11 +2042,19 @@ end
 --- Publish one accepted valuation without rebuilding the whole Guild Supplies export.
 -- Losers and pending rows are not exported. Cold rebuild drains any that this
 -- call cannot see yet (dataset mismatch).
+-- Storage, `gs:val:` upsert, and descriptor valuationCount stay immediate.
+-- Outward NotifyProviderChanged / NotifyUI coalesce inside an open
+-- BeginLocalDurableNotifyBatch (bank-log snapshot) and flush on End.
 function GS.NoteValuationExported(record, canonicalTxnId)
     if type(record) ~= "table" or type(canonicalTxnId) ~= "string" or canonicalTxnId == "" then
         return
     end
     if not providerRegistered then
+        if (tonumber(durableNotifyBatchDepth) or 0) > 0 then
+            durableNotifyBatchPending = PreferDurableNotifyReason(
+                durableNotifyBatchPending, "valuation")
+            return
+        end
         if GS.NotifyUI then
             GS.NotifyUI("valuation")
         end
@@ -2071,6 +2086,11 @@ function GS.NoteValuationExported(record, canonicalTxnId)
         -- The winner set grew or this id was not yet advertised. Replacing an
         -- existing id does not change the count. No history scan.
         NoteValuationManifestId(canonicalTxnId)
+    end
+    if (tonumber(durableNotifyBatchDepth) or 0) > 0 then
+        durableNotifyBatchPending = PreferDurableNotifyReason(
+            durableNotifyBatchPending, "valuation")
+        return
     end
     if GG and GG.NotifyProviderChanged then
         GG.NotifyProviderChanged(GS.PROVIDER_ID)
@@ -3046,6 +3066,9 @@ local function ValidateAndApply(record, ctx)
             sender = sender,
             member = member,
             offlineRecord = localRecord,
+            -- Provider record id `gs:val:<canonical>` binds the donation key
+            -- without rewriting the immutable assignment.txnId.
+            exportRecordId = tostring(record.id),
         })
     end
 
@@ -3187,11 +3210,8 @@ function GS._exportMaintIsIdle()
 end
 
 -- Coalesce NotifyLocalDurableChange during a completed bank-log snapshot (or
--- any other short local batch). Nested ledger/evidence notifies defer export
--- rebuild + NotifyProviderChanged until EndLocalDurableNotifyBatch.
-local durableNotifyBatchDepth = 0
-local durableNotifyBatchPending = nil
-
+-- any other short local batch). Nested ledger/evidence/valuation notifies defer
+-- export rebuild + NotifyProviderChanged until EndLocalDurableNotifyBatch.
 local DURABLE_NOTIFY_REASON_RANK = {
     ["export-maint"] = 0,
     evidence = 40,
@@ -3203,6 +3223,7 @@ local DURABLE_NOTIFY_REASON_RANK = {
     config = 45,
     campaign = 45,
     ["remote-op"] = 45,
+    valuation = 50,
     ledger = 50,
     create = 60,
     confirm = 60,
@@ -3212,7 +3233,7 @@ local DURABLE_NOTIFY_REASON_RANK = {
     dataset = 100,
 }
 
-local function PreferDurableNotifyReason(current, incoming)
+PreferDurableNotifyReason = function(current, incoming)
     if type(current) ~= "string" or current == "" then
         return incoming
     end

@@ -1151,8 +1151,28 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     end
 end
 
+--- Parse provider/adoption record id `gs:val:<canonicalTxnId>`.
+-- Returns the validated canonical txn id, or nil when the id is absent /
+-- synthetic (tests) / not a valuation export binding.
+local function ParseValuationExportCanonical(recordId)
+    if type(recordId) ~= "string" or recordId == "" then
+        return nil, false
+    end
+    if recordId:sub(1, 7) ~= "gs:val:" then
+        -- Non-export ids (including synthetic test ids) carry no binding.
+        return nil, false
+    end
+    local canonical = ValidTxnId(recordId:sub(8))
+    if not canonical then
+        return nil, true
+    end
+    return canonical, true
+end
+
 --- Admit one gossip or adoption valuation body.
 -- Transport sender authority is opts.member. Actor fields are stored, not trusted.
+-- opts.exportRecordId / opts.exportCanonicalTxnId carry the provider binding
+-- `gs:val:<canonical>` without rewriting the immutable assignment.txnId.
 function GS:AdmitValuationAssignment(body, opts)
     opts = opts or {}
     local record = opts.offlineRecord
@@ -1205,9 +1225,59 @@ function GS:AdmitValuationAssignment(body, opts)
             return "rejected", "wrong_guild"
         end
     end
+    -- Canonical binding from the provider record id. Aliases are local-only, so
+    -- a fresh peer that only has donation C must still accept gs:val:C whose
+    -- immutable assignment.txnId is the source alias A.
+    local exportCanonical = nil
+    if type(opts.exportCanonicalTxnId) == "string" and opts.exportCanonicalTxnId ~= "" then
+        exportCanonical = ValidTxnId(opts.exportCanonicalTxnId)
+        if not exportCanonical then
+            return "rejected", "invalid_export_id"
+        end
+    else
+        local parsed, isValExport = ParseValuationExportCanonical(opts.exportRecordId)
+        if isValExport and not parsed then
+            return "rejected", "invalid_export_id"
+        end
+        exportCanonical = parsed
+    end
     local ids, canonical = AliasSet(record, assignment.txnId)
     if not canonical then
         return "rejected", "invalid_txn"
+    end
+    if exportCanonical then
+        -- Local registry may already fold assignment.txnId onto a different
+        -- canonical. That is a hard conflict; do not invent a second winner.
+        local resolvedAssignment = ResolveCanonical(record, assignment.txnId)
+        if resolvedAssignment and resolvedAssignment ~= assignment.txnId
+            and resolvedAssignment ~= exportCanonical then
+            return "rejected", "canonical_conflict"
+        end
+        local resolvedExport = ResolveCanonical(record, exportCanonical)
+        if resolvedExport and resolvedExport ~= exportCanonical then
+            return "rejected", "canonical_conflict"
+        end
+        -- Prefer the authenticated export binding as the lookup/storage key.
+        -- Keep assignment.txnId immutable (fingerprint / earliest-wins).
+        -- Event lookup uses only the export canonical (and its local aliases),
+        -- never a distinct live donation still named by the original txn id.
+        local exportIds = AliasSet(record, exportCanonical)
+        if exportCanonical ~= assignment.txnId then
+            local exportEvent = FindEventForIds(record, exportIds)
+            local originalEvent = FindEventForIds(record, { [assignment.txnId] = true })
+            if originalEvent and exportEvent then
+                local ot, et = EventTxn(originalEvent), EventTxn(exportEvent)
+                if ot and et and ot ~= et then
+                    return "rejected", "canonical_conflict"
+                end
+            elseif originalEvent and not exportEvent then
+                return "rejected", "canonical_conflict"
+            end
+        end
+        canonical = exportCanonical
+        ids = exportIds
+        ids[assignment.txnId] = true
+        ids[exportCanonical] = true
     end
     local event = FindEventForIds(record, ids)
     local holdForCredit = false
