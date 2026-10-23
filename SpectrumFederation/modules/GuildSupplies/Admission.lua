@@ -7,7 +7,10 @@ SF.GuildSupplies = SF.GuildSupplies or {}
 local GS = SF.GuildSupplies
 
 GS.PROVIDER_ID = "sf.guildsupplies.config"
-GS.PROVIDER_SCHEMA = 1
+-- Wire schema for the Guild Supplies Gossip provider. Bumped for #397 so
+-- pre-valuation clients cannot adopt/publish datasets that drop gs-valuation
+-- records. Persisted GS.SCHEMA_VERSION stays independent.
+GS.PROVIDER_SCHEMA = 2
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
@@ -2650,10 +2653,6 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
     end
 
-    if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
-        return "rejected", "full"
-    end
-
     -- Descriptor revision invalidation runs before generic same-ID handling so
     -- the production gs:desc:<dataset> id can replace content under a pinned
     -- policy or abort when accepted snapshot / pinned fields diverge.
@@ -2794,6 +2793,13 @@ function GS:BufferAdoptionRecord(recordId, body)
             return "rejected", "source_changed"
         end
         return "rejected", "id_conflict"
+    end
+
+    -- Capacity applies only to genuinely new logical record ids. Exact
+    -- duplicates, pinned descriptor replacement, and changed valuation
+    -- source_changed must still run when the buffer is already full.
+    if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
+        return "rejected", "full"
     end
 
     -- Source descriptor changes during transfer invalidate the selection.

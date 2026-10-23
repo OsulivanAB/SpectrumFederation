@@ -70,20 +70,29 @@ function GS.ValuationStoreRevision(store)
     return valuationStoreRev[store] or 0
 end
 
--- Ephemeral assignmentId → storage-key map. Rebuilt only when the store
--- revision advances (admit/forget/alias). Never consulted from render paths.
+-- Ephemeral assignmentId → storage-key map. Maintained incrementally across
+-- controlled admits/forget/alias; cold-rebuilt once after load/store replace.
+-- Never consulted from render paths. Not persisted.
 local assignmentBindingCache = setmetatable({}, { __mode = "k" })
 
 local function NoteValuationStoreMutation(store, record)
     if type(store) ~= "table" then
         return
     end
-    local rev = (valuationStoreRev[store] or 0) + 1
+    local oldRev = valuationStoreRev[store] or 0
+    local rev = oldRev + 1
     if rev > 4294967295 then
         rev = 1
     end
     valuationStoreRev[store] = rev
-    assignmentBindingCache[store] = nil
+    -- Keep an incrementally maintained map when it matched the prior revision.
+    -- Missing/stale caches fall back to one bounded cold rebuild on next read.
+    local bindCached = assignmentBindingCache[store]
+    if bindCached and bindCached.rev == oldRev and type(bindCached.map) == "table" then
+        bindCached.rev = rev
+    else
+        assignmentBindingCache[store] = nil
+    end
     local cached = valuationValidationCache[store]
     local datasetId = type(record) == "table" and record.datasetId or nil
     if cached and cached.ok and type(datasetId) == "string" and cached.datasetId == datasetId then
@@ -91,6 +100,94 @@ local function NoteValuationStoreMutation(store, record)
     else
         valuationValidationCache[store] = nil
     end
+end
+
+local function BindingMapForPatch(store)
+    local cached = assignmentBindingCache[store]
+    if cached and type(cached.map) == "table" then
+        return cached.map
+    end
+    return nil
+end
+
+local function BindAssignmentId(map, id, key)
+    if type(map) ~= "table" or type(id) ~= "string" or id == "" or type(key) ~= "string" then
+        return
+    end
+    map[id] = key
+end
+
+local function UnbindAssignmentId(map, id, key)
+    if type(map) ~= "table" or type(id) ~= "string" then
+        return
+    end
+    if map[id] == key then
+        map[id] = nil
+    end
+end
+
+local function UnbindSnapAssignments(map, snap, key)
+    if type(map) ~= "table" or type(snap) ~= "table" or type(key) ~= "string" then
+        return
+    end
+    UnbindAssignmentId(map, snap.assignmentId, key)
+    if type(snap.seen) == "table" then
+        local last = #snap.seen
+        if last > MAX_SEEN then
+            last = MAX_SEEN
+        end
+        for i = 1, last do
+            local row = snap.seen[i]
+            if type(row) == "table" then
+                UnbindAssignmentId(map, row.id, key)
+            end
+        end
+    end
+end
+
+local function BindSnapAssignments(map, snap, key)
+    if type(map) ~= "table" or type(snap) ~= "table" or type(key) ~= "string" then
+        return
+    end
+    BindAssignmentId(map, snap.assignmentId, key)
+    if type(snap.seen) == "table" then
+        local last = #snap.seen
+        if last > MAX_SEEN then
+            last = MAX_SEEN
+        end
+        for i = 1, last do
+            local row = snap.seen[i]
+            if type(row) == "table" then
+                BindAssignmentId(map, row.id, key)
+            end
+        end
+    end
+end
+
+--- Patch the ephemeral binding map after a successful ApplyIncoming write.
+local function PatchBindingsAfterApply(store, bucket, key, priorSnap, wrote)
+    if not wrote or type(store) ~= "table" or type(key) ~= "string" then
+        return
+    end
+    local map = BindingMapForPatch(store)
+    if not map then
+        return
+    end
+    local snap = type(bucket) == "table" and bucket[key] or nil
+    if priorSnap and priorSnap ~= snap then
+        -- Winner replacement retains old id in seen; rebinding the new snap
+        -- covers winner + losers. Clear stale ids that no longer appear.
+        UnbindSnapAssignments(map, priorSnap, key)
+    end
+    BindSnapAssignments(map, snap, key)
+end
+
+local function PatchBindingsRemoveSnap(store, snap, key)
+    local map = BindingMapForPatch(store)
+    if not map then
+        return
+    end
+    UnbindSnapAssignments(map, snap, key)
 end
 
 local function DebugInfo(fmt, ...)
@@ -524,6 +621,10 @@ local function AssignmentBindingMap(store)
     local cached = assignmentBindingCache[store]
     if cached and cached.rev == rev and type(cached.map) == "table" then
         return cached.map
+    end
+    -- GS._onAssignmentBindingRebuild is nil in production; tests count cold builds.
+    if type(GS._onAssignmentBindingRebuild) == "function" then
+        GS._onAssignmentBindingRebuild(store)
     end
     local map = BuildAssignmentBindingMap(store)
     assignmentBindingCache[store] = { rev = rev, map = map }
@@ -964,7 +1065,7 @@ local function DropKeys(bucket, ids)
     return removed
 end
 
-local function RemoveValuationExports(record, ids)
+local function RemoveValuationExports(record, ids, opts)
     -- Temporary adoption records must not edit the active dataset's exports.
     if not ShouldPublish(record) then
         return
@@ -972,9 +1073,17 @@ local function RemoveValuationExports(record, ids)
     if not GS.RemoveGossipExportBodies then
         return
     end
+    opts = opts or {}
     local list = {}
     for key in pairs(ids) do
         list[#list + 1] = "gs:val:" .. tostring(key)
+    end
+    if #list < 1 then
+        return
+    end
+    if opts.bulk == true then
+        GS.RemoveGossipExportBodies(list, { bulk = true })
+        return
     end
     local offset = 1
     while offset <= #list do
@@ -988,10 +1097,11 @@ local function RemoveValuationExports(record, ids)
     end
 end
 
-function GS.ForgetDonationValuations(record, txnIds)
+function GS.ForgetDonationValuations(record, txnIds, opts)
     if type(record) ~= "table" or type(txnIds) ~= "table" then
         return
     end
+    opts = opts or {}
     local store = record.valuations
     if type(store) ~= "table" then
         return
@@ -1013,15 +1123,18 @@ function GS.ForgetDonationValuations(record, txnIds)
             return
         end
         local remove = {}
+        local removeSnaps = {}
         for key, snap in pairs(bucket) do
             local snapTxn = type(snap) == "table" and snap.txnId or nil
             local canonical = type(snap) == "table" and snap.canonicalTxnId or nil
             if drop[key] or (snapTxn and drop[snapTxn]) or (canonical and drop[canonical]) then
                 remove[#remove + 1] = key
+                removeSnaps[#removeSnaps + 1] = snap
                 drop[key] = true
             end
         end
         for i = 1, #remove do
+            PatchBindingsRemoveSnap(store, removeSnaps[i], remove[i])
             bucket[remove[i]] = nil
         end
         if #remove > 0 then
@@ -1033,7 +1146,9 @@ function GS.ForgetDonationValuations(record, txnIds)
     if removedAny then
         NoteValuationStoreMutation(store, record)
     end
-    RemoveValuationExports(record, drop)
+    RemoveValuationExports(record, drop, {
+        bulk = opts.bulkExport == true or opts.bulk == true,
+    })
 end
 
 local function MergeOntoCanonical(record, canonical, incoming, changed)
@@ -1046,8 +1161,10 @@ local function MergeOntoCanonical(record, canonical, incoming, changed)
         return changed
     end
     local store = EnsureStore(record)
+    local prior = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
     local _, did, _, wrote = ApplyIncoming(store.byTxn, canonical, incoming)
     if wrote then
+        PatchBindingsAfterApply(store, store.byTxn, canonical, prior, true)
         NoteValuationStoreMutation(store, record)
     end
     return changed or did == true
@@ -1070,6 +1187,14 @@ function GS.ReconcilePendingValuations(record, txnId)
         if CreditStillUnresolved(record, event) then
             return false
         end
+        if type(store.pending) == "table" then
+            for key in pairs(ids) do
+                local snap = store.pending[key]
+                if snap ~= nil then
+                    PatchBindingsRemoveSnap(store, snap, key)
+                end
+            end
+        end
         if DropKeys(store.pending, ids) then
             NoteValuationStoreMutation(store, record)
         end
@@ -1085,12 +1210,14 @@ function GS.ReconcilePendingValuations(record, txnId)
         if key ~= canonical and type(store.byTxn) == "table" then
             fromWinner = store.byTxn[key]
             if fromWinner ~= nil then
+                PatchBindingsRemoveSnap(store, fromWinner, key)
                 store.byTxn[key] = nil
                 removed = true
             end
         end
         local fromPending = type(store.pending) == "table" and store.pending[key] or nil
         if fromPending ~= nil and type(store.pending) == "table" then
+            PatchBindingsRemoveSnap(store, fromPending, key)
             store.pending[key] = nil
             removed = true
         end
@@ -1155,6 +1282,7 @@ local function HoldAliasPending(record, store, canonical, event, candidates)
             if store.pending[canonical] == nil and CountKeys(store.pending) >= MAX_PENDING then
                 -- Pending storage stays capped. A full map cannot take a new key.
             else
+                local prior = store.pending[canonical]
                 local _, _, _, didWrite = ApplyIncoming(store.pending, canonical, {
                     assignmentId = snap.assignmentId,
                     assignedAt = snap.assignedAt,
@@ -1169,6 +1297,7 @@ local function HoldAliasPending(record, store, canonical, event, candidates)
                     actorName = snap.actorName,
                 })
                 if didWrite then
+                    PatchBindingsAfterApply(store, store.pending, canonical, prior, true)
                     wrote = true
                 end
             end
@@ -1205,15 +1334,18 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     push(store.pending, alias, true)
     local removed = false
     if type(store.byTxn) == "table" and store.byTxn[alias] ~= nil then
+        PatchBindingsRemoveSnap(store, store.byTxn[alias], alias)
         store.byTxn[alias] = nil
         removed = true
     end
     if type(store.pending) == "table" then
         if store.pending[alias] ~= nil then
+            PatchBindingsRemoveSnap(store, store.pending[alias], alias)
             store.pending[alias] = nil
             removed = true
         end
         if store.pending[canonical] ~= nil then
+            PatchBindingsRemoveSnap(store, store.pending[canonical], canonical)
             store.pending[canonical] = nil
             removed = true
         end
@@ -1424,8 +1556,10 @@ function GS:AdmitValuationAssignment(body, opts)
             and assignment.txnId ~= canonical
             and type(store.pending[assignment.txnId]) == "table" then
             local prior = store.pending[assignment.txnId]
+            PatchBindingsRemoveSnap(store, prior, assignment.txnId)
             store.pending[assignment.txnId] = nil
             local priorTxn = ValidTxnId(prior.txnId) or assignment.txnId
+            local priorAtCanonical = store.pending[canonical]
             local _, _, _, priorWrote = ApplyIncoming(store.pending, canonical, {
                 assignmentId = prior.assignmentId,
                 assignedAt = prior.assignedAt,
@@ -1440,6 +1574,7 @@ function GS:AdmitValuationAssignment(body, opts)
                 actorName = prior.actorName,
             })
             if priorWrote then
+                PatchBindingsAfterApply(store, store.pending, canonical, priorAtCanonical, true)
                 folded = true
             end
             pendingKey = canonical
@@ -1453,7 +1588,11 @@ function GS:AdmitValuationAssignment(body, opts)
             exportCanonical, assignment.txnId) then
             return "rejected", "assignment_bound"
         end
+        local priorPending = store.pending[pendingKey]
         local status, _, detail, wrote = ApplyIncoming(store.pending, pendingKey, assignment)
+        if wrote then
+            PatchBindingsAfterApply(store, store.pending, pendingKey, priorPending, true)
+        end
         if wrote or folded then
             NoteValuationStoreMutation(store, record)
         end
@@ -1472,20 +1611,27 @@ function GS:AdmitValuationAssignment(body, opts)
         exportCanonical, assignment.txnId) then
         return "rejected", "assignment_bound"
     end
+    local priorWinner = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
     local status, changed, detail, wrote = ApplyIncoming(store.byTxn, canonical, assignment)
+    if wrote then
+        PatchBindingsAfterApply(store, store.byTxn, canonical, priorWinner, true)
+    end
     local clearedPending = false
     if type(store.pending) == "table" then
         for key in pairs(ids) do
             if store.pending[key] ~= nil then
+                PatchBindingsRemoveSnap(store, store.pending[key], key)
                 store.pending[key] = nil
                 clearedPending = true
             end
         end
         if store.pending[assignment.txnId] ~= nil then
+            PatchBindingsRemoveSnap(store, store.pending[assignment.txnId], assignment.txnId)
             store.pending[assignment.txnId] = nil
             clearedPending = true
         end
         if store.pending[canonical] ~= nil then
+            PatchBindingsRemoveSnap(store, store.pending[canonical], canonical)
             store.pending[canonical] = nil
             clearedPending = true
         end

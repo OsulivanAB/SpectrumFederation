@@ -365,6 +365,7 @@ do
         end
         local entry = {
             id = spec.id,
+            schema = tonumber(spec.schema) or 1,
             api = spec,
             enabled = spec.enabled and true or false,
             ready = spec.ready ~= false,
@@ -34223,6 +34224,658 @@ do
         "val: C non-batch price committed")
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
     assertEq(#world.chat, 0, "val: C stays chat-free")
+end
+
+do
+    -- A1: bulk archive trim coalesces export-order compaction (discussion_r4364648454).
+    valuationTsmValue = 50
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local priorArch = GS.MAX_ARCHIVED_EVENTS
+    local priorLive = GS.MAX_LEDGER_EVENTS
+    GS.MAX_ARCHIVED_EVENTS = 40
+    GS.MAX_LEDGER_EVENTS = 200
+    local record = activateValuationGuild(9901)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local priced = 0
+    for n = 1, 96 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9901,
+            quantity = (n % 3) + 1,
+            donor = "A1Donor" .. n .. "-Garona",
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = n,
+            neighborsOlder = { "a1-old-" .. n },
+            neighborsNewer = { "a1-new-" .. n },
+        })
+        local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(st, "accepted", "val: A1 officer credit " .. n .. " " .. tostring(reason))
+        priced = priced + 1
+    end
+    drainExportMaint(256)
+    record = GS:GetCurrentRecord()
+    assertTrue(valuationCount(record) >= 80, "val: A1 many valued donations before trim got="
+        .. tostring(valuationCount(record)))
+    local orderCompactions = 0
+    local orderScanned = 0
+    GS._onGossipExportOrderCompaction = function(scanned)
+        orderCompactions = orderCompactions + 1
+        orderScanned = orderScanned + (tonumber(scanned) or 0)
+    end
+    startCampaign()
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    local archive = record.accounting and record.accounting._consumableEventArchive
+    assertTrue(type(archive) == "table" and #archive <= GS.MAX_ARCHIVED_EVENTS,
+        "val: A1 archive at cap got=" .. tostring(archive and #archive))
+    GS._onGossipExportOrderCompaction = nil
+    GS.MAX_ARCHIVED_EVENTS = priorArch
+    GS.MAX_LEDGER_EVENTS = priorLive
+    -- >64 evictions would have been many chunked ledger+valuation full-order
+    -- scans; coalesced trim must compact once (or a small constant).
+    assertTrue(orderCompactions <= 2,
+        "val: A1 order compactions bounded got=" .. tostring(orderCompactions)
+            .. " scanned=" .. tostring(orderScanned))
+    assertTrue(orderCompactions >= 1, "val: A1 performed coalesced compaction")
+    -- Old path: ceil(evictions/64) ledger + ceil(vals/64) valuation passes.
+    local oldLowerBound = math.floor(80 / 64) + math.floor(40 / 64) + 2
+    assertTrue(orderCompactions < oldLowerBound,
+        "val: A1 better than chunk×index lower bound old>=" .. tostring(oldLowerBound)
+            .. " got=" .. tostring(orderCompactions))
+    drainExportMaint(256)
+    record = GS:GetCurrentRecord()
+    local descCount = nil
+    local exportVal = 0
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "dataset-desc" then
+            descCount = row.body.valuationCount
+        elseif row.body and row.body.kind == "gs-valuation" then
+            exportVal = exportVal + 1
+        end
+    end
+    assertEq(descCount, valuationCount(record),
+        "val: A1 descriptor matches retained winners")
+    assertEq(exportVal, valuationCount(record),
+        "val: A1 export coverage matches winners")
+    -- Ordinary small removal still works and stays single-pass.
+    local smallCompactions = 0
+    GS._onGossipExportOrderCompaction = function()
+        smallCompactions = smallCompactions + 1
+    end
+    local keepTxn = nil
+    for txn in pairs(record.valuations.byTxn or {}) do
+        keepTxn = txn
+        break
+    end
+    assertTrue(type(keepTxn) == "string", "val: A1 has a winner to forget")
+    GS.ForgetDonationValuations(record, { keepTxn })
+    GS._onGossipExportOrderCompaction = nil
+    assertEq(smallCompactions, 1, "val: A1 ordinary forget one compaction")
+    assertEq(#world.chat, 0, "val: A1 chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- A2: incremental assignment-binding index (discussion_r4364648460).
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: A2 provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9902)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local rebuilds = 0
+    GS._onAssignmentBindingRebuild = function()
+        rebuilds = rebuilds + 1
+    end
+    local n = 120
+    local bodies = {}
+    for i = 1, n do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9902,
+            quantity = 1,
+            donor = "A2Donor" .. i .. "-Garona",
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = i,
+            neighborsOlder = { "a2-old-" .. i },
+            neighborsNewer = { "a2-new-" .. i },
+        })
+        local stCred, reasonCred = GS:_AdmitObservationForTests(
+            evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(stCred, "accepted", "val: A2 officer credit " .. i .. " " .. tostring(reasonCred))
+        record = GS:GetCurrentRecord()
+        local ev = nil
+        local lists = {
+            record.accounting._consumableEvents,
+            record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for j = #list, 1, -1 do
+                    local row = list[j]
+                    if type(row) == "table" and tonumber(row.itemId) == 9902
+                        and tonumber(row.quantity) == 1
+                        and tonumber(row.occurrenceIndex) == i then
+                        ev = row
+                        break
+                    end
+                end
+            end
+            if ev then break end
+        end
+        assertTrue(ev ~= nil, "val: A2 donation " .. i)
+        -- Without TSM, mint does not run; admit valuations through the provider.
+        local assignId = string.format("gsv1:%024x:%08x", i, 9902)
+        local body = craftValuation(record, ev, {
+            assignmentId = assignId,
+            assignedAt = 1000 + i,
+            unitCopper = 3,
+            txnId = ev.txnId,
+        })
+        bodies[#bodies + 1] = { id = "gs:val:" .. ev.txnId, body = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = body,
+        } }
+        local st, reason = providerApplyWithId(bodies[#bodies].id, bodies[#bodies].body, "Alice-Garona")
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: A2 admit " .. i .. " " .. tostring(st) .. " " .. tostring(reason))
+        if i % 17 == 0 then
+            local loser = deepCopy(bodies[#bodies].body)
+            loser.assignment = deepCopy(body)
+            loser.assignment.assignmentId = string.format("gsv1:%024x:%08x", i + 5000, 9902)
+            loser.assignment.assignedAt = 2000 + i
+            local stL = select(1, providerApplyWithId(bodies[#bodies].id, loser, "Alice-Garona"))
+            assertTrue(stL == "duplicate" or stL == "accepted",
+                "val: A2 loser " .. i .. " " .. tostring(stL))
+        end
+    end
+    assertTrue(rebuilds <= 3,
+        "val: A2 binding rebuilds bounded during admits got=" .. tostring(rebuilds))
+    local afterAdmits = rebuilds
+    local evidenceOther = makeDepositEvidence(record, {
+        itemId = 9902, quantity = 2, donor = "A2Clash-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = n + 1,
+        neighborsOlder = { "a2-clash-old" }, neighborsNewer = { "a2-clash-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceOther, "Player-1-Alice", "Alice-Garona")), "accepted", "val: A2 clash credit")
+    record = GS:GetCurrentRecord()
+    local other = valuationFindDonation(record, 9902, 2)
+    assertTrue(other ~= nil, "val: A2 clash donation")
+    local borrowed = deepCopy(bodies[1].body)
+    borrowed.assignment = deepCopy(bodies[1].body.assignment)
+    borrowed.assignment.txnId = other.txnId
+    borrowed.assignment.quantity = 2
+    borrowed.assignment.totalCopper = borrowed.assignment.unitCopper * 2
+    borrowed.assignment.itemId = 9902
+    local stBound, reasonBound = providerApplyWithId("gs:val:" .. other.txnId, borrowed, "Alice-Garona")
+    assertEq(stBound, "rejected", "val: A2 borrowed assignment rejected")
+    assertEq(reasonBound, "assignment_bound", "val: A2 assignment_bound")
+    assertTrue(rebuilds - afterAdmits <= 1,
+        "val: A2 clash did not quadratic-rebuild got=" .. tostring(rebuilds - afterAdmits))
+    local beforeForget = rebuilds
+    local drop = {}
+    for i = 1, 20 do
+        drop[#drop + 1] = bodies[i].body.assignment.txnId
+    end
+    GS.ForgetDonationValuations(record, drop)
+    assertEq(rebuilds, beforeForget, "val: A2 forget stays incremental")
+    GS._onAssignmentBindingRebuild = nil
+    assertEq(#world.chat, 0, "val: A2 chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- B1: PROVIDER_SCHEMA advanced for valuation-aware wire (discussion_r4364648464).
+    assertEq(GS.PROVIDER_SCHEMA, 2, "val: B1 PROVIDER_SCHEMA is 2")
+    local record = activateValuationGuild(9903)
+    assertEq(GS:EnsureGossipProvider(), true, "val: B1 provider")
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(type(prov) == "table", "val: B1 provider registered")
+    assertEq(tonumber(prov.schema), 2, "val: B1 registered schema 2")
+    local wireCaps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
+    assertTrue(type(wireCaps) == "table", "val: B1 provider GetCapabilities")
+    assertEq(tonumber(wireCaps.schema), 2, "val: B1 wire capabilities schema 2")
+    drainExportMaint(32)
+    local descSchema = nil
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "dataset-desc"
+            and row.body.datasetId == record.datasetId then
+            descSchema = row.body.schemaVersion
+        end
+    end
+    assertEq(descSchema, 2, "val: B1 descriptor schemaVersion 2")
+    -- Strict GG equality: schema 1 peer is incompatible with local schema 2.
+    local localSchema = tonumber(prov.schema)
+    assertEq(localSchema, 2, "val: B1 local schema 2")
+    assertTrue(localSchema ~= 1, "val: B1 old schema 1 incompatible with local 2")
+    assertEq(tonumber(2) == localSchema, true, "val: B1 new/new compatible")
+    -- Persisted local schema stays 1 across the wire bump.
+    assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, GS.SCHEMA_VERSION,
+        "val: B1 persisted root schema unchanged")
+    assertEq(GS.SCHEMA_VERSION, 1, "val: B1 SCHEMA_VERSION remains 1")
+    assertEq(#world.chat, 0, "val: B1 chat-free")
+end
+
+do
+    -- B2: existing-ID handling before adoption capacity (conversation disposition).
+    valuationTsmValue = 9
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9904)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9904, quantity = 2 })
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9904, 2)
+    assertTrue(event ~= nil, "val: B2 source donation")
+    local canonical = event.txnId
+    local snap = valuationSnap(record, canonical)
+    assertTrue(type(snap) == "table", "val: B2 priced")
+    local sourceDataset = record.datasetId
+    local exportBodies = collectAllExportBodies()
+    local descId = "gs:desc:" .. sourceDataset
+    local baseDesc = nil
+    local valBody = nil
+    local others = {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        if row.id == descId then
+            baseDesc = deepCopy(row.body)
+        elseif row.body and row.body.kind == "gs-valuation" then
+            valBody = deepCopy(row.body)
+        else
+            others[#others + 1] = row
+        end
+    end
+    assertTrue(type(baseDesc) == "table", "val: B2 descriptor")
+    assertTrue(type(valBody) == "table", "val: B2 valuation body")
+    assertEq(tonumber(baseDesc.valuationCount), 1, "val: B2 pin count 1")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    local liveDataset = GS:GetCurrentRecord().datasetId
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B2 begin")
+    local savedCap = GS.MAX_ADOPTION_PENDING_RECORDS
+    -- Fill to exact capacity with descriptor + valuation + others truncated.
+    GS.MAX_ADOPTION_PENDING_RECORDS = 3
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, deepCopy(baseDesc))), "accepted",
+        "val: B2 buffer desc")
+    assertEq(select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody))),
+        "accepted", "val: B2 buffer val")
+    -- One filler to reach capacity.
+    local filler = others[1]
+    assertTrue(filler ~= nil, "val: B2 filler export")
+    assertEq(select(1, GS:BufferAdoptionRecord(filler.id, deepCopy(filler.body))), "accepted",
+        "val: B2 filler")
+    assertEq(#GS._adoption.order, GS.MAX_ADOPTION_PENDING_RECORDS, "val: B2 buffer full")
+    local ready = select(1, GS:IsAdoptionTransferComplete())
+    -- May or may not be ready depending on filler; capacity is what matters.
+    local stDup = select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody)))
+    assertEq(stDup, "duplicate", "val: B2 exact duplicate at capacity")
+    assertTrue(GS._adoption ~= nil, "val: B2 adoption remains after duplicate")
+    local omit = deepCopy(baseDesc)
+    omit.valuationCount = nil
+    local stOmit, reasonOmit = GS:BufferAdoptionRecord(descId, omit)
+    assertEq(stOmit, "rejected", "val: B2 omit count at capacity rejected")
+    assertEq(reasonOmit, "source_changed", "val: B2 omit reason")
+    assertEq(GS:GetPendingAdoption(), nil, "val: B2 cleared on omit")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B2 live preserved after omit")
+
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B2 begin again")
+    GS.MAX_ADOPTION_PENDING_RECORDS = 3
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, deepCopy(baseDesc))), "accepted",
+        "val: B2 re-pin")
+    assertEq(select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody))),
+        "accepted", "val: B2 re-val")
+    assertEq(select(1, GS:BufferAdoptionRecord(filler.id, deepCopy(filler.body))), "accepted",
+        "val: B2 re-filler")
+    local changed = deepCopy(valBody)
+    changed.assignment = deepCopy(valBody.assignment)
+    changed.assignment.assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009904"
+    changed.assignment.assignedAt = (tonumber(valBody.assignment.assignedAt) or 10) - 5
+    local stChg, reasonChg = GS:BufferAdoptionRecord("gs:val:" .. canonical, changed)
+    assertEq(stChg, "rejected", "val: B2 changed winner at capacity rejected")
+    assertEq(reasonChg, "source_changed", "val: B2 changed reason")
+    assertEq(GS:GetPendingAdoption(), nil, "val: B2 cleared on winner change")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B2 live preserved after change")
+
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B2 begin for full")
+    GS.MAX_ADOPTION_PENDING_RECORDS = 3
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, deepCopy(baseDesc))), "accepted",
+        "val: B2 fill desc")
+    assertEq(select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody))),
+        "accepted", "val: B2 fill val")
+    assertEq(select(1, GS:BufferAdoptionRecord(filler.id, deepCopy(filler.body))), "accepted",
+        "val: B2 fill filler")
+    local stFull, reasonFull = GS:BufferAdoptionRecord("gs:le:ctx:brand-new-full-9904", {
+        kind = "gs-ledger-event",
+        datasetId = sourceDataset,
+        event = { type = "donation", id = "ctx:brand-new-full-9904", txnId = "ctx:brand-new-full-9904" },
+    })
+    assertEq(stFull, "rejected", "val: B2 genuinely new still full")
+    assertEq(reasonFull, "full", "val: B2 full reason")
+    assertTrue(GS._adoption ~= nil, "val: B2 adoption remains after full")
+    GS:CancelDatasetAdoption()
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B2 abort did not replace live")
+    GS.MAX_ADOPTION_PENDING_RECORDS = savedCap
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: B2 chat-free")
+end
+
+do
+    -- C1: no valuation alias from untrusted incomplete provenance (discussion_r4364653917).
+    SF.TSM = nil
+    local record = activateValuationGuild(9905)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9905, quantity = 4 })
+    record = GS:GetCurrentRecord()
+    local eventA = valuationFindDonation(record, 9905, 4)
+    assertTrue(eventA ~= nil, "val: C1 donation A")
+    local txnA = eventA.txnId
+    local txnX = "ctx:c1-competing-x-9905"
+    local marker = record.liveCutover and record.liveCutover.cutoverMarker
+    assertTrue(type(marker) == "string" and marker ~= "", "val: C1 live marker")
+    -- Officer-authorized pending valuation parked on competing id X.
+    local pending = craftValuation(record, eventA, {
+        assignmentId = "gsv1:cccccccccccccccccccccccc:00009905",
+        assignedAt = 40,
+        unitCopper = 15,
+        txnId = txnX,
+    })
+    local stPend, reasonPend = applyValuationBody(pending, "Alice-Garona")
+    assertEq(stPend, "pending", "val: C1 pending on X " .. tostring(reasonPend))
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[txnX]) == "table", "val: C1 pending[X] stored")
+    assertEq(valuationSnap(record, txnA), nil, "val: C1 A not priced yet")
+    -- Non-editor sends a matching copy of A under txnId=X without officer provenance.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local clone = deepCopy(eventA)
+    clone.id = txnX
+    clone.txnId = txnX
+    clone.verification = "witnesses"
+    clone.verifierGuid = nil
+    clone.writer = "Player-1-Dave"
+    local stBad, reasonBad = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = clone,
+    }, "Dave-Garona")
+    assertTrue(stBad == "duplicate" or stBad == "pending" or stBad == "rejected",
+        "val: C1 untrusted competing id st=" .. tostring(stBad) .. " " .. tostring(reasonBad))
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[txnX]) == "table",
+        "val: C1 pending[X] unchanged after untrusted copy")
+    assertEq(valuationSnap(record, txnA), nil, "val: C1 no valuation move to A")
+    assertEq(valuationSnap(record, txnX), nil, "val: C1 no published winner under X")
+    local cfg = record.accounting and record.accounting._consumables
+    local aliased = false
+    if type(cfg) == "table" and type(cfg.txnRegistry) == "table" then
+        for i = 1, #cfg.txnRegistry do
+            local row = cfg.txnRegistry[i]
+            if type(row) == "table" and row.txnId == txnA and type(row.aliases) == "table" then
+                for j = 1, #row.aliases do
+                    if row.aliases[j] == txnX then
+                        aliased = true
+                    end
+                end
+            end
+            if type(row) == "table" and row.txnId == txnX and row.status == "alias" then
+                aliased = true
+            end
+        end
+    end
+    assertEq(aliased, false, "val: C1 no A→X alias from incomplete provenance")
+
+    -- Later complete officer-history for competing id X converges exactly once.
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local evidence = {
+        donor = eventA.actor or eventA.donor,
+        itemId = eventA.itemId,
+        quantity = eventA.quantity,
+        generation = eventA.generation,
+        approxTxnTime = eventA.timestamp or eventA.approxTxnTime,
+        ageHours = 0,
+        coreSignature = eventA.coreSignature,
+        occurrenceIndex = eventA.occurrenceIndex,
+        guildGuid = eventA.guildGuid,
+        bankTab = eventA.bankTab,
+        neighborsOlder = eventA.neighborsOlder,
+        neighborsNewer = eventA.neighborsNewer,
+    }
+    local hist = officerLedgerEvent(record, evidence, txnX, {
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        verifierRankOrder = 1,
+        verification = "officer",
+    })
+    local stOk, reasonOk = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = marker,
+        event = hist,
+    }, "Bob-Garona")
+    assertTrue(stOk == "duplicate" or stOk == "accepted",
+        "val: C1 trusted officer history st=" .. tostring(stOk) .. " " .. tostring(reasonOk))
+    record = GS:GetCurrentRecord()
+    local moved = valuationSnap(record, txnA)
+    assertTrue(type(moved) == "table", "val: C1 trusted alias moves valuation to A")
+    assertEq(moved.unitCopper, 15, "val: C1 moved unit")
+    assertEq(moved.txnId, txnX, "val: C1 keeps immutable assignment txnId")
+    assertEq(record.valuations.pending[txnX], nil, "val: C1 pending[X] cleared once")
+    assertEq(valuationCount(record), 1, "val: C1 one winner after trusted convergence")
+    -- Divergent marker stays fail-closed for a second competing id.
+    local txnY = "ctx:c1-divergent-y-9905"
+    local badHist = officerLedgerEvent(record, evidence, txnY, {
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        verifierRankOrder = 1,
+        verification = "officer",
+    })
+    local stDiv, reasonDiv = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = "gsc1:divergent-marker-9905",
+        event = badHist,
+    }, "Bob-Garona")
+    assertTrue(reasonDiv ~= "officer_history",
+        "val: C1 divergent marker is not officer credit st="
+            .. tostring(stDiv) .. " " .. tostring(reasonDiv))
+    assertEq(valuationCount(GS:GetCurrentRecord()), 1, "val: C1 still one winner")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: C1 chat-free")
+end
+
+do
+    -- C2: snapshot market cache cleanup on exception (discussion_r4364648470).
+    local tsmByKey = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function(item)
+            valuationTsmCalls = valuationTsmCalls + 1
+            local key = type(item) == "number" and ("n:" .. item) or ("s:" .. tostring(item))
+            tsmByKey[key] = (tsmByKey[key] or 0) + 1
+            if type(valuationTsmValue) == "function" then
+                return valuationTsmValue(item)
+            end
+            return valuationTsmValue
+        end,
+    }
+    local itemId = 9906
+    local record = activateValuationGuild(itemId)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    local O = SF.ConsumablesObservation
+    record = GS:GetCurrentRecord()
+    local cfg = record.accounting._consumables
+    local rows = {}
+    for i = 1, 4 do
+        rows[i] = {
+            type = "deposit",
+            name = "C2Donor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    local snapshot = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows,
+    }
+    local ctx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = snapshot.bankTab,
+        guildGuid = snapshot.guildGuid,
+        generation = snapshot.generation,
+        profileId = "gs",
+        requestedSet = snapshot.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    local realAdmit = GS.AdmitDirectObservation
+    local calls = 0
+    GS.AdmitDirectObservation = function(self, evidence, opts)
+        calls = calls + 1
+        if calls == 2 then
+            error("forced-c2-admit-exception")
+        end
+        return realAdmit(self, evidence, opts)
+    end
+    local ok, err = pcall(function()
+        BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
+    end)
+    GS.AdmitDirectObservation = realAdmit
+    assertEq(ok, false, "val: C2 exception propagated")
+    assertTrue(tostring(err):find("forced-c2-admit-exception", 1, true) ~= nil,
+        "val: C2 original error preserved got=" .. tostring(err))
+    -- Later snapshot must re-query TSM (including a prior nil miss) rather than
+    -- reuse a stranded depth-1 cache.
+    valuationTsmCalls = 0
+    tsmByKey = {}
+    local phase = 0
+    valuationTsmValue = function(item)
+        phase = phase + 1
+        if phase == 1 then
+            return nil
+        end
+        return 777
+    end
+    local rows2 = {
+        {
+            type = "deposit",
+            name = "C2LaterA-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 2,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = 1,
+        },
+        {
+            type = "deposit",
+            name = "C2LaterB-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 3,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = 2,
+        },
+    }
+    local snap2 = {
+        guildGuid = snapshot.guildGuid,
+        bankTab = snapshot.bankTab,
+        generation = snapshot.generation,
+        observedBy = "Alice-Garona",
+        observedAt = world.time + 10,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows2,
+    }
+    ctx.observedAt = snap2.observedAt
+    local stats2 = BankLog:AdmitGuildSuppliesSnapshot(ctx, snap2)
+    assertTrue(type(stats2) == "table", "val: C2 later snapshot returns stats")
+    assertTrue(valuationTsmCalls >= 1, "val: C2 later snapshot re-queries TSM")
+    -- Normal batching: two same-item deposits after a fresh begin query once per key
+    -- when the price is stable.
+    valuationTsmCalls = 0
+    valuationTsmValue = 42
+    local rows3 = {
+        {
+            type = "deposit", name = "C2Batch1-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId, count = 1,
+            year = 0, month = 0, day = 0, hour = 0, ageHours = 0, index = 1,
+        },
+        {
+            type = "deposit", name = "C2Batch2-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId, count = 1,
+            year = 0, month = 0, day = 0, hour = 0, ageHours = 0, index = 2,
+        },
+    }
+    local snap3 = {
+        guildGuid = snapshot.guildGuid,
+        bankTab = snapshot.bankTab,
+        generation = snapshot.generation,
+        observedBy = "Alice-Garona",
+        observedAt = world.time + 20,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows3,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(ctx, snap3)
+    assertEq(valuationTsmCalls, 1, "val: C2 normal batch one query per key got="
+        .. tostring(valuationTsmCalls))
+    assertEq(#world.chat, 0, "val: C2 chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
 end
 
 do

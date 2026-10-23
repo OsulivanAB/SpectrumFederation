@@ -1604,8 +1604,14 @@ function GS.ValidateLedgerEventLists(accounting, datasetId)
     return true
 end
 
-local function RemoveEvictedLedgerExportIds(removedIds)
+local function RemoveEvictedLedgerExportIds(removedIds, opts)
     if type(removedIds) ~= "table" or #removedIds < 1 or not GS.RemoveGossipExportBodies then
+        return
+    end
+    opts = opts or {}
+    if opts.bulk == true then
+        -- Trusted archive trim: one pass over the full eviction set.
+        GS.RemoveGossipExportBodies(removedIds, { bulk = true })
         return
     end
     local offset = 1
@@ -1650,9 +1656,19 @@ local function TrimEventArchive(record)
     end
     record.accounting._consumableEventArchive = kept
     BumpAccountingMutation(record)
-    RemoveEvictedLedgerExportIds(removedIds)
+    -- Coalesce ledger + valuation export drops into one order compaction and
+    -- one provider/manifest notification for this trusted retention trim.
+    local beganRemovalBatch = false
+    if GS.BeginGossipExportBodyRemovalBatch then
+        GS.BeginGossipExportBodyRemovalBatch()
+        beganRemovalBatch = true
+    end
+    RemoveEvictedLedgerExportIds(removedIds, { bulk = true })
     if GS.ForgetDonationValuations then
-        GS.ForgetDonationValuations(record, removedTxn)
+        GS.ForgetDonationValuations(record, removedTxn, { bulkExport = true })
+    end
+    if beganRemovalBatch and GS.EndGossipExportBodyRemovalBatch then
+        GS.EndGossipExportBodyRemovalBatch()
     end
     -- Length may match the prior warm watermark after shelve+trim; still force
     -- archive paced rebuild so newly retained rows are exported and descriptor
@@ -3180,12 +3196,17 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             end
             if regHit and ValidTxnId(regHit.txnId) and regHit.txnId ~= txnId then
                 -- Same occurrence, competing ID: alias without second credit.
+                -- Only complete officer-history (or later trusted paths) may
+                -- create A→X aliases that move valuation state. Uncredited
+                -- matching copies must not redirect pending[X].
                 if regHit.status == "verified" then
-                    AddTxnAlias(cfg, regHit.txnId, txnId, record)
-                    local led = FindLedgerEventByTxnId(record, regHit.txnId)
-                    if led then
-                        ReconcileVerifiedDonationDuplicate(
-                            record, led, candidate, admissionCtx, event)
+                    if IsCompleteOfficerHistoryEvent(event) then
+                        AddTxnAlias(cfg, regHit.txnId, txnId, record)
+                        local led = FindLedgerEventByTxnId(record, regHit.txnId)
+                        if led then
+                            ReconcileVerifiedDonationDuplicate(
+                                record, led, candidate, admissionCtx, event)
+                        end
                     end
                     return "duplicate", "occurrence_duplicate"
                 end
@@ -3195,9 +3216,11 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "pending", "ambiguous"
             end
             if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
-                AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record)
-                ReconcileVerifiedDonationDuplicate(
-                    record, ledHit, candidate, admissionCtx, event)
+                if IsCompleteOfficerHistoryEvent(event) then
+                    AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record)
+                    ReconcileVerifiedDonationDuplicate(
+                        record, ledHit, candidate, admissionCtx, event)
+                end
                 return "duplicate", "occurrence_duplicate"
             end
             if ledHit and (ledHit.txnId or ledHit.id) == txnId then

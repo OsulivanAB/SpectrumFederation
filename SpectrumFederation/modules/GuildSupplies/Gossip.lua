@@ -9,7 +9,9 @@ local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
 
 GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 1
+-- Wire schema for sf.guildsupplies.config. #397 valuations require schema 2;
+-- Guild Gossip matches provider schemas by strict equality.
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 2
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -2157,17 +2159,112 @@ function GS.MarkLedgerArchiveExportStale()
     end
 end
 
+-- Coalesce trusted bulk export eviction (archive trim) into one order pass.
+local exportRemovalBatchDepth = 0
+local exportRemovalBatchDrop = nil
+local exportRemovalBatchRemoved = 0
+local exportRemovalBatchDroppedValuation = false
+
+--- Begin coalescing RemoveGossipExportBodies compaction/notify. Nested.
+function GS.BeginGossipExportBodyRemovalBatch()
+    exportRemovalBatchDepth = (tonumber(exportRemovalBatchDepth) or 0) + 1
+    if exportRemovalBatchDepth == 1 then
+        exportRemovalBatchDrop = {}
+        exportRemovalBatchRemoved = 0
+        exportRemovalBatchDroppedValuation = false
+    end
+end
+
+local function CompactGossipExportOrder(drop)
+    if type(drop) ~= "table" then
+        return
+    end
+    local order = exportState.order
+    local scanned = #order
+    local write = 1
+    for read = 1, scanned do
+        local id = order[read]
+        if not drop[id] then
+            order[write] = id
+            write = write + 1
+        end
+    end
+    for i = write, scanned do
+        order[i] = nil
+    end
+    if exportState.enumPos and exportState.enumPos > #order then
+        exportState.enumPos = #order
+    end
+    exportState.countsDirty = true
+    exportState.maintIdle = false
+    -- GS._onGossipExportOrderCompaction is nil in production; tests count passes.
+    if type(GS._onGossipExportOrderCompaction) == "function" then
+        GS._onGossipExportOrderCompaction(scanned)
+    end
+end
+
+local function FinishGossipExportBodyRemovals(removed, droppedValuation)
+    if removed > 0 or droppedValuation then
+        if droppedValuation then
+            PublishValuationManifest()
+        end
+        if GG and GG.GetProvider and providerRegistered then
+            local prov = GG.GetProvider(GS.PROVIDER_ID)
+            if removed > 0 and prov and prov.index then
+                prov.index.dirty = true
+                prov.index.buildComplete = false
+            end
+            if droppedValuation and GG.NotifyProviderChanged then
+                GG.NotifyProviderChanged(GS.PROVIDER_ID)
+            end
+        end
+    end
+end
+
+--- Flush one coalesced order compaction + provider notify when outermost ends.
+function GS.EndGossipExportBodyRemovalBatch()
+    local depth = tonumber(exportRemovalBatchDepth) or 0
+    if depth <= 0 then
+        exportRemovalBatchDepth = 0
+        exportRemovalBatchDrop = nil
+        exportRemovalBatchRemoved = 0
+        exportRemovalBatchDroppedValuation = false
+        return
+    end
+    depth = depth - 1
+    exportRemovalBatchDepth = depth
+    if depth > 0 then
+        return
+    end
+    local drop = exportRemovalBatchDrop
+    local removed = tonumber(exportRemovalBatchRemoved) or 0
+    local droppedValuation = exportRemovalBatchDroppedValuation and true or false
+    exportRemovalBatchDrop = nil
+    exportRemovalBatchRemoved = 0
+    exportRemovalBatchDroppedValuation = false
+    if removed > 0 and type(drop) == "table" then
+        CompactGossipExportOrder(drop)
+    end
+    FinishGossipExportBodyRemovals(removed, droppedValuation)
+end
+
 --- Drop evicted durable export ids from the warm Gossip index (bounded).
--- Called when Ledger evicts directExports so descriptor counts and GetRecord
--- cannot keep serving removed bodies until a full rebuild.
-function GS.RemoveGossipExportBodies(ids)
+-- Ordinary callers: at most 64 ids, immediate order compaction + notify.
+-- Inside Begin/EndGossipExportBodyRemovalBatch (trusted archive trim): all ids
+-- in the call are applied to byId/manifest, and compaction/notify coalesce to
+-- one pass at End. opts.bulk permits >64 ids in a single non-batched call.
+function GS.RemoveGossipExportBodies(ids, opts)
     if type(ids) ~= "table" or #ids < 1 then
         return 0
     end
+    opts = opts or {}
+    local batching = (tonumber(exportRemovalBatchDepth) or 0) > 0
+        and type(exportRemovalBatchDrop) == "table"
+    local bulk = opts.bulk == true or batching
+    local limit = bulk and #ids or math.min(#ids, 64)
     local removed = 0
-    local drop = {}
+    local drop = batching and exportRemovalBatchDrop or {}
     local droppedValuation = false
-    local limit = math.min(#ids, 64)
     for i = 1, limit do
         local id = ids[i]
         if type(id) == "string" then
@@ -2184,40 +2281,20 @@ function GS.RemoveGossipExportBodies(ids)
             end
         end
     end
+    if batching then
+        exportRemovalBatchRemoved = (tonumber(exportRemovalBatchRemoved) or 0) + removed
+        if droppedValuation then
+            exportRemovalBatchDroppedValuation = true
+        end
+        return removed
+    end
     if removed < 1 and not droppedValuation then
         return 0
     end
     if removed > 0 then
-        local write = 1
-        for read = 1, #exportState.order do
-            local id = exportState.order[read]
-            if not drop[id] then
-                exportState.order[write] = id
-                write = write + 1
-            end
-        end
-        for i = write, #exportState.order do
-            exportState.order[i] = nil
-        end
-        if exportState.enumPos and exportState.enumPos > #exportState.order then
-            exportState.enumPos = #exportState.order
-        end
-        exportState.countsDirty = true
-        exportState.maintIdle = false
+        CompactGossipExportOrder(drop)
     end
-    if droppedValuation then
-        PublishValuationManifest()
-    end
-    if GG and GG.GetProvider and providerRegistered then
-        local prov = GG.GetProvider(GS.PROVIDER_ID)
-        if removed > 0 and prov and prov.index then
-            prov.index.dirty = true
-            prov.index.buildComplete = false
-        end
-        if droppedValuation and GG.NotifyProviderChanged then
-            GG.NotifyProviderChanged(GS.PROVIDER_ID)
-        end
-    end
+    FinishGossipExportBodyRemovals(removed, droppedValuation)
     return removed
 end
 

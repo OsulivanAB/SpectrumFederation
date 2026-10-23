@@ -369,37 +369,52 @@ function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
         GS.BeginLocalDurableNotifyBatch()
         beganBatch = true
     end
-    for i = 1, #evidenceRows do
-        local evidence = evidenceRows[i]
-        if type(evidence) == "table" then
-            evidence.campaignId = evidence.campaignId or ctx.campaignId
-            evidence.datasetId = evidence.datasetId or ctx.datasetId
-            local st, reason = GS:AdmitDirectObservation(evidence, {
-                member = member,
-                sender = member.name,
-                localWrite = true,
-                campaignId = ctx.campaignId,
-                liveWritesBlockedCached = true,
-                liveWritesBlocked = liveBlocked and true or false,
-                liveWritesBlockReason = liveBlockReason,
-            })
-            if st == "accepted" then
-                stats.admitted = stats.admitted + 1
-            elseif st == "duplicate" then
-                stats.duplicate = stats.duplicate + 1
-            elseif st == "pending" then
-                stats.pending = stats.pending + 1
-            else
-                stats.rejected = stats.rejected + 1
-                Debug("Verbose", "guild supplies evidence rejected reason=%s", tostring(reason))
+    -- Protected admit + guaranteed End for both scopes so an unexpected
+    -- exception cannot leave snapshotMarketDepth stranded with stale prices.
+    local admitOk, admitErr = pcall(function()
+        for i = 1, #evidenceRows do
+            local evidence = evidenceRows[i]
+            if type(evidence) == "table" then
+                evidence.campaignId = evidence.campaignId or ctx.campaignId
+                evidence.datasetId = evidence.datasetId or ctx.datasetId
+                local st, reason = GS:AdmitDirectObservation(evidence, {
+                    member = member,
+                    sender = member.name,
+                    localWrite = true,
+                    campaignId = ctx.campaignId,
+                    liveWritesBlockedCached = true,
+                    liveWritesBlocked = liveBlocked and true or false,
+                    liveWritesBlockReason = liveBlockReason,
+                })
+                if st == "accepted" then
+                    stats.admitted = stats.admitted + 1
+                elseif st == "duplicate" then
+                    stats.duplicate = stats.duplicate + 1
+                elseif st == "pending" then
+                    stats.pending = stats.pending + 1
+                else
+                    stats.rejected = stats.rejected + 1
+                    Debug("Verbose", "guild supplies evidence rejected reason=%s", tostring(reason))
+                end
             end
         end
-    end
+    end)
+    local endBatchOk, endBatchErr = true, nil
     if beganBatch and GS.EndLocalDurableNotifyBatch then
-        GS.EndLocalDurableNotifyBatch()
+        endBatchOk, endBatchErr = pcall(GS.EndLocalDurableNotifyBatch)
     end
+    local endMarketOk, endMarketErr = true, nil
     if beganMarket and GS.EndValuationSnapshotMarketCache then
-        GS.EndValuationSnapshotMarketCache()
+        endMarketOk, endMarketErr = pcall(GS.EndValuationSnapshotMarketCache)
+    end
+    if not admitOk then
+        error(admitErr)
+    end
+    if not endBatchOk then
+        error(endBatchErr)
+    end
+    if not endMarketOk then
+        error(endMarketErr)
     end
     return stats
 end
