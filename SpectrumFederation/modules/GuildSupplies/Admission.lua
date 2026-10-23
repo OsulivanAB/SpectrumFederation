@@ -4113,13 +4113,15 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             moreWork = true
         else
             state.dependencyWaitSlices = 0
-            -- Full scan found dependents waiting with no progress: finite stall.
+            -- Full scan found dependents waiting with no progress: keep revolving
+            -- under a finite idle budget so temporary rejected/full valuation
+            -- admits can retry after later donations free pending capacity.
             state.idlePasses = (tonumber(state.idlePasses) or 0) + 1
             local maxIdle = math.max(4, #adop.order + 2)
             if state.idlePasses > maxIdle then
                 return false, "incomplete_transfer", progress
             end
-            moreWork = false
+            moreWork = true
         end
     elseif not progress and not budgetHit and not unsettledSeen then
         moreWork = state.deferRankScan ~= nil
