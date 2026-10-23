@@ -16,10 +16,12 @@ another review, or paid continuation.
 Cursor may assess delivered findings and post disposition replies only when a
 current owner request authorizes that assessment (and any reply) under
 `.cursor/skills/ai-review-loop/SKILL.md` and
-`.cursor/skills/pr-review-comments/SKILL.md`. Arriving review comments alone
-are not authorization. Repair batches, additional reviews, and other paid
-continuation still require a current owner request under
-`.cursor/skills/ai-review-loop/SKILL.md`.
+`.cursor/skills/pr-review-comments/SKILL.md`. An authorized repair batch
+includes disposition replies on addressed threads after delivery by default
+unless the owner opts out; pure assessment still needs an explicit reply
+authorization. Arriving review comments alone are not authorization. Repair
+batches, additional reviews, and other paid continuation still require a
+current owner request under `.cursor/skills/ai-review-loop/SKILL.md`.
 
 Prioritize correctness, regressions, integration risk, runtime behavior, persistence, synchronization, performance, security, release safety, and meaningful verification over cosmetic preferences.
 

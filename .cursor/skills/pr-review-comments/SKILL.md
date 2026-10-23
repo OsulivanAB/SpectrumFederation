@@ -3,10 +3,12 @@ name: pr-review-comments
 description: >-
   Investigates SpectrumFederation pull-request review findings with
   evidence-based classification and recommendation. Use only as part of an
-  explicit owner-requested assessment, review, or repair operation. Posts a
-  disposition reply or resolves a thread only when the owner's current request
-  authorizes that write. Never edits code, commits, pushes, starts a repair
-  batch, or requests another review on its own.
+  explicit owner-requested assessment, review, or repair operation. For an
+  authorized repair batch, posts disposition replies on addressed threads after
+  delivery by default unless the owner opts out; otherwise posts or resolves
+  only when the owner's current request authorizes that write. Never edits
+  code, commits, pushes, starts a repair batch, or requests another review on
+  its own.
 ---
 
 # PR Review Comments
@@ -90,10 +92,10 @@ Follow this order for each finding.
    do not affect the assessed behavior. Reassess when the allegation, behavior,
    requirements, or material evidence genuinely changed. For shared root causes
    across multiple findings in the authorized set, reuse the investigation and,
-   when replies are authorized, post a concise disposition on each relevant
-   thread. Before posting, check for an equivalent reply already made where
-   practical; if a write outcome is ambiguous, verify the thread rather than
-   blindly reposting.
+   when replies are authorized (including the repair-batch reply default), post
+   a concise disposition on each relevant thread. Before posting, check for an
+   equivalent reply already made where practical; if a write outcome is
+   ambiguous, verify the thread rather than blindly reposting.
 1. **Establish evidence:** identify the triggering condition, reachable failure
    path, impact, and violated requirement or invariant at current HEAD, and
    whether the finding still applies. Reproduction or a regression test is
@@ -120,10 +122,17 @@ Follow this order for each finding.
    - For an **owner-authorized assessment or review** that did not authorize
      replies, return the classification and recommendation without posting
      unless the request also authorized the write.
-   - Reply to or resolve review threads only when the owner's current request
-     reasonably includes that action.
-   - For an **owner-authorized repair batch**, reply after delivery when replies
-     were authorized so the response can name the fixing commit.
+   - For an **owner-authorized repair batch**, posting a concise disposition
+     reply on each addressed review thread after delivery is the **default**.
+     The repair request itself authorizes those replies unless the owner
+     explicitly opts out (for example, “fix without replying” or “code
+     only”). Prefer posting after the fixing commit is available so the reply
+     can name it. Do not skip these replies merely because the owner did not
+     also say “and reply.”
+   - Outside that repair-batch default, reply to or resolve review threads only
+     when the owner's current request reasonably includes that action.
+   - Thread **resolution** is never part of the repair-batch reply default;
+     resolve only under step 6.
 6. **Resolve only when authorized:** resolve a confirmed finding when it is
    fixed in current HEAD, including an `already fixed` finding whose original
    defect was confirmed and whose fix remains in current HEAD, **and**
@@ -209,11 +218,17 @@ before authorizing a repair batch.
   `reply_to_review_comment` tool with the top-level inline review comment ID.
   Do not use `gh` to write comments. Clearly identify automated dispositions as
   recommendations. Retain useful returned comment IDs in task context when available.
+- After an **authorized repair batch**, post those disposition replies as part
+  of delivery by default (see workflow step 5). Treating “fix the findings”
+  as code-only and leaving threads unanswered is incorrect unless the owner
+  opted out of replies. Pure assessment/review still requires an explicit
+  reply authorization.
 - Prefer `ManagePullRequest` `resolve_comment`; if unavailable, use the GitHub
   connector `resolve_review_thread` tool with the GraphQL thread ID. Resolve only
   after the reply, only when step 6 applies, and only when resolution was authorized.
 - Do not resolve a thread just because you replied, and do not resolve merely
-  because the finding was classified.
+  because the finding was classified. Repair-batch reply authorization does not
+  imply resolution authorization.
 - The equivalent GitHub connector fallback is permitted for the same authorized
   action; it does not expand authorization. If neither `ManagePullRequest` nor
   the equivalent connector tool is available, report that the reply was not
@@ -227,8 +242,9 @@ When an owner-authorized assessment or repair covers several findings, assess
 each included finding. Consolidate duplicate/root-cause-equivalent findings
 where appropriate without hiding distinct defects. Reuse shared investigation.
 Do not treat the request as authorization for a broad new PR audit beyond the
-named or clearly included set. After the authorized findings are assessed (and
-replied to only when authorized), stop.
+named or clearly included set. After the authorized findings are assessed (and,
+for a repair batch, disposition-replied by default unless opted out; for pure
+assessment, replied to only when authorized), stop.
 
 ## Constraints
 
