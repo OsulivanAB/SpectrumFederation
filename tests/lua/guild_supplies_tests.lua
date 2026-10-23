@@ -32043,6 +32043,634 @@ do
 end
 
 do
+    -- Finding 1: late canonical cutover provenance keeps pending price after install.
+    SF.TSM = nil
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local function findByTxn(rec, txnId)
+        local events = rec.accounting and rec.accounting._consumableEvents or {}
+        for i = 1, #events do
+            if events[i] and (events[i].txnId == txnId or events[i].id == txnId) then
+                return events[i]
+            end
+        end
+        return nil
+    end
+    local function descValuationCount()
+        local bodies = collectAllExportBodies()
+        for i = 1, #bodies do
+            local row = bodies[i].body
+            if type(row) == "table" and row.kind == "dataset-desc" then
+                return tonumber(row.valuationCount) or 0
+            end
+        end
+        return nil
+    end
+    local function loadStaged(configRoot, name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+
+    -- Happy path: unmarked staged + pending valuation → cutover → late marked repair.
+    local record = activateValuationGuild(9801)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    local marker = cutover.cutoverMarker
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9801, quantity = 3, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "late-marker-older" }, neighborsNewer = { "late-marker-newer" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: late-marker origin credit")
+    local body = exportDonationBody(9801)
+    assertTrue(type(body) == "table" and type(body.event) == "table", "val: late-marker export")
+    local originTxn = body.event.txnId
+    -- Unmarked officer-history export (no cutoverMarker on the wire body).
+    local unmarked = deepCopy(body)
+    unmarked.cutoverMarker = nil
+
+    local bob = loadStaged(configRoot, "Bob-Garona", "Player-1-Bob", 2)
+    SF.TSM = nil
+    assertEq(select(2, applyExportBody(unmarked, "Bob-Garona")), "officer_history",
+        "val: late-marker unmarked staged history")
+    bob = GS:GetCurrentRecord()
+    local bobEvent = findByTxn(bob, originTxn)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, false, "val: late-marker staged uncredited")
+    assertEq(bobEvent and bobEvent.gsSourceCutoverMarker, nil, "val: late-marker no marker yet")
+    local early = craftValuation(bob, bobEvent, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00009801",
+        assignedAt = 17,
+        unitCopper = 33,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local pendSt, pendReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(pendSt, "pending", "val: late-marker valuation waits " .. tostring(pendReason))
+    assertEq(pendReason, "awaiting_credit", "val: late-marker awaits credit")
+    bob = GS:GetCurrentRecord()
+    assertTrue(type(bob.valuations.pending[originTxn]) == "table", "val: late-marker pending held")
+    assertEq(valuationSnap(bob, originTxn), nil, "val: late-marker not a winner yet")
+    assertEq(descValuationCount(), 0, "val: late-marker unpublished while staged")
+
+    local cutSt, cutReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(cutSt, "accepted", "val: late-marker cutover " .. tostring(cutReason))
+    bob = GS:GetCurrentRecord()
+    assertEq(GS.IsLiveActive(bob), true, "val: late-marker peer is live")
+    bobEvent = findByTxn(bob, originTxn)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, false,
+        "val: late-marker still uncredited after unmarked install")
+    assertTrue(type(bob.valuations.pending[originTxn]) == "table",
+        "val: late-marker pending survives cutover without provenance")
+    assertEq(valuationSnap(bob, originTxn), nil, "val: late-marker still unpublished after cutover")
+    assertEq(descValuationCount(), 0, "val: late-marker still not exported")
+
+    -- Source offline: only a later authenticated marked duplicate arrives.
+    SF.TSM = nil
+    local marked = deepCopy(unmarked)
+    marked.cutoverMarker = marker
+    local markSt, markReason = applyExportBody(marked, "Eve-Garona")
+    assertEq(markSt, "duplicate", "val: late-marker marked duplicate " .. tostring(markReason))
+    bob = GS:GetCurrentRecord()
+    bobEvent = findByTxn(bob, originTxn)
+    assertEq(bobEvent and bobEvent.gsSourceCutoverMarker, marker, "val: late-marker attaches")
+    assertEq(bobEvent and bobEvent.gsProductionCredit, true, "val: late-marker credits")
+    local bobSnap = valuationSnap(bob, originTxn)
+    assertEq(bobSnap and bobSnap.totalCopper, 99, "val: late-marker promotes original total")
+    assertEq(bobSnap and bobSnap.assignmentId, early.assignmentId, "val: late-marker keeps assignment id")
+    assertEq(bob.valuations.pending[originTxn], nil, "val: late-marker pending cleared")
+    assertEq(descValuationCount(), 1, "val: late-marker exports the promoted winner")
+    -- No valuation redelivery: replaying the same ledger marked body stays a duplicate.
+    assertEq(select(1, applyExportBody(marked, "Eve-Garona")), "duplicate",
+        "val: late-marker ledger redelivery is duplicate")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, originTxn) and valuationSnap(bob, originTxn).assignmentId,
+        early.assignmentId, "val: late-marker winner unchanged without valuation redelivery")
+
+    -- Negative: pre-cutover floor discards pending and never credits.
+    local earlyPeer = loadStaged(configRoot, "Carol-Garona", "Player-1-Carol", 2)
+    SF.TSM = nil
+    local preBody = deepCopy(unmarked)
+    local preTime = (tonumber(cutover.contextObservedAt) or 0) - 100
+    preBody.event = deepCopy(unmarked.event)
+    preBody.event.timestamp = preTime
+    preBody.event.approxTxnTime = preTime
+    preBody.event.id = "ctx:late-marker-pre:9801"
+    preBody.event.txnId = "ctx:late-marker-pre:9801"
+    assertEq(select(2, applyExportBody(preBody, "Carol-Garona")), "officer_history",
+        "val: late-marker pre-floor history")
+    earlyPeer = GS:GetCurrentRecord()
+    local preEvent = findByTxn(earlyPeer, "ctx:late-marker-pre:9801")
+    local preVal = craftValuation(earlyPeer, preEvent, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009801",
+        assignedAt = 3,
+        unitCopper = 7,
+        txnId = "ctx:late-marker-pre:9801",
+    })
+    assertEq(select(1, applyValuationBody(preVal, "Carol-Garona")), "pending",
+        "val: late-marker pre-floor valuation waits while staged")
+    assertEq(GS.InstallRemoteLiveCutover(earlyPeer, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Carol", name = "Carol-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    }), "accepted", "val: late-marker pre-floor cutover")
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(earlyPeer.valuations.pending["ctx:late-marker-pre:9801"], nil,
+        "val: late-marker pre-floor pending discarded")
+    assertEq(valuationSnap(earlyPeer, "ctx:late-marker-pre:9801"), nil,
+        "val: late-marker pre-floor never priced")
+    local preMarked = deepCopy(preBody)
+    preMarked.cutoverMarker = marker
+    assertEq(select(1, applyExportBody(preMarked, "Eve-Garona")), "duplicate",
+        "val: late-marker pre-floor marked duplicate")
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(findByTxn(earlyPeer, "ctx:late-marker-pre:9801").gsProductionCredit, false,
+        "val: late-marker pre-floor stays uncredited")
+    assertEq(valuationSnap(earlyPeer, "ctx:late-marker-pre:9801"), nil,
+        "val: late-marker pre-floor still unpriced")
+
+    -- Negative: unauthorized sender cannot hold a pending price.
+    local dave = loadStaged(configRoot, "Dave-Garona", "Player-1-Dave", 4)
+    SF.TSM = nil
+    assertEq(select(2, applyExportBody(unmarked, "Bob-Garona")), "officer_history",
+        "val: late-marker auth peer history")
+    dave = GS:GetCurrentRecord()
+    local daveEvent = findByTxn(dave, originTxn)
+    local badVal = craftValuation(dave, daveEvent, {
+        assignmentId = "gsv1:cccccccccccccccccccccccc:00009801",
+        assignedAt = 1,
+        unitCopper = 2,
+        txnId = originTxn,
+    })
+    local badSt, badReason = applyValuationBody(badVal, "Dave-Garona")
+    assertEq(badSt, "rejected", "val: late-marker non-editor rejected")
+    assertEq(badReason, "unauthorized", "val: late-marker non-editor reason")
+    dave = GS:GetCurrentRecord()
+    assertEq(dave.valuations and dave.valuations.pending
+        and dave.valuations.pending[originTxn], nil,
+        "val: late-marker unauthorized leaves no pending")
+
+    -- Negative: divergent marker never promotes the pending price.
+    local frank = loadStaged(configRoot, "Frank-Garona", "Player-1-Frank", 2)
+    SF.TSM = nil
+    assertEq(select(2, applyExportBody(unmarked, "Bob-Garona")), "officer_history",
+        "val: late-marker divergent peer history")
+    frank = GS:GetCurrentRecord()
+    local frankEvent = findByTxn(frank, originTxn)
+    local frankVal = craftValuation(frank, frankEvent, {
+        assignmentId = "gsv1:dddddddddddddddddddddddd:00009801",
+        assignedAt = 9,
+        unitCopper = 5,
+        txnId = originTxn,
+    })
+    assertEq(select(1, applyValuationBody(frankVal, "Bob-Garona")), "pending",
+        "val: late-marker divergent valuation waits")
+    assertEq(GS.InstallRemoteLiveCutover(frank, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Frank", name = "Frank-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    }), "accepted", "val: late-marker divergent cutover")
+    frank = GS:GetCurrentRecord()
+    assertTrue(type(frank.valuations.pending[originTxn]) == "table",
+        "val: late-marker divergent still holds pending while uncredited")
+    local divergent = deepCopy(unmarked)
+    divergent.cutoverMarker = marker .. ":other"
+    assertEq(select(1, applyExportBody(divergent, "Eve-Garona")), "duplicate",
+        "val: late-marker divergent marked duplicate")
+    frank = GS:GetCurrentRecord()
+    assertEq(findByTxn(frank, originTxn).gsProductionCredit, false,
+        "val: late-marker divergent does not credit")
+    assertTrue(type(frank.valuations.pending[originTxn]) == "table",
+        "val: late-marker divergent pending retained until a real canonical repair")
+    assertEq(valuationSnap(frank, originTxn), nil, "val: late-marker divergent unpublished")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: late-marker stays chat-free")
+end
+
+do
+    -- Finding 2: remove unmaterialized valuation from tracked manifest during cold rebuild.
+    SF.TSM = {
+        GetMarketValue = function()
+            return 11
+        end,
+    }
+    local record = activateValuationGuild(9802)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidenceA = makeDepositEvidence(record, {
+        itemId = 9802, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "manifest-a-old" }, neighborsNewer = { "manifest-a-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidenceA, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: manifest-cold primary credit")
+    local evidenceB = makeDepositEvidence(record, {
+        itemId = 9802, quantity = 1, observedAt = world.time + 10, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "manifest-b-old" }, neighborsNewer = { "manifest-b-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidenceB, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: manifest-cold alias credit")
+    record = GS:GetCurrentRecord()
+    drainExportMaint(64)
+    local primary = valuationFindDonation(record, 9802, 2)
+    local aliasEv = valuationFindDonation(record, 9802, 1)
+    assertTrue(primary and aliasEv, "val: manifest-cold both donations")
+    local primaryTxn = primary.txnId
+    local aliasTxn = aliasEv.txnId
+    assertTrue(type(valuationSnap(record, primaryTxn)) == "table", "val: manifest-cold primary priced")
+    assertTrue(type(valuationSnap(record, aliasTxn)) == "table", "val: manifest-cold alias priced")
+    local sourceDataset = record.datasetId
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, valuations = nil, 0
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                valuations = valuations + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            end
+        end
+        return descCount, valuations
+    end
+    local beforeDesc, beforeVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(beforeDesc, 2, "val: manifest-cold starts with two advertised")
+    assertEq(beforeVals, 2, "val: manifest-cold starts with two bodies")
+
+    GS._exportMaintSyncDrain = false
+    timers = {}
+    GS:DisableGossipProvider()
+    assertTrue(GS:EnsureGossipProvider(), "val: manifest-cold re-register")
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(prov and prov.api, "val: manifest-cold provider")
+    -- Cold rebuild advertises winners before paced gs:val bodies exist.
+    assertEq(prov.api.GetRecordBody("gs:val:" .. primaryTxn), nil,
+        "val: manifest-cold primary body not materialized yet")
+    assertEq(prov.api.GetRecordBody("gs:val:" .. aliasTxn), nil,
+        "val: manifest-cold alias body not materialized yet")
+    local midDesc = nil
+    local listed = collectAllExportBodies()
+    for i = 1, #listed do
+        local row = listed[i].body
+        if type(row) == "table" and row.kind == "dataset-desc"
+            and row.datasetId == sourceDataset then
+            midDesc = row.valuationCount
+        end
+    end
+    assertEq(midDesc, 2, "val: manifest-cold descriptor still counts both winners")
+
+    -- Alias/remove the unmaterialized winner; manifest must drop without byId.
+    GS.OnDonationTxnAlias(record, primaryTxn, aliasTxn)
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, aliasTxn), nil, "val: manifest-cold alias winner removed")
+    assertTrue(type(valuationSnap(record, primaryTxn)) == "table",
+        "val: manifest-cold primary winner retained")
+    assertEq(prov.api.GetRecordBody("gs:val:" .. aliasTxn), nil,
+        "val: manifest-cold alias still has no body")
+    local afterAliasDesc, afterAliasVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(afterAliasDesc, 1, "val: manifest-cold advertised count drops before body build")
+    assertTrue(afterAliasVals <= 1, "val: manifest-cold no stale alias body")
+
+    drainExportMaint(128)
+    GS._exportMaintSyncDrain = true
+    assertTrue(GS._exportMaintIsIdle and GS._exportMaintIsIdle(), "val: manifest-cold eventually idle")
+    local exportBodies = collectAllExportBodies()
+    local finalDesc, finalVals = valuationExportSummary(exportBodies, sourceDataset)
+    assertEq(finalDesc, 1, "val: manifest-cold finished descriptor count")
+    assertEq(finalVals, 1, "val: manifest-cold finished body count")
+    assertEq(prov.api.GetRecordBody("gs:val:" .. aliasTxn), nil,
+        "val: manifest-cold finished without alias body")
+    assertTrue(type(prov.api.GetRecordBody("gs:val:" .. primaryTxn)) == "table",
+        "val: manifest-cold finished with primary body")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: manifest-cold adoption begins")
+    for i = #exportBodies, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: manifest-cold buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: manifest-cold adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: manifest-cold adopted dataset")
+    assertEq(valuationSnap(adopted, primaryTxn) and valuationSnap(adopted, primaryTxn).unitCopper, 11,
+        "val: manifest-cold adoption keeps the remaining price")
+    assertEq(valuationSnap(adopted, aliasTxn), nil, "val: manifest-cold adoption has no alias price")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: manifest-cold stays chat-free")
+end
+
+do
+    -- Finding 3: capacity-blocked valuation admits retry after donations free pending.
+    SF.TSM = {
+        GetMarketValue = function()
+            return 5
+        end,
+    }
+    local record = activateValuationGuild(9803)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local n = (GS.MAX_PENDING_VALUATIONS or 256) + 4
+    local seeded = {}
+    for i = 1, n do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9803, quantity = 1, observedAt = world.time + i, ageHours = 0,
+            occurrenceIndex = i,
+            neighborsOlder = { "cap-old-" .. i }, neighborsNewer = { "cap-new-" .. i },
+        })
+        local st = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona"))
+        assertEq(st, "accepted", "val: cap-retry seed " .. i)
+        record = GS:GetCurrentRecord()
+        local ev = valuationFindDonation(record, 9803, 1)
+        -- Find the newest priced row for this occurrence by scanning after each credit.
+        local events = record.accounting._consumableEvents or {}
+        local newest = nil
+        for ei = 1, #events do
+            local row = events[ei]
+            if type(row) == "table" and tonumber(row.itemId) == 9803
+                and tonumber(row.quantity) == 1
+                and tonumber(row.occurrenceIndex) == i then
+                newest = row
+            end
+        end
+        assertTrue(newest ~= nil, "val: cap-retry donation " .. i)
+        assertTrue(type(valuationSnap(record, newest.txnId)) == "table",
+            "val: cap-retry priced " .. i)
+        seeded[#seeded + 1] = newest.txnId
+    end
+    drainExportMaint(256)
+    record = GS:GetCurrentRecord()
+    local sourceDataset = record.datasetId
+    local exportBodies = collectAllExportBodies()
+    local vals, ledgers, other = {}, {}, {}
+    local descBody = nil
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            vals[#vals + 1] = row
+        elseif kind == "gs-ledger-event" then
+            ledgers[#ledgers + 1] = row
+        elseif kind == "dataset-desc" then
+            descBody = row
+            other[#other + 1] = row
+        else
+            other[#other + 1] = row
+        end
+    end
+    assertTrue(#vals >= n, "val: cap-retry exported valuations got=" .. tostring(#vals))
+    assertTrue(#ledgers >= n, "val: cap-retry exported ledgers got=" .. tostring(#ledgers))
+    assertEq(descBody and descBody.body and descBody.body.valuationCount, #vals,
+        "val: cap-retry descriptor matches valuation export count")
+
+    -- Empty client: valuations before donations so pending hits the 256 cap.
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: cap-retry starts with no local record")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: cap-retry adoption begins")
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: cap-retry buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    for i = 1, #vals do
+        bufferRow(vals[i])
+    end
+    for i = 1, #ledgers do
+        bufferRow(ledgers[i])
+    end
+    for i = 1, #other do
+        bufferRow(other[i])
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 20000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: cap-retry adoption commits "
+        .. tostring(reasonAdopt) .. " waves=" .. tostring(guard))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: cap-retry adopted dataset")
+    local priced = 0
+    for i = 1, #seeded do
+        if valuationSnap(adopted, seeded[i]) then
+            priced = priced + 1
+        end
+    end
+    assertEq(priced, n, "val: cap-retry priced every assignment got=" .. tostring(priced))
+    assertEq(#world.chat, 0, "val: cap-retry happy path stays chat-free")
+
+    -- Missing donations: valuations alone must terminate without a timer loop.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: cap-missing starts empty")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: cap-missing adoption begins")
+    local missingDesc = deepCopy(descBody)
+    missingDesc.body = deepCopy(descBody.body)
+    missingDesc.body.acceptedLedgerCount = 0
+    missingDesc.body.valuationCount = math.min(8, #vals)
+    bufferRow(missingDesc)
+    for i = 1, math.min(8, #vals) do
+        bufferRow(vals[i])
+    end
+    for i = 1, #other do
+        if other[i] ~= descBody then
+            bufferRow(other[i])
+        end
+    end
+    timers = {}
+    GS._adoptionReplaySyncDrain = true
+    local missSt, missReason = GS:CommitDatasetAdoption()
+    local missGuard = 0
+    while GS._adoption and GS._adoption.replayTemp and missGuard < 4000 do
+        missGuard = missGuard + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+    end
+    if missSt == "pending" then
+        missSt, missReason = GS:CommitDatasetAdoption()
+    end
+    assertTrue(missSt == "rejected" or missSt == "pending",
+        "val: cap-missing terminates conservatively st=" .. tostring(missSt)
+            .. " r=" .. tostring(missReason))
+    if missSt == "rejected" then
+        assertTrue(tostring(missReason or ""):find("incomplete", 1, true) ~= nil
+            or tostring(missReason or "") == "incomplete_transfer",
+            "val: cap-missing reason " .. tostring(missReason))
+    end
+    assertTrue(missGuard < 4000, "val: cap-missing finite budget got=" .. tostring(missGuard))
+    assertEq(#timers, 0, "val: cap-missing leaves no timer loop")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: cap-retry stays chat-free")
+end
+
+do
+    -- Finding 4: fresh-client adoption bootstrap auth for valuation replay.
+    SF.TSM = {
+        GetMarketValue = function()
+            return 19
+        end,
+    }
+    local source = activateValuationGuild(9804)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(source, { itemId = 9804, quantity = 2 })
+    drainExportMaint(64)
+    source = GS:GetCurrentRecord()
+    local event = valuationFindDonation(source, 9804, 2)
+    assertTrue(type(valuationSnap(source, event.txnId)) == "table", "val: bootstrap source priced")
+    local sourceDataset = source.datasetId
+    local exportBodies = collectAllExportBodies()
+    local valued = 0
+    for i = 1, #exportBodies do
+        if exportBodies[i].body and exportBodies[i].body.kind == "gs-valuation" then
+            valued = valued + 1
+        end
+    end
+    assertTrue(valued >= 1, "val: bootstrap source exports valuations")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: bootstrap empty client")
+    assertEq(GS._root.guilds and GS._root.guilds["club:42"], nil,
+        "val: bootstrap live guild slot absent")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: bootstrap adoption begins")
+    for i = #exportBodies, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: bootstrap buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind))
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: bootstrap adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: bootstrap adopted dataset")
+    assertEq(valuationSnap(adopted, event.txnId) and valuationSnap(adopted, event.txnId).totalCopper, 38,
+        "val: bootstrap keeps the valued donation")
+
+    -- Negative: unauthorized source cannot begin bootstrap adoption.
+    SpectrumFederationDB = {}
+    switchPlayer("Dave-Garona", "Player-1-Dave", 4)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: bootstrap unauthorized empty")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Dave-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginRet = { GS:BeginDatasetAdoption("Dave-Garona", sourceDataset) }
+    assertEq(beginRet[2], "rejected", "val: bootstrap unauthorized begin rejected")
+    assertEq(beginRet[3], "unauthorized", "val: bootstrap unauthorized reason "
+        .. tostring(beginRet[3]))
+
+    -- Negative: existing live record does not get bootstrap rights for ordinary gossip.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    initGS()
+    local live = activateValuationGuild(9805)
+    GS:EnsureGossipProvider()
+    SF.TSM = nil
+    local gossipVal = craftValuation(live, {
+        itemId = 9805, quantity = 1, txnId = "ctx:bootstrap-gossip:9805",
+        id = "ctx:bootstrap-gossip:9805",
+    }, {
+        assignmentId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00009805",
+        assignedAt = 4,
+        unitCopper = 3,
+        txnId = "ctx:bootstrap-gossip:9805",
+    })
+    local gSt, gReason = applyValuationBody(gossipVal, "Dave-Garona")
+    assertEq(gSt, "rejected", "val: bootstrap gossip non-editor rejected")
+    assertEq(gReason, "unauthorized", "val: bootstrap gossip reason")
+    live = GS:GetCurrentRecord()
+    assertEq(live.valuations and live.valuations.pending
+        and live.valuations.pending["ctx:bootstrap-gossip:9805"], nil,
+        "val: bootstrap gossip did not weaken ordinary ingress")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: bootstrap auth stays chat-free")
+end
+
+do
     local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
     assertTrue(src ~= nil, "val: module readable")
     local text = src:read("*a")

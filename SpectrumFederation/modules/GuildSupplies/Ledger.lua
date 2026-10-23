@@ -1439,6 +1439,7 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             return false
         end
     end
+    local wasCredited = existing.gsProductionCredit == true
     local changed = false
     if live then
         if CollapseDonationCutoverMarkers(existing, liveMarker) then
@@ -1481,6 +1482,17 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
         BumpAccountingMutation(record)
         if GS._NotifyLocalDurableChange then
             GS._NotifyLocalDurableChange("ledger")
+        end
+        -- Late authenticated marker repair: promote a preserved pending price,
+        -- or mint once when an eligible officer still has no assignment.
+        if not wasCredited and existing.gsProductionCredit == true then
+            local txnId = ValidTxnId(existing.txnId) or ValidTxnId(existing.id)
+            if txnId and GS.ReconcilePendingValuations then
+                GS.ReconcilePendingValuations(record, txnId)
+            end
+            if GS.TryAssignDonationValuation then
+                GS.TryAssignDonationValuation(record, existing, nil)
+            end
         end
     end
     return changed

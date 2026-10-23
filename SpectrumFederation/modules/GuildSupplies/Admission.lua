@@ -3896,20 +3896,27 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     state.sliceUsed = sliceUsed
                     return true, nil, progress
                 end
-                local stVal = "rejected"
+                local stVal, reasonVal = "rejected", nil
                 if GS.AdmitValuationAssignment then
-                    stVal = select(1, GS:AdmitValuationAssignment(body, {
+                    stVal, reasonVal = GS:AdmitValuationAssignment(body, {
                         sender = adop.sourcePeer,
                         member = member,
                         offlineRecord = temp,
                         adoptionReplay = true,
-                    }))
+                    })
                 end
-                state.valuationSeen[seenKey] = true
                 admissions = admissions + 1
                 sliceUsed = sliceUsed + 1
-                if stVal == "accepted" or stVal == "pending" then
-                    progress = true
+                -- Temporary pending capacity can free when donations later
+                -- promote pending valuations. Retry only rejected/full; keep
+                -- malformed, unauthorized, and id_conflict terminal.
+                if stVal == "rejected" and reasonVal == "full" then
+                    unsettledSeen = true
+                else
+                    state.valuationSeen[seenKey] = true
+                    if stVal == "accepted" or stVal == "pending" then
+                        progress = true
+                    end
                 end
             end
         end

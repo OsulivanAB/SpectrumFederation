@@ -394,13 +394,13 @@ local function PriceableDonation(record, event)
     return true
 end
 
---- Staged same-dataset credit can still change when the canonical cutover arrives.
--- A well-formed donation that is not yet live stays unresolved. Once live, a
--- non-priceable row is definitive and must be dropped.
+--- Whether a matching pending valuation should stay unpublished.
+-- Staged well-formed donations stay open until cutover classification. A live
+-- uncredited donation that is still after the cutover floor can receive late
+-- authenticated canonical-marker provenance; keep its pending price. Rows that
+-- are already credited, malformed, or permanently before the cutover floor are
+-- resolved and must not hold a pending assignment.
 local function CreditStillUnresolved(record, event)
-    if GS.IsLiveActive and GS.IsLiveActive(record) then
-        return false
-    end
     if not IsDonationEvent(event) then
         return false
     end
@@ -409,6 +409,21 @@ local function CreditStillUnresolved(record, event)
     end
     if not NormalizeInteger(tonumber(event.itemId), 1, MAX_EXACT - 1) then
         return false
+    end
+    if event.gsProductionCredit == true then
+        return false
+    end
+    if not (GS.IsLiveActive and GS.IsLiveActive(record)) then
+        return true
+    end
+    if GS.IsEvidenceAfterLiveCutover then
+        local approx = tonumber(event.approxTxnTime) or tonumber(event.timestamp)
+        local afterOk = select(1, GS.IsEvidenceAfterLiveCutover(record, {
+            approxTxnTime = approx,
+        }))
+        if not afterOk then
+            return false
+        end
     end
     return true
 end
@@ -1158,7 +1173,19 @@ function GS:AdmitValuationAssignment(body, opts)
         if type(member) ~= "table" then
             return "rejected", "unauthorized"
         end
-        local editorOk = GS.SenderHasEditorAuthority and select(1, GS.SenderHasEditorAuthority(member, {}))
+        -- Fresh-client adoption replay: the live guild slot is absent, so the
+        -- ordinary editor lookup returns not_configured. Reuse the guarded
+        -- allowBootstrapInstall path already used by AdmitRemoteOperation.
+        local authOpts = {}
+        if opts.adoptionReplay and type(opts.offlineRecord) == "table"
+            and type(member.guildKey) == "string" and member.guildKey ~= "" then
+            local liveGuild = GS._root and GS._root.guilds and GS._root.guilds[member.guildKey]
+            if type(liveGuild) ~= "table" then
+                authOpts.allowBootstrapInstall = true
+            end
+        end
+        local editorOk = GS.SenderHasEditorAuthority
+            and select(1, GS.SenderHasEditorAuthority(member, authOpts))
         if not editorOk then
             return "rejected", "unauthorized"
         end

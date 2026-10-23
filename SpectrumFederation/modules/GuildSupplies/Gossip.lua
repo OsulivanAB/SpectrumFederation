@@ -2150,40 +2150,47 @@ function GS.RemoveGossipExportBodies(ids)
     local limit = math.min(#ids, 64)
     for i = 1, limit do
         local id = ids[i]
-        if type(id) == "string" and exportState.byId[id] then
-            exportState.byId[id] = nil
-            drop[id] = true
-            removed = removed + 1
+        if type(id) == "string" then
+            -- Cold paced rebuild can advertise winners in valuationManifest
+            -- before gs:val bodies exist in byId. Drop the tracked manifest
+            -- entry even when the body has not been materialized yet.
             if id:sub(1, 7) == "gs:val:" and DropValuationManifestId(id:sub(8)) then
                 droppedValuation = true
             end
+            if exportState.byId[id] then
+                exportState.byId[id] = nil
+                drop[id] = true
+                removed = removed + 1
+            end
         end
     end
-    if removed < 1 then
+    if removed < 1 and not droppedValuation then
         return 0
     end
-    local write = 1
-    for read = 1, #exportState.order do
-        local id = exportState.order[read]
-        if not drop[id] then
-            exportState.order[write] = id
-            write = write + 1
+    if removed > 0 then
+        local write = 1
+        for read = 1, #exportState.order do
+            local id = exportState.order[read]
+            if not drop[id] then
+                exportState.order[write] = id
+                write = write + 1
+            end
         end
+        for i = write, #exportState.order do
+            exportState.order[i] = nil
+        end
+        if exportState.enumPos and exportState.enumPos > #exportState.order then
+            exportState.enumPos = #exportState.order
+        end
+        exportState.countsDirty = true
+        exportState.maintIdle = false
     end
-    for i = write, #exportState.order do
-        exportState.order[i] = nil
-    end
-    if exportState.enumPos and exportState.enumPos > #exportState.order then
-        exportState.enumPos = #exportState.order
-    end
-    exportState.countsDirty = true
-    exportState.maintIdle = false
     if droppedValuation then
         PublishValuationManifest()
     end
     if GG and GG.GetProvider and providerRegistered then
         local prov = GG.GetProvider(GS.PROVIDER_ID)
-        if prov and prov.index then
+        if removed > 0 and prov and prov.index then
             prov.index.dirty = true
             prov.index.buildComplete = false
         end
