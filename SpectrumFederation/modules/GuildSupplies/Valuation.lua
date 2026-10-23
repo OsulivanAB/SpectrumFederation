@@ -727,7 +727,11 @@ local function ValidateSnapFields(snap, key, pending)
         return false
     end
     if pending and snap.txnId ~= key then
-        return false
+        -- Alias fold may keep the row under the canonical lookup key while the
+        -- immutable assignment still carries its original transaction id.
+        if snap.canonicalTxnId ~= key or not ValidTxnId(snap.txnId) then
+            return false
+        end
     end
     if snap.seen ~= nil then
         if type(snap.seen) ~= "table" or #snap.seen > MAX_SEEN then
@@ -1021,7 +1025,8 @@ end
 
 --- Fold alias candidates into pending[canonical] while credit is still open.
 -- Does not publish. Same assignment id keeps the first body (id conflict).
--- Different ids use earliest (assignedAt, assignmentId).
+-- Different ids use earliest (assignedAt, assignmentId). The original
+-- assignment txnId stays on the immutable body; canonical is only the key.
 local function HoldAliasPending(record, store, canonical, event, candidates)
     if type(store.pending) ~= "table" then
         store.pending = {}
@@ -1034,7 +1039,8 @@ local function HoldAliasPending(record, store, canonical, event, candidates)
         local scoped = type(snap) == "table"
             and snap.datasetId == record.datasetId
             and (not guildKey or snap.guildKey == guildKey)
-        if scoped and ValidateSnapFields(snap, row.key, row.pending)
+        local originalTxn = type(snap) == "table" and ValidTxnId(snap.txnId) or nil
+        if scoped and originalTxn and ValidateSnapFields(snap, row.key, row.pending)
             and (not event or DonationMatches(snap, event)) then
             if store.pending[canonical] == nil and CountKeys(store.pending) >= MAX_PENDING then
                 -- Pending storage stays capped. A full map cannot take a new key.
@@ -1046,7 +1052,7 @@ local function HoldAliasPending(record, store, canonical, event, candidates)
                     quantity = snap.quantity,
                     totalCopper = snap.totalCopper,
                     itemId = snap.itemId,
-                    txnId = canonical,
+                    txnId = originalTxn,
                     datasetId = snap.datasetId,
                     guildKey = snap.guildKey,
                     actorGuid = snap.actorGuid,
@@ -1194,17 +1200,37 @@ function GS:AdmitValuationAssignment(body, opts)
     end
     local store = EnsureStore(record)
     if not event or holdForCredit then
+        -- Alias fold may already keep the earliest pending row under the
+        -- canonical lookup key while the assignment body still names its
+        -- original transaction id. Prefer that key so redelivery stays a
+        -- fingerprint duplicate instead of a second pending row.
+        local pendingKey = assignment.txnId
+        if type(store.pending) == "table" then
+            if store.pending[canonical] ~= nil then
+                pendingKey = canonical
+            elseif store.pending[assignment.txnId] == nil then
+                for key in pairs(ids) do
+                    if store.pending[key] ~= nil then
+                        pendingKey = key
+                        break
+                    end
+                end
+            end
+        end
         local pendingCount = CountKeys(store.pending)
-        local existing = store.pending[assignment.txnId]
+        local existing = store.pending[pendingKey]
         if not existing and pendingCount >= MAX_PENDING then
             return "rejected", "full"
         end
-        local status, _, detail, wrote = ApplyIncoming(store.pending, assignment.txnId, assignment)
+        local status, _, detail, wrote = ApplyIncoming(store.pending, pendingKey, assignment)
         if wrote then
             NoteValuationStoreMutation(store, record)
         end
         if status == "rejected" then
             return "rejected", detail or "id_conflict"
+        end
+        if status == "duplicate" then
+            return "duplicate", detail or "duplicate"
         end
         if holdForCredit then
             return "pending", "awaiting_credit"
@@ -1214,6 +1240,12 @@ function GS:AdmitValuationAssignment(body, opts)
     local status, changed, detail, wrote = ApplyIncoming(store.byTxn, canonical, assignment)
     local clearedPending = false
     if type(store.pending) == "table" then
+        for key in pairs(ids) do
+            if store.pending[key] ~= nil then
+                store.pending[key] = nil
+                clearedPending = true
+            end
+        end
         if store.pending[assignment.txnId] ~= nil then
             store.pending[assignment.txnId] = nil
             clearedPending = true

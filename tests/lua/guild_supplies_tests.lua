@@ -31807,16 +31807,80 @@ do
     local held = bob.valuations.pending[originTxn]
     assertEq(held and held.assignmentId, early.assignmentId, "val: alias hold keeps the earlier id")
     assertEq(held and held.totalCopper, 15 * qty, "val: alias hold keeps the earlier total")
-    assertEq(held and held.txnId, originTxn, "val: alias hold is stored on the canonical id")
+    assertEq(held and held.txnId, aliasTxn, "val: alias hold keeps the original assignment txn")
+    assertEq(held and held.canonicalTxnId, originTxn, "val: alias hold sits on the canonical lookup key")
     assertEq(descValuationCount(), 0, "val: alias hold is not exported")
+    local beforeCutSt, beforeCutReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(beforeCutSt, "duplicate", "val: original assignment redelivery before cutover "
+        .. tostring(beforeCutReason))
+    assertEq(beforeCutReason, "duplicate", "val: before-cutover reason is duplicate")
+    bob = GS:GetCurrentRecord()
+    assertEq(bob.valuations.pending[originTxn] and bob.valuations.pending[originTxn].txnId, aliasTxn,
+        "val: redelivery before cutover does not rewrite txnId")
+    assertEq(descValuationCount(), 0, "val: redelivery before cutover still exports nothing")
     local cutSt, cutReason = installCutover(bob, cutover, "Player-1-Bob", "Bob-Garona", 2)
     assertEq(cutSt, "accepted", "val: alias cutover installs " .. tostring(cutReason))
     bob = GS:GetCurrentRecord()
     local bobSnap = valuationSnap(bob, originTxn)
     assertEq(bobSnap and bobSnap.totalCopper, 15 * qty, "val: cutover promotes the held alias price")
     assertEq(bobSnap and bobSnap.assignmentId, early.assignmentId, "val: cutover keeps the held id")
+    assertEq(bobSnap and bobSnap.txnId, aliasTxn, "val: promoted winner keeps the original txn")
+    assertEq(bobSnap and bobSnap.canonicalTxnId, originTxn, "val: promoted winner is keyed by canonical")
     assertEq(bob.valuations.pending[originTxn], nil, "val: cutover clears the held pending row")
     assertEq(descValuationCount(), 1, "val: cutover exports one promoted valuation")
+    local afterCutSt, afterCutReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(afterCutSt, "duplicate", "val: original assignment redelivery after cutover "
+        .. tostring(afterCutReason))
+    assertEq(afterCutReason, "duplicate", "val: after-cutover reason is duplicate")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, originTxn) and valuationSnap(bob, originTxn).txnId, aliasTxn,
+        "val: redelivery after cutover leaves the original txn")
+    assertEq(descValuationCount(), 1, "val: redelivery after cutover does not add exports")
+    local bobExport = GS.BuildValuationExportBody(bob, originTxn)
+    assertTrue(type(bobExport) == "table" and type(bobExport.assignment) == "table",
+        "val: promoted export body exists")
+    assertEq(bobExport.assignment.txnId, aliasTxn, "val: re-exported winner keeps the original txn")
+    assertEq(bobExport.assignment.assignmentId, early.assignmentId, "val: re-exported winner id")
+
+    local frankRoot = deepCopy(configRoot)
+    local frank = loadClientFromConfigRoot(frankRoot, "Frank-Garona", "Player-1-Frank", 2)
+    assertEq(GS.IsLiveActive(frank), true, "val: peer starts live")
+    SF.TSM = nil
+    assertEq(select(1, applyExportBody(body, "Frank-Garona")), "accepted", "val: live peer ledger")
+    frank = GS:GetCurrentRecord()
+    local frankEvent = valuationFindDonation(frank, 9708, qty)
+    assertEq(frankEvent and frankEvent.gsProductionCredit, true, "val: live peer donation is credited")
+    local frankAliasSt, frankAliasReason = applyExportBody(aliasLedger(aliasTxn), "Frank-Garona")
+    assertTrue(frankAliasSt == "duplicate" or frankAliasSt == "accepted",
+        "val: live peer alias " .. tostring(frankAliasSt) .. " " .. tostring(frankAliasReason))
+    local frankPendSt, frankPendReason = applyValuationBody(early, "Frank-Garona")
+    assertEq(frankPendSt, "accepted", "val: live peer accepts the original assignment "
+        .. tostring(frankPendReason))
+    frank = GS:GetCurrentRecord()
+    assertEq(valuationSnap(frank, originTxn) and valuationSnap(frank, originTxn).txnId, aliasTxn,
+        "val: live peer stores the original txn")
+    local peerSt, peerReason = applyValuationBody(bobExport.assignment, "Bob-Garona")
+    assertEq(peerSt, "duplicate", "val: live peer recognizes the re-exported winner "
+        .. tostring(peerReason))
+    assertEq(peerReason, "duplicate", "val: live peer reason is duplicate")
+    frank = GS:GetCurrentRecord()
+    assertEq(valuationSnap(frank, originTxn) and valuationSnap(frank, originTxn).assignmentId,
+        early.assignmentId, "val: live peer keeps the same assignment id")
+    assertEq(valuationCount(frank), 1, "val: live peer still has one winner")
+    local altered = craftValuation(frank, frankEvent, {
+        assignmentId = early.assignmentId,
+        assignedAt = early.assignedAt,
+        unitCopper = 99,
+        txnId = aliasTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local conflictSt, conflictReason = applyValuationBody(altered, "Bob-Garona")
+    assertEq(conflictSt, "rejected", "val: altered same-id body is rejected")
+    assertEq(conflictReason, "id_conflict", "val: altered same-id reason")
+    frank = GS:GetCurrentRecord()
+    assertEq(valuationSnap(frank, originTxn) and valuationSnap(frank, originTxn).unitCopper, 15,
+        "val: altered same-id body does not replace the winner")
 
     local carol = loadStaged("Carol-Garona", "Player-1-Carol", 2)
     SF.TSM = nil
@@ -31851,6 +31915,8 @@ do
     assertEq(tieHeld and tieHeld.assignmentId, aliasTie.assignmentId,
         "val: same-second tie keeps the lower assignment id")
     assertEq(tieHeld and tieHeld.unitCopper, 9, "val: same-second tie keeps that unit")
+    assertEq(tieHeld and tieHeld.txnId, tieAlias, "val: same-second tie keeps the original txn")
+    assertEq(tieHeld and tieHeld.canonicalTxnId, originTxn, "val: same-second tie uses canonical key")
     assertEq(carol.valuations.pending[tieAlias], nil, "val: tie alias key is consumed")
     assertEq(descValuationCount(), 0, "val: tie is not exported")
     local conflictAlias = "ctx:alias-conflict-9708"
@@ -31947,6 +32013,9 @@ do
     assertEq(beforeHeld and beforeHeld.assignmentId, beforeEarly.assignmentId,
         "val: pre-donation alias keeps the earlier id")
     assertEq(beforeHeld and beforeHeld.unitCopper, 3, "val: pre-donation alias keeps the earlier unit")
+    assertEq(beforeHeld and beforeHeld.txnId, beforeAlias, "val: pre-donation alias keeps the original txn")
+    assertEq(beforeHeld and beforeHeld.canonicalTxnId, originTxn,
+        "val: pre-donation alias uses the canonical lookup key")
     assertEq(earlyPeer.valuations.pending[beforeAlias], nil, "val: pre-donation alias key is consumed")
     assertEq(descValuationCount(), 0, "val: pre-donation alias is not exported")
     local arriveSt, arriveReason = applyExportBody(body, "Bob-Garona")
