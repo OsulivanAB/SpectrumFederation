@@ -1457,6 +1457,14 @@ function Controls:AddScrollList(section, opts)
 	local removeColumnGap = opts.removeColumnGap or 4
 	local removeButtonSize = opts.removeButtonSize or 18
 	local compactTextPadding = opts.compactTextPadding or 10
+	-- Opt-in. Lists that omit showItemIcons keep the previous text-only layout.
+	local showItemIcons = opts.showItemIcons and true or false
+	local itemIconSize = opts.itemIconSize or 16
+	local itemIconGap = opts.itemIconGap or 4
+	local iconReserve = showItemIcons and (itemIconSize + itemIconGap) or 0
+	-- History uses an inline texture and a tooltip instead of a leading icon column.
+	local singleLine = opts.singleLine and true or false
+	local showDetailTooltip = opts.showDetailTooltip and true or false
 
 	local resize = (opts.resize ~= false)	-- Default to true
 	local border = (opts.border == true)	-- Default to false
@@ -1530,6 +1538,17 @@ function Controls:AddScrollList(section, opts)
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 			fs:SetPoint("LEFT", r, "LEFT", 0, 0)
 			fs:SetJustifyH("LEFT")
+			if showItemIcons or singleLine then
+				if fs.SetWordWrap then fs:SetWordWrap(false) end
+				if fs.SetNonSpaceWrap then fs:SetNonSpaceWrap(false) end
+				if fs.SetMaxLines then fs:SetMaxLines(1) end
+				if fs.SetJustifyV then fs:SetJustifyV("MIDDLE") end
+			end
+			if showItemIcons then
+				local icon = r:CreateTexture(nil, "ARTWORK")
+				icon:SetSize(itemIconSize, itemIconSize)
+				r.Icon = icon
+			end
 			r.Text = fs
 
 			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", removeButtonSize)
@@ -1587,9 +1606,13 @@ function Controls:AddScrollList(section, opts)
 				y = y + rowHeight + rowSpacing
 			end
 
+			local textBudget = availableWidth
+			if showItemIcons and textBudget > 0 then
+				textBudget = math.max(1, textBudget - iconReserve)
+			end
 			local compactTextWidth = maxTextWidth + compactTextPadding
-			if compactColumns and availableWidth > 0 then
-				compactTextWidth = math.min(compactTextWidth, math.max(1, availableWidth - removeButtonSize - removeColumnGap))
+			if compactColumns and textBudget > 0 then
+				compactTextWidth = math.min(compactTextWidth, math.max(1, textBudget - removeButtonSize - removeColumnGap))
 			end
 
 			y = 0
@@ -1633,12 +1656,50 @@ function Controls:AddScrollList(section, opts)
 					r:SetScript("OnClick", nil)
 				end
 
+				if showItemIcons and r.Icon then
+					r.Icon:ClearAllPoints()
+					r.Icon:SetSize(itemIconSize, itemIconSize)
+					r.Icon:SetPoint("LEFT", r, "LEFT", 0, 0)
+					if item.icon ~= nil and item.icon ~= false and item.icon ~= "" then
+						r.Icon:SetTexture(item.icon)
+						r.Icon:Show()
+					else
+						r.Icon:Hide()
+					end
+				end
+
+				if showDetailTooltip then
+					local tip = item.tooltip
+					if type(tip) == "string" and tip ~= "" then
+						r.tooltipText = tip
+						r:SetScript("OnEnter", function(self)
+							if not GameTooltip or not GameTooltip.SetOwner or not GameTooltip.SetText then
+								return
+							end
+							GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+							GameTooltip:SetText(self.tooltipText, 1, 1, 1, 1, true)
+							if GameTooltip.Show then
+								GameTooltip:Show()
+							end
+						end)
+						r:SetScript("OnLeave", function()
+							if GameTooltip and GameTooltip.Hide then
+								GameTooltip:Hide()
+							end
+						end)
+					else
+						r.tooltipText = nil
+						r:SetScript("OnEnter", nil)
+						r:SetScript("OnLeave", nil)
+					end
+				end
+
 				if compactColumns and availableWidth > 0 then
-					r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+					r.Text:SetPoint("LEFT", r, "LEFT", iconReserve, 0)
 					r.Text:SetWidth(compactTextWidth)
 					r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
 				else
-					r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+					r.Text:SetPoint("LEFT", r, "LEFT", iconReserve, 0)
 					r.Text:SetPoint("RIGHT", r, "RIGHT", -24, 0)
 					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 				end
@@ -1772,9 +1833,12 @@ function Controls.ConsumableRequestedTextMaxWidth(availableWidth, sizes)
 	local goalEditGap = Controls.ConsumableRequestedGoalEditGap(sizes)
 	local edgePad = sizes.edgePad or d.edgePad
 	local minTextWidth = sizes.minTextWidth or d.minTextWidth
+	local iconReserve = tonumber(sizes.iconReserve) or 0
+	if iconReserve < 0 then iconReserve = 0 end
 
 	-- Name → Goal → Input → X: reserve trailing controls so names cannot overlap.
-	local reservedControls = goalLabelGap + goalLabelWidth + goalEditGap + goalWidth
+	-- iconReserve is 0 unless the list opted into a leading item icon.
+	local reservedControls = iconReserve + goalLabelGap + goalLabelWidth + goalEditGap + goalWidth
 		+ removeColumnGap + removeButtonSize + edgePad
 	local width = tonumber(availableWidth) or 0
 	return math.max(minTextWidth, width - reservedControls), reservedControls
@@ -1822,6 +1886,10 @@ function Controls:AddConsumableRequestedList(section, opts)
 	local goalLabelWidth = opts.goalLabelWidth or defaults.goalLabelWidth
 	local goalEditGap = opts.goalEditGap or defaults.goalEditGap
 	local goalEditInputInset = opts.goalEditInputInset or defaults.goalEditInputInset
+	local showItemIcons = opts.showItemIcons and true or false
+	local itemIconSize = opts.itemIconSize or 16
+	local itemIconGap = opts.itemIconGap or 4
+	local iconReserve = showItemIcons and (itemIconSize + itemIconGap) or 0
 	local fixedHeight = opts.height or 180
 	local maxHeight = opts.maxHeight or fixedHeight
 	local resize = (opts.resize ~= false)
@@ -1833,6 +1901,7 @@ function Controls:AddConsumableRequestedList(section, opts)
 		goalLabelWidth = goalLabelWidth,
 		goalEditGap = goalEditGap,
 		goalEditInputInset = goalEditInputInset,
+		iconReserve = iconReserve,
 	}
 	local effectiveGoalEditGap = Controls.ConsumableRequestedGoalEditGap(layoutSizes)
 
@@ -1899,6 +1968,12 @@ function Controls:AddConsumableRequestedList(section, opts)
 			end
 			r.Text = fs
 
+			if showItemIcons then
+				local icon = r:CreateTexture(nil, "ARTWORK")
+				icon:SetSize(itemIconSize, itemIconSize)
+				r.Icon = icon
+			end
+
 			rows[i] = r
 			return r
 		end
@@ -1925,8 +2000,12 @@ function Controls:AddConsumableRequestedList(section, opts)
 			r.GoalLabel:ClearAllPoints()
 			r.GoalEdit:ClearAllPoints()
 			r.Remove:ClearAllPoints()
+			if r.Icon then
+				r.Icon:ClearAllPoints()
+				r.Icon:SetPoint("LEFT", r, "LEFT", 0, 0)
+			end
 
-			r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+			r.Text:SetPoint("LEFT", r, "LEFT", iconReserve, 0)
 			r.Text:SetWidth(nameColumnWidth)
 			r.GoalEdit:SetPoint(
 				"LEFT",
@@ -1956,6 +2035,14 @@ function Controls:AddConsumableRequestedList(section, opts)
 				r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
 
 				r.Text:SetText(item.text or "")
+				if showItemIcons and r.Icon then
+					if item.icon ~= nil and item.icon ~= false and item.icon ~= "" then
+						r.Icon:SetTexture(item.icon)
+						r.Icon:Show()
+					else
+						r.Icon:Hide()
+					end
+				end
 
 				local canRemove = item.canRemove and true or false
 				r.Remove:SetShown(canRemove)

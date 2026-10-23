@@ -4972,6 +4972,9 @@ do
     loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Dialogs.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    if not SF.ItemDisplay then
+        loadModule("SpectrumFederation/modules/UI/Settings/ItemDisplay.lua")
+    end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
 
@@ -6010,7 +6013,7 @@ do
         function region:GetStringWidth() return 40 end
         function region:GetStringHeight() return 12 end
         function region:SetColorTexture() end
-        function region:SetTexture() end
+        function region:SetTexture(value) self.texture = value end
         function region:SetAtlas() end
         function region:SetTexCoord() end
         function region:SetVertexColor() end
@@ -7682,6 +7685,588 @@ do
             GO.ClearUIListeners()
         end
     end
+
+    -- #414: item icons/names, late cache fill, compact history, no pending-evidence UI.
+    -- Nested so this scenario's locals stay inside their own function. Lua 5.1
+    -- allows 200 locals per function, and this settings harness is already near that.
+    local function checkIssue414ItemDisplay()
+        local priorCItem = C_Item
+        local priorGetItemInfo = GetItemInfo
+        local priorGetItemIcon = GetItemIcon
+        local savedAfter = C_Timer.After
+        local queued = {}
+        C_Timer.After = function(_, fn)
+            queued[#queued + 1] = fn
+        end
+        local function drainQueued()
+            local ran = 0
+            while #queued > 0 and ran < 8 do
+                ran = ran + 1
+                local batch = queued
+                queued = {}
+                for i = 1, #batch do
+                    batch[i]()
+                end
+            end
+            return ran
+        end
+        local names = {}
+        local icons = {}
+        local instantIcons = {}
+        local loads = {}
+        C_Item = {
+            GetItemInfo = function(itemId)
+                local name = names[tonumber(itemId)]
+                if type(name) == "string" and name ~= "" then
+                    return name
+                end
+                return nil
+            end,
+            GetItemIconByID = function(itemId)
+                return icons[tonumber(itemId)]
+            end,
+            GetItemInfoInstant = function(itemId)
+                local icon = instantIcons[tonumber(itemId)]
+                if not icon then
+                    return nil
+                end
+                return tonumber(itemId), "Consumable", "Other", "", icon, 0, 0
+            end,
+            RequestLoadItemDataByID = function(itemId)
+                loads[#loads + 1] = tonumber(itemId)
+            end,
+        }
+        GetItemInfo = nil
+        GetItemIcon = nil
+        -- A refresh queued on the harness timer before this override leaves
+        -- refreshQueued set. Clear it so item-data completion can refresh.
+        if logsPage.OnHide then logsPage:OnHide() end
+        if configPage.OnHide then configPage:OnHide() end
+        local chatBefore = #(world.chat or {})
+        assertTrue(SF.ItemDisplay ~= nil, "414: item display helper loaded")
+        SF.ItemDisplay.ResetSession()
+        if configPage.panel then
+            configPage.panel.shown = false
+            configPage.panel.visible = false
+        end
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        GS:CreateStagedRecord()
+        local camp = startCampaign()
+        local record = GS:GetCurrentRecord()
+        local generation = record.accounting._consumables.generation
+        assertEq(GS:ApplyStagedConfigOperation(GS:NewConfigOperation("set-requested-item", {
+            itemId = 13467,
+        }, { itemId = 13467, goal = 0, removed = false })), "accepted", "414: add goal-0 item")
+        assertEq(GS:ApplyStagedConfigOperation(GS:NewConfigOperation("set-requested-item", {
+            itemId = 13468,
+        }, { itemId = 13468, goal = 10, removed = false })), "accepted", "414: add goal item")
+        local events = record.accounting._consumableEvents
+        events[#events + 1] = {
+            id = "414-don",
+            type = "donation",
+            itemId = 13467,
+            quantity = 40,
+            actor = "Ursully-Garona",
+            generation = generation,
+            timestamp = 1700000000,
+            source = "guildbank",
+            verification = "officer",
+        }
+        events[#events + 1] = {
+            id = "414-adj",
+            type = "adjustment",
+            itemId = 13468,
+            quantity = -2,
+            actor = "Alice-Garona",
+            attributed = "Bob-Garona",
+            generation = generation,
+            timestamp = 1700000100,
+        }
+        events[#events + 1] = {
+            id = "414-prog",
+            type = "donation",
+            itemId = 13468,
+            quantity = 4,
+            actor = "Bob-Garona",
+            generation = generation,
+            timestamp = 1700000200,
+            source = "guildbank",
+            verification = "witnesses",
+        }
+
+        local function findDefItems(pagePanel, predicate)
+            local found = {}
+            local def = pagePanel.__sfPageDef
+            for _, sec in ipairs((def and def.sections) or {}) do
+                for _, item in ipairs(sec.items or {}) do
+                    if predicate(item, sec) then
+                        found[#found + 1] = item
+                    end
+                end
+            end
+            return found
+        end
+
+        local logsUi = makeRegion("Frame", "GS414Logs", nil)
+        logsUi:SetSize(640, 800)
+        logsPage:Build(logsUi)
+        local configUi = makeRegion("Frame", "GS414Config", nil)
+        configUi:SetSize(640, 800)
+        configPage:Build(configUi)
+
+        local pending = findDefItems(logsUi, function(item)
+            local label = tostring(item.label or "")
+            local staticText = tostring(item.text or "")
+            if label:find("Pending deposit", 1, true) or staticText:find("Pending deposit", 1, true) then
+                return true
+            end
+            if type(item.getText) == "function" then
+                local ok, value = pcall(item.getText)
+                if ok and type(value) == "string"
+                    and (value:find("Pending deposit", 1, true) or value:find("no manual approval", 1, true)) then
+                    return true
+                end
+            end
+            return false
+        end)
+        assertEq(#pending, 0, "414: pending deposit evidence UI and help are absent")
+        assertTrue(type(GS.ListPendingEvidence) == "function",
+            "414: pending evidence API remains")
+
+        local goalLists = findDefItems(logsUi, function(item)
+            return item.label == "Goals and progress"
+        end)
+        local historyLists = findDefItems(logsUi, function(item)
+            return item.label == "Campaign history"
+        end)
+        local configLists = findDefItems(configUi, function(item)
+            return item.type == "consumableRequestedList"
+        end)
+        assertEq(#goalLists, 1, "414: goals list present")
+        assertEq(#historyLists, 1, "414: history list present")
+        assertEq(#configLists, 1, "414: campaign item list present")
+        assertTrue(goalLists[1].showItemIcons == true, "414: goals icons are opt-in on that list")
+        assertTrue(historyLists[1].showItemIcons ~= true, "414: history does not use a leading icon column")
+        assertTrue(historyLists[1].showDetailTooltip == true, "414: history details use an opt-in tooltip")
+        assertTrue(historyLists[1].singleLine == true, "414: history stays on one line")
+        assertTrue(configLists[1].showItemIcons == true, "414: campaign items opt into icons")
+        local sawLogsHelp = false
+        local helpItems = findDefItems(logsUi, function(item)
+            return type(item.getText) == "function"
+        end)
+        for i = 1, #helpItems do
+            local okHelp, helpValue = pcall(helpItems[i].getText)
+            if okHelp and type(helpValue) == "string" then
+                assertTrue(helpValue:find("pending evidence", 1, true) == nil,
+                    "414: logs help does not promise pending evidence")
+                if helpValue:find("Privileged edits", 1, true) then
+                    sawLogsHelp = true
+                    assertTrue(helpValue:find("history", 1, true) ~= nil,
+                        "414: logs help still mentions history")
+                end
+            end
+        end
+        assertTrue(sawLogsHelp, "414: membership help is present")
+
+        icons[13467] = 200067
+        icons[13468] = 200068
+        local watch = SF.ItemDisplay._watchFrame
+        assertTrue(watch ~= nil and watch.registeredEvents and watch.registeredEvents.ITEM_DATA_LOAD_RESULT,
+            "414: one item-data listener is registered")
+        local framesBefore = SF.ItemDisplay.WatchFrameCount()
+        local listenersBefore = SF.ItemDisplay.ListenerCount()
+
+        local configRows = configLists[1].getItems()
+        assertEq(#configRows, 2, "414: both campaign items listed")
+        local byId = {}
+        for i = 1, #configRows do
+            byId[configRows[i].itemId] = configRows[i]
+            assertTrue(configRows[i].text:find("13467", 1, true) == nil
+                and configRows[i].text:find("13468", 1, true) == nil,
+                "414: campaign row hides the item id: " .. tostring(configRows[i].text))
+            assertTrue(configRows[i].text:find("Loading item", 1, true) ~= nil,
+                "414: uncached campaign name is loading")
+        end
+        assertEq(byId[13467].icon, 200067, "414: campaign icon comes from GetItemIconByID")
+        assertEq(byId[13468].goal, 10, "414: goal value stays on the row")
+        assertEq(byId[13467].canEditGoal, true, "414: goal edit remains available")
+        assertEq(byId[13467].canRemove, true, "414: remove remains available")
+
+        local function loadCount(itemId)
+            local n = 0
+            for i = 1, #loads do
+                if loads[i] == itemId then
+                    n = n + 1
+                end
+            end
+            return n
+        end
+        assertEq(loadCount(13467), 1, "414: uncached name requests item data once")
+        assertEq(loadCount(13468), 1, "414: second item requests item data once")
+        local loadsAfterFirstPaint = #loads
+        configLists[1].getItems()
+        goalLists[1].getItems()
+        assertEq(#loads, loadsAfterFirstPaint, "414: repeated paints do not request again")
+
+        local goalRows = goalLists[1].getItems()
+        local goalById = {}
+        for i = 1, #goalRows do
+            goalById[goalRows[i].itemId] = goalRows[i]
+        end
+        assertTrue((goalById[13467].text or ""):find("/ —", 1, true) ~= nil
+            or (goalById[13467].text or ""):find("/ %—", 1, true) ~= nil,
+            "414: unset goal keeps the em dash: " .. tostring(goalById[13467].text))
+        assertTrue((goalById[13468].text or ""):find("2 / 10", 1, true) ~= nil,
+            "414: positive goal keeps current/goal: " .. tostring(goalById[13468].text))
+
+        local hist = historyLists[1].getItems()
+        assertTrue(#hist >= 3, "414: history rows preserved")
+        assertEq(hist[1].id, "414-prog", "414: newest history event stays first")
+        local queuedBeforeUnrelated = #queued
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 42, true)
+        assertEq(#queued, queuedBeforeUnrelated, "414: unrelated item results do not refresh")
+
+        -- Run callbacks already queued by page setup while names are still
+        -- unresolved. Dropping them leaves refreshQueued set, and refreshing
+        -- after the names are filled would resolve the items before the event.
+        drainQueued()
+        assertEq(#queued, 0, "414: setup refresh drains before item data")
+        names[13467] = "Dreamleaf"
+        names[13468] = "Starlight Rose"
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 13467, true)
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 13468, true)
+        assertEq(#queued, 1, "414: matching load results coalesce to one refresh")
+        local ran = drainQueued()
+        assertTrue(ran >= 1 and ran <= 4, "414: refresh settles: " .. tostring(ran))
+        assertEq(#queued, 0, "414: item refresh queue drains")
+
+        configRows = configLists[1].getItems()
+        byId = {}
+        for i = 1, #configRows do
+            byId[configRows[i].itemId] = configRows[i]
+        end
+        assertEq(byId[13467].text, "Dreamleaf", "414: campaign row shows the localized name")
+        assertEq(byId[13467].itemId, 13467, "414: internal item id stays authoritative")
+        assertTrue(byId[13467].text:find("13467", 1, true) == nil, "414: resolved name hides the id")
+        goalRows = goalLists[1].getItems()
+        goalById = {}
+        for i = 1, #goalRows do
+            goalById[goalRows[i].itemId] = goalRows[i]
+        end
+        assertTrue((goalById[13467].text or ""):find("Dreamleaf — 40 / —", 1, true) ~= nil,
+            "414: goals show icon name and unset goal: " .. tostring(goalById[13467].text))
+        assertTrue((goalById[13468].text or ""):find("Starlight Rose — 2 / 10", 1, true) ~= nil,
+            "414: goals keep donated progress: " .. tostring(goalById[13468].text))
+        assertEq(goalById[13468].icon, 200068, "414: goals row keeps its icon")
+
+        hist = historyLists[1].getItems()
+        local donationText, donationTip, adjustText, adjustTip
+        for i = 1, #hist do
+            if hist[i].id == "414-don" then
+                donationText = hist[i].text
+                donationTip = hist[i].tooltip
+                assertTrue(hist[i].icon == nil, "414: history row has no leading icon field")
+                assertEq(hist[i].itemId, 13467, "414: history keeps item id")
+            elseif hist[i].id == "414-adj" then
+                adjustText = hist[i].text
+                adjustTip = hist[i].tooltip
+            end
+        end
+        assertTrue(type(donationText) == "string", "414: donation history row visible")
+        assertTrue(donationText:find("Ursully-Garona ×40 — |T200067:16|t Dreamleaf", 1, true) ~= nil,
+            "414: donation icon sits on the item name: " .. tostring(donationText))
+        assertTrue(donationText:find("donated", 1, true) == nil, "414: compact donation is not the long sentence")
+        assertTrue(donationText:find("13467", 1, true) == nil, "414: history hides the item id")
+        assertTrue(donationText:find("%d%d%d%d%-%d%d%-%d%d", 1) == nil,
+            "414: one-line donation leaves the timestamp in the tooltip")
+        assertTrue(type(donationTip) == "string", "414: donation tooltip present")
+        assertTrue(donationTip:find("officer", 1, true) ~= nil, "414: officer verification stays in the tooltip")
+        assertTrue(donationTip:find("donated", 1, true) ~= nil, "414: tooltip keeps donation wording")
+        assertTrue(donationTip:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
+            "414: tooltip keeps a timestamp: " .. donationTip)
+        assertTrue(type(adjustText) == "string", "414: adjustment history row visible")
+        assertTrue(adjustText:find("Alice-Garona -2 — |T200068:16|t Starlight Rose", 1, true) ~= nil,
+            "414: adjustment icon sits on the item name: " .. tostring(adjustText))
+        assertTrue(adjustText:find("donated", 1, true) == nil, "414: adjustment avoids donation wording")
+        assertTrue(type(adjustTip) == "string", "414: adjustment tooltip present")
+        assertTrue(adjustTip:find("adjusted", 1, true) ~= nil, "414: tooltip labels the adjustment")
+        assertTrue(adjustTip:find("-2", 1, true) ~= nil, "414: tooltip keeps the signed quantity")
+        assertTrue(adjustTip:find("credited to Bob-Garona", 1, true) ~= nil,
+            "414: tooltip keeps adjustment credit")
+        local renderedDonation
+        local function walkRegion(node)
+            if type(node.text) == "string" and node.text:find("|T200067:16|t Dreamleaf", 1, true)
+                and node.text:find("Ursully-Garona", 1, true) then
+                renderedDonation = node
+            end
+            for _, child in ipairs(node.children or {}) do
+                walkRegion(child)
+            end
+        end
+        walkRegion(logsUi)
+        assertTrue(renderedDonation ~= nil, "414: history font string renders the inline icon")
+        assertTrue(renderedDonation.parent and renderedDonation.parent.Icon == nil,
+            "414: rendered history row has no leading icon texture")
+        assertTrue(type(renderedDonation.parent.scripts.OnEnter) == "function",
+            "414: rendered history row has a detail hover")
+        local savedSetText = GameTooltip and GameTooltip.SetText
+        local savedShow = GameTooltip and GameTooltip.Show
+        local savedHide = GameTooltip and GameTooltip.Hide
+        local tipText
+        if GameTooltip then
+            GameTooltip.SetText = function(_, text)
+                tipText = text
+            end
+            GameTooltip.Show = function() end
+            GameTooltip.Hide = function() end
+            renderedDonation.parent.scripts.OnEnter(renderedDonation.parent)
+            assertTrue(type(tipText) == "string" and tipText:find("donated", 1, true) ~= nil,
+                "414: rendered hover shows the donation detail")
+            assertTrue(tipText:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
+                "414: rendered hover keeps the timestamp")
+            GameTooltip.SetText = savedSetText
+            GameTooltip.Show = savedShow
+            GameTooltip.Hide = savedHide
+        end
+
+        local ledgerRows = GS:ListCampaignHistory(camp.id, 10, 0)
+        local ledgerDonation
+        for i = 1, #ledgerRows do
+            if ledgerRows[i].id == "414-don" then
+                ledgerDonation = ledgerRows[i]
+            end
+        end
+        assertTrue(ledgerDonation ~= nil, "414: ledger history row present")
+        assertEq(ledgerDonation.verification, "officer", "414: verification stays on the structured row")
+        assertTrue((ledgerDonation.text or ""):find("donated", 1, true) ~= nil,
+            "414: long history text still records a donation")
+        assertEq(ledgerDonation.quantity, 40, "414: ledger quantity unchanged")
+        assertEq(ledgerDonation.actor, "Ursully-Garona", "414: ledger actor unchanged")
+
+        local uncreditedEvent = {
+            type = "donation",
+            quantity = 6,
+            actor = "ArchStaged-Garona",
+            timestamp = 1700000000,
+            verification = "witnesses",
+            uncredited = true,
+        }
+        local uncredited = GS.FormatCampaignHistoryCompact(uncreditedEvent, "Dreamleaf", 9)
+        assertTrue(uncredited:find("ArchStaged-Garona ×6 — |T9:16|t Dreamleaf", 1, true) ~= nil,
+            "414: uncredited line keeps actor, quantity, and adjacent icon")
+        assertTrue(uncredited:find("uncredited", 1, true) == nil,
+            "414: one-line label leaves uncredited status for the tooltip")
+        local uncreditedDetail = GS.FormatCampaignHistoryDetail(uncreditedEvent, "Dreamleaf")
+        assertTrue(uncreditedDetail:find("uncredited", 1, true) ~= nil, "414: archived uncredited label preserved")
+        assertTrue(uncreditedDetail:find("three Guild Bank", 1, true) ~= nil, "414: witness verification preserved")
+        assertTrue(uncreditedDetail:find("ArchStaged-Garona", 1, true) ~= nil, "414: uncredited actor preserved")
+        local plainEvent = {
+            type = "adjustment",
+            quantity = 5,
+            actor = "Alice-Garona",
+            timestamp = 1700000000,
+        }
+        local plainAdjust = GS.FormatCampaignHistoryCompact(plainEvent, "Dreamleaf")
+        assertTrue(plainAdjust:find("+5", 1, true) ~= nil, "414: positive adjustment stays signed")
+        assertTrue(plainAdjust:find("unattributed", 1, true) == nil,
+            "414: one-line adjustment leaves attribution for the tooltip")
+        local plainDetail = GS.FormatCampaignHistoryDetail(plainEvent, "Dreamleaf")
+        assertTrue(plainDetail:find("unattributed", 1, true) ~= nil, "414: missing credit stays unattributed")
+        assertEq(GS.FormatHistoryInlineIcon("|bad|"), "", "414: unsafe icon markup is omitted")
+
+        -- Failed metadata becomes Unknown item and does not retry.
+        assertEq(GS:ApplyStagedConfigOperation(GS:NewConfigOperation("set-requested-item", {
+            itemId = 424242,
+        }, { itemId = 424242, goal = 1, removed = false })), "accepted", "414: add unresolved item")
+        local beforeFailLoads = #loads
+        configPage:Refresh(configUi)
+        assertEq(loadCount(424242), 1, "414: failed candidate is requested once")
+        drainQueued()
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, false)
+        drainQueued()
+        local failedRow
+        configRows = configLists[1].getItems()
+        for i = 1, #configRows do
+            if configRows[i].itemId == 424242 then
+                failedRow = configRows[i]
+            end
+        end
+        assertTrue(failedRow ~= nil, "414: failed item stays in the list")
+        assertTrue((failedRow.text or ""):find("Unknown item", 1, true) ~= nil,
+            "414: failed item uses the unknown fallback: " .. tostring(failedRow.text))
+        assertTrue((failedRow.text or ""):find("424242", 1, true) == nil,
+            "414: unknown fallback hides the id")
+        local loadsAtFailure = #loads
+        for _ = 1, 5 do
+            configLists[1].getItems()
+            watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, false)
+        end
+        drainQueued()
+        assertEq(#loads, loadsAtFailure, "414: failed item data does not retry")
+        assertTrue(loadsAtFailure >= beforeFailLoads, "414: failure accounting stays finite")
+
+        local function findRendered(node, needle, found)
+            found = found or {}
+            if type(node.text) == "string" and node.text:find(needle, 1, true) then
+                found[#found + 1] = node
+            end
+            for _, child in ipairs(node.children or {}) do
+                findRendered(child, needle, found)
+            end
+            return found
+        end
+        local unknownWidgets = findRendered(configUi, "Unknown item")
+        assertTrue(#unknownWidgets >= 1, "414: unknown item is visible before the later success")
+        names[424242] = "Laterleaf"
+        icons[424242] = 424001
+        for i = 1, #unknownWidgets do
+            assertTrue(unknownWidgets[i].text:find("Unknown item", 1, true) ~= nil,
+                "414: a cached name does not repaint until item data succeeds")
+        end
+        local queuedBeforeLate = #queued
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 42, true)
+        assertEq(#queued, queuedBeforeLate, "414: an unrelated success stays idle")
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, false)
+        assertEq(#queued, queuedBeforeLate, "414: another failure of a failed item stays idle")
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, true)
+        assertEq(#queued, queuedBeforeLate + 1, "414: a later success refreshes the failed item")
+        drainQueued()
+        local lateWidgets = findRendered(configUi, "Laterleaf")
+        assertTrue(#lateWidgets >= 1, "414: visible row shows the name from the later success")
+        local lateIcon = false
+        local function findIcon(node)
+            if node.texture == 424001 then
+                lateIcon = true
+            end
+            for _, child in ipairs(node.children or {}) do
+                findIcon(child)
+            end
+        end
+        findIcon(configUi)
+        assertTrue(lateIcon, "414: visible row shows the icon from the later success")
+        configRows = configLists[1].getItems()
+        for i = 1, #configRows do
+            if configRows[i].itemId == 424242 then
+                assertEq(configRows[i].text, "Laterleaf", "414: campaign row uses the recovered name")
+                assertEq(configRows[i].icon, 424001, "414: campaign row uses the recovered icon")
+                assertEq(configRows[i].itemId, 424242, "414: recovered row keeps its item id")
+            end
+        end
+        assertEq(#loads, loadsAtFailure, "414: later success does not request the item again")
+        queuedBeforeLate = #queued
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, true)
+        assertEq(#queued, queuedBeforeLate, "414: a resolved item stays idle")
+
+        -- Instant icon is used when GetItemIconByID returns nothing.
+        icons[13467] = nil
+        instantIcons[13467] = 300067
+        SF.ItemDisplay.ResetSession()
+        names[13467] = "Dreamleaf"
+        configRows = configLists[1].getItems()
+        for i = 1, #configRows do
+            if configRows[i].itemId == 13467 then
+                assertEq(configRows[i].icon, 300067, "414: GetItemInfoInstant supplies the icon")
+            end
+        end
+
+        -- Hidden page does not refresh; showing it picks up the resolved name.
+        local refreshCount = 0
+        local realRefresh = logsPage.Refresh
+        logsPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+        names[13468] = nil
+        SF.ItemDisplay.ResetSession()
+        names[13467] = nil
+        logsUi.shown = true
+        logsPage:Refresh(logsUi)
+        drainQueued()
+        refreshCount = 0
+        logsUi.shown = false
+        logsUi.visible = false
+        names[13467] = "Dreamleaf"
+        watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 13467, true)
+        drainQueued()
+        assertEq(refreshCount, 0, "414: hidden logs do not refresh on item data")
+        logsUi.shown = true
+        logsUi.visible = nil
+        drainQueued()
+        refreshCount = 0
+        local onShow = logsUi.hooks and logsUi.hooks.OnShow or {}
+        for i = 1, #onShow do
+            onShow[i](logsUi)
+        end
+        drainQueued()
+        assertTrue(refreshCount >= 1, "414: showing logs refreshes resolved item names")
+        logsPage.Refresh = realRefresh
+
+        local longName = string.rep("Longleaf ", 8)
+        names[13467] = longName
+        configRows = configLists[1].getItems()
+        local commitItem
+        for i = 1, #configRows do
+            if configRows[i].itemId == 13467 then
+                commitItem = configRows[i]
+            end
+        end
+        assertEq(commitItem.text, longName, "414: long name stays the row label")
+        assertEq(commitItem.itemId, 13467, "414: long name does not retarget the item id")
+        local messages = {}
+        configLists[1].onGoalCommit({
+            section = {
+                SetMessage = function(_, message)
+                    messages[#messages + 1] = message
+                end,
+                ClearMessage = function() end,
+            },
+        }, commitItem, "15")
+        local stored = GS:GetCurrentRecord().accounting._consumables.requestedItems["13467"]
+        assertEq(stored and stored.goal, 15, "414: goal edit commits the original item id")
+        assertEq(stored.itemId, 13467, "414: stored item id unchanged")
+
+        local listenersAfter = SF.ItemDisplay.ListenerCount()
+        for _ = 1, 20 do
+            logsPage:Build(logsUi)
+            configPage:Build(configUi)
+        end
+        assertEq(SF.ItemDisplay.ListenerCount(), listenersAfter, "414: reopen does not accumulate listeners")
+        assertEq(SF.ItemDisplay.WatchFrameCount(), framesBefore, "414: reopen does not add item-data frames")
+        assertEq(listenersBefore > 0, true, "414: listeners were installed with the pages")
+        assertEq(#(world.chat or {}), chatBefore, "414: item display emits no chat")
+
+        local function checkDispatchResumes()
+            SF.ItemDisplay.RegisterRefresh("414-dispatch-guard", function()
+                error("414-dispatch-boom")
+            end)
+            SF.ItemDisplay.Notify()
+            local okBoom = pcall(drainQueued)
+            assertTrue(okBoom == false, "414: a refresh callback error still surfaces")
+            local resumed = false
+            SF.ItemDisplay.RegisterRefresh("414-dispatch-guard", function()
+                resumed = true
+            end)
+            if logsPage.OnHide then logsPage:OnHide() end
+            if configPage.OnHide then configPage:OnHide() end
+            SF.ItemDisplay.Notify()
+            drainQueued()
+            assertTrue(resumed, "414: item refresh resumes after a callback error")
+            SF.ItemDisplay.RegisterRefresh("414-dispatch-guard", function() end)
+        end
+        checkDispatchResumes()
+
+        C_Timer.After = savedAfter
+        C_Item = priorCItem
+        GetItemInfo = priorGetItemInfo
+        GetItemIcon = priorGetItemIcon
+        SF.ItemDisplay.ResetSession()
+        queued = {}
+    end
+    checkIssue414ItemDisplay()
 
     CreateFrame = priorCreateFrame
     C_Timer.After = priorAfter
@@ -17468,29 +18053,39 @@ local function makeDepositEvidence(record, opts)
     }
 end
 
+-- Ranks 4 and 5 stay below the default officer threshold (3). Quorum tests must
+-- use these characters; Alice/Bob/Carol qualify for officer-trusted credit.
+local function ensureNonOfficerRoster()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    setPlayer("Eve-Garona", "Player-1-Eve", 4)
+    setPlayer("Frank-Garona", "Player-1-Frank", 5)
+    setPlayer("Grace-Garona", "Player-1-Grace", 5)
+end
+
 do
     -- 3B1) Exactly 3 independent witnesses auto-credit; 1–2 do not
     local record = seedStagedCampaignWithItem(1001, 50)
+    ensureNonOfficerRoster()
     local evidence = makeDepositEvidence(record)
 
-    local st1, r1 = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+    local st1, r1 = GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")
     assertEq(st1, "pending", "3B1: first witness pending")
     assertEq(r1, "awaiting_witnesses", "3B1: awaiting after 1")
 
-    local st2, r2 = GS:_AdmitObservationForTests(evidence, "Player-1-Bob", "Bob-Garona")
+    local st2, r2 = GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")
     assertEq(st2, "pending", "3B1: second witness pending")
     assertEq(r2, "awaiting_witnesses", "3B1: awaiting after 2")
 
     local progress2 = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress2.itemTotals[1001]) or 0, 0, "3B1: no credit before quorum")
 
-    local st3, r3 = GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")
+    local st3, r3 = GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")
     assertEq(st3, "accepted", "3B1: third witness accepts: " .. tostring(r3))
     local progress3 = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress3.itemTotals[1001]) or 0, 5, "3B1: credited after 3")
 
-    -- Fourth report is duplicate; editor has no shortcut (re-admit Alice)
-    local st4, r4 = GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")
+    -- Fourth report is duplicate; an officer re-observation does not double-credit
+    local st4, r4 = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
     assertTrue(st4 == "duplicate" or st4 == "accepted", "3B1: fourth is no-op credit")
     local progress4 = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress4.itemTotals[1001]) or 0, 5, "3B1: still single credit")
@@ -17500,31 +18095,34 @@ end
 do
     -- 3B2) Linked alts count as one witness; relayed witness map adds no vote
     local record = seedStagedCampaignWithItem(2002, 40)
+    ensureNonOfficerRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local evidence = makeDepositEvidence(record, { itemId = 2002, quantity = 3 })
 
-    local linkOp = GS:NewLinkCharactersOperation("Player-1-Alice", "Player-1-Bob")
+    local linkOp = GS:NewLinkCharactersOperation("Player-1-Dave", "Player-1-Eve")
     assertTrue(linkOp ~= nil, "3B2: link prepared")
     assertEq(GS:ApplyStagedConfigOperation(linkOp), "accepted", "3B2: link accepted")
-    assertTrue(GS.AreSameWitnessIdentity(record, "Player-1-Alice", "Player-1-Bob"),
+    assertTrue(GS.AreSameWitnessIdentity(record, "Player-1-Dave", "Player-1-Eve"),
         "3B2: linked same identity")
 
-    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
-        "pending", "3B2: alice witness")
-    -- Bob is linked to Alice → no extra vote
-    local stBob, rBob = GS:_AdmitObservationForTests(evidence, "Player-1-Bob", "Bob-Garona")
-    assertEq(stBob, "duplicate", "3B2: linked alt duplicate witness: " .. tostring(rBob))
-    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "3B2: dave witness")
+    -- Eve is linked to Dave → no extra vote
+    local stEve, rEve = GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")
+    assertEq(stEve, "duplicate", "3B2: linked alt duplicate witness: " .. tostring(rEve))
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
         "pending", "3B2: still need third independent")
     local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress.itemTotals[2002]) or 0, 0, "3B2: not credited with 2 independent")
 
-    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
-        "accepted", "3B2: dave completes quorum")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "accepted", "3B2: grace completes quorum")
     progress = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress.itemTotals[2002]) or 0, 3, "3B2: credited once")
 
     -- Unlink must not reattribute past credit
-    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Bob")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Eve")
     assertEq(GS:ApplyStagedConfigOperation(unlinkOp), "accepted", "3B2: unlink")
     progress = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress.itemTotals[2002]) or 0, 3, "3B2: unlink does not duplicate credit")
@@ -17533,6 +18131,7 @@ end
 do
     -- 3B3) Distinct identical deposits may both credit; same occurrence never doubles
     local record = seedStagedCampaignWithItem(3003, 80)
+    ensureNonOfficerRoster()
     local e1 = makeDepositEvidence(record, {
         itemId = 3003, quantity = 2, occurrenceIndex = 1,
         neighborsOlder = { "n1" }, neighborsNewer = { "n2" },
@@ -17545,21 +18144,21 @@ do
     })
 
     for _, guidName in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
+        { "Player-1-Frank", "Frank-Garona" },
     }) do
         assertEq(select(1, GS:_AdmitObservationForTests(e1, guidName[1], guidName[2])),
-            guidName[1] == "Player-1-Carol" and "accepted" or "pending",
+            guidName[1] == "Player-1-Frank" and "accepted" or "pending",
             "3B3: first deposit " .. guidName[2])
     end
     local p1 = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(p1.itemTotals[3003]) or 0, 2, "3B3: first deposit credited")
 
     for _, guidName in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
+        { "Player-1-Frank", "Frank-Garona" },
     }) do
         local st = select(1, GS:_AdmitObservationForTests(e2, guidName[1], guidName[2]))
         assertTrue(st == "pending" or st == "accepted" or st == "duplicate",
@@ -17623,21 +18222,18 @@ end
 do
     -- 3B5) Gossip gs-evidence path: authenticated sender votes; forged author ignored
     local record = seedStagedCampaignWithItem(5005, 10)
+    ensureNonOfficerRoster()
     local evidence = makeDepositEvidence(record, { itemId = 5005, quantity = 4 })
-    setPlayer("Bob-Garona", "Player-1-Bob", 2)
-    -- Install Alice dataset on Bob via descriptor path already used in 3A; here reuse Alice record
-    -- by keeping single-client DB and applying evidence as remote sender.
-    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local body = {
         kind = "gs-evidence",
         datasetId = record.datasetId,
         campaignId = record.currentCampaignId,
         evidence = evidence,
     }
-    assertEq(providerApply(body, "Alice-Garona"), "pending", "3B5: alice evidence pending")
-    assertEq(providerApply(body, "Bob-Garona"), "pending", "3B5: bob evidence pending")
-    local stCarol = providerApply(body, "Carol-Garona")
-    assertEq(stCarol, "accepted", "3B5: carol completes via gossip")
+    assertEq(providerApply(body, "Dave-Garona"), "pending", "3B5: dave evidence pending")
+    assertEq(providerApply(body, "Eve-Garona"), "pending", "3B5: eve evidence pending")
+    local stFrank = providerApply(body, "Frank-Garona")
+    assertEq(stFrank, "accepted", "3B5: frank completes via gossip")
     local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress.itemTotals[5005]) or 0, 4, "3B5: gossip quorum credited")
 
@@ -17735,10 +18331,11 @@ end
 do
     -- 3B8) Idle / idempotent witness retries; chat-free
     local record = seedStagedCampaignWithItem(8008, 5)
+    ensureNonOfficerRoster()
     local evidence = makeDepositEvidence(record, { itemId = 8008, quantity = 1 })
-    local st1 = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona"))
+    local st1 = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona"))
     assertEq(st1, "pending", "3B8: first")
-    local stRetry = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona"))
+    local stRetry = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona"))
     assertEq(stRetry, "duplicate", "3B8: retry duplicate witness")
     assertEq(#world.chat, 0, "3B8: no chat")
     assertEq(#world.prints, 0, "3B8: no prints")
@@ -17872,6 +18469,7 @@ end
 do
     -- 3B10) Three genuine remote witnesses via separate-client export/import
     local aliceRecord = seedStagedCampaignWithItem(9010, 30)
+    ensureNonOfficerRoster()
     GS:EnsureGossipProvider()
     local evidence = makeDepositEvidence(aliceRecord, { itemId = 9010, quantity = 8 })
     local configRoot = snapshotConfigRoot()
@@ -17902,25 +18500,25 @@ do
         return deepCopy(SpectrumFederationDB.guildSupplies), mine
     end
 
-    local _, aliceEv = observeAndExport("Alice", "Player-1-Alice", 1)
-    local _, bobEv = observeAndExport("Bob", "Player-1-Bob", 2)
-    local _, carolEv = observeAndExport("Carol", "Player-1-Carol", 2)
+    local _, daveEv = observeAndExport("Dave", "Player-1-Dave", 4)
+    local _, eveEv = observeAndExport("Eve", "Player-1-Eve", 4)
+    local _, frankEv = observeAndExport("Frank", "Player-1-Frank", 5)
 
-    -- Dave late-joins with config only, imports the three authenticated exports.
-    local daveRec = loadClientFromConfigRoot(configRoot, "Dave", "Player-1-Dave", 4)
-    assertEq(daveRec.datasetId, datasetId, "3B10: dave same dataset")
-    assertEq(applyExportBody(aliceEv, "Alice-Garona"), "pending", "3B10: alice vote pending")
-    assertEq(applyExportBody(bobEv, "Bob-Garona"), "pending", "3B10: bob vote pending")
-    local stCarol, rCarol = applyExportBody(carolEv, "Carol-Garona")
-    assertEq(stCarol, "accepted", "3B10: carol completes quorum: " .. tostring(rCarol))
+    -- Grace late-joins with config only, imports the three authenticated exports.
+    local graceRec = loadClientFromConfigRoot(configRoot, "Grace", "Player-1-Grace", 5)
+    assertEq(graceRec.datasetId, datasetId, "3B10: grace same dataset")
+    assertEq(applyExportBody(daveEv, "Dave-Garona"), "pending", "3B10: dave vote pending")
+    assertEq(applyExportBody(eveEv, "Eve-Garona"), "pending", "3B10: eve vote pending")
+    local stFrank, rFrank = applyExportBody(frankEv, "Frank-Garona")
+    assertEq(stFrank, "accepted", "3B10: frank completes quorum: " .. tostring(rFrank))
     assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9010]) or 0,
-        8, "3B10: dave credited from remote witnesses")
+        8, "3B10: grace credited from remote witnesses")
 
-    -- Relayed evidence cannot impersonate an original witness: Eve sending Alice's
-    -- body counts as Eve, not a fourth Alice vote / forged author.
-    local stEve = applyExportBody(aliceEv, "Eve-Garona")
-    assertTrue(stEve == "duplicate" or stEve == "accepted" or stEve == "pending",
-        "3B10: eve relay absorbed st=" .. tostring(stEve))
+    -- Relayed evidence cannot impersonate an original witness: Alice sending Dave's
+    -- body counts as Alice, not a fourth Dave vote / forged author.
+    local stAlice = applyExportBody(daveEv, "Alice-Garona")
+    assertTrue(stAlice == "duplicate" or stAlice == "accepted" or stAlice == "pending",
+        "3B10: alice relay absorbed st=" .. tostring(stAlice))
     assertEq(tonumber(GS:ProjectCampaignProgress(campaignId).itemTotals[9010]) or 0,
         8, "3B10: relay does not double-credit")
 end
@@ -17928,12 +18526,15 @@ end
 do
     -- 3B11) Cold reload/backfill exports ledger + direct evidence; ledger alone does not credit
     local record = seedStagedCampaignWithItem(9011, 20)
+    ensureNonOfficerRoster()
+    -- Cold evidence export includes only the logged-in character's direct rows.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
     GS:EnsureGossipProvider()
     local evidence = makeDepositEvidence(record, { itemId = 9011, quantity = 3 })
     for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
+        { "Player-1-Frank", "Frank-Garona" },
     }) do
         GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
     end
@@ -17961,11 +18562,11 @@ do
     end
     assertTrue(ledgerBody ~= nil, "3B11: donation ledger body present")
 
-    local dave = loadClientFromConfigRoot(configRoot, "Dave", "Player-1-Dave", 4)
-    local stLe, rLe = applyExportBody(ledgerBody, "Alice-Garona")
+    local grace = loadClientFromConfigRoot(configRoot, "Grace", "Player-1-Grace", 5)
+    local stLe, rLe = applyExportBody(ledgerBody, "Dave-Garona")
     assertEq(stLe, "accepted", "3B11: ledger catch-up retained: " .. tostring(rLe))
     assertEq(rLe, "awaiting_local_quorum", "3B11: ledger catch-up awaits quorum")
-    assertEq(tonumber(GS:ProjectCampaignProgress(dave.currentCampaignId).itemTotals[9011]) or 0,
+    assertEq(tonumber(GS:ProjectCampaignProgress(grace.currentCampaignId).itemTotals[9011]) or 0,
         0, "3B11: ledger alone does not credit late joiner")
 end
 
@@ -19262,24 +19863,27 @@ do
         itemId = 9033, quantity = 7, donor = "CompactB-Garona", occurrenceIndex = 2,
         neighborsOlder = { "n1" }, neighborsNewer = {},
     })
-    -- Store Alice+Bob witnesses first (unlinked), then link so both GUIDs remain
-    -- recorded while independent count collapses, then add Carol.
+    -- Store Dave+Eve witnesses first (unlinked), then link so both GUIDs remain
+    -- recorded while independent count collapses, then add Frank.
+    ensureNonOfficerRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
     }) do
         GS:_AdmitObservationForTests(ev1, pair[1], pair[2])
         GS:_AdmitObservationForTests(ev2, pair[1], pair[2])
     end
-    local linkOp = GS:NewLinkCharactersOperation("Player-1-Alice", "Player-1-Bob")
+    local linkOp = GS:NewLinkCharactersOperation("Player-1-Dave", "Player-1-Eve")
     assertTrue(linkOp ~= nil, "3B29: link prepared")
     assertEq(GS:ApplyStagedConfigOperation(linkOp), "accepted", "3B29: link accepted")
-    GS:_AdmitObservationForTests(ev1, "Player-1-Carol", "Carol-Garona")
-    GS:_AdmitObservationForTests(ev2, "Player-1-Carol", "Carol-Garona")
+    GS:_AdmitObservationForTests(ev1, "Player-1-Frank", "Frank-Garona")
+    GS:_AdmitObservationForTests(ev2, "Player-1-Frank", "Frank-Garona")
     assertEq(tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9033]) or 0,
         0, "3B29: linked alts hold both clusters pending")
     -- Unlink restores three independents; reevaluate must verify both without skip.
-    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Bob")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Eve")
     assertTrue(unlinkOp ~= nil, "3B29: unlink prepared")
     assertEq(GS:ApplyStagedConfigOperation(unlinkOp), "accepted", "3B29: unlink accepted")
     local total = tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9033]) or 0
@@ -19876,8 +20480,10 @@ do
         neighborsOlder = { "unmatched|older" },
         neighborsNewer = { "unmatched|newer" },
     })
+    ensureNonOfficerRoster()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
     local stPend, rPend = GS:_AdmitObservationForTests(
-        pendingEv, "Player-1-Alice", "Alice-Garona")
+        pendingEv, "Player-1-Dave", "Dave-Garona")
     assertEq(stPend, "pending", "3B37: single witness pending st=" .. tostring(stPend))
     assertEq(rPend, "awaiting_witnesses", "3B37: awaiting_witnesses")
     -- Incremental ledger Notify only upserts the latest window; force a cold
@@ -20981,15 +21587,17 @@ do
     -- 3B46) Late historical three-witness settlement preserves campaign provenance,
     -- exports newly archived IDs without reload, and peers adopt complete counts.
     local aliceRecord = seedStagedCampaignWithItem(9060, 40)
+    ensureNonOfficerRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local oldCampaign = aliceRecord.currentCampaignId
     local oldGen = tonumber(aliceRecord.accounting._consumables.generation)
     local evidence = makeDepositEvidence(aliceRecord, {
         itemId = 9060, quantity = 5, donor = "LateHist-Garona",
     })
     -- Two witnesses before rollover (no credit yet).
-    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
         "pending", "3B46: first witness pending")
-    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Bob", "Bob-Garona")),
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
         "pending", "3B46: second witness pending")
     startCampaign()
     assertTrue(aliceRecord.campaignArchives and aliceRecord.campaignArchives[oldCampaign] ~= nil,
@@ -21000,7 +21608,7 @@ do
     evidence.generation = oldGen
     GS:EnsureGossipProvider()
     drainExportMaint(64)
-    local st3, r3 = GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")
+    local st3, r3 = GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")
     assertEq(st3, "accepted", "3B46: late third witness credits historical deposit r="
         .. tostring(r3))
     local archive = aliceRecord.accounting._consumableEventArchive
@@ -21630,11 +22238,12 @@ do
     local stForge = select(1, GS:_AdmitObservationForTests(forged, "Player-1-Alice", "Alice-Garona"))
     assertEq(stForge, "rejected", "3B52: forged first witness rejected")
     -- Two honest witnesses + one more → exact credit of 10.
-    assertEq(select(1, GS:_AdmitObservationForTests(honest, "Player-1-Alice", "Alice-Garona")),
+    ensureNonOfficerRoster()
+    assertEq(select(1, GS:_AdmitObservationForTests(honest, "Player-1-Dave", "Dave-Garona")),
         "pending", "3B52: honest1 pending")
-    assertEq(select(1, GS:_AdmitObservationForTests(honest, "Player-1-Bob", "Bob-Garona")),
+    assertEq(select(1, GS:_AdmitObservationForTests(honest, "Player-1-Eve", "Eve-Garona")),
         "pending", "3B52: honest2 pending")
-    assertEq(select(1, GS:_AdmitObservationForTests(honest, "Player-1-Carol", "Carol-Garona")),
+    assertEq(select(1, GS:_AdmitObservationForTests(honest, "Player-1-Frank", "Frank-Garona")),
         "accepted", "3B52: honest3 credits")
     local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress.itemTotals[9066]) or 0, 10,
@@ -22060,10 +22669,12 @@ do
         ageHours = 2, -- approxTxnTime = observedAt - 7200 < boundary
     })
     assertTrue(pre.approxTxnTime < boundary, "3C5: pre evidence before boundary")
+    setPlayer("Eve-Garona", "Player-1-Eve", 4)
+    setPlayer("Frank-Garona", "Player-1-Frank", 5)
     for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
+        { "Player-1-Frank", "Frank-Garona" },
     }) do
         GS:_AdmitObservationForTests(pre, pair[1], pair[2])
     end
@@ -22077,9 +22688,9 @@ do
         ageHours = 0,
     })
     for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Dave", "Dave-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
+        { "Player-1-Frank", "Frank-Garona" },
     }) do
         GS:_AdmitObservationForTests(post, pair[1], pair[2])
     end
@@ -23722,13 +24333,12 @@ do
 end
 
 do
-    -- 3C24) Activation requires confirmation; history hides uncredited staged rows;
-    -- legacy Settings pages follow the active profile's guild.
+    -- 3C24) Activation requires confirmation; history hides uncredited staged rows.
+    -- Legacy writer eligibility still follows the profile guild (#389).
+    -- The legacy Settings pages are not registered (#415).
     loadModule("SpectrumFederation/locale/enUS.lua")
     loadModule("SpectrumFederation/modules/LootHelper/Consumables.lua")
     loadModule("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
     local C = SF.Consumables
     local Sync = SF.LootHelperSync
 
@@ -23890,16 +24500,23 @@ do
     assertEq(GS:GetCurrentRecord().activation, GS.ACTIVATION_ACTIVE,
         "3C24: explicit confirmation activates")
 
-    -- Multi-guild page availability follows active profile, not login guild.
-    local Nav = SF.SettingsNavigationModel
-    if not Nav then
-        loadModule("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
-        Nav = SF.SettingsNavigationModel
+    -- Multi-guild writer eligibility follows the profile guild. The removed
+    -- settings pages stay unregistered for both guilds and both profiles.
+    if not SF.SettingsUI.pagesById.guildSuppliesLogs then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
     end
-    local consumablesPage = SF.SettingsUI.pagesById.lootHelperConsumables
-    local logsPage = SF.SettingsUI.pagesById.lootHelperConsumableLogs
-    assertTrue(consumablesPage and logsPage, "3C24: legacy pages registered")
     assertEq(GS:IsLiveActiveForCurrentGuild(), true, "3C24: guild A live before multi-guild nav")
+    local function assertLegacyPagesAbsent(label)
+        assertEq(SF.SettingsUI.pagesById.lootHelperConsumables, nil,
+            label .. ": legacy Consumables page is not registered")
+        assertEq(SF.SettingsUI.pagesById.lootHelperConsumableLogs, nil,
+            label .. ": legacy Consumable Logs page is not registered")
+        assertTrue(SF.SettingsUI.pagesById.guildSuppliesConfiguration ~= nil,
+            label .. ": Raid Supplies Configuration remains registered")
+        assertTrue(SF.SettingsUI.pagesById.guildSuppliesLogs ~= nil,
+            label .. ": Raid Supplies Logs remains registered")
+    end
+    assertLegacyPagesAbsent("3C24: before profile switch")
     -- Create staged guild B while A remains live.
     world.guild.clubId = 99
     world.guild.name = "OtherGuild"
@@ -23933,19 +24550,14 @@ do
     }
     assertEq(C.LegacyWritersAllowed(profileA), false, "3C24: profile A retired")
     assertEq(C.LegacyWritersAllowed(profileB), true, "3C24: profile B writable")
-    -- Logged into B; active profile A (live guild) → pages hidden.
+    -- Logged into B. Pages stay absent whether the active profile's guild is live or staged.
     SF.GetActiveProfile = function() return profileA end
-    assertEq(Nav.IsPageAvailable(consumablesPage), false,
-        "3C24: on B, active profile A hides Consumables")
-    assertEq(Nav.IsPageAvailable(logsPage), false,
-        "3C24: on B, active profile A hides Logs")
-    -- Active profile B (staged) → pages available while on B.
+    assertLegacyPagesAbsent("3C24: on B, active profile A")
+    assertEq(C.LegacyWritersAllowed(profileA), false, "3C24: profile A stays retired on B login")
     SF.GetActiveProfile = function() return profileB end
-    assertEq(Nav.IsPageAvailable(consumablesPage), true,
-        "3C24: on B, active profile B shows Consumables")
-    assertEq(Nav.IsPageAvailable(logsPage), true,
-        "3C24: on B, active profile B shows Logs")
-    -- Logged into A (live); active profile B still shows pages.
+    assertLegacyPagesAbsent("3C24: on B, active profile B")
+    assertEq(C.LegacyWritersAllowed(profileB), true, "3C24: profile B stays writable on B login")
+    -- Logged into A (live). Staged profile B is still writable, and the pages stay absent.
     world.guild.clubId = 42
     world.guild.name = "Spectrum"
     world.guild.members = {
@@ -23956,11 +24568,11 @@ do
     }
     fireEvent("GUILD_ROSTER_UPDATE")
     SF.GetActiveProfile = function() return profileB end
-    assertEq(Nav.IsPageAvailable(consumablesPage), true,
-        "3C24: on A, active profile B shows Consumables")
+    assertLegacyPagesAbsent("3C24: on A, active profile B")
+    assertEq(C.LegacyWritersAllowed(profileB), true, "3C24: profile B stays writable on A login")
     SF.GetActiveProfile = function() return profileA end
-    assertEq(Nav.IsPageAvailable(consumablesPage), false,
-        "3C24: on A, active profile A hides Consumables")
+    assertLegacyPagesAbsent("3C24: on A, active profile A")
+    assertEq(C.LegacyWritersAllowed(profileA), false, "3C24: profile A stays retired on A login")
     -- Sync wrappers use localized retirement string.
     local okSync, errSync = Sync:CommitConsumablesOp(profileA, { name = "set_bank_tab", bankTab = 3 },
         "Alice-Garona", { asAdmin = true })
@@ -24650,10 +25262,12 @@ end
 do
     -- 3C29) C: per-witness pending quota + reserved local capacity; honest deposit still credits.
     local record = seedActivatableCampaign(9129, 200)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local _, st = GS:ActivateCanonicalDataset()
     assertEq(st, "accepted", "3C29: activate")
     record = GS:GetCurrentRecord()
     world.time = (tonumber(record.liveCutover.contextObservedAt) or world.time) + 7200
+    ensureNonOfficerRoster()
     GS:EnsureGossipProvider()
     local perWitness = GS.MAX_PENDING_EVIDENCE_PER_WITNESS or 32
     local reserved = GS.RESERVED_LOCAL_PENDING_EVIDENCE or 16
@@ -24692,9 +25306,9 @@ do
         neighborsNewer = { "newer|honest" },
     })
     for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
+        { "Player-1-Frank", "Frank-Garona" },
+        { "Player-1-Grace", "Grace-Garona" },
     }) do
         local stH, rH = GS:_AdmitObservationForTests(honest, pair[1], pair[2])
         assertTrue(stH == "accepted" or stH == "pending" or stH == "duplicate",
@@ -26487,18 +27101,26 @@ do
         for _ = 1, 4 do GS.EndLocalDurableNotifyBatch() end
     end
     loadModule("SpectrumFederation/modules/UI/Settings/NavigationModel.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
-    loadModule("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    if not (SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesConfiguration) then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    end
     local Nav = SF.SettingsNavigationModel
     local ui = SF.SettingsUI
     assertTrue(Nav and ui and ui.pagesById, "B-ui: settings registry present")
 
-    local consumablesPage = ui.pagesById.lootHelperConsumables
-    assertTrue(consumablesPage and type(consumablesPage.available) == "function",
-        "B-ui: legacy consumables page registered")
-    assertEq(Nav.IsPageAvailable(consumablesPage), true,
-        "B-ui: legacy page available while staged")
+    assertEq(ui.pagesById.lootHelperConsumables, nil,
+        "B-ui: legacy Consumables page is not registered while staged")
+    assertEq(ui.pagesById.lootHelperConsumableLogs, nil,
+        "B-ui: legacy Consumable Logs page is not registered while staged")
+    assertTrue(ui.pagesById.guildSuppliesConfiguration ~= nil,
+        "B-ui: Raid Supplies Configuration remains registered while staged")
+    assertTrue(ui.pagesById.guildSuppliesLogs ~= nil,
+        "B-ui: Raid Supplies Logs remains registered while staged")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesConfiguration"), true,
+        "B-ui: Configuration is a content page while staged")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
+        "B-ui: Logs is a content page while staged")
 
     local uiReasons = {}
     assertTrue(type(GS.RegisterUIListener) == "function", "B-ui: RegisterUIListener present")
@@ -26527,16 +27149,21 @@ do
             "B-ui: export-maint must not reach UI listeners")
     end
     assertTrue(sawActivation, "B-ui: activation reason delivered")
-    assertEq(Nav.IsPageAvailable(consumablesPage), false,
-        "B-ui: legacy page unavailable after activation")
+    assertEq(ui.pagesById.lootHelperConsumables, nil,
+        "B-ui: legacy Consumables page stays unregistered after activation")
+    assertEq(ui.pagesById.lootHelperConsumableLogs, nil,
+        "B-ui: legacy Consumable Logs page stays unregistered after activation")
     assertEq(Nav.IsContentPage(ui, "lootHelperConsumables"), false,
-        "B-ui: retired page excluded from content pages")
+        "B-ui: unknown legacy id is not a content page")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesConfiguration"), true,
+        "B-ui: Configuration remains a content page after activation")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
+        "B-ui: Logs remains a content page after activation")
 
     -- Earlier suite stubs may RegisterPage without UpsertCategoryFromPage.
     -- Mirror production Loot Helper category + always-available General fallback
-    -- so ResolveSidebarSelect can leave the retired Consumables tab.
-    local categoryId = consumablesPage.parentId or "lootHelper"
-    consumablesPage.categoryId = consumablesPage.categoryId or categoryId
+    -- so ResolveSidebarSelect leaves an unknown legacy tab id.
+    local categoryId = "lootHelper"
     ui.categoriesById = ui.categoriesById or {}
     ui.categories = ui.categories or {}
     ui.pages = ui.pages or {}
@@ -27330,6 +27957,1435 @@ do
     assertEq(beginSt, "rejected",
         "recover-caps: permission recovery does not authorize adoption")
     world.skipOfficerBootstrap = false
+end
+
+---------------------------------------------------------------------------
+-- #411 Officer-trusted Guild Bank donation verification
+---------------------------------------------------------------------------
+
+local function ensureRankedMember(name, guid, rankOrder)
+    setPlayer(name, guid, rankOrder)
+end
+
+local function campaignTotal(record, itemId)
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    return tonumber(progress and progress.itemTotals and progress.itemTotals[itemId]) or 0
+end
+
+local function findDonation(record, itemId)
+    local lists = {
+        record.accounting and record.accounting._consumableEvents,
+        record.accounting and record.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local events = lists[li]
+        if type(events) == "table" then
+            for i = 1, #events do
+                local ev = events[i]
+                if type(ev) == "table" and tonumber(ev.itemId) == tonumber(itemId)
+                    and (ev.type == "donation" or ev.type == "CONSUMABLE_DONATION") then
+                    return ev
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function exportDonationBody(itemId)
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(64)
+    GS:DisableGossipProvider()
+    assertTrue(GS:EnsureGossipProvider(), "411: cold export provider")
+    drainExportMaint(128)
+    local les = filterExportBodies(collectAllExportBodies(), "gs-ledger-event")
+    for i = 1, #les do
+        local ev = les[i].body and les[i].body.event
+        if ev and tonumber(ev.itemId) == tonumber(itemId) then
+            return les[i].body
+        end
+    end
+    return nil
+end
+
+do
+    -- Officer-first: rank 3 under threshold 3 credits once. A second officer does not.
+    ensureRankedMember("Carol-Garona", "Player-1-Carol", 3)
+    local record = seedStagedCampaignWithItem(9410, 30)
+    local evidence = makeDepositEvidence(record, { itemId = 9410, quantity = 4 })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")
+    assertEq(st, "accepted", "411 officer-first: accepted " .. tostring(reason))
+    assertEq(campaignTotal(record, 9410), 4, "411 officer-first: one credit")
+    local ev = findDonation(record, 9410)
+    assertTrue(ev ~= nil, "411 officer-first: ledger row")
+    assertEq(ev.verification, "officer", "411 officer-first: officer provenance")
+    assertEq(ev.writer, "Player-1-Carol", "411 officer-first: verifier guid")
+    assertEq(ev.verifierGuid, "Player-1-Carol", "411 officer-first: verifierGuid")
+    assertEq(tonumber(ev.verifierRankOrder), 3, "411 officer-first: rank snapshot")
+    local st2 = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Bob", "Bob-Garona"))
+    assertEq(st2, "duplicate", "411 officer-first: second officer duplicate")
+    assertEq(campaignTotal(record, 9410), 4, "411 officer-first: still one credit")
+    assertEq(findDonation(record, 9410).verification, "officer", "411 officer-first: provenance immutable")
+    local rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    local joined = rows and rows[1] and rows[1].text or ""
+    assertTrue(type(joined) == "string" and joined:find("officer Guild Bank observation", 1, true) ~= nil,
+        "411 officer-first: history text got=" .. tostring(joined))
+    assertEq(#world.chat, 0, "411 officer-first: no chat")
+end
+
+do
+    -- One or two non-officers stay pending; the third credits as witnesses.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    ensureRankedMember("Frank-Garona", "Player-1-Frank", 5)
+    local record = seedStagedCampaignWithItem(9412, 30)
+    local evidence = makeDepositEvidence(record, { itemId = 9412, quantity = 6 })
+    local st1, r1 = GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")
+    assertEq(st1, "pending", "411 quorum: first pending")
+    assertEq(r1, "awaiting_witnesses", "411 quorum: awaiting after 1")
+    local st2, r2 = GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")
+    assertEq(st2, "pending", "411 quorum: second pending")
+    assertEq(r2, "awaiting_witnesses", "411 quorum: awaiting after 2")
+    assertEq(campaignTotal(record, 9412), 0, "411 quorum: no credit yet")
+    local st3 = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona"))
+    assertEq(st3, "accepted", "411 quorum: third accepts")
+    assertEq(campaignTotal(record, 9412), 6, "411 quorum: one credit")
+    local ev = findDonation(record, 9412)
+    assertEq(ev and ev.verification, "witnesses", "411 quorum: witnesses provenance")
+    local rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    local joined = rows and rows[1] and rows[1].text or ""
+    assertTrue(type(joined) == "string" and joined:find("three Guild Bank observers", 1, true) ~= nil,
+        "411 quorum: history text got=" .. tostring(joined))
+    -- A later officer observation must not rewrite witnesses provenance or credit again.
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+        "duplicate", "411 quorum: later officer duplicate")
+    assertEq(findDonation(record, 9412).verification, "witnesses", "411 quorum: witnesses stay")
+    assertEq(campaignTotal(record, 9412), 6, "411 quorum: still one")
+end
+
+do
+    -- Ordinary observers, then an officer, share one occurrence.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local record = seedStagedCampaignWithItem(9413, 20)
+    local evidence = makeDepositEvidence(record, { itemId = 9413, quantity = 3 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "411 mixed: dave pending")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "411 mixed: eve pending")
+    assertEq(campaignTotal(record, 9413), 0, "411 mixed: still pending")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+        "accepted", "411 mixed: officer completes the same occurrence")
+    assertEq(campaignTotal(record, 9413), 3, "411 mixed: one credit")
+    assertEq(findDonation(record, 9413).verification, "officer", "411 mixed: officer provenance")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "duplicate", "411 mixed: later ordinary duplicate")
+    assertEq(campaignTotal(record, 9413), 3, "411 mixed: no second credit")
+end
+
+do
+    -- Threshold 3 qualifies rank 3; tightening to 2 removes that fast path.
+    local record = seedStagedCampaignWithItem(9414, 20)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, SF.GuildOfficer:CommitThreshold(2)), "accepted", "411 policy: tighten to 2")
+    assertEq(select(1, SF.GuildOfficer:GetEstablishedThreshold()), 2, "411 policy: effective 2")
+    local evidence = makeDepositEvidence(record, { itemId = 9414, quantity = 2 })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")
+    assertEq(st, "pending", "411 policy: rank 3 no longer fast-path got " .. tostring(reason))
+    assertEq(campaignTotal(record, 9414), 0, "411 policy: rank 3 did not credit")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local other = makeDepositEvidence(record, {
+        itemId = 9414, quantity = 2, occurrenceIndex = 2,
+        neighborsOlder = { "other-old" }, neighborsNewer = { "other-new" },
+        observedAt = (world.time or 0) + 8000,
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(other, "Player-1-Bob", "Bob-Garona")),
+        "accepted", "411 policy: rank 2 still qualifies")
+    assertEq(findDonation(record, 9414).verification, "officer", "411 policy: rank 2 officer credit")
+    assertEq(findDonation(record, 9414).writer, "Player-1-Bob", "411 policy: bob is verifier")
+end
+
+do
+    -- Unknown policy cannot fast-approve. The observation remains an ordinary witness.
+    local record = seedStagedCampaignWithItem(9415, 10)
+    world.skipOfficerBootstrap = true
+    local GO = SF.GuildOfficer
+    GO:Initialize(SpectrumFederationDB)
+    if GO._root and GO._root.guilds then
+        GO._root.guilds["club:42"] = nil
+    end
+    assertNil(select(1, GO:GetEstablishedThreshold()), "411 unknown: policy missing")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local evidence = makeDepositEvidence(record, { itemId = 9415, quantity = 1 })
+    local st = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona"))
+    assertEq(st, "pending", "411 unknown: officer-ranked character stays pending")
+    assertEq(campaignTotal(record, 9415), 0, "411 unknown: no credit")
+    world.skipOfficerBootstrap = false
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:GetCapabilities()
+end
+
+do
+    -- Demotion does not revoke. Promotion does not upgrade an old report until a new observation.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local record = seedStagedCampaignWithItem(9416, 20)
+    local first = makeDepositEvidence(record, { itemId = 9416, quantity = 5, occurrenceIndex = 1 })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GS:_AdmitObservationForTests(first, "Player-1-Carol", "Carol-Garona")),
+        "accepted", "411 rank: carol credits")
+    setPlayer("Carol-Garona", "Player-1-Carol", 5)
+    assertEq(campaignTotal(record, 9416), 5, "411 rank: demotion keeps credit")
+    assertEq(findDonation(record, 9416).verification, "officer", "411 rank: provenance unchanged")
+    local second = makeDepositEvidence(record, {
+        itemId = 9416, quantity = 1, occurrenceIndex = 2,
+        neighborsOlder = { "demoted-old" }, neighborsNewer = { "demoted-new" },
+        observedAt = (world.time or 0) + 9000,
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(second, "Player-1-Carol", "Carol-Garona")),
+        "pending", "411 rank: demoted character has no fast path")
+    assertEq(campaignTotal(record, 9416), 5, "411 rank: demoted observation did not credit")
+
+    local third = makeDepositEvidence(record, {
+        itemId = 9416, quantity = 1, occurrenceIndex = 3,
+        neighborsOlder = { "promo-old" }, neighborsNewer = { "promo-new" },
+        observedAt = (world.time or 0) + 18000,
+    })
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(select(1, GS:_AdmitObservationForTests(third, "Player-1-Dave", "Dave-Garona")),
+        "pending", "411 rank: dave pending before promotion")
+    setPlayer("Dave-Garona", "Player-1-Dave", 2)
+    assertEq(GS.ReevaluatePendingEvidence(record), 0, "411 rank: promotion does not upgrade pending")
+    assertEq(campaignTotal(record, 9416), 5, "411 rank: still only the original credit")
+    assertEq(select(1, GS:_AdmitObservationForTests(third, "Player-1-Dave", "Dave-Garona")),
+        "duplicate", "411 rank: unchanged local replay after promotion is not a new scan")
+    assertEq(campaignTotal(record, 9416), 5, "411 rank: replay did not credit")
+    GS:EnsureGossipProvider()
+    local stRemote = select(1, providerApply({
+        kind = "gs-evidence",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        evidence = third,
+    }, "Dave-Garona"))
+    assertEq(stRemote, "duplicate", "411 rank: remote gs-evidence after promotion stays a witness")
+    assertEq(campaignTotal(record, 9416), 5, "411 rank: remote replay did not officer-credit")
+    local fresh = makeDepositEvidence(record, {
+        itemId = 9416, quantity = 1, occurrenceIndex = 3,
+        neighborsOlder = { "promo-old" }, neighborsNewer = { "promo-new" },
+        observedAt = (tonumber(third.observedAt) or 0) + 5000,
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(fresh, "Player-1-Dave", "Dave-Garona")),
+        "accepted", "411 rank: newer local scan after promotion credits")
+    assertEq(campaignTotal(record, 9416), 6, "411 rank: fresh scan credited once")
+    local freshRow = nil
+    local events = record.accounting._consumableEvents or {}
+    for i = 1, #events do
+        local ev = events[i]
+        if type(ev) == "table" and tonumber(ev.itemId) == 9416 and tonumber(ev.quantity) == 1 then
+            freshRow = ev
+        end
+    end
+    assertEq(freshRow and freshRow.verification, "officer", "411 rank: fresh scan officer provenance")
+    assertEq(freshRow and freshRow.writer, "Player-1-Dave", "411 rank: fresh scan writer")
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+end
+
+do
+    -- Linked alts still collapse the three-witness path. An officer's own later
+    -- observation of a linked alt's pending row still fast-paths.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    ensureRankedMember("Frank-Garona", "Player-1-Frank", 5)
+    ensureRankedMember("Grace-Garona", "Player-1-Grace", 5)
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local record = seedStagedCampaignWithItem(9417, 20)
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local link = GS:NewLinkCharactersOperation("Player-1-Dave", "Player-1-Eve")
+    assertEq(GS:ApplyStagedConfigOperation(link), "accepted", "411 links: dave-eve linked")
+    local evidence = makeDepositEvidence(record, { itemId = 9417, quantity = 2 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "411 links: dave witness")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "duplicate", "411 links: linked alt is not a second witness")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "411 links: frank is second independent")
+    assertEq(campaignTotal(record, 9417), 0, "411 links: two independents stay pending")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "accepted", "411 links: third independent credits")
+    assertEq(findDonation(record, 9417).verification, "witnesses", "411 links: witnesses mode")
+
+    local other = makeDepositEvidence(record, {
+        itemId = 9417, quantity = 2, occurrenceIndex = 2,
+        neighborsOlder = { "link-old" }, neighborsNewer = { "link-new" },
+        observedAt = (world.time or 0) + 10000,
+    })
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 4)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local linkOfficer = GS:NewLinkCharactersOperation("Player-1-Bob", "Player-1-Hank")
+    assertEq(GS:ApplyStagedConfigOperation(linkOfficer), "accepted", "411 links: bob-hank linked")
+    setPlayer("Hank-Garona", "Player-1-Hank", 4)
+    assertEq(select(1, GS:_AdmitObservationForTests(other, "Player-1-Hank", "Hank-Garona")),
+        "pending", "411 links: alt observation is not officer credit")
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(select(1, GS:_AdmitObservationForTests(other, "Player-1-Bob", "Bob-Garona")),
+        "accepted", "411 links: officer direct observation still credits")
+    assertEq(campaignTotal(record, 9417), 4, "411 links: both occurrences credited once")
+end
+
+do
+    -- Eligibility failures are not overridden by officer rank.
+    local record = seedStagedCampaignWithItem(9418, 10)
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local wrongTab = makeDepositEvidence(record, { itemId = 9418, quantity = 1 })
+    wrongTab.bankTab = 1
+    local stTab, rTab = GS:_AdmitObservationForTests(wrongTab, "Player-1-Carol", "Carol-Garona")
+    assertTrue(stTab == "rejected" or stTab == "pending",
+        "411 eligibility: wrong tab st=" .. tostring(stTab))
+    assertEq(campaignTotal(record, 9418), 0, "411 eligibility: wrong tab no credit")
+    local wrongItem = makeDepositEvidence(record, { itemId = 9999418, quantity = 1 })
+    local stItem = select(1, GS:_AdmitObservationForTests(wrongItem, "Player-1-Carol", "Carol-Garona"))
+    assertEq(stItem, "pending", "411 eligibility: unrequested item pending got " .. tostring(stItem))
+    assertEq(campaignTotal(record, 9999418), 0, "411 eligibility: unrequested item no credit")
+
+    local live = seedActivatableCampaign(9419, 10)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "411 eligibility: activate")
+    live = GS:GetCurrentRecord()
+    local boundary = tonumber(live.liveCutover.contextObservedAt)
+    local pre = makeDepositEvidence(live, {
+        itemId = 9419, quantity = 8,
+        observedAt = boundary + 100,
+        ageHours = 2,
+    })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local stPre = select(1, GS:_AdmitObservationForTests(pre, "Player-1-Carol", "Carol-Garona"))
+    assertEq(stPre, "pending", "411 eligibility: pre-cutover officer stays pending")
+    assertEq(campaignTotal(live, 9419), 0, "411 eligibility: pre-cutover no credit")
+    disarmFreshBankSample()
+end
+
+do
+    -- Gossip claims do not bypass quorum. A raw ledger assertion does not credit.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local record = seedStagedCampaignWithItem(9420, 10)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, { itemId = 9420, quantity = 4 })
+    evidence.isAdmin = true
+    evidence.rankOrder = 1
+    evidence.verification = "officer"
+    evidence.observedBy = "Alice-Garona"
+    evidence.writer = "Player-1-Alice"
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local stEv = providerApply({
+        kind = "gs-evidence",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        evidence = evidence,
+    }, "Dave-Garona")
+    assertEq(stEv, "pending", "411 forged: evidence claim stays pending")
+    assertEq(campaignTotal(record, 9420), 0, "411 forged: evidence claim no credit")
+
+    local forgedWitness = {
+        type = "donation",
+        id = "ctx:forged:officer-claim:1:aa",
+        txnId = "ctx:forged:officer-claim:1:aa",
+        generation = evidence.generation,
+        timestamp = math.floor(tonumber(evidence.approxTxnTime) or 0),
+        actor = evidence.donor,
+        itemId = evidence.itemId,
+        quantity = evidence.quantity,
+        source = "guildbank",
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        verification = "witnesses",
+        isAdmin = true,
+        rankOrder = 1,
+        observedBy = "Alice-Garona",
+        coreSignature = evidence.coreSignature,
+        occurrenceIndex = evidence.occurrenceIndex,
+        guildGuid = evidence.guildGuid,
+        bankTab = evidence.bankTab,
+        neighborsOlder = evidence.neighborsOlder,
+        neighborsNewer = evidence.neighborsNewer,
+        ageHours = evidence.ageHours,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+    }
+    local stW, rW = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = forgedWitness,
+    }, "Dave-Garona")
+    assertEq(stW, "accepted", "411 forged: witnesses ledger retained " .. tostring(rW))
+    assertEq(rW, "awaiting_local_quorum", "411 forged: witnesses mode does not credit")
+    assertEq(campaignTotal(record, 9420), 0, "411 forged: witnesses ledger no credit")
+
+    local forgedBare = {}
+    for k, v in pairs(forgedWitness) do
+        forgedBare[k] = v
+    end
+    forgedBare.id = "ctx:forged:officer-bare:1:bb"
+    forgedBare.txnId = forgedBare.id
+    forgedBare.verification = "officer"
+    forgedBare.ageHours = nil
+    local stBare, rBare = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = forgedBare,
+    }, "Dave-Garona")
+    assertEq(stBare, "accepted", "411 forged: bare officer row retained " .. tostring(rBare))
+    assertEq(rBare, "awaiting_local_quorum", "411 forged: missing age/provenance does not credit")
+    assertEq(campaignTotal(record, 9420), 0, "411 forged: bare officer row no credit")
+
+    local stStranger = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = forgedWitness,
+    }, "Stranger-Garona")
+    assertEq(stStranger, "rejected", "411 forged: unauthenticated sender rejected")
+    assertEq(#world.chat, 0, "411 forged: no chat")
+end
+
+do
+    -- A officer → B guildmate → C late joiner, with A offline before C joins.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local record = seedActivatableCampaign(9421, 40)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "411 relay: activate")
+    disarmFreshBankSample()
+    record = GS:GetCurrentRecord()
+    local configRoot = snapshotConfigRoot()
+    world.time = (tonumber(record.liveCutover.contextObservedAt) or world.time) + 7200
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9421, quantity = 9, observedAt = world.time, ageHours = 0,
+    })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    GS:EnsureGossipProvider()
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+        "accepted", "411 relay: carol commits")
+    assertEq(campaignTotal(record, 9421), 9, "411 relay: origin credit")
+    local origin = findDonation(record, 9421)
+    assertEq(origin.verification, "officer", "411 relay: origin mode")
+    assertEq(origin.gsProductionCredit, true, "411 relay: origin production credit")
+    local aliceBody = exportDonationBody(9421)
+    assertTrue(aliceBody ~= nil and aliceBody.event and aliceBody.event.verification == "officer",
+        "411 relay: cold export keeps officer provenance")
+
+    local bob = loadClientFromConfigRoot(configRoot, "Bob-Garona", "Player-1-Bob", 4)
+    local stB, rB = applyExportBody(aliceBody, "Carol-Garona")
+    assertEq(stB, "accepted", "411 relay: bob accepts " .. tostring(rB))
+    assertEq(rB, "officer_history", "411 relay: bob reason")
+    assertEq(campaignTotal(bob, 9421), 9, "411 relay: bob credit")
+    local bobEvent = findDonation(bob, 9421)
+    assertEq(bobEvent.verification, "officer", "411 relay: bob provenance")
+    assertEq(bobEvent.writer, "Player-1-Carol", "411 relay: writer stays carol")
+    assertEq(bobEvent.txnId, origin.txnId, "411 relay: same txn")
+    assertEq(bobEvent.gsProductionCredit, true, "411 relay: bob production credit")
+    assertEq(bobEvent.gsSourceCutoverMarker, bob.liveCutover.cutoverMarker,
+        "411 relay: bob retains canonical marker")
+    assertEq(aliceBody.cutoverMarker, record.liveCutover.cutoverMarker,
+        "411 relay: export carries canonical marker")
+    local bobBody = exportDonationBody(9421)
+    assertTrue(bobBody ~= nil, "411 relay: bob export")
+
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Carol" or m.guid == "Player-1-Alice" then
+            m.online = false
+        end
+    end
+    local dave = loadClientFromConfigRoot(configRoot, "Dave-Garona", "Player-1-Dave", 4)
+    local stC, rC = applyExportBody(bobBody, "Bob-Garona")
+    assertEq(stC, "accepted", "411 relay: carol-offline bob serves dave " .. tostring(rC))
+    assertEq(rC, "officer_history", "411 relay: dave reason")
+    assertEq(campaignTotal(dave, 9421), 9, "411 relay: dave credit")
+    local daveEvent = findDonation(dave, 9421)
+    assertEq(daveEvent.txnId, origin.txnId, "411 relay: dave same txn")
+    assertEq(daveEvent.verification, "officer", "411 relay: dave provenance")
+    assertEq(daveEvent.writer, "Player-1-Carol", "411 relay: dave writer")
+    local stDup, rDup = applyExportBody(bobBody, "Bob-Garona")
+    assertEq(stDup, "duplicate", "411 relay: replay duplicate " .. tostring(rDup))
+    assertEq(campaignTotal(dave, 9421), 9, "411 relay: replay does not double-credit")
+
+    -- Reload keeps the accepted officer row.
+    local saved = SpectrumFederationDB
+    GS._root = nil
+    GS._rootValid = false
+    initGS()
+    local restored = GS:GetCurrentRecord()
+    assertEq(campaignTotal(restored, 9421), 9, "411 relay: reload keeps credit")
+    assertEq(findDonation(restored, 9421).verification, "officer", "411 relay: reload provenance")
+    assertTrue(saved == SpectrumFederationDB, "411 relay: same db")
+
+    -- Adoption replay preserves officer provenance instead of rewriting witnesses.
+    local adopted = loadClientFromConfigRoot(configRoot, "Eve-Garona", "Player-1-Eve", 4)
+    local copy = {}
+    for k, v in pairs(bobBody.event) do
+        copy[k] = v
+    end
+    local stAd, rAd = GS:AdmitLedgerEvent(copy, {
+        sender = "Bob-Garona",
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 4,
+        },
+        offlineRecord = adopted,
+        adoptionReplay = true,
+        preserveAttribution = true,
+    })
+    assertEq(stAd, "accepted", "411 adoption: transfer " .. tostring(rAd))
+    assertEq(rAd, "adoption_transfer", "411 adoption: reason")
+    assertEq(findDonation(adopted, 9421).verification, "officer", "411 adoption: keeps officer mode")
+    assertEq(campaignTotal(adopted, 9421), 9, "411 adoption: one credit")
+end
+
+do
+    -- Documented v1 limit: a complete officer-provenance row from an ordinary
+    -- guild member is accepted as relayed history. A mismatched signature is not.
+    local record = seedStagedCampaignWithItem(9422, 10)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, { itemId = 9422, quantity = 3 })
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local wellFormed = {
+        type = "donation",
+        id = "ctx:gs:relay-limit:9422",
+        txnId = "ctx:gs:relay-limit:9422",
+        generation = evidence.generation,
+        timestamp = evidence.approxTxnTime,
+        actor = evidence.donor,
+        itemId = evidence.itemId,
+        quantity = evidence.quantity,
+        source = "guildbank",
+        writer = "Player-1-Carol",
+        verifierGuid = "Player-1-Carol",
+        verifierRankOrder = 1,
+        verification = "officer",
+        isAdmin = true,
+        rankOrder = 1,
+        coreSignature = evidence.coreSignature,
+        occurrenceIndex = evidence.occurrenceIndex,
+        guildGuid = evidence.guildGuid,
+        bankTab = evidence.bankTab,
+        neighborsOlder = evidence.neighborsOlder,
+        neighborsNewer = evidence.neighborsNewer,
+        ageHours = 0,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+    }
+    local st, reason = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = wellFormed,
+    }, "Dave-Garona")
+    assertEq(st, "accepted", "411 v1: well-formed relay accepted " .. tostring(reason))
+    assertEq(reason, "officer_history", "411 v1: treated as accepted history")
+    assertEq(campaignTotal(record, 9422), 3, "411 v1: one credit")
+    assertEq(findDonation(record, 9422).writer, "Player-1-Carol", "411 v1: claimed writer stored")
+
+    local mismatched = {}
+    for k, v in pairs(wellFormed) do
+        mismatched[k] = v
+    end
+    mismatched.id = "ctx:gs:relay-limit:bad"
+    mismatched.txnId = mismatched.id
+    mismatched.quantity = 99
+    mismatched.occurrenceIndex = 2
+    local stBad, rBad = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = mismatched,
+    }, "Dave-Garona")
+    assertTrue(stBad == "accepted" or stBad == "rejected" or stBad == "pending"
+        or stBad == "duplicate",
+        "411 v1: mismatched signature st=" .. tostring(stBad))
+    assertTrue(rBad ~= "officer_history", "411 v1: quantity/signature mismatch is not officer credit")
+    assertEq(campaignTotal(record, 9422), 3, "411 v1: mismatch did not credit")
+end
+
+local function officerLedgerEvent(record, evidence, txnId, opts)
+    opts = opts or {}
+    local event = {
+        type = "donation",
+        id = txnId,
+        txnId = txnId,
+        generation = evidence.generation,
+        timestamp = math.floor(tonumber(evidence.approxTxnTime) or 0),
+        actor = evidence.donor,
+        itemId = evidence.itemId,
+        quantity = opts.quantity or evidence.quantity,
+        source = "guildbank",
+        writer = opts.writer or "Player-1-Carol",
+        verification = opts.verification or "officer",
+        coreSignature = opts.coreSignature or evidence.coreSignature,
+        occurrenceIndex = evidence.occurrenceIndex,
+        guildGuid = evidence.guildGuid,
+        bankTab = evidence.bankTab,
+        neighborsOlder = evidence.neighborsOlder,
+        neighborsNewer = evidence.neighborsNewer,
+        ageHours = evidence.ageHours or 0,
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+    }
+    if opts.verifierGuid ~= nil then
+        event.verifierGuid = opts.verifierGuid
+    end
+    if opts.verifierRankOrder ~= nil then
+        event.verifierRankOrder = opts.verifierRankOrder
+    end
+    return event
+end
+
+local function countPendingCandidates(record)
+    local pending = record.accounting and record.accounting._pendingDonationCandidates
+    local n = 0
+    if type(pending) == "table" then
+        for _ in pairs(pending) do
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function pendingHasDonor(record, donor)
+    local rows = GS:ListPendingEvidence(record.currentCampaignId, 64) or {}
+    for i = 1, #rows do
+        if rows[i] and rows[i].donor == donor then
+            return true, rows[i].status
+        end
+    end
+    return false, nil
+end
+
+do
+    -- Repair: unchanged evidence after a threshold widening is not officer credit.
+    -- A newer local scan is. Remote gs-evidence from the officer stays a witness.
+    local record = seedStagedCampaignWithItem(9430, 20)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, SF.GuildOfficer:CommitThreshold(2)), "accepted", "411 fresh: tighten")
+    local evidence = makeDepositEvidence(record, { itemId = 9430, quantity = 2 })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+        "pending", "411 fresh: rank 3 pending under threshold 2")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, SF.GuildOfficer:CommitThreshold(3)), "accepted", "411 fresh: restore 3")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+        "duplicate", "411 fresh: same body after widening is not a new scan")
+    assertEq(campaignTotal(record, 9430), 0, "411 fresh: widening did not credit")
+    GS:EnsureGossipProvider()
+    assertEq(select(1, providerApply({
+        kind = "gs-evidence",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        evidence = evidence,
+    }, "Carol-Garona")), "duplicate", "411 fresh: remote officer evidence stays a witness")
+    assertEq(campaignTotal(record, 9430), 0, "411 fresh: remote evidence no credit")
+    local newer = makeDepositEvidence(record, {
+        itemId = 9430, quantity = 2,
+        observedAt = (tonumber(evidence.observedAt) or 0) + 4000,
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(newer, "Player-1-Carol", "Carol-Garona")),
+        "accepted", "411 fresh: newer local scan credits")
+    assertEq(campaignTotal(record, 9430), 2, "411 fresh: one credit")
+    assertEq(findDonation(record, 9430).verification, "officer", "411 fresh: officer provenance")
+end
+
+do
+    -- Repair: witness cluster, then a ledger candidate, then officer history.
+    -- Same-id candidate upgrades once. Ambiguous and distinct deposits remain.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local record = seedStagedCampaignWithItem(9436, 30)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local spanItem = GS:NewConfigOperation("set-requested-item", { itemId = 9437 }, {
+        itemId = 9437, goal = 10, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(spanItem), "accepted", "411 pending: span item")
+    local cfg = record.accounting._consumables
+    local spanAt = (world.time or 0)
+    cfg.eligibility = cfg.eligibility or {}
+    cfg.eligibility.items = cfg.eligibility.items or {}
+    cfg.eligibility.items[tostring(9437)] = spanAt - 600
+    local spanning = makeDepositEvidence(record, {
+        itemId = 9437, quantity = 2, donor = "Span-Garona",
+        observedAt = spanAt, ageHours = 0, occurrenceIndex = 7,
+        neighborsOlder = { "span-old" }, neighborsNewer = { "span-new" },
+    })
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local stSpan, rSpan = GS:_AdmitObservationForTests(spanning, "Player-1-Dave", "Dave-Garona")
+    assertEq(stSpan, "pending", "411 pending: spanning stays pending " .. tostring(rSpan))
+    assertEq(rSpan, "ambiguous_boundary", "411 pending: spanning ambiguous")
+    local distinct = makeDepositEvidence(record, {
+        itemId = 9436, quantity = 4, donor = "Other-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "other-old" }, neighborsNewer = { "other-new" },
+        observedAt = (world.time or 0) + 20000,
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(distinct, "Player-1-Dave", "Dave-Garona")),
+        "pending", "411 pending: distinct deposit stays pending")
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9436, quantity = 4, donor = "Donor-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "411 pending: witness-first candidate")
+    local hasDonor, donorStatus = pendingHasDonor(record, "Donor-Garona")
+    assertEq(hasDonor, true, "411 pending: witness visible before history")
+    assertEq(donorStatus, "pending", "411 pending: witness status")
+    GS:EnsureGossipProvider()
+    local txnId = "ctx:gs:cand-upgrade:9436"
+    local stagedWitness = officerLedgerEvent(record, evidence, txnId, {
+        verification = "witnesses",
+        writer = "Player-1-Dave",
+    })
+    local stCand, rCand = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = stagedWitness,
+    }, "Dave-Garona")
+    assertEq(stCand, "accepted", "411 pending: candidate retained " .. tostring(rCand))
+    assertEq(rCand, "awaiting_local_quorum", "411 pending: witnesses ledger is not credit")
+    assertEq(campaignTotal(record, 9436), 0, "411 pending: no credit yet")
+    assertTrue(record.accounting._pendingDonationCandidates[txnId] ~= nil,
+        "411 pending: candidate occupies capacity")
+    local conflictTxn = "ctx:gs:cand-conflict:9436"
+    local conflictEvidence = makeDepositEvidence(record, {
+        itemId = 9436, quantity = 1, donor = "Conflict-Garona",
+        occurrenceIndex = 4,
+        neighborsOlder = { "conflict-old" }, neighborsNewer = { "conflict-new" },
+        observedAt = (world.time or 0) + 30000,
+    })
+    local conflictCand = officerLedgerEvent(record, conflictEvidence, conflictTxn, {
+        verification = "witnesses", writer = "Player-1-Dave",
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = record.datasetId, event = conflictCand,
+    }, "Dave-Garona")), "awaiting_local_quorum", "411 pending: conflict candidate stored")
+    local conflictOfficer = officerLedgerEvent(record, conflictEvidence, conflictTxn, {
+        verifierGuid = "Player-1-Carol",
+        verifierRankOrder = 3,
+        quantity = 99,
+        coreSignature = conflictEvidence.coreSignature,
+    })
+    local stConflict, rConflict = providerApply({
+        kind = "gs-ledger-event", datasetId = record.datasetId, event = conflictOfficer,
+    }, "Dave-Garona")
+    assertEq(stConflict, "rejected", "411 pending: conflicting upgrade rejected " .. tostring(rConflict))
+    assertEq(rConflict, "id_conflict", "411 pending: id_conflict preserved")
+    assertEq(campaignTotal(record, 9436), 0, "411 pending: conflict did not credit")
+    assertTrue(record.accounting._pendingDonationCandidates[conflictTxn] ~= nil,
+        "411 pending: conflicting candidate remains")
+    local beforeCands = countPendingCandidates(record)
+    local officer = officerLedgerEvent(record, evidence, txnId, {
+        verifierGuid = "Player-1-Carol",
+        verifierRankOrder = 3,
+    })
+    local stUp, rUp = providerApply({
+        kind = "gs-ledger-event", datasetId = record.datasetId, event = officer,
+    }, "Eve-Garona")
+    assertEq(stUp, "accepted", "411 pending: candidate upgrades " .. tostring(rUp))
+    assertEq(rUp, "officer_history", "411 pending: officer history after candidate")
+    assertEq(campaignTotal(record, 9436), 4, "411 pending: one credit")
+    local upgraded = findDonation(record, 9436)
+    assertEq(upgraded and upgraded.verification, "officer", "411 pending: officer provenance")
+    assertEq(upgraded and upgraded.verifierGuid, "Player-1-Carol", "411 pending: explicit verifier")
+    assertEq(record.accounting._pendingDonationCandidates[txnId], nil,
+        "411 pending: upgraded candidate released")
+    assertTrue(countPendingCandidates(record) < beforeCands,
+        "411 pending: candidate capacity reclaimed")
+    local stillDonor = pendingHasDonor(record, "Donor-Garona")
+    assertEq(stillDonor, false, "411 pending: credited witness row cleared")
+    local stillOther, otherStatus = pendingHasDonor(record, "Other-Garona")
+    assertEq(stillOther, true, "411 pending: distinct deposit remains")
+    assertEq(otherStatus, "pending", "411 pending: distinct stays pending")
+    local stillSpan, spanStatus = pendingHasDonor(record, "Span-Garona")
+    assertEq(stillSpan, true, "411 pending: ambiguous deposit remains")
+    assertEq(spanStatus, "ambiguous", "411 pending: ambiguous status preserved")
+    local stReplay, rReplay = providerApply({
+        kind = "gs-ledger-event", datasetId = record.datasetId, event = officer,
+    }, "Eve-Garona")
+    assertEq(stReplay, "duplicate", "411 pending: replay duplicate " .. tostring(rReplay))
+    assertEq(campaignTotal(record, 9436), 4, "411 pending: replay does not double-credit")
+end
+
+do
+    -- Repair: missing or mismatched verifierGuid is not manufactured.
+    local record = seedStagedCampaignWithItem(9431, 10)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, { itemId = 9431, quantity = 3 })
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local txnId = "ctx:gs:verifier:9431"
+    local missing = officerLedgerEvent(record, evidence, txnId, {
+        verifierRankOrder = 3,
+    })
+    local stMiss, rMiss = providerApply({
+        kind = "gs-ledger-event", datasetId = record.datasetId, event = missing,
+    }, "Dave-Garona")
+    assertEq(stMiss, "accepted", "411 verifier: missing retained " .. tostring(rMiss))
+    assertEq(rMiss, "awaiting_local_quorum", "411 verifier: missing verifierGuid does not credit")
+    assertEq(campaignTotal(record, 9431), 0, "411 verifier: missing no credit")
+    local mismatched = officerLedgerEvent(record, evidence, txnId, {
+        verifierGuid = "Player-1-Dave",
+        verifierRankOrder = 3,
+    })
+    local stMis, rMis = providerApply({
+        kind = "gs-ledger-event", datasetId = record.datasetId, event = mismatched,
+    }, "Dave-Garona")
+    assertEq(stMis, "duplicate", "411 verifier: mismatch is not an upgrade " .. tostring(rMis))
+    assertEq(campaignTotal(record, 9431), 0, "411 verifier: mismatch no credit")
+    local valid = officerLedgerEvent(record, evidence, txnId, {
+        verifierGuid = "Player-1-Carol",
+        verifierRankOrder = 3,
+    })
+    local stOk, rOk = providerApply({
+        kind = "gs-ledger-event", datasetId = record.datasetId, event = valid,
+    }, "Dave-Garona")
+    assertEq(stOk, "accepted", "411 verifier: explicit match upgrades " .. tostring(rOk))
+    assertEq(rOk, "officer_history", "411 verifier: officer history")
+    local verified = findDonation(record, 9431)
+    assertEq(verified and verified.verifierGuid, "Player-1-Carol", "411 verifier: stored explicit guid")
+    assertEq(campaignTotal(record, 9431), 3, "411 verifier: one credit")
+
+    local adopted = seedStagedCampaignWithItem(9432, 10)
+    local adoptedEvidence = makeDepositEvidence(adopted, { itemId = 9432, quantity = 3 })
+    local incomplete = officerLedgerEvent(adopted, adoptedEvidence, "ctx:gs:adopt-missing:9432", {
+        verifierRankOrder = 3,
+    })
+    local stAd, rAd = GS:AdmitLedgerEvent(incomplete, {
+        sender = "Bob-Garona",
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 4,
+        },
+        offlineRecord = adopted,
+        adoptionReplay = true,
+        preserveAttribution = true,
+    })
+    assertEq(stAd, "accepted", "411 verifier: incomplete adoption transfers " .. tostring(rAd))
+    assertEq(rAd, "adoption_transfer", "411 verifier: adoption reason")
+    local adoptedRow = findDonation(adopted, 9432)
+    assertEq(adoptedRow and adoptedRow.verification, "witnesses",
+        "411 verifier: adoption does not invent officer mode")
+    assertEq(adoptedRow and adoptedRow.verifierGuid, nil,
+        "411 verifier: adoption does not invent verifierGuid")
+    assertEq(campaignTotal(adopted, 9432), 3, "411 verifier: adopted quantity kept")
+end
+
+do
+    -- Repair: live relay requires the canonical marker. A staged marked row is
+    -- classified when that marker is installed later. Unmarked and divergent
+    -- staged rows are not promoted. Local activation does not launder them.
+    local live = seedActivatableCampaign(9433, 20)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "411 marker: activate")
+    disarmFreshBankSample()
+    live = GS:GetCurrentRecord()
+    local marker = live.liveCutover.cutoverMarker
+    world.time = (tonumber(live.liveCutover.contextObservedAt) or world.time) + 7200
+    local evidence = makeDepositEvidence(live, {
+        itemId = 9433, quantity = 5, observedAt = world.time, ageHours = 0,
+    })
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local txnId = "ctx:gs:marker:9433"
+    local event = officerLedgerEvent(live, evidence, txnId, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    local stMissing, rMissing = providerApply({
+        kind = "gs-ledger-event", datasetId = live.datasetId, event = event,
+    }, "Dave-Garona")
+    assertEq(stMissing, "accepted", "411 marker: missing retained " .. tostring(rMissing))
+    assertEq(rMissing, "awaiting_local_quorum", "411 marker: missing marker does not credit")
+    assertEq(campaignTotal(live, 9433), 0, "411 marker: missing no credit")
+    local stDiv, rDiv = providerApply({
+        kind = "gs-ledger-event", datasetId = live.datasetId, event = event,
+        cutoverMarker = marker .. ":divergent",
+    }, "Dave-Garona")
+    assertEq(stDiv, "duplicate", "411 marker: divergent is not an upgrade " .. tostring(rDiv))
+    assertEq(campaignTotal(live, 9433), 0, "411 marker: divergent no credit")
+    local stMatch, rMatch = providerApply({
+        kind = "gs-ledger-event", datasetId = live.datasetId, event = event,
+        cutoverMarker = marker,
+    }, "Dave-Garona")
+    assertEq(stMatch, "accepted", "411 marker: matching marker upgrades " .. tostring(rMatch))
+    assertEq(rMatch, "officer_history", "411 marker: live officer history")
+    assertEq(campaignTotal(live, 9433), 5, "411 marker: one live credit")
+    local matched = findDonation(live, 9433)
+    assertEq(matched and matched.gsSourceCutoverMarker, marker, "411 marker: stored canonical marker")
+    assertEq(matched and matched.gsProductionCredit, true, "411 marker: production credit")
+    assertEq(live.accounting._pendingDonationCandidates[txnId], nil,
+        "411 marker: live candidate cleared")
+    local early = makeDepositEvidence(live, {
+        itemId = 9433, quantity = 1, donor = "Early-Garona",
+        observedAt = (tonumber(live.liveCutover.contextObservedAt) or 0) - 100,
+        ageHours = 0, occurrenceIndex = 2,
+        neighborsOlder = { "early-old" }, neighborsNewer = { "early-new" },
+    })
+    local earlyEvent = officerLedgerEvent(live, early, "ctx:gs:marker-early:9433", {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    local stEarly, rEarly = providerApply({
+        kind = "gs-ledger-event", datasetId = live.datasetId, event = earlyEvent,
+        cutoverMarker = marker,
+    }, "Dave-Garona")
+    assertTrue(rEarly ~= "officer_history",
+        "411 marker: pre-boundary marker match is not credit r=" .. tostring(rEarly))
+    assertEq(stEarly == "accepted" or stEarly == "pending" or stEarly == "rejected", true,
+        "411 marker: pre-boundary handled")
+    assertEq(campaignTotal(live, 9433), 5, "411 marker: pre-boundary did not credit")
+
+    local staged = seedStagedCampaignWithItem(9434, 30)
+    local markedEvidence = makeDepositEvidence(staged, {
+        itemId = 9434, quantity = 6, donor = "Marked-Garona",
+    })
+    local activatedAt = math.floor(tonumber(markedEvidence.approxTxnTime) or 0) - 50
+    local tab = tonumber(staged.accounting._consumables.bankTab)
+    local stagedMarker = GS.BuildCutoverMarker(staged.datasetId, activatedAt, tab)
+    local cutover = {
+        schemaVersion = 1,
+        datasetId = staged.datasetId,
+        guildKey = "club:42",
+        activatedAt = activatedAt,
+        activatedByGuid = "Player-1-Alice",
+        activatedByName = "Alice-Garona",
+        bankTab = tab,
+        contextStatus = "empty",
+        contextObservedAt = activatedAt,
+        contextRecordCount = 0,
+        cutoverMarker = stagedMarker,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = activatedAt,
+        },
+    }
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local markedEvent = officerLedgerEvent(staged, markedEvidence, "ctx:gs:staged-marked:9434", {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    local stMarked, rMarked = providerApply({
+        kind = "gs-ledger-event", datasetId = staged.datasetId, event = markedEvent,
+        cutoverMarker = stagedMarker,
+    }, "Dave-Garona")
+    assertEq(stMarked, "accepted", "411 staged: marked accepted " .. tostring(rMarked))
+    assertEq(rMarked, "officer_history", "411 staged: marked history before cutover")
+    local unmarkedEvidence = makeDepositEvidence(staged, {
+        itemId = 9434, quantity = 2, donor = "Unmarked-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "unmarked-old" }, neighborsNewer = { "unmarked-new" },
+        observedAt = (world.time or 0) + 8000,
+    })
+    local unmarkedEvent = officerLedgerEvent(staged, unmarkedEvidence, "ctx:gs:staged-unmarked:9434", {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = staged.datasetId, event = unmarkedEvent,
+    }, "Dave-Garona")), "officer_history", "411 staged: unmarked history retained")
+    local divergentEvidence = makeDepositEvidence(staged, {
+        itemId = 9434, quantity = 1, donor = "Divergent-Garona",
+        occurrenceIndex = 3,
+        neighborsOlder = { "divergent-old" }, neighborsNewer = { "divergent-new" },
+        observedAt = (world.time or 0) + 16000,
+    })
+    local divergentEvent = officerLedgerEvent(staged, divergentEvidence, "ctx:gs:staged-divergent:9434", {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = staged.datasetId, event = divergentEvent,
+        cutoverMarker = stagedMarker .. ":other",
+    }, "Dave-Garona")), "officer_history", "411 staged: divergent marker retained without live credit")
+    assertEq(campaignTotal(staged, 9434), 9, "411 staged: preparation total counts retained rows")
+    local function findByDonor(rec, donor)
+        local events = rec.accounting and rec.accounting._consumableEvents or {}
+        for i = 1, #events do
+            if events[i] and events[i].actor == donor then
+                return events[i]
+            end
+        end
+        return nil
+    end
+    local markedRow = findByDonor(staged, "Marked-Garona")
+    local unmarkedRow = findByDonor(staged, "Unmarked-Garona")
+    local divergentRow = findByDonor(staged, "Divergent-Garona")
+    assertEq(markedRow and markedRow.gsProductionCredit, false, "411 staged: marked not live yet")
+    assertEq(markedRow and markedRow.gsSourceCutoverMarker, stagedMarker,
+        "411 staged: trusted marker retained")
+    assertEq(unmarkedRow and unmarkedRow.gsSourceCutoverMarker, nil,
+        "411 staged: unmarked has no marker")
+    local stCut, cutReason = GS.InstallRemoteLiveCutover(staged, cutover, "club:42", {})
+    assertEq(stCut, "accepted", "411 staged: remote cutover " .. tostring(cutReason))
+    markedRow = findByDonor(staged, "Marked-Garona")
+    unmarkedRow = findByDonor(staged, "Unmarked-Garona")
+    divergentRow = findByDonor(staged, "Divergent-Garona")
+    assertEq(markedRow and markedRow.gsProductionCredit, true,
+        "411 staged: matching marker becomes live credit")
+    assertEq(unmarkedRow and unmarkedRow.gsProductionCredit, false,
+        "411 staged: unmarked history not promoted")
+    assertEq(divergentRow and divergentRow.gsProductionCredit, false,
+        "411 staged: divergent history not promoted")
+    assertEq(campaignTotal(staged, 9434), 6, "411 staged: live total is the marked credit only")
+
+    local localStage = seedActivatableCampaign(9435, 10)
+    local plain = makeDepositEvidence(localStage, { itemId = 9435, quantity = 4 })
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local plainEvent = officerLedgerEvent(localStage, plain, "ctx:gs:local-activate:9435", {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = localStage.datasetId, event = plainEvent,
+    }, "Dave-Garona")), "officer_history", "411 staged: pre-activation history")
+    assertEq(campaignTotal(localStage, 9435), 4, "411 staged: counts before local activation")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "411 staged: local activation")
+    disarmFreshBankSample()
+    localStage = GS:GetCurrentRecord()
+    assertEq(campaignTotal(localStage, 9435), 0, "411 staged: local activation does not promote history")
+    local plainRow = findDonation(localStage, 9435)
+    assertEq(plainRow and plainRow.gsProductionCredit, false,
+        "411 staged: local activation leaves the row uncredited")
+end
+
+local function buildRemoteCutover(record, evidence, activatedAt)
+    local tab = tonumber(record.accounting._consumables.bankTab)
+    activatedAt = math.floor(tonumber(activatedAt)
+        or ((tonumber(evidence.approxTxnTime) or 0) - 50))
+    local marker = GS.BuildCutoverMarker(record.datasetId, activatedAt, tab)
+    return {
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        activatedAt = activatedAt,
+        activatedByGuid = "Player-1-Alice",
+        activatedByName = "Alice-Garona",
+        bankTab = tab,
+        contextStatus = "empty",
+        contextObservedAt = activatedAt,
+        contextRecordCount = 0,
+        cutoverMarker = marker,
+        eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = activatedAt,
+        },
+    }, marker
+end
+
+do
+    -- Repair: same-occurrence unmarked/divergent staged rows must not permanently
+    -- block a later canonical marked officer history from becoming live credit.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local function findByTxn(rec, txnId)
+        local events = rec.accounting and rec.accounting._consumableEvents or {}
+        for i = 1, #events do
+            if events[i] and (events[i].txnId == txnId or events[i].id == txnId) then
+                return events[i]
+            end
+        end
+        return nil
+    end
+
+    -- 1) Unmarked staged → canonical marked → cutover.
+    local unmarked = seedStagedCampaignWithItem(9440, 20)
+    local umEvidence = makeDepositEvidence(unmarked, { itemId = 9440, quantity = 7 })
+    local umCutover, umMarker = buildRemoteCutover(unmarked, umEvidence)
+    local umTxn = "ctx:gs:reconcile-unmarked:9440"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local umEvent = officerLedgerEvent(unmarked, umEvidence, umTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = unmarked.datasetId, event = umEvent,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: unmarked staged accepted")
+    assertEq(findByTxn(unmarked, umTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: unmarked has no marker yet")
+    assertEq(campaignTotal(unmarked, 9440), 7, "411 reconcile: staged prep counts unmarked")
+    local stUmMark, rUmMark = providerApply({
+        kind = "gs-ledger-event", datasetId = unmarked.datasetId, event = umEvent,
+        cutoverMarker = umMarker,
+    }, "Eve-Garona")
+    assertEq(stUmMark, "duplicate", "411 reconcile: marked duplicate " .. tostring(rUmMark))
+    assertEq(findByTxn(unmarked, umTxn).gsSourceCutoverMarker, umMarker,
+        "411 reconcile: unmarked repaired to canonical marker")
+    assertEq(findByTxn(unmarked, umTxn).gsProductionCredit, false,
+        "411 reconcile: staged repair is not live credit")
+    assertEq(campaignTotal(unmarked, 9440), 7, "411 reconcile: still one staged credit")
+    assertEq(GS.InstallRemoteLiveCutover(unmarked, umCutover, "club:42", {}),
+        "accepted", "411 reconcile: unmarked path cutover")
+    assertEq(findByTxn(unmarked, umTxn).gsProductionCredit, true,
+        "411 reconcile: unmarked→marked becomes live after cutover")
+    assertEq(campaignTotal(unmarked, 9440), 7, "411 reconcile: unmarked path live total once")
+
+    -- 2) Divergent staged marker → canonical marked → cutover (D → M).
+    local divergent = seedStagedCampaignWithItem(9441, 20)
+    local dvEvidence = makeDepositEvidence(divergent, { itemId = 9441, quantity = 5 })
+    local dvCutover, dvMarker = buildRemoteCutover(divergent, dvEvidence)
+    local dvTxn = "ctx:gs:reconcile-divergent:9441"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local dvEvent = officerLedgerEvent(divergent, dvEvidence, dvTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = divergent.datasetId, event = dvEvent,
+        cutoverMarker = dvMarker .. ":other",
+    }, "Dave-Garona")), "officer_history", "411 reconcile: divergent staged accepted")
+    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker .. ":other",
+        "411 reconcile: divergent marker stored as primary")
+    local stDvMark, rDvMark = providerApply({
+        kind = "gs-ledger-event", datasetId = divergent.datasetId, event = dvEvent,
+        cutoverMarker = dvMarker,
+    }, "Eve-Garona")
+    assertEq(stDvMark, "duplicate", "411 reconcile: divergent retains canonical as alternate "
+        .. tostring(rDvMark))
+    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker .. ":other",
+        "411 reconcile: D→M keeps divergent primary (no last-writer-wins)")
+    assertEq(findByTxn(divergent, dvTxn).gsAltSourceCutoverMarker, dvMarker,
+        "411 reconcile: D→M retains canonical as alternate")
+    assertEq(findByTxn(divergent, dvTxn).gsProductionCredit, false,
+        "411 reconcile: divergent staged repair not live")
+    assertEq(GS.InstallRemoteLiveCutover(divergent, dvCutover, "club:42", {}),
+        "accepted", "411 reconcile: divergent path cutover")
+    assertEq(findByTxn(divergent, dvTxn).gsSourceCutoverMarker, dvMarker,
+        "411 reconcile: cutover collapses alternate to canonical")
+    assertEq(findByTxn(divergent, dvTxn).gsAltSourceCutoverMarker, nil,
+        "411 reconcile: alternate cleared after cutover")
+    assertEq(findByTxn(divergent, dvTxn).gsProductionCredit, true,
+        "411 reconcile: divergent→canonical becomes live after cutover")
+    assertEq(campaignTotal(divergent, 9441), 5, "411 reconcile: divergent path live total once")
+
+    -- 2b) Canonical → divergent while staged must not lose credit (M → D).
+    local md = seedStagedCampaignWithItem(9445, 20)
+    local mdEvidence = makeDepositEvidence(md, { itemId = 9445, quantity = 8 })
+    local mdCutover, mdMarker = buildRemoteCutover(md, mdEvidence)
+    local mdTxn = "ctx:gs:reconcile-md:9445"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local mdEvent = officerLedgerEvent(md, mdEvidence, mdTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = md.datasetId, event = mdEvent,
+        cutoverMarker = mdMarker,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: M→D canonical first")
+    assertEq(findByTxn(md, mdTxn).gsSourceCutoverMarker, mdMarker,
+        "411 reconcile: M→D primary is canonical")
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = md.datasetId, event = mdEvent,
+        cutoverMarker = mdMarker .. ":other",
+    }, "Eve-Garona")), "duplicate", "411 reconcile: M→D divergent duplicate")
+    assertEq(findByTxn(md, mdTxn).gsSourceCutoverMarker, mdMarker,
+        "411 reconcile: M→D keeps canonical primary")
+    assertEq(findByTxn(md, mdTxn).gsAltSourceCutoverMarker, mdMarker .. ":other",
+        "411 reconcile: M→D retains divergent as alternate")
+    assertEq(findByTxn(md, mdTxn).gsProductionCredit, false,
+        "411 reconcile: M→D staged not live")
+    assertEq(GS.InstallRemoteLiveCutover(md, mdCutover, "club:42", {}),
+        "accepted", "411 reconcile: M→D cutover")
+    assertEq(findByTxn(md, mdTxn).gsSourceCutoverMarker, mdMarker,
+        "411 reconcile: M→D still canonical after cutover")
+    assertEq(findByTxn(md, mdTxn).gsAltSourceCutoverMarker, nil,
+        "411 reconcile: M→D alternate cleared")
+    assertEq(findByTxn(md, mdTxn).gsProductionCredit, true,
+        "411 reconcile: M→D live credit once")
+    assertEq(campaignTotal(md, 9445), 8, "411 reconcile: M→D live total once")
+
+    -- 3) Canonical marked row arriving after cutover installation.
+    local after = seedStagedCampaignWithItem(9442, 20)
+    local afEvidence = makeDepositEvidence(after, { itemId = 9442, quantity = 4 })
+    local afCutover, afMarker = buildRemoteCutover(after, afEvidence)
+    local afTxn = "ctx:gs:reconcile-after:9442"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local afEvent = officerLedgerEvent(after, afEvidence, afTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = after.datasetId, event = afEvent,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: after path unmarked first")
+    assertEq(GS.InstallRemoteLiveCutover(after, afCutover, "club:42", {}),
+        "accepted", "411 reconcile: after path cutover before marked")
+    assertEq(findByTxn(after, afTxn).gsProductionCredit, false,
+        "411 reconcile: unmarked stays uncredited after cutover alone")
+    assertEq(campaignTotal(after, 9442), 0, "411 reconcile: no live total before marked repair")
+    local stAfter, rAfter = providerApply({
+        kind = "gs-ledger-event", datasetId = after.datasetId, event = afEvent,
+        cutoverMarker = afMarker,
+    }, "Eve-Garona")
+    assertEq(stAfter, "duplicate", "411 reconcile: post-cutover marked duplicate "
+        .. tostring(rAfter))
+    assertEq(findByTxn(after, afTxn).gsSourceCutoverMarker, afMarker,
+        "411 reconcile: post-cutover attaches canonical marker")
+    assertEq(findByTxn(after, afTxn).gsProductionCredit, true,
+        "411 reconcile: post-cutover marked becomes live credit")
+    assertEq(campaignTotal(after, 9442), 4, "411 reconcile: after path live total once")
+    local stAfterDup = select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = after.datasetId, event = afEvent,
+        cutoverMarker = afMarker,
+    }, "Eve-Garona"))
+    assertEq(stAfterDup, "duplicate", "411 reconcile: post-cutover replay duplicate")
+    assertEq(campaignTotal(after, 9442), 4, "411 reconcile: post-cutover replay no second credit")
+
+    -- 3b) Witness-only / incomplete officer marked duplicates cannot attach provenance.
+    local shape = seedStagedCampaignWithItem(9446, 20)
+    local shEvidence = makeDepositEvidence(shape, { itemId = 9446, quantity = 3 })
+    local shCutover, shMarker = buildRemoteCutover(shape, shEvidence)
+    local shTxn = "ctx:gs:reconcile-shape:9446"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local shOfficer = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = shOfficer,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: shape base unmarked officer")
+    local witnessDup = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verification = "witnesses",
+        writer = "Player-1-Carol",
+        verifierGuid = "Player-1-Carol",
+    })
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = witnessDup,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: witness-only marked is duplicate")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: witness-only does not attach marker")
+    local missingVer = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verifierRankOrder = 3,
+    })
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = missingVer,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: missing verifier marked is duplicate")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: missing verifier does not attach marker")
+    local mismatchVer = officerLedgerEvent(shape, shEvidence, shTxn, {
+        verifierGuid = "Player-1-Dave", verifierRankOrder = 3,
+    })
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = mismatchVer,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: mismatched verifier marked is duplicate")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: mismatched verifier does not attach marker")
+    assertEq(select(1, providerApply({
+        kind = "gs-ledger-event", datasetId = shape.datasetId, event = shOfficer,
+        cutoverMarker = shMarker,
+    }, "Eve-Garona")), "duplicate", "411 reconcile: complete officer marked attaches")
+    assertEq(findByTxn(shape, shTxn).gsSourceCutoverMarker, shMarker,
+        "411 reconcile: complete officer attaches canonical marker")
+    assertEq(GS.InstallRemoteLiveCutover(shape, shCutover, "club:42", {}),
+        "accepted", "411 reconcile: shape cutover")
+    assertEq(campaignTotal(shape, 9446), 3, "411 reconcile: shape live total once")
+
+    -- 4/5) Same-ID conflict and a distinct occurrence stay separate.
+    local conflict = seedStagedCampaignWithItem(9443, 20)
+    local cfEvidence = makeDepositEvidence(conflict, { itemId = 9443, quantity = 3 })
+    local cfCutover, cfMarker = buildRemoteCutover(conflict, cfEvidence)
+    local cfTxn = "ctx:gs:reconcile-conflict:9443"
+    GS:EnsureGossipProvider()
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local cfEvent = officerLedgerEvent(conflict, cfEvidence, cfTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = conflict.datasetId, event = cfEvent,
+    }, "Dave-Garona")), "officer_history", "411 reconcile: conflict base accepted")
+    local bad = {}
+    for k, v in pairs(cfEvent) do bad[k] = v end
+    bad.quantity = 99
+    local stBad, rBad = providerApply({
+        kind = "gs-ledger-event", datasetId = conflict.datasetId, event = bad,
+        cutoverMarker = cfMarker,
+    }, "Eve-Garona")
+    assertEq(stBad, "rejected", "411 reconcile: conflicting body rejected " .. tostring(rBad))
+    assertEq(rBad, "id_conflict", "411 reconcile: id_conflict preserved")
+    assertEq(findByTxn(conflict, cfTxn).gsSourceCutoverMarker, nil,
+        "411 reconcile: conflict does not attach marker")
+    local otherEvidence = makeDepositEvidence(conflict, {
+        itemId = 9443, quantity = 2, donor = "Other-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "other-old" }, neighborsNewer = { "other-new" },
+        observedAt = (world.time or 0) + 12000,
+    })
+    local otherTxn = "ctx:gs:reconcile-other:9443"
+    local otherEvent = officerLedgerEvent(conflict, otherEvidence, otherTxn, {
+        verifierGuid = "Player-1-Carol", verifierRankOrder = 3,
+    })
+    assertEq(select(2, providerApply({
+        kind = "gs-ledger-event", datasetId = conflict.datasetId, event = otherEvent,
+        cutoverMarker = cfMarker,
+    }, "Eve-Garona")), "officer_history", "411 reconcile: distinct occurrence kept separate")
+    assertEq(GS.InstallRemoteLiveCutover(conflict, cfCutover, "club:42", {}),
+        "accepted", "411 reconcile: conflict fixture cutover")
+    assertEq(findByTxn(conflict, cfTxn).gsProductionCredit, false,
+        "411 reconcile: conflict base still unmarked after cutover")
+    assertEq(findByTxn(conflict, otherTxn).gsProductionCredit, true,
+        "411 reconcile: distinct marked occurrence credits")
+    assertEq(campaignTotal(conflict, 9443), 2, "411 reconcile: only distinct marked credits")
+
+    -- 6/7) No retroactive staged credit; re-export and offline A→B→C keep one credit.
+    local origin = seedActivatableCampaign(9444, 30)
+    local stagedRoot = snapshotConfigRoot()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "411 reconcile: abc activate")
+    disarmFreshBankSample()
+    origin = GS:GetCurrentRecord()
+    local originMarker = origin.liveCutover.cutoverMarker
+    local originCutover = origin.liveCutover
+    world.time = (tonumber(origin.liveCutover.contextObservedAt) or world.time) + 7200
+    local abcEvidence = makeDepositEvidence(origin, {
+        itemId = 9444, quantity = 6, observedAt = world.time, ageHours = 0,
+    })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    GS:EnsureGossipProvider()
+    assertEq(select(1, GS:_AdmitObservationForTests(abcEvidence, "Player-1-Carol", "Carol-Garona")),
+        "accepted", "411 reconcile: abc carol commits")
+    local aliceBody = exportDonationBody(9444)
+    assertEq(aliceBody and aliceBody.cutoverMarker, originMarker, "411 reconcile: abc export marker")
+
+    local bob = loadClientFromConfigRoot(stagedRoot, "Bob-Garona", "Player-1-Bob", 4)
+    assertEq(bob.activation, GS.ACTIVATION_STAGED, "411 reconcile: bob starts staged")
+    local unmarkedBody = {
+        kind = "gs-ledger-event",
+        datasetId = aliceBody.datasetId,
+        event = {},
+    }
+    for k, v in pairs(aliceBody.event) do
+        unmarkedBody.event[k] = v
+    end
+    assertEq(select(2, applyExportBody(unmarkedBody, "Carol-Garona")),
+        "officer_history", "411 reconcile: bob accepts unmarked first")
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, nil,
+        "411 reconcile: bob unmarked has no marker")
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob staged prep counts unmarked")
+    local stBobMark, rBobMark = applyExportBody(aliceBody, "Carol-Garona")
+    assertEq(stBobMark, "duplicate", "411 reconcile: bob marked repairs " .. tostring(rBobMark))
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, originMarker,
+        "411 reconcile: bob stores canonical marker")
+    assertEq(findDonation(bob, 9444).gsProductionCredit, false,
+        "411 reconcile: bob staged repair is not live credit")
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob still one staged credit")
+    local divergentBody = {
+        kind = "gs-ledger-event",
+        datasetId = aliceBody.datasetId,
+        event = {},
+        cutoverMarker = originMarker .. ":other",
+    }
+    for k, v in pairs(aliceBody.event) do
+        divergentBody.event[k] = v
+    end
+    assertEq(select(1, applyExportBody(divergentBody, "Eve-Garona")), "duplicate",
+        "411 reconcile: bob M→D divergent after canonical")
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, originMarker,
+        "411 reconcile: bob keeps canonical after divergent")
+    assertEq(findDonation(bob, 9444).gsAltSourceCutoverMarker, originMarker .. ":other",
+        "411 reconcile: bob retains divergent alternate")
+    assertEq(GS.InstallRemoteLiveCutover(bob, originCutover, "club:42", {}),
+        "accepted", "411 reconcile: bob installs alice cutover")
+    assertEq(findDonation(bob, 9444).gsProductionCredit, true,
+        "411 reconcile: bob live after cutover")
+    assertEq(findDonation(bob, 9444).gsAltSourceCutoverMarker, nil,
+        "411 reconcile: bob alternate cleared after cutover")
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob one live credit")
+    -- Reload keeps the collapsed canonical credit.
+    local savedBob = SpectrumFederationDB
+    GS._root = nil
+    GS._rootValid = false
+    initGS()
+    bob = GS:GetCurrentRecord()
+    assertEq(campaignTotal(bob, 9444), 6, "411 reconcile: bob reload keeps credit")
+    assertEq(findDonation(bob, 9444).gsSourceCutoverMarker, originMarker,
+        "411 reconcile: bob reload keeps canonical marker")
+    assertTrue(savedBob == SpectrumFederationDB, "411 reconcile: bob reload same db")
+    local bobBody = exportDonationBody(9444)
+    assertEq(bobBody and bobBody.cutoverMarker, originMarker,
+        "411 reconcile: bob re-exports canonical marker")
+    assertEq(bobBody.event.verification, "officer", "411 reconcile: bob re-exports officer")
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Carol" or m.guid == "Player-1-Alice" then
+            m.online = false
+        end
+    end
+    local dave = loadClientFromConfigRoot(stagedRoot, "Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS.InstallRemoteLiveCutover(dave, originCutover, "club:42", {}),
+        "accepted", "411 reconcile: dave installs cutover")
+    local stDave, rDave = applyExportBody(bobBody, "Bob-Garona")
+    assertEq(stDave, "accepted", "411 reconcile: dave catch-up " .. tostring(rDave))
+    assertEq(rDave, "officer_history", "411 reconcile: dave officer history")
+    assertEq(campaignTotal(dave, 9444), 6, "411 reconcile: dave one credit")
+    assertEq(select(1, applyExportBody(bobBody, "Bob-Garona")), "duplicate",
+        "411 reconcile: dave replay duplicate")
+    assertEq(campaignTotal(dave, 9444), 6, "411 reconcile: dave replay no second credit")
+end
+
+do
+    -- Repair: candidate-first A → B → C while A is offline. One credit, then replay.
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    local record = seedActivatableCampaign(9438, 40)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(2, GS:ActivateCanonicalDataset()), "accepted", "411 abc: activate")
+    disarmFreshBankSample()
+    record = GS:GetCurrentRecord()
+    local configRoot = snapshotConfigRoot()
+    local marker = record.liveCutover.cutoverMarker
+    world.time = (tonumber(record.liveCutover.contextObservedAt) or world.time) + 7200
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9438, quantity = 8, observedAt = world.time, ageHours = 0,
+    })
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    GS:EnsureGossipProvider()
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Carol", "Carol-Garona")),
+        "accepted", "411 abc: carol commits")
+    local origin = findDonation(record, 9438)
+    local aliceBody = exportDonationBody(9438)
+    assertEq(aliceBody and aliceBody.cutoverMarker, marker, "411 abc: origin marker")
+    local bob = loadClientFromConfigRoot(configRoot, "Bob-Garona", "Player-1-Bob", 4)
+    local witnessFirst = {}
+    for k, v in pairs(aliceBody.event) do
+        witnessFirst[k] = v
+    end
+    witnessFirst.verification = "witnesses"
+    witnessFirst.verifierGuid = nil
+    local witnessBody = {
+        kind = "gs-ledger-event",
+        datasetId = aliceBody.datasetId,
+        event = witnessFirst,
+        cutoverMarker = aliceBody.cutoverMarker,
+    }
+    local stWitness, rWitness = applyExportBody(witnessBody, "Carol-Garona")
+    assertEq(stWitness, "accepted", "411 abc: bob holds candidate " .. tostring(rWitness))
+    assertEq(rWitness, "awaiting_local_quorum", "411 abc: witness ledger is not officer credit")
+    assertEq(campaignTotal(bob, 9438), 0, "411 abc: bob uncredited before history")
+    assertTrue(bob.accounting._pendingDonationCandidates[origin.txnId] ~= nil,
+        "411 abc: candidate present")
+    local stBob, rBob = applyExportBody(aliceBody, "Carol-Garona")
+    assertEq(stBob, "accepted", "411 abc: bob upgrades " .. tostring(rBob))
+    assertEq(rBob, "officer_history", "411 abc: officer history after candidate")
+    assertEq(campaignTotal(bob, 9438), 8, "411 abc: bob one credit")
+    assertEq(bob.accounting._pendingDonationCandidates[origin.txnId], nil,
+        "411 abc: bob candidate cleared")
+    local stBobDup = select(1, applyExportBody(aliceBody, "Carol-Garona"))
+    assertEq(stBobDup, "duplicate", "411 abc: bob replay duplicate")
+    assertEq(campaignTotal(bob, 9438), 8, "411 abc: bob replay no second credit")
+    local bobBody = exportDonationBody(9438)
+    assertEq(bobBody and bobBody.event and bobBody.event.verification, "officer",
+        "411 abc: bob re-exports officer provenance")
+    assertEq(bobBody and bobBody.cutoverMarker, marker, "411 abc: bob re-exports marker")
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Carol" or m.guid == "Player-1-Alice" then
+            m.online = false
+        end
+    end
+    local dave = loadClientFromConfigRoot(configRoot, "Dave-Garona", "Player-1-Dave", 4)
+    local stDave, rDave = applyExportBody(bobBody, "Bob-Garona")
+    assertEq(stDave, "accepted", "411 abc: dave catch-up " .. tostring(rDave))
+    assertEq(rDave, "officer_history", "411 abc: dave officer history with A offline")
+    assertEq(campaignTotal(dave, 9438), 8, "411 abc: dave one credit")
+    local daveRow = findDonation(dave, 9438)
+    assertEq(daveRow and daveRow.writer, "Player-1-Carol", "411 abc: writer stays carol")
+    assertEq(daveRow and daveRow.txnId, origin and origin.txnId, "411 abc: same txn")
+    local stDaveDup = select(1, applyExportBody(bobBody, "Bob-Garona"))
+    assertEq(stDaveDup, "duplicate", "411 abc: dave replay duplicate")
+    assertEq(campaignTotal(dave, 9438), 8, "411 abc: dave replay no second credit")
 end
 
 do

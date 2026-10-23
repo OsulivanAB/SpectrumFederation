@@ -167,6 +167,9 @@ local function makeRegion(kind, name, parent, template)
     function region:EnableMouse()
     end
 
+    function region:RegisterForClicks()
+    end
+
     function region:SetHitRectInsets()
     end
 
@@ -203,13 +206,15 @@ local function makeRegion(kind, name, parent, template)
     function region:SetJustifyV()
     end
 
-    function region:SetWordWrap()
+    function region:SetWordWrap(wrap)
+        self.wordWrap = wrap
     end
 
     function region:SetNonSpaceWrap()
     end
 
-    function region:SetMaxLines()
+    function region:SetMaxLines(lines)
+        self.maxLines = lines
     end
 
     function region:SetAutoFocus()
@@ -248,7 +253,8 @@ local function makeRegion(kind, name, parent, template)
     function region:SetColorTexture()
     end
 
-    function region:SetTexture()
+    function region:SetTexture(value)
+        self.texture = value
     end
 
     function region:SetAtlas()
@@ -565,6 +571,286 @@ do
     assertTrue(after - before <= 2, "nested OnSizeChanged does not recursively refresh requested list")
     assertTrue(nestedFires >= 1, "nested size notification was delivered during Refresh")
     assertTrue(after <= 80, "getItems stays bounded under nested size events")
+end
+
+-- Opt-in icons reserve a leading slot without moving Goal/input/X relative to the name.
+do
+    local plain = {
+        { text = "Flask", itemId = 111, goal = 4, canRemove = true, canEditGoal = true },
+    }
+    local _, _, _, _, plainRows = buildList(plain, 380)
+    assertTrue(plainRows()[1].Icon == nil, "lists without showItemIcons do not create an icon")
+
+    local wideWithout = select(1, Controls.ConsumableRequestedTextMaxWidth(400))
+    local wideWith = select(1, Controls.ConsumableRequestedTextMaxWidth(400, { iconReserve = 20 }))
+    assertEq(wideWith, wideWithout - 20, "icon reserve shrinks the shared name column")
+
+    local items = {
+        {
+            text = "Short",
+            itemId = 111,
+            goal = 4,
+            canRemove = true,
+            canEditGoal = true,
+            icon = 111001,
+        },
+        {
+            text = "Wonderfully Long Consumable Item Name",
+            itemId = 222,
+            goal = 9,
+            canRemove = true,
+            canEditGoal = true,
+            icon = 222002,
+        },
+    }
+    local commits = {}
+    local panel = CreateFrame("Frame")
+    panel:SetSize(700, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("Consumables")
+    section.Content:SetWidth(640)
+    local calls = 0
+    Controls:AddConsumableRequestedList(section, {
+        label = "Requested Items",
+        height = 180,
+        showItemIcons = true,
+        itemIconSize = 16,
+        itemIconGap = 4,
+        getItems = function()
+            calls = calls + 1
+            if calls > 80 then
+                error("icon list refresh exceeded 80 getItems calls")
+            end
+            return items
+        end,
+        onGoalCommit = function(item, text)
+            commits[#commits + 1] = { itemId = item.itemId, text = text }
+        end,
+    })
+    local scroll = findScroll(section)
+    scroll:SetSize(380, 180)
+    pageBuilder:Finalize()
+    fireEvent(scroll, "OnSizeChanged", 380, 180)
+    local rows = findRequestedRows(scroll.scrollChild)
+    assertEq(#rows, 2, "icon list builds both rows")
+    assertEq(rows[1].Icon.texture, 111001, "first row shows its item icon")
+    assertEq(rows[2].Icon.texture, 222002, "second row shows its item icon")
+    local textAnchor = leftAnchor(rows[1].Text)
+    assertEq(textAnchor and textAnchor.x, 20, "name starts after the 16px icon and gap")
+    assertEq(leftAnchor(rows[1].Text).x, leftAnchor(rows[2].Text).x, "icon rows share the name inset")
+    assertEq(leftAnchor(rows[1].GoalEdit).x, leftAnchor(rows[2].GoalEdit).x,
+        "Goal inputs stay aligned when icons are shown")
+    assertTrue(rows[1].Text.width + 20 <= (scroll.scrollChild:GetWidth() or 0),
+        "icon plus name column stays inside the row")
+
+    rows[1].GoalEdit.focused = true
+    rows[1].GoalEdit:SetText("42")
+    rows[1].__sfBoundItemId = 111
+    items[1].icon = 111009
+    items[1].text = "Short Renamed"
+    local callsBefore = calls
+    fireEvent(scroll, "OnSizeChanged", 380, 180)
+    rows = findRequestedRows(scroll.scrollChild)
+    assertEq(rows[1].GoalEdit:GetText(), "42", "focused goal edit survives an icon refresh")
+    assertTrue(rows[1].GoalEdit:HasFocus(), "focused goal edit keeps focus for the same item")
+    assertEq(rows[1].__sfBoundItemId, 111, "icon refresh keeps the bound item id")
+    assertEq(rows[1].Icon.texture, 111009, "recycled row picks up the new icon")
+    assertEq(#commits, 0, "icon refresh does not commit the goal")
+    assertTrue(calls - callsBefore <= 2, "icon refresh does not storm getItems")
+
+    items[1].itemId = 333
+    items[1].goal = 7
+    items[1].icon = 333003
+    items[1].text = "Rebound Item"
+    fireEvent(scroll, "OnSizeChanged", 380, 180)
+    rows = findRequestedRows(scroll.scrollChild)
+    assertEq(rows[1].__sfBoundItemId, 333, "rebound row targets the new item id")
+    assertEq(rows[1].GoalEdit:GetText(), "7", "rebound row shows the new goal")
+    assertTrue(not rows[1].GoalEdit:HasFocus(), "stale goal focus is cleared when the item changes")
+    assertEq(#commits, 0, "cancelled rebind does not commit the previous text")
+    assertEq(rows[1].Icon.texture, 333003, "rebound row replaces the previous icon")
+
+    items[2] = nil
+    fireEvent(scroll, "OnSizeChanged", 380, 180)
+    rows = findRequestedRows(scroll.scrollChild)
+    local shown = 0
+    for i = 1, #rows do
+        if rows[i]:IsShown() then
+            shown = shown + 1
+        end
+    end
+    assertEq(shown, 1, "dropping an item hides the recycled row")
+    assertTrue(calls <= 80, "icon list getItems stays bounded")
+end
+
+do
+    local panel = CreateFrame("Frame")
+    panel:SetSize(700, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("Logs")
+    section.Content:SetWidth(640)
+    local plainCalls = 0
+    Controls:AddScrollList(section, {
+        label = "Plain",
+        height = 80,
+        getItems = function()
+            plainCalls = plainCalls + 1
+            return { { text = "No icon here", id = "a" } }
+        end,
+    })
+    local plainScroll = findScroll(section)
+    plainScroll:SetSize(360, 80)
+    pageBuilder:Finalize()
+    local function scrollRows(scroll)
+        local found = {}
+        for _, child in ipairs((scroll.scrollChild and scroll.scrollChild.children) or {}) do
+            if child.Text and child.Remove and not child.GoalEdit then
+                found[#found + 1] = child
+            end
+        end
+        return found
+    end
+    local plain = scrollRows(plainScroll)
+    assertTrue(plain[1] ~= nil and plain[1].Icon == nil, "scroll lists without the flag stay text-only")
+
+    local iconSection = pageBuilder:AddSection("Icons")
+    local iconItems = {
+        { text = "Dreamleaf — 0 / —", itemId = 5, icon = 555 },
+    }
+    local iconCalls = 0
+    Controls:AddScrollList(iconSection, {
+        label = "Icons",
+        height = 80,
+        showItemIcons = true,
+        getItems = function()
+            iconCalls = iconCalls + 1
+            if iconCalls > 80 then
+                error("icon scroll list exceeded 80 getItems calls")
+            end
+            return iconItems
+        end,
+    })
+    local iconScroll = findScroll(iconSection)
+    iconScroll:SetSize(360, 80)
+    fireEvent(iconScroll, "OnSizeChanged", 360, 80)
+    local iconRows = scrollRows(iconScroll)
+    assertEq(iconRows[1].Icon.texture, 555, "opt-in scroll list shows the item icon")
+    assertEq(leftAnchor(iconRows[1].Text).x, 20, "opt-in scroll text clears the icon")
+    iconItems[1].icon = 556
+    iconItems[1].text = "Dreamleaf — 2 / 10"
+    fireEvent(iconScroll, "OnSizeChanged", 360, 80)
+    iconRows = scrollRows(iconScroll)
+    assertEq(iconRows[1].Icon.texture, 556, "scroll row refresh replaces the icon")
+    assertEq(iconRows[1].Text.text, "Dreamleaf — 2 / 10", "scroll row refresh replaces the label")
+    assertTrue(iconCalls <= 80 and plainCalls <= 80, "scroll refreshes stay bounded")
+end
+
+do
+    local panel = CreateFrame("Frame")
+    panel:SetSize(700, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("History")
+    section.Content:SetWidth(640)
+    local items = {
+        {
+            text = "Ursully-Garona ×40 — |T200067:16|t Dreamleaf",
+            tooltip = "2023-11-14 22:13 — Ursully-Garona donated 40 Dreamleaf. Verified by one officer Guild Bank observation.",
+            id = "414-don",
+            itemId = 13467,
+        },
+    }
+    local calls = 0
+    Controls:AddScrollList(section, {
+        label = "Campaign history",
+        height = 80,
+        singleLine = true,
+        showDetailTooltip = true,
+        getItems = function()
+            calls = calls + 1
+            if calls > 80 then
+                error("history scroll list exceeded 80 getItems calls")
+            end
+            return items
+        end,
+    })
+    local scroll = findScroll(section)
+    scroll:SetSize(360, 80)
+    fireEvent(scroll, "OnSizeChanged", 360, 80)
+    local function scrollRows(target)
+        local found = {}
+        for _, child in ipairs((target.scrollChild and target.scrollChild.children) or {}) do
+            if child.Text and child.Remove and not child.GoalEdit then
+                found[#found + 1] = child
+            end
+        end
+        return found
+    end
+    local row = scrollRows(scroll)[1]
+    assertTrue(row ~= nil, "history row renders")
+    assertTrue(row.Icon == nil, "history does not add a leading icon column")
+    assertEq(leftAnchor(row.Text).x, 0, "history text starts at the row edge")
+    assertEq(row.Text.wordWrap, false, "history text stays on one line")
+    assertEq(row.Text.maxLines, 1, "history text does not wrap under the row")
+    local rendered = row.Text.text
+    local iconAt = rendered:find("|T200067:16|t Dreamleaf", 1, true)
+    local dashAt = rendered:find("×40 — ", 1, true)
+    assertTrue(dashAt ~= nil and iconAt ~= nil and iconAt > dashAt,
+        "rendered history places the icon immediately before the item name")
+    assertTrue(rendered:find("2023", 1, true) == nil, "the one-line label leaves the timestamp for the tooltip")
+    assertTrue(rendered:find("officer", 1, true) == nil, "the one-line label leaves verification for the tooltip")
+
+    local tip, shown
+    local savedSetText = GameTooltip.SetText
+    local savedShow = GameTooltip.Show
+    local savedHide = GameTooltip.Hide
+    local savedSetOwner = GameTooltip.SetOwner
+    GameTooltip.SetOwner = function() end
+    GameTooltip.SetText = function(_, text)
+        tip = text
+    end
+    GameTooltip.Show = function()
+        shown = true
+    end
+    GameTooltip.Hide = function()
+        shown = false
+    end
+    assertTrue(type(row.scripts.OnEnter) == "function", "history row exposes one enter handler")
+    assertTrue(type(row.scripts.OnLeave) == "function", "history row exposes one leave handler")
+    row.scripts.OnEnter(row)
+    assertTrue(shown == true, "history hover shows the detail tooltip")
+    assertTrue(type(tip) == "string" and tip:find("Verified by one officer", 1, true) ~= nil,
+        "history tooltip keeps officer verification")
+    assertTrue(tip:find("2023-11-14", 1, true) ~= nil, "history tooltip keeps the timestamp")
+    assertTrue(tip:find("donated 40", 1, true) ~= nil, "history tooltip keeps donation wording")
+    row.scripts.OnLeave(row)
+    assertTrue(shown == false, "history leave hides the tooltip")
+
+    items[1].tooltip = "2023-11-14 22:13 — Alice-Garona adjusted Starlight Rose by -2 (credited to Bob-Garona)."
+    items[1].text = "Alice-Garona -2 — |T200068:16|t Starlight Rose"
+    local enterBefore = row.scripts.OnEnter
+    fireEvent(scroll, "OnSizeChanged", 360, 80)
+    row = scrollRows(scroll)[1]
+    assertTrue(row.scripts.OnEnter ~= enterBefore, "refresh replaces the tooltip handler")
+    assertEq(row.Text.text, items[1].text, "refresh replaces the inline history label")
+    row.scripts.OnEnter(row)
+    assertTrue(tip:find("adjusted", 1, true) ~= nil, "refreshed tooltip shows the adjustment")
+    assertTrue(tip:find("credited to Bob-Garona", 1, true) ~= nil, "refreshed tooltip keeps attribution")
+    assertTrue(tip:find("-2", 1, true) ~= nil, "refreshed tooltip keeps the signed quantity")
+    row.scripts.OnLeave(row)
+
+    items[1].tooltip = nil
+    fireEvent(scroll, "OnSizeChanged", 360, 80)
+    row = scrollRows(scroll)[1]
+    assertTrue(row.scripts.OnEnter == nil, "a row without detail clears the enter handler")
+    assertTrue(row.scripts.OnLeave == nil, "a row without detail clears the leave handler")
+    assertTrue(calls <= 80, "history tooltip refreshes stay bounded")
+    GameTooltip.SetText = savedSetText
+    GameTooltip.Show = savedShow
+    GameTooltip.Hide = savedHide
+    GameTooltip.SetOwner = savedSetOwner
 end
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))

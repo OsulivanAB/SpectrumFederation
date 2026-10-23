@@ -2802,6 +2802,7 @@ local function ValidateAndApply(record, ctx)
         -- Never trust self-declared credit/provenance on the event payload.
         event.gsProductionCredit = nil
         event.gsSourceCutoverMarker = nil
+        event.gsAltSourceCutoverMarker = nil
         -- Transport-level marker from an authenticated active exporter only.
         local sourceMarker = nil
         if type(body.cutoverMarker) == "string" and body.cutoverMarker ~= "" then
