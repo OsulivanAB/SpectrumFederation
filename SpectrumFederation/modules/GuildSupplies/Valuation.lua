@@ -1019,6 +1019,48 @@ function GS.ReconcileValuationsAfterCreditChange(record)
     end
 end
 
+--- Fold alias candidates into pending[canonical] while credit is still open.
+-- Does not publish. Same assignment id keeps the first body (id conflict).
+-- Different ids use earliest (assignedAt, assignmentId).
+local function HoldAliasPending(record, store, canonical, event, candidates)
+    if type(store.pending) ~= "table" then
+        store.pending = {}
+    end
+    local wrote = false
+    local guildKey = CurrentGuildKey()
+    for i = 1, #candidates do
+        local row = candidates[i]
+        local snap = row.snap
+        local scoped = type(snap) == "table"
+            and snap.datasetId == record.datasetId
+            and (not guildKey or snap.guildKey == guildKey)
+        if scoped and ValidateSnapFields(snap, row.key, row.pending)
+            and (not event or DonationMatches(snap, event)) then
+            if store.pending[canonical] == nil and CountKeys(store.pending) >= MAX_PENDING then
+                -- Pending storage stays capped. A full map cannot take a new key.
+            else
+                local _, _, _, didWrite = ApplyIncoming(store.pending, canonical, {
+                    assignmentId = snap.assignmentId,
+                    assignedAt = snap.assignedAt,
+                    unitCopper = snap.unitCopper,
+                    quantity = snap.quantity,
+                    totalCopper = snap.totalCopper,
+                    itemId = snap.itemId,
+                    txnId = canonical,
+                    datasetId = snap.datasetId,
+                    guildKey = snap.guildKey,
+                    actorGuid = snap.actorGuid,
+                    actorName = snap.actorName,
+                })
+                if didWrite then
+                    wrote = true
+                end
+            end
+        end
+    end
+    return wrote
+end
+
 function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     if type(record) ~= "table" then
         return
@@ -1035,16 +1077,16 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     -- Read every candidate before deleting a key. The earlier assignment may
     -- already sit on the canonical id while a later one sits on the alias.
     local candidates = {}
-    local function push(bucket, key)
+    local function push(bucket, key, pending)
         local snap = type(bucket) == "table" and bucket[key] or nil
         if type(snap) == "table" then
-            candidates[#candidates + 1] = snap
+            candidates[#candidates + 1] = { snap = snap, key = key, pending = pending and true or false }
         end
     end
-    push(store.byTxn, canonical)
-    push(store.byTxn, alias)
-    push(store.pending, canonical)
-    push(store.pending, alias)
+    push(store.byTxn, canonical, false)
+    push(store.byTxn, alias, false)
+    push(store.pending, canonical, true)
+    push(store.pending, alias, true)
     local removed = false
     if type(store.byTxn) == "table" and store.byTxn[alias] ~= nil then
         store.byTxn[alias] = nil
@@ -1060,12 +1102,26 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
             removed = true
         end
     end
+    local ids = AliasSet(record, canonical)
+    local event = FindEventForIds(record, ids)
+    local priceable = event and PriceableDonation(record, event) and true or false
+    -- No donation yet, or a staged donation whose cutover credit is still open.
+    -- Keep one pending row on the canonical id. Do not publish it.
+    local hold = (not event) or (event and not priceable and CreditStillUnresolved(record, event))
+    if hold then
+        local wrote = HoldAliasPending(record, store, canonical, event, candidates)
+        if removed or wrote then
+            NoteValuationStoreMutation(store, record)
+        end
+        RemoveValuationExports(record, { [alias] = true })
+        return
+    end
     if removed then
         NoteValuationStoreMutation(store, record)
     end
     local changed = false
     for i = 1, #candidates do
-        changed = MergeOntoCanonical(record, canonical, candidates[i], changed)
+        changed = MergeOntoCanonical(record, canonical, candidates[i].snap, changed)
     end
     RemoveValuationExports(record, { [alias] = true })
     if changed and ShouldPublish(record) then

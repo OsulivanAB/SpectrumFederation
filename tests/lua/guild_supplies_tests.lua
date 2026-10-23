@@ -31711,6 +31711,269 @@ do
 end
 
 do
+    -- Staged alias reconciliation keeps unresolved candidates until cutover.
+    SF.TSM = nil
+    local record = activateValuationGuild(9708)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9708, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "alias-cut-older" }, neighborsNewer = { "alias-cut-newer" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: alias-cutover origin credit")
+    local body = exportDonationBody(9708)
+    assertTrue(type(body) == "table" and type(body.event) == "table", "val: alias-cutover export")
+    local originTxn = body.event.txnId
+    local qty = tonumber(body.event.quantity)
+    local function loadStaged(name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+    local function descValuationCount()
+        local bodies = collectAllExportBodies()
+        for i = 1, #bodies do
+            local row = bodies[i].body
+            if type(row) == "table" and row.kind == "dataset-desc" then
+                return tonumber(row.valuationCount) or 0
+            end
+        end
+        return nil
+    end
+    local function installCutover(target, markerCutover, guid, name, rank)
+        return GS.InstallRemoteLiveCutover(target, markerCutover, "club:42", {
+            member = {
+                guid = guid, name = name, guildKey = "club:42", rankOrder = rank,
+            },
+            bindActorToSender = false,
+        })
+    end
+    local function divergentCutover(base)
+        local other = deepCopy(base)
+        other.activatedAt = (tonumber(base.activatedAt) or 0) + 99
+        other.contextObservedAt = other.activatedAt
+        other.contextRecordCount = 0
+        other.eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = other.activatedAt,
+        }
+        other.cutoverMarker = GS.BuildCutoverMarker(other.datasetId, other.activatedAt, other.bankTab)
+        return other
+    end
+    local function aliasLedger(aliasTxn)
+        local copy = deepCopy(body)
+        copy.event = deepCopy(body.event)
+        copy.event.id = aliasTxn
+        copy.event.txnId = aliasTxn
+        return copy
+    end
+
+    local bob = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(bob.activation, GS.ACTIVATION_STAGED, "val: alias peer is staged")
+    SF.TSM = nil
+    local ledSt, ledReason = applyExportBody(body, "Bob-Garona")
+    assertEq(ledSt, "accepted", "val: alias peer ledger " .. tostring(ledReason))
+    bob = GS:GetCurrentRecord()
+    local bobEvent = valuationFindDonation(bob, 9708, qty)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, false, "val: alias peer donation is uncredited")
+    local aliasTxn = "ctx:alias-cut-9708"
+    local early = craftValuation(bob, bobEvent, {
+        assignmentId = "gsv1:111111111111111111111111:00009708",
+        assignedAt = 11,
+        unitCopper = 15,
+        txnId = aliasTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local earlySt, earlyReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(earlySt, "pending", "val: alias price waits " .. tostring(earlyReason))
+    assertEq(earlyReason, "awaiting_donation", "val: alias price is not on the donation yet")
+    local aliasSt, aliasReason = applyExportBody(aliasLedger(aliasTxn), "Bob-Garona")
+    assertEq(aliasSt, "duplicate", "val: alias ledger links the occurrence " .. tostring(aliasReason))
+    assertEq(aliasReason, "occurrence_duplicate", "val: alias ledger reason")
+    bob = GS:GetCurrentRecord()
+    assertTrue(bob ~= nil, "val: alias hold still validates")
+    assertEq(valuationSnap(bob, originTxn), nil, "val: alias hold is not a winner")
+    assertEq(bob.valuations.byTxn[originTxn], nil, "val: alias hold has no canonical winner")
+    assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: alias hold has no alias winner")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: alias pending moved off the alias id")
+    local held = bob.valuations.pending[originTxn]
+    assertEq(held and held.assignmentId, early.assignmentId, "val: alias hold keeps the earlier id")
+    assertEq(held and held.totalCopper, 15 * qty, "val: alias hold keeps the earlier total")
+    assertEq(held and held.txnId, originTxn, "val: alias hold is stored on the canonical id")
+    assertEq(descValuationCount(), 0, "val: alias hold is not exported")
+    local cutSt, cutReason = installCutover(bob, cutover, "Player-1-Bob", "Bob-Garona", 2)
+    assertEq(cutSt, "accepted", "val: alias cutover installs " .. tostring(cutReason))
+    bob = GS:GetCurrentRecord()
+    local bobSnap = valuationSnap(bob, originTxn)
+    assertEq(bobSnap and bobSnap.totalCopper, 15 * qty, "val: cutover promotes the held alias price")
+    assertEq(bobSnap and bobSnap.assignmentId, early.assignmentId, "val: cutover keeps the held id")
+    assertEq(bob.valuations.pending[originTxn], nil, "val: cutover clears the held pending row")
+    assertEq(descValuationCount(), 1, "val: cutover exports one promoted valuation")
+
+    local carol = loadStaged("Carol-Garona", "Player-1-Carol", 2)
+    SF.TSM = nil
+    assertEq(select(1, applyExportBody(body, "Carol-Garona")), "accepted", "val: tie peer ledger")
+    carol = GS:GetCurrentRecord()
+    local tieAlias = "ctx:alias-tie-9708"
+    local canonicalTie = craftValuation(carol, body.event, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009708",
+        assignedAt = 40,
+        unitCopper = 4,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local aliasTie = craftValuation(carol, body.event, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00009708",
+        assignedAt = 40,
+        unitCopper = 9,
+        txnId = tieAlias,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    assertEq(select(1, applyValuationBody(canonicalTie, "Carol-Garona")), "pending",
+        "val: tie canonical price waits")
+    assertEq(select(1, applyValuationBody(aliasTie, "Carol-Garona")), "pending",
+        "val: tie alias price waits")
+    local tieSt, tieReason = applyExportBody(aliasLedger(tieAlias), "Carol-Garona")
+    assertEq(tieSt, "duplicate", "val: tie alias links " .. tostring(tieReason))
+    carol = GS:GetCurrentRecord()
+    assertEq(valuationSnap(carol, originTxn), nil, "val: tie is not accepted before cutover")
+    local tieHeld = carol.valuations.pending[originTxn]
+    assertEq(tieHeld and tieHeld.assignmentId, aliasTie.assignmentId,
+        "val: same-second tie keeps the lower assignment id")
+    assertEq(tieHeld and tieHeld.unitCopper, 9, "val: same-second tie keeps that unit")
+    assertEq(carol.valuations.pending[tieAlias], nil, "val: tie alias key is consumed")
+    assertEq(descValuationCount(), 0, "val: tie is not exported")
+    local conflictAlias = "ctx:alias-conflict-9708"
+    carol.valuations.pending[conflictAlias] = {
+        assignmentId = aliasTie.assignmentId,
+        assignedAt = 1,
+        unitCopper = 8,
+        quantity = qty,
+        totalCopper = 8 * qty,
+        itemId = 9708,
+        txnId = conflictAlias,
+        datasetId = carol.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    GS.OnDonationTxnAlias(carol, originTxn, conflictAlias)
+    carol = GS:GetCurrentRecord()
+    assertTrue(carol ~= nil, "val: id conflict still validates")
+    assertEq(carol.valuations.pending[originTxn] and carol.valuations.pending[originTxn].unitCopper, 9,
+        "val: same assignment id does not replace the stored body")
+    assertEq(carol.valuations.pending[conflictAlias], nil, "val: conflicting alias key is consumed")
+    local mismatchAlias = "ctx:alias-mismatch-9708"
+    carol.valuations.pending[mismatchAlias] = {
+        assignmentId = "gsv1:cccccccccccccccccccccccc:00009708",
+        assignedAt = 1,
+        unitCopper = 1,
+        quantity = qty,
+        totalCopper = qty,
+        itemId = 1,
+        txnId = mismatchAlias,
+        datasetId = carol.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    GS.OnDonationTxnAlias(carol, originTxn, mismatchAlias)
+    carol = GS:GetCurrentRecord()
+    assertEq(carol.valuations.pending[mismatchAlias], nil, "val: mismatched alias candidate is dropped")
+    assertEq(carol.valuations.pending[originTxn] and carol.valuations.pending[originTxn].unitCopper, 9,
+        "val: mismatch leaves the matching candidate")
+    assertEq(valuationSnap(carol, originTxn), nil, "val: mismatch does not promote")
+    local badCut, badCutReason = installCutover(
+        carol, divergentCutover(cutover), "Player-1-Carol", "Carol-Garona", 2)
+    assertEq(badCut, "accepted", "val: divergent cutover installs " .. tostring(badCutReason))
+    carol = GS:GetCurrentRecord()
+    assertEq(valuationSnap(carol, originTxn), nil, "val: divergent cutover leaves the price unaccepted")
+    assertEq(carol.valuations.pending[originTxn], nil, "val: divergent cutover discards the pending row")
+    assertEq(descValuationCount(), 0, "val: divergent cutover exports nothing")
+
+    local earlyPeer = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    SF.TSM = nil
+    local beforeAlias = "ctx:alias-before-9708"
+    local beforeEarly = craftValuation(earlyPeer, body.event, {
+        assignmentId = "gsv1:dddddddddddddddddddddddd:00009708",
+        assignedAt = 5,
+        unitCopper = 3,
+        txnId = beforeAlias,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local beforeLater = craftValuation(earlyPeer, body.event, {
+        assignmentId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00009708",
+        assignedAt = 8,
+        unitCopper = 6,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    assertEq(select(1, applyValuationBody(beforeEarly, "Bob-Garona")), "pending",
+        "val: pre-donation alias price waits")
+    assertEq(select(1, applyValuationBody(beforeLater, "Bob-Garona")), "pending",
+        "val: pre-donation canonical price waits")
+    earlyPeer = GS:GetCurrentRecord()
+    local malformedAlias = "ctx:alias-malformed-9708"
+    earlyPeer.valuations.pending[malformedAlias] = {
+        assignmentId = "not-an-assignment",
+        txnId = malformedAlias,
+    }
+    GS.OnDonationTxnAlias(earlyPeer, originTxn, malformedAlias)
+    earlyPeer = GS:GetCurrentRecord()
+    assertTrue(earlyPeer ~= nil, "val: malformed alias candidate does not poison the store")
+    assertEq(earlyPeer.valuations.pending[malformedAlias], nil, "val: malformed alias candidate is dropped")
+    assertEq(earlyPeer.valuations.pending[beforeAlias] and earlyPeer.valuations.pending[beforeAlias].unitCopper, 3,
+        "val: malformed pass leaves the other pending row")
+    GS.OnDonationTxnAlias(earlyPeer, originTxn, beforeAlias)
+    earlyPeer = GS:GetCurrentRecord()
+    assertTrue(earlyPeer ~= nil, "val: pre-donation alias still validates")
+    assertEq(valuationFindDonation(earlyPeer, 9708, qty), nil, "val: pre-donation alias has no donation yet")
+    assertEq(valuationSnap(earlyPeer, originTxn), nil, "val: pre-donation alias is not a winner")
+    local beforeHeld = earlyPeer.valuations.pending[originTxn]
+    assertEq(beforeHeld and beforeHeld.assignmentId, beforeEarly.assignmentId,
+        "val: pre-donation alias keeps the earlier id")
+    assertEq(beforeHeld and beforeHeld.unitCopper, 3, "val: pre-donation alias keeps the earlier unit")
+    assertEq(earlyPeer.valuations.pending[beforeAlias], nil, "val: pre-donation alias key is consumed")
+    assertEq(descValuationCount(), 0, "val: pre-donation alias is not exported")
+    local arriveSt, arriveReason = applyExportBody(body, "Bob-Garona")
+    assertEq(arriveSt, "accepted", "val: donation arrives after the alias " .. tostring(arriveReason))
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(valuationSnap(earlyPeer, originTxn), nil, "val: arrived donation stays unpriced while staged")
+    assertEq(earlyPeer.valuations.pending[originTxn] and earlyPeer.valuations.pending[originTxn].unitCopper, 3,
+        "val: arrived donation keeps the earlier pending price")
+    local deniedSt, deniedReason = installCutover(
+        earlyPeer, cutover, "Player-1-Dave", "Dave-Garona", 4)
+    assertEq(deniedSt, "rejected", "val: non-editor cutover rejected " .. tostring(deniedReason))
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(earlyPeer.activation, GS.ACTIVATION_STAGED, "val: rejected cutover stays staged")
+    assertEq(valuationSnap(earlyPeer, originTxn), nil, "val: rejected cutover does not promote")
+    assertEq(descValuationCount(), 0, "val: rejected cutover exports nothing")
+    local okCut, okReason = installCutover(earlyPeer, cutover, "Player-1-Bob", "Bob-Garona", 2)
+    assertEq(okCut, "accepted", "val: pre-donation cutover installs " .. tostring(okReason))
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(valuationSnap(earlyPeer, originTxn) and valuationSnap(earlyPeer, originTxn).totalCopper, 3 * qty,
+        "val: pre-donation cutover promotes the earlier price")
+    assertEq(earlyPeer.valuations.pending[originTxn], nil, "val: pre-donation pending cleared")
+    assertEq(descValuationCount(), 1, "val: pre-donation cutover exports one valuation")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: staged alias reconciliation stays chat-free")
+end
+
+do
     local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
     assertTrue(src ~= nil, "val: module readable")
     local text = src:read("*a")
