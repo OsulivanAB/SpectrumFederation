@@ -1297,15 +1297,18 @@ function GS:AdmitValuationAssignment(body, opts)
     end
     local store = EnsureStore(record)
     if not event or holdForCredit then
-        -- Alias fold may already keep the earliest pending row under the
-        -- canonical lookup key while the assignment body still names its
-        -- original transaction id. Prefer that key so redelivery stays a
-        -- fingerprint duplicate instead of a second pending row.
+        -- Park under the lookup key that later donation reconcile will use.
+        -- A validated gs:val:<canonical> binding must retain pending[C] even
+        -- when immutable assignment.txnId is still the source alias A; a fresh
+        -- peer has no A→C registry, so pending[A] would never promote.
         local pendingKey = assignment.txnId
+        if exportCanonical then
+            pendingKey = canonical
+        end
         if type(store.pending) == "table" then
             if store.pending[canonical] ~= nil then
                 pendingKey = canonical
-            elseif store.pending[assignment.txnId] == nil then
+            elseif not exportCanonical and store.pending[assignment.txnId] == nil then
                 for key in pairs(ids) do
                     if store.pending[key] ~= nil then
                         pendingKey = key
@@ -1314,13 +1317,41 @@ function GS:AdmitValuationAssignment(body, opts)
                 end
             end
         end
+        -- Fold a previously unbound pending[A] onto export-canonical C before
+        -- installing this body. Earliest (assignedAt, assignmentId) wins;
+        -- same-ID divergent payloads still reject via ApplyIncoming.
+        local folded = false
+        if exportCanonical and type(store.pending) == "table"
+            and assignment.txnId ~= canonical
+            and type(store.pending[assignment.txnId]) == "table" then
+            local prior = store.pending[assignment.txnId]
+            store.pending[assignment.txnId] = nil
+            local priorTxn = ValidTxnId(prior.txnId) or assignment.txnId
+            local _, _, _, priorWrote = ApplyIncoming(store.pending, canonical, {
+                assignmentId = prior.assignmentId,
+                assignedAt = prior.assignedAt,
+                unitCopper = prior.unitCopper,
+                quantity = prior.quantity,
+                totalCopper = prior.totalCopper,
+                itemId = prior.itemId,
+                txnId = priorTxn,
+                datasetId = prior.datasetId,
+                guildKey = prior.guildKey,
+                actorGuid = prior.actorGuid,
+                actorName = prior.actorName,
+            })
+            if priorWrote then
+                folded = true
+            end
+            pendingKey = canonical
+        end
         local pendingCount = CountKeys(store.pending)
         local existing = store.pending[pendingKey]
         if not existing and pendingCount >= MAX_PENDING then
             return "rejected", "full"
         end
         local status, _, detail, wrote = ApplyIncoming(store.pending, pendingKey, assignment)
-        if wrote then
+        if wrote or folded then
             NoteValuationStoreMutation(store, record)
         end
         if status == "rejected" then

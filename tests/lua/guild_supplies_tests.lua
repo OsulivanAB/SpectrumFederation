@@ -32922,6 +32922,264 @@ do
 end
 
 do
+    -- Remaining Group A gap: gs:val:C before gs:le:C parks under pending[C].
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: A-order provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+
+    valuationTsmValue = 33
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9825)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9825, quantity = 4, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "order-old" }, neighborsNewer = { "order-new" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: A-order source officer credit")
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9825, 4)
+    assertTrue(event ~= nil, "val: A-order source donation")
+    local canonical = event.txnId
+    local aliasTxn = "ctx:canon-bind-order-9825"
+    local snap = valuationSnap(record, canonical)
+    assertTrue(type(snap) == "table", "val: A-order source priced")
+    local total = snap.totalCopper
+    local unit = snap.unitCopper
+    local assignmentId = snap.assignmentId
+    local assignedAt = snap.assignedAt
+    local fpBefore = nil
+    if GS.ContentFingerprint then
+        fpBefore = GS.ContentFingerprint({
+            canon = table.concat({
+                tostring(assignmentId), tostring(assignedAt), tostring(unit),
+                "4", tostring(total), "9825", aliasTxn, tostring(record.datasetId),
+                "club:42", "Player-1-Alice", "Alice-Garona",
+            }, "|"),
+        })
+    end
+    snap.txnId = aliasTxn
+    snap.canonicalTxnId = canonical
+    local cfg = record.accounting._consumables
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    local planted = false
+    for i = 1, #cfg.txnRegistry do
+        local row = cfg.txnRegistry[i]
+        if type(row) == "table" and row.txnId == canonical then
+            row.aliases = { aliasTxn }
+            planted = true
+            break
+        end
+    end
+    if not planted then
+        cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+            txnId = canonical, status = "committed", aliases = { aliasTxn },
+            itemId = 9825, quantity = 4,
+        }
+    end
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = aliasTxn, status = "alias", aliasOf = canonical,
+    }
+    GS.NoteValuationExported(record, canonical)
+    drainExportMaint(64)
+    local exported = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonical)
+    assertTrue(type(exported) == "table" and type(exported.body) == "table",
+        "val: A-order exports gs:val:C")
+    assertEq(exported.body.assignment.txnId, aliasTxn, "val: A-order export txnId=A")
+    local valBody = deepCopy(exported.body)
+    local ledgerBody = exportDonationBody(9825)
+    assertTrue(type(ledgerBody) == "table" and ledgerBody.event
+        and ledgerBody.event.txnId == canonical, "val: A-order ledger is C")
+    local sourceDataset = record.datasetId
+    local aliceExport = collectAllExportBodies()
+    local configRoot = snapshotConfigRoot()
+
+    -- Gossip: valuation first, then ledger. No TSM, no valuation redelivery.
+    SF.TSM = nil
+    local bobRoot = deepCopy(configRoot)
+    local bobGuild = bobRoot.guilds and bobRoot.guilds["club:42"]
+    if type(bobGuild) == "table" then
+        bobGuild.valuations = nil
+    end
+    local bob = loadClientFromConfigRoot(bobRoot, "Bob-Garona", "Player-1-Bob", 2)
+    assertEq(valuationCount(bob), 0, "val: A-order Bob starts empty")
+    local stVal, reasonVal = providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")
+    assertEq(stVal, "pending", "val: A-order valuation-first pending " .. tostring(reasonVal))
+    assertEq(reasonVal, "awaiting_donation", "val: A-order awaits donation")
+    bob = GS:GetCurrentRecord()
+    assertTrue(type(bob.valuations.pending[canonical]) == "table",
+        "val: A-order parks under pending[C]")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: A-order does not park under A")
+    assertEq(bob.valuations.pending[canonical].txnId, aliasTxn,
+        "val: A-order pending keeps immutable A")
+    assertEq(bob.valuations.pending[canonical].assignmentId, assignmentId,
+        "val: A-order pending assignment id")
+    assertEq(bob.valuations.pending[canonical].canonicalTxnId, canonical,
+        "val: A-order pending canonicalTxnId=C")
+    assertEq(valuationSnap(bob, canonical), nil, "val: A-order not published before ledger")
+    assertEq(valuationCount(bob), 0, "val: A-order no winner before ledger")
+
+    -- Source Alice is offline for minting; Bob has no TSM. Only the ledger arrives.
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local stLed, reasonLed = applyExportBody(ledgerBody, "Alice-Garona")
+    assertEq(stLed, "accepted", "val: A-order ledger second " .. tostring(reasonLed))
+    assertEq(reasonLed, "officer_history", "val: A-order officer history")
+    bob = GS:GetCurrentRecord()
+    local bobDonation = valuationFindDonation(bob, 9825, 4)
+    assertTrue(bobDonation and bobDonation.txnId == canonical, "val: A-order Bob has C")
+    local bobSnap = valuationSnap(bob, canonical)
+    assertTrue(type(bobSnap) == "table", "val: A-order promotes pending under C")
+    assertEq(bobSnap.txnId, aliasTxn, "val: A-order winner keeps txnId=A")
+    assertEq(bobSnap.assignmentId, assignmentId, "val: A-order winner assignment id")
+    assertEq(bobSnap.assignedAt, assignedAt, "val: A-order winner timestamp")
+    assertEq(bobSnap.unitCopper, unit, "val: A-order winner unit")
+    assertEq(bobSnap.totalCopper, total, "val: A-order winner total")
+    assertEq(bob.valuations.pending[canonical], nil, "val: A-order pending cleared")
+    assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: A-order no alias winner key")
+    assertEq(valuationCount(bob), 1, "val: A-order one winner")
+    local desc = GS.DescribeDonationValuation(bob, bobDonation)
+    assertEq(desc.priced, true, "val: A-order Logs priced")
+    assertEq(desc.totalCopper, total, "val: A-order Logs total")
+    drainExportMaint(64)
+    local bobDescCount = nil
+    local bobExports = collectAllExportBodies()
+    for i = 1, #bobExports do
+        local row = bobExports[i]
+        if row.body and row.body.kind == "dataset-desc"
+            and row.body.datasetId == bob.datasetId then
+            bobDescCount = row.body.valuationCount
+        end
+    end
+    assertEq(bobDescCount, 1, "val: A-order descriptor count")
+    local stDup = select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona"))
+    assertEq(stDup, "duplicate", "val: A-order redelivery duplicate")
+    assertEq(valuationCount(bob), 1, "val: A-order still one after redelivery")
+
+    -- Fold prior unbound pending[A] when bound gs:val:C arrives.
+    local foldRoot = deepCopy(configRoot)
+    local foldGuild = foldRoot.guilds and foldRoot.guilds["club:42"]
+    if type(foldGuild) == "table" then
+        foldGuild.valuations = nil
+    end
+    local fold = loadClientFromConfigRoot(foldRoot, "Carol-Garona", "Player-1-Carol", 2)
+    assertEq(select(1, applyValuationBody(valBody.assignment, "Alice-Garona")), "pending",
+        "val: A-order unbound first")
+    fold = GS:GetCurrentRecord()
+    assertTrue(type(fold.valuations.pending[aliasTxn]) == "table",
+        "val: A-order unbound under A")
+    assertEq(select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")),
+        "pending", "val: A-order bind folds to C")
+    fold = GS:GetCurrentRecord()
+    assertTrue(type(fold.valuations.pending[canonical]) == "table",
+        "val: A-order folded pending[C]")
+    assertEq(fold.valuations.pending[aliasTxn], nil, "val: A-order folded clears A")
+    assertEq(fold.valuations.pending[canonical].assignmentId, assignmentId,
+        "val: A-order folded keeps assignment")
+
+    -- Fresh-client adoption with valuations buffered before ledgers.
+    SpectrumFederationDB = {}
+    switchPlayer("Dave-Garona", "Player-1-Dave", 2)
+    -- Dave is rank 4 by default in some suites; restore editor-capable peer.
+    setPlayer("Dave-Garona", "Player-1-Dave", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: A-order adopt starts empty")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: A-order adopt begins")
+    local valsFirst, ledgersSecond, other = {}, {}, {}
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            valsFirst[#valsFirst + 1] = {
+                id = "gs:val:" .. canonical,
+                body = deepCopy(valBody),
+            }
+        elseif kind == "gs-ledger-event" then
+            ledgersSecond[#ledgersSecond + 1] = row
+        elseif kind == "gs-evidence" then
+            -- skip; officer ledger is enough
+        else
+            other[#other + 1] = row
+        end
+    end
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: A-order adopt buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    for i = 1, #other do
+        bufferRow(other[i])
+    end
+    for i = 1, #valsFirst do
+        bufferRow(valsFirst[i])
+    end
+    for i = 1, #ledgersSecond do
+        bufferRow(ledgersSecond[i])
+    end
+    -- Strip evidence from the descriptor so completeness does not wait on it.
+    local adop = GS._adoption
+    if type(adop) == "table" and type(adop.records) == "table" then
+        local descId = "gs:desc:" .. sourceDataset
+        local desc = adop.records[descId]
+        if type(desc) == "table" then
+            desc.donationEvidenceCount = 0
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: A-order adopt commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: A-order adopt dataset")
+    local adoptedSnap = valuationSnap(adopted, canonical)
+    assertTrue(type(adoptedSnap) == "table", "val: A-order adopt priced from val-first")
+    assertEq(adoptedSnap.txnId, aliasTxn, "val: A-order adopt immutable txnId")
+    assertEq(adoptedSnap.assignmentId, assignmentId, "val: A-order adopt assignment id")
+    assertEq(adoptedSnap.totalCopper, total, "val: A-order adopt total")
+    assertEq(adopted.valuations.byTxn[aliasTxn], nil, "val: A-order adopt no alias key")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: A-order stays chat-free")
+end
+
+do
     -- Group B: pinned valuationCount cannot be omitted; malformed bodies do not count.
     SF.TSM = {
         GetMarketValue = function()
