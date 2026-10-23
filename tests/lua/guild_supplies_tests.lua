@@ -34595,11 +34595,13 @@ do
 end
 
 do
-    -- C1: no valuation alias from untrusted incomplete provenance (discussion_r4364653917).
+    -- C1: competing-ID alias requires full officer-history preflight
+    -- (discussion_r4364653917 PARTIALLY FIXED closure).
     SF.TSM = nil
     local record = activateValuationGuild(9905)
     GS:EnsureGossipProvider()
     creditValuationDeposit(record, { itemId = 9905, quantity = 4 })
+    drainExportMaint(32)
     record = GS:GetCurrentRecord()
     local eventA = valuationFindDonation(record, 9905, 4)
     assertTrue(eventA ~= nil, "val: C1 donation A")
@@ -34607,9 +34609,9 @@ do
     local txnX = "ctx:c1-competing-x-9905"
     local marker = record.liveCutover and record.liveCutover.cutoverMarker
     assertTrue(type(marker) == "string" and marker ~= "", "val: C1 live marker")
-    -- Officer-authorized pending valuation parked on competing id X.
+    local assignId = "gsv1:cccccccccccccccccccccccc:00009905"
     local pending = craftValuation(record, eventA, {
-        assignmentId = "gsv1:cccccccccccccccccccccccc:00009905",
+        assignmentId = assignId,
         assignedAt = 40,
         unitCopper = 15,
         txnId = txnX,
@@ -34617,49 +34619,78 @@ do
     local stPend, reasonPend = applyValuationBody(pending, "Alice-Garona")
     assertEq(stPend, "pending", "val: C1 pending on X " .. tostring(reasonPend))
     record = GS:GetCurrentRecord()
-    assertTrue(type(record.valuations.pending[txnX]) == "table", "val: C1 pending[X] stored")
+    local pendingSnap = record.valuations.pending[txnX]
+    assertTrue(type(pendingSnap) == "table", "val: C1 pending[X] stored")
     assertEq(valuationSnap(record, txnA), nil, "val: C1 A not priced yet")
-    -- Non-editor sends a matching copy of A under txnId=X without officer provenance.
-    setPlayer("Dave-Garona", "Player-1-Dave", 4)
-    local clone = deepCopy(eventA)
-    clone.id = txnX
-    clone.txnId = txnX
-    clone.verification = "witnesses"
-    clone.verifierGuid = nil
-    clone.writer = "Player-1-Dave"
-    local stBad, reasonBad = providerApply({
-        kind = "gs-ledger-event",
+    local pendingFp = GS.ContentFingerprint({
+        kind = "gs-valuation",
+        schemaVersion = 1,
         datasetId = record.datasetId,
-        event = clone,
-    }, "Dave-Garona")
-    assertTrue(stBad == "duplicate" or stBad == "pending" or stBad == "rejected",
-        "val: C1 untrusted competing id st=" .. tostring(stBad) .. " " .. tostring(reasonBad))
-    record = GS:GetCurrentRecord()
-    assertTrue(type(record.valuations.pending[txnX]) == "table",
-        "val: C1 pending[X] unchanged after untrusted copy")
-    assertEq(valuationSnap(record, txnA), nil, "val: C1 no valuation move to A")
-    assertEq(valuationSnap(record, txnX), nil, "val: C1 no published winner under X")
-    local cfg = record.accounting and record.accounting._consumables
-    local aliased = false
-    if type(cfg) == "table" and type(cfg.txnRegistry) == "table" then
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = pendingSnap.assignmentId,
+            assignedAt = pendingSnap.assignedAt,
+            unitCopper = pendingSnap.unitCopper,
+            quantity = pendingSnap.quantity,
+            totalCopper = pendingSnap.totalCopper,
+            itemId = pendingSnap.itemId,
+            txnId = pendingSnap.txnId,
+            datasetId = pendingSnap.datasetId,
+            guildKey = pendingSnap.guildKey,
+        },
+    })
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, vals = nil, 0
+        for i = 1, #bodies do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            elseif type(body) == "table" and body.kind == "gs-valuation" then
+                vals = vals + 1
+            end
+        end
+        return descCount, vals
+    end
+    local function registryHasAlias(rec, primary, alias)
+        local cfg = rec.accounting and rec.accounting._consumables
+        if type(cfg) ~= "table" or type(cfg.txnRegistry) ~= "table" then
+            return false
+        end
         for i = 1, #cfg.txnRegistry do
             local row = cfg.txnRegistry[i]
-            if type(row) == "table" and row.txnId == txnA and type(row.aliases) == "table" then
+            if type(row) == "table" and row.txnId == primary and type(row.aliases) == "table" then
                 for j = 1, #row.aliases do
-                    if row.aliases[j] == txnX then
-                        aliased = true
+                    if row.aliases[j] == alias then
+                        return true
                     end
                 end
             end
-            if type(row) == "table" and row.txnId == txnX and row.status == "alias" then
-                aliased = true
+            if type(row) == "table" and row.txnId == alias and row.status == "alias" then
+                return true
             end
         end
+        return false
     end
-    assertEq(aliased, false, "val: C1 no A→X alias from incomplete provenance")
+    local function assertNoAliasSideEffects(label)
+        record = GS:GetCurrentRecord()
+        assertTrue(type(record.valuations.pending[txnX]) == "table",
+            "val: C1 " .. label .. " pending[X] unchanged")
+        assertEq(record.valuations.pending[txnX].assignmentId, assignId,
+            "val: C1 " .. label .. " assignment id intact")
+        assertEq(record.valuations.pending[txnX].unitCopper, 15,
+            "val: C1 " .. label .. " unit intact")
+        assertEq(valuationSnap(record, txnA), nil, "val: C1 " .. label .. " no winner on A")
+        assertEq(valuationSnap(record, txnX), nil, "val: C1 " .. label .. " no winner on X")
+        assertEq(registryHasAlias(record, txnA, txnX), false,
+            "val: C1 " .. label .. " no A→X alias")
+        assertEq(valuationCount(record), 0, "val: C1 " .. label .. " no published winner")
+        local descCount, exportVals = valuationExportSummary(
+            collectAllExportBodies(), record.datasetId)
+        assertEq(tonumber(descCount) or 0, 0, "val: C1 " .. label .. " descriptor count 0")
+        assertEq(exportVals, 0, "val: C1 " .. label .. " no valuation exports")
+    end
 
-    -- Later complete officer-history for competing id X converges exactly once.
-    setPlayer("Bob-Garona", "Player-1-Bob", 2)
     local evidence = {
         donor = eventA.actor or eventA.donor,
         itemId = eventA.itemId,
@@ -34674,28 +34705,93 @@ do
         neighborsOlder = eventA.neighborsOlder,
         neighborsNewer = eventA.neighborsNewer,
     }
-    local hist = officerLedgerEvent(record, evidence, txnX, {
+    -- Shape-complete officer claim (writer==verifier) but NO cutoverMarker.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local shapeOnly = officerLedgerEvent(record, evidence, txnX, {
         writer = "Player-1-Alice",
         verifierGuid = "Player-1-Alice",
         verifierRankOrder = 1,
         verification = "officer",
     })
+    local stNoMark, reasonNoMark = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = shapeOnly,
+    }, "Dave-Garona")
+    assertEq(stNoMark, "duplicate", "val: C1 no-marker still occurrence_duplicate")
+    assertEq(reasonNoMark, "occurrence_duplicate", "val: C1 no-marker reason")
+    assertNoAliasSideEffects("no-marker")
+
+    -- Same shape-complete claim with a divergent cutoverMarker.
+    local stDiv, reasonDiv = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = "gsc1:divergent-marker-9905",
+        event = deepCopy(shapeOnly),
+    }, "Dave-Garona")
+    assertEq(stDiv, "duplicate", "val: C1 divergent still occurrence_duplicate")
+    assertEq(reasonDiv, "occurrence_duplicate", "val: C1 divergent reason")
+    assertTrue(reasonDiv ~= "officer_history", "val: C1 divergent not officer credit")
+    assertNoAliasSideEffects("divergent")
+
+    -- Fully eligible canonical-marked officer history relayed by ordinary
+    -- guildmate Dave while original officer Alice is offline.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS:GetCapabilities().canEdit, false, "val: C1 Dave is non-editor carrier")
+    local hist = deepCopy(shapeOnly)
     local stOk, reasonOk = providerApply({
         kind = "gs-ledger-event",
         datasetId = record.datasetId,
         cutoverMarker = marker,
         event = hist,
-    }, "Bob-Garona")
+    }, "Dave-Garona")
     assertTrue(stOk == "duplicate" or stOk == "accepted",
         "val: C1 trusted officer history st=" .. tostring(stOk) .. " " .. tostring(reasonOk))
     record = GS:GetCurrentRecord()
     local moved = valuationSnap(record, txnA)
     assertTrue(type(moved) == "table", "val: C1 trusted alias moves valuation to A")
     assertEq(moved.unitCopper, 15, "val: C1 moved unit")
+    assertEq(moved.totalCopper, 60, "val: C1 moved total")
     assertEq(moved.txnId, txnX, "val: C1 keeps immutable assignment txnId")
+    assertEq(moved.assignmentId, assignId, "val: C1 assignment id unchanged")
     assertEq(record.valuations.pending[txnX], nil, "val: C1 pending[X] cleared once")
     assertEq(valuationCount(record), 1, "val: C1 one winner after trusted convergence")
-    -- Divergent marker stays fail-closed for a second competing id.
+    assertEq(registryHasAlias(record, txnA, txnX), true, "val: C1 A→X alias after trusted relay")
+    local afterFp = GS.ContentFingerprint({
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = moved.assignmentId,
+            assignedAt = moved.assignedAt,
+            unitCopper = moved.unitCopper,
+            quantity = moved.quantity,
+            totalCopper = moved.totalCopper,
+            itemId = moved.itemId,
+            txnId = moved.txnId,
+            datasetId = moved.datasetId,
+            guildKey = moved.guildKey,
+        },
+    })
+    assertEq(afterFp, pendingFp, "val: C1 immutable fingerprint unchanged")
+
+    -- Redelivery is idempotent.
+    local stDup, reasonDup = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = marker,
+        event = deepCopy(hist),
+    }, "Dave-Garona")
+    assertTrue(stDup == "duplicate" or stDup == "accepted",
+        "val: C1 redelivery st=" .. tostring(stDup) .. " " .. tostring(reasonDup))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 1, "val: C1 redelivery keeps one winner")
+    assertEq(valuationSnap(record, txnA).assignmentId, assignId,
+        "val: C1 redelivery keeps assignment")
+    assertEq(valuationSnap(record, txnA).unitCopper, 15, "val: C1 redelivery unit")
+
+    -- Unrelated competing id with divergent marker remains fail-closed.
     local txnY = "ctx:c1-divergent-y-9905"
     local badHist = officerLedgerEvent(record, evidence, txnY, {
         writer = "Player-1-Alice",
@@ -34703,16 +34799,18 @@ do
         verifierRankOrder = 1,
         verification = "officer",
     })
-    local stDiv, reasonDiv = providerApply({
+    local stY, reasonY = providerApply({
         kind = "gs-ledger-event",
         datasetId = record.datasetId,
         cutoverMarker = "gsc1:divergent-marker-9905",
         event = badHist,
-    }, "Bob-Garona")
-    assertTrue(reasonDiv ~= "officer_history",
-        "val: C1 divergent marker is not officer credit st="
-            .. tostring(stDiv) .. " " .. tostring(reasonDiv))
+    }, "Dave-Garona")
+    assertTrue(reasonY ~= "officer_history",
+        "val: C1 second divergent not officer credit st="
+            .. tostring(stY) .. " " .. tostring(reasonY))
     assertEq(valuationCount(GS:GetCurrentRecord()), 1, "val: C1 still one winner")
+    assertEq(registryHasAlias(GS:GetCurrentRecord(), txnA, txnY), false,
+        "val: C1 no A→Y alias from divergent")
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
     assertEq(#world.chat, 0, "val: C1 chat-free")
 end

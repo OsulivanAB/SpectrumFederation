@@ -2821,16 +2821,14 @@ local function SettleAcceptedOfficerOccurrence(record, cfg, txnId, evidence)
     end
 end
 
---- Ordinary Guild Gossip catch-up of an already accepted officer-trusted donation.
--- The transport sender must be an authenticated same-guild member. The verification
--- field, writer, rank, or isAdmin claim is not authority by itself: occurrence,
--- eligibility, dataset, an explicit verifierGuid, and (when live) the canonical
--- cutover marker are required. v1 cannot prove the named writer saw Blizzard's
--- bank log. That limit is documented in GuildSupplies/AGENTS.md. Returns nil when
--- the row must stay an unverified candidate.
-local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cfg, senderName, admissionCtx)
+--- Non-mutating accepted officer-history preflight.
+-- Shared by catch-up credit and competing-ID alias authorization so valuation
+-- side effects cannot run when credit/provenance would refuse the same row.
+-- Returns writer, verifier, validated evidence row, sourceMarker, authedMember
+-- on success; otherwise nil. Does not mutate ledger, registry, or valuations.
+local function OfficerTrustedHistoryPreflight(record, event, candidate, txnId, senderName, admissionCtx)
     local writer, verifier = OfficerHistoryWriter(event)
-    if not writer or not verifier or not ValidTxnId(txnId) or type(cfg) ~= "table" then
+    if not writer or not verifier or not ValidTxnId(txnId) or type(candidate) ~= "table" then
         return nil
     end
     if type(GS.AuthenticateTransportSender) ~= "function" then
@@ -2888,8 +2886,26 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
             end
         end
     end
-    local eligOk = IsEvidenceEligible(record, row)
-    if not eligOk then
+    if not IsEvidenceEligible(record, row) then
+        return nil
+    end
+    return writer, verifier, row, sourceMarker, authed
+end
+
+--- Ordinary Guild Gossip catch-up of an already accepted officer-trusted donation.
+-- The transport sender must be an authenticated same-guild member. The verification
+-- field, writer, rank, or isAdmin claim is not authority by itself: occurrence,
+-- eligibility, dataset, an explicit verifierGuid, and (when live) the canonical
+-- cutover marker are required. v1 cannot prove the named writer saw Blizzard's
+-- bank log. That limit is documented in GuildSupplies/AGENTS.md. Returns nil when
+-- the row must stay an unverified candidate.
+local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cfg, senderName, admissionCtx)
+    if type(cfg) ~= "table" then
+        return nil
+    end
+    local writer, verifier, row, sourceMarker, authed = OfficerTrustedHistoryPreflight(
+        record, event, candidate, txnId, senderName, admissionCtx)
+    if not writer or not verifier or type(row) ~= "table" then
         return nil
     end
     local stored = {
@@ -2949,7 +2965,7 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
         GS._NotifyLocalDurableChange("ledger")
     end
     Debug("Info", "officer-trusted history accepted txn=%s writer=%s sender=%s",
-        tostring(txnId), tostring(writer), tostring(authed.name or senderName))
+        tostring(txnId), tostring(writer), tostring(authed and authed.name or senderName))
     if GS.ReconcilePendingValuations then
         GS.ReconcilePendingValuations(record, txnId)
     end
@@ -3196,11 +3212,13 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             end
             if regHit and ValidTxnId(regHit.txnId) and regHit.txnId ~= txnId then
                 -- Same occurrence, competing ID: alias without second credit.
-                -- Only complete officer-history (or later trusted paths) may
-                -- create A→X aliases that move valuation state. Uncredited
-                -- matching copies must not redirect pending[X].
+                -- Only officer-history that would pass catch-up credit preflight
+                -- (live canonical marker + eligibility) may create A→X aliases
+                -- that move valuation state. Shape-only officer claims with a
+                -- missing/divergent marker must not redirect pending[X].
                 if regHit.status == "verified" then
-                    if IsCompleteOfficerHistoryEvent(event) then
+                    if OfficerTrustedHistoryPreflight(
+                        record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
                         AddTxnAlias(cfg, regHit.txnId, txnId, record)
                         local led = FindLedgerEventByTxnId(record, regHit.txnId)
                         if led then
@@ -3216,7 +3234,8 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "pending", "ambiguous"
             end
             if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
-                if IsCompleteOfficerHistoryEvent(event) then
+                if OfficerTrustedHistoryPreflight(
+                    record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
                     AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record)
                     ReconcileVerifiedDonationDuplicate(
                         record, ledHit, candidate, admissionCtx, event)

@@ -3883,6 +3883,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     return yieldReplayCursorLe()
                 end
                 event.datasetId = body.datasetId or temp.datasetId
+                -- Preserve transport cutoverMarker so competing-ID alias and
+                -- officer-history credit preflight match ordinary Gossip ingress.
+                local adoptMarker = nil
+                if type(body.cutoverMarker) == "string" and body.cutoverMarker ~= "" then
+                    adoptMarker = body.cutoverMarker
+                end
                 local stLe = GS:AdmitLedgerEvent(event, {
                     sender = adop.sourcePeer,
                     member = member,
@@ -3890,6 +3896,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     adoptionReplay = true,
                     preserveAttribution = true,
                     localWrite = false,
+                    sourceCutoverMarker = adoptMarker,
                 })
                 admissions = admissions + 1
                 sliceUsed = sliceUsed + 1
