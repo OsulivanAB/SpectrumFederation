@@ -307,34 +307,85 @@ do
     assertTrue(localePos < generalPos, "TOC loads locale/enUS.lua before General.lua")
 end
 
--- Schema default
+-- Schema / window defaults: 90%; range remains 70–100 step 5
 assertEq(
     SF.SettingsSchema.DEFAULTS.global.settingsWindowOpacity,
-    70,
-    "schema default settingsWindowOpacity is 70"
+    90,
+    "schema default settingsWindowOpacity is 90"
 )
+do
+    local windowSource = assert(io.open("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua", "r")):read("*a")
+    assertTrue(
+        windowSource:find("SETTINGS_WINDOW_OPACITY_DEFAULT = 90", 1, true) ~= nil,
+        "StandaloneWindow default opacity constant is 90"
+    )
+    assertTrue(
+        windowSource:find("SETTINGS_WINDOW_OPACITY_MIN = 70", 1, true) ~= nil,
+        "StandaloneWindow min opacity remains 70"
+    )
+    assertTrue(
+        windowSource:find("SETTINGS_WINDOW_OPACITY_MAX = 100", 1, true) ~= nil,
+        "StandaloneWindow max opacity remains 100"
+    )
+    assertTrue(
+        windowSource:find("SETTINGS_WINDOW_OPACITY_STEP = 5", 1, true) ~= nil,
+        "StandaloneWindow opacity step remains 5"
+    )
+    assertTrue(
+        windowSource:find("BG = {0, 0, 0, 0.90}", 1, true) ~= nil,
+        "StandaloneWindow BG alpha matches 90% default"
+    )
+end
 
 -- Normalize: missing, invalid, clamp, step rounding
-assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(nil), 70, "nil opacity normalizes to 70")
-assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity("nope"), 70, "nonnumeric opacity normalizes to 70")
+assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(nil), 90, "nil opacity normalizes to 90")
+assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity("nope"), 90, "nonnumeric opacity normalizes to 90")
 assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(50), 70, "below-min opacity clamps to 70")
 assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(150), 100, "above-max opacity clamps to 100")
 assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(73), 75, "73 rounds to nearest 5% step (75)")
 assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(72), 70, "72 rounds to nearest 5% step (70)")
+assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(70), 70, "70% is valid minimum")
+assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(90), 90, "90% default is preserved as in-range")
 assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(85), 85, "in-range stepped value is preserved")
 assertEq(SettingsWindow:_NormalizeSettingsWindowOpacity(100), 100, "100% is valid fully opaque")
 
 -- Store Init fills missing default; Set persists account-wide
 resetDb()
-assertEq(Store:Get("global.settingsWindowOpacity"), 70, "Init merges missing opacity to default 70")
+assertEq(Store:Get("global.settingsWindowOpacity"), 90, "Init merges missing opacity to default 90")
 Store:Set("global.settingsWindowOpacity", 85)
 assertEq(Store:Get("global.settingsWindowOpacity"), 85, "Set persists settingsWindowOpacity")
 assertEq(SpectrumFederationDB.global.settingsWindowOpacity, 85, "value is account-wide in SpectrumFederationDB")
 
--- Reset restores 70
+-- Explicitly stored preferences (including 70%) survive Init; no migration
+SpectrumFederationDB = {
+    version = 3,
+    global = { settingsWindowOpacity = 70 },
+    lootHelper = { profiles = {}, activeProfileId = nil },
+}
+SpectrumFederationCharDB = {}
+Store.db = nil
+Store.charDb = nil
+Store._callbacks = nil
+Store:Init()
+assertEq(Store:Get("global.settingsWindowOpacity"), 70, "explicitly stored 70% is unchanged after Init")
+assertEq(SpectrumFederationDB.global.settingsWindowOpacity, 70, "saved 70% remains in SpectrumFederationDB")
+
+SpectrumFederationDB = {
+    version = 3,
+    global = { settingsWindowOpacity = 85 },
+    lootHelper = { profiles = {}, activeProfileId = nil },
+}
+SpectrumFederationCharDB = {}
+Store.db = nil
+Store.charDb = nil
+Store._callbacks = nil
+Store:Init()
+assertEq(Store:Get("global.settingsWindowOpacity"), 85, "explicitly stored 85% is unchanged after Init")
+
+-- Reset restores 90
 local resetOk = Store:ResetPath("global.settingsWindowOpacity")
 assertTrue(resetOk, "ResetPath succeeds for settingsWindowOpacity")
-assertEq(Store:Get("global.settingsWindowOpacity"), 70, "ResetPath restores opacity to 70")
+assertEq(Store:Get("global.settingsWindowOpacity"), 90, "ResetPath restores opacity to 90")
 
 -- Invalid window: backdrop alpha only; frame alpha unchanged
 resetWindow()
@@ -357,7 +408,7 @@ assertAlmost(frame.alpha, 1, 1e-6, "100% still leaves frame SetAlpha untouched")
 assertAlmost(frame.backdropBorderColor.a, borderA, 1e-6, "backdrop border alpha is unchanged by opacity apply")
 
 SettingsWindow:ApplySettingsWindowOpacity(70)
-assertAlmost(frame.backdropColor.a, 0.70, 1e-6, "70% restores default backdrop alpha")
+assertAlmost(frame.backdropColor.a, 0.70, 1e-6, "70% applies valid minimum backdrop alpha")
 assertAlmost(frame.alpha, 1, 1e-6, "70% still leaves frame SetAlpha untouched")
 
 -- Live drag-style updates (immediate Apply without recreating the window)
@@ -368,7 +419,7 @@ assertAlmost(frame.backdropColor.a, 0.95, 1e-6, "second live Apply updates backd
 
 -- Invalid/out-of-range values via Apply
 SettingsWindow:ApplySettingsWindowOpacity("bad")
-assertAlmost(frame.backdropColor.a, 0.70, 1e-6, "invalid Apply value falls back to 70% backdrop")
+assertAlmost(frame.backdropColor.a, 0.90, 1e-6, "invalid Apply value falls back to 90% backdrop")
 SettingsWindow:ApplySettingsWindowOpacity(10)
 assertAlmost(frame.backdropColor.a, 0.70, 1e-6, "below-min Apply clamps to 70% backdrop")
 SettingsWindow:ApplySettingsWindowOpacity(200)
@@ -405,8 +456,8 @@ assertAlmost(frame.backdropColor.a, 1.0, 1e-6, "store callback applies opacity i
 assertAlmost(frame.alpha, 1, 1e-6, "store callback never sets overall frame alpha")
 
 Store:ResetPath("global.settingsWindowOpacity")
-assertEq(Store:Get("global.settingsWindowOpacity"), 70, "reset after live updates restores store default")
-assertAlmost(frame.backdropColor.a, 0.70, 1e-6, "reset reapplies 70% backdrop via callback")
+assertEq(Store:Get("global.settingsWindowOpacity"), 90, "reset after live updates restores store default")
+assertAlmost(frame.backdropColor.a, 0.90, 1e-6, "reset reapplies 90% backdrop via callback")
 
 -- Persistence across "character change": account DB survives char DB swap
 local accountOpacity = Store:Get("global.settingsWindowOpacity")

@@ -28,7 +28,7 @@ Set Loot Helper title and roster text between 8 and 20 points.
 
 **Settings Window Opacity**
 
-Account-wide opacity for the standalone settings window background only (70–100%, in 5% steps). Default is 70%, matching the previous fixed backdrop. 100% is fully opaque. Text and controls stay fully opaque. The slider updates the backdrop while you drag it. This does not change other Spectrum Federation windows.
+Account-wide opacity for the standalone settings window background only (70–100%, in 5% steps). Default is 90%. 100% is fully opaque. Text and controls stay fully opaque. The slider updates the backdrop while you drag it. This does not change other Spectrum Federation windows.
 
 Window Style, Font Style, and Font Size do not currently restyle the standalone settings window or every addon surface.
 

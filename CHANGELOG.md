@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.13-beta.2] - 2026-10-23
+
+### Changed
+- Default Settings Window Opacity to 90%
+
 ## [1.5.13-beta.1] - 2026-10-23
 
 ### Changed

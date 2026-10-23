@@ -41,13 +41,13 @@ local C = {
     IMPERSONATION_BANNER_HEIGHT = 36,
 
     -- Colors (RGBA, 0-1 range)
-    -- BG alpha is the default settings-window backdrop opacity (70%).
+    -- BG alpha is the default settings-window backdrop opacity (90%).
     -- Runtime opacity is driven by global.settingsWindowOpacity; do not SetAlpha the frame.
-    BG = {0, 0, 0, 0.70},
+    BG = {0, 0, 0, 0.90},
     BORDER = {0.65, 0.65, 0.65, 0.65},
 
     -- Account-wide settings window backdrop opacity (percent)
-    SETTINGS_WINDOW_OPACITY_DEFAULT = 70,
+    SETTINGS_WINDOW_OPACITY_DEFAULT = 90,
     SETTINGS_WINDOW_OPACITY_MIN = 70,
     SETTINGS_WINDOW_OPACITY_MAX = 100,
     SETTINGS_WINDOW_OPACITY_STEP = 5,
