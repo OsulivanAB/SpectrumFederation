@@ -66,6 +66,16 @@ function Page:Build(panel)
 						step = 1,
 						valueFormat = "%d",
 					},
+
+					{
+						type = "slider",
+						label = "Settings Window Opacity",
+						tooltip = "Adjust the opacity of the settings window background only. Text and controls stay fully opaque. 100% is fully opaque; lower values show more of the game underneath.",
+						path = "global.settingsWindowOpacity",
+						min = 70,
+						max = 100,
+						step = 5,
+					},
 				},
 			},
 		},
