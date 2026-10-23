@@ -2,21 +2,6 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.12-beta.3] - 2026-10-22
-
-### Changed
-- Show Raid Supplies items by icon and name
-
-## [1.5.12-beta.2] - 2026-10-22
-
-### Removed
-- Remove legacy Loot Helper consumables settings pages
-
-## [1.5.12-beta.1] - 2026-10-22
-
-### Added
-- Add officer-trusted Guild Bank donation verification
-
 ## [1.5.12] - 2026-10-21
 
 ### Added
