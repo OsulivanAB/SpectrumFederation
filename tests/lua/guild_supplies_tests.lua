@@ -32724,10 +32724,20 @@ do
     }
     local record = activateValuationGuild(9820)
     GS:EnsureGossipProvider()
-    creditValuationDeposit(record, { itemId = 9820, quantity = 3 })
+    -- Officer-direct credit so a fresh peer can install production history without
+    -- rebuilding a three-witness quorum (matches the #411 history path).
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9820, quantity = 3, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "canon-bind-old" }, neighborsNewer = { "canon-bind-new" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: A source officer credit")
     record = GS:GetCurrentRecord()
     local event = valuationFindDonation(record, 9820, 3)
     assertTrue(event ~= nil, "val: A source donation")
+    assertEq(event.verification, "officer", "val: A source is officer-trusted")
     local canonical = event.txnId
     local aliasTxn = "ctx:canon-bind-alias-9820"
     local snap = valuationSnap(record, canonical)
@@ -32779,28 +32789,38 @@ do
     local ledgerBody = exportDonationBody(9820)
     assertTrue(type(ledgerBody) == "table" and ledgerBody.event, "val: A ledger export")
     assertEq(ledgerBody.event.txnId, canonical, "val: A ledger is canonical id")
-    local configRoot = snapshotConfigRoot()
     local sourceDataset = record.datasetId
     local aliceExport = collectAllExportBodies()
+    local configRoot = snapshotConfigRoot()
 
-    -- Fresh gossip peer: donation C only, empty alias registry.
-    local bob = loadClientFromConfigRoot(configRoot, "Bob-Garona", "Player-1-Bob", 2)
-    assertEq(GS.ValuationOfficerEligible(), true, "val: A Bob eligible")
-    local bobCfg = bob.accounting and bob.accounting._consumables
-    if type(bobCfg) == "table" then
-        bobCfg.txnRegistry = {}
+    -- Fresh gossip peer: donation C only, empty alias registry, no source valuations.
+    SF.TSM = nil
+    local bobRoot = deepCopy(configRoot)
+    local bobGuild = bobRoot.guilds and bobRoot.guilds["club:42"]
+    if type(bobGuild) == "table" then
+        bobGuild.valuations = nil
     end
-    local ledSt, ledReason = providerApplyWithId(
-        "gs:le:" .. tostring(ledgerBody.event.txnId or "x"), ledgerBody, "Alice-Garona")
+    local bob = loadClientFromConfigRoot(bobRoot, "Bob-Garona", "Player-1-Bob", 2)
+    assertEq(GS.ValuationOfficerEligible(), true, "val: A Bob eligible")
+    assertEq(valuationCount(bob), 0, "val: A Bob starts without source valuations")
+    local ledSt, ledReason = applyExportBody(ledgerBody, "Alice-Garona")
     assertEq(ledSt, "accepted", "val: A Bob accepts canonical ledger " .. tostring(ledReason))
+    assertEq(ledReason, "officer_history", "val: A Bob officer-history reason")
     bob = GS:GetCurrentRecord()
     local bobDonation = valuationFindDonation(bob, 9820, 3)
     assertTrue(bobDonation ~= nil and bobDonation.txnId == canonical,
         "val: A Bob has only canonical donation")
-    assertEq(bob.accounting._consumables.txnRegistry
-        and bob.accounting._consumables.txnRegistry[1]
-        and bob.accounting._consumables.txnRegistry[1].aliases, nil,
-        "val: A Bob has no source alias list")
+    assertEq(bobDonation.gsProductionCredit, true, "val: A Bob donation is credited")
+    assertEq(valuationCount(bob), 0, "val: A Bob has no TSM auto-price")
+    -- Without the export binding, AliasSet cannot find donation C from alias A.
+    local stUnbound, reasonUnbound = applyValuationBody(valBody.assignment, "Alice-Garona")
+    assertEq(stUnbound, "pending",
+        "val: A unbound alias body stays pending " .. tostring(reasonUnbound))
+    assertEq(reasonUnbound, "awaiting_donation", "val: A unbound awaits donation")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, canonical), nil, "val: A unbound did not price canonical")
+    assertTrue(type(bob.valuations.pending[aliasTxn]) == "table",
+        "val: A unbound parked under alias key")
     local stBind, reasonBind = providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")
     assertEq(stBind, "accepted", "val: A Bob accepts bound valuation " .. tostring(reasonBind))
     bob = GS:GetCurrentRecord()
@@ -32810,30 +32830,37 @@ do
     assertEq(bobSnap.txnId, aliasTxn, "val: A Bob keeps immutable alias txnId")
     assertEq(bobSnap.assignmentId, assignmentId, "val: A Bob assignment id")
     assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: A Bob has no alias winner key")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: A bind cleared alias pending")
     local desc = GS.DescribeDonationValuation(bob, bobDonation)
     assertEq(desc.priced, true, "val: A Bob displays price")
     assertEq(desc.totalCopper, total, "val: A Bob displayed total")
     local stDup, reasonDup = providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")
     assertEq(stDup, "duplicate", "val: A redelivery is duplicate not conflict")
-    assertTrue(reasonDup == "duplicate" or reasonDup == nil or reasonDup == "assigned",
-        "val: A duplicate reason " .. tostring(reasonDup))
+    assertEq(reasonDup, "duplicate", "val: A duplicate reason")
     assertEq(valuationCount(bob), 1, "val: A still one winner after redelivery")
 
     -- Conflicting binding: gs:val points at a different live donation.
-    creditValuationDeposit(bob, {
-        itemId = 9820, quantity = 1, occurrenceIndex = 2,
+    SF.TSM = nil
+    local otherEvidence = makeDepositEvidence(bob, {
+        itemId = 9820, quantity = 1, observedAt = world.time + 20, ageHours = 0,
+        occurrenceIndex = 2,
         neighborsOlder = { "bind-other-old" }, neighborsNewer = { "bind-other-new" },
     })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(otherEvidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: A other officer credit on Bob")
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
     bob = GS:GetCurrentRecord()
     local other = valuationFindDonation(bob, 9820, 1)
     assertTrue(other and other.txnId and other.txnId ~= canonical, "val: A other donation")
-    local conflictBody = deepCopy(valBody)
+    assertEq(valuationSnap(bob, other.txnId), nil, "val: A other stays unpriced without TSM")
     local stConflict, reasonConflict = providerApplyWithId(
-        "gs:val:" .. other.txnId, conflictBody, "Alice-Garona")
+        "gs:val:" .. other.txnId, valBody, "Alice-Garona")
     assertEq(stConflict, "rejected", "val: A conflicting binding rejected")
     assertTrue(reasonConflict == "canonical_conflict" or reasonConflict == "inconsistent_donation",
         "val: A conflict reason " .. tostring(reasonConflict))
     assertEq(valuationSnap(bob, other.txnId), nil, "val: A conflict did not price other")
+    assertEq(valuationCount(bob), 1, "val: A conflict keeps original winner")
 
     -- Untrusted / cross-dataset fail closed.
     local stUnauth = select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Dave-Garona"))
@@ -32971,9 +32998,13 @@ do
         "val: B same-count begin")
     assertEq(select(1, GS:BufferAdoptionRecord(descId, baseDesc)), "accepted", "val: B re-pin")
     local same = deepCopy(baseDesc)
+    -- Non-pin field change with the same valuationCount must remain valid.
+    same.bankTab = 2
     local stSame = select(1, GS:BufferAdoptionRecord(descId, same))
     assertEq(stSame, "accepted", "val: B same positive count accepted")
     assertEq(GS._adoption.pinnedValuationCount, 2, "val: B pin unchanged")
+    assertEq(GS:GetPendingAdoption() ~= nil and true or false, true,
+        "val: B adoption remains after same-count descriptor")
     GS._adoption = nil
     assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
         "val: B zero-pin begin")
@@ -33045,96 +33076,97 @@ do
             return valuationTsmValue
         end,
     }
-    local record = activateValuationGuild(9822)
+    local itemId = 9822
+    local record = activateValuationGuild(itemId)
     GS:EnsureGossipProvider()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    local itemId = 9822
-    if not SF.ConsumablesBankLog then
-        loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
-    end
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
     local BankLog = SF.ConsumablesBankLog
+    local O = SF.ConsumablesObservation
     assertTrue(BankLog and BankLog.AdmitGuildSuppliesSnapshot, "val: C BankLog loaded")
-    world.bankTxnRows = { [2] = {} }
-    world.bankTxnCounts = { [2] = 0 }
+    assertTrue(O and O.ListEligibleEvidenceFromSnapshot, "val: C observation loaded")
+    record = GS:GetCurrentRecord()
+    local cfg = record.accounting._consumables
     local n = 5
+    local rows = {}
     for i = 1, n do
-        local link = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r"
-        world.bankTxnRows[2][i] = {
-            "deposit", "Donor" .. i .. "-Garona", link, 1, nil, nil, 0, 0, 0, 0,
+        rows[i] = {
+            type = "deposit",
+            name = "Donor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
         }
     end
-    world.bankTxnCounts[2] = n
-    function GetNumGuildBankTransactions(tab)
-        return world.bankTxnCounts[tab] or 0
-    end
-    function GetGuildBankTransaction(tab, index)
-        local r = world.bankTxnRows[tab] and world.bankTxnRows[tab][index]
-        if not r then
-            return nil
-        end
-        return unpack(r)
-    end
+    local snapshot = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows,
+    }
     local ctx = {
+        source = "guildSupplies",
+        sampleOnly = false,
         campaignId = record.currentCampaignId,
         datasetId = record.datasetId,
-        bankTab = 2,
-        guildGuid = "42",
-        generation = record.accounting and record.accounting._consumables
-            and record.accounting._consumables.generation or 1,
+        bankTab = snapshot.bankTab,
+        guildGuid = snapshot.guildGuid,
+        generation = snapshot.generation,
         profileId = "gs",
-        requestedSet = { [itemId] = true },
+        requestedSet = snapshot.requestedSet,
         observedBy = "Alice-Garona",
-        eligibility = {},
+        eligibility = cfg.eligibility,
     }
-    local O = SF.ConsumablesObservation
-    assertTrue(O and O.BuildSnapshotFromBankLog, "val: C observation helper")
-    local snapshot = O.BuildSnapshotFromBankLog(ctx)
-    assertTrue(type(snapshot) == "table", "val: C snapshot built")
+    assertTrue(#O.ListEligibleEvidenceFromSnapshot(snapshot) >= n,
+        "val: C snapshot yields eligible deposits")
 
     world.notifyChanged = 0
     local uiCount = 0
-    local uiFn = GS.RegisterUIListener(function(reason)
-        if reason == "valuation" or reason == "ledger" or reason == "evidence"
-            or reason == "remote-evidence" then
-            uiCount = uiCount + 1
-        else
-            uiCount = uiCount + 1
-        end
+    GS.RegisterUIListener(function()
+        uiCount = uiCount + 1
     end)
-    local notifyBefore = world.notifyChanged or 0
     local stats = BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
     flushTimers()
     drainExportMaint(64)
     record = GS:GetCurrentRecord()
     local priced = valuationCount(record)
+    assertTrue((stats and (stats.admitted or 0) or 0) >= 3
+            or priced >= 3,
+        "val: C snapshot admitted/priced several admitted="
+            .. tostring(stats and stats.admitted) .. " priced=" .. tostring(priced))
     assertTrue(priced >= 3, "val: C snapshot priced several got=" .. tostring(priced))
-    local notifyDelta = (world.notifyChanged or 0) - notifyBefore
+    local notifyDelta = world.notifyChanged or 0
     assertTrue(notifyDelta >= 1 and notifyDelta <= 4,
         "val: C provider notifies coalesced got=" .. tostring(notifyDelta))
     assertTrue(uiCount >= 1 and uiCount <= 6,
         "val: C UI notifies coalesced got=" .. tostring(uiCount))
-    drainExportMaint(64)
     local exportBodies = collectAllExportBodies()
-    local valExports = 0
-    for i = 1, #exportBodies do
-        if exportBodies[i].body and exportBodies[i].body.kind == "gs-valuation" then
-            valExports = valExports + 1
-        end
-    end
-    assertTrue(valExports >= priced, "val: C exports all valuations")
-
-    -- Peer can receive every valuation.
-    local configRoot = snapshotConfigRoot()
     local aliceVals = filterExportBodies(exportBodies, "gs-valuation")
     local aliceLedgers = filterExportBodies(exportBodies, "gs-ledger-event")
+    assertTrue(#aliceVals >= priced, "val: C exports all valuations")
+
+    -- Peer can receive every valuation through real export ids.
+    local configRoot = snapshotConfigRoot()
     local peer = loadClientFromConfigRoot(configRoot, "Bob-Garona", "Player-1-Bob", 2)
     for i = 1, #aliceLedgers do
-        providerApply(aliceLedgers[i].body, "Alice-Garona")
+        local row = aliceLedgers[i]
+        GG.GetProvider(GS.PROVIDER_ID).api.ValidateAndApply({
+            id = row.id,
+            versionFp = GS.ContentFingerprint(row.body),
+            body = row.body,
+        }, { sender = "Alice-Garona" })
     end
     for i = 1, #aliceVals do
         local row = aliceVals[i]
-        local entry = GG.GetProvider(GS.PROVIDER_ID)
-        entry.api.ValidateAndApply({
+        GG.GetProvider(GS.PROVIDER_ID).api.ValidateAndApply({
             id = row.id,
             versionFp = GS.ContentFingerprint(row.body),
             body = row.body,
@@ -33146,10 +33178,6 @@ do
 
     -- Independent non-batch mint notifies immediately.
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
-    SpectrumFederationDB = { guildSupplies = deepCopy(configRoot) }
-    -- Restore Alice live record with the priced snapshot dataset.
-    initGS()
-    -- Re-activate from a clean valuation guild for the immediate-notify check.
     local immediate = activateValuationGuild(9823)
     GS:EnsureGossipProvider()
     world.notifyChanged = 0
@@ -33163,11 +33191,11 @@ do
         "val: C non-batch mint notifies provider immediately got="
             .. tostring(world.notifyChanged))
     assertTrue(immediateUi >= 1, "val: C non-batch mint notifies UI immediately")
-    assertTrue(type(valuationSnap(GS:GetCurrentRecord(),
-        valuationFindDonation(GS:GetCurrentRecord(), 9823, 2).txnId)) == "table",
+    immediate = GS:GetCurrentRecord()
+    local immEvent = valuationFindDonation(immediate, 9823, 2)
+    assertTrue(type(immEvent) == "table"
+            and type(valuationSnap(immediate, immEvent.txnId)) == "table",
         "val: C non-batch price committed")
-    GetNumGuildBankTransactions = nil
-    GetGuildBankTransaction = nil
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
     assertEq(#world.chat, 0, "val: C stays chat-free")
 end

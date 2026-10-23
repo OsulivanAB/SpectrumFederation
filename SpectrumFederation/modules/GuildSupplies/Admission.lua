@@ -3210,7 +3210,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     local unsettledSeen = false
     while scanned < #adop.order and sliceUsed < sliceBudget do
         scanned = scanned + 1
-        local body = adop.records[adop.order[i]]
+        -- Capture the buffer key before advancing the circular cursor. Later
+        -- admit paths (valuations) need this record id, not the next entry.
+        local recordId = adop.order[i]
+        local body = adop.records[recordId]
         i = i + 1
         if i > #adop.order then
             i = 1
@@ -3538,7 +3541,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             -- source peer only; verified totals come from gs-ledger-event transfer.
             local evidence = body.evidence
             local campId = evidence.campaignId or body.campaignId or temp.currentCampaignId
-            local orderId = adop.order[i]
+            local orderId = recordId
             -- Session-owned occurrence buckets: fingerprint groups candidates;
             -- MatchScore decides same-occurrence (fp alone is not identity).
             -- Index the accepted ledger tail once per session (byId + byOcc) so
@@ -3919,7 +3922,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                         adoptionReplay = true,
                         -- Adoption buffer key is the provider export id
                         -- `gs:val:<canonical>`; carry that binding into admit.
-                        exportRecordId = tostring(adop.order[i]),
+                        exportRecordId = tostring(recordId),
                     })
                 end
                 admissions = admissions + 1
