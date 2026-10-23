@@ -32046,6 +32046,7 @@ do
     -- Finding 1: late canonical cutover provenance keeps pending price after install.
     SF.TSM = nil
     ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    ensureRankedMember("Frank-Garona", "Player-1-Frank", 2)
     local function findByTxn(rec, txnId)
         local events = rec.accounting and rec.accounting._consumableEvents or {}
         for i = 1, #events do
