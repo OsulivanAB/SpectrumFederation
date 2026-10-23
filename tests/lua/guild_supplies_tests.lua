@@ -33082,14 +33082,18 @@ do
     fold = GS:GetCurrentRecord()
     assertTrue(type(fold.valuations.pending[aliasTxn]) == "table",
         "val: A-order unbound under A")
-    assertEq(select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")),
-        "pending", "val: A-order bind folds to C")
+    -- Same immutable body after fold is a fingerprint duplicate under pending[C].
+    local stFold = select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona"))
+    assertTrue(stFold == "pending" or stFold == "duplicate",
+        "val: A-order bind folds to C status=" .. tostring(stFold))
     fold = GS:GetCurrentRecord()
     assertTrue(type(fold.valuations.pending[canonical]) == "table",
         "val: A-order folded pending[C]")
     assertEq(fold.valuations.pending[aliasTxn], nil, "val: A-order folded clears A")
     assertEq(fold.valuations.pending[canonical].assignmentId, assignmentId,
         "val: A-order folded keeps assignment")
+    assertEq(fold.valuations.pending[canonical].txnId, aliasTxn,
+        "val: A-order folded keeps immutable A")
 
     -- Fresh-client adoption with valuations buffered before ledgers.
     SpectrumFederationDB = {}
