@@ -461,7 +461,8 @@ end
 -- @return boolean True on success, false on failure
 -- @return string|nil Error message if failed
 function Store:ResetPath(path)
-	local def = self:GetDefault(path)
+	-- Method name is GetDefaults (plural); keep ResetPath working for section resets.
+	local def = self:GetDefaults(path)
 	if def == nil then
 		return false, "No default exists for: " .. tostring(path)
 	end

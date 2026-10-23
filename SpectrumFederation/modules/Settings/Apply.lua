@@ -42,6 +42,11 @@ function Apply:Init()
         end)
     end)
 
+    -- Live while dragging: apply backdrop opacity immediately (no debounce).
+    store:RegisterCallback("global.settingsWindowOpacity", function(newValue)
+        self:ApplySettingsWindowOpacity(newValue)
+    end)
+
     store:RegisterCallback("lootHelper.enabled", function(newValue)
         self:Debounce("lootHelperEnabled", 0.1, function()
             self:RunOrDefer(function()
@@ -150,6 +155,7 @@ function Apply:ApplyAll()
     self:ApplyWindowStyle(store:Get("global.windowStyle"))
     self:ApplyFontStyle(store:Get("global.fontStyle"))
     self:ApplyFontSize(store:Get("global.fontSize"))
+    self:ApplySettingsWindowOpacity(store:Get("global.settingsWindowOpacity"))
 
     self:ApplyLootHelperEnabled(store:Get("lootHelper.enabled"))
     self:ApplyActiveProfileChange(store:Get("lootHelper.activeProfile"), nil)
@@ -192,6 +198,20 @@ function Apply:ApplyFontSize(value)
         SF.Debug:Verbose("SETTINGS", "Applying font size: %s", tostring(value))
     end
     -- TODO: implement
+end
+
+-- Apply standalone settings window backdrop opacity (percent).
+-- Backdrop only; does not change frame/text/control alpha.
+-- @param value number|nil Opacity percent from the store
+-- @return nil
+function Apply:ApplySettingsWindowOpacity(value)
+    if SF.Debug then
+        SF.Debug:Verbose("SETTINGS", "Applying settings window opacity: %s", tostring(value))
+    end
+    local win = SF.SettingsWindow
+    if win and win.ApplySettingsWindowOpacity then
+        win:ApplySettingsWindowOpacity(value)
+    end
 end
 
 -- Apply loot helper enabled/disabled state

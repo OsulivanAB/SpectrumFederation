@@ -11,6 +11,9 @@ SF.SettingsSchema = {
 			windowStyle = "Default",
 			fontStyle   = "Friz Quadrata",
 			fontSize    = 12,
+			-- Account-local settings window backdrop opacity (percent).
+			-- Matches StandaloneWindow default backdrop alpha (0.70).
+			settingsWindowOpacity = 70,
 		},
 
 		lootHelper = {
