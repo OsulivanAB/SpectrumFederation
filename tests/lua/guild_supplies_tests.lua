@@ -33266,6 +33266,11 @@ do
     assertTrue(type(exportD) == "table" and type(exportD.body) == "table", "val: uniq export D")
     local bodyC = deepCopy(exportC.body)
     local bodyD = deepCopy(exportD.body)
+    -- Fresh-peer attack shape: immutable assignment still names a source-only
+    -- alias A. Item/quantity match both C and D, so export binding alone must
+    -- keep one assignmentId from pricing two donations.
+    local sharedAlias = "ctx:uniq-shared-alias-9830"
+    bodyC.assignment.txnId = sharedAlias
     local ledgerBodies = filterExportBodies(collectAllExportBodies(), "gs-ledger-event")
     local configRoot = snapshotConfigRoot()
 
@@ -33293,6 +33298,8 @@ do
     assertTrue(type(valuationSnap(bob, canonicalC)) == "table", "val: uniq C winner")
     assertEq(valuationSnap(bob, canonicalC).assignmentId, bodyC.assignment.assignmentId,
         "val: uniq C keeps assignment")
+    assertEq(valuationSnap(bob, canonicalC).txnId, sharedAlias,
+        "val: uniq C keeps immutable alias txnId")
     local stDupC = select(1, providerApplyWithId("gs:val:" .. canonicalC, bodyC, "Alice-Garona"))
     assertEq(stDupC, "duplicate", "val: uniq C redelivery duplicate")
     local stClash, reasonClash = providerApplyWithId("gs:val:" .. canonicalD, bodyC, "Alice-Garona")
