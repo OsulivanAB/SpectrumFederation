@@ -1,6 +1,13 @@
 -- modules/UI/Settings/Pages/General.lua
 local _, SF = ...
 
+local function Loc(key, default)
+	if SF.LocaleText then
+		return SF.LocaleText(key, default)
+	end
+	return default or key
+end
+
 local Page = {
 	id = "general",
 	name = "General",
@@ -69,8 +76,11 @@ function Page:Build(panel)
 
 					{
 						type = "slider",
-						label = "Settings Window Opacity",
-						tooltip = "Adjust the opacity of the settings window background only. Text and controls stay fully opaque. 100% is fully opaque; lower values show more of the game underneath.",
+						label = Loc("SETTINGS_WINDOW_OPACITY_LABEL", "Settings Window Opacity"),
+						tooltip = Loc(
+							"SETTINGS_WINDOW_OPACITY_TOOLTIP",
+							"Adjust the opacity of the settings window background only. Text and controls stay fully opaque. 100% is fully opaque; lower values show more of the game underneath."
+						),
 						path = "global.settingsWindowOpacity",
 						min = 70,
 						max = 100,

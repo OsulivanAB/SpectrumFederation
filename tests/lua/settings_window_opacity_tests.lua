@@ -258,6 +258,55 @@ local function resetDb()
     Store:Init()
 end
 
+-- Localization keys for the General-page slider (#418 follow-up)
+do
+    local localeChunk = assert(loadfile("SpectrumFederation/locale/enUS.lua"))
+    local localeNs = {}
+    localeChunk("SpectrumFederation", localeNs)
+    assertEq(
+        localeNs.L["SETTINGS_WINDOW_OPACITY_LABEL"],
+        "Settings Window Opacity",
+        "enUS defines SETTINGS_WINDOW_OPACITY_LABEL"
+    )
+    assertTrue(
+        type(localeNs.L["SETTINGS_WINDOW_OPACITY_TOOLTIP"]) == "string"
+            and localeNs.L["SETTINGS_WINDOW_OPACITY_TOOLTIP"] ~= "",
+        "enUS defines SETTINGS_WINDOW_OPACITY_TOOLTIP"
+    )
+    assertEq(
+        localeNs.LocaleText("SETTINGS_WINDOW_OPACITY_LABEL", "fallback"),
+        "Settings Window Opacity",
+        "LocaleText resolves SETTINGS_WINDOW_OPACITY_LABEL"
+    )
+    assertEq(
+        localeNs.LocaleText("SETTINGS_WINDOW_OPACITY_MISSING", "fallback label"),
+        "fallback label",
+        "LocaleText falls back when opacity key is missing"
+    )
+
+    local generalSource = assert(io.open("SpectrumFederation/modules/UI/Settings/Pages/General.lua", "r")):read("*a")
+    assertTrue(
+        generalSource:find('Loc("SETTINGS_WINDOW_OPACITY_LABEL"', 1, true) ~= nil,
+        "General.lua uses Loc for SETTINGS_WINDOW_OPACITY_LABEL"
+    )
+    assertTrue(
+        generalSource:find('Loc(', 1, true) ~= nil
+            and generalSource:find("SETTINGS_WINDOW_OPACITY_TOOLTIP", 1, true) ~= nil,
+        "General.lua uses Loc for SETTINGS_WINDOW_OPACITY_TOOLTIP"
+    )
+    assertTrue(
+        generalSource:find("SF.LocaleText", 1, true) ~= nil,
+        "General.lua Loc helper routes through SF.LocaleText"
+    )
+
+    local toc = assert(io.open("SpectrumFederation/SpectrumFederation.toc", "r")):read("*a")
+    local localePos = toc:find("locale/enUS.lua", 1, true)
+    local generalPos = toc:find("modules/UI/Settings/Pages/General.lua", 1, true)
+    assertTrue(localePos ~= nil, "TOC lists locale/enUS.lua")
+    assertTrue(generalPos ~= nil, "TOC lists General.lua")
+    assertTrue(localePos < generalPos, "TOC loads locale/enUS.lua before General.lua")
+end
+
 -- Schema default
 assertEq(
     SF.SettingsSchema.DEFAULTS.global.settingsWindowOpacity,
