@@ -33480,6 +33480,222 @@ do
 end
 
 do
+    -- discussion_r4364379656: adoption completeness binds each gs:val:<canonical>.
+    local function listDonations(record, itemId, quantity)
+        local out = {}
+        local lists = {
+            record and record.accounting and record.accounting._consumableEvents,
+            record and record.accounting and record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    local ev = list[i]
+                    if type(ev) == "table"
+                        and (ev.type == "donation" or ev.type == GS.LEDGER_EVENT.DONATION)
+                        and tonumber(ev.itemId) == itemId
+                        and tonumber(ev.quantity) == quantity then
+                        out[#out + 1] = ev
+                    end
+                end
+            end
+        end
+        return out
+    end
+    local function stripEvidencePins(adop, sourceDataset)
+        if type(adop) ~= "table" or type(adop.records) ~= "table" then
+            return
+        end
+        local desc = adop.records["gs:desc:" .. sourceDataset]
+        if type(desc) == "table" then
+            desc.donationEvidenceCount = 0
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    local function commitAdoptionOrDrain()
+        GS._adoptionReplaySyncDrain = true
+        local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        local guard = 0
+        while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+            guard = guard + 1
+            flushTimers()
+            world.time = (world.time or 0) + 1
+            flushTimers()
+        end
+        if stAdopt == "pending" then
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        end
+        return stAdopt, reasonAdopt
+    end
+
+    valuationTsmValue = 55
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9840)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local ev1 = makeDepositEvidence(record, {
+        itemId = 9840, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "bind-old-1" }, neighborsNewer = { "bind-new-1" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev1, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: bind first officer credit")
+    world.time = (world.time or 0) + 30
+    record = GS:GetCurrentRecord()
+    local ev2 = makeDepositEvidence(record, {
+        itemId = 9840, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "bind-old-2" }, neighborsNewer = { "bind-new-2" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev2, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: bind second officer credit")
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local donations = listDonations(record, 9840, 2)
+    assertEq(#donations, 2, "val: bind two donations")
+    local canonicalC1 = donations[1].txnId
+    local canonicalC2 = donations[2].txnId
+    assertTrue(canonicalC1 ~= canonicalC2, "val: bind distinct canonicals")
+    local snap1 = valuationSnap(record, canonicalC1)
+    local snap2 = valuationSnap(record, canonicalC2)
+    assertTrue(type(snap1) == "table" and type(snap2) == "table", "val: bind both priced")
+    assertTrue(snap1.assignmentId ~= snap2.assignmentId, "val: bind distinct assignment ids")
+    local export1 = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalC1)
+    local export2 = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalC2)
+    assertTrue(type(export1) == "table" and type(export2) == "table", "val: bind exports")
+    local bodyC1 = deepCopy(export1.body)
+    local bodyC2 = deepCopy(export2.body)
+    -- Alias shape still supported for the legitimate path.
+    local aliasTxn = "ctx:bind-alias-9840"
+    bodyC1.assignment.txnId = aliasTxn
+    local aliceExport = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    local liveDataset = nil
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    liveDataset = GS:GetCurrentRecord().datasetId
+    local keepVal = {
+        schemaVersion = 1, nextSeq = 2, pending = {},
+        byTxn = {
+            ["ctx:bind-keep"] = {
+                assignmentId = "gsv1:dddddddddddddddddddddddd:00009840",
+                assignedAt = 3, unitCopper = 1, quantity = 1, totalCopper = 1,
+                itemId = 1, txnId = "ctx:bind-keep", canonicalTxnId = "ctx:bind-keep",
+                datasetId = liveDataset, guildKey = "club:42",
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona", seen = {},
+            },
+        },
+    }
+    GS:GetCurrentRecord().valuations = keepVal
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: bind bad adoption begins")
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: bind buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    -- Malformed source: both canonical records carry the same immutable assignment.
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            local rid = row.id
+            if type(rid) ~= "string" or rid:sub(1, 7) ~= "gs:val:" then
+                if row.body.assignment and row.body.assignment.txnId == canonicalC1 then
+                    rid = "gs:val:" .. canonicalC1
+                else
+                    rid = "gs:val:" .. canonicalC2
+                end
+            end
+            bufferRow({ id = rid, body = deepCopy(bodyC1) })
+        elseif kind == "gs-evidence" then
+            -- officer ledger carries credit
+        else
+            bufferRow(row)
+        end
+    end
+    -- Ensure both provider IDs are present even if export order collapsed.
+    bufferRow({ id = "gs:val:" .. canonicalC1, body = deepCopy(bodyC1) })
+    bufferRow({ id = "gs:val:" .. canonicalC2, body = deepCopy(bodyC1) })
+    local stDup = select(1, GS:BufferAdoptionRecord("gs:val:" .. canonicalC1, deepCopy(bodyC1)))
+    assertEq(stDup, "duplicate", "val: bind exact redelivery duplicate")
+    assertEq(GS._adoption and GS._adoption.pinnedValuationCount, 2,
+        "val: bind pinned count 2")
+    stripEvidencePins(GS._adoption, sourceDataset)
+    local stBad, reasonBad = commitAdoptionOrDrain()
+    assertEq(stBad, "rejected", "val: bind incomplete commit rejected " .. tostring(reasonBad))
+    assertEq(reasonBad, "incomplete_transfer", "val: bind incomplete_transfer")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: bind live dataset preserved")
+    assertTrue(GS:GetCurrentRecord().valuations.byTxn["ctx:bind-keep"] ~= nil,
+        "val: bind live valuations preserved")
+    assertEq(valuationSnap(GS:GetCurrentRecord(), canonicalC1), nil,
+        "val: bind did not install partial transfer")
+
+    -- Distinct legitimate assignments for both donations succeed (alias on C1).
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: bind good adoption begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            local rid = row.id
+            if type(rid) ~= "string" or rid:sub(1, 7) ~= "gs:val:" then
+                rid = "gs:val:" .. ((row.body.assignment and row.body.assignment.txnId) or canonicalC1)
+            end
+            local body = deepCopy(bodyC2)
+            if rid == ("gs:val:" .. canonicalC1) or (row.body.assignment
+                and row.body.assignment.assignmentId == snap1.assignmentId) then
+                body = deepCopy(bodyC1)
+                rid = "gs:val:" .. canonicalC1
+            else
+                rid = "gs:val:" .. canonicalC2
+            end
+            bufferRow({ id = rid, body = body })
+        elseif kind == "gs-evidence" then
+            -- skip
+        else
+            bufferRow(row)
+        end
+    end
+    bufferRow({ id = "gs:val:" .. canonicalC1, body = deepCopy(bodyC1) })
+    bufferRow({ id = "gs:val:" .. canonicalC2, body = deepCopy(bodyC2) })
+    stripEvidencePins(GS._adoption, sourceDataset)
+    local stGood, reasonGood = commitAdoptionOrDrain()
+    assertEq(stGood, "accepted", "val: bind good commits " .. tostring(reasonGood))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: bind adopted dataset")
+    local a1 = valuationSnap(adopted, canonicalC1)
+    local a2 = valuationSnap(adopted, canonicalC2)
+    assertTrue(type(a1) == "table" and type(a2) == "table", "val: bind both winners")
+    assertEq(a1.assignmentId, bodyC1.assignment.assignmentId, "val: bind C1 assignment")
+    assertEq(a1.txnId, aliasTxn, "val: bind C1 alias txnId")
+    assertEq(a2.assignmentId, bodyC2.assignment.assignmentId, "val: bind C2 assignment")
+    assertEq(valuationCount(adopted), 2, "val: bind count 2")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: bind stays chat-free")
+end
+
+do
     -- Group B: pinned valuationCount cannot be omitted; malformed bodies do not count.
     SF.TSM = {
         GetMarketValue = function()
@@ -33627,17 +33843,29 @@ do
 end
 
 do
-    -- Group C: bank-snapshot batch coalesces valuation NotifyProviderChanged / NotifyUI.
+    -- Group C: bank-snapshot batch coalesces valuation NotifyProviderChanged / NotifyUI
+    -- and reuses DBMarket reads per distinct price-query key (discussion_r4364379664).
+    valuationTsmCalls = 0
+    local tsmByKey = {}
     valuationTsmValue = 100
     SF.TSM = {
-        GetMarketValue = function()
+        GetMarketValue = function(item)
+            valuationTsmCalls = valuationTsmCalls + 1
+            local key = type(item) == "number" and ("n:" .. item) or ("s:" .. tostring(item))
+            tsmByKey[key] = (tsmByKey[key] or 0) + 1
+            if type(valuationTsmValue) == "function" then
+                return valuationTsmValue(item)
+            end
             return valuationTsmValue
         end,
     }
     local itemId = 9822
+    local otherItemId = 9824
     local record = activateValuationGuild(itemId)
     GS:EnsureGossipProvider()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Include a second item id in the snapshot requested set / rows. Campaign
+    -- eligibility may or may not admit it; same-item caching is the primary assert.
     loadModule("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
     loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
     local BankLog = SF.ConsumablesBankLog
@@ -33646,6 +33874,19 @@ do
     assertTrue(O and O.ListEligibleEvidenceFromSnapshot, "val: C observation loaded")
     record = GS:GetCurrentRecord()
     local cfg = record.accounting._consumables
+    -- Plant a second campaign item so the snapshot can admit a distinct key.
+    if type(cfg.requestedItems) ~= "table" then
+        cfg.requestedItems = {}
+    end
+    cfg.requestedItems[tostring(otherItemId)] = { itemId = otherItemId, goal = 10 }
+    if type(cfg.eligibility) ~= "table" then
+        cfg.eligibility = { items = {} }
+    end
+    if type(cfg.eligibility.items) ~= "table" then
+        cfg.eligibility.items = {}
+    end
+    cfg.eligibility.items[tostring(otherItemId)] =
+        tonumber(cfg.eligibility.tabEligibleFrom) or (world.time or 1)
     local n = 5
     local rows = {}
     for i = 1, n do
@@ -33660,6 +33901,16 @@ do
             index = i,
         }
     end
+    rows[#rows + 1] = {
+        type = "deposit",
+        name = "DonorOther-Garona",
+        itemLink = "|cffffffff|Hitem:" .. otherItemId .. "::::::::|h[Other]|h|r",
+        itemID = otherItemId,
+        count = 2,
+        year = 0, month = 0, day = 0, hour = 0,
+        ageHours = 0,
+        index = n + 1,
+    }
     local snapshot = {
         guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
         bankTab = tonumber(cfg.bankTab) or 2,
@@ -33667,7 +33918,7 @@ do
         observedBy = "Alice-Garona",
         observedAt = world.time,
         eligibility = cfg.eligibility,
-        requestedSet = { [itemId] = true },
+        requestedSet = { [itemId] = true, [otherItemId] = true },
         rows = rows,
     }
     local ctx = {
@@ -33691,6 +33942,8 @@ do
     GS.RegisterUIListener(function()
         uiCount = uiCount + 1
     end)
+    valuationTsmCalls = 0
+    tsmByKey = {}
     local stats = BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
     flushTimers()
     drainExportMaint(64)
@@ -33701,11 +33954,225 @@ do
         "val: C snapshot admitted/priced several admitted="
             .. tostring(stats and stats.admitted) .. " priced=" .. tostring(priced))
     assertTrue(priced >= 3, "val: C snapshot priced several got=" .. tostring(priced))
+    -- One TSM read per distinct price-query key in this completed snapshot.
+    local distinctKeys = 0
+    for _ in pairs(tsmByKey) do
+        distinctKeys = distinctKeys + 1
+    end
+    assertEq(distinctKeys, 2,
+        "val: C snapshot distinct TSM keys got=" .. tostring(distinctKeys))
+    assertEq(valuationTsmCalls, 2,
+        "val: C snapshot one TSM read per key calls=" .. tostring(valuationTsmCalls))
+    for key, count in pairs(tsmByKey) do
+        assertEq(count, 1, "val: C snapshot key queried once " .. tostring(key))
+    end
+    assertTrue(priced >= 6, "val: C both items priced got=" .. tostring(priced))
     local notifyDelta = world.notifyChanged or 0
     assertTrue(notifyDelta >= 1 and notifyDelta <= 4,
         "val: C provider notifies coalesced got=" .. tostring(notifyDelta))
     assertTrue(uiCount >= 1 and uiCount <= 6,
         "val: C UI notifies coalesced got=" .. tostring(uiCount))
+
+    -- A later completed snapshot must query again (cache not shared).
+    local callsAfterFirst = valuationTsmCalls
+    world.time = (world.time or 0) + 60
+    local rows2 = {
+        {
+            type = "deposit",
+            name = "DonorLater-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = 1,
+        },
+    }
+    local snapshot2 = {
+        guildGuid = snapshot.guildGuid,
+        bankTab = snapshot.bankTab,
+        generation = snapshot.generation,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows2,
+    }
+    local ctx2 = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = snapshot2.bankTab,
+        guildGuid = snapshot2.guildGuid,
+        generation = snapshot2.generation,
+        profileId = "gs",
+        requestedSet = snapshot2.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(ctx2, snapshot2)
+    flushTimers()
+    assertTrue(valuationTsmCalls > callsAfterFirst,
+        "val: C second snapshot re-queries TSM got=" .. tostring(valuationTsmCalls))
+
+    -- Zero is a real cached price; nil miss is reused within one snapshot.
+    local zeroGuild = activateValuationGuild(9826)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    valuationTsmValue = 0
+    valuationTsmCalls = 0
+    tsmByKey = {}
+    local zeroRows = {}
+    for i = 1, 3 do
+        zeroRows[i] = {
+            type = "deposit",
+            name = "ZeroDonor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:9826::::::::|h[Zero]|h|r",
+            itemID = 9826,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    local zeroSnap = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [9826] = true },
+        rows = zeroRows,
+    }
+    local zeroCtx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = zeroSnap.bankTab,
+        guildGuid = zeroSnap.guildGuid,
+        generation = zeroSnap.generation,
+        profileId = "gs",
+        requestedSet = zeroSnap.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(zeroCtx, zeroSnap)
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationTsmCalls, 1, "val: C zero price queried once")
+    assertTrue(valuationCount(record) >= 3, "val: C zero priced donations")
+    local zeroEvent = valuationFindDonation(record, 9826, 1)
+    assertTrue(zeroEvent ~= nil, "val: C zero donation present")
+    local zeroSnapVal = valuationSnap(record, zeroEvent.txnId)
+    assertTrue(type(zeroSnapVal) == "table" and zeroSnapVal.unitCopper == 0,
+        "val: C zero is a real unit price")
+
+    local missGuild = activateValuationGuild(9827)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    valuationTsmValue = nil
+    valuationTsmCalls = 0
+    local missRows = {}
+    for i = 1, 3 do
+        missRows[i] = {
+            type = "deposit",
+            name = "MissDonor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:9827::::::::|h[Miss]|h|r",
+            itemID = 9827,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    local missSnap = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [9827] = true },
+        rows = missRows,
+    }
+    local missCtx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = missSnap.bankTab,
+        guildGuid = missSnap.guildGuid,
+        generation = missSnap.generation,
+        profileId = "gs",
+        requestedSet = missSnap.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(missCtx, missSnap)
+    flushTimers()
+    assertEq(valuationTsmCalls, 1, "val: C nil miss queried once")
+    assertEq(valuationCount(GS:GetCurrentRecord()), 0, "val: C nil miss leaves unpriced")
+
+    -- Restore priced snapshot state for peer export checks below.
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    record = activateValuationGuild(itemId)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    cfg = record.accounting._consumables
+    local peerRows = {}
+    for i = 1, n do
+        peerRows[i] = {
+            type = "deposit",
+            name = "Donor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    snapshot = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = peerRows,
+    }
+    ctx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = snapshot.bankTab,
+        guildGuid = snapshot.guildGuid,
+        generation = snapshot.generation,
+        profileId = "gs",
+        requestedSet = snapshot.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
+    flushTimers()
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    priced = valuationCount(record)
+    assertTrue(priced >= 3, "val: C peer-export source priced")
     local exportBodies = collectAllExportBodies()
     local aliceVals = filterExportBodies(exportBodies, "gs-valuation")
     local aliceLedgers = filterExportBodies(exportBodies, "gs-ledger-event")

@@ -1264,6 +1264,10 @@ local function ParseValuationExportCanonical(recordId)
     return canonical, true
 end
 
+function GS.ParseValuationExportCanonical(recordId)
+    return ParseValuationExportCanonical(recordId)
+end
+
 --- Admit one gossip or adoption valuation body.
 -- Transport sender authority is opts.member. Actor fields are stored, not trusted.
 -- opts.exportRecordId / opts.exportCanonicalTxnId carry the provider binding
@@ -1576,6 +1580,62 @@ local function QueryMarket(item)
     return NormalizeCopper(value, MAX_EXACT - 1)
 end
 
+-- Runtime-only DBMarket cache for one completed bank-snapshot admission.
+-- Nested Begin/End; cleared at the outermost End. Not SavedVariables.
+local snapshotMarketDepth = 0
+local snapshotMarketCache = nil
+
+local function MarketCacheKey(item)
+    if type(item) == "number" then
+        return "n:" .. tostring(item)
+    end
+    return "s:" .. tostring(item)
+end
+
+function GS.BeginValuationSnapshotMarketCache()
+    snapshotMarketDepth = (tonumber(snapshotMarketDepth) or 0) + 1
+    if snapshotMarketDepth == 1 then
+        snapshotMarketCache = {}
+    end
+end
+
+function GS.EndValuationSnapshotMarketCache()
+    local depth = tonumber(snapshotMarketDepth) or 0
+    if depth <= 0 then
+        snapshotMarketDepth = 0
+        snapshotMarketCache = nil
+        return
+    end
+    depth = depth - 1
+    snapshotMarketDepth = depth
+    if depth == 0 then
+        snapshotMarketCache = nil
+    end
+end
+
+--- Query DBMarket, reusing results only while a snapshot market cache is open.
+-- Ordinary mint and Logs catch-up call QueryMarket / CachedCopper directly.
+local function QueryMarketForSnapshotMint(item)
+    if type(snapshotMarketCache) ~= "table" then
+        return QueryMarket(item)
+    end
+    local key = MarketCacheKey(item)
+    local cached = snapshotMarketCache[key]
+    if cached ~= nil then
+        if cached == false then
+            return nil
+        end
+        return cached
+    end
+    local copper = QueryMarket(item)
+    if copper == nil then
+        snapshotMarketCache[key] = false
+        return nil
+    end
+    snapshotMarketCache[key] = copper
+    return copper
+end
+
 local function PriceQueryItem(evidence, event)
     if type(evidence) == "table" then
         if type(evidence.itemLink) == "string" and evidence.itemLink ~= "" then
@@ -1685,7 +1745,9 @@ function GS.TryAssignDonationValuation(record, event, evidence)
     if LookupSnap(record, EventTxn(event)) then
         return false
     end
-    local copper = QueryMarket(PriceQueryItem(evidence, event))
+    -- Snapshot admission may reuse per-item DBMarket results for this batch.
+    -- Outside Begin/EndValuationSnapshotMarketCache this is a direct query.
+    local copper = QueryMarketForSnapshotMint(PriceQueryItem(evidence, event))
     if copper == nil then
         return false
     end
@@ -1859,18 +1921,11 @@ local function DiscoverUnpriced(record, gen)
     return visits
 end
 
-local function CacheKey(item)
-    if type(item) == "number" then
-        return "n:" .. tostring(item)
-    end
-    return "s:" .. tostring(item)
-end
-
 local function CachedCopper(item)
     if type(catchup.cache) ~= "table" then
         catchup.cache = {}
     end
-    local key = CacheKey(item)
+    local key = MarketCacheKey(item)
     local cached = catchup.cache[key]
     if cached ~= nil then
         if cached == false then

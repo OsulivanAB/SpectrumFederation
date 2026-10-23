@@ -358,6 +358,13 @@ function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
         })
     end
     local beganBatch = false
+    local beganMarket = false
+    -- One completed snapshot: reuse DBMarket reads for identical price-query
+    -- keys while still minting a separate immutable assignment per donation.
+    if GS.BeginValuationSnapshotMarketCache then
+        GS.BeginValuationSnapshotMarketCache()
+        beganMarket = true
+    end
     if GS.BeginLocalDurableNotifyBatch then
         GS.BeginLocalDurableNotifyBatch()
         beganBatch = true
@@ -390,6 +397,9 @@ function BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
     end
     if beganBatch and GS.EndLocalDurableNotifyBatch then
         GS.EndLocalDurableNotifyBatch()
+    end
+    if beganMarket and GS.EndValuationSnapshotMarketCache then
+        GS.EndValuationSnapshotMarketCache()
     end
     return stats
 end

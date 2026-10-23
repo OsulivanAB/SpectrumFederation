@@ -3905,12 +3905,13 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 end
             end
         elseif body.kind == "gs-valuation" and type(body.assignment) == "table" then
-            -- One attempt per immutable assignment. A later scan that reports
-            -- duplicate must not keep the replay wave alive (earliest-wins is
-            -- settled on the first admit; donation admit reconciles pending).
+            -- One attempt per provider record + immutable assignment. Distinct
+            -- gs:val:<canonical> bindings must not collapse when they share the
+            -- same assignmentId/txnId; exact same-record redelivery stays settled.
             state.valuationSeen = state.valuationSeen or {}
             local asg = body.assignment
-            local seenKey = tostring(asg.assignmentId or "")
+            local seenKey = tostring(recordId)
+                .. "\0" .. tostring(asg.assignmentId or "")
                 .. "\0" .. tostring(asg.txnId or "")
             if not state.valuationSeen[seenKey] then
                 if sliceUsed >= sliceBudget then
@@ -3938,7 +3939,8 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 sliceUsed = sliceUsed + 1
                 -- Temporary pending capacity can free when donations later
                 -- promote pending valuations. Retry only rejected/full; keep
-                -- malformed, unauthorized, and id_conflict terminal.
+                -- malformed, unauthorized, id_conflict, and assignment_bound
+                -- terminal so completeness can fail closed.
                 if stVal == "rejected" and reasonVal == "full" then
                     unsettledSeen = true
                 else
@@ -4232,18 +4234,6 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
     if start < 1 then
         start = 1
     end
-    if type(opts.valuationIds) ~= "table" then
-        local valuationIds = {}
-        local byTxn = temp.valuations and temp.valuations.byTxn
-        if type(byTxn) == "table" then
-            for _, snap in pairs(byTxn) do
-                if type(snap) == "table" and type(snap.assignmentId) == "string" then
-                    valuationIds[snap.assignmentId] = true
-                end
-            end
-        end
-        opts.valuationIds = valuationIds
-    end
     local function publishCompletenessStats()
         local finiteBudget = budget
         if finiteBudget == math.huge then
@@ -4257,6 +4247,35 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             budgetExhausted = opts.budgetExhausted == true,
         }
     end
+    local function ValuationCanonicalFromRecordId(recordId)
+        if type(GS.ParseValuationExportCanonical) == "function" then
+            local canonical, isVal = GS.ParseValuationExportCanonical(recordId)
+            if isVal then
+                return canonical
+            end
+            return nil
+        end
+        if type(recordId) ~= "string" or recordId:sub(1, 7) ~= "gs:val:" then
+            return nil
+        end
+        local canonical = recordId:sub(8)
+        if canonical == "" or #canonical > (GS.MAX_TXN_ID or 160) then
+            return nil
+        end
+        return canonical
+    end
+    local function SnapMatchesBufferedAssignment(snap, assignment)
+        if type(snap) ~= "table" or type(assignment) ~= "table" then
+            return false
+        end
+        return snap.assignmentId == assignment.assignmentId
+            and snap.txnId == assignment.txnId
+            and tonumber(snap.assignedAt) == tonumber(assignment.assignedAt)
+            and tonumber(snap.unitCopper) == tonumber(assignment.unitCopper)
+            and tonumber(snap.quantity) == tonumber(assignment.quantity)
+            and tonumber(snap.totalCopper) == tonumber(assignment.totalCopper)
+            and tonumber(snap.itemId) == tonumber(assignment.itemId)
+    end
     for i = start, #adop.order do
         if visited >= budget then
             opts.cursor = i
@@ -4264,13 +4283,21 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             publishCompletenessStats()
             return false, "budget"
         end
-        local body = adop.records[adop.order[i]]
+        local recordId = adop.order[i]
+        local body = adop.records[recordId]
         visited = visited + 1
         adop._workStats.completenessVisited = (adop._workStats.completenessVisited or 0) + 1
         if type(body) == "table" and body.kind == "gs-valuation"
             and type(body.assignment) == "table" then
-            local assignmentId = body.assignment.assignmentId
-            if type(assignmentId) ~= "string" or not opts.valuationIds[assignmentId] then
+            -- Each buffered gs:val:<canonical> must be represented by the
+            -- matching accepted winner under that exact donation key.
+            local canonical = ValuationCanonicalFromRecordId(recordId)
+            local snap = canonical
+                and temp.valuations
+                and type(temp.valuations.byTxn) == "table"
+                and temp.valuations.byTxn[canonical]
+                or nil
+            if not canonical or not SnapMatchesBufferedAssignment(snap, body.assignment) then
                 opts.cursor = nil
                 opts.budgetExhausted = false
                 publishCompletenessStats()
