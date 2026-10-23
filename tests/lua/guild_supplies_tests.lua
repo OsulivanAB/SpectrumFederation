@@ -33184,6 +33184,295 @@ do
 end
 
 do
+    -- discussion_r4363901606: one assignmentId cannot price two distinct donations.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: uniq provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function listDonations(record, itemId, quantity)
+        local out = {}
+        local lists = {
+            record and record.accounting and record.accounting._consumableEvents,
+            record and record.accounting and record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    local ev = list[i]
+                    if type(ev) == "table"
+                        and (ev.type == "donation" or ev.type == GS.LEDGER_EVENT.DONATION)
+                        and tonumber(ev.itemId) == itemId
+                        and tonumber(ev.quantity) == quantity then
+                        out[#out + 1] = ev
+                    end
+                end
+            end
+        end
+        return out
+    end
+
+    valuationTsmValue = 40
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9830)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local ev1 = makeDepositEvidence(record, {
+        itemId = 9830, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "uniq-old-1" }, neighborsNewer = { "uniq-new-1" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev1, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: uniq first officer credit")
+    world.time = (world.time or 0) + 30
+    record = GS:GetCurrentRecord()
+    local ev2 = makeDepositEvidence(record, {
+        itemId = 9830, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "uniq-old-2" }, neighborsNewer = { "uniq-new-2" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev2, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: uniq second officer credit")
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local donations = listDonations(record, 9830, 2)
+    assertEq(#donations, 2, "val: uniq two same-item donations")
+    local canonicalC = donations[1].txnId
+    local canonicalD = donations[2].txnId
+    assertTrue(canonicalC ~= canonicalD, "val: uniq distinct txn ids")
+    local snapC = valuationSnap(record, canonicalC)
+    local snapD = valuationSnap(record, canonicalD)
+    assertTrue(type(snapC) == "table", "val: uniq C priced")
+    assertTrue(type(snapD) == "table", "val: uniq D priced independently")
+    assertTrue(snapC.assignmentId ~= snapD.assignmentId, "val: uniq independent assignment ids")
+    local totalC = snapC.totalCopper
+    local totalD = snapD.totalCopper
+    GS.NoteValuationExported(record, canonicalC)
+    GS.NoteValuationExported(record, canonicalD)
+    drainExportMaint(64)
+    local exportC = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalC)
+    local exportD = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalD)
+    assertTrue(type(exportC) == "table" and type(exportC.body) == "table", "val: uniq export C")
+    assertTrue(type(exportD) == "table" and type(exportD.body) == "table", "val: uniq export D")
+    local bodyC = deepCopy(exportC.body)
+    local bodyD = deepCopy(exportD.body)
+    local ledgerBodies = filterExportBodies(collectAllExportBodies(), "gs-ledger-event")
+    local configRoot = snapshotConfigRoot()
+
+    SF.TSM = nil
+    local bobRoot = deepCopy(configRoot)
+    local bobGuild = bobRoot.guilds and bobRoot.guilds["club:42"]
+    if type(bobGuild) == "table" then
+        bobGuild.valuations = nil
+    end
+    local bob = loadClientFromConfigRoot(bobRoot, "Bob-Garona", "Player-1-Bob", 2)
+    for i = 1, #ledgerBodies do
+        local row = ledgerBodies[i]
+        local ev = row.body and row.body.event
+        if ev and tonumber(ev.itemId) == 9830 and tonumber(ev.quantity) == 2 then
+            assertEq(select(1, providerApplyWithId(row.id, row.body, "Alice-Garona")), "accepted",
+                "val: uniq Bob ledger " .. tostring(ev.txnId))
+        end
+    end
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationCount(bob), 0, "val: uniq Bob starts unpriced")
+    assertEq(#listDonations(bob, 9830, 2), 2, "val: uniq Bob has both donations")
+    local stC, reasonC = providerApplyWithId("gs:val:" .. canonicalC, bodyC, "Alice-Garona")
+    assertEq(stC, "accepted", "val: uniq bind C " .. tostring(reasonC))
+    bob = GS:GetCurrentRecord()
+    assertTrue(type(valuationSnap(bob, canonicalC)) == "table", "val: uniq C winner")
+    assertEq(valuationSnap(bob, canonicalC).assignmentId, bodyC.assignment.assignmentId,
+        "val: uniq C keeps assignment")
+    local stDupC = select(1, providerApplyWithId("gs:val:" .. canonicalC, bodyC, "Alice-Garona"))
+    assertEq(stDupC, "duplicate", "val: uniq C redelivery duplicate")
+    local stClash, reasonClash = providerApplyWithId("gs:val:" .. canonicalD, bodyC, "Alice-Garona")
+    assertEq(stClash, "rejected", "val: uniq second canonical rejects shared assignment")
+    assertEq(reasonClash, "assignment_bound", "val: uniq reason assignment_bound")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, canonicalD), nil, "val: uniq D not priced by C assignment")
+    assertEq(valuationCount(bob), 1, "val: uniq only one winner after clash")
+    local stD, reasonD = providerApplyWithId("gs:val:" .. canonicalD, bodyD, "Alice-Garona")
+    assertEq(stD, "accepted", "val: uniq independent D assignment " .. tostring(reasonD))
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationCount(bob), 2, "val: uniq both donations priced")
+    assertEq(valuationSnap(bob, canonicalC).totalCopper, totalC, "val: uniq C total")
+    assertEq(valuationSnap(bob, canonicalD).totalCopper, totalD, "val: uniq D total")
+    assertEq(valuationSnap(bob, canonicalD).assignmentId, bodyD.assignment.assignmentId,
+        "val: uniq D independent id")
+    drainExportMaint(64)
+    local descCount = nil
+    local bobExports = collectAllExportBodies()
+    for i = 1, #bobExports do
+        local row = bobExports[i]
+        if row.body and row.body.kind == "dataset-desc"
+            and row.body.datasetId == bob.datasetId then
+            descCount = row.body.valuationCount
+        end
+    end
+    assertEq(descCount, 2, "val: uniq descriptor count")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: uniq stays chat-free")
+end
+
+do
+    -- discussion_r4363901617: changed gs:val body during adoption is source_changed.
+    valuationTsmValue = 11
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9831)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9831, quantity = 2 })
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9831, 2)
+    assertTrue(event ~= nil, "val: chg source donation")
+    local canonical = event.txnId
+    local snap = valuationSnap(record, canonical)
+    assertTrue(type(snap) == "table", "val: chg source priced")
+    local laterBody = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonical)
+    assertTrue(type(laterBody) == "table" and type(laterBody.body) == "table",
+        "val: chg export later winner")
+    laterBody = deepCopy(laterBody.body)
+    local earlierBody = deepCopy(laterBody)
+    earlierBody.assignment = deepCopy(laterBody.assignment)
+    earlierBody.assignment.assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009831"
+    earlierBody.assignment.assignedAt = (tonumber(laterBody.assignment.assignedAt) or 100) - 25
+    local earlierTotal = earlierBody.assignment.totalCopper
+    local laterTotal = laterBody.assignment.totalCopper
+    assertTrue(earlierBody.assignment.assignedAt < laterBody.assignment.assignedAt,
+        "val: chg earlier timestamp")
+    assertTrue(earlierBody.assignment.assignmentId ~= laterBody.assignment.assignmentId,
+        "val: chg distinct assignment ids")
+    local sourceDataset = record.datasetId
+    local aliceExport = collectAllExportBodies()
+    local liveDataset = nil
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    liveDataset = GS:GetCurrentRecord().datasetId
+    local keepVal = {
+        schemaVersion = 1, nextSeq = 2, pending = {},
+        byTxn = {
+            ["ctx:chg-keep"] = {
+                assignmentId = "gsv1:cccccccccccccccccccccccc:00009831",
+                assignedAt = 3, unitCopper = 1, quantity = 1, totalCopper = 1,
+                itemId = 1, txnId = "ctx:chg-keep", canonicalTxnId = "ctx:chg-keep",
+                datasetId = liveDataset, guildKey = "club:42",
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona", seen = {},
+            },
+        },
+    }
+    GS:GetCurrentRecord().valuations = keepVal
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: chg adoption begins")
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: chg buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            bufferRow({ id = "gs:val:" .. canonical, body = deepCopy(laterBody) })
+        elseif kind == "gs-evidence" then
+            -- officer ledger carries credit
+        else
+            bufferRow(row)
+        end
+    end
+    assertEq(GS._adoption and GS._adoption.pinnedValuationCount, 1,
+        "val: chg pinned valuationCount")
+    local stDup = select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(laterBody)))
+    assertEq(stDup, "duplicate", "val: chg identical redelivery duplicate")
+    assertTrue(GS._adoption ~= nil, "val: chg adoption remains after duplicate")
+    local stChg, reasonChg = GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(earlierBody))
+    assertEq(stChg, "rejected", "val: chg changed winner rejected")
+    assertEq(reasonChg, "source_changed", "val: chg reason source_changed")
+    assertEq(GS:GetPendingAdoption(), nil, "val: chg adoption cleared")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: chg live dataset preserved")
+    assertTrue(GS:GetCurrentRecord().valuations.byTxn["ctx:chg-keep"] ~= nil,
+        "val: chg live valuations preserved")
+    assertEq(valuationSnap(GS:GetCurrentRecord(), canonical), nil,
+        "val: chg did not commit superseded price")
+
+    -- Clean retry with the observed earlier winner succeeds.
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: chg retry begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            bufferRow({ id = "gs:val:" .. canonical, body = deepCopy(earlierBody) })
+        elseif kind == "gs-evidence" then
+            -- skip
+        else
+            bufferRow(row)
+        end
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" and type(adop.records) == "table" then
+        local desc = adop.records["gs:desc:" .. sourceDataset]
+        if type(desc) == "table" then
+            desc.donationEvidenceCount = 0
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: chg retry commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: chg adopted dataset")
+    local adoptedSnap = valuationSnap(adopted, canonical)
+    assertTrue(type(adoptedSnap) == "table", "val: chg adopted priced")
+    assertEq(adoptedSnap.assignmentId, earlierBody.assignment.assignmentId,
+        "val: chg adopted earlier winner")
+    assertEq(adoptedSnap.assignedAt, earlierBody.assignment.assignedAt,
+        "val: chg adopted earlier timestamp")
+    assertEq(adoptedSnap.totalCopper, earlierTotal, "val: chg adopted earlier total")
+    assertEq(laterTotal, earlierTotal, "val: chg copper unchanged across winners")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: chg stays chat-free")
+end
+
+do
     -- Group B: pinned valuationCount cannot be omitted; malformed bodies do not count.
     SF.TSM = {
         GetMarketValue = function()

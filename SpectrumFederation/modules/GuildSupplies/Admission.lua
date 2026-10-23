@@ -2784,6 +2784,15 @@ function GS:BufferAdoptionRecord(recordId, body)
             end
             return "accepted", "adoption_buffer"
         end
+        -- A changed gs-valuation body at the same provider record id means the
+        -- selected source's earliest-wins winner moved. Abort rather than keep
+        -- a superseded provisional price commitable under an unchanged count pin.
+        if body.kind == "gs-valuation" and adop.records[recordId].kind == "gs-valuation" then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return "rejected", "id_conflict"
     end
 

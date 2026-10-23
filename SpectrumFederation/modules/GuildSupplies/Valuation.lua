@@ -70,6 +70,10 @@ function GS.ValuationStoreRevision(store)
     return valuationStoreRev[store] or 0
 end
 
+-- Ephemeral assignmentId → storage-key map. Rebuilt only when the store
+-- revision advances (admit/forget/alias). Never consulted from render paths.
+local assignmentBindingCache = setmetatable({}, { __mode = "k" })
+
 local function NoteValuationStoreMutation(store, record)
     if type(store) ~= "table" then
         return
@@ -79,6 +83,7 @@ local function NoteValuationStoreMutation(store, record)
         rev = 1
     end
     valuationStoreRev[store] = rev
+    assignmentBindingCache[store] = nil
     local cached = valuationValidationCache[store]
     local datasetId = type(record) == "table" and record.datasetId or nil
     if cached and cached.ok and type(datasetId) == "string" and cached.datasetId == datasetId then
@@ -467,6 +472,86 @@ local function CountKeys(map)
     return n
 end
 
+--- Map each remembered assignmentId (winner or bounded loser) to its donation
+-- storage key. Built from the current byTxn/pending tables only after a store
+-- mutation; hot UI/catch-up reads must not call this.
+local function BuildAssignmentBindingMap(store)
+    local map = {}
+    local conflict = false
+    local function ingest(bucket)
+        if type(bucket) ~= "table" then
+            return
+        end
+        for key, snap in pairs(bucket) do
+            if type(snap) == "table" and type(key) == "string" then
+                local function bind(id)
+                    if type(id) ~= "string" or id == "" then
+                        return
+                    end
+                    local prior = map[id]
+                    if prior and prior ~= key then
+                        conflict = true
+                    else
+                        map[id] = key
+                    end
+                end
+                bind(snap.assignmentId)
+                if type(snap.seen) == "table" then
+                    local last = #snap.seen
+                    if last > MAX_SEEN then
+                        last = MAX_SEEN
+                    end
+                    for i = 1, last do
+                        local row = snap.seen[i]
+                        if type(row) == "table" then
+                            bind(row.id)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    ingest(store.byTxn)
+    ingest(store.pending)
+    return map, conflict
+end
+
+local function AssignmentBindingMap(store)
+    if type(store) ~= "table" then
+        return {}
+    end
+    local rev = valuationStoreRev[store] or 0
+    local cached = assignmentBindingCache[store]
+    if cached and cached.rev == rev and type(cached.map) == "table" then
+        return cached.map
+    end
+    local map = BuildAssignmentBindingMap(store)
+    assignmentBindingCache[store] = { rev = rev, map = map }
+    return map
+end
+
+--- True when assignmentId is already bound to a genuinely different donation.
+-- Allows same-donation alias keys and pending[A]→pending[C] fold for the same
+-- immutable assignment under a validated export binding.
+local function AssignmentBoundElsewhere(record, store, assignmentId, targetKey, exportCanonical, assignmentTxnId)
+    if type(assignmentId) ~= "string" or type(targetKey) ~= "string" then
+        return false
+    end
+    local bound = AssignmentBindingMap(store)[assignmentId]
+    if type(bound) ~= "string" or bound == targetKey then
+        return false
+    end
+    local boundResolved = ResolveCanonical(record, bound) or bound
+    local targetResolved = ResolveCanonical(record, targetKey) or targetKey
+    if boundResolved == targetResolved then
+        return false
+    end
+    if exportCanonical and targetKey == exportCanonical and bound == assignmentTxnId then
+        return false
+    end
+    return true
+end
+
 local function ValidAssignmentId(id)
     return type(id) == "string"
         and id ~= ""
@@ -848,6 +933,16 @@ function GS.ValidateValuationStore(store, record, guildKey)
                 return false, "invalid_valuations"
             end
         end
+    end
+    -- One logical assignment id may bind to only one donation key. Checked only
+    -- on the deep-validation path already walking every snap.
+    local _, assignmentConflict = BuildAssignmentBindingMap(store)
+    if assignmentConflict then
+        valuationValidationCache[store] = {
+            rev = rev, ok = false, err = "invalid_valuations",
+            datasetId = record.datasetId, guildKey = guildKey,
+        }
+        return false, "invalid_valuations"
     end
     valuationValidationCache[store] = {
         rev = rev, ok = true, datasetId = record.datasetId, guildKey = guildKey,
@@ -1350,6 +1445,10 @@ function GS:AdmitValuationAssignment(body, opts)
         if not existing and pendingCount >= MAX_PENDING then
             return "rejected", "full"
         end
+        if AssignmentBoundElsewhere(record, store, assignment.assignmentId, pendingKey,
+            exportCanonical, assignment.txnId) then
+            return "rejected", "assignment_bound"
+        end
         local status, _, detail, wrote = ApplyIncoming(store.pending, pendingKey, assignment)
         if wrote or folded then
             NoteValuationStoreMutation(store, record)
@@ -1364,6 +1463,10 @@ function GS:AdmitValuationAssignment(body, opts)
             return "pending", "awaiting_credit"
         end
         return "pending", "awaiting_donation"
+    end
+    if AssignmentBoundElsewhere(record, store, assignment.assignmentId, canonical,
+        exportCanonical, assignment.txnId) then
+        return "rejected", "assignment_bound"
     end
     local status, changed, detail, wrote = ApplyIncoming(store.byTxn, canonical, assignment)
     local clearedPending = false
