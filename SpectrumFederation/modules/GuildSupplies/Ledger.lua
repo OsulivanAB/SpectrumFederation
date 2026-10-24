@@ -1233,7 +1233,15 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
         return false
     end
     local row = FindRegistryByTxn(cfg, primaryTxnId)
-    if not row then return false end
+    if not row then
+        -- Ledger-occurrence competing-ID can still hold the accepted primary
+        -- event after registry eviction. Reconcile valuations from knownEvent
+        -- without inventing a registry row.
+        if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
+            GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+        end
+        return false
+    end
     if type(row.aliases) ~= "table" then
         row.aliases = {}
     end

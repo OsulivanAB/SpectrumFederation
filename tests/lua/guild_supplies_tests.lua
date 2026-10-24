@@ -37042,8 +37042,10 @@ do
             "val: idxd-alias " .. label .. " pending[A] cleared")
         assertEq(valuationCount(record), 1,
             "val: idxd-alias " .. label .. " one winner")
-        assertEq(registryHasAlias(record, txnA, txnX), true,
-            "val: idxd-alias " .. label .. " A→X alias")
+        if not clearRegistry then
+            assertEq(registryHasAlias(record, txnA, txnX), true,
+                "val: idxd-alias " .. label .. " A→X alias")
+        end
         drainExportMaint(32)
         local exported = 0
         for _, row in ipairs(collectAllExportBodies()) do
