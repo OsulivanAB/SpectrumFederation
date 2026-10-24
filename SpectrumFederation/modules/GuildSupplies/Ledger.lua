@@ -1227,7 +1227,7 @@ local function RegisterTxn(cfg, entry)
     return true
 end
 
-local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId)
+local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record)
     primaryTxnId, aliasTxnId = ValidTxnId(primaryTxnId), ValidTxnId(aliasTxnId)
     if not primaryTxnId or not aliasTxnId or primaryTxnId == aliasTxnId then
         return false
@@ -1264,6 +1264,9 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId)
         neighborsOlder = row.neighborsOlder,
         neighborsNewer = row.neighborsNewer,
     })
+    if type(record) == "table" and GS.OnDonationTxnAlias then
+        GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
+    end
     return true
 end
 
@@ -1436,6 +1439,7 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             return false
         end
     end
+    local wasCredited = existing.gsProductionCredit == true
     local changed = false
     if live then
         if CollapseDonationCutoverMarkers(existing, liveMarker) then
@@ -1478,6 +1482,17 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
         BumpAccountingMutation(record)
         if GS._NotifyLocalDurableChange then
             GS._NotifyLocalDurableChange("ledger")
+        end
+        -- Late authenticated marker repair: promote a preserved pending price,
+        -- or mint once when an eligible officer still has no assignment.
+        if not wasCredited and existing.gsProductionCredit == true then
+            local txnId = ValidTxnId(existing.txnId) or ValidTxnId(existing.id)
+            if txnId and GS.ReconcilePendingValuations then
+                GS.ReconcilePendingValuations(record, txnId)
+            end
+            if GS.TryAssignDonationValuation then
+                GS.TryAssignDonationValuation(record, existing, nil)
+            end
         end
     end
     return changed
@@ -1589,8 +1604,14 @@ function GS.ValidateLedgerEventLists(accounting, datasetId)
     return true
 end
 
-local function RemoveEvictedLedgerExportIds(removedIds)
+local function RemoveEvictedLedgerExportIds(removedIds, opts)
     if type(removedIds) ~= "table" or #removedIds < 1 or not GS.RemoveGossipExportBodies then
+        return
+    end
+    opts = opts or {}
+    if opts.bulk == true then
+        -- Trusted archive trim: one pass over the full eviction set.
+        GS.RemoveGossipExportBodies(removedIds, { bulk = true })
         return
     end
     local offset = 1
@@ -1616,10 +1637,17 @@ local function TrimEventArchive(record)
         return false
     end
     local removedIds = {}
+    local removedTxn = {}
     for i = 1, overflow do
         local ev = archive[i]
         if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
             removedIds[#removedIds + 1] = "gs:le:" .. ev.id
+        end
+        if type(ev) == "table" then
+            local txn = ev.txnId or ev.id
+            if type(txn) == "string" and txn ~= "" then
+                removedTxn[#removedTxn + 1] = txn
+            end
         end
     end
     local kept = {}
@@ -1628,7 +1656,20 @@ local function TrimEventArchive(record)
     end
     record.accounting._consumableEventArchive = kept
     BumpAccountingMutation(record)
-    RemoveEvictedLedgerExportIds(removedIds)
+    -- Coalesce ledger + valuation export drops into one order compaction and
+    -- one provider/manifest notification for this trusted retention trim.
+    local beganRemovalBatch = false
+    if GS.BeginGossipExportBodyRemovalBatch then
+        GS.BeginGossipExportBodyRemovalBatch()
+        beganRemovalBatch = true
+    end
+    RemoveEvictedLedgerExportIds(removedIds, { bulk = true })
+    if GS.ForgetDonationValuations then
+        GS.ForgetDonationValuations(record, removedTxn, { bulkExport = true })
+    end
+    if beganRemovalBatch and GS.EndGossipExportBodyRemovalBatch then
+        GS.EndGossipExportBodyRemovalBatch()
+    end
     -- Length may match the prior warm watermark after shelve+trim; still force
     -- archive paced rebuild so newly retained rows are exported and descriptor
     -- counts cannot exceed GetRecord coverage.
@@ -2163,7 +2204,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMo
                     status = "pending",
                 }, evidence)
                 if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
-                    AddTxnAlias(cfg, txnId, candId)
+                    AddTxnAlias(cfg, txnId, candId, record)
                     pendingCands[candId] = nil
                 end
             elseif candId == txnId then
@@ -2185,6 +2226,12 @@ local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMo
     Debug("Info", "donation committed txn=%s mode=%s witnesses=%s",
         tostring(txnId), tostring(mode),
         tostring(GS.CountIndependentWitnesses(record, cluster.witnesses)))
+    if GS.ReconcilePendingValuations then
+        GS.ReconcilePendingValuations(record, txnId)
+    end
+    if GS.TryAssignDonationValuation then
+        GS.TryAssignDonationValuation(record, event, evidence)
+    end
     return true, "accepted"
 end
 
@@ -2738,7 +2785,7 @@ local function SettleAcceptedOfficerOccurrence(record, cfg, txnId, evidence)
             end
             if clear then
                 if candId ~= txnId and ValidTxnId(candId) then
-                    AddTxnAlias(cfg, txnId, candId)
+                    AddTxnAlias(cfg, txnId, candId, record)
                 end
                 pendingCands[candId] = nil
                 changed = true
@@ -2774,16 +2821,14 @@ local function SettleAcceptedOfficerOccurrence(record, cfg, txnId, evidence)
     end
 end
 
---- Ordinary Guild Gossip catch-up of an already accepted officer-trusted donation.
--- The transport sender must be an authenticated same-guild member. The verification
--- field, writer, rank, or isAdmin claim is not authority by itself: occurrence,
--- eligibility, dataset, an explicit verifierGuid, and (when live) the canonical
--- cutover marker are required. v1 cannot prove the named writer saw Blizzard's
--- bank log. That limit is documented in GuildSupplies/AGENTS.md. Returns nil when
--- the row must stay an unverified candidate.
-local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cfg, senderName, admissionCtx)
+--- Non-mutating accepted officer-history preflight.
+-- Shared by catch-up credit and competing-ID alias authorization so valuation
+-- side effects cannot run when credit/provenance would refuse the same row.
+-- Returns writer, verifier, validated evidence row, sourceMarker, authedMember
+-- on success; otherwise nil. Does not mutate ledger, registry, or valuations.
+local function OfficerTrustedHistoryPreflight(record, event, candidate, txnId, senderName, admissionCtx)
     local writer, verifier = OfficerHistoryWriter(event)
-    if not writer or not verifier or not ValidTxnId(txnId) or type(cfg) ~= "table" then
+    if not writer or not verifier or not ValidTxnId(txnId) or type(candidate) ~= "table" then
         return nil
     end
     if type(GS.AuthenticateTransportSender) ~= "function" then
@@ -2841,8 +2886,26 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
             end
         end
     end
-    local eligOk = IsEvidenceEligible(record, row)
-    if not eligOk then
+    if not IsEvidenceEligible(record, row) then
+        return nil
+    end
+    return writer, verifier, row, sourceMarker, authed
+end
+
+--- Ordinary Guild Gossip catch-up of an already accepted officer-trusted donation.
+-- The transport sender must be an authenticated same-guild member. The verification
+-- field, writer, rank, or isAdmin claim is not authority by itself: occurrence,
+-- eligibility, dataset, an explicit verifierGuid, and (when live) the canonical
+-- cutover marker are required. v1 cannot prove the named writer saw Blizzard's
+-- bank log. That limit is documented in GuildSupplies/AGENTS.md. Returns nil when
+-- the row must stay an unverified candidate.
+local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cfg, senderName, admissionCtx)
+    if type(cfg) ~= "table" then
+        return nil
+    end
+    local writer, verifier, row, sourceMarker, authed = OfficerTrustedHistoryPreflight(
+        record, event, candidate, txnId, senderName, admissionCtx)
+    if not writer or not verifier or type(row) ~= "table" then
         return nil
     end
     local stored = {
@@ -2902,7 +2965,13 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
         GS._NotifyLocalDurableChange("ledger")
     end
     Debug("Info", "officer-trusted history accepted txn=%s writer=%s sender=%s",
-        tostring(txnId), tostring(writer), tostring(authed.name or senderName))
+        tostring(txnId), tostring(writer), tostring(authed and authed.name or senderName))
+    if GS.ReconcilePendingValuations then
+        GS.ReconcilePendingValuations(record, txnId)
+    end
+    if GS.TryAssignDonationValuation then
+        GS.TryAssignDonationValuation(record, stored, row)
+    end
     return "accepted", "officer_history"
 end
 
@@ -3143,12 +3212,19 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             end
             if regHit and ValidTxnId(regHit.txnId) and regHit.txnId ~= txnId then
                 -- Same occurrence, competing ID: alias without second credit.
+                -- Only officer-history that would pass catch-up credit preflight
+                -- (live canonical marker + eligibility) may create A→X aliases
+                -- that move valuation state. Shape-only officer claims with a
+                -- missing/divergent marker must not redirect pending[X].
                 if regHit.status == "verified" then
-                    AddTxnAlias(cfg, regHit.txnId, txnId)
-                    local led = FindLedgerEventByTxnId(record, regHit.txnId)
-                    if led then
-                        ReconcileVerifiedDonationDuplicate(
-                            record, led, candidate, admissionCtx, event)
+                    if OfficerTrustedHistoryPreflight(
+                        record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
+                        AddTxnAlias(cfg, regHit.txnId, txnId, record)
+                        local led = FindLedgerEventByTxnId(record, regHit.txnId)
+                        if led then
+                            ReconcileVerifiedDonationDuplicate(
+                                record, led, candidate, admissionCtx, event)
+                        end
                     end
                     return "duplicate", "occurrence_duplicate"
                 end
@@ -3158,9 +3234,12 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "pending", "ambiguous"
             end
             if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
-                AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId)
-                ReconcileVerifiedDonationDuplicate(
-                    record, ledHit, candidate, admissionCtx, event)
+                if OfficerTrustedHistoryPreflight(
+                    record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
+                    AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record)
+                    ReconcileVerifiedDonationDuplicate(
+                        record, ledHit, candidate, admissionCtx, event)
+                end
                 return "duplicate", "occurrence_duplicate"
             end
             if ledHit and (ledHit.txnId or ledHit.id) == txnId then
@@ -3278,6 +3357,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 neighborsNewer = stored.neighborsNewer,
                 verification = stored.verification,
             })
+            if GS.ReconcilePendingValuations then
+                GS.ReconcilePendingValuations(record, txnId)
+            end
             return "accepted", "adoption_transfer"
         end
 
