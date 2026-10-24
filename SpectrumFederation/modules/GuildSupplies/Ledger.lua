@@ -1227,7 +1227,7 @@ local function RegisterTxn(cfg, entry)
     return true
 end
 
-local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record)
+local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
     primaryTxnId, aliasTxnId = ValidTxnId(primaryTxnId), ValidTxnId(aliasTxnId)
     if not primaryTxnId or not aliasTxnId or primaryTxnId == aliasTxnId then
         return false
@@ -1239,6 +1239,11 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record)
     end
     for i = 1, #row.aliases do
         if row.aliases[i] == aliasTxnId then
+            -- Alias already registered; still reconcile valuations when a known
+            -- accepted donation is supplied (cold competing-ID convergence).
+            if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
+                GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+            end
             return true
         end
     end
@@ -1265,7 +1270,7 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record)
         neighborsNewer = row.neighborsNewer,
     })
     if type(record) == "table" and GS.OnDonationTxnAlias then
-        GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
+        GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
     end
     return true
 end
@@ -2204,7 +2209,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMo
                     status = "pending",
                 }, evidence)
                 if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
-                    AddTxnAlias(cfg, txnId, candId, record)
+                    AddTxnAlias(cfg, txnId, candId, record, event)
                     pendingCands[candId] = nil
                 end
             elseif candId == txnId then
@@ -3219,8 +3224,10 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 if regHit.status == "verified" then
                     if OfficerTrustedHistoryPreflight(
                         record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
-                        AddTxnAlias(cfg, regHit.txnId, txnId, record)
+                        -- Pass the accepted primary donation so cold-index alias
+                        -- reconcile can promote pending[X] without redelivery.
                         local led = FindLedgerEventByTxnId(record, regHit.txnId)
+                        AddTxnAlias(cfg, regHit.txnId, txnId, record, led)
                         if led then
                             ReconcileVerifiedDonationDuplicate(
                                 record, led, candidate, admissionCtx, event)
@@ -3236,7 +3243,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
                 if OfficerTrustedHistoryPreflight(
                     record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
-                    AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record)
+                    AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record, ledHit)
                     ReconcileVerifiedDonationDuplicate(
                         record, ledHit, candidate, admissionCtx, event)
                 end

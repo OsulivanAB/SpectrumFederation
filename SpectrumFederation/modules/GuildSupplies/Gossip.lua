@@ -69,6 +69,12 @@ local exportState = {
     -- #397 paced cold construction for accepted donation valuations.
     valuationBuildNeeded = false,
     valuationBuildCursor = nil,
+    -- Session-only sorted byTxn keys for cold valuation export (invalidated on
+    -- dataset/store/revision change so slices do not re-sort every callback).
+    valuationBuildKeys = nil,
+    valuationBuildKeysStore = nil,
+    valuationBuildKeysDataset = nil,
+    valuationBuildKeysRev = nil,
     -- Invalidates queued maint closures after disable/replacement.
     maintGeneration = 0,
 }
@@ -1932,6 +1938,10 @@ local function RebuildExportIndex()
     local valuationExportCount = ResolveValuationExportCount(record)
     exportState.valuationBuildNeeded = valuationExportCount > 0
     exportState.valuationBuildCursor = nil
+    exportState.valuationBuildKeys = nil
+    exportState.valuationBuildKeysStore = nil
+    exportState.valuationBuildKeysDataset = nil
+    exportState.valuationBuildKeysRev = nil
 
     local descId = "gs:desc:" .. record.datasetId
     local descEntry = exportState.byId[descId]
@@ -3220,6 +3230,10 @@ function GS:DisableGossipProvider()
     exportState.donationEvidenceBuildNeeded = false
     exportState.valuationBuildNeeded = false
     exportState.valuationBuildCursor = nil
+    exportState.valuationBuildKeys = nil
+    exportState.valuationBuildKeysStore = nil
+    exportState.valuationBuildKeysDataset = nil
+    exportState.valuationBuildKeysRev = nil
     exportState.opBuildCursor = nil
     exportState.archiveBuildCursor = nil
     exportState.ledgerBuildCursor = nil
@@ -4133,10 +4147,31 @@ function GS.NotifyLocalDurableChange(reason)
 
         -- #397 cold/reload: pace accepted valuation snapshots. Updates to an
         -- existing winner go through NoteValuationExported; this drain fills gaps.
+        -- Sorted keys are snapshotted for the active store revision so each
+        -- 32-body slice does not reallocate/sort the full byTxn map.
         if exportState.valuationBuildNeeded and used < slice then
             local byTxn = record.valuations and record.valuations.byTxn
             if type(byTxn) == "table" then
-                local keys = sortedKeys(byTxn)
+                local store = record.valuations
+                local rev = 0
+                if type(store) == "table" and GS.ValuationStoreRevision then
+                    rev = GS.ValuationStoreRevision(store)
+                end
+                local keys = exportState.valuationBuildKeys
+                local keysCurrent = type(keys) == "table"
+                    and exportState.valuationBuildKeysStore == store
+                    and exportState.valuationBuildKeysDataset == record.datasetId
+                    and exportState.valuationBuildKeysRev == rev
+                if not keysCurrent then
+                    keys = sortedKeys(byTxn)
+                    exportState.valuationBuildKeys = keys
+                    exportState.valuationBuildKeysStore = store
+                    exportState.valuationBuildKeysDataset = record.datasetId
+                    exportState.valuationBuildKeysRev = rev
+                    if type(GS._onValuationBuildKeysSort) == "function" then
+                        GS._onValuationBuildKeysSort(#keys)
+                    end
+                end
                 local startK = resumeAfterKey(keys, exportState.valuationBuildCursor, function(k)
                     return "gs:val:" .. tostring(k)
                 end)
@@ -4161,10 +4196,18 @@ function GS.NotifyLocalDurableChange(reason)
                 if used < slice then
                     exportState.valuationBuildCursor = nil
                     exportState.valuationBuildNeeded = false
+                    exportState.valuationBuildKeys = nil
+                    exportState.valuationBuildKeysStore = nil
+                    exportState.valuationBuildKeysDataset = nil
+                    exportState.valuationBuildKeysRev = nil
                 end
             else
                 exportState.valuationBuildCursor = nil
                 exportState.valuationBuildNeeded = false
+                exportState.valuationBuildKeys = nil
+                exportState.valuationBuildKeysStore = nil
+                exportState.valuationBuildKeysDataset = nil
+                exportState.valuationBuildKeysRev = nil
             end
         end
 

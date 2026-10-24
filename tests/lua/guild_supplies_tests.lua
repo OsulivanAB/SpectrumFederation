@@ -36369,6 +36369,699 @@ do
 end
 
 do
+    -- idxd: cold valuation export sorted-key snapshot (discussion_r4368029061).
+    SF.TSM = nil
+    local record = activateValuationGuild(9920)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    record = GS:GetCurrentRecord()
+    local n = 160
+    local byTxn = {}
+    for i = 1, n do
+        local txn = string.format("ctx:idxd-export-%04d", i)
+        byTxn[txn] = {
+            assignmentId = string.format("gsv1:%024d:00009920", i),
+            assignedAt = i,
+            unitCopper = 10,
+            quantity = 1,
+            totalCopper = 10,
+            itemId = 9920,
+            txnId = txn,
+            canonicalTxnId = txn,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            seen = {},
+        }
+    end
+    record.valuations = {
+        schemaVersion = 1,
+        nextSeq = n + 1,
+        byTxn = byTxn,
+        pending = {},
+    }
+    -- Matching credited ledger rows so adoption completeness can accept the set.
+    local liveDonations = {}
+    for i = 1, n do
+        local txn = string.format("ctx:idxd-export-%04d", i)
+        liveDonations[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9920,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 800000 + i,
+        }
+    end
+    record.accounting._consumableEvents = liveDonations
+    record.accounting._consumableEventArchive = {}
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local sorts = 0
+    GS._onValuationBuildKeysSort = function(count)
+        sorts = sorts + 1
+        assertTrue((tonumber(count) or 0) >= n - 2,
+            "val: idxd sort covers near-capacity keys got=" .. tostring(count))
+    end
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local slices = math.ceil(n / (GS.MAX_EXPORT_MAINT_PER_SLICE or 32))
+    assertTrue(slices >= 4, "val: idxd expects multi-slice export got=" .. tostring(slices))
+    assertTrue(sorts <= 2, "val: idxd cold export sorts once got=" .. tostring(sorts)
+        .. " slices~" .. tostring(slices))
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, vals = nil, 0
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                vals = vals + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            end
+        end
+        return descCount, vals
+    end
+    local descCount, exportVals = valuationExportSummary(
+        collectAllExportBodies(), record.datasetId)
+    assertEq(tonumber(descCount), n, "val: idxd descriptor count")
+    assertEq(exportVals, n, "val: idxd exported valuation bodies")
+    -- Interleaved winner add/remove must invalidate the snapshot without
+    -- re-sorting every remaining slice, and still converge to idle.
+    sorts = 0
+    local removeTxn = "ctx:idxd-export-0001"
+    local addTxn = "ctx:idxd-export-new"
+    GS.ForgetDonationValuations(record, { removeTxn })
+    record = GS:GetCurrentRecord()
+    do
+        local live = record.accounting._consumableEvents
+        if type(live) == "table" then
+            for i = #live, 1, -1 do
+                if live[i] and live[i].txnId == removeTxn then
+                    table.remove(live, i)
+                end
+            end
+            record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+        end
+    end
+    record.valuations.byTxn[addTxn] = {
+        assignmentId = "gsv1:999999999999999999999999:00009920",
+        assignedAt = 9999,
+        unitCopper = 11,
+        quantity = 1,
+        totalCopper = 11,
+        itemId = 9920,
+        txnId = addTxn,
+        canonicalTxnId = addTxn,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    local live = record.accounting._consumableEvents
+    if type(live) == "table" then
+        live[#live + 1] = {
+            type = "donation",
+            id = addTxn,
+            txnId = addTxn,
+            itemId = 9920,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 800000 + n + 1,
+        }
+        record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    end
+    GS.NoteValuationExported(record, addTxn)
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    assertTrue(sorts <= 4, "val: idxd mutation rebuilds keys bounded got=" .. tostring(sorts))
+    record = GS:GetCurrentRecord()
+    descCount, exportVals = valuationExportSummary(
+        collectAllExportBodies(), record.datasetId)
+    local expected = n -- removed one, added one
+    assertEq(tonumber(descCount), expected, "val: idxd descriptor after add/remove")
+    assertEq(exportVals, expected, "val: idxd bodies after add/remove")
+    assertEq(GS._exportMaintIsIdle and GS._exportMaintIsIdle(), true, "val: idxd export idle")
+    local sourceDataset = record.datasetId
+    local exportBodies = collectAllExportBodies()
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idxd adopt begins")
+    for i = #exportBodies, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: idxd buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: idxd adopt commits " .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxd adopt idle")
+    GS._onValuationBuildKeysSort = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idxd chat-free")
+end
+
+do
+    -- idxd: deferred ingress keep-first conflict (discussion_r4368029064).
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxd-defer provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function plantColdWithTarget(record, archCount, target)
+        local accounting = record.accounting
+        local arch, live = {}, {}
+        for i = 1, archCount do
+            local txn = string.format("ctx:idxd-defer-arch-%04d", i)
+            arch[i] = {
+                type = "donation",
+                id = txn,
+                txnId = txn,
+                itemId = 9921,
+                quantity = 1,
+                generation = 1,
+                gsProductionCredit = true,
+                verification = "officer",
+                writer = "Player-1-Alice",
+                verifierGuid = "Player-1-Alice",
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                approxTxnTime = world.time,
+                timestamp = math.floor(world.time or 0),
+                occurrenceIndex = 400000 + i,
+            }
+        end
+        live[1] = target
+        accounting._consumableEventArchive = arch
+        accounting._consumableEvents = live
+        accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+    end
+
+    SF.TSM = nil
+    local record = activateValuationGuild(9921)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    creditValuationDeposit(record, { itemId = 9921, quantity = 3 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9921, 3)
+    assertTrue(event ~= nil, "val: idxd-defer target donation")
+    local txnId = event.txnId
+    local target = deepCopy(event)
+    target.gsProductionCredit = true
+    plantColdWithTarget(record, (GS.DONATION_EVENT_INDEX_BUDGET or 512) + 32, target)
+    record = GS:GetCurrentRecord()
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxd-defer index cold")
+
+    local assignId = "gsv1:dddddddddddddddddddddddd:00009921"
+    local first = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target, {
+            assignmentId = assignId,
+            assignedAt = 20,
+            unitCopper = 25,
+            txnId = txnId,
+        }),
+    }
+    local conflict = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target, {
+            assignmentId = assignId,
+            assignedAt = 20,
+            unitCopper = 99,
+            txnId = txnId,
+        }),
+    }
+    local exportId = "gs:val:" .. txnId
+    local st1, reason1 = providerApplyWithId(exportId, first, "Alice-Garona")
+    assertEq(st1, "pending", "val: idxd-defer first queues " .. tostring(reason1))
+    assertEq(reason1, "awaiting_index", "val: idxd-defer first awaiting_index")
+    local st2, reason2 = providerApplyWithId(exportId, conflict, "Alice-Garona")
+    assertEq(st2, "rejected", "val: idxd-defer conflict rejected")
+    assertEq(reason2, "id_conflict", "val: idxd-defer conflict reason")
+    local st3, reason3 = providerApplyWithId(exportId, deepCopy(first), "Alice-Garona")
+    assertEq(st3, "pending", "val: idxd-defer identical redelivery " .. tostring(reason3))
+    assertEq(reason3, "awaiting_index", "val: idxd-defer identical still deferred")
+
+    local guard = 0
+    while guard < 64 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        record = GS:GetCurrentRecord()
+        if valuationSnap(record, txnId) ~= nil then
+            break
+        end
+    end
+    record = GS:GetCurrentRecord()
+    local snap = valuationSnap(record, txnId)
+    assertTrue(type(snap) == "table", "val: idxd-defer first body promoted")
+    assertEq(snap.unitCopper, 25, "val: idxd-defer retained first unit")
+    assertEq(snap.totalCopper, 75, "val: idxd-defer retained first total")
+    assertEq(snap.assignmentId, assignId, "val: idxd-defer assignment id")
+    local stDup = select(1, providerApplyWithId(exportId, conflict, "Alice-Garona"))
+    assertEq(stDup, "rejected", "val: idxd-defer warm-path conflict still rejects")
+    assertEq(#world.chat, 0, "val: idxd-defer chat-free")
+end
+
+do
+    -- idxd: cutover credit-reconcile continuation (discussion_r4368029069).
+    SF.TSM = nil
+    local record = activateValuationGuild(9922)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local pendingN = 6
+    local exportBodies = {}
+    local seenTxn = {}
+    for i = 1, pendingN do
+        local qty = 1 + i
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9922, quantity = qty, observedAt = world.time, ageHours = 0,
+            occurrenceIndex = 50 + i,
+            neighborsOlder = { "idxd-cut-old-" .. i },
+            neighborsNewer = { "idxd-cut-new-" .. i },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+            "accepted", "val: idxd-cut seed credit " .. i)
+        GS.NotifyLocalDurableChange("ledger")
+        drainExportMaint(64)
+        local body = nil
+        for _, row in ipairs(filterExportBodies(collectAllExportBodies(), "gs-ledger-event")) do
+            local ev = row.body and row.body.event
+            if ev and tonumber(ev.itemId) == 9922 and tonumber(ev.quantity) == qty
+                and not seenTxn[ev.txnId] then
+                body = row.body
+                seenTxn[ev.txnId] = true
+                break
+            end
+        end
+        assertTrue(type(body) == "table", "val: idxd-cut export body " .. i)
+        exportBodies[i] = deepCopy(body)
+    end
+    local function loadStaged(name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+    local bob = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    GS:EnsureGossipProvider()
+    local marker = cutover.cutoverMarker
+    local retained = {}
+    for i = 1, pendingN do
+        local st, reason = applyExportBody(exportBodies[i], "Bob-Garona")
+        assertEq(st, "accepted", "val: idxd-cut staged ledger " .. i .. " " .. tostring(reason))
+        bob = GS:GetCurrentRecord()
+        local ev = nil
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = bob.accounting[listName]
+            if type(list) == "table" then
+                for j = 1, #list do
+                    if list[j] and list[j].txnId == exportBodies[i].event.txnId then
+                        ev = list[j]
+                    end
+                end
+            end
+        end
+        assertTrue(ev ~= nil, "val: idxd-cut retained event " .. i)
+        retained[i] = deepCopy(ev)
+        local qty = tonumber(ev.quantity) or (1 + i)
+        local pend = craftValuation(bob, ev, {
+            assignmentId = string.format("gsv1:%024d:00009922", i),
+            assignedAt = 10 + i,
+            unitCopper = 30 + i,
+            txnId = ev.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        })
+        local pst, preason = applyValuationBody(pend, "Bob-Garona")
+        assertEq(pst, "pending", "val: idxd-cut pending " .. i .. " " .. tostring(preason))
+        assertEq(preason, "awaiting_credit", "val: idxd-cut awaits credit " .. i)
+        retained[i].quantity = qty
+    end
+    bob = GS:GetCurrentRecord()
+    -- Cold index: filler archive before retained donations so first 512 warm misses them.
+    local arch = {}
+    local filler = (GS.DONATION_EVENT_INDEX_BUDGET or 512) + 16
+    for i = 1, filler do
+        local txn = string.format("ctx:idxd-cut-fill-%04d", i)
+        arch[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9922,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = false,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = bob.datasetId,
+            campaignId = bob.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 500000 + i,
+        }
+    end
+    for i = 1, pendingN do
+        local ev = retained[i]
+        ev.gsProductionCredit = false
+        ev.gsSourceCutoverMarker = marker
+        arch[#arch + 1] = ev
+    end
+    bob.accounting._consumableEventArchive = arch
+    bob.accounting._consumableEvents = {}
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    assertEq(GS.DonationEventIndexReady(bob), false, "val: idxd-cut index cold")
+
+    local cbMaxVisits, cbMaxProcessed = 0, 0
+    local totalCallbacks = 0
+    local fallbackVisits = 0
+    GS._onDonationEventIndexCallback = function(visited, complete)
+        local v = tonumber(visited) or 0
+        if v > cbMaxVisits then cbMaxVisits = v end
+        totalCallbacks = totalCallbacks + 1
+    end
+    GS._onDonationEventFallbackVisit = function()
+        fallbackVisits = fallbackVisits + 1
+    end
+    GS._onCreditReconcileCallback = function(info)
+        local p = tonumber(info and info.processed) or 0
+        if p > cbMaxProcessed then cbMaxProcessed = p end
+    end
+    local cutSt, cutReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(cutSt, "accepted", "val: idxd-cut installs " .. tostring(cutReason))
+    -- First inline chunk cannot see donations past the warm window.
+    bob = GS:GetCurrentRecord()
+    local promotedEarly = 0
+    for i = 1, pendingN do
+        if valuationSnap(bob, retained[i].txnId) ~= nil then
+            promotedEarly = promotedEarly + 1
+        end
+    end
+    assertTrue(promotedEarly < pendingN,
+        "val: idxd-cut cold first chunk leaves work pending got=" .. tostring(promotedEarly))
+    local guard = 0
+    while guard < 128 and not (GS._creditReconcileIsIdle and GS._creditReconcileIsIdle()) do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertTrue(GS._creditReconcileIsIdle and GS._creditReconcileIsIdle(),
+        "val: idxd-cut reconcile idle")
+    bob = GS:GetCurrentRecord()
+    for i = 1, pendingN do
+        local snap = valuationSnap(bob, retained[i].txnId)
+        local qty = tonumber(retained[i].quantity) or (1 + i)
+        assertTrue(type(snap) == "table", "val: idxd-cut promoted " .. i)
+        assertEq(snap.unitCopper, 30 + i, "val: idxd-cut unit " .. i)
+        assertEq(snap.totalCopper, (30 + i) * qty, "val: idxd-cut total " .. i)
+        assertEq(bob.valuations.pending[retained[i].txnId], nil,
+            "val: idxd-cut pending cleared " .. i)
+    end
+    assertTrue(cbMaxVisits <= (GS.DONATION_EVENT_INDEX_BUDGET or 512),
+        "val: idxd-cut max index/callback <= budget got=" .. tostring(cbMaxVisits))
+    assertTrue(cbMaxProcessed <= (GS.DEFERRED_VALUATION_ADMIT_BUDGET or 32),
+        "val: idxd-cut max pending/callback <= budget got=" .. tostring(cbMaxProcessed))
+    assertTrue(fallbackVisits <= 0,
+        "val: idxd-cut no full-ledger fallback got=" .. tostring(fallbackVisits))
+    assertTrue(totalCallbacks >= 2, "val: idxd-cut yielded across callbacks")
+    -- Dataset replacement cancels an in-flight continuation.
+    bob = GS:GetCurrentRecord()
+    bob.valuations.pending = bob.valuations.pending or {}
+    for i = 1, 3 do
+        local txn = "ctx:idxd-cut-cancel-" .. i
+        bob.valuations.pending[txn] = {
+            assignmentId = string.format("gsv1:%024d:00009922", 100 + i),
+            assignedAt = 100 + i,
+            unitCopper = 1,
+            quantity = 1,
+            totalCopper = 1,
+            itemId = 9922,
+            txnId = txn,
+            datasetId = bob.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            seen = {},
+        }
+    end
+    local coldArch = {}
+    for i = 1, filler + 8 do
+        local txn = string.format("ctx:idxd-cut-cancel-fill-%04d", i)
+        coldArch[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9922,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = bob.datasetId,
+            campaignId = bob.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 700000 + i,
+        }
+    end
+    bob.accounting._consumableEventArchive = coldArch
+    bob.accounting._consumableEvents = {}
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    GS.ReconcileValuationsAfterCreditChange(bob)
+    assertTrue(not (GS._creditReconcileIsIdle and GS._creditReconcileIsIdle())
+        or #timers > 0, "val: idxd-cut continuation scheduled")
+    -- Store replacement cancels the dataset-scoped continuation.
+    bob.valuations = {
+        schemaVersion = 1,
+        nextSeq = 1,
+        byTxn = {},
+        pending = {},
+    }
+    world.time = (world.time or 0) + 1
+    flushTimers()
+    assertTrue(GS._creditReconcileIsIdle and GS._creditReconcileIsIdle(),
+        "val: idxd-cut cancel on store replacement")
+    GS._onDonationEventIndexCallback = nil
+    GS._onDonationEventFallbackVisit = nil
+    GS._onCreditReconcileCallback = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idxd-cut chat-free")
+end
+
+do
+    -- idxd: cold competing-ID alias knownEvent (discussion_r4365058306 @ 4367992203).
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxd-alias provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function registryHasAlias(rec, primary, alias)
+        local cfg = rec.accounting and rec.accounting._consumables
+        if type(cfg) ~= "table" or type(cfg.txnRegistry) ~= "table" then
+            return false
+        end
+        for i = 1, #cfg.txnRegistry do
+            local row = cfg.txnRegistry[i]
+            if type(row) == "table" and row.txnId == primary and type(row.aliases) == "table" then
+                for j = 1, #row.aliases do
+                    if row.aliases[j] == alias then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end
+    local function plantColdAround(record, eventA, archFiller)
+        local accounting = record.accounting
+        local arch = {}
+        for i = 1, archFiller do
+            local txn = string.format("ctx:idxd-alias-fill-%04d", i)
+            arch[i] = {
+                type = "donation",
+                id = txn,
+                txnId = txn,
+                itemId = eventA.itemId,
+                quantity = 1,
+                generation = 1,
+                gsProductionCredit = true,
+                verification = "officer",
+                writer = "Player-1-Alice",
+                verifierGuid = "Player-1-Alice",
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                approxTxnTime = world.time,
+                timestamp = math.floor(world.time or 0),
+                occurrenceIndex = 600000 + i,
+            }
+        end
+        arch[#arch + 1] = deepCopy(eventA)
+        accounting._consumableEventArchive = arch
+        accounting._consumableEvents = {}
+        accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+    end
+    local function runColdAliasPath(label, clearRegistry)
+        SF.TSM = nil
+        local record = activateValuationGuild(9923)
+        GS:EnsureGossipProvider()
+        creditValuationDeposit(record, {
+            itemId = 9923, quantity = 4,
+            occurrenceIndex = 700 + (clearRegistry and 2 or 1),
+            neighborsOlder = { "idxd-alias-old-" .. label },
+            neighborsNewer = { "idxd-alias-new-" .. label },
+        })
+        drainExportMaint(32)
+        record = GS:GetCurrentRecord()
+        local eventA = valuationFindDonation(record, 9923, 4)
+        assertTrue(eventA ~= nil, "val: idxd-alias " .. label .. " donation A")
+        local txnA = eventA.txnId
+        local txnX = "ctx:idxd-alias-x-" .. label
+        local marker = record.liveCutover and record.liveCutover.cutoverMarker
+        assertTrue(type(marker) == "string" and marker ~= "", "val: idxd-alias " .. label .. " marker")
+        local assignId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00009923"
+        local pending = craftValuation(record, eventA, {
+            assignmentId = assignId,
+            assignedAt = 40,
+            unitCopper = 15,
+            txnId = txnX,
+        })
+        local stPend, reasonPend = applyValuationBody(pending, "Alice-Garona")
+        assertEq(stPend, "pending", "val: idxd-alias " .. label .. " pending "
+            .. tostring(reasonPend))
+        record = GS:GetCurrentRecord()
+        assertTrue(type(record.valuations.pending[txnX]) == "table",
+            "val: idxd-alias " .. label .. " pending[X]")
+        local keptEvent = deepCopy(eventA)
+        keptEvent.gsProductionCredit = true
+        if clearRegistry then
+            record.accounting._consumables.txnRegistry = {}
+        end
+        plantColdAround(record, keptEvent, (GS.DONATION_EVENT_INDEX_BUDGET or 512) + 8)
+        record = GS:GetCurrentRecord()
+        assertEq(GS.DonationEventIndexReady(record), false,
+            "val: idxd-alias " .. label .. " cold")
+        local evidence = {
+            donor = keptEvent.actor or keptEvent.donor,
+            itemId = keptEvent.itemId,
+            quantity = keptEvent.quantity,
+            generation = keptEvent.generation,
+            approxTxnTime = keptEvent.timestamp or keptEvent.approxTxnTime,
+            ageHours = 0,
+            coreSignature = keptEvent.coreSignature,
+            occurrenceIndex = keptEvent.occurrenceIndex,
+            guildGuid = keptEvent.guildGuid,
+            bankTab = keptEvent.bankTab,
+            neighborsOlder = keptEvent.neighborsOlder,
+            neighborsNewer = keptEvent.neighborsNewer,
+        }
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        assertEq(GS:GetCapabilities().canEdit, false,
+            "val: idxd-alias " .. label .. " Dave non-editor")
+        local hist = officerLedgerEvent(record, evidence, txnX, {
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            verifierRankOrder = 1,
+            verification = "officer",
+        })
+        local stOk, reasonOk = providerApply({
+            kind = "gs-ledger-event",
+            datasetId = record.datasetId,
+            cutoverMarker = marker,
+            event = hist,
+        }, "Dave-Garona")
+        assertTrue(stOk == "duplicate" or stOk == "accepted",
+            "val: idxd-alias " .. label .. " st=" .. tostring(stOk)
+                .. " " .. tostring(reasonOk))
+        -- No timer / redelivery: knownEvent must promote immediately.
+        record = GS:GetCurrentRecord()
+        local moved = valuationSnap(record, txnA)
+        assertTrue(type(moved) == "table",
+            "val: idxd-alias " .. label .. " promoted to A without redelivery")
+        assertEq(moved.unitCopper, 15, "val: idxd-alias " .. label .. " unit")
+        assertEq(moved.txnId, txnX, "val: idxd-alias " .. label .. " immutable txn")
+        assertEq(record.valuations.pending[txnX], nil,
+            "val: idxd-alias " .. label .. " pending[X] cleared")
+        assertEq(record.valuations.pending[txnA], nil,
+            "val: idxd-alias " .. label .. " pending[A] cleared")
+        assertEq(valuationCount(record), 1,
+            "val: idxd-alias " .. label .. " one winner")
+        assertEq(registryHasAlias(record, txnA, txnX), true,
+            "val: idxd-alias " .. label .. " A→X alias")
+        drainExportMaint(32)
+        local exported = 0
+        for _, row in ipairs(collectAllExportBodies()) do
+            if row.body and row.body.kind == "gs-valuation" then
+                exported = exported + 1
+                assertEq(row.body.assignment.assignmentId, assignId,
+                    "val: idxd-alias " .. label .. " export assignment")
+            end
+        end
+        assertTrue(exported >= 1, "val: idxd-alias " .. label .. " export present")
+        switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    runColdAliasPath("registry", false)
+    runColdAliasPath("ledger", true)
+    assertEq(#world.chat, 0, "val: idxd-alias chat-free")
+end
+
+do
     local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
     assertTrue(src ~= nil, "val: module readable")
     local text = src:read("*a")

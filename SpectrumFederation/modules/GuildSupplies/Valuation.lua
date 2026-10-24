@@ -789,19 +789,48 @@ local function ScheduleDeferredValuationDrain()
     end
 end
 
+--- True when two assignment tables match the immutable fingerprint fields.
+-- Local to deferral so it does not depend on Fingerprint's later definition.
+local function SameImmutableAssignment(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    return a.assignmentId == b.assignmentId
+        and a.assignedAt == b.assignedAt
+        and a.unitCopper == b.unitCopper
+        and a.quantity == b.quantity
+        and a.totalCopper == b.totalCopper
+        and a.itemId == b.itemId
+        and a.txnId == b.txnId
+        and a.datasetId == b.datasetId
+        and a.guildKey == b.guildKey
+        and (a.actorGuid or "") == (b.actorGuid or "")
+        and (a.actorName or "") == (b.actorName or "")
+end
+
+--- Queue an authorized valuation while the donation index warms.
+-- Same export/assignment/txn key: keep the first authenticated body. Identical
+-- redelivery is a no-op; divergent immutable contents reject as id_conflict so
+-- cold-index timing cannot overwrite the first candidate before ApplyIncoming.
+-- @return status, reason — "pending","awaiting_index" or "rejected","id_conflict"
 local function DeferValuationIngress(body, opts)
     opts = opts or {}
     local key = tostring(opts.exportRecordId or "")
         .. "\0" .. tostring(body and body.assignment and body.assignment.assignmentId or "")
         .. "\0" .. tostring(body and body.assignment and body.assignment.txnId or "")
+    local incomingAssign = body and body.assignment
     for i = 1, #deferredValuationIngress do
         local row = deferredValuationIngress[i]
         if row and row.key == key then
-            row.body = body
-            row.opts = opts
-            row.record = opts.offlineRecord
+            local priorAssign = row.body and row.body.assignment
+            if SameImmutableAssignment(priorAssign, incomingAssign) then
+                -- Identical redelivery: preserve the first authenticated context.
+                ScheduleDeferredValuationDrain()
+                return "pending", "awaiting_index"
+            end
+            -- Conflicting immutable payload under the same id: keep the first.
             ScheduleDeferredValuationDrain()
-            return
+            return "rejected", "id_conflict"
         end
     end
     deferredValuationIngress[#deferredValuationIngress + 1] = {
@@ -811,6 +840,7 @@ local function DeferValuationIngress(body, opts)
         record = opts.offlineRecord,
     }
     ScheduleDeferredValuationDrain()
+    return "pending", "awaiting_index"
 end
 
 --- Lookup donation event by txn/alias ids.
@@ -874,10 +904,11 @@ end
 
 --- Resolve a donation for local reconcile helpers (not Gossip admission).
 -- Prefers a caller-supplied known event, then the ephemeral index. Advances at
--- most one budgeted warm. Never falls back to a full ledger VisitEvents scan:
--- an incomplete index returns ready=false so pending winners are not cleared.
+-- most one budgeted warm unless peekOnly (cutover continuation already warmed).
+-- Never falls back to a full ledger VisitEvents scan: an incomplete index
+-- returns ready=false so pending winners are not cleared.
 -- @return event|nil, ready bool
-local function ResolveEventForIds(record, ids, knownEvent)
+local function ResolveEventForIds(record, ids, knownEvent, peekOnly)
     if type(knownEvent) == "table" and type(ids) == "table" then
         local txn = EventTxn(knownEvent)
         if (type(txn) == "string" and ids[txn] == true)
@@ -891,6 +922,9 @@ local function ResolveEventForIds(record, ids, knownEvent)
     local event, ready = FindEventForIds(record, ids)
     if event ~= nil or ready then
         return event, ready and true or false
+    end
+    if peekOnly then
+        return nil, false
     end
     GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
     event, ready = FindEventForIds(record, ids)
@@ -1740,7 +1774,8 @@ end
 
 --- Promote/drop pending valuations for one donation txn.
 -- knownEvent: optional just-admitted ledger row (avoids cold full-history scans).
-function GS.ReconcilePendingValuations(record, txnId, knownEvent)
+-- opts.peekOnly: skip the nested warm (caller already spent the callback budget).
+function GS.ReconcilePendingValuations(record, txnId, knownEvent, opts)
     if type(record) ~= "table" then
         return false
     end
@@ -1752,7 +1787,8 @@ function GS.ReconcilePendingValuations(record, txnId, knownEvent)
     if type(store) ~= "table" then
         return false
     end
-    local event, ready = ResolveEventForIds(record, ids, knownEvent)
+    local peekOnly = type(opts) == "table" and opts.peekOnly and true or false
+    local event, ready = ResolveEventForIds(record, ids, knownEvent, peekOnly)
     if not ready and not event then
         -- Incomplete index without a known event: not a definitive miss.
         return false
@@ -1808,9 +1844,139 @@ function GS.ReconcilePendingValuations(record, txnId, knownEvent)
     return changed
 end
 
+-- Cutover / credit-change reconcile: dataset-scoped After(0) continuation.
+-- Each tick warms ≤ DONATION_EVENT_INDEX_BUDGET once, then peeks up to
+-- DEFERRED_VALUATION_ADMIT_BUDGET pending keys. Cancels on dataset/store
+-- replacement. Idle when the index is complete and one full pending walk has
+-- finished (remaining pending rows are legitimately awaiting credit/donation).
+local creditReconcile = {
+    scheduled = false,
+    datasetId = nil,
+    store = nil,
+    keys = nil,
+    cursor = 1,
+    completePass = false,
+}
+
+local function CollectPendingValuationKeys(store)
+    local pending = type(store) == "table" and store.pending or nil
+    local keys = {}
+    if type(pending) ~= "table" then
+        return keys
+    end
+    for key in pairs(pending) do
+        if type(key) == "string" and key ~= "" then
+            keys[#keys + 1] = key
+            if #keys >= MAX_PENDING then
+                break
+            end
+        end
+    end
+    table.sort(keys)
+    return keys
+end
+
+local ScheduleCreditReconcileContinuation
+
+local function CreditReconcileDrain()
+    creditReconcile.scheduled = false
+    local record = nil
+    if type(GS.GetCurrentRecord) == "function" then
+        record = select(1, GS:GetCurrentRecord())
+    end
+    if type(record) ~= "table"
+        or record.datasetId ~= creditReconcile.datasetId
+        or record.valuations ~= creditReconcile.store then
+        creditReconcile.keys = nil
+        creditReconcile.datasetId = nil
+        creditReconcile.store = nil
+        creditReconcile.completePass = false
+        return
+    end
+    local store = creditReconcile.store
+    if GS.WarmDonationEventIndex then
+        GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
+    end
+    local indexReady = GS.DonationEventIndexReady
+        and GS.DonationEventIndexReady(record) and true or false
+    if type(creditReconcile.keys) ~= "table" then
+        creditReconcile.keys = CollectPendingValuationKeys(store)
+        creditReconcile.cursor = 1
+    end
+    -- A walk that begins against a ready index is the completion pass.
+    if indexReady and (tonumber(creditReconcile.cursor) or 1) == 1 then
+        creditReconcile.completePass = true
+    end
+    local keys = creditReconcile.keys
+    local admitBudget = tonumber(GS.DEFERRED_VALUATION_ADMIT_BUDGET)
+        or GS.MAX_ADMISSION_WORK_PER_SLICE
+        or 32
+    if admitBudget < 1 then
+        admitBudget = 1
+    end
+    local processed = 0
+    local i = tonumber(creditReconcile.cursor) or 1
+    while i <= #keys and processed < admitBudget do
+        local key = keys[i]
+        i = i + 1
+        if type(store.pending) == "table" and store.pending[key] ~= nil then
+            processed = processed + 1
+            GS.ReconcilePendingValuations(record, key, nil, { peekOnly = true })
+        end
+    end
+    creditReconcile.cursor = i
+    if type(GS._onCreditReconcileCallback) == "function" then
+        GS._onCreditReconcileCallback({
+            processed = processed,
+            indexReady = indexReady,
+            pendingKeys = #keys,
+            cursor = creditReconcile.cursor,
+            completePass = creditReconcile.completePass and true or false,
+        })
+    end
+    local function needMore()
+        if creditReconcile.cursor <= #keys then
+            return true
+        end
+        if not indexReady then
+            creditReconcile.keys = nil
+            creditReconcile.completePass = false
+            return #(CollectPendingValuationKeys(store)) > 0
+        end
+        if not creditReconcile.completePass then
+            creditReconcile.keys = nil
+            creditReconcile.completePass = true
+            return #(CollectPendingValuationKeys(store)) > 0
+        end
+        creditReconcile.keys = nil
+        creditReconcile.datasetId = nil
+        creditReconcile.store = nil
+        creditReconcile.completePass = false
+        return false
+    end
+    if needMore() then
+        ScheduleCreditReconcileContinuation()
+    end
+end
+
+-- Further chunks use After(0); the kickoff runs the first chunk inline.
+ScheduleCreditReconcileContinuation = function()
+    if creditReconcile.scheduled then
+        return
+    end
+    creditReconcile.scheduled = true
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, CreditReconcileDrain)
+    else
+        CreditReconcileDrain()
+    end
+end
+
 --- After a cutover classifies retained rows, fold still-pending assignments.
--- One bounded pass. Priceable rows merge with earliest-wins. Rows that are
--- now definitively unpriceable are discarded. Not a timer.
+-- First chunk is inline (one warm + peek batch). Further work continues via
+-- After(0) until the index is complete and pending have been walked. Cancels
+-- when the live dataset/store is replaced. Priceable rows merge with
+-- earliest-wins; rows that stay unpriceable remain pending without looping.
 function GS.ReconcileValuationsAfterCreditChange(record)
     if type(record) ~= "table" then
         return
@@ -1820,22 +1986,24 @@ function GS.ReconcileValuationsAfterCreditChange(record)
     if type(pending) ~= "table" then
         return
     end
-    -- One budgeted warm for the whole pass; per-key reconcile peeks only.
-    if GS.WarmDonationEventIndex then
-        GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
+    local keys = CollectPendingValuationKeys(store)
+    if #keys == 0 then
+        return
     end
-    local keys = {}
-    for key in pairs(pending) do
-        if #keys >= MAX_PENDING then
-            break
-        end
-        keys[#keys + 1] = key
+    creditReconcile.datasetId = record.datasetId
+    creditReconcile.store = store
+    creditReconcile.keys = keys
+    creditReconcile.cursor = 1
+    creditReconcile.completePass = false
+    if creditReconcile.scheduled then
+        return
     end
-    for i = 1, #keys do
-        if type(store.pending) == "table" and store.pending[keys[i]] ~= nil then
-            GS.ReconcilePendingValuations(record, keys[i])
-        end
-    end
+    CreditReconcileDrain()
+end
+
+function GS._creditReconcileIsIdle()
+    return not creditReconcile.scheduled
+        and (creditReconcile.keys == nil or #(creditReconcile.keys) == 0)
 end
 
 --- Fold alias candidates into pending[canonical] while credit is still open.
@@ -1884,7 +2052,7 @@ local function HoldAliasPending(record, store, canonical, event, candidates)
     return wrote
 end
 
-function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
+function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
     if type(record) ~= "table" then
         return
     end
@@ -1931,15 +2099,21 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
         end
     end
     local ids = AliasSet(record, canonical)
-    local event, ready = ResolveEventForIds(record, ids)
+    -- Prefer a caller-supplied accepted donation (competing-ID alias paths) so a
+    -- cold index cannot strand pending[X] after HoldAliasPending.
+    local event, ready = ResolveEventForIds(record, ids, knownEvent)
     -- Incomplete index: keep candidates under pending[canonical]; do not treat
-    -- as a definitive miss or clear pending winners.
+    -- as a definitive miss or clear pending winners. Schedule the shared
+    -- credit-reconcile continuation so promotion converges without redelivery.
     if not ready and not event then
         local wrote = HoldAliasPending(record, store, canonical, nil, candidates)
         if removed or wrote then
             NoteValuationStoreMutation(store, record)
         end
         RemoveValuationExports(record, { [alias] = true })
+        if GS.ReconcileValuationsAfterCreditChange then
+            GS.ReconcileValuationsAfterCreditChange(record)
+        end
         return
     end
     local priceable = event and PriceableDonation(record, event) and true or false
@@ -2099,7 +2273,10 @@ function GS:AdmitValuationAssignment(body, opts)
             end
             if exportReady == false or originalReady == false then
                 if not opts.adoptionReplay and not opts._indexDeferAttempt then
-                    DeferValuationIngress(body, opts)
+                    local deferSt, deferReason = DeferValuationIngress(body, opts)
+                    if deferSt == "rejected" then
+                        return deferSt, deferReason
+                    end
                 end
                 return "pending", "awaiting_index"
             end
@@ -2129,7 +2306,10 @@ function GS:AdmitValuationAssignment(body, opts)
         -- Index still warming: keep the authorized body without treating a miss
         -- as a definitive absence. Adoption retries; Gossip uses local After(0).
         if not opts.adoptionReplay and not opts._indexDeferAttempt then
-            DeferValuationIngress(body, opts)
+            local deferSt, deferReason = DeferValuationIngress(body, opts)
+            if deferSt == "rejected" then
+                return deferSt, deferReason
+            end
         end
         return "pending", "awaiting_index"
     end
