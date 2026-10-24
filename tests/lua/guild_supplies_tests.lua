@@ -37064,6 +37064,254 @@ do
 end
 
 do
+    -- idxe: ledger-first then gs:val:X (discussion_r4368429497).
+    -- Independent Gossip order: authenticated competing-ID ledger X arrives
+    -- before the separately exported valuation bound as gs:val:X.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxe provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function registryHasAlias(rec, primary, alias)
+        local cfg = rec.accounting and rec.accounting._consumables
+        if type(cfg) ~= "table" or type(cfg.txnRegistry) ~= "table" then
+            return false
+        end
+        for i = 1, #cfg.txnRegistry do
+            local row = cfg.txnRegistry[i]
+            if type(row) == "table" and row.txnId == primary and type(row.aliases) == "table" then
+                for j = 1, #row.aliases do
+                    if row.aliases[j] == alias then
+                        return true
+                    end
+                end
+            end
+            if type(row) == "table" and row.txnId == alias and row.status == "alias"
+                and row.aliasOf == primary then
+                return true
+            end
+        end
+        return false
+    end
+    local function runLedgerFirstValuation(label, clearRegistry)
+        SF.TSM = nil
+        local record = activateValuationGuild(9924)
+        GS:EnsureGossipProvider()
+        creditValuationDeposit(record, {
+            itemId = 9924, quantity = 5,
+            occurrenceIndex = 810 + (clearRegistry and 2 or 1),
+            neighborsOlder = { "idxe-old-" .. label },
+            neighborsNewer = { "idxe-new-" .. label },
+        })
+        drainExportMaint(32)
+        record = GS:GetCurrentRecord()
+        local eventA = valuationFindDonation(record, 9924, 5)
+        assertTrue(eventA ~= nil, "val: idxe " .. label .. " donation A")
+        local txnA = eventA.txnId
+        local txnX = "ctx:idxe-x-" .. label
+        local marker = record.liveCutover and record.liveCutover.cutoverMarker
+        assertTrue(type(marker) == "string" and marker ~= "", "val: idxe " .. label .. " marker")
+        local creditsBefore = 0
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = record.accounting[listName]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    if list[i] and list[i].gsProductionCredit == true then
+                        creditsBefore = creditsBefore + 1
+                    end
+                end
+            end
+        end
+        local keptEvent = deepCopy(eventA)
+        keptEvent.gsProductionCredit = true
+        if clearRegistry then
+            record.accounting._consumables.txnRegistry = {}
+        end
+        local evidence = {
+            donor = keptEvent.actor or keptEvent.donor,
+            itemId = keptEvent.itemId,
+            quantity = keptEvent.quantity,
+            generation = keptEvent.generation,
+            approxTxnTime = keptEvent.timestamp or keptEvent.approxTxnTime,
+            ageHours = 0,
+            coreSignature = keptEvent.coreSignature,
+            occurrenceIndex = keptEvent.occurrenceIndex,
+            guildGuid = keptEvent.guildGuid,
+            bankTab = keptEvent.bankTab,
+            neighborsOlder = keptEvent.neighborsOlder,
+            neighborsNewer = keptEvent.neighborsNewer,
+        }
+        -- Ledger X first (ordinary-member relay), no valuation yet.
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        assertEq(GS:GetCapabilities().canEdit, false,
+            "val: idxe " .. label .. " Dave non-editor")
+        local hist = officerLedgerEvent(record, evidence, txnX, {
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            verifierRankOrder = 1,
+            verification = "officer",
+        })
+        local stLed, reasonLed = providerApply({
+            kind = "gs-ledger-event",
+            datasetId = record.datasetId,
+            cutoverMarker = marker,
+            event = hist,
+        }, "Dave-Garona")
+        assertTrue(stLed == "duplicate" or stLed == "accepted",
+            "val: idxe " .. label .. " ledger X st=" .. tostring(stLed)
+                .. " " .. tostring(reasonLed))
+        record = GS:GetCurrentRecord()
+        assertEq(valuationCount(record), 0,
+            "val: idxe " .. label .. " no price before valuation")
+        assertEq(registryHasAlias(record, txnA, txnX), true,
+            "val: idxe " .. label .. " lasting A→X after ledger X")
+        local creditsAfter = 0
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = record.accounting[listName]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    if list[i] and list[i].gsProductionCredit == true then
+                        creditsAfter = creditsAfter + 1
+                    end
+                end
+            end
+        end
+        assertEq(creditsAfter, creditsBefore,
+            "val: idxe " .. label .. " no second production credit")
+
+        -- Later authenticated gs:val:X (immutable assignment.txnId=X).
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        local assignId = "gsv1:fffffffffffffffffffffff1:00009924"
+        local valBody = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, eventA, {
+                assignmentId = assignId,
+                assignedAt = 55,
+                unitCopper = 18,
+                txnId = txnX,
+            }),
+        }
+        local stVal, reasonVal = providerApplyWithId("gs:val:" .. txnX, valBody, "Alice-Garona")
+        assertEq(stVal, "accepted",
+            "val: idxe " .. label .. " gs:val:X accepted got="
+                .. tostring(stVal) .. " " .. tostring(reasonVal))
+        record = GS:GetCurrentRecord()
+        local snap = valuationSnap(record, txnA)
+        assertTrue(type(snap) == "table",
+            "val: idxe " .. label .. " winner on A")
+        assertEq(snap.unitCopper, 18, "val: idxe " .. label .. " unit")
+        assertEq(snap.totalCopper, 90, "val: idxe " .. label .. " total")
+        assertEq(snap.txnId, txnX, "val: idxe " .. label .. " immutable txnId")
+        assertEq(snap.assignmentId, assignId, "val: idxe " .. label .. " assignment id")
+        assertEq(record.valuations.byTxn[txnX], nil,
+            "val: idxe " .. label .. " no winner under X")
+        assertEq(record.valuations.pending[txnX], nil,
+            "val: idxe " .. label .. " pending[X] cleared")
+        assertEq(valuationCount(record), 1, "val: idxe " .. label .. " one winner")
+        local desc = GS.DescribeDonationValuation(record, eventA)
+        assertEq(desc.priced, true, "val: idxe " .. label .. " Logs priced")
+        assertEq(desc.totalCopper, 90, "val: idxe " .. label .. " Logs total")
+        drainExportMaint(32)
+        local descCount, exportVals = 0, 0
+        for _, row in ipairs(collectAllExportBodies()) do
+            local body = row.body
+            if type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == record.datasetId then
+                descCount = tonumber(body.valuationCount) or 0
+            elseif type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == record.datasetId then
+                exportVals = exportVals + 1
+                assertEq(body.assignment.assignmentId, assignId,
+                    "val: idxe " .. label .. " export assignment")
+                assertEq(body.assignment.txnId, txnX,
+                    "val: idxe " .. label .. " export immutable txn")
+            end
+        end
+        assertEq(descCount, 1, "val: idxe " .. label .. " descriptor count")
+        assertEq(exportVals, 1, "val: idxe " .. label .. " export bodies")
+
+        -- /reload keeps the A→X relation and the priced winner.
+        -- Use a full SavedVariables copy (snapshotConfigRoot clears txnRegistry).
+        local reloadRoot = deepCopy(SpectrumFederationDB.guildSupplies)
+        SpectrumFederationDB = { guildSupplies = deepCopy(reloadRoot) }
+        switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+        settleRoster()
+        initGS()
+        GS:EnsureGossipProvider()
+        record = GS:GetCurrentRecord()
+        assertEq(registryHasAlias(record, txnA, txnX), true,
+            "val: idxe " .. label .. " alias survives reload")
+        local reloaded = valuationSnap(record, txnA)
+        assertTrue(type(reloaded) == "table",
+            "val: idxe " .. label .. " winner survives reload")
+        assertEq(reloaded.assignmentId, assignId,
+            "val: idxe " .. label .. " reload assignment")
+        assertEq(reloaded.txnId, txnX, "val: idxe " .. label .. " reload txn")
+        assertEq(valuationCount(record), 1,
+            "val: idxe " .. label .. " reload one winner")
+        -- Post-reload gs:val:X redelivery still folds onto A (no redelivery of ledger).
+        local stReloadDup = select(1, providerApplyWithId("gs:val:" .. txnX, valBody, "Alice-Garona"))
+        assertTrue(stReloadDup == "duplicate" or stReloadDup == "accepted",
+            "val: idxe " .. label .. " post-reload gs:val:X st=" .. tostring(stReloadDup))
+        assertEq(valuationCount(GS:GetCurrentRecord()), 1,
+            "val: idxe " .. label .. " post-reload still one winner")
+
+        -- Unrelated / unmarked competing ids stay fail-closed.
+        local txnY = "ctx:idxe-y-" .. label
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        local badHist = officerLedgerEvent(record, evidence, txnY, {
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            verifierRankOrder = 1,
+            verification = "officer",
+        })
+        local stBad, reasonBad = providerApply({
+            kind = "gs-ledger-event",
+            datasetId = record.datasetId,
+            cutoverMarker = "gsc1:idxe-divergent-" .. label,
+            event = badHist,
+        }, "Dave-Garona")
+        assertTrue(reasonBad ~= "officer_history",
+            "val: idxe " .. label .. " divergent not officer credit st="
+                .. tostring(stBad) .. " " .. tostring(reasonBad))
+        assertEq(registryHasAlias(GS:GetCurrentRecord(), txnA, txnY), false,
+            "val: idxe " .. label .. " no A→Y from divergent")
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        local badVal = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, eventA, {
+                assignmentId = "gsv1:fffffffffffffffffffffff2:00009924",
+                assignedAt = 1,
+                unitCopper = 3,
+                txnId = txnY,
+            }),
+        }
+        local stBadVal = select(1, providerApplyWithId("gs:val:" .. txnY, badVal, "Alice-Garona"))
+        assertTrue(stBadVal == "pending" or stBadVal == "rejected",
+            "val: idxe " .. label .. " unbound Y not accepted onto A")
+        assertEq(valuationCount(GS:GetCurrentRecord()), 1,
+            "val: idxe " .. label .. " still one winner")
+        assertEq(valuationSnap(GS:GetCurrentRecord(), txnA).assignmentId, assignId,
+            "val: idxe " .. label .. " earliest winner intact")
+        switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    runLedgerFirstValuation("registry", false)
+    runLedgerFirstValuation("evicted", true)
+    assertEq(#world.chat, 0, "val: idxe chat-free")
+end
+
+do
     local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
     assertTrue(src ~= nil, "val: module readable")
     local text = src:read("*a")

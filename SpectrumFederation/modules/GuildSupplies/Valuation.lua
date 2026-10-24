@@ -2241,23 +2241,32 @@ function GS:AdmitValuationAssignment(body, opts)
         return "rejected", "invalid_txn"
     end
     if exportCanonical then
-        -- Local registry may already fold assignment.txnId onto a different
-        -- canonical. That is a hard conflict; do not invent a second winner.
+        -- Resolve wire ids through the local txn registry.
+        -- 1) Same local primary (gs:val:X with X→A): store/lookup under that
+        --    primary so ledger-first competing-ID valuations converge.
+        -- 2) Classic cross-client bind (gs:val:C with unbound source alias A):
+        --    keep the export id as the storage key; dual-event checks below
+        --    prove A is not a distinct credited donation.
+        -- Unrelated resolved primaries stay rejected.
         local resolvedAssignment = ResolveCanonical(record, assignment.txnId)
-        if resolvedAssignment and resolvedAssignment ~= assignment.txnId
-            and resolvedAssignment ~= exportCanonical then
-            return "rejected", "canonical_conflict"
-        end
+            or assignment.txnId
         local resolvedExport = ResolveCanonical(record, exportCanonical)
-        if resolvedExport and resolvedExport ~= exportCanonical then
+            or exportCanonical
+        local storageCanonical
+        if resolvedAssignment == resolvedExport then
+            storageCanonical = resolvedExport
+        elseif resolvedExport == exportCanonical
+            and (resolvedAssignment == assignment.txnId
+                or resolvedAssignment == exportCanonical) then
+            storageCanonical = exportCanonical
+        else
             return "rejected", "canonical_conflict"
         end
-        -- Prefer the authenticated export binding as the lookup/storage key.
         -- Keep assignment.txnId immutable (fingerprint / earliest-wins).
-        -- Event lookup uses only the export canonical (and its local aliases),
-        -- never a distinct live donation still named by the original txn id.
-        local exportIds = AliasSet(record, exportCanonical)
+        local exportIds = AliasSet(record, storageCanonical)
         if exportCanonical ~= assignment.txnId then
+            -- Distinct wire ids (gs:val:C with assignment.txnId=A): both must
+            -- name the same live donation, never two distinct credited rows.
             local exportEvent, exportReady = FindEventForIds(record, exportIds)
             local originalEvent, originalReady = FindEventForIds(record, { [assignment.txnId] = true })
             if (exportReady == false or originalReady == false)
@@ -2289,7 +2298,7 @@ function GS:AdmitValuationAssignment(body, opts)
                 return "rejected", "canonical_conflict"
             end
         end
-        canonical = exportCanonical
+        canonical = storageCanonical
         ids = exportIds
         ids[assignment.txnId] = true
         ids[exportCanonical] = true

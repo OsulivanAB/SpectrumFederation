@@ -1233,10 +1233,33 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
         return false
     end
     local row = FindRegistryByTxn(cfg, primaryTxnId)
+    if not row and type(knownEvent) == "table" then
+        -- Registry eviction can drop the verified primary while the ledger still
+        -- holds the accepted donation. Re-anchor A from that known event so the
+        -- A→X alias survives /reload and a later gs:val:X can ResolveCanonical.
+        RegisterTxn(cfg, {
+            txnId = primaryTxnId,
+            status = "verified",
+            committed = true,
+            coreSignature = knownEvent.coreSignature,
+            approxTxnTime = knownEvent.approxTxnTime or knownEvent.timestamp,
+            donor = knownEvent.actor or knownEvent.donor,
+            itemId = knownEvent.itemId,
+            quantity = knownEvent.quantity,
+            guildGuid = knownEvent.guildGuid,
+            bankTab = knownEvent.bankTab,
+            generation = knownEvent.generation,
+            occurrenceIndex = knownEvent.occurrenceIndex,
+            neighborsOlder = knownEvent.neighborsOlder,
+            neighborsNewer = knownEvent.neighborsNewer,
+            verification = GS.CanonicalVerificationMode(knownEvent.verification),
+            decidedBy = ValidGuid(knownEvent.writer) or ValidGuid(knownEvent.verifierGuid),
+        })
+        row = FindRegistryByTxn(cfg, primaryTxnId)
+    end
     if not row then
-        -- Ledger-occurrence competing-ID can still hold the accepted primary
-        -- event after registry eviction. Reconcile valuations from knownEvent
-        -- without inventing a registry row.
+        -- No durable primary to attach; still attempt a one-shot valuation fold
+        -- when a known accepted donation is supplied.
         if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
             GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
         end
