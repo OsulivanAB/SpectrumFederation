@@ -35516,8 +35516,22 @@ do
     record = GS:GetCurrentRecord()
     assertEq(GS._root.localWriter.nonce, nonce, "val: seq nonce survived adoption")
     local nextAfter = tonumber(record.valuations.nextSeq)
+    assertTrue(nextAfter and nextAfter > 4,
+        "val: seq nextSeq past imported winners got=" .. tostring(nextAfter))
+    -- Bounded remembered losers are local to a peer's snap; when present on the
+    -- adopted record, AdvanceValuationSeqForLocalWriter must raise nextSeq past them.
+    local anyTxn = minted[2].txnId
+    local anySnap = record.valuations.byTxn[anyTxn]
+    assertTrue(type(anySnap) == "table", "val: seq adopted snap for loser plant")
+    if type(anySnap.seen) ~= "table" then
+        anySnap.seen = {}
+    end
+    local loserId = string.format("gsv1:%s:%08x", nonce, 90)
+    anySnap.seen[#anySnap.seen + 1] = { id = loserId, fp = "planted-loser" }
+    GS.AdvanceValuationSeqForLocalWriter(record)
+    nextAfter = tonumber(record.valuations.nextSeq)
     assertTrue(nextAfter and nextAfter >= 91,
-        "val: seq nextSeq past loser got=" .. tostring(nextAfter))
+        "val: seq nextSeq past remembered loser got=" .. tostring(nextAfter))
     -- First mint on a new donation must succeed with a fresh id.
     local evidenceNew = makeDepositEvidence(record, {
         itemId = 9913, quantity = 3, donor = "SeqNew-Garona",
