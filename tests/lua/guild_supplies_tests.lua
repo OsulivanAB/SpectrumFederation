@@ -35181,15 +35181,9 @@ do
     end
     local function plantLedgerRows(record, liveCount, archCount, itemId)
         local accounting = record.accounting
-        local oldLive = accounting._consumableEvents or {}
-        local oldArch = accounting._consumableEventArchive or {}
+        -- Replace array identities at exact counts (do not append onto seed
+        -- rows — over-cap fails ValidateGuildRecord / GetCurrentRecord).
         local live, arch = {}, {}
-        for i = 1, #oldLive do
-            live[#live + 1] = oldLive[i]
-        end
-        for i = 1, #oldArch do
-            arch[#arch + 1] = oldArch[i]
-        end
         local function push(list, n, prefix)
             for i = 1, n do
                 local txn = string.format("ctx:%s-%s-%04d", prefix, tostring(itemId), i)
@@ -35248,17 +35242,13 @@ do
         }
     end
 
-    -- Yieldable warm: one budgeted chunk per After(0) callback.
+    -- Yieldable warm: one budgeted chunk per callback (sync; no timer flush —
+    -- flushing can run unrelated catch-up/adoption work from prior groups).
     local warmGuard = 0
     local complete = false
     while not complete and warmGuard < 64 do
         warmGuard = warmGuard + 1
         complete = select(1, GS.WarmDonationEventIndex(record, budget))
-        if not complete then
-            flushTimers()
-            world.time = (world.time or 0) + 1
-            flushTimers()
-        end
     end
     assertEq(complete, true, "val: idxb cold warm converges")
     assertTrue(warmGuard >= 2, "val: idxb cold warm yielded across callbacks")
@@ -35278,17 +35268,29 @@ do
 
     -- Ordinary Gossip + large in-place append tail (same array identities):
     -- index extends incrementally; valuation retained via local deferral drain
-    -- without a second provider delivery.
-    local target = live[#live]
-    assertTrue(type(target) == "table", "val: idxb target donation")
+    -- without a second provider delivery. Stay within MAX_LEDGER_EVENTS so
+    -- ValidateGuildRecord / GetCurrentRecord remain usable.
     local tailN = 600
+    record = GS:GetCurrentRecord() or record
+    assertTrue(type(record) == "table", "val: idxb live record after cold warm")
+    live, arch = plantLedgerRows(record, maxLive - tailN, maxArch, 9915)
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record) == "table", "val: idxb record under append headroom")
+    -- Warm the under-cap plant so the subsequent append is incremental.
+    complete = false
+    warmGuard = 0
+    while not complete and warmGuard < 64 do
+        warmGuard = warmGuard + 1
+        complete = select(1, GS.WarmDonationEventIndex(record, budget))
+    end
+    assertEq(complete, true, "val: idxb under-cap warm converges")
     local beforeAppendCb = #callbackVisits
     local beforeAppendVisits = totalVisits
     local beforeAppendRebuilds = rebuilds
-    record = GS:GetCurrentRecord()
     local accounting = record.accounting
     local liveArr = accounting._consumableEvents
     assertTrue(type(liveArr) == "table", "val: idxb live array")
+    local liveBeforeAppend = #liveArr
     for i = 1, tailN do
         local txn = string.format("ctx:tail-9915-%04d", i)
         liveArr[#liveArr + 1] = {
@@ -35309,12 +35311,13 @@ do
         }
     end
     accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+    assertEq(#liveArr, liveBeforeAppend + tailN, "val: idxb append length")
+    assertTrue(#liveArr <= maxLive, "val: idxb append stays within live cap")
     assertEq(GS.DonationEventIndexReady(record), false, "val: idxb append needs warm")
     local appendTarget = liveArr[#liveArr]
     -- Per After(0)/admit wall: sum visits across Ensure calls in one drain tick.
     local wallMax = 0
     local wallBucket = 0
-    local prevCbCount = #callbackVisits
     GS._onDonationEventIndexCallback = function(visited, completeFlag)
         local v = tonumber(visited) or 0
         callbackVisits[#callbackVisits + 1] = {
@@ -35322,12 +35325,6 @@ do
             complete = completeFlag and true or false,
         }
         wallBucket = wallBucket + v
-        if v > 0 and v <= budget then
-            -- each Ensure stays within budget; wall checked after each drain tick
-        end
-        if v > maxCb then
-            maxCb = v
-        end
     end
     local body = {
         kind = "gs-valuation",
@@ -35393,8 +35390,6 @@ do
     assertTrue((rebuilds - beforeAppendRebuilds) <= 1,
         "val: idxb append does not full-rebuild per valuation got="
             .. tostring(rebuilds - beforeAppendRebuilds))
-    -- silence unused when warm path never invoked wall callback before redefine
-    assertTrue(prevCbCount >= 0, "val: idxb callback baseline")
 
     -- Yieldable adoption with cold near-capacity index on the temp record.
     drainExportMaint(64)
