@@ -35505,12 +35505,9 @@ do
     GS._root.localWriter = { nonce = nonce, nextSeq = 1 }
     assertEq(GS:GetCurrentRecord(), nil, "val: seq Alice fresh before adopt")
     GS:EnsureGossipProvider()
-    valuationTsmValue = 55
-    SF.TSM = {
-        GetMarketValue = function()
-            return valuationTsmValue
-        end,
-    }
+    -- Keep TSM off during adoption replay so officer-ledger credit cannot
+    -- locally mint a competing assignment before buffered gs:val bodies apply.
+    SF.TSM = nil
     GS.NotePeerDataset("Bob-Garona", sourceDataset, { editorRankPosition = 3 })
     assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", sourceDataset)), "accepted",
         "val: seq adopt begins")
@@ -35574,6 +35571,12 @@ do
     assertTrue(nextAfter and nextAfter >= 91,
         "val: seq nextSeq past remembered loser got=" .. tostring(nextAfter))
     -- First mint on a new donation must succeed with a fresh id.
+    valuationTsmValue = 55
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
     local evidenceNew = makeDepositEvidence(record, {
         itemId = 9913, quantity = 3, donor = "SeqNew-Garona",
         observedAt = world.time, ageHours = 0, occurrenceIndex = 50,
