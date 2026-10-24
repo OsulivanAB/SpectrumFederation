@@ -45,6 +45,6 @@ unregister/shutdown → clear runtime queues/callbacks; leave provider durable d
 ## Evidence
 
 - Production-Lua multi-peer harness: `tests/lua/guild_gossip_tests.lua`
-- Owner-review regression probes (fail on reviewed head `aa6fa91`, pass after repair): `tests/lua/guild_gossip_repair_tests.lua` (through F98; F98 covers offline whisper selection/drain/reconnect)
+- Owner-review regression probes (fail on reviewed head `aa6fa91`, pass after repair): `tests/lua/guild_gossip_repair_tests.lua` (through F99; F98 offline whisper/reconnect convergence, F99 allowWithoutProvider NACK offline drain)
 - Packaging/lint/docs validation per root `AGENTS.md`
 - Retail smoke remains human QA

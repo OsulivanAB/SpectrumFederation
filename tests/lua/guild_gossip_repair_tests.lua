@@ -6877,7 +6877,7 @@ do
     -- Logout while queued: custom gossipValid alone would stay true; drain must cancel.
     reset()
     A = makeClient("Alice")
-    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f98q" })
+    local pA = A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f98q" })
     for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
     e = A.GuildGossip._engine
     local Comm = A.LootHelperComm
@@ -6953,13 +6953,18 @@ do
     end
     assertEq(retries, 0, "F98: no repeated Bob outPull retries while offline")
 
-    -- Reconnect: Bob online again; normal sync may resume.
+    -- Reconnect: Bob online again; Alice's current provider must converge Bob's record.
     setMemberOnline("Bob-Garona", true)
     refreshRosterPresence(A)
     assertTrue(A.GuildGossip.IsGuildMemberOnline("Bob-Garona"), "F98: Bob online after reconnect")
+    -- pA is the EnableSynthetic handle from this post-reset Alice client (not a prior fixture).
+    assertTrue(pA and type(pA.GetStore) == "function",
+        "F98: current Alice provider after reset")
+    assertTrue(pA.GetStore().records["reconnect-1"] == nil,
+        "F98: reconnect record absent before Bob sync")
     B = makeClient("Bob")
-    pB = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f98b2" })
-    pB.AppendLocal("reconnect-body", "reconnect-1")
+    local pBReconnect = B.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f98b2" })
+    pBReconnect.AppendLocal("reconnect-body", "reconnect-1")
     for _ = 1, 8 do
         stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
         stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
@@ -6976,21 +6981,16 @@ do
     e.outPull = nil
     e.pendingOutCapture = nil
     e.peerOrder = { "bob-garona" }
-    local resumed = false
-    for _ = 1, 100 do
+    for _ = 1, 160 do
         stepClient(A, A.GuildGossip.GetStepLimits("NORMAL"))
         stepClient(B, B.GuildGossip.GetStepLimits("NORMAL"))
         advance(0.05)
-        if e.outPull and e.outPull.peer == "Bob-Garona" then
-            resumed = true
-            break
-        end
         if pA.GetStore().records["reconnect-1"] then
-            resumed = true
             break
         end
     end
-    assertTrue(resumed, "F98: sync resumes toward Bob after reconnect")
+    assertTrue(pA.GetStore().records["reconnect-1"] ~= nil,
+        "F98: Alice current provider converges Bob reconnect record")
 
     -- Bounded cleanup: offline mid-serve frees inPull without stuck lease.
     reset()
@@ -7022,6 +7022,95 @@ do
     end
     assertTrue(e.inPull ~= nil and e.inPull.peer == "Carol-Garona",
         "F98: freed serve slot reusable by online peer")
+end
+
+---------------------------------------------------------------------------
+-- F99: allowWithoutProvider proto NACK still gates offline whisper drain
+---------------------------------------------------------------------------
+do
+    reset()
+    local A = makeClient("Alice")
+    A.GuildGossip:EnableSynthetic({ id = "sf.synthetic.gossip", instanceKey = "f99" })
+    for _ = 1, 4 do stepClient(A, A.GuildGossip.GetStepLimits("NORMAL")) end
+    local e = A.GuildGossip._engine
+    local Comm = A.LootHelperComm
+    local origPump = Comm._PumpQueue
+    Comm._PumpQueue = function() end
+    e.lastNackAt = {}
+
+    -- Incompatible proto on a WHISPER-eligible message queues GG_NACK with
+    -- allowWithoutProvider (DISC on WHISPER is rejected before proto feedback).
+    local bad = "GG_VIEW\t99\tB64CBOR\tB64" .. ser({
+        op = "request", viewId = "v-bad", providerId = "sf.synthetic.gossip",
+    })
+    A.GuildGossip.OnGossipCommReceived("SF_GG", bad, "WHISPER", "Bob-Garona")
+    assertTrue((Comm.state.total or 0) >= 1, "F99: incompatible proto NACK queued while online")
+    local key = Comm.state.keys[1]
+    local item = key and Comm.state.byKey[key] and Comm.state.byKey[key][1] or nil
+    assertTrue(item and item.dist == "WHISPER", "F99: queued item is a WHISPER")
+    assertTrue(type(item.msg) == "string" and item.msg:find("^GG_NACK\t", 1, false) ~= nil,
+        "F99: queued envelope is GG_NACK")
+    assertTrue(item.gossipValid and item.gossipValid() == true,
+        "F99: NACK gossipValid true while recipient online")
+
+    setMemberOnline("Bob-Garona", false)
+    refreshRosterPresence(A)
+    assertTrue(not A.GuildGossip.IsGuildMemberOnline("Bob-Garona"),
+        "F99: Bob offline before NACK drain")
+    assertTrue(item.gossipValid() == false,
+        "F99: allowWithoutProvider NACK gossipValid false after logout")
+
+    Comm._PumpQueue = origPump
+    local wireBefore = #world.wire
+    world.time = world.time + 0.1
+    world._unitName = "Alice"
+    world._sendAs = "Alice-Garona"
+    Comm:_PumpQueue()
+    world._sendAs = nil
+    local nackWhispers = 0
+    for i = wireBefore + 1, #world.wire do
+        local msg = world.wire[i]
+        if msg.distribution == "WHISPER"
+            and type(msg.text) == "string"
+            and msg.text:find("^GG_NACK\t", 1, false) then
+            nackWhispers = nackWhispers + 1
+        end
+    end
+    assertEq(nackWhispers, 0, "F99: offline recipient does not receive proto NACK whisper")
+    assertEq(Comm.state.total or 0, 0, "F99: cancelled offline NACK released from Comm queue")
+    assertEq(e.admittedOutBytes or 0, 0, "F99: NACK admission accounting released")
+
+    -- Normal online NACK path remains intact.
+    setMemberOnline("Bob-Garona", true)
+    refreshRosterPresence(A)
+    assertTrue(A.GuildGossip.IsGuildMemberOnline("Bob-Garona"), "F99: Bob online for intact NACK")
+    e.lastNackAt = {}
+    Comm._PumpQueue = function() end
+    A.GuildGossip.OnGossipCommReceived("SF_GG", bad, "WHISPER", "Bob-Garona")
+    assertTrue((Comm.state.total or 0) >= 1, "F99: online incompatible proto NACK queued")
+    key = Comm.state.keys[1]
+    item = key and Comm.state.byKey[key] and Comm.state.byKey[key][1] or nil
+    assertTrue(item and item.gossipValid and item.gossipValid() == true,
+        "F99: online NACK gossipValid remains true")
+    Comm._PumpQueue = origPump
+    wireBefore = #world.wire
+    world.time = world.time + 0.1
+    world._unitName = "Alice"
+    world._sendAs = "Alice-Garona"
+    Comm:_PumpQueue()
+    world._sendAs = nil
+    nackWhispers = 0
+    for i = wireBefore + 1, #world.wire do
+        local msg = world.wire[i]
+        if msg.distribution == "WHISPER"
+            and type(msg.text) == "string"
+            and msg.text:find("^GG_NACK\t", 1, false) then
+            nackWhispers = nackWhispers + 1
+        end
+    end
+    assertTrue(nackWhispers >= 1, "F99: online incompatible proto still sends GG_NACK whisper")
+    assertEq(Comm.state.total or 0, 0, "F99: online NACK drain empties Comm queue")
+    assertEq(e.admittedOutBytes or 0, 0, "F99: online NACK admission released after submit")
 end
 
 

@@ -308,9 +308,11 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         return false, "guild_not_ready"
     end
     -- Whisper admission: membership authorization and known-online presence are
-    -- independent. GUILD discovery is unchanged (no per-recipient online gate).
-    if distribution == "WHISPER" and target and not opts.allowWithoutProvider then
-        if not GG.IsGuildMember(target) then
+    -- independent. Online presence applies to every WHISPER target (including
+    -- allowWithoutProvider proto NACKs). Membership checks stay on the normal
+    -- provider path. GUILD discovery is unchanged (no per-recipient online gate).
+    if distribution == "WHISPER" and target then
+        if not opts.allowWithoutProvider and not GG.IsGuildMember(target) then
             return false, "target_not_member"
         end
         if not GG.IsGuildMemberOnline(target) then
@@ -394,9 +396,10 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         return providerEligible and providerEligible(GG.GetProvider(providerId), target, scopeId)
     end
     -- Revalidate known-online at Comm queue drain for every whisper, including
-    -- messages that supply a custom gossipValid. Membership stays separate.
+    -- allowWithoutProvider NACKs and custom gossipValid callbacks. Membership
+    -- and provider/readiness checks stay in userGossipValid / admission above.
     local gossipValid = userGossipValid
-    if distribution == "WHISPER" and target and not opts.allowWithoutProvider then
+    if distribution == "WHISPER" and target then
         local whisperTarget = target
         gossipValid = function()
             if not GG.IsGuildMemberOnline(whisperTarget) then
