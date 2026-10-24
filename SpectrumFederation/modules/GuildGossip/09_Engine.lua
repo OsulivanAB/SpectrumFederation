@@ -307,9 +307,14 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
     if not GG.IsGuildReady() and not opts.allowWithoutProvider then
         return false, "guild_not_ready"
     end
+    -- Whisper admission: membership authorization and known-online presence are
+    -- independent. GUILD discovery is unchanged (no per-recipient online gate).
     if distribution == "WHISPER" and target and not opts.allowWithoutProvider then
         if not GG.IsGuildMember(target) then
             return false, "target_not_member"
+        end
+        if not GG.IsGuildMemberOnline(target) then
+            return false, "target_offline"
         end
     end
 
@@ -379,7 +384,7 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
         scopeId = providerScope(GG.GetProvider(providerId))
     end
     local sendGeneration = e.generation
-    local gossipValid = opts.gossipValid or function()
+    local userGossipValid = opts.gossipValid or function()
         if sendGeneration ~= GG._engine.generation or not GG.IsGuildReady() then
             return false
         end
@@ -387,6 +392,18 @@ function GG.SendGossip(msgType, payload, distribution, target, opts)
             return GG.HasActiveProvider()
         end
         return providerEligible and providerEligible(GG.GetProvider(providerId), target, scopeId)
+    end
+    -- Revalidate known-online at Comm queue drain for every whisper, including
+    -- messages that supply a custom gossipValid. Membership stays separate.
+    local gossipValid = userGossipValid
+    if distribution == "WHISPER" and target and not opts.allowWithoutProvider then
+        local whisperTarget = target
+        gossipValid = function()
+            if not GG.IsGuildMemberOnline(whisperTarget) then
+                return false
+            end
+            return userGossipValid()
+        end
     end
     local ok = Comm:Send("GOSSIP", msgType, payload, distribution, target, GG.ACE_PRIO, {
         enc = (payload == nil or (type(payload) == "table" and next(payload) == nil)) and GG.ENC_NONE or GG.ENC_B64CBOR,
@@ -653,6 +670,11 @@ local function noteOutPullSubmission(pull, success, sendResult)
         pull.awaitingSince = GG._Now()
         pull.usableProgressAt = pull.awaitingSince
     else
+        -- Known-offline cancel must free the lease without PAGE_RETRY storms.
+        if not GG.IsGuildMemberOnline(pull.peer) then
+            closeOutPull("peer_offline")
+            return
+        end
         scheduleOutPullRetry(pull, sendResult or "final_submission_failed")
     end
 end
@@ -806,6 +828,9 @@ local function noteInPullSubmission(pull, success, opts)
             if renewLease then
                 pull.usableProgressAt = pull.awaitingSince
             end
+        elseif not GG.IsGuildMemberOnline(pull.peer) then
+            -- Offline cancels free the served lease even on replay paths.
+            closeInPull("peer_offline")
         elseif closeOnFail then
             -- An unsent offer/page cannot retain the stop-and-wait lease.
             closeInPull("submission_failed")
@@ -829,7 +854,8 @@ local function makeServedGossipValid(pull)
     return function()
         if sendGeneration ~= GG._engine.generation
             or not GG.IsGuildReady()
-            or not GG.IsGuildMember(peer) then
+            or not GG.IsGuildMember(peer)
+            or not GG.IsGuildMemberOnline(peer) then
             return false
         end
         local entry = GG.GetProvider(providerId)
@@ -894,6 +920,10 @@ local function sendServedResponse(pull, msgType, response, advancing)
         GG.MarkWorkPending()
         return false
     end
+    if err == "target_offline" then
+        closeInPull("peer_offline")
+        return false
+    end
     if advancing then
         -- An unsent advancing page cannot retain the stop-and-wait lease.
         noteInPullSubmission(pull, false, { renewLease = false, closeOnFail = true })
@@ -951,8 +981,11 @@ local function trySendServedOffer(pull)
                     pull.finalSubmitted = true
                     pull.offerRetryPending = nil
                     pull.awaitingSince = GG._Now()
+                elseif not GG.IsGuildMemberOnline(pull.peer) then
+                    closeInPull("peer_offline")
                 end
-                -- Replay failure must not clear finalSubmitted or close the pull.
+                -- Replay failure must not clear finalSubmitted or close the pull
+                -- unless the peer is known offline.
                 return
             end
             noteInPullSubmission(pull, success, { renewLease = true, closeOnFail = true })
@@ -964,6 +997,10 @@ local function trySendServedOffer(pull)
     if ok then
         pull.offerRetryPending = nil
         return true
+    end
+    if err == "target_offline" then
+        closeInPull("peer_offline")
+        return false
     end
     if err == "stream_busy" then
         -- Preserve the correlated served view and retry when the stream drains.
@@ -1099,6 +1136,35 @@ GG.OnGuildReady = function()
     end
 end
 
+-- Roster presence refresh: terminate offline whisper exchanges without retries
+-- or stuck leases. Discovered peer state is retained so sync can resume when
+-- the member is online again. Queued whispers cancel via gossipValid on drain.
+GG.OnGuildPresenceChanged = function()
+    local e = GG._engine
+    if not e or not e.inited then
+        return
+    end
+    if e.outPull and not GG.IsGuildMemberOnline(e.outPull.peer) then
+        closeOutPull("peer_offline")
+    end
+    if e.inPull and not GG.IsGuildMemberOnline(e.inPull.peer) then
+        closeInPull("peer_offline")
+    end
+    if e.pendingOutCapture then
+        local peer = e.peers[e.pendingOutCapture.peerKey]
+        if not peer or not GG.IsGuildMemberOnline(peer.name) then
+            e.pendingOutCapture = nil
+        end
+    end
+    -- Closing offline pulls and resuming when a peer returns both need a step.
+    if GG.HasActiveProvider and GG.HasActiveProvider() then
+        GG.MarkWorkPending()
+        if GG._EnsureScheduler then
+            GG._EnsureScheduler()
+        end
+    end
+end
+
 GG.OnProviderRemoved = function(providerId)
     local e = GG._engine
     local entry = GG.GetProvider(providerId)
@@ -1139,6 +1205,10 @@ local function startOutPull(peer, providerEntry)
         return false
     end
     if not GG.IsGuildReady() then
+        return false
+    end
+    -- Defer initiation while the peer is known offline; keep discovery state.
+    if not GG.IsGuildMemberOnline(peer.name) then
         return false
     end
     local scopeId = providerScope(providerEntry)
@@ -1258,7 +1328,7 @@ local function startOutPull(peer, providerEntry)
     }
     peer.activeExchange = true
     e.outPull = pull
-    local ok = GG.SendGossip(GG.MSG.VIEW, payload, "WHISPER", peer.name, {
+    local ok, sendErr = GG.SendGossip(GG.MSG.VIEW, payload, "WHISPER", peer.name, {
         providerId = providerEntry.id,
         scopeId = scopeId,
         gossipValid = makeOutPullGossipValid(pull, GG.MSG.VIEW, nil),
@@ -1270,7 +1340,7 @@ local function startOutPull(peer, providerEntry)
         end,
     })
     if not ok then
-        closeOutPull("view_queue_rejected")
+        closeOutPull(sendErr == "target_offline" and "peer_offline" or "view_queue_rejected")
         return false
     end
     GG.MarkWorkPending()
@@ -1289,7 +1359,9 @@ local function selectPullPeer()
     for _, key in ipairs(e.peerOrder) do
         local peer = e.peers[key]
         local cool = e.peerCooldownUntil[key]
-        if peer and not peer.activeExchange and not (cool and now < cool) then
+        -- Known-offline peers stay discovered but are skipped for whisper pulls.
+        if peer and not peer.activeExchange and not (cool and now < cool)
+            and GG.IsGuildMemberOnline(peer.name) then
             local matched = compatibleProviders(peer.caps)
             -- Prefer a provider not already covered for this peer.
             for _, entry in ipairs(matched) do
@@ -2231,7 +2303,8 @@ makeOutPullGossipValid = function(pull, msgType, requestId)
     return function()
         if sendGeneration ~= GG._engine.generation
             or not GG.IsGuildReady()
-            or not GG.IsGuildMember(peer) then
+            or not GG.IsGuildMember(peer)
+            or not GG.IsGuildMemberOnline(peer) then
             return false
         end
         local entry = GG.GetProvider(providerId)
@@ -2278,6 +2351,10 @@ local function resendOutstanding(pull)
     if not outstanding then
         return false
     end
+    if not GG.IsGuildMemberOnline(pull.peer) then
+        closeOutPull("peer_offline")
+        return false
+    end
     local entry = GG.GetProvider(pull.providerId)
     if not providerEligible(entry, pull.peer, pull.scopeId) then
         closeOutPull("provider_ineligible")
@@ -2286,7 +2363,7 @@ local function resendOutstanding(pull)
     local msgType = outstanding.msgType
     local requestId = type(outstanding.payload) == "table" and outstanding.payload.requestId or nil
     pull.finalSubmitted = false
-    return GG.SendGossip(msgType, outstanding.payload, "WHISPER", pull.peer, {
+    local ok, sendErr = GG.SendGossip(msgType, outstanding.payload, "WHISPER", pull.peer, {
         providerId = pull.providerId,
         scopeId = pull.scopeId,
         gossipValid = makeOutPullGossipValid(pull, msgType, requestId),
@@ -2298,6 +2375,11 @@ local function resendOutstanding(pull)
             noteOutPullSubmission(pull, success, sendResult)
         end,
     })
+    if not ok and sendErr == "target_offline" then
+        closeOutPull("peer_offline")
+        return false
+    end
+    return ok
 end
 
 -- Reopen bookmarks/coverage for a scoped peer/provider without deleting sibling
@@ -2471,6 +2553,10 @@ local function advanceOutPull(limits, now)
     end
     if pull.engineGen ~= e.generation then
         closeOutPull("stale_gen")
+        return false
+    end
+    if not GG.IsGuildMemberOnline(pull.peer) then
+        closeOutPull("peer_offline")
         return false
     end
 
@@ -2818,6 +2904,10 @@ local function advanceInPull(now)
         closeInPull("stale_gen")
         return true
     end
+    if not GG.IsGuildMemberOnline(pull.peer) then
+        closeInPull("peer_offline")
+        return true
+    end
     -- Pause-adjusted usable-time lease applies in capturing / queued-offer /
     -- serving states. Delayed SendGossip callbacks cannot revive a closed pull
     -- (noteInPullSubmission / trySendServedOffer / gossipValid check identity).
@@ -3082,6 +3172,7 @@ function GG.OnSchedulerStep(limits, now)
             local entry = GG.GetProvider(pc.providerId)
             local scopeId = entry and providerScope(entry)
             local stillValid = peer and entry and not peer.activeExchange
+                and GG.IsGuildMemberOnline(peer.name)
                 and indexReadyForView(entry)
                 and scopeId ~= nil
                 and scopeId == pc.scopeId

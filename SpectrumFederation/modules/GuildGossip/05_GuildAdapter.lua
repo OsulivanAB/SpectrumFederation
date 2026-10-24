@@ -313,6 +313,19 @@ function GG.IsGuildMember(name)
     return true, entry
 end
 
+--- Cached roster presence for whisper transport. Membership authorization stays
+-- on IsGuildMember; known-offline (or unknown) peers are not whisper targets.
+-- Uses the event-driven membership cache only — no full-roster scan per send.
+-- @param name string
+-- @return boolean
+function GG.IsGuildMemberOnline(name)
+    local isMember, entry = GG.IsGuildMember(name)
+    if not isMember or type(entry) ~= "table" then
+        return false
+    end
+    return entry.online == true
+end
+
 function GG.RefreshGuildState()
     local g = GG._guild
     local inGuild = (IsInGuild and IsInGuild()) and true or false
@@ -453,6 +466,10 @@ function GG.RefreshGuildState()
     local becameReady = (not wasReady) and g.ready
     if (becameReady or scopeChanged) and GG.OnGuildReady then
         GG.OnGuildReady()
+    end
+    -- Presence-only refreshes still need to free offline whisper leases / queues.
+    if wasReady and not scopeChanged and GG.OnGuildPresenceChanged then
+        GG.OnGuildPresenceChanged()
     end
 end
 
