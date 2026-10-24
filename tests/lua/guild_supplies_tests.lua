@@ -35470,34 +35470,10 @@ do
             -- Commit will create temp; plant after first pending slice instead.
         end
     end
-    callbackVisits = {}
-    totalVisits = 0
-    local adoptWarmCallbacks = 0
-    GS._onDonationEventIndexVisit = function()
-        totalVisits = totalVisits + 1
-    end
-    GS._onDonationEventIndexCallback = function(visited, completeFlag)
-        local v = tonumber(visited) or 0
-        callbackVisits[#callbackVisits + 1] = {
-            visited = v,
-            complete = completeFlag and true or false,
-        }
-        if v > 0 then
-            adoptWarmCallbacks = adoptWarmCallbacks + 1
-        end
-    end
-    -- Plant cold capacity on the first adoption Warm so ReplayAdoptionSlice
-    -- must yield inside the production continuation (not after commit returns).
-    local plantedAdopt = false
-    local origWarm = GS.WarmDonationEventIndex
-    GS.WarmDonationEventIndex = function(rec, bud)
-        if not plantedAdopt and type(rec) == "table"
-            and GS._adoption and GS._adoption.replayTemp == rec then
-            plantedAdopt = true
-            plantLedgerRows(rec, 2000, 2000, 9916)
-        end
-        return origWarm(rec, bud)
-    end
+    -- Source-backed adoption must commit (no junk ledger plant).
+    GS._onDonationEventIndexVisit = nil
+    GS._onDonationEventIndexRebuild = nil
+    GS._onDonationEventIndexCallback = nil
     GS._adoptionReplaySyncDrain = false
     assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
         "val: idxb adopt ready")
@@ -35512,35 +35488,403 @@ do
     if stAdopt == "pending" then
         stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
     end
-    GS.WarmDonationEventIndex = origWarm
-    -- Index budget is the primary gate; planted rows may leave adoption incomplete.
-    local maxAdoptCb = 0
-    for i = 1, #callbackVisits do
-        if callbackVisits[i].visited > maxAdoptCb then
-            maxAdoptCb = callbackVisits[i].visited
-        end
-    end
-    assertTrue(plantedAdopt, "val: idxb adopt planted cold ledger")
-    assertTrue(maxAdoptCb <= budget,
-        "val: idxb adopt per-callback visits <= budget got=" .. tostring(maxAdoptCb)
-            .. " callbacks=" .. tostring(#callbackVisits)
-            .. " slices=" .. tostring(adoptGuard))
-    assertTrue(adoptWarmCallbacks >= 2,
-        "val: idxb adopt warm yielded across callbacks got="
-            .. tostring(adoptWarmCallbacks))
-    assertTrue(adoptGuard >= 1 or stAdopt == "accepted" or stAdopt == "rejected",
-        "val: idxb adopt yielded or settled st=" .. tostring(stAdopt)
-            .. " " .. tostring(reasonAdopt))
-    -- Clear a stuck adoption so later groups stay isolated.
-    if GS._adoption then
-        GS._adoption = nil
-    end
+    assertEq(stAdopt, "accepted",
+        "val: idxb adopt commits got=" .. tostring(stAdopt) .. " " .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxb adopt idle")
     GS._adoptionReplaySyncDrain = true
-    GS._onDonationEventIndexVisit = nil
-    GS._onDonationEventIndexRebuild = nil
-    GS._onDonationEventIndexCallback = nil
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
     assertEq(#world.chat, 0, "val: idxb chat-free")
+end
+
+do
+    -- Group A remainder (discussion_r4365058306 @ d5d0884a): per-callback bounds
+    -- for deferred Gossip admits and reconcile without full-ledger fallback.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxc provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function plantLedgerRows(record, liveCount, archCount, itemId)
+        local accounting = record.accounting
+        local live, arch = {}, {}
+        local function push(list, n, prefix)
+            for i = 1, n do
+                local txn = string.format("ctx:%s-%s-%04d", prefix, tostring(itemId), i)
+                list[#list + 1] = {
+                    type = "donation",
+                    id = txn,
+                    txnId = txn,
+                    itemId = itemId,
+                    quantity = 1,
+                    generation = 1,
+                    gsProductionCredit = true,
+                    verification = "officer",
+                    writer = "Player-1-Alice",
+                    verifierGuid = "Player-1-Alice",
+                    datasetId = record.datasetId,
+                    campaignId = record.currentCampaignId,
+                    approxTxnTime = world.time,
+                    timestamp = math.floor(world.time or 0),
+                    occurrenceIndex = 300000 + #list + i,
+                }
+            end
+        end
+        push(arch, archCount, "arch")
+        push(live, liveCount, "live")
+        accounting._consumableEventArchive = arch
+        accounting._consumableEvents = live
+        accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+        return live, arch
+    end
+
+    SF.TSM = nil
+    local record = activateValuationGuild(9917)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local budget = GS.DONATION_EVENT_INDEX_BUDGET or 512
+    local admitBudget = GS.DEFERRED_VALUATION_ADMIT_BUDGET
+        or GS.MAX_ADMISSION_WORK_PER_SLICE
+        or 32
+    assertEq(admitBudget, 32, "val: idxc deferred admit budget 32")
+    local maxLive = GS.MAX_LEDGER_EVENTS or 4096
+    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    local live, arch = plantLedgerRows(record, maxLive, maxArch, 9917)
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record) == "table", "val: idxc near-cap record")
+    assertTrue(#live >= maxLive - 8 and #arch >= maxArch - 8, "val: idxc near capacity")
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxc index starts cold")
+
+    local indexCbMax, fallbackCbMax, admitCbMax = 0, 0, 0
+    local indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+    local totalIndex, totalFallback, totalAdmits = 0, 0, 0
+    local drainCallbacks = 0
+    local function rollCallbackBuckets()
+        if indexCbBucket > indexCbMax then indexCbMax = indexCbBucket end
+        if fallbackCbBucket > fallbackCbMax then fallbackCbMax = fallbackCbBucket end
+        if admitCbBucket > admitCbMax then admitCbMax = admitCbBucket end
+        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+    end
+    GS._onDonationEventIndexVisit = function()
+        totalIndex = totalIndex + 1
+        indexCbBucket = indexCbBucket + 1
+    end
+    GS._onDonationEventFallbackVisit = function()
+        totalFallback = totalFallback + 1
+        fallbackCbBucket = fallbackCbBucket + 1
+    end
+    GS._onDeferredValuationAdmit = function()
+        totalAdmits = totalAdmits + 1
+        admitCbBucket = admitCbBucket + 1
+    end
+    GS._onDeferredValuationDrainCallback = function()
+        drainCallbacks = drainCallbacks + 1
+        -- Prior tick's buckets already rolled after flush; start fresh.
+    end
+    GS._onDonationEventIndexCallback = function(visited)
+        -- Ensure resets per Ensure call; drain may warm once then admit.
+        local v = tonumber(visited) or 0
+        if v > indexCbBucket then
+            -- keep cumulative bucket for the drain wall
+        end
+    end
+
+    local nDefer = 80
+    local targets = {}
+    for i = 1, nDefer do
+        targets[i] = live[#live - nDefer + i]
+        assertTrue(type(targets[i]) == "table", "val: idxc target " .. i)
+        local body = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, targets[i], {
+                assignmentId = string.format("gsv1:%024x:%08x", i + 100, 9917),
+                assignedAt = 9000 + i,
+                unitCopper = 11,
+                txnId = targets[i].txnId,
+            }),
+        }
+        local st, reason = providerApplyWithId(
+            "gs:val:" .. targets[i].txnId, body, "Alice-Garona")
+        assertTrue(st == "pending" or st == "accepted" or st == "duplicate",
+            "val: idxc enqueue st=" .. tostring(st) .. " " .. tostring(reason))
+    end
+    -- First admits may warm once then defer; roll that wall.
+    rollCallbackBuckets()
+
+    local drainGuard = 0
+    while drainGuard < 256 do
+        drainGuard = drainGuard + 1
+        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+        flushTimers()
+        rollCallbackBuckets()
+        world.time = (world.time or 0) + 1
+        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+        flushTimers()
+        rollCallbackBuckets()
+        record = GS:GetCurrentRecord()
+        local kept = 0
+        for i = 1, nDefer do
+            if valuationSnap(record, targets[i].txnId)
+                or (record.valuations and record.valuations.pending
+                    and record.valuations.pending[targets[i].txnId]) then
+                kept = kept + 1
+            end
+        end
+        if kept >= nDefer then
+            break
+        end
+    end
+    record = GS:GetCurrentRecord()
+    local accepted = 0
+    for i = 1, nDefer do
+        if valuationSnap(record, targets[i].txnId) then
+            accepted = accepted + 1
+        end
+    end
+    assertEq(accepted, nDefer,
+        "val: idxc all deferred valuations retained without redelivery got="
+            .. tostring(accepted))
+    assertTrue(admitCbMax <= admitBudget,
+        "val: idxc max admits/callback <= budget got=" .. tostring(admitCbMax)
+            .. " budget=" .. tostring(admitBudget))
+    assertTrue(indexCbMax <= budget,
+        "val: idxc max index visits/callback <= budget got=" .. tostring(indexCbMax))
+    assertTrue(fallbackCbMax <= 0,
+        "val: idxc no full-ledger fallback during defer drain got="
+            .. tostring(fallbackCbMax))
+    assertTrue(drainCallbacks >= 2,
+        "val: idxc deferred drain yielded across callbacks got="
+            .. tostring(drainCallbacks))
+    assertTrue(totalIndex <= (#live + #arch) + budget,
+        "val: idxc total index near-linear got=" .. tostring(totalIndex))
+
+    -- Cold reconcile: pending valuations + several new credits with knownEvent.
+    plantLedgerRows(record, 64, 64, 9918)
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record) == "table", "val: idxc reconcile plant")
+    -- Force cold index on new array identities.
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxc reconcile cold")
+    local creditN = 8
+    local pendingTxns = {}
+    for i = 1, creditN do
+        pendingTxns[i] = string.format("ctx:idxc-credit-%04d", i)
+        local store = record.valuations
+        if type(store) ~= "table" then
+            record.valuations = { schemaVersion = 1, nextSeq = 1, byTxn = {}, pending = {} }
+            store = record.valuations
+        end
+        store.pending = store.pending or {}
+        store.pending[pendingTxns[i]] = {
+            assignmentId = string.format("gsv1:%024x:%08x", i + 200, 9918),
+            assignedAt = 10000 + i,
+            unitCopper = 13,
+            quantity = 1,
+            totalCopper = 13,
+            itemId = 9918,
+            txnId = pendingTxns[i],
+            canonicalTxnId = pendingTxns[i],
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            seen = {},
+        }
+    end
+    totalFallback = 0
+    fallbackCbMax = 0
+    for i = 1, creditN do
+        fallbackCbBucket = 0
+        indexCbBucket = 0
+        local ev = {
+            type = "donation",
+            id = pendingTxns[i],
+            txnId = pendingTxns[i],
+            itemId = 9918,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 400000 + i,
+        }
+        local liveArr = record.accounting._consumableEvents
+        liveArr[#liveArr + 1] = ev
+        record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+        GS.ReconcilePendingValuations(record, pendingTxns[i], ev)
+        if fallbackCbBucket > fallbackCbMax then
+            fallbackCbMax = fallbackCbBucket
+        end
+        if indexCbBucket > indexCbMax then
+            indexCbMax = indexCbBucket
+        end
+    end
+    assertTrue(fallbackCbMax <= 0,
+        "val: idxc reconcile credits use knownEvent (no fallback) got="
+            .. tostring(fallbackCbMax))
+    record = GS:GetCurrentRecord()
+    for i = 1, creditN do
+        assertTrue(type(valuationSnap(record, pendingTxns[i])) == "table",
+            "val: idxc credit " .. i .. " promoted")
+    end
+
+    -- Large source-backed adoption must COMMIT with all advertised valuations.
+    drainExportMaint(64)
+    local adoptN = 48
+    record = activateValuationGuild(9919)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adoptEvents = {}
+    for i = 1, adoptN do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9919, quantity = 1, donor = "IdxcDonor" .. i .. "-Garona",
+            observedAt = world.time, ageHours = 0, occurrenceIndex = i,
+            neighborsOlder = { "idxc-old-" .. i }, neighborsNewer = { "idxc-new-" .. i },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+            "accepted", "val: idxc adopt seed credit " .. i)
+        record = GS:GetCurrentRecord()
+        local ev = nil
+        local lists = {
+            record.accounting._consumableEvents,
+            record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for j = #list, 1, -1 do
+                    local row = list[j]
+                    if type(row) == "table" and tonumber(row.itemId) == 9919
+                        and tonumber(row.occurrenceIndex) == i then
+                        ev = row
+                        break
+                    end
+                end
+            end
+            if ev then break end
+        end
+        assertTrue(ev ~= nil, "val: idxc adopt seed donation " .. i)
+        adoptEvents[i] = ev
+        local body = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, ev, {
+                assignmentId = string.format("gsv1:%024x:%08x", i + 300, 9919),
+                assignedAt = 11000 + i,
+                unitCopper = 15,
+                txnId = ev.txnId,
+            }),
+        }
+        local st = select(1, providerApplyWithId("gs:val:" .. ev.txnId, body, "Alice-Garona"))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: idxc adopt seed valuation " .. i .. " " .. tostring(st))
+    end
+    flushTimers()
+    drainExportMaint(64)
+    local aliceExport = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    local sourceCount = valuationCount(record)
+    assertTrue(sourceCount >= adoptN, "val: idxc source valuations got=" .. tostring(sourceCount))
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idxc adopt begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: idxc buffer " .. tostring(row.body and row.body.kind)
+                    .. " " .. tostring(st) .. " " .. tostring(reason))
+        end
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" then
+        if type(adop.records) == "table" then
+            local desc = adop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    totalIndex, totalFallback = 0, 0
+    indexCbMax, fallbackCbMax = 0, 0
+    GS._onDonationEventIndexVisit = function()
+        totalIndex = totalIndex + 1
+        indexCbBucket = indexCbBucket + 1
+    end
+    GS._onDonationEventFallbackVisit = function()
+        totalFallback = totalFallback + 1
+        fallbackCbBucket = fallbackCbBucket + 1
+    end
+    GS._adoptionReplaySyncDrain = false
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: idxc adopt ready")
+    local stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+    local adoptGuard2 = 0
+    while GS._adoption and GS._adoption.replayTemp and adoptGuard2 < 12000 do
+        adoptGuard2 = adoptGuard2 + 1
+        indexCbBucket, fallbackCbBucket = 0, 0
+        flushTimers()
+        if indexCbBucket > indexCbMax then indexCbMax = indexCbBucket end
+        if fallbackCbBucket > fallbackCbMax then fallbackCbMax = fallbackCbBucket end
+        world.time = (world.time or 0) + 1
+        indexCbBucket, fallbackCbBucket = 0, 0
+        flushTimers()
+        if indexCbBucket > indexCbMax then indexCbMax = indexCbBucket end
+        if fallbackCbBucket > fallbackCbMax then fallbackCbMax = fallbackCbBucket end
+    end
+    if stAdopt2 == "pending" then
+        stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt2, "accepted",
+        "val: idxc large adopt commits got=" .. tostring(stAdopt2)
+            .. " " .. tostring(reasonAdopt2))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxc adopt idle")
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: idxc adopt dataset")
+    assertTrue(valuationCount(adopted) >= adoptN,
+        "val: idxc adopt retained valuations got=" .. tostring(valuationCount(adopted)))
+    assertTrue(indexCbMax <= budget,
+        "val: idxc adopt max index/callback <= budget got=" .. tostring(indexCbMax))
+    assertTrue(fallbackCbMax <= 0,
+        "val: idxc adopt no full-ledger fallback got=" .. tostring(fallbackCbMax))
+    assertTrue(totalIndex <= (adoptN * 4) + budget,
+        "val: idxc adopt index near-linear got=" .. tostring(totalIndex))
+    GS._adoptionReplaySyncDrain = true
+    GS._onDonationEventIndexVisit = nil
+    GS._onDonationEventFallbackVisit = nil
+    GS._onDeferredValuationAdmit = nil
+    GS._onDeferredValuationDrainCallback = nil
+    GS._onDonationEventIndexCallback = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idxc chat-free")
 end
 
 do

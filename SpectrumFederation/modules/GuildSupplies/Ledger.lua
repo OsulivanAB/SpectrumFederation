@@ -1488,7 +1488,7 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
         if not wasCredited and existing.gsProductionCredit == true then
             local txnId = ValidTxnId(existing.txnId) or ValidTxnId(existing.id)
             if txnId and GS.ReconcilePendingValuations then
-                GS.ReconcilePendingValuations(record, txnId)
+                GS.ReconcilePendingValuations(record, txnId, existing)
             end
             if GS.TryAssignDonationValuation then
                 GS.TryAssignDonationValuation(record, existing, nil)
@@ -2227,7 +2227,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMo
         tostring(txnId), tostring(mode),
         tostring(GS.CountIndependentWitnesses(record, cluster.witnesses)))
     if GS.ReconcilePendingValuations then
-        GS.ReconcilePendingValuations(record, txnId)
+        GS.ReconcilePendingValuations(record, txnId, event)
     end
     if GS.TryAssignDonationValuation then
         GS.TryAssignDonationValuation(record, event, evidence)
@@ -2967,7 +2967,7 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
     Debug("Info", "officer-trusted history accepted txn=%s writer=%s sender=%s",
         tostring(txnId), tostring(writer), tostring(authed and authed.name or senderName))
     if GS.ReconcilePendingValuations then
-        GS.ReconcilePendingValuations(record, txnId)
+        GS.ReconcilePendingValuations(record, txnId, stored)
     end
     if GS.TryAssignDonationValuation then
         GS.TryAssignDonationValuation(record, stored, row)
@@ -3358,7 +3358,7 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 verification = stored.verification,
             })
             if GS.ReconcilePendingValuations then
-                GS.ReconcilePendingValuations(record, txnId)
+                GS.ReconcilePendingValuations(record, txnId, stored)
             end
             return "accepted", "adoption_transfer"
         end

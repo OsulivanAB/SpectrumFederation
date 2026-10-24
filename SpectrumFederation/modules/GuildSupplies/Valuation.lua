@@ -458,6 +458,9 @@ local function VisitEvents(record, fn)
         local list = lists[li]
         if type(list) == "table" then
             for i = 1, #list do
+                if type(GS._onDonationEventFallbackVisit) == "function" then
+                    GS._onDonationEventFallbackVisit(list[i])
+                end
                 if fn(list[i]) then
                     return list[i]
                 end
@@ -475,6 +478,12 @@ end
 local donationEventIndex = setmetatable({}, { __mode = "k" })
 -- Max ledger rows indexed in one Ensure/Warm/FindEvent callback.
 GS.DONATION_EVENT_INDEX_BUDGET = GS.DONATION_EVENT_INDEX_BUDGET or 512
+-- Max deferred ordinary-Gossip valuation admits attempted per After(0) drain.
+-- Matches the adoption admission slice unit so one UI callback cannot re-admit
+-- an entire catch-up queue while the index is still warming.
+GS.DEFERRED_VALUATION_ADMIT_BUDGET = GS.DEFERRED_VALUATION_ADMIT_BUDGET
+    or GS.MAX_ADMISSION_WORK_PER_SLICE
+    or 32
 local function IndexBudget(budget)
     -- Explicit 0 = peek-only (no row visits this call).
     if budget == 0 then
@@ -697,6 +706,9 @@ end
 
 -- Ordinary Gossip: retain authorized bodies locally while the index warms.
 -- One-shot After(0) drain (same pattern as Logs catch-up); not a poller.
+-- Each tick warms ≤ DONATION_EVENT_INDEX_BUDGET rows and attempts at most
+-- DEFERRED_VALUATION_ADMIT_BUDGET admissions from the front of the queue;
+-- awaiting_index rows and the unprocessed tail stay queued for the next tick.
 local deferredValuationIngress = {}
 local deferredValuationScheduled = false
 
@@ -710,6 +722,9 @@ local function ScheduleDeferredValuationDrain()
         if #deferredValuationIngress < 1 then
             return
         end
+        if type(GS._onDeferredValuationDrainCallback) == "function" then
+            GS._onDeferredValuationDrainCallback(#deferredValuationIngress)
+        end
         local record = nil
         if type(GS.GetCurrentRecord) == "function" then
             record = select(1, GS:GetCurrentRecord())
@@ -717,10 +732,32 @@ local function ScheduleDeferredValuationDrain()
         if type(record) == "table" then
             GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
         end
+        local admitBudget = tonumber(GS.DEFERRED_VALUATION_ADMIT_BUDGET)
+            or GS.MAX_ADMISSION_WORK_PER_SLICE
+            or 32
+        if admitBudget < 1 then
+            admitBudget = 1
+        end
         local remain = {}
-        for i = 1, #deferredValuationIngress do
+        local admits = 0
+        local queueVisits = 0
+        local i = 1
+        local n = #deferredValuationIngress
+        while i <= n do
             local row = deferredValuationIngress[i]
+            if admits >= admitBudget then
+                -- Preserve the unprocessed tail (and any prior awaiting rows).
+                for j = i, n do
+                    remain[#remain + 1] = deferredValuationIngress[j]
+                end
+                break
+            end
+            queueVisits = queueVisits + 1
             if type(row) == "table" and type(row.body) == "table" then
+                admits = admits + 1
+                if type(GS._onDeferredValuationAdmit) == "function" then
+                    GS._onDeferredValuationAdmit(row, admits, queueVisits)
+                end
                 local live = row.record
                 if type(GS.GetCurrentRecord) == "function" then
                     local cur = select(1, GS:GetCurrentRecord())
@@ -735,7 +772,10 @@ local function ScheduleDeferredValuationDrain()
                 if st == "pending" and reason == "awaiting_index" then
                     remain[#remain + 1] = row
                 end
+                -- accepted / duplicate / rejected / other pending: drop from
+                -- deferral; durable store or reject already recorded the body.
             end
+            i = i + 1
         end
         deferredValuationIngress = remain
         if #deferredValuationIngress > 0 then
@@ -816,23 +856,48 @@ local function FindEventForIds(record, ids)
     end), true
 end
 
---- Definitive lookup for local reconcile/mint helpers (not Gossip admission).
--- Prefers the ephemeral index; advances at most one budgeted warm, then falls
--- back to VisitEvents so a cold miss cannot be treated as "no donation".
-local function ResolveEventForIds(record, ids)
+--- Remember a just-admitted donation on the ephemeral index without a scan.
+local function RememberDonationEvent(record, event)
+    local accounting = record and record.accounting
+    local cached = type(accounting) == "table" and donationEventIndex[accounting] or nil
+    if type(cached) ~= "table" or type(cached.byTxn) ~= "table" or type(event) ~= "table" then
+        return
+    end
+    local txn = EventTxn(event)
+    if type(txn) == "string" and txn ~= "" then
+        cached.byTxn[txn] = event
+    end
+    if type(event.id) == "string" and event.id ~= "" and event.id ~= txn then
+        cached.byTxn[event.id] = event
+    end
+end
+
+--- Resolve a donation for local reconcile helpers (not Gossip admission).
+-- Prefers a caller-supplied known event, then the ephemeral index. Advances at
+-- most one budgeted warm. Never falls back to a full ledger VisitEvents scan:
+-- an incomplete index returns ready=false so pending winners are not cleared.
+-- @return event|nil, ready bool
+local function ResolveEventForIds(record, ids, knownEvent)
+    if type(knownEvent) == "table" and type(ids) == "table" then
+        local txn = EventTxn(knownEvent)
+        if (type(txn) == "string" and ids[txn] == true)
+            or (type(knownEvent.id) == "string" and ids[knownEvent.id] == true) then
+            -- Peek creates/resumes the ephemeral map so the known pointer sticks.
+            EnsureDonationEventIndex(record, 0)
+            RememberDonationEvent(record, knownEvent)
+            return knownEvent, true
+        end
+    end
     local event, ready = FindEventForIds(record, ids)
     if event ~= nil or ready then
-        return event
+        return event, ready and true or false
     end
     GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
     event, ready = FindEventForIds(record, ids)
-    if event ~= nil or ready then
-        return event
+    if event ~= nil then
+        return event, true
     end
-    return VisitEvents(record, function(ev)
-        local txn = EventTxn(ev)
-        return txn and ids[txn] == true
-    end)
+    return nil, ready and true or false
 end
 
 local function PriceableDonation(record, event)
@@ -1650,12 +1715,16 @@ function GS.ForgetDonationValuations(record, txnIds, opts)
     })
 end
 
-local function MergeOntoCanonical(record, canonical, incoming, changed)
+local function MergeOntoCanonical(record, canonical, incoming, changed, knownEvent)
     if type(incoming) ~= "table" then
         return changed
     end
     local eventIds = AliasSet(record, canonical)
-    local event = ResolveEventForIds(record, eventIds)
+    local event, ready = ResolveEventForIds(record, eventIds, knownEvent)
+    if not ready and not event then
+        -- Index still warming: leave pending/winners untouched.
+        return changed
+    end
     if not event or not PriceableDonation(record, event) or not DonationMatches(incoming, event) then
         return changed
     end
@@ -1669,7 +1738,9 @@ local function MergeOntoCanonical(record, canonical, incoming, changed)
     return changed or did == true
 end
 
-function GS.ReconcilePendingValuations(record, txnId)
+--- Promote/drop pending valuations for one donation txn.
+-- knownEvent: optional just-admitted ledger row (avoids cold full-history scans).
+function GS.ReconcilePendingValuations(record, txnId, knownEvent)
     if type(record) ~= "table" then
         return false
     end
@@ -1681,7 +1752,11 @@ function GS.ReconcilePendingValuations(record, txnId)
     if type(store) ~= "table" then
         return false
     end
-    local event = ResolveEventForIds(record, ids)
+    local event, ready = ResolveEventForIds(record, ids, knownEvent)
+    if not ready and not event then
+        -- Incomplete index without a known event: not a definitive miss.
+        return false
+    end
     if event and not PriceableDonation(record, event) then
         if CreditStillUnresolved(record, event) then
             return false
@@ -1720,8 +1795,8 @@ function GS.ReconcilePendingValuations(record, txnId)
             store.pending[key] = nil
             removed = true
         end
-        changed = MergeOntoCanonical(record, canonical, fromWinner, changed)
-        changed = MergeOntoCanonical(record, canonical, fromPending, changed)
+        changed = MergeOntoCanonical(record, canonical, fromWinner, changed, event)
+        changed = MergeOntoCanonical(record, canonical, fromPending, changed, event)
     end
     if removed then
         NoteValuationStoreMutation(store, record)
@@ -1744,6 +1819,10 @@ function GS.ReconcileValuationsAfterCreditChange(record)
     local pending = type(store) == "table" and store.pending or nil
     if type(pending) ~= "table" then
         return
+    end
+    -- One budgeted warm for the whole pass; per-key reconcile peeks only.
+    if GS.WarmDonationEventIndex then
+        GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
     end
     local keys = {}
     for key in pairs(pending) do
@@ -1852,7 +1931,17 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
         end
     end
     local ids = AliasSet(record, canonical)
-    local event = ResolveEventForIds(record, ids)
+    local event, ready = ResolveEventForIds(record, ids)
+    -- Incomplete index: keep candidates under pending[canonical]; do not treat
+    -- as a definitive miss or clear pending winners.
+    if not ready and not event then
+        local wrote = HoldAliasPending(record, store, canonical, nil, candidates)
+        if removed or wrote then
+            NoteValuationStoreMutation(store, record)
+        end
+        RemoveValuationExports(record, { [alias] = true })
+        return
+    end
     local priceable = event and PriceableDonation(record, event) and true or false
     -- No donation yet, or a staged donation whose cutover credit is still open.
     -- Keep one pending row on the canonical id. Do not publish it.
@@ -1870,7 +1959,7 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     end
     local changed = false
     for i = 1, #candidates do
-        changed = MergeOntoCanonical(record, canonical, candidates[i].snap, changed)
+        changed = MergeOntoCanonical(record, canonical, candidates[i].snap, changed, event)
     end
     RemoveValuationExports(record, { [alias] = true })
     if changed and ShouldPublish(record) then
@@ -1999,9 +2088,11 @@ function GS:AdmitValuationAssignment(body, opts)
             local originalEvent, originalReady = FindEventForIds(record, { [assignment.txnId] = true })
             if (exportReady == false or originalReady == false)
                 and not opts.adoptionReplay
-                and not opts._indexDeferAttempt then
-                -- Ordinary ingress: one bounded warm (≤ DONATION_EVENT_INDEX_BUDGET).
-                -- Deferred After(0) drain warms before re-admit; do not double-charge.
+                and not opts._indexDeferAttempt
+                and not deferredValuationScheduled then
+                -- Ordinary ingress: one bounded warm (≤ DONATION_EVENT_INDEX_BUDGET)
+                -- per callback. A burst that already scheduled the After(0) drain
+                -- leaves further warming to that tick so 512 is not multiplied.
                 GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
                 exportEvent, exportReady = FindEventForIds(record, exportIds)
                 originalEvent, originalReady = FindEventForIds(record, { [assignment.txnId] = true })
@@ -2027,16 +2118,16 @@ function GS:AdmitValuationAssignment(body, opts)
         ids[exportCanonical] = true
     end
     local event, eventReady = FindEventForIds(record, ids)
-    if eventReady == false and not opts.adoptionReplay and not opts._indexDeferAttempt then
-        -- Documented ordinary-ingress bound: at most one index budget per admit
-        -- callback. Remainder continues via local After(0) deferral drain, which
-        -- warms before re-admit so a deferred pass does not spend a second budget.
+    if eventReady == false and not opts.adoptionReplay and not opts._indexDeferAttempt
+        and not deferredValuationScheduled then
+        -- At most one index budget per ordinary-ingress callback. Further bodies
+        -- in the same burst defer; the After(0) drain owns subsequent warms.
         GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
         event, eventReady = FindEventForIds(record, ids)
     end
     if eventReady == false then
         -- Index still warming: keep the authorized body without treating a miss
-        -- as "no donation". Adoption retries; Gossip uses local After(0) drain.
+        -- as a definitive absence. Adoption retries; Gossip uses local After(0).
         if not opts.adoptionReplay and not opts._indexDeferAttempt then
             DeferValuationIngress(body, opts)
         end
