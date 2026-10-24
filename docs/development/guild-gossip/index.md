@@ -86,6 +86,7 @@ Delivery results distinguish **accepted**, **duplicate**, **rejected**, and **pe
 - Encoding: uncompressed `B64CBOR` only (`NONE` for empty control envelopes)
 - Compressed `B64CBORZ` gossip is **rejected before decompression**
 - Distributions: small `GUILD` discovery; scoped `WHISPER` for views/manifests/bodies
+- Whisper targets must be guild members who are **known online** in the event-driven roster cache (`IsGuildMemberOnline`). Membership authorization (`IsGuildMember`) stays separate. Presence is rechecked at Comm queue drain (including custom `gossipValid`). Offline peers defer without retry storms; sync resumes when they are online again. GUILD discovery is unchanged.
 
 ## Operational limits (D1 initial contract)
 
