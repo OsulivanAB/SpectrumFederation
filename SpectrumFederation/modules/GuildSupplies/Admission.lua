@@ -5035,6 +5035,11 @@ local function PublishAdoptionTemp(adop, temp, desc)
     local priorLive = GS._root and GS._root.guilds and GS._root.guilds[adop.guildKey]
     ClearConfirmationRedriveForRecord(priorLive)
     ClearConfirmationRedriveForGuild(adop.guildKey)
+    -- Raise nextSeq past same-nonce imported winners/pending/losers before the
+    -- adopted record becomes the live guild dataset (survives writer nonce).
+    if GS.AdvanceValuationSeqForLocalWriter then
+        GS.AdvanceValuationSeqForLocalWriter(temp)
+    end
     GS._root.guilds[adop.guildKey] = temp
     GS._adoptionEpoch = (tonumber(GS._adoptionEpoch) or 0) + 1
     adop.committed = true

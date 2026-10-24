@@ -467,9 +467,187 @@ local function VisitEvents(record, fn)
     return nil
 end
 
+-- Ephemeral txnId/id → event pointer for valuation admission. Keyed by the
+-- accounting table; invalidated on shelve/trim (array identity change) and
+-- extended incrementally on append-only mutation bumps. Never persisted.
+-- Cold rebuild is resumable under a visit budget so adoption slices can yield.
+local donationEventIndex = setmetatable({}, { __mode = "k" })
+local DONATION_EVENT_INDEX_BUDGET = 512
+
+local function IndexDonationEvent(byTxn, event)
+    if type(byTxn) ~= "table" or type(event) ~= "table" then
+        return 0
+    end
+    local txn = EventTxn(event)
+    if type(txn) == "string" and txn ~= "" then
+        byTxn[txn] = event
+    end
+    if type(event.id) == "string" and event.id ~= "" and event.id ~= txn then
+        byTxn[event.id] = event
+    end
+    if type(GS._onDonationEventIndexVisit) == "function" then
+        GS._onDonationEventIndexVisit(event)
+    end
+    return 1
+end
+
+local function ContinueDonationEventIndex(cached, live, arch, liveN, archN, budget)
+    local byTxn = cached.byTxn
+    local spent = 0
+    local limit = tonumber(budget)
+    if not limit or limit < 1 then
+        limit = DONATION_EVENT_INDEX_BUDGET
+    end
+    -- Archive first, then live, so live overwrites win on collisions (matches
+    -- VisitEvents live-then-archive first-match preference on lookup ties).
+    local archPos = tonumber(cached.archPos) or 0
+    while archPos < archN and spent < limit do
+        archPos = archPos + 1
+        spent = spent + IndexDonationEvent(byTxn, arch[archPos])
+    end
+    cached.archPos = archPos
+    local livePos = tonumber(cached.livePos) or 0
+    while livePos < liveN and spent < limit do
+        livePos = livePos + 1
+        spent = spent + IndexDonationEvent(byTxn, live[livePos])
+    end
+    cached.livePos = livePos
+    cached.liveN = liveN
+    cached.archN = archN
+    if archPos >= archN and livePos >= liveN then
+        cached.building = false
+        cached.archPos = nil
+        cached.livePos = nil
+        return spent, true
+    end
+    cached.building = true
+    return spent, false
+end
+
+--- Ensure / advance the donation event index. Returns byTxn, complete.
+-- budget: max events to visit on a cold/resume pass (nil = default slice).
+-- Pass math.huge (or a very large number) to finish synchronously.
+local function EnsureDonationEventIndex(record, budget)
+    local accounting = record and record.accounting
+    if type(accounting) ~= "table" then
+        return nil, true
+    end
+    local mut = tonumber(accounting._mutationSeq) or 0
+    local live = accounting._consumableEvents
+    local arch = accounting._consumableEventArchive
+    local liveN = type(live) == "table" and #live or 0
+    local archN = type(arch) == "table" and #arch or 0
+    local cached = donationEventIndex[accounting]
+    if cached and not cached.building and cached.mut == mut and type(cached.byTxn) == "table" then
+        return cached.byTxn, true
+    end
+    -- Resume an in-progress cold rebuild for the same array identities.
+    if cached and cached.building and type(cached.byTxn) == "table"
+        and cached.live == live and cached.arch == arch then
+        local _, complete = ContinueDonationEventIndex(cached, live, arch, liveN, archN, budget)
+        if complete then
+            cached.mut = mut
+        end
+        return cached.byTxn, complete
+    end
+    -- Append-only: same array identities grew after mutation bumps.
+    if cached and not cached.building and type(cached.byTxn) == "table"
+        and cached.live == live and cached.arch == arch
+        and liveN >= (cached.liveN or 0) and archN >= (cached.archN or 0)
+        and mut >= (cached.mut or 0) then
+        for i = (cached.archN or 0) + 1, archN do
+            IndexDonationEvent(cached.byTxn, arch[i])
+        end
+        for i = (cached.liveN or 0) + 1, liveN do
+            IndexDonationEvent(cached.byTxn, live[i])
+        end
+        cached.mut = mut
+        cached.liveN = liveN
+        cached.archN = archN
+        return cached.byTxn, true
+    end
+    -- Cold rebuild (dataset replace, shelve/trim, first use). Resumable.
+    if type(GS._onDonationEventIndexRebuild) == "function" then
+        GS._onDonationEventIndexRebuild(accounting, liveN + archN)
+    end
+    cached = {
+        mut = mut,
+        byTxn = {},
+        live = live,
+        arch = arch,
+        liveN = liveN,
+        archN = archN,
+        archPos = 0,
+        livePos = 0,
+        building = true,
+    }
+    donationEventIndex[accounting] = cached
+    local _, complete = ContinueDonationEventIndex(cached, live, arch, liveN, archN, budget)
+    if complete then
+        cached.mut = mut
+    end
+    return cached.byTxn, complete
+end
+
+--- Map an alias onto an already-indexed canonical donation event (O(1)).
+function GS.NoteDonationEventTxnAlias(record, primaryTxnId, aliasTxnId)
+    local accounting = record and record.accounting
+    local cached = type(accounting) == "table" and donationEventIndex[accounting] or nil
+    if type(cached) ~= "table" or type(cached.byTxn) ~= "table" then
+        return
+    end
+    if type(primaryTxnId) ~= "string" or type(aliasTxnId) ~= "string" then
+        return
+    end
+    local ev = cached.byTxn[primaryTxnId]
+    if type(ev) == "table" then
+        cached.byTxn[aliasTxnId] = ev
+    end
+end
+
+--- Advance a resumable cold index build; returns complete, visited.
+function GS.WarmDonationEventIndex(record, budget)
+    local byTxn, complete = EnsureDonationEventIndex(record, budget)
+    if type(byTxn) ~= "table" then
+        return true, 0
+    end
+    return complete and true or false, 0
+end
+
 local function FindEventForIds(record, ids)
     if type(ids) ~= "table" then
         return nil
+    end
+    -- Finish any in-progress cold build so admission stays correct; ordinary
+    -- appends stay incremental. WarmDonationEventIndex can pre-pay the cost.
+    local byTxn, complete = EnsureDonationEventIndex(record, DONATION_EVENT_INDEX_BUDGET)
+    local guard = 0
+    while type(byTxn) == "table" and not complete and guard < 64 do
+        guard = guard + 1
+        byTxn, complete = EnsureDonationEventIndex(record, DONATION_EVENT_INDEX_BUDGET)
+    end
+    if type(byTxn) == "table" and not complete then
+        byTxn, complete = EnsureDonationEventIndex(record, math.huge)
+    end
+    if type(byTxn) == "table" then
+        local hit = nil
+        for txn in pairs(ids) do
+            if type(txn) == "string" then
+                local ev = byTxn[txn]
+                if type(ev) == "table" then
+                    if hit == nil then
+                        hit = ev
+                    elseif hit ~= ev then
+                        -- Rare multi-donation id set: preserve VisitEvents order.
+                        return VisitEvents(record, function(event)
+                            local t = EventTxn(event)
+                            return t and ids[t] == true
+                        end)
+                    end
+                end
+            end
+        end
+        return hit
     end
     return VisitEvents(record, function(event)
         local txn = EventTxn(event)
@@ -660,6 +838,83 @@ local function ValidAssignmentId(id)
         and id:match("^gsv1:[0-9a-fA-F]+:[0-9a-fA-F]+$") ~= nil
 end
 
+--- Raise store.nextSeq past a same-nonce locally minted assignment id.
+-- Cheap O(1) parse; no history scan. Exhaustion pins nextSeq at max.
+local function ObserveAssignmentIdSeq(store, assignmentId)
+    if type(store) ~= "table" or not ValidAssignmentId(assignmentId) then
+        return
+    end
+    local root = GS._root
+    local writer = root and root.localWriter
+    if type(writer) ~= "table" or type(writer.nonce) ~= "string"
+        or not writer.nonce:match("^[0-9a-fA-F]+$") or #writer.nonce ~= 24 then
+        return
+    end
+    local prefix = "gsv1:" .. writer.nonce .. ":"
+    if assignmentId:sub(1, #prefix) ~= prefix then
+        return
+    end
+    local hex = assignmentId:sub(#prefix + 1)
+    if type(hex) ~= "string" or not hex:match("^[0-9a-fA-F]+$") then
+        return
+    end
+    local seq = tonumber(hex, 16)
+    if not seq or seq ~= math.floor(seq) or seq < 1 then
+        return
+    end
+    local nextSeq = tonumber(store.nextSeq) or 1
+    if seq < nextSeq then
+        return
+    end
+    if seq >= 4294967295 then
+        store.nextSeq = 4294967295
+        return
+    end
+    store.nextSeq = seq + 1
+end
+
+local function ObserveSnapSeqs(store, snap)
+    if type(store) ~= "table" or type(snap) ~= "table" then
+        return
+    end
+    ObserveAssignmentIdSeq(store, snap.assignmentId)
+    if type(snap.seen) ~= "table" then
+        return
+    end
+    local last = #snap.seen
+    if last > MAX_SEEN then
+        last = MAX_SEEN
+    end
+    for i = 1, last do
+        local row = snap.seen[i]
+        if type(row) == "table" then
+            ObserveAssignmentIdSeq(store, row.id)
+        end
+    end
+end
+
+--- Advance nextSeq from all retained same-nonce ids (winners, pending, losers).
+-- Bounded by current valuation cardinality; used at adoption publish.
+function GS.AdvanceValuationSeqForLocalWriter(record)
+    if type(record) ~= "table" then
+        return
+    end
+    local store = record.valuations
+    if type(store) ~= "table" then
+        return
+    end
+    local function ingest(bucket)
+        if type(bucket) ~= "table" then
+            return
+        end
+        for _, snap in pairs(bucket) do
+            ObserveSnapSeqs(store, snap)
+        end
+    end
+    ingest(store.byTxn)
+    ingest(store.pending)
+end
+
 local function ValidActorGuid(guid)
     if guid == nil then
         return true
@@ -745,48 +1000,112 @@ local function RememberLoser(snap, id, fp)
     snap.seen[#snap.seen + 1] = { id = id, fp = fp }
 end
 
---- Install or reject one normalized assignment into a byTxn/pending bucket.
--- @return status string, changed bool, reason string|nil
-local function ApplyIncoming(bucket, key, incoming)
-    local snap = bucket[key]
+local function CopySeenList(seen)
+    if type(seen) ~= "table" then
+        return {}
+    end
+    local out = {}
+    local last = #seen
+    if last > MAX_SEEN then
+        last = MAX_SEEN
+    end
+    for i = 1, last do
+        local row = seen[i]
+        if type(row) == "table" then
+            out[#out + 1] = { id = row.id, fp = row.fp }
+        end
+    end
+    return out
+end
+
+--- Pure classify of incoming against an existing snap (no bucket writes).
+-- @return status, changed, detail, wouldWrite, projectedSnap
+local function ClassifyIncomingAgainst(snap, incoming, key)
     local fp = Fingerprint(incoming)
+    local storageKey = key
+    if type(storageKey) ~= "string" or storageKey == "" then
+        storageKey = ValidTxnId(incoming.txnId) or incoming.txnId
+    end
     if type(snap) ~= "table" then
-        bucket[key] = CopySnap(incoming, key)
-        return "accepted", true, nil, true
+        return "accepted", true, nil, true, CopySnap(incoming, storageKey)
     end
     local winnerFp = Fingerprint(snap)
     if incoming.assignmentId == snap.assignmentId then
         if fp == winnerFp then
-            return "duplicate", false, "duplicate", false
+            return "duplicate", false, "duplicate", false, snap
         end
-        return "rejected", false, "id_conflict", false
+        return "rejected", false, "id_conflict", false, snap
     end
     local seenRow = SeenHas(snap.seen, incoming.assignmentId)
     if seenRow then
         if seenRow.fp == fp then
-            return "duplicate", false, "duplicate", false
+            return "duplicate", false, "duplicate", false, snap
         end
-        return "rejected", false, "id_conflict", false
+        return "rejected", false, "id_conflict", false, snap
     end
     local earlier = incoming.assignedAt < snap.assignedAt
         or (incoming.assignedAt == snap.assignedAt and incoming.assignmentId < snap.assignmentId)
     if earlier then
-        local oldId = snap.assignmentId
-        local seen = snap.seen
-        local replacement = CopySnap(incoming, key)
-        replacement.seen = type(seen) == "table" and seen or {}
-        RememberLoser(replacement, oldId, winnerFp)
-        bucket[key] = replacement
-        return "accepted", true, "earlier_assignment", true
+        local replacement = CopySnap(incoming, storageKey)
+        replacement.seen = CopySeenList(snap.seen)
+        RememberLoser(replacement, snap.assignmentId, winnerFp)
+        return "accepted", true, "earlier_assignment", true, replacement
     end
-    if type(snap.seen) ~= "table" then
-        snap.seen = {}
+    local projected = {
+        assignmentId = snap.assignmentId,
+        assignedAt = snap.assignedAt,
+        unitCopper = snap.unitCopper,
+        quantity = snap.quantity,
+        totalCopper = snap.totalCopper,
+        itemId = snap.itemId,
+        txnId = snap.txnId,
+        canonicalTxnId = snap.canonicalTxnId or storageKey,
+        datasetId = snap.datasetId,
+        guildKey = snap.guildKey,
+        actorGuid = snap.actorGuid,
+        actorName = snap.actorName,
+        seen = CopySeenList(snap.seen),
+    }
+    if #projected.seen < MAX_SEEN then
+        projected.seen[#projected.seen + 1] = { id = incoming.assignmentId, fp = fp }
+        return "duplicate", false, "later_assignment", true, projected
     end
-    if #snap.seen < MAX_SEEN then
-        snap.seen[#snap.seen + 1] = { id = incoming.assignmentId, fp = fp }
-        return "duplicate", false, "later_assignment", true
+    return "duplicate", false, "later_assignment", false, projected
+end
+
+--- Install or reject one normalized assignment into a byTxn/pending bucket.
+-- @return status string, changed bool, reason string|nil, wrote bool
+local function ApplyIncoming(bucket, key, incoming)
+    local snap = bucket[key]
+    local status, changed, detail, wouldWrite, projected = ClassifyIncomingAgainst(snap, incoming, key)
+    if status == "rejected" or not wouldWrite then
+        return status, changed, detail, false
     end
-    return "duplicate", false, "later_assignment", false
+    if status == "accepted" then
+        bucket[key] = projected
+        return status, true, detail, true
+    end
+    -- later_assignment with room in seen: mutate the live snap in place so
+    -- identity of the winner row is preserved for callers holding references.
+    if detail == "later_assignment" and type(snap) == "table" then
+        if type(snap.seen) ~= "table" then
+            snap.seen = {}
+        end
+        local fp = Fingerprint(incoming)
+        if not SeenHas(snap.seen, incoming.assignmentId) and #snap.seen < MAX_SEEN then
+            snap.seen[#snap.seen + 1] = { id = incoming.assignmentId, fp = fp }
+            return status, false, detail, true
+        end
+        return status, false, detail, false
+    end
+    if status == "duplicate" and detail == "duplicate" then
+        return status, false, detail, false
+    end
+    if wouldWrite and type(projected) == "table" then
+        bucket[key] = projected
+        return status, changed, detail, true
+    end
+    return status, changed, detail, false
 end
 
 local function LookupSnap(record, txnId)
@@ -1315,6 +1634,8 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
     if not canonical or not alias or canonical == alias then
         return
     end
+    -- Keep the ephemeral donation-event index aligned with the registry alias.
+    GS.NoteDonationEventTxnAlias(record, canonical, alias)
     local store = record.valuations
     if type(store) ~= "table" then
         return
@@ -1549,44 +1870,67 @@ function GS:AdmitValuationAssignment(body, opts)
             end
         end
         -- Fold a previously unbound pending[A] onto export-canonical C before
-        -- installing this body. Earliest (assignedAt, assignmentId) wins;
-        -- same-ID divergent payloads still reject via ApplyIncoming.
+        -- installing this body. Earliest (assignedAt, assignmentId) wins.
+        -- Preflight ClassifyIncomingAgainst so a rejected incoming body cannot
+        -- move pending[A] or patch bindings (rejected folds stay atomic).
         local folded = false
+        local foldPrior = nil
+        local foldPriorIncoming = nil
         if exportCanonical and type(store.pending) == "table"
             and assignment.txnId ~= canonical
             and type(store.pending[assignment.txnId]) == "table" then
-            local prior = store.pending[assignment.txnId]
-            PatchBindingsRemoveSnap(store, prior, assignment.txnId)
-            store.pending[assignment.txnId] = nil
-            local priorTxn = ValidTxnId(prior.txnId) or assignment.txnId
-            local priorAtCanonical = store.pending[canonical]
-            local _, _, _, priorWrote = ApplyIncoming(store.pending, canonical, {
-                assignmentId = prior.assignmentId,
-                assignedAt = prior.assignedAt,
-                unitCopper = prior.unitCopper,
-                quantity = prior.quantity,
-                totalCopper = prior.totalCopper,
-                itemId = prior.itemId,
+            foldPrior = store.pending[assignment.txnId]
+            local priorTxn = ValidTxnId(foldPrior.txnId) or assignment.txnId
+            foldPriorIncoming = {
+                assignmentId = foldPrior.assignmentId,
+                assignedAt = foldPrior.assignedAt,
+                unitCopper = foldPrior.unitCopper,
+                quantity = foldPrior.quantity,
+                totalCopper = foldPrior.totalCopper,
+                itemId = foldPrior.itemId,
                 txnId = priorTxn,
-                datasetId = prior.datasetId,
-                guildKey = prior.guildKey,
-                actorGuid = prior.actorGuid,
-                actorName = prior.actorName,
-            })
-            if priorWrote then
-                PatchBindingsAfterApply(store, store.pending, canonical, priorAtCanonical, true)
-                folded = true
+                datasetId = foldPrior.datasetId,
+                guildKey = foldPrior.guildKey,
+                actorGuid = foldPrior.actorGuid,
+                actorName = foldPrior.actorName,
+            }
+            local priorAtCanonical = store.pending[canonical]
+            local foldStatus, _, foldDetail, _, foldProjected =
+                ClassifyIncomingAgainst(priorAtCanonical, foldPriorIncoming, canonical)
+            if foldStatus == "rejected" then
+                return "rejected", foldDetail or "id_conflict"
+            end
+            local inStatus, _, inDetail =
+                ClassifyIncomingAgainst(foldProjected, assignment, canonical)
+            if inStatus == "rejected" then
+                return "rejected", inDetail or "id_conflict"
             end
             pendingKey = canonical
         end
         local pendingCount = CountKeys(store.pending)
         local existing = store.pending[pendingKey]
         if not existing and pendingCount >= MAX_PENDING then
-            return "rejected", "full"
+            -- Folding A→C removes A before installing C, so net capacity is unchanged.
+            local foldingFreesSlot = foldPrior ~= nil and store.pending[assignment.txnId] ~= nil
+                and pendingKey == canonical and assignment.txnId ~= canonical
+            if not foldingFreesSlot then
+                return "rejected", "full"
+            end
         end
         if AssignmentBoundElsewhere(record, store, assignment.assignmentId, pendingKey,
             exportCanonical, assignment.txnId) then
             return "rejected", "assignment_bound"
+        end
+        if foldPrior and foldPriorIncoming then
+            local priorAtCanonical = store.pending[canonical]
+            PatchBindingsRemoveSnap(store, foldPrior, assignment.txnId)
+            store.pending[assignment.txnId] = nil
+            local _, _, _, priorWrote = ApplyIncoming(store.pending, canonical, foldPriorIncoming)
+            if priorWrote then
+                PatchBindingsAfterApply(store, store.pending, canonical, priorAtCanonical, true)
+                folded = true
+            end
+            pendingKey = canonical
         end
         local priorPending = store.pending[pendingKey]
         local status, _, detail, wrote = ApplyIncoming(store.pending, pendingKey, assignment)
@@ -1595,6 +1939,7 @@ function GS:AdmitValuationAssignment(body, opts)
         end
         if wrote or folded then
             NoteValuationStoreMutation(store, record)
+            ObserveSnapSeqs(store, store.pending[pendingKey])
         end
         if status == "rejected" then
             return "rejected", detail or "id_conflict"
@@ -1615,6 +1960,7 @@ function GS:AdmitValuationAssignment(body, opts)
     local status, changed, detail, wrote = ApplyIncoming(store.byTxn, canonical, assignment)
     if wrote then
         PatchBindingsAfterApply(store, store.byTxn, canonical, priorWinner, true)
+        ObserveSnapSeqs(store, store.byTxn[canonical])
     end
     local clearedPending = false
     if type(store.pending) == "table" then
