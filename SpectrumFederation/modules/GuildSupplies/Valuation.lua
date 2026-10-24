@@ -470,9 +470,27 @@ end
 -- Ephemeral txnId/id → event pointer for valuation admission. Keyed by the
 -- accounting table; invalidated on shelve/trim (array identity change) and
 -- extended incrementally on append-only mutation bumps. Never persisted.
--- Cold rebuild is resumable under a visit budget so adoption slices can yield.
+-- Cold rebuild and large append tails are budgeted per callback so adoption
+-- slices / Gossip deferral can yield instead of draining 8k rows synchronously.
 local donationEventIndex = setmetatable({}, { __mode = "k" })
-local DONATION_EVENT_INDEX_BUDGET = 512
+-- Max ledger rows indexed in one Ensure/Warm/FindEvent callback.
+GS.DONATION_EVENT_INDEX_BUDGET = GS.DONATION_EVENT_INDEX_BUDGET or 512
+local function IndexBudget(budget)
+    -- Explicit 0 = peek-only (no row visits this call).
+    if budget == 0 then
+        return 0
+    end
+    local limit = tonumber(budget)
+    if limit == math.huge then
+        return math.huge
+    end
+    if not limit or limit < 1 then
+        return GS.DONATION_EVENT_INDEX_BUDGET or 512
+    end
+    return limit
+end
+
+local indexCallbackVisits = 0
 
 local function IndexDonationEvent(byTxn, event)
     if type(byTxn) ~= "table" or type(event) ~= "table" then
@@ -485,6 +503,7 @@ local function IndexDonationEvent(byTxn, event)
     if type(event.id) == "string" and event.id ~= "" and event.id ~= txn then
         byTxn[event.id] = event
     end
+    indexCallbackVisits = indexCallbackVisits + 1
     if type(GS._onDonationEventIndexVisit) == "function" then
         GS._onDonationEventIndexVisit(event)
     end
@@ -494,10 +513,7 @@ end
 local function ContinueDonationEventIndex(cached, live, arch, liveN, archN, budget)
     local byTxn = cached.byTxn
     local spent = 0
-    local limit = tonumber(budget)
-    if not limit or limit < 1 then
-        limit = DONATION_EVENT_INDEX_BUDGET
-    end
+    local limit = IndexBudget(budget)
     -- Archive first, then live, so live overwrites win on collisions (matches
     -- VisitEvents live-then-archive first-match preference on lookup ties).
     local archPos = tonumber(cached.archPos) or 0
@@ -512,59 +528,99 @@ local function ContinueDonationEventIndex(cached, live, arch, liveN, archN, budg
         spent = spent + IndexDonationEvent(byTxn, live[livePos])
     end
     cached.livePos = livePos
-    cached.liveN = liveN
-    cached.archN = archN
+    -- Watermarks track how far the index covers; incomplete cold/append leaves
+    -- building=true so the next callback resumes instead of restarting.
     if archPos >= archN and livePos >= liveN then
+        cached.liveN = liveN
+        cached.archN = archN
         cached.building = false
         cached.archPos = nil
         cached.livePos = nil
         return spent, true
     end
+    cached.liveN = livePos
+    cached.archN = archPos
     cached.building = true
     return spent, false
 end
 
---- Ensure / advance the donation event index. Returns byTxn, complete.
--- budget: max events to visit on a cold/resume pass (nil = default slice).
--- Pass math.huge (or a very large number) to finish synchronously.
+local function PublishIndexCallbackStats(complete)
+    if type(GS._onDonationEventIndexCallback) == "function" then
+        GS._onDonationEventIndexCallback(indexCallbackVisits, complete and true or false)
+    end
+end
+
+--- Ensure / advance the donation event index. Returns byTxn, complete, visited.
+-- budget: max events to visit this call (nil = GS.DONATION_EVENT_INDEX_BUDGET;
+-- 0 = peek current coverage without indexing rows).
+-- Never drains beyond that budget inside one callback.
 local function EnsureDonationEventIndex(record, budget)
+    indexCallbackVisits = 0
     local accounting = record and record.accounting
     if type(accounting) ~= "table" then
-        return nil, true
+        PublishIndexCallbackStats(true)
+        return nil, true, 0
     end
     local mut = tonumber(accounting._mutationSeq) or 0
     local live = accounting._consumableEvents
     local arch = accounting._consumableEventArchive
     local liveN = type(live) == "table" and #live or 0
     local archN = type(arch) == "table" and #arch or 0
+    local limit = IndexBudget(budget)
     local cached = donationEventIndex[accounting]
-    if cached and not cached.building and cached.mut == mut and type(cached.byTxn) == "table" then
-        return cached.byTxn, true
+    local function coverageComplete(c)
+        return c and not c.building and c.mut == mut and type(c.byTxn) == "table"
+            and c.live == live and c.arch == arch
+            and (c.liveN or 0) >= liveN and (c.archN or 0) >= archN
     end
-    -- Resume an in-progress cold rebuild for the same array identities.
-    if cached and cached.building and type(cached.byTxn) == "table"
+    if coverageComplete(cached) then
+        PublishIndexCallbackStats(true)
+        return cached.byTxn, true, 0
+    end
+    -- Peek-only: expose current partial map without spending the visit budget.
+    if limit == 0 then
+        if cached and type(cached.byTxn) == "table"
+            and cached.live == live and cached.arch == arch then
+            PublishIndexCallbackStats(false)
+            return cached.byTxn, false, 0
+        end
+        if type(GS._onDonationEventIndexRebuild) == "function" then
+            GS._onDonationEventIndexRebuild(accounting, liveN + archN)
+        end
+        cached = {
+            mut = mut,
+            byTxn = {},
+            live = live,
+            arch = arch,
+            liveN = 0,
+            archN = 0,
+            archPos = 0,
+            livePos = 0,
+            building = true,
+        }
+        donationEventIndex[accounting] = cached
+        PublishIndexCallbackStats(false)
+        return cached.byTxn, false, 0
+    end
+    -- Resume cold rebuild or budgeted append for the same array identities.
+    if cached and type(cached.byTxn) == "table"
         and cached.live == live and cached.arch == arch then
-        local _, complete = ContinueDonationEventIndex(cached, live, arch, liveN, archN, budget)
-        if complete then
-            cached.mut = mut
+        if cached.building
+            or liveN > (cached.liveN or 0) or archN > (cached.archN or 0)
+            or mut > (cached.mut or 0) then
+            if not cached.building then
+                cached.archPos = cached.archN or 0
+                cached.livePos = cached.liveN or 0
+                cached.building = true
+            end
+            local spent, complete = ContinueDonationEventIndex(
+                cached, live, arch, liveN, archN, limit)
+            if complete then
+                cached.mut = mut
+            end
+            PublishIndexCallbackStats(complete)
+            return cached.byTxn, complete, spent
         end
-        return cached.byTxn, complete
-    end
-    -- Append-only: same array identities grew after mutation bumps.
-    if cached and not cached.building and type(cached.byTxn) == "table"
-        and cached.live == live and cached.arch == arch
-        and liveN >= (cached.liveN or 0) and archN >= (cached.archN or 0)
-        and mut >= (cached.mut or 0) then
-        for i = (cached.archN or 0) + 1, archN do
-            IndexDonationEvent(cached.byTxn, arch[i])
-        end
-        for i = (cached.liveN or 0) + 1, liveN do
-            IndexDonationEvent(cached.byTxn, live[i])
-        end
-        cached.mut = mut
-        cached.liveN = liveN
-        cached.archN = archN
-        return cached.byTxn, true
     end
     -- Cold rebuild (dataset replace, shelve/trim, first use). Resumable.
     if type(GS._onDonationEventIndexRebuild) == "function" then
@@ -575,18 +631,19 @@ local function EnsureDonationEventIndex(record, budget)
         byTxn = {},
         live = live,
         arch = arch,
-        liveN = liveN,
-        archN = archN,
+        liveN = 0,
+        archN = 0,
         archPos = 0,
         livePos = 0,
         building = true,
     }
     donationEventIndex[accounting] = cached
-    local _, complete = ContinueDonationEventIndex(cached, live, arch, liveN, archN, budget)
+    local spent, complete = ContinueDonationEventIndex(cached, live, arch, liveN, archN, limit)
     if complete then
         cached.mut = mut
     end
-    return cached.byTxn, complete
+    PublishIndexCallbackStats(complete)
+    return cached.byTxn, complete, spent
 end
 
 --- Map an alias onto an already-indexed canonical donation event (O(1)).
@@ -605,30 +662,128 @@ function GS.NoteDonationEventTxnAlias(record, primaryTxnId, aliasTxnId)
     end
 end
 
---- Advance a resumable cold index build; returns complete, visited.
+--- Advance a resumable cold/append index build.
+-- @return complete bool, visited number
 function GS.WarmDonationEventIndex(record, budget)
-    local byTxn, complete = EnsureDonationEventIndex(record, budget)
+    local byTxn, complete, visited = EnsureDonationEventIndex(record, budget)
     if type(byTxn) ~= "table" then
         return true, 0
     end
-    return complete and true or false, 0
+    return complete and true or false, tonumber(visited) or 0
 end
 
+--- True when the donation-event index fully covers the current ledger arrays.
+function GS.DonationEventIndexReady(record)
+    local accounting = record and record.accounting
+    if type(accounting) ~= "table" then
+        return true
+    end
+    local cached = donationEventIndex[accounting]
+    if type(cached) ~= "table" or type(cached.byTxn) ~= "table" or cached.building then
+        return false
+    end
+    local live = accounting._consumableEvents
+    local arch = accounting._consumableEventArchive
+    local liveN = type(live) == "table" and #live or 0
+    local archN = type(arch) == "table" and #arch or 0
+    if cached.live ~= live or cached.arch ~= arch then
+        return false
+    end
+    local mut = tonumber(accounting._mutationSeq) or 0
+    return cached.mut == mut
+        and (cached.liveN or 0) >= liveN
+        and (cached.archN or 0) >= archN
+end
+
+-- Ordinary Gossip: retain authorized bodies locally while the index warms.
+-- One-shot After(0) drain (same pattern as Logs catch-up); not a poller.
+local deferredValuationIngress = {}
+local deferredValuationScheduled = false
+
+local function ScheduleDeferredValuationDrain()
+    if deferredValuationScheduled then
+        return
+    end
+    deferredValuationScheduled = true
+    local function drain()
+        deferredValuationScheduled = false
+        if #deferredValuationIngress < 1 then
+            return
+        end
+        local record = nil
+        if type(GS.GetCurrentRecord) == "function" then
+            record = select(1, GS:GetCurrentRecord())
+        end
+        if type(record) == "table" then
+            GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
+        end
+        local remain = {}
+        for i = 1, #deferredValuationIngress do
+            local row = deferredValuationIngress[i]
+            if type(row) == "table" and type(row.body) == "table" then
+                local live = row.record
+                if type(GS.GetCurrentRecord) == "function" then
+                    local cur = select(1, GS:GetCurrentRecord())
+                    if cur ~= nil then
+                        live = cur
+                    end
+                end
+                local opts = row.opts or {}
+                opts.offlineRecord = live
+                opts._indexDeferAttempt = true
+                local st, reason = GS:AdmitValuationAssignment(row.body, opts)
+                if st == "pending" and reason == "awaiting_index" then
+                    remain[#remain + 1] = row
+                end
+            end
+        end
+        deferredValuationIngress = remain
+        if #deferredValuationIngress > 0 then
+            ScheduleDeferredValuationDrain()
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, drain)
+    else
+        drain()
+    end
+end
+
+local function DeferValuationIngress(body, opts)
+    opts = opts or {}
+    local key = tostring(opts.exportRecordId or "")
+        .. "\0" .. tostring(body and body.assignment and body.assignment.assignmentId or "")
+        .. "\0" .. tostring(body and body.assignment and body.assignment.txnId or "")
+    for i = 1, #deferredValuationIngress do
+        local row = deferredValuationIngress[i]
+        if row and row.key == key then
+            row.body = body
+            row.opts = opts
+            row.record = opts.offlineRecord
+            ScheduleDeferredValuationDrain()
+            return
+        end
+    end
+    deferredValuationIngress[#deferredValuationIngress + 1] = {
+        key = key,
+        body = body,
+        opts = opts,
+        record = opts.offlineRecord,
+    }
+    ScheduleDeferredValuationDrain()
+end
+
+--- Lookup donation event by txn/alias ids.
+-- Peek-only against the ephemeral index. Advancement is owned by
+-- WarmDonationEventIndex (adoption slices) and the Gossip deferral drain so a
+-- single callback never indexes more than DONATION_EVENT_INDEX_BUDGET rows.
+-- @return event|nil, ready bool — ready=false means the index still needs work
+--         and a nil event must not be treated as a definitive miss.
 local function FindEventForIds(record, ids)
     if type(ids) ~= "table" then
-        return nil
+        return nil, true
     end
-    -- Finish any in-progress cold build so admission stays correct; ordinary
-    -- appends stay incremental. WarmDonationEventIndex can pre-pay the cost.
-    local byTxn, complete = EnsureDonationEventIndex(record, DONATION_EVENT_INDEX_BUDGET)
-    local guard = 0
-    while type(byTxn) == "table" and not complete and guard < 64 do
-        guard = guard + 1
-        byTxn, complete = EnsureDonationEventIndex(record, DONATION_EVENT_INDEX_BUDGET)
-    end
-    if type(byTxn) == "table" and not complete then
-        byTxn, complete = EnsureDonationEventIndex(record, math.huge)
-    end
+    local byTxn, complete = EnsureDonationEventIndex(record, 0)
     if type(byTxn) == "table" then
         local hit = nil
         for txn in pairs(ids) do
@@ -642,17 +797,23 @@ local function FindEventForIds(record, ids)
                         return VisitEvents(record, function(event)
                             local t = EventTxn(event)
                             return t and ids[t] == true
-                        end)
+                        end), true
                     end
                 end
             end
         end
-        return hit
+        if hit ~= nil then
+            return hit, true
+        end
+        if not complete then
+            return nil, false
+        end
+        return nil, true
     end
     return VisitEvents(record, function(event)
         local txn = EventTxn(event)
         return txn and ids[txn] == true
-    end)
+    end), true
 end
 
 local function PriceableDonation(record, event)
@@ -1815,8 +1976,23 @@ function GS:AdmitValuationAssignment(body, opts)
         -- never a distinct live donation still named by the original txn id.
         local exportIds = AliasSet(record, exportCanonical)
         if exportCanonical ~= assignment.txnId then
-            local exportEvent = FindEventForIds(record, exportIds)
-            local originalEvent = FindEventForIds(record, { [assignment.txnId] = true })
+            local exportEvent, exportReady = FindEventForIds(record, exportIds)
+            local originalEvent, originalReady = FindEventForIds(record, { [assignment.txnId] = true })
+            if (exportReady == false or originalReady == false)
+                and not opts.adoptionReplay
+                and not opts._indexDeferAttempt then
+                -- Ordinary ingress: one bounded warm (≤ DONATION_EVENT_INDEX_BUDGET).
+                -- Deferred After(0) drain warms before re-admit; do not double-charge.
+                GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
+                exportEvent, exportReady = FindEventForIds(record, exportIds)
+                originalEvent, originalReady = FindEventForIds(record, { [assignment.txnId] = true })
+            end
+            if exportReady == false or originalReady == false then
+                if not opts.adoptionReplay and not opts._indexDeferAttempt then
+                    DeferValuationIngress(body, opts)
+                end
+                return "pending", "awaiting_index"
+            end
             if originalEvent and exportEvent then
                 local ot, et = EventTxn(originalEvent), EventTxn(exportEvent)
                 if ot and et and ot ~= et then
@@ -1831,7 +2007,22 @@ function GS:AdmitValuationAssignment(body, opts)
         ids[assignment.txnId] = true
         ids[exportCanonical] = true
     end
-    local event = FindEventForIds(record, ids)
+    local event, eventReady = FindEventForIds(record, ids)
+    if eventReady == false and not opts.adoptionReplay and not opts._indexDeferAttempt then
+        -- Documented ordinary-ingress bound: at most one index budget per admit
+        -- callback. Remainder continues via local After(0) deferral drain, which
+        -- warms before re-admit so a deferred pass does not spend a second budget.
+        GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
+        event, eventReady = FindEventForIds(record, ids)
+    end
+    if eventReady == false then
+        -- Index still warming: keep the authorized body without treating a miss
+        -- as "no donation". Adoption retries; Gossip uses local After(0) drain.
+        if not opts.adoptionReplay and not opts._indexDeferAttempt then
+            DeferValuationIngress(body, opts)
+        end
+        return "pending", "awaiting_index"
+    end
     local holdForCredit = false
     if event and not PriceableDonation(record, event) then
         if not DonationMatches(assignment, event) then

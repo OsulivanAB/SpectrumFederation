@@ -3104,6 +3104,23 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     -- legal reverse-order history that retries dependents before predecessors.
     local admissions = 0
     state.dependencyWaits = 0
+    local unsettledSeen = false
+
+    -- Budgeted donation-event index warm: one chunk per adoption callback so a
+    -- cold 8k ledger cannot drain inside a single valuation admit.
+    if GS.WarmDonationEventIndex and type(temp) == "table" and type(temp.accounting) == "table" then
+        local idxBudget = GS.DONATION_EVENT_INDEX_BUDGET or 512
+        local idxComplete, idxVisited = GS.WarmDonationEventIndex(temp, idxBudget)
+        if (tonumber(idxVisited) or 0) > 0 then
+            progress = true
+            -- One admission-equivalent unit so the slice still yields under load.
+            sliceUsed = sliceUsed + 1
+            admissions = admissions + 1
+        end
+        if not idxComplete then
+            unsettledSeen = true
+        end
+    end
 
     -- Policy-deferral scan: resumable across callbacks. Charge every order visit
     -- and nested confirmation-search visit against the shared slice budget.
@@ -3222,7 +3239,6 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     end
     local i = start
     local scanned = 0
-    local unsettledSeen = false
     while scanned < #adop.order and sliceUsed < sliceBudget do
         scanned = scanned + 1
         -- Capture the buffer key before advancing the circular cursor. Later
@@ -3951,10 +3967,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 admissions = admissions + 1
                 sliceUsed = sliceUsed + 1
                 -- Temporary pending capacity can free when donations later
-                -- promote pending valuations. Retry only rejected/full; keep
+                -- promote pending valuations. Retry rejected/full and
+                -- awaiting_index (budgeted donation-event index warm). Keep
                 -- malformed, unauthorized, id_conflict, and assignment_bound
                 -- terminal so completeness can fail closed.
-                if stVal == "rejected" and reasonVal == "full" then
+                if (stVal == "rejected" and reasonVal == "full")
+                    or (stVal == "pending" and reasonVal == "awaiting_index") then
                     unsettledSeen = true
                 else
                     state.valuationSeen[seenKey] = true
