@@ -35393,22 +35393,20 @@ do
         "val: idxb append does not full-rebuild per valuation got="
             .. tostring(rebuilds - beforeAppendRebuilds))
 
-    -- Yieldable adoption with cold near-capacity index on the temp record.
-    -- Shrink the planted capacity ledger so a real credit/export can admit.
-    plantLedgerRows(record, 8, 0, 9914)
-    record = GS:GetCurrentRecord()
-    assertTrue(type(record) == "table", "val: idxb record after capacity shrink")
+    -- Fresh source-backed adoption export (do not ship planted capacity stubs).
     drainExportMaint(64)
-    -- Credit one real donation + valuation for adoption content.
+    record = activateValuationGuild(9920)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local evidence = makeDepositEvidence(record, {
-        itemId = 9914, quantity = 2, donor = "IdxbDonor-Garona",
+        itemId = 9920, quantity = 2, donor = "IdxbDonor-Garona",
         observedAt = world.time, ageHours = 0, occurrenceIndex = 1,
         neighborsOlder = { "idxb-old" }, neighborsNewer = { "idxb-new" },
     })
     assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
         "accepted", "val: idxb adopt source credit")
     record = GS:GetCurrentRecord()
-    local realEv = valuationFindDonation(record, 9914, 2)
+    local realEv = valuationFindDonation(record, 9920, 2)
     assertTrue(realEv ~= nil, "val: idxb adopt source donation")
     local valBody = {
         kind = "gs-valuation",
@@ -35486,11 +35484,22 @@ do
         flushTimers()
     end
     if stAdopt == "pending" then
-        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        if not GS._adoption then
+            local bobRec = GS:GetCurrentRecord()
+            if bobRec and bobRec.datasetId == sourceDataset then
+                stAdopt, reasonAdopt = "accepted", nil
+            else
+                stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+            end
+        else
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        end
     end
     assertEq(stAdopt, "accepted",
         "val: idxb adopt commits got=" .. tostring(stAdopt) .. " " .. tostring(reasonAdopt))
     assertEq(GS:GetPendingAdoption(), nil, "val: idxb adopt idle")
+    local bobAdopted = GS:GetCurrentRecord()
+    assertEq(bobAdopted and bobAdopted.datasetId, sourceDataset, "val: idxb adopt dataset")
     GS._adoptionReplaySyncDrain = true
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
     assertEq(#world.chat, 0, "val: idxb chat-free")
@@ -35581,20 +35590,18 @@ do
         totalAdmits = totalAdmits + 1
         admitCbBucket = admitCbBucket + 1
     end
+    -- flushTimers may chain many After(0) drains; roll per drain start.
     GS._onDeferredValuationDrainCallback = function()
-        drainCallbacks = drainCallbacks + 1
-        -- Prior tick's buckets already rolled after flush; start fresh.
-    end
-    GS._onDonationEventIndexCallback = function(visited)
-        -- Ensure resets per Ensure call; drain may warm once then admit.
-        local v = tonumber(visited) or 0
-        if v > indexCbBucket then
-            -- keep cumulative bucket for the drain wall
+        if drainCallbacks > 0 then
+            rollCallbackBuckets()
         end
+        drainCallbacks = drainCallbacks + 1
+        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
     end
 
     local nDefer = 80
     local targets = {}
+    indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
     for i = 1, nDefer do
         targets[i] = live[#live - nDefer + i]
         assertTrue(type(targets[i]) == "table", "val: idxc target " .. i)
@@ -35615,17 +35622,17 @@ do
         assertTrue(st == "pending" or st == "accepted" or st == "duplicate",
             "val: idxc enqueue st=" .. tostring(st) .. " " .. tostring(reason))
     end
-    -- First admits may warm once then defer; roll that wall.
+    -- Burst enqueue wall: at most one index budget before the drain is scheduled.
     rollCallbackBuckets()
+    assertTrue(indexCbMax <= budget,
+        "val: idxc burst enqueue index/callback <= budget got=" .. tostring(indexCbMax))
 
     local drainGuard = 0
     while drainGuard < 256 do
         drainGuard = drainGuard + 1
-        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
         flushTimers()
         rollCallbackBuckets()
         world.time = (world.time or 0) + 1
-        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
         flushTimers()
         rollCallbackBuckets()
         record = GS:GetCurrentRecord()
@@ -35653,7 +35660,8 @@ do
             .. tostring(accepted))
     assertTrue(admitCbMax <= admitBudget,
         "val: idxc max admits/callback <= budget got=" .. tostring(admitCbMax)
-            .. " budget=" .. tostring(admitBudget))
+            .. " budget=" .. tostring(admitBudget)
+            .. " drains=" .. tostring(drainCallbacks))
     assertTrue(indexCbMax <= budget,
         "val: idxc max index visits/callback <= budget got=" .. tostring(indexCbMax))
     assertTrue(fallbackCbMax <= 0,
@@ -35846,6 +35854,8 @@ do
     GS._adoptionReplaySyncDrain = false
     assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
         "val: idxc adopt ready")
+    indexCbMax, fallbackCbMax = 0, 0
+    totalIndex, totalFallback = 0, 0
     local stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
     local adoptGuard2 = 0
     while GS._adoption and GS._adoption.replayTemp and adoptGuard2 < 12000 do
@@ -35861,7 +35871,16 @@ do
         if fallbackCbBucket > fallbackCbMax then fallbackCbMax = fallbackCbBucket end
     end
     if stAdopt2 == "pending" then
-        stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+        if not GS._adoption then
+            local bobRec = GS:GetCurrentRecord()
+            if bobRec and bobRec.datasetId == sourceDataset then
+                stAdopt2, reasonAdopt2 = "accepted", nil
+            else
+                stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+            end
+        else
+            stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+        end
     end
     assertEq(stAdopt2, "accepted",
         "val: idxc large adopt commits got=" .. tostring(stAdopt2)
