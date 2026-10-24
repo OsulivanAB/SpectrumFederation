@@ -35508,8 +35508,10 @@ do
     -- Keep TSM off during adoption replay so officer-ledger credit cannot
     -- locally mint a competing assignment before buffered gs:val bodies apply.
     SF.TSM = nil
-    GS.NotePeerDataset("Bob-Garona", sourceDataset, { editorRankPosition = 3 })
-    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", sourceDataset)), "accepted",
+    -- Export bodies are still Alice-authored; authenticate the source peer as
+    -- Alice even though Bob is the peer that retained/adopted the dataset.
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
         "val: seq adopt begins")
     for i = 1, #aliceExport do
         local row = aliceExport[i]
