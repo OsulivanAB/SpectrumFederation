@@ -35490,10 +35490,9 @@ do
     local bob = GS:GetCurrentRecord()
     assertTrue(bob ~= nil and valuationCount(bob) >= 3,
         "val: seq Bob retained winners got=" .. tostring(valuationCount(bob)))
-    drainExportMaint(64)
-    local bobExport = collectAllExportBodies()
-    local bobDataset = bob.datasetId
-    -- Fresh Alice keeps the same writer nonce and explicitly adopts Bob's dataset.
+    -- Fresh Alice keeps the same writer nonce and explicitly adopts the peer-retained
+    -- dataset (same export Bob just committed), so PublishAdoptionTemp must advance
+    -- nextSeq past imported same-nonce winners before the first post-adopt mint.
     SpectrumFederationDB = {}
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -35512,11 +35511,11 @@ do
             return valuationTsmValue
         end,
     }
-    GS.NotePeerDataset("Bob-Garona", bobDataset, { editorRankPosition = 3 })
-    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", bobDataset)), "accepted",
+    GS.NotePeerDataset("Bob-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", sourceDataset)), "accepted",
         "val: seq adopt begins")
-    for i = 1, #bobExport do
-        local row = bobExport[i]
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
         if row.body and row.body.kind ~= "gs-evidence" then
             local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
             assertTrue(st == "accepted" or st == "duplicate",
@@ -35527,7 +35526,7 @@ do
     local adop = GS._adoption
     if type(adop) == "table" then
         if type(adop.records) == "table" then
-            local desc = adop.records["gs:desc:" .. bobDataset]
+            local desc = adop.records["gs:desc:" .. sourceDataset]
             if type(desc) == "table" then
                 desc.donationEvidenceCount = 0
             end
