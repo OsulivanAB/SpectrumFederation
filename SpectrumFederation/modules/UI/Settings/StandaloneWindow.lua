@@ -41,8 +41,16 @@ local C = {
     IMPERSONATION_BANNER_HEIGHT = 36,
 
     -- Colors (RGBA, 0-1 range)
-    BG = {0, 0, 0, 0.70},
+    -- BG alpha is the default settings-window backdrop opacity (90%).
+    -- Runtime opacity is driven by global.settingsWindowOpacity; do not SetAlpha the frame.
+    BG = {0, 0, 0, 0.90},
     BORDER = {0.65, 0.65, 0.65, 0.65},
+
+    -- Account-wide settings window backdrop opacity (percent)
+    SETTINGS_WINDOW_OPACITY_DEFAULT = 90,
+    SETTINGS_WINDOW_OPACITY_MIN = 70,
+    SETTINGS_WINDOW_OPACITY_MAX = 100,
+    SETTINGS_WINDOW_OPACITY_STEP = 5,
     DIVIDER = {1, 1, 1, 0.08},
     NAV_SELECTED_BG = {1, 1, 1, 0.08},
     NAV_HOVER_BG = {1, 1, 1, 0.04},
@@ -97,6 +105,55 @@ end
 -- ============================================================
 -- Helper Functions
 -- ============================================================
+
+local function Clamp(v, minV, maxV)
+    if v < minV then return minV end
+    if v > maxV then return maxV end
+    return v
+end
+
+-- Normalize a stored opacity percent: missing/nonnumeric -> default,
+-- otherwise round to step and clamp to [MIN, MAX].
+function SettingsWindow:_NormalizeSettingsWindowOpacity(value)
+    local n = tonumber(value)
+    if not n then
+        return C.SETTINGS_WINDOW_OPACITY_DEFAULT
+    end
+    local step = C.SETTINGS_WINDOW_OPACITY_STEP
+    n = math.floor((n / step) + 0.5) * step
+    return Clamp(n, C.SETTINGS_WINDOW_OPACITY_MIN, C.SETTINGS_WINDOW_OPACITY_MAX)
+end
+
+function SettingsWindow:_ReadSettingsWindowOpacitySetting()
+    local raw
+    if SF.SettingsStore and SF.SettingsStore.Get then
+        raw = SF.SettingsStore:Get("global.settingsWindowOpacity")
+    else
+        local global = SpectrumFederationDB and SpectrumFederationDB.global
+        raw = global and global.settingsWindowOpacity
+    end
+    return self:_NormalizeSettingsWindowOpacity(raw)
+end
+
+-- Apply backdrop background alpha only. Does not call SetAlpha on the frame,
+-- so text, controls, and child windows remain fully opaque.
+-- @param value number|nil Optional raw percent; when nil, reads from the store
+function SettingsWindow:ApplySettingsWindowOpacity(value)
+    local frame = self.frame
+    if not frame or type(frame.SetBackdropColor) ~= "function" then
+        return
+    end
+
+    local pct
+    if value ~= nil then
+        pct = self:_NormalizeSettingsWindowOpacity(value)
+    else
+        pct = self:_ReadSettingsWindowOpacitySetting()
+    end
+
+    local bg = C.BG
+    frame:SetBackdropColor(bg[1], bg[2], bg[3], pct / 100)
+end
 
 -- Get addon version string
 -- @return string Version string (e.g., "0.4.0-beta.7")
@@ -806,6 +863,9 @@ function SettingsWindow:CreateWindow()
     frame:SetBackdrop(C.BACKDROP)
     frame:SetBackdropColor(unpack(C.BG))
     frame:SetBackdropBorderColor(unpack(C.BORDER))
+    -- Prefer the account-wide setting when available (may match C.BG alpha).
+    self.frame = frame
+    self:ApplySettingsWindowOpacity()
 
     frame:SetMovable(true)
     frame:EnableMouse(true)
@@ -951,6 +1011,8 @@ function SettingsWindow:CreateWindow()
 
     self:BuildNavPanel(navPanel)
     self:ApplyPreferredWindowMin(nil)
+    -- Re-apply after BuildNavPanel in case CreateWindow ran before Store init.
+    self:ApplySettingsWindowOpacity()
 
     if SF.Debug then
         SF.Debug:Info("UI", "Standalone Settings Window created")

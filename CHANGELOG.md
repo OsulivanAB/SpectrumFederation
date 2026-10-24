@@ -2,6 +2,21 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.13-beta.3] - 2026-10-24
+
+### Changed
+- Stop whispering offline guild members
+
+## [1.5.13-beta.2] - 2026-10-23
+
+### Changed
+- Default Settings Window Opacity to 90%
+
+## [1.5.13-beta.1] - 2026-10-23
+
+### Changed
+- Settings Window Opacity (#418)
+
 ## [1.5.12] - 2026-10-21
 
 ### Added

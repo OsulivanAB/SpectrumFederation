@@ -18,7 +18,7 @@ Zip-excluded guidance (`*/AGENTS.md`). Canonical provider API and Retail smoke s
 2. Read sequences are transport cursors only — never authoritative event order, txn identity, campaign boundaries, or admin revisions.
 3. D1 NORMAL/SLOW thresholds; missing/invalid FPS ⇒ SLOW; steady low FPS still makes bounded progress; combat/loading pauses preserve unfinished needs and do not consume view leases.
 4. Aggregate work/queue/peer/receive/reassembly limits across providers; one initiated pull and one served pull per client; stop-and-wait paging with requestId/subpage correlation and byte-aware pages.
-5. Queue acceptance ≠ final-fragment submission ≠ remote receipt ≠ provider acceptance; unsent gossip is cancellable by provider/runtime invalidation.
+5. Queue acceptance ≠ final-fragment submission ≠ remote receipt ≠ provider acceptance; unsent gossip is cancellable by provider/runtime invalidation. Whisper selection/admission/drain require known-online presence from the guild membership cache (independent of membership authorization); GUILD discovery is unchanged. Offline peers defer without retry storms or stuck leases and resume when online again.
 6. Independent of raid/session/Loot Helper enablement/UI/profiles/coordinators.
 7. Chat-free: enabled `SF.Debug` only. Synthetic provider disabled by default; no active provider ⇒ no recurring work (including guild roster request/refresh). Activation re-verifies roster before auth/discovery; idle clears membership cache and preserves `lastVerifiedScopeId`.
 8. Admit encoded gossip before decode; validate bounded structures + distributions before mutation; physical AceComm spool is released with guard accounting, including during pause via an independent expiry timer.
@@ -45,6 +45,6 @@ unregister/shutdown → clear runtime queues/callbacks; leave provider durable d
 ## Evidence
 
 - Production-Lua multi-peer harness: `tests/lua/guild_gossip_tests.lua`
-- Owner-review regression probes (fail on reviewed head `aa6fa91`, pass after repair): `tests/lua/guild_gossip_repair_tests.lua` (through F89)
+- Owner-review regression probes (fail on reviewed head `aa6fa91`, pass after repair): `tests/lua/guild_gossip_repair_tests.lua` (through F99; F98 offline whisper/reconnect convergence, F99 allowWithoutProvider NACK offline drain)
 - Packaging/lint/docs validation per root `AGENTS.md`
 - Retail smoke remains human QA
