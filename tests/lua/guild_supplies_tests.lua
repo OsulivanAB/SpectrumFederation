@@ -35387,15 +35387,18 @@ do
             "val: seq minted with local nonce")
         minted[#minted + 1] = { txnId = ev.txnId, assignmentId = snap.assignmentId, event = ev }
         if i == 2 then
+            -- Later assignedAt so this stays a remembered loser, not an earlier winner.
+            local loserId = string.format("gsv1:%s:%08x", nonce, 90)
             local loser = {
                 kind = "gs-valuation",
                 schemaVersion = 1,
                 datasetId = record.datasetId,
                 guildKey = "club:42",
                 assignment = craftValuation(record, ev, {
-                    assignmentId = string.format("gsv1:%s:%08x", nonce, 90),
-                    assignedAt = 9000,
-                    unitCopper = 1,
+                    assignmentId = loserId,
+                    assignedAt = (tonumber(snap.assignedAt) or world.time) + 50000,
+                    unitCopper = snap.unitCopper,
+                    totalCopper = snap.totalCopper,
                     txnId = ev.txnId,
                 }),
             }
@@ -35408,48 +35411,89 @@ do
             local hasLoser = false
             if type(seen) == "table" then
                 for si = 1, #seen do
-                    if type(seen[si]) == "table"
-                        and seen[si].id == string.format("gsv1:%s:%08x", nonce, 90) then
+                    if type(seen[si]) == "table" and seen[si].id == loserId then
                         hasLoser = true
                     end
                 end
             end
             assertTrue(hasLoser, "val: seq retained loser id")
+            -- Local observe must raise nextSeq past the loser without a full rescan.
+            local beforeLosers = tonumber(record.valuations.nextSeq) or 1
+            GS.AdvanceValuationSeqForLocalWriter(record)
+            assertTrue((tonumber(record.valuations.nextSeq) or 0) >= 91,
+                "val: seq advance past loser got="
+                    .. tostring(record.valuations.nextSeq)
+                    .. " before=" .. tostring(beforeLosers))
         end
     end
     local aliceNextSeq = tonumber(record.valuations.nextSeq)
-    assertTrue(aliceNextSeq and aliceNextSeq > 4, "val: seq advanced on Alice")
+    assertTrue(aliceNextSeq and aliceNextSeq >= 91, "val: seq advanced on Alice")
     drainExportMaint(64)
     local aliceExport = collectAllExportBodies()
     local sourceDataset = record.datasetId
-    local configRoot = snapshotConfigRoot()
-    -- Peer Bob retains Alice's valuations (different writer nonce).
+    -- Peer Bob adopts Alice's dataset (different writer nonce) and retains winners.
     SF.TSM = nil
-    local bobRoot = deepCopy(configRoot)
-    bobRoot.localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 }
-    if bobRoot.guilds and bobRoot.guilds["club:42"] then
-        bobRoot.guilds["club:42"].valuations = nil
-    end
-    local bob = loadClientFromConfigRoot(bobRoot, "Bob-Garona", "Player-1-Bob", 2)
-    assertTrue(bob ~= nil, "val: seq Bob loaded")
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._pendingRelay = {}
+    initGS()
+    GS._root.localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 }
+    assertEq(GS:GetCurrentRecord(), nil, "val: seq Bob fresh")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: seq Bob adopt begins")
     for i = 1, #aliceExport do
         local row = aliceExport[i]
-        if row.body and (row.body.kind == "gs-ledger-event" or row.body.kind == "gs-valuation"
-            or row.body.kind == "dataset-desc" or row.body.kind == "gs-campaign"
-            or row.body.kind == "gs-cutover" or row.body.kind == "campaign-header"
-            or row.body.kind == "gs-op") then
-            local st = select(1, providerApplyWithId(row.id, row.body, "Alice-Garona"))
-            assertTrue(st == "accepted" or st == "duplicate" or st == "pending",
-                "val: seq Bob ingest " .. tostring(row.body.kind) .. " " .. tostring(st))
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: seq Bob buffer " .. tostring(row.body.kind)
+                    .. " " .. tostring(st) .. " " .. tostring(reason))
         end
     end
-    bob = GS:GetCurrentRecord()
-    assertTrue(valuationCount(bob) >= 3, "val: seq Bob retained winners")
+    local bobAdop = GS._adoption
+    if type(bobAdop) == "table" then
+        if type(bobAdop.records) == "table" then
+            local desc = bobAdop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(bobAdop.pinnedDonationEvidenceCount) == "number" then
+            bobAdop.pinnedDonationEvidenceCount = 0
+        end
+        if type(bobAdop._bufCounts) == "table" then
+            bobAdop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: seq Bob transfer ready")
+    local stBob, reasonBob = GS:CommitDatasetAdoption()
+    local bobGuard = 0
+    while GS._adoption and GS._adoption.replayTemp and bobGuard < 8000 do
+        bobGuard = bobGuard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stBob == "pending" then
+        stBob, reasonBob = GS:CommitDatasetAdoption()
+    end
+    assertEq(stBob, "accepted", "val: seq Bob adopt commits " .. tostring(reasonBob))
+    local bob = GS:GetCurrentRecord()
+    assertTrue(bob ~= nil and valuationCount(bob) >= 3,
+        "val: seq Bob retained winners got=" .. tostring(valuationCount(bob)))
     drainExportMaint(64)
     local bobExport = collectAllExportBodies()
     local bobDataset = bob.datasetId
-    -- Fresh Alice client keeps the same writer nonce but has no live guild record,
-    -- so explicit adoption is not rejected as same_dataset.
+    -- Fresh Alice keeps the same writer nonce and explicitly adopts Bob's dataset.
     SpectrumFederationDB = {}
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -35511,12 +35555,13 @@ do
     end
     assertEq(stAdopt, "accepted", "val: seq adopt commits " .. tostring(reasonAdopt))
     record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "val: seq adopted record present")
     assertEq(GS._root.localWriter.nonce, nonce, "val: seq nonce survived adoption")
     local nextAfter = tonumber(record.valuations.nextSeq)
     assertTrue(nextAfter and nextAfter > 4,
         "val: seq nextSeq past imported winners got=" .. tostring(nextAfter))
-    -- Bounded remembered losers are local to a peer's snap; when present on the
-    -- adopted record, AdvanceValuationSeqForLocalWriter must raise nextSeq past them.
+    -- Wire export does not carry seen[]; when a same-nonce loser is present on the
+    -- adopted record, AdvanceValuationSeqForLocalWriter must raise nextSeq past it.
     local anyTxn = minted[2].txnId
     local anySnap = record.valuations.byTxn[anyTxn]
     assertTrue(type(anySnap) == "table", "val: seq adopted snap for loser plant")
