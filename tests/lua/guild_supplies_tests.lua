@@ -35136,30 +35136,30 @@ do
     GS._onDonationEventIndexVisit = function()
         adoptVisits = adoptVisits + 1
     end
+    -- Yieldable commit: timers may finish the transfer; do not re-Commit after idle.
     GS._adoptionReplaySyncDrain = false
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: idx adopt transfer ready")
     local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertTrue(stAdopt == "pending" or stAdopt == "accepted",
+        "val: idx adopt commit starts " .. tostring(stAdopt) .. " " .. tostring(reasonAdopt))
     local guard = 0
-    local sawPending = stAdopt == "pending"
     while GS._adoption and GS._adoption.replayTemp and guard < 12000 do
         guard = guard + 1
         flushTimers()
         world.time = (world.time or 0) + 1
         flushTimers()
-        sawPending = true
     end
-    if stAdopt == "pending" then
-        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
-    end
-    assertEq(stAdopt, "accepted", "val: idx adopt commits " .. tostring(reasonAdopt))
-    assertTrue(sawPending or guard > 0 or GS._adoption == nil,
-        "val: idx adopt yielded or drained")
+    assertTrue(guard >= 1 or stAdopt == "accepted",
+        "val: idx adopt yielded or drained slices=" .. tostring(guard))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idx adopt idle")
     assertTrue(adoptVisits <= (n * 4) + 64,
         "val: idx adopt visits near-linear got=" .. tostring(adoptVisits))
     local adopted = GS:GetCurrentRecord()
     assertEq(adopted and adopted.datasetId, sourceDataset, "val: idx adopt dataset")
     assertTrue(valuationCount(adopted) >= n - 2,
         "val: idx adopt retained valuations got=" .. tostring(valuationCount(adopted)))
-    assertEq(GS._adoption, nil, "val: idx adopt idle")
+    GS._adoptionReplaySyncDrain = true
     GS._onDonationEventIndexVisit = nil
     GS._onDonationEventIndexRebuild = nil
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -35347,7 +35347,7 @@ do
     assertTrue(type(writer) == "table" and type(writer.nonce) == "string"
         and #writer.nonce == 24, "val: seq localWriter nonce")
     local nonce = writer.nonce
-    -- Mint several local assignments (including a remembered loser).
+    -- Mint several local assignments (officer credit auto-mints when TSM is set).
     local minted = {}
     for i = 1, 4 do
         local evidence = makeDepositEvidence(record, {
@@ -35360,13 +35360,11 @@ do
             "val: seq credit " .. i)
         flushTimers()
         record = GS:GetCurrentRecord()
-        local ev = valuationFindDonation(record, 9913, 1)
-        -- Find the i-th donation by occurrence.
+        local ev = nil
         local lists = {
             record.accounting._consumableEvents,
             record.accounting._consumableEventArchive,
         }
-        ev = nil
         for li = 1, #lists do
             local list = lists[li]
             if type(list) == "table" then
@@ -35382,16 +35380,14 @@ do
             if ev then break end
         end
         assertTrue(ev ~= nil, "val: seq donation " .. i)
-        assertTrue(GS.TryAssignDonationValuation(record, ev, evidence),
-            "val: seq mint " .. i)
-        record = GS:GetCurrentRecord()
         local snap = valuationSnap(record, ev.txnId)
-        assertTrue(type(snap) == "table", "val: seq snap " .. i)
-        assertTrue(snap.assignmentId:sub(1, 5 + #nonce) == ("gsv1:" .. nonce),
+        assertTrue(type(snap) == "table", "val: seq mint " .. i)
+        assertTrue(type(snap.assignmentId) == "string"
+            and snap.assignmentId:sub(1, 5 + #nonce) == ("gsv1:" .. nonce),
             "val: seq minted with local nonce")
         minted[#minted + 1] = { txnId = ev.txnId, assignmentId = snap.assignmentId, event = ev }
         if i == 2 then
-            local loser = deepCopy({
+            local loser = {
                 kind = "gs-valuation",
                 schemaVersion = 1,
                 datasetId = record.datasetId,
@@ -35402,7 +35398,7 @@ do
                     unitCopper = 1,
                     txnId = ev.txnId,
                 }),
-            })
+            }
             local stL = select(1, providerApplyWithId("gs:val:" .. ev.txnId, loser, "Alice-Garona"))
             assertTrue(stL == "duplicate" or stL == "accepted",
                 "val: seq remember loser st=" .. tostring(stL))
@@ -35440,7 +35436,8 @@ do
         local row = aliceExport[i]
         if row.body and (row.body.kind == "gs-ledger-event" or row.body.kind == "gs-valuation"
             or row.body.kind == "dataset-desc" or row.body.kind == "gs-campaign"
-            or row.body.kind == "gs-cutover") then
+            or row.body.kind == "gs-cutover" or row.body.kind == "campaign-header"
+            or row.body.kind == "gs-op") then
             local st = select(1, providerApplyWithId(row.id, row.body, "Alice-Garona"))
             assertTrue(st == "accepted" or st == "duplicate" or st == "pending",
                 "val: seq Bob ingest " .. tostring(row.body.kind) .. " " .. tostring(st))
@@ -35451,21 +35448,19 @@ do
     drainExportMaint(64)
     local bobExport = collectAllExportBodies()
     local bobDataset = bob.datasetId
-    -- Alice adopts Bob's dataset (same nonce, nextSeq may restart on bootstrap).
-    SpectrumFederationDB = { guildSupplies = deepCopy(configRoot) }
-    SpectrumFederationDB.guildSupplies.localWriter = { nonce = nonce, nextSeq = 1 }
+    -- Fresh Alice client keeps the same writer nonce but has no live guild record,
+    -- so explicit adoption is not rejected as same_dataset.
+    SpectrumFederationDB = {}
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     settleRoster()
-    GS._db = SpectrumFederationDB
-    GS._root = SpectrumFederationDB.guildSupplies
-    GS._rootValid = true
     GS._adoptionEpoch = 0
     GS._peerDatasets = {}
     GS._adoption = nil
     GS._pendingRelay = {}
     initGS()
-    -- Keep the same persistent nonce after init.
     GS._root.localWriter = { nonce = nonce, nextSeq = 1 }
+    assertEq(GS:GetCurrentRecord(), nil, "val: seq Alice fresh before adopt")
     GS:EnsureGossipProvider()
     valuationTsmValue = 55
     SF.TSM = {
@@ -35501,6 +35496,8 @@ do
         end
     end
     GS._adoptionReplaySyncDrain = true
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: seq adopt transfer ready")
     local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
     local guard = 0
     while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
@@ -35544,17 +35541,19 @@ do
     record = GS:GetCurrentRecord()
     local newEv = valuationFindDonation(record, 9913, 3)
     assertTrue(newEv ~= nil, "val: seq new donation")
-    local okMint = GS.TryAssignDonationValuation(record, newEv, evidenceNew)
-    assertEq(okMint, true, "val: seq first post-adopt mint succeeds")
-    record = GS:GetCurrentRecord()
     local newSnap = valuationSnap(record, newEv.txnId)
-    assertTrue(type(newSnap) == "table", "val: seq new snap")
+    if type(newSnap) ~= "table" then
+        assertEq(GS.TryAssignDonationValuation(record, newEv, evidenceNew), true,
+            "val: seq first post-adopt mint succeeds")
+        record = GS:GetCurrentRecord()
+        newSnap = valuationSnap(record, newEv.txnId)
+    end
+    assertTrue(type(newSnap) == "table", "val: seq first post-adopt mint succeeds")
     for i = 1, #minted do
         assertTrue(newSnap.assignmentId ~= minted[i].assignmentId,
             "val: seq new id differs from imported " .. i)
     end
-    assertTrue(newSnap.assignmentId ~= string.format("gsv1:%s:%08x", nonce, 90),
-        "val: seq new id differs from loser")
+    assertTrue(newSnap.assignmentId ~= loserId, "val: seq new id differs from loser")
     assertTrue(newSnap.assignmentId:find("^gsv1:" .. nonce .. ":", 1) ~= nil,
         "val: seq new id uses local nonce")
     drainExportMaint(32)
@@ -35573,7 +35572,8 @@ do
     settleRoster()
     initGS()
     record = GS:GetCurrentRecord()
-    assertEq(tonumber(record.valuations.nextSeq), tonumber(reloadRoot.guilds["club:42"].valuations.nextSeq),
+    assertEq(tonumber(record.valuations.nextSeq),
+        tonumber(reloadRoot.guilds["club:42"].valuations.nextSeq),
         "val: seq nextSeq survives reload")
     assertEq(#world.chat, 0, "val: seq chat-free")
     switchPlayer("Alice-Garona", "Player-1-Alice", 1)
