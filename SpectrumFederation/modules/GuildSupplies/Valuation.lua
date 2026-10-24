@@ -775,8 +775,8 @@ end
 
 --- Lookup donation event by txn/alias ids.
 -- Peek-only against the ephemeral index. Advancement is owned by
--- WarmDonationEventIndex (adoption slices) and the Gossip deferral drain so a
--- single callback never indexes more than DONATION_EVENT_INDEX_BUDGET rows.
+-- WarmDonationEventIndex (adoption slices, catch-up slices, Gossip deferral)
+-- so a single callback never indexes more than DONATION_EVENT_INDEX_BUDGET rows.
 -- @return event|nil, ready bool — ready=false means the index still needs work
 --         and a nil event must not be treated as a definitive miss.
 local function FindEventForIds(record, ids)
@@ -814,6 +814,25 @@ local function FindEventForIds(record, ids)
         local txn = EventTxn(event)
         return txn and ids[txn] == true
     end), true
+end
+
+--- Definitive lookup for local reconcile/mint helpers (not Gossip admission).
+-- Prefers the ephemeral index; advances at most one budgeted warm, then falls
+-- back to VisitEvents so a cold miss cannot be treated as "no donation".
+local function ResolveEventForIds(record, ids)
+    local event, ready = FindEventForIds(record, ids)
+    if event ~= nil or ready then
+        return event
+    end
+    GS.WarmDonationEventIndex(record, GS.DONATION_EVENT_INDEX_BUDGET)
+    event, ready = FindEventForIds(record, ids)
+    if event ~= nil or ready then
+        return event
+    end
+    return VisitEvents(record, function(ev)
+        local txn = EventTxn(ev)
+        return txn and ids[txn] == true
+    end)
 end
 
 local function PriceableDonation(record, event)
@@ -1636,7 +1655,7 @@ local function MergeOntoCanonical(record, canonical, incoming, changed)
         return changed
     end
     local eventIds = AliasSet(record, canonical)
-    local event = FindEventForIds(record, eventIds)
+    local event = ResolveEventForIds(record, eventIds)
     if not event or not PriceableDonation(record, event) or not DonationMatches(incoming, event) then
         return changed
     end
@@ -1662,7 +1681,7 @@ function GS.ReconcilePendingValuations(record, txnId)
     if type(store) ~= "table" then
         return false
     end
-    local event = FindEventForIds(record, ids)
+    local event = ResolveEventForIds(record, ids)
     if event and not PriceableDonation(record, event) then
         if CreditStillUnresolved(record, event) then
             return false
@@ -1833,7 +1852,7 @@ function GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId)
         end
     end
     local ids = AliasSet(record, canonical)
-    local event = FindEventForIds(record, ids)
+    local event = ResolveEventForIds(record, ids)
     local priceable = event and PriceableDonation(record, event) and true or false
     -- No donation yet, or a staged donation whose cutover credit is still open.
     -- Keep one pending row on the canonical id. Do not publish it.
@@ -2638,7 +2657,8 @@ local function PriceQueued(record, gen)
         attempts = attempts + 1
         if not LookupSnap(record, txnId) then
             local ids = AliasSet(record, txnId)
-            local event = FindEventForIds(record, ids)
+            -- Caller (ProcessCatchupSlice) warms the index to completion first.
+            local event = select(1, FindEventForIds(record, ids))
             if event and PriceableDonation(record, event) then
                 local copper = CachedCopper(PriceQueryItem(nil, event))
                 if copper ~= nil then
@@ -2669,6 +2689,15 @@ local function ProcessCatchupSlice(gen)
         return false
     end
     catchup.lastVisits = 0
+    -- Budgeted index warm shares the catch-up After(0) continuation so pricing
+    -- never peeks an empty cold index and drops queued donations.
+    if GS.WarmDonationEventIndex then
+        local idxComplete = select(1, GS.WarmDonationEventIndex(
+            record, GS.DONATION_EVENT_INDEX_BUDGET))
+        if not idxComplete then
+            return true
+        end
+    end
     local queued = #(catchup.queue or {})
     if queued < BATCH and not catchup.scanDone then
         DiscoverUnpriced(record, gen)
