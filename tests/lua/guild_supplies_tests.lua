@@ -35392,6 +35392,10 @@ do
             .. tostring(rebuilds - beforeAppendRebuilds))
 
     -- Yieldable adoption with cold near-capacity index on the temp record.
+    -- Shrink the planted capacity ledger so a real credit/export can admit.
+    plantLedgerRows(record, 8, 0, 9914)
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record) == "table", "val: idxb record after capacity shrink")
     drainExportMaint(64)
     -- Credit one real donation + valuation for adoption content.
     local evidence = makeDepositEvidence(record, {
