@@ -1129,6 +1129,9 @@ local function ValidAssignmentId(id)
     return true
 end
 
+-- Shared with adoption buffering so invalid ids never enter the pinned count.
+GS.IsValidValuationAssignmentId = ValidAssignmentId
+
 --- Raise store.nextSeq past a same-nonce locally minted assignment id.
 -- Cheap O(1) parse; no history scan. Exhaustion pins nextSeq at max.
 local function ObserveAssignmentIdSeq(store, assignmentId)
@@ -2516,17 +2519,19 @@ function GS:AdmitValuationAssignment(body, opts)
     end
     local wrote = false
     local changed = false
+    local acceptDetail = nil
     for i = 1, #pendingMerge do
         local cand = IncomingFromSnap(pendingMerge[i])
         if cand and DonationMatches(cand, event) then
             local prior = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
-            local _, did, _, didWrite = ApplyIncoming(store.byTxn, canonical, cand)
+            local _, did, det, didWrite = ApplyIncoming(store.byTxn, canonical, cand)
             if didWrite then
                 PatchBindingsAfterApply(store, store.byTxn, canonical, prior, true)
                 wrote = true
             end
             if did then
                 changed = true
+                acceptDetail = det or "assigned"
             end
         end
     end
@@ -2538,6 +2543,7 @@ function GS:AdmitValuationAssignment(body, opts)
     end
     if didIn then
         changed = true
+        acceptDetail = detail or "assigned"
     end
     if wrote then
         ObserveSnapSeqs(store, store.byTxn[canonical])
@@ -2568,8 +2574,10 @@ function GS:AdmitValuationAssignment(body, opts)
             tostring(winner and winner.assignedAt or assignment.assignedAt),
             tostring(winner and winner.totalCopper or assignment.totalCopper))
     end
-    if status == "accepted" then
-        return "accepted", detail or "assigned"
+    -- Pending merge may install the winner before an identical incoming body
+    -- classifies as duplicate; the call still newly accepted that snapshot.
+    if changed then
+        return "accepted", acceptDetail or detail or "assigned"
     end
     return "duplicate", detail or "duplicate"
 end

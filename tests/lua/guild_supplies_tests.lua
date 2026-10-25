@@ -37403,16 +37403,25 @@ do
         ev.gsProductionCredit = false
         ev.gsSourceCutoverMarker = marker
         arch[#arch + 1] = ev
+        retained[i] = ev
+    end
+    -- Install rewritten ledger first so staged admit finds the donation and
+    -- parks under awaiting_credit (not awaiting_donation).
+    bob.accounting._consumableEventArchive = arch
+    bob.accounting._consumableEvents = {}
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    for i = 1, pendingN do
+        local ev = retained[i]
         local earlyId = string.format("gsv1:%024x:%08x", 0xa000 + i, 0x9925)
         local pend = craftValuation(bob, ev, {
             assignmentId = earlyId,
             assignedAt = 100 + i,
             unitCopper = 40 + i,
-            txnId = newTxn,
+            txnId = ev.txnId,
             actorGuid = "Player-1-Alice",
             actorName = "Alice-Garona",
         })
-        local pst, preason = providerApplyWithId("gs:val:" .. newTxn, {
+        local pst, preason = providerApplyWithId("gs:val:" .. ev.txnId, {
             kind = "gs-valuation",
             schemaVersion = 1,
             datasetId = bob.datasetId,
@@ -37421,14 +37430,10 @@ do
         }, "Bob-Garona")
         assertEq(pst, "pending", "val: idxf pending " .. i .. " " .. tostring(preason))
         assertEq(preason, "awaiting_credit", "val: idxf awaits credit " .. i)
-        retained[i] = ev
         retained[i].earlyId = earlyId
         retained[i].earlyAt = 100 + i
         retained[i].earlyUnit = 40 + i
     end
-    bob.accounting._consumableEventArchive = arch
-    bob.accounting._consumableEvents = {}
-    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
 
     local cutSt, cutReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
         member = {
@@ -37844,7 +37849,7 @@ do
                 "val: idxg buffer " .. tostring(row.body.kind))
         end
     end
-    -- Plant an oversized valuation into the adoption buffer directly.
+    -- Oversized same-nonce valuation must fail closed at adoption buffer.
     local overAdoptId = "gs:val:ctx:idxg-over-adopt"
     local overAdoptBody = {
         kind = "gs-valuation",
@@ -37865,9 +37870,9 @@ do
             actorName = "Alice-Garona",
         },
     }
-    local stBuf = select(1, GS:BufferAdoptionRecord(overAdoptId, overAdoptBody))
-    assertTrue(stBuf == "rejected" or stBuf == "accepted" or stBuf == "duplicate",
-        "val: idxg oversized buffer st=" .. tostring(stBuf))
+    local stBuf, reasonBuf = GS:BufferAdoptionRecord(overAdoptId, overAdoptBody)
+    assertEq(stBuf, "rejected", "val: idxg oversized buffer rejected")
+    assertEq(reasonBuf, "invalid_assignment", "val: idxg oversized buffer reason")
     local adop = GS._adoption
     if type(adop) == "table" then
         if type(adop.records) == "table" then

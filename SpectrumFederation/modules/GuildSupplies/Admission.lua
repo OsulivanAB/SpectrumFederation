@@ -2881,11 +2881,18 @@ function GS:BufferAdoptionRecord(recordId, body)
         adop._archiveIndex[body.campaignId] = info
     end
 
-    -- Reject malformed gs-valuation before buffering/counting. Replay and the
-    -- final completeness scan skip non-table assignments; counting them here
-    -- would let a pinned valuationCount complete without a usable body.
-    if body.kind == "gs-valuation" and type(body.assignment) ~= "table" then
-        return "rejected", "malformed"
+    -- Reject malformed / unmintable gs-valuation before buffering/counting.
+    -- Replay and the final completeness scan skip unusable assignments;
+    -- counting them here would let a pinned valuationCount complete without a
+    -- usable body, and oversized same-nonce ids must not enter adoption.
+    if body.kind == "gs-valuation" then
+        if type(body.assignment) ~= "table" then
+            return "rejected", "malformed"
+        end
+        if GS.IsValidValuationAssignmentId
+            and not GS.IsValidValuationAssignmentId(body.assignment.assignmentId) then
+            return "rejected", "invalid_assignment"
+        end
     end
 
     local wasReady = adop.ready == true
