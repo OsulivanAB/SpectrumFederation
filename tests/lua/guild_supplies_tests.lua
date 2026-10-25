@@ -35334,7 +35334,7 @@ do
         datasetId = record.datasetId,
         guildKey = "club:42",
         assignment = craftValuation(record, appendTarget, {
-            assignmentId = "gsv1:cccccccccccccccdddddddd:00000011",
+            assignmentId = "gsv1:ccccccccccccccdddddddddd:00000011",
             assignedAt = 7000,
             unitCopper = 9,
             txnId = appendTarget.txnId,
@@ -37309,6 +37309,643 @@ do
     runLedgerFirstValuation("registry", false)
     runLedgerFirstValuation("evicted", true)
     assertEq(#world.chat, 0, "val: idxe chat-free")
+end
+
+do
+    -- idxf (discussion_r4368627572): priceable admit merges held pending before clear.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxf provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9925)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local admitBudget = GS.DEFERRED_VALUATION_ADMIT_BUDGET or 32
+    local pendingN = admitBudget + 8
+    local exportBodies = {}
+    local seenTxn = {}
+    for i = 1, pendingN do
+        local qty = 1 + (i % 5)
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9925, quantity = qty, observedAt = world.time, ageHours = 0,
+            occurrenceIndex = 80 + i,
+            neighborsOlder = { "idxf-old-" .. i },
+            neighborsNewer = { "idxf-new-" .. i },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+            "accepted", "val: idxf seed credit " .. i)
+        GS.NotifyLocalDurableChange("ledger")
+        drainExportMaint(64)
+        local body = nil
+        for _, row in ipairs(filterExportBodies(collectAllExportBodies(), "gs-ledger-event")) do
+            local ev = row.body and row.body.event
+            if ev and tonumber(ev.itemId) == 9925 and tonumber(ev.quantity) == qty
+                and not seenTxn[ev.txnId] then
+                body = row.body
+                seenTxn[ev.txnId] = true
+                break
+            end
+        end
+        assertTrue(type(body) == "table", "val: idxf export body " .. i)
+        exportBodies[i] = deepCopy(body)
+    end
+    local function loadStaged(name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+    local bob = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    GS:EnsureGossipProvider()
+    local marker = cutover.cutoverMarker
+    local retained = {}
+    -- Sorted pending keys: first admitBudget keys are a01..; targets sort after.
+    for i = 1, pendingN do
+        local st, reason = applyExportBody(exportBodies[i], "Bob-Garona")
+        assertEq(st, "accepted", "val: idxf staged ledger " .. i .. " " .. tostring(reason))
+        bob = GS:GetCurrentRecord()
+        local ev = nil
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = bob.accounting[listName]
+            if type(list) == "table" then
+                for j = 1, #list do
+                    if list[j] and list[j].txnId == exportBodies[i].event.txnId then
+                        ev = list[j]
+                    end
+                end
+            end
+        end
+        assertTrue(ev ~= nil, "val: idxf retained event " .. i)
+        retained[i] = deepCopy(ev)
+        retained[i].quantity = tonumber(ev.quantity) or (1 + (i % 5))
+    end
+    -- Rewrite txn ids so collect/sort leaves the last eight after the first slice.
+    bob = GS:GetCurrentRecord()
+    local arch = {}
+    for i = 1, pendingN do
+        local ev = retained[i]
+        local prefix = (i <= admitBudget) and "a" or "z"
+        local idx = (i <= admitBudget) and i or (i - admitBudget)
+        local newTxn = string.format("ctx:idxf-%s-%04d", prefix, idx)
+        ev.txnId = newTxn
+        ev.id = newTxn
+        ev.gsProductionCredit = false
+        ev.gsSourceCutoverMarker = marker
+        arch[#arch + 1] = ev
+        local earlyId = string.format("gsv1:%024x:%08x", 0xa000 + i, 0x9925)
+        local pend = craftValuation(bob, ev, {
+            assignmentId = earlyId,
+            assignedAt = 100 + i,
+            unitCopper = 40 + i,
+            txnId = newTxn,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        })
+        local pst, preason = providerApplyWithId("gs:val:" .. newTxn, {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = bob.datasetId,
+            guildKey = "club:42",
+            assignment = pend,
+        }, "Bob-Garona")
+        assertEq(pst, "pending", "val: idxf pending " .. i .. " " .. tostring(preason))
+        assertEq(preason, "awaiting_credit", "val: idxf awaits credit " .. i)
+        retained[i] = ev
+        retained[i].earlyId = earlyId
+        retained[i].earlyAt = 100 + i
+        retained[i].earlyUnit = 40 + i
+    end
+    bob.accounting._consumableEventArchive = arch
+    bob.accounting._consumableEvents = {}
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+
+    local cutSt, cutReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(cutSt, "accepted", "val: idxf cutover " .. tostring(cutReason))
+    bob = GS:GetCurrentRecord()
+    -- First inline slice promotes ≤ admitBudget; z-* targets remain pending.
+    local stillPending = {}
+    for i = admitBudget + 1, pendingN do
+        local txn = retained[i].txnId
+        assertEq(bob.valuations.byTxn[txn], nil, "val: idxf target still pending " .. i)
+        assertTrue(type(bob.valuations.pending[txn]) == "table",
+            "val: idxf held pending " .. i)
+        stillPending[#stillPending + 1] = i
+    end
+    assertTrue(#stillPending >= 2, "val: idxf >32 leaves post-slice pending")
+
+    -- Later authorized price for a donation still awaiting reconcile: earlier wins.
+    local laterIdx = stillPending[1]
+    local laterEv = retained[laterIdx]
+    local laterBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, laterEv, {
+            assignmentId = string.format("gsv1:%024x:%08x", 0xb000 + laterIdx, 0x9925),
+            assignedAt = laterEv.earlyAt + 5000,
+            unitCopper = laterEv.earlyUnit + 100,
+            txnId = laterEv.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stLater, reasonLater = providerApplyWithId("gs:val:" .. laterEv.txnId, laterBody, "Bob-Garona")
+    assertTrue(stLater == "accepted" or stLater == "duplicate",
+        "val: idxf later admit st=" .. tostring(stLater) .. " " .. tostring(reasonLater))
+    bob = GS:GetCurrentRecord()
+    local snapLater = valuationSnap(bob, laterEv.txnId)
+    assertTrue(type(snapLater) == "table", "val: idxf later-path winner present")
+    assertEq(snapLater.assignmentId, laterEv.earlyId, "val: idxf earlier pending wins")
+    assertEq(snapLater.unitCopper, laterEv.earlyUnit, "val: idxf earlier unit")
+    assertEq(snapLater.assignedAt, laterEv.earlyAt, "val: idxf earlier assignedAt")
+    assertEq(snapLater.txnId, laterEv.txnId, "val: idxf immutable txn")
+    assertEq(bob.valuations.pending[laterEv.txnId], nil, "val: idxf pending cleared on admit")
+    local seenLater = false
+    if type(snapLater.seen) == "table" then
+        for si = 1, #snapLater.seen do
+            if snapLater.seen[si] and snapLater.seen[si].id == laterBody.assignment.assignmentId then
+                seenLater = true
+            end
+        end
+    end
+    assertTrue(seenLater, "val: idxf later id retained in bounded seen")
+
+    -- Reverse: earlier incoming beats later held pending.
+    local earlierIdx = stillPending[2]
+    local earlierEv = retained[earlierIdx]
+    local earlierBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, earlierEv, {
+            assignmentId = string.format("gsv1:%024x:%08x", 0xc000 + earlierIdx, 0x9925),
+            assignedAt = earlierEv.earlyAt - 50,
+            unitCopper = 7,
+            txnId = earlierEv.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stEarly, reasonEarly = providerApplyWithId("gs:val:" .. earlierEv.txnId, earlierBody, "Bob-Garona")
+    assertTrue(stEarly == "accepted" or stEarly == "duplicate",
+        "val: idxf earlier incoming st=" .. tostring(stEarly) .. " " .. tostring(reasonEarly))
+    bob = GS:GetCurrentRecord()
+    local snapEarly = valuationSnap(bob, earlierEv.txnId)
+    assertEq(snapEarly.assignmentId, earlierBody.assignment.assignmentId,
+        "val: idxf earlier incoming wins")
+    assertEq(snapEarly.unitCopper, 7, "val: idxf earlier incoming unit")
+    local seenHeld = false
+    if type(snapEarly.seen) == "table" then
+        for si = 1, #snapEarly.seen do
+            if snapEarly.seen[si] and snapEarly.seen[si].id == earlierEv.earlyId then
+                seenHeld = true
+            end
+        end
+    end
+    assertTrue(seenHeld, "val: idxf later held pending remembered")
+
+    -- Alias pending key: held pending[alias] merges when gs:val:canonical admits later.
+    local aliasTxn = "ctx:idxf-alias-src"
+    local canonTxn = "ctx:idxf-alias-dst"
+    local aliasEvent = {
+        type = "donation",
+        id = canonTxn,
+        txnId = canonTxn,
+        itemId = 9925,
+        quantity = 2,
+        generation = 1,
+        gsProductionCredit = true,
+        verification = "officer",
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        datasetId = bob.datasetId,
+        campaignId = bob.currentCampaignId,
+        approxTxnTime = world.time,
+        timestamp = math.floor(world.time or 0),
+        occurrenceIndex = 900001,
+    }
+    bob.accounting._consumableEvents = bob.accounting._consumableEvents or {}
+    bob.accounting._consumableEvents[#bob.accounting._consumableEvents + 1] = aliasEvent
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    local cfg = bob.accounting._consumables
+    if type(cfg) ~= "table" then
+        bob.accounting._consumables = {}
+        cfg = bob.accounting._consumables
+    end
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = canonTxn,
+        status = "committed",
+        aliases = { aliasTxn },
+        itemId = 9925,
+        quantity = 2,
+    }
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = aliasTxn,
+        status = "alias",
+        aliasOf = canonTxn,
+    }
+    local aliasEarlyId = "gsv1:aaaaaaaaaaaaaaaaaaaaaa01:00009925"
+    bob.valuations.pending = bob.valuations.pending or {}
+    bob.valuations.pending[aliasTxn] = {
+        assignmentId = aliasEarlyId,
+        assignedAt = 50,
+        unitCopper = 11,
+        quantity = 2,
+        totalCopper = 22,
+        itemId = 9925,
+        txnId = aliasTxn,
+        canonicalTxnId = aliasTxn,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    local aliasLater = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, aliasEvent, {
+            assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbb02:00009925",
+            assignedAt = 500,
+            unitCopper = 99,
+            txnId = aliasTxn,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stAlias, reasonAlias = providerApplyWithId("gs:val:" .. canonTxn, aliasLater, "Bob-Garona")
+    assertTrue(stAlias == "accepted" or stAlias == "duplicate",
+        "val: idxf alias admit st=" .. tostring(stAlias) .. " " .. tostring(reasonAlias))
+    bob = GS:GetCurrentRecord()
+    local aliasSnap = valuationSnap(bob, canonTxn)
+    assertTrue(type(aliasSnap) == "table", "val: idxf alias winner under canonical")
+    assertEq(aliasSnap.assignmentId, aliasEarlyId, "val: idxf alias earlier pending wins")
+    assertEq(aliasSnap.txnId, aliasTxn, "val: idxf alias immutable txnId")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: idxf alias pending cleared")
+    assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: idxf no second alias winner")
+
+    -- Duplicate identical redelivery.
+    local stDup = select(1, providerApplyWithId("gs:val:" .. laterEv.txnId, laterBody, "Bob-Garona"))
+    assertEq(stDup, "duplicate", "val: idxf identical later redelivery duplicate")
+    assertEq(valuationSnap(bob, laterEv.txnId).assignmentId, laterEv.earlyId,
+        "val: idxf duplicate leaves earlier winner")
+
+    -- Same-ID divergent conflict leaves accepted/pending authority intact.
+    local conflictIdx = stillPending[4] or stillPending[1]
+    local conflictEv = retained[conflictIdx]
+    bob = GS:GetCurrentRecord()
+    local beforeConflictPending = deepCopy(bob.valuations.pending[conflictEv.txnId])
+    local beforeConflictWinner = deepCopy(bob.valuations.byTxn[conflictEv.txnId])
+    local beforeNextSeq = tonumber(bob.valuations.nextSeq)
+    assertTrue(type(beforeConflictPending) == "table", "val: idxf conflict still pending")
+    local conflictBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, conflictEv, {
+            assignmentId = conflictEv.earlyId,
+            assignedAt = conflictEv.earlyAt,
+            unitCopper = conflictEv.earlyUnit + 77,
+            txnId = conflictEv.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stConflict, reasonConflict = providerApplyWithId(
+        "gs:val:" .. conflictEv.txnId, conflictBody, "Bob-Garona")
+    assertEq(stConflict, "rejected", "val: idxf same-id conflict rejected")
+    assertEq(reasonConflict, "id_conflict", "val: idxf same-id conflict reason")
+    bob = GS:GetCurrentRecord()
+    assertEq(bob.valuations.byTxn[conflictEv.txnId], beforeConflictWinner,
+        "val: idxf conflict no byTxn mutation")
+    local afterPend = bob.valuations.pending[conflictEv.txnId]
+    assertTrue(type(afterPend) == "table", "val: idxf conflict pending retained")
+    assertEq(afterPend.assignmentId, beforeConflictPending.assignmentId, "val: idxf conflict id")
+    assertEq(afterPend.unitCopper, beforeConflictPending.unitCopper, "val: idxf conflict unit")
+    assertEq(afterPend.totalCopper, beforeConflictPending.totalCopper, "val: idxf conflict total")
+    assertEq(tonumber(bob.valuations.nextSeq), beforeNextSeq, "val: idxf conflict nextSeq intact")
+
+    -- Drain remaining reconcile; eventual idle; exports/Logs/descriptor match winners.
+    local guard = 0
+    while guard < 128 and not (GS._creditReconcileIsIdle and GS._creditReconcileIsIdle()) do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertTrue(GS._creditReconcileIsIdle and GS._creditReconcileIsIdle(), "val: idxf reconcile idle")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, laterEv.txnId).assignmentId, laterEv.earlyId,
+        "val: idxf winner survives reconcile")
+    drainExportMaint(64)
+    local exportVals, descCount = 0, nil
+    for _, row in ipairs(collectAllExportBodies()) do
+        local body = row.body
+        if type(body) == "table" and body.kind == "gs-valuation"
+            and body.datasetId == bob.datasetId then
+            exportVals = exportVals + 1
+            if body.assignment and body.assignment.assignmentId == laterEv.earlyId then
+                assertEq(body.assignment.unitCopper, laterEv.earlyUnit,
+                    "val: idxf export earlier unit")
+                assertEq(body.assignment.txnId, laterEv.txnId, "val: idxf export immutable txn")
+            end
+        elseif type(body) == "table" and body.kind == "dataset-desc"
+            and body.datasetId == bob.datasetId then
+            descCount = body.valuationCount or body.valuationsCount
+        end
+    end
+    assertTrue(exportVals >= 1, "val: idxf export valuations present")
+    assertEq(descCount, valuationCount(bob), "val: idxf descriptor matches winners")
+    local desc = GS.DescribeDonationValuation and GS.DescribeDonationValuation(bob, laterEv)
+    if type(desc) == "table" then
+        assertEq(desc.priced, true, "val: idxf Logs priced")
+        assertEq(desc.totalCopper, laterEv.earlyUnit * (tonumber(laterEv.quantity) or 1),
+            "val: idxf Logs total")
+    end
+
+    -- /reload preserves winners without redelivery.
+    local reloadRoot = snapshotConfigRoot()
+    -- Preserve accounting events for reload assertions (snapshot clears them).
+    reloadRoot.guilds["club:42"].accounting = deepCopy(bob.accounting)
+    reloadRoot.guilds["club:42"].valuations = deepCopy(bob.valuations)
+    SpectrumFederationDB = { guildSupplies = deepCopy(reloadRoot) }
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    initGS()
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, laterEv.txnId).assignmentId, laterEv.earlyId,
+        "val: idxf reload earlier winner")
+    assertEq(valuationCount(bob), valuationCount(reloadRoot.guilds["club:42"]),
+        "val: idxf reload winner count")
+    assertEq(#world.chat, 0, "val: idxf chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- idxg (discussion_r4368627575): oversized same-nonce IDs cannot exhaust nextSeq.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxg provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    valuationTsmValue = 33
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9926)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local nonce = "dddddddddddddddddddddddd"
+    GS._root.localWriter = { nonce = nonce, nextSeq = 1 }
+    record.valuations = record.valuations or {
+        schemaVersion = 1, nextSeq = 1, byTxn = {}, pending = {},
+    }
+    record.valuations.nextSeq = 1
+    -- Valid same-nonce import advances the allocator.
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9926, quantity = 2, donor = "IdxgDonor-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 1,
+        neighborsOlder = { "idxg-old" }, neighborsNewer = { "idxg-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: idxg credit donation")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local ev = valuationFindDonation(record, 9926, 2)
+    assertTrue(ev ~= nil, "val: idxg donation")
+    -- Clear any auto-mint so the imported id is the controlled sequence source.
+    if type(record.valuations) == "table" then
+        record.valuations.byTxn = {}
+        record.valuations.pending = {}
+        record.valuations.nextSeq = 1
+    end
+    local validId = string.format("gsv1:%s:%08x", nonce, 0x10)
+    local validBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, ev, {
+            assignmentId = validId,
+            assignedAt = 200,
+            unitCopper = 33,
+            txnId = ev.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stValid, reasonValid = providerApplyWithId("gs:val:" .. ev.txnId, validBody, "Alice-Garona")
+    assertTrue(stValid == "accepted" or stValid == "duplicate",
+        "val: idxg valid import st=" .. tostring(stValid) .. " " .. tostring(reasonValid))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, ev.txnId).assignmentId, validId, "val: idxg valid winner")
+    assertTrue((tonumber(record.valuations.nextSeq) or 0) >= 0x11,
+        "val: idxg nextSeq advanced past valid import got="
+            .. tostring(record.valuations.nextSeq))
+    local nextAfterValid = tonumber(record.valuations.nextSeq)
+
+    local oversizedId = string.format("gsv1:%s:fffffffff", nonce) -- 9 hex chars
+    local overBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, ev, {
+            assignmentId = oversizedId,
+            assignedAt = 201,
+            unitCopper = 33,
+            txnId = ev.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stOver, reasonOver = providerApplyWithId("gs:val:" .. ev.txnId, overBody, "Alice-Garona")
+    assertEq(stOver, "rejected", "val: idxg oversized rejected")
+    assertEq(reasonOver, "invalid_assignment", "val: idxg oversized reason")
+    record = GS:GetCurrentRecord()
+    assertEq(tonumber(record.valuations.nextSeq), nextAfterValid,
+        "val: idxg oversized did not poison nextSeq")
+    assertEq(valuationSnap(record, ev.txnId).assignmentId, validId,
+        "val: idxg oversized left winner intact")
+
+    local exhaustId = string.format("gsv1:%s:ffffffff", nonce)
+    local exhaustBody = deepCopy(overBody)
+    exhaustBody.assignment.assignmentId = exhaustId
+    local stEx, reasonEx = providerApplyWithId("gs:val:" .. ev.txnId, exhaustBody, "Alice-Garona")
+    assertEq(stEx, "rejected", "val: idxg unmintable ffffffff rejected")
+    assertEq(reasonEx, "invalid_assignment", "val: idxg unmintable reason")
+    record = GS:GetCurrentRecord()
+    assertEq(tonumber(record.valuations.nextSeq), nextAfterValid,
+        "val: idxg ffffffff did not exhaust allocator")
+
+    local zeroBody = deepCopy(overBody)
+    zeroBody.assignment.assignmentId = string.format("gsv1:%s:00000000", nonce)
+    assertEq(select(1, providerApplyWithId("gs:val:" .. ev.txnId, zeroBody, "Alice-Garona")),
+        "rejected", "val: idxg zero seq rejected")
+    local shortNonce = deepCopy(overBody)
+    shortNonce.assignment.assignmentId = "gsv1:abcd:00000002"
+    assertEq(select(1, providerApplyWithId("gs:val:" .. ev.txnId, shortNonce, "Alice-Garona")),
+        "rejected", "val: idxg short nonce rejected")
+
+    -- Adoption path: oversized same-nonce body cannot poison nextSeq.
+    drainExportMaint(32)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 3)
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._pendingRelay = {}
+    initGS()
+    GS._root.localWriter = { nonce = nonce, nextSeq = 1 }
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idxg adopt begins")
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st = select(1, GS:BufferAdoptionRecord(row.id, row.body))
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: idxg buffer " .. tostring(row.body.kind))
+        end
+    end
+    -- Plant an oversized valuation into the adoption buffer directly.
+    local overAdoptId = "gs:val:ctx:idxg-over-adopt"
+    local overAdoptBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = sourceDataset,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = oversizedId,
+            assignedAt = 999,
+            unitCopper = 1,
+            quantity = 1,
+            totalCopper = 1,
+            itemId = 9926,
+            txnId = "ctx:idxg-over-adopt",
+            datasetId = sourceDataset,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        },
+    }
+    local stBuf = select(1, GS:BufferAdoptionRecord(overAdoptId, overAdoptBody))
+    assertTrue(stBuf == "rejected" or stBuf == "accepted" or stBuf == "duplicate",
+        "val: idxg oversized buffer st=" .. tostring(stBuf))
+    local adop = GS._adoption
+    if type(adop) == "table" then
+        if type(adop.records) == "table" then
+            local desc = adop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: idxg adopt ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: idxg adopt commits " .. tostring(reasonAdopt))
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "val: idxg adopted record")
+    assertEq(GS._root.localWriter.nonce, nonce, "val: idxg nonce survived")
+    local adoptedNext = tonumber(record.valuations and record.valuations.nextSeq) or 1
+    assertTrue(adoptedNext < 4294967295, "val: idxg adopt nextSeq not exhausted got="
+        .. tostring(adoptedNext))
+    -- Even if a corrupt same-nonce oversized id were planted into seen, observe must ignore it.
+    local anyTxn, anySnap = next(record.valuations.byTxn or {})
+    if type(anySnap) == "table" then
+        anySnap.seen = anySnap.seen or {}
+        anySnap.seen[#anySnap.seen + 1] = { id = oversizedId, fp = "bad" }
+        GS.AdvanceValuationSeqForLocalWriter(record)
+        assertTrue((tonumber(record.valuations.nextSeq) or 0) < 4294967295,
+            "val: idxg planted oversized seen ignored")
+    end
+
+    -- Eligible officer prices the next donation on the first attempt.
+    valuationTsmValue = 44
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local evidenceNew = makeDepositEvidence(record, {
+        itemId = 9926, quantity = 3, donor = "IdxgNew-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 40,
+        neighborsOlder = { "idxg-new-old" }, neighborsNewer = { "idxg-new-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceNew, "Player-1-Carol", "Carol-Garona")), "accepted", "val: idxg new credit")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local newEv = valuationFindDonation(record, 9926, 3)
+    assertTrue(newEv ~= nil, "val: idxg new donation")
+    local newSnap = valuationSnap(record, newEv.txnId)
+    if type(newSnap) ~= "table" then
+        assertEq(GS.TryAssignDonationValuation(record, newEv, evidenceNew), true,
+            "val: idxg first mint succeeds")
+        record = GS:GetCurrentRecord()
+        newSnap = valuationSnap(record, newEv.txnId)
+    end
+    assertTrue(type(newSnap) == "table", "val: idxg first mint stored")
+    assertTrue(newSnap.assignmentId:find("^gsv1:" .. nonce .. ":", 1) ~= nil,
+        "val: idxg mint uses local nonce")
+    assertTrue(newSnap.assignmentId ~= oversizedId, "val: idxg mint not oversized")
+    assertTrue(newSnap.assignmentId ~= exhaustId, "val: idxg mint not exhaustion id")
+    assertEq(#world.chat, 0, "val: idxg chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
 end
 
 do

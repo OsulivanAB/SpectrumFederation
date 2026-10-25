@@ -1110,11 +1110,23 @@ local function AssignmentBoundElsewhere(record, store, assignmentId, targetKey, 
     return true
 end
 
+--- Canonical local mint shape: gsv1:<24 hex nonce>:<8 hex seq in 1..0xfffffffe>.
+-- Rejects oversized/malformed/zero/exhaustion suffixes so ObserveAssignmentIdSeq
+-- cannot pin nextSeq at the allocator sentinel from Gossip or adoption.
 local function ValidAssignmentId(id)
-    return type(id) == "string"
-        and id ~= ""
-        and #id <= (GS.MAX_OPERATION_ID or 192)
-        and id:match("^gsv1:[0-9a-fA-F]+:[0-9a-fA-F]+$") ~= nil
+    if type(id) ~= "string" or id == "" or #id > (GS.MAX_OPERATION_ID or 192) then
+        return false
+    end
+    local nonce, seqHex = id:match("^gsv1:([0-9a-fA-F]+):([0-9a-fA-F]+)$")
+    if type(nonce) ~= "string" or #nonce ~= 24
+        or type(seqHex) ~= "string" or #seqHex ~= 8 then
+        return false
+    end
+    local seq = tonumber(seqHex, 16)
+    if not seq or seq ~= math.floor(seq) or seq < 1 or seq >= 4294967295 then
+        return false
+    end
+    return true
 end
 
 --- Raise store.nextSeq past a same-nonce locally minted assignment id.
@@ -1133,20 +1145,17 @@ local function ObserveAssignmentIdSeq(store, assignmentId)
     if assignmentId:sub(1, #prefix) ~= prefix then
         return
     end
+    -- ValidAssignmentId already enforced an 8-hex mintable suffix.
     local hex = assignmentId:sub(#prefix + 1)
-    if type(hex) ~= "string" or not hex:match("^[0-9a-fA-F]+$") then
+    if type(hex) ~= "string" or #hex ~= 8 or not hex:match("^[0-9a-fA-F]+$") then
         return
     end
     local seq = tonumber(hex, 16)
-    if not seq or seq ~= math.floor(seq) or seq < 1 then
+    if not seq or seq ~= math.floor(seq) or seq < 1 or seq >= 4294967295 then
         return
     end
     local nextSeq = tonumber(store.nextSeq) or 1
     if seq < nextSeq then
-        return
-    end
-    if seq >= 4294967295 then
-        store.nextSeq = 4294967295
         return
     end
     store.nextSeq = seq + 1
@@ -1250,6 +1259,26 @@ local function CopySnap(assignment, canonical)
         actorGuid = assignment.actorGuid,
         actorName = assignment.actorName,
         seen = {},
+    }
+end
+
+--- Rebuild an ApplyIncoming candidate from a stored snap without rewriting fields.
+local function IncomingFromSnap(snap)
+    if type(snap) ~= "table" then
+        return nil
+    end
+    return {
+        assignmentId = snap.assignmentId,
+        assignedAt = snap.assignedAt,
+        unitCopper = snap.unitCopper,
+        quantity = snap.quantity,
+        totalCopper = snap.totalCopper,
+        itemId = snap.itemId,
+        txnId = ValidTxnId(snap.txnId) or snap.txnId,
+        datasetId = snap.datasetId,
+        guildKey = snap.guildKey,
+        actorGuid = snap.actorGuid,
+        actorName = snap.actorName,
     }
 end
 
@@ -2446,30 +2475,82 @@ function GS:AdmitValuationAssignment(body, opts)
         exportCanonical, assignment.txnId) then
         return "rejected", "assignment_bound"
     end
+    -- Cutover credit reconcile walks ≤ DEFERRED_VALUATION_ADMIT_BUDGET pending
+    -- keys per slice. A priceable admit that arrives before that continuation
+    -- must merge held canonical/alias pending candidates with the existing
+    -- winner and this body (earliest assignedAt, assignmentId) before clearing
+    -- pending. Rejected id_conflict stays atomic: no byTxn/pending mutation.
+    local pendingMerge = {}
+    local pendingClear = {}
+    if type(store.pending) == "table" then
+        local function notePending(key)
+            if type(key) ~= "string" or key == "" or pendingClear[key] then
+                return
+            end
+            local snap = store.pending[key]
+            if type(snap) ~= "table" then
+                return
+            end
+            pendingClear[key] = true
+            pendingMerge[#pendingMerge + 1] = snap
+        end
+        for key in pairs(ids) do
+            notePending(key)
+        end
+        notePending(assignment.txnId)
+        notePending(canonical)
+    end
+    local projected = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
+    for i = 1, #pendingMerge do
+        local cand = IncomingFromSnap(pendingMerge[i])
+        if cand and DonationMatches(cand, event) then
+            local st, _, _, _, nextProjected = ClassifyIncomingAgainst(projected, cand, canonical)
+            if st ~= "rejected" then
+                projected = nextProjected
+            end
+        end
+    end
+    local preStatus, _, preDetail = ClassifyIncomingAgainst(projected, assignment, canonical)
+    if preStatus == "rejected" then
+        return "rejected", preDetail or "id_conflict"
+    end
+    local wrote = false
+    local changed = false
+    for i = 1, #pendingMerge do
+        local cand = IncomingFromSnap(pendingMerge[i])
+        if cand and DonationMatches(cand, event) then
+            local prior = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
+            local _, did, _, didWrite = ApplyIncoming(store.byTxn, canonical, cand)
+            if didWrite then
+                PatchBindingsAfterApply(store, store.byTxn, canonical, prior, true)
+                wrote = true
+            end
+            if did then
+                changed = true
+            end
+        end
+    end
     local priorWinner = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
-    local status, changed, detail, wrote = ApplyIncoming(store.byTxn, canonical, assignment)
-    if wrote then
+    local status, didIn, detail, wroteIn = ApplyIncoming(store.byTxn, canonical, assignment)
+    if wroteIn then
         PatchBindingsAfterApply(store, store.byTxn, canonical, priorWinner, true)
+        wrote = true
+    end
+    if didIn then
+        changed = true
+    end
+    if wrote then
         ObserveSnapSeqs(store, store.byTxn[canonical])
     end
     local clearedPending = false
     if type(store.pending) == "table" then
-        for key in pairs(ids) do
-            if store.pending[key] ~= nil then
-                PatchBindingsRemoveSnap(store, store.pending[key], key)
+        for key in pairs(pendingClear) do
+            local snap = store.pending[key]
+            if snap ~= nil then
+                PatchBindingsRemoveSnap(store, snap, key)
                 store.pending[key] = nil
                 clearedPending = true
             end
-        end
-        if store.pending[assignment.txnId] ~= nil then
-            PatchBindingsRemoveSnap(store, store.pending[assignment.txnId], assignment.txnId)
-            store.pending[assignment.txnId] = nil
-            clearedPending = true
-        end
-        if store.pending[canonical] ~= nil then
-            PatchBindingsRemoveSnap(store, store.pending[canonical], canonical)
-            store.pending[canonical] = nil
-            clearedPending = true
         end
     end
     if wrote or clearedPending then
@@ -2479,10 +2560,13 @@ function GS:AdmitValuationAssignment(body, opts)
         return "rejected", detail or "id_conflict"
     end
     if changed and ShouldPublish(record) then
+        local winner = store.byTxn[canonical]
         PublishWinner(record, canonical)
         DebugInfo("valuation winner txn=%s id=%s at=%s total=%s",
-            tostring(canonical), tostring(assignment.assignmentId),
-            tostring(assignment.assignedAt), tostring(assignment.totalCopper))
+            tostring(canonical),
+            tostring(winner and winner.assignmentId or assignment.assignmentId),
+            tostring(winner and winner.assignedAt or assignment.assignedAt),
+            tostring(winner and winner.totalCopper or assignment.totalCopper))
     end
     if status == "accepted" then
         return "accepted", detail or "assigned"
