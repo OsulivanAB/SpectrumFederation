@@ -4986,15 +4986,21 @@ do
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    local troubleshootingPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
     assertTrue(configPage ~= nil, "Configuration page registered")
     assertTrue(logsPage ~= nil, "Logs page registered")
+    assertTrue(troubleshootingPage ~= nil, "Troubleshooting page registered")
     assertTrue(type(configPage.Build) == "function" and type(configPage.Refresh) == "function",
         "Configuration exposes Build/Refresh")
     assertTrue(type(logsPage.Build) == "function" and type(logsPage.Refresh) == "function",
         "Logs exposes Build/Refresh")
+    assertTrue(type(troubleshootingPage.Build) == "function"
+            and type(troubleshootingPage.Refresh) == "function",
+        "Troubleshooting exposes Build/Refresh")
     assertEq(SF.SettingsUI.categories.guildSupplies.name, "Raid Supplies",
         "category name localized through Loc default")
 
@@ -5069,6 +5075,27 @@ do
     assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
     assertTrue(foundStatusDisplay, "status area uses display rows")
     assertTrue(foundNextStepHelp, "status next-step/warning help uses getText+visible")
+    local configHasAdoption, configHasConflicts = false, false
+    for _, sec in ipairs(pageDef.sections or {}) do
+        if sec.id == "gsAdoption" then configHasAdoption = true end
+        if sec.id == "gsConflicts" then configHasConflicts = true end
+    end
+    assertEq(configHasAdoption, false, "#422: Configuration no longer hosts gsAdoption")
+    assertEq(configHasConflicts, false, "#422: Configuration no longer hosts gsConflicts")
+    local tsPanel = makeRegion("Frame", "GSTroubleshootingPanel", nil)
+    tsPanel:SetSize(600, 800)
+    troubleshootingPage:Build(tsPanel)
+    local tsDef = tsPanel.__sfPageDef
+    assertTrue(type(tsDef) == "table", "Troubleshooting Build stores page definition")
+    local tsHasAdoption, tsHasConflicts, tsHasItems = false, false, false
+    for _, sec in ipairs(tsDef.sections or {}) do
+        if sec.id == "gsAdoption" then tsHasAdoption = true end
+        if sec.id == "gsConflicts" then tsHasConflicts = true end
+        if sec.id == "gsItems" then tsHasItems = true end
+    end
+    assertEq(tsHasAdoption, true, "#422: Troubleshooting hosts gsAdoption")
+    assertEq(tsHasConflicts, true, "#422: Troubleshooting hosts gsConflicts")
+    assertEq(tsHasItems, false, "#422: Troubleshooting does not host unrelated items section")
 
     -- Activation guidance in Next step help (bank sample states; no Chat).
     local statusNextStepGetText
@@ -6143,10 +6170,13 @@ do
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
-    assertTrue(configPage ~= nil and logsPage ~= nil, "pages available for 2B18")
+    local troubleshootingPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
+    assertTrue(configPage ~= nil and logsPage ~= nil and troubleshootingPage ~= nil,
+        "pages available for 2B18")
 
     local function findEditBoxes(node, out)
         out = out or {}
@@ -7179,6 +7209,10 @@ do
     assertEq(view.warningShown, true, "status UX: mismatch warning visible")
     assertTrue(view.warning:find("Bob-Garona", 1, true) and view.warning:find("peer-ds-1", 1, true),
         "status UX: mismatch warning names peer got=" .. tostring(view.warning))
+    assertTrue(view.warning:find("Troubleshooting", 1, true),
+        "status UX: mismatch warning points to Troubleshooting got=" .. tostring(view.warning))
+    assertTrue(not view.warning:find("below", 1, true),
+        "status UX: mismatch warning must not say below got=" .. tostring(view.warning))
     assertTrue(not (view.nextStepShown and view.nextStep
         and view.nextStep:find("different staged dataset", 1, true)),
         "status UX: mismatch text is not duplicated into next step")
@@ -7418,30 +7452,38 @@ do
     world.guild.members = priorMembersTip
     settleRoster()
 
-    -- Adoption / conflict tips when no sources / no conflicts.
-    configPage:Refresh(tipPanel)
-    local adoptSource = findDefItem(tipPanel, function(item)
+    -- Adoption / conflict tips when no sources / no conflicts (#422: Troubleshooting).
+    assertTrue(troubleshootingPage ~= nil, "disabled tip: Troubleshooting page available")
+    local tsTipPanel = makeRegion("Frame", "GSDisabledTipTroubleshooting", nil)
+    tsTipPanel:SetSize(600, 900)
+    troubleshootingPage:Build(tsTipPanel)
+    -- Configuration must not still expose these controls.
+    assertNil(findDefItem(tipPanel, function(item)
+        return item.type == "dropdown" and item.label
+            and tostring(item.label):find("Source dataset", 1, true)
+    end), "disabled tip: Configuration no longer has Source dataset")
+    local adoptSource = findDefItem(tsTipPanel, function(item)
         return item.type == "dropdown" and item.label
             and tostring(item.label):find("Source dataset", 1, true)
     end)
     local adoptTip = adoptSource.getDisabledTooltip()
     assertTrue(type(adoptTip) == "string" and adoptTip:find("No eligible peer", 1, true),
         "disabled tip: adoption source empty got=" .. tostring(adoptTip))
-    local adoptBegin = findDefItem(tipPanel, function(item)
+    local adoptBegin = findDefItem(tsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Start adoption", 1, true)
     end)
     assertTrue(adoptBegin.getDisabledTooltip():find("No eligible peer", 1, true)
             or adoptBegin.getDisabledTooltip():find("Select a source", 1, true),
         "disabled tip: start adoption blocked without source")
-    local adoptCancel = findDefItem(tipPanel, function(item)
+    local adoptCancel = findDefItem(tsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Cancel adoption", 1, true)
     end)
     assertEq(adoptCancel.getDisabledTooltip(),
         "There is no adoption in progress.",
         "disabled tip: cancel adoption when idle")
-    local conflictOpen = findDefItem(tipPanel, function(item)
+    local conflictOpen = findDefItem(tsTipPanel, function(item)
         return item.type == "dropdown" and item.label
             and tostring(item.label):find("Open conflict", 1, true)
     end)
@@ -7449,7 +7491,7 @@ do
             or conflictOpen.getDisabledTooltip():find("no unresolved configuration", 1, true)
             or conflictOpen.getDisabledTooltip():find("There are no unresolved", 1, true),
         "disabled tip: open conflict none got=" .. tostring(conflictOpen.getDisabledTooltip()))
-    local conflictChoose = findDefItem(tipPanel, function(item)
+    local conflictChoose = findDefItem(tsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Use this value", 1, true)
     end)
@@ -7694,6 +7736,184 @@ do
             GO.ClearUIListeners()
         end
     end
+
+    -- #422: Troubleshooting hosts adoption/conflicts; tab/hide must not cancel
+    -- adoption or accumulate listeners/refreshes.
+    local function checkIssue422TroubleshootingLifecycle()
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+        local tsPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
+        assertTrue(tsPage ~= nil, "#422: Troubleshooting page registered")
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        assertEq(select(2, GS:CreateStagedRecord()), "accepted", "#422: init")
+        startCampaign()
+
+        local tsPanel = makeRegion("Frame", "GS422TsPanel", nil)
+        tsPanel:SetSize(600, 800)
+        tsPanel.shown = true
+        tsPanel.visible = true
+        tsPage:Build(tsPanel)
+        local tsDef = tsPanel.__sfPageDef
+        assertTrue(type(tsDef) == "table", "#422: Troubleshooting definition present")
+        local hasAdoption, hasConflicts = false, false
+        for _, sec in ipairs(tsDef.sections or {}) do
+            if sec.id == "gsAdoption" then hasAdoption = true end
+            if sec.id == "gsConflicts" then hasConflicts = true end
+        end
+        assertEq(hasAdoption, true, "#422: gsAdoption on Troubleshooting")
+        assertEq(hasConflicts, true, "#422: gsConflicts on Troubleshooting")
+
+        -- Config still shows mismatch warnings pointing at Troubleshooting.
+        local cfgPanel = makeRegion("Frame", "GS422CfgPanel", nil)
+        cfgPanel:SetSize(600, 800)
+        cfgPanel.shown = true
+        cfgPanel.visible = true
+        configPage:Build(cfgPanel)
+        local cfgDef = cfgPanel.__sfPageDef
+        for _, sec in ipairs(cfgDef.sections or {}) do
+            assertTrue(sec.id ~= "gsAdoption" and sec.id ~= "gsConflicts",
+                "#422: Configuration must not retain " .. tostring(sec.id))
+        end
+        local priorMismatch = GS.GetDatasetMismatchState
+        GS.GetDatasetMismatchState = function()
+            return {
+                blocked = true,
+                peers = { { peerName = "Bob-Garona", datasetId = "peer-ds-422" } },
+            }
+        end
+        configPage:Refresh(cfgPanel)
+        local warningText
+        for _, sec in ipairs((cfgPanel.__sfPageDef and cfgPanel.__sfPageDef.sections) or {}) do
+            if sec.id == "gsStatus" then
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "help" and type(item.getText) == "function"
+                        and type(item.visible) == "function" and item.visible() then
+                        local t = item.getText()
+                        if type(t) == "string" and t:find("peer-ds-422", 1, true) then
+                            warningText = t
+                        end
+                    end
+                end
+            end
+        end
+        assertTrue(type(warningText) == "string" and warningText:find("Troubleshooting", 1, true),
+            "#422: config warning directs to Troubleshooting got=" .. tostring(warningText))
+        assertTrue(not warningText:find("below", 1, true),
+            "#422: config warning must not say below")
+        GS.GetDatasetMismatchState = priorMismatch
+
+        -- Begin adoption, hide Troubleshooting (tab switch), confirm not cancelled.
+        local peerDs = "adopt-ds-422"
+        assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", peerDs)), "accepted",
+            "#422: begin adoption")
+        assertTrue(GS:GetPendingAdoption() ~= nil, "#422: adoption pending before hide")
+        tsPanel.shown = false
+        tsPanel.visible = false
+        if tsPage.panel then
+            tsPage.panel.shown = false
+            tsPage.panel.visible = false
+        end
+        if tsPage.OnHide then tsPage:OnHide() end
+        assertTrue(GS:GetPendingAdoption() ~= nil,
+            "#422: hiding Troubleshooting does not cancel adoption")
+        assertEq(GS:GetPendingAdoption().sourceDatasetId, peerDs,
+            "#422: pending adoption source preserved across hide")
+
+        -- Ready notify while hidden must not refresh; visible re-entry refreshes.
+        local refreshCount = 0
+        local realRefresh = tsPage.Refresh
+        tsPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+        timers = {}
+        local before = refreshCount
+        if GS.OnAdoptionStateChanged then
+            GS.OnAdoptionStateChanged("ready")
+        end
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertEq(refreshCount, before,
+            "#422: hidden Troubleshooting ignores adoption state notify")
+
+        tsPanel.shown = true
+        tsPanel.visible = true
+        if tsPage.panel then
+            tsPage.panel.shown = true
+            tsPage.panel.visible = true
+        end
+        timers = {}
+        before = refreshCount
+        if GS.OnAdoptionStateChanged then
+            GS.OnAdoptionStateChanged("ready")
+        end
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertTrue(refreshCount > before,
+            "#422: visible Troubleshooting refreshes on adoption state notify")
+
+        -- Repeated Build must not stack officer listeners beyond one per page module.
+        local GO = SF.GuildOfficer
+        if GO and GO.ClearUIListeners then
+            GO.ClearUIListeners()
+        end
+        local regCount = 0
+        local realReg = GO and GO.RegisterUIListener
+        if GO and realReg then
+            GO.RegisterUIListener = function(fn)
+                regCount = regCount + 1
+                return realReg(fn)
+            end
+            loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+            tsPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
+            local p1 = makeRegion("Frame", "GS422Listen1", nil)
+            p1:SetSize(400, 600)
+            p1.shown = true
+            tsPage:Build(p1)
+            local p2 = makeRegion("Frame", "GS422Listen2", nil)
+            p2:SetSize(400, 600)
+            p2.shown = true
+            tsPage:Build(p2)
+            for _ = 1, 5 do
+                tsPage:Refresh(p1)
+            end
+            assertEq(regCount, 1,
+                "#422: repeated Troubleshooting Build/Refresh registers one officer listener")
+            GO.RegisterUIListener = realReg
+            if GO.ClearUIListeners then
+                GO.ClearUIListeners()
+            end
+        end
+
+        -- Idle: no spontaneous refresh while visible with no state change.
+        tsPage.Refresh = realRefresh
+        refreshCount = 0
+        tsPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+        tsPanel.shown = true
+        tsPanel.visible = true
+        if tsPage.panel then
+            tsPage.panel.shown = true
+            tsPage.panel.visible = true
+        end
+        timers = {}
+        world.time = (world.time or 0) + 5
+        flushTimers()
+        assertEq(refreshCount, 0,
+            "#422: idle visible Troubleshooting does not self-refresh")
+        tsPage.Refresh = realRefresh
+
+        GS:CancelDatasetAdoption()
+        assertEq(GS:GetPendingAdoption(), nil, "#422: cancel clears adoption")
+        assertEq(#world.chat, 0, "#422: no chat from Troubleshooting lifecycle")
+    end
+    checkIssue422TroubleshootingLifecycle()
 
     -- #414: item icons/names, late cache fill, compact history, no pending-evidence UI.
     -- Nested so this scenario's locals stay inside their own function. Lua 5.1
@@ -24528,6 +24748,11 @@ do
             label .. ": Raid Supplies Configuration remains registered")
         assertTrue(SF.SettingsUI.pagesById.guildSuppliesLogs ~= nil,
             label .. ": Raid Supplies Logs remains registered")
+        if not SF.SettingsUI.pagesById.guildSuppliesTroubleshooting then
+            loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+        end
+        assertTrue(SF.SettingsUI.pagesById.guildSuppliesTroubleshooting ~= nil,
+            label .. ": Raid Supplies Troubleshooting remains registered")
     end
     assertLegacyPagesAbsent("3C24: before profile switch")
     -- Create staged guild B while A remains live.
@@ -27118,6 +27343,9 @@ do
     if not (SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesConfiguration) then
         loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     end
+    if not (SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesTroubleshooting) then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+    end
     local Nav = SF.SettingsNavigationModel
     local ui = SF.SettingsUI
     assertTrue(Nav and ui and ui.pagesById, "B-ui: settings registry present")
@@ -27130,10 +27358,14 @@ do
         "B-ui: Raid Supplies Configuration remains registered while staged")
     assertTrue(ui.pagesById.guildSuppliesLogs ~= nil,
         "B-ui: Raid Supplies Logs remains registered while staged")
+    assertTrue(ui.pagesById.guildSuppliesTroubleshooting ~= nil,
+        "B-ui: Raid Supplies Troubleshooting remains registered while staged")
     assertEq(Nav.IsContentPage(ui, "guildSuppliesConfiguration"), true,
         "B-ui: Configuration is a content page while staged")
     assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
         "B-ui: Logs is a content page while staged")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesTroubleshooting"), true,
+        "B-ui: Troubleshooting is a content page while staged")
 
     local uiReasons = {}
     assertTrue(type(GS.RegisterUIListener) == "function", "B-ui: RegisterUIListener present")
@@ -27172,6 +27404,8 @@ do
         "B-ui: Configuration remains a content page after activation")
     assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
         "B-ui: Logs remains a content page after activation")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesTroubleshooting"), true,
+        "B-ui: Troubleshooting remains a content page after activation")
 
     -- Earlier suite stubs may RegisterPage without UpsertCategoryFromPage.
     -- Mirror production Loot Helper category + always-available General fallback

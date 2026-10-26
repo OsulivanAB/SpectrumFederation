@@ -57,11 +57,12 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     item_display = toc.find("modules/UI/Settings/ItemDisplay.lua")
     config_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     logs_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
-    assert 0 <= item_display < config_page < logs_page
+    troubleshooting_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+    assert 0 <= item_display < config_page < logs_page < troubleshooting_page
     obs = toc.find("modules/LootHelper/ConsumablesObservation.lua")
     assert 0 <= obs
     assert 0 <= gossip < state < authority < operations < campaigns < activation < ledger < admission < valuation < gs_gossip
-    assert 0 <= config_page < logs_page
+    assert 0 <= config_page < logs_page < troubleshooting_page
 
 
 def test_demand_driven_guild_apis_exist():
