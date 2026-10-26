@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.15-beta.1] - 2026-10-26
+
+### Changed
+- Move Raid Supplies adoption/conflicts to Troubleshooting (#422)
+
 ## [1.5.14-beta.1] - 2026-10-26
 
 ### Changed
