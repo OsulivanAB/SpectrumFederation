@@ -1336,6 +1336,20 @@ local function ClassifyStaleBase(record, op, targetKey)
         return "apply", nil
     end
 
+    -- #424 campaign names: deterministic last-write-wins. Never open a
+    -- Troubleshooting conflict for concurrent renames/clears.
+    if op.kind == GS.KIND.RENAME_CAMPAIGN then
+        local headId = ops.heads and ops.heads[targetKey]
+        local headBody = headId and ops.records and ops.records[headId]
+        if type(headBody) ~= "table" or headBody.id == op.id then
+            return "apply", nil
+        end
+        if GS.RenameRevisionWins and GS.RenameRevisionWins(op, headBody) then
+            return "apply", nil
+        end
+        return "obsolete", "stale_name"
+    end
+
     -- Open conflict already holds this target: retain as additional candidate.
     if type(ops.openConflicts) == "table" and ops.openConflicts[targetKey] then
         return "conflict", "open_conflict"
@@ -5507,6 +5521,8 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             and op.kind ~= GS.KIND.RESOLVE_CONFLICT
             and op.kind ~= GS.KIND.CONFIRM_CANDIDATE
             and op.kind ~= GS.KIND.SET_EDITOR_RANK
+            -- Names are keyed by target campaign id, not by authorship campaign.
+            and op.kind ~= GS.KIND.RENAME_CAMPAIGN
     end
 
     local promoteOps = {}

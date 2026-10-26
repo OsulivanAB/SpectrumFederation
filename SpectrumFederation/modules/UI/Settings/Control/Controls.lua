@@ -904,10 +904,15 @@ function Controls:AddEditBoxWithButton(section, opts)
 		local _, control = self:InitRow(row, opts)
 
 		local bound = false
+		local displayFromGet = false
 		local get, set
 		if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
 			bound = true
 			get, set = ResolveGetSet(opts)
+		elseif type(opts.get) == "function" then
+			-- Display the current value; commit only through onSubmit / button.
+			displayFromGet = true
+			get = opts.get
 		end
 
 		local edit = CreateFrame("EditBox", nil, control, "InputBoxTemplate")
@@ -960,7 +965,10 @@ function Controls:AddEditBoxWithButton(section, opts)
 
 		btn:SetScript("OnClick", DoSubmit)
 		edit:SetScript("OnEnterPressed", function(selfEdit)
-			if bound then
+			-- Prefer explicit submit handlers over silent set() commits.
+			if opts.onSubmit then
+				DoSubmit()
+			elseif bound then
 				Commit()
 			else
 				DoSubmit()
@@ -968,13 +976,13 @@ function Controls:AddEditBoxWithButton(section, opts)
 			selfEdit:ClearFocus()
 		end)
 		edit:SetScript("OnEditFocusLost", function()
-			if bound then
+			if bound and not opts.onSubmit then
 				Commit()
 			end
 		end)
 
 		local function Refresh()
-			if bound then
+			if bound or displayFromGet then
 				ignore = true
 				edit:SetText(tostring(get() or ""))
 				if edit.SetCursorPosition then

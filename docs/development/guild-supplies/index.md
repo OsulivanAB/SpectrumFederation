@@ -18,6 +18,7 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
 | Guarded live activation + cutover marker | `Activation` (`ActivateCanonicalDataset`, `InstallRemoteLiveCutover`) |
 | Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 2`) via Guild Gossip API |
+| Campaign display names (#424) | `rename-campaign` ops + `campaignNames` projection; LWW by `(timestamp, op.id)`; no Troubleshooting conflict; provider schema stays 2 |
 | Donation evidence / officer or three-witness ledger / identity links | `Ledger` |
 | Configuration / Logs Settings pages | `UI/Settings/Pages/GuildSupplies*.lua` |
 | Live bank observation after activation | `ConsumablesBankLog` → `AdmitDirectObservation` |
@@ -56,6 +57,9 @@ SpectrumFederationDB.guildSupplies = {
       campaigns = { -- [campaignId] = immutable boundary header },
       campaignArchives = { -- [campaignId] = frozen requestedItems + generation },
       campaignContext = { -- [campaignId] = bounded bank anchors (not gossip envelopes) },
+      campaignNames = nil | { -- #424 optional guild-owned display names; absent on older saves
+        [campaignId] = { name = "<string or nil clear>", revisionId = "<op id>", renamedAt = <GetServerTime> },
+      },
       accounting = {
         _consumables = { guild = { guid, name, realm }, bankTab, requestedItems, eligibility, txnRegistry, ... },
         _consumableEvents = {},
