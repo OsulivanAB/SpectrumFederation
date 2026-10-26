@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.14-beta.1] - 2026-10-26
+
+### Changed
+- Guild Supplies TSM donation valuation (#397)
+
 ## [1.5.13] - 2026-10-24
 
 ### Changed
