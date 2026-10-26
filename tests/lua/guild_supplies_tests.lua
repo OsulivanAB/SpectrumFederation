@@ -37954,6 +37954,412 @@ do
 end
 
 do
+    -- idxh (discussion_r4373011801): pendingClear must not strip promoted bindings.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxh provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function snapshotAuthority(record, txnA, txnB)
+        return {
+            snapA = deepCopy(valuationSnap(record, txnA)),
+            snapB = deepCopy(valuationSnap(record, txnB)),
+            pendingA = deepCopy(record.valuations and record.valuations.pending
+                and record.valuations.pending[txnA]),
+            pendingB = deepCopy(record.valuations and record.valuations.pending
+                and record.valuations.pending[txnB]),
+            count = valuationCount(record),
+            nextSeq = tonumber(record.valuations and record.valuations.nextSeq),
+        }
+    end
+    local function assertAuthorityUnchanged(before, record, txnA, txnB, label)
+        local after = snapshotAuthority(record, txnA, txnB)
+        assertEq(after.count, before.count, "val: idxh " .. label .. " winner count")
+        assertEq(after.nextSeq, before.nextSeq, "val: idxh " .. label .. " nextSeq")
+        local a = valuationSnap(record, txnA)
+        assertTrue(type(a) == "table", "val: idxh " .. label .. " A present")
+        assertEq(a.assignmentId, before.snapA.assignmentId, "val: idxh " .. label .. " A id")
+        assertEq(a.unitCopper, before.snapA.unitCopper, "val: idxh " .. label .. " A unit")
+        assertEq(a.totalCopper, before.snapA.totalCopper, "val: idxh " .. label .. " A total")
+        assertEq(valuationSnap(record, txnB), before.snapB, "val: idxh " .. label .. " B absent")
+        assertEq(record.valuations.pending[txnA], before.pendingA,
+            "val: idxh " .. label .. " pending A")
+        assertEq(record.valuations.pending[txnB], before.pendingB,
+            "val: idxh " .. label .. " pending B")
+    end
+
+    SF.TSM = nil
+    local record = activateValuationGuild(9927)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local rebuilds = 0
+    GS._onAssignmentBindingRebuild = function()
+        rebuilds = rebuilds + 1
+    end
+
+    -- Donation A: credit, park earlier pending[canonical], remember a loser, then
+    -- promote via a later authorized body while the binding cache is warm.
+    local evidenceA = makeDepositEvidence(record, {
+        itemId = 9927, quantity = 2, donor = "IdxhA-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 1,
+        neighborsOlder = { "idxh-a-old" }, neighborsNewer = { "idxh-a-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceA, "Player-1-Alice", "Alice-Garona")), "accepted", "val: idxh credit A")
+    record = GS:GetCurrentRecord()
+    local evA = valuationFindDonation(record, 9927, 2)
+    assertTrue(evA ~= nil, "val: idxh donation A")
+    local txnA = evA.txnId
+    -- Force A into unpublished pending by temporarily clearing production credit.
+    evA.gsProductionCredit = false
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local winnerId = "gsv1:aaaaaaaaaaaaaaaaaaaaaa01:00009927"
+    local loserId = "gsv1:bbbbbbbbbbbbbbbbbbbbbb02:00009927"
+    local earlyBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evA, {
+            assignmentId = winnerId,
+            assignedAt = 100,
+            unitCopper = 15,
+            txnId = txnA,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stPend, reasonPend = providerApplyWithId("gs:val:" .. txnA, earlyBody, "Alice-Garona")
+    assertEq(stPend, "pending", "val: idxh park pending A " .. tostring(reasonPend))
+    assertEq(reasonPend, "awaiting_credit", "val: idxh A awaiting_credit")
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[txnA]) == "table", "val: idxh pending[A]")
+    -- Warm the binding cache before promotion (AssignmentBoundElsewhere cold-builds once).
+    local warmBefore = rebuilds
+    local laterBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evA, {
+            assignmentId = loserId,
+            assignedAt = 500,
+            unitCopper = 15,
+            txnId = txnA,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stLaterPend = select(1, providerApplyWithId("gs:val:" .. txnA, laterBody, "Alice-Garona"))
+    assertTrue(stLaterPend == "pending" or stLaterPend == "duplicate",
+        "val: idxh later pending remembered st=" .. tostring(stLaterPend))
+    record = GS:GetCurrentRecord()
+    local pendSnap = record.valuations.pending[txnA]
+    assertEq(pendSnap.assignmentId, winnerId, "val: idxh pending keeps earlier winner")
+    local hasLoser = false
+    if type(pendSnap.seen) == "table" then
+        for i = 1, #pendSnap.seen do
+            if pendSnap.seen[i] and pendSnap.seen[i].id == loserId then
+                hasLoser = true
+            end
+        end
+    end
+    assertTrue(hasLoser, "val: idxh pending retains loser in seen")
+    assertTrue(rebuilds >= warmBefore, "val: idxh binding cache warmed")
+    local rebuildsAfterWarm = rebuilds
+
+    -- Restore credit and promote via another later authorized body (or identical).
+    evA.gsProductionCredit = true
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local promoteBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evA, {
+            assignmentId = "gsv1:cccccccccccccccccccccc03:00009927",
+            assignedAt = 900,
+            unitCopper = 15,
+            txnId = txnA,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local promoteLoserId = promoteBody.assignment.assignmentId
+    local stPromo, reasonPromo = providerApplyWithId("gs:val:" .. txnA, promoteBody, "Alice-Garona")
+    assertTrue(stPromo == "accepted" or stPromo == "duplicate",
+        "val: idxh promote st=" .. tostring(stPromo) .. " " .. tostring(reasonPromo))
+    record = GS:GetCurrentRecord()
+    local snapA = valuationSnap(record, txnA)
+    assertTrue(type(snapA) == "table", "val: idxh A promoted")
+    assertEq(snapA.assignmentId, winnerId, "val: idxh earlier pending wins")
+    assertEq(record.valuations.pending[txnA], nil, "val: idxh pending cleared")
+    local seenPendingLoser, seenPromoteLoser = false, false
+    if type(snapA.seen) == "table" then
+        for i = 1, #snapA.seen do
+            local id = snapA.seen[i] and snapA.seen[i].id
+            if id == loserId then
+                seenPendingLoser = true
+            elseif id == promoteLoserId then
+                seenPromoteLoser = true
+            end
+        end
+    end
+    assertTrue(seenPendingLoser, "val: idxh promoted seen keeps pending-era loser")
+    assertTrue(seenPromoteLoser, "val: idxh promoted seen retains later loser")
+    -- Promotion must stay incremental (no cold rebuild required for correctness).
+    assertEq(rebuilds, rebuildsAfterWarm,
+        "val: idxh promote stayed incremental got=" .. tostring(rebuilds))
+
+    -- Second credited donation B.
+    local evidenceB = makeDepositEvidence(record, {
+        itemId = 9927, quantity = 3, donor = "IdxhB-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 2,
+        neighborsOlder = { "idxh-b-old" }, neighborsNewer = { "idxh-b-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceB, "Player-1-Alice", "Alice-Garona")), "accepted", "val: idxh credit B")
+    record = GS:GetCurrentRecord()
+    local evB = valuationFindDonation(record, 9927, 3)
+    assertTrue(evB ~= nil, "val: idxh donation B")
+    local txnB = evB.txnId
+    local beforeBound = snapshotAuthority(record, txnA, txnB)
+    local rebuildsBeforeBound = rebuilds
+    drainExportMaint(32)
+    local exportBefore = collectAllExportBodies()
+    local function valuationExportCount(bodies, datasetId)
+        local n, desc = 0, nil
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                n = n + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                desc = body.valuationCount or body.valuationsCount
+            end
+        end
+        return n, desc
+    end
+    local exportCountBefore, descBefore = valuationExportCount(exportBefore, record.datasetId)
+
+    -- Reuse promoted winner ID on B → assignment_bound; warm cache, no rebuild needed.
+    local reuseWinner = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evB, {
+            assignmentId = winnerId,
+            assignedAt = 1000,
+            unitCopper = 20,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stReuse, reasonReuse = providerApplyWithId("gs:val:" .. txnB, reuseWinner, "Alice-Garona")
+    assertEq(stReuse, "rejected", "val: idxh reused winner rejected")
+    assertEq(reasonReuse, "assignment_bound", "val: idxh reused winner assignment_bound")
+    record = GS:GetCurrentRecord()
+    assertAuthorityUnchanged(beforeBound, record, txnA, txnB, "reuse-winner")
+    assertEq(rebuilds, rebuildsBeforeBound,
+        "val: idxh reuse-winner no cold rebuild got=" .. tostring(rebuilds))
+
+    -- Reuse retained loser IDs from the accepted winner's seen list on B.
+    for _, seenId in ipairs({ loserId, promoteLoserId }) do
+        local reuseLoser = deepCopy(reuseWinner)
+        reuseLoser.assignment.assignmentId = seenId
+        reuseLoser.assignment.assignedAt = 1001
+        local stLoser, reasonLoser = providerApplyWithId(
+            "gs:val:" .. txnB, reuseLoser, "Alice-Garona")
+        assertEq(stLoser, "rejected",
+            "val: idxh reused loser rejected " .. tostring(seenId))
+        assertEq(reasonLoser, "assignment_bound",
+            "val: idxh reused loser assignment_bound " .. tostring(seenId))
+        record = GS:GetCurrentRecord()
+        assertAuthorityUnchanged(beforeBound, record, txnA, txnB,
+            "reuse-loser-" .. tostring(seenId))
+        assertEq(rebuilds, rebuildsBeforeBound,
+            "val: idxh reuse-loser no cold rebuild " .. tostring(seenId)
+                .. " got=" .. tostring(rebuilds))
+    end
+
+    drainExportMaint(16)
+    local exportCountAfter, descAfter = valuationExportCount(collectAllExportBodies(), record.datasetId)
+    assertEq(exportCountAfter, exportCountBefore, "val: idxh export count unchanged")
+    assertEq(descAfter, descBefore, "val: idxh descriptor unchanged")
+    assertEq(descAfter, valuationCount(record), "val: idxh descriptor matches winners")
+
+    -- Legitimate unique assignment for B still succeeds.
+    local uniqueId = "gsv1:dddddddddddddddddddddd04:00009927"
+    local uniqueBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evB, {
+            assignmentId = uniqueId,
+            assignedAt = 1100,
+            unitCopper = 21,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stUnique, reasonUnique = providerApplyWithId("gs:val:" .. txnB, uniqueBody, "Alice-Garona")
+    assertTrue(stUnique == "accepted" or stUnique == "duplicate",
+        "val: idxh unique B st=" .. tostring(stUnique) .. " " .. tostring(reasonUnique))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnB).assignmentId, uniqueId, "val: idxh unique B wins")
+    assertEq(valuationSnap(record, txnA).assignmentId, winnerId, "val: idxh A intact after B")
+    assertEq(rebuilds, rebuildsBeforeBound,
+        "val: idxh unique B stayed incremental got=" .. tostring(rebuilds))
+
+    -- Alias-key pending promotion: pending[alias] → byTxn[canonical], then bound check.
+    local aliasTxn = "ctx:idxh-alias-src"
+    local canonTxn = "ctx:idxh-alias-dst"
+    local aliasEvent = {
+        type = "donation",
+        id = canonTxn,
+        txnId = canonTxn,
+        itemId = 9927,
+        quantity = 4,
+        generation = 1,
+        gsProductionCredit = false,
+        verification = "officer",
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        approxTxnTime = world.time,
+        timestamp = math.floor(world.time or 0),
+        occurrenceIndex = 900010,
+    }
+    record.accounting._consumableEvents = record.accounting._consumableEvents or {}
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = aliasEvent
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local cfg = record.accounting._consumables
+    if type(cfg) ~= "table" then
+        record.accounting._consumables = {}
+        cfg = record.accounting._consumables
+    end
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = canonTxn, status = "committed", aliases = { aliasTxn },
+        itemId = 9927, quantity = 4,
+    }
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = aliasTxn, status = "alias", aliasOf = canonTxn,
+    }
+    local aliasWinner = "gsv1:eeeeeeeeeeeeeeeeeeeeee05:00009927"
+    local aliasPendBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, aliasEvent, {
+            assignmentId = aliasWinner,
+            assignedAt = 50,
+            unitCopper = 9,
+            txnId = aliasTxn,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stAliasPend, reasonAliasPend = providerApplyWithId(
+        "gs:val:" .. canonTxn, aliasPendBody, "Alice-Garona")
+    assertEq(stAliasPend, "pending",
+        "val: idxh alias pending st=" .. tostring(stAliasPend) .. " " .. tostring(reasonAliasPend))
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[canonTxn]) == "table"
+        or type(record.valuations.pending[aliasTxn]) == "table",
+        "val: idxh alias pending parked")
+    aliasEvent.gsProductionCredit = true
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local aliasLater = deepCopy(aliasPendBody)
+    aliasLater.assignment.assignmentId = "gsv1:ffffffffffffffffffffff06:00009927"
+    aliasLater.assignment.assignedAt = 800
+    aliasLater.assignment.unitCopper = 9
+    aliasLater.assignment.totalCopper = 36
+    local rebuildsBeforeAlias = rebuilds
+    local stAliasPromo = select(1, providerApplyWithId(
+        "gs:val:" .. canonTxn, aliasLater, "Alice-Garona"))
+    assertTrue(stAliasPromo == "accepted" or stAliasPromo == "duplicate",
+        "val: idxh alias promote st=" .. tostring(stAliasPromo))
+    record = GS:GetCurrentRecord()
+    local aliasSnap = valuationSnap(record, canonTxn)
+    assertTrue(type(aliasSnap) == "table", "val: idxh alias winner")
+    assertEq(aliasSnap.assignmentId, aliasWinner, "val: idxh alias earlier wins")
+    assertEq(aliasSnap.txnId, aliasTxn, "val: idxh alias immutable txn")
+    assertEq(rebuilds, rebuildsBeforeAlias,
+        "val: idxh alias promote incremental got=" .. tostring(rebuilds))
+    local reuseAlias = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evB, {
+            assignmentId = aliasWinner,
+            assignedAt = 1200,
+            unitCopper = 21,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    -- B already priced; reuse must still be assignment_bound (not overwrite B).
+    local beforeAliasReuse = deepCopy(valuationSnap(record, txnB))
+    local stAliasReuse, reasonAliasReuse = providerApplyWithId(
+        "gs:val:" .. txnB, reuseAlias, "Alice-Garona")
+    assertEq(stAliasReuse, "rejected", "val: idxh alias winner reuse rejected")
+    assertEq(reasonAliasReuse, "assignment_bound", "val: idxh alias winner assignment_bound")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnB).assignmentId, beforeAliasReuse.assignmentId,
+        "val: idxh B intact after alias reuse reject")
+
+    -- /reload: durable winners still enforce assignment_bound after cold rebuild.
+    local reloadRoot = snapshotConfigRoot()
+    reloadRoot.guilds["club:42"].accounting = deepCopy(record.accounting)
+    reloadRoot.guilds["club:42"].valuations = deepCopy(record.valuations)
+    SpectrumFederationDB = { guildSupplies = deepCopy(reloadRoot) }
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    GS:EnsureGossipProvider()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnA).assignmentId, winnerId, "val: idxh reload A")
+    assertEq(valuationSnap(record, txnB).assignmentId, uniqueId, "val: idxh reload B")
+    assertEq(valuationSnap(record, canonTxn).assignmentId, aliasWinner, "val: idxh reload alias")
+    local stReloadBound, reasonReloadBound = providerApplyWithId("gs:val:" .. txnB, {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, valuationFindDonation(record, 9927, 3), {
+            assignmentId = winnerId,
+            assignedAt = 2000,
+            unitCopper = 21,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }, "Alice-Garona")
+    assertEq(stReloadBound, "rejected", "val: idxh reload reuse rejected")
+    assertEq(reasonReloadBound, "assignment_bound", "val: idxh reload assignment_bound")
+    GS._onAssignmentBindingRebuild = nil
+    assertEq(#world.chat, 0, "val: idxh chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
     local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
     assertTrue(src ~= nil, "val: module readable")
     local text = src:read("*a")

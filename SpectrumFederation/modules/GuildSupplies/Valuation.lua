@@ -2521,12 +2521,32 @@ function GS:AdmitValuationAssignment(body, opts)
     local changed = false
     local acceptDetail = nil
     for i = 1, #pendingMerge do
-        local cand = IncomingFromSnap(pendingMerge[i])
+        local pendingSnap = pendingMerge[i]
+        local cand = IncomingFromSnap(pendingSnap)
         if cand and DonationMatches(cand, event) then
             local prior = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
             local _, did, det, didWrite = ApplyIncoming(store.byTxn, canonical, cand)
             if didWrite then
                 PatchBindingsAfterApply(store, store.byTxn, canonical, prior, true)
+                -- IncomingFromSnap omits seen[]; carry bounded pending losers onto
+                -- the accepted winner so assignment_bound still covers them.
+                local winner = store.byTxn[canonical]
+                if type(winner) == "table" and type(pendingSnap.seen) == "table" then
+                    local last = #pendingSnap.seen
+                    if last > MAX_SEEN then
+                        last = MAX_SEEN
+                    end
+                    for j = 1, last do
+                        local row = pendingSnap.seen[j]
+                        if type(row) == "table" and type(row.id) == "string" then
+                            RememberLoser(winner, row.id, row.fp)
+                        end
+                    end
+                    local map = BindingMapForPatch(store)
+                    if map then
+                        BindSnapAssignments(map, winner, canonical)
+                    end
+                end
                 wrote = true
             end
             if did then
@@ -2556,6 +2576,19 @@ function GS:AdmitValuationAssignment(body, opts)
                 PatchBindingsRemoveSnap(store, snap, key)
                 store.pending[key] = nil
                 clearedPending = true
+            end
+        end
+    end
+    -- Clearing pending[canonical] unbinds IDs that PatchBindingsAfterApply just
+    -- attached to byTxn[canonical] (same storage key). Rebind the accepted
+    -- winner and its bounded seen losers so the warm incremental cache keeps
+    -- assignment_bound checks correct without a full-map rebuild.
+    if clearedPending then
+        local winner = type(store.byTxn) == "table" and store.byTxn[canonical] or nil
+        if type(winner) == "table" then
+            local map = BindingMapForPatch(store)
+            if map then
+                BindSnapAssignments(map, winner, canonical)
             end
         end
     end
