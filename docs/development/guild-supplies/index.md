@@ -17,7 +17,7 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Authenticated remote admission / adoption / conflicts | `Admission` (`AdmitRemote*`, adoption APIs) |
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
 | Guarded live activation + cutover marker | `Activation` (`ActivateCanonicalDataset`, `InstallRemoteLiveCutover`) |
-| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`) via Guild Gossip API |
+| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 2`) via Guild Gossip API |
 | Donation evidence / officer or three-witness ledger / identity links | `Ledger` |
 | Configuration / Logs Settings pages | `UI/Settings/Pages/GuildSupplies*.lua` |
 | Live bank observation after activation | `ConsumablesBankLog` → `AdmitDirectObservation` |
@@ -66,6 +66,12 @@ SpectrumFederationDB.guildSupplies = {
       operations = { records = {}, order = {}, heads = {}, pending = {}, conflicts = {}, openConflicts = {} },
       confirmationRefs = {},
       migration = nil,
+      valuations = nil | { -- #397 accepted DBMarket snapshots only; absent on older saves
+        schemaVersion = 1,
+        nextSeq = 1,
+        byTxn = {}, -- [canonicalTxnId] = immutable winner + local seen fingerprints
+        pending = {}, -- bounded assignments waiting for the donation to verify
+      },
     },
   },
 }
@@ -75,6 +81,10 @@ SpectrumFederationDB.guildSupplies = {
 - `permission.editorRankPosition` and `set-editor-rank` history remain so existing datasets, revisions, and operation ancestry still validate. They are not a second live authorization source. Current edits use the shared officer rank. A corrupt permission record can still be repaired by the Guild Master without resetting campaigns, donation logs, or accounting. The old editor-rank setting is not migrated.
 - Absent root → empty defaults. Unsupported/malformed root or guild records are retained read-only.
 - Active records without a valid `liveCutover` fail closed (unavailable), never silently rewritten.
+
+## Donation valuation (#397)
+
+Eligible officers on the exact guild home realm assign one TSM DBMarket snapshot when a live, production-credited donation is verified. That includes a new officer direct credit and a three-witness credit, and an eligible officer who accepts officer-trusted history can price it without opening Logs. Logs open discovers unpriced rows in bounded slices and then queries TSM in bounded batches (`C_Timer.After(0)` catch-up: at most 32 discoveries and 8 price attempts per callback, with per-pass DBMarket reuse, cancellation, and eventual idle — a narrow #397 exception to the usual no-timer TSM rule; not recurring polling, login scans, or chat). Earliest assignment time wins, with the assignment id breaking same-second ties, including when both an alias and its canonical id already hold a candidate. The donation ledger itself is not edited. Values travel as `gs-valuation` records on the existing Guild Supplies gossip provider (`PROVIDER_SCHEMA = 2`). Guild Gossip matches provider schemas by strict equality, so older addon builds that still advertise schema 1 cannot exchange or adopt Guild Supplies datasets with valuation-aware peers — update those clients before Guild Supplies synchronization resumes. Persisted `GS.SCHEMA_VERSION` is unchanged; local SavedVariables remain usable across the upgrade. The dataset descriptor advertises `valuationCount`, and adoption pins and checks that count before commit. Publishing or removing a winner, including a later Logs catch-up price, updates that count in place without a separate dataset rebuild. Removing a tracked valuation drops its manifest ID even when the cold paced export has not yet materialized its `gs:val` body. A current editor may relay an offline author's accepted assignment; claimed author fields are not proof. Ordinary members can read the winning total and cannot mint one. Missing TSM leaves the row unpriced. Zero is a real price. Only the accepted snapshot is stored — not a general TSM price cache. Unit copper must stay an exact integer whose product with the donated quantity is strictly below 2^53. A same-dataset peer that is still staged holds an authorized matching assignment as pending until the installed cutover classifies the donation, and does not export it before then. An unmarked accepted donation that can still receive late authenticated canonical-marker provenance keeps that pending price after cutover install until credit settles; a false→true credit transition reconciles the original immutable assignment (and may attempt a local price only if still unpriced). An alias created before the donation arrives, or while that credit is still unresolved, keeps the earliest valid pending candidate under the canonical lookup key without rewriting that assignment's original transaction id. Export maintenance reuses the tracked valuation manifest while that winner set is unchanged. Valuation cleanup for a temporary adoption record stays on that record. An unexpected TSM adapter exception is debug-logged and leaves the row unpriced. Fresh-client adoption replay reuses the guarded `allowBootstrapInstall` editor check when the live guild slot is absent; ordinary Gossip ingress does not.
 
 ## Public API (`SF.GuildSupplies`) — activation (#389)
 
@@ -133,3 +143,4 @@ Automated production-Lua tests do **not** replace Retail QA.
 11. Profile switch/delete, snapshot import, and old-client `CONSUMABLES_*` session traffic must not mutate canonical Guild Supplies or double-credit.
 12. New Campaign after activation archives prior goals and starts empty; shared tab/editor policy/cutover identity remain.
 13. Disconnect/rejoin, rank demotion, combat/FPS, and normal Loot Helper raid loot behavior remain intact; no game Chat from Guild Supplies paths.
+14. **Valuation:** a same-realm officer with TSM prices a new donation; a different-realm officer and an ordinary member do not. Two disconnected officers converge on the earlier assignment after reconnect, in either arrival order. Missing TSM stays unpriced. Archived campaigns and `/reload` keep the winning total. No game Chat and no continuous pricing work while Logs is closed.

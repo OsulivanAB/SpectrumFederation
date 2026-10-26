@@ -7,7 +7,10 @@ SF.GuildSupplies = SF.GuildSupplies or {}
 local GS = SF.GuildSupplies
 
 GS.PROVIDER_ID = "sf.guildsupplies.config"
-GS.PROVIDER_SCHEMA = 1
+-- Wire schema for the Guild Supplies Gossip provider. Bumped for #397 so
+-- pre-valuation clients cannot adopt/publish datasets that drop gs-valuation
+-- records. Persisted GS.SCHEMA_VERSION stays independent.
+GS.PROVIDER_SCHEMA = 2
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16
@@ -42,12 +45,15 @@ GS.MAX_MANIFEST_PAGES = math.max(
 -- Must fit a full legal accepted export: ops + headers + archive meta/pages +
 -- conflict evidence + operation-manifest pages + descriptor. Archive and
 -- confirm/resolve paging multiply bodies beyond logical operation counts.
--- Logical adoption buffer: accepted ops + live/archived ledger + donation
--- evidence + campaigns/archives + headroom. Ledger and ops are independently
--- capped; the shared buffer must hold both at once.
+-- Logical adoption buffer: accepted ops + live/archived ledger + one valuation
+-- per retained ledger row + donation evidence + campaigns/archives + headroom.
+-- Ledger and ops are independently capped; the shared buffer must hold both,
+-- plus the valuation class, at once.
 -- Wire pages for incomplete paged manifests live in a separate assembly arena so
 -- interleaved pages-first delivery cannot fill this ceiling before shells arrive.
 GS.MAX_ADOPTION_PENDING_RECORDS = (GS.MAX_ACCEPTED_OPERATIONS or 4096)
+    + (GS.MAX_LEDGER_EVENTS or 4096)
+    + (GS.MAX_ARCHIVED_EVENTS or 4096)
     + (GS.MAX_LEDGER_EVENTS or 4096)
     + (GS.MAX_ARCHIVED_EVENTS or 4096)
     + (GS.MAX_DIRECT_EVIDENCE_EXPORTS or 256)
@@ -70,7 +76,8 @@ GS.FRAGMENT_BUFFER_TTL_SECONDS = GS.MAX_ADOPTION_SECONDS or 600
 -- Per-slice admission / export maintenance (same order as confirmation redrive).
 GS.MAX_ADMISSION_WORK_PER_SLICE = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
 GS.MAX_EXPORT_MAINT_PER_SLICE = GS.MAX_CONFIRMATION_REDRIVE_PER_SLICE or 32
--- Aggregate adoption admissions bounded by buffered body count (no silent truncate).
+-- Aggregate adoption admissions bounded by buffered body count, including the
+-- valuation class inside MAX_ADOPTION_PENDING_RECORDS (no silent truncate).
 GS.MAX_ADOPTION_AGGREGATE_ADMISSIONS = GS.MAX_ADOPTION_PENDING_RECORDS
     + (GS.MAX_ADOPTION_ASSEMBLY_PAGES or 0)
 
@@ -1614,6 +1621,7 @@ local function NoteBufferedKindInsert(adop, body)
             archives = 0,
             ledgerEvents = 0,
             donationEvidence = 0,
+            valuations = 0,
             descId = nil,
         }
         adop._bufCounts = c
@@ -1634,6 +1642,8 @@ local function NoteBufferedKindInsert(adop, body)
         c.ledgerEvents = (tonumber(c.ledgerEvents) or 0) + 1
     elseif body.kind == "gs-evidence" then
         c.donationEvidence = (tonumber(c.donationEvidence) or 0) + 1
+    elseif body.kind == "gs-valuation" then
+        c.valuations = (tonumber(c.valuations) or 0) + 1
     end
 end
 
@@ -1641,7 +1651,7 @@ local function CountBufferedKinds(adop)
     -- Prefer session-owned incremental counters; fall back to a one-shot recount
     -- only when legacy sessions lack _bufCounts (should not happen after begin).
     local acceptedOps, transferOps, headers, archives, desc = 0, 0, 0, 0, nil
-    local ledgerEvents, donationEvidence = 0, 0
+    local ledgerEvents, donationEvidence, valuations = 0, 0, 0
     local archivePages = {} -- campaignId → { meta, pages = {}, pageCount }
     local opPages = {} -- opId → { shell, pages = {}, pageCount }
     local c = adop._bufCounts
@@ -1652,6 +1662,7 @@ local function CountBufferedKinds(adop)
         archives = tonumber(c.archives) or 0
         ledgerEvents = tonumber(c.ledgerEvents) or 0
         donationEvidence = tonumber(c.donationEvidence) or 0
+        valuations = tonumber(c.valuations) or 0
         if type(c.descId) == "string" then
             desc = adop.records and adop.records[c.descId]
         end
@@ -1682,6 +1693,8 @@ local function CountBufferedKinds(adop)
                     ledgerEvents = ledgerEvents + 1
                 elseif body.kind == "gs-evidence" then
                     donationEvidence = donationEvidence + 1
+                elseif body.kind == "gs-valuation" then
+                    valuations = valuations + 1
                 end
             end
         end
@@ -1710,7 +1723,7 @@ local function CountBufferedKinds(adop)
         end
     end
     return desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
-        ledgerEvents, donationEvidence
+        ledgerEvents, donationEvidence, valuations
 end
 
 --- Assemble paged archive bodies into a single canonical archive table.
@@ -1830,7 +1843,7 @@ function GS:IsAdoptionTransferComplete()
         return false, "no_adoption"
     end
     local desc, acceptedOps, transferOps, headers, archives, archivePages, opPages,
-        ledgerEvents, donationEvidence =
+        ledgerEvents, donationEvidence, valuations =
         CountBufferedKinds(adop)
     if not desc then
         return false, "incomplete_transfer"
@@ -1856,6 +1869,8 @@ function GS:IsAdoptionTransferComplete()
     local expectLedger = tonumber(desc.acceptedLedgerCount)
     local hasEvidenceManifest = desc.donationEvidenceCount ~= nil
     local expectDonationEvidence = tonumber(desc.donationEvidenceCount)
+    local hasValuationManifest = desc.valuationCount ~= nil
+    local expectValuations = tonumber(desc.valuationCount)
     if not expectAccepted or not expectTransfer or not expectHeaders or not expectArchives
         or expectAccepted ~= math.floor(expectAccepted) or expectAccepted < 0
         or expectTransfer ~= math.floor(expectTransfer) or expectTransfer < 0
@@ -1876,6 +1891,15 @@ function GS:IsAdoptionTransferComplete()
             return false, "incomplete_transfer"
         end
     end
+    if hasValuationManifest then
+        if expectValuations == nil
+            or expectValuations ~= math.floor(expectValuations)
+            or expectValuations < 0 then
+            return false, "incomplete_transfer"
+        end
+    elseif (tonumber(valuations) or 0) ~= 0 then
+        return false, "incomplete_transfer"
+    end
     if acceptedOps ~= expectAccepted or transferOps ~= expectTransfer
         or headers ~= expectHeaders or archives ~= expectArchives then
         return false, "incomplete_transfer"
@@ -1884,6 +1908,9 @@ function GS:IsAdoptionTransferComplete()
         return false, "incomplete_transfer"
     end
     if hasEvidenceManifest and donationEvidence ~= expectDonationEvidence then
+        return false, "incomplete_transfer"
+    end
+    if hasValuationManifest and (tonumber(valuations) or 0) ~= expectValuations then
         return false, "incomplete_transfer"
     end
     -- Exact accepted snapshot size must match descriptor (evidenceOnly excluded).
@@ -1899,6 +1926,14 @@ function GS:IsAdoptionTransferComplete()
     end
     if hasEvidenceManifest and adop.pinnedDonationEvidenceCount ~= nil
         and adop.pinnedDonationEvidenceCount ~= expectDonationEvidence then
+        return false, "source_changed"
+    end
+    -- A once-pinned valuation manifest must remain on the current descriptor.
+    if adop.pinnedValuationCount ~= nil and not hasValuationManifest then
+        return false, "source_changed"
+    end
+    if hasValuationManifest and adop.pinnedValuationCount ~= nil
+        and adop.pinnedValuationCount ~= expectValuations then
         return false, "source_changed"
     end
     if #(adop.sourceAcceptedIds or {}) ~= expectAccepted then
@@ -2088,6 +2123,11 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         AbortAdoptionReplay(previous, "replaced")
         ClearAdoptionTransientAcks()
     end
+    -- Stop Logs catch-up before the new session can race old-dataset minting.
+    -- already_pending above returns earlier and does not cancel an active pass.
+    if GS.CancelValuationCatchup then
+        GS.CancelValuationCatchup("adoption_begin")
+    end
     GS._adoption = {
         epoch = (tonumber(GS._adoptionEpoch) or 0) + 1,
         sourcePeer = member.name,
@@ -2123,6 +2163,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
             archives = 0,
             ledgerEvents = 0,
             donationEvidence = 0,
+            valuations = 0,
             descId = nil,
         },
         _workStats = {
@@ -2145,6 +2186,7 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         pinnedArchiveCount = nil,
         pinnedAcceptedLedgerCount = nil,
         pinnedDonationEvidenceCount = nil,
+        pinnedValuationCount = nil,
         startedAt = GetServerTime and GetServerTime() or nil,
         committed = false,
         ready = false,
@@ -2616,10 +2658,6 @@ function GS:BufferAdoptionRecord(recordId, body)
         end
     end
 
-    if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
-        return "rejected", "full"
-    end
-
     -- Descriptor revision invalidation runs before generic same-ID handling so
     -- the production gs:desc:<dataset> id can replace content under a pinned
     -- policy or abort when accepted snapshot / pinned fields diverge.
@@ -2637,6 +2675,7 @@ function GS:BufferAdoptionRecord(recordId, body)
         local arch = tonumber(descBody.archiveCount)
         local ledger = tonumber(descBody.acceptedLedgerCount)
         local donEv = tonumber(descBody.donationEvidenceCount)
+        local valuations = tonumber(descBody.valuationCount)
         if adop.pinnedPermissionRevisionId == nil and type(rev) == "string" then
             adop.pinnedPermissionRevisionId = rev
         elseif type(rev) == "string" and adop.pinnedPermissionRevisionId ~= nil
@@ -2698,6 +2737,18 @@ function GS:BufferAdoptionRecord(recordId, body)
             InvalidateAdoptionDeliveryOutcomes("source_changed")
             return "rejected", "source_changed"
         end
+        -- Once valuationCount is pinned, omission or change is source_changed.
+        -- Genuinely old descriptors that never advertised a count stay unpinned.
+        if adop.pinnedValuationCount == nil then
+            if valuations ~= nil then
+                adop.pinnedValuationCount = valuations
+            end
+        elseif valuations == nil or valuations ~= adop.pinnedValuationCount then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return nil
     end
 
@@ -2737,7 +2788,23 @@ function GS:BufferAdoptionRecord(recordId, body)
             end
             return "accepted", "adoption_buffer"
         end
+        -- A changed gs-valuation body at the same provider record id means the
+        -- selected source's earliest-wins winner moved. Abort rather than keep
+        -- a superseded provisional price commitable under an unchanged count pin.
+        if body.kind == "gs-valuation" and adop.records[recordId].kind == "gs-valuation" then
+            GS._adoption = nil
+            NotifyAdoptionStateChanged("source_changed")
+            InvalidateAdoptionDeliveryOutcomes("source_changed")
+            return "rejected", "source_changed"
+        end
         return "rejected", "id_conflict"
+    end
+
+    -- Capacity applies only to genuinely new logical record ids. Exact
+    -- duplicates, pinned descriptor replacement, and changed valuation
+    -- source_changed must still run when the buffer is already full.
+    if #adop.order >= GS.MAX_ADOPTION_PENDING_RECORDS then
+        return "rejected", "full"
     end
 
     -- Source descriptor changes during transfer invalidate the selection.
@@ -2817,6 +2884,20 @@ function GS:BufferAdoptionRecord(recordId, body)
         info.pages[page] = body
         info.pageCount = info.pageCount or pc
         adop._archiveIndex[body.campaignId] = info
+    end
+
+    -- Reject malformed / unmintable gs-valuation before buffering/counting.
+    -- Replay and the final completeness scan skip unusable assignments;
+    -- counting them here would let a pinned valuationCount complete without a
+    -- usable body, and oversized same-nonce ids must not enter adoption.
+    if body.kind == "gs-valuation" then
+        if type(body.assignment) ~= "table" then
+            return "rejected", "malformed"
+        end
+        if GS.IsValidValuationAssignmentId
+            and not GS.IsValidValuationAssignmentId(body.assignment.assignmentId) then
+            return "rejected", "invalid_assignment"
+        end
     end
 
     local wasReady = adop.ready == true
@@ -3035,6 +3116,23 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     -- legal reverse-order history that retries dependents before predecessors.
     local admissions = 0
     state.dependencyWaits = 0
+    local unsettledSeen = false
+
+    -- Budgeted donation-event index warm: one chunk per adoption callback so a
+    -- cold 8k ledger cannot drain inside a single valuation admit.
+    if GS.WarmDonationEventIndex and type(temp) == "table" and type(temp.accounting) == "table" then
+        local idxBudget = GS.DONATION_EVENT_INDEX_BUDGET or 512
+        local idxComplete, idxVisited = GS.WarmDonationEventIndex(temp, idxBudget)
+        if (tonumber(idxVisited) or 0) > 0 then
+            progress = true
+            -- One admission-equivalent unit so the slice still yields under load.
+            sliceUsed = sliceUsed + 1
+            admissions = admissions + 1
+        end
+        if not idxComplete then
+            unsettledSeen = true
+        end
+    end
 
     -- Policy-deferral scan: resumable across callbacks. Charge every order visit
     -- and nested confirmation-search visit against the shared slice budget.
@@ -3153,10 +3251,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
     end
     local i = start
     local scanned = 0
-    local unsettledSeen = false
     while scanned < #adop.order and sliceUsed < sliceBudget do
         scanned = scanned + 1
-        local body = adop.records[adop.order[i]]
+        -- Capture the buffer key before advancing the circular cursor. Later
+        -- admit paths (valuations) need this record id, not the next entry.
+        local recordId = adop.order[i]
+        local body = adop.records[recordId]
         i = i + 1
         if i > #adop.order then
             i = 1
@@ -3484,7 +3584,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             -- source peer only; verified totals come from gs-ledger-event transfer.
             local evidence = body.evidence
             local campId = evidence.campaignId or body.campaignId or temp.currentCampaignId
-            local orderId = adop.order[i]
+            local orderId = recordId
             -- Session-owned occurrence buckets: fingerprint groups candidates;
             -- MatchScore decides same-occurrence (fp alone is not identity).
             -- Index the accepted ledger tail once per session (byId + byOcc) so
@@ -3811,6 +3911,12 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     return yieldReplayCursorLe()
                 end
                 event.datasetId = body.datasetId or temp.datasetId
+                -- Preserve transport cutoverMarker so competing-ID alias and
+                -- officer-history credit preflight match ordinary Gossip ingress.
+                local adoptMarker = nil
+                if type(body.cutoverMarker) == "string" and body.cutoverMarker ~= "" then
+                    adoptMarker = body.cutoverMarker
+                end
                 local stLe = GS:AdmitLedgerEvent(event, {
                     sender = adop.sourcePeer,
                     member = member,
@@ -3818,6 +3924,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     adoptionReplay = true,
                     preserveAttribution = true,
                     localWrite = false,
+                    sourceCutoverMarker = adoptMarker,
                 })
                 admissions = admissions + 1
                 sliceUsed = sliceUsed + 1
@@ -3836,6 +3943,54 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 else
                     -- Floor-held adjustments / rejected bodies remain unsettled.
                     unsettledSeen = true
+                end
+            end
+        elseif body.kind == "gs-valuation" and type(body.assignment) == "table" then
+            -- One attempt per provider record + immutable assignment. Distinct
+            -- gs:val:<canonical> bindings must not collapse when they share the
+            -- same assignmentId/txnId; exact same-record redelivery stays settled.
+            state.valuationSeen = state.valuationSeen or {}
+            local asg = body.assignment
+            local seenKey = tostring(recordId)
+                .. "\0" .. tostring(asg.assignmentId or "")
+                .. "\0" .. tostring(asg.txnId or "")
+            if not state.valuationSeen[seenKey] then
+                if sliceUsed >= sliceBudget then
+                    state.cursor = (i - 1)
+                    if state.cursor < 1 then
+                        state.cursor = #adop.order
+                    end
+                    state.admissions = (tonumber(state.admissions) or 0) + admissions
+                    state.sliceUsed = sliceUsed
+                    return true, nil, progress
+                end
+                local stVal, reasonVal = "rejected", nil
+                if GS.AdmitValuationAssignment then
+                    stVal, reasonVal = GS:AdmitValuationAssignment(body, {
+                        sender = adop.sourcePeer,
+                        member = member,
+                        offlineRecord = temp,
+                        adoptionReplay = true,
+                        -- Adoption buffer key is the provider export id
+                        -- `gs:val:<canonical>`; carry that binding into admit.
+                        exportRecordId = tostring(recordId),
+                    })
+                end
+                admissions = admissions + 1
+                sliceUsed = sliceUsed + 1
+                -- Temporary pending capacity can free when donations later
+                -- promote pending valuations. Retry rejected/full and
+                -- awaiting_index (budgeted donation-event index warm). Keep
+                -- malformed, unauthorized, id_conflict, and assignment_bound
+                -- terminal so completeness can fail closed.
+                if (stVal == "rejected" and reasonVal == "full")
+                    or (stVal == "pending" and reasonVal == "awaiting_index") then
+                    unsettledSeen = true
+                else
+                    state.valuationSeen[seenKey] = true
+                    if stVal == "accepted" or stVal == "pending" then
+                        progress = true
+                    end
                 end
             end
         end
@@ -4032,13 +4187,15 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             moreWork = true
         else
             state.dependencyWaitSlices = 0
-            -- Full scan found dependents waiting with no progress: finite stall.
+            -- Full scan found dependents waiting with no progress: keep revolving
+            -- under a finite idle budget so temporary rejected/full valuation
+            -- admits can retry after later donations free pending capacity.
             state.idlePasses = (tonumber(state.idlePasses) or 0) + 1
             local maxIdle = math.max(4, #adop.order + 2)
             if state.idlePasses > maxIdle then
                 return false, "incomplete_transfer", progress
             end
-            moreWork = false
+            moreWork = true
         end
     elseif not progress and not budgetHit and not unsettledSeen then
         moreWork = state.deferRankScan ~= nil
@@ -4133,6 +4290,35 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             budgetExhausted = opts.budgetExhausted == true,
         }
     end
+    local function ValuationCanonicalFromRecordId(recordId)
+        if type(GS.ParseValuationExportCanonical) == "function" then
+            local canonical, isVal = GS.ParseValuationExportCanonical(recordId)
+            if isVal then
+                return canonical
+            end
+            return nil
+        end
+        if type(recordId) ~= "string" or recordId:sub(1, 7) ~= "gs:val:" then
+            return nil
+        end
+        local canonical = recordId:sub(8)
+        if canonical == "" or #canonical > (GS.MAX_TXN_ID or 160) then
+            return nil
+        end
+        return canonical
+    end
+    local function SnapMatchesBufferedAssignment(snap, assignment)
+        if type(snap) ~= "table" or type(assignment) ~= "table" then
+            return false
+        end
+        return snap.assignmentId == assignment.assignmentId
+            and snap.txnId == assignment.txnId
+            and tonumber(snap.assignedAt) == tonumber(assignment.assignedAt)
+            and tonumber(snap.unitCopper) == tonumber(assignment.unitCopper)
+            and tonumber(snap.quantity) == tonumber(assignment.quantity)
+            and tonumber(snap.totalCopper) == tonumber(assignment.totalCopper)
+            and tonumber(snap.itemId) == tonumber(assignment.itemId)
+    end
     for i = start, #adop.order do
         if visited >= budget then
             opts.cursor = i
@@ -4140,9 +4326,27 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             publishCompletenessStats()
             return false, "budget"
         end
-        local body = adop.records[adop.order[i]]
+        local recordId = adop.order[i]
+        local body = adop.records[recordId]
         visited = visited + 1
         adop._workStats.completenessVisited = (adop._workStats.completenessVisited or 0) + 1
+        if type(body) == "table" and body.kind == "gs-valuation"
+            and type(body.assignment) == "table" then
+            -- Each buffered gs:val:<canonical> must be represented by the
+            -- matching accepted winner under that exact donation key.
+            local canonical = ValuationCanonicalFromRecordId(recordId)
+            local snap = canonical
+                and temp.valuations
+                and type(temp.valuations.byTxn) == "table"
+                and temp.valuations.byTxn[canonical]
+                or nil
+            if not canonical or not SnapMatchesBufferedAssignment(snap, body.assignment) then
+                opts.cursor = nil
+                opts.budgetExhausted = false
+                publishCompletenessStats()
+                return false, "incomplete_transfer"
+            end
+        end
         if type(body) == "table" and body.kind == "gs-op" and type(body.op) == "table" then
             local oid = body.op.id
             local sourceAuthored = ActorMatchesMember(body.op, member)
@@ -4861,6 +5065,11 @@ local function PublishAdoptionTemp(adop, temp, desc)
     local priorLive = GS._root and GS._root.guilds and GS._root.guilds[adop.guildKey]
     ClearConfirmationRedriveForRecord(priorLive)
     ClearConfirmationRedriveForGuild(adop.guildKey)
+    -- Raise nextSeq past same-nonce imported winners/pending/losers before the
+    -- adopted record becomes the live guild dataset (survives writer nonce).
+    if GS.AdvanceValuationSeqForLocalWriter then
+        GS.AdvanceValuationSeqForLocalWriter(temp)
+    end
     GS._root.guilds[adop.guildKey] = temp
     GS._adoptionEpoch = (tonumber(GS._adoptionEpoch) or 0) + 1
     adop.committed = true
