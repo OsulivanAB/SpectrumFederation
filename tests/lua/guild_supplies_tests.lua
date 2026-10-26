@@ -4253,6 +4253,12 @@ do
     assertTrue(msg:find("out of date", 1, true), "pending reason localized")
     assertTrue(GS.FormatReasonText("not_ready"):find("not ready", 1, true),
         "FormatReasonText maps known codes")
+    -- #422: conflict resolution lives on Troubleshooting, not Configuration.
+    local divergentText = GS.FormatReasonText("divergent_edit")
+    assertTrue(divergentText:find("Troubleshooting", 1, true),
+        "#422: divergent_edit reason names Troubleshooting got=" .. tostring(divergentText))
+    assertEq(divergentText:find("Configuration", 1, true), nil,
+        "#422: divergent_edit reason must not name Configuration got=" .. tostring(divergentText))
 
     local ctx = GS.CaptureBankContext(nil)
     assertEq(ctx.status, "unavailable", "unset tab is unavailable not empty")
@@ -5797,6 +5803,11 @@ do
         "mapped no_campaign wording")
     assertTrue(GS.FormatReasonText("stale_handle"):find("out of date", 1, true),
         "mapped stale_handle wording")
+    local divergentMapped = GS.FormatReasonText("divergent_edit")
+    assertTrue(divergentMapped:find("Troubleshooting", 1, true),
+        "#422: mapped divergent_edit points to Troubleshooting got=" .. tostring(divergentMapped))
+    assertEq(divergentMapped:find("Configuration", 1, true), nil,
+        "#422: mapped divergent_edit must not point to Configuration")
 
     -- Production BankLog → adapter lifecycle (RequestLog / CancelTimers / ProcessLogUpdate).
     GS._BankContextReadinessProbe = nil
