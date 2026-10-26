@@ -1247,7 +1247,7 @@ function GS.FormatReasonText(reason)
         same_dataset = Loc("GUILD_SUPPLIES_REASON_SAME_DATASET",
             "that peer already shares this client's staged dataset"),
         divergent_edit = Loc("GUILD_SUPPLIES_REASON_DIVERGENT_EDIT",
-            "conflicting edits need an explicit choice in Configuration"),
+            "conflicting edits need an explicit choice in Troubleshooting"),
         campaign_conflict = Loc("GUILD_SUPPLIES_REASON_CAMPAIGN_CONFLICT",
             "concurrent New Campaign operations need an explicit choice"),
         untrusted_relay = Loc("GUILD_SUPPLIES_REASON_UNTRUSTED_RELAY",

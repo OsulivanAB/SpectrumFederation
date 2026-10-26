@@ -4776,6 +4776,8 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
         "TOC still loads Raid Supplies Configuration")
     assertTrue(toc:find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua", 1, true) ~= nil,
         "TOC still loads Raid Supplies Logs")
+    assertTrue(toc:find("modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua", 1, true) ~= nil,
+        "TOC still loads Raid Supplies Troubleshooting")
     assertTrue(toc:find("modules/LootHelper/Consumables.lua", 1, true) ~= nil,
         "TOC still loads the Consumables backend")
     assertTrue(readFile("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua") == nil,
@@ -4803,6 +4805,7 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
     end
     load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local ui = SF.SettingsUI
     local Nav = SF.SettingsNavigationModel
@@ -4810,6 +4813,8 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
         "Raid Supplies Configuration registers")
     assertTrue(ui.pagesById.guildSuppliesLogs ~= nil,
         "Raid Supplies Logs registers")
+    assertTrue(ui.pagesById.guildSuppliesTroubleshooting ~= nil,
+        "Raid Supplies Troubleshooting registers")
     assertTrue(ui.pagesById.lootHelperConsumables == nil,
         "legacy Consumables page does not register")
     assertTrue(ui.pagesById.lootHelperConsumableLogs == nil,
@@ -4818,16 +4823,20 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
         "Raid Supplies Configuration stays available")
     assertEq(Nav.IsPageAvailable(ui.pagesById.guildSuppliesLogs), true,
         "Raid Supplies Logs stays available")
+    assertEq(Nav.IsPageAvailable(ui.pagesById.guildSuppliesTroubleshooting), true,
+        "Raid Supplies Troubleshooting stays available")
     assertEq(Nav.IsContentPage(ui, "lootHelperConsumables"), false,
         "legacy Consumables id is not a content page")
     assertEq(Nav.IsContentPage(ui, "lootHelperConsumableLogs"), false,
         "legacy Consumable Logs id is not a content page")
     local ids = Nav.GetContentPageIds(ui, "guildSupplies")
-    assertEq(#ids, 2, "Raid Supplies registers exactly two content pages")
+    assertEq(#ids, 3, "Raid Supplies registers exactly three content pages")
     assertEq(ids[1], "guildSuppliesConfiguration",
         "Configuration remains the first Raid Supplies page")
     assertEq(ids[2], "guildSuppliesLogs",
         "Logs remains the second Raid Supplies page")
+    assertEq(ids[3], "guildSuppliesTroubleshooting",
+        "Troubleshooting remains the third Raid Supplies page")
     local showRemoved = Nav.ResolveShowPage(ui, {
         currentCategoryId = "lootHelper",
         currentPageId = "lootHelperGeneral",
