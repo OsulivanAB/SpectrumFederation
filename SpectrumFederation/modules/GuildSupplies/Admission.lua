@@ -2123,6 +2123,11 @@ function GS:BeginDatasetAdoption(sourcePeer, sourceDatasetId)
         AbortAdoptionReplay(previous, "replaced")
         ClearAdoptionTransientAcks()
     end
+    -- Stop Logs catch-up before the new session can race old-dataset minting.
+    -- already_pending above returns earlier and does not cancel an active pass.
+    if GS.CancelValuationCatchup then
+        GS.CancelValuationCatchup("adoption_begin")
+    end
     GS._adoption = {
         epoch = (tonumber(GS._adoptionEpoch) or 0) + 1,
         sourcePeer = member.name,

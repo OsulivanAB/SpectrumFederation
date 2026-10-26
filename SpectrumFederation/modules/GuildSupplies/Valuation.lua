@@ -712,6 +712,48 @@ end
 local deferredValuationIngress = {}
 local deferredValuationScheduled = false
 
+--- Fresh transport auth for one deferred drain tick (reuse per sender).
+-- Fail closed on missing roster proof, demotion/removal, or GUID change.
+-- @return member|nil, reason|nil, drop bool — drop=true means do not requeue
+local function ReauthDeferredSender(row, cache)
+    cache = cache or {}
+    local opts = type(row) == "table" and row.opts or nil
+    local sender = type(opts) == "table" and opts.sender or nil
+    if type(sender) ~= "string" or sender == "" then
+        return nil, "unauthorized", true
+    end
+    local cached = cache[sender]
+    if type(cached) == "table" then
+        if cached.drop then
+            return nil, cached.reason, true
+        end
+        return cached.member, nil, false
+    end
+    if type(GS.AuthenticateTransportSender) ~= "function" then
+        cache[sender] = { drop = true, reason = "not_ready" }
+        return nil, "not_ready", true
+    end
+    local member, mReason = GS.AuthenticateTransportSender(sender)
+    if not member then
+        -- Roster unavailable or unknown sender: fail closed (no busy After(0) retry).
+        cache[sender] = { drop = true, reason = mReason or "unauthorized" }
+        return nil, mReason or "unauthorized", true
+    end
+    local priorGuid = type(opts.member) == "table" and opts.member.guid or row.senderGuid
+    if type(priorGuid) == "string" and priorGuid ~= ""
+        and type(member.guid) == "string" and member.guid ~= priorGuid then
+        cache[sender] = { drop = true, reason = "sender_identity_changed" }
+        return nil, "sender_identity_changed", true
+    end
+    local editorOk, editorReason = GS.SenderHasEditorAuthority(member, {})
+    if not editorOk then
+        cache[sender] = { drop = true, reason = editorReason or "unauthorized" }
+        return nil, editorReason or "unauthorized", true
+    end
+    cache[sender] = { member = member, drop = false }
+    return member, nil, false
+end
+
 local function ScheduleDeferredValuationDrain()
     if deferredValuationScheduled then
         return
@@ -741,6 +783,7 @@ local function ScheduleDeferredValuationDrain()
         local remain = {}
         local admits = 0
         local queueVisits = 0
+        local authCache = {}
         local i = 1
         local n = #deferredValuationIngress
         while i <= n do
@@ -758,22 +801,34 @@ local function ScheduleDeferredValuationDrain()
                 if type(GS._onDeferredValuationAdmit) == "function" then
                     GS._onDeferredValuationAdmit(row, admits, queueVisits)
                 end
-                local live = row.record
-                if type(GS.GetCurrentRecord) == "function" then
-                    local cur = select(1, GS:GetCurrentRecord())
-                    if cur ~= nil then
-                        live = cur
+                local freshMember, authReason = ReauthDeferredSender(row, authCache)
+                if not freshMember then
+                    if type(GS._onDeferredValuationAuthReject) == "function" then
+                        GS._onDeferredValuationAuthReject(row, authReason)
                     end
+                    -- Auth failed closed: do not requeue; no authoritative write.
+                else
+                    local live = row.record
+                    if type(GS.GetCurrentRecord) == "function" then
+                        local cur = select(1, GS:GetCurrentRecord())
+                        if cur ~= nil then
+                            live = cur
+                        end
+                    end
+                    local opts = row.opts or {}
+                    -- Never reuse the queued rank snapshot as current authority.
+                    opts.member = freshMember
+                    opts.sender = opts.sender or freshMember.name
+                    opts.offlineRecord = live
+                    opts._indexDeferAttempt = true
+                    local st, reason = GS:AdmitValuationAssignment(row.body, opts)
+                    if st == "pending" and reason == "awaiting_index" then
+                        -- Keep the queued row; next tick reauthenticates again.
+                        remain[#remain + 1] = row
+                    end
+                    -- accepted / duplicate / rejected / other pending: drop from
+                    -- deferral; durable store or reject already recorded the body.
                 end
-                local opts = row.opts or {}
-                opts.offlineRecord = live
-                opts._indexDeferAttempt = true
-                local st, reason = GS:AdmitValuationAssignment(row.body, opts)
-                if st == "pending" and reason == "awaiting_index" then
-                    remain[#remain + 1] = row
-                end
-                -- accepted / duplicate / rejected / other pending: drop from
-                -- deferral; durable store or reject already recorded the body.
             end
             i = i + 1
         end
@@ -838,6 +893,7 @@ local function DeferValuationIngress(body, opts)
         body = body,
         opts = opts,
         record = opts.offlineRecord,
+        senderGuid = type(opts.member) == "table" and opts.member.guid or nil,
     }
     ScheduleDeferredValuationDrain()
     return "pending", "awaiting_index"
@@ -3081,8 +3137,18 @@ local function PriceQueued(record, gen)
     end
 end
 
+local function AdoptionInProgress()
+    local adop = GS._adoption
+    return type(adop) == "table" and adop.committed ~= true
+end
+
 local function ProcessCatchupSlice(gen)
     if gen ~= catchup.generation then
+        return false
+    end
+    -- Explicit dataset adoption replaces the guild record; do not mint on the
+    -- soon-to-be-discarded dataset while a session is active.
+    if AdoptionInProgress() then
         return false
     end
     if not GS.ValuationOfficerEligible() then
@@ -3165,6 +3231,9 @@ end
 function GS.StartValuationCatchup(reason)
     GS.CancelValuationCatchup("restart")
     local gen = catchup.generation
+    if AdoptionInProgress() then
+        return false
+    end
     if not GS.ValuationOfficerEligible() then
         return false
     end

@@ -38360,12 +38360,339 @@ do
 end
 
 do
+    -- idxi (discussion_r4380534080): catch-up must stop when adoption begins.
+    SF.TSM = nil
+    local record = activateValuationGuild(9928)
+    local oldDataset = record.datasetId
+    local credited = 0
+    for n = 1, 40 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9928,
+            quantity = (n % 2) + 1,
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = n,
+            neighborsOlder = { "idxi-old-" .. n },
+            neighborsNewer = { "idxi-new-" .. n },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(
+            evidence, "Player-1-Alice", "Alice-Garona")), "accepted",
+            "val: idxi seed " .. n)
+        credited = credited + 1
+    end
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: idxi starts unpriced")
+    assertTrue(credited > (GS.VALUATION_CATCHUP_BATCH or 8),
+        "val: idxi backlog exceeds one catch-up batch")
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 55
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("idxi-logs"), true, "val: idxi catch-up starts")
+    assertEq(runOneDueTimer(), true, "val: idxi first catch-up slice")
+    record = GS:GetCurrentRecord()
+    local afterSlice = valuationCount(record)
+    assertTrue(afterSlice > 0 and afterSlice < credited,
+        "val: idxi partial slice priced got=" .. tostring(afterSlice))
+    local callsAfterSlice = valuationTsmCalls
+    local catchState = GS.GetValuationCatchupState()
+    assertEq(catchState.active, true, "val: idxi catch-up still active")
+    local genBefore = catchState.generation
+
+    -- Different-dataset asynchronous adoption begins while catch-up is mid-pass.
+    local otherDataset = "ds-idxi-other-9928"
+    GS.NotePeerDataset("Bob-Garona", otherDataset, { editorRankPosition = 2 })
+    local adop, stBegin, reasonBegin = GS:BeginDatasetAdoption("Bob-Garona", otherDataset)
+    assertEq(stBegin, "accepted", "val: idxi begin adoption " .. tostring(reasonBegin))
+    assertTrue(type(adop) == "table", "val: idxi adoption session")
+    assertTrue(GS:GetPendingAdoption() ~= nil, "val: idxi pending adoption")
+    local catchAfterBegin = GS.GetValuationCatchupState()
+    assertEq(catchAfterBegin.active, false, "val: idxi catch-up cancelled on begin")
+    assertTrue(catchAfterBegin.generation > genBefore,
+        "val: idxi catch-up generation advanced")
+    assertEq(GS.StartValuationCatchup("idxi-logs-reopen"), false,
+        "val: idxi Logs reopen during adoption refused")
+    -- already_pending must not revive catch-up.
+    local _, stAgain = GS:BeginDatasetAdoption("Bob-Garona", otherDataset)
+    assertEq(stAgain, "accepted", "val: idxi already_pending")
+    assertEq(GS.StartValuationCatchup("idxi-already-pending"), false,
+        "val: idxi catch-up stays blocked while already_pending")
+
+    local countAtBegin = valuationCount(GS:GetCurrentRecord())
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, oldDataset, "val: idxi old dataset retained during adoption")
+    assertEq(valuationCount(record), countAtBegin,
+        "val: idxi no further old-dataset mints after begin")
+    assertEq(valuationTsmCalls, callsAfterSlice,
+        "val: idxi no further TSM queries after begin")
+    drainExportMaint(16)
+    local exportVals = 0
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "gs-valuation"
+            and row.body.datasetId == oldDataset then
+            exportVals = exportVals + 1
+        end
+    end
+    assertEq(exportVals, countAtBegin, "val: idxi export matches pre-begin winners")
+
+    -- Cancelled adoption restores prior record; user-triggered catch-up works again.
+    assertEq(select(1, GS:CancelDatasetAdoption()), "accepted", "val: idxi cancel adoption")
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxi adoption cleared")
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, oldDataset, "val: idxi prior record valid after cancel")
+    assertEq(valuationCount(record), countAtBegin, "val: idxi winners retained after cancel")
+    timers = {}
+    assertEq(GS.StartValuationCatchup("idxi-after-cancel"), true,
+        "val: idxi catch-up restarts after cancel")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), credited, "val: idxi catch-up finishes after cancel")
+    assertEq(GS.GetValuationCatchupState().active, false, "val: idxi catch-up idle")
+    assertEq(#world.chat, 0, "val: idxi chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- idxj (discussion_r4380534091): deferred drain reauthenticates transport sender.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxj provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9929)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    -- Cold ledger so valuation defers awaiting_index (>512 archive fillers).
+    local budget = GS.DONATION_EVENT_INDEX_BUDGET or 512
+    local arch = {}
+    for i = 1, budget + 32 do
+        local txn = string.format("ctx:idxj-fill-%04d", i)
+        arch[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9929,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 600000 + i,
+        }
+    end
+    local targetTxn = "ctx:idxj-target-0001"
+    local target = {
+        type = "donation",
+        id = targetTxn,
+        txnId = targetTxn,
+        itemId = 9929,
+        quantity = 2,
+        generation = 1,
+        gsProductionCredit = true,
+        verification = "officer",
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        approxTxnTime = world.time,
+        timestamp = math.floor(world.time or 0),
+        occurrenceIndex = 700001,
+    }
+    arch[#arch + 1] = target
+    record.accounting._consumableEventArchive = arch
+    record.accounting._consumableEvents = {}
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxj index cold")
+
+    local assignId = "gsv1:aaaaaaaaaaaaaaaaaaaaaa11:00009929"
+    local body = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target, {
+            assignmentId = assignId,
+            assignedAt = 100,
+            unitCopper = 17,
+            txnId = targetTxn,
+            actorGuid = "Player-1-Bob",
+            actorName = "Bob-Garona",
+        }),
+    }
+    timers = {}
+    local authRejects = 0
+    GS._onDeferredValuationAuthReject = function()
+        authRejects = authRejects + 1
+    end
+    local stPend, reasonPend = providerApplyWithId("gs:val:" .. targetTxn, body, "Bob-Garona")
+    assertEq(stPend, "pending", "val: idxj defers while cold " .. tostring(reasonPend))
+    assertEq(reasonPend, "awaiting_index", "val: idxj awaiting_index")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, targetTxn), nil, "val: idxj no winner yet")
+    assertEq(record.valuations and record.valuations.pending
+        and record.valuations.pending[targetTxn], nil,
+        "val: idxj no pending price yet")
+    assertTrue(#timers >= 1, "val: idxj deferred drain scheduled")
+
+    -- Demote Bob below editor threshold before the deferred drain runs.
+    for _, m in ipairs(world.guild.members) do
+        if m.name == "Bob-Garona" then
+            m.rankOrder = 5
+        end
+    end
+    settleRoster()
+    local countBeforeDrain = valuationCount(record)
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, targetTxn), nil, "val: idxj demoted no winner")
+    assertTrue(record.valuations == nil
+        or record.valuations.pending == nil
+        or record.valuations.pending[targetTxn] == nil,
+        "val: idxj demoted no pending")
+    assertEq(valuationCount(record), countBeforeDrain, "val: idxj demoted no new winners")
+    assertTrue(authRejects >= 1, "val: idxj auth reject observed")
+    drainExportMaint(16)
+    local exportedDemoted = false
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "gs-valuation"
+            and row.body.assignment
+            and row.body.assignment.assignmentId == assignId then
+            exportedDemoted = true
+        end
+    end
+    assertEq(exportedDemoted, false, "val: idxj demoted no export")
+
+    -- Control: restore editor authority; a fresh delivery converges without relying
+    -- on the discarded deferred body.
+    for _, m in ipairs(world.guild.members) do
+        if m.name == "Bob-Garona" then
+            m.rankOrder = 2
+        end
+    end
+    settleRoster()
+    -- Warm enough of the index so a new admit can complete (or defer then drain).
+    timers = {}
+    authRejects = 0
+    local stOk, reasonOk = providerApplyWithId("gs:val:" .. targetTxn, body, "Bob-Garona")
+    assertTrue(stOk == "accepted" or stOk == "pending" or stOk == "duplicate",
+        "val: idxj restored admit st=" .. tostring(stOk) .. " " .. tostring(reasonOk))
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local guard = 0
+    while valuationSnap(record, targetTxn) == nil and guard < 64 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        record = GS:GetCurrentRecord()
+    end
+    assertTrue(type(valuationSnap(record, targetTxn)) == "table",
+        "val: idxj authorized delivery converges")
+    assertEq(valuationSnap(record, targetTxn).assignmentId, assignId,
+        "val: idxj authorized winner")
+    assertEq(authRejects, 0, "val: idxj authorized path no auth reject")
+
+    -- Missing roster proof fails closed on a second cold-deferred body.
+    local target2 = deepCopy(target)
+    target2.txnId = "ctx:idxj-target-0002"
+    target2.id = target2.txnId
+    target2.occurrenceIndex = 700002
+    -- Replace archive identity (+ append target2) so the ephemeral index is cold.
+    local arch2 = deepCopy(record.accounting._consumableEventArchive or {})
+    arch2[#arch2 + 1] = target2
+    record.accounting._consumableEventArchive = arch2
+    record.accounting._consumableEvents = {}
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxj second body cold")
+    local body2 = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target2, {
+            assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbb12:00009929",
+            assignedAt = 200,
+            unitCopper = 19,
+            txnId = target2.txnId,
+            actorGuid = "Player-1-Bob",
+            actorName = "Bob-Garona",
+        }),
+    }
+    timers = {}
+    authRejects = 0
+    local st2, reason2 = providerApplyWithId("gs:val:" .. target2.txnId, body2, "Bob-Garona")
+    assertEq(st2, "pending", "val: idxj second defers " .. tostring(reason2))
+    assertEq(reason2, "awaiting_index", "val: idxj second awaiting_index")
+    -- Remove Bob from the native roster before drain.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.name ~= "Bob-Garona" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    settleRoster()
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, target2.txnId), nil, "val: idxj removed no winner")
+    assertTrue(authRejects >= 1, "val: idxj removed auth reject")
+    -- Re-add Bob as editor; a new legitimate delivery succeeds.
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    timers = {}
+    local st3 = select(1, providerApplyWithId("gs:val:" .. target2.txnId, body2, "Bob-Garona"))
+    assertTrue(st3 == "accepted" or st3 == "pending" or st3 == "duplicate",
+        "val: idxj rejoin admit st=" .. tostring(st3))
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    guard = 0
+    while valuationSnap(record, target2.txnId) == nil and guard < 64 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        record = GS:GetCurrentRecord()
+    end
+    assertTrue(type(valuationSnap(record, target2.txnId)) == "table",
+        "val: idxj rejoin converges")
+    GS._onDeferredValuationAuthReject = nil
+    assertEq(#world.chat, 0, "val: idxj chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
     local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
     assertTrue(src ~= nil, "val: module readable")
     local text = src:read("*a")
     src:close()
     assertTrue(text:find("TSM_API", 1, true) == nil, "val: feature code does not call TSM_API")
     assertTrue(text:find("GetMarketValue", 1, true) ~= nil, "val: feature code uses SF.TSM.GetMarketValue")
+    assertTrue(text:find("ReauthDeferredSender", 1, true) ~= nil,
+        "val: deferred drain reauthenticates senders")
+    assertTrue(text:find("AdoptionInProgress", 1, true) ~= nil,
+        "val: catch-up guards adoption in progress")
+    local adm = io.open("SpectrumFederation/modules/GuildSupplies/Admission.lua", "r")
+    assertTrue(adm ~= nil, "val: Admission readable")
+    local admText = adm:read("*a")
+    adm:close()
+    assertTrue(admText:find('CancelValuationCatchup("adoption_begin")', 1, true) ~= nil,
+        "val: BeginDatasetAdoption cancels catch-up")
     assertEq(#world.chat, 0, "val: suite section stays chat-free")
 end
 
