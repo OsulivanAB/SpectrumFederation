@@ -1074,6 +1074,10 @@ local function Definition()
 							end
 							return ""
 						end,
+						getSelectionKey = function()
+							local rec = CurrentRecord()
+							return rec and rec.currentCampaignId or nil
+						end,
 						enabled = function()
 							local rec = CurrentRecord()
 							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"

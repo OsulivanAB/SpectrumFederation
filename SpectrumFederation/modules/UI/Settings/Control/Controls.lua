@@ -939,6 +939,28 @@ function Controls:AddEditBoxWithButton(section, opts)
 		btn:SetPoint("LEFT", edit, "RIGHT", 8, 0)
 
 		local ignore = false
+		-- Getter-only rename fields: keep unfinished drafts across unrelated
+		-- refreshes; reload when the backing selection key changes.
+		local lastLoadedText = nil
+		local lastSelectionKey = nil
+
+		local function CurrentSelectionKey()
+			if type(opts.getSelectionKey) == "function" then
+				return opts.getSelectionKey()
+			end
+			return nil
+		end
+
+		local function LoadFromGet()
+			local nextText = tostring(get() or "")
+			ignore = true
+			edit:SetText(nextText)
+			if edit.SetCursorPosition then
+				edit:SetCursorPosition(0)
+			end
+			ignore = false
+			lastLoadedText = nextText
+		end
 
 		local function Commit()
 			if not bound then return end
@@ -961,6 +983,17 @@ function Controls:AddEditBoxWithButton(section, opts)
 			elseif bound then
 				Commit()
 			end
+			if displayFromGet then
+				-- After an explicit submit, converge to the durable getter value
+				-- (success) or keep a failed draft only when get() still differs.
+				local fromGet = tostring(get() or "")
+				local cur = edit:GetText() or ""
+				if cur == fromGet or not (edit.HasFocus and edit:HasFocus()) then
+					LoadFromGet()
+				else
+					lastLoadedText = cur
+				end
+			end
 		end
 
 		btn:SetScript("OnClick", DoSubmit)
@@ -982,13 +1015,31 @@ function Controls:AddEditBoxWithButton(section, opts)
 		end)
 
 		local function Refresh()
-			if bound or displayFromGet then
-				ignore = true
-				edit:SetText(tostring(get() or ""))
-				if edit.SetCursorPosition then
-					edit:SetCursorPosition(0)
+			if bound then
+				LoadFromGet()
+			elseif displayFromGet then
+				local selectionKey = CurrentSelectionKey()
+				local selectionChanged = selectionKey ~= lastSelectionKey
+				local focused = edit.HasFocus and edit:HasFocus()
+				local cur = edit:GetText() or ""
+				local dirty = cur ~= (lastLoadedText or "")
+				if selectionChanged then
+					LoadFromGet()
+					lastSelectionKey = selectionKey
+				elseif focused or dirty then
+					-- Preserve unfinished text under roster/durable/item refreshes.
+					if selectionKey ~= nil then
+						lastSelectionKey = selectionKey
+					end
+					if not focused and dirty and cur == tostring(get() or "") then
+						lastLoadedText = cur
+					end
+				else
+					LoadFromGet()
+					if selectionKey ~= nil then
+						lastSelectionKey = selectionKey
+					end
 				end
-				ignore = false
 			end
 
 			local _, enabled = self:_ApplyRowState(row, section, opts, {edit, btn})

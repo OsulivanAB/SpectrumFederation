@@ -1301,6 +1301,74 @@ do
         "424-order: bank tab still opens Troubleshooting conflict")
 end
 
+-- #424 rename authored under prior campaign converges after rollover
+do
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local camp1 = record.currentCampaignId
+    local ds = record.datasetId
+    local pol = record.permission.revisionId
+    world.time = 11000
+    local renameBefore = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Alice:rolloveraaaaaaaaaaaaaaa:00000040",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = camp1,
+        kind = "rename-campaign",
+        target = camp1,
+        value = "PreRollover",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 11000,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = camp1,
+    }
+    -- Peer rolls to camp2 before the rename arrives.
+    startCampaign()
+    local camp2 = GS:GetCurrentRecord().currentCampaignId
+    assertTrue(camp2 ~= camp1, "424-rollover: new campaign current")
+    local stRoll, reasonRoll = GS:AdmitRemoteOperation(renameBefore, { sender = "Alice-Garona" })
+    assertEq(stRoll, "accepted", "424-rollover: archived rename accepted reason=" .. tostring(reasonRoll))
+    record = GS:GetCurrentRecord()
+    assertEq(record.currentCampaignId, camp2, "424-rollover: current unchanged")
+    assertEq(GS.GetCampaignDisplayName(record, camp1), "PreRollover",
+        "424-rollover: archived name converges")
+    assertEq(GS.GetCampaignDisplayName(record, camp2), camp2,
+        "424-rollover: current still ID fallback")
+    -- Unrelated causality still rejects a stale bank-tab from camp1 authorship.
+    local staleTab = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Alice:rolloverbbbbbbbbbbbbbbb:00000041",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = camp1,
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = 3,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 11001,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = camp1,
+    }
+    local beforeTab = GS:GetCurrentRecord().accounting._consumables.bankTab
+    local stTab, reasonTab = GS:AdmitRemoteOperation(staleTab, { sender = "Alice-Garona" })
+    assertTrue(stTab ~= "accepted",
+        "424-rollover: unrelated kind not accepted st=" .. tostring(stTab))
+    assertTrue(reasonTab == "stale_campaign" or reasonTab == "campaign_conflict"
+        or reasonTab == "open_conflict" or reasonTab == "divergent_edit",
+        "424-rollover: unrelated campaign causality reason=" .. tostring(reasonTab))
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, beforeTab,
+        "424-rollover: bank tab unchanged")
+end
+
 -- #424 adoption carries names; wrong dataset rejected; schema stays 2
 do
     resetDb()
@@ -1359,6 +1427,191 @@ do
     assertEq(GS.GetCampaignDisplayName(record, campId), "AdoptMe", "424-adopt: name adopted")
     assertEq(record.campaignNames[campId].name, "AdoptMe", "424-adopt: name metadata")
     assertEq(GS.PROVIDER_SCHEMA, 2, "424-adopt: schema remains 2")
+end
+
+-- #424 multi-rename adoption newest-first retains losers; projects LWW winner
+local function adoptExportNewestFirstRenames(exportBodies, preferLaterRename)
+    local nonRename, renames = {}, {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        local body = row.body
+        if type(body) == "table" and body.kind == "gs-op"
+            and type(body.op) == "table" and body.op.kind == "rename-campaign" then
+            renames[#renames + 1] = row
+        else
+            nonRename[#nonRename + 1] = row
+        end
+    end
+    table.sort(renames, function(a, b)
+        local oa, ob = a.body.op, b.body.op
+        local ta, tb = tonumber(oa.timestamp) or 0, tonumber(ob.timestamp) or 0
+        if ta ~= tb then
+            if preferLaterRename then
+                return ta > tb
+            end
+            return ta < tb
+        end
+        if preferLaterRename then
+            return tostring(oa.id) > tostring(ob.id)
+        end
+        return tostring(oa.id) < tostring(ob.id)
+    end)
+    for i = 1, #nonRename do
+        GS:BufferAdoptionRecord(nonRename[i].id, nonRename[i].body)
+    end
+    for i = 1, #renames do
+        GS:BufferAdoptionRecord(renames[i].id, renames[i].body)
+    end
+    return renames
+end
+
+do
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local campId = record.currentCampaignId
+    local ds = record.datasetId
+    world.time = 12000
+    local earlyOp = select(1, GS:NewRenameCampaignOperation(campId, "EarlyAdopt"))
+    assertEq(GS:ApplyStagedConfigOperation(earlyOp), "accepted", "424-adopt-lww: early")
+    world.time = 12001
+    local lateOp = select(1, GS:NewRenameCampaignOperation(campId, "LateAdopt"))
+    assertEq(GS:ApplyStagedConfigOperation(lateOp), "accepted", "424-adopt-lww: late")
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("config")
+    end
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+    local _, stBegin = GS:BeginDatasetAdoption("Alice-Garona", ds)
+    assertEq(stBegin, "accepted", "424-adopt-lww: begin")
+    local renames = adoptExportNewestFirstRenames(exportBodies, true)
+    assertTrue(#renames >= 2, "424-adopt-lww: two renames buffered")
+    local adop = GS:GetPendingAdoption()
+    assertTrue(adop and adop.ready, "424-adopt-lww: ready")
+    local stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    assertEq(stCommit, "accepted", "424-adopt-lww: commit " .. tostring(reasonCommit))
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), "LateAdopt",
+        "424-adopt-lww: winner projected")
+    assertTrue(record.operations.records[earlyOp.id] ~= nil,
+        "424-adopt-lww: early retained in history")
+    assertTrue(record.operations.records[lateOp.id] ~= nil,
+        "424-adopt-lww: late retained in history")
+    assertEq(record.operations.heads["name:" .. campId], lateOp.id,
+        "424-adopt-lww: head is winner")
+    assertEq(record.campaignNames[campId].name, "LateAdopt",
+        "424-adopt-lww: projection name")
+end
+
+-- Equal-timestamp tie + clear variants under newest-first adoption
+do
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local campId = record.currentCampaignId
+    local ds = record.datasetId
+    local pol = record.permission.revisionId
+    world.time = 13000
+    local lowId = "gs1:Player-1-Alice:tieaaaaaaaaaaaaaaaaaaaa:00000050"
+    local highId = "gs1:Player-1-Alice:tiezzzzzzzzzzzzzzzzzzzz:00000051"
+    assertTrue(highId > lowId, "424-adopt-tie: high id sorts after")
+    local tieLow = {
+        schemaVersion = 1,
+        id = lowId,
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "TieLow",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 13000,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    local tieHigh = {
+        schemaVersion = 1,
+        id = highId,
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "TieHigh",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 13000,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    assertEq(GS:AdmitRemoteOperation(tieLow, { sender = "Alice-Garona" }), "accepted",
+        "424-adopt-tie: low local")
+    assertEq(GS:AdmitRemoteOperation(tieHigh, { sender = "Alice-Garona" }), "accepted",
+        "424-adopt-tie: high wins")
+    world.time = 13002
+    local clearOp = select(1, GS:NewRenameCampaignOperation(campId, ""))
+    assertEq(GS:ApplyStagedConfigOperation(clearOp), "accepted", "424-adopt-tie: clear")
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("config")
+    end
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+    local _, stBegin = GS:BeginDatasetAdoption("Alice-Garona", ds)
+    assertEq(stBegin, "accepted", "424-adopt-tie: begin")
+    local renames = adoptExportNewestFirstRenames(exportBodies, true)
+    assertTrue(#renames >= 3, "424-adopt-tie: three renames")
+    local adop = GS:GetPendingAdoption()
+    assertTrue(adop and adop.ready, "424-adopt-tie: ready")
+    local stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    assertEq(stCommit, "accepted", "424-adopt-tie: commit " .. tostring(reasonCommit))
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), campId,
+        "424-adopt-tie: clear wins projection")
+    assertTrue(record.operations.records[lowId] ~= nil, "424-adopt-tie: low retained")
+    assertTrue(record.operations.records[highId] ~= nil, "424-adopt-tie: high retained")
+    assertTrue(record.operations.records[clearOp.id] ~= nil, "424-adopt-tie: clear retained")
+    assertEq(record.operations.heads["name:" .. campId], clearOp.id,
+        "424-adopt-tie: head is clear")
+    assertEq(record.campaignNames[campId].name, nil, "424-adopt-tie: cleared name")
+    assertEq(record.campaignNames[campId].revisionId, clearOp.id,
+        "424-adopt-tie: clear revision kept")
 end
 
 SF.TSM = nil

@@ -120,6 +120,55 @@ local function FormatCampaignLabel(entry)
 	return string.format("%s — %s (%s)", when, status, tostring(label))
 end
 
+local function CampaignOptions()
+	local opts = {}
+	if not Caps().canRead then
+		return opts
+	end
+	local list = InspectableCampaigns()
+	for i = 1, #list do
+		local entry = list[i]
+		opts[#opts + 1] = {
+			value = entry.campaignId,
+			label = FormatCampaignLabel(entry),
+		}
+	end
+	return opts
+end
+
+-- Declared before CommitRenameSelected: Lua 5.1 would otherwise bind the early
+-- call site to a nil global and throw on Logs Rename submit.
+local function ResolveSelectedCampaign()
+	if not Caps().canRead then
+		selectedCampaignId = nil
+		return nil
+	end
+	local record = CurrentRecord()
+	if not record then
+		selectedCampaignId = nil
+		return nil
+	end
+	local list = InspectableCampaigns()
+	if #list == 0 then
+		selectedCampaignId = nil
+		return nil
+	end
+	if selectedCampaignId then
+		for i = 1, #list do
+			if list[i].campaignId == selectedCampaignId then
+				return selectedCampaignId
+			end
+		end
+	end
+	-- Default to current, else newest inspectable.
+	if type(record.currentCampaignId) == "string" then
+		selectedCampaignId = record.currentCampaignId
+		return selectedCampaignId
+	end
+	selectedCampaignId = list[1].campaignId
+	return selectedCampaignId
+end
+
 local function CommitRenameSelected(ctx, text)
 	local g = GS()
 	if not g or not g.NewRenameCampaignOperation then
@@ -160,53 +209,6 @@ local function CommitRenameSelected(ctx, text)
 	elseif ctx.pageBuilder and ctx.pageBuilder.Refresh then
 		ctx.pageBuilder:Refresh()
 	end
-end
-
-local function CampaignOptions()
-	local opts = {}
-	if not Caps().canRead then
-		return opts
-	end
-	local list = InspectableCampaigns()
-	for i = 1, #list do
-		local entry = list[i]
-		opts[#opts + 1] = {
-			value = entry.campaignId,
-			label = FormatCampaignLabel(entry),
-		}
-	end
-	return opts
-end
-
-local function ResolveSelectedCampaign()
-	if not Caps().canRead then
-		selectedCampaignId = nil
-		return nil
-	end
-	local record = CurrentRecord()
-	if not record then
-		selectedCampaignId = nil
-		return nil
-	end
-	local list = InspectableCampaigns()
-	if #list == 0 then
-		selectedCampaignId = nil
-		return nil
-	end
-	if selectedCampaignId then
-		for i = 1, #list do
-			if list[i].campaignId == selectedCampaignId then
-				return selectedCampaignId
-			end
-		end
-	end
-	-- Default to current, else newest inspectable.
-	if type(record.currentCampaignId) == "string" then
-		selectedCampaignId = record.currentCampaignId
-		return selectedCampaignId
-	end
-	selectedCampaignId = list[1].campaignId
-	return selectedCampaignId
 end
 
 local function MembershipHelpText()
@@ -496,6 +498,9 @@ local function Definition()
 								return ""
 							end
 							return g.GetCampaignCustomName(rec, id) or ""
+						end,
+						getSelectionKey = function()
+							return ResolveSelectedCampaign()
 						end,
 						enabled = function()
 							return Caps().canEdit and ResolveSelectedCampaign() ~= nil

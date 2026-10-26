@@ -62,6 +62,9 @@ def test_guild_supplies_campaign_rename_424():
     assert "0 failed" in result.stdout
     assert "424-adopt: name adopted" in result.stdout
     assert "424-lww: bob wins equal-time" in result.stdout
+    assert "424-rollover: archived name converges" in result.stdout
+    assert "424-adopt-lww: early retained in history" in result.stdout
+    assert "424-adopt-tie: clear revision kept" in result.stdout
 
 
 def test_parent_toc_loads_guild_supplies_after_gossip():
