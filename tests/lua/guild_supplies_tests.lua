@@ -39832,9 +39832,17 @@ do
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
         90, "430-1: seed 90")
 
-    -- Author prepares +10 while under goal, then a donation arrives first (reorder).
+    -- Author prepares +10 while under goal; snapshot the real authored body, then a
+    -- donation arrives first (reorder). Deliver through AdmitRemoteOperation.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local adjOp = select(1, GS:NewAdjustmentOperation(9501, 10, nil))
     assertTrue(adjOp ~= nil, "430-1: +10 prepared under goal")
+    local authoredAdj = snapshotOp(adjOp)
+    assertTrue(type(authoredAdj) == "table" and type(authoredAdj.id) == "string",
+        "430-1: authored adjustment snapshot")
+    local authoredAdjId = authoredAdj.id
+    local authoredDataset = authoredAdj.datasetId
+    local authoredCampaign = authoredAdj.campaignId
     local extra = makeDepositEvidence(record, {
         itemId = 9501, quantity = 20, donor = "LateDonor-Garona",
         observedAt = (world.time or 0) + 5,
@@ -39858,70 +39866,39 @@ do
         record, 9501, 10, nil, record.currentCampaignId, { enforceGoalCeiling = true }))
     assertEq(floorLocal, false, "430-1: local ceiling still blocks new +10 at 110/100")
 
-    local ledgerBody = {
-        type = "adjustment",
-        id = adjOp.id,
-        txnId = adjOp.id,
-        opId = adjOp.id,
-        generation = record.accounting._consumables.generation,
-        timestamp = world.time or 1,
-        actor = "Alice-Garona",
-        writer = "Player-1-Alice",
-        itemId = 9501,
-        quantity = 10,
-        campaignId = record.currentCampaignId,
-        datasetId = record.datasetId,
-    }
-    local stLe, reasonLe = GS:AdmitLedgerEvent(ledgerBody, {
+    local stRemote, reasonRemote = GS:AdmitRemoteOperation(authoredAdj, {
         sender = "Alice-Garona",
-        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
-        offlineRecord = record,
-        localWrite = false,
     })
-    assertEq(stLe, "accepted", "430-1: ledger admit after donation err=" .. tostring(reasonLe))
+    assertEq(stRemote, "accepted",
+        "430-1: AdmitRemoteOperation after donation err=" .. tostring(reasonRemote))
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
         120, "430-1: donation+adjustment converge to 120")
+    assertTrue(record.operations and record.operations.records
+        and record.operations.records[authoredAdjId] ~= nil,
+        "430-1: authenticated remote adjustment retained")
 
-    local stDup = select(1, GS:AdmitLedgerEvent(ledgerBody, {
+    local stDup, reasonDup = GS:AdmitRemoteOperation(authoredAdj, {
         sender = "Alice-Garona",
-        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
-        offlineRecord = record,
-    }))
-    assertEq(stDup, "duplicate", "430-1: duplicate ledger delivery credits once")
+    })
+    assertEq(stDup, "duplicate",
+        "430-1: duplicate AdmitRemoteOperation credits once got=" .. tostring(reasonDup))
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
         120, "430-1: total unchanged after duplicate")
 
-    -- Remote op path (no localProductionAuthority) also skips ceiling.
+    -- Local authoring ceiling still blocks new positives while over goal.
     local refill = select(1, GS:NewAdjustmentOperation(9501, -5, nil))
     assertTrue(refill ~= nil, "430-1: negative prepares")
     assertEq(GS:ApplyStagedConfigOperation(refill), "accepted", "430-1: negative local apply")
-    local remotePos = GS:NewConfigOperation(GS.KIND.ADJUST_QUANTITY, { itemId = 9501 }, {
-        itemId = 9501, quantity = 3, attributed = nil,
-    })
-    -- NewConfigOperation prep enforces ceiling — craft a stored body and mutate remotely.
+    local remotePos = select(1, GS:NewAdjustmentOperation(9501, 3, nil))
     assertEq(remotePos, nil, "430-1: local prep still rejects over-goal positive")
-    local forgedRemote = {
-        schemaVersion = 1,
-        id = "ctx:gs:4301:remote-pos",
-        guildKey = "club:42",
-        datasetId = record.datasetId,
-        campaignId = record.currentCampaignId,
-        kind = GS.KIND.ADJUST_QUANTITY,
-        target = { itemId = 9501 },
-        value = { itemId = 9501, quantity = 3, attributed = nil },
-        actorGuid = "Player-1-Alice",
-        actorName = "Alice-Garona",
-        timestamp = world.time or 1,
-        baseTargetRevision = record.datasetId,
-        basePolicyRevision = record.permission and record.permission.revisionId,
-        baseCampaignId = record.currentCampaignId,
-    }
-    local okMut, mutStatus = GS.ApplyAdjustmentMutation(record, forgedRemote, {})
-    assertEq(okMut, true, "430-1: remote mutation applies without ceiling status=" .. tostring(mutStatus))
+    record = GS:GetCurrentRecord()
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
-        118, "430-1: remote +3 applied after -5")
+        115, "430-1: after negative correction")
+    assertEq(authoredAdj.datasetId, authoredDataset, "430-1: authored body dataset stable")
+    assertEq(authoredAdj.campaignId, authoredCampaign, "430-1: authored body campaign stable")
 
     -- Lowered/zero goal must not block authenticated historical admission.
+    -- Keep the originally authored dataset/campaign/event identity unchanged.
     record = seedStagedCampaignWithItem(9502, 100)
     local seed90 = makeDepositEvidence(record, { itemId = 9502, quantity = 90 })
     for _, pair in ipairs({
@@ -39931,51 +39908,49 @@ do
     }) do
         GS:_AdmitObservationForTests(seed90, pair[1], pair[2])
     end
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local histAdj = select(1, GS:NewAdjustmentOperation(9502, 10, nil))
     assertTrue(histAdj ~= nil, "430-1: hist +10 prepared")
-    assertEq(GS:ApplyStagedConfigOperation(histAdj), "accepted", "430-1: hist +10 local")
-    local histLedger = {
-        type = "adjustment",
-        id = histAdj.id,
-        txnId = histAdj.id,
-        opId = histAdj.id,
-        generation = record.accounting._consumables.generation,
-        timestamp = world.time or 1,
-        actor = "Alice-Garona",
-        writer = "Player-1-Alice",
-        itemId = 9502,
-        quantity = 10,
-        campaignId = record.currentCampaignId,
-        datasetId = record.datasetId,
-    }
-    -- Fresh peer-like state: total 90, goal lowered to 0 before history arrives.
-    record = seedStagedCampaignWithItem(9502, 0)
-    -- Re-seed 90 donations on the zero-goal campaign.
-    seed90 = makeDepositEvidence(record, { itemId = 9502, quantity = 90 })
-    for _, pair in ipairs({
-        { "Player-1-Alice", "Alice-Garona" },
-        { "Player-1-Bob", "Bob-Garona" },
-        { "Player-1-Carol", "Carol-Garona" },
-    }) do
-        GS:_AdmitObservationForTests(seed90, pair[1], pair[2])
-    end
-    histLedger.campaignId = record.currentCampaignId
-    histLedger.datasetId = record.datasetId
-    histLedger.generation = record.accounting._consumables.generation
-    histLedger.id = "ctx:gs:4301:hist-zero-goal"
-    histLedger.txnId = histLedger.id
-    histLedger.opId = histLedger.id
-    local stZero, reasonZero = GS:AdmitLedgerEvent(histLedger, {
+    local histStored = snapshotOp(histAdj)
+    assertTrue(type(histStored) == "table" and type(histStored.id) == "string",
+        "430-1: hist +10 snapshot")
+    local histId = histStored.id
+    local histDataset = histStored.datasetId
+    local histCampaign = histStored.campaignId
+    assertEq(histDataset, record.datasetId, "430-1: hist snapshot keeps dataset")
+    assertEq(histCampaign, record.currentCampaignId, "430-1: hist snapshot keeps campaign")
+
+    -- Same dataset/campaign: later goal reduction, then admit the unchanged body.
+    local goalOp = GS:NewConfigOperation("set-requested-item", { itemId = 9502 }, {
+        itemId = 9502, goal = 0, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(goalOp), "accepted", "430-1: goal lowered to 0")
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, histDataset, "430-1: dataset unchanged after goal lower")
+    assertEq(record.currentCampaignId, histCampaign, "430-1: campaign unchanged after goal lower")
+    local localBlocked = select(1, GS:NewAdjustmentOperation(9502, 1, nil))
+    assertEq(localBlocked, nil, "430-1: new local positive still blocked by zero goal")
+
+    local stZero, reasonZero = GS:AdmitRemoteOperation(histStored, {
         sender = "Alice-Garona",
-        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
-        offlineRecord = record,
     })
     assertEq(stZero, "accepted",
         "430-1: historical +10 admitted after goal lowered to 0 err=" .. tostring(reasonZero))
+    assertEq(histStored.id, histId, "430-1: admitted body kept original op id")
+    assertEq(histStored.datasetId, histDataset, "430-1: admitted body kept original dataset")
+    assertEq(histStored.campaignId, histCampaign, "430-1: admitted body kept original campaign")
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9502]) or 0,
         100, "430-1: zero-goal peer converges with history")
-    local localBlocked = select(1, GS:NewAdjustmentOperation(9502, 1, nil))
-    assertEq(localBlocked, nil, "430-1: new local positive still blocked by zero goal")
+    assertTrue(record.operations and record.operations.records
+        and record.operations.records[histId] ~= nil,
+        "430-1: historical adjustment retained under original id")
+
+    local stZeroDup = select(1, GS:AdmitRemoteOperation(histStored, {
+        sender = "Alice-Garona",
+    }))
+    assertEq(stZeroDup, "duplicate", "430-1: zero-goal history duplicate credits once")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9502]) or 0,
+        100, "430-1: zero-goal total unchanged after duplicate")
 end
 
 do
@@ -40229,7 +40204,7 @@ do
     local pageDef = panel.__sfPageDef
     assertTrue(type(pageDef) == "table", "430-ui: page definition stored")
 
-    local attrSuggest, attrResolved, attrTextChanged, attrGet, attrSet
+    local attrSuggest, attrResolved, attrGet, attrSet
     local qtyEnabled, qtyButtonEnabled, qtyOnTextChanged, qtyOnSubmit, qtyGet
     local itemOnChanged
     for _, sec in ipairs(pageDef.sections or {}) do
@@ -40238,9 +40213,10 @@ do
                 if item.type == "autocomplete" then
                     attrSuggest = item.getSuggestions
                     attrResolved = item.onResolved
-                    attrTextChanged = item.onTextChanged
                     attrGet = item.get
                     attrSet = item.set
+                    assertEq(item.onTextChanged, nil,
+                        "430-ui: attribution has no redundant onTextChanged")
                 elseif item.type == "editboxButton"
                     and item.label
                     and tostring(item.label):find("Quantity", 1, true) then
@@ -40258,6 +40234,7 @@ do
         end
     end
     assertTrue(type(attrSuggest) == "function", "430-ui: attribution getSuggestions")
+    assertTrue(type(attrSet) == "function", "430-ui: attribution bound setter")
     assertTrue(type(qtyButtonEnabled) == "function", "430-ui: quantity buttonEnabled")
     assertTrue(type(qtyOnTextChanged) == "function", "430-ui: quantity onTextChanged")
 
@@ -40275,7 +40252,7 @@ do
     assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved attribution retained")
 
     -- Unassigned remains the empty default and is restored on clear.
-    attrTextChanged(nil, "")
+    attrSet("")
     assertEq(attrGet(), "", "430-ui: cleared attribution shows empty/Unassigned draft")
     local emptySuggestions = attrSuggest(nil, "")
     assertTrue(type(emptySuggestions) == "table" and #emptySuggestions >= 1,
@@ -40365,9 +40342,7 @@ do
         onResolved = function(item)
             attrResolved(nil, item)
         end,
-        onTextChanged = function(text)
-            attrTextChanged(nil, text)
-        end,
+        -- Production path: bound set only (no redundant onTextChanged).
         maxSuggestions = 8,
     })
     local attrEdit, qtyEdit, applyBtn

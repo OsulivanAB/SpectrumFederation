@@ -1598,6 +1598,9 @@ local function Definition()
 								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
 						end,
 						get = AdjustAttributionText,
+						-- Bound setter alone owns typing / blur / selection text
+						-- updates. Do not also wire onTextChanged: AddAutocomplete
+						-- would run both and double the draft update + refresh (#430).
 						set = function(v)
 							SetAdjustAttributionFromText(v)
 							-- Quantity Apply depends on attribution validity; refresh
@@ -1609,10 +1612,10 @@ local function Definition()
 						end,
 						onResolved = function(_, item)
 							SyncAdjustDraftContext()
-							-- Typing notifies nil before onTextChanged/set. Do not
-							-- refresh here: get() still has the prior search draft
-							-- and would rewrite the edit mid-keystroke. set /
-							-- onTextChanged refresh after the draft catches up.
+							-- Typing notifies nil before set. Do not refresh here:
+							-- get() still has the prior search draft and would
+							-- rewrite the edit mid-keystroke. set refreshes after
+							-- the draft catches up.
 							if not item then
 								adjustDraft.attributed = ADJUST_UNASSIGNED
 								adjustDraft.attributionResolved = false
@@ -1633,10 +1636,6 @@ local function Definition()
 								return
 							end
 							SetAdjustAttributionFromText(item.text or item.label or "")
-							RefreshPageControls()
-						end,
-						onTextChanged = function(_, text)
-							SetAdjustAttributionFromText(text)
 							RefreshPageControls()
 						end,
 					},
