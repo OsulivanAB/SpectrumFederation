@@ -669,8 +669,16 @@ function GS:ListInspectableCampaigns()
             local ok = GS.ValidateCampaignBoundary(header, record, guildKey)
             if ok and header.campaignId == campaignId
                 and CampaignArchiveInspectable(record, campaignId, header) then
+                local displayName = GS.GetCampaignDisplayName
+                    and GS.GetCampaignDisplayName(record, campaignId)
+                    or campaignId
+                local custom = GS.GetCampaignCustomName
+                    and GS.GetCampaignCustomName(record, campaignId)
+                    or ""
                 list[#list + 1] = {
                     campaignId = campaignId,
+                    displayName = displayName,
+                    hasCustomName = type(custom) == "string" and custom ~= "",
                     startedAt = header.startedAt,
                     boundaryKind = header.boundaryKind,
                     contextStatus = header.contextStatus,
@@ -1270,6 +1278,12 @@ function GS.FormatReasonText(reason)
             "the active character changed"),
         no_campaign = Loc("GUILD_SUPPLIES_REASON_NO_CAMPAIGN",
             "start a New Campaign before changing requested items"),
+        missing_campaign = Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
+            "that campaign is not available on this dataset"),
+        invalid_campaign_name = Loc("GUILD_SUPPLIES_REASON_INVALID_CAMPAIGN_NAME",
+            "enter a plain campaign name up to 64 characters, or clear the name"),
+        stale_name = Loc("GUILD_SUPPLIES_REASON_STALE_NAME",
+            "a newer campaign name revision already applied"),
         already_requested = Loc("GUILD_SUPPLIES_REASON_ALREADY_REQUESTED",
             "that item is already on the current campaign"),
         server_time_unavailable = Loc("GUILD_SUPPLIES_REASON_SERVER_TIME",

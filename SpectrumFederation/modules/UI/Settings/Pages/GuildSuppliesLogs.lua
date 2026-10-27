@@ -109,11 +109,15 @@ local function FormatCampaignLabel(entry)
 	local status = entry.isCurrent
 		and Loc("GUILD_SUPPLIES_CAMPAIGN_CURRENT", "Current")
 		or Loc("GUILD_SUPPLIES_CAMPAIGN_ARCHIVED", "Archived")
-	local shortId = tostring(entry.campaignId or "")
-	if #shortId > 24 then
-		shortId = shortId:sub(1, 21) .. "..."
+	-- Friendly name when set; otherwise the immutable ID (never both).
+	local label = entry.displayName or entry.campaignId or "?"
+	if not entry.hasCustomName then
+		label = tostring(label)
+		if #label > 24 then
+			label = label:sub(1, 21) .. "..."
+		end
 	end
-	return string.format("%s — %s (%s)", when, status, shortId)
+	return string.format("%s — %s (%s)", when, status, tostring(label))
 end
 
 local function CampaignOptions()
@@ -132,6 +136,8 @@ local function CampaignOptions()
 	return opts
 end
 
+-- Declared before CommitRenameSelected: Lua 5.1 would otherwise bind the early
+-- call site to a nil global and throw on Logs Rename submit.
 local function ResolveSelectedCampaign()
 	if not Caps().canRead then
 		selectedCampaignId = nil
@@ -161,6 +167,48 @@ local function ResolveSelectedCampaign()
 	end
 	selectedCampaignId = list[1].campaignId
 	return selectedCampaignId
+end
+
+local function CommitRenameSelected(ctx, text)
+	local g = GS()
+	if not g or not g.NewRenameCampaignOperation then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	local campaignId = ResolveSelectedCampaign()
+	if type(campaignId) ~= "string" or campaignId == "" then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns"), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local op, prepStatus, prepReason = g:NewRenameCampaignOperation(campaignId, text)
+	if not op then
+		local message, severity
+		if g.FormatMutationFeedback then
+			message, severity = g.FormatMutationFeedback(prepStatus or "rejected", prepReason)
+		else
+			message = tostring(prepStatus or "rejected")
+			severity = "error"
+		end
+		ctx.section:SetMessage(message, severity)
+		return
+	end
+	local status, reason = g:ApplyStagedConfigOperation(op)
+	local message, severity
+	if g.FormatMutationFeedback then
+		message, severity = g.FormatMutationFeedback(status, reason)
+	else
+		message = tostring(status or "rejected")
+		severity = (status == "accepted" and "success") or "error"
+	end
+	ctx.section:SetMessage(message, severity)
+	-- Keep the Logs selection on the same immutable campaign id.
+	selectedCampaignId = campaignId
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	elseif ctx.pageBuilder and ctx.pageBuilder.Refresh then
+		ctx.pageBuilder:Refresh()
+	end
 end
 
 local function MembershipHelpText()
@@ -426,6 +474,53 @@ local function Definition()
 								end
 							end
 							return id
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_LABEL", "Campaign name"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_HINT", "Friendly name (blank clears)"),
+						buttonText = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_BUTTON", "Rename"),
+						buttonWidth = 90,
+						editWidth = 200,
+						maxLetters = 64,
+						tooltip = Loc("GUILD_SUPPLIES_RENAME_LOGS_TIP",
+							"Sets a guild-wide display name for the selected campaign, including archived campaigns. Clearing restores the campaign ID label without changing which campaign is current."),
+						get = function()
+							if not Caps().canRead then
+								return ""
+							end
+							local id = ResolveSelectedCampaign()
+							local rec = CurrentRecord()
+							local g = GS()
+							if not id or not rec or not g or not g.GetCampaignCustomName then
+								return ""
+							end
+							return g.GetCampaignCustomName(rec, id) or ""
+						end,
+						getSelectionKey = function()
+							return ResolveSelectedCampaign()
+						end,
+						enabled = function()
+							return Caps().canEdit and ResolveSelectedCampaign() ~= nil
+						end,
+						getDisabledTooltip = function()
+							if not Caps().canRead then
+								return DisabledLogsMembershipTip()
+							end
+							if not Caps().canEdit then
+								local g = GS()
+								local formatReason = g and g.FormatReasonText or tostring
+								return Loc("GUILD_SUPPLIES_REASON_UNAUTHORIZED",
+									"you are not authorized for that change")
+									.. " (" .. formatReason(Caps().reason or "unauthorized") .. ")"
+							end
+							return Loc("GUILD_SUPPLIES_DISABLED_LOGS_NO_CAMPAIGNS",
+								"No campaigns are available to inspect yet.")
+						end,
+						onSubmit = function(ctx, text)
+							CommitRenameSelected(ctx, text)
 						end,
 					},
 					{

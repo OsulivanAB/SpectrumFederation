@@ -1308,22 +1308,28 @@ local function ClassifyStaleBase(record, op, targetKey)
             end
             return "conflict", "campaign_conflict"
         end
-        -- Sibling campaign head that shares the same parent base → conflict, not obsolete.
-        local headId = ops.heads and (ops.heads[GS.CAMPAIGN_TARGET_KEY] or ops.heads[targetKey])
-        local headBody = headId and ops.records[headId]
-        if type(headBody) == "table"
-            and headBody.kind == GS.KIND.START_CAMPAIGN
-            and (headBody.baseCampaignId or nil) == (op.baseCampaignId or nil)
-            and headBody.id == campaignNow then
-            return "conflict", "campaign_conflict"
+        -- #424: rename authorship campaignId/baseCampaignId are prepare-time current.
+        -- After rollover a valid rename for an existing (often archived) target must
+        -- still reach LWW rather than permanent stale_campaign rejection. Do not
+        -- relax campaign-head causality for any other kind.
+        if op.kind ~= GS.KIND.RENAME_CAMPAIGN then
+            -- Sibling campaign head that shares the same parent base → conflict, not obsolete.
+            local headId = ops.heads and (ops.heads[GS.CAMPAIGN_TARGET_KEY] or ops.heads[targetKey])
+            local headBody = headId and ops.records[headId]
+            if type(headBody) == "table"
+                and headBody.kind == GS.KIND.START_CAMPAIGN
+                and (headBody.baseCampaignId or nil) == (op.baseCampaignId or nil)
+                and headBody.id == campaignNow then
+                return "conflict", "campaign_conflict"
+            end
+            if type(op.baseCampaignId) == "string" and HasAcceptedId(ops, op.baseCampaignId) then
+                return "obsolete", "stale_campaign"
+            end
+            if op.baseCampaignId == nil and campaignNow ~= nil then
+                return "obsolete", "stale_campaign"
+            end
+            return "pending", "missing_campaign_predecessor"
         end
-        if type(op.baseCampaignId) == "string" and HasAcceptedId(ops, op.baseCampaignId) then
-            return "obsolete", "stale_campaign"
-        end
-        if op.baseCampaignId == nil and campaignNow ~= nil then
-            return "obsolete", "stale_campaign"
-        end
-        return "pending", "missing_campaign_predecessor"
     end
 
     if base == currentRev then
@@ -1334,6 +1340,20 @@ local function ClassifyStaleBase(record, op, targetKey)
     -- config-style divergent conflicts; incompatible negatives stay pending.
     if op.kind == GS.KIND.ADJUST_QUANTITY then
         return "apply", nil
+    end
+
+    -- #424 campaign names: deterministic last-write-wins. Never open a
+    -- Troubleshooting conflict for concurrent renames/clears.
+    if op.kind == GS.KIND.RENAME_CAMPAIGN then
+        local headId = ops.heads and ops.heads[targetKey]
+        local headBody = headId and ops.records and ops.records[headId]
+        if type(headBody) ~= "table" or headBody.id == op.id then
+            return "apply", nil
+        end
+        if GS.RenameRevisionWins and GS.RenameRevisionWins(op, headBody) then
+            return "apply", nil
+        end
+        return "obsolete", "stale_name"
     end
 
     -- Open conflict already holds this target: retain as additional candidate.
@@ -5507,6 +5527,8 @@ local function ReconstructChosenCampaignProjection(record, chosenId, header, adm
             and op.kind ~= GS.KIND.RESOLVE_CONFLICT
             and op.kind ~= GS.KIND.CONFIRM_CANDIDATE
             and op.kind ~= GS.KIND.SET_EDITOR_RANK
+            -- Names are keyed by target campaign id, not by authorship campaign.
+            and op.kind ~= GS.KIND.RENAME_CAMPAIGN
     end
 
     local promoteOps = {}
@@ -7653,6 +7675,25 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
         return stPend, reasonPend
     end
     if class == "obsolete" then
+        -- #424: newest-first adoption can replay a source-accepted rename after a
+        -- newer LWW winner already projects the name head. Retain the losing
+        -- revision in accepted history without changing campaignNames / heads.
+        if stored.kind == GS.KIND.RENAME_CAMPAIGN
+            and classReason == "stale_name"
+            and admissionCtx.adoptionReplay
+            and type(admissionCtx.sourceAcceptedSet) == "table"
+            and admissionCtx.sourceAcceptedSet[stored.id] == true then
+            if not ops.records[stored.id] then
+                if GS._AcceptedCount
+                    and GS._AcceptedCount(ops) >= GS.MAX_ACCEPTED_OPERATIONS then
+                    return "rejected", "full"
+                end
+                if GS._StoreAccepted then
+                    GS._StoreAccepted(ops, stored, nil)
+                end
+            end
+            return "accepted", nil
+        end
         return "rejected", classReason or "stale_base"
     end
     if class == "conflict" then

@@ -29,9 +29,12 @@ local KIND = {
     LINK_CHARACTERS = "link-characters",
     UNLINK_CHARACTERS = "unlink-characters",
     ADJUST_QUANTITY = "adjust-quantity",
+    -- #424 guild-owned display names (LWW; not Troubleshooting conflicts)
+    RENAME_CAMPAIGN = "rename-campaign",
 }
 
 GS.KIND = KIND
+GS.MAX_CAMPAIGN_NAME_LEN = GS.MAX_CAMPAIGN_NAME_LEN or 64
 
 -- Public durable fields only; private "_" prepare metadata is never retained.
 local CONFIG_SNAPSHOT_FIELDS = {
@@ -365,8 +368,99 @@ local function TargetKey(kind, target)
             return nil
         end
         return "adjust:" .. tostring(canon.itemId)
+    elseif kind == KIND.RENAME_CAMPAIGN then
+        if type(target) == "string" and target ~= "" and #target <= GS.MAX_OPERATION_ID then
+            return "name:" .. target
+        end
+        return nil
     end
     return nil
+end
+
+--- Trim, bound, and reject control / WoW-escape characters. Empty → clear.
+-- @return name|nil, ok boolean, reason|nil
+function GS.NormalizeCampaignName(raw)
+    if raw == nil then
+        return nil, true, nil
+    end
+    if type(raw) ~= "string" then
+        return nil, false, "invalid_campaign_name"
+    end
+    local trimmed = raw:match("^%s*(.-)%s*$") or ""
+    if trimmed == "" then
+        return nil, true, nil
+    end
+    local maxLen = GS.MAX_CAMPAIGN_NAME_LEN or 64
+    if #trimmed > maxLen then
+        return nil, false, "invalid_campaign_name"
+    end
+    -- Reject C0 controls, DEL, and any '|' (WoW color/texture/hyperlink escapes).
+    if trimmed:find("[%z\1-\31\127]") or trimmed:find("|", 1, true) then
+        return nil, false, "invalid_campaign_name"
+    end
+    return trimmed, true, nil
+end
+
+--- Last-write-wins for rename-campaign: newer server timestamp wins; equal
+-- timestamps break ties by stable operation id (lexicographic, descending).
+-- @return true when `incoming` should replace `incumbent`
+function GS.RenameRevisionWins(incoming, incumbent)
+    if type(incoming) ~= "table" or type(incoming.id) ~= "string" then
+        return false
+    end
+    if type(incumbent) ~= "table" or type(incumbent.id) ~= "string" then
+        return true
+    end
+    local it = tonumber(incoming.timestamp)
+    local ht = tonumber(incumbent.timestamp)
+    if not it or it ~= it or it < 0 then
+        return false
+    end
+    if not ht or ht ~= ht or ht < 0 then
+        return true
+    end
+    if it ~= ht then
+        return it > ht
+    end
+    return tostring(incoming.id) > tostring(incumbent.id)
+end
+
+--- Visible label for a campaign: custom name when set, else immutable ID.
+local function CampaignDisplayName(record, campaignId)
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return ""
+    end
+    if type(record) == "table" and type(record.campaignNames) == "table" then
+        local entry = record.campaignNames[campaignId]
+        if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" then
+            return entry.name
+        end
+    end
+    return campaignId
+end
+
+function GS.GetCampaignDisplayName(record, campaignId)
+    return CampaignDisplayName(record, campaignId)
+end
+
+function GS:GetCurrentCampaignDisplayName(campaignId)
+    local record = GS:GetCurrentRecord()
+    return CampaignDisplayName(record, campaignId)
+end
+
+--- Custom name text for editors (empty when falling back to the ID).
+function GS.GetCampaignCustomName(record, campaignId)
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return ""
+    end
+    if type(record) ~= "table" or type(record.campaignNames) ~= "table" then
+        return ""
+    end
+    local entry = record.campaignNames[campaignId]
+    if type(entry) == "table" and type(entry.name) == "string" then
+        return entry.name
+    end
+    return ""
 end
 
 --- Shared target-key helper for durable head validation (State load order is earlier).
@@ -663,6 +757,22 @@ local function ValidateKindValue(op)
             end
         end
         return true
+    elseif kind == KIND.RENAME_CAMPAIGN then
+        if type(op.target) ~= "string" or op.target == "" or #op.target > GS.MAX_OPERATION_ID then
+            return false, "invalid_target"
+        end
+        -- nil clears; nonempty string must already be canonical (trimmed/bounded).
+        if op.value == nil then
+            return true
+        end
+        if type(op.value) ~= "string" then
+            return false, "invalid_campaign_name"
+        end
+        local name, ok = GS.NormalizeCampaignName(op.value)
+        if not ok or name == nil or name ~= op.value then
+            return false, "invalid_campaign_name"
+        end
+        return true
     end
     return false, "unsupported_kind"
 end
@@ -812,6 +922,65 @@ function GS:NewConfigOperation(kind, target, value)
     return op, "accepted", nil
 end
 
+--- Prepare a guild-owned campaign rename/clear (#424).
+-- Target may be the current or an archived campaign; authorship campaignId stays
+-- the current campaign for ordinary causality without relaxing global checks.
+function GS:NewRenameCampaignOperation(campaignId, nameText)
+    local ctx = GS:GetCurrentContext()
+    if not ctx or not ctx.ready then
+        return nil, "rejected", (ctx and ctx.reason) or "not_ready"
+    end
+    local ts = ServerTime()
+    if not ts then
+        return nil, "rejected", "server_time_unavailable"
+    end
+    if type(campaignId) ~= "string" or campaignId == "" or #campaignId > GS.MAX_OPERATION_ID then
+        return nil, "rejected", "invalid_target"
+    end
+    local caps = GS:GetCapabilities()
+    if not caps.canEdit then
+        return nil, "rejected", caps.reason or "unauthorized"
+    end
+    local record, recordReason = GS:GetCurrentRecord()
+    if not record then
+        return nil, "rejected", recordReason or "not_configured"
+    end
+    if type(record.campaigns) ~= "table" or type(record.campaigns[campaignId]) ~= "table" then
+        return nil, "rejected", "missing_campaign"
+    end
+    local name, nameOk, nameErr = GS.NormalizeCampaignName(nameText)
+    if not nameOk then
+        return nil, "rejected", nameErr or "invalid_campaign_name"
+    end
+    local tKey = TargetKey(KIND.RENAME_CAMPAIGN, campaignId)
+    if not tKey then
+        return nil, "rejected", "invalid_target"
+    end
+    local id, idErr = GS:_AllocateOperationId(ctx.actorGuid)
+    if not id then
+        return nil, "rejected", idErr or "id_failed"
+    end
+    local op = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = id,
+        guildKey = ctx.guildKey,
+        datasetId = record.datasetId,
+        -- Authorship / causality: current campaign at prepare time.
+        campaignId = record.currentCampaignId,
+        kind = KIND.RENAME_CAMPAIGN,
+        target = campaignId,
+        value = name,
+        actorGuid = ctx.actorGuid,
+        actorName = ctx.actorName,
+        timestamp = ts,
+        baseTargetRevision = CurrentTargetRevision(record, tKey),
+        basePolicyRevision = CurrentPolicyRevision(record),
+        baseCampaignId = record.currentCampaignId,
+        _preparedHandleGeneration = ctx.handleGeneration,
+    }
+    return op, "accepted", nil
+end
+
 function GS:ValidateConfigOperation(op, context)
     local ok, err = ValidateConfigShape(op)
     if not ok then
@@ -865,10 +1034,21 @@ function GS:ValidateConfigOperation(op, context)
     -- Compatible prepared local quantity adjustments must not stay permanently
     -- stale after a sibling adjustment advances adjust:<itemId>. Commit-time
     -- floor validation in ApplyAdjustmentMutation remains authoritative.
-    if op.kind ~= KIND.ADJUST_QUANTITY then
+    -- Rename-campaign uses deterministic LWW at apply/admission (#424).
+    if op.kind ~= KIND.ADJUST_QUANTITY and op.kind ~= KIND.RENAME_CAMPAIGN then
         local currentRev = CurrentTargetRevision(record, tKey)
         if op.baseTargetRevision ~= currentRev then
             return false, "stale_base"
+        end
+    end
+
+    if op.kind == KIND.RENAME_CAMPAIGN then
+        local targetCamp = op.target
+        if type(targetCamp) ~= "string" or targetCamp == "" then
+            return false, "invalid_target"
+        end
+        if type(record.campaigns) ~= "table" or type(record.campaigns[targetCamp]) ~= "table" then
+            return false, "missing_campaign"
         end
     end
 
@@ -1123,6 +1303,43 @@ local function ApplyMutations(record, op, opts)
             return false, status or "adjustment_floor"
         end
         return true, status
+    elseif op.kind == KIND.RENAME_CAMPAIGN then
+        local campaignId = op.target
+        if type(campaignId) ~= "string" or campaignId == "" then
+            return false, "invalid_target"
+        end
+        if type(record.campaigns) ~= "table" or type(record.campaigns[campaignId]) ~= "table" then
+            return false, "missing_campaign"
+        end
+        local name, nameOk, nameErr = GS.NormalizeCampaignName(op.value)
+        if not nameOk then
+            return false, nameErr or "invalid_campaign_name"
+        end
+        -- Clear stores nil name; nonempty must match the canonical op value.
+        if name ~= nil and name ~= op.value then
+            return false, "invalid_campaign_name"
+        end
+        if name == nil and op.value ~= nil then
+            return false, "invalid_campaign_name"
+        end
+        local tKey = TargetKey(op.kind, campaignId)
+        local ops = record.operations
+        local headId = ops and ops.heads and ops.heads[tKey]
+        local headBody = headId and ops.records and ops.records[headId]
+        if type(headBody) == "table" and headBody.id ~= op.id
+            and not GS.RenameRevisionWins(op, headBody) then
+            return false, "stale_name"
+        end
+        if type(record.campaignNames) ~= "table" then
+            record.campaignNames = {}
+        end
+        -- Keep the revision entry after a clear so delayed older names lose LWW.
+        record.campaignNames[campaignId] = {
+            name = name,
+            revisionId = op.id,
+            renamedAt = op.timestamp,
+        }
+        return true
     end
     return false, "unsupported_kind"
 end
@@ -1190,6 +1407,12 @@ function GS:ApplyStagedConfigOperation(op, context)
             return "rejected", coerceErr
         end
         op.value = coerced
+    elseif op.kind == KIND.RENAME_CAMPAIGN then
+        local name, nameOk, nameErr = GS.NormalizeCampaignName(op.value)
+        if not nameOk then
+            return "rejected", nameErr or "invalid_campaign_name"
+        end
+        op.value = name
     end
 
     local kindOk, kindErr = ValidateKindValue(op)
@@ -1652,7 +1875,7 @@ function GS.ValidateAcceptedOperationBody(body, guildKey, datasetId)
         return true
     elseif kind == KIND.SET_EDITOR_RANK or kind == KIND.SET_BANK_TAB or kind == KIND.SET_REQUESTED_ITEM
         or kind == KIND.LINK_CHARACTERS or kind == KIND.UNLINK_CHARACTERS
-        or kind == KIND.ADJUST_QUANTITY then
+        or kind == KIND.ADJUST_QUANTITY or kind == KIND.RENAME_CAMPAIGN then
         local ok, err = ValidateConfigShape(body)
         if not ok then
             return false, err or "invalid_operations"

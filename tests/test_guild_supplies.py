@@ -11,6 +11,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PARENT_TOC = REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc"
 LUA_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_tests.lua"
+LUA_RENAME_424_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_rename_424_tests.lua"
 GS_DIR = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildSupplies"
 DOCS = REPO_ROOT / "docs" / "development" / "guild-supplies" / "index.md"
 ADAPTER = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildGossip" / "05_GuildAdapter.lua"
@@ -40,6 +41,30 @@ def test_guild_supplies_production_lua():
     assert "0 failed" in result.stdout
     assert GS_DIR.exists()
     assert DOCS.exists()
+
+
+def test_guild_supplies_campaign_rename_424():
+    """Focused #424 rename/LWW/adoption coverage (also embedded in the full suite)."""
+    assert LUA_RENAME_424_TESTS.exists()
+    result = subprocess.run(
+        [_lua51(), str(LUA_RENAME_424_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Guild Supplies #424 rename tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "0 failed" in result.stdout
+    assert "424-adopt: name adopted" in result.stdout
+    assert "424-lww: bob wins equal-time" in result.stdout
+    assert "424-rollover: archived name converges" in result.stdout
+    assert "424-adopt-lww: early retained in history" in result.stdout
+    assert "424-adopt-tie: clear revision kept" in result.stdout
 
 
 def test_parent_toc_loads_guild_supplies_after_gossip():

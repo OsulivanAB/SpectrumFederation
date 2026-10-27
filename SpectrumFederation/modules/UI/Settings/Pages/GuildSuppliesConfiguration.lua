@@ -398,7 +398,8 @@ local function BuildStatusSnapshot()
 	snap.showCampaign = true
 	local campaignId = record.currentCampaignId
 	if type(campaignId) == "string" and campaignId ~= "" then
-		snap.campaign = campaignId
+		snap.campaign = (g and g.GetCampaignDisplayName and g.GetCampaignDisplayName(record, campaignId))
+			or campaignId
 	else
 		snap.campaign = Loc("GUILD_SUPPLIES_CAMPAIGN_NOT_STARTED", "Not started.")
 	end
@@ -524,6 +525,22 @@ local function CommitConfig(ctx, kind, target, value)
 	end
 	ctx.section:ClearMessage()
 	local op, prepStatus, prepReason = g:NewConfigOperation(kind, target, value)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local status, reason = g:ApplyStagedConfigOperation(op)
+	ReportStatus(ctx, status, reason)
+end
+
+local function CommitRenameCampaign(ctx, campaignId, text)
+	local g = GS()
+	if not g or not g.NewRenameCampaignOperation then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local op, prepStatus, prepReason = g:NewRenameCampaignOperation(campaignId, text)
 	if not op then
 		ReportStatus(ctx, prepStatus or "rejected", prepReason)
 		return
@@ -1033,6 +1050,53 @@ local function Definition()
 						end,
 						onClick = function(ctx)
 							CommitNewCampaign(ctx)
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_LABEL", "Campaign name"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_HINT", "Friendly name (blank clears)"),
+						buttonText = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_BUTTON", "Rename"),
+						buttonWidth = 90,
+						editWidth = 200,
+						maxLetters = 64,
+						tooltip = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_TIP",
+							"Sets a guild-wide display name for the current campaign. Clearing the name restores the campaign ID label. Accounting and campaign identity stay unchanged."),
+						get = function()
+							local rec = CurrentRecord()
+							if not rec or type(rec.currentCampaignId) ~= "string" then
+								return ""
+							end
+							local g = GS()
+							if g and g.GetCampaignCustomName then
+								return g.GetCampaignCustomName(rec, rec.currentCampaignId) or ""
+							end
+							return ""
+						end,
+						getSelectionKey = function()
+							local rec = CurrentRecord()
+							return rec and rec.currentCampaignId or nil
+						end,
+						enabled = function()
+							local rec = CurrentRecord()
+							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RENAME", "renaming the campaign"))
+						end,
+						onSubmit = function(ctx, text)
+							local rec = select(1, GS() and GS():GetCurrentRecord())
+							local campaignId = rec and rec.currentCampaignId
+							if type(campaignId) ~= "string" or campaignId == "" then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_REASON_NO_CAMPAIGN",
+										"start a New Campaign before changing requested items"),
+									"error")
+								return
+							end
+							CommitRenameCampaign(ctx, campaignId, text)
 						end,
 					},
 				},
