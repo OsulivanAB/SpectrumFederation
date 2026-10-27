@@ -40050,7 +40050,15 @@ do
         function region:UnregisterAllEvents() self.registeredEvents = {} end
         function region:HasFocus() return self._focused end
         function region:SetFocus() self._focused = true end
-        function region:ClearFocus() self._focused = false end
+        function region:ClearFocus()
+            self._focused = false
+            local fn = self._scripts.OnEditFocusLost
+            if fn then fn(self) end
+        end
+        function region:Click(...)
+            local fn = self._scripts.OnClick
+            if fn then fn(self, ...) end
+        end
         function region:SetCursorPosition() end
         function region:GetCursorPosition() return 0 end
         function region:SetFrameStrata() end
@@ -40310,26 +40318,44 @@ do
     qtyOnTextChanged("-10")
     assertEq(qtyButtonEnabled("-10"), true, "430-ui: Apply enabled for valid -10")
 
-    -- #430 unresolved search text must not become a credited character.
-    -- Exercise production AddAutocomplete OnTextChanged + page submit callbacks.
-    local attrSection = {
-        __sfPageBuilder = {
-            _refresh = {},
-            RegisterRefresh = function(self, fn)
-                self._refresh[#self._refresh + 1] = fn
-            end,
-            FireRefresh = function(self)
-                for i = 1, #self._refresh do self._refresh[i]() end
-            end,
-        },
+    -- #430 connected controls: attribution autocomplete drives the real Apply button
+    -- through production RefreshPageControls → RegisterRefresh (not direct validators).
+    local sharedPB = {
+        _refresh = {},
+        RegisterRefresh = function(self, fn)
+            self._refresh[#self._refresh + 1] = fn
+        end,
+        FireRefresh = function(self)
+            for i = 1, #self._refresh do self._refresh[i]() end
+        end,
+    }
+    local sharedSection = {
+        __sfPageBuilder = sharedPB,
         AddRow = function(self, _, builder)
-            local row = makeRegion("Frame", "AttrRow", nil)
+            local row = makeRegion("Frame", "SharedRow", nil)
             builder(row)
             return row
         end,
     }
-    local attrCreatedBefore = #created
-    SF.SettingsUI.Controls:AddAutocomplete(attrSection, {
+    -- Production attribution handlers call RefreshPageControls via Page:Refresh.
+    configPage.panel = makeRegion("Frame", "ConnectedConfigPanel")
+    function configPage.panel:IsVisible() return true end
+    function configPage:Refresh()
+        sharedPB:FireRefresh()
+    end
+
+    local connectedBefore = #created
+    SF.SettingsUI.Controls:AddEditBoxWithButton(sharedSection, {
+        label = "Quantity change",
+        buttonText = "Apply adjustment",
+        get = qtyGet,
+        getSelectionKey = function() return "adj-connected" end,
+        enabled = qtyEnabled,
+        buttonEnabled = qtyButtonEnabled,
+        onTextChanged = qtyOnTextChanged,
+        onSubmit = function() end,
+    })
+    SF.SettingsUI.Controls:AddAutocomplete(sharedSection, {
         label = "Attribution",
         get = attrGet,
         set = attrSet,
@@ -40344,14 +40370,33 @@ do
         end,
         maxSuggestions = 8,
     })
-    local attrEdit
-    for i = attrCreatedBefore + 1, #created do
+    local attrEdit, qtyEdit, applyBtn
+    for i = connectedBefore + 1, #created do
         local obj = created[i]
-        if obj.GetObjectType and obj:GetObjectType() == "EditBox" and not attrEdit then
-            attrEdit = obj
+        if obj.GetObjectType and obj:GetObjectType() == "EditBox" then
+            if not qtyEdit then
+                qtyEdit = obj
+            elseif not attrEdit then
+                attrEdit = obj
+            end
+        elseif obj.GetObjectType and obj:GetObjectType() == "Button" and not applyBtn then
+            applyBtn = obj
         end
     end
-    assertTrue(attrEdit ~= nil, "430-ui: attribution autocomplete edit created")
+    assertTrue(attrEdit ~= nil and qtyEdit ~= nil and applyBtn ~= nil,
+        "430-ui: connected attribution+quantity controls created")
+
+    local function clickSuggestionLabeled(label)
+        for i = 1, #created do
+            local obj = created[i]
+            if obj.Text and tostring(obj.Text._text or "") == label and obj._scripts and obj._scripts.OnClick then
+                obj:Click()
+                return true
+            end
+        end
+        return false
+    end
+
     local beforeProgress = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
     local beforeTotal = tonumber(beforeProgress.itemTotals[9503]) or 0
     local beforeZed = 0
@@ -40370,6 +40415,8 @@ do
         confirmCallsPartial = confirmCallsPartial + 1
     end
     sectionMessages = {}
+
+    -- Unresolved prefix then valid quantity: real Apply stays disabled.
     attrEdit:TypeText("Zed")
     assertEq(attrGet(), "Zed", "430-ui: partial search draft retained")
     assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete edit shows partial search")
@@ -40387,15 +40434,14 @@ do
     end
     assertEq(phantomPrefix, false, "430-ui: unmatched prefix is not a suggestion")
     assertEq(foundZedLastPartial, true, "430-ui: real ZedLast still suggested for prefix")
-    qtyOnTextChanged("8")
-    assertEq(qtyButtonEnabled("8"), false, "430-ui: Apply disabled for unresolved attribution")
-    -- Blur/refresh must keep the unresolved search draft without crediting it.
-    if attrEdit.GetScript and attrEdit:GetScript("OnEditFocusLost") then
-        attrEdit:GetScript("OnEditFocusLost")(attrEdit)
-    end
-    attrSection.__sfPageBuilder:FireRefresh()
-    assertEq(attrGet(), "Zed", "430-ui: unresolved search survives refresh")
-    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete refresh keeps unresolved text")
+    qtyEdit:TypeText("8")
+    assertEq(qtyEdit:GetText(), "8", "430-ui: quantity draft typed while attribution unresolved")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: real Apply disabled for unresolved attribution")
+    -- Blur/refresh keeps unresolved search without crediting it.
+    attrEdit:ClearFocus()
+    assertEq(attrGet(), "Zed", "430-ui: unresolved search survives blur")
+    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete blur keeps unresolved text")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: Apply still disabled after unresolved blur")
     qtyOnSubmit(ctx, "8")
     assertEq(confirmCallsPartial, 0, "430-ui: unresolved attribution blocks confirm")
     assertTrue(#sectionMessages >= 1 and sectionMessages[#sectionMessages].sev == "error",
@@ -40411,10 +40457,59 @@ do
         afterZed = tonumber(afterPartial.contributions["Zed-Garona"][9503]) or 0
     end
     assertEq(afterZed, beforeZed, "430-ui: unresolved submit creates no Zed-Garona phantom credit")
-    -- Explicit selection beyond row 256 credits the exact character.
-    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona", label = "ZedLast-Garona" })
-    assertEq(attrGet(), "ZedLast-Garona", "430-ui: selecting ZedLast resolves attribution")
-    assertEq(qtyButtonEnabled("8"), true, "430-ui: Apply enables after resolved attribution")
+
+    -- Click the real suggestion: Apply enables without retyping quantity.
+    attrEdit:SetFocus()
+    attrEdit:TypeText("Zed")
+    assertEq(clickSuggestionLabeled("ZedLast-Garona"), true,
+        "430-ui: clicked ZedLast suggestion beyond row 256")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: suggestion click resolves attribution")
+    assertEq(qtyEdit:GetText(), "8", "430-ui: quantity draft preserved across suggestion click")
+    assertEq(applyBtn:IsEnabled(), true,
+        "430-ui: real Apply enables after suggestion without qty retype")
+
+    -- Reverse: typing unresolved text disables the live Apply button.
+    attrEdit:TypeText("Zed")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: real Apply disables when attribution becomes unresolved")
+    -- Clearing restores Unassigned and re-enables Apply for valid quantity.
+    attrEdit:TypeText("")
+    assertEq(attrGet(), "", "430-ui: clear restores Unassigned display")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: real Apply enables for Unassigned + valid qty")
+    -- Exact typed name resolves without a click and updates Apply.
+    attrEdit:TypeText("ZedLast-Garona")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: exact typed name resolves without click")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: exact resolve enables real Apply")
+
+    -- Roster lag: unchanged blur must not invalidate a resolved selection.
+    local savedMembers = world.guild.members
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+    }
+    fireEvent("GUILD_ROSTER_UPDATE")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved selection survives roster lag")
+    local lagSuggestions = attrSuggest(nil, "Zed")
+    local lagHasResolved = false
+    for i = 1, #(lagSuggestions or {}) do
+        if lagSuggestions[i].value == "ZedLast-Garona" then
+            lagHasResolved = true
+        end
+    end
+    assertEq(lagHasResolved, true, "430-ui: lag suggestions keep resolved credit")
+    attrEdit:ClearFocus()
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: lag blur preserves resolved identity")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: lag blur keeps Apply enabled")
+    -- Retained suggestion selection + ClearFocus also preserves identity.
+    attrEdit:SetFocus()
+    attrEdit:TypeText("Zed")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: typing during lag unresolved disables Apply")
+    assertEq(clickSuggestionLabeled("ZedLast-Garona"), true,
+        "430-ui: clicked retained lag suggestion")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: lag suggestion re-resolves attribution")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: lag suggestion click enables Apply")
+    world.guild.members = savedMembers
+    fireEvent("GUILD_ROSTER_UPDATE")
+
+    -- Submit with resolved attribution still applies exact credit.
     SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
         confirmCallsPartial = confirmCallsPartial + 1
         if type(accept) == "function" then accept() end
@@ -40435,35 +40530,12 @@ do
         afterZed2 = tonumber(afterSelect.contributions["Zed-Garona"][9503]) or 0
     end
     assertEq(afterZed2, beforeZed, "430-ui: still no Zed-Garona phantom after real select")
-    -- Clearing restores Unassigned; exact typed match also resolves without a click.
-    attrTextChanged(nil, "")
-    assertEq(attrGet(), "", "430-ui: clear restores Unassigned display")
-    assertEq(qtyButtonEnabled("1"), true, "430-ui: Unassigned allows Apply with valid qty")
-    attrTextChanged(nil, "ZedLast-Garona")
-    assertEq(attrGet(), "ZedLast-Garona", "430-ui: exact typed name resolves without click")
-    assertEq(qtyButtonEnabled("1"), true, "430-ui: exact resolve enables Apply")
-    -- Temporary roster lag keeps a previously resolved selection.
-    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona" })
-    local savedMembers = world.guild.members
-    world.guild.members = {
-        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
-    }
-    fireEvent("GUILD_ROSTER_UPDATE")
-    assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved selection survives roster lag")
-    local lagSuggestions = attrSuggest(nil, "Zed")
-    local lagHasResolved = false
-    for i = 1, #(lagSuggestions or {}) do
-        if lagSuggestions[i].value == "ZedLast-Garona" then
-            lagHasResolved = true
-        end
-    end
-    assertEq(lagHasResolved, true, "430-ui: lag suggestions keep resolved credit")
-    world.guild.members = savedMembers
-    fireEvent("GUILD_ROSTER_UPDATE")
     SF.SettingsUI.Dialogs.Confirm = priorConfirmPartial
     qtyOnTextChanged("10")
+    sharedPB:FireRefresh()
+    assertEq(qtyEdit:GetText(), "10", "430-ui: quantity draft retained after connected refresh")
 
-    -- Production editboxButton: edit stays enabled while Apply toggles.
+    -- Isolated quantity editboxButton: edit stays enabled while Apply toggles.
     local btnSection = {
         __sfPageBuilder = {
             _refresh = {},
@@ -40496,30 +40568,30 @@ do
         end,
         onSubmit = function() end,
     })
-    local editBox, applyBtn
+    local editBox, isolatedApply
     for i = createdBefore + 1, #created do
         local obj = created[i]
         if obj.GetObjectType and obj:GetObjectType() == "EditBox" and not editBox then
             editBox = obj
-        elseif obj.GetObjectType and obj:GetObjectType() == "Button" and not applyBtn then
-            applyBtn = obj
+        elseif obj.GetObjectType and obj:GetObjectType() == "Button" and not isolatedApply then
+            isolatedApply = obj
         end
     end
-    assertTrue(editBox ~= nil and applyBtn ~= nil, "430-ui: edit+button created")
+    assertTrue(editBox ~= nil and isolatedApply ~= nil, "430-ui: edit+button created")
     assertEq(editBox:IsEnabled(), true, "430-ui: edit enabled initially")
-    assertEq(applyBtn:IsEnabled(), false, "430-ui: Apply disabled initially")
+    assertEq(isolatedApply:IsEnabled(), false, "430-ui: Apply disabled initially")
     editBox:TypeText("10")
     assertEq(editBox:IsEnabled(), true, "430-ui: edit stays editable after valid text")
-    assertEq(applyBtn:IsEnabled(), true, "430-ui: Apply enables on valid text")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: Apply enables on valid text")
     editBox:TypeText("+10")
     assertEq(editBox:IsEnabled(), true, "430-ui: edit stays editable on invalid text")
-    assertEq(applyBtn:IsEnabled(), false, "430-ui: Apply disables on invalid text")
+    assertEq(isolatedApply:IsEnabled(), false, "430-ui: Apply disables on invalid text")
     editBox:TypeText("7")
-    assertEq(applyBtn:IsEnabled(), true, "430-ui: Apply re-enables on corrected text")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: Apply re-enables on corrected text")
     -- Ordinary refresh preserves draft and button state.
     btnSection.__sfPageBuilder:FireRefresh()
     assertEq(editBox:GetText(), "7", "430-ui: refresh preserves quantity draft")
-    assertEq(applyBtn:IsEnabled(), true, "430-ui: refresh keeps Apply enabled for valid draft")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: refresh keeps Apply enabled for valid draft")
 
     -- Async confirmation: cancel preserves; success clears quantity via page submit path.
     attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona" })

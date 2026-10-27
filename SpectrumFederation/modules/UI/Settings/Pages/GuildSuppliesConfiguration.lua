@@ -601,6 +601,15 @@ local function SetAdjustAttributionFromText(text)
 		adjustDraft.attributionResolved = true
 		return
 	end
+	-- Unchanged display of an already-resolved identity survives temporary roster
+	-- incompleteness on blur / ClearFocus after selection (#430).
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= ""
+		and string.lower(trimmed) == string.lower(adjustDraft.attributed) then
+		adjustDraft.attributionText = adjustDraft.attributed
+		return
+	end
 	adjustDraft.attributionText = trimmed
 	adjustDraft.attributed = ADJUST_UNASSIGNED
 	adjustDraft.attributionResolved = false
@@ -1591,14 +1600,19 @@ local function Definition()
 						get = AdjustAttributionText,
 						set = function(v)
 							SetAdjustAttributionFromText(v)
+							-- Quantity Apply depends on attribution validity; refresh
+							-- the bound editboxButton without requiring a qty retype.
+							RefreshPageControls()
 						end,
 						getSuggestions = function(_, prefix)
 							return AdjustAttributionSuggestions(prefix)
 						end,
 						onResolved = function(_, item)
 							SyncAdjustDraftContext()
-							-- Typing notifies nil before onTextChanged; leave the
-							-- search draft to SetAdjustAttributionFromText.
+							-- Typing notifies nil before onTextChanged/set. Do not
+							-- refresh here: get() still has the prior search draft
+							-- and would rewrite the edit mid-keystroke. set /
+							-- onTextChanged refresh after the draft catches up.
 							if not item then
 								adjustDraft.attributed = ADJUST_UNASSIGNED
 								adjustDraft.attributionResolved = false
@@ -1608,18 +1622,22 @@ local function Definition()
 								adjustDraft.attributed = ADJUST_UNASSIGNED
 								adjustDraft.attributionText = ""
 								adjustDraft.attributionResolved = true
+								RefreshPageControls()
 								return
 							end
 							if type(item.value) == "string" and item.value ~= "" then
 								adjustDraft.attributed = item.value
 								adjustDraft.attributionText = item.text or item.label or item.value
 								adjustDraft.attributionResolved = true
+								RefreshPageControls()
 								return
 							end
 							SetAdjustAttributionFromText(item.text or item.label or "")
+							RefreshPageControls()
 						end,
 						onTextChanged = function(_, text)
 							SetAdjustAttributionFromText(text)
+							RefreshPageControls()
 						end,
 					},
 					{
