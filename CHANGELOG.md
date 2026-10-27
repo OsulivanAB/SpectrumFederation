@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.2] - 2026-10-27
+
+### Changed
+- Raid Supplies: Apply Adjustment item/quantity/attribution UI (#426)
+
 ## [1.5.16-beta.1] - 2026-10-27
 
 ### Changed
