@@ -347,10 +347,15 @@ end
 -- and delayed item-name loads must not reset valid in-progress input.
 ---------------------------------------------------------------------------
 local ADJUST_UNASSIGNED = false -- UI-only sentinel; stored attribution stays nil.
+-- attributed: Unassigned (false) or an explicitly/exactly resolved character name.
+-- attributionText: search-box draft, kept separate so prefixes are never credited.
+-- attributionResolved: false while nonempty search text has no exact resolution.
 local adjustDraft = {
 	itemId = nil,
 	quantityText = "",
 	attributed = ADJUST_UNASSIGNED,
+	attributionText = "",
+	attributionResolved = true,
 }
 local adjustDraftContextKey = nil
 
@@ -371,6 +376,8 @@ local function SyncAdjustDraftContext()
 	adjustDraft.itemId = nil
 	adjustDraft.quantityText = ""
 	adjustDraft.attributed = ADJUST_UNASSIGNED
+	adjustDraft.attributionText = ""
+	adjustDraft.attributionResolved = true
 end
 
 local function FormatAdjustItemLabel(itemId)
@@ -492,10 +499,21 @@ end
 
 local function AdjustAttributionText()
 	SyncAdjustDraftContext()
-	if type(adjustDraft.attributed) == "string" and adjustDraft.attributed ~= "" then
+	-- Prefer the search draft so unfinished typing survives blur/refresh.
+	if type(adjustDraft.attributionText) == "string" then
+		return adjustDraft.attributionText
+	end
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= "" then
 		return adjustDraft.attributed
 	end
 	return ""
+end
+
+local function AdjustAttributionIsUnresolved()
+	SyncAdjustDraftContext()
+	return not adjustDraft.attributionResolved
 end
 
 local function AdjustAttributionSuggestions(prefix)
@@ -529,8 +547,11 @@ local function AdjustAttributionSuggestions(prefix)
 			}
 		end
 	end
-	-- Keep a previously chosen credit visible even if the roster briefly lags.
-	if type(adjustDraft.attributed) == "string" and adjustDraft.attributed ~= "" then
+	-- Keep a previously resolved credit visible through temporary roster lag.
+	-- Never promote unresolved search prefixes into suggestions (#430).
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= "" then
 		local lowerSel = string.lower(adjustDraft.attributed)
 		if not cache.byLower[lowerSel]
 			and (needle == "" or string.find(lowerSel, needle, 1, true) == 1) then
@@ -553,26 +574,36 @@ local function AdjustAttributionSuggestions(prefix)
 	return out
 end
 
+--- Update search draft. Only Unassigned or an exact roster match resolves.
+-- Unmatched nonempty text stays searchable and blocks Apply/submit; it is never
+-- stored as a credited identity (#430).
 local function SetAdjustAttributionFromText(text)
 	SyncAdjustDraftContext()
 	local trimmed = tostring(text or ""):match("^%s*(.-)%s*$") or ""
 	if trimmed == "" then
 		adjustDraft.attributed = ADJUST_UNASSIGNED
+		adjustDraft.attributionText = ""
+		adjustDraft.attributionResolved = true
 		return
 	end
 	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
 	if string.lower(trimmed) == string.lower(unassignedLabel) then
 		adjustDraft.attributed = ADJUST_UNASSIGNED
+		adjustDraft.attributionText = ""
+		adjustDraft.attributionResolved = true
 		return
 	end
 	local cache = EnsureAdjustRosterCache()
 	local exact = cache.byLower[string.lower(trimmed)]
 	if exact then
 		adjustDraft.attributed = exact
+		adjustDraft.attributionText = exact
+		adjustDraft.attributionResolved = true
 		return
 	end
-	-- Preserve typed draft while unresolved; commit path NormName validates.
-	adjustDraft.attributed = trimmed
+	adjustDraft.attributionText = trimmed
+	adjustDraft.attributed = ADJUST_UNASSIGNED
+	adjustDraft.attributionResolved = false
 end
 
 local function AdjustCanEdit()
@@ -597,6 +628,9 @@ local function AdjustApplyButtonEnabled(text)
 		return false
 	end
 	if adjustDraft.itemId == nil then
+		return false
+	end
+	if AdjustAttributionIsUnresolved() then
 		return false
 	end
 	return AdjustQuantityValid(text or adjustDraft.quantityText or "")
@@ -1563,12 +1597,23 @@ local function Definition()
 						end,
 						onResolved = function(_, item)
 							SyncAdjustDraftContext()
-							if not item or item.value == ADJUST_UNASSIGNED or item.value == nil then
+							-- Typing notifies nil before onTextChanged; leave the
+							-- search draft to SetAdjustAttributionFromText.
+							if not item then
 								adjustDraft.attributed = ADJUST_UNASSIGNED
+								adjustDraft.attributionResolved = false
+								return
+							end
+							if item.value == ADJUST_UNASSIGNED or item.value == nil then
+								adjustDraft.attributed = ADJUST_UNASSIGNED
+								adjustDraft.attributionText = ""
+								adjustDraft.attributionResolved = true
 								return
 							end
 							if type(item.value) == "string" and item.value ~= "" then
 								adjustDraft.attributed = item.value
+								adjustDraft.attributionText = item.text or item.label or item.value
+								adjustDraft.attributionResolved = true
 								return
 							end
 							SetAdjustAttributionFromText(item.text or item.label or "")
@@ -1618,6 +1663,10 @@ local function Definition()
 								return Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
 									"Select a requested campaign item before applying an adjustment.")
 							end
+							if AdjustAttributionIsUnresolved() then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_ATTR",
+									"Select Unassigned or a guild character from the suggestions. Typed search text is not credited until you select a match.")
+							end
 							if not AdjustQuantityValid(adjustDraft.quantityText or "") then
 								return Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
 									"Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign.")
@@ -1653,6 +1702,13 @@ local function Definition()
 								ctx.section:SetMessage(
 									Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
 										"Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign."),
+									"error")
+								return
+							end
+							if AdjustAttributionIsUnresolved() then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_ATTR",
+										"Select Unassigned or a guild character from the suggestions. Typed search text is not credited until you select a match."),
 									"error")
 								return
 							end

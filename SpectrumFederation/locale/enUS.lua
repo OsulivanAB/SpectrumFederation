@@ -250,6 +250,7 @@ L["GUILD_SUPPLIES_ERR_BANK_TAB"] = "Choose a Guild Bank tab from the list, or cl
 L["GUILD_SUPPLIES_ERR_ITEM"] = "Enter an item ID or paste an item link."
 L["GUILD_SUPPLIES_ERR_ADJUST_FORMAT"] = "Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign."
 L["GUILD_SUPPLIES_ERR_ADJUST_ITEM"] = "Select a requested campaign item before applying an adjustment."
+L["GUILD_SUPPLIES_ERR_ADJUST_ATTR"] = "Select Unassigned or a guild character from the suggestions. Typed search text is not credited until you select a match."
 L["GUILD_SUPPLIES_ERR_ITEM_EXISTS"] = "That item is already requested. Change its goal in the list instead of adding it again."
 L["GUILD_SUPPLIES_ERR_GOAL"] = "Enter a non-negative whole-number goal."
 L["GUILD_SUPPLIES_ERR_GOAL_RANGE"] = "Enter a whole-number goal from 0 to %d."

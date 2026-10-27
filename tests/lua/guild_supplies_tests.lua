@@ -40221,7 +40221,7 @@ do
     local pageDef = panel.__sfPageDef
     assertTrue(type(pageDef) == "table", "430-ui: page definition stored")
 
-    local attrSuggest, attrResolved, attrTextChanged, attrGet
+    local attrSuggest, attrResolved, attrTextChanged, attrGet, attrSet
     local qtyEnabled, qtyButtonEnabled, qtyOnTextChanged, qtyOnSubmit, qtyGet
     local itemOnChanged
     for _, sec in ipairs(pageDef.sections or {}) do
@@ -40232,6 +40232,7 @@ do
                     attrResolved = item.onResolved
                     attrTextChanged = item.onTextChanged
                     attrGet = item.get
+                    attrSet = item.set
                 elseif item.type == "editboxButton"
                     and item.label
                     and tostring(item.label):find("Quantity", 1, true) then
@@ -40285,9 +40286,12 @@ do
     assertEq(attrGet(), "ZedLast-Garona", "430-ui: selection survives roster reorder")
 
     -- Select item so quantity row enables; Apply tracks validity live.
+    local sectionMessages = {}
     local section = {
         ClearMessage = function() end,
-        SetMessage = function() end,
+        SetMessage = function(_, msg, sev)
+            sectionMessages[#sectionMessages + 1] = { msg = msg, sev = sev }
+        end,
     }
     local ctx = { section = section, pageBuilder = panel.__sfPageBuilder }
     assertTrue(type(itemOnChanged) == "function", "430-ui: item onValueChanged")
@@ -40305,6 +40309,159 @@ do
     assertEq(qtyButtonEnabled("10"), true, "430-ui: Apply enabled for valid 10")
     qtyOnTextChanged("-10")
     assertEq(qtyButtonEnabled("-10"), true, "430-ui: Apply enabled for valid -10")
+
+    -- #430 unresolved search text must not become a credited character.
+    -- Exercise production AddAutocomplete OnTextChanged + page submit callbacks.
+    local attrSection = {
+        __sfPageBuilder = {
+            _refresh = {},
+            RegisterRefresh = function(self, fn)
+                self._refresh[#self._refresh + 1] = fn
+            end,
+            FireRefresh = function(self)
+                for i = 1, #self._refresh do self._refresh[i]() end
+            end,
+        },
+        AddRow = function(self, _, builder)
+            local row = makeRegion("Frame", "AttrRow", nil)
+            builder(row)
+            return row
+        end,
+    }
+    local attrCreatedBefore = #created
+    SF.SettingsUI.Controls:AddAutocomplete(attrSection, {
+        label = "Attribution",
+        get = attrGet,
+        set = attrSet,
+        getSuggestions = function(prefix)
+            return attrSuggest(nil, prefix)
+        end,
+        onResolved = function(item)
+            attrResolved(nil, item)
+        end,
+        onTextChanged = function(text)
+            attrTextChanged(nil, text)
+        end,
+        maxSuggestions = 8,
+    })
+    local attrEdit
+    for i = attrCreatedBefore + 1, #created do
+        local obj = created[i]
+        if obj.GetObjectType and obj:GetObjectType() == "EditBox" and not attrEdit then
+            attrEdit = obj
+        end
+    end
+    assertTrue(attrEdit ~= nil, "430-ui: attribution autocomplete edit created")
+    local beforeProgress = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    local beforeTotal = tonumber(beforeProgress.itemTotals[9503]) or 0
+    local beforeZed = 0
+    if beforeProgress.contributions and beforeProgress.contributions["Zed-Garona"] then
+        beforeZed = tonumber(beforeProgress.contributions["Zed-Garona"][9503]) or 0
+    end
+    local beforeZedLast = 0
+    if beforeProgress.contributions and beforeProgress.contributions["ZedLast-Garona"] then
+        beforeZedLast = tonumber(beforeProgress.contributions["ZedLast-Garona"][9503]) or 0
+    end
+    local confirmCallsPartial = 0
+    local priorConfirmPartial = SF.SettingsUI.Dialogs and SF.SettingsUI.Dialogs.Confirm
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.Confirm = function()
+        confirmCallsPartial = confirmCallsPartial + 1
+    end
+    sectionMessages = {}
+    attrEdit:TypeText("Zed")
+    assertEq(attrGet(), "Zed", "430-ui: partial search draft retained")
+    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete edit shows partial search")
+    local partialSuggestions = attrSuggest(nil, "Zed")
+    local phantomPrefix = false
+    local foundZedLastPartial = false
+    for i = 1, #(partialSuggestions or {}) do
+        local value = partialSuggestions[i].value
+        if value == "Zed" or value == "Zed-Garona" then
+            phantomPrefix = true
+        end
+        if value == "ZedLast-Garona" then
+            foundZedLastPartial = true
+        end
+    end
+    assertEq(phantomPrefix, false, "430-ui: unmatched prefix is not a suggestion")
+    assertEq(foundZedLastPartial, true, "430-ui: real ZedLast still suggested for prefix")
+    qtyOnTextChanged("8")
+    assertEq(qtyButtonEnabled("8"), false, "430-ui: Apply disabled for unresolved attribution")
+    -- Blur/refresh must keep the unresolved search draft without crediting it.
+    if attrEdit.GetScript and attrEdit:GetScript("OnEditFocusLost") then
+        attrEdit:GetScript("OnEditFocusLost")(attrEdit)
+    end
+    attrSection.__sfPageBuilder:FireRefresh()
+    assertEq(attrGet(), "Zed", "430-ui: unresolved search survives refresh")
+    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete refresh keeps unresolved text")
+    qtyOnSubmit(ctx, "8")
+    assertEq(confirmCallsPartial, 0, "430-ui: unresolved attribution blocks confirm")
+    assertTrue(#sectionMessages >= 1 and sectionMessages[#sectionMessages].sev == "error",
+        "430-ui: unresolved attribution shows localized error")
+    assertTrue(tostring(sectionMessages[#sectionMessages].msg):find("Select Unassigned", 1, true)
+        or tostring(sectionMessages[#sectionMessages].msg):find("suggestions", 1, true),
+        "430-ui: unresolved attribution error explains selection requirement")
+    local afterPartial = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    assertEq(tonumber(afterPartial.itemTotals[9503]) or 0, beforeTotal,
+        "430-ui: unresolved submit creates no item total change")
+    local afterZed = 0
+    if afterPartial.contributions and afterPartial.contributions["Zed-Garona"] then
+        afterZed = tonumber(afterPartial.contributions["Zed-Garona"][9503]) or 0
+    end
+    assertEq(afterZed, beforeZed, "430-ui: unresolved submit creates no Zed-Garona phantom credit")
+    -- Explicit selection beyond row 256 credits the exact character.
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona", label = "ZedLast-Garona" })
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: selecting ZedLast resolves attribution")
+    assertEq(qtyButtonEnabled("8"), true, "430-ui: Apply enables after resolved attribution")
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        confirmCallsPartial = confirmCallsPartial + 1
+        if type(accept) == "function" then accept() end
+    end
+    qtyOnSubmit(ctx, "8")
+    assertTrue(confirmCallsPartial >= 1, "430-ui: resolved attribution reaches confirm/apply")
+    local afterSelect = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    assertEq(tonumber(afterSelect.itemTotals[9503]) or 0, beforeTotal + 8,
+        "430-ui: resolved ZedLast adjustment applied to item total")
+    local afterZedLast = 0
+    if afterSelect.contributions and afterSelect.contributions["ZedLast-Garona"] then
+        afterZedLast = tonumber(afterSelect.contributions["ZedLast-Garona"][9503]) or 0
+    end
+    assertEq(afterZedLast, beforeZedLast + 8,
+        "430-ui: resolved credit is exact ZedLast-Garona")
+    local afterZed2 = 0
+    if afterSelect.contributions and afterSelect.contributions["Zed-Garona"] then
+        afterZed2 = tonumber(afterSelect.contributions["Zed-Garona"][9503]) or 0
+    end
+    assertEq(afterZed2, beforeZed, "430-ui: still no Zed-Garona phantom after real select")
+    -- Clearing restores Unassigned; exact typed match also resolves without a click.
+    attrTextChanged(nil, "")
+    assertEq(attrGet(), "", "430-ui: clear restores Unassigned display")
+    assertEq(qtyButtonEnabled("1"), true, "430-ui: Unassigned allows Apply with valid qty")
+    attrTextChanged(nil, "ZedLast-Garona")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: exact typed name resolves without click")
+    assertEq(qtyButtonEnabled("1"), true, "430-ui: exact resolve enables Apply")
+    -- Temporary roster lag keeps a previously resolved selection.
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona" })
+    local savedMembers = world.guild.members
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+    }
+    fireEvent("GUILD_ROSTER_UPDATE")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved selection survives roster lag")
+    local lagSuggestions = attrSuggest(nil, "Zed")
+    local lagHasResolved = false
+    for i = 1, #(lagSuggestions or {}) do
+        if lagSuggestions[i].value == "ZedLast-Garona" then
+            lagHasResolved = true
+        end
+    end
+    assertEq(lagHasResolved, true, "430-ui: lag suggestions keep resolved credit")
+    world.guild.members = savedMembers
+    fireEvent("GUILD_ROSTER_UPDATE")
+    SF.SettingsUI.Dialogs.Confirm = priorConfirmPartial
+    qtyOnTextChanged("10")
 
     -- Production editboxButton: edit stays enabled while Apply toggles.
     local btnSection = {
