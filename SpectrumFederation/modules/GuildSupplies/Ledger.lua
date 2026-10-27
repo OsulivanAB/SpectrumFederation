@@ -3598,13 +3598,17 @@ local function CurrentItemGoal(record, itemId)
     return goal
 end
 
---- Floor and positive-goal ceiling against accepted authoritative projection.
--- Positive manual adjustments may not exceed the configured goal (including a
--- zero goal, which blocks all positive adjustments). Negative corrections of an
--- already over-goal total remain allowed subject to existing floors.
+--- Floor (and optional positive-goal ceiling) against accepted projection.
+-- Negative corrections of an already over-goal total remain allowed subject to
+-- existing floors. The goal ceiling is opt-in via opts.enforceGoalCeiling and is
+-- intended for new local preparation/commit only. Authenticated remote replay of
+-- previously accepted adjustments must not pass that flag: a peer that receives
+-- a later donation or lowered goal before the earlier adjustment would otherwise
+-- diverge permanently (#426 / #430).
 -- @param campaignId optional; defaults to record.currentCampaignId. Callers that
 --   cannot prove historical campaign provenance should reject before calling.
-function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId)
+-- @param opts optional { enforceGoalCeiling = boolean }
+function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, opts)
     itemId = tonumber(itemId)
     quantity = tonumber(quantity)
     if not IsItemId(itemId) then
@@ -3642,13 +3646,8 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId)
     if attributed and ActorItemTotal(record, attributed, itemId, campaignId) + quantity < 0 then
         return false, "player_negative"
     end
-    -- Goal ceiling applies only to positive changes against a currently
-    -- configured requested item. Over-goal totals may still be reduced without
-    -- requiring the result to land at or below the goal. When the item is no
-    -- longer requested, skip the ceiling so authenticated remote catch-up of
-    -- already-authored history is not blocked; local prep/commit membership
-    -- checks reject new adjustments for removed items (#426).
-    if quantity > 0 then
+    opts = opts or {}
+    if opts.enforceGoalCeiling and quantity > 0 then
         local goal = CurrentItemGoal(record, itemId)
         if goal ~= nil and nextItem > goal then
             return false, "item_over_goal"
@@ -3666,7 +3665,8 @@ function GS:PreviewAdjustment(itemId, quantity, attributed)
     if not GS.IsCurrentRequestedItem(record, itemId) then
         return nil, "item_not_requested"
     end
-    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(record, itemId, quantity, attributed)
+    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
+        record, itemId, quantity, attributed, nil, { enforceGoalCeiling = true })
     if not floorOk then
         return nil, floorErr
     end
@@ -3925,13 +3925,18 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
     -- removed while confirmation is open cannot apply. Remote admission of
     -- already-authored ops must not fail solely because the item was later
     -- removed (#426 / historical catch-up).
-    if opts.localProductionAuthority or opts.localWrite then
+    local isLocalCommit = opts.localProductionAuthority or opts.localWrite
+    if isLocalCommit then
         if not GS.IsCurrentRequestedItem(record, itemId) then
             return false, "item_not_requested"
         end
     end
+    -- Goal ceiling is local-authoring only. Remote/authenticated catch-up keeps
+    -- floors and campaign checks without replaying the authoring-time ceiling
+    -- against a peer's later donation or goal state (#430).
     local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
-        record, itemId, quantity, attributed, record.currentCampaignId)
+        record, itemId, quantity, attributed, record.currentCampaignId,
+        isLocalCommit and { enforceGoalCeiling = true } or nil)
     if not floorOk then
         return false, floorErr or "adjustment_floor"
     end

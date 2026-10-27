@@ -996,6 +996,30 @@ function Controls:AddEditBoxWithButton(section, opts)
 			end
 		end
 
+		local function SyncButtonEnabled(text)
+			-- Row-level enabled still gates the edit box. Optional buttonEnabled
+			-- lets Apply stay disabled for invalid text while the input remains
+			-- editable (#426 / #430).
+			local _, rowEnabled = self:_ApplyRowState(row, section, opts, { edit })
+			local buttonOk = rowEnabled and true or false
+			if buttonOk and type(opts.buttonEnabled) == "function" then
+				buttonOk = opts.buttonEnabled(text or (edit:GetText() or "")) and true or false
+			end
+			if btn.SetEnabled then
+				btn:SetEnabled(buttonOk)
+			elseif buttonOk and btn.Enable then
+				btn:Enable()
+			elseif (not buttonOk) and btn.Disable then
+				btn:Disable()
+			end
+			btn:SetAlpha(buttonOk and 1 or 0.45)
+			-- Disabled-tip overlay follows the Apply button when present.
+			SyncDisabledTooltipOverlay(btn, buttonOk, opts)
+			local c = rowEnabled and 1 or 0.6
+			edit:SetTextColor(c, c, c)
+			return rowEnabled, buttonOk
+		end
+
 		btn:SetScript("OnClick", DoSubmit)
 		edit:SetScript("OnEnterPressed", function(selfEdit)
 			-- Prefer explicit submit handlers over silent set() commits.
@@ -1011,6 +1035,18 @@ function Controls:AddEditBoxWithButton(section, opts)
 		edit:SetScript("OnEditFocusLost", function()
 			if bound and not opts.onSubmit then
 				Commit()
+			end
+		end)
+		edit:SetScript("OnTextChanged", function(selfEdit, userInput)
+			if ignore then
+				return
+			end
+			local text = selfEdit:GetText() or ""
+			if userInput and type(opts.onTextChanged) == "function" then
+				opts.onTextChanged(text, selfEdit, btn)
+			end
+			if type(opts.buttonEnabled) == "function" then
+				SyncButtonEnabled(text)
 			end
 		end)
 
@@ -1042,9 +1078,13 @@ function Controls:AddEditBoxWithButton(section, opts)
 				end
 			end
 
-			local _, enabled = self:_ApplyRowState(row, section, opts, {edit, btn})
-			local c = enabled and 1 or 0.6
-			edit:SetTextColor(c, c, c)
+			if type(opts.buttonEnabled) == "function" then
+				SyncButtonEnabled(edit:GetText() or "")
+			else
+				local _, enabled = self:_ApplyRowState(row, section, opts, {edit, btn})
+				local c = enabled and 1 or 0.6
+				edit:SetTextColor(c, c, c)
+			end
 		end
 		Refresh()
 		RegisterRefresh(section, Refresh)
@@ -3345,8 +3385,12 @@ function Controls:AddAutocomplete(section, opts)
 		end
 
 		local drop = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
-		drop:SetFrameStrata("TOOLTIP")
-		drop:SetClampedToScreen(true)
+		if drop.SetFrameStrata then
+			drop:SetFrameStrata("TOOLTIP")
+		end
+		if drop.SetClampedToScreen then
+			drop:SetClampedToScreen(true)
+		end
 		drop:Hide()
 		if drop.SetBackdrop then
 			drop:SetBackdrop({

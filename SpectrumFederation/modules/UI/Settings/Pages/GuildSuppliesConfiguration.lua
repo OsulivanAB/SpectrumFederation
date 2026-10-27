@@ -424,21 +424,48 @@ local function AdjustItemDefaultText()
 	return Loc("GUILD_SUPPLIES_ADJUST_ITEM_DEFAULT", "Select a requested item")
 end
 
-local function AdjustAttributionOptions()
-	SyncAdjustDraftContext()
-	local options = {
-		{
-			value = ADJUST_UNASSIGNED,
-			label = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned"),
-		},
-	}
-	local seen = {}
+-- Session roster name cache for attribution autocomplete. Full scan once per
+-- guild/roster generation; getSuggestions filters the in-memory list only so
+-- keystrokes never rescan GetGuildRosterInfo (#430).
+local adjustRosterCache = {
+	guildKey = nil,
+	generation = nil,
+	names = {}, -- sorted normalized names
+	byLower = {}, -- lower(name) -> normalized name
+}
+
+local function AdjustRosterGeneration()
+	local GG = SF.GuildGossip
+	if GG and GG.GetGuildGeneration then
+		return tonumber(GG.GetGuildGeneration()) or 0
+	end
+	return 0
+end
+
+local function InvalidateAdjustRosterCache()
+	adjustRosterCache.guildKey = nil
+	adjustRosterCache.generation = nil
+	adjustRosterCache.names = {}
+	adjustRosterCache.byLower = {}
+end
+
+local function EnsureAdjustRosterCache()
+	local key = CurrentGuildKey() or "none"
+	local gen = AdjustRosterGeneration()
+	if adjustRosterCache.guildKey == key
+		and adjustRosterCache.generation == gen
+		and type(adjustRosterCache.names) == "table" then
+		return adjustRosterCache
+	end
 	local names = {}
-	local maxNames = 256
+	local byLower = {}
 	if type(GetNumGuildMembers) == "function" and type(GetGuildRosterInfo) == "function" then
-		local total = tonumber(GetNumGuildMembers()) or 0
-		if total > maxNames then
-			total = maxNames
+		-- GetNumGuildMembers returns several numbers. Keep only the first before
+		-- tonumber; passing the rest makes Lua treat the second value as a base.
+		local total = GetNumGuildMembers()
+		total = tonumber(total) or 0
+		if total < 0 then
+			total = 0
 		end
 		for i = 1, total do
 			local rosterName = GetGuildRosterInfo(i)
@@ -446,33 +473,106 @@ local function AdjustAttributionOptions()
 			if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
 				norm = SF.NameUtil.NormalizeNameRealm(rosterName) or rosterName
 			end
-			if type(norm) == "string" and norm ~= "" and not seen[norm] then
-				seen[norm] = true
-				names[#names + 1] = norm
+			if type(norm) == "string" and norm ~= "" then
+				local lower = string.lower(norm)
+				if not byLower[lower] then
+					byLower[lower] = norm
+					names[#names + 1] = norm
+				end
 			end
 		end
+		table.sort(names)
 	end
-	table.sort(names)
-	for i = 1, #names do
-		options[#options + 1] = { value = names[i], label = names[i] }
-	end
-	-- Keep a previously chosen credit visible even if the roster briefly lags.
-	if type(adjustDraft.attributed) == "string" and adjustDraft.attributed ~= ""
-		and not seen[adjustDraft.attributed] then
-		options[#options + 1] = {
-			value = adjustDraft.attributed,
-			label = adjustDraft.attributed,
-		}
-	end
-	return options
+	adjustRosterCache.guildKey = key
+	adjustRosterCache.generation = gen
+	adjustRosterCache.names = names
+	adjustRosterCache.byLower = byLower
+	return adjustRosterCache
 end
 
-local function AdjustAttributionDefaultText()
+local function AdjustAttributionText()
 	SyncAdjustDraftContext()
 	if type(adjustDraft.attributed) == "string" and adjustDraft.attributed ~= "" then
 		return adjustDraft.attributed
 	end
-	return Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	return ""
+end
+
+local function AdjustAttributionSuggestions(prefix)
+	SyncAdjustDraftContext()
+	local cache = EnsureAdjustRosterCache()
+	local raw = tostring(prefix or "")
+	local needle = string.lower((raw:match("^%s*(.-)%s*$") or ""))
+	local out = {}
+	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local maxSuggestions = 8
+	-- Empty / Unassigned prefix keeps Unassigned selectable as the default.
+	if needle == "" or string.find(string.lower(unassignedLabel), needle, 1, true) == 1 then
+		out[#out + 1] = {
+			value = ADJUST_UNASSIGNED,
+			label = unassignedLabel,
+			text = "",
+		}
+	end
+	local names = cache.names or {}
+	for i = 1, #names do
+		if #out >= maxSuggestions then
+			break
+		end
+		local name = names[i]
+		local lower = string.lower(name)
+		if needle == "" or string.find(lower, needle, 1, true) == 1 then
+			out[#out + 1] = {
+				value = name,
+				label = name,
+				text = name,
+			}
+		end
+	end
+	-- Keep a previously chosen credit visible even if the roster briefly lags.
+	if type(adjustDraft.attributed) == "string" and adjustDraft.attributed ~= "" then
+		local lowerSel = string.lower(adjustDraft.attributed)
+		if not cache.byLower[lowerSel]
+			and (needle == "" or string.find(lowerSel, needle, 1, true) == 1) then
+			local exists = false
+			for i = 1, #out do
+				if out[i].value == adjustDraft.attributed then
+					exists = true
+					break
+				end
+			end
+			if not exists and #out < maxSuggestions then
+				out[#out + 1] = {
+					value = adjustDraft.attributed,
+					label = adjustDraft.attributed,
+					text = adjustDraft.attributed,
+				}
+			end
+		end
+	end
+	return out
+end
+
+local function SetAdjustAttributionFromText(text)
+	SyncAdjustDraftContext()
+	local trimmed = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+	if trimmed == "" then
+		adjustDraft.attributed = ADJUST_UNASSIGNED
+		return
+	end
+	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	if string.lower(trimmed) == string.lower(unassignedLabel) then
+		adjustDraft.attributed = ADJUST_UNASSIGNED
+		return
+	end
+	local cache = EnsureAdjustRosterCache()
+	local exact = cache.byLower[string.lower(trimmed)]
+	if exact then
+		adjustDraft.attributed = exact
+		return
+	end
+	-- Preserve typed draft while unresolved; commit path NormName validates.
+	adjustDraft.attributed = trimmed
 end
 
 local function AdjustCanEdit()
@@ -482,6 +582,24 @@ end
 
 local function AdjustHasRequestedItems()
 	return #AdjustItemOptions() > 0
+end
+
+local function AdjustQuantityValid(text)
+	local g = GS()
+	if not g or not g.ParseAdjustmentQuantity then
+		return false
+	end
+	return g.ParseAdjustmentQuantity(text or "") ~= nil
+end
+
+local function AdjustApplyButtonEnabled(text)
+	if not AdjustCanEdit() or not AdjustHasRequestedItems() then
+		return false
+	end
+	if adjustDraft.itemId == nil then
+		return false
+	end
+	return AdjustQuantityValid(text or adjustDraft.quantityText or "")
 end
 
 --- Compact Configuration status area: status / campaign / next step / warnings.
@@ -1421,17 +1539,14 @@ local function Definition()
 						end,
 					},
 					{
-						type = "dropdown",
+						type = "autocomplete",
 						label = Loc("GUILD_SUPPLIES_ADJUST_ATTR", "Attribution"),
 						adminOnly = true,
 						width = 220,
-						defaultText = AdjustAttributionDefaultText,
-						options = AdjustAttributionOptions,
-						get = function()
-							SyncAdjustDraftContext()
-							return adjustDraft.attributed
-						end,
-						set = function() end,
+						maxLetters = 96,
+						maxSuggestions = 8,
+						hint = Loc("GUILD_SUPPLIES_ADJUST_ATTR_HINT",
+							"Unassigned (type a guild character to credit)"),
 						enabled = function()
 							return AdjustCanEdit() and AdjustHasRequestedItems()
 						end,
@@ -1439,13 +1554,27 @@ local function Definition()
 							return DisabledNeedCampaignTip(
 								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
 						end,
-						onValueChanged = function(_, value)
+						get = AdjustAttributionText,
+						set = function(v)
+							SetAdjustAttributionFromText(v)
+						end,
+						getSuggestions = function(_, prefix)
+							return AdjustAttributionSuggestions(prefix)
+						end,
+						onResolved = function(_, item)
 							SyncAdjustDraftContext()
-							if value == ADJUST_UNASSIGNED or value == nil then
+							if not item or item.value == ADJUST_UNASSIGNED or item.value == nil then
 								adjustDraft.attributed = ADJUST_UNASSIGNED
-							elseif type(value) == "string" and value ~= "" then
-								adjustDraft.attributed = value
+								return
 							end
+							if type(item.value) == "string" and item.value ~= "" then
+								adjustDraft.attributed = item.value
+								return
+							end
+							SetAdjustAttributionFromText(item.text or item.label or "")
+						end,
+						onTextChanged = function(_, text)
+							SetAdjustAttributionFromText(text)
 						end,
 					},
 					{
@@ -1466,9 +1595,14 @@ local function Definition()
 							return AdjustDraftContextKey()
 						end,
 						enabled = function()
+							-- Keep the quantity input editable once an item is
+							-- selected; Apply uses buttonEnabled independently.
 							return AdjustCanEdit()
 								and AdjustHasRequestedItems()
 								and adjustDraft.itemId ~= nil
+						end,
+						buttonEnabled = function(text)
+							return AdjustApplyButtonEnabled(text)
 						end,
 						getDisabledTooltip = function()
 							local tip = DisabledNeedCampaignTip(
@@ -1484,7 +1618,15 @@ local function Definition()
 								return Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
 									"Select a requested campaign item before applying an adjustment.")
 							end
+							if not AdjustQuantityValid(adjustDraft.quantityText or "") then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
+									"Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign.")
+							end
 							return nil
+						end,
+						onTextChanged = function(text)
+							SyncAdjustDraftContext()
+							adjustDraft.quantityText = tostring(text or "")
 						end,
 						onSubmit = function(ctx, text)
 							SyncAdjustDraftContext()
@@ -1736,6 +1878,7 @@ local function QueueRefresh()
 		if guildBankOpen then
 			ObserveGuildBankTabs()
 		end
+		-- Roster cache rebuilds lazily on next attribution suggestion request.
 		Page:Refresh(Page.panel)
 	end
 	if C_Timer and C_Timer.After then
@@ -1767,6 +1910,7 @@ local function EnsureRosterListener()
 	end
 	frame:SetScript("OnEvent", function()
 		SyncBankTabCatalogGuild()
+		InvalidateAdjustRosterCache()
 		QueueRefresh()
 	end)
 end

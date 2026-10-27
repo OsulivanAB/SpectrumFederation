@@ -868,8 +868,10 @@ function GS:NewConfigOperation(kind, target, value)
         end
         local floorOk, floorErr, normAttr = true, nil, value.attributed
         if GS.AdjustmentFloorOk then
+            -- New local operation preparation enforces the goal ceiling.
             floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
-                record, canon.itemId, value.quantity, value.attributed)
+                record, canon.itemId, value.quantity, value.attributed, nil,
+                { enforceGoalCeiling = true })
             if not floorOk then
                 return nil, "rejected", floorErr or "adjustment_floor"
             end
