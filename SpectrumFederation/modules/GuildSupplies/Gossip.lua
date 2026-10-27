@@ -3189,6 +3189,23 @@ end
 -- relationships become ready or change. No polling.
 local guildInfoListenerRegistered = false
 local guildInfoReevalBusy = false
+local guildInfoInitHooked = false
+-- Skip full pending scans while GI is incomplete; one reevaluation runs when
+-- readiness becomes true (init, seal, or a later ready notification).
+local guildInfoLastReady = nil
+
+local function PublishGuildInfoReevaluate(reason, verified)
+    verified = tonumber(verified) or 0
+    if verified > 0 then
+        if GS.NotifyLocalDurableChange then
+            GS.NotifyLocalDurableChange("ledger")
+        elseif GS.NotifyUI then
+            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+        end
+    elseif GS.NotifyUI then
+        GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+    end
+end
 
 local function OnGuildInfoDurableChange(reason)
     if guildInfoReevalBusy then
@@ -3196,23 +3213,33 @@ local function OnGuildInfoDurableChange(reason)
     end
     guildInfoReevalBusy = true
     local ok, err = pcall(function()
-        local verified = 0
         local record = select(1, GS:GetCurrentRecord())
+        local ready = false
+        if type(record) == "table" and GS.WitnessRelationshipsReady then
+            ready = GS.WitnessRelationshipsReady(record) and true or false
+        elseif SF.GuildInfo and SF.GuildInfo.GetRelationshipReadiness then
+            ready = SF.GuildInfo:GetRelationshipReadiness() == "ready"
+        end
+        local becameReady = ready and guildInfoLastReady ~= true
+        guildInfoLastReady = ready and true or false
+
+        -- Incomplete / synchronizing baselines cannot form independent witness
+        -- quorum; skip the full pending scan until readiness flips to ready.
+        if not ready then
+            if GS.NotifyUI then
+                GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+            end
+            return
+        end
+
+        local verified = 0
         if type(record) == "table" and GS.ReevaluatePendingEvidence then
             verified = tonumber(GS.ReevaluatePendingEvidence(record)) or 0
         end
         -- Newly accepted donations must enter the existing ledger export path so
         -- peers can catch up. Skip durable publish when reevaluation was a no-op
         -- (UI refresh only). Busy flag above prevents recursive reentry.
-        if verified > 0 then
-            if GS.NotifyLocalDurableChange then
-                GS.NotifyLocalDurableChange("ledger")
-            elseif GS.NotifyUI then
-                GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
-            end
-        elseif GS.NotifyUI then
-            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
-        end
+        PublishGuildInfoReevaluate(becameReady and "gi-ready" or reason, verified)
     end)
     guildInfoReevalBusy = false
     if not ok and DebugWarn then
@@ -3220,16 +3247,68 @@ local function OnGuildInfoDurableChange(reason)
     end
 end
 
-function GS.EnsureGuildInfoBridge()
-    if guildInfoListenerRegistered then
-        return true
+--- One bounded reevaluation when Guild Info is already ready (startup/reload).
+-- Safe to call repeatedly; no-ops while busy, unavailable, or incomplete.
+function GS.MaybeReevaluatePendingAfterGuildInfoReady(reason)
+    local GI = SF.GuildInfo
+    if not GI then
+        return false, "guildinfo_unavailable"
     end
+    local ready = false
+    if GS.WitnessRelationshipsReady then
+        local record = select(1, GS:GetCurrentRecord())
+        if type(record) == "table" then
+            ready = GS.WitnessRelationshipsReady(record) and true or false
+        end
+    end
+    if not ready and type(GI.GetRelationshipReadiness) == "function" then
+        ready = GI:GetRelationshipReadiness() == "ready"
+    end
+    if not ready then
+        guildInfoLastReady = false
+        return false, "not_ready"
+    end
+    OnGuildInfoDurableChange(reason or "gi-ready")
+    return true
+end
+
+local function HookGuildInfoInitialize()
+    if guildInfoInitHooked then
+        return
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.Initialize) ~= "function" then
+        return
+    end
+    local previous = GI.Initialize
+    function GI:Initialize(db)
+        local ok, reason = previous(self, db)
+        -- GS initializes before GI in SpectrumFederation.lua; GI:Initialize does
+        -- not emit NotifyUI. Run one bounded pending reevaluation once the
+        -- persisted baseline is ready so reload/upgrade can credit saved quorum.
+        if ok and GS.MaybeReevaluatePendingAfterGuildInfoReady then
+            GS.MaybeReevaluatePendingAfterGuildInfoReady("gi-init")
+        end
+        return ok, reason
+    end
+    guildInfoInitHooked = true
+end
+
+function GS.EnsureGuildInfoBridge()
     local GI = SF.GuildInfo
     if not GI or type(GI.RegisterUIListener) ~= "function" then
         return false, "guildinfo_unavailable"
     end
-    GI.RegisterUIListener(OnGuildInfoDurableChange)
-    guildInfoListenerRegistered = true
+    HookGuildInfoInitialize()
+    local firstRegistration = not guildInfoListenerRegistered
+    if firstRegistration then
+        GI.RegisterUIListener(OnGuildInfoDurableChange)
+        guildInfoListenerRegistered = true
+        -- Catch up when GI already finished Initialize before the bridge existed
+        -- (tests / late provider registration). Normal addon order relies on the
+        -- GI.Initialize hook above instead.
+        GS.MaybeReevaluatePendingAfterGuildInfoReady("bridge-ready")
+    end
     return true
 end
 

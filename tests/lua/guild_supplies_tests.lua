@@ -41083,6 +41083,194 @@ do
         "427-r4: regrouped under Dave")
 end
 
+---------------------------------------------------------------------------
+-- #427 repair batch 2: init reeval / sync coalesce / GUID reconcile / mismatch
+---------------------------------------------------------------------------
+
+do
+    -- Repair-5: saved pending quorum is reevaluated when GI initializes ready.
+    local record = seedStagedCampaignWithItem(42721, 40)
+    ensureNonOfficerRoster()
+    GS:EnsureGossipProvider()
+    assertTrue(GS.EnsureGuildInfoBridge(), "427-r5: bridge")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = false
+    local evidence = makeDepositEvidence(record, { itemId = 42721, quantity = 5 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-r5: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-r5: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r5: w3 pending while incomplete")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42721]) or 0,
+        0, "427-r5: uncredited before init")
+
+    -- Persist ready baseline in SV without NotifyUI (reload gap before GI init).
+    giRec.baseline.complete = true
+    local ledgerNotifies = 0
+    local prevNotify = GS.NotifyLocalDurableChange
+    GS.NotifyLocalDurableChange = function(reason)
+        if reason == "ledger" then
+            ledgerNotifies = ledgerNotifies + 1
+        end
+        if prevNotify then
+            return prevNotify(reason)
+        end
+    end
+    -- Production order: GS already initialized; GI:Initialize alone must credit.
+    assertTrue(select(1, GI:Initialize(SpectrumFederationDB)), "427-r5: gi init")
+    drainExportMaint(32)
+    GS.NotifyLocalDurableChange = prevNotify
+
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42721]) or 0,
+        5, "427-r5: credited after GI init")
+    assertTrue(ledgerNotifies >= 1, "427-r5: durable ledger publish after init")
+end
+
+do
+    -- Repair-6: incomplete GI sync does not reevaluate pending on every remote notify.
+    local record = seedStagedCampaignWithItem(42722, 40)
+    ensureNonOfficerRoster()
+    GS:EnsureGossipProvider()
+    assertTrue(GS.EnsureGuildInfoBridge(), "427-r6: bridge")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = false
+    local evidence = makeDepositEvidence(record, { itemId = 42722, quantity = 4 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-r6: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-r6: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r6: w3 still pending while incomplete")
+
+    local reevalCalls = 0
+    local prevReeval = GS.ReevaluatePendingEvidence
+    GS.ReevaluatePendingEvidence = function(rec)
+        reevalCalls = reevalCalls + 1
+        return prevReeval(rec)
+    end
+    for i = 1, 24 do
+        GI.NotifyUI("remote-" .. tostring(i))
+    end
+    assertEq(reevalCalls, 0, "427-r6: no pending reeval while incomplete")
+
+    giRec.baseline.complete = true
+    GI.NotifyUI("remote-complete")
+    local afterReady = reevalCalls
+    GS.ReevaluatePendingEvidence = prevReeval
+    assertTrue(afterReady >= 1, "427-r6: reeval once when ready got=" .. tostring(afterReady))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42722]) or 0,
+        4, "427-r6: converges after completion")
+end
+
+do
+    -- Repair-7: op-first adjustment later enriched with ledger attributedGuid.
+    local record = seedStagedCampaignWithItem(42723, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42723, quantity = 12, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r7: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r7: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r7: w3")
+    local adjOp = select(1, GS:NewAdjustmentOperation(42723, -2, "Dave-Garona"))
+    assertTrue(adjOp ~= nil, "427-r7: adjust prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "427-r7: op-first")
+    local stored = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and (ev.id == adjOp.id or ev.opId == adjOp.id) then
+            stored = ev
+            break
+        end
+    end
+    assertTrue(stored ~= nil, "427-r7: adjustment row present")
+    -- Simulate op-first row authored while GUID could not be resolved.
+    stored.attributedGuid = nil
+    local stDup, rDup = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = adjOp.id,
+        txnId = "ctx:42723:ledger:1",
+        opId = adjOp.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42723,
+        quantity = -2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stDup, "duplicate", "427-r7: ledger after op is duplicate r=" .. tostring(rDup))
+    assertEq(stored.attributedGuid, "Player-1-Dave", "427-r7: attributedGuid enriched")
+    assertEq(stored.attributed, "Dave-Garona", "427-r7: attributed name unchanged")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42723]) or 0,
+        10, "427-r7: no duplicate quantity")
+end
+
+do
+    -- Repair-8: remote attributed name/GUID mismatch cannot bypass personal floor.
+    local record = seedStagedCampaignWithItem(42724, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42724, quantity = 10, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r8: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r8: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r8: w3")
+
+    local stBad, rBad = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "gs1:Player-1-Alice:deadbeef42724:1",
+        txnId = "gs1:Player-1-Alice:deadbeef42724:1",
+        opId = "gs1:Player-1-Alice:deadbeef42724:1",
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42724,
+        quantity = -10,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Eve",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stBad, "rejected", "427-r8: mismatched attribution rejected")
+    assertEq(rBad, "attribution_mismatch", "427-r8: mismatch reason")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42724]) or 0, 10, "427-r8: item total unchanged")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42724]) or 0, 0,
+        "427-r8: Eve not credited with Dave's floor")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42724]) or 0, 10,
+        "427-r8: Dave balance intact")
+end
+
 SF.TSM = nil
 world.impersonationActive = false
 setPlayer("Alice-Garona", "Player-1-Alice", 1)

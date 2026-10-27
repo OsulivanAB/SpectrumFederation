@@ -430,6 +430,41 @@ function GS.ResolveUniqueCharacterGuid(record, name, hintGuid)
     return nil
 end
 
+--- Canonical attributed identity for floor checks and durable storage.
+-- When both name and GUID are supplied and relationships are ready, they must
+-- resolve to the same character. Conflicting remote payloads are rejected so a
+-- floor cannot be checked for one identity while projection credits another.
+-- Unverified GUID claims while relationships are incomplete are dropped (name
+-- kept) rather than stored as authoritative.
+-- @return string|nil name, string|nil guid, string|nil err
+function GS.ResolveAttributedIdentity(record, attributedName, attributedGuid)
+    local name = NormName(attributedName)
+    local guid = ValidGuid(attributedGuid)
+    if not name then
+        if guid then
+            return nil, nil, "invalid_attribution"
+        end
+        return nil, nil, nil
+    end
+    if not guid then
+        return name, GS.ResolveUniqueCharacterGuid(record, name, nil), nil
+    end
+    local ready = GS.WitnessRelationshipsReady(record)
+    if not ready then
+        -- Cannot authenticate the name↔GUID binding yet; keep the durable name
+        -- and omit the GUID until a verified source supplies it under ready GI.
+        return name, nil, nil
+    end
+    local resolved = GS.ResolveUniqueCharacterGuid(record, name, nil)
+    if not resolved then
+        return nil, nil, "attribution_mismatch"
+    end
+    if resolved ~= guid then
+        return nil, nil, "attribution_mismatch"
+    end
+    return name, guid, nil
+end
+
 --- Resolve a ledger actor/attributed name (optional GUID) to the current
 -- contributor display identity. Never guesses from ambiguous names.
 -- Optional ctx from BeginContributorProjectionContext reuses readiness/mappings.
@@ -1687,6 +1722,35 @@ function GS.GetAccountingMutationSeq(record)
         return 0
     end
     return tonumber(record.accounting._mutationSeq) or 0
+end
+
+--- Enrich an op-first equivalent adjustment with a later ledger attributedGuid.
+-- Does not rewrite attributed name, quantity, or other immutable fields.
+local function ReconcileAdjustmentAttributedGuid(record, existing, incoming)
+    if type(existing) ~= "table" or type(incoming) ~= "table" then
+        return false
+    end
+    if ValidGuid(existing.attributedGuid) then
+        return false
+    end
+    local incomingGuid = ValidGuid(incoming.attributedGuid)
+    if not incomingGuid then
+        return false
+    end
+    local name = NormName(existing.attributed) or NormName(incoming.attributed)
+    local canonName, canonGuid, err = GS.ResolveAttributedIdentity(record, name, incomingGuid)
+    if err or not canonGuid then
+        return false
+    end
+    if canonName and existing.attributed and NormName(existing.attributed) ~= canonName then
+        return false
+    end
+    existing.attributedGuid = canonGuid
+    BumpAccountingMutation(record)
+    if GS._NotifyLocalDurableChange then
+        GS._NotifyLocalDurableChange("ledger")
+    end
+    return true
 end
 
 --- Attach authenticated active-exporter cutover provenance to an already-retained
@@ -3470,6 +3534,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                                     -- authenticated marked ledger body before duplicate.
                                     ReconcileAdjustmentCutoverProvenance(
                                         record, e, admissionCtx)
+                                    -- Same path: retain a validated attributedGuid from
+                                    -- the later ledger body without minting a second row.
+                                    ReconcileAdjustmentAttributedGuid(record, e, event)
                                     return "duplicate", "duplicate"
                                 end
                                 QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)
@@ -3798,7 +3865,11 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         end
         local eventGen = tonumber(event.generation)
         local curGen = tonumber(cfg.generation)
-        local attributed = NormName(event.attributed)
+        local attributed, attrGuid, attrErr = GS.ResolveAttributedIdentity(
+            record, event.attributed, event.attributedGuid)
+        if attrErr then
+            return "rejected", attrErr
+        end
         local qty = tonumber(event.quantity)
         local historicalAdoption = admissionCtx.adoptionReplay
             and admissionCtx.preserveAttribution
@@ -3821,8 +3892,10 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             if eventGen and curGen and eventGen ~= curGen then
                 return "rejected", "stale_generation"
             end
+            -- Floor and stored GUID share one authenticated attributed identity.
             local floorOk, floorErr = GS.AdjustmentFloorOk(
-                record, tonumber(event.itemId), qty, attributed, eventCampaign)
+                record, tonumber(event.itemId), qty, attributed, eventCampaign,
+                { attributedGuid = attrGuid })
             if not floorOk then
                 return "pending", floorErr or "adjustment_floor"
             end
@@ -3843,10 +3916,6 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             campaignId = eventCampaign,
             datasetId = record.datasetId,
         }
-        local attrGuid = ValidGuid(event.attributedGuid)
-        if not attrGuid and attributed then
-            attrGuid = GS.ResolveUniqueCharacterGuid(record, attributed, nil)
-        end
         if attrGuid then
             stored.attributedGuid = attrGuid
         end
@@ -4316,9 +4385,17 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
     -- Goal ceiling is local-authoring only. Remote/authenticated catch-up keeps
     -- floors and campaign checks without replaying the authoring-time ceiling
     -- against a peer's later donation or goal state (#430).
-    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
-        record, itemId, quantity, attributed, record.currentCampaignId,
-        isLocalCommit and { enforceGoalCeiling = true } or nil)
+    local normAttr, attrGuid, attrErr = GS.ResolveAttributedIdentity(
+        record, attributed, op.value and op.value.attributedGuid)
+    if attrErr then
+        return false, attrErr
+    end
+    local floorOpts = { attributedGuid = attrGuid }
+    if isLocalCommit then
+        floorOpts.enforceGoalCeiling = true
+    end
+    local floorOk, floorErr = GS.AdjustmentFloorOk(
+        record, itemId, quantity, normAttr, record.currentCampaignId, floorOpts)
     if not floorOk then
         return false, floorErr or "adjustment_floor"
     end
@@ -4337,11 +4414,8 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
         datasetId = record.datasetId,
         opId = op.id,
     }
-    if normAttr then
-        local attrGuid = GS.ResolveUniqueCharacterGuid(record, normAttr, nil)
-        if attrGuid then
-            event.attributedGuid = attrGuid
-        end
+    if attrGuid then
+        event.attributedGuid = attrGuid
     end
     -- Only the local authenticated editor path may mint live cutover provenance
     -- when this client is already active. Remote gs-op admission stays unmarked
