@@ -27219,54 +27219,32 @@ do
 end
 
 do
-    -- C2/C3) Adjustment format locale + unlink disabled action string.
+    -- C2/C3) Adjustment format locale + unlink disabled action string (#426 UI).
     resetDb()
     initGS()
     setPlayer("Bob-Garona", "Player-1-Bob", 5) -- unauthorized
     world.guild.clubId = 42
     settleRoster()
-    -- Locale keys must ship accurate copy (not link-paste / linking).
-    local L = (SF.Locale and SF.Locale.GetDictionary and SF.Locale:GetDictionary())
-        or (_G.SpectrumFederationLocale)
-    if type(L) ~= "table" then
-        -- Fall back to raw enUS table loaded with the addon.
-        L = ns and ns.L
-    end
-    -- Production Loc path uses SF.LocaleText / enUS keys.
-    local adjKey = "GUILD_SUPPLIES_ERR_ADJUST_FORMAT"
-    local unlinkKey = "GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"
-    local adjMsg = SF.LocaleText and SF.LocaleText(adjKey)
-        or (SF.L and SF.L[adjKey])
-    local unlinkMsg = SF.LocaleText and SF.LocaleText(unlinkKey)
-        or (SF.L and SF.L[unlinkKey])
-    -- Read directly from locale module table when helpers differ in harness.
-    if (not adjMsg or adjMsg == adjKey) and type(_G) == "table" then
-        -- Loaded via locales in test harness as part of addon.
-        local en = nil
-        if SF.GetLocaleTable then en = SF.GetLocaleTable() end
-        if type(en) == "table" then
-            adjMsg = en[adjKey] or adjMsg
-            unlinkMsg = en[unlinkKey] or unlinkMsg
-        end
-    end
-    -- Source-backed assertion: enUS.lua must define both keys accurately.
+    -- Source-backed assertion: enUS.lua must define keys accurately.
     local enUS = io.open("SpectrumFederation/locale/enUS.lua", "r")
     assertTrue(enUS ~= nil, "C2/C3: enUS.lua readable")
     local enBody = enUS:read("*a")
     enUS:close()
     assertTrue(enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT', 1, true),
         "C2: adjust format locale key present")
-    assertTrue(enBody:find("item ID, a signed quantity", 1, true),
-        "C2: adjust format message states expected syntax")
-    assertTrue(not (enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT.-item link')),
-        "C2: adjust format must not suggest item links")
+    assertTrue(enBody:find("whole-number quantity such as 10 or -10", 1, true),
+        "C2: adjust format message states signed whole-number syntax")
+    assertTrue(enBody:find("leading plus", 1, true),
+        "C2: adjust format rejects leading plus")
+    assertTrue(enBody:find('GUILD_SUPPLIES_ADJUST_UNASSIGNED', 1, true),
+        "C2: Unassigned attribution locale present")
     assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK', 1, true),
         "C3: unlink action locale key present")
     assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"].-=.-"unlinking characters"', 1, true)
             or enBody:find('DISABLED_ACTION_UNLINK"] = "unlinking characters"', 1, true),
         "C3: unlink locale says unlinking characters")
 
-    -- UI definition uses the unlink-specific key.
+    -- UI definition uses separated controls + unlink-specific key.
     local confSrc = io.open(
         "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r")
     assertTrue(confSrc ~= nil, "C2/C3: configuration page readable")
@@ -27274,6 +27252,16 @@ do
     confSrc:close()
     assertTrue(confBody:find("GUILD_SUPPLIES_ERR_ADJUST_FORMAT", 1, true),
         "C2: adjustment onSubmit uses adjust-format locale")
+    assertTrue(confBody:find("ParseAdjustmentQuantity", 1, true),
+        "C2: adjustment UI uses strict quantity parser")
+    assertTrue(confBody:find("FormatAdjustmentConfirmation", 1, true),
+        "C2: adjustment UI uses confirmation helper")
+    assertTrue(confBody:find("GUILD_SUPPLIES_ADJUST_UNASSIGNED", 1, true),
+        "C2: adjustment UI defaults attribution to Unassigned")
+    assertTrue(confBody:find("adjustDraft", 1, true),
+        "C2: adjustment UI keeps a session draft")
+    assertTrue(not confBody:find("itemPart, qtyPart, attrPart", 1, true),
+        "C2: combined item/qty/attr text parser removed")
     assertTrue(confBody:find("GUILD_SUPPLIES_DISABLED_ACTION_UNLINK", 1, true),
         "C3: unlink disabled tip uses unlink action key")
 end
@@ -39636,6 +39624,198 @@ do
     assertEq(record.campaignNames[campId].name, nil, "424-adopt-tie: cleared name")
     assertEq(record.campaignNames[campId].revisionId, clearOp.id,
         "424-adopt-tie: clear revision kept")
+end
+
+do
+    -- #426) Apply Adjustment: parse rules, goal ceiling, membership, confirmation.
+    assertTrue(type(GS.ParseAdjustmentQuantity) == "function", "426: parser exported")
+    assertTrue(type(GS.FormatAdjustmentConfirmation) == "function", "426: confirm helper exported")
+    assertTrue(type(GS.IsCurrentRequestedItem) == "function", "426: membership helper exported")
+
+    local function assertParse(text, expectQty, label)
+        local qty, err = GS.ParseAdjustmentQuantity(text)
+        if expectQty == nil then
+            assertEq(qty, nil, "426 parse reject qty " .. label)
+            assertEq(err, "invalid_quantity", "426 parse reject err " .. label)
+        else
+            assertEq(qty, expectQty, "426 parse accept " .. label .. " got=" .. tostring(qty))
+        end
+    end
+    assertParse("10", 10, "positive")
+    assertParse("-10", -10, "negative")
+    assertParse(" 10 ", 10, "trimmed")
+    assertParse("+10", nil, "leading-plus")
+    assertParse("0", nil, "zero")
+    assertParse("-0", nil, "neg-zero")
+    assertParse("10.5", nil, "decimal")
+    assertParse("10a", nil, "trailing-junk")
+    assertParse("abc", nil, "alpha")
+    assertParse("", nil, "empty")
+    assertParse("100001", nil, "over-magnitude")
+    assertParse("-100001", nil, "over-magnitude-neg")
+    assertParse("100000", 100000, "max-magnitude")
+    assertParse("-100000", -100000, "max-magnitude-neg")
+
+    local record = seedStagedCampaignWithItem(9426, 100)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Seed 90 toward a goal of 100.
+    local evidence = makeDepositEvidence(record, { itemId = 9426, quantity = 90, donor = "Donor-Garona" })
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, guidName[1], guidName[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0,
+        90, "426: seed total 90")
+
+    local ok10 = select(1, GS:NewAdjustmentOperation(9426, 10, nil))
+    assertTrue(ok10 ~= nil, "426: +10 to exact goal prepares")
+    assertEq(GS:ApplyStagedConfigOperation(ok10), "accepted", "426: +10 accepted")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0,
+        100, "426: total reaches goal")
+
+    local over, overSt, overReason = GS:NewAdjustmentOperation(9426, 1, nil)
+    assertEq(over, nil, "426: over-goal rejected")
+    assertEq(overSt, "rejected", "426: over-goal status")
+    assertEq(overReason, "item_over_goal", "426: over-goal reason")
+
+    -- Push total over goal via a second donation so negative partial corrections
+    -- can be exercised while still above the goal.
+    local more = makeDepositEvidence(record, {
+        itemId = 9426, quantity = 20, donor = "Extra-Garona",
+        observedAt = (world.time or 0) + 10,
+    })
+    -- Force a distinct occurrence so quorum can credit another 20 (120 total).
+    more.occurrenceIndex = 2
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(more, guidName[1], guidName[2])
+    end
+    local totalAfterExtra = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0
+    assertTrue(totalAfterExtra >= 100, "426: total at/above goal after extra got=" .. tostring(totalAfterExtra))
+    if totalAfterExtra < 120 then
+        -- If donation admission did not stack, synthesize over-goal with an
+        -- already-accepted path by temporarily relaxing through ledger append
+        -- is out of scope; instead seed a fresh campaign for the over-goal case.
+        record = seedStagedCampaignWithItem(9427, 100)
+        local seed90 = makeDepositEvidence(record, { itemId = 9427, quantity = 90 })
+        for _, guidName in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(seed90, guidName[1], guidName[2])
+        end
+        -- Accept an adjustment that reaches goal, then use ApplyAdjustmentMutation
+        -- is blocked for further positives. Build over-goal by accepting donations
+        -- that do not enforce the goal ceiling (automatic tracking unchanged).
+        local boost = makeDepositEvidence(record, {
+            itemId = 9427, quantity = 30, donor = "Boost-Garona",
+            observedAt = (world.time or 0) + 20,
+        })
+        boost.occurrenceIndex = 2
+        for _, guidName in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(boost, guidName[1], guidName[2])
+        end
+        totalAfterExtra = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9427]) or 0
+        local overItem = 9427
+        assertTrue(totalAfterExtra > 100,
+            "426: donation can exceed goal got=" .. tostring(totalAfterExtra))
+        local posBlocked = select(1, GS:NewAdjustmentOperation(overItem, 1, nil))
+        assertEq(posBlocked, nil, "426: positive blocked while over goal")
+        local negPartial = select(1, GS:NewAdjustmentOperation(overItem, -10, nil))
+        assertTrue(negPartial ~= nil, "426: partial negative while over goal prepares")
+        assertEq(GS:ApplyStagedConfigOperation(negPartial), "accepted", "426: partial negative accepted")
+        local afterNeg = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[overItem]) or 0
+        assertEq(afterNeg, totalAfterExtra - 10, "426: partial negative result")
+        assertTrue(afterNeg > 100, "426: result may remain above goal")
+    else
+        local posBlocked = select(1, GS:NewAdjustmentOperation(9426, 1, nil))
+        assertEq(posBlocked, nil, "426: positive blocked while over goal")
+        local negPartial = select(1, GS:NewAdjustmentOperation(9426, -10, nil))
+        assertTrue(negPartial ~= nil, "426: partial negative while over goal prepares")
+        assertEq(GS:ApplyStagedConfigOperation(negPartial), "accepted", "426: partial negative accepted")
+        local afterNeg = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0
+        assertEq(afterNeg, totalAfterExtra - 10, "426: partial negative result")
+        assertTrue(afterNeg > 100, "426: result may remain above goal")
+    end
+
+    -- Zero goal blocks positive adjustments.
+    record = seedStagedCampaignWithItem(9428, 0)
+    local zeroPos, zeroSt, zeroReason = GS:NewAdjustmentOperation(9428, 5, nil)
+    assertEq(zeroPos, nil, "426: zero-goal positive rejected")
+    assertEq(zeroSt, "rejected", "426: zero-goal status")
+    assertEq(zeroReason, "item_over_goal", "426: zero-goal reason")
+
+    -- Membership: unknown / removed item cannot prepare.
+    local missing, missSt, missReason = GS:NewAdjustmentOperation(9999426, 1, nil)
+    assertEq(missing, nil, "426: non-requested rejected")
+    assertEq(missSt, "rejected", "426: non-requested status")
+    assertEq(missReason, "item_not_requested", "426: non-requested reason")
+
+    -- Zero-progress and completed items remain adjustable (membership only).
+    record = seedStagedCampaignWithItem(9429, 50)
+    local zeroProgress = select(1, GS:NewAdjustmentOperation(9429, 1, nil))
+    assertTrue(zeroProgress ~= nil, "426: zero-progress item prepares")
+    assertEq(GS:ApplyStagedConfigOperation(zeroProgress), "accepted", "426: zero-progress apply")
+    local fill = select(1, GS:NewAdjustmentOperation(9429, 49, nil))
+    assertTrue(fill ~= nil, "426: fill to completed prepares")
+    assertEq(GS:ApplyStagedConfigOperation(fill), "accepted", "426: completed apply")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9429]) or 0,
+        50, "426: completed total")
+    local completedNeg = select(1, GS:NewAdjustmentOperation(9429, -5, nil))
+    assertTrue(completedNeg ~= nil, "426: completed item still adjustable")
+    assertEq(GS:ApplyStagedConfigOperation(completedNeg), "accepted", "426: completed negative")
+
+    -- Confirmation copy: Unassigned + before/after totals.
+    record = seedStagedCampaignWithItem(9430, 100)
+    local preview = GS:PreviewAdjustment(9430, 10, nil)
+    assertTrue(type(preview) == "table", "426: preview for confirm")
+    local confirm = GS.FormatAdjustmentConfirmation(preview, "Test Rose (#9430)")
+    assertTrue(confirm:find("Test Rose (#9430)", 1, true) ~= nil, "426: confirm item name")
+    assertTrue(confirm:find("+10", 1, true) ~= nil, "426: confirm signed change")
+    assertTrue(confirm:find("0 → 10", 1, true) ~= nil, "426: confirm before/after")
+    assertTrue(confirm:find("Unassigned", 1, true) ~= nil, "426: confirm Unassigned")
+    local previewNamed = GS:PreviewAdjustment(9430, -1, "Alice-Garona")
+    -- Negative from zero fails floor; seed one first.
+    local seedOne = select(1, GS:NewAdjustmentOperation(9430, 5, "Alice-Garona"))
+    assertTrue(seedOne ~= nil, "426: attributed seed prepares")
+    assertEq(GS:ApplyStagedConfigOperation(seedOne), "accepted", "426: attributed seed")
+    previewNamed = GS:PreviewAdjustment(9430, -2, "Alice-Garona")
+    assertTrue(type(previewNamed) == "table", "426: attributed preview")
+    local confirmNamed = GS.FormatAdjustmentConfirmation(previewNamed, "Test Rose")
+    assertTrue(confirmNamed:find("Alice-Garona", 1, true) ~= nil, "426: confirm named credit")
+    assertTrue(confirmNamed:find("Character contribution", 1, true) ~= nil,
+        "426: confirm player before/after")
+
+    -- Item-total and attributed floors still hold.
+    local floorItem, floorItemSt, floorItemReason = GS:NewAdjustmentOperation(9430, -100, nil)
+    assertEq(floorItem, nil, "426: item floor rejects")
+    assertEq(floorItemReason, "item_negative", "426: item floor reason")
+    local floorPlayer, _, floorPlayerReason = GS:NewAdjustmentOperation(9430, -100, "Alice-Garona")
+    assertEq(floorPlayer, nil, "426: player floor rejects")
+    assertTrue(floorPlayerReason == "player_negative" or floorPlayerReason == "item_negative",
+        "426: player/item floor reason got=" .. tostring(floorPlayerReason))
+
+    -- Local commit revalidates membership when the item is removed mid-flight.
+    record = seedStagedCampaignWithItem(9431, 100)
+    local pendingOp = select(1, GS:NewAdjustmentOperation(9431, 3, nil))
+    assertTrue(pendingOp ~= nil, "426: pending op prepared")
+    local removeOp = GS:NewConfigOperation("set-requested-item", { itemId = 9431 }, { removed = true })
+    assertEq(GS:ApplyStagedConfigOperation(removeOp), "accepted", "426: item removed")
+    local stGone, reasonGone = GS:ApplyStagedConfigOperation(pendingOp)
+    assertEq(stGone, "rejected", "426: removed-item commit rejected")
+    assertEq(reasonGone, "item_not_requested", "426: removed-item reason")
 end
 
 SF.TSM = nil

@@ -7793,7 +7793,8 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
             if not ok then
                 if stored.kind == GS.KIND.ADJUST_QUANTITY
                     and (err == "item_negative" or err == "player_negative"
-                        or err == "adjustment_floor") then
+                        or err == "adjustment_floor" or err == "item_over_goal"
+                        or err == "invalid_quantity") then
                     local stPend, reasonPend = "pending", err
                     if GS._AdmitPendingOrConflict then
                         stPend, reasonPend = GS._AdmitPendingOrConflict(ops, stored, err)

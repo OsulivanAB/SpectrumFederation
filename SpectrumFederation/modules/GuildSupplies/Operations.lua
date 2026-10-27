@@ -862,6 +862,10 @@ function GS:NewConfigOperation(kind, target, value)
         if type(value) ~= "table" then
             return nil, "rejected", "invalid_value"
         end
+        -- New local adjustments must target a current campaign requested item.
+        if GS.IsCurrentRequestedItem and not GS.IsCurrentRequestedItem(record, canon.itemId) then
+            return nil, "rejected", "item_not_requested"
+        end
         local floorOk, floorErr, normAttr = true, nil, value.attributed
         if GS.AdjustmentFloorOk then
             floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
