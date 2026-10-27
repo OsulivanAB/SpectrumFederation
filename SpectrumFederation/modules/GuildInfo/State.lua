@@ -2074,6 +2074,210 @@ function GI.CountRetainedState(record)
     }
 end
 
+---------------------------------------------------------------------------
+-- Read-only identity resolution for Guild Supplies (#427)
+-- Authority: Guild Info main/alt graph only. Never mutates relationships.
+---------------------------------------------------------------------------
+
+local function ResolveGuildInfoRecord(guildKey)
+    if guildKey then
+        return GI:GetRecordForGuildKey(guildKey)
+    end
+    return GI:GetCurrentRecord()
+end
+
+--- Relationship readiness for witness/attribution decisions.
+-- ready: authoritative baseline (including empty / not_configured).
+-- generation_syncing: incomplete new-generation sync — do not invent independence.
+-- unavailable: root/identity not usable.
+-- @return string status, table|nil record, string|nil detail
+function GI:GetRelationshipReadiness(guildKey)
+    if not GI:IsRootReady() then
+        return "unavailable", nil, GI:GetRootReason() or "not_ready"
+    end
+    local record, reason = ResolveGuildInfoRecord(guildKey)
+    if not record then
+        if reason == "not_configured" then
+            -- No durable row yet ≡ empty finished relationships (all unassigned).
+            return "ready", nil, nil
+        end
+        if reason == "generation_syncing" then
+            return "generation_syncing", nil, reason
+        end
+        return "unavailable", nil, reason or "not_ready"
+    end
+    if GI.IsBaselineComplete and not GI.IsBaselineComplete(record) then
+        return "generation_syncing", record, "generation_syncing"
+    end
+    return "ready", record, nil
+end
+
+local function DisplayNameForGuid(record, guid)
+    if not ValidGuid(guid) then
+        return nil
+    end
+    if type(record) == "table" and type(record.characters) == "table" then
+        local row = record.characters[guid]
+        if type(row) == "table" and type(row.nameRealm) == "string" and row.nameRealm ~= "" then
+            return row.nameRealm
+        end
+    end
+    local members = record and record.members
+    if type(members) == "table" then
+        local m = members[guid]
+        if type(m) == "table" and type(m.nameRealm) == "string" and m.nameRealm ~= "" then
+            return m.nameRealm
+        end
+    end
+    return nil
+end
+
+--- Current effective contributor for a character GUID.
+-- status: "assigned" (main or alt under a main), "unassigned", or "unknown".
+-- mainGuid is the logical contributor identity when known.
+-- @return table|nil info
+function GI:ResolveContributorIdentity(guid, guildKey)
+    -- ValidGuid is a boolean predicate in this module (does not echo the string).
+    if not ValidGuid(guid) then
+        return nil
+    end
+    local readiness, record = GI:GetRelationshipReadiness(guildKey)
+    if readiness ~= "ready" then
+        return {
+            status = "unknown",
+            reason = readiness,
+            guid = guid,
+            mainGuid = nil,
+            displayName = nil,
+            role = nil,
+        }
+    end
+    local info = record and record.graph and record.graph.byGuid and record.graph.byGuid[guid]
+    if type(info) == "table" and ValidGuid(info.mainGuid) then
+        local mainGuid = info.mainGuid
+        return {
+            status = "assigned",
+            guid = guid,
+            mainGuid = mainGuid,
+            displayName = DisplayNameForGuid(record, mainGuid) or DisplayNameForGuid(record, guid),
+            role = info.role,
+            groupId = info.groupId,
+        }
+    end
+    -- Known-unassigned (or never retained): independent identity under a ready baseline.
+    return {
+        status = "unassigned",
+        guid = guid,
+        mainGuid = guid,
+        displayName = DisplayNameForGuid(record, guid),
+        role = nil,
+    }
+end
+
+--- Same / different / unknown for authenticated witness GUIDs.
+-- unknown when Guild Info is unavailable or synchronizing — never invent independence.
+-- @return "same"|"different"|"unknown"
+function GI:CompareWitnessIdentities(guidA, guidB, guildKey)
+    if not ValidGuid(guidA) or not ValidGuid(guidB) then
+        return "unknown"
+    end
+    if guidA == guidB then
+        return "same"
+    end
+    local readiness = GI:GetRelationshipReadiness(guildKey)
+    if readiness ~= "ready" then
+        return "unknown"
+    end
+    local a = GI:ResolveContributorIdentity(guidA, guildKey)
+    local b = GI:ResolveContributorIdentity(guidB, guildKey)
+    if not a or not b or a.status == "unknown" or b.status == "unknown" then
+        return "unknown"
+    end
+    if a.mainGuid and b.mainGuid and a.mainGuid == b.mainGuid then
+        return "same"
+    end
+    return "different"
+end
+
+--- Unique name→GUID only. Ambiguous or missing names return nil (no guessing).
+-- Short names (no realm) are resolved through the roster without filling the
+-- player's realm, matching Guild Info assign semantics.
+-- @return string|nil guid, string|nil reason
+function GI:ResolveCharacterGuidByName(name, guildKey)
+    if type(name) ~= "string" then
+        return nil, "identity_unavailable"
+    end
+    local trimmed = name:match("^%s*(.-)%s*$")
+    if not trimmed or trimmed == "" then
+        return nil, "identity_unavailable"
+    end
+    local readiness, record = GI:GetRelationshipReadiness(guildKey)
+    if readiness ~= "ready" then
+        return nil, readiness
+    end
+    local hasRealm = trimmed:find("-", 1, true) ~= nil
+    local lookup = trimmed
+    if hasRealm then
+        local NU = SF.NameUtil
+        if NU and NU.NormalizeNameRealm then
+            lookup = NU.NormalizeNameRealm(trimmed) or trimmed
+        elseif SF.GuildGossip and SF.GuildGossip.NormalizePlayer then
+            lookup = SF.GuildGossip.NormalizePlayer(trimmed) or trimmed
+        end
+    end
+    -- Prefer the complete roster so short-name cross-realm ambiguity is visible.
+    if GI.GetRosterSnapshot then
+        local snap = GI.GetRosterSnapshot(false)
+        if type(snap) == "table" and snap.complete and type(snap.Resolve) == "function" then
+            local row, err = snap:Resolve(lookup)
+            if row and ValidGuid(row.guid) then
+                return row.guid, nil
+            end
+            if err == "ambiguous_name" then
+                return nil, "ambiguous_name"
+            end
+        end
+    end
+    local lower = string.lower(lookup)
+    local shortLower = string.lower(lookup:match("^([^-]+)") or lookup)
+    local matches = {}
+    local function consider(guid, nameRealm)
+        if not ValidGuid(guid) or type(nameRealm) ~= "string" or nameRealm == "" then
+            return
+        end
+        local nl = string.lower(nameRealm)
+        local sl = string.lower(nameRealm:match("^([^-]+)") or nameRealm)
+        if nl == lower or (not hasRealm and sl == shortLower) then
+            matches[guid] = true
+        end
+    end
+    if type(record) == "table" then
+        for guid, row in pairs(record.characters or {}) do
+            if type(row) == "table" then
+                consider(guid, row.nameRealm)
+            end
+        end
+        for guid, m in pairs(record.members or {}) do
+            if type(m) == "table" then
+                consider(guid, m.nameRealm)
+            end
+        end
+    end
+    local unique = nil
+    local count = 0
+    for guid in pairs(matches) do
+        count = count + 1
+        unique = guid
+        if count > 1 then
+            return nil, "ambiguous_name"
+        end
+    end
+    if unique then
+        return unique, nil
+    end
+    return nil, "not_a_member"
+end
+
 GI._RememberCharacter = RememberCharacter
 GI._DissolveEmptyGroup = DissolveEmptyGroup
 GI._BeatVers = BeatVers

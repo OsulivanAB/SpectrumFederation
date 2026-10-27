@@ -9,9 +9,9 @@ local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
 
 GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
--- Wire schema for sf.guildsupplies.config. #397 valuations require schema 2;
--- Guild Gossip matches provider schemas by strict equality.
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 2
+-- Wire schema for sf.guildsupplies.config. Schema 3 (#427) is incompatible with
+-- older link-based witness peers; Guild Gossip matches by strict equality.
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 3
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -3184,12 +3184,52 @@ local function BuildProviderSpec()
     }
 end
 
+-- One-shot Guild Info → Guild Supplies bridge (#427). GS may initialize before
+-- Guild Info; resolve lazily and reevaluate pending three-witness evidence when
+-- relationships become ready or change. No polling.
+local guildInfoListenerRegistered = false
+local guildInfoReevalBusy = false
+
+local function OnGuildInfoDurableChange(reason)
+    if guildInfoReevalBusy then
+        return
+    end
+    guildInfoReevalBusy = true
+    local ok, err = pcall(function()
+        local record = select(1, GS:GetCurrentRecord())
+        if type(record) == "table" and GS.ReevaluatePendingEvidence then
+            GS.ReevaluatePendingEvidence(record)
+        end
+        if GS.NotifyUI then
+            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+        end
+    end)
+    guildInfoReevalBusy = false
+    if not ok and DebugWarn then
+        DebugWarn("guildinfo reevaluate failed: %s", tostring(err))
+    end
+end
+
+function GS.EnsureGuildInfoBridge()
+    if guildInfoListenerRegistered then
+        return true
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.RegisterUIListener) ~= "function" then
+        return false, "guildinfo_unavailable"
+    end
+    GI.RegisterUIListener(OnGuildInfoDurableChange)
+    guildInfoListenerRegistered = true
+    return true
+end
+
 --- Idempotent provider registration. Safe when Guild Gossip is not yet ready.
 function GS:EnsureGossipProvider()
     if not GG or not GG.RegisterProvider then
         return false, "gossip_unavailable"
     end
     if providerRegistered and GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID) then
+        GS.EnsureGuildInfoBridge()
         return true
     end
     if GG.Init then
@@ -3200,6 +3240,7 @@ function GS:EnsureGossipProvider()
         -- RegisterProvider is idempotent; treat success-ish outcomes as ok.
         if GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID) then
             providerRegistered = true
+            GS.EnsureGuildInfoBridge()
             return true
         end
         DebugWarn("provider register failed: %s", tostring(err))
@@ -3210,6 +3251,7 @@ function GS:EnsureGossipProvider()
     end
     providerRegistered = true
     RebuildExportIndex()
+    GS.EnsureGuildInfoBridge()
     DebugInfo("registered staged config provider id=%s", GS.PROVIDER_ID)
     return true
 end
@@ -4348,5 +4390,8 @@ function GS:Initialize(db)
     -- Always attempt provider registration on initialize; gossip may idle with
     -- zero peers. Failure is non-fatal for local staged editing.
     GS:EnsureGossipProvider()
+    -- GS loads before Guild Info in the TOC; bridge is idempotent and retries
+    -- when Guild Info later exposes RegisterUIListener.
+    GS.EnsureGuildInfoBridge()
     return ok, reason
 end

@@ -1,6 +1,6 @@
 # Guild Info — Main / Alt Assignments
 
-Guild Info is a **guild-owned**, directed main→alt relationship system. It is independent of Loot Helper profile identity links and Guild Supplies witness GUID groups. Issue contract: [#402](https://github.com/OsulivanAB/SpectrumFederation/issues/402).
+Guild Info is a **guild-owned**, directed main→alt relationship system. It is independent of Loot Helper profile identity links. Raid Supplies (#427) reads these relationships for donation display attribution and three-witness independence; Guild Info does not own Raid Supplies accounting. Issue contracts: [#402](https://github.com/OsulivanAB/SpectrumFederation/issues/402), [#427](https://github.com/OsulivanAB/SpectrumFederation/issues/427).
 
 Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378)). Guild Info does **not** require a Loot Helper session, raid, or Guild Supplies activation.
 
@@ -24,13 +24,23 @@ Transport dependency: Guild Gossip ([#378](https://github.com/OsulivanAB/Spectru
 - Concurrent edits converge by deterministic version tuples `(n, w)` (logical revision + writer nonce), not wall-clock timestamps alone.
 - Storage scales with retained character/group identities, not lifetime edit count.
 
-### Non-goals (this ticket)
+### Non-goals
 
-- Import/migrate from Loot Helper or Guild Supplies identity data.
-- Drive donation witness counting or Loot Helper profile permissions from Guild Info.
+- Import/migrate from Loot Helper or legacy Guild Supplies `identityLinks`.
+- Own Raid Supplies donation ledger rows or rewrite historical donor identity (#427 projects attribution read-only).
+- Drive Loot Helper profile permissions from Guild Info.
 - A Guild Info-owned editor rank. The guild officer threshold lives in `SF.GuildOfficer` and is not reset by relationship cleanup.
 - Multi-level family trees.
 - Append-only operation logs, cutovers, or compaction checkpoints.
+
+### Read-only consumers (#427)
+
+| API | Use |
+| --- | --- |
+| `GetRelationshipReadiness` | `ready` / `generation_syncing` / `unavailable` |
+| `ResolveContributorIdentity` | Current main (or self when unassigned) for a GUID |
+| `CompareWitnessIdentities` | `same` / `different` / `unknown` for witness quorum |
+| `ResolveCharacterGuidByName` | Unique name→GUID only; never guesses ambiguous names |
 
 ## Saved schema (`schemaVersion = 3`)
 

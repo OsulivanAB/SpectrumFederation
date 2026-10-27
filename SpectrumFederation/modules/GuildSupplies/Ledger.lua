@@ -128,7 +128,8 @@ local function CopyStringList(list, limit)
 end
 
 ---------------------------------------------------------------------------
--- Identity links (guild-owned; GUID based; not Loot Helper profiles)
+-- Legacy identityLinks storage (inert; Guild Info owns witness identity #427)
+-- Retained only so existing SavedVariables / historical link ops still load.
 ---------------------------------------------------------------------------
 
 function GS.EmptyIdentityLinks()
@@ -216,18 +217,53 @@ function GS.ValidateIdentityLinks(links)
     return true
 end
 
---- Collapse known guild-owned links: same group ⇒ same witness identity.
-function GS.AreSameWitnessIdentity(record, guidA, guidB)
-    guidA, guidB = ValidGuid(guidA), ValidGuid(guidB)
-    if not guidA or not guidB then return false end
-    if guidA == guidB then return true end
-    local links = record and record.identityLinks
-    if type(links) ~= "table" or type(links.byGuid) ~= "table" then
-        return false
+local function GuildKeyForRecord(record)
+    if type(record) ~= "table" then
+        return nil
     end
-    local ga = links.byGuid[guidA]
-    local gb = links.byGuid[guidB]
-    return type(ga) == "string" and ga ~= "" and ga == gb
+    if type(record._guildKey) == "string" and record._guildKey ~= "" then
+        return record._guildKey
+    end
+    if type(record.guildKey) == "string" and record.guildKey ~= "" then
+        return record.guildKey
+    end
+    return nil
+end
+
+--- True when Guild Info relationships are authoritative for this guild.
+-- Incomplete / synchronizing / unavailable baselines must not invent independence.
+function GS.WitnessRelationshipsReady(record)
+    local GI = SF.GuildInfo
+    if not GI or type(GI.GetRelationshipReadiness) ~= "function" then
+        return false, "unavailable"
+    end
+    local status = GI:GetRelationshipReadiness(GuildKeyForRecord(record))
+    return status == "ready", status
+end
+
+--- same | different | unknown for authenticated witness GUIDs via Guild Info.
+function GS.CompareWitnessIdentities(record, guidA, guidB)
+    guidA, guidB = ValidGuid(guidA), ValidGuid(guidB)
+    if not guidA or not guidB then
+        return "unknown"
+    end
+    if guidA == guidB then
+        return "same"
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.CompareWitnessIdentities) ~= "function" then
+        return "unknown"
+    end
+    local cmp = GI:CompareWitnessIdentities(guidA, guidB, GuildKeyForRecord(record))
+    if cmp == "same" or cmp == "different" or cmp == "unknown" then
+        return cmp
+    end
+    return "unknown"
+end
+
+--- Known-same only. Unknown relationship state is not "same".
+function GS.AreSameWitnessIdentity(record, guidA, guidB)
+    return GS.CompareWitnessIdentities(record, guidA, guidB) == "same"
 end
 
 function GS.WitnessAlreadyCounted(record, witnessMap, witnessGuid)
@@ -244,8 +280,14 @@ function GS.WitnessAlreadyCounted(record, witnessMap, witnessGuid)
     return false
 end
 
+--- Independent witness count under current Guild Info relationships.
+-- Returns 0 when relationships are unavailable/syncing so quorum stays pending.
 function GS.CountIndependentWitnesses(record, witnessMap)
     if type(witnessMap) ~= "table" then return 0 end
+    local ready = GS.WitnessRelationshipsReady(record)
+    if not ready then
+        return 0
+    end
     local keys = {}
     for key, row in pairs(witnessMap) do
         local guid = type(row) == "table" and ValidGuid(row.guid or row.witnessGuid) or ValidGuid(key)
@@ -271,6 +313,65 @@ function GS.CountIndependentWitnesses(record, witnessMap)
         end
     end
     return n
+end
+
+---------------------------------------------------------------------------
+-- Donation / adjustment display attribution via Guild Info (#427)
+-- Durable actor/attributed strings stay immutable; projection is read-only.
+---------------------------------------------------------------------------
+
+--- Resolve a ledger actor/attributed name (optional GUID) to the current
+-- contributor display identity. Never guesses from ambiguous names.
+-- @return string displayName, table meta
+function GS.ResolveDisplayContributor(record, actorName, actorGuid)
+    local original = NormName(actorName)
+    local meta = {
+        original = original,
+        guid = ValidGuid(actorGuid),
+        status = "provisional",
+        mainGuid = nil,
+        provisional = true,
+    }
+    if not original and not meta.guid then
+        return nil, meta
+    end
+    local GI = SF.GuildInfo
+    if not GI then
+        return original, meta
+    end
+    local ready = GS.WitnessRelationshipsReady(record)
+    if not ready then
+        -- Provisional fallback: show the original donor without rewriting history.
+        return original, meta
+    end
+    local guid = meta.guid
+    if not guid and original and type(GI.ResolveCharacterGuidByName) == "function" then
+        local resolved, err = GI:ResolveCharacterGuidByName(original, GuildKeyForRecord(record))
+        if type(resolved) == "string" then
+            guid = resolved
+            meta.guid = guid
+        elseif err == "ambiguous_name" then
+            meta.status = "ambiguous"
+            return original, meta
+        end
+    end
+    if not guid or type(GI.ResolveContributorIdentity) ~= "function" then
+        return original, meta
+    end
+    local info = GI:ResolveContributorIdentity(guid, GuildKeyForRecord(record))
+    if type(info) ~= "table" or info.status == "unknown" then
+        return original, meta
+    end
+    meta.status = info.status
+    meta.mainGuid = info.mainGuid
+    meta.provisional = false
+    local display = NormName(info.displayName) or original
+    if info.status == "unassigned" then
+        display = original or display
+    elseif type(display) ~= "string" or display == "" then
+        display = original
+    end
+    return display, meta
 end
 
 local function CountLinkGroups(links)
@@ -2670,8 +2771,9 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     return "pending", "awaiting_witnesses", cluster
 end
 
---- Reevaluate unfinished evidence after link-map changes (conservative).
--- Compaction may remove the current index; do not skip the shifted cluster.
+--- Reevaluate unfinished evidence after Guild Info relationship changes
+-- (or inert legacy link-op replay). Compaction may remove the current index;
+-- do not skip the shifted cluster. Bounded by MAX_PENDING_EVIDENCE_TOTAL.
 function GS.ReevaluatePendingEvidence(record)
     if type(record) ~= "table" or type(record.observations) ~= "table" then
         return 0
@@ -3523,7 +3625,12 @@ end
 local function ActorItemTotal(record, actorName, itemId, campaignId)
     local progress = ProgressOnRecord(record, campaignId)
     if not progress then return 0 end
-    local contrib = progress.contributions and progress.contributions[actorName]
+    -- Floors use the same projected contributor key as progress totals (#427).
+    local key = actorName
+    if GS.ResolveDisplayContributor then
+        key = select(1, GS.ResolveDisplayContributor(record, actorName, nil)) or actorName
+    end
+    local contrib = progress.contributions and progress.contributions[key]
     return (contrib and tonumber(contrib[itemId])) or 0
 end
 
