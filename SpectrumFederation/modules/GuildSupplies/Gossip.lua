@@ -3196,11 +3196,21 @@ local function OnGuildInfoDurableChange(reason)
     end
     guildInfoReevalBusy = true
     local ok, err = pcall(function()
+        local verified = 0
         local record = select(1, GS:GetCurrentRecord())
         if type(record) == "table" and GS.ReevaluatePendingEvidence then
-            GS.ReevaluatePendingEvidence(record)
+            verified = tonumber(GS.ReevaluatePendingEvidence(record)) or 0
         end
-        if GS.NotifyUI then
+        -- Newly accepted donations must enter the existing ledger export path so
+        -- peers can catch up. Skip durable publish when reevaluation was a no-op
+        -- (UI refresh only). Busy flag above prevents recursive reentry.
+        if verified > 0 then
+            if GS.NotifyLocalDurableChange then
+                GS.NotifyLocalDurableChange("ledger")
+            elseif GS.NotifyUI then
+                GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+            end
+        elseif GS.NotifyUI then
             GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
         end
     end)

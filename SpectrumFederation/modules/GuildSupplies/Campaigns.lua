@@ -843,6 +843,9 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
 
     local itemTotals = {}
     local contributions = {}
+    -- One read-only resolution context for the whole projection (not per event).
+    local resolveCtx = GS.BeginContributorProjectionContext
+        and GS.BeginContributorProjectionContext(record) or nil
     ForEachCampaignLedgerEvent(record, generation, function(event)
         -- Active datasets exclude pre-activation staged accounting from live totals.
         if GS.EventCountsTowardLiveProgress
@@ -861,7 +864,7 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
                 local actor = nil
                 if GS.ResolveDisplayContributor then
                     actor = select(1, GS.ResolveDisplayContributor(
-                        record, event.actor, event.actorGuid or event.donorGuid))
+                        record, event.actor, event.actorGuid or event.donorGuid, resolveCtx))
                 end
                 actor = BoundedActorName(actor) or BoundedActorName(event.actor)
                 if actor then
@@ -874,7 +877,7 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
             local credit = nil
             if GS.ResolveDisplayContributor then
                 credit = select(1, GS.ResolveDisplayContributor(
-                    record, event.attributed, event.attributedGuid))
+                    record, event.attributed, event.attributedGuid, resolveCtx))
             end
             credit = BoundedActorName(credit) or BoundedActorName(event.attributed)
             if credit then
@@ -1162,6 +1165,8 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         if last > total then last = total end
     end
     local rows = {}
+    local resolveCtx = GS.BeginContributorProjectionContext
+        and GS.BeginContributorProjectionContext(record) or nil
     for i = offset + 1, last do
         local event = ordered[i]
         local itemName = nil
@@ -1177,10 +1182,10 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         local displayAttributed = nil
         if IsDonationEvent(event) and GS.ResolveDisplayContributor then
             displayActor = select(1, GS.ResolveDisplayContributor(
-                record, event.actor, event.actorGuid or event.donorGuid))
+                record, event.actor, event.actorGuid or event.donorGuid, resolveCtx))
         elseif IsAdjustmentEvent(event) and event.attributed and GS.ResolveDisplayContributor then
             displayAttributed = select(1, GS.ResolveDisplayContributor(
-                record, event.attributed, event.attributedGuid))
+                record, event.attributed, event.attributedGuid, resolveCtx))
         end
         -- Project display names onto a shallow copy; keep txn/valuation fields
         -- from the durable event so priced history stays intact.
