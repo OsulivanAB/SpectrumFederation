@@ -54,6 +54,13 @@ function GS.CanonicalVerificationMode(mode)
     return GS.VERIFICATION.WITNESSES
 end
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 local function Debug(level, message, ...)
     if SF.Debug and SF.Debug[level] then
         SF.Debug[level](SF.Debug, "GUILD_SUPPLIES", message, ...)
@@ -3526,10 +3533,82 @@ local function ItemTotal(record, itemId, campaignId)
     return tonumber(progress.itemTotals and progress.itemTotals[itemId]) or 0
 end
 
---- Floor against accepted authoritative projection at commit time.
+--- Strict signed-integer parse for Settings quantity input (#426).
+-- Accepts "10" and "-10". Rejects "+10", zero, decimals, whitespace-only,
+-- non-integers, and magnitudes above MAX_OBS_QUANTITY. Does not round.
+-- @return number|nil quantity, string|nil err
+function GS.ParseAdjustmentQuantity(text)
+    if type(text) ~= "string" then
+        return nil, "invalid_quantity"
+    end
+    local trimmed = text:match("^%s*(.-)%s*$") or ""
+    if trimmed == "" then
+        return nil, "invalid_quantity"
+    end
+    -- Explicit leading '+' is rejected even though tonumber would accept it.
+    if trimmed:sub(1, 1) == "+" then
+        return nil, "invalid_quantity"
+    end
+    local whole = trimmed:match("^(%-?%d+)$")
+    if not whole then
+        return nil, "invalid_quantity"
+    end
+    local quantity = tonumber(whole)
+    if not quantity or quantity ~= quantity or quantity ~= math.floor(quantity) or quantity == 0 then
+        return nil, "invalid_quantity"
+    end
+    if math.abs(quantity) > (GS.MAX_OBS_QUANTITY or 100000) then
+        return nil, "invalid_quantity"
+    end
+    return quantity
+end
+
+--- True when itemId is a configured requested item on the current campaign.
+function GS.IsCurrentRequestedItem(record, itemId)
+    itemId = tonumber(itemId)
+    if not IsItemId(itemId) or type(record) ~= "table" then
+        return false
+    end
+    if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+        return false
+    end
+    local items = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.requestedItems
+    if type(items) ~= "table" then
+        return false
+    end
+    local row = items[tostring(itemId)]
+    return type(row) == "table" and tonumber(row.itemId) == itemId
+end
+
+local function CurrentItemGoal(record, itemId)
+    local items = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.requestedItems
+    if type(items) ~= "table" then
+        return nil
+    end
+    local row = items[tostring(itemId)]
+    if type(row) ~= "table" then
+        return nil
+    end
+    local goal = tonumber(row.goal)
+    if not goal or goal ~= goal or goal ~= math.floor(goal) or goal < 0 then
+        return nil
+    end
+    return goal
+end
+
+--- Floor (and optional positive-goal ceiling) against accepted projection.
+-- Negative corrections of an already over-goal total remain allowed subject to
+-- existing floors. The goal ceiling is opt-in via opts.enforceGoalCeiling and is
+-- intended for new local preparation/commit only. Authenticated remote replay of
+-- previously accepted adjustments must not pass that flag: a peer that receives
+-- a later donation or lowered goal before the earlier adjustment would otherwise
+-- diverge permanently (#426 / #430).
 -- @param campaignId optional; defaults to record.currentCampaignId. Callers that
 --   cannot prove historical campaign provenance should reject before calling.
-function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId)
+-- @param opts optional { enforceGoalCeiling = boolean }
+function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, opts)
     itemId = tonumber(itemId)
     quantity = tonumber(quantity)
     if not IsItemId(itemId) then
@@ -3560,11 +3639,19 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId)
         return false, "stale_campaign"
     end
     local currentItem = ItemTotal(record, itemId, campaignId)
-    if currentItem + quantity < 0 then
+    local nextItem = currentItem + quantity
+    if nextItem < 0 then
         return false, "item_negative"
     end
     if attributed and ActorItemTotal(record, attributed, itemId, campaignId) + quantity < 0 then
         return false, "player_negative"
+    end
+    opts = opts or {}
+    if opts.enforceGoalCeiling and quantity > 0 then
+        local goal = CurrentItemGoal(record, itemId)
+        if goal ~= nil and nextItem > goal then
+            return false, "item_over_goal"
+        end
     end
     return true, nil, attributed
 end
@@ -3574,14 +3661,19 @@ function GS:PreviewAdjustment(itemId, quantity, attributed)
     if not record then
         return nil, reason or "not_ready"
     end
-    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(record, itemId, quantity, attributed)
+    itemId = tonumber(itemId)
+    if not GS.IsCurrentRequestedItem(record, itemId) then
+        return nil, "item_not_requested"
+    end
+    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
+        record, itemId, quantity, attributed, nil, { enforceGoalCeiling = true })
     if not floorOk then
         return nil, floorErr
     end
-    itemId = tonumber(itemId)
     quantity = tonumber(quantity)
     local currentItem = ItemTotal(record, itemId)
     local currentPlayer = normAttr and ActorItemTotal(record, normAttr, itemId) or nil
+    local goal = CurrentItemGoal(record, itemId)
     return {
         itemId = itemId,
         quantity = quantity,
@@ -3590,7 +3682,42 @@ function GS:PreviewAdjustment(itemId, quantity, attributed)
         nextItem = currentItem + quantity,
         currentPlayer = currentPlayer,
         nextPlayer = currentPlayer and (currentPlayer + quantity) or nil,
+        goal = goal,
     }
+end
+
+--- Settings confirmation copy for a prepared adjustment preview (#426).
+-- Positive changes may show a leading '+' here; input parsing still rejects '+'.
+function GS.FormatAdjustmentConfirmation(preview, itemName)
+    if type(preview) ~= "table" then
+        return ""
+    end
+    local name = itemName
+    if type(name) ~= "string" or name == "" then
+        name = Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s")
+            :format(tostring(preview.itemId or "?"))
+    end
+    local qty = tonumber(preview.quantity) or 0
+    local credit
+    if preview.attributed then
+        credit = tostring(preview.attributed)
+    else
+        credit = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+    end
+    local lines = {
+        Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_HEADER", "Adjust %s by %+d?")
+            :format(name, qty),
+        Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_TOTAL", "Item total: %d → %d")
+            :format(tonumber(preview.currentItem) or 0, tonumber(preview.nextItem) or 0),
+    }
+    if preview.attributed then
+        lines[#lines + 1] = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_PLAYER",
+            "Character contribution: %d → %d")
+            :format(tonumber(preview.currentPlayer) or 0, tonumber(preview.nextPlayer) or 0)
+    end
+    lines[#lines + 1] = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_CREDIT", "Attribution: %s")
+        :format(credit)
+    return table.concat(lines, "\n")
 end
 
 ---------------------------------------------------------------------------
@@ -3794,8 +3921,22 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
             end
         end
     end
+    -- Local editor commits re-check current campaign membership so an item
+    -- removed while confirmation is open cannot apply. Remote admission of
+    -- already-authored ops must not fail solely because the item was later
+    -- removed (#426 / historical catch-up).
+    local isLocalCommit = opts.localProductionAuthority or opts.localWrite
+    if isLocalCommit then
+        if not GS.IsCurrentRequestedItem(record, itemId) then
+            return false, "item_not_requested"
+        end
+    end
+    -- Goal ceiling is local-authoring only. Remote/authenticated catch-up keeps
+    -- floors and campaign checks without replaying the authoring-time ceiling
+    -- against a peer's later donation or goal state (#430).
     local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
-        record, itemId, quantity, attributed, record.currentCampaignId)
+        record, itemId, quantity, attributed, record.currentCampaignId,
+        isLocalCommit and { enforceGoalCeiling = true } or nil)
     if not floorOk then
         return false, floorErr or "adjustment_floor"
     end

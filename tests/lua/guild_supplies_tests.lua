@@ -27219,54 +27219,32 @@ do
 end
 
 do
-    -- C2/C3) Adjustment format locale + unlink disabled action string.
+    -- C2/C3) Adjustment format locale + unlink disabled action string (#426 UI).
     resetDb()
     initGS()
     setPlayer("Bob-Garona", "Player-1-Bob", 5) -- unauthorized
     world.guild.clubId = 42
     settleRoster()
-    -- Locale keys must ship accurate copy (not link-paste / linking).
-    local L = (SF.Locale and SF.Locale.GetDictionary and SF.Locale:GetDictionary())
-        or (_G.SpectrumFederationLocale)
-    if type(L) ~= "table" then
-        -- Fall back to raw enUS table loaded with the addon.
-        L = ns and ns.L
-    end
-    -- Production Loc path uses SF.LocaleText / enUS keys.
-    local adjKey = "GUILD_SUPPLIES_ERR_ADJUST_FORMAT"
-    local unlinkKey = "GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"
-    local adjMsg = SF.LocaleText and SF.LocaleText(adjKey)
-        or (SF.L and SF.L[adjKey])
-    local unlinkMsg = SF.LocaleText and SF.LocaleText(unlinkKey)
-        or (SF.L and SF.L[unlinkKey])
-    -- Read directly from locale module table when helpers differ in harness.
-    if (not adjMsg or adjMsg == adjKey) and type(_G) == "table" then
-        -- Loaded via locales in test harness as part of addon.
-        local en = nil
-        if SF.GetLocaleTable then en = SF.GetLocaleTable() end
-        if type(en) == "table" then
-            adjMsg = en[adjKey] or adjMsg
-            unlinkMsg = en[unlinkKey] or unlinkMsg
-        end
-    end
-    -- Source-backed assertion: enUS.lua must define both keys accurately.
+    -- Source-backed assertion: enUS.lua must define keys accurately.
     local enUS = io.open("SpectrumFederation/locale/enUS.lua", "r")
     assertTrue(enUS ~= nil, "C2/C3: enUS.lua readable")
     local enBody = enUS:read("*a")
     enUS:close()
     assertTrue(enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT', 1, true),
         "C2: adjust format locale key present")
-    assertTrue(enBody:find("item ID, a signed quantity", 1, true),
-        "C2: adjust format message states expected syntax")
-    assertTrue(not (enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT.-item link')),
-        "C2: adjust format must not suggest item links")
+    assertTrue(enBody:find("whole-number quantity such as 10 or -10", 1, true),
+        "C2: adjust format message states signed whole-number syntax")
+    assertTrue(enBody:find("leading plus", 1, true),
+        "C2: adjust format rejects leading plus")
+    assertTrue(enBody:find('GUILD_SUPPLIES_ADJUST_UNASSIGNED', 1, true),
+        "C2: Unassigned attribution locale present")
     assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK', 1, true),
         "C3: unlink action locale key present")
     assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"].-=.-"unlinking characters"', 1, true)
             or enBody:find('DISABLED_ACTION_UNLINK"] = "unlinking characters"', 1, true),
         "C3: unlink locale says unlinking characters")
 
-    -- UI definition uses the unlink-specific key.
+    -- UI definition uses separated controls + unlink-specific key.
     local confSrc = io.open(
         "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r")
     assertTrue(confSrc ~= nil, "C2/C3: configuration page readable")
@@ -27274,6 +27252,16 @@ do
     confSrc:close()
     assertTrue(confBody:find("GUILD_SUPPLIES_ERR_ADJUST_FORMAT", 1, true),
         "C2: adjustment onSubmit uses adjust-format locale")
+    assertTrue(confBody:find("ParseAdjustmentQuantity", 1, true),
+        "C2: adjustment UI uses strict quantity parser")
+    assertTrue(confBody:find("FormatAdjustmentConfirmation", 1, true),
+        "C2: adjustment UI uses confirmation helper")
+    assertTrue(confBody:find("GUILD_SUPPLIES_ADJUST_UNASSIGNED", 1, true),
+        "C2: adjustment UI defaults attribution to Unassigned")
+    assertTrue(confBody:find("adjustDraft", 1, true),
+        "C2: adjustment UI keeps a session draft")
+    assertTrue(not confBody:find("itemPart, qtyPart, attrPart", 1, true),
+        "C2: combined item/qty/attr text parser removed")
     assertTrue(confBody:find("GUILD_SUPPLIES_DISABLED_ACTION_UNLINK", 1, true),
         "C3: unlink disabled tip uses unlink action key")
 end
@@ -39636,6 +39624,994 @@ do
     assertEq(record.campaignNames[campId].name, nil, "424-adopt-tie: cleared name")
     assertEq(record.campaignNames[campId].revisionId, clearOp.id,
         "424-adopt-tie: clear revision kept")
+end
+
+do
+    -- #426) Apply Adjustment: parse rules, goal ceiling, membership, confirmation.
+    assertTrue(type(GS.ParseAdjustmentQuantity) == "function", "426: parser exported")
+    assertTrue(type(GS.FormatAdjustmentConfirmation) == "function", "426: confirm helper exported")
+    assertTrue(type(GS.IsCurrentRequestedItem) == "function", "426: membership helper exported")
+
+    local function assertParse(text, expectQty, label)
+        local qty, err = GS.ParseAdjustmentQuantity(text)
+        if expectQty == nil then
+            assertEq(qty, nil, "426 parse reject qty " .. label)
+            assertEq(err, "invalid_quantity", "426 parse reject err " .. label)
+        else
+            assertEq(qty, expectQty, "426 parse accept " .. label .. " got=" .. tostring(qty))
+        end
+    end
+    assertParse("10", 10, "positive")
+    assertParse("-10", -10, "negative")
+    assertParse(" 10 ", 10, "trimmed")
+    assertParse("+10", nil, "leading-plus")
+    assertParse("0", nil, "zero")
+    assertParse("-0", nil, "neg-zero")
+    assertParse("10.5", nil, "decimal")
+    assertParse("10a", nil, "trailing-junk")
+    assertParse("abc", nil, "alpha")
+    assertParse("", nil, "empty")
+    assertParse("100001", nil, "over-magnitude")
+    assertParse("-100001", nil, "over-magnitude-neg")
+    assertParse("100000", 100000, "max-magnitude")
+    assertParse("-100000", -100000, "max-magnitude-neg")
+
+    local record = seedStagedCampaignWithItem(9426, 100)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Seed 90 toward a goal of 100.
+    local evidence = makeDepositEvidence(record, { itemId = 9426, quantity = 90, donor = "Donor-Garona" })
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, guidName[1], guidName[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0,
+        90, "426: seed total 90")
+
+    local ok10 = select(1, GS:NewAdjustmentOperation(9426, 10, nil))
+    assertTrue(ok10 ~= nil, "426: +10 to exact goal prepares")
+    assertEq(GS:ApplyStagedConfigOperation(ok10), "accepted", "426: +10 accepted")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0,
+        100, "426: total reaches goal")
+
+    local over, overSt, overReason = GS:NewAdjustmentOperation(9426, 1, nil)
+    assertEq(over, nil, "426: over-goal rejected")
+    assertEq(overSt, "rejected", "426: over-goal status")
+    assertEq(overReason, "item_over_goal", "426: over-goal reason")
+
+    -- Push total over goal via a second donation so negative partial corrections
+    -- can be exercised while still above the goal.
+    local more = makeDepositEvidence(record, {
+        itemId = 9426, quantity = 20, donor = "Extra-Garona",
+        observedAt = (world.time or 0) + 10,
+    })
+    -- Force a distinct occurrence so quorum can credit another 20 (120 total).
+    more.occurrenceIndex = 2
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(more, guidName[1], guidName[2])
+    end
+    local totalAfterExtra = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0
+    assertTrue(totalAfterExtra >= 100, "426: total at/above goal after extra got=" .. tostring(totalAfterExtra))
+    if totalAfterExtra < 120 then
+        -- If donation admission did not stack, synthesize over-goal with an
+        -- already-accepted path by temporarily relaxing through ledger append
+        -- is out of scope; instead seed a fresh campaign for the over-goal case.
+        record = seedStagedCampaignWithItem(9427, 100)
+        local seed90 = makeDepositEvidence(record, { itemId = 9427, quantity = 90 })
+        for _, guidName in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(seed90, guidName[1], guidName[2])
+        end
+        -- Accept an adjustment that reaches goal, then use ApplyAdjustmentMutation
+        -- is blocked for further positives. Build over-goal by accepting donations
+        -- that do not enforce the goal ceiling (automatic tracking unchanged).
+        local boost = makeDepositEvidence(record, {
+            itemId = 9427, quantity = 30, donor = "Boost-Garona",
+            observedAt = (world.time or 0) + 20,
+        })
+        boost.occurrenceIndex = 2
+        for _, guidName in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(boost, guidName[1], guidName[2])
+        end
+        totalAfterExtra = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9427]) or 0
+        local overItem = 9427
+        assertTrue(totalAfterExtra > 100,
+            "426: donation can exceed goal got=" .. tostring(totalAfterExtra))
+        local posBlocked = select(1, GS:NewAdjustmentOperation(overItem, 1, nil))
+        assertEq(posBlocked, nil, "426: positive blocked while over goal")
+        local negPartial = select(1, GS:NewAdjustmentOperation(overItem, -10, nil))
+        assertTrue(negPartial ~= nil, "426: partial negative while over goal prepares")
+        assertEq(GS:ApplyStagedConfigOperation(negPartial), "accepted", "426: partial negative accepted")
+        local afterNeg = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[overItem]) or 0
+        assertEq(afterNeg, totalAfterExtra - 10, "426: partial negative result")
+        assertTrue(afterNeg > 100, "426: result may remain above goal")
+    else
+        local posBlocked = select(1, GS:NewAdjustmentOperation(9426, 1, nil))
+        assertEq(posBlocked, nil, "426: positive blocked while over goal")
+        local negPartial = select(1, GS:NewAdjustmentOperation(9426, -10, nil))
+        assertTrue(negPartial ~= nil, "426: partial negative while over goal prepares")
+        assertEq(GS:ApplyStagedConfigOperation(negPartial), "accepted", "426: partial negative accepted")
+        local afterNeg = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0
+        assertEq(afterNeg, totalAfterExtra - 10, "426: partial negative result")
+        assertTrue(afterNeg > 100, "426: result may remain above goal")
+    end
+
+    -- Zero goal blocks positive adjustments.
+    record = seedStagedCampaignWithItem(9428, 0)
+    local zeroPos, zeroSt, zeroReason = GS:NewAdjustmentOperation(9428, 5, nil)
+    assertEq(zeroPos, nil, "426: zero-goal positive rejected")
+    assertEq(zeroSt, "rejected", "426: zero-goal status")
+    assertEq(zeroReason, "item_over_goal", "426: zero-goal reason")
+
+    -- Membership: unknown / removed item cannot prepare.
+    local missing, missSt, missReason = GS:NewAdjustmentOperation(9999426, 1, nil)
+    assertEq(missing, nil, "426: non-requested rejected")
+    assertEq(missSt, "rejected", "426: non-requested status")
+    assertEq(missReason, "item_not_requested", "426: non-requested reason")
+
+    -- Zero-progress and completed items remain adjustable (membership only).
+    record = seedStagedCampaignWithItem(9429, 50)
+    local zeroProgress = select(1, GS:NewAdjustmentOperation(9429, 1, nil))
+    assertTrue(zeroProgress ~= nil, "426: zero-progress item prepares")
+    assertEq(GS:ApplyStagedConfigOperation(zeroProgress), "accepted", "426: zero-progress apply")
+    local fill = select(1, GS:NewAdjustmentOperation(9429, 49, nil))
+    assertTrue(fill ~= nil, "426: fill to completed prepares")
+    assertEq(GS:ApplyStagedConfigOperation(fill), "accepted", "426: completed apply")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9429]) or 0,
+        50, "426: completed total")
+    local completedNeg = select(1, GS:NewAdjustmentOperation(9429, -5, nil))
+    assertTrue(completedNeg ~= nil, "426: completed item still adjustable")
+    assertEq(GS:ApplyStagedConfigOperation(completedNeg), "accepted", "426: completed negative")
+
+    -- Confirmation copy: Unassigned + before/after totals.
+    record = seedStagedCampaignWithItem(9430, 100)
+    local preview = GS:PreviewAdjustment(9430, 10, nil)
+    assertTrue(type(preview) == "table", "426: preview for confirm")
+    local confirm = GS.FormatAdjustmentConfirmation(preview, "Test Rose (#9430)")
+    assertTrue(confirm:find("Test Rose (#9430)", 1, true) ~= nil, "426: confirm item name")
+    assertTrue(confirm:find("+10", 1, true) ~= nil, "426: confirm signed change")
+    assertTrue(confirm:find("0 → 10", 1, true) ~= nil, "426: confirm before/after")
+    assertTrue(confirm:find("Unassigned", 1, true) ~= nil, "426: confirm Unassigned")
+    local previewNamed = GS:PreviewAdjustment(9430, -1, "Alice-Garona")
+    -- Negative from zero fails floor; seed one first.
+    local seedOne = select(1, GS:NewAdjustmentOperation(9430, 5, "Alice-Garona"))
+    assertTrue(seedOne ~= nil, "426: attributed seed prepares")
+    assertEq(GS:ApplyStagedConfigOperation(seedOne), "accepted", "426: attributed seed")
+    previewNamed = GS:PreviewAdjustment(9430, -2, "Alice-Garona")
+    assertTrue(type(previewNamed) == "table", "426: attributed preview")
+    local confirmNamed = GS.FormatAdjustmentConfirmation(previewNamed, "Test Rose")
+    assertTrue(confirmNamed:find("Alice-Garona", 1, true) ~= nil, "426: confirm named credit")
+    assertTrue(confirmNamed:find("Character contribution", 1, true) ~= nil,
+        "426: confirm player before/after")
+
+    -- Item-total and attributed floors still hold.
+    local floorItem, floorItemSt, floorItemReason = GS:NewAdjustmentOperation(9430, -100, nil)
+    assertEq(floorItem, nil, "426: item floor rejects")
+    assertEq(floorItemReason, "item_negative", "426: item floor reason")
+    local floorPlayer, _, floorPlayerReason = GS:NewAdjustmentOperation(9430, -100, "Alice-Garona")
+    assertEq(floorPlayer, nil, "426: player floor rejects")
+    assertTrue(floorPlayerReason == "player_negative" or floorPlayerReason == "item_negative",
+        "426: player/item floor reason got=" .. tostring(floorPlayerReason))
+
+    -- Local commit revalidates membership when the item is removed mid-flight.
+    record = seedStagedCampaignWithItem(9431, 100)
+    local pendingOp = select(1, GS:NewAdjustmentOperation(9431, 3, nil))
+    assertTrue(pendingOp ~= nil, "426: pending op prepared")
+    local removeOp = GS:NewConfigOperation("set-requested-item", { itemId = 9431 }, { removed = true })
+    assertEq(GS:ApplyStagedConfigOperation(removeOp), "accepted", "426: item removed")
+    local stGone, reasonGone = GS:ApplyStagedConfigOperation(pendingOp)
+    assertEq(stGone, "rejected", "426: removed-item commit rejected")
+    assertEq(reasonGone, "item_not_requested", "426: removed-item reason")
+end
+
+do
+    -- #430-1) Goal ceiling is local-authoring only; remote/history admission converges.
+    local record = seedStagedCampaignWithItem(9501, 100)
+    local evidence = makeDepositEvidence(record, { itemId = 9501, quantity = 90 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        90, "430-1: seed 90")
+
+    -- Author prepares +10 while under goal; snapshot the real authored body, then a
+    -- donation arrives first (reorder). Deliver through AdmitRemoteOperation.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9501, 10, nil))
+    assertTrue(adjOp ~= nil, "430-1: +10 prepared under goal")
+    local authoredAdj = snapshotOp(adjOp)
+    assertTrue(type(authoredAdj) == "table" and type(authoredAdj.id) == "string",
+        "430-1: authored adjustment snapshot")
+    local authoredAdjId = authoredAdj.id
+    local authoredDataset = authoredAdj.datasetId
+    local authoredCampaign = authoredAdj.campaignId
+    local extra = makeDepositEvidence(record, {
+        itemId = 9501, quantity = 20, donor = "LateDonor-Garona",
+        observedAt = (world.time or 0) + 5,
+    })
+    extra.occurrenceIndex = 2
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(extra, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        110, "430-1: donation first raises total over authored base")
+
+    -- Floor without ceiling allows the historical +10; with ceiling it would reject.
+    local floorRemote = select(1, GS.AdjustmentFloorOk(
+        record, 9501, 10, nil, record.currentCampaignId, nil))
+    assertEq(floorRemote, true, "430-1: remote floor (no ceiling) accepts over-goal history")
+    local floorLocal = select(1, GS.AdjustmentFloorOk(
+        record, 9501, 10, nil, record.currentCampaignId, { enforceGoalCeiling = true }))
+    assertEq(floorLocal, false, "430-1: local ceiling still blocks new +10 at 110/100")
+
+    local stRemote, reasonRemote = GS:AdmitRemoteOperation(authoredAdj, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stRemote, "accepted",
+        "430-1: AdmitRemoteOperation after donation err=" .. tostring(reasonRemote))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        120, "430-1: donation+adjustment converge to 120")
+    assertTrue(record.operations and record.operations.records
+        and record.operations.records[authoredAdjId] ~= nil,
+        "430-1: authenticated remote adjustment retained")
+
+    local stDup, reasonDup = GS:AdmitRemoteOperation(authoredAdj, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stDup, "duplicate",
+        "430-1: duplicate AdmitRemoteOperation credits once got=" .. tostring(reasonDup))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        120, "430-1: total unchanged after duplicate")
+
+    -- Local authoring ceiling still blocks new positives while over goal.
+    local refill = select(1, GS:NewAdjustmentOperation(9501, -5, nil))
+    assertTrue(refill ~= nil, "430-1: negative prepares")
+    assertEq(GS:ApplyStagedConfigOperation(refill), "accepted", "430-1: negative local apply")
+    local remotePos = select(1, GS:NewAdjustmentOperation(9501, 3, nil))
+    assertEq(remotePos, nil, "430-1: local prep still rejects over-goal positive")
+    record = GS:GetCurrentRecord()
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        115, "430-1: after negative correction")
+    assertEq(authoredAdj.datasetId, authoredDataset, "430-1: authored body dataset stable")
+    assertEq(authoredAdj.campaignId, authoredCampaign, "430-1: authored body campaign stable")
+
+    -- Lowered/zero goal must not block authenticated historical admission.
+    -- Keep the originally authored dataset/campaign/event identity unchanged.
+    record = seedStagedCampaignWithItem(9502, 100)
+    local seed90 = makeDepositEvidence(record, { itemId = 9502, quantity = 90 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(seed90, pair[1], pair[2])
+    end
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local histAdj = select(1, GS:NewAdjustmentOperation(9502, 10, nil))
+    assertTrue(histAdj ~= nil, "430-1: hist +10 prepared")
+    local histStored = snapshotOp(histAdj)
+    assertTrue(type(histStored) == "table" and type(histStored.id) == "string",
+        "430-1: hist +10 snapshot")
+    local histId = histStored.id
+    local histDataset = histStored.datasetId
+    local histCampaign = histStored.campaignId
+    assertEq(histDataset, record.datasetId, "430-1: hist snapshot keeps dataset")
+    assertEq(histCampaign, record.currentCampaignId, "430-1: hist snapshot keeps campaign")
+
+    -- Same dataset/campaign: later goal reduction, then admit the unchanged body.
+    local goalOp = GS:NewConfigOperation("set-requested-item", { itemId = 9502 }, {
+        itemId = 9502, goal = 0, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(goalOp), "accepted", "430-1: goal lowered to 0")
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, histDataset, "430-1: dataset unchanged after goal lower")
+    assertEq(record.currentCampaignId, histCampaign, "430-1: campaign unchanged after goal lower")
+    local localBlocked = select(1, GS:NewAdjustmentOperation(9502, 1, nil))
+    assertEq(localBlocked, nil, "430-1: new local positive still blocked by zero goal")
+
+    local stZero, reasonZero = GS:AdmitRemoteOperation(histStored, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stZero, "accepted",
+        "430-1: historical +10 admitted after goal lowered to 0 err=" .. tostring(reasonZero))
+    assertEq(histStored.id, histId, "430-1: admitted body kept original op id")
+    assertEq(histStored.datasetId, histDataset, "430-1: admitted body kept original dataset")
+    assertEq(histStored.campaignId, histCampaign, "430-1: admitted body kept original campaign")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9502]) or 0,
+        100, "430-1: zero-goal peer converges with history")
+    assertTrue(record.operations and record.operations.records
+        and record.operations.records[histId] ~= nil,
+        "430-1: historical adjustment retained under original id")
+
+    local stZeroDup = select(1, GS:AdmitRemoteOperation(histStored, {
+        sender = "Alice-Garona",
+    }))
+    assertEq(stZeroDup, "duplicate", "430-1: zero-goal history duplicate credits once")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9502]) or 0,
+        100, "430-1: zero-goal total unchanged after duplicate")
+end
+
+do
+    -- #430-2/3/4) Attribution autocomplete beyond 256 + tonumber multi-return + Apply button.
+    if type(CopyTable) ~= "function" then
+        function CopyTable(t)
+            if type(t) ~= "table" then return t end
+            local out = {}
+            for k, v in pairs(t) do
+                out[k] = type(v) == "table" and CopyTable(v) or v
+            end
+            return out
+        end
+    end
+    local created = {}
+    local function makeRegion(objectType, name, parent, template)
+        local region = {
+            _shown = true,
+            _text = "",
+            _enabled = true,
+            _alpha = 1,
+            _scripts = {},
+            _hooks = {},
+            _points = {},
+            _width = 180,
+            _height = 20,
+            parent = parent,
+            name = name,
+            objectType = objectType or "Frame",
+            registeredEvents = {},
+        }
+        function region:GetObjectType() return self.objectType end
+        function region:SetShown(v) self._shown = v and true or false end
+        function region:IsShown() return self._shown end
+        function region:Show() self._shown = true end
+        function region:Hide() self._shown = false end
+        function region:SetSize(w, h)
+            self._width = tonumber(w) or self._width
+            self._height = tonumber(h) or self._height
+        end
+        function region:SetWidth(w) self._width = tonumber(w) or self._width end
+        function region:SetHeight(h) self._height = tonumber(h) or self._height end
+        function region:GetWidth() return self._width end
+        function region:GetHeight() return self._height end
+        function region:SetPoint(...) self._points[#self._points + 1] = { ... } end
+        function region:ClearAllPoints() self._points = {} end
+        function region:SetAllPoints() end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetText(t) self._text = tostring(t or "") end
+        function region:GetText() return self._text end
+        function region:SetTextColor() end
+        function region:SetHighlightColor() end
+        function region:SetAutoFocus() end
+        function region:SetMaxLetters() end
+        function region:SetNumeric() end
+        function region:SetEnabled(v) self._enabled = v and true or false end
+        function region:IsEnabled() return self._enabled end
+        function region:Enable() self._enabled = true end
+        function region:Disable() self._enabled = false end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:SetAlpha(a) self._alpha = a end
+        function region:SetScript(ev, fn) self._scripts[ev] = fn end
+        function region:GetScript(ev) return self._scripts[ev] end
+        function region:HookScript(ev, fn)
+            self._hooks[ev] = self._hooks[ev] or {}
+            self._hooks[ev][#self._hooks[ev] + 1] = fn
+        end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterEvent(e) self.registeredEvents[e] = nil end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:HasFocus() return self._focused end
+        function region:SetFocus() self._focused = true end
+        function region:ClearFocus()
+            self._focused = false
+            local fn = self._scripts.OnEditFocusLost
+            if fn then fn(self) end
+        end
+        function region:Click(...)
+            local fn = self._scripts.OnClick
+            if fn then fn(self, ...) end
+        end
+        function region:SetCursorPosition() end
+        function region:GetCursorPosition() return 0 end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:GetFrameLevel() return 0 end
+        function region:SetClampedToScreen() end
+        function region:SetClipsChildren() end
+        function region:SetScrollChild(child) self.scrollChild = child end
+        function region:SetVerticalScroll() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetNonSpaceWrap() end
+        function region:GetStringWidth() return 40 end
+        function region:GetStringHeight() return 12 end
+        function region:SetFontObject() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:RegisterForClicks() end
+        function region:SetMinMaxValues() end
+        function region:SetValueStep() end
+        function region:SetValue() end
+        function region:GetValue() return self.value or 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:SetColorTexture() end
+        function region:SetTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetVertexColor() end
+        function region:SetBlendMode() end
+        function region:SetDefaultText() end
+        function region:SetupMenu() end
+        function region:GenerateMenu() end
+        function region:SetBackdrop() end
+        function region:SetBackdropColor() end
+        function region:SetBackdropBorderColor() end
+        function region:CreateFontString()
+            return makeRegion("FontString", nil, self)
+        end
+        function region:CreateTexture()
+            return makeRegion("Texture", nil, self)
+        end
+        function region:CreateFrame(ft, n, p, tmpl)
+            return CreateFrame(ft, n, p or self, tmpl)
+        end
+        -- Simulate user typing into an EditBox.
+        function region:TypeText(text)
+            self._text = tostring(text or "")
+            local fn = self._scripts.OnTextChanged
+            if fn then fn(self, true) end
+        end
+        if template and tostring(template):find("ScrollFrame", 1, true) then
+            region.ScrollBar = makeRegion("Slider", nil, region)
+            region.ScrollBar:SetWidth(20)
+            region.ScrollBar._shown = false
+        end
+        if template and tostring(template):find("InputBox", 1, true) then
+            region.objectType = "EditBox"
+            region.Instructions = makeRegion("FontString", nil, region)
+            function region.Instructions:SetText(t) self._text = tostring(t or "") end
+        end
+        if template and tostring(template):find("UIPanelButton", 1, true) then
+            region.objectType = "Button"
+        end
+        if objectType == "Button" or (template and tostring(template):find("Button", 1, true)) then
+            region.objectType = region.objectType ~= "Frame" and region.objectType or "Button"
+        end
+        if objectType == "EditBox" then
+            region.objectType = "EditBox"
+        end
+        created[#created + 1] = region
+        return region
+    end
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        return makeRegion(frameType or "Frame", name, parent, template)
+    end
+    UIParent = UIParent or makeRegion("Frame", "UIParent")
+
+    -- Force-reload Controls so buttonEnabled / OnTextChanged repairs are present
+    -- even when an earlier harness already registered AddEditBoxWithButton.
+    loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    if not (SF.SettingsUI and SF.SettingsUI.DefinitionRenderer) then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    end
+    -- Capture production Definition via Page:Build without requiring every chrome
+    -- widget. EnsureRosterListener still runs under this CreateFrame stub.
+    SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {}
+    local realRendererBuild = SF.SettingsUI.DefinitionRenderer.Build
+    SF.SettingsUI.DefinitionRenderer.Build = function(_, panel, pageDef)
+        panel.__sfPageDef = pageDef
+        panel.__sfPageBuilder = panel.__sfPageBuilder or {
+            RegisterRefresh = function() end,
+            Refresh = function() end,
+            FireRefresh = function() end,
+        }
+        return panel
+    end
+    -- Reload Configuration so helpers and definition pick up repairs.
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pagesById.guildSuppliesConfiguration = nil
+    local buildLoadOk, buildLoadErr = pcall(function()
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    end)
+    assertEq(buildLoadOk, true,
+        "430-ui: config module loads under multi-return-safe CreateFrame: " .. tostring(buildLoadErr))
+    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+    assertTrue(configPage ~= nil, "430-ui: config page registered")
+
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    -- Build a roster larger than 256 with a distinctive late member.
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+    }
+    for i = 1, 300 do
+        world.guild.members[#world.guild.members + 1] = {
+            name = string.format("Member%03d-Garona", i),
+            guid = string.format("Player-1-M%03d", i),
+            rankOrder = 4,
+            online = (i % 2 == 0),
+        }
+    end
+    world.guild.members[#world.guild.members + 1] = {
+        name = "ZedLast-Garona",
+        guid = "Player-1-ZedLast",
+        rankOrder = 4,
+        online = true,
+    }
+    -- Multi-return online count > 36 reproduces the tonumber base bug.
+    local priorGetNum = GetNumGuildMembers
+    function GetNumGuildMembers()
+        local total = #world.guild.members
+        local online = 50
+        return total, online, online
+    end
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 9503 }, {
+        itemId = 9503, goal = 50, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "430-ui: item seeded")
+
+    local panel = makeRegion("Frame", "ConfigPanel")
+    function panel:IsVisible() return true end
+    local buildOk, buildErr = pcall(function()
+        configPage:Build(panel)
+    end)
+    SF.SettingsUI.DefinitionRenderer.Build = realRendererBuild
+    assertEq(buildOk, true, "430-ui: Build with multi-return guild count: " .. tostring(buildErr))
+    local pageDef = panel.__sfPageDef
+    assertTrue(type(pageDef) == "table", "430-ui: page definition stored")
+
+    local attrSuggest, attrResolved, attrGet, attrSet
+    local qtyEnabled, qtyButtonEnabled, qtyOnTextChanged, qtyOnSubmit, qtyGet
+    local itemOnChanged
+    for _, sec in ipairs(pageDef.sections or {}) do
+        if sec.id == "gsAdjust" then
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "autocomplete" then
+                    attrSuggest = item.getSuggestions
+                    attrResolved = item.onResolved
+                    attrGet = item.get
+                    attrSet = item.set
+                    assertEq(item.onTextChanged, nil,
+                        "430-ui: attribution has no redundant onTextChanged")
+                elseif item.type == "editboxButton"
+                    and item.label
+                    and tostring(item.label):find("Quantity", 1, true) then
+                    qtyEnabled = item.enabled
+                    qtyButtonEnabled = item.buttonEnabled
+                    qtyOnTextChanged = item.onTextChanged
+                    qtyOnSubmit = item.onSubmit
+                    qtyGet = item.get
+                elseif item.type == "dropdown"
+                    and item.label
+                    and tostring(item.label):find("Requested item", 1, true) then
+                    itemOnChanged = item.onValueChanged
+                end
+            end
+        end
+    end
+    assertTrue(type(attrSuggest) == "function", "430-ui: attribution getSuggestions")
+    assertTrue(type(attrSet) == "function", "430-ui: attribution bound setter")
+    assertTrue(type(qtyButtonEnabled) == "function", "430-ui: quantity buttonEnabled")
+    assertTrue(type(qtyOnTextChanged) == "function", "430-ui: quantity onTextChanged")
+
+    -- Suggestions must reach members beyond roster row 256 without error.
+    local suggestOk, suggestions = pcall(attrSuggest, nil, "ZedLast")
+    assertEq(suggestOk, true, "430-ui: suggestions with multi-return count: " .. tostring(suggestions))
+    local foundZed = false
+    for i = 1, #(suggestions or {}) do
+        if suggestions[i].value == "ZedLast-Garona" or suggestions[i].text == "ZedLast-Garona" then
+            foundZed = true
+        end
+    end
+    assertEq(foundZed, true, "430-ui: ZedLast beyond row 256 is selectable")
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona", label = "ZedLast-Garona" })
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved attribution retained")
+
+    -- Unassigned remains the empty default and is restored on clear.
+    attrSet("")
+    assertEq(attrGet(), "", "430-ui: cleared attribution shows empty/Unassigned draft")
+    local emptySuggestions = attrSuggest(nil, "")
+    assertTrue(type(emptySuggestions) == "table" and #emptySuggestions >= 1,
+        "430-ui: empty prefix yields suggestions")
+    assertEq(emptySuggestions[1].value, false, "430-ui: Unassigned is first empty suggestion")
+
+    -- Typing after roster reorder keeps an explicit selection until cleared.
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona" })
+    -- Move ZedLast earlier without losing the draft selection value.
+    world.guild.members[2], world.guild.members[#world.guild.members] =
+        world.guild.members[#world.guild.members], world.guild.members[2]
+    if GS and configPage.Refresh then
+        -- Invalidate cache via roster event path.
+        fireEvent("GUILD_ROSTER_UPDATE")
+    end
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: selection survives roster reorder")
+
+    -- Select item so quantity row enables; Apply tracks validity live.
+    local sectionMessages = {}
+    local section = {
+        ClearMessage = function() end,
+        SetMessage = function(_, msg, sev)
+            sectionMessages[#sectionMessages + 1] = { msg = msg, sev = sev }
+        end,
+    }
+    local ctx = { section = section, pageBuilder = panel.__sfPageBuilder }
+    assertTrue(type(itemOnChanged) == "function", "430-ui: item onValueChanged")
+    itemOnChanged(ctx, 9503)
+    assertEq(qtyEnabled(), true, "430-ui: quantity edit enables with item selected")
+    assertEq(qtyButtonEnabled(""), false, "430-ui: Apply disabled for empty quantity")
+    qtyOnTextChanged("+10")
+    assertEq(qtyGet(), "+10", "430-ui: draft preserves invalid +10 text")
+    assertEq(qtyButtonEnabled("+10"), false, "430-ui: Apply disabled for +10")
+    qtyOnTextChanged("0")
+    assertEq(qtyButtonEnabled("0"), false, "430-ui: Apply disabled for zero")
+    qtyOnTextChanged("10.5")
+    assertEq(qtyButtonEnabled("10.5"), false, "430-ui: Apply disabled for decimal")
+    qtyOnTextChanged("10")
+    assertEq(qtyButtonEnabled("10"), true, "430-ui: Apply enabled for valid 10")
+    qtyOnTextChanged("-10")
+    assertEq(qtyButtonEnabled("-10"), true, "430-ui: Apply enabled for valid -10")
+
+    -- #430 connected controls: attribution autocomplete drives the real Apply button
+    -- through production RefreshPageControls → RegisterRefresh (not direct validators).
+    local sharedPB = {
+        _refresh = {},
+        RegisterRefresh = function(self, fn)
+            self._refresh[#self._refresh + 1] = fn
+        end,
+        FireRefresh = function(self)
+            for i = 1, #self._refresh do self._refresh[i]() end
+        end,
+    }
+    local sharedSection = {
+        __sfPageBuilder = sharedPB,
+        AddRow = function(self, _, builder)
+            local row = makeRegion("Frame", "SharedRow", nil)
+            builder(row)
+            return row
+        end,
+    }
+    -- Production attribution handlers call RefreshPageControls via Page:Refresh.
+    configPage.panel = makeRegion("Frame", "ConnectedConfigPanel")
+    function configPage.panel:IsVisible() return true end
+    function configPage:Refresh()
+        sharedPB:FireRefresh()
+    end
+
+    local connectedBefore = #created
+    SF.SettingsUI.Controls:AddEditBoxWithButton(sharedSection, {
+        label = "Quantity change",
+        buttonText = "Apply adjustment",
+        get = qtyGet,
+        getSelectionKey = function() return "adj-connected" end,
+        enabled = qtyEnabled,
+        buttonEnabled = qtyButtonEnabled,
+        onTextChanged = qtyOnTextChanged,
+        onSubmit = function() end,
+    })
+    SF.SettingsUI.Controls:AddAutocomplete(sharedSection, {
+        label = "Attribution",
+        get = attrGet,
+        set = attrSet,
+        getSuggestions = function(prefix)
+            return attrSuggest(nil, prefix)
+        end,
+        onResolved = function(item)
+            attrResolved(nil, item)
+        end,
+        -- Production path: bound set only (no redundant onTextChanged).
+        maxSuggestions = 8,
+    })
+    local attrEdit, qtyEdit, applyBtn
+    for i = connectedBefore + 1, #created do
+        local obj = created[i]
+        if obj.GetObjectType and obj:GetObjectType() == "EditBox" then
+            if not qtyEdit then
+                qtyEdit = obj
+            elseif not attrEdit then
+                attrEdit = obj
+            end
+        elseif obj.GetObjectType and obj:GetObjectType() == "Button" and not applyBtn then
+            applyBtn = obj
+        end
+    end
+    assertTrue(attrEdit ~= nil and qtyEdit ~= nil and applyBtn ~= nil,
+        "430-ui: connected attribution+quantity controls created")
+
+    local function clickSuggestionLabeled(label)
+        for i = 1, #created do
+            local obj = created[i]
+            if obj.Text and tostring(obj.Text._text or "") == label and obj._scripts and obj._scripts.OnClick then
+                obj:Click()
+                return true
+            end
+        end
+        return false
+    end
+
+    local beforeProgress = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    local beforeTotal = tonumber(beforeProgress.itemTotals[9503]) or 0
+    local beforeZed = 0
+    if beforeProgress.contributions and beforeProgress.contributions["Zed-Garona"] then
+        beforeZed = tonumber(beforeProgress.contributions["Zed-Garona"][9503]) or 0
+    end
+    local beforeZedLast = 0
+    if beforeProgress.contributions and beforeProgress.contributions["ZedLast-Garona"] then
+        beforeZedLast = tonumber(beforeProgress.contributions["ZedLast-Garona"][9503]) or 0
+    end
+    local confirmCallsPartial = 0
+    local priorConfirmPartial = SF.SettingsUI.Dialogs and SF.SettingsUI.Dialogs.Confirm
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.Confirm = function()
+        confirmCallsPartial = confirmCallsPartial + 1
+    end
+    sectionMessages = {}
+
+    -- Unresolved prefix then valid quantity: real Apply stays disabled.
+    attrEdit:TypeText("Zed")
+    assertEq(attrGet(), "Zed", "430-ui: partial search draft retained")
+    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete edit shows partial search")
+    local partialSuggestions = attrSuggest(nil, "Zed")
+    local phantomPrefix = false
+    local foundZedLastPartial = false
+    for i = 1, #(partialSuggestions or {}) do
+        local value = partialSuggestions[i].value
+        if value == "Zed" or value == "Zed-Garona" then
+            phantomPrefix = true
+        end
+        if value == "ZedLast-Garona" then
+            foundZedLastPartial = true
+        end
+    end
+    assertEq(phantomPrefix, false, "430-ui: unmatched prefix is not a suggestion")
+    assertEq(foundZedLastPartial, true, "430-ui: real ZedLast still suggested for prefix")
+    qtyEdit:TypeText("8")
+    assertEq(qtyEdit:GetText(), "8", "430-ui: quantity draft typed while attribution unresolved")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: real Apply disabled for unresolved attribution")
+    -- Blur/refresh keeps unresolved search without crediting it.
+    attrEdit:ClearFocus()
+    assertEq(attrGet(), "Zed", "430-ui: unresolved search survives blur")
+    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete blur keeps unresolved text")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: Apply still disabled after unresolved blur")
+    qtyOnSubmit(ctx, "8")
+    assertEq(confirmCallsPartial, 0, "430-ui: unresolved attribution blocks confirm")
+    assertTrue(#sectionMessages >= 1 and sectionMessages[#sectionMessages].sev == "error",
+        "430-ui: unresolved attribution shows localized error")
+    assertTrue(tostring(sectionMessages[#sectionMessages].msg):find("Select Unassigned", 1, true)
+        or tostring(sectionMessages[#sectionMessages].msg):find("suggestions", 1, true),
+        "430-ui: unresolved attribution error explains selection requirement")
+    local afterPartial = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    assertEq(tonumber(afterPartial.itemTotals[9503]) or 0, beforeTotal,
+        "430-ui: unresolved submit creates no item total change")
+    local afterZed = 0
+    if afterPartial.contributions and afterPartial.contributions["Zed-Garona"] then
+        afterZed = tonumber(afterPartial.contributions["Zed-Garona"][9503]) or 0
+    end
+    assertEq(afterZed, beforeZed, "430-ui: unresolved submit creates no Zed-Garona phantom credit")
+
+    -- Click the real suggestion: Apply enables without retyping quantity.
+    attrEdit:SetFocus()
+    attrEdit:TypeText("Zed")
+    assertEq(clickSuggestionLabeled("ZedLast-Garona"), true,
+        "430-ui: clicked ZedLast suggestion beyond row 256")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: suggestion click resolves attribution")
+    assertEq(qtyEdit:GetText(), "8", "430-ui: quantity draft preserved across suggestion click")
+    assertEq(applyBtn:IsEnabled(), true,
+        "430-ui: real Apply enables after suggestion without qty retype")
+
+    -- Reverse: typing unresolved text disables the live Apply button.
+    attrEdit:TypeText("Zed")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: real Apply disables when attribution becomes unresolved")
+    -- Clearing restores Unassigned and re-enables Apply for valid quantity.
+    attrEdit:TypeText("")
+    assertEq(attrGet(), "", "430-ui: clear restores Unassigned display")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: real Apply enables for Unassigned + valid qty")
+    -- Exact typed name resolves without a click and updates Apply.
+    attrEdit:TypeText("ZedLast-Garona")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: exact typed name resolves without click")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: exact resolve enables real Apply")
+
+    -- Roster lag: unchanged blur must not invalidate a resolved selection.
+    local savedMembers = world.guild.members
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+    }
+    fireEvent("GUILD_ROSTER_UPDATE")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved selection survives roster lag")
+    local lagSuggestions = attrSuggest(nil, "Zed")
+    local lagHasResolved = false
+    for i = 1, #(lagSuggestions or {}) do
+        if lagSuggestions[i].value == "ZedLast-Garona" then
+            lagHasResolved = true
+        end
+    end
+    assertEq(lagHasResolved, true, "430-ui: lag suggestions keep resolved credit")
+    attrEdit:ClearFocus()
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: lag blur preserves resolved identity")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: lag blur keeps Apply enabled")
+    -- Retained suggestion selection + ClearFocus also preserves identity.
+    attrEdit:SetFocus()
+    attrEdit:TypeText("Zed")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: typing during lag unresolved disables Apply")
+    assertEq(clickSuggestionLabeled("ZedLast-Garona"), true,
+        "430-ui: clicked retained lag suggestion")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: lag suggestion re-resolves attribution")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: lag suggestion click enables Apply")
+    world.guild.members = savedMembers
+    fireEvent("GUILD_ROSTER_UPDATE")
+
+    -- Submit with resolved attribution still applies exact credit.
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        confirmCallsPartial = confirmCallsPartial + 1
+        if type(accept) == "function" then accept() end
+    end
+    qtyOnSubmit(ctx, "8")
+    assertTrue(confirmCallsPartial >= 1, "430-ui: resolved attribution reaches confirm/apply")
+    local afterSelect = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    assertEq(tonumber(afterSelect.itemTotals[9503]) or 0, beforeTotal + 8,
+        "430-ui: resolved ZedLast adjustment applied to item total")
+    local afterZedLast = 0
+    if afterSelect.contributions and afterSelect.contributions["ZedLast-Garona"] then
+        afterZedLast = tonumber(afterSelect.contributions["ZedLast-Garona"][9503]) or 0
+    end
+    assertEq(afterZedLast, beforeZedLast + 8,
+        "430-ui: resolved credit is exact ZedLast-Garona")
+    local afterZed2 = 0
+    if afterSelect.contributions and afterSelect.contributions["Zed-Garona"] then
+        afterZed2 = tonumber(afterSelect.contributions["Zed-Garona"][9503]) or 0
+    end
+    assertEq(afterZed2, beforeZed, "430-ui: still no Zed-Garona phantom after real select")
+    SF.SettingsUI.Dialogs.Confirm = priorConfirmPartial
+    qtyOnTextChanged("10")
+    sharedPB:FireRefresh()
+    assertEq(qtyEdit:GetText(), "10", "430-ui: quantity draft retained after connected refresh")
+
+    -- Isolated quantity editboxButton: edit stays enabled while Apply toggles.
+    local btnSection = {
+        __sfPageBuilder = {
+            _refresh = {},
+            RegisterRefresh = function(self, fn)
+                self._refresh[#self._refresh + 1] = fn
+            end,
+            FireRefresh = function(self)
+                for i = 1, #self._refresh do self._refresh[i]() end
+            end,
+        },
+        AddRow = function(self, _, builder)
+            local row = makeRegion("Frame", "QtyRow", nil)
+            builder(row)
+            return row
+        end,
+    }
+    local liveDraft = { text = "" }
+    local createdBefore = #created
+    SF.SettingsUI.Controls:AddEditBoxWithButton(btnSection, {
+        label = "Quantity change",
+        buttonText = "Apply adjustment",
+        get = function() return liveDraft.text end,
+        getSelectionKey = function() return "qty-key" end,
+        enabled = function() return true end,
+        buttonEnabled = function(text)
+            return GS.ParseAdjustmentQuantity(text or "") ~= nil
+        end,
+        onTextChanged = function(text)
+            liveDraft.text = tostring(text or "")
+        end,
+        onSubmit = function() end,
+    })
+    local editBox, isolatedApply
+    for i = createdBefore + 1, #created do
+        local obj = created[i]
+        if obj.GetObjectType and obj:GetObjectType() == "EditBox" and not editBox then
+            editBox = obj
+        elseif obj.GetObjectType and obj:GetObjectType() == "Button" and not isolatedApply then
+            isolatedApply = obj
+        end
+    end
+    assertTrue(editBox ~= nil and isolatedApply ~= nil, "430-ui: edit+button created")
+    assertEq(editBox:IsEnabled(), true, "430-ui: edit enabled initially")
+    assertEq(isolatedApply:IsEnabled(), false, "430-ui: Apply disabled initially")
+    editBox:TypeText("10")
+    assertEq(editBox:IsEnabled(), true, "430-ui: edit stays editable after valid text")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: Apply enables on valid text")
+    editBox:TypeText("+10")
+    assertEq(editBox:IsEnabled(), true, "430-ui: edit stays editable on invalid text")
+    assertEq(isolatedApply:IsEnabled(), false, "430-ui: Apply disables on invalid text")
+    editBox:TypeText("7")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: Apply re-enables on corrected text")
+    -- Ordinary refresh preserves draft and button state.
+    btnSection.__sfPageBuilder:FireRefresh()
+    assertEq(editBox:GetText(), "7", "430-ui: refresh preserves quantity draft")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: refresh keeps Apply enabled for valid draft")
+
+    -- Async confirmation: cancel preserves; success clears quantity via page submit path.
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona" })
+    qtyOnTextChanged("5")
+    local confirmCalls = 0
+    local capturedAccept
+    local priorConfirm = SF.SettingsUI.Dialogs and SF.SettingsUI.Dialogs.Confirm
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        confirmCalls = confirmCalls + 1
+        capturedAccept = accept
+        -- Cancel: do not invoke accept.
+    end
+    qtyOnSubmit(ctx, "5")
+    assertEq(confirmCalls, 1, "430-ui: confirm shown")
+    assertEq(qtyGet(), "5", "430-ui: cancel path preserves quantity draft")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: cancel path preserves attribution")
+
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        confirmCalls = confirmCalls + 1
+        if type(accept) == "function" then accept() end
+    end
+    qtyOnTextChanged("4")
+    qtyOnSubmit(ctx, "4")
+    assertTrue(confirmCalls >= 2, "430-ui: success confirm invoked")
+    assertEq(qtyGet(), "", "430-ui: success clears quantity")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: success retains attribution/item context text")
+
+    -- Failure path: remove item then confirm accept → reject, draft preserved.
+    qtyOnTextChanged("3")
+    local pendingAccept
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        pendingAccept = accept
+    end
+    qtyOnSubmit(ctx, "3")
+    assertTrue(type(pendingAccept) == "function", "430-ui: failure-case confirm captured")
+    local removeOp = GS:NewConfigOperation("set-requested-item", { itemId = 9503 }, { removed = true })
+    assertEq(GS:ApplyStagedConfigOperation(removeOp), "accepted", "430-ui: remove item before accept")
+    pendingAccept()
+    assertEq(qtyGet(), "3", "430-ui: failure preserves quantity draft")
+
+    SF.SettingsUI.Dialogs.Confirm = priorConfirm
+    GetNumGuildMembers = priorGetNum
+    CreateFrame = priorCreateFrame
 end
 
 SF.TSM = nil
