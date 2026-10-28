@@ -41366,6 +41366,18 @@ do
         localWrite = false,
     })
     assertEq(stAdj, "accepted", "427-r10: rename historical adj accepted r=" .. tostring(rAdj))
+    -- No local name↔GUID provenance after stripping the donation GUID: claim dropped.
+    local adjRow = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and ev.id == "gs1:Player-1-Alice:deadbeef42732:1" then
+            adjRow = ev
+            break
+        end
+    end
+    assertTrue(adjRow ~= nil, "427-r10: adj row present")
+    assertEq(adjRow.attributed, "Dave-Garona", "427-r10: durable attributed name kept")
+    assertEq(adjRow.attributedGuid, nil, "427-r10: unverified GUID discarded without provenance")
     assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42732]) or 0,
         7, "427-r10: item after rename adj")
 
@@ -41579,6 +41591,191 @@ do
     assertEq(reevalCalls, afterCredit,
         "427-r13: empty pending skips expensive reeval got=" .. tostring(reevalCalls))
     GS.ReevaluatePendingEvidence = prevReeval
+end
+
+---------------------------------------------------------------------------
+-- #427 repair: provenance-gated donor name/GUID trust (Codex security follow-up)
+---------------------------------------------------------------------------
+
+local function renameGuildCharacter(guid, newName)
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == guid then
+            m.name = newName
+        end
+    end
+    local giRec = select(1, GI:GetCurrentRecord())
+    if giRec and giRec.characters and giRec.characters[guid] then
+        giRec.characters[guid].nameRealm = newName
+    end
+    if giRec and giRec.members and giRec.members[guid] then
+        giRec.members[guid].nameRealm = newName
+    end
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+end
+
+do
+    -- Repair-14: unresolved donor name + unrelated retained GUID cannot redirect credit.
+    local record = seedStagedCampaignWithItem(42741, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Departed-looking donor name that no longer resolves on roster/GI.
+    renameGuildCharacter("Player-1-Dave", "David-Garona")
+
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42741, quantity = 5, donor = "Dave-Garona",
+    })
+    evidence.donorGuid = "Player-1-Eve"
+    evidence.actorGuid = "Player-1-Eve"
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r14: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r14: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r14: w3")
+    local donation = findDonation(record, 42741)
+    assertTrue(donation ~= nil, "427-r14: donation present")
+    assertEq(donation.actor, "Dave-Garona", "427-r14: immutable donor name")
+    assertEq(donation.actorGuid, nil, "427-r14: unrelated retained GUID discarded")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42741]) or 0, 5,
+        "427-r14: credit stays under durable name")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42741]) or 0, 0,
+        "427-r14: Eve main not credited")
+    assertEq(tonumber(progress.contributions["David-Garona"]
+        and progress.contributions["David-Garona"][42741]) or 0, 0,
+        "427-r14: renamed GUID not claimed by forged bind")
+end
+
+do
+    -- Repair-15: legitimate rename keeps GUID when local ledger already linked it.
+    local record = seedStagedCampaignWithItem(42742, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42742, quantity = 8, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r15: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r15: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r15: w3")
+    local donation = findDonation(record, 42742)
+    assertEq(donation.actorGuid, "Player-1-Dave", "427-r15: donation GUID stored while name resolved")
+    renameGuildCharacter("Player-1-Dave", "David-Garona")
+
+    local stAdj, rAdj = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "gs1:Player-1-Alice:deadbeef42742:1",
+        txnId = "gs1:Player-1-Alice:deadbeef42742:1",
+        opId = "gs1:Player-1-Alice:deadbeef42742:1",
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42742,
+        quantity = -2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stAdj, "accepted", "427-r15: rename adj with ledger provenance r=" .. tostring(rAdj))
+    local adjRow = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and ev.id == "gs1:Player-1-Alice:deadbeef42742:1" then
+            adjRow = ev
+            break
+        end
+    end
+    assertTrue(adjRow ~= nil, "427-r15: adj present")
+    assertEq(adjRow.attributed, "Dave-Garona", "427-r15: original attributed name")
+    assertEq(adjRow.attributedGuid, "Player-1-Dave", "427-r15: GUID kept via ledger provenance")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42742]) or 0, 6, "427-r15: item total")
+    -- Unassigned contributors keep the durable original name in projection while
+    -- GUID provenance remains for floors/future main assignment.
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42742]) or 0, 6,
+        "427-r15: durable name projection intact")
+    assertEq(GS.PersonalContributorItemTotal(record, "Dave-Garona", "Player-1-Dave", 42742),
+        6, "427-r15: personal floor follows GUID provenance")
+end
+
+do
+    -- Repair-16: cross-client replay — forged GUID dropped; later duplicate stays name-only.
+    local record = seedStagedCampaignWithItem(42743, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    renameGuildCharacter("Player-1-Dave", "David-Garona")
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42743, quantity = 4, donor = "Dave-Garona",
+    })
+    evidence.actorGuid = "Player-1-Eve"
+    evidence.donorGuid = "Player-1-Eve"
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r16: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r16: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r16: w3")
+    local first = findDonation(record, 42743)
+    assertEq(first.actorGuid, nil, "427-r16: first admit drops forged GUID")
+
+    -- Replay with a different retained GUID still cannot attach one.
+    evidence.actorGuid = "Player-1-Alice"
+    evidence.donorGuid = "Player-1-Alice"
+    local stDup, rDup = GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")
+    assertTrue(stDup == "duplicate" or stDup == "accepted",
+        "427-r16: replay status=" .. tostring(stDup) .. " r=" .. tostring(rDup))
+    assertEq(findDonation(record, 42743).actorGuid, nil, "427-r16: replay does not attach forged GUID")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42743]) or 0,
+        4, "427-r16: single credit")
+end
+
+do
+    -- Repair-17: legacy/ambiguous unresolved name cannot invent a GUID from membership.
+    local record = seedStagedCampaignWithItem(42744, 40)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    ensureRankedMember("Dave-Area52", "Player-1-DaveAlt", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+    local amb, ambErr = GI:ResolveCharacterGuidByName("Dave")
+    assertTrue(amb == nil, "427-r17: short name ambiguous at GI err=" .. tostring(ambErr))
+
+    -- Departed/legacy durable name: does not resolve, no ledger provenance.
+    local legacy = "LegacyTwin-Garona"
+    assertEq(GS.ResolveUniqueCharacterGuid(record, legacy, nil), nil,
+        "427-r17: legacy name unresolved")
+    local name, guid, err = GS.BindCharacterIdentity(record, legacy, "Player-1-Eve", nil)
+    assertEq(name, legacy, "427-r17: name preserved")
+    assertEq(guid, nil, "427-r17: unresolved legacy drops claimed GUID")
+    assertEq(err, nil, "427-r17: not a hard mismatch when unresolved")
+
+    local softName, softGuid = GS.ResolveDonorIdentity(record, legacy, "Player-1-Eve")
+    assertEq(softName, legacy, "427-r17: donor soft name")
+    assertEq(softGuid, nil, "427-r17: donor soft drops unverified GUID")
+
+    -- Proven current-name mismatch remains hard-reject for adjustments.
+    local _, _, hardErr = GS.BindCharacterIdentity(
+        record, "Eve-Garona", "Player-1-Dave", nil)
+    assertEq(hardErr, "attribution_mismatch", "427-r17: resolved mismatch still hard")
 end
 
 SF.TSM = nil

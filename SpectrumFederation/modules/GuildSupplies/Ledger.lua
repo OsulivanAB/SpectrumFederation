@@ -447,10 +447,12 @@ function GS.ResolveUniqueCharacterGuid(record, name, hintGuid)
     return nil
 end
 
---- True when GUID is a retained Guild Info member under a ready baseline.
-local function CharacterGuidIsRetained(record, guid)
+--- True when Guild Info currently displays `name` for `guid` (ready baseline).
+-- Membership alone is insufficient; the GUID's current nameRealm must match.
+local function GuidCurrentNameMatches(record, guid, name)
     guid = ValidGuid(guid)
-    if not guid or not GS.WitnessRelationshipsReady(record) then
+    name = NormName(name)
+    if not guid or not name or not GS.WitnessRelationshipsReady(record) then
         return false
     end
     local GI = SF.GuildInfo
@@ -461,15 +463,69 @@ local function CharacterGuidIsRetained(record, guid)
     if readiness ~= "ready" or type(giRec) ~= "table" then
         return false
     end
+    local char = giRec.characters and giRec.characters[guid]
+    if type(char) == "table" and NormName(char.nameRealm) == name then
+        return true
+    end
     local member = giRec.members and giRec.members[guid]
-    return type(member) == "table"
+    if type(member) == "table" and NormName(member.nameRealm) == name then
+        return true
+    end
+    return false
+end
+
+--- True when an already-accepted local ledger row links this durable name to GUID.
+-- Authenticated history is provenance; a bare remote claim is not. Bounded scan.
+local function LedgerEstablishesNameGuid(record, name, guid)
+    name = NormName(name)
+    guid = ValidGuid(guid)
+    if not name or not guid or type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return false
+    end
+    local function rowLinks(ev)
+        if type(ev) ~= "table" then
+            return false
+        end
+        local sideGuid = ValidGuid(ev.actorGuid) or ValidGuid(ev.donorGuid)
+        if sideGuid == guid then
+            if NormName(ev.actor) == name or NormName(ev.donor) == name then
+                return true
+            end
+        end
+        if ValidGuid(ev.attributedGuid) == guid and NormName(ev.attributed) == name then
+            return true
+        end
+        return false
+    end
+    local lists = {
+        { record.accounting._consumableEvents, GS.MAX_LEDGER_EVENTS or 4096 },
+        { record.accounting._consumableEventArchive, GS.MAX_ARCHIVED_EVENTS or 4096 },
+    }
+    for li = 1, #lists do
+        local list, maxLen = lists[li][1], lists[li][2]
+        if type(list) == "table" then
+            local limit = math.min(#list, maxLen)
+            for i = 1, limit do
+                if rowLinks(list[i]) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
 end
 
 --- Bind a durable character name to an optional claimed GUID.
--- Proven name↔GUID mismatches error (unless opts.softMismatch drops the GUID).
--- Unresolved names are not proof of mismatch: a retained GUID may be historical
--- provenance after rename. Unverifiable claims drop the GUID and keep the name.
--- Incomplete relationships drop claimed GUIDs rather than storing them.
+-- Trust rule:
+--   1) Name uniquely resolves to claimed GUID → accept.
+--   2) Name uniquely resolves to a different GUID → hard mismatch (or soft
+--      replace with the name-bound GUID for donations).
+--   3) Name does not uniquely resolve → accept claimed GUID only with
+--      verifiable provenance: Guild Info currently displays that name for the
+--      GUID, or an accepted local ledger row already links the same name↔GUID.
+--   4) Otherwise discard the claimed GUID and keep the immutable name.
+-- Membership alone never establishes name↔GUID binding. Incomplete
+-- relationships drop claimed GUIDs rather than storing them.
 -- @param opts optional { softMismatch = boolean }
 -- @return string|nil name, string|nil guid, string|nil err
 function GS.BindCharacterIdentity(record, characterName, claimedGuid, opts)
@@ -500,9 +556,9 @@ function GS.BindCharacterIdentity(record, characterName, claimedGuid, opts)
         end
         return name, guid, nil
     end
-    -- Name did not uniquely resolve (rename / departed listing). A retained GUID
-    -- still authenticates identity for historical convergence; keep durable name.
-    if CharacterGuidIsRetained(record, guid) then
+    -- Unresolved name: require verifiable name↔GUID provenance, not membership.
+    if GuidCurrentNameMatches(record, guid, name)
+        or LedgerEstablishesNameGuid(record, name, guid) then
         return name, guid, nil
     end
     -- Unverifiable claimed GUID: omit rather than redirect credit.
