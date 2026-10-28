@@ -107,6 +107,44 @@ local unprepared = CheckRun.ClassifyPlayer(unpreparedPlayer, 10)
 assertEq(unprepared.class, CheckRun.CLASS.UNPREPARED, "fresh policy Unprepared")
 assertTrue(unprepared.countsForPot, "policy Unprepared counts for Reward Pot")
 
+-- #433: a confirmed miss that is still incomplete must not become a terminal
+-- freshObservation. Raid Check keeps inspecting until the observation is complete.
+local partialUnprepared = CheckRun.NewPlayer("PU")
+CheckRun.MarkAttempt(partialUnprepared, "incomplete", true, 10)
+partialUnprepared.lastIncompleteReason = "unresolved_item_level"
+partialUnprepared.policyResult = {
+	complete = false,
+	knownUnprepared = true,
+	prepared = false,
+	missing = { "Chest Enchant" },
+	incompleteReason = "unresolved_item_level",
+}
+assertTrue(CheckRun.PlayerNeedsMoreInspects(partialUnprepared), "partial knownUnprepared still needs more inspects")
+assertTrue(CheckRun.PlayerMayQueueInspect(partialUnprepared, 10), "partial knownUnprepared may queue another inspect")
+local partialClass = CheckRun.ClassifyPlayer(partialUnprepared, 10)
+assertEq(partialClass.class, CheckRun.CLASS.INSPECTION_FAILED, "partial knownUnprepared is not terminal Unprepared during acquisition")
+
+-- Once item level resolves below minimum, the complete observation carries both misses.
+local resolvedBoth = CheckRun.NewPlayer("RB")
+CheckRun.MarkAttempt(resolvedBoth, "complete", true, 20)
+resolvedBoth.freshObservation = {
+	complete = true,
+	policy = {
+		complete = true,
+		knownUnprepared = true,
+		prepared = false,
+		missing = { "Chest Enchant", "Item Level 642.3 (650 required)" },
+	},
+	capturedAt = 20,
+}
+resolvedBoth.policyResult = resolvedBoth.freshObservation.policy
+assertTrue(not CheckRun.PlayerNeedsMoreInspects(resolvedBoth), "fully evaluated Unprepared stops further inspects")
+local bothClass = CheckRun.ClassifyPlayer(resolvedBoth, 20)
+assertEq(bothClass.class, CheckRun.CLASS.UNPREPARED, "fully evaluated dual failure classifies Unprepared")
+assertEq(#(bothClass.missing or {}), 2, "fully evaluated dual failure reports both missing requirements")
+assertEq(bothClass.missing[1], "Chest Enchant", "first missing requirement is the enchant")
+assertEq(bothClass.missing[2], "Item Level 642.3 (650 required)", "second missing requirement is item level")
+
 local never = CheckRun.NewPlayer("C")
 local avail = CheckRun.ClassifyPlayer(never, 10)
 assertEq(avail.class, CheckRun.CLASS.UNPREPARED_AVAILABILITY, "never inspectable is availability Unprepared")

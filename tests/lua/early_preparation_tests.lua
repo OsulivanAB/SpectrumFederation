@@ -836,28 +836,52 @@ scans = 0
 EarlyPrep:Refresh("roster")
 assertEq(scans, 1, "a roster refresh scans when the window has just opened")
 
--- #432: Policy finishes known Unprepared even while required item level is still
--- unresolved. Early Preparation must treat that complete observation as a send.
+-- #432 / #433: knownUnprepared (possibly still incomplete) may warn; incomplete
+-- without a confirmed miss must not; fully evaluated Unprepared still may.
 local issue432, issue432Why = EarlyPrep.ObservationShouldWarn({
 	eligible = true,
 	inRaid = true,
 	fresh = true,
-	complete = true,
+	complete = false,
+	knownUnprepared = true,
 	prepared = false,
 	alreadyWarned = false,
 })
-assertTrue(issue432, "a complete Unprepared observation should warn")
+assertTrue(issue432, "a knownUnprepared observation should warn even while incomplete")
 assertEq(issue432Why, "send", "known Unprepared maps to send")
+local issue432Complete, issue432CompleteWhy = EarlyPrep.ObservationShouldWarn({
+	eligible = true,
+	inRaid = true,
+	fresh = true,
+	complete = true,
+	knownUnprepared = true,
+	prepared = false,
+	alreadyWarned = false,
+})
+assertTrue(issue432Complete, "a fully evaluated Unprepared observation should warn")
+assertEq(issue432CompleteWhy, "send", "complete Unprepared maps to send")
 local incompleteStill, incompleteWhy = EarlyPrep.ObservationShouldWarn({
 	eligible = true,
 	inRaid = true,
 	fresh = true,
 	complete = false,
+	knownUnprepared = false,
 	prepared = false,
 	alreadyWarned = false,
 })
-assertTrue(not incompleteStill, "incomplete observations still do not warn")
+assertTrue(not incompleteStill, "incomplete observations without a confirmed miss still do not warn")
 assertEq(incompleteWhy, "incomplete", "incomplete observations keep the incomplete reason")
+local preparedIncomplete, preparedIncompleteWhy = EarlyPrep.ObservationShouldWarn({
+	eligible = true,
+	inRaid = true,
+	fresh = true,
+	complete = false,
+	knownUnprepared = false,
+	prepared = true,
+	alreadyWarned = false,
+})
+assertTrue(not preparedIncomplete, "prepared observations do not warn")
+assertEq(preparedIncompleteWhy, "prepared", "prepared observations keep the prepared reason")
 
 observationStamp = "remote|432|ready|1|0|cfg"
 local issue432Whispers = {}
@@ -879,13 +903,14 @@ SF.LootHelperSync.state.coordEpoch = 7
 SF.LootHelperSync.state.isCoordinator = true
 SF.RaidCheck.GetAuthoritativePreparation = function(_, memberId)
 	prepCalls = prepCalls + 1
-	-- Shape Policy returns after the #432 fix: known enchant failure with no
-	-- incompleteReason, even when item level has not resolved yet.
+	-- Shape Policy returns after the #433 representation split: known enchant
+	-- failure with knownUnprepared, while item level remains unresolved.
 	return {
-		complete = true,
+		complete = false,
+		knownUnprepared = true,
 		prepared = false,
 		missing = { "Chest Enchant" },
-		incompleteReason = nil,
+		incompleteReason = "unresolved_item_level",
 	}, "fresh"
 end
 SF.RaidCheck.DeliverMissingRequirementsWhisper = function(_, memberId, _, missing)

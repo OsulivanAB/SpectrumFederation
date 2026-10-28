@@ -467,17 +467,16 @@ local function CountSocketsAndLimitedGems(slot)
 	return total, filled, limited, nil
 end
 
--- A definitive missing requirement already proves Unprepared. Later unresolved
--- fields must not discard that proof: Early Preparation and readiness treat
--- incomplete as "do not warn," which would silence a known enchant/gem failure
--- while item level or another slot is still loading.
-local function FinishKnownUnprepared(result)
+-- A definitive missing requirement proves Unprepared for Early Preparation and
+-- readiness. That is not the same as a fully evaluated observation: Raid Check
+-- treats complete as terminal and must keep inspecting while other required
+-- fields remain unresolved.
+local function MarkKnownUnprepared(result)
 	if type(result) ~= "table" or type(result.missing) ~= "table" or #result.missing == 0 then
 		return false
 	end
-	result.complete = true
+	result.knownUnprepared = true
 	result.prepared = false
-	result.incompleteReason = nil
 	return true
 end
 
@@ -486,6 +485,7 @@ function Policy.EvaluateObservation(observation, config)
 		complete = false,
 		incompleteReason = nil,
 		prepared = false,
+		knownUnprepared = false,
 		missing = {},
 		usableSockets = 0,
 		limitedGems = 0,
@@ -603,11 +603,21 @@ function Policy.EvaluateObservation(observation, config)
 	-- Item level is optional profile configuration. A known low value is one more
 	-- missing requirement. An unknown value makes a still-prepared observation
 	-- incomplete instead of Unprepared, and only when the requirement is active.
-	-- A previously recorded missing enchant/gem already proves Unprepared.
+	-- Prefer a pending-slot reason over unresolved_item_level so link-loading
+	-- keeps spaced retries instead of burning the ordinary incomplete cap.
 	if Policy.ItemLevelRequirementActive(config) then
 		local canonical = Policy.CanonicalOverallItemLevel(observation.overallEquippedItemLevel)
 		if not canonical then
-			if FinishKnownUnprepared(result) then
+			if MarkKnownUnprepared(result) then
+				if hadUnresolved then
+					result.incompleteReason = unresolvedReason or "unresolved_slot"
+				else
+					result.incompleteReason = "unresolved_item_level"
+				end
+				return result
+			end
+			if hadUnresolved then
+				result.incompleteReason = unresolvedReason or "unresolved_slot"
 				return result
 			end
 			result.incompleteReason = "unresolved_item_level"
@@ -620,8 +630,12 @@ function Policy.EvaluateObservation(observation, config)
 	end
 
 	if #result.missing > 0 then
+		MarkKnownUnprepared(result)
+		if hadUnresolved then
+			result.incompleteReason = unresolvedReason or "unresolved_slot"
+			return result
+		end
 		result.complete = true
-		result.prepared = false
 		result.incompleteReason = nil
 		return result
 	end
@@ -655,6 +669,19 @@ function Policy.ReadinessFromObservation(observation, config)
 		}
 	end
 	local result = Policy.EvaluateObservation(observation, config)
+	-- Confirmed Unprepared is Not Ready even while other fields are still
+	-- loading. Incomplete without a confirmed miss stays Unknown.
+	if result.knownUnprepared then
+		local missing = {}
+		for i = 1, #(result.missing or {}) do
+			missing[i] = result.missing[i]
+		end
+		return {
+			state = "not_ready",
+			missing = missing,
+			incompleteReason = nil,
+		}
+	end
 	if not result.complete then
 		return {
 			state = "unknown",

@@ -455,10 +455,9 @@ assertNotHas(unknownLevel.missing, "Item Level 0 (650 required)", "missing item 
 local unknownReady = Policy.ReadinessFromObservation(observe(completeSlots(), nil), itemLevelConfig(650))
 assertEq(unknownReady.state, "unknown", "missing item level stays Unknown")
 
--- #432: a known missing enchant must stay Unprepared even when a later
--- optional field (required item level, another slot's unresolved link) is still
--- loading. Incomplete must not discard definitive failures Early Preparation
--- already proved from complete slots.
+-- #432 / #433: a known missing enchant proves Unprepared (knownUnprepared) even
+-- when required item level or another slot is still loading. complete remains
+-- false so Raid Check keeps acquiring; Early Preparation may still warn.
 local enchantUnknownLevel = completeSlots({
     [5] = {
         empty = false,
@@ -476,15 +475,33 @@ local knownMissingUnknownLevel = Policy.EvaluateObservation({
     slotsByInventory = enchantUnknownLevel,
     overallEquippedItemLevel = nil,
 }, itemLevelConfig(650))
-assertTrue(knownMissingUnknownLevel.complete, "known missing enchant stays complete when item level is unresolved")
+assertTrue(knownMissingUnknownLevel.knownUnprepared, "known missing enchant is knownUnprepared while item level loads")
+assertTrue(not knownMissingUnknownLevel.complete, "known missing enchant is not fully evaluated while item level loads")
 assertTrue(not knownMissingUnknownLevel.prepared, "known missing enchant is Unprepared while item level loads")
 assertHas(knownMissingUnknownLevel.missing, "Chest Enchant", "unresolved item level does not drop a known enchant failure")
-assertEq(knownMissingUnknownLevel.incompleteReason, nil, "known Unprepared clears incompleteReason")
+assertEq(knownMissingUnknownLevel.incompleteReason, "unresolved_item_level", "partial Unprepared keeps the unresolved item-level reason")
 local knownMissingUnknownReady = Policy.ReadinessFromObservation({
     slotsByInventory = enchantUnknownLevel,
     overallEquippedItemLevel = nil,
 }, itemLevelConfig(650))
 assertEq(knownMissingUnknownReady.state, "not_ready", "readiness stays Not Ready for a known enchant failure while item level loads")
+assertHas(knownMissingUnknownReady.missing, "Chest Enchant", "readiness exposes the known enchant failure while item level loads")
+
+-- Fully prepared slots with only unresolved item level must not look Unprepared.
+local preparedUnknownLevel = Policy.EvaluateObservation({
+    slotsByInventory = completeSlots(),
+    overallEquippedItemLevel = nil,
+}, itemLevelConfig(650))
+assertTrue(not preparedUnknownLevel.knownUnprepared, "prepared-but-incomplete is not knownUnprepared")
+assertTrue(not preparedUnknownLevel.complete, "prepared-but-incomplete stays incomplete")
+assertTrue(not preparedUnknownLevel.prepared, "incomplete observations are not prepared")
+assertEq(#preparedUnknownLevel.missing, 0, "prepared-but-incomplete has no confirmed misses")
+assertEq(preparedUnknownLevel.incompleteReason, "unresolved_item_level", "prepared-but-incomplete keeps unresolved item level")
+local preparedUnknownReady = Policy.ReadinessFromObservation({
+    slotsByInventory = completeSlots(),
+    overallEquippedItemLevel = nil,
+}, itemLevelConfig(650))
+assertEq(preparedUnknownReady.state, "unknown", "prepared-but-incomplete readiness stays Unknown")
 
 local enchantThenUnresolved = completeSlots({
     [5] = {
@@ -502,9 +519,20 @@ local enchantThenUnresolved = completeSlots({
 local knownMissingLaterUnresolved = Policy.EvaluateObservation({
     slotsByInventory = enchantThenUnresolved,
 })
-assertTrue(knownMissingLaterUnresolved.complete, "known missing enchant stays complete when a later slot is unresolved")
+assertTrue(knownMissingLaterUnresolved.knownUnprepared, "known missing enchant is knownUnprepared despite a later unresolved slot")
+assertTrue(not knownMissingLaterUnresolved.complete, "a later unresolved slot keeps the observation incomplete")
 assertTrue(not knownMissingLaterUnresolved.prepared, "known missing enchant is Unprepared despite a later unresolved slot")
 assertHas(knownMissingLaterUnresolved.missing, "Chest Enchant", "a later unresolved slot does not drop a known enchant failure")
+assertEq(knownMissingLaterUnresolved.incompleteReason, "incomplete_link", "pending-slot reason is preserved for retry classification")
+
+-- Pending-slot reason must win over unresolved_item_level when both are open.
+local pendingAndLevel = Policy.EvaluateObservation({
+    slotsByInventory = enchantThenUnresolved,
+    overallEquippedItemLevel = nil,
+}, itemLevelConfig(650))
+assertTrue(pendingAndLevel.knownUnprepared, "pending slot plus unresolved item level stays knownUnprepared")
+assertTrue(not pendingAndLevel.complete, "pending slot plus unresolved item level stays incomplete")
+assertEq(pendingAndLevel.incompleteReason, "incomplete_link", "pending-slot reason is preferred over unresolved_item_level")
 
 local enchantAndLevel = completeSlots({
     [5] = {
@@ -523,6 +551,8 @@ local both = Policy.EvaluateObservation({
     slotsByInventory = enchantAndLevel,
     overallEquippedItemLevel = 642.3,
 }, itemLevelConfig(650))
+assertTrue(both.complete, "fully resolved dual failure is a complete observation")
+assertTrue(both.knownUnprepared, "fully resolved dual failure is knownUnprepared")
 assertHas(both.missing, "Chest Enchant", "item level does not hide another known failure")
 assertHas(both.missing, "Item Level 642.3 (650 required)", "item level is reported with the other failure")
 
@@ -530,6 +560,8 @@ local highWithEnchant = Policy.EvaluateObservation({
     slotsByInventory = enchantAndLevel,
     overallEquippedItemLevel = 680,
 }, itemLevelConfig(650))
+assertTrue(highWithEnchant.complete, "resolved missing enchant alone is complete")
+assertTrue(highWithEnchant.knownUnprepared, "resolved missing enchant alone is knownUnprepared")
 assertHas(highWithEnchant.missing, "Chest Enchant", "meeting item level does not clear a missing enchant")
 assertTrue(not highWithEnchant.prepared, "a missing enchant stays Unprepared")
 
@@ -538,6 +570,7 @@ local ignoredSlots = Policy.EvaluateObservation({
     overallEquippedItemLevel = 680,
 }, itemLevelConfig(650, false))
 assertTrue(not ignoredSlots.prepared, "slot item levels are not an alternate overall item level")
+assertTrue(ignoredSlots.complete, "disabled item-level requirement still yields a complete observation")
 
 local readyLevel = Policy.ReadinessFromObservation(observe(completeSlots(), 651.2), itemLevelConfig(650))
 assertEq(readyLevel.state, "ready", "readiness is Ready when item level and other rules pass")

@@ -265,11 +265,13 @@ function EarlyPrep.ObservationShouldWarn(ctx)
 	if ctx.fresh ~= true then
 		return false, "stale"
 	end
-	if ctx.complete ~= true then
-		return false, "incomplete"
-	end
 	if ctx.prepared == true then
 		return false, "prepared"
+	end
+	-- knownUnprepared is a confirmed miss that may still be incomplete for Raid
+	-- Check acquisition. complete alone remains valid for fully evaluated misses.
+	if ctx.knownUnprepared ~= true and ctx.complete ~= true then
+		return false, "incomplete"
 	end
 	if ctx.alreadyWarned == true then
 		return false, "warned"
@@ -2211,6 +2213,7 @@ function EarlyPrep:EvaluateMember(memberId)
 		inRaid = true,
 		fresh = why == "fresh",
 		complete = result and result.complete == true or false,
+		knownUnprepared = result and result.knownUnprepared == true or false,
 		prepared = result and result.prepared == true or false,
 		alreadyWarned = false,
 	})
@@ -2222,7 +2225,10 @@ function EarlyPrep:EvaluateMember(memberId)
 	if not self:ComputeWindow() or self:WasWarned(memberId) or not self:IsEligibleTarget(memberId) then
 		return false
 	end
-	if why ~= "fresh" or type(result) ~= "table" or result.complete ~= true or result.prepared == true then
+	local confirmedUnprepared = type(result) == "table"
+		and result.prepared ~= true
+		and (result.knownUnprepared == true or result.complete == true)
+	if why ~= "fresh" or not confirmedUnprepared then
 		self:NoteEvaluateSkip(memberId, why or "observation")
 		self:RememberNonWarning(memberId, stamp)
 		return false
