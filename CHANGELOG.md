@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.3] - 2026-10-28
+
+### Changed
+- Use Guild Info main/alt for Raid Supplies attribution and witnesses (#427)
+
 ## [1.5.16-beta.2] - 2026-10-27
 
 ### Changed
