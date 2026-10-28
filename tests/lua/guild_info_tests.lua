@@ -6422,6 +6422,26 @@ do
     rec.baseline.complete = true
     assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-Carol"), "different",
         "427: ready again")
+
+    -- Retained member with nonempty unresolved groupId is unknown, not unassigned.
+    rec.members = rec.members or {}
+    rec.members["Player-1-OrphanRel"] = {
+        guid = "Player-1-OrphanRel",
+        groupId = "gig:missing-relationship",
+        ver = { n = 1, w = "w" },
+        at = 1,
+        nameRealm = "OrphanRel-Garona",
+    }
+    if GI.RebuildDerived then
+        GI.RebuildDerived(rec)
+    end
+    local orphanInfo = GI:ResolveContributorIdentity("Player-1-OrphanRel")
+    assertEq(orphanInfo.status, "unknown", "427: unresolved group ⇒ unknown")
+    assertEq(orphanInfo.reason, "unresolved_group", "427: unresolved_group reason")
+    assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-OrphanRel"), "unknown",
+        "427: unresolved cannot invent independence")
+    local stillUn = GI:ResolveContributorIdentity("Player-1-Carol")
+    assertEq(stillUn.status, "unassigned", "427: true unassigned unchanged")
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

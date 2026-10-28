@@ -3193,6 +3193,10 @@ local guildInfoInitHooked = false
 -- Skip full pending scans while GI is incomplete; one reevaluation runs when
 -- readiness becomes true (init, seal, or a later ready notification).
 local guildInfoLastReady = nil
+-- Coalesce ready-state remote bursts into one deferred pending scan.
+local guildInfoCoalescePending = false
+local guildInfoCoalesceScheduled = false
+local guildInfoCoalesceReason = nil
 
 local function PublishGuildInfoReevaluate(reason, verified)
     verified = tonumber(verified) or 0
@@ -3207,8 +3211,75 @@ local function PublishGuildInfoReevaluate(reason, verified)
     end
 end
 
+local function IsRemoteGuildInfoReason(reason)
+    reason = tostring(reason or "")
+    return reason == "remote" or reason:sub(1, 7) == "remote-"
+end
+
+local function RunGuildInfoPendingReevaluate(reason, becameReady)
+    local record = select(1, GS:GetCurrentRecord())
+    -- Cheap skip when already ready and nothing unfinished remains.
+    if not becameReady
+        and type(record) == "table"
+        and GS.HasUnfinishedPendingEvidence
+        and not GS.HasUnfinishedPendingEvidence(record) then
+        if GS.NotifyUI then
+            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+        end
+        return
+    end
+    local verified = 0
+    if type(record) == "table" and GS.ReevaluatePendingEvidence then
+        verified = tonumber(GS.ReevaluatePendingEvidence(record)) or 0
+    end
+    PublishGuildInfoReevaluate(becameReady and "gi-ready" or reason, verified)
+end
+
+local function ScheduleCoalescedGuildInfoReevaluate(reason)
+    guildInfoCoalescePending = true
+    guildInfoCoalesceReason = reason or guildInfoCoalesceReason or "remote"
+    if guildInfoCoalesceScheduled then
+        return
+    end
+    guildInfoCoalesceScheduled = true
+    local function flush()
+        guildInfoCoalesceScheduled = false
+        if not guildInfoCoalescePending then
+            return
+        end
+        guildInfoCoalescePending = false
+        local queuedReason = guildInfoCoalesceReason or "remote"
+        guildInfoCoalesceReason = nil
+        if guildInfoReevalBusy then
+            -- Re-arm so the in-flight pass schedules one trailing flush.
+            ScheduleCoalescedGuildInfoReevaluate(queuedReason)
+            return
+        end
+        guildInfoReevalBusy = true
+        local ok, err = pcall(function()
+            RunGuildInfoPendingReevaluate(queuedReason, false)
+        end)
+        guildInfoReevalBusy = false
+        if not ok and DebugWarn then
+            DebugWarn("guildinfo coalesced reevaluate failed: %s", tostring(err))
+        end
+        if guildInfoCoalescePending then
+            ScheduleCoalescedGuildInfoReevaluate(guildInfoCoalesceReason)
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, flush)
+    else
+        flush()
+    end
+end
+
 local function OnGuildInfoDurableChange(reason)
     if guildInfoReevalBusy then
+        -- Reentrancy during an in-flight scan: coalesce a trailing pass.
+        if IsRemoteGuildInfoReason(reason) then
+            ScheduleCoalescedGuildInfoReevaluate(reason)
+        end
         return
     end
     guildInfoReevalBusy = true
@@ -3232,14 +3303,15 @@ local function OnGuildInfoDurableChange(reason)
             return
         end
 
-        local verified = 0
-        if type(record) == "table" and GS.ReevaluatePendingEvidence then
-            verified = tonumber(GS.ReevaluatePendingEvidence(record)) or 0
+        -- Ready remote membership/group bursts: coalesce into one deferred scan
+        -- so a large catch-up does not re-walk pending clusters per body.
+        if not becameReady and IsRemoteGuildInfoReason(reason) then
+            guildInfoReevalBusy = false
+            ScheduleCoalescedGuildInfoReevaluate(reason)
+            return
         end
-        -- Newly accepted donations must enter the existing ledger export path so
-        -- peers can catch up. Skip durable publish when reevaluation was a no-op
-        -- (UI refresh only). Busy flag above prevents recursive reentry.
-        PublishGuildInfoReevaluate(becameReady and "gi-ready" or reason, verified)
+
+        RunGuildInfoPendingReevaluate(reason, becameReady)
     end)
     guildInfoReevalBusy = false
     if not ok and DebugWarn then

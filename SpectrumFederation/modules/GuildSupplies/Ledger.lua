@@ -282,17 +282,30 @@ end
 
 --- Independent witness count under current Guild Info relationships.
 -- Returns 0 when relationships are unavailable/syncing so quorum stays pending.
+-- Witnesses whose contributor identity is unknown (e.g. unresolved group) are
+-- excluded so they cannot satisfy three-independent-witness quorum.
 function GS.CountIndependentWitnesses(record, witnessMap)
     if type(witnessMap) ~= "table" then return 0 end
     local ready = GS.WitnessRelationshipsReady(record)
     if not ready then
         return 0
     end
+    local GI = SF.GuildInfo
+    local guildKey = GuildKeyForRecord(record)
     local keys = {}
     for key, row in pairs(witnessMap) do
         local guid = type(row) == "table" and ValidGuid(row.guid or row.witnessGuid) or ValidGuid(key)
         if guid then
-            keys[#keys + 1] = guid
+            local usable = true
+            if GI and type(GI.ResolveContributorIdentity) == "function" then
+                local info = GI:ResolveContributorIdentity(guid, guildKey)
+                if type(info) ~= "table" or info.status == "unknown" then
+                    usable = false
+                end
+            end
+            if usable then
+                keys[#keys + 1] = guid
+            end
         end
     end
     table.sort(keys)
@@ -302,9 +315,13 @@ function GS.CountIndependentWitnesses(record, witnessMap)
         local guid = keys[i]
         local skip = false
         for j = 1, #counted do
-            if GS.AreSameWitnessIdentity(record, counted[j], guid) then
+            local cmp = GS.CompareWitnessIdentities(record, counted[j], guid)
+            if cmp == "same" then
                 skip = true
                 break
+            elseif cmp == "unknown" then
+                -- Fail closed: unresolved pairwise relationship cannot grow quorum.
+                return 0
             end
         end
         if not skip then
@@ -430,16 +447,35 @@ function GS.ResolveUniqueCharacterGuid(record, name, hintGuid)
     return nil
 end
 
---- Canonical attributed identity for floor checks and durable storage.
--- When both name and GUID are supplied and relationships are ready, they must
--- resolve to the same character. Conflicting remote payloads are rejected so a
--- floor cannot be checked for one identity while projection credits another.
--- Unverified GUID claims while relationships are incomplete are dropped (name
--- kept) rather than stored as authoritative.
+--- True when GUID is a retained Guild Info member under a ready baseline.
+local function CharacterGuidIsRetained(record, guid)
+    guid = ValidGuid(guid)
+    if not guid or not GS.WitnessRelationshipsReady(record) then
+        return false
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.GetRelationshipReadiness) ~= "function" then
+        return false
+    end
+    local readiness, giRec = GI:GetRelationshipReadiness(GuildKeyForRecord(record))
+    if readiness ~= "ready" or type(giRec) ~= "table" then
+        return false
+    end
+    local member = giRec.members and giRec.members[guid]
+    return type(member) == "table"
+end
+
+--- Bind a durable character name to an optional claimed GUID.
+-- Proven name↔GUID mismatches error (unless opts.softMismatch drops the GUID).
+-- Unresolved names are not proof of mismatch: a retained GUID may be historical
+-- provenance after rename. Unverifiable claims drop the GUID and keep the name.
+-- Incomplete relationships drop claimed GUIDs rather than storing them.
+-- @param opts optional { softMismatch = boolean }
 -- @return string|nil name, string|nil guid, string|nil err
-function GS.ResolveAttributedIdentity(record, attributedName, attributedGuid)
-    local name = NormName(attributedName)
-    local guid = ValidGuid(attributedGuid)
+function GS.BindCharacterIdentity(record, characterName, claimedGuid, opts)
+    opts = opts or {}
+    local name = NormName(characterName)
+    local guid = ValidGuid(claimedGuid)
     if not name then
         if guid then
             return nil, nil, "invalid_attribution"
@@ -449,20 +485,43 @@ function GS.ResolveAttributedIdentity(record, attributedName, attributedGuid)
     if not guid then
         return name, GS.ResolveUniqueCharacterGuid(record, name, nil), nil
     end
-    local ready = GS.WitnessRelationshipsReady(record)
-    if not ready then
-        -- Cannot authenticate the name↔GUID binding yet; keep the durable name
-        -- and omit the GUID until a verified source supplies it under ready GI.
+    if not GS.WitnessRelationshipsReady(record) then
         return name, nil, nil
     end
     local resolved = GS.ResolveUniqueCharacterGuid(record, name, nil)
-    if not resolved then
-        return nil, nil, "attribution_mismatch"
+    if resolved then
+        if resolved ~= guid then
+            if opts.softMismatch then
+                -- Donation credit is already witness/officer authenticated by name;
+                -- keep the name-bound GUID and drop the conflicting claim.
+                return name, resolved, nil
+            end
+            return nil, nil, "attribution_mismatch"
+        end
+        return name, guid, nil
     end
-    if resolved ~= guid then
-        return nil, nil, "attribution_mismatch"
+    -- Name did not uniquely resolve (rename / departed listing). A retained GUID
+    -- still authenticates identity for historical convergence; keep durable name.
+    if CharacterGuidIsRetained(record, guid) then
+        return name, guid, nil
     end
-    return name, guid, nil
+    -- Unverifiable claimed GUID: omit rather than redirect credit.
+    return name, nil, nil
+end
+
+--- Canonical attributed identity for floor checks and durable storage.
+-- @return string|nil name, string|nil guid, string|nil err
+function GS.ResolveAttributedIdentity(record, attributedName, attributedGuid)
+    return GS.BindCharacterIdentity(record, attributedName, attributedGuid, nil)
+end
+
+--- Donor identity for donation persistence. Mismatched claimed GUIDs are dropped
+-- (donation credit itself is already witness/officer authenticated).
+-- @return string|nil name, string|nil guid
+function GS.ResolveDonorIdentity(record, donorName, claimedGuid)
+    local name, guid = GS.BindCharacterIdentity(
+        record, donorName, claimedGuid, { softMismatch = true })
+    return name, guid
 end
 
 --- Resolve a ledger actor/attributed name (optional GUID) to the current
@@ -594,10 +653,22 @@ function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, c
         if identityGuid and g then
             return g == identityGuid
         end
+        local side = NormName(sideName)
         if identityGuid and not g then
-            return NormName(sideName) == identityName
+            if side and identityName and side == identityName then
+                return true
+            end
+            -- Legacy name-only rows: match when the durable name uniquely
+            -- resolves to this GUID (identity established without a stored GUID).
+            if side then
+                local resolved = GS.ResolveUniqueCharacterGuid(record, side, nil)
+                if resolved and resolved == identityGuid then
+                    return true
+                end
+            end
+            return false
         end
-        return NormName(sideName) == identityName
+        return side ~= nil and identityName ~= nil and side == identityName
     end
     local total = 0
     local function consider(event)
@@ -2254,12 +2325,13 @@ local function BuildDonationEvent(evidence, writerGuid, txnId, verification, rec
         ageHours = tonumber(evidence.ageHours),
     }
     -- Persist a uniquely known original donor GUID without rewriting actor name.
-    local donorGuid = ValidGuid(evidence.donorGuid) or ValidGuid(evidence.actorGuid)
-    if not donorGuid and type(record) == "table" then
-        donorGuid = GS.ResolveUniqueCharacterGuid(record, donor, nil)
-    end
-    if donorGuid then
-        event.actorGuid = donorGuid
+    -- Relayed claimed GUIDs must bind to the donor name (soft-drop on mismatch).
+    if type(record) == "table" then
+        local claimed = ValidGuid(evidence.donorGuid) or ValidGuid(evidence.actorGuid)
+        local _, donorGuid = GS.ResolveDonorIdentity(record, donor, claimed)
+        if donorGuid then
+            event.actorGuid = donorGuid
+        end
     end
     return event
 end
@@ -3079,6 +3151,11 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     return "pending", "awaiting_witnesses", cluster
 end
 
+--- Cheap presence check for unfinished pending clusters (no verification work).
+function GS.HasUnfinishedPendingEvidence(record)
+    return CountTotalUnfinishedPending(record) > 0
+end
+
 --- Reevaluate unfinished evidence after Guild Info relationship changes
 -- (or inert legacy link-op replay). Compaction may remove the current index;
 -- do not skip the shifted cluster. Bounded by MAX_PENDING_EVIDENCE_TOTAL.
@@ -3384,11 +3461,13 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
         datasetId = record.datasetId,
         ageHours = tonumber(row.ageHours),
     }
-    local donorGuid = ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
-        or ValidGuid(candidate.actorGuid) or ValidGuid(candidate.donorGuid)
-        or GS.ResolveUniqueCharacterGuid(record, row.donor, nil)
-    if donorGuid then
-        stored.actorGuid = donorGuid
+    do
+        local claimed = ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
+            or ValidGuid(candidate.actorGuid) or ValidGuid(candidate.donorGuid)
+        local _, donorGuid = GS.ResolveDonorIdentity(record, row.donor, claimed)
+        if donorGuid then
+            stored.actorGuid = donorGuid
+        end
     end
     if sourceMarker then
         stored.gsSourceCutoverMarker = sourceMarker
@@ -3565,7 +3644,6 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             generation = tonumber(event.generation),
             timestamp = tonumber(event.timestamp) or Now(),
             actor = NormName(event.actor or event.donor),
-            actorGuid = ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid),
             itemId = tonumber(event.itemId),
             quantity = FloorNonNeg(event.quantity),
             source = "guildbank",
@@ -3582,6 +3660,14 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             approxTxnTime = tonumber(event.timestamp) or tonumber(event.approxTxnTime),
             donor = NormName(event.actor or event.donor),
         }
+        do
+            local claimed = ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
+            local _, donorGuid = GS.ResolveDonorIdentity(
+                record, candidate.actor or candidate.donor, claimed)
+            if donorGuid then
+                candidate.actorGuid = donorGuid
+            end
+        end
 
         -- Exact fingerprint ID may be shared by temporally distinct deposits.
         -- Only treat as duplicate when MatchScore agrees; otherwise remint the
@@ -3789,11 +3875,14 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 datasetId = record.datasetId,
                 ageHours = tonumber(event.ageHours),
             }
-            local donorGuid = ValidGuid(candidate.actorGuid) or ValidGuid(candidate.donorGuid)
-                or ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
-                or GS.ResolveUniqueCharacterGuid(record, candidate.actor, nil)
-            if donorGuid then
-                stored.actorGuid = donorGuid
+            do
+                local claimed = ValidGuid(candidate.actorGuid) or ValidGuid(candidate.donorGuid)
+                    or ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
+                local _, donorGuid = GS.ResolveDonorIdentity(
+                    record, candidate.actor or candidate.donor, claimed)
+                if donorGuid then
+                    stored.actorGuid = donorGuid
+                end
             end
             if officerComplete then
                 stored.verifierGuid = explicitVerifier

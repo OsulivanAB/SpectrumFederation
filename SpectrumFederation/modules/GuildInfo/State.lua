@@ -2135,6 +2135,8 @@ end
 --- Current effective contributor for a character GUID.
 -- status: "assigned" (main or alt under a main), "unassigned", or "unknown".
 -- mainGuid is the logical contributor identity when known.
+-- Retained members whose nonempty groupId cannot currently derive into the
+-- relationship graph are "unknown" (not independent unassigned witnesses).
 -- @return table|nil info
 function GI:ResolveContributorIdentity(guid, guildKey)
     -- ValidGuid is a boolean predicate in this module (does not echo the string).
@@ -2164,7 +2166,25 @@ function GI:ResolveContributorIdentity(guid, guildKey)
             groupId = info.groupId,
         }
     end
-    -- Known-unassigned (or never retained): independent identity under a ready baseline.
+    -- Retained membership with a nonempty groupId that did not resolve into the
+    -- derived graph (missing/forward-broken group) must not invent independence.
+    local member = record and record.members and record.members[guid]
+    if type(member) == "table" then
+        local gid = member.groupId
+        if gid ~= nil and gid ~= GI.UNASSIGNED
+            and type(gid) == "string" and gid ~= "" then
+            return {
+                status = "unknown",
+                reason = "unresolved_group",
+                guid = guid,
+                mainGuid = nil,
+                displayName = DisplayNameForGuid(record, guid),
+                role = nil,
+                groupId = gid,
+            }
+        end
+    end
+    -- Known-unassigned sentinel / never retained: independent under a ready baseline.
     return {
         status = "unassigned",
         guid = guid,
