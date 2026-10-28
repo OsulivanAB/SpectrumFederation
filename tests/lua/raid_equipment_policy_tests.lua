@@ -455,6 +455,57 @@ assertNotHas(unknownLevel.missing, "Item Level 0 (650 required)", "missing item 
 local unknownReady = Policy.ReadinessFromObservation(observe(completeSlots(), nil), itemLevelConfig(650))
 assertEq(unknownReady.state, "unknown", "missing item level stays Unknown")
 
+-- #432: a known missing enchant must stay Unprepared even when a later
+-- optional field (required item level, another slot's unresolved link) is still
+-- loading. Incomplete must not discard definitive failures Early Preparation
+-- already proved from complete slots.
+local enchantUnknownLevel = completeSlots({
+    [5] = {
+        empty = false,
+        itemId = 200000,
+        link = "|cffa335ee|Hitem:200000:0:0:0:0:0:0:0:80:::|h[Item]|h|r",
+        texture = "tex",
+        equipLoc = "INVTYPE_CHEST",
+        hasEnchant = false,
+        enchantId = 0,
+        sockets = {},
+        itemLevel = 900,
+    },
+})
+local knownMissingUnknownLevel = Policy.EvaluateObservation({
+    slotsByInventory = enchantUnknownLevel,
+    overallEquippedItemLevel = nil,
+}, itemLevelConfig(650))
+assertTrue(knownMissingUnknownLevel.complete, "known missing enchant stays complete when item level is unresolved")
+assertTrue(not knownMissingUnknownLevel.prepared, "known missing enchant is Unprepared while item level loads")
+assertHas(knownMissingUnknownLevel.missing, "Chest Enchant", "unresolved item level does not drop a known enchant failure")
+assertEq(knownMissingUnknownLevel.incompleteReason, nil, "known Unprepared clears incompleteReason")
+local knownMissingUnknownReady = Policy.ReadinessFromObservation({
+    slotsByInventory = enchantUnknownLevel,
+    overallEquippedItemLevel = nil,
+}, itemLevelConfig(650))
+assertEq(knownMissingUnknownReady.state, "not_ready", "readiness stays Not Ready for a known enchant failure while item level loads")
+
+local enchantThenUnresolved = completeSlots({
+    [5] = {
+        empty = false,
+        itemId = 200000,
+        link = "|cffa335ee|Hitem:200000:0:0:0:0:0:0:0:80:::|h[Item]|h|r",
+        texture = "tex",
+        equipLoc = "INVTYPE_CHEST",
+        hasEnchant = false,
+        enchantId = 0,
+        sockets = {},
+    },
+    [11] = equipped({ linkComplete = false, equipLoc = "INVTYPE_FINGER" }),
+})
+local knownMissingLaterUnresolved = Policy.EvaluateObservation({
+    slotsByInventory = enchantThenUnresolved,
+})
+assertTrue(knownMissingLaterUnresolved.complete, "known missing enchant stays complete when a later slot is unresolved")
+assertTrue(not knownMissingLaterUnresolved.prepared, "known missing enchant is Unprepared despite a later unresolved slot")
+assertHas(knownMissingLaterUnresolved.missing, "Chest Enchant", "a later unresolved slot does not drop a known enchant failure")
+
 local enchantAndLevel = completeSlots({
     [5] = {
         empty = false,

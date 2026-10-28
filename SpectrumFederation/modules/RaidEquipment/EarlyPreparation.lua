@@ -582,6 +582,7 @@ function EarlyPrep:SyncNoticeToSession()
 	self.notice = self.notice or EarlyPrep.NewNotice()
 	if EarlyPrep.BindNotice(self.notice, sessionId, profileId) then
 		self._rejectLogged = {}
+		self._evaluateSkipLogged = nil
 		self._skipStamp = nil
 	end
 end
@@ -618,7 +619,7 @@ function EarlyPrep:ComputeWindow()
 	if self.notice and self.notice.sessionId and self.notice.raidCheckBegun == true then
 		raidCheckBegun = true
 	end
-	local open = EarlyPrep.WindowOpen({
+	local open, why = EarlyPrep.WindowOpen({
 		settingEnabled = EarlyPrep.IsSettingEnabled(self:ReadSetting()),
 		sessionActive = sessionActive,
 		announced = announced,
@@ -628,6 +629,11 @@ function EarlyPrep:ComputeWindow()
 		groupIsRaid = groupIsRaid,
 		raidCheckBegun = raidCheckBegun,
 	})
+	if open then
+		self._windowClosedWhy = nil
+	else
+		self._windowClosedWhy = why
+	end
 	return open and true or false
 end
 
@@ -806,8 +812,10 @@ function EarlyPrep:OnSessionReset(reason)
 	DebugVerbose("Cleared early preparation session state (%s)", tostring(reason))
 	self.notice = EarlyPrep.NewNotice()
 	self._windowOpen = false
+	self._windowClosedWhy = nil
 	self._wasCoordinator = false
 	self._rejectLogged = {}
+	self._evaluateSkipLogged = nil
 	self._deferredNotices = nil
 	self._outboundPending = false
 	self._outboundAttempts = 0
@@ -2147,15 +2155,45 @@ function EarlyPrep:CollectEligibleIds()
 	return ids
 end
 
+function EarlyPrep:NoteEvaluateSkip(memberId, reason, detail)
+	if type(memberId) ~= "string" or memberId == "" then
+		return
+	end
+	reason = tostring(reason or "skip")
+	self._evaluateSkipLogged = self._evaluateSkipLogged or {}
+	local key = memberId .. ":" .. reason
+	if self._evaluateSkipLogged[key] then
+		return
+	end
+	local count = 0
+	for _ in pairs(self._evaluateSkipLogged) do
+		count = count + 1
+		if count >= EarlyPrep.MAX_NOTICE_MEMBERS then
+			return
+		end
+	end
+	self._evaluateSkipLogged[key] = true
+	if detail then
+		DebugVerbose("Skipped %s (%s: %s)", memberId, reason, tostring(detail))
+	else
+		DebugVerbose("Skipped %s (%s)", memberId, reason)
+	end
+end
+
 function EarlyPrep:EvaluateMember(memberId)
 	if not self:ComputeWindow() then
 		return false
 	end
-	if self:WasWarned(memberId) or not self:IsEligibleTarget(memberId) then
+	if self:WasWarned(memberId) then
+		return false
+	end
+	if not self:IsEligibleTarget(memberId) then
+		self:NoteEvaluateSkip(memberId, "ineligible")
 		return false
 	end
 	local raidCheck = SF.RaidCheck
 	if not raidCheck or type(raidCheck.GetAuthoritativePreparation) ~= "function" then
+		self:NoteEvaluateSkip(memberId, "no_preparation_api")
 		return false
 	end
 	local profile = self:GetSessionProfile()
@@ -2168,7 +2206,7 @@ function EarlyPrep:EvaluateMember(memberId)
 		end
 	end
 	local result, why = raidCheck:GetAuthoritativePreparation(memberId, cfg)
-	local decision = EarlyPrep.ObservationShouldWarn({
+	local decision, decisionWhy = EarlyPrep.ObservationShouldWarn({
 		eligible = true,
 		inRaid = true,
 		fresh = why == "fresh",
@@ -2177,6 +2215,7 @@ function EarlyPrep:EvaluateMember(memberId)
 		alreadyWarned = false,
 	})
 	if not decision then
+		self:NoteEvaluateSkip(memberId, decisionWhy or why or "observation", result and result.incompleteReason)
 		self:RememberNonWarning(memberId, stamp)
 		return false
 	end
@@ -2184,27 +2223,33 @@ function EarlyPrep:EvaluateMember(memberId)
 		return false
 	end
 	if why ~= "fresh" or type(result) ~= "table" or result.complete ~= true or result.prepared == true then
+		self:NoteEvaluateSkip(memberId, why or "observation")
 		self:RememberNonWarning(memberId, stamp)
 		return false
 	end
 	if type(raidCheck.DeliverMissingRequirementsWhisper) ~= "function" then
+		self:NoteEvaluateSkip(memberId, "no_sender")
 		return false
 	end
 	self:SyncNoticeToSession()
 	if not EarlyPrep.WarningRecordable(self.notice, memberId) then
+		self:NoteEvaluateSkip(memberId, "cap")
 		self:RememberNonWarning(memberId, stamp)
 		return false
 	end
 	local claim = self:BeginMissingWhisper(memberId, "early", result.missing)
 	if claim == "pending" then
+		DebugVerbose("Warning claim pending for %s", tostring(memberId))
 		return false
 	end
 	if claim ~= "granted" then
+		self:NoteEvaluateSkip(memberId, "claim_denied")
 		self:RememberNonWarning(memberId, stamp)
 		return false
 	end
 	local sent = raidCheck:DeliverMissingRequirementsWhisper(memberId, cfg, result.missing, profile, "pre")
 	if not sent then
+		DebugInfo("Missing-requirements whisper delivery failed for %s", tostring(memberId))
 		self:AbandonWarningClaim(memberId, "send_failed")
 		return false
 	end
@@ -2293,7 +2338,16 @@ function EarlyPrep:Refresh(reason)
 		self._wasCoordinator = isCoordinator and true or false
 
 		if open ~= wasOpen then
-			DebugInfo("Early preparation %s (%s)", open and "active" or "inactive", tostring(reason or "refresh"))
+			if open then
+				DebugInfo("Early preparation active (%s)", tostring(reason or "refresh"))
+				self._evaluateSkipLogged = nil
+			else
+				DebugInfo(
+					"Early preparation inactive (%s, reason=%s)",
+					tostring(reason or "refresh"),
+					tostring(self._windowClosedWhy or "closed")
+				)
+			end
 		end
 		if isCoordinator ~= wasCoordinator then
 			DebugInfo("Coordinator responsibility %s (%s)", isCoordinator and "gained" or "lost", tostring(reason or "refresh"))
