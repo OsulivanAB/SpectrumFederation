@@ -7,10 +7,11 @@ SF.GuildSupplies = SF.GuildSupplies or {}
 local GS = SF.GuildSupplies
 
 GS.PROVIDER_ID = "sf.guildsupplies.config"
--- Wire schema for the Guild Supplies Gossip provider. Bumped for #397 so
--- pre-valuation clients cannot adopt/publish datasets that drop gs-valuation
--- records. Persisted GS.SCHEMA_VERSION stays independent.
-GS.PROVIDER_SCHEMA = 2
+-- Wire schema for the Guild Supplies Gossip provider.
+-- 2: valuation-aware wire (#397). 3: Guild Info witness/attribution semantics (#427).
+-- Older link-based peers cannot silently exchange quorum with schema-3 clients.
+-- Persisted GS.SCHEMA_VERSION stays independent.
+GS.PROVIDER_SCHEMA = 3
 GS.MAX_OPEN_CONFLICTS = 32
 -- Must match State.lua openConflicts candidateIds upper bound.
 GS.MAX_CONFLICT_CANDIDATES = 16

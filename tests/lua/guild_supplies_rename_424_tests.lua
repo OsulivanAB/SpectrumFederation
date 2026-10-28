@@ -1032,7 +1032,7 @@ do
     local camp1Id = record.currentCampaignId
     assertEq(GS.GetCampaignDisplayName(record, camp1Id), camp1Id,
         "424: new campaign falls back to ID")
-    assertEq(GS.PROVIDER_SCHEMA, 2, "424: provider schema stays 2")
+    assertEq(GS.PROVIDER_SCHEMA, 3, "424: provider schema is 3")
 
     -- Ordinary member cannot rename.
     setPlayer("Dave-Garona", "Player-1-Dave", 4)
@@ -1369,7 +1369,7 @@ do
         "424-rollover: bank tab unchanged")
 end
 
--- #424 adoption carries names; wrong dataset rejected; schema stays 2
+-- #424 adoption carries names; wrong dataset rejected; provider schema is 3
 do
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
@@ -1426,7 +1426,7 @@ do
     assertEq(record.datasetId, ds, "424-adopt: dataset replaced")
     assertEq(GS.GetCampaignDisplayName(record, campId), "AdoptMe", "424-adopt: name adopted")
     assertEq(record.campaignNames[campId].name, "AdoptMe", "424-adopt: name metadata")
-    assertEq(GS.PROVIDER_SCHEMA, 2, "424-adopt: schema remains 2")
+    assertEq(GS.PROVIDER_SCHEMA, 3, "424-adopt: schema is 3")
 end
 
 -- #424 multi-rename adoption newest-first retains losers; projects LWW winner

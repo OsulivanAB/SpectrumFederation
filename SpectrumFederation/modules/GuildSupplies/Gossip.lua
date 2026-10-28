@@ -9,9 +9,9 @@ local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
 
 GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
--- Wire schema for sf.guildsupplies.config. #397 valuations require schema 2;
--- Guild Gossip matches provider schemas by strict equality.
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 2
+-- Wire schema for sf.guildsupplies.config. Schema 3 (#427) is incompatible with
+-- older link-based witness peers; Guild Gossip matches by strict equality.
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 3
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -3184,12 +3184,213 @@ local function BuildProviderSpec()
     }
 end
 
+-- One-shot Guild Info → Guild Supplies bridge (#427). GS may initialize before
+-- Guild Info; resolve lazily and reevaluate pending three-witness evidence when
+-- relationships become ready or change. No polling.
+local guildInfoListenerRegistered = false
+local guildInfoReevalBusy = false
+local guildInfoInitHooked = false
+-- Skip full pending scans while GI is incomplete; one reevaluation runs when
+-- readiness becomes true (init, seal, or a later ready notification).
+local guildInfoLastReady = nil
+-- Coalesce ready-state remote bursts into one deferred pending scan.
+local guildInfoCoalescePending = false
+local guildInfoCoalesceScheduled = false
+local guildInfoCoalesceReason = nil
+
+local function PublishGuildInfoReevaluate(reason, verified)
+    verified = tonumber(verified) or 0
+    if verified > 0 then
+        if GS.NotifyLocalDurableChange then
+            GS.NotifyLocalDurableChange("ledger")
+        elseif GS.NotifyUI then
+            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+        end
+    elseif GS.NotifyUI then
+        GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+    end
+end
+
+local function IsRemoteGuildInfoReason(reason)
+    reason = tostring(reason or "")
+    return reason == "remote" or reason:sub(1, 7) == "remote-"
+end
+
+local function RunGuildInfoPendingReevaluate(reason, becameReady)
+    local record = select(1, GS:GetCurrentRecord())
+    -- Cheap skip when already ready and nothing unfinished remains.
+    if not becameReady
+        and type(record) == "table"
+        and GS.HasUnfinishedPendingEvidence
+        and not GS.HasUnfinishedPendingEvidence(record) then
+        if GS.NotifyUI then
+            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+        end
+        return
+    end
+    local verified = 0
+    if type(record) == "table" and GS.ReevaluatePendingEvidence then
+        verified = tonumber(GS.ReevaluatePendingEvidence(record)) or 0
+    end
+    PublishGuildInfoReevaluate(becameReady and "gi-ready" or reason, verified)
+end
+
+local function ScheduleCoalescedGuildInfoReevaluate(reason)
+    guildInfoCoalescePending = true
+    guildInfoCoalesceReason = reason or guildInfoCoalesceReason or "remote"
+    if guildInfoCoalesceScheduled then
+        return
+    end
+    guildInfoCoalesceScheduled = true
+    local function flush()
+        guildInfoCoalesceScheduled = false
+        if not guildInfoCoalescePending then
+            return
+        end
+        guildInfoCoalescePending = false
+        local queuedReason = guildInfoCoalesceReason or "remote"
+        guildInfoCoalesceReason = nil
+        if guildInfoReevalBusy then
+            -- Re-arm so the in-flight pass schedules one trailing flush.
+            ScheduleCoalescedGuildInfoReevaluate(queuedReason)
+            return
+        end
+        guildInfoReevalBusy = true
+        local ok, err = pcall(function()
+            RunGuildInfoPendingReevaluate(queuedReason, false)
+        end)
+        guildInfoReevalBusy = false
+        if not ok and DebugWarn then
+            DebugWarn("guildinfo coalesced reevaluate failed: %s", tostring(err))
+        end
+        if guildInfoCoalescePending then
+            ScheduleCoalescedGuildInfoReevaluate(guildInfoCoalesceReason)
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, flush)
+    else
+        flush()
+    end
+end
+
+local function OnGuildInfoDurableChange(reason)
+    if guildInfoReevalBusy then
+        -- Reentrancy during an in-flight scan: coalesce a trailing pass.
+        if IsRemoteGuildInfoReason(reason) then
+            ScheduleCoalescedGuildInfoReevaluate(reason)
+        end
+        return
+    end
+    guildInfoReevalBusy = true
+    local ok, err = pcall(function()
+        local record = select(1, GS:GetCurrentRecord())
+        local ready = false
+        if type(record) == "table" and GS.WitnessRelationshipsReady then
+            ready = GS.WitnessRelationshipsReady(record) and true or false
+        elseif SF.GuildInfo and SF.GuildInfo.GetRelationshipReadiness then
+            ready = SF.GuildInfo:GetRelationshipReadiness() == "ready"
+        end
+        local becameReady = ready and guildInfoLastReady ~= true
+        guildInfoLastReady = ready and true or false
+
+        -- Incomplete / synchronizing baselines cannot form independent witness
+        -- quorum; skip the full pending scan until readiness flips to ready.
+        if not ready then
+            if GS.NotifyUI then
+                GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+            end
+            return
+        end
+
+        -- Ready remote membership/group bursts: coalesce into one deferred scan
+        -- so a large catch-up does not re-walk pending clusters per body.
+        if not becameReady and IsRemoteGuildInfoReason(reason) then
+            guildInfoReevalBusy = false
+            ScheduleCoalescedGuildInfoReevaluate(reason)
+            return
+        end
+
+        RunGuildInfoPendingReevaluate(reason, becameReady)
+    end)
+    guildInfoReevalBusy = false
+    if not ok and DebugWarn then
+        DebugWarn("guildinfo reevaluate failed: %s", tostring(err))
+    end
+end
+
+--- One bounded reevaluation when Guild Info is already ready (startup/reload).
+-- Safe to call repeatedly; no-ops while busy, unavailable, or incomplete.
+function GS.MaybeReevaluatePendingAfterGuildInfoReady(reason)
+    local GI = SF.GuildInfo
+    if not GI then
+        return false, "guildinfo_unavailable"
+    end
+    local ready = false
+    if GS.WitnessRelationshipsReady then
+        local record = select(1, GS:GetCurrentRecord())
+        if type(record) == "table" then
+            ready = GS.WitnessRelationshipsReady(record) and true or false
+        end
+    end
+    if not ready and type(GI.GetRelationshipReadiness) == "function" then
+        ready = GI:GetRelationshipReadiness() == "ready"
+    end
+    if not ready then
+        guildInfoLastReady = false
+        return false, "not_ready"
+    end
+    OnGuildInfoDurableChange(reason or "gi-ready")
+    return true
+end
+
+local function HookGuildInfoInitialize()
+    if guildInfoInitHooked then
+        return
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.Initialize) ~= "function" then
+        return
+    end
+    local previous = GI.Initialize
+    function GI:Initialize(db)
+        local ok, reason = previous(self, db)
+        -- GS initializes before GI in SpectrumFederation.lua; GI:Initialize does
+        -- not emit NotifyUI. Run one bounded pending reevaluation once the
+        -- persisted baseline is ready so reload/upgrade can credit saved quorum.
+        if ok and GS.MaybeReevaluatePendingAfterGuildInfoReady then
+            GS.MaybeReevaluatePendingAfterGuildInfoReady("gi-init")
+        end
+        return ok, reason
+    end
+    guildInfoInitHooked = true
+end
+
+function GS.EnsureGuildInfoBridge()
+    local GI = SF.GuildInfo
+    if not GI or type(GI.RegisterUIListener) ~= "function" then
+        return false, "guildinfo_unavailable"
+    end
+    HookGuildInfoInitialize()
+    local firstRegistration = not guildInfoListenerRegistered
+    if firstRegistration then
+        GI.RegisterUIListener(OnGuildInfoDurableChange)
+        guildInfoListenerRegistered = true
+        -- Catch up when GI already finished Initialize before the bridge existed
+        -- (tests / late provider registration). Normal addon order relies on the
+        -- GI.Initialize hook above instead.
+        GS.MaybeReevaluatePendingAfterGuildInfoReady("bridge-ready")
+    end
+    return true
+end
+
 --- Idempotent provider registration. Safe when Guild Gossip is not yet ready.
 function GS:EnsureGossipProvider()
     if not GG or not GG.RegisterProvider then
         return false, "gossip_unavailable"
     end
     if providerRegistered and GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID) then
+        GS.EnsureGuildInfoBridge()
         return true
     end
     if GG.Init then
@@ -3200,6 +3401,7 @@ function GS:EnsureGossipProvider()
         -- RegisterProvider is idempotent; treat success-ish outcomes as ok.
         if GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID) then
             providerRegistered = true
+            GS.EnsureGuildInfoBridge()
             return true
         end
         DebugWarn("provider register failed: %s", tostring(err))
@@ -3210,6 +3412,7 @@ function GS:EnsureGossipProvider()
     end
     providerRegistered = true
     RebuildExportIndex()
+    GS.EnsureGuildInfoBridge()
     DebugInfo("registered staged config provider id=%s", GS.PROVIDER_ID)
     return true
 end
@@ -4348,5 +4551,8 @@ function GS:Initialize(db)
     -- Always attempt provider registration on initialize; gossip may idle with
     -- zero peers. Failure is non-fatal for local staged editing.
     GS:EnsureGossipProvider()
+    -- GS loads before Guild Info in the TOC; bridge is idempotent and retries
+    -- when Guild Info later exposes RegisterUIListener.
+    GS.EnsureGuildInfoBridge()
     return ok, reason
 end

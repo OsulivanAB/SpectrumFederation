@@ -6383,6 +6383,67 @@ do
     pass("unreferenced cycle cleanup reclaim / referenced fail-closed")
 end
 
+---------------------------------------------------------------------------
+-- #427 read-only contributor / witness resolution API
+---------------------------------------------------------------------------
+
+do
+    resetDB()
+    setActor("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GI:GetRelationshipReadiness(), "ready", "427: empty ready")
+    assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-Bob"), "different",
+        "427: unassigned GUIDS are independent")
+    assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-Alice"), "same",
+        "427: same GUID")
+    assertEq(assign("Alice-Garona", "Bob-Garona"), "accepted", "427: assign bob")
+    assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-Bob"), "same",
+        "427: main+alt same identity")
+    local info = GI:ResolveContributorIdentity("Player-1-Bob")
+    assertEq(info.status, "assigned", "427: bob assigned")
+    assertEq(info.mainGuid, "Player-1-Alice", "427: bob's main is alice")
+    local un = GI:ResolveContributorIdentity("Player-1-Carol")
+    assertEq(un.status, "unassigned", "427: carol unassigned")
+    assertEq(un.mainGuid, "Player-1-Carol", "427: unassigned self")
+
+    GI.InvalidateRosterSnapshot()
+    local guid, err = GI:ResolveCharacterGuidByName("Bob-Garona")
+    assertEq(guid, "Player-1-Bob", "427: unique name resolves")
+    assertNil(err, "427: no name err")
+    local amb, ambErr = GI:ResolveCharacterGuidByName("Bob")
+    -- Bob-Garona and Bob-Area52 make short name ambiguous when both rostered.
+    assertTrue(amb == nil, "427: ambiguous short name rejected err=" .. tostring(ambErr))
+    assertEq(ambErr, "ambiguous_name", "427: ambiguous reason")
+
+    local rec = select(1, GI:EnsureGuildRecord("club:42"))
+    rec.baseline.complete = false
+    assertEq(GI:GetRelationshipReadiness(), "generation_syncing", "427: syncing status")
+    assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-Carol"), "unknown",
+        "427: syncing ⇒ unknown independence")
+    rec.baseline.complete = true
+    assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-Carol"), "different",
+        "427: ready again")
+
+    -- Retained member with nonempty unresolved groupId is unknown, not unassigned.
+    rec.members = rec.members or {}
+    rec.members["Player-1-OrphanRel"] = {
+        guid = "Player-1-OrphanRel",
+        groupId = "gig:missing-relationship",
+        ver = { n = 1, w = "w" },
+        at = 1,
+        nameRealm = "OrphanRel-Garona",
+    }
+    if GI.RebuildDerived then
+        GI.RebuildDerived(rec)
+    end
+    local orphanInfo = GI:ResolveContributorIdentity("Player-1-OrphanRel")
+    assertEq(orphanInfo.status, "unknown", "427: unresolved group ⇒ unknown")
+    assertEq(orphanInfo.reason, "unresolved_group", "427: unresolved_group reason")
+    assertEq(GI:CompareWitnessIdentities("Player-1-Alice", "Player-1-OrphanRel"), "unknown",
+        "427: unresolved cannot invent independence")
+    local stillUn = GI:ResolveContributorIdentity("Player-1-Carol")
+    assertEq(stillUn.status, "unassigned", "427: true unassigned unchanged")
+end
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
