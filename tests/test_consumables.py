@@ -236,8 +236,16 @@ def test_legacy_consumables_settings_pages_are_not_packaged():
     # Backend, sync, and the personal reminder stay packaged.
     assert "modules/LootHelper/Consumables.lua" in toc
     assert "modules/LootHelperSync/19_Consumables.lua" in toc
+    # #428: reminder + campaign rename live only on Raid Supplies → Configuration.
     general = (pages / "LootHelper.lua").read_text(encoding="utf-8")
-    assert 'path = "lootHelper.showRaidSupplyReminders"' in general
+    assert 'path = "lootHelper.showRaidSupplyReminders"' not in general
+    config = (pages / "GuildSuppliesConfiguration.lua").read_text(encoding="utf-8")
+    logs = (pages / "GuildSuppliesLogs.lua").read_text(encoding="utf-8")
+    assert 'lootHelper.showRaidSupplyReminders' in config
+    assert 'lootHelper.showRaidSupplyReminders' not in logs
+    assert "GUILD_SUPPLIES_RENAME_TARGET_LABEL" in config
+    assert "GUILD_SUPPLIES_RENAME_CAMPAIGN" not in logs
+    assert "gsLogsPersonal" not in logs
 
 
 def test_consumables_snapshot_merge_is_inside_import():

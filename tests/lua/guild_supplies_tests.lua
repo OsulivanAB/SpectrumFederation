@@ -5813,54 +5813,446 @@ do
     local histRows, histTotal = GS:ListCampaignHistory(c1.id, 25, 0)
     assertTrue((histTotal or 0) >= 1, "history projection available for UI")
 
-    -- #424: Logs rename submit uses local ResolveSelectedCampaign (not a nil global).
-    local renameSubmit
+    -- #428: Logs is inspection-only — no campaign rename control or personal section.
+    local logsRenameSubmit = nil
+    local logsPersonalSection = nil
     for _, sec in ipairs((logsPanel.__sfPageDef and logsPanel.__sfPageDef.sections) or {}) do
+        if sec.id == "gsLogsPersonal" then
+            logsPersonalSection = sec
+        end
         for _, item in ipairs(sec.items or {}) do
-            if item.type == "editboxButton" and type(item.onSubmit) == "function"
-                and item.label and tostring(item.label):find("Campaign name", 1, true) then
-                renameSubmit = item.onSubmit
+            if item.type == "editboxButton" and item.label
+                and tostring(item.label):find("Campaign name", 1, true) then
+                logsRenameSubmit = item.onSubmit
+            end
+            if item.type == "checkbox" and item.label
+                and tostring(item.label):find("raid supply reminders", 1, true) then
+                logsPersonalSection = logsPersonalSection or sec
             end
         end
     end
-    assertTrue(type(renameSubmit) == "function", "424-ui: Logs rename onSubmit present")
-    local archivedId = c1.id
-    -- Force selection onto the archived campaign before submit.
-    for i = 1, #(drop.menuOptions or {}) do
-        if drop.menuOptions[i].value == archivedId and drop.menuOptions[i].setSelected then
-            drop.menuOptions[i].setSelected(archivedId)
-            break
+    assertNil(logsRenameSubmit, "428-ui: Logs has no campaign rename control")
+    assertNil(logsPersonalSection, "428-ui: Logs has no personal-preferences / reminders section")
+
+    -- #428: Configuration rename-target selector + archived rename.
+    local function findConfigItem(panel, itemType, labelNeedle)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == itemType and item.label
+                    and tostring(item.label):find(labelNeedle, 1, true) then
+                    return item
+                end
+            end
+        end
+        return nil
+    end
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    local archivedCamp = startCampaign()
+    local archivedId = archivedCamp.id
+    local currentCamp = startCampaign()
+    local currentId = currentCamp.id
+    assertTrue(archivedId ~= currentId, "428-ui: fixture has archived + current")
+
+    configPanel = makeRegion("Frame", "GSConfigRenamePanel", nil)
+    configPanel:SetSize(600, 800)
+    configPage:Build(configPanel)
+    configPage:Refresh(configPanel)
+
+    local renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    local renameSubmitDef = findConfigItem(configPanel, "editboxButton", "Campaign name")
+    local reminderDef = findConfigItem(configPanel, "checkbox", "raid supply reminders")
+    assertTrue(renameTargetDef ~= nil, "428-ui: Configuration rename-target dropdown present")
+    assertTrue(renameSubmitDef ~= nil, "428-ui: Configuration rename editbox present")
+    assertTrue(reminderDef ~= nil, "428-ui: Configuration reminder checkbox present")
+    assertTrue(type(renameSubmitDef.onSubmit) == "function", "428-ui: rename onSubmit present")
+
+    -- Default target is the current campaign; options are keyed by immutable id.
+    assertEq(renameTargetDef.get(), currentId, "428-ui: rename target defaults to current")
+    local renameOpts = renameTargetDef.options and renameTargetDef.options() or {}
+    local sawArchived, sawCurrent, idKeyed = false, false, true
+    for i = 1, #renameOpts do
+        local opt = renameOpts[i]
+        if type(opt.value) ~= "string" or opt.value == "" then
+            idKeyed = false
+        end
+        if opt.value == archivedId then
+            sawArchived = true
+            assertTrue(tostring(opt.label):find("Archived", 1, true),
+                "428-ui: archived option labeled Archived")
+        end
+        if opt.value == currentId then
+            sawCurrent = true
+            assertTrue(tostring(opt.label):find("Current", 1, true),
+                "428-ui: current option labeled Current")
         end
     end
-    logsPage:Refresh(logsPanel)
+    assertTrue(idKeyed and sawArchived and sawCurrent,
+        "428-ui: rename options include current/archived keyed by campaignId")
+
+    -- Selecting archived is rename-only: current campaign identity stays put.
+    local beforeCurrent = GS:GetCurrentRecord().currentCampaignId
+    renameTargetDef.onValueChanged({
+        section = { SetMessage = function() end, ClearMessage = function() end },
+    }, archivedId)
+    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeCurrent,
+        "428-ui: selecting archived rename target does not activate it")
+    assertEq(renameTargetDef.get(), archivedId, "428-ui: rename target is archived id")
+    assertEq(renameSubmitDef.getSelectionKey(), archivedId,
+        "428-ui: rename editbox selection key tracks target")
+    assertEq(renameSubmitDef.get(), "", "428-ui: archived custom name starts blank")
+
     local renameMessages = {}
     local renameOk, renameErr = pcall(function()
-        renameSubmit({
+        renameSubmitDef.onSubmit({
             section = {
                 SetMessage = function(_, msg, sev)
                     renameMessages[#renameMessages + 1] = { msg = msg, sev = sev }
                 end,
                 ClearMessage = function() end,
             },
-            pageBuilder = logsPanel.__sfPageBuilder,
-        }, "LogsArchiveName")
+            pageBuilder = configPanel.__sfPageBuilder,
+        }, "ConfigArchiveName")
     end)
-    assertTrue(renameOk, "424-ui: Logs rename submit no Lua error: " .. tostring(renameErr))
-    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), archivedId), "LogsArchiveName",
-        "424-ui: archived rename applied via Logs submit")
-    -- Selection key must remain the archived campaign after rename refresh.
-    local selectedAfter
-    for _, sec in ipairs((logsPanel.__sfPageDef and logsPanel.__sfPageDef.sections) or {}) do
-        for _, item in ipairs(sec.items or {}) do
-            if item.type == "dropdown" and type(item.get) == "function"
-                and item.label and tostring(item.label):find("Campaign", 1, true) then
-                selectedAfter = item.get()
+    assertTrue(renameOk, "428-ui: Configuration rename submit no Lua error: " .. tostring(renameErr))
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), archivedId), "ConfigArchiveName",
+        "428-ui: archived rename applied via Configuration")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, currentId,
+        "428-ui: archived rename leaves current campaign unchanged")
+    assertEq(renameTargetDef.get(), archivedId,
+        "428-ui: rename target retained on archived id after submit")
+
+    -- Clear name on archived target restores ID fallback without switching current.
+    renameSubmitDef.onSubmit({
+        section = {
+            SetMessage = function() end,
+            ClearMessage = function() end,
+        },
+        pageBuilder = configPanel.__sfPageBuilder,
+    }, "   ")
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), archivedId), archivedId,
+        "428-ui: clearing archived name restores ID fallback")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, currentId,
+        "428-ui: clear leaves current campaign unchanged")
+
+    -- Ordinary member cannot commit renames; personal reminder remains available.
+    local priorMembers = world.guild.members
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 5 },
+    }
+    settleRoster()
+    flushTimers()
+    configPage:Refresh(configPanel)
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    renameSubmitDef = findConfigItem(configPanel, "editboxButton", "Campaign name")
+    reminderDef = findConfigItem(configPanel, "checkbox", "raid supply reminders")
+    assertEq(renameTargetDef.enabled and renameTargetDef.enabled(), false,
+        "428-ui: ordinary member rename target disabled")
+    assertEq(renameSubmitDef.enabled and renameSubmitDef.enabled(), false,
+        "428-ui: ordinary member rename submit disabled")
+    assertTrue(reminderDef ~= nil, "428-ui: ordinary member still sees reminder checkbox")
+    assertTrue(reminderDef.adminOnly ~= true,
+        "428-ui: reminder is not adminOnly")
+    local deniedMessages = {}
+    renameSubmitDef.onSubmit({
+        section = {
+            SetMessage = function(_, msg, sev)
+                deniedMessages[#deniedMessages + 1] = { msg = msg, sev = sev }
+            end,
+            ClearMessage = function() end,
+        },
+    }, "ShouldNotApply")
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), archivedId), archivedId,
+        "428-ui: unauthorized rename does not change name")
+    world.guild.members = priorMembers
+    settleRoster()
+    flushTimers()
+    configPage:Refresh(configPanel)
+
+    -- Stale target: disappear from inspectable list → reselect current safely.
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    renameTargetDef.onValueChanged({
+        section = { SetMessage = function() end, ClearMessage = function() end },
+    }, archivedId)
+    assertEq(renameTargetDef.get(), archivedId, "428-ui: target set to archived before stale")
+    -- Remove archived header so ResolveRenameTarget must fall back.
+    local recStale = GS:GetCurrentRecord()
+    recStale.campaigns[archivedId] = nil
+    recStale.campaignArchives[archivedId] = nil
+    configPage:Refresh(configPanel)
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    assertEq(renameTargetDef.get(), currentId,
+        "428-ui: stale archived target falls back to current")
+
+    -- Unrelated refresh preserves a valid target (and draft via selection key).
+    renameTargetDef.onValueChanged({
+        section = { SetMessage = function() end, ClearMessage = function() end },
+    }, currentId)
+    local preservedTarget = renameTargetDef.get()
+    configPage:Refresh(configPanel)
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    assertEq(renameTargetDef.get(), preservedTarget,
+        "428-ui: unrelated refresh preserves valid rename target")
+
+    -- #434 repair: implicit rename target follows current through campaign rollover;
+    -- explicit archived pin survives while inspectable (local + remote-shaped).
+    do
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local rollFirst = startCampaign()
+        local rollFirstId = rollFirst.id
+        configPanel = makeRegion("Frame", "GSConfigRenameRolloverPanel", nil)
+        configPanel:SetSize(600, 800)
+        configPanel.shown = true
+        configPage:Build(configPanel)
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollFirstId,
+            "434-ui: implicit target starts on first current")
+
+        -- Local New Campaign while still following current → follow the new current.
+        local rollSecond = startCampaign()
+        local rollSecondId = rollSecond.id
+        assertTrue(rollSecondId ~= rollFirstId, "434-ui: rollover created a new current")
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollSecondId,
+            "434-ui: implicit target follows newly current after rollover")
+        assertTrue(GS:GetCurrentRecord().campaignArchives[rollFirstId] ~= nil
+                or GS:GetCurrentRecord().campaigns[rollFirstId] ~= nil,
+            "434-ui: prior campaign remains inspectable as archive")
+
+        -- Explicit archived pin survives a further rollover.
+        renameTargetDef.onValueChanged({
+            section = { SetMessage = function() end, ClearMessage = function() end },
+        }, rollFirstId)
+        assertEq(renameTargetDef.get(), rollFirstId, "434-ui: pinned archived target")
+        local rollThird = startCampaign()
+        local rollThirdId = rollThird.id
+        assertEq(GS:GetCurrentRecord().currentCampaignId, rollThirdId,
+            "434-ui: third campaign is current")
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollFirstId,
+            "434-ui: explicit archived pin survives rollover")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, rollThirdId,
+            "434-ui: pinned rename target does not activate archive")
+
+        -- Remote-shaped current change while following: select current (follow mode),
+        -- then start another campaign as a peer rollover would.
+        renameTargetDef.onValueChanged({
+            section = { SetMessage = function() end, ClearMessage = function() end },
+        }, rollThirdId)
+        assertEq(renameTargetDef.get(), rollThirdId, "434-ui: follow resumes on current")
+        local peerFourth = startCampaign()
+        local peerFourthId = peerFourth.id
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), peerFourthId,
+            "434-ui: follow mode tracks remote-shaped campaign change")
+        flushTimers()
+    end
+
+    -- #434 repair: Configuration registers GS.RegisterUIListener once and
+    -- coalesced QueueRefresh updates visible pages only.
+    do
+        local regCount = 0
+        local realReg = GS.RegisterUIListener
+        GS.RegisterUIListener = function(fn)
+            regCount = regCount + 1
+            return realReg(fn)
+        end
+        -- Reload so durableListenerRegistered / Page hook start clean.
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+        configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+        assertTrue(configPage ~= nil, "434-ui: configuration page reloaded for durable listen")
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local listenCamp = startCampaign()
+        local listenCampId = listenCamp.id
+
+        local refreshCount = 0
+        local realRefresh = configPage.Refresh
+        configPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+
+        local listenPanel = makeRegion("Frame", "GSConfigDurablePanel", nil)
+        listenPanel:SetSize(600, 800)
+        listenPanel.shown = true
+        configPage:Build(listenPanel)
+        local listenPanel2 = makeRegion("Frame", "GSConfigDurablePanel2", nil)
+        listenPanel2:SetSize(600, 800)
+        listenPanel2.shown = true
+        configPage:Build(listenPanel2)
+        for _ = 1, 5 do
+            configPage:Refresh(listenPanel)
+        end
+        assertEq(regCount, 1,
+            "434-ui: repeated Build/Refresh registers one GS durable listener")
+
+        -- Remote rename while visible: NotifyUI → QueueRefresh updates labels.
+        timers = {}
+        local beforeRefresh = refreshCount
+        local remoteRename = select(1, GS:NewRenameCampaignOperation(listenCampId, "RemoteName"))
+        assertEq(GS:ApplyStagedConfigOperation(remoteRename), "accepted",
+            "434-ui: remote-shaped rename accepted")
+        GS.NotifyUI("remote-op")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertTrue(refreshCount > beforeRefresh,
+            "434-ui: durable GS notify refreshes visible Configuration")
+        renameTargetDef = findConfigItem(listenPanel, "dropdown", "Rename target")
+        local optsAfter = renameTargetDef.options and renameTargetDef.options() or {}
+        local sawRemoteName = false
+        for i = 1, #optsAfter do
+            if tostring(optsAfter[i].label or ""):find("RemoteName", 1, true) then
+                sawRemoteName = true
+                break
             end
         end
-    end
-    assertEq(selectedAfter, archivedId, "424-ui: Logs selection retained on archived id")
+        assertTrue(sawRemoteName,
+            "434-ui: refreshed options show remote campaign name")
+        assertEq(renameTargetDef.get(), listenCampId,
+            "434-ui: durable refresh preserves valid rename target")
 
-    -- #424: getter-only editbox keeps unfinished draft across unrelated Refresh.
+        -- Hidden page: no Refresh work from durable notify.
+        listenPanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        timers = {}
+        beforeRefresh = refreshCount
+        GS.NotifyUI("remote-op-hidden")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertEq(refreshCount, beforeRefresh,
+            "434-ui: hidden Configuration skips durable refresh work")
+
+        GS.RegisterUIListener = realReg
+        configPage.Refresh = realRefresh
+        flushTimers()
+    end
+
+    -- #434: Configuration rename EditBox DoSubmit aborts when current campaign
+    -- rolls over before the deferred QueueRefresh reloads the selection key.
+    do
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local campA = startCampaign()
+        local campAId = campA.id
+        local renameA = select(1, GS:NewRenameCampaignOperation(campAId, "AlphaLive"))
+        assertEq(GS:ApplyStagedConfigOperation(renameA), "accepted",
+            "434-stale-cfg: seed Campaign A name")
+        flushTimers()
+
+        local stalePanel = makeRegion("Frame", "GSConfigStaleSubmitPanel", nil)
+        stalePanel:SetSize(600, 800)
+        stalePanel.shown = true
+        local createdBeforeCfg = #created
+        configPage:Build(stalePanel)
+        configPage:Refresh(stalePanel)
+        flushTimers()
+
+        local renameEdit, renameBtn
+        for i = createdBeforeCfg + 1, #created do
+            local obj = created[i]
+            if obj.GetObjectType and obj:GetObjectType() == "Button"
+                and obj.text == "Rename" then
+                renameBtn = obj
+                -- Controls create EditBox then Button in the same row.
+                for j = i - 1, createdBeforeCfg + 1, -1 do
+                    local prev = created[j]
+                    if prev.GetObjectType and prev:GetObjectType() == "EditBox" then
+                        renameEdit = prev
+                        break
+                    end
+                end
+                break
+            end
+        end
+        assertTrue(renameEdit ~= nil and renameBtn ~= nil,
+            "434-stale-cfg: Configuration rename editbox/button present")
+        assertEq(renameEdit:GetText(), "AlphaLive",
+            "434-stale-cfg: editbox loaded Campaign A name")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campAId,
+            "434-stale-cfg: A is current before rollover")
+
+        -- Rollover to B without running the deferred UI refresh.
+        timers = {}
+        local campB = startCampaign()
+        local campBId = campB.id
+        assertTrue(campBId ~= campAId, "434-stale-cfg: rollover created Campaign B")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campBId,
+            "434-stale-cfg: B is current")
+        -- Leave timers uncleared so QueueRefresh has not yet reloaded the editbox.
+        renameEdit:SetText("ShouldNotApplyToB")
+        local opsBefore = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsBefore = opsBefore + 1
+        end
+        renameBtn:Click()
+        local opsAfter = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsAfter = opsAfter + 1
+        end
+        assertEq(opsAfter, opsBefore,
+            "434-stale-cfg: stale DoSubmit allocates no rename operation")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campAId), "AlphaLive",
+            "434-stale-cfg: Campaign A name unchanged by stale submit")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campBId), campBId,
+            "434-stale-cfg: Campaign B name unchanged by stale submit")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campBId,
+            "434-stale-cfg: stale submit does not change current campaign")
+
+        -- After refresh, intentional rename of B succeeds.
+        flushTimers()
+        configPage:Refresh(stalePanel)
+        assertEq(renameEdit:GetText(), "",
+            "434-stale-cfg: refresh loads blank custom name for B")
+        renameEdit:SetText("BetaLive")
+        local opsBeforeOk = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsBeforeOk = opsBeforeOk + 1
+        end
+        renameBtn:Click()
+        flushTimers()
+        local opsAfterOk = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsAfterOk = opsAfterOk + 1
+        end
+        assertTrue(opsAfterOk > opsBeforeOk,
+            "434-stale-cfg: intentional B rename allocates an operation")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campBId), "BetaLive",
+            "434-stale-cfg: intentional Campaign B rename applied")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campAId), "AlphaLive",
+            "434-stale-cfg: intentional B rename leaves A untouched")
+        stalePanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        flushTimers()
+    end
+
+    -- #424/#428: getter-only editbox keeps unfinished draft across unrelated Refresh.
     local draftSection = {
         __sfPageBuilder = {
             _refresh = {},
@@ -5913,6 +6305,108 @@ do
     selection.name = "Bravo"
     draftSection.__sfPageBuilder:FireRefresh()
     assertEq(draftEdit:GetText(), "Bravo", "424-ui: selection change reloads getter text")
+
+    -- #434: production AddEditBoxWithButton DoSubmit rejects stale selection text
+    -- when the backing key changes before deferred Refresh (campaign rollover).
+    do
+        local names = {
+            ["camp-a"] = "AlphaName",
+            ["camp-b"] = "BetaName",
+        }
+        local selectionLive = { key = "camp-a" }
+        local submitCalls = {}
+        local staleSection = {
+            __sfPageBuilder = {
+                _refresh = {},
+                RegisterRefresh = function(self, fn)
+                    self._refresh[#self._refresh + 1] = fn
+                end,
+                FireRefresh = function(self)
+                    for i = 1, #self._refresh do
+                        self._refresh[i]()
+                    end
+                end,
+            },
+            AddRow = function(self, _, builder)
+                local row = makeRegion("Frame", "StaleRenameRow", nil)
+                row:SetSize(400, 26)
+                builder(row)
+                return row
+            end,
+        }
+        local createdBeforeStale = #created
+        SF.SettingsUI.Controls:AddEditBoxWithButton(staleSection, {
+            label = "Stale rename",
+            buttonText = "Rename",
+            get = function()
+                return names[selectionLive.key] or ""
+            end,
+            getSelectionKey = function()
+                return selectionLive.key
+            end,
+            onSubmit = function(text)
+                submitCalls[#submitCalls + 1] = {
+                    text = text,
+                    key = selectionLive.key,
+                }
+                names[selectionLive.key] = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+            end,
+        })
+        local staleEdit, staleBtn
+        for i = createdBeforeStale + 1, #created do
+            local obj = created[i]
+            if obj.GetObjectType then
+                local kind = obj:GetObjectType()
+                if kind == "EditBox" and not staleEdit then
+                    staleEdit = obj
+                elseif kind == "Button" and obj.text == "Rename" and not staleBtn then
+                    staleBtn = obj
+                end
+            end
+        end
+        assertTrue(staleEdit ~= nil, "434-stale: editbox created")
+        assertTrue(staleBtn ~= nil, "434-stale: rename button created")
+        assertEq(staleEdit:GetText(), "AlphaName", "434-stale: loaded Campaign A name")
+
+        -- Rollover changes the resolved key before deferred Refresh runs.
+        selectionLive.key = "camp-b"
+        staleEdit:SetText("StaleAlphaDraft")
+        local beforeA = names["camp-a"]
+        local beforeB = names["camp-b"]
+        local beforeSubmitCount = #submitCalls
+        staleBtn:Click()
+        assertEq(#submitCalls, beforeSubmitCount,
+            "434-stale: DoSubmit aborts when selection key changed before refresh")
+        assertEq(names["camp-a"], beforeA, "434-stale: Campaign A name unchanged")
+        assertEq(names["camp-b"], beforeB, "434-stale: Campaign B name unchanged")
+        assertEq(staleEdit:GetText(), "BetaName",
+            "434-stale: aborted submit reloads Campaign B value")
+
+        -- After refresh, intentional rename of B succeeds through the same widget.
+        staleSection.__sfPageBuilder:FireRefresh()
+        assertEq(staleEdit:GetText(), "BetaName", "434-stale: refresh keeps Campaign B value")
+        staleEdit:SetText("BetaRenamed")
+        staleBtn:Click()
+        assertEq(#submitCalls, beforeSubmitCount + 1,
+            "434-stale: intentional submit after refresh reaches onSubmit")
+        assertEq(submitCalls[#submitCalls].key, "camp-b",
+            "434-stale: intentional submit targets Campaign B")
+        assertEq(names["camp-b"], "BetaRenamed",
+            "434-stale: intentional Campaign B rename applied")
+        assertEq(names["camp-a"], beforeA,
+            "434-stale: intentional B rename leaves Campaign A untouched")
+
+        -- Pinned archived selection: key stays on A while "current" advances.
+        selectionLive.key = "camp-a"
+        staleSection.__sfPageBuilder:FireRefresh()
+        assertEq(staleEdit:GetText(), "AlphaName", "434-stale: pinned A reloads")
+        staleEdit:SetText("PinnedArchive")
+        staleBtn:Click()
+        assertEq(names["camp-a"], "PinnedArchive",
+            "434-stale: pinned archived rename still submits")
+        assertEq(names["camp-b"], "BetaRenamed",
+            "434-stale: pinned A rename leaves B untouched")
+    end
 
     -- Small-guild explicit threshold through CreateStagedRecord path used by UI.
     resetDb()
@@ -6541,6 +7035,9 @@ do
             end
         end
     end
+    -- Drain durable GS NotifyUI → QueueRefresh work from earlier config ops so
+    -- refreshQueued is idle before this coalesce probe (#434 Configuration listener).
+    flushTimers()
     local priorAfter = C_Timer.After
     local deferredFns = {}
     C_Timer.After = function(_, fn)

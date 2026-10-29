@@ -141,7 +141,7 @@ Historical **Main Swap** entries remain in Loot Logs as lineage. They are not of
 
 Raid supply configuration and history are guild-owned. Open **Raid Supplies → Configuration** to set the Guild Bank tab and the exact items the guild currently accepts as donations. A different quality is a different item. There are no Crafters, recipient assignments, or material routing. **Raid Supplies → Logs** shows campaign goals, progress, and donation history. Loot Helper does not have Consumables or Consumable Logs tabs.
 
-**Loot Helper → General → Show Raid Supply Reminders** is personal. It only controls the reminder and the automatic deposit review when the configured Guild Bank opens. Turning it off does not stop accounting.
+**Raid Supplies → Configuration → Show raid supply reminders** is personal. It only controls the reminder and the automatic deposit review when the configured Guild Bank opens. Turning it off does not stop accounting. Campaign renaming for current and archived campaigns also lives on Configuration.
 
 Members who carry a requested item can see a compact Raid Supplies reminder with a secure Mobile Banking icon when that path is relevant (including while Mobile Banking is on cooldown). Opening Mobile Banking from that banner selects the configured Guild Bank tab once; the existing deposit assistant then handles quantities and deposits when the tab is usable. Spectrum records contribution credit only for quantities observed successfully entering that tab. What happens to the materials afterward is not tracked.
 
