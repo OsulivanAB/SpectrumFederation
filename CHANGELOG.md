@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.6] - 2026-10-29
+
+### Added
+- Add overall progress bar to Raid Supplies Logs (#429)
+
 ## [1.5.16-beta.5] - 2026-10-29
 
 ### Changed
