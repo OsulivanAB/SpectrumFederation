@@ -2473,6 +2473,85 @@ function Controls:AddConsumableGoalSummary(section, opts)
 	end)
 end
 
+-- Read-only overall progress bar only (no per-item summary). Matches Guild Bank
+-- assistant bar appearance/percentage clamp for Raid Supplies Logs (#429).
+-- @param section table Section to add row into
+-- @param opts table Options with getProgress returning GoalProgress model
+-- @return Frame The created row
+function Controls:AddOverallProgressBar(section, opts)
+	opts = opts or {}
+
+	local getProgress = opts.getProgress
+	if type(getProgress) ~= "function" then
+		getProgress = function() return nil end
+	end
+
+	local barHeight = opts.barHeight or 14
+	local rowHeight = opts.height or (barHeight + 12)
+
+	local function Loc(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default or key
+	end
+
+	return section:AddRow(rowHeight, function(row)
+		local _, control = self:InitRow(row, opts)
+
+		local emptyText = control:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+		emptyText:SetPoint("LEFT", control, "LEFT", 0, 0)
+		emptyText:SetPoint("RIGHT", control, "RIGHT", 0, 0)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:SetText(Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."))
+
+		local bar = CreateFrame("StatusBar", nil, control)
+		bar:SetPoint("LEFT", control, "LEFT", 0, 0)
+		bar:SetPoint("RIGHT", control, "RIGHT", 0, 0)
+		bar:SetHeight(barHeight)
+		if bar.SetMinMaxValues then bar:SetMinMaxValues(0, 100) end
+		if bar.SetValue then bar:SetValue(0) end
+		if bar.SetStatusBarTexture then
+			bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+		end
+		if bar.SetStatusBarColor then
+			bar:SetStatusBarColor(0.2, 0.7, 0.3, 1)
+		end
+		local barBg = bar:CreateTexture(nil, "BACKGROUND")
+		if barBg.SetAllPoints then barBg:SetAllPoints(bar) end
+		if barBg.SetTexture then barBg:SetTexture("Interface\\Buttons\\WHITE8x8") end
+		if barBg.SetVertexColor then barBg:SetVertexColor(0.15, 0.15, 0.15, 0.8) end
+		local barText = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		barText:SetPoint("CENTER", bar, "CENTER", 0, 0)
+		bar.Text = barText
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, { bar, emptyText })
+			local progress = getProgress() or {}
+			if progress.hasPositiveGoal then
+				emptyText:Hide()
+				bar:Show()
+				local pct = tonumber(progress.overallPercent) or 0
+				pct = math.max(0, math.min(100, pct))
+				if bar.SetValue then bar:SetValue(pct) end
+				if bar.Text then
+					bar.Text:SetText(string.format("%d%%", pct))
+				end
+			else
+				bar:Hide()
+				emptyText:Show()
+				emptyText:SetText(
+					progress.overallEmptyText
+						or Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured.")
+				)
+			end
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 function Controls:AddLogTable(section, opts)
 	opts = opts or {}
 

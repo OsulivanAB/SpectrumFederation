@@ -167,6 +167,44 @@ local function ResolveSelectedCampaign()
 	return selectedCampaignId
 end
 
+--- One projected pass for the selected campaign: items, ledger totals, overall bar.
+-- Reused by the progress bar and Goals list so Refresh does not walk the ledger twice.
+local function SelectedCampaignProjection()
+	if passCache and passCache.selectedProjectionChecked then
+		return passCache.selectedProjection
+	end
+	local projection = {
+		campaignId = nil,
+		items = nil,
+		progress = nil,
+		goalProgress = nil,
+	}
+	if Caps().canRead then
+		local campaignId = ResolveSelectedCampaign()
+		projection.campaignId = campaignId
+		local g = GS()
+		if g and campaignId then
+			if g.GetCampaignRequestedItems then
+				projection.items = g:GetCampaignRequestedItems(campaignId)
+			end
+			if g.ProjectCampaignProgress then
+				projection.progress = g:ProjectCampaignProgress(campaignId)
+			end
+			if type(projection.items) == "table" and g.ComputeGoalProgress then
+				local totals = projection.progress and projection.progress.itemTotals or {}
+				projection.goalProgress = g.ComputeGoalProgress(projection.items, totals)
+			elseif g.CampaignGoalProgress then
+				projection.goalProgress = g:CampaignGoalProgress(campaignId)
+			end
+		end
+	end
+	if passCache then
+		passCache.selectedProjectionChecked = true
+		passCache.selectedProjection = projection
+	end
+	return projection
+end
+
 local function MembershipHelpText()
 	local caps = Caps()
 	local g = GS()
@@ -200,14 +238,9 @@ local function ItemRowsForSelected()
 	if not Caps().canRead then
 		return rows
 	end
-	local g = GS()
-	local campaignId = ResolveSelectedCampaign()
-	if not g or not campaignId then
-		return rows
-	end
-	local items = g:GetCampaignRequestedItems(campaignId)
-	local progress = g:ProjectCampaignProgress(campaignId)
-	local totals = progress and progress.itemTotals or {}
+	local projection = SelectedCampaignProjection()
+	local items = projection.items
+	local totals = projection.progress and projection.progress.itemTotals or {}
 	if type(items) ~= "table" then
 		return rows
 	end
@@ -235,6 +268,30 @@ local function ItemRowsForSelected()
 		return (a.itemId or 0) < (b.itemId or 0)
 	end)
 	return rows
+end
+
+local function OverallProgressForSelected()
+	if not Caps().canRead then
+		return {
+			hasPositiveGoal = false,
+			overallPercent = nil,
+			overallEmptyText = Loc("GUILD_SUPPLIES_LOGS_NO_READ",
+				"Join a guild with a verified membership to inspect Guild Supplies logs."),
+		}
+	end
+	if not ResolveSelectedCampaign() then
+		return {
+			hasPositiveGoal = false,
+			overallPercent = nil,
+			overallEmptyText = Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns"),
+		}
+	end
+	local projection = SelectedCampaignProjection()
+	return projection.goalProgress or {
+		hasPositiveGoal = false,
+		overallPercent = nil,
+		overallEmptyText = Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."),
+	}
 end
 
 local function ItemNameForHistory(itemId)
@@ -431,6 +488,18 @@ local function Definition()
 							end
 							return id
 						end,
+					},
+					{
+						-- Immediately under the campaign selection controls; before Goals.
+						type = "overallProgressBar",
+						label = Loc("RAID_SUPPLIES_OVERALL_PROGRESS", "Overall progress"),
+						getProgress = function()
+							return OverallProgressForSelected()
+						end,
+						enabled = function()
+							return Caps().canRead
+						end,
+						getDisabledTooltip = DisabledLogsListTip,
 					},
 					{
 						type = "scrollList",

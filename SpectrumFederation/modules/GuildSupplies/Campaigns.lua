@@ -903,6 +903,84 @@ function GS:ProjectCampaignProgress(campaignId)
     return GS.ProjectCampaignProgressOnRecord(record, campaignId)
 end
 
+--- Overall / per-item goal progress matching Consumables.GoalProgress semantics.
+-- Caps each positive-goal item at its own goal for the overall bar, excludes
+-- goal-0 items from the overall denominator, and floors percentages. Pure math
+-- over already-projected totals — does not walk the ledger again.
+-- @param requestedItems table|nil map/list of { itemId, goal }
+-- @param itemTotals table|nil itemId → donated quantity
+-- @return table GoalProgress model
+function GS.ComputeGoalProgress(requestedItems, itemTotals)
+    itemTotals = type(itemTotals) == "table" and itemTotals or {}
+    local items = {}
+    local sumCapped = 0
+    local sumGoal = 0
+    if type(requestedItems) == "table" then
+        local C = SF.Consumables
+        for _, row in pairs(requestedItems) do
+            if type(row) == "table" then
+                local itemId = tonumber(row.itemId)
+                if itemId and itemId == itemId and itemId == math.floor(itemId) and itemId >= 1 then
+                    local goal
+                    if C and type(C.ValidGoal) == "function" then
+                        goal = C.ValidGoal(row.goal) or 0
+                    else
+                        goal = tonumber(row.goal) or 0
+                        if goal ~= goal or goal ~= math.floor(goal) or goal < 0 then
+                            goal = 0
+                        end
+                    end
+                    local donated = tonumber(itemTotals[itemId]) or 0
+                    local entry = {
+                        itemId = itemId,
+                        goal = goal,
+                        donated = donated,
+                        noGoal = goal == 0,
+                        percent = nil,
+                    }
+                    if goal > 0 then
+                        entry.percent = math.floor((100 * donated) / goal)
+                        sumCapped = sumCapped + math.min(donated, goal)
+                        sumGoal = sumGoal + goal
+                    end
+                    items[#items + 1] = entry
+                end
+            end
+        end
+    end
+    table.sort(items, function(a, b)
+        return a.itemId < b.itemId
+    end)
+    local hasPositiveGoal = sumGoal > 0
+    local overallPercent = nil
+    if hasPositiveGoal then
+        overallPercent = math.floor((100 * sumCapped) / sumGoal)
+    end
+    return {
+        items = items,
+        hasPositiveGoal = hasPositiveGoal,
+        overallPercent = overallPercent,
+        overallEmptyText = Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."),
+        sumCapped = sumCapped,
+        sumGoal = sumGoal,
+    }
+end
+
+--- Campaign-scoped GoalProgress from Guild Supplies accounting (live or archive).
+-- Prefer ComputeGoalProgress with already-projected parts when a UI pass already
+-- fetched items/totals, to avoid a second full ledger projection.
+function GS:CampaignGoalProgress(campaignId)
+    local items, err = self:GetCampaignRequestedItems(campaignId)
+    if type(items) ~= "table" then
+        return nil, err or "missing_campaign"
+    end
+    local progress, perr = self:ProjectCampaignProgress(campaignId)
+    if type(progress) ~= "table" then
+        return nil, perr or "not_ready"
+    end
+    return GS.ComputeGoalProgress(items, progress.itemTotals)
+end
+
 local function FormatHistoryTimestamp(event)
     local ts = tonumber(event and event.timestamp)
     if not ts or ts ~= ts or ts < 0 then

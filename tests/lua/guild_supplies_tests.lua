@@ -5834,6 +5834,319 @@ do
     assertNil(logsRenameSubmit, "428-ui: Logs has no campaign rename control")
     assertNil(logsPersonalSection, "428-ui: Logs has no personal-preferences / reminders section")
 
+    -- #429: Logs overall progress bar (GS accounting; follows campaign selector).
+    local function findLogsItem(panel, itemType, labelNeedle)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == itemType then
+                    if not labelNeedle then
+                        return item
+                    end
+                    if item.label and tostring(item.label):find(labelNeedle, 1, true) then
+                        return item
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    local function findOverallBeforeGoals(panel)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            local sawOverall, sawGoals = false, false
+            local overallBeforeGoals = false
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "overallProgressBar" then
+                    sawOverall = true
+                    if not sawGoals then overallBeforeGoals = true end
+                end
+                if item.type == "scrollList" and item.label
+                    and tostring(item.label):find("Goals and progress", 1, true) then
+                    sawGoals = true
+                end
+            end
+            if sawOverall then
+                return overallBeforeGoals, sawGoals
+            end
+        end
+        return false, false
+    end
+
+    -- Pure ComputeGoalProgress matches Consumables.GoalProgress weighting/caps.
+    local pure = GS.ComputeGoalProgress({
+        ["100"] = { itemId = 100, goal = 50 },
+        ["200"] = { itemId = 200, goal = 100 },
+        ["300"] = { itemId = 300, goal = 0 },
+        ["400"] = { itemId = 400, goal = 50 },
+    }, {
+        [100] = 0,
+        [200] = 100,
+        [300] = 300,
+        [400] = 110,
+    })
+    -- sumCapped = min(0,50)+min(100,100)+min(110,50) = 0+100+50 = 150; sumGoal = 200 → 75%
+    assertTrue(pure.hasPositiveGoal, "429: positive goals enable overall bar")
+    assertEq(pure.overallPercent, 75, "429: overall floors capped donations / positive goals")
+    assertEq(pure.sumCapped, 150, "429: over-donation capped at goal")
+    assertEq(pure.sumGoal, 200, "429: goal-0 excluded from denominator")
+    local byPure = {}
+    for i = 1, #pure.items do byPure[pure.items[i].itemId] = pure.items[i] end
+    assertEq(byPure[400].percent, 220, "429: per-item percent may exceed 100")
+    assertTrue(byPure[300].noGoal, "429: goal-0 marked noGoal")
+    assertEq(byPure[300].percent, nil, "429: goal-0 has no percent")
+
+    local noGoals = GS.ComputeGoalProgress({
+        ["1"] = { itemId = 1, goal = 0 },
+    }, { [1] = 99 })
+    assertTrue(not noGoals.hasPositiveGoal, "429: all goal-0 → no overall bar")
+    assertEq(noGoals.overallPercent, nil, "429: no misleading overall percent")
+    assertTrue(tostring(noGoals.overallEmptyText or ""):find("No goals configured", 1, true),
+        "429: empty text is No goals configured")
+
+    local zeroDon = GS.ComputeGoalProgress({
+        ["5"] = { itemId = 5, goal = 40 },
+    }, {})
+    assertTrue(zeroDon.hasPositiveGoal, "429: positive goals with zero donations still show bar")
+    assertEq(zeroDon.overallPercent, 0, "429: zero donations → 0%")
+
+    -- Clamp display fill inputs above 100 stay computable; UI clamps SetValue.
+    local overAll = GS.ComputeGoalProgress({
+        ["9"] = { itemId = 9, goal = 10 },
+    }, { [9] = 10 })
+    assertEq(overAll.overallPercent, 100, "429: fully met overall is 100 not over")
+
+    -- Live Logs fixture: current vs archived selection, donation/adjustment/goal updates.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    local campA = startCampaign()
+    local itemA = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
+        itemId = 501, goal = 50, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemA), "accepted", "429: seed item A")
+    local itemB = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 502 }, {
+        itemId = 502, goal = 100, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemB), "accepted", "429: seed item B")
+    local itemZ = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 503 }, {
+        itemId = 503, goal = 0, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemZ), "accepted", "429: seed goal-0 item")
+    local recA = GS:GetCurrentRecord()
+    local genA = recA.accounting._consumables.generation
+    recA.accounting._consumableEvents[#recA.accounting._consumableEvents + 1] = {
+        id = "429-don-a",
+        type = "donation",
+        itemId = 501,
+        quantity = 25,
+        actor = "Bob-Garona",
+        generation = genA,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    recA.accounting._consumableEvents[#recA.accounting._consumableEvents + 1] = {
+        id = "429-don-b",
+        type = "donation",
+        itemId = 502,
+        quantity = 110,
+        actor = "Bob-Garona",
+        generation = genA,
+        timestamp = world.time + 1,
+        source = "guildbank",
+    }
+    recA.accounting._consumableEvents[#recA.accounting._consumableEvents + 1] = {
+        id = "429-don-z",
+        type = "donation",
+        itemId = 503,
+        quantity = 40,
+        actor = "Bob-Garona",
+        generation = genA,
+        timestamp = world.time + 2,
+        source = "guildbank",
+    }
+    -- Archived campaign A keeps its goals/progress; new campaign B starts empty.
+    local campB = startCampaign()
+    assertTrue(campA.id ~= campB.id, "429: archived vs current campaigns")
+
+    logsPanel = makeRegion("Frame", "GSLogsProgressPanel", nil)
+    logsPanel:SetSize(600, 800)
+    logsPage:Build(logsPanel)
+    local beforeGoals, hasGoals = findOverallBeforeGoals(logsPanel)
+    assertTrue(beforeGoals and hasGoals,
+        "429: overall progress bar is defined before Goals and progress")
+    local overallDef = findLogsItem(logsPanel, "overallProgressBar", "Overall progress")
+    assertTrue(overallDef ~= nil and type(overallDef.getProgress) == "function",
+        "429: overallProgressBar control present")
+    assertTrue(findLogsItem(logsPanel, "consumableGoalSummary") == nil,
+        "429: does not reintroduce consumableGoalSummary item list")
+
+    -- Default selection is current campaign (empty goals) → No goals configured.
+    logsPage:Refresh(logsPanel)
+    local currentProg = overallDef.getProgress()
+    assertTrue(not currentProg.hasPositiveGoal, "429: current empty campaign has no positive goals")
+    assertEq(currentProg.overallPercent, nil, "429: current empty → no percent")
+    assertTrue(tostring(currentProg.overallEmptyText or ""):find("No goals configured", 1, true),
+        "429: current empty shows No goals configured")
+
+    -- Select archived campaign via dropdown set path.
+    drops = findDropdowns(logsPanel)
+    drop = drops[1]
+    assertTrue(drop and type(drop.menuOptions) == "table", "429: campaign dropdown ready")
+    local archivedOpt, currentOpt
+    for i = 1, #drop.menuOptions do
+        local opt = drop.menuOptions[i]
+        if opt.value == campA.id then archivedOpt = opt end
+        if opt.value == campB.id then currentOpt = opt end
+    end
+    assertTrue(archivedOpt ~= nil and currentOpt ~= nil, "429: both campaigns listed")
+    if type(archivedOpt.setSelected) == "function" then
+        archivedOpt.setSelected(archivedOpt.value)
+    else
+        -- Fallback: invoke definition set if menu setSelected unavailable.
+        local campDrop = findLogsItem(logsPanel, "dropdown", "Campaign")
+        assertTrue(campDrop and type(campDrop.set) == "function", "429: campaign set available")
+        campDrop.set(campA.id)
+        if type(campDrop.onValueChanged) == "function" then
+            campDrop.onValueChanged({ pageBuilder = logsPanel.__sfPageBuilder })
+        end
+    end
+    logsPage:Refresh(logsPanel)
+    local archivedProg = overallDef.getProgress()
+    -- sumCapped = min(25,50)+min(110,100) = 25+100 = 125; sumGoal = 150 → 83%
+    assertTrue(archivedProg.hasPositiveGoal, "429: archived campaign has positive goals")
+    assertEq(archivedProg.overallPercent, 83, "429: archived weighted overall percent")
+
+    local campGoal = GS:CampaignGoalProgress(campA.id)
+    assertEq(campGoal.overallPercent, 83, "429: CampaignGoalProgress matches Logs bar")
+
+    -- Switch back to current; progress follows selection without a second selector.
+    if type(currentOpt.setSelected) == "function" then
+        currentOpt.setSelected(currentOpt.value)
+    else
+        local campDrop2 = findLogsItem(logsPanel, "dropdown", "Campaign")
+        campDrop2.set(campB.id)
+    end
+    logsPage:Refresh(logsPanel)
+    currentProg = overallDef.getProgress()
+    assertTrue(not currentProg.hasPositiveGoal, "429: selecting current restores empty overall")
+
+    -- Seed current campaign goals + zero donations → 0% bar (not empty text).
+    local curItem = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 601 }, {
+        itemId = 601, goal = 80, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(curItem), "accepted", "429: current campaign goal")
+    logsPage:Refresh(logsPanel)
+    currentProg = overallDef.getProgress()
+    assertTrue(currentProg.hasPositiveGoal, "429: current with goals shows bar")
+    assertEq(currentProg.overallPercent, 0, "429: zero donations on current → 0%")
+
+    -- Donation updates overall; adjustment updates; goal change reweights.
+    local recB = GS:GetCurrentRecord()
+    local genB = recB.accounting._consumables.generation
+    recB.accounting._consumableEvents[#recB.accounting._consumableEvents + 1] = {
+        id = "429-don-cur",
+        type = "donation",
+        itemId = 601,
+        quantity = 20,
+        actor = "Carol-Garona",
+        generation = genB,
+        timestamp = world.time + 10,
+        source = "guildbank",
+    }
+    logsPage:Refresh(logsPanel)
+    assertEq(overallDef.getProgress().overallPercent, 25, "429: donation updates overall (20/80)")
+
+    recB.accounting._consumableEvents[#recB.accounting._consumableEvents + 1] = {
+        id = "429-adj-cur",
+        type = "adjustment",
+        itemId = 601,
+        quantity = 20,
+        actor = "Alice-Garona",
+        attributed = "Carol-Garona",
+        generation = genB,
+        timestamp = world.time + 11,
+    }
+    logsPage:Refresh(logsPanel)
+    assertEq(overallDef.getProgress().overallPercent, 50, "429: adjustment updates overall (40/80)")
+
+    local raiseGoal = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 601 }, {
+        itemId = 601, goal = 160, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(raiseGoal), "accepted", "429: raise goal")
+    logsPage:Refresh(logsPanel)
+    assertEq(overallDef.getProgress().overallPercent, 25, "429: goal change reweights (40/160)")
+
+    -- Member-readable (non-editor) still sees overall progress.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    settleRoster()
+    local memberCaps = GS:GetCapabilities()
+    assertEq(memberCaps.canRead, true, "429: member can read")
+    assertEq(memberCaps.canEdit, false, "429: member cannot edit")
+    logsPage:Refresh(logsPanel)
+    local memberProg = overallDef.getProgress()
+    assertTrue(memberProg.hasPositiveGoal, "429: member-read overall still available")
+    assertEq(memberProg.overallPercent, 25, "429: member-read overall percent matches")
+
+    -- Missing guild → no read; empty/disabled membership state preserved.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    local priorClub = world.guild.clubId
+    world.guild.clubId = nil
+    resetDemandRoster()
+    assertEq(GS:GetCapabilities().canRead, false, "429: missing club cannot read")
+    logsPage:Refresh(logsPanel)
+    local noGuildProg = overallDef.getProgress()
+    assertTrue(not noGuildProg.hasPositiveGoal, "429: missing guild disables overall bar")
+    assertTrue(tostring(noGuildProg.overallEmptyText or ""):find("Join a guild", 1, true)
+            or tostring(noGuildProg.overallEmptyText or ""):find("verified membership", 1, true),
+        "429: missing guild empty text is membership help")
+    world.guild.clubId = priorClub
+    resetDemandRoster()
+    settleRoster()
+
+    -- Bounded refresh: one ledger projection per visible Refresh (bar + goals share pass).
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    local campDrop3 = findLogsItem(logsPanel, "dropdown", "Campaign")
+    if campDrop3 and campDrop3.set then campDrop3.set(campB.id) end
+    local projectCalls = 0
+    local realProject = GS.ProjectCampaignProgress
+    function GS:ProjectCampaignProgress(...)
+        projectCalls = projectCalls + 1
+        return realProject(self, ...)
+    end
+    logsPage:Refresh(logsPanel)
+    local callsOne = projectCalls
+    assertEq(callsOne, 1, "429: single Refresh projects ledger once (shared pass cache)")
+    projectCalls = 0
+    for _ = 1, 5 do
+        logsPage:Refresh(logsPanel)
+    end
+    assertEq(projectCalls, 5, "429: five Refresh passes → five projections (no hidden polling)")
+    GS.ProjectCampaignProgress = realProject
+
+    -- Hidden panel stays idle (no projection) when Refresh is gated.
+    logsPanel.shown = false
+    logsPanel.visible = false
+    projectCalls = 0
+    function GS:ProjectCampaignProgress(...)
+        projectCalls = projectCalls + 1
+        return realProject(self, ...)
+    end
+    logsPage:Refresh(logsPanel)
+    assertEq(projectCalls, 0, "429: hidden Logs Refresh does not project")
+    GS.ProjectCampaignProgress = realProject
+    logsPanel.shown = true
+    logsPanel.visible = true
+
+    assertEq(#world.chat, 0, "429: Logs overall progress emits no Chat")
+
+    -- Restore editor player for subsequent UI tests in this harness.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+
     -- #428: Configuration rename-target selector + archived rename.
     local function findConfigItem(panel, itemType, labelNeedle)
         for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
