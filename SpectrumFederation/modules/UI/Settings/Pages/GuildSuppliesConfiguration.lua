@@ -842,8 +842,13 @@ end
 -- Selecting an archived campaign is rename-only: never activates it, never
 -- changes Logs selection, and never alters accounting. Cleared when the
 -- guild/dataset context changes; ordinary refreshes keep a valid target.
+--
+-- Follow vs pin (#434 repair): the default/implicit target follows the current
+-- campaign through local or remote rollover. Explicitly choosing a non-current
+-- (archived) campaign pins that immutable ID while it remains inspectable.
 ---------------------------------------------------------------------------
 local renameTargetCampaignId = nil
+local renameTargetFollowCurrent = true
 local renameTargetContextKey = nil
 
 local function RenameTargetContextKey()
@@ -861,6 +866,7 @@ local function SyncRenameTargetContext()
 	end
 	renameTargetContextKey = key
 	renameTargetCampaignId = nil
+	renameTargetFollowCurrent = true
 end
 
 local function InspectableCampaigns()
@@ -918,33 +924,79 @@ local function RenameTargetOptions()
 	return opts
 end
 
+local function CampaignIdInList(list, campaignId)
+	if type(campaignId) ~= "string" or campaignId == "" or type(list) ~= "table" then
+		return false
+	end
+	for i = 1, #list do
+		if list[i].campaignId == campaignId then
+			return true
+		end
+	end
+	return false
+end
+
+--- Apply a user or restore selection. Explicit picks of the current campaign
+-- stay in follow-current mode; explicit non-current picks pin that ID.
+local function SetRenameTarget(campaignId, explicit)
+	SyncRenameTargetContext()
+	if type(campaignId) ~= "string" or campaignId == "" then
+		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
+		return
+	end
+	renameTargetCampaignId = campaignId
+	if not explicit then
+		renameTargetFollowCurrent = true
+		return
+	end
+	local rec = CurrentRecord()
+	local currentId = rec and rec.currentCampaignId
+	renameTargetFollowCurrent = (type(currentId) == "string" and campaignId == currentId)
+end
+
 --- Resolve the ephemeral rename target by immutable campaignId.
--- Defaults to the current campaign. Never activates archived campaigns.
+-- Implicit selection follows the current campaign through rollover. Explicit
+-- archived pins remain while valid. Never activates archived campaigns.
 local function ResolveRenameTarget()
 	SyncRenameTargetContext()
 	if not Caps().canRead then
 		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
 		return nil
 	end
 	local record = CurrentRecord()
 	if not record then
 		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
 		return nil
 	end
 	local list = InspectableCampaigns()
 	if #list == 0 then
 		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
 		return nil
 	end
-	if renameTargetCampaignId then
-		for i = 1, #list do
-			if list[i].campaignId == renameTargetCampaignId then
-				return renameTargetCampaignId
-			end
+	local currentId = record.currentCampaignId
+	if renameTargetFollowCurrent then
+		if type(currentId) == "string" and currentId ~= "" then
+			renameTargetCampaignId = currentId
+			return renameTargetCampaignId
 		end
+		if CampaignIdInList(list, renameTargetCampaignId) then
+			return renameTargetCampaignId
+		end
+		renameTargetCampaignId = list[1].campaignId
+		return renameTargetCampaignId
 	end
-	if type(record.currentCampaignId) == "string" and record.currentCampaignId ~= "" then
-		renameTargetCampaignId = record.currentCampaignId
+	-- Pinned non-current selection: keep while inspectable.
+	if CampaignIdInList(list, renameTargetCampaignId) then
+		return renameTargetCampaignId
+	end
+	-- Stale pin: resume following the current campaign.
+	renameTargetFollowCurrent = true
+	if type(currentId) == "string" and currentId ~= "" then
+		renameTargetCampaignId = currentId
 		return renameTargetCampaignId
 	end
 	renameTargetCampaignId = list[1].campaignId
@@ -978,7 +1030,7 @@ local function CommitRenameCampaign(ctx, campaignId, text)
 		return
 	end
 	local status, reason = g:ApplyStagedConfigOperation(op)
-	-- Keep the rename target on the same immutable campaign id after refresh.
+	-- Keep the same immutable campaign id; preserve follow vs pin mode.
 	if type(campaignId) == "string" and campaignId ~= "" then
 		renameTargetCampaignId = campaignId
 	end
@@ -1499,9 +1551,8 @@ local function Definition()
 						options = RenameTargetOptions,
 						get = ResolveRenameTarget,
 						set = function(value)
-							SyncRenameTargetContext()
 							if type(value) == "string" and value ~= "" then
-								renameTargetCampaignId = value
+								SetRenameTarget(value, true)
 							end
 						end,
 						enabled = function()
@@ -1512,21 +1563,13 @@ local function Definition()
 								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RENAME", "renaming the campaign"))
 						end,
 						onValueChanged = function(ctx, value)
-							SyncRenameTargetContext()
 							if type(value) ~= "string" or value == "" then
 								return
 							end
 							-- Accept only inspectable campaign IDs; never activate.
 							local list = InspectableCampaigns()
-							local found = false
-							for i = 1, #list do
-								if list[i].campaignId == value then
-									found = true
-									break
-								end
-							end
-							if not found then
-								renameTargetCampaignId = nil
+							if not CampaignIdInList(list, value) then
+								SetRenameTarget(nil, false)
 								ResolveRenameTarget()
 								ctx.section:SetMessage(
 									Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
@@ -1535,7 +1578,7 @@ local function Definition()
 								RefreshPageControls()
 								return
 							end
-							renameTargetCampaignId = value
+							SetRenameTarget(value, true)
 							RefreshPageControls()
 						end,
 					},
@@ -1596,7 +1639,7 @@ local function Definition()
 									Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
 										"that campaign is not available on this dataset"),
 									"error")
-								renameTargetCampaignId = nil
+								SetRenameTarget(nil, false)
 								RefreshPageControls()
 								return
 							end
@@ -2171,6 +2214,24 @@ local function EnsureOfficerListener()
 	end)
 end
 
+--- Durable Guild Supplies updates (remote rename/campaign/config). Register once;
+-- QueueRefresh already gates on visibility and coalesces.
+local durableListenerRegistered = false
+local function EnsureDurableListener()
+	if durableListenerRegistered or Page.__sfGuildSuppliesDurableHook then
+		return
+	end
+	local supplies = SF.GuildSupplies
+	if not supplies or type(supplies.RegisterUIListener) ~= "function" then
+		return
+	end
+	durableListenerRegistered = true
+	Page.__sfGuildSuppliesDurableHook = true
+	supplies.RegisterUIListener(function()
+		QueueRefresh()
+	end)
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
@@ -2180,6 +2241,7 @@ function Page:Build(panel)
 	EnsureBankListener()
 	EnsureAdoptionListener()
 	EnsureOfficerListener()
+	EnsureDurableListener()
 	EnsureItemDisplayListener()
 	BeginRenderPass()
 	renderer:Build(panel, Definition())
@@ -2214,6 +2276,7 @@ end
 EnsureRosterListener()
 EnsureBankListener()
 EnsureAdoptionListener()
+EnsureDurableListener()
 EnsureItemDisplayListener()
 
 SF.SettingsUI:RegisterPage(Page)

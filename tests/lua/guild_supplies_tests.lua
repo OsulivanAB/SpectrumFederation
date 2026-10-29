@@ -5998,6 +5998,156 @@ do
     assertEq(renameTargetDef.get(), preservedTarget,
         "428-ui: unrelated refresh preserves valid rename target")
 
+    -- #434 repair: implicit rename target follows current through campaign rollover;
+    -- explicit archived pin survives while inspectable (local + remote-shaped).
+    do
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local rollFirst = startCampaign()
+        local rollFirstId = rollFirst.id
+        configPanel = makeRegion("Frame", "GSConfigRenameRolloverPanel", nil)
+        configPanel:SetSize(600, 800)
+        configPanel.shown = true
+        configPage:Build(configPanel)
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollFirstId,
+            "434-ui: implicit target starts on first current")
+
+        -- Local New Campaign while still following current → follow the new current.
+        local rollSecond = startCampaign()
+        local rollSecondId = rollSecond.id
+        assertTrue(rollSecondId ~= rollFirstId, "434-ui: rollover created a new current")
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollSecondId,
+            "434-ui: implicit target follows newly current after rollover")
+        assertTrue(GS:GetCurrentRecord().campaignArchives[rollFirstId] ~= nil
+                or GS:GetCurrentRecord().campaigns[rollFirstId] ~= nil,
+            "434-ui: prior campaign remains inspectable as archive")
+
+        -- Explicit archived pin survives a further rollover.
+        renameTargetDef.onValueChanged({
+            section = { SetMessage = function() end, ClearMessage = function() end },
+        }, rollFirstId)
+        assertEq(renameTargetDef.get(), rollFirstId, "434-ui: pinned archived target")
+        local rollThird = startCampaign()
+        local rollThirdId = rollThird.id
+        assertEq(GS:GetCurrentRecord().currentCampaignId, rollThirdId,
+            "434-ui: third campaign is current")
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollFirstId,
+            "434-ui: explicit archived pin survives rollover")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, rollThirdId,
+            "434-ui: pinned rename target does not activate archive")
+
+        -- Remote-shaped current change while following: select current (follow mode),
+        -- then start another campaign as a peer rollover would.
+        renameTargetDef.onValueChanged({
+            section = { SetMessage = function() end, ClearMessage = function() end },
+        }, rollThirdId)
+        assertEq(renameTargetDef.get(), rollThirdId, "434-ui: follow resumes on current")
+        local peerFourth = startCampaign()
+        local peerFourthId = peerFourth.id
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), peerFourthId,
+            "434-ui: follow mode tracks remote-shaped campaign change")
+        flushTimers()
+    end
+
+    -- #434 repair: Configuration registers GS.RegisterUIListener once and
+    -- coalesced QueueRefresh updates visible pages only.
+    do
+        local regCount = 0
+        local realReg = GS.RegisterUIListener
+        GS.RegisterUIListener = function(fn)
+            regCount = regCount + 1
+            return realReg(fn)
+        end
+        -- Reload so durableListenerRegistered / Page hook start clean.
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+        configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+        assertTrue(configPage ~= nil, "434-ui: configuration page reloaded for durable listen")
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local listenCamp = startCampaign()
+        local listenCampId = listenCamp.id
+
+        local refreshCount = 0
+        local realRefresh = configPage.Refresh
+        configPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+
+        local listenPanel = makeRegion("Frame", "GSConfigDurablePanel", nil)
+        listenPanel:SetSize(600, 800)
+        listenPanel.shown = true
+        configPage:Build(listenPanel)
+        local listenPanel2 = makeRegion("Frame", "GSConfigDurablePanel2", nil)
+        listenPanel2:SetSize(600, 800)
+        listenPanel2.shown = true
+        configPage:Build(listenPanel2)
+        for _ = 1, 5 do
+            configPage:Refresh(listenPanel)
+        end
+        assertEq(regCount, 1,
+            "434-ui: repeated Build/Refresh registers one GS durable listener")
+
+        -- Remote rename while visible: NotifyUI → QueueRefresh updates labels.
+        timers = {}
+        local beforeRefresh = refreshCount
+        local remoteRename = select(1, GS:NewRenameCampaignOperation(listenCampId, "RemoteName"))
+        assertEq(GS:ApplyStagedConfigOperation(remoteRename), "accepted",
+            "434-ui: remote-shaped rename accepted")
+        GS.NotifyUI("remote-op")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertTrue(refreshCount > beforeRefresh,
+            "434-ui: durable GS notify refreshes visible Configuration")
+        renameTargetDef = findConfigItem(listenPanel, "dropdown", "Rename target")
+        local optsAfter = renameTargetDef.options and renameTargetDef.options() or {}
+        local sawRemoteName = false
+        for i = 1, #optsAfter do
+            if tostring(optsAfter[i].label or ""):find("RemoteName", 1, true) then
+                sawRemoteName = true
+                break
+            end
+        end
+        assertTrue(sawRemoteName,
+            "434-ui: refreshed options show remote campaign name")
+        assertEq(renameTargetDef.get(), listenCampId,
+            "434-ui: durable refresh preserves valid rename target")
+
+        -- Hidden page: no Refresh work from durable notify.
+        listenPanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        timers = {}
+        beforeRefresh = refreshCount
+        GS.NotifyUI("remote-op-hidden")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertEq(refreshCount, beforeRefresh,
+            "434-ui: hidden Configuration skips durable refresh work")
+
+        GS.RegisterUIListener = realReg
+        configPage.Refresh = realRefresh
+        flushTimers()
+    end
+
     -- #424/#428: getter-only editbox keeps unfinished draft across unrelated Refresh.
     local draftSection = {
         __sfPageBuilder = {
@@ -6679,6 +6829,9 @@ do
             end
         end
     end
+    -- Drain durable GS NotifyUI → QueueRefresh work from earlier config ops so
+    -- refreshQueued is idle before this coalesce probe (#434 Configuration listener).
+    flushTimers()
     local priorAfter = C_Timer.After
     local deferredFns = {}
     C_Timer.After = function(_, fn)
