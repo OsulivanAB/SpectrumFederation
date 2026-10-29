@@ -2,55 +2,21 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.16-beta.8] - 2026-10-29
-
-### Changed
-- Show per-item percent on Raid Supplies Logs Goals rows (#437)
-
-## [1.5.16-beta.7] - 2026-10-29
-
-### Changed
-- Show Goal Met for completed Raid Supplies donation goals (#435)
-
-## [1.5.16-beta.6] - 2026-10-29
+## [1.5.16] - 2026-10-29
 
 ### Added
 - Add overall progress bar to Raid Supplies Logs (#429)
 
-## [1.5.16-beta.5] - 2026-10-29
-
 ### Changed
+- Show per-item percent on Raid Supplies Logs Goals rows (#437)
+- Show Goal Met for completed Raid Supplies donation goals (#435)
 - Consolidate rename and reminders on Configuration (#428)
-
-## [1.5.16-beta.4] - 2026-10-29
+- Use Guild Info main/alt for Raid Supplies attribution and witnesses (#427)
+- Raid Supplies: Apply Adjustment item/quantity/attribution UI (#426)
+- Rename current and archived campaigns (#424)
 
 ### Fixed
 - Fix Early Preparation whispers for known missing enchants (#432)
-
-## [1.5.16-beta.3] - 2026-10-28
-
-### Changed
-- Use Guild Info main/alt for Raid Supplies attribution and witnesses (#427)
-
-## [1.5.16-beta.2] - 2026-10-27
-
-### Changed
-- Raid Supplies: Apply Adjustment item/quantity/attribution UI (#426)
-
-## [1.5.16-beta.1] - 2026-10-27
-
-### Changed
-- Rename current and archived campaigns (#424)
-
-## [1.5.15-beta.1] - 2026-10-26
-
-### Changed
-- Move Raid Supplies adoption/conflicts to Troubleshooting (#422)
-
-## [1.5.14-beta.1] - 2026-10-26
-
-### Changed
-- Guild Supplies TSM donation valuation (#397)
 
 ## [1.5.13] - 2026-10-24
 
