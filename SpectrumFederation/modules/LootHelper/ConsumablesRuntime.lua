@@ -1526,6 +1526,13 @@ function Runtime:AcquireRow(index)
     button:SetSize(REVIEW_DEPOSIT_WIDTH, 18)
     button:SetPoint("LEFT", edit, "RIGHT", 4, 0)
     row.Button = button
+    -- Noninteractive label occupies the qty + Deposit space when a finite goal is met.
+    local goalMet = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    goalMet:SetPoint("LEFT", progress, "RIGHT", 4, 0)
+    goalMet:SetWidth(REVIEW_EDIT_WIDTH + 4 + REVIEW_DEPOSIT_WIDTH)
+    goalMet:SetJustifyH("CENTER")
+    goalMet:Hide()
+    row.GoalMet = goalMet
     frame.Rows[index] = row
     return row
 end
@@ -1650,7 +1657,10 @@ function Runtime:RebuildReview()
         if header.IconButton then header.IconButton:Hide() end
         if header.Progress then header.Progress:Hide() end
         header.Edit:Hide()
+        header.Edit:SetScript("OnEnterPressed", nil)
         header.Button:Hide()
+        header.Button:SetScript("OnClick", nil)
+        if header.GoalMet then header.GoalMet:Hide() end
         y = y + 22
         for i = 1, #group.lines do
             if index >= maxRows then
@@ -1675,6 +1685,7 @@ function Runtime:RebuildReview()
             end
             local depositable = not line.goalComplete
             if depositable then
+                if row.GoalMet then row.GoalMet:Hide() end
                 row.Edit:Show()
                 local editing = row.Edit.HasFocus and row.Edit:HasFocus()
                 local sameItem = row.boundItemId == line.itemId
@@ -1733,6 +1744,10 @@ function Runtime:RebuildReview()
                 row.Edit:SetScript("OnEnterPressed", nil)
                 row.Button:Hide()
                 row.Button:SetScript("OnClick", nil)
+                if row.GoalMet then
+                    row.GoalMet:SetText(Loc("RAID_SUPPLIES_GOAL_MET", "Goal Met"))
+                    row.GoalMet:Show()
+                end
             end
             y = y + 26
         end
@@ -1748,7 +1763,10 @@ function Runtime:RebuildReview()
         if empty.IconButton then empty.IconButton:Hide() end
         if empty.Progress then empty.Progress:Hide() end
         empty.Edit:Hide()
+        empty.Edit:SetScript("OnEnterPressed", nil)
         empty.Button:Hide()
+        empty.Button:SetScript("OnClick", nil)
+        if empty.GoalMet then empty.GoalMet:Hide() end
         y = 24
     end
     frame.Child:SetHeight(math.max(1, y))
