@@ -6281,6 +6281,7 @@ do
         assertTrue(goalsDef ~= nil and type(goalsDef.getItems) == "function",
             "437: Goals and progress list present")
         assertTrue(goalsDef.showItemIcons ~= true, "437: goals do not use a leading icon column")
+        assertTrue(goalsDef.leadingColumn == true, "440: goals opt into the shared percent column")
         assertTrue(goalsDef.singleLine == true, "437: goals stay single-line for inline icons")
 
         -- Select archived campaign (has goals/progress).
@@ -6299,20 +6300,25 @@ do
         assertTrue(archivedOverall.overallPercent <= 100, "437: overall remains capped at 100 semantics")
 
         local byArch = rowsById(goalsDef.getItems())
-        assertTrue((byArch[701].text or ""):find("0% |T3701:16|t Zeroleaf — 0 / 40", 1, true) ~= nil,
-            "437: 0% row: " .. tostring(byArch[701].text))
+        assertEq(byArch[701].leadingText, "0%", "437/440: 0% leading column")
+        assertTrue((byArch[701].text or ""):find("|T3701:16|t Zeroleaf — 0 / 40", 1, true) ~= nil,
+            "437: 0% remainder: " .. tostring(byArch[701].text))
         assertEq(byArch[701].percent, 0, "437: 0% field")
-        assertTrue((byArch[702].text or ""):find("20% |T3702:16|t Partial Rose — 16 / 80", 1, true) ~= nil,
-            "437: signed adjustment partial %: " .. tostring(byArch[702].text))
+        assertEq(byArch[702].leadingText, "20%", "437/440: partial leading column")
+        assertTrue((byArch[702].text or ""):find("|T3702:16|t Partial Rose — 16 / 80", 1, true) ~= nil,
+            "437: signed adjustment partial remainder: " .. tostring(byArch[702].text))
         assertEq(byArch[702].percent, 20, "437: 16 of 80 is 20%")
-        assertTrue((byArch[703].text or ""):find("100% |T3703:16|t Complete Ore — 50 / 50", 1, true) ~= nil,
-            "437: 100% row: " .. tostring(byArch[703].text))
+        assertEq(byArch[703].leadingText, "100%", "437/440: 100% leading column")
+        assertTrue((byArch[703].text or ""):find("|T3703:16|t Complete Ore — 50 / 50", 1, true) ~= nil,
+            "437: 100% remainder: " .. tostring(byArch[703].text))
         assertEq(byArch[703].percent, 100, "437: 100% field")
-        assertTrue((byArch[704].text or ""):find("220% |T3704:16|t Overflow Herb — 110 / 50", 1, true) ~= nil,
-            "437: over-100% row uncapped: " .. tostring(byArch[704].text))
+        assertEq(byArch[704].leadingText, "220%", "437/440: over-100% leading column")
+        assertTrue((byArch[704].text or ""):find("|T3704:16|t Overflow Herb — 110 / 50", 1, true) ~= nil,
+            "437: over-100% remainder: " .. tostring(byArch[704].text))
         assertEq(byArch[704].percent, 220, "437: per-item percent may exceed 100")
-        assertTrue((byArch[705].text or ""):find("— |T3705:16|t NoGoal Dust — 9 / —", 1, true) ~= nil,
-            "437: no-goal uses em dash: " .. tostring(byArch[705].text))
+        assertEq(byArch[705].leadingText, "—", "437/440: no-goal em dash leading column")
+        assertTrue((byArch[705].text or ""):find("|T3705:16|t NoGoal Dust — 9 / —", 1, true) ~= nil,
+            "437: no-goal remainder: " .. tostring(byArch[705].text))
         assertEq(byArch[705].percent, nil, "437: no-goal has no percent field")
         assertTrue(byArch[705].noGoal, "437: no-goal flagged")
 
@@ -6329,8 +6335,9 @@ do
         }
         logsPage:Refresh(panel437)
         byArch = rowsById(goalsDef.getItems())
-        assertTrue((byArch[701].text or ""):find("-25% |T3701:16|t Zeroleaf — -10 / 40", 1, true) ~= nil,
-            "437: signed negative percent: " .. tostring(byArch[701].text))
+        assertEq(byArch[701].leadingText, "-25%", "437/440: signed negative leading column")
+        assertTrue((byArch[701].text or ""):find("|T3701:16|t Zeroleaf — -10 / 40", 1, true) ~= nil,
+            "437: signed negative remainder: " .. tostring(byArch[701].text))
         assertEq(byArch[701].percent, -25, "437: -10 of 40 floors to -25%")
         -- Overall still caps per-item contribution at goal (never below 0 via min(donated, goal)
         -- when donated is negative: min(-10, 40) = -10 would lower overall — match ComputeGoalProgress).
@@ -6365,8 +6372,9 @@ do
         logsPage:Refresh(panel437)
         local curRows = goalsDef.getItems()
         assertEq(#curRows, 1, "437: current campaign shows its goal row")
-        assertTrue((curRows[1].text or ""):find("0% |T3801:16|t Current Item — 0 / 20", 1, true) ~= nil,
-            "437: current 0% after refresh: " .. tostring(curRows[1].text))
+        assertEq(curRows[1].leadingText, "0%", "437/440: current 0% leading column")
+        assertTrue((curRows[1].text or ""):find("|T3801:16|t Current Item — 0 / 20", 1, true) ~= nil,
+            "437: current 0% remainder after refresh: " .. tostring(curRows[1].text))
 
         -- Shared projection: goals percent does not add a second ledger walk.
         local projectCalls437 = 0
@@ -6385,9 +6393,60 @@ do
         campDrop437.set(campArch.id)
         logsPage:Refresh(panel437)
         local memberRows = rowsById(goalsDef.getItems())
-        assertTrue((memberRows[704].text or ""):find("220%", 1, true) ~= nil,
+        assertEq(memberRows[704].leadingText, "220%",
             "437: member-read still sees over-100% rows")
         assertEq(#world.chat, 0, "437: percent rows emit no Chat")
+
+        -- #440: percentage width variety stays in the leading column; remainder
+        -- text still starts with the inline icon and is unchanged across widths.
+        do
+            local widthRows = rowsById(goalsDef.getItems())
+            local expected = {
+                [701] = { leading = "-25%", remainder = "|T3701:16|t Zeroleaf — -10 / 40" },
+                [702] = { leading = "20%", remainder = "|T3702:16|t Partial Rose — 16 / 80" },
+                [703] = { leading = "100%", remainder = "|T3703:16|t Complete Ore — 50 / 50" },
+                [704] = { leading = "220%", remainder = "|T3704:16|t Overflow Herb — 110 / 50" },
+                [705] = { leading = "—", remainder = "|T3705:16|t NoGoal Dust — 9 / —" },
+            }
+            for itemId, want in pairs(expected) do
+                local row = widthRows[itemId]
+                assertTrue(row ~= nil, "440: row present for " .. tostring(itemId))
+                assertEq(row.leadingText, want.leading,
+                    "440: leading percent for " .. tostring(itemId))
+                assertTrue((row.text or ""):find(want.remainder, 1, true) ~= nil,
+                    "440: remainder text for " .. tostring(itemId) .. ": " .. tostring(row.text))
+                assertTrue((row.text or ""):find("%%", 1, true) == nil,
+                    "440: remainder does not embed the percent for " .. tostring(itemId))
+                assertTrue((row.text or ""):match("^|T") ~= nil,
+                    "440: remainder starts at the inline icon for " .. tostring(itemId))
+            end
+            -- Missing icon uses the ItemDisplay question-mark placeholder so
+            -- the name still follows a consistent icon markup slot.
+            local savedIcon440 = C_Item.GetItemIconByID
+            C_Item.GetItemIconByID = function(itemId)
+                if tonumber(itemId) == 705 then
+                    return nil
+                end
+                return savedIcon440 and savedIcon440(itemId) or nil
+            end
+            if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
+                SF.ItemDisplay.ResetSession()
+            end
+            logsPage:Refresh(panel437)
+            local missingIconRow = rowsById(goalsDef.getItems())[705]
+            local qm = SF.ItemDisplay and SF.ItemDisplay.QUESTION_MARK
+            assertTrue(type(qm) == "string" and qm ~= "", "440: question-mark fallback exists")
+            local fallbackMarkup = "|T" .. qm .. ":16|t"
+            assertTrue((missingIconRow.text or ""):find(fallbackMarkup, 1, true) ~= nil,
+                "440: unavailable icon keeps a placeholder markup: " .. tostring(missingIconRow.text))
+            assertTrue((missingIconRow.text or ""):find("NoGoal Dust — 9 / —", 1, true) ~= nil,
+                "440: fallback row keeps name and totals")
+            assertEq(missingIconRow.leadingText, "—", "440: fallback row keeps em-dash percent")
+            C_Item.GetItemIconByID = savedIcon440
+            if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
+                SF.ItemDisplay.ResetSession()
+            end
+        end
 
         setPlayer("Alice-Garona", "Player-1-Alice", 1)
         settleRoster()
@@ -9312,10 +9371,12 @@ do
         assertEq(#goalLists, 1, "414: goals list present")
         assertEq(#historyLists, 1, "414: history list present")
         assertEq(#configLists, 1, "414: campaign item list present")
-        -- #437: goals place the percent left of an inline icon (no leading icon column).
-        assertTrue(goalLists[1].showItemIcons ~= true, "414/437: goals use inline icons, not a leading column")
+        -- #437/#440: goals use a shared percent column plus an inline icon (not a leading icon texture).
+        assertTrue(goalLists[1].showItemIcons ~= true, "414/437: goals use inline icons, not a leading icon column")
+        assertTrue(goalLists[1].leadingColumn == true, "414/440: goals opt into the shared percent column")
         assertTrue(goalLists[1].singleLine == true, "414/437: goals stay on one line with inline icons")
         assertTrue(historyLists[1].showItemIcons ~= true, "414: history does not use a leading icon column")
+        assertTrue(historyLists[1].leadingColumn ~= true, "414/440: history does not opt into leading column")
         assertTrue(historyLists[1].showDetailTooltip == true, "414: history details use an opt-in tooltip")
         assertTrue(historyLists[1].singleLine == true, "414: history stays on one line")
         assertTrue(configLists[1].showItemIcons == true, "414: campaign items opt into icons")
@@ -9385,12 +9446,12 @@ do
         assertTrue((goalById[13467].text or ""):find("/ —", 1, true) ~= nil
             or (goalById[13467].text or ""):find("/ %—", 1, true) ~= nil,
             "414: unset goal keeps the em dash: " .. tostring(goalById[13467].text))
-        assertTrue((goalById[13467].text or ""):match("^— ") ~= nil,
-            "414/437: goal-0 row starts with an em-dash percent: " .. tostring(goalById[13467].text))
+        assertEq(goalById[13467].leadingText, "—",
+            "414/437/440: goal-0 row uses an em-dash percent column")
         assertTrue((goalById[13468].text or ""):find("2 / 10", 1, true) ~= nil,
             "414: positive goal keeps current/goal: " .. tostring(goalById[13468].text))
-        assertTrue((goalById[13468].text or ""):match("^20%% ") ~= nil,
-            "414/437: 2 of 10 floors to 20%: " .. tostring(goalById[13468].text))
+        assertEq(goalById[13468].leadingText, "20%",
+            "414/437/440: 2 of 10 floors to 20% in the leading column")
         assertTrue(goalById[13468].icon == nil, "414/437: goals no longer expose a leading icon field")
 
         local hist = historyLists[1].getItems()
@@ -9427,11 +9488,15 @@ do
         for i = 1, #goalRows do
             goalById[goalRows[i].itemId] = goalRows[i]
         end
-        assertTrue((goalById[13467].text or ""):find("— |T200067:16|t Dreamleaf — 40 / —", 1, true) ~= nil,
-            "414/437: goals show percent dash, inline icon, name, unset goal: "
+        assertEq(goalById[13467].leadingText, "—",
+            "414/437/440: resolved goal-0 keeps em-dash leading column")
+        assertTrue((goalById[13467].text or ""):find("|T200067:16|t Dreamleaf — 40 / —", 1, true) ~= nil,
+            "414/437: goals show inline icon, name, unset goal: "
                 .. tostring(goalById[13467].text))
-        assertTrue((goalById[13468].text or ""):find("20% |T200068:16|t Starlight Rose — 2 / 10", 1, true) ~= nil,
-            "414/437: goals keep percent, inline icon, name, donated/goal: "
+        assertEq(goalById[13468].leadingText, "20%",
+            "414/437/440: resolved positive goal keeps percent leading column")
+        assertTrue((goalById[13468].text or ""):find("|T200068:16|t Starlight Rose — 2 / 10", 1, true) ~= nil,
+            "414/437: goals keep inline icon, name, donated/goal: "
                 .. tostring(goalById[13468].text))
         assertTrue(goalById[13468].icon == nil, "414/437: resolved goals keep icons inline only")
 

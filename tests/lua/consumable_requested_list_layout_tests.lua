@@ -200,10 +200,12 @@ local function makeRegion(kind, name, parent, template)
     function region:SetTextColor()
     end
 
-    function region:SetJustifyH()
+    function region:SetJustifyH(justify)
+        self.justifyH = justify
     end
 
-    function region:SetJustifyV()
+    function region:SetJustifyV(justify)
+        self.justifyV = justify
     end
 
     function region:SetWordWrap(wrap)
@@ -851,6 +853,158 @@ do
     GameTooltip.Show = savedShow
     GameTooltip.Hide = savedHide
     GameTooltip.SetOwner = savedSetOwner
+end
+
+do
+    -- #440: opt-in leading column aligns right-justified prefixes; other lists stay unchanged.
+    local width, gap = Controls.ScrollListLeadingColumnWidth(28, 400, { gap = 6 })
+    assertEq(width, 28, "leading helper keeps the measured width when the viewport is wide")
+    assertEq(gap, 6, "leading helper returns the configured gap")
+    local clamped = Controls.ScrollListLeadingColumnWidth(200, 80, {
+        gap = 6,
+        minRemainderWidth = 40,
+        edgePad = 4,
+    })
+    assertTrue(clamped < 200, "leading helper clamps on a narrow viewport")
+    assertTrue(clamped >= 0, "leading helper never goes negative")
+
+    local panel = CreateFrame("Frame")
+    panel:SetSize(700, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("Goals")
+    section.Content:SetWidth(640)
+    local items = {
+        {
+            leadingText = "0%",
+            text = "|T111:16|t Short — 0 / 40",
+            id = "a",
+            itemId = 1,
+        },
+        {
+            leadingText = "220%",
+            text = "|T222:16|t Longer Name — 110 / 50",
+            id = "b",
+            itemId = 2,
+        },
+        {
+            leadingText = "-25%",
+            text = "|T333:16|t Neg — -10 / 40",
+            id = "c",
+            itemId = 3,
+        },
+        {
+            leadingText = "—",
+            text = "|T444:16|t NoGoal — 9 / —",
+            id = "d",
+            itemId = 4,
+        },
+    }
+    local calls = 0
+    Controls:AddScrollList(section, {
+        label = "Goals and progress",
+        height = 120,
+        leadingColumn = true,
+        singleLine = true,
+        getItems = function()
+            calls = calls + 1
+            if calls > 80 then
+                error("leading-column scroll list exceeded 80 getItems calls")
+            end
+            return items
+        end,
+    })
+    local scroll = findScroll(section)
+    scroll:SetSize(420, 120)
+    pageBuilder:Finalize()
+    fireEvent(scroll, "OnSizeChanged", 420, 120)
+
+    local function scrollRows(target)
+        local found = {}
+        for _, child in ipairs((target.scrollChild and target.scrollChild.children) or {}) do
+            if child.Text and child.Remove and not child.GoalEdit then
+                found[#found + 1] = child
+            end
+        end
+        return found
+    end
+
+    local rows = scrollRows(scroll)
+    assertEq(#rows, 4, "440: leading-column list renders four rows")
+    assertTrue(rows[1].Leading ~= nil, "440: opt-in list creates a Leading FontString")
+    assertEq(rows[1].Leading.justifyH, "RIGHT", "440: Leading is right-justified")
+    assertEq(rows[1].Leading.text, "0%", "440: short percent text")
+    assertEq(rows[2].Leading.text, "220%", "440: wide percent text")
+    assertEq(rows[3].Leading.text, "-25%", "440: negative percent text")
+    assertEq(rows[4].Leading.text, "—", "440: goal-zero em dash text")
+    assertEq(rows[1].Text.text, items[1].text, "440: remainder text is unchanged for short %")
+    assertEq(rows[2].Text.text, items[2].text, "440: remainder text is unchanged for wide %")
+
+    local leadingWidth = rows[1].Leading.width
+    assertTrue(leadingWidth ~= nil and leadingWidth > 0, "440: Leading has a shared width")
+    for i = 1, #rows do
+        assertEq(rows[i].Leading.width, leadingWidth,
+            "440: all Leading columns share width on row " .. tostring(i))
+        assertEq(leftAnchor(rows[i].Leading).x, 0,
+            "440: Leading starts at the row edge on row " .. tostring(i))
+        local textLeft = leftAnchor(rows[i].Text).x
+        assertEq(textLeft, leadingWidth + 6,
+            "440: remainder starts after Leading+gap on row " .. tostring(i))
+    end
+    local textStart = leftAnchor(rows[1].Text).x
+    for i = 2, #rows do
+        assertEq(leftAnchor(rows[i].Text).x, textStart,
+            "440: icons/remainder share one horizontal start on row " .. tostring(i))
+    end
+    assertEq(rows[1].Text.wordWrap, false, "440: remainder stays single-line")
+    assertEq(rows[1].Text.maxLines, 1, "440: remainder does not wrap under the row")
+    assertTrue(rows[1].Icon == nil, "440: goals-style list does not add a leading icon texture")
+
+    -- Plain lists without leadingColumn stay text-only and left-aligned at 0.
+    local plainSection = pageBuilder:AddSection("Plain")
+    Controls:AddScrollList(plainSection, {
+        label = "Plain",
+        height = 60,
+        getItems = function()
+            return { { text = "Unaffected", id = "p" } }
+        end,
+    })
+    local plainScroll = findScroll(plainSection)
+    plainScroll:SetSize(300, 60)
+    fireEvent(plainScroll, "OnSizeChanged", 300, 60)
+    local plainRows = scrollRows(plainScroll)
+    assertTrue(plainRows[1].Leading == nil, "440: lists without the flag stay single-text")
+    assertEq(leftAnchor(plainRows[1].Text).x, 0, "440: plain text still starts at the edge")
+
+    -- Refresh + narrow resize stay bounded and keep a shared text start.
+    items[1].leadingText = "1234%"
+    items[1].text = "|T111:16|t Short renamed — 1 / 40"
+    local callsBefore = calls
+    fireEvent(scroll, "OnSizeChanged", 200, 120)
+    rows = scrollRows(scroll)
+    assertEq(rows[1].Leading.text, "1234%", "440: refresh replaces a longer leading percent")
+    assertEq(rows[1].Text.text, items[1].text, "440: refresh replaces remainder text")
+    local narrowStart = leftAnchor(rows[1].Text).x
+    for i = 2, #rows do
+        assertEq(leftAnchor(rows[i].Text).x, narrowStart,
+            "440: narrow resize keeps a shared remainder start on row " .. tostring(i))
+    end
+    assertTrue(rows[1].Leading.width <= 200, "440: narrow viewport clamps the leading width")
+    assertTrue(calls - callsBefore <= 4, "440: resize refresh does not storm getItems")
+
+    for _ = 1, 8 do
+        fireEvent(scroll, "OnSizeChanged", 420, 120)
+        fireEvent(scroll, "OnSizeChanged", 200, 120)
+    end
+    rows = scrollRows(scroll)
+    local shown = 0
+    for i = 1, #rows do
+        if rows[i]:IsShown() then
+            shown = shown + 1
+        end
+    end
+    assertEq(shown, 4, "440: repeated open/resize keeps four visible rows")
+    assertTrue(calls <= 80, "440: repeated refreshes stay bounded")
 end
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
