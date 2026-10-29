@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.5] - 2026-10-29
+
+### Changed
+- Consolidate rename and reminders on Configuration (#428)
+
 ## [1.5.16-beta.4] - 2026-10-29
 
 ### Fixed
