@@ -6148,6 +6148,110 @@ do
         flushTimers()
     end
 
+    -- #434: Configuration rename EditBox DoSubmit aborts when current campaign
+    -- rolls over before the deferred QueueRefresh reloads the selection key.
+    do
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local campA = startCampaign()
+        local campAId = campA.id
+        local renameA = select(1, GS:NewRenameCampaignOperation(campAId, "AlphaLive"))
+        assertEq(GS:ApplyStagedConfigOperation(renameA), "accepted",
+            "434-stale-cfg: seed Campaign A name")
+        flushTimers()
+
+        local stalePanel = makeRegion("Frame", "GSConfigStaleSubmitPanel", nil)
+        stalePanel:SetSize(600, 800)
+        stalePanel.shown = true
+        local createdBeforeCfg = #created
+        configPage:Build(stalePanel)
+        configPage:Refresh(stalePanel)
+        flushTimers()
+
+        local renameEdit, renameBtn
+        for i = createdBeforeCfg + 1, #created do
+            local obj = created[i]
+            if obj.GetObjectType and obj:GetObjectType() == "Button"
+                and obj.text == "Rename" then
+                renameBtn = obj
+                -- Controls create EditBox then Button in the same row.
+                for j = i - 1, createdBeforeCfg + 1, -1 do
+                    local prev = created[j]
+                    if prev.GetObjectType and prev:GetObjectType() == "EditBox" then
+                        renameEdit = prev
+                        break
+                    end
+                end
+                break
+            end
+        end
+        assertTrue(renameEdit ~= nil and renameBtn ~= nil,
+            "434-stale-cfg: Configuration rename editbox/button present")
+        assertEq(renameEdit:GetText(), "AlphaLive",
+            "434-stale-cfg: editbox loaded Campaign A name")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campAId,
+            "434-stale-cfg: A is current before rollover")
+
+        -- Rollover to B without running the deferred UI refresh.
+        timers = {}
+        local campB = startCampaign()
+        local campBId = campB.id
+        assertTrue(campBId ~= campAId, "434-stale-cfg: rollover created Campaign B")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campBId,
+            "434-stale-cfg: B is current")
+        -- Leave timers uncleared so QueueRefresh has not yet reloaded the editbox.
+        renameEdit:SetText("ShouldNotApplyToB")
+        local opsBefore = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsBefore = opsBefore + 1
+        end
+        renameBtn:Click()
+        local opsAfter = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsAfter = opsAfter + 1
+        end
+        assertEq(opsAfter, opsBefore,
+            "434-stale-cfg: stale DoSubmit allocates no rename operation")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campAId), "AlphaLive",
+            "434-stale-cfg: Campaign A name unchanged by stale submit")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campBId), campBId,
+            "434-stale-cfg: Campaign B name unchanged by stale submit")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campBId,
+            "434-stale-cfg: stale submit does not change current campaign")
+
+        -- After refresh, intentional rename of B succeeds.
+        flushTimers()
+        configPage:Refresh(stalePanel)
+        assertEq(renameEdit:GetText(), "",
+            "434-stale-cfg: refresh loads blank custom name for B")
+        renameEdit:SetText("BetaLive")
+        local opsBeforeOk = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsBeforeOk = opsBeforeOk + 1
+        end
+        renameBtn:Click()
+        flushTimers()
+        local opsAfterOk = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsAfterOk = opsAfterOk + 1
+        end
+        assertTrue(opsAfterOk > opsBeforeOk,
+            "434-stale-cfg: intentional B rename allocates an operation")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campBId), "BetaLive",
+            "434-stale-cfg: intentional Campaign B rename applied")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campAId), "AlphaLive",
+            "434-stale-cfg: intentional B rename leaves A untouched")
+        stalePanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        flushTimers()
+    end
+
     -- #424/#428: getter-only editbox keeps unfinished draft across unrelated Refresh.
     local draftSection = {
         __sfPageBuilder = {
@@ -6201,6 +6305,108 @@ do
     selection.name = "Bravo"
     draftSection.__sfPageBuilder:FireRefresh()
     assertEq(draftEdit:GetText(), "Bravo", "424-ui: selection change reloads getter text")
+
+    -- #434: production AddEditBoxWithButton DoSubmit rejects stale selection text
+    -- when the backing key changes before deferred Refresh (campaign rollover).
+    do
+        local names = {
+            ["camp-a"] = "AlphaName",
+            ["camp-b"] = "BetaName",
+        }
+        local selectionLive = { key = "camp-a" }
+        local submitCalls = {}
+        local staleSection = {
+            __sfPageBuilder = {
+                _refresh = {},
+                RegisterRefresh = function(self, fn)
+                    self._refresh[#self._refresh + 1] = fn
+                end,
+                FireRefresh = function(self)
+                    for i = 1, #self._refresh do
+                        self._refresh[i]()
+                    end
+                end,
+            },
+            AddRow = function(self, _, builder)
+                local row = makeRegion("Frame", "StaleRenameRow", nil)
+                row:SetSize(400, 26)
+                builder(row)
+                return row
+            end,
+        }
+        local createdBeforeStale = #created
+        SF.SettingsUI.Controls:AddEditBoxWithButton(staleSection, {
+            label = "Stale rename",
+            buttonText = "Rename",
+            get = function()
+                return names[selectionLive.key] or ""
+            end,
+            getSelectionKey = function()
+                return selectionLive.key
+            end,
+            onSubmit = function(text)
+                submitCalls[#submitCalls + 1] = {
+                    text = text,
+                    key = selectionLive.key,
+                }
+                names[selectionLive.key] = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+            end,
+        })
+        local staleEdit, staleBtn
+        for i = createdBeforeStale + 1, #created do
+            local obj = created[i]
+            if obj.GetObjectType then
+                local kind = obj:GetObjectType()
+                if kind == "EditBox" and not staleEdit then
+                    staleEdit = obj
+                elseif kind == "Button" and obj.text == "Rename" and not staleBtn then
+                    staleBtn = obj
+                end
+            end
+        end
+        assertTrue(staleEdit ~= nil, "434-stale: editbox created")
+        assertTrue(staleBtn ~= nil, "434-stale: rename button created")
+        assertEq(staleEdit:GetText(), "AlphaName", "434-stale: loaded Campaign A name")
+
+        -- Rollover changes the resolved key before deferred Refresh runs.
+        selectionLive.key = "camp-b"
+        staleEdit:SetText("StaleAlphaDraft")
+        local beforeA = names["camp-a"]
+        local beforeB = names["camp-b"]
+        local beforeSubmitCount = #submitCalls
+        staleBtn:Click()
+        assertEq(#submitCalls, beforeSubmitCount,
+            "434-stale: DoSubmit aborts when selection key changed before refresh")
+        assertEq(names["camp-a"], beforeA, "434-stale: Campaign A name unchanged")
+        assertEq(names["camp-b"], beforeB, "434-stale: Campaign B name unchanged")
+        assertEq(staleEdit:GetText(), "BetaName",
+            "434-stale: aborted submit reloads Campaign B value")
+
+        -- After refresh, intentional rename of B succeeds through the same widget.
+        staleSection.__sfPageBuilder:FireRefresh()
+        assertEq(staleEdit:GetText(), "BetaName", "434-stale: refresh keeps Campaign B value")
+        staleEdit:SetText("BetaRenamed")
+        staleBtn:Click()
+        assertEq(#submitCalls, beforeSubmitCount + 1,
+            "434-stale: intentional submit after refresh reaches onSubmit")
+        assertEq(submitCalls[#submitCalls].key, "camp-b",
+            "434-stale: intentional submit targets Campaign B")
+        assertEq(names["camp-b"], "BetaRenamed",
+            "434-stale: intentional Campaign B rename applied")
+        assertEq(names["camp-a"], beforeA,
+            "434-stale: intentional B rename leaves Campaign A untouched")
+
+        -- Pinned archived selection: key stays on A while "current" advances.
+        selectionLive.key = "camp-a"
+        staleSection.__sfPageBuilder:FireRefresh()
+        assertEq(staleEdit:GetText(), "AlphaName", "434-stale: pinned A reloads")
+        staleEdit:SetText("PinnedArchive")
+        staleBtn:Click()
+        assertEq(names["camp-a"], "PinnedArchive",
+            "434-stale: pinned archived rename still submits")
+        assertEq(names["camp-b"], "BetaRenamed",
+            "434-stale: pinned A rename leaves B untouched")
+    end
 
     -- Small-guild explicit threshold through CreateStagedRecord path used by UI.
     resetDb()

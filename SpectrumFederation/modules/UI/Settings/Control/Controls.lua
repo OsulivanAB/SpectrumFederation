@@ -976,7 +976,19 @@ function Controls:AddEditBoxWithButton(section, opts)
 		end
 
 		local function DoSubmit()
-			if (btn.IsEnabled and not btn:IsEnabled()) then return end	
+			if (btn.IsEnabled and not btn:IsEnabled()) then return end
+			-- Getter-only fields with getSelectionKey: if the backing selection
+			-- changed before a deferred Refresh ran, the edit still holds the
+			-- previous campaign's text. Reload and abort rather than submitting
+			-- that text against the newly resolved target (#434 / #428).
+			if displayFromGet and type(opts.getSelectionKey) == "function" then
+				local selectionKey = CurrentSelectionKey()
+				if selectionKey ~= lastSelectionKey then
+					LoadFromGet()
+					lastSelectionKey = selectionKey
+					return
+				end
+			end
 			local text = edit:GetText()
 			if opts.onSubmit then
 				opts.onSubmit(text, edit, btn)
@@ -990,6 +1002,9 @@ function Controls:AddEditBoxWithButton(section, opts)
 				local cur = edit:GetText() or ""
 				if cur == fromGet or not (edit.HasFocus and edit:HasFocus()) then
 					LoadFromGet()
+					if type(opts.getSelectionKey) == "function" then
+						lastSelectionKey = CurrentSelectionKey()
+					end
 				else
 					lastLoadedText = cur
 				end
