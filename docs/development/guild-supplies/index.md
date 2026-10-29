@@ -108,10 +108,10 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 
 | Area | Access |
 | --- | --- |
-| **Raid Supplies → Configuration** | Initialize, bank tab, New Campaign, items/goals, adjustments, **Activate Guild Supplies**. Main/alt edits live under **Guild Settings → Main / Alt Assignments** (#427). Status/campaign/next-step/warnings (including dataset mismatch and adoption-in-progress) stay here. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
-| **Raid Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history |
+| **Raid Supplies → Configuration** | Initialize, bank tab, New Campaign, rename target (current/archived), items/goals, adjustments, **Activate Guild Supplies**, and the personal reminder checkbox. Main/alt edits live under **Guild Settings → Main / Alt Assignments** (#427). Status/campaign/next-step/warnings (including dataset mismatch and adoption-in-progress) stay here. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
+| **Raid Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history (read-only; no rename or personal preferences) |
 | **Raid Supplies → Troubleshooting** | Staged dataset adoption and configuration-conflict resolution (#422). Same editor/authority restrictions as before; ordinary members can navigate. |
-| **Personal preferences** | Account-local reminder checkbox |
+| **Personal preferences** | Account-local reminder checkbox on Configuration only (#428) |
 | **Loot Helper → Consumables / Consumable Logs** | Removed from the packaged addon (#415). They are not registered before or after activation, including across profile switches. Legacy profile writers, SavedVariables, and the #389 eligibility gates stay in place. |
 
 ## Donation verification (#411 / #427)

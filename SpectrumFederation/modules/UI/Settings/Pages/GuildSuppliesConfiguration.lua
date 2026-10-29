@@ -837,6 +837,134 @@ local function CommitConfig(ctx, kind, target, value)
 	ReportStatus(ctx, status, reason)
 end
 
+---------------------------------------------------------------------------
+-- Session-local rename target (#428). Never SavedVariables / Gossip.
+-- Selecting an archived campaign is rename-only: never activates it, never
+-- changes Logs selection, and never alters accounting. Cleared when the
+-- guild/dataset context changes; ordinary refreshes keep a valid target.
+---------------------------------------------------------------------------
+local renameTargetCampaignId = nil
+local renameTargetContextKey = nil
+
+local function RenameTargetContextKey()
+	local rec = CurrentRecord()
+	if not rec then
+		return "none"
+	end
+	return tostring(CurrentGuildKey() or "") .. "|" .. tostring(rec.datasetId or "")
+end
+
+local function SyncRenameTargetContext()
+	local key = RenameTargetContextKey()
+	if key == renameTargetContextKey then
+		return
+	end
+	renameTargetContextKey = key
+	renameTargetCampaignId = nil
+end
+
+local function InspectableCampaigns()
+	if passCache and passCache.campaignsChecked then
+		return passCache.campaigns
+	end
+	local g = GS()
+	local list
+	if Caps().canRead and g and g.ListInspectableCampaigns then
+		list = g:ListInspectableCampaigns()
+	end
+	if type(list) ~= "table" then
+		list = {}
+	end
+	if passCache then
+		passCache.campaignsChecked = true
+		passCache.campaigns = list
+	end
+	return list
+end
+
+local function FormatRenameTargetLabel(entry)
+	if type(entry) ~= "table" then
+		return "?"
+	end
+	local started = tonumber(entry.startedAt)
+	local when = started and date and date("%Y-%m-%d %H:%M", started) or tostring(entry.startedAt or "?")
+	local status = entry.isCurrent
+		and Loc("GUILD_SUPPLIES_CAMPAIGN_CURRENT", "Current")
+		or Loc("GUILD_SUPPLIES_CAMPAIGN_ARCHIVED", "Archived")
+	local label = entry.displayName or entry.campaignId or "?"
+	if not entry.hasCustomName then
+		label = tostring(label)
+		if #label > 24 then
+			label = label:sub(1, 21) .. "..."
+		end
+	end
+	return string.format("%s — %s (%s)", when, status, tostring(label))
+end
+
+local function RenameTargetOptions()
+	SyncRenameTargetContext()
+	local opts = {}
+	if not Caps().canRead then
+		return opts
+	end
+	local list = InspectableCampaigns()
+	for i = 1, #list do
+		local entry = list[i]
+		opts[#opts + 1] = {
+			value = entry.campaignId,
+			label = FormatRenameTargetLabel(entry),
+		}
+	end
+	return opts
+end
+
+--- Resolve the ephemeral rename target by immutable campaignId.
+-- Defaults to the current campaign. Never activates archived campaigns.
+local function ResolveRenameTarget()
+	SyncRenameTargetContext()
+	if not Caps().canRead then
+		renameTargetCampaignId = nil
+		return nil
+	end
+	local record = CurrentRecord()
+	if not record then
+		renameTargetCampaignId = nil
+		return nil
+	end
+	local list = InspectableCampaigns()
+	if #list == 0 then
+		renameTargetCampaignId = nil
+		return nil
+	end
+	if renameTargetCampaignId then
+		for i = 1, #list do
+			if list[i].campaignId == renameTargetCampaignId then
+				return renameTargetCampaignId
+			end
+		end
+	end
+	if type(record.currentCampaignId) == "string" and record.currentCampaignId ~= "" then
+		renameTargetCampaignId = record.currentCampaignId
+		return renameTargetCampaignId
+	end
+	renameTargetCampaignId = list[1].campaignId
+	return renameTargetCampaignId
+end
+
+local function RenameTargetDefaultText()
+	local id = ResolveRenameTarget()
+	if not id then
+		return Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns")
+	end
+	local list = InspectableCampaigns()
+	for i = 1, #list do
+		if list[i].campaignId == id then
+			return FormatRenameTargetLabel(list[i])
+		end
+	end
+	return tostring(id)
+end
+
 local function CommitRenameCampaign(ctx, campaignId, text)
 	local g = GS()
 	if not g or not g.NewRenameCampaignOperation then
@@ -850,6 +978,10 @@ local function CommitRenameCampaign(ctx, campaignId, text)
 		return
 	end
 	local status, reason = g:ApplyStagedConfigOperation(op)
+	-- Keep the rename target on the same immutable campaign id after refresh.
+	if type(campaignId) == "string" and campaignId ~= "" then
+		renameTargetCampaignId = campaignId
+	end
 	ReportStatus(ctx, status, reason)
 end
 
@@ -1357,6 +1489,57 @@ local function Definition()
 						end,
 					},
 					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_RENAME_TARGET_LABEL", "Rename target"),
+						adminOnly = true,
+						width = 280,
+						tooltip = Loc("GUILD_SUPPLIES_RENAME_TARGET_TIP",
+							"Choose which campaign to rename. Selecting an archived campaign does not activate it or change accounting."),
+						defaultText = RenameTargetDefaultText,
+						options = RenameTargetOptions,
+						get = ResolveRenameTarget,
+						set = function(value)
+							SyncRenameTargetContext()
+							if type(value) == "string" and value ~= "" then
+								renameTargetCampaignId = value
+							end
+						end,
+						enabled = function()
+							return Caps().canEdit and ResolveRenameTarget() ~= nil
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RENAME", "renaming the campaign"))
+						end,
+						onValueChanged = function(ctx, value)
+							SyncRenameTargetContext()
+							if type(value) ~= "string" or value == "" then
+								return
+							end
+							-- Accept only inspectable campaign IDs; never activate.
+							local list = InspectableCampaigns()
+							local found = false
+							for i = 1, #list do
+								if list[i].campaignId == value then
+									found = true
+									break
+								end
+							end
+							if not found then
+								renameTargetCampaignId = nil
+								ResolveRenameTarget()
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
+										"that campaign is not available on this dataset"),
+									"error")
+								RefreshPageControls()
+								return
+							end
+							renameTargetCampaignId = value
+							RefreshPageControls()
+						end,
+					},
+					{
 						type = "editboxButton",
 						label = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_LABEL", "Campaign name"),
 						adminOnly = true,
@@ -1366,38 +1549,55 @@ local function Definition()
 						editWidth = 200,
 						maxLetters = 64,
 						tooltip = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_TIP",
-							"Sets a guild-wide display name for the current campaign. Clearing the name restores the campaign ID label. Accounting and campaign identity stay unchanged."),
+							"Sets a guild-wide display name for the selected campaign, including archived campaigns. Clearing the name restores the campaign ID label. Accounting and which campaign is current stay unchanged."),
 						get = function()
+							local id = ResolveRenameTarget()
 							local rec = CurrentRecord()
-							if not rec or type(rec.currentCampaignId) ~= "string" then
+							local g = GS()
+							if not id or not rec or not g or not g.GetCampaignCustomName then
 								return ""
 							end
-							local g = GS()
-							if g and g.GetCampaignCustomName then
-								return g.GetCampaignCustomName(rec, rec.currentCampaignId) or ""
-							end
-							return ""
+							return g.GetCampaignCustomName(rec, id) or ""
 						end,
 						getSelectionKey = function()
-							local rec = CurrentRecord()
-							return rec and rec.currentCampaignId or nil
+							return ResolveRenameTarget()
 						end,
 						enabled = function()
-							local rec = CurrentRecord()
-							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+							return Caps().canEdit and ResolveRenameTarget() ~= nil
 						end,
 						getDisabledTooltip = function()
 							return DisabledNeedCampaignTip(
 								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RENAME", "renaming the campaign"))
 						end,
 						onSubmit = function(ctx, text)
-							local rec = select(1, GS() and GS():GetCurrentRecord())
-							local campaignId = rec and rec.currentCampaignId
+							-- Revalidate target and authorization at submit time.
+							if not Caps().canEdit then
+								ReportStatus(ctx, "rejected", "unauthorized")
+								return
+							end
+							local campaignId = ResolveRenameTarget()
 							if type(campaignId) ~= "string" or campaignId == "" then
 								ctx.section:SetMessage(
 									Loc("GUILD_SUPPLIES_REASON_NO_CAMPAIGN",
 										"start a New Campaign before changing requested items"),
 									"error")
+								return
+							end
+							local list = InspectableCampaigns()
+							local found = false
+							for i = 1, #list do
+								if list[i].campaignId == campaignId then
+									found = true
+									break
+								end
+							end
+							if not found then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
+										"that campaign is not available on this dataset"),
+									"error")
+								renameTargetCampaignId = nil
+								RefreshPageControls()
 								return
 							end
 							CommitRenameCampaign(ctx, campaignId, text)

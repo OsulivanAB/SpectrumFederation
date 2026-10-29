@@ -136,8 +136,6 @@ local function CampaignOptions()
 	return opts
 end
 
--- Declared before CommitRenameSelected: Lua 5.1 would otherwise bind the early
--- call site to a nil global and throw on Logs Rename submit.
 local function ResolveSelectedCampaign()
 	if not Caps().canRead then
 		selectedCampaignId = nil
@@ -167,48 +165,6 @@ local function ResolveSelectedCampaign()
 	end
 	selectedCampaignId = list[1].campaignId
 	return selectedCampaignId
-end
-
-local function CommitRenameSelected(ctx, text)
-	local g = GS()
-	if not g or not g.NewRenameCampaignOperation then
-		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
-		return
-	end
-	local campaignId = ResolveSelectedCampaign()
-	if type(campaignId) ~= "string" or campaignId == "" then
-		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns"), "error")
-		return
-	end
-	ctx.section:ClearMessage()
-	local op, prepStatus, prepReason = g:NewRenameCampaignOperation(campaignId, text)
-	if not op then
-		local message, severity
-		if g.FormatMutationFeedback then
-			message, severity = g.FormatMutationFeedback(prepStatus or "rejected", prepReason)
-		else
-			message = tostring(prepStatus or "rejected")
-			severity = "error"
-		end
-		ctx.section:SetMessage(message, severity)
-		return
-	end
-	local status, reason = g:ApplyStagedConfigOperation(op)
-	local message, severity
-	if g.FormatMutationFeedback then
-		message, severity = g.FormatMutationFeedback(status, reason)
-	else
-		message = tostring(status or "rejected")
-		severity = (status == "accepted" and "success") or "error"
-	end
-	ctx.section:SetMessage(message, severity)
-	-- Keep the Logs selection on the same immutable campaign id.
-	selectedCampaignId = campaignId
-	if Page.Refresh and Page.panel then
-		Page:Refresh(Page.panel)
-	elseif ctx.pageBuilder and ctx.pageBuilder.Refresh then
-		ctx.pageBuilder:Refresh()
-	end
 end
 
 local function MembershipHelpText()
@@ -477,53 +433,6 @@ local function Definition()
 						end,
 					},
 					{
-						type = "editboxButton",
-						label = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_LABEL", "Campaign name"),
-						adminOnly = true,
-						hint = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_HINT", "Friendly name (blank clears)"),
-						buttonText = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_BUTTON", "Rename"),
-						buttonWidth = 90,
-						editWidth = 200,
-						maxLetters = 64,
-						tooltip = Loc("GUILD_SUPPLIES_RENAME_LOGS_TIP",
-							"Sets a guild-wide display name for the selected campaign, including archived campaigns. Clearing restores the campaign ID label without changing which campaign is current."),
-						get = function()
-							if not Caps().canRead then
-								return ""
-							end
-							local id = ResolveSelectedCampaign()
-							local rec = CurrentRecord()
-							local g = GS()
-							if not id or not rec or not g or not g.GetCampaignCustomName then
-								return ""
-							end
-							return g.GetCampaignCustomName(rec, id) or ""
-						end,
-						getSelectionKey = function()
-							return ResolveSelectedCampaign()
-						end,
-						enabled = function()
-							return Caps().canEdit and ResolveSelectedCampaign() ~= nil
-						end,
-						getDisabledTooltip = function()
-							if not Caps().canRead then
-								return DisabledLogsMembershipTip()
-							end
-							if not Caps().canEdit then
-								local g = GS()
-								local formatReason = g and g.FormatReasonText or tostring
-								return Loc("GUILD_SUPPLIES_REASON_UNAUTHORIZED",
-									"you are not authorized for that change")
-									.. " (" .. formatReason(Caps().reason or "unauthorized") .. ")"
-							end
-							return Loc("GUILD_SUPPLIES_DISABLED_LOGS_NO_CAMPAIGNS",
-								"No campaigns are available to inspect yet.")
-						end,
-						onSubmit = function(ctx, text)
-							CommitRenameSelected(ctx, text)
-						end,
-					},
-					{
 						type = "scrollList",
 						label = Loc("GUILD_SUPPLIES_LOGS_ITEMS", "Goals and progress"),
 						height = 160,
@@ -596,27 +505,6 @@ local function Definition()
 						indent = "label",
 						text = Loc("GUILD_SUPPLIES_LOGS_EMPTY_NOTE",
 							"A New Campaign starts with zero progress. Archived campaigns keep their own configuration and history."),
-					},
-				},
-			},
-			{
-				id = "gsLogsPersonal",
-				title = Loc("GUILD_SUPPLIES_PERSONAL_TITLE", "Personal preferences"),
-				items = {
-					{
-						type = "checkbox",
-						label = Loc("GUILD_SUPPLIES_REMINDERS", "Show raid supply reminders"),
-						get = function()
-							local store = SF.SettingsStore
-							if not store or not store.Get then return true end
-							return store:Get("lootHelper.showRaidSupplyReminders") and true or false
-						end,
-						set = function(value)
-							local store = SF.SettingsStore
-							if store and store.Set then
-								store:Set("lootHelper.showRaidSupplyReminders", value and true or false)
-							end
-						end,
 					},
 				},
 			},
