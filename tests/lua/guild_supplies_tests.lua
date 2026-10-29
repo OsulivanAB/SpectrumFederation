@@ -6147,6 +6147,254 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     settleRoster()
 
+    -- #437: Goals and progress rows show per-item percent left of the inline icon.
+    do
+        local function findGoalsList(panel)
+            for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "scrollList" and item.label
+                        and tostring(item.label):find("Goals and progress", 1, true) then
+                        return item
+                    end
+                end
+            end
+            return nil
+        end
+        local function findOverall(panel)
+            for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "overallProgressBar" then
+                        return item
+                    end
+                end
+            end
+            return nil
+        end
+        local function rowsById(list)
+            local byId = {}
+            for i = 1, #(list or {}) do
+                byId[list[i].itemId] = list[i]
+            end
+            return byId
+        end
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local campArch = startCampaign()
+        -- 0%, partial, 100%, over 100%, and no-goal.
+        local seeds = {
+            { itemId = 701, goal = 40 },
+            { itemId = 702, goal = 80 },
+            { itemId = 703, goal = 50 },
+            { itemId = 704, goal = 50 },
+            { itemId = 705, goal = 0 },
+        }
+        for i = 1, #seeds do
+            local op = select(1, GS:NewConfigOperation("set-requested-item", {
+                itemId = seeds[i].itemId,
+            }, {
+                itemId = seeds[i].itemId,
+                goal = seeds[i].goal,
+                removed = false,
+            }))
+            assertEq(GS:ApplyStagedConfigOperation(op), "accepted",
+                "437: seed item " .. tostring(seeds[i].itemId))
+        end
+        local recArch = GS:GetCurrentRecord()
+        local genArch = recArch.accounting._consumables.generation
+        local donations = {
+            { id = "437-d0", itemId = 701, quantity = 0 },
+            { id = "437-d25", itemId = 702, quantity = 20 },
+            { id = "437-d100", itemId = 703, quantity = 50 },
+            { id = "437-d220", itemId = 704, quantity = 110 },
+            { id = "437-dz", itemId = 705, quantity = 9 },
+        }
+        for i = 1, #donations do
+            recArch.accounting._consumableEvents[#recArch.accounting._consumableEvents + 1] = {
+                id = donations[i].id,
+                type = "donation",
+                itemId = donations[i].itemId,
+                quantity = donations[i].quantity,
+                actor = "Bob-Garona",
+                generation = genArch,
+                timestamp = world.time + i,
+                source = "guildbank",
+            }
+        end
+        -- Signed adjustment on the partial item: 20 - 4 = 16 of 80 → 20%.
+        recArch.accounting._consumableEvents[#recArch.accounting._consumableEvents + 1] = {
+            id = "437-adj",
+            type = "adjustment",
+            itemId = 702,
+            quantity = -4,
+            actor = "Alice-Garona",
+            attributed = "Bob-Garona",
+            generation = genArch,
+            timestamp = world.time + 20,
+        }
+        -- Current campaign starts empty; archived keeps its own goals/totals.
+        local campCur = startCampaign()
+        assertTrue(campArch.id ~= campCur.id, "437: archived vs current campaigns")
+
+        local itemNames = {
+            [701] = "Zeroleaf",
+            [702] = "Partial Rose",
+            [703] = "Complete Ore",
+            [704] = "Overflow Herb",
+            [705] = "NoGoal Dust",
+        }
+        local itemIcons = {
+            [701] = 3701,
+            [702] = 3702,
+            [703] = 3703,
+            [704] = 3704,
+            [705] = 3705,
+        }
+        local savedGetItemInfo = C_Item and C_Item.GetItemInfo
+        local savedGetItemIcon = C_Item and C_Item.GetItemIconByID
+        C_Item = C_Item or {}
+        C_Item.GetItemInfo = function(itemId)
+            local n = itemNames[tonumber(itemId)]
+            if type(n) == "string" then return n end
+            if savedGetItemInfo then return savedGetItemInfo(itemId) end
+            return nil
+        end
+        C_Item.GetItemIconByID = function(itemId)
+            local ic = itemIcons[tonumber(itemId)]
+            if ic then return ic end
+            if savedGetItemIcon then return savedGetItemIcon(itemId) end
+            return nil
+        end
+        if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
+            SF.ItemDisplay.ResetSession()
+        end
+
+        local panel437 = makeRegion("Frame", "GSLogsPercentPanel", nil)
+        panel437:SetSize(600, 800)
+        logsPage:Build(panel437)
+        local goalsDef = findGoalsList(panel437)
+        local overallDef437 = findOverall(panel437)
+        assertTrue(goalsDef ~= nil and type(goalsDef.getItems) == "function",
+            "437: Goals and progress list present")
+        assertTrue(goalsDef.showItemIcons ~= true, "437: goals do not use a leading icon column")
+        assertTrue(goalsDef.singleLine == true, "437: goals stay single-line for inline icons")
+
+        -- Select archived campaign (has goals/progress).
+        local campDrop437 = findLogsItem(panel437, "dropdown", "Campaign")
+        assertTrue(campDrop437 and type(campDrop437.set) == "function", "437: campaign dropdown")
+        campDrop437.set(campArch.id)
+        if type(campDrop437.onValueChanged) == "function" then
+            campDrop437.onValueChanged({ pageBuilder = panel437.__sfPageBuilder })
+        end
+        logsPage:Refresh(panel437)
+
+        local archivedOverall = overallDef437.getProgress()
+        -- sumCapped = min(0,40)+min(16,80)+min(50,50)+min(110,50) = 0+16+50+50 = 116
+        -- sumGoal = 40+80+50+50 = 220 → floor(11600/220) = 52
+        assertEq(archivedOverall.overallPercent, 52, "437: overall bar stays capped/weighted")
+        assertTrue(archivedOverall.overallPercent <= 100, "437: overall remains capped at 100 semantics")
+
+        local byArch = rowsById(goalsDef.getItems())
+        assertTrue((byArch[701].text or ""):find("0% |T3701:16|t Zeroleaf — 0 / 40", 1, true) ~= nil,
+            "437: 0% row: " .. tostring(byArch[701].text))
+        assertEq(byArch[701].percent, 0, "437: 0% field")
+        assertTrue((byArch[702].text or ""):find("20% |T3702:16|t Partial Rose — 16 / 80", 1, true) ~= nil,
+            "437: signed adjustment partial %: " .. tostring(byArch[702].text))
+        assertEq(byArch[702].percent, 20, "437: 16 of 80 is 20%")
+        assertTrue((byArch[703].text or ""):find("100% |T3703:16|t Complete Ore — 50 / 50", 1, true) ~= nil,
+            "437: 100% row: " .. tostring(byArch[703].text))
+        assertEq(byArch[703].percent, 100, "437: 100% field")
+        assertTrue((byArch[704].text or ""):find("220% |T3704:16|t Overflow Herb — 110 / 50", 1, true) ~= nil,
+            "437: over-100% row uncapped: " .. tostring(byArch[704].text))
+        assertEq(byArch[704].percent, 220, "437: per-item percent may exceed 100")
+        assertTrue((byArch[705].text or ""):find("— |T3705:16|t NoGoal Dust — 9 / —", 1, true) ~= nil,
+            "437: no-goal uses em dash: " .. tostring(byArch[705].text))
+        assertEq(byArch[705].percent, nil, "437: no-goal has no percent field")
+        assertTrue(byArch[705].noGoal, "437: no-goal flagged")
+
+        -- Negative credited total stays signed in the uncapped per-item percent.
+        recArch.accounting._consumableEvents[#recArch.accounting._consumableEvents + 1] = {
+            id = "437-adj-neg",
+            type = "adjustment",
+            itemId = 701,
+            quantity = -10,
+            actor = "Alice-Garona",
+            attributed = "Bob-Garona",
+            generation = genArch,
+            timestamp = world.time + 30,
+        }
+        logsPage:Refresh(panel437)
+        byArch = rowsById(goalsDef.getItems())
+        assertTrue((byArch[701].text or ""):find("-25% |T3701:16|t Zeroleaf — -10 / 40", 1, true) ~= nil,
+            "437: signed negative percent: " .. tostring(byArch[701].text))
+        assertEq(byArch[701].percent, -25, "437: -10 of 40 floors to -25%")
+        -- Overall still caps per-item contribution at goal (never below 0 via min(donated, goal)
+        -- when donated is negative: min(-10, 40) = -10 would lower overall — match ComputeGoalProgress).
+        local afterNegOverall = overallDef437.getProgress().overallPercent
+        local pureNeg = GS.ComputeGoalProgress(
+            GS:GetCampaignRequestedItems(campArch.id),
+            GS:ProjectCampaignProgress(campArch.id).itemTotals
+        )
+        assertEq(afterNegOverall, pureNeg.overallPercent,
+            "437: overall still matches ComputeGoalProgress after signed adjustment")
+
+        -- Current campaign selection uses its own goals/totals (empty → no goals).
+        campDrop437.set(campCur.id)
+        if type(campDrop437.onValueChanged) == "function" then
+            campDrop437.onValueChanged({ pageBuilder = panel437.__sfPageBuilder })
+        end
+        logsPage:Refresh(panel437)
+        assertEq(#goalsDef.getItems(), 0, "437: current empty campaign has no goal rows")
+        assertTrue(not overallDef437.getProgress().hasPositiveGoal,
+            "437: current empty overall stays empty")
+
+        -- Seed current with one goal; refresh keeps icons/names/counts correct.
+        local curOp = select(1, GS:NewConfigOperation("set-requested-item", {
+            itemId = 801,
+        }, { itemId = 801, goal = 20, removed = false }))
+        assertEq(GS:ApplyStagedConfigOperation(curOp), "accepted", "437: current goal")
+        itemNames[801] = "Current Item"
+        itemIcons[801] = 3801
+        if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
+            SF.ItemDisplay.ResetSession()
+        end
+        logsPage:Refresh(panel437)
+        local curRows = goalsDef.getItems()
+        assertEq(#curRows, 1, "437: current campaign shows its goal row")
+        assertTrue((curRows[1].text or ""):find("0% |T3801:16|t Current Item — 0 / 20", 1, true) ~= nil,
+            "437: current 0% after refresh: " .. tostring(curRows[1].text))
+
+        -- Shared projection: goals percent does not add a second ledger walk.
+        local projectCalls437 = 0
+        local realProject437 = GS.ProjectCampaignProgress
+        function GS:ProjectCampaignProgress(...)
+            projectCalls437 = projectCalls437 + 1
+            return realProject437(self, ...)
+        end
+        logsPage:Refresh(panel437)
+        assertEq(projectCalls437, 1, "437: goals percent reuses the single pass projection")
+        GS.ProjectCampaignProgress = realProject437
+
+        -- Member-readable; read-only list still shows percents.
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        settleRoster()
+        campDrop437.set(campArch.id)
+        logsPage:Refresh(panel437)
+        local memberRows = rowsById(goalsDef.getItems())
+        assertTrue((memberRows[704].text or ""):find("220%", 1, true) ~= nil,
+            "437: member-read still sees over-100% rows")
+        assertEq(#world.chat, 0, "437: percent rows emit no Chat")
+
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        settleRoster()
+        if savedGetItemInfo then C_Item.GetItemInfo = savedGetItemInfo end
+        if savedGetItemIcon then C_Item.GetItemIconByID = savedGetItemIcon end
+    end
+
     -- #428: Configuration rename-target selector + archived rename.
     local function findConfigItem(panel, itemType, labelNeedle)
         for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
@@ -9064,7 +9312,9 @@ do
         assertEq(#goalLists, 1, "414: goals list present")
         assertEq(#historyLists, 1, "414: history list present")
         assertEq(#configLists, 1, "414: campaign item list present")
-        assertTrue(goalLists[1].showItemIcons == true, "414: goals icons are opt-in on that list")
+        -- #437: goals place the percent left of an inline icon (no leading icon column).
+        assertTrue(goalLists[1].showItemIcons ~= true, "414/437: goals use inline icons, not a leading column")
+        assertTrue(goalLists[1].singleLine == true, "414/437: goals stay on one line with inline icons")
         assertTrue(historyLists[1].showItemIcons ~= true, "414: history does not use a leading icon column")
         assertTrue(historyLists[1].showDetailTooltip == true, "414: history details use an opt-in tooltip")
         assertTrue(historyLists[1].singleLine == true, "414: history stays on one line")
@@ -9135,8 +9385,13 @@ do
         assertTrue((goalById[13467].text or ""):find("/ —", 1, true) ~= nil
             or (goalById[13467].text or ""):find("/ %—", 1, true) ~= nil,
             "414: unset goal keeps the em dash: " .. tostring(goalById[13467].text))
+        assertTrue((goalById[13467].text or ""):match("^— ") ~= nil,
+            "414/437: goal-0 row starts with an em-dash percent: " .. tostring(goalById[13467].text))
         assertTrue((goalById[13468].text or ""):find("2 / 10", 1, true) ~= nil,
             "414: positive goal keeps current/goal: " .. tostring(goalById[13468].text))
+        assertTrue((goalById[13468].text or ""):match("^20%% ") ~= nil,
+            "414/437: 2 of 10 floors to 20%: " .. tostring(goalById[13468].text))
+        assertTrue(goalById[13468].icon == nil, "414/437: goals no longer expose a leading icon field")
 
         local hist = historyLists[1].getItems()
         assertTrue(#hist >= 3, "414: history rows preserved")
@@ -9172,11 +9427,13 @@ do
         for i = 1, #goalRows do
             goalById[goalRows[i].itemId] = goalRows[i]
         end
-        assertTrue((goalById[13467].text or ""):find("Dreamleaf — 40 / —", 1, true) ~= nil,
-            "414: goals show icon name and unset goal: " .. tostring(goalById[13467].text))
-        assertTrue((goalById[13468].text or ""):find("Starlight Rose — 2 / 10", 1, true) ~= nil,
-            "414: goals keep donated progress: " .. tostring(goalById[13468].text))
-        assertEq(goalById[13468].icon, 200068, "414: goals row keeps its icon")
+        assertTrue((goalById[13467].text or ""):find("— |T200067:16|t Dreamleaf — 40 / —", 1, true) ~= nil,
+            "414/437: goals show percent dash, inline icon, name, unset goal: "
+                .. tostring(goalById[13467].text))
+        assertTrue((goalById[13468].text or ""):find("20% |T200068:16|t Starlight Rose — 2 / 10", 1, true) ~= nil,
+            "414/437: goals keep percent, inline icon, name, donated/goal: "
+                .. tostring(goalById[13468].text))
+        assertTrue(goalById[13468].icon == nil, "414/437: resolved goals keep icons inline only")
 
         hist = historyLists[1].getItems()
         local donationText, donationTip, adjustText, adjustTip
