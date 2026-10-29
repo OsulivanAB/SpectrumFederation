@@ -11,6 +11,7 @@ L["ADDON_LOADED_MSG"] = "Spectrum Federation loaded successfully!"
 L["RAID_SUPPLIES_OVERALL_PROGRESS"] = "Overall progress"
 L["RAID_SUPPLIES_NO_GOALS_CONFIGURED"] = "No goals configured."
 L["RAID_SUPPLIES_NO_GOAL"] = "No Goal"
+L["RAID_SUPPLIES_GOAL_MET"] = "Goal Met"
 L["RAID_SUPPLIES_GOAL_ALREADY_MET"] = "That item's donation goal is already met."
 
 -- Raid Consumable Logs / Guild Bank verification (#366)
