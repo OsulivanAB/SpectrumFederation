@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.4] - 2026-10-29
+
+### Fixed
+- Fix Early Preparation whispers for known missing enchants (#432)
+
 ## [1.5.16-beta.3] - 2026-10-28
 
 ### Changed
