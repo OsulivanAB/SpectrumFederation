@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.8] - 2026-10-29
+
+### Changed
+- Show per-item percent on Raid Supplies Logs Goals rows (#437)
+
 ## [1.5.16-beta.7] - 2026-10-29
 
 ### Changed
