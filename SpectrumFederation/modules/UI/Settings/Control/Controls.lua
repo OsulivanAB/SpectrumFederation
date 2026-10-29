@@ -1753,7 +1753,6 @@ function Controls:AddScrollList(section, opts)
 			local y = 0
 			local maxTextWidth = 0
 			local maxLeadingWidth = 0
-			local availableWidth = (content:GetWidth() or scroll:GetWidth() or 0)
 
 			for i = 1, #items do
 				local item = items[i]
@@ -1771,6 +1770,57 @@ function Controls:AddScrollList(section, opts)
 				maxTextWidth = math.max(maxTextWidth, r.Text:GetStringWidth() or 0)
 				r:Show()
 				y = y + rowHeight + rowSpacing
+			end
+
+			for i = #items + 1, #rows do
+				rows[i]:Hide()
+			end
+
+			local contentH = (y > 0) and (y - rowSpacing) or 0
+			content:SetHeight(math.max(1, contentH))
+
+			-- Resolve scrollbar before measuring width so the leading-column
+			-- clamp uses the live viewport, not a stale content:GetWidth() (#440).
+			local sbw = 0
+			if resize then
+				local maxVisible = math.max(rowHeight, maxHeight - (borderInset * 2))
+				local needVisible = math.max(rowHeight, contentH)
+
+				local showScroll = needVisible > maxVisible
+				sbw = SetScrollBarShown(showScroll)
+
+				local targetVisible = math.min(needVisible, maxVisible)
+				local targetRowH = targetVisible + (borderInset * 2)
+
+				-- Only apply if changed, then request reflow so stacking updates
+				if math.abs((row:GetHeight() or 0) - targetRowH) > 0.5 then
+					row:SetHeight(targetRowH)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+			else
+				SetScrollBarShown(true)
+
+				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
+					row:SetHeight(fixedHeight)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+
+				local sb = scroll.ScrollBar
+				sbw = (sb and sb:GetWidth()) or 20
+			end
+
+			-- Measure from the live scroll viewport (minus scrollbar). Initial
+			-- zero-width layout keeps availableWidth at 0 so clamping is a no-op
+			-- until OnSizeChanged supplies a real viewport.
+			local w = scroll:GetWidth() or 0
+			local availableWidth = 0
+			if w > 0 then
+				availableWidth = math.max(1, w - sbw - 4)
+				content:SetWidth(availableWidth)
 			end
 
 			local leadingWidth, leadingGap = 0, leadingColumnGap
@@ -1798,7 +1848,6 @@ function Controls:AddScrollList(section, opts)
 				compactTextWidth = math.min(compactTextWidth, math.max(1, textBudget - removeButtonSize - removeColumnGap))
 			end
 
-			y = 0
 			for i = 1, #items do
 				local item = items[i]
 				local r = rows[i]
@@ -1899,54 +1948,6 @@ function Controls:AddScrollList(section, opts)
 					r.Text:SetPoint("RIGHT", r, "RIGHT", -24, 0)
 					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 				end
-
-				y = y + rowHeight + rowSpacing
-			end
-
-			for i = #items + 1, #rows do
-				rows[i]:Hide()
-			end
-
-			local contentH = (y > 0) and (y - rowSpacing) or 0
-			content:SetHeight(math.max(1, contentH))
-
-			-- Resize behavior
-			local sbw = 0
-			if resize then
-				local maxVisible = math.max(rowHeight, maxHeight - (borderInset * 2))
-				local needVisible = math.max(rowHeight, contentH)
-
-				local showScroll = needVisible > maxVisible
-				sbw = SetScrollBarShown(showScroll)
-
-				local targetVisible = math.min(needVisible, maxVisible)
-				local targetRowH = targetVisible + (borderInset * 2)
-
-				-- Only apply if changed, then request reflow so stacking updates
-				if math.abs((row:GetHeight() or 0) - targetRowH) > 0.5 then
-					row:SetHeight(targetRowH)
-					if section.RequestReflow then
-						section:RequestReflow()
-					end
-				end
-			else
-				SetScrollBarShown(true)
-
-				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
-					row:SetHeight(fixedHeight)
-					if section.RequestReflow then
-						section:RequestReflow()
-					end
-				end
-
-				local sb = scroll.ScrollBar
-				sbw = (sb and sb:GetWidth()) or 20
-			end
-
-			-- Width management
-			local w = scroll:GetWidth() or 0
-			if w > 0 then
-				content:SetWidth(math.max(1, w - sbw - 4))
 			end
 
 			row.__sfScrollListRefreshing = false

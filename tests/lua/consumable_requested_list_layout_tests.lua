@@ -976,25 +976,44 @@ do
     assertTrue(plainRows[1].Leading == nil, "440: lists without the flag stay single-text")
     assertEq(leftAnchor(plainRows[1].Text).x, 0, "440: plain text still starts at the edge")
 
-    -- Refresh + narrow resize stay bounded and keep a shared text start.
-    items[1].leadingText = "1234%"
+    -- Refresh + narrow resize: actually change the mock viewport width, force
+    -- clamp with an overwide leading percent, and keep the remainder budget.
+    local overwideLeading = "999999999%"
+    items[1].leadingText = overwideLeading
     items[1].text = "|T111:16|t Short renamed — 1 / 40"
+    local measuredLeading = math.max(1, #overwideLeading * 7)
+    local narrowViewport = 100
     local callsBefore = calls
-    fireEvent(scroll, "OnSizeChanged", 200, 120)
+    -- SetSize updates scroll.width; fireEvent alone would leave GetWidth stale.
+    scroll:SetSize(narrowViewport, 120)
     rows = scrollRows(scroll)
-    assertEq(rows[1].Leading.text, "1234%", "440: refresh replaces a longer leading percent")
+    assertEq(rows[1].Leading.text, overwideLeading, "440: refresh replaces an overwide leading percent")
     assertEq(rows[1].Text.text, items[1].text, "440: refresh replaces remainder text")
+    local contentWidth = scroll.scrollChild:GetWidth()
+    assertTrue(contentWidth > 0 and contentWidth < narrowViewport,
+        "440: content width follows the live viewport after narrow resize")
+    local expectedLeading = Controls.ScrollListLeadingColumnWidth(measuredLeading, contentWidth, {
+        gap = 6,
+    })
+    assertEq(rows[1].Leading.width, expectedLeading,
+        "440: leading width clamps against the new viewport")
+    assertTrue(expectedLeading < measuredLeading,
+        "440: overwide leading forces a clamp on the narrow viewport")
     local narrowStart = leftAnchor(rows[1].Text).x
+    assertEq(narrowStart, expectedLeading + 6,
+        "440: remainder starts after the clamped leading column")
     for i = 2, #rows do
         assertEq(leftAnchor(rows[i].Text).x, narrowStart,
             "440: narrow resize keeps a shared remainder start on row " .. tostring(i))
     end
-    assertTrue(rows[1].Leading.width <= 200, "440: narrow viewport clamps the leading width")
+    local remainderBudget = contentWidth - narrowStart
+    assertTrue(remainderBudget >= 40,
+        "440: remainder keeps its intended width budget after clamp: " .. tostring(remainderBudget))
     assertTrue(calls - callsBefore <= 4, "440: resize refresh does not storm getItems")
 
     for _ = 1, 8 do
-        fireEvent(scroll, "OnSizeChanged", 420, 120)
-        fireEvent(scroll, "OnSizeChanged", 200, 120)
+        scroll:SetSize(420, 120)
+        scroll:SetSize(narrowViewport, 120)
     end
     rows = scrollRows(scroll)
     local shown = 0
@@ -1004,6 +1023,17 @@ do
         end
     end
     assertEq(shown, 4, "440: repeated open/resize keeps four visible rows")
+    local finalContentWidth = scroll.scrollChild:GetWidth()
+    local finalExpected = Controls.ScrollListLeadingColumnWidth(measuredLeading, finalContentWidth, {
+        gap = 6,
+    })
+    assertEq(rows[1].Leading.width, finalExpected,
+        "440: repeated resize reconverges on the clamped leading width")
+    local finalStart = leftAnchor(rows[1].Text).x
+    for i = 1, #rows do
+        assertEq(leftAnchor(rows[i].Text).x, finalStart,
+            "440: repeated resize keeps aligned remainder starts on row " .. tostring(i))
+    end
     assertTrue(calls <= 80, "440: repeated refreshes stay bounded")
 end
 

@@ -6415,7 +6415,7 @@ do
                     "440: leading percent for " .. tostring(itemId))
                 assertTrue((row.text or ""):find(want.remainder, 1, true) ~= nil,
                     "440: remainder text for " .. tostring(itemId) .. ": " .. tostring(row.text))
-                assertTrue((row.text or ""):find("%%", 1, true) == nil,
+                assertTrue((row.text or ""):find("%", 1, true) == nil,
                     "440: remainder does not embed the percent for " .. tostring(itemId))
                 assertTrue((row.text or ""):match("^|T") ~= nil,
                     "440: remainder starts at the inline icon for " .. tostring(itemId))
