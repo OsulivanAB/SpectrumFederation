@@ -279,7 +279,14 @@ SF.Debug = {
         world.debugLogs[#world.debugLogs + 1] = { cat = cat, msg = string.format(fmt, ...) }
     end,
     Verbose = function() end,
-    Error = function() end,
+    Error = function(self, cat, fmt, ...)
+        if not self._enabled then return end
+        world.debugLogs[#world.debugLogs + 1] = {
+            level = "ERROR",
+            cat = cat,
+            msg = string.format(fmt, ...),
+        }
+    end,
 }
 
 SF.Consumables = {
@@ -341,7 +348,18 @@ loadModule("SpectrumFederation/modules/GuildSupplies/Campaigns.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Activation.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Ledger.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Admission.lua")
+loadModule("SpectrumFederation/modules/GuildSupplies/Valuation.lua")
 loadModule("SpectrumFederation/modules/GuildSupplies/Gossip.lua")
+
+-- Guild Info (#427): witness independence + donation attribution authority.
+-- Loaded after Guild Supplies to mirror TOC order (GS initializes before GI).
+SF.GuildInfo = SF.GuildInfo or {}
+loadModule("SpectrumFederation/modules/GuildInfo/State.lua")
+loadModule("SpectrumFederation/modules/GuildInfo/Cleanup.lua")
+loadModule("SpectrumFederation/modules/GuildInfo/Authority.lua")
+loadModule("SpectrumFederation/modules/GuildInfo/Operations.lua")
+loadModule("SpectrumFederation/modules/GuildInfo/Roster.lua")
+loadModule("SpectrumFederation/modules/GuildInfo/Gossip.lua")
 
 -- Minimal provider registry stub so EnsureGossipProvider can register without the
 -- full engine. 3A multi-client tests exercise ValidateAndApply / AdmitRemote*.
@@ -357,6 +375,7 @@ do
         end
         local entry = {
             id = spec.id,
+            schema = tonumber(spec.schema) or 1,
             api = spec,
             enabled = spec.enabled and true or false,
             ready = spec.ready ~= false,
@@ -594,6 +613,7 @@ loadModule("SpectrumFederation/modules/GuildOfficer/Gossip.lua")
 
 local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
+local GI = SF.GuildInfo
 local officerBootstrapping = false
 
 local function ensureDefaultOfficerPolicy()
@@ -706,6 +726,17 @@ local function resetDb()
     GS._pendingCampaignBoundaries = {}
     GS._bootstrapEditLock = {}
     GS._confirmationRedriveByKey = {}
+    if GI then
+        GI._db = nil
+        GI._root = nil
+        GI._rootValid = false
+        GI._rootReason = "not_initialized"
+        GI._handleGeneration = 0
+        GI._lastGuildKey = nil
+        if GI.InvalidateRosterSnapshot then
+            GI.InvalidateRosterSnapshot()
+        end
+    end
     world.notifyChanged = 0
     world.meaningfulChange = 0
     world.indexUpserts = 0
@@ -739,8 +770,16 @@ local function initGS(opts)
     -- EnsureGossipProvider sees accepted ops. Paced/idle lifecycle tests clear it.
     GS._exportMaintSyncDrain = true
     local ok, reason = GS:Initialize(SpectrumFederationDB)
+    -- Guild Info may initialize after GS (TOC order); empty ready baseline makes
+    -- distinct GUIDs independent until assignments exist (#427).
+    if GI and GI.Initialize then
+        GI:Initialize(SpectrumFederationDB)
+    end
     if opts.settle ~= false then
         settleRoster()
+    end
+    if GS.EnsureGuildInfoBridge then
+        GS.EnsureGuildInfoBridge()
     end
     return ok, reason
 end
@@ -967,6 +1006,40 @@ local function setPlayer(name, guid, rankOrder)
             name = name, guid = guid, rankOrder = rankOrder, online = true,
         }
     end
+end
+
+--- Assign alt under main via Guild Info (Alice as editor). #427
+local function assignMainAlt(mainName, altName)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    ensureDefaultOfficerPolicy()
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+    local st, reason = GI:AssignAlt(mainName, altName, {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    return st, reason
+end
+
+local function unassignAltGuid(altGuid, expectedMainGuid)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    ensureDefaultOfficerPolicy()
+    local st, reason = GI:UnassignAlt(altGuid, {
+        expectedMainGuid = expectedMainGuid,
+    })
+    return st, reason
+end
+
+local function changeMainGuid(oldMainGuid, newMainGuid)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    ensureDefaultOfficerPolicy()
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+    local st, reason = GI:ChangeMain(oldMainGuid, newMainGuid, {
+        roster = GI.GetRosterSnapshot(true),
+    })
+    return st, reason
 end
 
 local function ensureIdleGossip()
@@ -4244,6 +4317,12 @@ do
     assertTrue(msg:find("out of date", 1, true), "pending reason localized")
     assertTrue(GS.FormatReasonText("not_ready"):find("not ready", 1, true),
         "FormatReasonText maps known codes")
+    -- #422: conflict resolution lives on Troubleshooting, not Configuration.
+    local divergentText = GS.FormatReasonText("divergent_edit")
+    assertTrue(divergentText:find("Troubleshooting", 1, true),
+        "#422: divergent_edit reason names Troubleshooting got=" .. tostring(divergentText))
+    assertEq(divergentText:find("Configuration", 1, true), nil,
+        "#422: divergent_edit reason must not name Configuration got=" .. tostring(divergentText))
 
     local ctx = GS.CaptureBankContext(nil)
     assertEq(ctx.status, "unavailable", "unset tab is unavailable not empty")
@@ -4977,15 +5056,21 @@ do
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    local troubleshootingPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
     assertTrue(configPage ~= nil, "Configuration page registered")
     assertTrue(logsPage ~= nil, "Logs page registered")
+    assertTrue(troubleshootingPage ~= nil, "Troubleshooting page registered")
     assertTrue(type(configPage.Build) == "function" and type(configPage.Refresh) == "function",
         "Configuration exposes Build/Refresh")
     assertTrue(type(logsPage.Build) == "function" and type(logsPage.Refresh) == "function",
         "Logs exposes Build/Refresh")
+    assertTrue(type(troubleshootingPage.Build) == "function"
+            and type(troubleshootingPage.Refresh) == "function",
+        "Troubleshooting exposes Build/Refresh")
     assertEq(SF.SettingsUI.categories.guildSupplies.name, "Raid Supplies",
         "category name localized through Loc default")
 
@@ -5060,6 +5145,27 @@ do
     assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
     assertTrue(foundStatusDisplay, "status area uses display rows")
     assertTrue(foundNextStepHelp, "status next-step/warning help uses getText+visible")
+    local configHasAdoption, configHasConflicts = false, false
+    for _, sec in ipairs(pageDef.sections or {}) do
+        if sec.id == "gsAdoption" then configHasAdoption = true end
+        if sec.id == "gsConflicts" then configHasConflicts = true end
+    end
+    assertEq(configHasAdoption, false, "#422: Configuration no longer hosts gsAdoption")
+    assertEq(configHasConflicts, false, "#422: Configuration no longer hosts gsConflicts")
+    local tsPanel = makeRegion("Frame", "GSTroubleshootingPanel", nil)
+    tsPanel:SetSize(600, 800)
+    troubleshootingPage:Build(tsPanel)
+    local tsDef = tsPanel.__sfPageDef
+    assertTrue(type(tsDef) == "table", "Troubleshooting Build stores page definition")
+    local tsHasAdoption, tsHasConflicts, tsHasItems = false, false, false
+    for _, sec in ipairs(tsDef.sections or {}) do
+        if sec.id == "gsAdoption" then tsHasAdoption = true end
+        if sec.id == "gsConflicts" then tsHasConflicts = true end
+        if sec.id == "gsItems" then tsHasItems = true end
+    end
+    assertEq(tsHasAdoption, true, "#422: Troubleshooting hosts gsAdoption")
+    assertEq(tsHasConflicts, true, "#422: Troubleshooting hosts gsConflicts")
+    assertEq(tsHasItems, false, "#422: Troubleshooting does not host unrelated items section")
 
     -- Activation guidance in Next step help (bank sample states; no Chat).
     local statusNextStepGetText
@@ -5707,6 +5813,1162 @@ do
     local histRows, histTotal = GS:ListCampaignHistory(c1.id, 25, 0)
     assertTrue((histTotal or 0) >= 1, "history projection available for UI")
 
+    -- #428: Logs is inspection-only — no campaign rename control or personal section.
+    local logsRenameSubmit = nil
+    local logsPersonalSection = nil
+    for _, sec in ipairs((logsPanel.__sfPageDef and logsPanel.__sfPageDef.sections) or {}) do
+        if sec.id == "gsLogsPersonal" then
+            logsPersonalSection = sec
+        end
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "editboxButton" and item.label
+                and tostring(item.label):find("Campaign name", 1, true) then
+                logsRenameSubmit = item.onSubmit
+            end
+            if item.type == "checkbox" and item.label
+                and tostring(item.label):find("raid supply reminders", 1, true) then
+                logsPersonalSection = logsPersonalSection or sec
+            end
+        end
+    end
+    assertNil(logsRenameSubmit, "428-ui: Logs has no campaign rename control")
+    assertNil(logsPersonalSection, "428-ui: Logs has no personal-preferences / reminders section")
+
+    -- #429: Logs overall progress bar (GS accounting; follows campaign selector).
+    local function findLogsItem(panel, itemType, labelNeedle)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == itemType then
+                    if not labelNeedle then
+                        return item
+                    end
+                    if item.label and tostring(item.label):find(labelNeedle, 1, true) then
+                        return item
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    local function findOverallBeforeGoals(panel)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            local sawOverall, sawGoals = false, false
+            local overallBeforeGoals = false
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "overallProgressBar" then
+                    sawOverall = true
+                    if not sawGoals then overallBeforeGoals = true end
+                end
+                if item.type == "scrollList" and item.label
+                    and tostring(item.label):find("Goals and progress", 1, true) then
+                    sawGoals = true
+                end
+            end
+            if sawOverall then
+                return overallBeforeGoals, sawGoals
+            end
+        end
+        return false, false
+    end
+
+    -- Pure ComputeGoalProgress matches Consumables.GoalProgress weighting/caps.
+    local pure = GS.ComputeGoalProgress({
+        ["100"] = { itemId = 100, goal = 50 },
+        ["200"] = { itemId = 200, goal = 100 },
+        ["300"] = { itemId = 300, goal = 0 },
+        ["400"] = { itemId = 400, goal = 50 },
+    }, {
+        [100] = 0,
+        [200] = 100,
+        [300] = 300,
+        [400] = 110,
+    })
+    -- sumCapped = min(0,50)+min(100,100)+min(110,50) = 0+100+50 = 150; sumGoal = 200 → 75%
+    assertTrue(pure.hasPositiveGoal, "429: positive goals enable overall bar")
+    assertEq(pure.overallPercent, 75, "429: overall floors capped donations / positive goals")
+    assertEq(pure.sumCapped, 150, "429: over-donation capped at goal")
+    assertEq(pure.sumGoal, 200, "429: goal-0 excluded from denominator")
+    local byPure = {}
+    for i = 1, #pure.items do byPure[pure.items[i].itemId] = pure.items[i] end
+    assertEq(byPure[400].percent, 220, "429: per-item percent may exceed 100")
+    assertTrue(byPure[300].noGoal, "429: goal-0 marked noGoal")
+    assertEq(byPure[300].percent, nil, "429: goal-0 has no percent")
+
+    local noGoals = GS.ComputeGoalProgress({
+        ["1"] = { itemId = 1, goal = 0 },
+    }, { [1] = 99 })
+    assertTrue(not noGoals.hasPositiveGoal, "429: all goal-0 → no overall bar")
+    assertEq(noGoals.overallPercent, nil, "429: no misleading overall percent")
+    assertTrue(tostring(noGoals.overallEmptyText or ""):find("No goals configured", 1, true),
+        "429: empty text is No goals configured")
+
+    local zeroDon = GS.ComputeGoalProgress({
+        ["5"] = { itemId = 5, goal = 40 },
+    }, {})
+    assertTrue(zeroDon.hasPositiveGoal, "429: positive goals with zero donations still show bar")
+    assertEq(zeroDon.overallPercent, 0, "429: zero donations → 0%")
+
+    -- Clamp display fill inputs above 100 stay computable; UI clamps SetValue.
+    local overAll = GS.ComputeGoalProgress({
+        ["9"] = { itemId = 9, goal = 10 },
+    }, { [9] = 10 })
+    assertEq(overAll.overallPercent, 100, "429: fully met overall is 100 not over")
+
+    -- Live Logs fixture: current vs archived selection, donation/adjustment/goal updates.
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    local campA = startCampaign()
+    local itemA = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
+        itemId = 501, goal = 50, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemA), "accepted", "429: seed item A")
+    local itemB = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 502 }, {
+        itemId = 502, goal = 100, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemB), "accepted", "429: seed item B")
+    local itemZ = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 503 }, {
+        itemId = 503, goal = 0, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemZ), "accepted", "429: seed goal-0 item")
+    local recA = GS:GetCurrentRecord()
+    local genA = recA.accounting._consumables.generation
+    recA.accounting._consumableEvents[#recA.accounting._consumableEvents + 1] = {
+        id = "429-don-a",
+        type = "donation",
+        itemId = 501,
+        quantity = 25,
+        actor = "Bob-Garona",
+        generation = genA,
+        timestamp = world.time,
+        source = "guildbank",
+    }
+    recA.accounting._consumableEvents[#recA.accounting._consumableEvents + 1] = {
+        id = "429-don-b",
+        type = "donation",
+        itemId = 502,
+        quantity = 110,
+        actor = "Bob-Garona",
+        generation = genA,
+        timestamp = world.time + 1,
+        source = "guildbank",
+    }
+    recA.accounting._consumableEvents[#recA.accounting._consumableEvents + 1] = {
+        id = "429-don-z",
+        type = "donation",
+        itemId = 503,
+        quantity = 40,
+        actor = "Bob-Garona",
+        generation = genA,
+        timestamp = world.time + 2,
+        source = "guildbank",
+    }
+    -- Archived campaign A keeps its goals/progress; new campaign B starts empty.
+    local campB = startCampaign()
+    assertTrue(campA.id ~= campB.id, "429: archived vs current campaigns")
+
+    logsPanel = makeRegion("Frame", "GSLogsProgressPanel", nil)
+    logsPanel:SetSize(600, 800)
+    logsPage:Build(logsPanel)
+    local beforeGoals, hasGoals = findOverallBeforeGoals(logsPanel)
+    assertTrue(beforeGoals and hasGoals,
+        "429: overall progress bar is defined before Goals and progress")
+    local overallDef = findLogsItem(logsPanel, "overallProgressBar", "Overall progress")
+    assertTrue(overallDef ~= nil and type(overallDef.getProgress) == "function",
+        "429: overallProgressBar control present")
+    assertTrue(findLogsItem(logsPanel, "consumableGoalSummary") == nil,
+        "429: does not reintroduce consumableGoalSummary item list")
+
+    -- Default selection is current campaign (empty goals) → No goals configured.
+    logsPage:Refresh(logsPanel)
+    local currentProg = overallDef.getProgress()
+    assertTrue(not currentProg.hasPositiveGoal, "429: current empty campaign has no positive goals")
+    assertEq(currentProg.overallPercent, nil, "429: current empty → no percent")
+    assertTrue(tostring(currentProg.overallEmptyText or ""):find("No goals configured", 1, true),
+        "429: current empty shows No goals configured")
+
+    -- Select archived campaign via dropdown set path.
+    drops = findDropdowns(logsPanel)
+    drop = drops[1]
+    assertTrue(drop and type(drop.menuOptions) == "table", "429: campaign dropdown ready")
+    local archivedOpt, currentOpt
+    for i = 1, #drop.menuOptions do
+        local opt = drop.menuOptions[i]
+        if opt.value == campA.id then archivedOpt = opt end
+        if opt.value == campB.id then currentOpt = opt end
+    end
+    assertTrue(archivedOpt ~= nil and currentOpt ~= nil, "429: both campaigns listed")
+    if type(archivedOpt.setSelected) == "function" then
+        archivedOpt.setSelected(archivedOpt.value)
+    else
+        -- Fallback: invoke definition set if menu setSelected unavailable.
+        local campDrop = findLogsItem(logsPanel, "dropdown", "Campaign")
+        assertTrue(campDrop and type(campDrop.set) == "function", "429: campaign set available")
+        campDrop.set(campA.id)
+        if type(campDrop.onValueChanged) == "function" then
+            campDrop.onValueChanged({ pageBuilder = logsPanel.__sfPageBuilder })
+        end
+    end
+    logsPage:Refresh(logsPanel)
+    local archivedProg = overallDef.getProgress()
+    -- sumCapped = min(25,50)+min(110,100) = 25+100 = 125; sumGoal = 150 → 83%
+    assertTrue(archivedProg.hasPositiveGoal, "429: archived campaign has positive goals")
+    assertEq(archivedProg.overallPercent, 83, "429: archived weighted overall percent")
+
+    local campGoal = GS:CampaignGoalProgress(campA.id)
+    assertEq(campGoal.overallPercent, 83, "429: CampaignGoalProgress matches Logs bar")
+
+    -- Switch back to current; progress follows selection without a second selector.
+    if type(currentOpt.setSelected) == "function" then
+        currentOpt.setSelected(currentOpt.value)
+    else
+        local campDrop2 = findLogsItem(logsPanel, "dropdown", "Campaign")
+        campDrop2.set(campB.id)
+    end
+    logsPage:Refresh(logsPanel)
+    currentProg = overallDef.getProgress()
+    assertTrue(not currentProg.hasPositiveGoal, "429: selecting current restores empty overall")
+
+    -- Seed current campaign goals + zero donations → 0% bar (not empty text).
+    local curItem = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 601 }, {
+        itemId = 601, goal = 80, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(curItem), "accepted", "429: current campaign goal")
+    logsPage:Refresh(logsPanel)
+    currentProg = overallDef.getProgress()
+    assertTrue(currentProg.hasPositiveGoal, "429: current with goals shows bar")
+    assertEq(currentProg.overallPercent, 0, "429: zero donations on current → 0%")
+
+    -- Donation updates overall; adjustment updates; goal change reweights.
+    local recB = GS:GetCurrentRecord()
+    local genB = recB.accounting._consumables.generation
+    recB.accounting._consumableEvents[#recB.accounting._consumableEvents + 1] = {
+        id = "429-don-cur",
+        type = "donation",
+        itemId = 601,
+        quantity = 20,
+        actor = "Carol-Garona",
+        generation = genB,
+        timestamp = world.time + 10,
+        source = "guildbank",
+    }
+    logsPage:Refresh(logsPanel)
+    assertEq(overallDef.getProgress().overallPercent, 25, "429: donation updates overall (20/80)")
+
+    recB.accounting._consumableEvents[#recB.accounting._consumableEvents + 1] = {
+        id = "429-adj-cur",
+        type = "adjustment",
+        itemId = 601,
+        quantity = 20,
+        actor = "Alice-Garona",
+        attributed = "Carol-Garona",
+        generation = genB,
+        timestamp = world.time + 11,
+    }
+    logsPage:Refresh(logsPanel)
+    assertEq(overallDef.getProgress().overallPercent, 50, "429: adjustment updates overall (40/80)")
+
+    local raiseGoal = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 601 }, {
+        itemId = 601, goal = 160, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(raiseGoal), "accepted", "429: raise goal")
+    logsPage:Refresh(logsPanel)
+    assertEq(overallDef.getProgress().overallPercent, 25, "429: goal change reweights (40/160)")
+
+    -- Member-readable (non-editor) still sees overall progress.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    settleRoster()
+    local memberCaps = GS:GetCapabilities()
+    assertEq(memberCaps.canRead, true, "429: member can read")
+    assertEq(memberCaps.canEdit, false, "429: member cannot edit")
+    logsPage:Refresh(logsPanel)
+    local memberProg = overallDef.getProgress()
+    assertTrue(memberProg.hasPositiveGoal, "429: member-read overall still available")
+    assertEq(memberProg.overallPercent, 25, "429: member-read overall percent matches")
+
+    -- Missing guild → no read; empty/disabled membership state preserved.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    local priorClub = world.guild.clubId
+    world.guild.clubId = nil
+    resetDemandRoster()
+    assertEq(GS:GetCapabilities().canRead, false, "429: missing club cannot read")
+    logsPage:Refresh(logsPanel)
+    local noGuildProg = overallDef.getProgress()
+    assertTrue(not noGuildProg.hasPositiveGoal, "429: missing guild disables overall bar")
+    assertTrue(tostring(noGuildProg.overallEmptyText or ""):find("Join a guild", 1, true)
+            or tostring(noGuildProg.overallEmptyText or ""):find("verified membership", 1, true),
+        "429: missing guild empty text is membership help")
+    world.guild.clubId = priorClub
+    resetDemandRoster()
+    settleRoster()
+
+    -- Bounded refresh: one ledger projection per visible Refresh (bar + goals share pass).
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    local campDrop3 = findLogsItem(logsPanel, "dropdown", "Campaign")
+    if campDrop3 and campDrop3.set then campDrop3.set(campB.id) end
+    local projectCalls = 0
+    local realProject = GS.ProjectCampaignProgress
+    function GS:ProjectCampaignProgress(...)
+        projectCalls = projectCalls + 1
+        return realProject(self, ...)
+    end
+    logsPage:Refresh(logsPanel)
+    local callsOne = projectCalls
+    assertEq(callsOne, 1, "429: single Refresh projects ledger once (shared pass cache)")
+    projectCalls = 0
+    for _ = 1, 5 do
+        logsPage:Refresh(logsPanel)
+    end
+    assertEq(projectCalls, 5, "429: five Refresh passes → five projections (no hidden polling)")
+    GS.ProjectCampaignProgress = realProject
+
+    -- Hidden panel stays idle (no projection) when Refresh is gated.
+    logsPanel.shown = false
+    logsPanel.visible = false
+    projectCalls = 0
+    function GS:ProjectCampaignProgress(...)
+        projectCalls = projectCalls + 1
+        return realProject(self, ...)
+    end
+    logsPage:Refresh(logsPanel)
+    assertEq(projectCalls, 0, "429: hidden Logs Refresh does not project")
+    GS.ProjectCampaignProgress = realProject
+    logsPanel.shown = true
+    logsPanel.visible = true
+
+    assertEq(#world.chat, 0, "429: Logs overall progress emits no Chat")
+
+    -- Restore editor player for subsequent UI tests in this harness.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+
+    -- #437: Goals and progress rows show per-item percent left of the inline icon.
+    do
+        local function findGoalsList(panel)
+            for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "scrollList" and item.label
+                        and tostring(item.label):find("Goals and progress", 1, true) then
+                        return item
+                    end
+                end
+            end
+            return nil
+        end
+        local function findOverall(panel)
+            for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "overallProgressBar" then
+                        return item
+                    end
+                end
+            end
+            return nil
+        end
+        local function rowsById(list)
+            local byId = {}
+            for i = 1, #(list or {}) do
+                byId[list[i].itemId] = list[i]
+            end
+            return byId
+        end
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local campArch = startCampaign()
+        -- 0%, partial, 100%, over 100%, and no-goal.
+        local seeds = {
+            { itemId = 701, goal = 40 },
+            { itemId = 702, goal = 80 },
+            { itemId = 703, goal = 50 },
+            { itemId = 704, goal = 50 },
+            { itemId = 705, goal = 0 },
+        }
+        for i = 1, #seeds do
+            local op = select(1, GS:NewConfigOperation("set-requested-item", {
+                itemId = seeds[i].itemId,
+            }, {
+                itemId = seeds[i].itemId,
+                goal = seeds[i].goal,
+                removed = false,
+            }))
+            assertEq(GS:ApplyStagedConfigOperation(op), "accepted",
+                "437: seed item " .. tostring(seeds[i].itemId))
+        end
+        local recArch = GS:GetCurrentRecord()
+        local genArch = recArch.accounting._consumables.generation
+        local donations = {
+            { id = "437-d0", itemId = 701, quantity = 0 },
+            { id = "437-d25", itemId = 702, quantity = 20 },
+            { id = "437-d100", itemId = 703, quantity = 50 },
+            { id = "437-d220", itemId = 704, quantity = 110 },
+            { id = "437-dz", itemId = 705, quantity = 9 },
+        }
+        for i = 1, #donations do
+            recArch.accounting._consumableEvents[#recArch.accounting._consumableEvents + 1] = {
+                id = donations[i].id,
+                type = "donation",
+                itemId = donations[i].itemId,
+                quantity = donations[i].quantity,
+                actor = "Bob-Garona",
+                generation = genArch,
+                timestamp = world.time + i,
+                source = "guildbank",
+            }
+        end
+        -- Signed adjustment on the partial item: 20 - 4 = 16 of 80 → 20%.
+        recArch.accounting._consumableEvents[#recArch.accounting._consumableEvents + 1] = {
+            id = "437-adj",
+            type = "adjustment",
+            itemId = 702,
+            quantity = -4,
+            actor = "Alice-Garona",
+            attributed = "Bob-Garona",
+            generation = genArch,
+            timestamp = world.time + 20,
+        }
+        -- Current campaign starts empty; archived keeps its own goals/totals.
+        local campCur = startCampaign()
+        assertTrue(campArch.id ~= campCur.id, "437: archived vs current campaigns")
+
+        local itemNames = {
+            [701] = "Zeroleaf",
+            [702] = "Partial Rose",
+            [703] = "Complete Ore",
+            [704] = "Overflow Herb",
+            [705] = "NoGoal Dust",
+        }
+        local itemIcons = {
+            [701] = 3701,
+            [702] = 3702,
+            [703] = 3703,
+            [704] = 3704,
+            [705] = 3705,
+        }
+        local savedGetItemInfo = C_Item and C_Item.GetItemInfo
+        local savedGetItemIcon = C_Item and C_Item.GetItemIconByID
+        C_Item = C_Item or {}
+        C_Item.GetItemInfo = function(itemId)
+            local n = itemNames[tonumber(itemId)]
+            if type(n) == "string" then return n end
+            if savedGetItemInfo then return savedGetItemInfo(itemId) end
+            return nil
+        end
+        C_Item.GetItemIconByID = function(itemId)
+            local ic = itemIcons[tonumber(itemId)]
+            if ic then return ic end
+            if savedGetItemIcon then return savedGetItemIcon(itemId) end
+            return nil
+        end
+        if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
+            SF.ItemDisplay.ResetSession()
+        end
+
+        local panel437 = makeRegion("Frame", "GSLogsPercentPanel", nil)
+        panel437:SetSize(600, 800)
+        logsPage:Build(panel437)
+        local goalsDef = findGoalsList(panel437)
+        local overallDef437 = findOverall(panel437)
+        assertTrue(goalsDef ~= nil and type(goalsDef.getItems) == "function",
+            "437: Goals and progress list present")
+        assertTrue(goalsDef.showItemIcons ~= true, "437: goals do not use a leading icon column")
+        assertTrue(goalsDef.singleLine == true, "437: goals stay single-line for inline icons")
+
+        -- Select archived campaign (has goals/progress).
+        local campDrop437 = findLogsItem(panel437, "dropdown", "Campaign")
+        assertTrue(campDrop437 and type(campDrop437.set) == "function", "437: campaign dropdown")
+        campDrop437.set(campArch.id)
+        if type(campDrop437.onValueChanged) == "function" then
+            campDrop437.onValueChanged({ pageBuilder = panel437.__sfPageBuilder })
+        end
+        logsPage:Refresh(panel437)
+
+        local archivedOverall = overallDef437.getProgress()
+        -- sumCapped = min(0,40)+min(16,80)+min(50,50)+min(110,50) = 0+16+50+50 = 116
+        -- sumGoal = 40+80+50+50 = 220 → floor(11600/220) = 52
+        assertEq(archivedOverall.overallPercent, 52, "437: overall bar stays capped/weighted")
+        assertTrue(archivedOverall.overallPercent <= 100, "437: overall remains capped at 100 semantics")
+
+        local byArch = rowsById(goalsDef.getItems())
+        assertTrue((byArch[701].text or ""):find("0% |T3701:16|t Zeroleaf — 0 / 40", 1, true) ~= nil,
+            "437: 0% row: " .. tostring(byArch[701].text))
+        assertEq(byArch[701].percent, 0, "437: 0% field")
+        assertTrue((byArch[702].text or ""):find("20% |T3702:16|t Partial Rose — 16 / 80", 1, true) ~= nil,
+            "437: signed adjustment partial %: " .. tostring(byArch[702].text))
+        assertEq(byArch[702].percent, 20, "437: 16 of 80 is 20%")
+        assertTrue((byArch[703].text or ""):find("100% |T3703:16|t Complete Ore — 50 / 50", 1, true) ~= nil,
+            "437: 100% row: " .. tostring(byArch[703].text))
+        assertEq(byArch[703].percent, 100, "437: 100% field")
+        assertTrue((byArch[704].text or ""):find("220% |T3704:16|t Overflow Herb — 110 / 50", 1, true) ~= nil,
+            "437: over-100% row uncapped: " .. tostring(byArch[704].text))
+        assertEq(byArch[704].percent, 220, "437: per-item percent may exceed 100")
+        assertTrue((byArch[705].text or ""):find("— |T3705:16|t NoGoal Dust — 9 / —", 1, true) ~= nil,
+            "437: no-goal uses em dash: " .. tostring(byArch[705].text))
+        assertEq(byArch[705].percent, nil, "437: no-goal has no percent field")
+        assertTrue(byArch[705].noGoal, "437: no-goal flagged")
+
+        -- Negative credited total stays signed in the uncapped per-item percent.
+        recArch.accounting._consumableEvents[#recArch.accounting._consumableEvents + 1] = {
+            id = "437-adj-neg",
+            type = "adjustment",
+            itemId = 701,
+            quantity = -10,
+            actor = "Alice-Garona",
+            attributed = "Bob-Garona",
+            generation = genArch,
+            timestamp = world.time + 30,
+        }
+        logsPage:Refresh(panel437)
+        byArch = rowsById(goalsDef.getItems())
+        assertTrue((byArch[701].text or ""):find("-25% |T3701:16|t Zeroleaf — -10 / 40", 1, true) ~= nil,
+            "437: signed negative percent: " .. tostring(byArch[701].text))
+        assertEq(byArch[701].percent, -25, "437: -10 of 40 floors to -25%")
+        -- Overall still caps per-item contribution at goal (never below 0 via min(donated, goal)
+        -- when donated is negative: min(-10, 40) = -10 would lower overall — match ComputeGoalProgress).
+        local afterNegOverall = overallDef437.getProgress().overallPercent
+        local pureNeg = GS.ComputeGoalProgress(
+            GS:GetCampaignRequestedItems(campArch.id),
+            GS:ProjectCampaignProgress(campArch.id).itemTotals
+        )
+        assertEq(afterNegOverall, pureNeg.overallPercent,
+            "437: overall still matches ComputeGoalProgress after signed adjustment")
+
+        -- Current campaign selection uses its own goals/totals (empty → no goals).
+        campDrop437.set(campCur.id)
+        if type(campDrop437.onValueChanged) == "function" then
+            campDrop437.onValueChanged({ pageBuilder = panel437.__sfPageBuilder })
+        end
+        logsPage:Refresh(panel437)
+        assertEq(#goalsDef.getItems(), 0, "437: current empty campaign has no goal rows")
+        assertTrue(not overallDef437.getProgress().hasPositiveGoal,
+            "437: current empty overall stays empty")
+
+        -- Seed current with one goal; refresh keeps icons/names/counts correct.
+        local curOp = select(1, GS:NewConfigOperation("set-requested-item", {
+            itemId = 801,
+        }, { itemId = 801, goal = 20, removed = false }))
+        assertEq(GS:ApplyStagedConfigOperation(curOp), "accepted", "437: current goal")
+        itemNames[801] = "Current Item"
+        itemIcons[801] = 3801
+        if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
+            SF.ItemDisplay.ResetSession()
+        end
+        logsPage:Refresh(panel437)
+        local curRows = goalsDef.getItems()
+        assertEq(#curRows, 1, "437: current campaign shows its goal row")
+        assertTrue((curRows[1].text or ""):find("0% |T3801:16|t Current Item — 0 / 20", 1, true) ~= nil,
+            "437: current 0% after refresh: " .. tostring(curRows[1].text))
+
+        -- Shared projection: goals percent does not add a second ledger walk.
+        local projectCalls437 = 0
+        local realProject437 = GS.ProjectCampaignProgress
+        function GS:ProjectCampaignProgress(...)
+            projectCalls437 = projectCalls437 + 1
+            return realProject437(self, ...)
+        end
+        logsPage:Refresh(panel437)
+        assertEq(projectCalls437, 1, "437: goals percent reuses the single pass projection")
+        GS.ProjectCampaignProgress = realProject437
+
+        -- Member-readable; read-only list still shows percents.
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        settleRoster()
+        campDrop437.set(campArch.id)
+        logsPage:Refresh(panel437)
+        local memberRows = rowsById(goalsDef.getItems())
+        assertTrue((memberRows[704].text or ""):find("220%", 1, true) ~= nil,
+            "437: member-read still sees over-100% rows")
+        assertEq(#world.chat, 0, "437: percent rows emit no Chat")
+
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        settleRoster()
+        if savedGetItemInfo then C_Item.GetItemInfo = savedGetItemInfo end
+        if savedGetItemIcon then C_Item.GetItemIconByID = savedGetItemIcon end
+    end
+
+    -- #428: Configuration rename-target selector + archived rename.
+    local function findConfigItem(panel, itemType, labelNeedle)
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == itemType and item.label
+                    and tostring(item.label):find(labelNeedle, 1, true) then
+                    return item
+                end
+            end
+        end
+        return nil
+    end
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    settleRoster()
+    GS:CreateStagedRecord()
+    local archivedCamp = startCampaign()
+    local archivedId = archivedCamp.id
+    local currentCamp = startCampaign()
+    local currentId = currentCamp.id
+    assertTrue(archivedId ~= currentId, "428-ui: fixture has archived + current")
+
+    configPanel = makeRegion("Frame", "GSConfigRenamePanel", nil)
+    configPanel:SetSize(600, 800)
+    configPage:Build(configPanel)
+    configPage:Refresh(configPanel)
+
+    local renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    local renameSubmitDef = findConfigItem(configPanel, "editboxButton", "Campaign name")
+    local reminderDef = findConfigItem(configPanel, "checkbox", "raid supply reminders")
+    assertTrue(renameTargetDef ~= nil, "428-ui: Configuration rename-target dropdown present")
+    assertTrue(renameSubmitDef ~= nil, "428-ui: Configuration rename editbox present")
+    assertTrue(reminderDef ~= nil, "428-ui: Configuration reminder checkbox present")
+    assertTrue(type(renameSubmitDef.onSubmit) == "function", "428-ui: rename onSubmit present")
+
+    -- Default target is the current campaign; options are keyed by immutable id.
+    assertEq(renameTargetDef.get(), currentId, "428-ui: rename target defaults to current")
+    local renameOpts = renameTargetDef.options and renameTargetDef.options() or {}
+    local sawArchived, sawCurrent, idKeyed = false, false, true
+    for i = 1, #renameOpts do
+        local opt = renameOpts[i]
+        if type(opt.value) ~= "string" or opt.value == "" then
+            idKeyed = false
+        end
+        if opt.value == archivedId then
+            sawArchived = true
+            assertTrue(tostring(opt.label):find("Archived", 1, true),
+                "428-ui: archived option labeled Archived")
+        end
+        if opt.value == currentId then
+            sawCurrent = true
+            assertTrue(tostring(opt.label):find("Current", 1, true),
+                "428-ui: current option labeled Current")
+        end
+    end
+    assertTrue(idKeyed and sawArchived and sawCurrent,
+        "428-ui: rename options include current/archived keyed by campaignId")
+
+    -- Selecting archived is rename-only: current campaign identity stays put.
+    local beforeCurrent = GS:GetCurrentRecord().currentCampaignId
+    renameTargetDef.onValueChanged({
+        section = { SetMessage = function() end, ClearMessage = function() end },
+    }, archivedId)
+    assertEq(GS:GetCurrentRecord().currentCampaignId, beforeCurrent,
+        "428-ui: selecting archived rename target does not activate it")
+    assertEq(renameTargetDef.get(), archivedId, "428-ui: rename target is archived id")
+    assertEq(renameSubmitDef.getSelectionKey(), archivedId,
+        "428-ui: rename editbox selection key tracks target")
+    assertEq(renameSubmitDef.get(), "", "428-ui: archived custom name starts blank")
+
+    local renameMessages = {}
+    local renameOk, renameErr = pcall(function()
+        renameSubmitDef.onSubmit({
+            section = {
+                SetMessage = function(_, msg, sev)
+                    renameMessages[#renameMessages + 1] = { msg = msg, sev = sev }
+                end,
+                ClearMessage = function() end,
+            },
+            pageBuilder = configPanel.__sfPageBuilder,
+        }, "ConfigArchiveName")
+    end)
+    assertTrue(renameOk, "428-ui: Configuration rename submit no Lua error: " .. tostring(renameErr))
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), archivedId), "ConfigArchiveName",
+        "428-ui: archived rename applied via Configuration")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, currentId,
+        "428-ui: archived rename leaves current campaign unchanged")
+    assertEq(renameTargetDef.get(), archivedId,
+        "428-ui: rename target retained on archived id after submit")
+
+    -- Clear name on archived target restores ID fallback without switching current.
+    renameSubmitDef.onSubmit({
+        section = {
+            SetMessage = function() end,
+            ClearMessage = function() end,
+        },
+        pageBuilder = configPanel.__sfPageBuilder,
+    }, "   ")
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), archivedId), archivedId,
+        "428-ui: clearing archived name restores ID fallback")
+    assertEq(GS:GetCurrentRecord().currentCampaignId, currentId,
+        "428-ui: clear leaves current campaign unchanged")
+
+    -- Ordinary member cannot commit renames; personal reminder remains available.
+    local priorMembers = world.guild.members
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 5 },
+    }
+    settleRoster()
+    flushTimers()
+    configPage:Refresh(configPanel)
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    renameSubmitDef = findConfigItem(configPanel, "editboxButton", "Campaign name")
+    reminderDef = findConfigItem(configPanel, "checkbox", "raid supply reminders")
+    assertEq(renameTargetDef.enabled and renameTargetDef.enabled(), false,
+        "428-ui: ordinary member rename target disabled")
+    assertEq(renameSubmitDef.enabled and renameSubmitDef.enabled(), false,
+        "428-ui: ordinary member rename submit disabled")
+    assertTrue(reminderDef ~= nil, "428-ui: ordinary member still sees reminder checkbox")
+    assertTrue(reminderDef.adminOnly ~= true,
+        "428-ui: reminder is not adminOnly")
+    local deniedMessages = {}
+    renameSubmitDef.onSubmit({
+        section = {
+            SetMessage = function(_, msg, sev)
+                deniedMessages[#deniedMessages + 1] = { msg = msg, sev = sev }
+            end,
+            ClearMessage = function() end,
+        },
+    }, "ShouldNotApply")
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), archivedId), archivedId,
+        "428-ui: unauthorized rename does not change name")
+    world.guild.members = priorMembers
+    settleRoster()
+    flushTimers()
+    configPage:Refresh(configPanel)
+
+    -- Stale target: disappear from inspectable list → reselect current safely.
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    renameTargetDef.onValueChanged({
+        section = { SetMessage = function() end, ClearMessage = function() end },
+    }, archivedId)
+    assertEq(renameTargetDef.get(), archivedId, "428-ui: target set to archived before stale")
+    -- Remove archived header so ResolveRenameTarget must fall back.
+    local recStale = GS:GetCurrentRecord()
+    recStale.campaigns[archivedId] = nil
+    recStale.campaignArchives[archivedId] = nil
+    configPage:Refresh(configPanel)
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    assertEq(renameTargetDef.get(), currentId,
+        "428-ui: stale archived target falls back to current")
+
+    -- Unrelated refresh preserves a valid target (and draft via selection key).
+    renameTargetDef.onValueChanged({
+        section = { SetMessage = function() end, ClearMessage = function() end },
+    }, currentId)
+    local preservedTarget = renameTargetDef.get()
+    configPage:Refresh(configPanel)
+    renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+    assertEq(renameTargetDef.get(), preservedTarget,
+        "428-ui: unrelated refresh preserves valid rename target")
+
+    -- #434 repair: implicit rename target follows current through campaign rollover;
+    -- explicit archived pin survives while inspectable (local + remote-shaped).
+    do
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local rollFirst = startCampaign()
+        local rollFirstId = rollFirst.id
+        configPanel = makeRegion("Frame", "GSConfigRenameRolloverPanel", nil)
+        configPanel:SetSize(600, 800)
+        configPanel.shown = true
+        configPage:Build(configPanel)
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollFirstId,
+            "434-ui: implicit target starts on first current")
+
+        -- Local New Campaign while still following current → follow the new current.
+        local rollSecond = startCampaign()
+        local rollSecondId = rollSecond.id
+        assertTrue(rollSecondId ~= rollFirstId, "434-ui: rollover created a new current")
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollSecondId,
+            "434-ui: implicit target follows newly current after rollover")
+        assertTrue(GS:GetCurrentRecord().campaignArchives[rollFirstId] ~= nil
+                or GS:GetCurrentRecord().campaigns[rollFirstId] ~= nil,
+            "434-ui: prior campaign remains inspectable as archive")
+
+        -- Explicit archived pin survives a further rollover.
+        renameTargetDef.onValueChanged({
+            section = { SetMessage = function() end, ClearMessage = function() end },
+        }, rollFirstId)
+        assertEq(renameTargetDef.get(), rollFirstId, "434-ui: pinned archived target")
+        local rollThird = startCampaign()
+        local rollThirdId = rollThird.id
+        assertEq(GS:GetCurrentRecord().currentCampaignId, rollThirdId,
+            "434-ui: third campaign is current")
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), rollFirstId,
+            "434-ui: explicit archived pin survives rollover")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, rollThirdId,
+            "434-ui: pinned rename target does not activate archive")
+
+        -- Remote-shaped current change while following: select current (follow mode),
+        -- then start another campaign as a peer rollover would.
+        renameTargetDef.onValueChanged({
+            section = { SetMessage = function() end, ClearMessage = function() end },
+        }, rollThirdId)
+        assertEq(renameTargetDef.get(), rollThirdId, "434-ui: follow resumes on current")
+        local peerFourth = startCampaign()
+        local peerFourthId = peerFourth.id
+        configPage:Refresh(configPanel)
+        renameTargetDef = findConfigItem(configPanel, "dropdown", "Rename target")
+        assertEq(renameTargetDef.get(), peerFourthId,
+            "434-ui: follow mode tracks remote-shaped campaign change")
+        flushTimers()
+    end
+
+    -- #434 repair: Configuration registers GS.RegisterUIListener once and
+    -- coalesced QueueRefresh updates visible pages only.
+    do
+        local regCount = 0
+        local realReg = GS.RegisterUIListener
+        GS.RegisterUIListener = function(fn)
+            regCount = regCount + 1
+            return realReg(fn)
+        end
+        -- Reload so durableListenerRegistered / Page hook start clean.
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+        configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+        assertTrue(configPage ~= nil, "434-ui: configuration page reloaded for durable listen")
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local listenCamp = startCampaign()
+        local listenCampId = listenCamp.id
+
+        local refreshCount = 0
+        local realRefresh = configPage.Refresh
+        configPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+
+        local listenPanel = makeRegion("Frame", "GSConfigDurablePanel", nil)
+        listenPanel:SetSize(600, 800)
+        listenPanel.shown = true
+        configPage:Build(listenPanel)
+        local listenPanel2 = makeRegion("Frame", "GSConfigDurablePanel2", nil)
+        listenPanel2:SetSize(600, 800)
+        listenPanel2.shown = true
+        configPage:Build(listenPanel2)
+        for _ = 1, 5 do
+            configPage:Refresh(listenPanel)
+        end
+        assertEq(regCount, 1,
+            "434-ui: repeated Build/Refresh registers one GS durable listener")
+
+        -- Remote rename while visible: NotifyUI → QueueRefresh updates labels.
+        timers = {}
+        local beforeRefresh = refreshCount
+        local remoteRename = select(1, GS:NewRenameCampaignOperation(listenCampId, "RemoteName"))
+        assertEq(GS:ApplyStagedConfigOperation(remoteRename), "accepted",
+            "434-ui: remote-shaped rename accepted")
+        GS.NotifyUI("remote-op")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertTrue(refreshCount > beforeRefresh,
+            "434-ui: durable GS notify refreshes visible Configuration")
+        renameTargetDef = findConfigItem(listenPanel, "dropdown", "Rename target")
+        local optsAfter = renameTargetDef.options and renameTargetDef.options() or {}
+        local sawRemoteName = false
+        for i = 1, #optsAfter do
+            if tostring(optsAfter[i].label or ""):find("RemoteName", 1, true) then
+                sawRemoteName = true
+                break
+            end
+        end
+        assertTrue(sawRemoteName,
+            "434-ui: refreshed options show remote campaign name")
+        assertEq(renameTargetDef.get(), listenCampId,
+            "434-ui: durable refresh preserves valid rename target")
+
+        -- Hidden page: no Refresh work from durable notify.
+        listenPanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        timers = {}
+        beforeRefresh = refreshCount
+        GS.NotifyUI("remote-op-hidden")
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertEq(refreshCount, beforeRefresh,
+            "434-ui: hidden Configuration skips durable refresh work")
+
+        GS.RegisterUIListener = realReg
+        configPage.Refresh = realRefresh
+        flushTimers()
+    end
+
+    -- #434: Configuration rename EditBox DoSubmit aborts when current campaign
+    -- rolls over before the deferred QueueRefresh reloads the selection key.
+    do
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        GS:CreateStagedRecord()
+        local campA = startCampaign()
+        local campAId = campA.id
+        local renameA = select(1, GS:NewRenameCampaignOperation(campAId, "AlphaLive"))
+        assertEq(GS:ApplyStagedConfigOperation(renameA), "accepted",
+            "434-stale-cfg: seed Campaign A name")
+        flushTimers()
+
+        local stalePanel = makeRegion("Frame", "GSConfigStaleSubmitPanel", nil)
+        stalePanel:SetSize(600, 800)
+        stalePanel.shown = true
+        local createdBeforeCfg = #created
+        configPage:Build(stalePanel)
+        configPage:Refresh(stalePanel)
+        flushTimers()
+
+        local renameEdit, renameBtn
+        for i = createdBeforeCfg + 1, #created do
+            local obj = created[i]
+            if obj.GetObjectType and obj:GetObjectType() == "Button"
+                and obj.text == "Rename" then
+                renameBtn = obj
+                -- Controls create EditBox then Button in the same row.
+                for j = i - 1, createdBeforeCfg + 1, -1 do
+                    local prev = created[j]
+                    if prev.GetObjectType and prev:GetObjectType() == "EditBox" then
+                        renameEdit = prev
+                        break
+                    end
+                end
+                break
+            end
+        end
+        assertTrue(renameEdit ~= nil and renameBtn ~= nil,
+            "434-stale-cfg: Configuration rename editbox/button present")
+        assertEq(renameEdit:GetText(), "AlphaLive",
+            "434-stale-cfg: editbox loaded Campaign A name")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campAId,
+            "434-stale-cfg: A is current before rollover")
+
+        -- Rollover to B without running the deferred UI refresh.
+        timers = {}
+        local campB = startCampaign()
+        local campBId = campB.id
+        assertTrue(campBId ~= campAId, "434-stale-cfg: rollover created Campaign B")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campBId,
+            "434-stale-cfg: B is current")
+        -- Leave timers uncleared so QueueRefresh has not yet reloaded the editbox.
+        renameEdit:SetText("ShouldNotApplyToB")
+        local opsBefore = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsBefore = opsBefore + 1
+        end
+        renameBtn:Click()
+        local opsAfter = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsAfter = opsAfter + 1
+        end
+        assertEq(opsAfter, opsBefore,
+            "434-stale-cfg: stale DoSubmit allocates no rename operation")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campAId), "AlphaLive",
+            "434-stale-cfg: Campaign A name unchanged by stale submit")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campBId), campBId,
+            "434-stale-cfg: Campaign B name unchanged by stale submit")
+        assertEq(GS:GetCurrentRecord().currentCampaignId, campBId,
+            "434-stale-cfg: stale submit does not change current campaign")
+
+        -- After refresh, intentional rename of B succeeds.
+        flushTimers()
+        configPage:Refresh(stalePanel)
+        assertEq(renameEdit:GetText(), "",
+            "434-stale-cfg: refresh loads blank custom name for B")
+        renameEdit:SetText("BetaLive")
+        local opsBeforeOk = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsBeforeOk = opsBeforeOk + 1
+        end
+        renameBtn:Click()
+        flushTimers()
+        local opsAfterOk = 0
+        for _ in pairs(GS:GetCurrentRecord().operations.records or {}) do
+            opsAfterOk = opsAfterOk + 1
+        end
+        assertTrue(opsAfterOk > opsBeforeOk,
+            "434-stale-cfg: intentional B rename allocates an operation")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campBId), "BetaLive",
+            "434-stale-cfg: intentional Campaign B rename applied")
+        assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campAId), "AlphaLive",
+            "434-stale-cfg: intentional B rename leaves A untouched")
+        stalePanel.shown = false
+        if configPage.panel then
+            configPage.panel.shown = false
+        end
+        flushTimers()
+    end
+
+    -- #424/#428: getter-only editbox keeps unfinished draft across unrelated Refresh.
+    local draftSection = {
+        __sfPageBuilder = {
+            _refresh = {},
+            RegisterRefresh = function(self, fn)
+                self._refresh[#self._refresh + 1] = fn
+            end,
+            FireRefresh = function(self)
+                for i = 1, #self._refresh do
+                    self._refresh[i]()
+                end
+            end,
+        },
+        AddRow = function(self, _, builder)
+            local row = makeRegion("Frame", "DraftRow", nil)
+            row:SetSize(400, 26)
+            builder(row)
+            return row
+        end,
+    }
+    local selection = { key = "camp-a", name = "Alpha" }
+    local createdBeforeDraft = #created
+    SF.SettingsUI.Controls:AddEditBoxWithButton(draftSection, {
+        label = "Draft rename",
+        buttonText = "Rename",
+        get = function()
+            return selection.name
+        end,
+        getSelectionKey = function()
+            return selection.key
+        end,
+        onSubmit = function() end,
+    })
+    local draftEdit
+    for i = createdBeforeDraft + 1, #created do
+        if created[i].GetObjectType and created[i]:GetObjectType() == "EditBox" then
+            draftEdit = created[i]
+            break
+        end
+    end
+    assertTrue(draftEdit ~= nil, "424-ui: draft editbox created")
+    draftEdit:SetFocus()
+    draftEdit:SetText("Unfinished")
+    draftSection.__sfPageBuilder:FireRefresh()
+    assertEq(draftEdit:GetText(), "Unfinished", "424-ui: focused draft survives unrelated refresh")
+    draftEdit:ClearFocus()
+    -- Still dirty relative to last loaded get() value.
+    draftSection.__sfPageBuilder:FireRefresh()
+    assertEq(draftEdit:GetText(), "Unfinished", "424-ui: dirty draft survives unfocused refresh")
+    selection.key = "camp-b"
+    selection.name = "Bravo"
+    draftSection.__sfPageBuilder:FireRefresh()
+    assertEq(draftEdit:GetText(), "Bravo", "424-ui: selection change reloads getter text")
+
+    -- #434: production AddEditBoxWithButton DoSubmit rejects stale selection text
+    -- when the backing key changes before deferred Refresh (campaign rollover).
+    do
+        local names = {
+            ["camp-a"] = "AlphaName",
+            ["camp-b"] = "BetaName",
+        }
+        local selectionLive = { key = "camp-a" }
+        local submitCalls = {}
+        local staleSection = {
+            __sfPageBuilder = {
+                _refresh = {},
+                RegisterRefresh = function(self, fn)
+                    self._refresh[#self._refresh + 1] = fn
+                end,
+                FireRefresh = function(self)
+                    for i = 1, #self._refresh do
+                        self._refresh[i]()
+                    end
+                end,
+            },
+            AddRow = function(self, _, builder)
+                local row = makeRegion("Frame", "StaleRenameRow", nil)
+                row:SetSize(400, 26)
+                builder(row)
+                return row
+            end,
+        }
+        local createdBeforeStale = #created
+        SF.SettingsUI.Controls:AddEditBoxWithButton(staleSection, {
+            label = "Stale rename",
+            buttonText = "Rename",
+            get = function()
+                return names[selectionLive.key] or ""
+            end,
+            getSelectionKey = function()
+                return selectionLive.key
+            end,
+            onSubmit = function(text)
+                submitCalls[#submitCalls + 1] = {
+                    text = text,
+                    key = selectionLive.key,
+                }
+                names[selectionLive.key] = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+            end,
+        })
+        local staleEdit, staleBtn
+        for i = createdBeforeStale + 1, #created do
+            local obj = created[i]
+            if obj.GetObjectType then
+                local kind = obj:GetObjectType()
+                if kind == "EditBox" and not staleEdit then
+                    staleEdit = obj
+                elseif kind == "Button" and obj.text == "Rename" and not staleBtn then
+                    staleBtn = obj
+                end
+            end
+        end
+        assertTrue(staleEdit ~= nil, "434-stale: editbox created")
+        assertTrue(staleBtn ~= nil, "434-stale: rename button created")
+        assertEq(staleEdit:GetText(), "AlphaName", "434-stale: loaded Campaign A name")
+
+        -- Rollover changes the resolved key before deferred Refresh runs.
+        selectionLive.key = "camp-b"
+        staleEdit:SetText("StaleAlphaDraft")
+        local beforeA = names["camp-a"]
+        local beforeB = names["camp-b"]
+        local beforeSubmitCount = #submitCalls
+        staleBtn:Click()
+        assertEq(#submitCalls, beforeSubmitCount,
+            "434-stale: DoSubmit aborts when selection key changed before refresh")
+        assertEq(names["camp-a"], beforeA, "434-stale: Campaign A name unchanged")
+        assertEq(names["camp-b"], beforeB, "434-stale: Campaign B name unchanged")
+        assertEq(staleEdit:GetText(), "BetaName",
+            "434-stale: aborted submit reloads Campaign B value")
+
+        -- After refresh, intentional rename of B succeeds through the same widget.
+        staleSection.__sfPageBuilder:FireRefresh()
+        assertEq(staleEdit:GetText(), "BetaName", "434-stale: refresh keeps Campaign B value")
+        staleEdit:SetText("BetaRenamed")
+        staleBtn:Click()
+        assertEq(#submitCalls, beforeSubmitCount + 1,
+            "434-stale: intentional submit after refresh reaches onSubmit")
+        assertEq(submitCalls[#submitCalls].key, "camp-b",
+            "434-stale: intentional submit targets Campaign B")
+        assertEq(names["camp-b"], "BetaRenamed",
+            "434-stale: intentional Campaign B rename applied")
+        assertEq(names["camp-a"], beforeA,
+            "434-stale: intentional B rename leaves Campaign A untouched")
+
+        -- Pinned archived selection: key stays on A while "current" advances.
+        selectionLive.key = "camp-a"
+        staleSection.__sfPageBuilder:FireRefresh()
+        assertEq(staleEdit:GetText(), "AlphaName", "434-stale: pinned A reloads")
+        staleEdit:SetText("PinnedArchive")
+        staleBtn:Click()
+        assertEq(names["camp-a"], "PinnedArchive",
+            "434-stale: pinned archived rename still submits")
+        assertEq(names["camp-b"], "BetaRenamed",
+            "434-stale: pinned A rename leaves B untouched")
+    end
+
     -- Small-guild explicit threshold through CreateStagedRecord path used by UI.
     resetDb()
     initGS()
@@ -5761,6 +7023,11 @@ do
         "mapped no_campaign wording")
     assertTrue(GS.FormatReasonText("stale_handle"):find("out of date", 1, true),
         "mapped stale_handle wording")
+    local divergentMapped = GS.FormatReasonText("divergent_edit")
+    assertTrue(divergentMapped:find("Troubleshooting", 1, true),
+        "#422: mapped divergent_edit points to Troubleshooting got=" .. tostring(divergentMapped))
+    assertEq(divergentMapped:find("Configuration", 1, true), nil,
+        "#422: mapped divergent_edit must not point to Configuration")
 
     -- Production BankLog → adapter lifecycle (RequestLog / CancelTimers / ProcessLogUpdate).
     GS._BankContextReadinessProbe = nil
@@ -6134,10 +7401,13 @@ do
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
-    assertTrue(configPage ~= nil and logsPage ~= nil, "pages available for 2B18")
+    local troubleshootingPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
+    assertTrue(configPage ~= nil and logsPage ~= nil and troubleshootingPage ~= nil,
+        "pages available for 2B18")
 
     local function findEditBoxes(node, out)
         out = out or {}
@@ -6326,6 +7596,9 @@ do
             end
         end
     end
+    -- Drain durable GS NotifyUI → QueueRefresh work from earlier config ops so
+    -- refreshQueued is idle before this coalesce probe (#434 Configuration listener).
+    flushTimers()
     local priorAfter = C_Timer.After
     local deferredFns = {}
     C_Timer.After = function(_, fn)
@@ -7170,6 +8443,10 @@ do
     assertEq(view.warningShown, true, "status UX: mismatch warning visible")
     assertTrue(view.warning:find("Bob-Garona", 1, true) and view.warning:find("peer-ds-1", 1, true),
         "status UX: mismatch warning names peer got=" .. tostring(view.warning))
+    assertTrue(view.warning:find("Troubleshooting", 1, true),
+        "status UX: mismatch warning points to Troubleshooting got=" .. tostring(view.warning))
+    assertTrue(not view.warning:find("below", 1, true),
+        "status UX: mismatch warning must not say below got=" .. tostring(view.warning))
     assertTrue(not (view.nextStepShown and view.nextStep
         and view.nextStep:find("different staged dataset", 1, true)),
         "status UX: mismatch text is not duplicated into next step")
@@ -7409,30 +8686,38 @@ do
     world.guild.members = priorMembersTip
     settleRoster()
 
-    -- Adoption / conflict tips when no sources / no conflicts.
-    configPage:Refresh(tipPanel)
-    local adoptSource = findDefItem(tipPanel, function(item)
+    -- Adoption / conflict tips when no sources / no conflicts (#422: Troubleshooting).
+    assertTrue(troubleshootingPage ~= nil, "disabled tip: Troubleshooting page available")
+    local tsTipPanel = makeRegion("Frame", "GSDisabledTipTroubleshooting", nil)
+    tsTipPanel:SetSize(600, 900)
+    troubleshootingPage:Build(tsTipPanel)
+    -- Configuration must not still expose these controls.
+    assertNil(findDefItem(tipPanel, function(item)
+        return item.type == "dropdown" and item.label
+            and tostring(item.label):find("Source dataset", 1, true)
+    end), "disabled tip: Configuration no longer has Source dataset")
+    local adoptSource = findDefItem(tsTipPanel, function(item)
         return item.type == "dropdown" and item.label
             and tostring(item.label):find("Source dataset", 1, true)
     end)
     local adoptTip = adoptSource.getDisabledTooltip()
     assertTrue(type(adoptTip) == "string" and adoptTip:find("No eligible peer", 1, true),
         "disabled tip: adoption source empty got=" .. tostring(adoptTip))
-    local adoptBegin = findDefItem(tipPanel, function(item)
+    local adoptBegin = findDefItem(tsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Start adoption", 1, true)
     end)
     assertTrue(adoptBegin.getDisabledTooltip():find("No eligible peer", 1, true)
             or adoptBegin.getDisabledTooltip():find("Select a source", 1, true),
         "disabled tip: start adoption blocked without source")
-    local adoptCancel = findDefItem(tipPanel, function(item)
+    local adoptCancel = findDefItem(tsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Cancel adoption", 1, true)
     end)
     assertEq(adoptCancel.getDisabledTooltip(),
         "There is no adoption in progress.",
         "disabled tip: cancel adoption when idle")
-    local conflictOpen = findDefItem(tipPanel, function(item)
+    local conflictOpen = findDefItem(tsTipPanel, function(item)
         return item.type == "dropdown" and item.label
             and tostring(item.label):find("Open conflict", 1, true)
     end)
@@ -7440,7 +8725,7 @@ do
             or conflictOpen.getDisabledTooltip():find("no unresolved configuration", 1, true)
             or conflictOpen.getDisabledTooltip():find("There are no unresolved", 1, true),
         "disabled tip: open conflict none got=" .. tostring(conflictOpen.getDisabledTooltip()))
-    local conflictChoose = findDefItem(tipPanel, function(item)
+    local conflictChoose = findDefItem(tsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Use this value", 1, true)
     end)
@@ -7686,6 +8971,184 @@ do
         end
     end
 
+    -- #422: Troubleshooting hosts adoption/conflicts; tab/hide must not cancel
+    -- adoption or accumulate listeners/refreshes.
+    local function checkIssue422TroubleshootingLifecycle()
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+        local tsPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
+        assertTrue(tsPage ~= nil, "#422: Troubleshooting page registered")
+
+        resetDb()
+        initGS()
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        world.guild.clubId = 42
+        settleRoster()
+        assertEq(select(2, GS:CreateStagedRecord()), "accepted", "#422: init")
+        startCampaign()
+
+        local tsPanel = makeRegion("Frame", "GS422TsPanel", nil)
+        tsPanel:SetSize(600, 800)
+        tsPanel.shown = true
+        tsPanel.visible = true
+        tsPage:Build(tsPanel)
+        local tsDef = tsPanel.__sfPageDef
+        assertTrue(type(tsDef) == "table", "#422: Troubleshooting definition present")
+        local hasAdoption, hasConflicts = false, false
+        for _, sec in ipairs(tsDef.sections or {}) do
+            if sec.id == "gsAdoption" then hasAdoption = true end
+            if sec.id == "gsConflicts" then hasConflicts = true end
+        end
+        assertEq(hasAdoption, true, "#422: gsAdoption on Troubleshooting")
+        assertEq(hasConflicts, true, "#422: gsConflicts on Troubleshooting")
+
+        -- Config still shows mismatch warnings pointing at Troubleshooting.
+        local cfgPanel = makeRegion("Frame", "GS422CfgPanel", nil)
+        cfgPanel:SetSize(600, 800)
+        cfgPanel.shown = true
+        cfgPanel.visible = true
+        configPage:Build(cfgPanel)
+        local cfgDef = cfgPanel.__sfPageDef
+        for _, sec in ipairs(cfgDef.sections or {}) do
+            assertTrue(sec.id ~= "gsAdoption" and sec.id ~= "gsConflicts",
+                "#422: Configuration must not retain " .. tostring(sec.id))
+        end
+        local priorMismatch = GS.GetDatasetMismatchState
+        GS.GetDatasetMismatchState = function()
+            return {
+                blocked = true,
+                peers = { { peerName = "Bob-Garona", datasetId = "peer-ds-422" } },
+            }
+        end
+        configPage:Refresh(cfgPanel)
+        local warningText
+        for _, sec in ipairs((cfgPanel.__sfPageDef and cfgPanel.__sfPageDef.sections) or {}) do
+            if sec.id == "gsStatus" then
+                for _, item in ipairs(sec.items or {}) do
+                    if item.type == "help" and type(item.getText) == "function"
+                        and type(item.visible) == "function" and item.visible() then
+                        local t = item.getText()
+                        if type(t) == "string" and t:find("peer-ds-422", 1, true) then
+                            warningText = t
+                        end
+                    end
+                end
+            end
+        end
+        assertTrue(type(warningText) == "string" and warningText:find("Troubleshooting", 1, true),
+            "#422: config warning directs to Troubleshooting got=" .. tostring(warningText))
+        assertTrue(not warningText:find("below", 1, true),
+            "#422: config warning must not say below")
+        GS.GetDatasetMismatchState = priorMismatch
+
+        -- Begin adoption, hide Troubleshooting (tab switch), confirm not cancelled.
+        local peerDs = "adopt-ds-422"
+        assertEq(select(2, GS:BeginDatasetAdoption("Bob-Garona", peerDs)), "accepted",
+            "#422: begin adoption")
+        assertTrue(GS:GetPendingAdoption() ~= nil, "#422: adoption pending before hide")
+        tsPanel.shown = false
+        tsPanel.visible = false
+        if tsPage.panel then
+            tsPage.panel.shown = false
+            tsPage.panel.visible = false
+        end
+        if tsPage.OnHide then tsPage:OnHide() end
+        assertTrue(GS:GetPendingAdoption() ~= nil,
+            "#422: hiding Troubleshooting does not cancel adoption")
+        assertEq(GS:GetPendingAdoption().sourceDatasetId, peerDs,
+            "#422: pending adoption source preserved across hide")
+
+        -- Ready notify while hidden must not refresh; visible re-entry refreshes.
+        local refreshCount = 0
+        local realRefresh = tsPage.Refresh
+        tsPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+        timers = {}
+        local before = refreshCount
+        if GS.OnAdoptionStateChanged then
+            GS.OnAdoptionStateChanged("ready")
+        end
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertEq(refreshCount, before,
+            "#422: hidden Troubleshooting ignores adoption state notify")
+
+        tsPanel.shown = true
+        tsPanel.visible = true
+        if tsPage.panel then
+            tsPage.panel.shown = true
+            tsPage.panel.visible = true
+        end
+        timers = {}
+        before = refreshCount
+        if GS.OnAdoptionStateChanged then
+            GS.OnAdoptionStateChanged("ready")
+        end
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        assertTrue(refreshCount > before,
+            "#422: visible Troubleshooting refreshes on adoption state notify")
+
+        -- Repeated Build must not stack officer listeners beyond one per page module.
+        local GO = SF.GuildOfficer
+        if GO and GO.ClearUIListeners then
+            GO.ClearUIListeners()
+        end
+        local regCount = 0
+        local realReg = GO and GO.RegisterUIListener
+        if GO and realReg then
+            GO.RegisterUIListener = function(fn)
+                regCount = regCount + 1
+                return realReg(fn)
+            end
+            loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+            tsPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
+            local p1 = makeRegion("Frame", "GS422Listen1", nil)
+            p1:SetSize(400, 600)
+            p1.shown = true
+            tsPage:Build(p1)
+            local p2 = makeRegion("Frame", "GS422Listen2", nil)
+            p2:SetSize(400, 600)
+            p2.shown = true
+            tsPage:Build(p2)
+            for _ = 1, 5 do
+                tsPage:Refresh(p1)
+            end
+            assertEq(regCount, 1,
+                "#422: repeated Troubleshooting Build/Refresh registers one officer listener")
+            GO.RegisterUIListener = realReg
+            if GO.ClearUIListeners then
+                GO.ClearUIListeners()
+            end
+        end
+
+        -- Idle: no spontaneous refresh while visible with no state change.
+        tsPage.Refresh = realRefresh
+        refreshCount = 0
+        tsPage.Refresh = function(self, panel)
+            refreshCount = refreshCount + 1
+            return realRefresh(self, panel)
+        end
+        tsPanel.shown = true
+        tsPanel.visible = true
+        if tsPage.panel then
+            tsPage.panel.shown = true
+            tsPage.panel.visible = true
+        end
+        timers = {}
+        world.time = (world.time or 0) + 5
+        flushTimers()
+        assertEq(refreshCount, 0,
+            "#422: idle visible Troubleshooting does not self-refresh")
+        tsPage.Refresh = realRefresh
+
+        GS:CancelDatasetAdoption()
+        assertEq(GS:GetPendingAdoption(), nil, "#422: cancel clears adoption")
+        assertEq(#world.chat, 0, "#422: no chat from Troubleshooting lifecycle")
+    end
+    checkIssue422TroubleshootingLifecycle()
+
     -- #414: item icons/names, late cache fill, compact history, no pending-evidence UI.
     -- Nested so this scenario's locals stay inside their own function. Lua 5.1
     -- allows 200 locals per function, and this settings harness is already near that.
@@ -7849,7 +9312,9 @@ do
         assertEq(#goalLists, 1, "414: goals list present")
         assertEq(#historyLists, 1, "414: history list present")
         assertEq(#configLists, 1, "414: campaign item list present")
-        assertTrue(goalLists[1].showItemIcons == true, "414: goals icons are opt-in on that list")
+        -- #437: goals place the percent left of an inline icon (no leading icon column).
+        assertTrue(goalLists[1].showItemIcons ~= true, "414/437: goals use inline icons, not a leading column")
+        assertTrue(goalLists[1].singleLine == true, "414/437: goals stay on one line with inline icons")
         assertTrue(historyLists[1].showItemIcons ~= true, "414: history does not use a leading icon column")
         assertTrue(historyLists[1].showDetailTooltip == true, "414: history details use an opt-in tooltip")
         assertTrue(historyLists[1].singleLine == true, "414: history stays on one line")
@@ -7920,8 +9385,13 @@ do
         assertTrue((goalById[13467].text or ""):find("/ —", 1, true) ~= nil
             or (goalById[13467].text or ""):find("/ %—", 1, true) ~= nil,
             "414: unset goal keeps the em dash: " .. tostring(goalById[13467].text))
+        assertTrue((goalById[13467].text or ""):match("^— ") ~= nil,
+            "414/437: goal-0 row starts with an em-dash percent: " .. tostring(goalById[13467].text))
         assertTrue((goalById[13468].text or ""):find("2 / 10", 1, true) ~= nil,
             "414: positive goal keeps current/goal: " .. tostring(goalById[13468].text))
+        assertTrue((goalById[13468].text or ""):match("^20%% ") ~= nil,
+            "414/437: 2 of 10 floors to 20%: " .. tostring(goalById[13468].text))
+        assertTrue(goalById[13468].icon == nil, "414/437: goals no longer expose a leading icon field")
 
         local hist = historyLists[1].getItems()
         assertTrue(#hist >= 3, "414: history rows preserved")
@@ -7957,11 +9427,13 @@ do
         for i = 1, #goalRows do
             goalById[goalRows[i].itemId] = goalRows[i]
         end
-        assertTrue((goalById[13467].text or ""):find("Dreamleaf — 40 / —", 1, true) ~= nil,
-            "414: goals show icon name and unset goal: " .. tostring(goalById[13467].text))
-        assertTrue((goalById[13468].text or ""):find("Starlight Rose — 2 / 10", 1, true) ~= nil,
-            "414: goals keep donated progress: " .. tostring(goalById[13468].text))
-        assertEq(goalById[13468].icon, 200068, "414: goals row keeps its icon")
+        assertTrue((goalById[13467].text or ""):find("— |T200067:16|t Dreamleaf — 40 / —", 1, true) ~= nil,
+            "414/437: goals show percent dash, inline icon, name, unset goal: "
+                .. tostring(goalById[13467].text))
+        assertTrue((goalById[13468].text or ""):find("20% |T200068:16|t Starlight Rose — 2 / 10", 1, true) ~= nil,
+            "414/437: goals keep percent, inline icon, name, donated/goal: "
+                .. tostring(goalById[13468].text))
+        assertTrue(goalById[13468].icon == nil, "414/437: resolved goals keep icons inline only")
 
         hist = historyLists[1].getItems()
         local donationText, donationTip, adjustText, adjustTip
@@ -18093,23 +19565,21 @@ do
 end
 
 do
-    -- 3B2) Linked alts count as one witness; relayed witness map adds no vote
+    -- 3B2) Guild Info main+alt count as one witness (#427)
     local record = seedStagedCampaignWithItem(2002, 40)
     ensureNonOfficerRoster()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     local evidence = makeDepositEvidence(record, { itemId = 2002, quantity = 3 })
 
-    local linkOp = GS:NewLinkCharactersOperation("Player-1-Dave", "Player-1-Eve")
-    assertTrue(linkOp ~= nil, "3B2: link prepared")
-    assertEq(GS:ApplyStagedConfigOperation(linkOp), "accepted", "3B2: link accepted")
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "3B2: assign eve under dave")
     assertTrue(GS.AreSameWitnessIdentity(record, "Player-1-Dave", "Player-1-Eve"),
-        "3B2: linked same identity")
+        "3B2: guild-info same identity")
 
     assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
         "pending", "3B2: dave witness")
-    -- Eve is linked to Dave → no extra vote
+    -- Eve is Dave's alt → no extra vote
     local stEve, rEve = GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")
-    assertEq(stEve, "duplicate", "3B2: linked alt duplicate witness: " .. tostring(rEve))
+    assertEq(stEve, "duplicate", "3B2: alt duplicate witness: " .. tostring(rEve))
     assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
         "pending", "3B2: still need third independent")
     local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
@@ -18120,12 +19590,10 @@ do
     progress = GS:ProjectCampaignProgress(record.currentCampaignId)
     assertEq(tonumber(progress.itemTotals[2002]) or 0, 3, "3B2: credited once")
 
-    -- Unlink must not reattribute past credit
-    setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Eve")
-    assertEq(GS:ApplyStagedConfigOperation(unlinkOp), "accepted", "3B2: unlink")
+    -- Unassign must not reattribute past credit
+    assertEq(unassignAltGuid("Player-1-Eve", "Player-1-Dave"), "accepted", "3B2: unassign eve")
     progress = GS:ProjectCampaignProgress(record.currentCampaignId)
-    assertEq(tonumber(progress.itemTotals[2002]) or 0, 3, "3B2: unlink does not duplicate credit")
+    assertEq(tonumber(progress.itemTotals[2002]) or 0, 3, "3B2: unassign does not duplicate credit")
 end
 
 do
@@ -19863,7 +21331,7 @@ do
         itemId = 9033, quantity = 7, donor = "CompactB-Garona", occurrenceIndex = 2,
         neighborsOlder = { "n1" }, neighborsNewer = {},
     })
-    -- Store Dave+Eve witnesses first (unlinked), then link so both GUIDs remain
+    -- Store Dave+Eve witnesses first (unassigned), then assign so both GUIDs remain
     -- recorded while independent count collapses, then add Frank.
     ensureNonOfficerRoster()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -19874,18 +21342,16 @@ do
         GS:_AdmitObservationForTests(ev1, pair[1], pair[2])
         GS:_AdmitObservationForTests(ev2, pair[1], pair[2])
     end
-    local linkOp = GS:NewLinkCharactersOperation("Player-1-Dave", "Player-1-Eve")
-    assertTrue(linkOp ~= nil, "3B29: link prepared")
-    assertEq(GS:ApplyStagedConfigOperation(linkOp), "accepted", "3B29: link accepted")
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "3B29: assign eve under dave")
     GS:_AdmitObservationForTests(ev1, "Player-1-Frank", "Frank-Garona")
     GS:_AdmitObservationForTests(ev2, "Player-1-Frank", "Frank-Garona")
     assertEq(tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9033]) or 0,
-        0, "3B29: linked alts hold both clusters pending")
-    -- Unlink restores three independents; reevaluate must verify both without skip.
-    setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    local unlinkOp = GS:NewUnlinkCharacterOperation("Player-1-Eve")
-    assertTrue(unlinkOp ~= nil, "3B29: unlink prepared")
-    assertEq(GS:ApplyStagedConfigOperation(unlinkOp), "accepted", "3B29: unlink accepted")
+        0, "3B29: main+alt hold both clusters pending")
+    -- Unassign restores three independents; reevaluate must verify both without skip.
+    assertEq(unassignAltGuid("Player-1-Eve", "Player-1-Dave"), "accepted", "3B29: unassign eve")
+    if GS.ReevaluatePendingEvidence then
+        GS.ReevaluatePendingEvidence(rec)
+    end
     local total = tonumber(GS:ProjectCampaignProgress(rec.currentCampaignId).itemTotals[9033]) or 0
     assertEq(total, 12,
         "3B29: both clusters verified after compaction-safe reevaluate got=" .. tostring(total))
@@ -21185,9 +22651,13 @@ do
     assertTrue(GS.MAX_ADOPTION_PENDING_RECORDS
         >= (GS.MAX_ACCEPTED_OPERATIONS or 4096)
             + (GS.MAX_LEDGER_EVENTS or 4096)
+            + (GS.MAX_ARCHIVED_EVENTS or 4096)
+            + (GS.MAX_LEDGER_EVENTS or 4096)
             + (GS.MAX_ARCHIVED_EVENTS or 4096),
-        "3B43: adoption buffer covers ops+live+archive ledger got="
+        "3B43: adoption buffer covers ops+ledger+valuations got="
             .. tostring(GS.MAX_ADOPTION_PENDING_RECORDS))
+    assertTrue(GS.MAX_ADOPTION_AGGREGATE_ADMISSIONS >= GS.MAX_ADOPTION_PENDING_RECORDS,
+        "3B43: aggregate admissions include the valuation buffer")
     -- Near-boundary transfer with lowered caps: many ops + ledger bodies buffer
     -- and adopt under paced slices (no unbounded per-callback work).
     local priorOps = GS.MAX_ACCEPTED_OPERATIONS
@@ -24515,6 +25985,11 @@ do
             label .. ": Raid Supplies Configuration remains registered")
         assertTrue(SF.SettingsUI.pagesById.guildSuppliesLogs ~= nil,
             label .. ": Raid Supplies Logs remains registered")
+        if not SF.SettingsUI.pagesById.guildSuppliesTroubleshooting then
+            loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+        end
+        assertTrue(SF.SettingsUI.pagesById.guildSuppliesTroubleshooting ~= nil,
+            label .. ": Raid Supplies Troubleshooting remains registered")
     end
     assertLegacyPagesAbsent("3C24: before profile switch")
     -- Create staged guild B while A remains live.
@@ -26869,54 +28344,31 @@ do
 end
 
 do
-    -- C2/C3) Adjustment format locale + unlink disabled action string.
+    -- C2/C3) Adjustment format locale + unlink disabled action string (#426 UI).
     resetDb()
     initGS()
     setPlayer("Bob-Garona", "Player-1-Bob", 5) -- unauthorized
     world.guild.clubId = 42
     settleRoster()
-    -- Locale keys must ship accurate copy (not link-paste / linking).
-    local L = (SF.Locale and SF.Locale.GetDictionary and SF.Locale:GetDictionary())
-        or (_G.SpectrumFederationLocale)
-    if type(L) ~= "table" then
-        -- Fall back to raw enUS table loaded with the addon.
-        L = ns and ns.L
-    end
-    -- Production Loc path uses SF.LocaleText / enUS keys.
-    local adjKey = "GUILD_SUPPLIES_ERR_ADJUST_FORMAT"
-    local unlinkKey = "GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"
-    local adjMsg = SF.LocaleText and SF.LocaleText(adjKey)
-        or (SF.L and SF.L[adjKey])
-    local unlinkMsg = SF.LocaleText and SF.LocaleText(unlinkKey)
-        or (SF.L and SF.L[unlinkKey])
-    -- Read directly from locale module table when helpers differ in harness.
-    if (not adjMsg or adjMsg == adjKey) and type(_G) == "table" then
-        -- Loaded via locales in test harness as part of addon.
-        local en = nil
-        if SF.GetLocaleTable then en = SF.GetLocaleTable() end
-        if type(en) == "table" then
-            adjMsg = en[adjKey] or adjMsg
-            unlinkMsg = en[unlinkKey] or unlinkMsg
-        end
-    end
-    -- Source-backed assertion: enUS.lua must define both keys accurately.
+    -- Source-backed assertion: enUS.lua must define keys accurately.
     local enUS = io.open("SpectrumFederation/locale/enUS.lua", "r")
     assertTrue(enUS ~= nil, "C2/C3: enUS.lua readable")
     local enBody = enUS:read("*a")
     enUS:close()
     assertTrue(enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT', 1, true),
         "C2: adjust format locale key present")
-    assertTrue(enBody:find("item ID, a signed quantity", 1, true),
-        "C2: adjust format message states expected syntax")
-    assertTrue(not (enBody:find('GUILD_SUPPLIES_ERR_ADJUST_FORMAT.-item link')),
-        "C2: adjust format must not suggest item links")
-    assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK', 1, true),
-        "C3: unlink action locale key present")
-    assertTrue(enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK"].-=.-"unlinking characters"', 1, true)
-            or enBody:find('DISABLED_ACTION_UNLINK"] = "unlinking characters"', 1, true),
-        "C3: unlink locale says unlinking characters")
+    assertTrue(enBody:find("whole-number quantity such as 10 or -10", 1, true),
+        "C2: adjust format message states signed whole-number syntax")
+    assertTrue(enBody:find("leading plus", 1, true),
+        "C2: adjust format rejects leading plus")
+    assertTrue(enBody:find('GUILD_SUPPLIES_ADJUST_UNASSIGNED', 1, true),
+        "C2: Unassigned attribution locale present")
+    assertTrue(not enBody:find('GUILD_SUPPLIES_LINKS_TITLE', 1, true),
+        "C3: obsolete witness-links locale removed")
+    assertTrue(not enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK', 1, true),
+        "C3: obsolete unlink action locale removed")
 
-    -- UI definition uses the unlink-specific key.
+    -- UI definition uses separated adjustment controls; witness links section gone (#427).
     local confSrc = io.open(
         "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r")
     assertTrue(confSrc ~= nil, "C2/C3: configuration page readable")
@@ -26924,8 +28376,20 @@ do
     confSrc:close()
     assertTrue(confBody:find("GUILD_SUPPLIES_ERR_ADJUST_FORMAT", 1, true),
         "C2: adjustment onSubmit uses adjust-format locale")
-    assertTrue(confBody:find("GUILD_SUPPLIES_DISABLED_ACTION_UNLINK", 1, true),
-        "C3: unlink disabled tip uses unlink action key")
+    assertTrue(confBody:find("ParseAdjustmentQuantity", 1, true),
+        "C2: adjustment UI uses strict quantity parser")
+    assertTrue(confBody:find("FormatAdjustmentConfirmation", 1, true),
+        "C2: adjustment UI uses confirmation helper")
+    assertTrue(confBody:find("GUILD_SUPPLIES_ADJUST_UNASSIGNED", 1, true),
+        "C2: adjustment UI defaults attribution to Unassigned")
+    assertTrue(confBody:find("adjustDraft", 1, true),
+        "C2: adjustment UI keeps a session draft")
+    assertTrue(not confBody:find("itemPart, qtyPart, attrPart", 1, true),
+        "C2: combined item/qty/attr text parser removed")
+    assertTrue(not confBody:find('id = "gsLinks"', 1, true),
+        "C3: gsLinks settings section removed")
+    assertTrue(not confBody:find("NewLinkCharactersOperation", 1, true),
+        "C3: link operation UI removed")
 end
 
 do
@@ -27105,6 +28569,9 @@ do
     if not (SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesConfiguration) then
         loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     end
+    if not (SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesTroubleshooting) then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
+    end
     local Nav = SF.SettingsNavigationModel
     local ui = SF.SettingsUI
     assertTrue(Nav and ui and ui.pagesById, "B-ui: settings registry present")
@@ -27117,10 +28584,14 @@ do
         "B-ui: Raid Supplies Configuration remains registered while staged")
     assertTrue(ui.pagesById.guildSuppliesLogs ~= nil,
         "B-ui: Raid Supplies Logs remains registered while staged")
+    assertTrue(ui.pagesById.guildSuppliesTroubleshooting ~= nil,
+        "B-ui: Raid Supplies Troubleshooting remains registered while staged")
     assertEq(Nav.IsContentPage(ui, "guildSuppliesConfiguration"), true,
         "B-ui: Configuration is a content page while staged")
     assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
         "B-ui: Logs is a content page while staged")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesTroubleshooting"), true,
+        "B-ui: Troubleshooting is a content page while staged")
 
     local uiReasons = {}
     assertTrue(type(GS.RegisterUIListener) == "function", "B-ui: RegisterUIListener present")
@@ -27159,6 +28630,8 @@ do
         "B-ui: Configuration remains a content page after activation")
     assertEq(Nav.IsContentPage(ui, "guildSuppliesLogs"), true,
         "B-ui: Logs remains a content page after activation")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesTroubleshooting"), true,
+        "B-ui: Troubleshooting remains a content page after activation")
 
     -- Earlier suite stubs may RegisterPage without UpsertCategoryFromPage.
     -- Mirror production Loot Helper category + always-available General fallback
@@ -28192,8 +29665,8 @@ do
 end
 
 do
-    -- Linked alts still collapse the three-witness path. An officer's own later
-    -- observation of a linked alt's pending row still fast-paths.
+    -- Guild Info main+alt still collapse the three-witness path. An officer's own
+    -- later observation of an alt's pending row still fast-paths (#427 / #411).
     ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
     ensureRankedMember("Frank-Garona", "Player-1-Frank", 5)
     ensureRankedMember("Grace-Garona", "Player-1-Grace", 5)
@@ -28201,19 +29674,18 @@ do
     local record = seedStagedCampaignWithItem(9417, 20)
     setPlayer("Dave-Garona", "Player-1-Dave", 4)
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    local link = GS:NewLinkCharactersOperation("Player-1-Dave", "Player-1-Eve")
-    assertEq(GS:ApplyStagedConfigOperation(link), "accepted", "411 links: dave-eve linked")
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "411 gi: dave-eve assigned")
     local evidence = makeDepositEvidence(record, { itemId = 9417, quantity = 2 })
     assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
-        "pending", "411 links: dave witness")
+        "pending", "411 gi: dave witness")
     assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
-        "duplicate", "411 links: linked alt is not a second witness")
+        "duplicate", "411 gi: alt is not a second witness")
     assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
-        "pending", "411 links: frank is second independent")
-    assertEq(campaignTotal(record, 9417), 0, "411 links: two independents stay pending")
+        "pending", "411 gi: frank is second independent")
+    assertEq(campaignTotal(record, 9417), 0, "411 gi: two independents stay pending")
     assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
-        "accepted", "411 links: third independent credits")
-    assertEq(findDonation(record, 9417).verification, "witnesses", "411 links: witnesses mode")
+        "accepted", "411 gi: third independent credits")
+    assertEq(findDonation(record, 9417).verification, "witnesses", "411 gi: witnesses mode")
 
     local other = makeDepositEvidence(record, {
         itemId = 9417, quantity = 2, occurrenceIndex = 2,
@@ -28222,15 +29694,14 @@ do
     })
     ensureRankedMember("Hank-Garona", "Player-1-Hank", 4)
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
-    local linkOfficer = GS:NewLinkCharactersOperation("Player-1-Bob", "Player-1-Hank")
-    assertEq(GS:ApplyStagedConfigOperation(linkOfficer), "accepted", "411 links: bob-hank linked")
+    assertEq(assignMainAlt("Bob-Garona", "Hank-Garona"), "accepted", "411 gi: bob-hank assigned")
     setPlayer("Hank-Garona", "Player-1-Hank", 4)
     assertEq(select(1, GS:_AdmitObservationForTests(other, "Player-1-Hank", "Hank-Garona")),
-        "pending", "411 links: alt observation is not officer credit")
+        "pending", "411 gi: alt observation is not officer credit")
     setPlayer("Bob-Garona", "Player-1-Bob", 2)
     assertEq(select(1, GS:_AdmitObservationForTests(other, "Player-1-Bob", "Bob-Garona")),
-        "accepted", "411 links: officer direct observation still credits")
-    assertEq(campaignTotal(record, 9417), 4, "411 links: both occurrences credited once")
+        "accepted", "411 gi: officer direct observation still credits")
+    assertEq(campaignTotal(record, 9417), 4, "411 gi: both occurrences credited once")
 end
 
 do
@@ -29396,6 +30867,11987 @@ do
     assertTrue(type(SF.GuildOfficer.RegisterUIListener) == "function",
         "C1: RegisterUIListener available")
 end
+
+---------------------------------------------------------------------------
+-- #397 DBMarket valuation: earliest assignment, realm, catch-up, gossip
+---------------------------------------------------------------------------
+
+local valuationTsmCalls = 0
+local valuationTsmValue = 2500
+
+local function valuationFindDonation(record, itemId, quantity)
+    local lists = {
+        record and record.accounting and record.accounting._consumableEvents,
+        record and record.accounting and record.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table" and (ev.type == "donation" or ev.type == GS.LEDGER_EVENT.DONATION) then
+                    local itemOk = not itemId or tonumber(ev.itemId) == itemId
+                    local qtyOk = not quantity or tonumber(ev.quantity) == quantity
+                    if itemOk and qtyOk then
+                        return ev
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function valuationCount(record)
+    local byTxn = record and record.valuations and record.valuations.byTxn
+    local n = 0
+    if type(byTxn) == "table" then
+        for _ in pairs(byTxn) do
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function valuationSnap(record, txnId)
+    local byTxn = record and record.valuations and record.valuations.byTxn
+    if type(byTxn) ~= "table" or type(txnId) ~= "string" then
+        return nil
+    end
+    return byTxn[txnId]
+end
+
+local function withRealms(guildRealm, characterRealm, fn)
+    local priorGuild = world.guild.realm
+    local priorFull = UnitFullName
+    local priorRealm = GetRealmName
+    world.guild.realm = guildRealm
+    UnitFullName = function()
+        return world.unitName, characterRealm
+    end
+    GetRealmName = function()
+        if type(characterRealm) ~= "string" or characterRealm == "" then
+            return nil
+        end
+        return characterRealm
+    end
+    fn()
+    world.guild.realm = priorGuild
+    UnitFullName = priorFull
+    GetRealmName = priorRealm
+end
+
+local function activateValuationGuild(itemId)
+    -- #411 relay tests leave Bob at rank 4. Valuation ingress uses the shared
+    -- officer threshold, so restore the default roster before each guild.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local record = seedActivatableCampaign(itemId, 80)
+    local _, st, reason = GS:ActivateCanonicalDataset()
+    assertEq(st, "accepted", "val: activate " .. tostring(itemId) .. " " .. tostring(reason))
+    record = GS:GetCurrentRecord()
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    disarmFreshBankSample()
+    world.time = boundary + 7200
+    return record
+end
+
+local function creditValuationDeposit(record, opts)
+    opts = opts or {}
+    local evidence = makeDepositEvidence(record, {
+        itemId = opts.itemId,
+        quantity = opts.quantity or 2,
+        donor = opts.donor or "Donor-Garona",
+        observedAt = world.time,
+        ageHours = 0,
+        occurrenceIndex = opts.occurrenceIndex or 1,
+        neighborsOlder = opts.neighborsOlder or {
+            "older|" .. tostring(opts.itemId) .. "|" .. tostring(opts.quantity or 2),
+        },
+        neighborsNewer = opts.neighborsNewer or {
+            "newer|" .. tostring(opts.occurrenceIndex or 1),
+        },
+    })
+    if opts.beforeWitness then
+        opts.beforeWitness()
+    end
+    local priorName, priorGuid = world.unitName, world.unitGuid
+    setPlayer("Eve-Garona", "Player-1-Eve", 4)
+    setPlayer("Frank-Garona", "Player-1-Frank", 5)
+    world.unitName = priorName
+    world.unitGuid = priorGuid
+    local lastStatus, lastReason = nil, nil
+    for _, pair in ipairs({
+        { "Player-1-Dave", "Dave-Garona" },
+        { "Player-1-Eve", "Eve-Garona" },
+        { "Player-1-Frank", "Frank-Garona" },
+    }) do
+        lastStatus, lastReason = GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(lastStatus, "accepted", "val: third witness accepted "
+        .. tostring(opts.itemId) .. " reason=" .. tostring(lastReason))
+    return evidence
+end
+
+local function applyValuationBody(assignment, sender)
+    return providerApply({
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = assignment.datasetId,
+        guildKey = assignment.guildKey,
+        assignment = assignment,
+    }, sender or "Alice-Garona")
+end
+
+local function craftValuation(record, event, opts)
+    opts = opts or {}
+    local qty = tonumber(event.quantity)
+    local unit = opts.unitCopper or 100
+    return {
+        assignmentId = opts.assignmentId,
+        assignedAt = opts.assignedAt,
+        unitCopper = unit,
+        quantity = qty,
+        totalCopper = opts.totalCopper or (unit * qty),
+        itemId = tonumber(event.itemId),
+        txnId = opts.txnId or event.txnId or event.id,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        actorGuid = opts.actorGuid or "Player-1-Alice",
+        actorName = opts.actorName or "Alice-Garona",
+    }
+end
+
+do
+    valuationTsmCalls = 0
+    valuationTsmValue = 2500
+    SF.TSM = {
+        GetMarketValue = function(item)
+            valuationTsmCalls = valuationTsmCalls + 1
+            if type(valuationTsmValue) == "function" then
+                return valuationTsmValue(item)
+            end
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9301)
+    local before = valuationTsmCalls
+    local mintedAt = math.floor(world.time)
+    creditValuationDeposit(record, { itemId = 9301, quantity = 4 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9301, 4)
+    assertTrue(event ~= nil, "val: donation event")
+    assertEq(event.gsProductionCredit, true, "val: production credit")
+    assertEq(valuationTsmCalls, before + 1, "val: one DBMarket query for a new donation")
+    local snap = valuationSnap(record, event.txnId)
+    assertTrue(type(snap) == "table", "val: snapshot stored")
+    assertEq(snap.unitCopper, 2500, "val: unit copper")
+    assertEq(snap.totalCopper, 10000, "val: total = unit x qty")
+    assertEq(snap.assignedAt, mintedAt, "val: assignment uses GetServerTime")
+    assertTrue(type(snap.assignmentId) == "string" and snap.assignmentId:match("^gsv1:"),
+        "val: assignment id")
+    local rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertTrue(rows and rows[1] and rows[1].text:find("donated", 1, true), "val: history donated")
+    assertTrue(rows[1].text:find("total", 1, true), "val: history total " .. tostring(rows[1].text))
+    assertTrue(rows[1].text:find("unpriced", 1, true) == nil, "val: priced row is not unpriced")
+    assertEq(rows[1].valuationTotal, 10000, "val: history total copper")
+    local historyDetail = GS.FormatCampaignHistoryDetail(rows[1], "Dreamleaf")
+    assertTrue(type(historyDetail) == "string" and historyDetail:find("total", 1, true) ~= nil,
+        "val: history tooltip keeps the price " .. tostring(historyDetail))
+    assertTrue(historyDetail:find("unpriced", 1, true) == nil, "val: history tooltip is not unpriced")
+    assertEq(#world.chat, 0, "val: no chat on price")
+    assertEq(#world.prints, 0, "val: no prints on price")
+    local callsAfter = valuationTsmCalls
+    GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertEq(valuationTsmCalls, callsAfter, "val: history refresh does not re-query TSM")
+end
+
+do
+    valuationTsmCalls = 0
+    valuationTsmValue = 111
+    SF.TSM = SF.TSM
+    local function expectMint(label)
+        label = label or "nil guild realm"
+        local record = activateValuationGuild(9302)
+        creditValuationDeposit(record, { itemId = 9302, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9302, 2)
+        local snap = event and valuationSnap(record, event.txnId)
+        assertTrue(type(snap) == "table" and snap.totalCopper == 222, label .. " minted")
+    end
+    local function expectNoMint(label)
+        local record = GS:GetCurrentRecord()
+        creditValuationDeposit(record, {
+            itemId = 9302,
+            quantity = 3,
+            occurrenceIndex = 9,
+            neighborsOlder = { "older-nomint" },
+            neighborsNewer = { "newer-nomint" },
+        })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9302, 3)
+        assertTrue(event ~= nil, label .. " event")
+        assertEq(valuationSnap(record, event.txnId), nil, label .. " no snapshot")
+    end
+    withRealms(nil, "Garona", expectMint)
+    withRealms("Ga rona", "Garona", function()
+        valuationTsmValue = 111
+        local record = activateValuationGuild(9303)
+        creditValuationDeposit(record, { itemId = 9303, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9303, 2)
+        local snap = event and valuationSnap(record, event.txnId)
+        assertTrue(type(snap) == "table", "val: spacing-only realm match mints")
+    end)
+    withRealms("Stormrage", "Garona", function()
+        valuationTsmCalls = 0
+        local record = activateValuationGuild(9304)
+        creditValuationDeposit(record, { itemId = 9304, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9304, 2)
+        assertEq(valuationSnap(record, event.txnId), nil, "val: different realm does not mint")
+        assertEq(valuationTsmCalls, 0, "val: cross-realm does not query TSM")
+    end)
+    do
+        -- Membership stays intact: the roster name follows the character realm
+        -- while the guild home realm stays Garona.
+        local record = activateValuationGuild(9305)
+        local alice = nil
+        for _, m in ipairs(world.guild.members) do
+            if m.guid == "Player-1-Alice" then
+                alice = m
+                break
+            end
+        end
+        local priorName = alice.name
+        local priorFull = UnitFullName
+        local priorRealm = GetRealmName
+        local priorGuild = world.guild.realm
+        alice.name = "Alice-Area52"
+        world.unitName = "Alice"
+        world.guild.realm = "Garona"
+        UnitFullName = function() return "Alice", "Area52" end
+        GetRealmName = function() return "Area52" end
+        assertEq(GS:GetCapabilities().canEdit, true, "val: cross-realm officer can still edit")
+        creditValuationDeposit(record, { itemId = 9305, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9305, 2)
+        assertEq(valuationSnap(record, event and event.txnId), nil,
+            "val: character realm mismatch does not mint")
+        alice.name = priorName
+        world.guild.realm = priorGuild
+        UnitFullName = priorFull
+        GetRealmName = priorRealm
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    do
+        local record = activateValuationGuild(9306)
+        local alice = nil
+        for _, m in ipairs(world.guild.members) do
+            if m.guid == "Player-1-Alice" then
+                alice = m
+                break
+            end
+        end
+        local priorName = alice.name
+        local priorFull = UnitFullName
+        local priorRealm = GetRealmName
+        local priorGuild = world.guild.realm
+        alice.name = "Alice"
+        world.unitName = "Alice"
+        world.guild.realm = "Garona"
+        UnitFullName = function() return "Alice", nil end
+        GetRealmName = function() return nil end
+        creditValuationDeposit(record, { itemId = 9306, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9306, 2)
+        assertEq(valuationSnap(record, event and event.txnId), nil,
+            "val: missing character realm fails closed")
+        alice.name = priorName
+        world.guild.realm = priorGuild
+        UnitFullName = priorFull
+        GetRealmName = priorRealm
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    do
+        local record = activateValuationGuild(9307)
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        creditValuationDeposit(record, { itemId = 9307, quantity = 2 })
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9307, 2)
+        assertEq(GS:GetCapabilities().canEdit, false, "val: member cannot edit")
+        assertEq(valuationSnap(record, event.txnId), nil, "val: non-officer does not mint")
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    do
+        local record = activateValuationGuild(9308)
+        world.impersonationActive = true
+        creditValuationDeposit(record, { itemId = 9308, quantity = 2 })
+        world.impersonationActive = false
+        record = GS:GetCurrentRecord()
+        local event = valuationFindDonation(record, 9308, 2)
+        assertEq(valuationSnap(record, event.txnId), nil, "val: preview-as-non-admin does not mint")
+    end
+    assertTrue(expectNoMint ~= nil, "val: helper retained")
+end
+
+do
+    local record = activateValuationGuild(9310)
+    SF.TSM = nil
+    creditValuationDeposit(record, { itemId = 9310, quantity = 2 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9310, 2)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: missing TSM stays unpriced")
+    assertEq(#world.chat, 0, "val: missing TSM no chat")
+    local rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertTrue(rows[1].text:find("unpriced", 1, true) ~= nil, "val: unpriced history " .. tostring(rows[1].text))
+
+    valuationTsmCalls = 0
+    valuationTsmValue = nil
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 3, occurrenceIndex = 3,
+        neighborsOlder = { "older-nil" }, neighborsNewer = { "newer-nil" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 3)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: nil market stays unpriced")
+    assertTrue(valuationTsmCalls >= 1, "val: nil market was queried")
+
+    valuationTsmValue = 1.5
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 4, occurrenceIndex = 4,
+        neighborsOlder = { "older-frac" }, neighborsNewer = { "newer-frac" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 4)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: fractional copper stays unpriced")
+
+    valuationTsmValue = -5
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 5, occurrenceIndex = 5,
+        neighborsOlder = { "older-neg" }, neighborsNewer = { "newer-neg" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 5)
+    assertEq(valuationSnap(record, event.txnId), nil, "val: negative copper stays unpriced")
+
+    valuationTsmValue = 0
+    creditValuationDeposit(record, {
+        itemId = 9310, quantity = 6, occurrenceIndex = 6,
+        neighborsOlder = { "older-zero" }, neighborsNewer = { "newer-zero" },
+    })
+    record = GS:GetCurrentRecord()
+    event = valuationFindDonation(record, 9310, 6)
+    local zeroSnap = valuationSnap(record, event.txnId)
+    assertTrue(type(zeroSnap) == "table", "val: zero is a real price")
+    assertEq(zeroSnap.unitCopper, 0, "val: zero unit")
+    assertEq(zeroSnap.totalCopper, 0, "val: zero total")
+    rows = GS:ListCampaignHistory(record.currentCampaignId, 10, 0)
+    local sawZero = false
+    for i = 1, #rows do
+        if rows[i].valuationTotal == 0 and rows[i].text:find("unpriced", 1, true) == nil then
+            sawZero = true
+        end
+    end
+    assertTrue(sawZero, "val: zero total is shown and is not unpriced")
+    assertEq(#world.chat, 0, "val: invalid TSM no chat")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9320)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9320, quantity = 4 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9320, 4)
+    local early = craftValuation(record, event, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00000001",
+        assignedAt = 100,
+        unitCopper = 10,
+    })
+    local late = craftValuation(record, event, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00000002",
+        assignedAt = 200,
+        unitCopper = 1,
+    })
+    record.valuations = nil
+    local stLate, rLate = applyValuationBody(late, "Alice-Garona")
+    assertEq(stLate, "accepted", "val: late-first accepted " .. tostring(rLate))
+    local stEarly, rEarly = applyValuationBody(early, "Bob-Garona")
+    assertEq(stEarly, "accepted", "val: earlier replaces later " .. tostring(rEarly))
+    record = GS:GetCurrentRecord()
+    local snap = valuationSnap(record, event.txnId)
+    assertEq(snap.assignmentId, early.assignmentId, "val: earlier id wins after late-first")
+    assertEq(snap.totalCopper, 40, "val: earlier price wins regardless of magnitude")
+    assertEq(snap.unitCopper, 10, "val: earlier unit kept")
+
+    record.valuations = nil
+    assertEq(select(1, applyValuationBody(early, "Alice-Garona")), "accepted", "val: early-first")
+    local stLater = select(1, applyValuationBody(late, "Bob-Garona"))
+    assertEq(stLater, "duplicate", "val: later assignment does not replace")
+    record = GS:GetCurrentRecord()
+    snap = valuationSnap(record, event.txnId)
+    assertEq(snap.assignmentId, early.assignmentId, "val: early-first remains")
+    assertEq(snap.totalCopper, 40, "val: later cheaper price does not win")
+
+    local tieLow = craftValuation(record, event, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:0000000a",
+        assignedAt = 300,
+        unitCopper = 7,
+    })
+    local tieHigh = craftValuation(record, event, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:0000000a",
+        assignedAt = 300,
+        unitCopper = 3,
+    })
+    record.valuations = nil
+    assertEq(select(1, applyValuationBody(tieHigh, "Alice-Garona")), "accepted", "val: tie high-id first")
+    assertEq(select(1, applyValuationBody(tieLow, "Bob-Garona")), "accepted", "val: tie low-id replaces")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).assignmentId, tieLow.assignmentId,
+        "val: same-second lower id wins after high-first")
+    record.valuations = nil
+    assertEq(select(1, applyValuationBody(tieLow, "Bob-Garona")), "accepted", "val: tie low-id first")
+    assertEq(select(1, applyValuationBody(tieHigh, "Alice-Garona")), "duplicate", "val: tie high-id loses")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).assignmentId, tieLow.assignmentId,
+        "val: same-second lower id wins after low-first")
+
+    local dupSt = select(1, applyValuationBody(tieLow, "Alice-Garona"))
+    assertEq(dupSt, "duplicate", "val: duplicate packet")
+    assertEq(valuationCount(record), 1, "val: duplicate does not add a row")
+
+    local divergent = craftValuation(record, event, {
+        assignmentId = tieLow.assignmentId,
+        assignedAt = 300,
+        unitCopper = 9,
+    })
+    local conflictSt, conflictReason = applyValuationBody(divergent, "Bob-Garona")
+    assertEq(conflictSt, "rejected", "val: same-id divergence rejected")
+    assertEq(conflictReason, "id_conflict", "val: id_conflict")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).unitCopper, 7, "val: first body remains after conflict")
+
+    local memberSt, memberReason = applyValuationBody(craftValuation(record, event, {
+        assignmentId = "gsv1:cccccccccccccccccccccccc:00000001",
+        assignedAt = 1,
+        unitCopper = 4,
+    }), "Dave-Garona")
+    assertEq(memberSt, "rejected", "val: member relay rejected")
+    assertEq(memberReason, "unauthorized", "val: member unauthorized " .. tostring(memberReason))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).unitCopper, 7, "val: member did not replace winner")
+
+    local relay = craftValuation(record, event, {
+        assignmentId = "gsv1:dddddddddddddddddddddddd:00000001",
+        assignedAt = 50,
+        unitCopper = 6,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    record.valuations = nil
+    local relaySt = select(1, applyValuationBody(relay, "Bob-Garona"))
+    assertEq(relaySt, "accepted", "val: editor relays offline author")
+    record = GS:GetCurrentRecord()
+    snap = valuationSnap(record, event.txnId)
+    assertEq(snap.actorGuid, "Player-1-Alice", "val: stored actor is not treated as authority")
+    assertEq(snap.totalCopper, 24, "val: relayed total")
+    assertEq(GS:GetCapabilities().canEdit, true, "val: editor still can edit")
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local memberRows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertEq(GS:GetCapabilities().canEdit, false, "val: member read cannot edit")
+    assertTrue(memberRows[1].text:find("total", 1, true) ~= nil, "val: member sees winning total")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    local wrong = craftValuation(record, event, {
+        assignmentId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00000001",
+        assignedAt = 1,
+        unitCopper = 2,
+    })
+    wrong.datasetId = "gs1:other-dataset"
+    local wrongSt, wrongReason = applyValuationBody(wrong, "Alice-Garona")
+    assertEq(wrongSt, "rejected", "val: wrong dataset rejected")
+    assertTrue(wrongReason == "dataset_mismatch" or wrongReason == "malformed",
+        "val: wrong dataset reason " .. tostring(wrongReason))
+
+    local pendingBody = craftValuation(record, event, {
+        assignmentId = "gsv1:ffffffffffffffffffffffff:00000001",
+        assignedAt = 10,
+        unitCopper = 8,
+        txnId = "ctx:not-yet-valued",
+    })
+    local pendSt, pendReason = applyValuationBody(pendingBody, "Alice-Garona")
+    assertEq(pendSt, "pending", "val: unknown donation pending")
+    assertEq(pendReason, "awaiting_donation", "val: awaiting donation")
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending["ctx:not-yet-valued"]) == "table", "val: pending stored")
+    assertEq(record.valuations.byTxn["ctx:not-yet-valued"], nil, "val: pending is not a winner")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9330)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9330, quantity = 5 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9330, 5)
+    local aliasTxn = "ctx:alias-val-9330"
+    local pending = craftValuation(record, event, {
+        assignmentId = "gsv1:abcabcabcabcabcabcabcabc:00000004",
+        assignedAt = 80,
+        unitCopper = 12,
+        txnId = aliasTxn,
+    })
+    assertEq(select(1, applyValuationBody(pending, "Bob-Garona")), "pending", "val: alias valuation waits")
+    local clone = deepCopy(event)
+    clone.txnId = aliasTxn
+    clone.id = aliasTxn
+    clone.gsProductionCredit = nil
+    clone.gsSourceCutoverMarker = nil
+    local aliasSt, aliasReason = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = clone,
+    }, "Alice-Garona")
+    record = GS:GetCurrentRecord()
+    local moved = valuationSnap(record, event.txnId)
+    assertTrue(aliasSt == "duplicate" or aliasSt == "accepted" or aliasSt == "pending",
+        "val: alias ledger status " .. tostring(aliasSt) .. " " .. tostring(aliasReason))
+    if moved then
+        assertEq(moved.unitCopper, 12, "val: alias valuation follows canonical donation")
+        assertEq(record.valuations.byTxn[aliasTxn], nil, "val: alias key is not a second winner")
+        assertEq(record.valuations.pending[aliasTxn], nil, "val: alias pending cleared")
+        assertEq(valuationCount(record), 1, "val: one effective valuation after alias")
+    else
+        -- Occurrence duplicate may still be pending on a path that has not
+        -- recorded the alias. The direct production hook must still converge.
+        GS.OnDonationTxnAlias(record, event.txnId, aliasTxn)
+        record = GS:GetCurrentRecord()
+        moved = valuationSnap(record, event.txnId)
+        assertTrue(type(moved) == "table", "val: alias hook attaches pending valuation")
+        assertEq(moved.unitCopper, 12, "val: hooked alias unit")
+        assertEq(valuationCount(record), 1, "val: hooked alias is one winner")
+    end
+
+    local before = valuationSnap(record, event.txnId).totalCopper
+    local adj = GS:NewAdjustmentOperation(9330, -1, nil)
+    if adj then
+        GS:ApplyStagedConfigOperation(adj)
+    end
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).totalCopper, before, "val: adjustment does not reprice")
+    assertEq(valuationCount(record), 1, "val: adjustment does not mint")
+end
+
+do
+    valuationTsmValue = 400
+    valuationTsmCalls = 0
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9340)
+    local oldId = record.currentCampaignId
+    creditValuationDeposit(record, { itemId = 9340, quantity = 2 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9340, 2)
+    local txnId = event.txnId
+    local total = valuationSnap(record, txnId).totalCopper
+    assertEq(total, 800, "val: archive seed total")
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    local archived = GS:ListCampaignHistory(oldId, 5, 0)
+    assertTrue(archived and archived[1] and archived[1].text:find("total", 1, true),
+        "val: archived history keeps total " .. tostring(archived and archived[1] and archived[1].text))
+    assertEq(valuationSnap(record, txnId).totalCopper, total, "val: archive keeps snapshot")
+
+    local saved = SpectrumFederationDB
+    local assignmentId = valuationSnap(record, txnId).assignmentId
+    GS.StartValuationCatchup("reload-prep")
+    GS._root = nil
+    GS._rootValid = false
+    initGS()
+    local restored = GS:GetCurrentRecord()
+    assertEq(valuationSnap(restored, txnId).totalCopper, total, "val: reload keeps total")
+    assertEq(valuationSnap(restored, txnId).assignmentId, assignmentId, "val: reload keeps id")
+    local idle = GS.GetValuationCatchupState()
+    assertEq(idle.active, false, "val: reload cancels catch-up")
+    assertEq(idle.scheduled, false, "val: reload catch-up idle")
+    assertTrue(saved == SpectrumFederationDB, "val: same saved root")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9350)
+    local boundary = tonumber(record.liveCutover.contextObservedAt)
+    local pre = makeDepositEvidence(record, {
+        itemId = 9350, quantity = 3,
+        observedAt = boundary + 100,
+        ageHours = 2,
+        occurrenceIndex = 2,
+        neighborsOlder = { "pre-older" },
+        neighborsNewer = { "pre-newer" },
+    })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(pre, pair[1], pair[2])
+    end
+    valuationTsmCalls = 0
+    valuationTsmValue = 50
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return 50
+        end,
+    }
+    GS.StartValuationCatchup("pre-cutover")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: pre-activation rows stay unpriced")
+    assertEq(valuationTsmCalls, 0, "val: uncredited rows are not queried")
+    local idle = GS.GetValuationCatchupState()
+    assertEq(idle.active, false, "val: empty catch-up idle")
+    assertEq(idle.scheduled, false, "val: empty catch-up not scheduled")
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9400)
+    for i = 1, 12 do
+        creditValuationDeposit(record, {
+            itemId = 9400,
+            quantity = i,
+            occurrenceIndex = i,
+            neighborsOlder = { "batch-older-" .. i },
+            neighborsNewer = { "batch-newer-" .. i },
+        })
+    end
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: catch-up starts unpriced")
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("logs-open"), true, "val: catch-up armed")
+    assertEq(runOneDueTimer(), true, "val: one catch-up slice")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), GS.VALUATION_CATCHUP_BATCH, "val: first slice prices one batch")
+    assertEq(valuationTsmCalls, 1, "val: same item is queried once per pass")
+    assertEq(GS.GetValuationCatchupState().active, true, "val: backlog remains active")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 12, "val: catch-up finishes the backlog")
+    assertEq(valuationTsmCalls, 1, "val: later slices reuse the pass cache")
+    local done = GS.GetValuationCatchupState()
+    assertEq(done.active, false, "val: catch-up inactive")
+    assertEq(done.scheduled, false, "val: catch-up unscheduled")
+    assertEq(#timers, 0, "val: catch-up timers idle")
+    local calls = valuationTsmCalls
+    flushTimers()
+    assertEq(valuationTsmCalls, calls, "val: idle flush does not query")
+    assertEq(GS.StartValuationCatchup("logs-again"), true, "val: later open rediscovers without a full preload")
+    flushTimers()
+    assertEq(GS.GetValuationCatchupState().active, false, "val: later open idles")
+    assertEq(valuationTsmCalls, calls, "val: second open does not query TSM")
+
+    SF.TSM = nil
+    local nilRecord = activateValuationGuild(9410)
+    creditValuationDeposit(nilRecord, { itemId = 9410, quantity = 2, occurrenceIndex = 1 })
+    creditValuationDeposit(nilRecord, {
+        itemId = 9410, quantity = 3, occurrenceIndex = 2,
+        neighborsOlder = { "nil-pass-a" }, neighborsNewer = { "nil-pass-b" },
+    })
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = nil
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("missing-market"), true, "val: nil market catch-up starts")
+    flushTimers()
+    nilRecord = GS:GetCurrentRecord()
+    assertEq(valuationCount(nilRecord), 0, "val: nil market catch-up stays unpriced")
+    assertEq(valuationTsmCalls, 1, "val: nil market queried once")
+    local nilIdle = GS.GetValuationCatchupState()
+    assertEq(nilIdle.active, false, "val: nil market catch-up idles")
+    assertEq(nilIdle.scheduled, false, "val: nil market catch-up not scheduled")
+    valuationTsmValue = 80
+    assertEq(GS.StartValuationCatchup("market-later"), true, "val: later open retries missing prices")
+    flushTimers()
+    nilRecord = GS:GetCurrentRecord()
+    assertEq(valuationCount(nilRecord), 2, "val: later open prices both")
+    assertEq(valuationTsmCalls, 2, "val: later open queries once more")
+    assertEq(GS.GetValuationCatchupState().active, false, "val: later open idles")
+    assertEq(#timers, 0, "val: later open timers idle")
+end
+
+do
+    valuationTsmValue = 15
+    valuationTsmCalls = 0
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return 15
+        end,
+    }
+    local record = activateValuationGuild(9501)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9501, quantity = 2 })
+    drainExportMaint()
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9501, 2)
+    local txnId = event.txnId
+    local total = valuationSnap(record, txnId) and valuationSnap(record, txnId).totalCopper
+    assertEq(total, 30, "val: adoption source priced")
+    local built = GS.BuildValuationExportBody(record, txnId)
+    assertTrue(type(built) == "table" and built.kind == "gs-valuation",
+        "val: export body builds for " .. tostring(txnId))
+    GS.NoteValuationExported(record, txnId)
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("dataset")
+    end
+    drainExportMaint()
+    local exportBodies = collectAllExportBodies()
+    local sawValuation = false
+    local kindCounts = {}
+    for i = 1, #exportBodies do
+        local kind = tostring(exportBodies[i].body and exportBodies[i].body.kind)
+        kindCounts[kind] = (kindCounts[kind] or 0) + 1
+        if exportBodies[i].body.kind == "gs-valuation" then
+            sawValuation = true
+        end
+    end
+    local kindText = {}
+    for kind, n in pairs(kindCounts) do
+        kindText[#kindText + 1] = kind .. "=" .. tostring(n)
+    end
+    table.sort(kindText)
+    assertTrue(sawValuation, "val: export includes gs-valuation bodies="
+        .. tostring(#exportBodies) .. " " .. table.concat(kindText, ","))
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local carol = GS:GetCurrentRecord()
+    carol.valuations = {
+        schemaVersion = 1,
+        nextSeq = 2,
+        byTxn = {
+            ["ctx:leak"] = {
+                assignmentId = "gsv1:111111111111111111111111:00000001",
+                assignedAt = 5,
+                unitCopper = 1,
+                quantity = 1,
+                totalCopper = 1,
+                itemId = 1,
+                txnId = "ctx:leak",
+                canonicalTxnId = "ctx:leak",
+                datasetId = carol.datasetId,
+                guildKey = "club:42",
+                actorGuid = "Player-1-Carol",
+                actorName = "Carol-Garona",
+                seen = {},
+            },
+        },
+        pending = {},
+    }
+    assertTrue(GS:GetCurrentRecord() ~= nil, "val: leak snapshot is a valid stored record")
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: adoption begin")
+    for i = #exportBodies, 1, -1 do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: adoption commit " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted.datasetId, sourceDataset, "val: adopted source dataset")
+    assertEq(adopted.valuations and adopted.valuations.byTxn["ctx:leak"], nil,
+        "val: replaced dataset drops leaked valuation")
+    local adoptedSnap = valuationSnap(adopted, txnId)
+    assertTrue(type(adoptedSnap) == "table", "val: adopted valuation present")
+    if type(adoptedSnap) == "table" then
+        assertEq(adoptedSnap.totalCopper, total, "val: adopted total preserved")
+    end
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- Earlier pending on the canonical key must beat a later alias winner and
+    -- a later alias pending. Deleting either pending key first would drop it.
+    SF.TSM = nil
+    local record = activateValuationGuild(9601)
+    creditValuationDeposit(record, { itemId = 9601, quantity = 4, occurrenceIndex = 1 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9601, 4)
+    assertTrue(event ~= nil, "val: alias canonical donation")
+    local canonical = event.txnId
+    local alias = "ctx:alias-9601"
+    record.valuations = {
+        schemaVersion = 1,
+        nextSeq = 1,
+        byTxn = {},
+        pending = {},
+    }
+    local function plant(txnId, assignedAt, unit, assignmentId)
+        return {
+            assignmentId = assignmentId,
+            assignedAt = assignedAt,
+            unitCopper = unit,
+            quantity = 4,
+            totalCopper = unit * 4,
+            itemId = 9601,
+            txnId = txnId,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Bob",
+            actorName = "Bob-Garona",
+            seen = {},
+        }
+    end
+    record.valuations.byTxn[canonical] = plant(canonical, 30, 8,
+        "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00000030")
+    record.valuations.byTxn[alias] = plant(alias, 20, 7,
+        "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00000020")
+    record.valuations.pending[canonical] = plant(canonical, 10, 5,
+        "gsv1:cccccccccccccccccccccccc:00000010")
+    record.valuations.pending[alias] = plant(alias, 50, 9,
+        "gsv1:dddddddddddddddddddddddd:00000050")
+    GS.OnDonationTxnAlias(record, canonical, alias)
+    local winner = valuationSnap(record, canonical)
+    assertTrue(type(winner) == "table", "val: alias merge keeps a winner")
+    assertEq(winner and winner.unitCopper, 5, "val: earlier canonical pending wins")
+    assertEq(winner and winner.assignmentId, "gsv1:cccccccccccccccccccccccc:00000010",
+        "val: earlier canonical assignment id")
+    assertEq(winner and winner.assignedAt, 10, "val: earlier canonical timestamp")
+    assertEq(record.valuations.byTxn[alias], nil, "val: alias winner key cleared")
+    assertEq(record.valuations.pending[canonical], nil, "val: canonical pending consumed")
+    assertEq(record.valuations.pending[alias], nil, "val: alias pending consumed")
+    assertEq(valuationCount(record), 1, "val: alias merge is one winner")
+
+    creditValuationDeposit(record, {
+        itemId = 9601, quantity = 3, occurrenceIndex = 2,
+        neighborsOlder = { "alias-older-2" }, neighborsNewer = { "alias-newer-2" },
+    })
+    record = GS:GetCurrentRecord()
+    local second = valuationFindDonation(record, 9601, 3)
+    assertTrue(second ~= nil, "val: second alias donation")
+    local canonical2 = second.txnId
+    local alias2 = "ctx:alias-9601-b"
+    record.valuations.pending[canonical2] = {
+        assignmentId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00000040",
+        assignedAt = 40, unitCopper = 6, quantity = 3, totalCopper = 18,
+        itemId = 9601, txnId = canonical2, datasetId = record.datasetId,
+        guildKey = "club:42", actorGuid = "Player-1-Bob", actorName = "Bob-Garona", seen = {},
+    }
+    record.valuations.pending[alias2] = {
+        assignmentId = "gsv1:ffffffffffffffffffffffff:00000004",
+        assignedAt = 4, unitCopper = 3, quantity = 3, totalCopper = 9,
+        itemId = 9601, txnId = alias2, datasetId = record.datasetId,
+        guildKey = "club:42", actorGuid = "Player-1-Alice", actorName = "Alice-Garona", seen = {},
+    }
+    GS.OnDonationTxnAlias(record, canonical2, alias2)
+    local winner2 = valuationSnap(record, canonical2)
+    assertEq(winner2 and winner2.unitCopper, 3, "val: earlier alias pending wins")
+    assertEq(winner2 and winner2.assignmentId, "gsv1:ffffffffffffffffffffffff:00000004",
+        "val: earlier alias assignment id")
+    assertEq(record.valuations.pending[alias2], nil, "val: second alias pending consumed")
+    assertEq(record.valuations.pending[canonical2], nil, "val: second canonical pending consumed")
+end
+
+do
+    valuationTsmValue = 12
+    valuationTsmCalls = 0
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9600)
+    creditValuationDeposit(record, { itemId = 9600, quantity = 2 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9600, 2)
+    local snap = valuationSnap(record, event.txnId)
+    assertTrue(type(snap) == "table", "val: scope seed snap")
+    local structureOk, structureReason = GS._ValidateGuildRecordStructure("club:42", record)
+    assertEq(structureOk, true, "val: matching scope validates " .. tostring(structureReason))
+    -- A reloaded store is a new table. Controlled mutations keep the fast path;
+    -- a restored wrong-scope snapshot still fails closed.
+    local function withRestoredValuations(mutate)
+        local src = record.valuations
+        local copy = {
+            schemaVersion = src.schemaVersion,
+            nextSeq = src.nextSeq,
+            byTxn = {},
+            pending = {},
+        }
+        local function copySnap(v)
+            local snapCopy = {}
+            for fk, fv in pairs(v) do
+                if fk == "seen" and type(fv) == "table" then
+                    local seen = {}
+                    for i = 1, #fv do
+                        seen[i] = fv[i]
+                    end
+                    snapCopy.seen = seen
+                else
+                    snapCopy[fk] = fv
+                end
+            end
+            return snapCopy
+        end
+        for k, v in pairs(src.byTxn or {}) do
+            if type(v) == "table" then
+                copy.byTxn[k] = copySnap(v)
+            end
+        end
+        for k, v in pairs(src.pending or {}) do
+            if type(v) == "table" then
+                copy.pending[k] = copySnap(v)
+            end
+        end
+        mutate(copy)
+        record.valuations = copy
+        return GS._ValidateGuildRecordStructure("club:42", record)
+    end
+    local liveStore = record.valuations
+    local badDataset, badDatasetReason = withRestoredValuations(function(copy)
+        copy.byTxn[event.txnId].datasetId = "gs1:wrong"
+    end)
+    assertEq(badDataset, false, "val: wrong dataset snapshot fails closed")
+    assertEq(badDatasetReason, "invalid_valuations", "val: wrong dataset reason")
+    record.valuations = liveStore
+    local badGuild, badGuildReason = withRestoredValuations(function(copy)
+        copy.byTxn[event.txnId].guildKey = "club:99"
+    end)
+    assertEq(badGuild, false, "val: wrong guild snapshot fails closed")
+    assertEq(badGuildReason, "invalid_valuations", "val: wrong guild reason")
+    record.valuations = liveStore
+    local pending = craftValuation(record, event, {
+        assignmentId = "gsv1:111111111111111111111112:00000009",
+        assignedAt = 9,
+        unitCopper = 4,
+        txnId = "ctx:scope-pending",
+    })
+    assertEq(select(1, applyValuationBody(pending, "Alice-Garona")), "pending",
+        "val: scope pending stored")
+    record = GS:GetCurrentRecord()
+    local pend = record.valuations.pending["ctx:scope-pending"]
+    assertTrue(type(pend) == "table", "val: scope pending row")
+    liveStore = record.valuations
+    local badPendDataset = select(1, withRestoredValuations(function(copy)
+        copy.pending["ctx:scope-pending"].datasetId = "gs1:wrong"
+    end))
+    assertEq(badPendDataset, false, "val: wrong pending dataset fails closed")
+    record.valuations = liveStore
+    local badPendGuild, badPendGuildReason = withRestoredValuations(function(copy)
+        copy.pending["ctx:scope-pending"].guildKey = "club:99"
+    end)
+    assertEq(badPendGuild, false, "val: wrong pending guild fails closed")
+    assertEq(badPendGuildReason, "invalid_valuations", "val: wrong pending guild reason")
+    record.valuations = liveStore
+    local restoredOk = select(1, GS._ValidateGuildRecordStructure("club:42", record))
+    assertEq(restoredOk, true, "val: restored scope validates")
+end
+
+do
+    local maxExact = 9007199254740992
+    local maxUnit = maxExact - 1
+    valuationTsmCalls = 0
+    valuationTsmValue = maxUnit
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9602)
+    creditValuationDeposit(record, { itemId = 9602, quantity = 1 })
+    record = GS:GetCurrentRecord()
+    local single = valuationFindDonation(record, 9602, 1)
+    local snap = valuationSnap(record, single.txnId)
+    assertEq(snap and snap.unitCopper, maxUnit, "val: qty-1 stores the max exact unit")
+    assertEq(snap and snap.totalCopper, maxUnit, "val: qty-1 total stays below 2^53")
+    local before = valuationCount(record)
+    creditValuationDeposit(record, {
+        itemId = 9602, quantity = 2, occurrenceIndex = 2,
+        neighborsOlder = { "overflow-older" }, neighborsNewer = { "overflow-newer" },
+    })
+    record = GS:GetCurrentRecord()
+    local wide = valuationFindDonation(record, 9602, 2)
+    assertTrue(wide ~= nil, "val: qty-2 donation credited")
+    assertEq(valuationSnap(record, wide.txnId), nil, "val: overflowing unit stays unpriced")
+    assertEq(valuationCount(record), before, "val: overflow does not add a snapshot")
+    local overflow = craftValuation(record, single, {
+        assignmentId = "gsv1:222222222222222222222222:00000002",
+        assignedAt = 2,
+        unitCopper = maxExact / 2,
+        totalCopper = maxExact,
+    })
+    overflow.quantity = 2
+    local overflowSt, overflowReason = applyValuationBody(overflow, "Alice-Garona")
+    assertEq(overflowSt, "rejected", "val: exact 2^53 total rejected")
+    assertEq(overflowReason, "invalid_assignment", "val: exact 2^53 reason " .. tostring(overflowReason))
+    local inconsistent = craftValuation(record, single, {
+        assignmentId = "gsv1:333333333333333333333333:00000003",
+        assignedAt = 3,
+        unitCopper = 10,
+        totalCopper = 21,
+    })
+    inconsistent.quantity = 2
+    local badSt, badReason = applyValuationBody(inconsistent, "Alice-Garona")
+    assertEq(badSt, "rejected", "val: inconsistent total rejected")
+    assertEq(badReason, "invalid_assignment", "val: inconsistent reason " .. tostring(badReason))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, single.txnId).totalCopper, maxUnit,
+        "val: rejected totals leave the winner")
+end
+
+do
+    valuationTsmCalls = 0
+    valuationTsmValue = 25
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9604)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9604, quantity = 3, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "officer-direct-older" },
+        neighborsNewer = { "officer-direct-newer" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+    assertEq(st, "accepted", "val: officer direct accepted " .. tostring(reason))
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9604, 3)
+    assertEq(event and event.verification, "officer", "val: officer direct provenance")
+    assertEq(event and event.gsProductionCredit, true, "val: officer direct production credit")
+    local snap = valuationSnap(record, event and event.txnId)
+    assertEq(snap and snap.totalCopper, 75, "val: officer direct prices without Logs")
+    assertEq(valuationTsmCalls, 1, "val: officer direct one query")
+    local catch = GS.GetValuationCatchupState()
+    assertEq(catch.active, false, "val: officer direct does not open catch-up")
+    assertEq(catch.scheduled, false, "val: officer direct catch-up idle")
+
+    local pendingEvidence = makeDepositEvidence(record, {
+        itemId = 9604, quantity = 4, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "pending-older" }, neighborsNewer = { "pending-newer" },
+    })
+    local calls = valuationTsmCalls
+    local stPending = select(1, GS:_AdmitObservationForTests(
+        pendingEvidence, "Player-1-Dave", "Dave-Garona"))
+    assertEq(stPending, "pending", "val: non-officer witness stays pending")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationFindDonation(record, 9604, 4), nil, "val: pending witness is not credited")
+    assertEq(valuationTsmCalls, calls, "val: pending witness does not query TSM")
+    assertEq(valuationCount(record), 1, "val: pending witness adds no valuation")
+
+    valuationTsmValue = 11
+    local priorName, priorGuid = world.unitName, world.unitGuid
+    setPlayer("Eve-Garona", "Player-1-Eve", 4)
+    setPlayer("Frank-Garona", "Player-1-Frank", 5)
+    world.unitName = priorName
+    world.unitGuid = priorGuid
+    local quorum = makeDepositEvidence(record, {
+        itemId = 9604, quantity = 5, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 3,
+        neighborsOlder = { "quorum-older" }, neighborsNewer = { "quorum-newer" },
+    })
+    local function witness(guid, name)
+        return GS:_AdmitObservationForTests(quorum, guid, name)
+    end
+    local st1 = select(1, witness("Player-1-Dave", "Dave-Garona"))
+    assertEq(st1, "pending", "val: first quorum witness pending")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 1, "val: one witness does not price")
+    local st2 = select(1, witness("Player-1-Eve", "Eve-Garona"))
+    assertEq(st2, "pending", "val: second quorum witness pending")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 1, "val: two witnesses do not price")
+    local st3, r3 = witness("Player-1-Frank", "Frank-Garona")
+    assertEq(st3, "accepted", "val: third witness accepts " .. tostring(r3))
+    record = GS:GetCurrentRecord()
+    local quorumEvent = valuationFindDonation(record, 9604, 5)
+    assertEq(quorumEvent and quorumEvent.verification, "witnesses", "val: three-witness provenance")
+    assertEq(valuationSnap(record, quorumEvent and quorumEvent.txnId)
+        and valuationSnap(record, quorumEvent.txnId).totalCopper, 55,
+        "val: three-witness credit prices on the verifying client")
+    assertEq(#world.chat, 0, "val: officer and quorum pricing stay chat-free")
+end
+
+do
+    SF.TSM = nil
+    valuationTsmCalls = 0
+    local record = activateValuationGuild(9606)
+    local configRoot = snapshotConfigRoot()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9606, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "history-older" }, neighborsNewer = { "history-newer" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    GS:EnsureGossipProvider()
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: history origin officer credit")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: origin without TSM stays unpriced")
+    local body = exportDonationBody(9606)
+    assertTrue(type(body) == "table" and body.event and body.event.verification == "officer",
+        "val: history export is officer-trusted")
+    local originTxn = body.event.txnId
+
+    local bob = loadClientFromConfigRoot(configRoot, "Bob-Garona", "Player-1-Bob", 2)
+    assertEq(GS.ValuationOfficerEligible(), true, "val: Bob is an eligible same-realm officer")
+    local early = craftValuation(bob, body.event, {
+        assignmentId = "gsv1:444444444444444444444444:0000000a",
+        assignedAt = 10,
+        unitCopper = 40,
+        txnId = originTxn,
+    })
+    local pendSt, pendReason = applyValuationBody(early, "Alice-Garona")
+    assertEq(pendSt, "pending", "val: valuation before donation waits " .. tostring(pendReason))
+    assertEq(valuationTsmCalls, 0, "val: early valuation does not query")
+    local histSt, histReason = applyExportBody(body, "Alice-Garona")
+    assertEq(histSt, "accepted", "val: Bob accepts officer history " .. tostring(histReason))
+    assertEq(histReason, "officer_history", "val: Bob officer-history reason")
+    bob = GS:GetCurrentRecord()
+    local bobEvent = valuationFindDonation(bob, 9606, 2)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, true, "val: history donation is production credit")
+    local bobSnap = valuationSnap(bob, originTxn)
+    assertEq(bobSnap and bobSnap.totalCopper, 80, "val: history reconciles the earlier valuation")
+    assertEq(bobSnap and bobSnap.unitCopper, 40, "val: reconciled unit is the early assignment")
+    assertEq(bob.valuations.pending[originTxn], nil, "val: reconciled pending key cleared")
+    assertEq(valuationTsmCalls, 0, "val: reconciled history does not query TSM")
+    assertEq(GS.GetValuationCatchupState().active, false, "val: history reconcile does not open Logs")
+
+    valuationTsmCalls = 0
+    valuationTsmValue = 9
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local carol = loadClientFromConfigRoot(configRoot, "Carol-Garona", "Player-1-Carol", 3)
+    assertEq(GS.ValuationOfficerEligible(), true, "val: Carol is an eligible same-realm officer")
+    local carolSt, carolReason = applyExportBody(body, "Alice-Garona")
+    assertEq(carolSt, "accepted", "val: Carol accepts officer history " .. tostring(carolReason))
+    assertEq(carolReason, "officer_history", "val: Carol officer-history reason")
+    carol = GS:GetCurrentRecord()
+    local carolSnap = valuationSnap(carol, originTxn)
+    assertEq(carolSnap and carolSnap.totalCopper, 18, "val: eligible officer prices history without Logs")
+    assertEq(valuationTsmCalls, 1, "val: history auto-price queries once")
+    assertEq(GS.GetValuationCatchupState().active, false, "val: history auto-price catch-up idle")
+
+    local untrusted = deepCopy(body.event)
+    untrusted.verification = "witnesses"
+    untrusted.id = "ctx:untrusted-9606"
+    untrusted.txnId = untrusted.id
+    untrusted.writer = "Player-1-Dave"
+    untrusted.verifierGuid = nil
+    untrusted.verifierRankOrder = nil
+    local priced = valuationCount(carol)
+    local calls = valuationTsmCalls
+    local untrustedSt, untrustedReason = applyExportBody({
+        kind = "gs-ledger-event",
+        datasetId = carol.datasetId,
+        event = untrusted,
+    }, "Dave-Garona")
+    assertTrue(untrustedReason ~= "officer_history",
+        "val: witnesses ledger is not officer history " .. tostring(untrustedSt)
+            .. " " .. tostring(untrustedReason))
+    carol = GS:GetCurrentRecord()
+    assertEq(valuationCount(carol), priced, "val: untrusted ledger adds no valuation")
+    assertEq(valuationSnap(carol, untrusted.txnId), nil, "val: untrusted txn stays unpriced")
+    assertEq(valuationTsmCalls, calls, "val: untrusted ledger does not query TSM")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    valuationTsmValue = 15
+    SF.TSM = {
+        GetMarketValue = function()
+            return 15
+        end,
+    }
+    local record = activateValuationGuild(9609)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9609, quantity = 2 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9609, 2)
+    local txnId = event.txnId
+    GS.NoteValuationExported(record, txnId)
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("dataset")
+    end
+    drainExportMaint()
+    local exportBodies = collectAllExportBodies()
+    local kept, dropped, descCount = {}, 0, nil
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        if row.body and row.body.kind == "gs-valuation" then
+            dropped = dropped + 1
+        else
+            kept[#kept + 1] = row
+            if row.body.kind == "dataset-desc" then
+                descCount = row.body.valuationCount
+            end
+        end
+    end
+    assertTrue(dropped >= 1, "val: export contained valuation bodies")
+    assertTrue(type(descCount) == "number" and descCount >= dropped,
+        "val: descriptor counts valuations got=" .. tostring(descCount))
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    local carol = GS:GetCurrentRecord()
+    local carolDataset = carol.datasetId
+    carol.valuations = {
+        schemaVersion = 1, nextSeq = 2, pending = {},
+        byTxn = {
+            ["ctx:leak-missing"] = {
+                assignmentId = "gsv1:555555555555555555555555:00000001",
+                assignedAt = 5, unitCopper = 1, quantity = 1, totalCopper = 1,
+                itemId = 1, txnId = "ctx:leak-missing", canonicalTxnId = "ctx:leak-missing",
+                datasetId = carol.datasetId, guildKey = "club:42",
+                actorGuid = "Player-1-Carol", actorName = "Carol-Garona", seen = {},
+            },
+        },
+    }
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginSt, beginReason = select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset))
+    assertEq(beginSt, "accepted", "val: missing-valuation adoption begins " .. tostring(beginReason))
+    for i = #kept, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(kept[i].id, kept[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: missing-valuation buffer " .. tostring(kept[i].body.kind) .. " " .. tostring(st))
+    end
+    local stMissing, reasonMissing = GS:CommitDatasetAdoption()
+    assertEq(stMissing, "rejected", "val: adoption without valuations is rejected")
+    assertEq(reasonMissing, "incomplete_transfer",
+        "val: missing valuations are incomplete " .. tostring(reasonMissing))
+    local intact = GS:GetCurrentRecord()
+    assertEq(intact.datasetId, carolDataset, "val: rejected adoption keeps the local dataset")
+    assertTrue(intact.valuations.byTxn["ctx:leak-missing"] ~= nil,
+        "val: rejected adoption keeps the local valuation")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    valuationTsmValue = 15
+    SF.TSM = {
+        GetMarketValue = function()
+            return 15
+        end,
+    }
+    local record = activateValuationGuild(9610)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9610, quantity = 2 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9610, 2)
+    local txnId = event.txnId
+    local total = valuationSnap(record, txnId).totalCopper
+    GS.NoteValuationExported(record, txnId)
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("dataset")
+    end
+    drainExportMaint()
+    local exportBodies = collectAllExportBodies()
+    local others, vals = {}, {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        if row.body and row.body.kind == "gs-valuation" then
+            vals[#vals + 1] = row
+        else
+            others[#others + 1] = row
+        end
+    end
+    assertTrue(#vals >= 1, "val: near-cap export has a valuation")
+    local sourceDataset = record.datasetId
+    local savedCap = GS.MAX_ADOPTION_PENDING_RECORDS
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginSt, beginReason = select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset))
+    assertEq(beginSt, "accepted", "val: near-cap adoption begins " .. tostring(beginReason))
+    for i = #others, 1, -1 do
+        local st, reason = GS:BufferAdoptionRecord(others[i].id, others[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: near-cap other buffer " .. tostring(reason))
+    end
+    local base = #(GS._adoption and GS._adoption.order or {})
+    GS.MAX_ADOPTION_PENDING_RECORDS = base + #vals - 1
+    local rejectedAt = nil
+    for i = 1, #vals do
+        local st, reason = GS:BufferAdoptionRecord(vals[i].id, vals[i].body)
+        if st == "rejected" and reason == "full" then
+            rejectedAt = i
+            break
+        end
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: near-cap valuation buffer " .. tostring(st) .. " " .. tostring(reason))
+    end
+    assertTrue(rejectedAt ~= nil, "val: valuation buffer returns full one slot short")
+    GS.MAX_ADOPTION_PENDING_RECORDS = base + #vals
+    if rejectedAt then
+        for i = rejectedAt, #vals do
+            local st, reason = GS:BufferAdoptionRecord(vals[i].id, vals[i].body)
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: raised cap accepts valuation " .. tostring(st) .. " " .. tostring(reason))
+        end
+        local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        assertEq(stAdopt, "accepted", "val: near-cap adoption commits " .. tostring(reasonAdopt))
+        local adopted = GS:GetCurrentRecord()
+        assertEq(adopted.datasetId, sourceDataset, "val: near-cap adopted dataset")
+        local adoptedSnap = valuationSnap(adopted, txnId)
+        assertEq(adoptedSnap and adoptedSnap.totalCopper, total, "val: near-cap valuation survived")
+    end
+    GS.MAX_ADOPTION_PENDING_RECORDS = savedCap
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    SF.TSM = nil
+    local record = activateValuationGuild(9608)
+    local credited = 0
+    for n = 1, 40 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9608,
+            quantity = (n % 2) + 1,
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = n,
+            neighborsOlder = { "catch-older-" .. n },
+            neighborsNewer = { "catch-newer-" .. n },
+        })
+        local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(st, "accepted", "val: catch-up seed " .. tostring(n) .. " " .. tostring(reason))
+        credited = credited + 1
+    end
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: large catch-up starts unpriced")
+    assertEq(credited, 40, "val: large catch-up seeded forty donations")
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("logs-large"), true, "val: large catch-up starts")
+    assertEq(runOneDueTimer(), true, "val: large catch-up one callback")
+    record = GS:GetCurrentRecord()
+    local sliceCount = valuationCount(record)
+    local sliceState = GS.GetValuationCatchupState()
+    assertTrue(sliceState.lastVisits > 0 and sliceState.lastVisits <= GS.VALUATION_CATCHUP_SCAN,
+        "val: discovery visits stay bounded got=" .. tostring(sliceState.lastVisits))
+    assertTrue(sliceCount > 0 and sliceCount <= GS.VALUATION_CATCHUP_BATCH,
+        "val: first callback prices at most one batch got=" .. tostring(sliceCount))
+    assertTrue(sliceCount < credited, "val: first callback does not finish the backlog")
+    assertEq(sliceState.active, true, "val: large catch-up stays active")
+    local callsAfterSlice = valuationTsmCalls
+    GS.CancelValuationCatchup("test-cancel")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), sliceCount, "val: cancel stops further pricing")
+    assertEq(valuationTsmCalls, callsAfterSlice, "val: cancelled callback does not query")
+    local cancelled = GS.GetValuationCatchupState()
+    assertEq(cancelled.active, false, "val: cancel idles")
+    assertEq(cancelled.scheduled, false, "val: cancel unschedules")
+    timers = {}
+    assertEq(GS.StartValuationCatchup("logs-large-again"), true, "val: catch-up restarts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), credited, "val: restarted catch-up prices every donation")
+    local done = GS.GetValuationCatchupState()
+    assertEq(done.active, false, "val: large catch-up eventually idle")
+    assertEq(done.scheduled, false, "val: large catch-up unscheduled")
+    assertEq(#timers, 0, "val: large catch-up timers idle")
+    assertEq(#world.chat, 0, "val: large catch-up stays chat-free")
+end
+
+do
+    -- Late Logs catch-up must refresh the already-exported descriptor. A forced
+    -- dataset notification would hide a stale valuationCount.
+    SF.TSM = nil
+    local record = activateValuationGuild(9611)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9611, quantity = 2 })
+    drainExportMaint()
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9611, 2)
+    assertTrue(event ~= nil, "val: manifest donation credited")
+    local txnId = event and event.txnId
+    assertEq(valuationSnap(record, txnId), nil, "val: manifest donation starts unpriced")
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, valuations = nil, 0
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                valuations = valuations + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            end
+        end
+        return descCount, valuations
+    end
+    local sourceDataset = record.datasetId
+    local beforeDesc, beforeVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(beforeDesc, 0, "val: exported descriptor starts at zero valuations")
+    assertEq(beforeVals, 0, "val: unpriced donation exports no valuation body")
+
+    local durableNotifies = 0
+    local origNotify = GS.NotifyLocalDurableChange
+    GS.NotifyLocalDurableChange = function(reason)
+        durableNotifies = durableNotifies + 1
+        return origNotify(reason)
+    end
+    valuationTsmCalls = 0
+    valuationTsmValue = 21
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    timers = {}
+    assertEq(GS.StartValuationCatchup("logs-manifest"), true, "val: manifest catch-up starts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local snap = valuationSnap(record, txnId)
+    assertEq(snap and snap.totalCopper, 42, "val: catch-up assigns unit x quantity")
+    local caught = GS.GetValuationCatchupState()
+    assertEq(caught.active, false, "val: manifest catch-up idles")
+    assertEq(caught.scheduled, false, "val: manifest catch-up unschedules")
+    assertEq(#timers, 0, "val: manifest catch-up timers idle")
+    assertEq(valuationTsmCalls, 1, "val: manifest catch-up queries once")
+    local pricedDesc, pricedVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(pricedDesc, 1, "val: catch-up descriptor advertises the new valuation")
+    assertEq(pricedVals, 1, "val: catch-up exports the valuation body")
+    assertEq(durableNotifies, 0, "val: catch-up does not rely on a dataset notification")
+
+    GS.ForgetDonationValuations(record, { txnId })
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnId), nil, "val: forgotten valuation leaves the donation")
+    local removedDesc, removedVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(removedDesc, 0, "val: removing a winner clears the advertised count")
+    assertEq(removedVals, 0, "val: removing a winner drops its export body")
+    assertEq(durableNotifies, 0, "val: removal does not rely on a dataset notification")
+
+    timers = {}
+    assertEq(GS.StartValuationCatchup("logs-manifest-again"), true, "val: removal catch-up restarts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    snap = valuationSnap(record, txnId)
+    assertEq(snap and snap.totalCopper, 42, "val: second catch-up restores the price")
+    local restored = GS.GetValuationCatchupState()
+    assertEq(restored.active, false, "val: second catch-up idles")
+    assertEq(restored.scheduled, false, "val: second catch-up unschedules")
+    assertEq(#timers, 0, "val: second catch-up timers idle")
+    local exportBodies = collectAllExportBodies()
+    local adoptedDesc, adoptedVals = valuationExportSummary(exportBodies, sourceDataset)
+    assertEq(adoptedDesc, 1, "val: restored descriptor advertises one valuation")
+    assertEq(adoptedVals, 1, "val: restored export has one valuation body")
+    assertEq(durableNotifies, 0, "val: restored export had no durable notification")
+    GS.NotifyLocalDurableChange = origNotify
+    assertEq(#world.chat, 0, "val: manifest catch-up stays chat-free")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginSt, beginReason = select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset))
+    assertEq(beginSt, "accepted", "val: late-valuation adoption begins " .. tostring(beginReason))
+    for i = #exportBodies, 1, -1 do
+        local st, reason = GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: late-valuation buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: late-valuation adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: late-valuation adopted dataset")
+    local adoptedSnap = valuationSnap(adopted, txnId)
+    assertEq(adoptedSnap and adoptedSnap.totalCopper, 42, "val: complete adoption keeps the catch-up price")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- Finding 1: catch-up must not deep-scan the valuation store on every read.
+    SF.TSM = nil
+    local record = activateValuationGuild(9702)
+    for n = 1, 24 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9702, quantity = 1, observedAt = world.time, ageHours = 0,
+            occurrenceIndex = n,
+            neighborsOlder = { "scan-older-" .. n },
+            neighborsNewer = { "scan-newer-" .. n },
+        })
+        local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(st, "accepted", "val: scan seed " .. n .. " " .. tostring(reason))
+    end
+    record = GS:GetCurrentRecord()
+    local planted = {
+        schemaVersion = 1,
+        nextSeq = 3,
+        byTxn = {},
+        pending = {},
+    }
+    for i = 1, 512 do
+        local txn = string.format("ctx:plant:%04x", i)
+        planted.byTxn[txn] = {
+            assignmentId = string.format("gsv1:%024x:%08x", i, i),
+            assignedAt = 1000 + i,
+            unitCopper = 4,
+            quantity = 1,
+            totalCopper = 4,
+            itemId = 9702,
+            txnId = txn,
+            canonicalTxnId = txn,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            seen = {},
+        }
+    end
+    record.valuations = planted
+    local deep = 0
+    GS._onValuationDeepValidation = function()
+        deep = deep + 1
+    end
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "val: planted store validates")
+    assertEq(deep, 1, "val: restored store deep-scans once got=" .. tostring(deep))
+    assertEq(valuationCount(record), 512, "val: planted winners retained")
+    deep = 0
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 6
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("logs-scan"), true, "val: scan catch-up starts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 536, "val: catch-up priced the real donations")
+    assertEq(deep, 0, "val: catch-up did not rescan valuations got=" .. tostring(deep))
+    assertEq(GS.GetValuationCatchupState().active, false, "val: scan catch-up idle")
+    assertEq(#timers, 0, "val: scan catch-up timers idle")
+    for _ = 1, 20 do
+        assertTrue(GS:GetCurrentRecord() ~= nil, "val: repeated read stays valid")
+    end
+    assertEq(deep, 0, "val: repeated reads do not rescan got=" .. tostring(deep))
+    local event = valuationFindDonation(record, 9702, 1)
+    local winner = event and valuationSnap(record, event.txnId)
+    assertTrue(type(winner) == "table", "val: catch-up winner stored")
+    local later = craftValuation(record, event, {
+        assignmentId = "gsv1:abcabcabcabcabcabcabcabc:0000abcd",
+        assignedAt = (winner.assignedAt or 0) + 50,
+        unitCopper = 1,
+    })
+    local laterSt, laterReason = applyValuationBody(later, "Bob-Garona")
+    assertEq(laterSt, "duplicate", "val: later loser stays duplicate " .. tostring(laterReason))
+    assertEq(laterReason, "later_assignment", "val: loser bookkeeping recorded")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, event.txnId).assignmentId, winner.assignmentId,
+        "val: loser did not replace the winner")
+    assertEq(deep, 0, "val: loser bookkeeping did not rescan got=" .. tostring(deep))
+    local pendSt = select(1, applyValuationBody(craftValuation(record, event, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:0000abce",
+        assignedAt = 3,
+        unitCopper = 2,
+        txnId = "ctx:scan-pending",
+    }), "Alice-Garona"))
+    assertEq(pendSt, "pending", "val: pending assignment stored")
+    record = GS:GetCurrentRecord()
+    assertTrue(record.valuations.pending["ctx:scan-pending"] ~= nil, "val: pending key kept")
+    assertEq(deep, 0, "val: pending mutation did not rescan got=" .. tostring(deep))
+
+    local badTxn = "ctx:plant:0001"
+    local badStore = {
+        schemaVersion = planted.schemaVersion,
+        nextSeq = planted.nextSeq,
+        byTxn = planted.byTxn,
+        pending = planted.pending,
+    }
+    badStore.byTxn[badTxn].guildKey = "club:99"
+    record.valuations = badStore
+    deep = 0
+    local badRec, badErr = GS:GetCurrentRecord()
+    assertEq(badRec, nil, "val: malformed restored store fails closed")
+    assertEq(badErr, "invalid_valuations", "val: malformed reason " .. tostring(badErr))
+    assertEq(deep, 1, "val: malformed store deep-scans once")
+    badRec = GS:GetCurrentRecord()
+    assertEq(badRec, nil, "val: cached malformed result stays fail-closed")
+    assertEq(deep, 1, "val: cached failure does not rescan got=" .. tostring(deep))
+    GS.ForgetDonationValuations(record, { badTxn })
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "val: removing the bad snapshot validates again")
+    assertEq(record.valuations.byTxn[badTxn], nil, "val: bad snapshot removed")
+    assertEq(deep, 2, "val: the removal revalidated once got=" .. tostring(deep))
+    local afterForget = deep
+    for _ = 1, 10 do
+        assertTrue(GS:GetCurrentRecord() ~= nil, "val: post-removal read")
+    end
+    assertEq(deep, afterForget, "val: post-removal reads stay cached")
+    record.valuations.nextSeq = 0
+    local seqRec = GS:GetCurrentRecord()
+    assertEq(seqRec, nil, "val: invalid nextSeq fails closed")
+    assertEq(deep, afterForget, "val: cheap nextSeq check does not deep-scan")
+    record.valuations.nextSeq = 3
+    assertTrue(GS:GetCurrentRecord() ~= nil, "val: restored nextSeq validates")
+    assertEq(deep, afterForget, "val: restored nextSeq reuses the ok cache")
+    GS._onValuationDeepValidation = nil
+    assertEq(#world.chat, 0, "val: scan catch-up stays chat-free")
+end
+
+do
+    -- Finding 2: export-maint slices reuse the valuation manifest.
+    SF.TSM = nil
+    local record = activateValuationGuild(9703)
+    local rebuilds = 0
+    GS._onValuationManifestRebuild = function()
+        rebuilds = rebuilds + 1
+    end
+    assertTrue(GS:EnsureGossipProvider(), "val: manifest provider")
+    drainExportMaint()
+    record = GS:GetCurrentRecord()
+    -- A new valuation store is a real scope change, so the next full rebuild
+    -- must walk the winner map once. Later unchanged slices must not.
+    record.valuations = {
+        schemaVersion = 1,
+        nextSeq = 1,
+        byTxn = {},
+        pending = {},
+    }
+    rebuilds = 0
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint()
+    assertEq(rebuilds, 1, "val: cold export rebuilds the manifest once got=" .. tostring(rebuilds))
+    rebuilds = 0
+    for n = 1, 36 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9703, quantity = 1, observedAt = world.time, ageHours = 0,
+            occurrenceIndex = n,
+            neighborsOlder = { "maint-older-" .. n },
+            neighborsNewer = { "maint-newer-" .. n },
+        })
+        local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(st, "accepted", "val: maint seed " .. n .. " " .. tostring(reason))
+    end
+    drainExportMaint()
+    assertEq(rebuilds, 0, "val: paced donation export did not rebuild valuations got="
+        .. tostring(rebuilds))
+    record = GS:GetCurrentRecord()
+    local sourceDataset = record.datasetId
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, valuations = nil, 0
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation" and body.datasetId == datasetId then
+                valuations = valuations + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc" and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            end
+        end
+        return descCount, valuations
+    end
+    local beforeDesc, beforeVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(beforeDesc, 0, "val: maint descriptor starts at zero")
+    assertEq(beforeVals, 0, "val: unpriced maint export has no valuation bodies")
+    valuationTsmValue = 7
+    valuationTsmCalls = 0
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    timers = {}
+    assertEq(GS.StartValuationCatchup("logs-maint"), true, "val: maint catch-up starts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 36, "val: maint catch-up priced every donation")
+    assertEq(GS.GetValuationCatchupState().active, false, "val: maint catch-up idle")
+    assertEq(#timers, 0, "val: maint catch-up timers idle")
+    drainExportMaint()
+    local pricedDesc, pricedVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(pricedDesc, 36, "val: in-place count after catch-up")
+    assertEq(pricedVals, 36, "val: in-place valuation bodies after catch-up")
+    assertEq(rebuilds, 0, "val: pricing did not rebuild the manifest got=" .. tostring(rebuilds))
+    local event = valuationFindDonation(record, 9703, 1)
+    local txnId = event and event.txnId
+    local keptTotal = valuationSnap(record, txnId) and valuationSnap(record, txnId).totalCopper
+    assertEq(keptTotal, 7, "val: maint winner total")
+    GS.ForgetDonationValuations(record, { txnId })
+    drainExportMaint()
+    local removedDesc, removedVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(removedDesc, 35, "val: removal updates the count in place")
+    assertEq(removedVals, 35, "val: removal drops one valuation body")
+    assertEq(rebuilds, 0, "val: removal did not rebuild the manifest got=" .. tostring(rebuilds))
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local epoch = prov and prov.index and prov.index.epoch
+    assertTrue(epoch ~= nil, "val: provider index epoch exists")
+    for _ = 1, 4 do
+        GS.NotifyLocalDurableChange("export-maint")
+    end
+    drainExportMaint()
+    assertEq(rebuilds, 0, "val: idle export-maint does not rebuild got=" .. tostring(rebuilds))
+    assertEq(prov.index.epoch, epoch, "val: export-maint does not restart the index epoch")
+    assertEq(GS._exportMaintIsIdle and GS._exportMaintIsIdle(), true, "val: export-maint is idle")
+    assertEq(GS.StartValuationCatchup("logs-maint-restore"), true, "val: removal catch-up restarts")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnId) and valuationSnap(record, txnId).totalCopper, 7,
+        "val: maint removal was priced again")
+    drainExportMaint()
+    local restoredDesc = select(1, valuationExportSummary(collectAllExportBodies(), sourceDataset))
+    assertEq(restoredDesc, 36, "val: restored descriptor count")
+    assertEq(rebuilds, 0, "val: restore did not rebuild the manifest got=" .. tostring(rebuilds))
+    local exportBodies = collectAllExportBodies()
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginSt = select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset))
+    assertEq(beginSt, "accepted", "val: maint adoption begins")
+    for i = #exportBodies, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: maint buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: maint adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: maint adopted dataset")
+    assertEq(valuationSnap(adopted, txnId) and valuationSnap(adopted, txnId).totalCopper, 7,
+        "val: maint adoption keeps the restored price")
+    GS._onValuationManifestRebuild = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: manifest maint stays chat-free")
+end
+
+do
+    -- Finding 3: staged same-dataset cutover keeps an early valuation pending.
+    SF.TSM = nil
+    local record = activateValuationGuild(9704)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9704, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "cut-older" }, neighborsNewer = { "cut-newer" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: cutover origin officer credit")
+    local body = exportDonationBody(9704)
+    assertTrue(type(body) == "table" and type(body.cutoverMarker) == "string",
+        "val: cutover export carries the marker")
+    local originTxn = body.event.txnId
+    local function loadStaged(name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+    local function descValuationCount()
+        local bodies = collectAllExportBodies()
+        for i = 1, #bodies do
+            local row = bodies[i].body
+            if type(row) == "table" and row.kind == "dataset-desc" then
+                return tonumber(row.valuationCount) or 0
+            end
+        end
+        return nil
+    end
+    local function installCutover(target)
+        return GS.InstallRemoteLiveCutover(target, cutover, "club:42", {
+            member = {
+                guid = "Player-1-Bob", name = "Bob-Garona",
+                guildKey = "club:42", rankOrder = 2,
+            },
+            bindActorToSender = false,
+        })
+    end
+    local function divergentCutover(base)
+        local other = deepCopy(base)
+        other.activatedAt = (tonumber(base.activatedAt) or 0) + 99
+        other.contextObservedAt = other.activatedAt
+        other.contextRecordCount = 0
+        other.eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = other.activatedAt,
+        }
+        other.cutoverMarker = GS.BuildCutoverMarker(other.datasetId, other.activatedAt, other.bankTab)
+        return other
+    end
+
+    local bob = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(bob.activation, GS.ACTIVATION_STAGED, "val: ledger-first peer is staged")
+    assertEq(GS.IsLiveActive(bob), false, "val: ledger-first peer is not live")
+    SF.TSM = nil
+    local histSt, histReason = applyExportBody(body, "Bob-Garona")
+    assertEq(histSt, "accepted", "val: staged ledger accepted " .. tostring(histReason))
+    assertEq(histReason, "officer_history", "val: staged ledger is officer history")
+    bob = GS:GetCurrentRecord()
+    local bobEvent = valuationFindDonation(bob, 9704, 2)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, false, "val: staged ledger is not yet credited")
+    assertEq(bobEvent and bobEvent.gsSourceCutoverMarker, body.cutoverMarker,
+        "val: staged ledger retained the marker")
+    local early = craftValuation(bob, bobEvent, {
+        assignmentId = "gsv1:111111111111111111111111:00009704",
+        assignedAt = 15,
+        unitCopper = 40,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local memberSt, memberReason = applyValuationBody(craftValuation(bob, bobEvent, {
+        assignmentId = "gsv1:222222222222222222222222:00009704",
+        assignedAt = 1,
+        unitCopper = 9,
+        txnId = originTxn,
+    }), "Dave-Garona")
+    assertEq(memberSt, "rejected", "val: staged non-editor valuation rejected")
+    assertEq(memberReason, "unauthorized", "val: staged non-editor reason")
+    local pendSt, pendReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(pendSt, "pending", "val: ledger-first valuation waits " .. tostring(pendReason))
+    assertEq(pendReason, "awaiting_credit", "val: ledger-first waits for cutover credit")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, originTxn), nil, "val: staged assignment is not a winner")
+    assertTrue(type(bob.valuations.pending[originTxn]) == "table", "val: staged assignment stays pending")
+    assertEq(descValuationCount(), 0, "val: staged assignment is not exported")
+    local deniedSt, deniedReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Dave", name = "Dave-Garona",
+            guildKey = "club:42", rankOrder = 4,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(deniedSt, "rejected", "val: non-editor cutover rejected")
+    assertEq(deniedReason, "unauthorized", "val: non-editor cutover reason " .. tostring(deniedReason))
+    bob = GS:GetCurrentRecord()
+    assertEq(bob.activation, GS.ACTIVATION_STAGED, "val: denied cutover stays staged")
+    assertEq(valuationSnap(bob, originTxn), nil, "val: denied cutover did not publish")
+    local cutSt, cutReason = installCutover(bob)
+    assertEq(cutSt, "accepted", "val: staged cutover installs " .. tostring(cutReason))
+    bob = GS:GetCurrentRecord()
+    assertEq(GS.IsLiveActive(bob), true, "val: ledger-first peer is live after cutover")
+    local bobSnap = valuationSnap(bob, originTxn)
+    assertEq(bobSnap and bobSnap.totalCopper, 80, "val: cutover reconciled the original total")
+    assertEq(bobSnap and bobSnap.assignmentId, early.assignmentId, "val: cutover kept the earliest id")
+    assertEq(bob.valuations.pending[originTxn], nil, "val: cutover cleared the pending key")
+    assertEq(descValuationCount(), 1, "val: cutover exports the reconciled winner")
+    local conflictSt, conflictReason = GS.InstallRemoteLiveCutover(
+        bob, divergentCutover(cutover), "club:42", { bindActorToSender = false,
+            member = { guid = "Player-1-Bob", name = "Bob-Garona", guildKey = "club:42", rankOrder = 2 } })
+    assertEq(conflictSt, "rejected", "val: divergent cutover rejected")
+    assertEq(conflictReason, "live_activation_conflict", "val: divergent cutover reason")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, originTxn) and valuationSnap(bob, originTxn).totalCopper, 80,
+        "val: divergent cutover leaves the winner")
+
+    local carol = loadStaged("Carol-Garona", "Player-1-Carol", 2)
+    assertEq(carol.activation, GS.ACTIVATION_STAGED, "val: valuation-first peer is staged")
+    SF.TSM = nil
+    local first = craftValuation(carol, body.event, {
+        assignmentId = "gsv1:333333333333333333333333:00009704",
+        assignedAt = 12,
+        unitCopper = 21,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local earlySt, earlyReason = applyValuationBody(first, "Carol-Garona")
+    assertEq(earlySt, "pending", "val: valuation-first waits " .. tostring(earlyReason))
+    assertEq(earlyReason, "awaiting_donation", "val: valuation-first has no donation yet")
+    local ledSt, ledReason = applyExportBody(body, "Carol-Garona")
+    assertEq(ledSt, "accepted", "val: valuation-first ledger " .. tostring(ledReason))
+    carol = GS:GetCurrentRecord()
+    local carolEvent = valuationFindDonation(carol, 9704, 2)
+    assertEq(carolEvent and carolEvent.gsProductionCredit, false,
+        "val: valuation-first ledger is not yet credited")
+    assertEq(valuationSnap(carol, originTxn), nil, "val: valuation-first is still not a winner")
+    assertTrue(type(carol.valuations.pending[originTxn]) == "table",
+        "val: valuation-first pending survived the ledger")
+    assertEq(descValuationCount(), 0, "val: valuation-first is not exported")
+    local carolCut, carolCutReason = GS.InstallRemoteLiveCutover(carol, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Carol", name = "Carol-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(carolCut, "accepted", "val: valuation-first cutover " .. tostring(carolCutReason))
+    carol = GS:GetCurrentRecord()
+    assertEq(valuationSnap(carol, originTxn) and valuationSnap(carol, originTxn).totalCopper, 42,
+        "val: valuation-first cutover kept the original total")
+    assertEq(carol.valuations.pending[originTxn], nil, "val: valuation-first pending cleared")
+
+    local dave = loadStaged("Dave-Garona", "Player-1-Dave", 4)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local wrong = deepCopy(body)
+    wrong.cutoverMarker = "gs-marker:not-canonical"
+    wrong.event = deepCopy(body.event)
+    SF.TSM = nil
+    local wrongVal = craftValuation(dave, wrong.event, {
+        assignmentId = "gsv1:444444444444444444444444:00009704",
+        assignedAt = 9,
+        unitCopper = 8,
+        txnId = originTxn,
+    })
+    assertEq(select(1, applyValuationBody(wrongVal, "Bob-Garona")), "pending",
+        "val: wrong-marker valuation waits")
+    local wrongLed, wrongLedReason = applyExportBody(wrong, "Bob-Garona")
+    assertEq(wrongLed, "accepted", "val: wrong-marker ledger " .. tostring(wrongLedReason))
+    dave = GS:GetCurrentRecord()
+    assertEq(valuationSnap(dave, originTxn), nil, "val: wrong marker is not a winner yet")
+    local wrongCut, wrongCutReason = GS.InstallRemoteLiveCutover(dave, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(wrongCut, "accepted", "val: canonical cutover after a foreign marker "
+        .. tostring(wrongCutReason))
+    dave = GS:GetCurrentRecord()
+    assertEq(valuationSnap(dave, originTxn), nil, "val: foreign marker does not become a price")
+    -- Live + uncredited after the floor can still receive a late canonical marker.
+    assertTrue(type(dave.valuations.pending[originTxn]) == "table",
+        "val: foreign marker pending retained until provenance settles")
+    assertEq(descValuationCount(), 0, "val: foreign marker exports nothing")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: staged cutover stays chat-free")
+end
+
+do
+    -- Finding 4: adoption replay must not edit the active dataset's valuation exports.
+    SF.TSM = nil
+    local source = activateValuationGuild(9705)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(source, {
+        itemId = 9705, quantity = 3, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "adopt-older" }, neighborsNewer = { "adopt-newer" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: adoption source credit")
+    drainExportMaint()
+    local sourceDataset = GS:GetCurrentRecord().datasetId
+    local sourceBodies = collectAllExportBodies()
+    local ledgerBody = nil
+    for i = 1, #sourceBodies do
+        local row = sourceBodies[i]
+        if row.body and row.body.kind == "gs-ledger-event"
+            and row.body.event and tonumber(row.body.event.itemId) == 9705 then
+            ledgerBody = row.body
+        end
+    end
+    assertTrue(type(ledgerBody) == "table", "val: adoption source ledger exported")
+    local aliasTxn = "ctx:adopt-alias-9705"
+    local aliasBody = deepCopy(ledgerBody)
+    aliasBody.event = deepCopy(ledgerBody.event)
+    aliasBody.event.id = aliasTxn
+    aliasBody.event.txnId = aliasTxn
+    local padCount = 20
+    for i = 1, #sourceBodies do
+        local desc = sourceBodies[i].body
+        if type(desc) == "table" and desc.kind == "dataset-desc" then
+            desc.acceptedLedgerCount = (tonumber(desc.acceptedLedgerCount) or 0) + 1 + padCount
+        end
+    end
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    local current = activateValuationGuild(9706)
+    GS:EnsureGossipProvider()
+    current.valuations = {
+        schemaVersion = 1,
+        nextSeq = 2,
+        byTxn = {
+            [aliasTxn] = {
+                assignmentId = "gsv1:555555555555555555555555:00009706",
+                assignedAt = 20,
+                unitCopper = 11,
+                quantity = 1,
+                totalCopper = 11,
+                itemId = 9706,
+                txnId = aliasTxn,
+                canonicalTxnId = aliasTxn,
+                datasetId = current.datasetId,
+                guildKey = "club:42",
+                actorGuid = "Player-1-Carol",
+                actorName = "Carol-Garona",
+                seen = {},
+            },
+        },
+        pending = {},
+    }
+    assertTrue(GS:GetCurrentRecord() ~= nil, "val: current valuation store is valid")
+    GS.NoteValuationExported(current, aliasTxn)
+    drainExportMaint()
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local exportId = "gs:val:" .. aliasTxn
+    local beforeFp = prov.api.GetRecordVersionFp(exportId)
+    local beforeBody = prov.api.GetRecordBody(exportId)
+    assertTrue(type(beforeBody) == "table", "val: current valuation is exported")
+    assertTrue(type(beforeFp) == "string" and beforeFp ~= "", "val: current valuation fingerprint")
+    local beforeCount = nil
+    local listed = collectAllExportBodies()
+    for i = 1, #listed do
+        local row = listed[i].body
+        if type(row) == "table" and row.kind == "dataset-desc" then
+            beforeCount = row.valuationCount
+        end
+    end
+    assertEq(beforeCount, 1, "val: current descriptor counts one valuation")
+    local currentDataset = current.datasetId
+
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginSt = select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset))
+    assertEq(beginSt, "accepted", "val: overlap adoption begins")
+    for i = 1, #sourceBodies do
+        local st = select(1, GS:BufferAdoptionRecord(sourceBodies[i].id, sourceBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: overlap buffer " .. tostring(sourceBodies[i].body and sourceBodies[i].body.kind))
+    end
+    local aliasBufSt = select(1, GS:BufferAdoptionRecord("gs:le:" .. aliasTxn, aliasBody))
+    assertTrue(aliasBufSt == "accepted" or aliasBufSt == "duplicate",
+        "val: overlap alias buffered " .. tostring(aliasBufSt))
+    for n = 1, padCount do
+        local pad = deepCopy(ledgerBody)
+        pad.event = deepCopy(ledgerBody.event)
+        local padTxn = string.format("ctx:adopt-pad-%02d", n)
+        pad.event.id = padTxn
+        pad.event.txnId = padTxn
+        local padSt = select(1, GS:BufferAdoptionRecord("gs:le:" .. padTxn, pad))
+        assertTrue(padSt == "accepted" or padSt == "duplicate",
+            "val: overlap pad " .. n .. " " .. tostring(padSt))
+    end
+    local savedSlice = GS.MAX_ADMISSION_WORK_PER_SLICE
+    GS.MAX_ADMISSION_WORK_PER_SLICE = 4
+    GS._adoptionReplaySyncDrain = false
+    timers = {}
+    local commitSt, commitReason = GS:CommitDatasetAdoption()
+    assertEq(commitSt, "pending", "val: overlap replay yields " .. tostring(commitReason))
+    local function registryHas(temp, txn)
+        local list = temp and temp.accounting and temp.accounting._consumables
+            and temp.accounting._consumables.txnRegistry
+        if type(list) ~= "table" then
+            return false
+        end
+        for i = 1, #list do
+            local row = list[i]
+            if type(row) == "table" and row.txnId == txn then
+                return true
+            end
+            if type(row) == "table" and type(row.aliases) == "table" then
+                for j = 1, #row.aliases do
+                    if row.aliases[j] == txn then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end
+    local temp = GS._adoption and GS._adoption.replayTemp
+    local found = temp and registryHas(temp, aliasTxn) or false
+    local guard = 0
+    while not found and GS._adoption and GS._adoption.replayTemp and guard < 80 do
+        guard = guard + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+        temp = GS._adoption and GS._adoption.replayTemp
+        found = temp and registryHas(temp, aliasTxn) or false
+    end
+    assertTrue(found, "val: replay aliased into the temporary record steps=" .. tostring(guard))
+    temp = GS._adoption and GS._adoption.replayTemp
+    assertTrue(type(temp) == "table", "val: temporary adoption record still exists")
+    GS.ForgetDonationValuations(temp, { aliasTxn })
+    local midFp = prov.api.GetRecordVersionFp(exportId)
+    local midBody = prov.api.GetRecordBody(exportId)
+    assertEq(midFp, beforeFp, "val: temp cleanup kept the current fingerprint")
+    assertTrue(type(midBody) == "table" and midBody.body and midBody.body.assignment
+        and midBody.body.assignment.totalCopper == 11,
+        "val: temp cleanup kept the current valuation body")
+    GS:CancelDatasetAdoption()
+    GS.MAX_ADMISSION_WORK_PER_SLICE = savedSlice
+    GS._adoptionReplaySyncDrain = true
+    flushTimers()
+    local after = GS:GetCurrentRecord()
+    assertEq(after and after.datasetId, currentDataset, "val: cancel kept the current dataset")
+    assertEq(valuationSnap(after, aliasTxn) and valuationSnap(after, aliasTxn).totalCopper, 11,
+        "val: cancel kept the current snapshot")
+    local afterFp = prov.api.GetRecordVersionFp(exportId)
+    local afterBody = prov.api.GetRecordBody(exportId)
+    assertEq(afterFp, beforeFp, "val: cancel kept the valuation fingerprint")
+    assertEq(afterBody and afterBody.body and afterBody.body.assignment
+        and afterBody.body.assignment.totalCopper, 11,
+        "val: cancel kept the valuation export")
+    local afterCount = nil
+    listed = collectAllExportBodies()
+    for i = 1, #listed do
+        local row = listed[i].body
+        if type(row) == "table" and row.kind == "dataset-desc"
+            and row.datasetId == currentDataset then
+            afterCount = row.valuationCount
+        end
+    end
+    assertEq(afterCount, beforeCount, "val: cancel kept the valuation count")
+    local primary = "ctx:live-alias-primary-9706"
+    after.valuations.byTxn[primary] = {
+        assignmentId = "gsv1:666666666666666666666666:00009706",
+        assignedAt = 5,
+        unitCopper = 3,
+        quantity = 1,
+        totalCopper = 3,
+        itemId = 9706,
+        txnId = primary,
+        canonicalTxnId = primary,
+        datasetId = after.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Carol",
+        actorName = "Carol-Garona",
+        seen = {},
+    }
+    GS.OnDonationTxnAlias(after, primary, aliasTxn)
+    assertEq(prov.api.GetRecordBody(exportId), nil, "val: live alias still removes its export")
+    assertEq(valuationSnap(after, primary) ~= nil or valuationSnap(after, aliasTxn) == nil, true,
+        "val: live alias merged on the current record")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: adoption isolation stays chat-free")
+end
+
+do
+    -- Finding 5: expected nil stays quiet; a thrown adapter error is debug-logged.
+    local record = activateValuationGuild(9707)
+    SF.Debug:SetEnabled(true)
+    world.debugLogs = {}
+    world.chat = {}
+    world.prints = {}
+    valuationTsmCalls = 0
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return nil
+        end,
+    }
+    local quiet = makeDepositEvidence(record, {
+        itemId = 9707, quantity = 1, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "tsm-nil-older" }, neighborsNewer = { "tsm-nil-newer" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(quiet, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: nil market donation accepted")
+    record = GS:GetCurrentRecord()
+    local quietEvent = valuationFindDonation(record, 9707, 1)
+    assertEq(valuationSnap(record, quietEvent and quietEvent.txnId), nil,
+        "val: nil market stays unpriced")
+    assertTrue(valuationTsmCalls >= 1, "val: nil market was queried")
+    local quietErrors = 0
+    for i = 1, #world.debugLogs do
+        if world.debugLogs[i].level == "ERROR" then
+            quietErrors = quietErrors + 1
+        end
+    end
+    assertEq(quietErrors, 0, "val: nil market does not debug-log")
+    assertEq(#world.chat, 0, "val: nil market stays chat-free")
+    assertEq(#world.prints, 0, "val: nil market stays print-free")
+
+    world.debugLogs = {}
+    SF.TSM = {
+        GetMarketValue = function()
+            error("valuation-adapter-boom")
+        end,
+    }
+    local thrown = makeDepositEvidence(record, {
+        itemId = 9707, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "tsm-throw-older" }, neighborsNewer = { "tsm-throw-newer" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(thrown, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: thrown market donation accepted")
+    record = GS:GetCurrentRecord()
+    local thrownEvent = valuationFindDonation(record, 9707, 2)
+    assertEq(valuationSnap(record, thrownEvent and thrownEvent.txnId), nil,
+        "val: thrown market stays unpriced")
+    local saw = false
+    for i = 1, #world.debugLogs do
+        local row = world.debugLogs[i]
+        if row.level == "ERROR" and row.cat == "GUILD_SUPPLIES"
+            and type(row.msg) == "string"
+            and row.msg:find("valuation-adapter-boom", 1, true) then
+            saw = true
+        end
+    end
+    assertTrue(saw, "val: thrown adapter was debug-logged")
+    assertEq(#world.chat, 0, "val: thrown adapter stays chat-free")
+    assertEq(#world.prints, 0, "val: thrown adapter stays print-free")
+    SF.Debug:SetEnabled(false)
+    SF.TSM = nil
+end
+
+do
+    -- Staged alias reconciliation keeps unresolved candidates until cutover.
+    SF.TSM = nil
+    local record = activateValuationGuild(9708)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9708, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "alias-cut-older" }, neighborsNewer = { "alias-cut-newer" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: alias-cutover origin credit")
+    local body = exportDonationBody(9708)
+    assertTrue(type(body) == "table" and type(body.event) == "table", "val: alias-cutover export")
+    local originTxn = body.event.txnId
+    local qty = tonumber(body.event.quantity)
+    local function loadStaged(name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+    local function descValuationCount()
+        local bodies = collectAllExportBodies()
+        for i = 1, #bodies do
+            local row = bodies[i].body
+            if type(row) == "table" and row.kind == "dataset-desc" then
+                return tonumber(row.valuationCount) or 0
+            end
+        end
+        return nil
+    end
+    local function installCutover(target, markerCutover, guid, name, rank)
+        return GS.InstallRemoteLiveCutover(target, markerCutover, "club:42", {
+            member = {
+                guid = guid, name = name, guildKey = "club:42", rankOrder = rank,
+            },
+            bindActorToSender = false,
+        })
+    end
+    local function divergentCutover(base)
+        local other = deepCopy(base)
+        other.activatedAt = (tonumber(base.activatedAt) or 0) + 99
+        other.contextObservedAt = other.activatedAt
+        other.contextRecordCount = 0
+        other.eligibilityBoundary = {
+            baselineEstablished = true,
+            tabEligibleFrom = other.activatedAt,
+        }
+        other.cutoverMarker = GS.BuildCutoverMarker(other.datasetId, other.activatedAt, other.bankTab)
+        return other
+    end
+    local function aliasLedger(aliasTxn)
+        local copy = deepCopy(body)
+        copy.event = deepCopy(body.event)
+        copy.event.id = aliasTxn
+        copy.event.txnId = aliasTxn
+        return copy
+    end
+
+    local bob = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    assertEq(bob.activation, GS.ACTIVATION_STAGED, "val: alias peer is staged")
+    SF.TSM = nil
+    local ledSt, ledReason = applyExportBody(body, "Bob-Garona")
+    assertEq(ledSt, "accepted", "val: alias peer ledger " .. tostring(ledReason))
+    bob = GS:GetCurrentRecord()
+    local bobEvent = valuationFindDonation(bob, 9708, qty)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, false, "val: alias peer donation is uncredited")
+    local aliasTxn = "ctx:alias-cut-9708"
+    local early = craftValuation(bob, bobEvent, {
+        assignmentId = "gsv1:111111111111111111111111:00009708",
+        assignedAt = 11,
+        unitCopper = 15,
+        txnId = aliasTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local earlySt, earlyReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(earlySt, "pending", "val: alias price waits " .. tostring(earlyReason))
+    assertEq(earlyReason, "awaiting_donation", "val: alias price is not on the donation yet")
+    local aliasSt, aliasReason = applyExportBody(aliasLedger(aliasTxn), "Bob-Garona")
+    assertEq(aliasSt, "duplicate", "val: alias ledger links the occurrence " .. tostring(aliasReason))
+    assertEq(aliasReason, "occurrence_duplicate", "val: alias ledger reason")
+    bob = GS:GetCurrentRecord()
+    assertTrue(bob ~= nil, "val: alias hold still validates")
+    assertEq(valuationSnap(bob, originTxn), nil, "val: alias hold is not a winner")
+    assertEq(bob.valuations.byTxn[originTxn], nil, "val: alias hold has no canonical winner")
+    assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: alias hold has no alias winner")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: alias pending moved off the alias id")
+    local held = bob.valuations.pending[originTxn]
+    assertEq(held and held.assignmentId, early.assignmentId, "val: alias hold keeps the earlier id")
+    assertEq(held and held.totalCopper, 15 * qty, "val: alias hold keeps the earlier total")
+    assertEq(held and held.txnId, aliasTxn, "val: alias hold keeps the original assignment txn")
+    assertEq(held and held.canonicalTxnId, originTxn, "val: alias hold sits on the canonical lookup key")
+    assertEq(descValuationCount(), 0, "val: alias hold is not exported")
+    local beforeCutSt, beforeCutReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(beforeCutSt, "duplicate", "val: original assignment redelivery before cutover "
+        .. tostring(beforeCutReason))
+    assertEq(beforeCutReason, "duplicate", "val: before-cutover reason is duplicate")
+    bob = GS:GetCurrentRecord()
+    assertEq(bob.valuations.pending[originTxn] and bob.valuations.pending[originTxn].txnId, aliasTxn,
+        "val: redelivery before cutover does not rewrite txnId")
+    assertEq(descValuationCount(), 0, "val: redelivery before cutover still exports nothing")
+    local cutSt, cutReason = installCutover(bob, cutover, "Player-1-Bob", "Bob-Garona", 2)
+    assertEq(cutSt, "accepted", "val: alias cutover installs " .. tostring(cutReason))
+    bob = GS:GetCurrentRecord()
+    local bobSnap = valuationSnap(bob, originTxn)
+    assertEq(bobSnap and bobSnap.totalCopper, 15 * qty, "val: cutover promotes the held alias price")
+    assertEq(bobSnap and bobSnap.assignmentId, early.assignmentId, "val: cutover keeps the held id")
+    assertEq(bobSnap and bobSnap.txnId, aliasTxn, "val: promoted winner keeps the original txn")
+    assertEq(bobSnap and bobSnap.canonicalTxnId, originTxn, "val: promoted winner is keyed by canonical")
+    assertEq(bob.valuations.pending[originTxn], nil, "val: cutover clears the held pending row")
+    assertEq(descValuationCount(), 1, "val: cutover exports one promoted valuation")
+    local afterCutSt, afterCutReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(afterCutSt, "duplicate", "val: original assignment redelivery after cutover "
+        .. tostring(afterCutReason))
+    assertEq(afterCutReason, "duplicate", "val: after-cutover reason is duplicate")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, originTxn) and valuationSnap(bob, originTxn).txnId, aliasTxn,
+        "val: redelivery after cutover leaves the original txn")
+    assertEq(descValuationCount(), 1, "val: redelivery after cutover does not add exports")
+    local bobExport = GS.BuildValuationExportBody(bob, originTxn)
+    assertTrue(type(bobExport) == "table" and type(bobExport.assignment) == "table",
+        "val: promoted export body exists")
+    assertEq(bobExport.assignment.txnId, aliasTxn, "val: re-exported winner keeps the original txn")
+    assertEq(bobExport.assignment.assignmentId, early.assignmentId, "val: re-exported winner id")
+
+    local frankRoot = deepCopy(configRoot)
+    local frank = loadClientFromConfigRoot(frankRoot, "Frank-Garona", "Player-1-Frank", 2)
+    assertEq(GS.IsLiveActive(frank), true, "val: peer starts live")
+    SF.TSM = nil
+    assertEq(select(1, applyExportBody(body, "Frank-Garona")), "accepted", "val: live peer ledger")
+    frank = GS:GetCurrentRecord()
+    local frankEvent = valuationFindDonation(frank, 9708, qty)
+    assertEq(frankEvent and frankEvent.gsProductionCredit, true, "val: live peer donation is credited")
+    local frankAliasSt, frankAliasReason = applyExportBody(aliasLedger(aliasTxn), "Frank-Garona")
+    assertTrue(frankAliasSt == "duplicate" or frankAliasSt == "accepted",
+        "val: live peer alias " .. tostring(frankAliasSt) .. " " .. tostring(frankAliasReason))
+    local frankPendSt, frankPendReason = applyValuationBody(early, "Frank-Garona")
+    assertEq(frankPendSt, "accepted", "val: live peer accepts the original assignment "
+        .. tostring(frankPendReason))
+    frank = GS:GetCurrentRecord()
+    assertEq(valuationSnap(frank, originTxn) and valuationSnap(frank, originTxn).txnId, aliasTxn,
+        "val: live peer stores the original txn")
+    local peerSt, peerReason = applyValuationBody(bobExport.assignment, "Bob-Garona")
+    assertEq(peerSt, "duplicate", "val: live peer recognizes the re-exported winner "
+        .. tostring(peerReason))
+    assertEq(peerReason, "duplicate", "val: live peer reason is duplicate")
+    frank = GS:GetCurrentRecord()
+    assertEq(valuationSnap(frank, originTxn) and valuationSnap(frank, originTxn).assignmentId,
+        early.assignmentId, "val: live peer keeps the same assignment id")
+    assertEq(valuationCount(frank), 1, "val: live peer still has one winner")
+    local altered = craftValuation(frank, frankEvent, {
+        assignmentId = early.assignmentId,
+        assignedAt = early.assignedAt,
+        unitCopper = 99,
+        txnId = aliasTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local conflictSt, conflictReason = applyValuationBody(altered, "Bob-Garona")
+    assertEq(conflictSt, "rejected", "val: altered same-id body is rejected")
+    assertEq(conflictReason, "id_conflict", "val: altered same-id reason")
+    frank = GS:GetCurrentRecord()
+    assertEq(valuationSnap(frank, originTxn) and valuationSnap(frank, originTxn).unitCopper, 15,
+        "val: altered same-id body does not replace the winner")
+
+    local carol = loadStaged("Carol-Garona", "Player-1-Carol", 2)
+    SF.TSM = nil
+    assertEq(select(1, applyExportBody(body, "Carol-Garona")), "accepted", "val: tie peer ledger")
+    carol = GS:GetCurrentRecord()
+    local tieAlias = "ctx:alias-tie-9708"
+    local canonicalTie = craftValuation(carol, body.event, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009708",
+        assignedAt = 40,
+        unitCopper = 4,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local aliasTie = craftValuation(carol, body.event, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00009708",
+        assignedAt = 40,
+        unitCopper = 9,
+        txnId = tieAlias,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    assertEq(select(1, applyValuationBody(canonicalTie, "Carol-Garona")), "pending",
+        "val: tie canonical price waits")
+    assertEq(select(1, applyValuationBody(aliasTie, "Carol-Garona")), "pending",
+        "val: tie alias price waits")
+    local tieSt, tieReason = applyExportBody(aliasLedger(tieAlias), "Carol-Garona")
+    assertEq(tieSt, "duplicate", "val: tie alias links " .. tostring(tieReason))
+    carol = GS:GetCurrentRecord()
+    assertEq(valuationSnap(carol, originTxn), nil, "val: tie is not accepted before cutover")
+    local tieHeld = carol.valuations.pending[originTxn]
+    assertEq(tieHeld and tieHeld.assignmentId, aliasTie.assignmentId,
+        "val: same-second tie keeps the lower assignment id")
+    assertEq(tieHeld and tieHeld.unitCopper, 9, "val: same-second tie keeps that unit")
+    assertEq(tieHeld and tieHeld.txnId, tieAlias, "val: same-second tie keeps the original txn")
+    assertEq(tieHeld and tieHeld.canonicalTxnId, originTxn, "val: same-second tie uses canonical key")
+    assertEq(carol.valuations.pending[tieAlias], nil, "val: tie alias key is consumed")
+    assertEq(descValuationCount(), 0, "val: tie is not exported")
+    local conflictAlias = "ctx:alias-conflict-9708"
+    carol.valuations.pending[conflictAlias] = {
+        assignmentId = aliasTie.assignmentId,
+        assignedAt = 1,
+        unitCopper = 8,
+        quantity = qty,
+        totalCopper = 8 * qty,
+        itemId = 9708,
+        txnId = conflictAlias,
+        datasetId = carol.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    GS.OnDonationTxnAlias(carol, originTxn, conflictAlias)
+    carol = GS:GetCurrentRecord()
+    assertTrue(carol ~= nil, "val: id conflict still validates")
+    assertEq(carol.valuations.pending[originTxn] and carol.valuations.pending[originTxn].unitCopper, 9,
+        "val: same assignment id does not replace the stored body")
+    assertEq(carol.valuations.pending[conflictAlias], nil, "val: conflicting alias key is consumed")
+    local mismatchAlias = "ctx:alias-mismatch-9708"
+    carol.valuations.pending[mismatchAlias] = {
+        assignmentId = "gsv1:cccccccccccccccccccccccc:00009708",
+        assignedAt = 1,
+        unitCopper = 1,
+        quantity = qty,
+        totalCopper = qty,
+        itemId = 1,
+        txnId = mismatchAlias,
+        datasetId = carol.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    GS.OnDonationTxnAlias(carol, originTxn, mismatchAlias)
+    carol = GS:GetCurrentRecord()
+    assertEq(carol.valuations.pending[mismatchAlias], nil, "val: mismatched alias candidate is dropped")
+    assertEq(carol.valuations.pending[originTxn] and carol.valuations.pending[originTxn].unitCopper, 9,
+        "val: mismatch leaves the matching candidate")
+    assertEq(valuationSnap(carol, originTxn), nil, "val: mismatch does not promote")
+    local badCut, badCutReason = installCutover(
+        carol, divergentCutover(cutover), "Player-1-Carol", "Carol-Garona", 2)
+    assertEq(badCut, "accepted", "val: divergent cutover installs " .. tostring(badCutReason))
+    carol = GS:GetCurrentRecord()
+    assertEq(valuationSnap(carol, originTxn), nil, "val: divergent cutover leaves the price unaccepted")
+    -- Divergent installed marker left the row uncredited after the floor; a later
+    -- authenticated matching marker can still repair, so keep the pending price.
+    assertTrue(type(carol.valuations.pending[originTxn]) == "table",
+        "val: divergent cutover retains pending until provenance settles")
+    assertEq(descValuationCount(), 0, "val: divergent cutover exports nothing")
+
+    local earlyPeer = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    SF.TSM = nil
+    local beforeAlias = "ctx:alias-before-9708"
+    local beforeEarly = craftValuation(earlyPeer, body.event, {
+        assignmentId = "gsv1:dddddddddddddddddddddddd:00009708",
+        assignedAt = 5,
+        unitCopper = 3,
+        txnId = beforeAlias,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local beforeLater = craftValuation(earlyPeer, body.event, {
+        assignmentId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00009708",
+        assignedAt = 8,
+        unitCopper = 6,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    assertEq(select(1, applyValuationBody(beforeEarly, "Bob-Garona")), "pending",
+        "val: pre-donation alias price waits")
+    assertEq(select(1, applyValuationBody(beforeLater, "Bob-Garona")), "pending",
+        "val: pre-donation canonical price waits")
+    earlyPeer = GS:GetCurrentRecord()
+    local malformedAlias = "ctx:alias-malformed-9708"
+    earlyPeer.valuations.pending[malformedAlias] = {
+        assignmentId = "not-an-assignment",
+        txnId = malformedAlias,
+    }
+    GS.OnDonationTxnAlias(earlyPeer, originTxn, malformedAlias)
+    earlyPeer = GS:GetCurrentRecord()
+    assertTrue(earlyPeer ~= nil, "val: malformed alias candidate does not poison the store")
+    assertEq(earlyPeer.valuations.pending[malformedAlias], nil, "val: malformed alias candidate is dropped")
+    assertEq(earlyPeer.valuations.pending[beforeAlias] and earlyPeer.valuations.pending[beforeAlias].unitCopper, 3,
+        "val: malformed pass leaves the other pending row")
+    GS.OnDonationTxnAlias(earlyPeer, originTxn, beforeAlias)
+    earlyPeer = GS:GetCurrentRecord()
+    assertTrue(earlyPeer ~= nil, "val: pre-donation alias still validates")
+    assertEq(valuationFindDonation(earlyPeer, 9708, qty), nil, "val: pre-donation alias has no donation yet")
+    assertEq(valuationSnap(earlyPeer, originTxn), nil, "val: pre-donation alias is not a winner")
+    local beforeHeld = earlyPeer.valuations.pending[originTxn]
+    assertEq(beforeHeld and beforeHeld.assignmentId, beforeEarly.assignmentId,
+        "val: pre-donation alias keeps the earlier id")
+    assertEq(beforeHeld and beforeHeld.unitCopper, 3, "val: pre-donation alias keeps the earlier unit")
+    assertEq(beforeHeld and beforeHeld.txnId, beforeAlias, "val: pre-donation alias keeps the original txn")
+    assertEq(beforeHeld and beforeHeld.canonicalTxnId, originTxn,
+        "val: pre-donation alias uses the canonical lookup key")
+    assertEq(earlyPeer.valuations.pending[beforeAlias], nil, "val: pre-donation alias key is consumed")
+    assertEq(descValuationCount(), 0, "val: pre-donation alias is not exported")
+    local arriveSt, arriveReason = applyExportBody(body, "Bob-Garona")
+    assertEq(arriveSt, "accepted", "val: donation arrives after the alias " .. tostring(arriveReason))
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(valuationSnap(earlyPeer, originTxn), nil, "val: arrived donation stays unpriced while staged")
+    assertEq(earlyPeer.valuations.pending[originTxn] and earlyPeer.valuations.pending[originTxn].unitCopper, 3,
+        "val: arrived donation keeps the earlier pending price")
+    local deniedSt, deniedReason = installCutover(
+        earlyPeer, cutover, "Player-1-Dave", "Dave-Garona", 4)
+    assertEq(deniedSt, "rejected", "val: non-editor cutover rejected " .. tostring(deniedReason))
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(earlyPeer.activation, GS.ACTIVATION_STAGED, "val: rejected cutover stays staged")
+    assertEq(valuationSnap(earlyPeer, originTxn), nil, "val: rejected cutover does not promote")
+    assertEq(descValuationCount(), 0, "val: rejected cutover exports nothing")
+    local okCut, okReason = installCutover(earlyPeer, cutover, "Player-1-Bob", "Bob-Garona", 2)
+    assertEq(okCut, "accepted", "val: pre-donation cutover installs " .. tostring(okReason))
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(valuationSnap(earlyPeer, originTxn) and valuationSnap(earlyPeer, originTxn).totalCopper, 3 * qty,
+        "val: pre-donation cutover promotes the earlier price")
+    assertEq(earlyPeer.valuations.pending[originTxn], nil, "val: pre-donation pending cleared")
+    assertEq(descValuationCount(), 1, "val: pre-donation cutover exports one valuation")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: staged alias reconciliation stays chat-free")
+end
+
+do
+    -- Finding 1: late canonical cutover provenance keeps pending price after install.
+    SF.TSM = nil
+    ensureRankedMember("Eve-Garona", "Player-1-Eve", 4)
+    ensureRankedMember("Frank-Garona", "Player-1-Frank", 2)
+    local function findByTxn(rec, txnId)
+        local events = rec.accounting and rec.accounting._consumableEvents or {}
+        for i = 1, #events do
+            if events[i] and (events[i].txnId == txnId or events[i].id == txnId) then
+                return events[i]
+            end
+        end
+        return nil
+    end
+    local function descValuationCount()
+        local bodies = collectAllExportBodies()
+        for i = 1, #bodies do
+            local row = bodies[i].body
+            if type(row) == "table" and row.kind == "dataset-desc" then
+                return tonumber(row.valuationCount) or 0
+            end
+        end
+        return nil
+    end
+    local function loadStaged(configRoot, name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+
+    -- Happy path: unmarked staged + pending valuation → cutover → late marked repair.
+    local record = activateValuationGuild(9801)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    local marker = cutover.cutoverMarker
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9801, quantity = 3, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "late-marker-older" }, neighborsNewer = { "late-marker-newer" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: late-marker origin credit")
+    local body = exportDonationBody(9801)
+    assertTrue(type(body) == "table" and type(body.event) == "table", "val: late-marker export")
+    local originTxn = body.event.txnId
+    -- Unmarked officer-history export (no cutoverMarker on the wire body).
+    local unmarked = deepCopy(body)
+    unmarked.cutoverMarker = nil
+
+    local bob = loadStaged(configRoot, "Bob-Garona", "Player-1-Bob", 2)
+    SF.TSM = nil
+    assertEq(select(2, applyExportBody(unmarked, "Bob-Garona")), "officer_history",
+        "val: late-marker unmarked staged history")
+    bob = GS:GetCurrentRecord()
+    local bobEvent = findByTxn(bob, originTxn)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, false, "val: late-marker staged uncredited")
+    assertEq(bobEvent and bobEvent.gsSourceCutoverMarker, nil, "val: late-marker no marker yet")
+    local early = craftValuation(bob, bobEvent, {
+        assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00009801",
+        assignedAt = 17,
+        unitCopper = 33,
+        txnId = originTxn,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+    })
+    local pendSt, pendReason = applyValuationBody(early, "Bob-Garona")
+    assertEq(pendSt, "pending", "val: late-marker valuation waits " .. tostring(pendReason))
+    assertEq(pendReason, "awaiting_credit", "val: late-marker awaits credit")
+    bob = GS:GetCurrentRecord()
+    assertTrue(type(bob.valuations.pending[originTxn]) == "table", "val: late-marker pending held")
+    assertEq(valuationSnap(bob, originTxn), nil, "val: late-marker not a winner yet")
+    assertEq(descValuationCount(), 0, "val: late-marker unpublished while staged")
+
+    local cutSt, cutReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(cutSt, "accepted", "val: late-marker cutover " .. tostring(cutReason))
+    bob = GS:GetCurrentRecord()
+    assertEq(GS.IsLiveActive(bob), true, "val: late-marker peer is live")
+    bobEvent = findByTxn(bob, originTxn)
+    assertEq(bobEvent and bobEvent.gsProductionCredit, false,
+        "val: late-marker still uncredited after unmarked install")
+    assertTrue(type(bob.valuations.pending[originTxn]) == "table",
+        "val: late-marker pending survives cutover without provenance")
+    assertEq(valuationSnap(bob, originTxn), nil, "val: late-marker still unpublished after cutover")
+    assertEq(descValuationCount(), 0, "val: late-marker still not exported")
+
+    -- Source offline: only a later authenticated marked duplicate arrives.
+    SF.TSM = nil
+    local marked = deepCopy(unmarked)
+    marked.cutoverMarker = marker
+    local markSt, markReason = applyExportBody(marked, "Eve-Garona")
+    assertEq(markSt, "duplicate", "val: late-marker marked duplicate " .. tostring(markReason))
+    bob = GS:GetCurrentRecord()
+    bobEvent = findByTxn(bob, originTxn)
+    assertEq(bobEvent and bobEvent.gsSourceCutoverMarker, marker, "val: late-marker attaches")
+    assertEq(bobEvent and bobEvent.gsProductionCredit, true, "val: late-marker credits")
+    local bobSnap = valuationSnap(bob, originTxn)
+    assertEq(bobSnap and bobSnap.totalCopper, 99, "val: late-marker promotes original total")
+    assertEq(bobSnap and bobSnap.assignmentId, early.assignmentId, "val: late-marker keeps assignment id")
+    assertEq(bob.valuations.pending[originTxn], nil, "val: late-marker pending cleared")
+    assertEq(descValuationCount(), 1, "val: late-marker exports the promoted winner")
+    -- No valuation redelivery: replaying the same ledger marked body stays a duplicate.
+    assertEq(select(1, applyExportBody(marked, "Eve-Garona")), "duplicate",
+        "val: late-marker ledger redelivery is duplicate")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, originTxn) and valuationSnap(bob, originTxn).assignmentId,
+        early.assignmentId, "val: late-marker winner unchanged without valuation redelivery")
+
+    -- Negative: pre-cutover floor discards pending and never credits.
+    -- Keep a normal staged unmarked admission, then install a later cutover so
+    -- that retained row sits permanently before the eligibility floor.
+    local earlyPeer = loadStaged(configRoot, "Carol-Garona", "Player-1-Carol", 2)
+    SF.TSM = nil
+    local preBody = deepCopy(unmarked)
+    preBody.event = deepCopy(unmarked.event)
+    preBody.event.id = "ctx:late-marker-pre:9801"
+    preBody.event.txnId = "ctx:late-marker-pre:9801"
+    assertEq(select(2, applyExportBody(preBody, "Carol-Garona")), "officer_history",
+        "val: late-marker pre-floor history")
+    earlyPeer = GS:GetCurrentRecord()
+    local preEvent = findByTxn(earlyPeer, "ctx:late-marker-pre:9801")
+    assertTrue(preEvent ~= nil, "val: late-marker pre-floor retained row")
+    local donationTime = tonumber(preEvent.approxTxnTime) or tonumber(preEvent.timestamp) or 0
+    local lateFloor = math.floor(donationTime + 5000)
+    local lateTab = tonumber(earlyPeer.accounting._consumables.bankTab)
+    local lateMarker = GS.BuildCutoverMarker(earlyPeer.datasetId, lateFloor, lateTab)
+    local lateCutover = deepCopy(cutover)
+    lateCutover.activatedAt = lateFloor
+    lateCutover.contextObservedAt = lateFloor
+    lateCutover.contextRecordCount = 0
+    lateCutover.cutoverMarker = lateMarker
+    lateCutover.eligibilityBoundary = {
+        baselineEstablished = true,
+        tabEligibleFrom = lateFloor,
+    }
+    local preVal = craftValuation(earlyPeer, preEvent, {
+        assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009801",
+        assignedAt = 3,
+        unitCopper = 7,
+        txnId = "ctx:late-marker-pre:9801",
+    })
+    assertEq(select(1, applyValuationBody(preVal, "Carol-Garona")), "pending",
+        "val: late-marker pre-floor valuation waits while staged")
+    assertEq(GS.InstallRemoteLiveCutover(earlyPeer, lateCutover, "club:42", {
+        member = {
+            guid = "Player-1-Carol", name = "Carol-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    }), "accepted", "val: late-marker pre-floor cutover")
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(earlyPeer.valuations.pending["ctx:late-marker-pre:9801"], nil,
+        "val: late-marker pre-floor pending discarded")
+    assertEq(valuationSnap(earlyPeer, "ctx:late-marker-pre:9801"), nil,
+        "val: late-marker pre-floor never priced")
+    local preMarked = deepCopy(preBody)
+    preMarked.cutoverMarker = lateMarker
+    assertEq(select(1, applyExportBody(preMarked, "Eve-Garona")), "duplicate",
+        "val: late-marker pre-floor marked duplicate")
+    earlyPeer = GS:GetCurrentRecord()
+    assertEq(findByTxn(earlyPeer, "ctx:late-marker-pre:9801").gsProductionCredit, false,
+        "val: late-marker pre-floor stays uncredited")
+    assertEq(valuationSnap(earlyPeer, "ctx:late-marker-pre:9801"), nil,
+        "val: late-marker pre-floor still unpriced")
+
+    -- Negative: unauthorized sender cannot hold a pending price.
+    local dave = loadStaged(configRoot, "Dave-Garona", "Player-1-Dave", 4)
+    SF.TSM = nil
+    assertEq(select(2, applyExportBody(unmarked, "Bob-Garona")), "officer_history",
+        "val: late-marker auth peer history")
+    dave = GS:GetCurrentRecord()
+    local daveEvent = findByTxn(dave, originTxn)
+    local badVal = craftValuation(dave, daveEvent, {
+        assignmentId = "gsv1:cccccccccccccccccccccccc:00009801",
+        assignedAt = 1,
+        unitCopper = 2,
+        txnId = originTxn,
+    })
+    local badSt, badReason = applyValuationBody(badVal, "Dave-Garona")
+    assertEq(badSt, "rejected", "val: late-marker non-editor rejected")
+    assertEq(badReason, "unauthorized", "val: late-marker non-editor reason")
+    dave = GS:GetCurrentRecord()
+    assertEq(dave.valuations and dave.valuations.pending
+        and dave.valuations.pending[originTxn], nil,
+        "val: late-marker unauthorized leaves no pending")
+
+    -- Negative: divergent marker never promotes the pending price.
+    local frank = loadStaged(configRoot, "Frank-Garona", "Player-1-Frank", 2)
+    SF.TSM = nil
+    assertEq(select(2, applyExportBody(unmarked, "Bob-Garona")), "officer_history",
+        "val: late-marker divergent peer history")
+    frank = GS:GetCurrentRecord()
+    local frankEvent = findByTxn(frank, originTxn)
+    local frankVal = craftValuation(frank, frankEvent, {
+        assignmentId = "gsv1:dddddddddddddddddddddddd:00009801",
+        assignedAt = 9,
+        unitCopper = 5,
+        txnId = originTxn,
+    })
+    assertEq(select(1, applyValuationBody(frankVal, "Bob-Garona")), "pending",
+        "val: late-marker divergent valuation waits")
+    assertEq(GS.InstallRemoteLiveCutover(frank, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Frank", name = "Frank-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    }), "accepted", "val: late-marker divergent cutover")
+    frank = GS:GetCurrentRecord()
+    assertTrue(type(frank.valuations.pending[originTxn]) == "table",
+        "val: late-marker divergent still holds pending while uncredited")
+    local divergent = deepCopy(unmarked)
+    divergent.cutoverMarker = marker .. ":other"
+    assertEq(select(1, applyExportBody(divergent, "Eve-Garona")), "duplicate",
+        "val: late-marker divergent marked duplicate")
+    frank = GS:GetCurrentRecord()
+    assertEq(findByTxn(frank, originTxn).gsProductionCredit, false,
+        "val: late-marker divergent does not credit")
+    assertTrue(type(frank.valuations.pending[originTxn]) == "table",
+        "val: late-marker divergent pending retained until a real canonical repair")
+    assertEq(valuationSnap(frank, originTxn), nil, "val: late-marker divergent unpublished")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: late-marker stays chat-free")
+end
+
+do
+    -- Finding 2: remove unmaterialized valuation from tracked manifest during cold rebuild.
+    SF.TSM = {
+        GetMarketValue = function()
+            return 11
+        end,
+    }
+    local record = activateValuationGuild(9802)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidenceA = makeDepositEvidence(record, {
+        itemId = 9802, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "manifest-a-old" }, neighborsNewer = { "manifest-a-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidenceA, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: manifest-cold primary credit")
+    local evidenceB = makeDepositEvidence(record, {
+        itemId = 9802, quantity = 1, observedAt = world.time + 10, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "manifest-b-old" }, neighborsNewer = { "manifest-b-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidenceB, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: manifest-cold alias credit")
+    record = GS:GetCurrentRecord()
+    drainExportMaint(64)
+    local primary = valuationFindDonation(record, 9802, 2)
+    local aliasEv = valuationFindDonation(record, 9802, 1)
+    assertTrue(primary and aliasEv, "val: manifest-cold both donations")
+    local primaryTxn = primary.txnId
+    local aliasTxn = aliasEv.txnId
+    assertTrue(type(valuationSnap(record, primaryTxn)) == "table", "val: manifest-cold primary priced")
+    assertTrue(type(valuationSnap(record, aliasTxn)) == "table", "val: manifest-cold alias priced")
+    local sourceDataset = record.datasetId
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, valuations = nil, 0
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                valuations = valuations + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            end
+        end
+        return descCount, valuations
+    end
+    local beforeDesc, beforeVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(beforeDesc, 2, "val: manifest-cold starts with two advertised")
+    assertEq(beforeVals, 2, "val: manifest-cold starts with two bodies")
+
+    GS._exportMaintSyncDrain = false
+    timers = {}
+    GS:DisableGossipProvider()
+    assertTrue(GS:EnsureGossipProvider(), "val: manifest-cold re-register")
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(prov and prov.api, "val: manifest-cold provider")
+    -- Cold rebuild advertises winners before paced gs:val bodies exist.
+    assertEq(prov.api.GetRecordBody("gs:val:" .. primaryTxn), nil,
+        "val: manifest-cold primary body not materialized yet")
+    assertEq(prov.api.GetRecordBody("gs:val:" .. aliasTxn), nil,
+        "val: manifest-cold alias body not materialized yet")
+    local midDesc = nil
+    local listed = collectAllExportBodies()
+    for i = 1, #listed do
+        local row = listed[i].body
+        if type(row) == "table" and row.kind == "dataset-desc"
+            and row.datasetId == sourceDataset then
+            midDesc = row.valuationCount
+        end
+    end
+    assertEq(midDesc, 2, "val: manifest-cold descriptor still counts both winners")
+
+    -- Alias/remove the unmaterialized winner; manifest must drop without byId.
+    GS.OnDonationTxnAlias(record, primaryTxn, aliasTxn)
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, aliasTxn), nil, "val: manifest-cold alias winner removed")
+    assertTrue(type(valuationSnap(record, primaryTxn)) == "table",
+        "val: manifest-cold primary winner retained")
+    assertEq(prov.api.GetRecordBody("gs:val:" .. aliasTxn), nil,
+        "val: manifest-cold alias still has no body")
+    local afterAliasDesc, afterAliasVals = valuationExportSummary(collectAllExportBodies(), sourceDataset)
+    assertEq(afterAliasDesc, 1, "val: manifest-cold advertised count drops before body build")
+    assertTrue(afterAliasVals <= 1, "val: manifest-cold no stale alias body")
+
+    drainExportMaint(128)
+    GS._exportMaintSyncDrain = true
+    assertTrue(GS._exportMaintIsIdle and GS._exportMaintIsIdle(), "val: manifest-cold eventually idle")
+    local exportBodies = collectAllExportBodies()
+    local finalDesc, finalVals = valuationExportSummary(exportBodies, sourceDataset)
+    assertEq(finalDesc, 1, "val: manifest-cold finished descriptor count")
+    assertEq(finalVals, 1, "val: manifest-cold finished body count")
+    assertEq(prov.api.GetRecordBody("gs:val:" .. aliasTxn), nil,
+        "val: manifest-cold finished without alias body")
+    assertTrue(type(prov.api.GetRecordBody("gs:val:" .. primaryTxn)) == "table",
+        "val: manifest-cold finished with primary body")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: manifest-cold adoption begins")
+    for i = #exportBodies, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: manifest-cold buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: manifest-cold adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: manifest-cold adopted dataset")
+    assertEq(valuationSnap(adopted, primaryTxn) and valuationSnap(adopted, primaryTxn).unitCopper, 11,
+        "val: manifest-cold adoption keeps the remaining price")
+    assertEq(valuationSnap(adopted, aliasTxn), nil, "val: manifest-cold adoption has no alias price")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: manifest-cold stays chat-free")
+end
+
+do
+    -- Finding 3: capacity-blocked valuation admits retry after donations free pending.
+    SF.TSM = {
+        GetMarketValue = function()
+            return 5
+        end,
+    }
+    local record = activateValuationGuild(9803)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local n = (GS.MAX_PENDING_VALUATIONS or 256) + 4
+    local seeded = {}
+    for i = 1, n do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9803, quantity = 1, observedAt = world.time + i, ageHours = 0,
+            occurrenceIndex = i,
+            neighborsOlder = { "cap-old-" .. i }, neighborsNewer = { "cap-new-" .. i },
+        })
+        local st = select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona"))
+        assertEq(st, "accepted", "val: cap-retry seed " .. i)
+        record = GS:GetCurrentRecord()
+        local ev = valuationFindDonation(record, 9803, 1)
+        -- Find the newest priced row for this occurrence by scanning after each credit.
+        local events = record.accounting._consumableEvents or {}
+        local newest = nil
+        for ei = 1, #events do
+            local row = events[ei]
+            if type(row) == "table" and tonumber(row.itemId) == 9803
+                and tonumber(row.quantity) == 1
+                and tonumber(row.occurrenceIndex) == i then
+                newest = row
+            end
+        end
+        assertTrue(newest ~= nil, "val: cap-retry donation " .. i)
+        assertTrue(type(valuationSnap(record, newest.txnId)) == "table",
+            "val: cap-retry priced " .. i)
+        seeded[#seeded + 1] = newest.txnId
+    end
+    drainExportMaint(256)
+    record = GS:GetCurrentRecord()
+    local sourceDataset = record.datasetId
+    local exportBodies = collectAllExportBodies()
+    local vals, ledgers, other = {}, {}, {}
+    local descBody = nil
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        local kind = row.body and row.body.kind
+        -- Skip direct evidence: officer-direct credits export hundreds of
+        -- gs-evidence bodies that are not required for ledger+valuation adoption
+        -- and drown the vals-before-ledgers ordering under test.
+        if kind == "gs-evidence" then
+            -- drop
+        elseif kind == "gs-valuation" then
+            vals[#vals + 1] = row
+        elseif kind == "gs-ledger-event" then
+            ledgers[#ledgers + 1] = row
+        elseif kind == "dataset-desc" then
+            descBody = {
+                id = row.id,
+                body = deepCopy(row.body),
+            }
+            descBody.body.donationEvidenceCount = 0
+            other[#other + 1] = descBody
+        else
+            other[#other + 1] = row
+        end
+    end
+    assertTrue(#vals >= n, "val: cap-retry exported valuations got=" .. tostring(#vals))
+    assertTrue(#ledgers >= n, "val: cap-retry exported ledgers got=" .. tostring(#ledgers))
+    assertEq(descBody and descBody.body and descBody.body.valuationCount, #vals,
+        "val: cap-retry descriptor matches valuation export count")
+    assertEq(descBody.body.donationEvidenceCount, 0, "val: cap-retry descriptor drops evidence")
+
+    -- Empty client: valuations before donations so pending hits the 256 cap.
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: cap-retry starts with no local record")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: cap-retry adoption begins")
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: cap-retry buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    -- Descriptor/campaign/ops first so ledger admits are not stuck on campaign
+    -- context; valuations still precede their matching ledger donations so the
+    -- temporary pending map hits the 256 cap before donations free capacity.
+    for i = 1, #other do
+        bufferRow(other[i])
+    end
+    for i = 1, #vals do
+        bufferRow(vals[i])
+    end
+    for i = 1, #ledgers do
+        bufferRow(ledgers[i])
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 20000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: cap-retry adoption commits "
+        .. tostring(reasonAdopt) .. " waves=" .. tostring(guard))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: cap-retry adopted dataset")
+    local priced = 0
+    for i = 1, #seeded do
+        if valuationSnap(adopted, seeded[i]) then
+            priced = priced + 1
+        end
+    end
+    assertEq(priced, n, "val: cap-retry priced every assignment got=" .. tostring(priced))
+    assertEq(#world.chat, 0, "val: cap-retry happy path stays chat-free")
+
+    -- Missing donations: valuations alone must terminate without a timer loop.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: cap-missing starts empty")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: cap-missing adoption begins")
+    local missingDesc = deepCopy(descBody)
+    missingDesc.body = deepCopy(descBody.body)
+    missingDesc.body.acceptedLedgerCount = 0
+    missingDesc.body.valuationCount = math.min(8, #vals)
+    bufferRow(missingDesc)
+    for i = 1, math.min(8, #vals) do
+        bufferRow(vals[i])
+    end
+    for i = 1, #other do
+        if other[i] ~= descBody then
+            bufferRow(other[i])
+        end
+    end
+    timers = {}
+    GS._adoptionReplaySyncDrain = true
+    local missSt, missReason = GS:CommitDatasetAdoption()
+    local missGuard = 0
+    while GS._adoption and GS._adoption.replayTemp and missGuard < 4000 do
+        missGuard = missGuard + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+    end
+    if missSt == "pending" then
+        missSt, missReason = GS:CommitDatasetAdoption()
+    end
+    assertTrue(missSt == "rejected" or missSt == "pending",
+        "val: cap-missing terminates conservatively st=" .. tostring(missSt)
+            .. " r=" .. tostring(missReason))
+    if missSt == "rejected" then
+        assertTrue(tostring(missReason or ""):find("incomplete", 1, true) ~= nil
+            or tostring(missReason or "") == "incomplete_transfer",
+            "val: cap-missing reason " .. tostring(missReason))
+    end
+    assertTrue(missGuard < 4000, "val: cap-missing finite budget got=" .. tostring(missGuard))
+    -- A single queued After(0) from export/provider setup is fine; no spin.
+    assertTrue(#timers <= 2, "val: cap-missing timers bounded got=" .. tostring(#timers))
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: cap-retry stays chat-free")
+end
+
+do
+    -- Finding 4: fresh-client adoption bootstrap auth for valuation replay.
+    SF.TSM = {
+        GetMarketValue = function()
+            return 19
+        end,
+    }
+    local source = activateValuationGuild(9804)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(source, { itemId = 9804, quantity = 2 })
+    drainExportMaint(64)
+    source = GS:GetCurrentRecord()
+    local event = valuationFindDonation(source, 9804, 2)
+    assertTrue(type(valuationSnap(source, event.txnId)) == "table", "val: bootstrap source priced")
+    local sourceDataset = source.datasetId
+    local exportBodies = collectAllExportBodies()
+    local valued = 0
+    for i = 1, #exportBodies do
+        if exportBodies[i].body and exportBodies[i].body.kind == "gs-valuation" then
+            valued = valued + 1
+        end
+    end
+    assertTrue(valued >= 1, "val: bootstrap source exports valuations")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: bootstrap empty client")
+    assertEq(GS._root.guilds and GS._root.guilds["club:42"], nil,
+        "val: bootstrap live guild slot absent")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: bootstrap adoption begins")
+    for i = #exportBodies, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: bootstrap buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind))
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: bootstrap adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: bootstrap adopted dataset")
+    assertEq(valuationSnap(adopted, event.txnId) and valuationSnap(adopted, event.txnId).totalCopper, 38,
+        "val: bootstrap keeps the valued donation")
+
+    -- Negative: unauthorized source cannot begin bootstrap adoption.
+    SpectrumFederationDB = {}
+    switchPlayer("Dave-Garona", "Player-1-Dave", 4)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: bootstrap unauthorized empty")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Dave-Garona", sourceDataset, { editorRankPosition = 3 })
+    local beginRet = { GS:BeginDatasetAdoption("Dave-Garona", sourceDataset) }
+    assertEq(beginRet[2], "rejected", "val: bootstrap unauthorized begin rejected")
+    assertEq(beginRet[3], "unauthorized", "val: bootstrap unauthorized reason "
+        .. tostring(beginRet[3]))
+
+    -- Negative: existing live record does not get bootstrap rights for ordinary gossip.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    initGS()
+    local live = activateValuationGuild(9805)
+    GS:EnsureGossipProvider()
+    SF.TSM = nil
+    local gossipVal = craftValuation(live, {
+        itemId = 9805, quantity = 1, txnId = "ctx:bootstrap-gossip:9805",
+        id = "ctx:bootstrap-gossip:9805",
+    }, {
+        assignmentId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00009805",
+        assignedAt = 4,
+        unitCopper = 3,
+        txnId = "ctx:bootstrap-gossip:9805",
+    })
+    local gSt, gReason = applyValuationBody(gossipVal, "Dave-Garona")
+    assertEq(gSt, "rejected", "val: bootstrap gossip non-editor rejected")
+    assertEq(gReason, "unauthorized", "val: bootstrap gossip reason")
+    live = GS:GetCurrentRecord()
+    assertEq(live.valuations and live.valuations.pending
+        and live.valuations.pending["ctx:bootstrap-gossip:9805"], nil,
+        "val: bootstrap gossip did not weaken ordinary ingress")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: bootstrap auth stays chat-free")
+end
+
+do
+    -- Group A: gs:val:<canonical> binds across clients without rewriting assignment.txnId.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: A provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+
+    valuationTsmValue = 25
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9820)
+    GS:EnsureGossipProvider()
+    -- Officer-direct credit so a fresh peer can install production history without
+    -- rebuilding a three-witness quorum (matches the #411 history path).
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9820, quantity = 3, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "canon-bind-old" }, neighborsNewer = { "canon-bind-new" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: A source officer credit")
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9820, 3)
+    assertTrue(event ~= nil, "val: A source donation")
+    assertEq(event.verification, "officer", "val: A source is officer-trusted")
+    local canonical = event.txnId
+    local aliasTxn = "ctx:canon-bind-alias-9820"
+    local snap = valuationSnap(record, canonical)
+    assertTrue(type(snap) == "table", "val: A source priced")
+    local total = snap.totalCopper
+    local assignmentId = snap.assignmentId
+    -- Alias-fold shape: winner under canonical key, immutable assignment.txnId = alias.
+    snap.txnId = aliasTxn
+    snap.canonicalTxnId = canonical
+    -- Source-only registry (recipient must not need it).
+    local cfg = record.accounting and record.accounting._consumables
+    assertTrue(type(cfg) == "table", "val: A source consumables cfg")
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    local planted = false
+    for i = 1, #cfg.txnRegistry do
+        local row = cfg.txnRegistry[i]
+        if type(row) == "table" and row.txnId == canonical then
+            row.aliases = { aliasTxn }
+            planted = true
+            break
+        end
+    end
+    if not planted then
+        cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+            txnId = canonical,
+            status = "committed",
+            aliases = { aliasTxn },
+            itemId = 9820,
+            quantity = 3,
+        }
+    end
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = aliasTxn,
+        status = "alias",
+        aliasOf = canonical,
+    }
+    GS.NoteValuationExported(record, canonical)
+    drainExportMaint(64)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local exported = prov.api.GetRecordBody("gs:val:" .. canonical)
+    assertTrue(type(exported) == "table" and type(exported.body) == "table",
+        "val: A exports gs:val:canonical")
+    assertEq(exported.body.assignment.txnId, aliasTxn,
+        "val: A export keeps immutable alias txnId")
+    assertEq(exported.body.assignment.assignmentId, assignmentId, "val: A export assignment id")
+    local valBody = deepCopy(exported.body)
+    local ledgerBody = exportDonationBody(9820)
+    assertTrue(type(ledgerBody) == "table" and ledgerBody.event, "val: A ledger export")
+    assertEq(ledgerBody.event.txnId, canonical, "val: A ledger is canonical id")
+    local sourceDataset = record.datasetId
+    local aliceExport = collectAllExportBodies()
+    local configRoot = snapshotConfigRoot()
+
+    -- Fresh gossip peer: donation C only, empty alias registry, no source valuations.
+    SF.TSM = nil
+    local bobRoot = deepCopy(configRoot)
+    local bobGuild = bobRoot.guilds and bobRoot.guilds["club:42"]
+    if type(bobGuild) == "table" then
+        bobGuild.valuations = nil
+    end
+    local bob = loadClientFromConfigRoot(bobRoot, "Bob-Garona", "Player-1-Bob", 2)
+    assertEq(GS.ValuationOfficerEligible(), true, "val: A Bob eligible")
+    assertEq(valuationCount(bob), 0, "val: A Bob starts without source valuations")
+    local ledSt, ledReason = applyExportBody(ledgerBody, "Alice-Garona")
+    assertEq(ledSt, "accepted", "val: A Bob accepts canonical ledger " .. tostring(ledReason))
+    assertEq(ledReason, "officer_history", "val: A Bob officer-history reason")
+    bob = GS:GetCurrentRecord()
+    local bobDonation = valuationFindDonation(bob, 9820, 3)
+    assertTrue(bobDonation ~= nil and bobDonation.txnId == canonical,
+        "val: A Bob has only canonical donation")
+    assertEq(bobDonation.gsProductionCredit, true, "val: A Bob donation is credited")
+    assertEq(valuationCount(bob), 0, "val: A Bob has no TSM auto-price")
+    -- Without the export binding, AliasSet cannot find donation C from alias A.
+    local stUnbound, reasonUnbound = applyValuationBody(valBody.assignment, "Alice-Garona")
+    assertEq(stUnbound, "pending",
+        "val: A unbound alias body stays pending " .. tostring(reasonUnbound))
+    assertEq(reasonUnbound, "awaiting_donation", "val: A unbound awaits donation")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, canonical), nil, "val: A unbound did not price canonical")
+    assertTrue(type(bob.valuations.pending[aliasTxn]) == "table",
+        "val: A unbound parked under alias key")
+    local stBind, reasonBind = providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")
+    assertEq(stBind, "accepted", "val: A Bob accepts bound valuation " .. tostring(reasonBind))
+    bob = GS:GetCurrentRecord()
+    local bobSnap = valuationSnap(bob, canonical)
+    assertTrue(type(bobSnap) == "table", "val: A Bob stores under canonical")
+    assertEq(bobSnap.totalCopper, total, "val: A Bob total")
+    assertEq(bobSnap.txnId, aliasTxn, "val: A Bob keeps immutable alias txnId")
+    assertEq(bobSnap.assignmentId, assignmentId, "val: A Bob assignment id")
+    assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: A Bob has no alias winner key")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: A bind cleared alias pending")
+    local desc = GS.DescribeDonationValuation(bob, bobDonation)
+    assertEq(desc.priced, true, "val: A Bob displays price")
+    assertEq(desc.totalCopper, total, "val: A Bob displayed total")
+    local stDup, reasonDup = providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")
+    assertEq(stDup, "duplicate", "val: A redelivery is duplicate not conflict")
+    assertEq(reasonDup, "duplicate", "val: A duplicate reason")
+    assertEq(valuationCount(bob), 1, "val: A still one winner after redelivery")
+
+    -- Conflicting binding: gs:val points at a different live donation.
+    SF.TSM = nil
+    local otherEvidence = makeDepositEvidence(bob, {
+        itemId = 9820, quantity = 1, observedAt = world.time + 20, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "bind-other-old" }, neighborsNewer = { "bind-other-new" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(otherEvidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: A other officer credit on Bob")
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    bob = GS:GetCurrentRecord()
+    local other = valuationFindDonation(bob, 9820, 1)
+    assertTrue(other and other.txnId and other.txnId ~= canonical, "val: A other donation")
+    assertEq(valuationSnap(bob, other.txnId), nil, "val: A other stays unpriced without TSM")
+    local stConflict, reasonConflict = providerApplyWithId(
+        "gs:val:" .. other.txnId, valBody, "Alice-Garona")
+    assertEq(stConflict, "rejected", "val: A conflicting binding rejected")
+    assertTrue(reasonConflict == "canonical_conflict" or reasonConflict == "inconsistent_donation",
+        "val: A conflict reason " .. tostring(reasonConflict))
+    assertEq(valuationSnap(bob, other.txnId), nil, "val: A conflict did not price other")
+    assertEq(valuationCount(bob), 1, "val: A conflict keeps original winner")
+
+    -- Untrusted / cross-dataset fail closed.
+    local stUnauth = select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Dave-Garona"))
+    assertEq(stUnauth, "rejected", "val: A untrusted sender rejected")
+    local cross = deepCopy(valBody)
+    cross.datasetId = "ds:foreign-canon-bind"
+    cross.assignment = deepCopy(valBody.assignment)
+    cross.assignment.datasetId = cross.datasetId
+    local stCross = select(1, providerApplyWithId("gs:val:" .. canonical, cross, "Alice-Garona"))
+    assertEq(stCross, "rejected", "val: A cross-dataset rejected")
+    assertEq(valuationCount(GS:GetCurrentRecord()), 1, "val: A negatives keep one winner")
+
+    -- Fresh-client adoption with the same alias-shaped export.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: A adoption starts empty")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: A adoption begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        if row.body and row.body.kind == "gs-valuation" then
+            row = { id = "gs:val:" .. canonical, body = deepCopy(valBody) }
+        end
+        local st = select(1, GS:BufferAdoptionRecord(row.id, row.body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: A adopt buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st))
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: A adoption commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: A adopted dataset")
+    local adoptedSnap = valuationSnap(adopted, canonical)
+    assertTrue(type(adoptedSnap) == "table", "val: A adoption priced canonical")
+    assertEq(adoptedSnap.txnId, aliasTxn, "val: A adoption keeps immutable txnId")
+    assertEq(adoptedSnap.totalCopper, total, "val: A adoption total")
+    assertEq(adopted.valuations.byTxn[aliasTxn], nil, "val: A adoption no alias key")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: A stays chat-free")
+end
+
+do
+    -- Remaining Group A gap: gs:val:C before gs:le:C parks under pending[C].
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: A-order provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+
+    valuationTsmValue = 33
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9825)
+    GS:EnsureGossipProvider()
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9825, quantity = 4, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "order-old" }, neighborsNewer = { "order-new" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: A-order source officer credit")
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9825, 4)
+    assertTrue(event ~= nil, "val: A-order source donation")
+    local canonical = event.txnId
+    local aliasTxn = "ctx:canon-bind-order-9825"
+    local snap = valuationSnap(record, canonical)
+    assertTrue(type(snap) == "table", "val: A-order source priced")
+    local total = snap.totalCopper
+    local unit = snap.unitCopper
+    local assignmentId = snap.assignmentId
+    local assignedAt = snap.assignedAt
+    local fpBefore = nil
+    if GS.ContentFingerprint then
+        fpBefore = GS.ContentFingerprint({
+            canon = table.concat({
+                tostring(assignmentId), tostring(assignedAt), tostring(unit),
+                "4", tostring(total), "9825", aliasTxn, tostring(record.datasetId),
+                "club:42", "Player-1-Alice", "Alice-Garona",
+            }, "|"),
+        })
+    end
+    snap.txnId = aliasTxn
+    snap.canonicalTxnId = canonical
+    local cfg = record.accounting._consumables
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    local planted = false
+    for i = 1, #cfg.txnRegistry do
+        local row = cfg.txnRegistry[i]
+        if type(row) == "table" and row.txnId == canonical then
+            row.aliases = { aliasTxn }
+            planted = true
+            break
+        end
+    end
+    if not planted then
+        cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+            txnId = canonical, status = "committed", aliases = { aliasTxn },
+            itemId = 9825, quantity = 4,
+        }
+    end
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = aliasTxn, status = "alias", aliasOf = canonical,
+    }
+    GS.NoteValuationExported(record, canonical)
+    drainExportMaint(64)
+    local exported = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonical)
+    assertTrue(type(exported) == "table" and type(exported.body) == "table",
+        "val: A-order exports gs:val:C")
+    assertEq(exported.body.assignment.txnId, aliasTxn, "val: A-order export txnId=A")
+    local valBody = deepCopy(exported.body)
+    local ledgerBody = exportDonationBody(9825)
+    assertTrue(type(ledgerBody) == "table" and ledgerBody.event
+        and ledgerBody.event.txnId == canonical, "val: A-order ledger is C")
+    local sourceDataset = record.datasetId
+    local aliceExport = collectAllExportBodies()
+    local configRoot = snapshotConfigRoot()
+
+    -- Gossip: valuation first, then ledger. No TSM, no valuation redelivery.
+    SF.TSM = nil
+    local bobRoot = deepCopy(configRoot)
+    local bobGuild = bobRoot.guilds and bobRoot.guilds["club:42"]
+    if type(bobGuild) == "table" then
+        bobGuild.valuations = nil
+    end
+    local bob = loadClientFromConfigRoot(bobRoot, "Bob-Garona", "Player-1-Bob", 2)
+    assertEq(valuationCount(bob), 0, "val: A-order Bob starts empty")
+    local stVal, reasonVal = providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona")
+    assertEq(stVal, "pending", "val: A-order valuation-first pending " .. tostring(reasonVal))
+    assertEq(reasonVal, "awaiting_donation", "val: A-order awaits donation")
+    bob = GS:GetCurrentRecord()
+    assertTrue(type(bob.valuations.pending[canonical]) == "table",
+        "val: A-order parks under pending[C]")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: A-order does not park under A")
+    assertEq(bob.valuations.pending[canonical].txnId, aliasTxn,
+        "val: A-order pending keeps immutable A")
+    assertEq(bob.valuations.pending[canonical].assignmentId, assignmentId,
+        "val: A-order pending assignment id")
+    assertEq(bob.valuations.pending[canonical].canonicalTxnId, canonical,
+        "val: A-order pending canonicalTxnId=C")
+    assertEq(valuationSnap(bob, canonical), nil, "val: A-order not published before ledger")
+    assertEq(valuationCount(bob), 0, "val: A-order no winner before ledger")
+
+    -- Source Alice is offline for minting; Bob has no TSM. Only the ledger arrives.
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local stLed, reasonLed = applyExportBody(ledgerBody, "Alice-Garona")
+    assertEq(stLed, "accepted", "val: A-order ledger second " .. tostring(reasonLed))
+    assertEq(reasonLed, "officer_history", "val: A-order officer history")
+    bob = GS:GetCurrentRecord()
+    local bobDonation = valuationFindDonation(bob, 9825, 4)
+    assertTrue(bobDonation and bobDonation.txnId == canonical, "val: A-order Bob has C")
+    local bobSnap = valuationSnap(bob, canonical)
+    assertTrue(type(bobSnap) == "table", "val: A-order promotes pending under C")
+    assertEq(bobSnap.txnId, aliasTxn, "val: A-order winner keeps txnId=A")
+    assertEq(bobSnap.assignmentId, assignmentId, "val: A-order winner assignment id")
+    assertEq(bobSnap.assignedAt, assignedAt, "val: A-order winner timestamp")
+    assertEq(bobSnap.unitCopper, unit, "val: A-order winner unit")
+    assertEq(bobSnap.totalCopper, total, "val: A-order winner total")
+    assertEq(bob.valuations.pending[canonical], nil, "val: A-order pending cleared")
+    assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: A-order no alias winner key")
+    assertEq(valuationCount(bob), 1, "val: A-order one winner")
+    local desc = GS.DescribeDonationValuation(bob, bobDonation)
+    assertEq(desc.priced, true, "val: A-order Logs priced")
+    assertEq(desc.totalCopper, total, "val: A-order Logs total")
+    drainExportMaint(64)
+    local bobDescCount = nil
+    local bobExports = collectAllExportBodies()
+    for i = 1, #bobExports do
+        local row = bobExports[i]
+        if row.body and row.body.kind == "dataset-desc"
+            and row.body.datasetId == bob.datasetId then
+            bobDescCount = row.body.valuationCount
+        end
+    end
+    assertEq(bobDescCount, 1, "val: A-order descriptor count")
+    local stDup = select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona"))
+    assertEq(stDup, "duplicate", "val: A-order redelivery duplicate")
+    assertEq(valuationCount(bob), 1, "val: A-order still one after redelivery")
+
+    -- Fold prior unbound pending[A] when bound gs:val:C arrives.
+    local foldRoot = deepCopy(configRoot)
+    local foldGuild = foldRoot.guilds and foldRoot.guilds["club:42"]
+    if type(foldGuild) == "table" then
+        foldGuild.valuations = nil
+    end
+    local fold = loadClientFromConfigRoot(foldRoot, "Carol-Garona", "Player-1-Carol", 2)
+    assertEq(select(1, applyValuationBody(valBody.assignment, "Alice-Garona")), "pending",
+        "val: A-order unbound first")
+    fold = GS:GetCurrentRecord()
+    assertTrue(type(fold.valuations.pending[aliasTxn]) == "table",
+        "val: A-order unbound under A")
+    -- Same immutable body after fold is a fingerprint duplicate under pending[C].
+    local stFold = select(1, providerApplyWithId("gs:val:" .. canonical, valBody, "Alice-Garona"))
+    assertTrue(stFold == "pending" or stFold == "duplicate",
+        "val: A-order bind folds to C status=" .. tostring(stFold))
+    fold = GS:GetCurrentRecord()
+    assertTrue(type(fold.valuations.pending[canonical]) == "table",
+        "val: A-order folded pending[C]")
+    assertEq(fold.valuations.pending[aliasTxn], nil, "val: A-order folded clears A")
+    assertEq(fold.valuations.pending[canonical].assignmentId, assignmentId,
+        "val: A-order folded keeps assignment")
+    assertEq(fold.valuations.pending[canonical].txnId, aliasTxn,
+        "val: A-order folded keeps immutable A")
+
+    -- Fresh-client adoption with valuations buffered before ledgers.
+    SpectrumFederationDB = {}
+    switchPlayer("Dave-Garona", "Player-1-Dave", 2)
+    -- Dave is rank 4 by default in some suites; restore editor-capable peer.
+    setPlayer("Dave-Garona", "Player-1-Dave", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    assertEq(GS:GetCurrentRecord(), nil, "val: A-order adopt starts empty")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: A-order adopt begins")
+    local valsFirst, ledgersSecond, other = {}, {}, {}
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            valsFirst[#valsFirst + 1] = {
+                id = "gs:val:" .. canonical,
+                body = deepCopy(valBody),
+            }
+        elseif kind == "gs-ledger-event" then
+            ledgersSecond[#ledgersSecond + 1] = row
+        elseif kind == "gs-evidence" then
+            -- skip; officer ledger is enough
+        else
+            other[#other + 1] = row
+        end
+    end
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: A-order adopt buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    for i = 1, #other do
+        bufferRow(other[i])
+    end
+    for i = 1, #valsFirst do
+        bufferRow(valsFirst[i])
+    end
+    for i = 1, #ledgersSecond do
+        bufferRow(ledgersSecond[i])
+    end
+    -- Strip evidence from the descriptor so completeness does not wait on it.
+    local adop = GS._adoption
+    if type(adop) == "table" and type(adop.records) == "table" then
+        local descId = "gs:desc:" .. sourceDataset
+        local desc = adop.records[descId]
+        if type(desc) == "table" then
+            desc.donationEvidenceCount = 0
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: A-order adopt commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: A-order adopt dataset")
+    local adoptedSnap = valuationSnap(adopted, canonical)
+    assertTrue(type(adoptedSnap) == "table", "val: A-order adopt priced from val-first")
+    assertEq(adoptedSnap.txnId, aliasTxn, "val: A-order adopt immutable txnId")
+    assertEq(adoptedSnap.assignmentId, assignmentId, "val: A-order adopt assignment id")
+    assertEq(adoptedSnap.totalCopper, total, "val: A-order adopt total")
+    assertEq(adopted.valuations.byTxn[aliasTxn], nil, "val: A-order adopt no alias key")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: A-order stays chat-free")
+end
+
+do
+    -- discussion_r4363901606: one assignmentId cannot price two distinct donations.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: uniq provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function listDonations(record, itemId, quantity)
+        local out = {}
+        local lists = {
+            record and record.accounting and record.accounting._consumableEvents,
+            record and record.accounting and record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    local ev = list[i]
+                    if type(ev) == "table"
+                        and (ev.type == "donation" or ev.type == GS.LEDGER_EVENT.DONATION)
+                        and tonumber(ev.itemId) == itemId
+                        and tonumber(ev.quantity) == quantity then
+                        out[#out + 1] = ev
+                    end
+                end
+            end
+        end
+        return out
+    end
+
+    valuationTsmValue = 40
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9830)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local ev1 = makeDepositEvidence(record, {
+        itemId = 9830, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "uniq-old-1" }, neighborsNewer = { "uniq-new-1" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev1, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: uniq first officer credit")
+    world.time = (world.time or 0) + 30
+    record = GS:GetCurrentRecord()
+    local ev2 = makeDepositEvidence(record, {
+        itemId = 9830, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "uniq-old-2" }, neighborsNewer = { "uniq-new-2" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev2, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: uniq second officer credit")
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local donations = listDonations(record, 9830, 2)
+    assertEq(#donations, 2, "val: uniq two same-item donations")
+    local canonicalC = donations[1].txnId
+    local canonicalD = donations[2].txnId
+    assertTrue(canonicalC ~= canonicalD, "val: uniq distinct txn ids")
+    local snapC = valuationSnap(record, canonicalC)
+    local snapD = valuationSnap(record, canonicalD)
+    assertTrue(type(snapC) == "table", "val: uniq C priced")
+    assertTrue(type(snapD) == "table", "val: uniq D priced independently")
+    assertTrue(snapC.assignmentId ~= snapD.assignmentId, "val: uniq independent assignment ids")
+    local totalC = snapC.totalCopper
+    local totalD = snapD.totalCopper
+    GS.NoteValuationExported(record, canonicalC)
+    GS.NoteValuationExported(record, canonicalD)
+    drainExportMaint(64)
+    local exportC = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalC)
+    local exportD = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalD)
+    assertTrue(type(exportC) == "table" and type(exportC.body) == "table", "val: uniq export C")
+    assertTrue(type(exportD) == "table" and type(exportD.body) == "table", "val: uniq export D")
+    local bodyC = deepCopy(exportC.body)
+    local bodyD = deepCopy(exportD.body)
+    -- Fresh-peer attack shape: immutable assignment still names a source-only
+    -- alias A. Item/quantity match both C and D, so export binding alone must
+    -- keep one assignmentId from pricing two donations.
+    local sharedAlias = "ctx:uniq-shared-alias-9830"
+    bodyC.assignment.txnId = sharedAlias
+    local ledgerBodies = filterExportBodies(collectAllExportBodies(), "gs-ledger-event")
+    local configRoot = snapshotConfigRoot()
+
+    SF.TSM = nil
+    local bobRoot = deepCopy(configRoot)
+    local bobGuild = bobRoot.guilds and bobRoot.guilds["club:42"]
+    if type(bobGuild) == "table" then
+        bobGuild.valuations = nil
+    end
+    local bob = loadClientFromConfigRoot(bobRoot, "Bob-Garona", "Player-1-Bob", 2)
+    for i = 1, #ledgerBodies do
+        local row = ledgerBodies[i]
+        local ev = row.body and row.body.event
+        if ev and tonumber(ev.itemId) == 9830 and tonumber(ev.quantity) == 2 then
+            assertEq(select(1, providerApplyWithId(row.id, row.body, "Alice-Garona")), "accepted",
+                "val: uniq Bob ledger " .. tostring(ev.txnId))
+        end
+    end
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationCount(bob), 0, "val: uniq Bob starts unpriced")
+    assertEq(#listDonations(bob, 9830, 2), 2, "val: uniq Bob has both donations")
+    local stC, reasonC = providerApplyWithId("gs:val:" .. canonicalC, bodyC, "Alice-Garona")
+    assertEq(stC, "accepted", "val: uniq bind C " .. tostring(reasonC))
+    bob = GS:GetCurrentRecord()
+    assertTrue(type(valuationSnap(bob, canonicalC)) == "table", "val: uniq C winner")
+    assertEq(valuationSnap(bob, canonicalC).assignmentId, bodyC.assignment.assignmentId,
+        "val: uniq C keeps assignment")
+    assertEq(valuationSnap(bob, canonicalC).txnId, sharedAlias,
+        "val: uniq C keeps immutable alias txnId")
+    local stDupC = select(1, providerApplyWithId("gs:val:" .. canonicalC, bodyC, "Alice-Garona"))
+    assertEq(stDupC, "duplicate", "val: uniq C redelivery duplicate")
+    local stClash, reasonClash = providerApplyWithId("gs:val:" .. canonicalD, bodyC, "Alice-Garona")
+    assertEq(stClash, "rejected", "val: uniq second canonical rejects shared assignment")
+    assertEq(reasonClash, "assignment_bound", "val: uniq reason assignment_bound")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, canonicalD), nil, "val: uniq D not priced by C assignment")
+    assertEq(valuationCount(bob), 1, "val: uniq only one winner after clash")
+    local stD, reasonD = providerApplyWithId("gs:val:" .. canonicalD, bodyD, "Alice-Garona")
+    assertEq(stD, "accepted", "val: uniq independent D assignment " .. tostring(reasonD))
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationCount(bob), 2, "val: uniq both donations priced")
+    assertEq(valuationSnap(bob, canonicalC).totalCopper, totalC, "val: uniq C total")
+    assertEq(valuationSnap(bob, canonicalD).totalCopper, totalD, "val: uniq D total")
+    assertEq(valuationSnap(bob, canonicalD).assignmentId, bodyD.assignment.assignmentId,
+        "val: uniq D independent id")
+    drainExportMaint(64)
+    local descCount = nil
+    local bobExports = collectAllExportBodies()
+    for i = 1, #bobExports do
+        local row = bobExports[i]
+        if row.body and row.body.kind == "dataset-desc"
+            and row.body.datasetId == bob.datasetId then
+            descCount = row.body.valuationCount
+        end
+    end
+    assertEq(descCount, 2, "val: uniq descriptor count")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: uniq stays chat-free")
+end
+
+do
+    -- discussion_r4363901617: changed gs:val body during adoption is source_changed.
+    valuationTsmValue = 11
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9831)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9831, quantity = 2 })
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9831, 2)
+    assertTrue(event ~= nil, "val: chg source donation")
+    local canonical = event.txnId
+    local snap = valuationSnap(record, canonical)
+    assertTrue(type(snap) == "table", "val: chg source priced")
+    local laterBody = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonical)
+    assertTrue(type(laterBody) == "table" and type(laterBody.body) == "table",
+        "val: chg export later winner")
+    laterBody = deepCopy(laterBody.body)
+    local earlierBody = deepCopy(laterBody)
+    earlierBody.assignment = deepCopy(laterBody.assignment)
+    earlierBody.assignment.assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009831"
+    earlierBody.assignment.assignedAt = (tonumber(laterBody.assignment.assignedAt) or 100) - 25
+    local earlierTotal = earlierBody.assignment.totalCopper
+    local laterTotal = laterBody.assignment.totalCopper
+    assertTrue(earlierBody.assignment.assignedAt < laterBody.assignment.assignedAt,
+        "val: chg earlier timestamp")
+    assertTrue(earlierBody.assignment.assignmentId ~= laterBody.assignment.assignmentId,
+        "val: chg distinct assignment ids")
+    local sourceDataset = record.datasetId
+    local aliceExport = collectAllExportBodies()
+    local liveDataset = nil
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    liveDataset = GS:GetCurrentRecord().datasetId
+    local keepVal = {
+        schemaVersion = 1, nextSeq = 2, pending = {},
+        byTxn = {
+            ["ctx:chg-keep"] = {
+                assignmentId = "gsv1:cccccccccccccccccccccccc:00009831",
+                assignedAt = 3, unitCopper = 1, quantity = 1, totalCopper = 1,
+                itemId = 1, txnId = "ctx:chg-keep", canonicalTxnId = "ctx:chg-keep",
+                datasetId = liveDataset, guildKey = "club:42",
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona", seen = {},
+            },
+        },
+    }
+    GS:GetCurrentRecord().valuations = keepVal
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: chg adoption begins")
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: chg buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            bufferRow({ id = "gs:val:" .. canonical, body = deepCopy(laterBody) })
+        elseif kind == "gs-evidence" then
+            -- officer ledger carries credit
+        else
+            bufferRow(row)
+        end
+    end
+    assertEq(GS._adoption and GS._adoption.pinnedValuationCount, 1,
+        "val: chg pinned valuationCount")
+    local stDup = select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(laterBody)))
+    assertEq(stDup, "duplicate", "val: chg identical redelivery duplicate")
+    assertTrue(GS._adoption ~= nil, "val: chg adoption remains after duplicate")
+    local stChg, reasonChg = GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(earlierBody))
+    assertEq(stChg, "rejected", "val: chg changed winner rejected")
+    assertEq(reasonChg, "source_changed", "val: chg reason source_changed")
+    assertEq(GS:GetPendingAdoption(), nil, "val: chg adoption cleared")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: chg live dataset preserved")
+    assertTrue(GS:GetCurrentRecord().valuations.byTxn["ctx:chg-keep"] ~= nil,
+        "val: chg live valuations preserved")
+    assertEq(valuationSnap(GS:GetCurrentRecord(), canonical), nil,
+        "val: chg did not commit superseded price")
+
+    -- Clean retry with the observed earlier winner succeeds.
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: chg retry begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            bufferRow({ id = "gs:val:" .. canonical, body = deepCopy(earlierBody) })
+        elseif kind == "gs-evidence" then
+            -- skip
+        else
+            bufferRow(row)
+        end
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" and type(adop.records) == "table" then
+        local desc = adop.records["gs:desc:" .. sourceDataset]
+        if type(desc) == "table" then
+            desc.donationEvidenceCount = 0
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: chg retry commits " .. tostring(reasonAdopt))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: chg adopted dataset")
+    local adoptedSnap = valuationSnap(adopted, canonical)
+    assertTrue(type(adoptedSnap) == "table", "val: chg adopted priced")
+    assertEq(adoptedSnap.assignmentId, earlierBody.assignment.assignmentId,
+        "val: chg adopted earlier winner")
+    assertEq(adoptedSnap.assignedAt, earlierBody.assignment.assignedAt,
+        "val: chg adopted earlier timestamp")
+    assertEq(adoptedSnap.totalCopper, earlierTotal, "val: chg adopted earlier total")
+    assertEq(laterTotal, earlierTotal, "val: chg copper unchanged across winners")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: chg stays chat-free")
+end
+
+do
+    -- discussion_r4364379656: adoption completeness binds each gs:val:<canonical>.
+    local function listDonations(record, itemId, quantity)
+        local out = {}
+        local lists = {
+            record and record.accounting and record.accounting._consumableEvents,
+            record and record.accounting and record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    local ev = list[i]
+                    if type(ev) == "table"
+                        and (ev.type == "donation" or ev.type == GS.LEDGER_EVENT.DONATION)
+                        and tonumber(ev.itemId) == itemId
+                        and tonumber(ev.quantity) == quantity then
+                        out[#out + 1] = ev
+                    end
+                end
+            end
+        end
+        return out
+    end
+    local function stripEvidencePins(adop, sourceDataset)
+        if type(adop) ~= "table" or type(adop.records) ~= "table" then
+            return
+        end
+        local desc = adop.records["gs:desc:" .. sourceDataset]
+        if type(desc) == "table" then
+            desc.donationEvidenceCount = 0
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    local function commitAdoptionOrDrain()
+        GS._adoptionReplaySyncDrain = true
+        local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        local guard = 0
+        while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+            guard = guard + 1
+            flushTimers()
+            world.time = (world.time or 0) + 1
+            flushTimers()
+        end
+        if stAdopt == "pending" then
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        end
+        return stAdopt, reasonAdopt
+    end
+
+    valuationTsmValue = 55
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9840)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local ev1 = makeDepositEvidence(record, {
+        itemId = 9840, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 1,
+        neighborsOlder = { "bind-old-1" }, neighborsNewer = { "bind-new-1" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev1, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: bind first officer credit")
+    world.time = (world.time or 0) + 30
+    record = GS:GetCurrentRecord()
+    local ev2 = makeDepositEvidence(record, {
+        itemId = 9840, quantity = 2, observedAt = world.time, ageHours = 0,
+        occurrenceIndex = 2,
+        neighborsOlder = { "bind-old-2" }, neighborsNewer = { "bind-new-2" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(ev2, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: bind second officer credit")
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local donations = listDonations(record, 9840, 2)
+    assertEq(#donations, 2, "val: bind two donations")
+    local canonicalC1 = donations[1].txnId
+    local canonicalC2 = donations[2].txnId
+    assertTrue(canonicalC1 ~= canonicalC2, "val: bind distinct canonicals")
+    local snap1 = valuationSnap(record, canonicalC1)
+    local snap2 = valuationSnap(record, canonicalC2)
+    assertTrue(type(snap1) == "table" and type(snap2) == "table", "val: bind both priced")
+    assertTrue(snap1.assignmentId ~= snap2.assignmentId, "val: bind distinct assignment ids")
+    local export1 = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalC1)
+    local export2 = GG.GetProvider(GS.PROVIDER_ID).api.GetRecordBody("gs:val:" .. canonicalC2)
+    assertTrue(type(export1) == "table" and type(export2) == "table", "val: bind exports")
+    local bodyC1 = deepCopy(export1.body)
+    local bodyC2 = deepCopy(export2.body)
+    -- Alias shape still supported for the legitimate path.
+    local aliasTxn = "ctx:bind-alias-9840"
+    bodyC1.assignment.txnId = aliasTxn
+    local aliceExport = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    local liveDataset = nil
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    liveDataset = GS:GetCurrentRecord().datasetId
+    local keepVal = {
+        schemaVersion = 1, nextSeq = 2, pending = {},
+        byTxn = {
+            ["ctx:bind-keep"] = {
+                assignmentId = "gsv1:dddddddddddddddddddddddd:00009840",
+                assignedAt = 3, unitCopper = 1, quantity = 1, totalCopper = 1,
+                itemId = 1, txnId = "ctx:bind-keep", canonicalTxnId = "ctx:bind-keep",
+                datasetId = liveDataset, guildKey = "club:42",
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona", seen = {},
+            },
+        },
+    }
+    GS:GetCurrentRecord().valuations = keepVal
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: bind bad adoption begins")
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: bind buffer " .. tostring(row.body and row.body.kind)
+                .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    -- Malformed source: both canonical records carry the same immutable assignment.
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            local rid = row.id
+            if type(rid) ~= "string" or rid:sub(1, 7) ~= "gs:val:" then
+                if row.body.assignment and row.body.assignment.txnId == canonicalC1 then
+                    rid = "gs:val:" .. canonicalC1
+                else
+                    rid = "gs:val:" .. canonicalC2
+                end
+            end
+            bufferRow({ id = rid, body = deepCopy(bodyC1) })
+        elseif kind == "gs-evidence" then
+            -- officer ledger carries credit
+        else
+            bufferRow(row)
+        end
+    end
+    -- Ensure both provider IDs are present even if export order collapsed.
+    bufferRow({ id = "gs:val:" .. canonicalC1, body = deepCopy(bodyC1) })
+    bufferRow({ id = "gs:val:" .. canonicalC2, body = deepCopy(bodyC1) })
+    local stDup = select(1, GS:BufferAdoptionRecord("gs:val:" .. canonicalC1, deepCopy(bodyC1)))
+    assertEq(stDup, "duplicate", "val: bind exact redelivery duplicate")
+    assertEq(GS._adoption and GS._adoption.pinnedValuationCount, 2,
+        "val: bind pinned count 2")
+    stripEvidencePins(GS._adoption, sourceDataset)
+    local stBad, reasonBad = commitAdoptionOrDrain()
+    assertEq(stBad, "rejected", "val: bind incomplete commit rejected " .. tostring(reasonBad))
+    assertEq(reasonBad, "incomplete_transfer", "val: bind incomplete_transfer")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: bind live dataset preserved")
+    assertTrue(GS:GetCurrentRecord().valuations.byTxn["ctx:bind-keep"] ~= nil,
+        "val: bind live valuations preserved")
+    assertEq(valuationSnap(GS:GetCurrentRecord(), canonicalC1), nil,
+        "val: bind did not install partial transfer")
+
+    -- Distinct legitimate assignments for both donations succeed (alias on C1).
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: bind good adoption begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            local rid = row.id
+            if type(rid) ~= "string" or rid:sub(1, 7) ~= "gs:val:" then
+                rid = "gs:val:" .. ((row.body.assignment and row.body.assignment.txnId) or canonicalC1)
+            end
+            local body = deepCopy(bodyC2)
+            if rid == ("gs:val:" .. canonicalC1) or (row.body.assignment
+                and row.body.assignment.assignmentId == snap1.assignmentId) then
+                body = deepCopy(bodyC1)
+                rid = "gs:val:" .. canonicalC1
+            else
+                rid = "gs:val:" .. canonicalC2
+            end
+            bufferRow({ id = rid, body = body })
+        elseif kind == "gs-evidence" then
+            -- skip
+        else
+            bufferRow(row)
+        end
+    end
+    bufferRow({ id = "gs:val:" .. canonicalC1, body = deepCopy(bodyC1) })
+    bufferRow({ id = "gs:val:" .. canonicalC2, body = deepCopy(bodyC2) })
+    stripEvidencePins(GS._adoption, sourceDataset)
+    local stGood, reasonGood = commitAdoptionOrDrain()
+    assertEq(stGood, "accepted", "val: bind good commits " .. tostring(reasonGood))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: bind adopted dataset")
+    local a1 = valuationSnap(adopted, canonicalC1)
+    local a2 = valuationSnap(adopted, canonicalC2)
+    assertTrue(type(a1) == "table" and type(a2) == "table", "val: bind both winners")
+    assertEq(a1.assignmentId, bodyC1.assignment.assignmentId, "val: bind C1 assignment")
+    assertEq(a1.txnId, aliasTxn, "val: bind C1 alias txnId")
+    assertEq(a2.assignmentId, bodyC2.assignment.assignmentId, "val: bind C2 assignment")
+    assertEq(valuationCount(adopted), 2, "val: bind count 2")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: bind stays chat-free")
+end
+
+do
+    -- Group B: pinned valuationCount cannot be omitted; malformed bodies do not count.
+    SF.TSM = {
+        GetMarketValue = function()
+            return 7
+        end,
+    }
+    local record = activateValuationGuild(9821)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9821, quantity = 2 })
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local sourceDataset = record.datasetId
+    local liveDataset = nil
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    liveDataset = GS:GetCurrentRecord().datasetId
+    local keepVal = {
+        schemaVersion = 1, nextSeq = 2, pending = {},
+        byTxn = {
+            ["ctx:pin-keep"] = {
+                assignmentId = "gsv1:999999999999999999999999:00009821",
+                assignedAt = 3, unitCopper = 1, quantity = 1, totalCopper = 1,
+                itemId = 1, txnId = "ctx:pin-keep", canonicalTxnId = "ctx:pin-keep",
+                datasetId = liveDataset, guildKey = "club:42",
+                actorGuid = "Player-1-Bob", actorName = "Bob-Garona", seen = {},
+            },
+        },
+    }
+    GS:GetCurrentRecord().valuations = keepVal
+    GS:EnsureGossipProvider()
+    local descId = "gs:desc:" .. sourceDataset
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B pin adoption begins")
+    local baseDesc = {
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = sourceDataset,
+        editorRankPosition = 3,
+        permissionRevisionId = "rev-pin-b",
+        bootstrapEditorRankPosition = 3,
+        activation = "staged",
+        acceptedOpCount = 0,
+        transferOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
+        acceptedLedgerCount = 0,
+        donationEvidenceCount = 0,
+        valuationCount = 2,
+    }
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, baseDesc)), "accepted",
+        "val: B pins positive valuationCount")
+    assertEq(GS._adoption.pinnedValuationCount, 2, "val: B pinned count is 2")
+    local omit = deepCopy(baseDesc)
+    omit.valuationCount = nil
+    local stOmit, reasonOmit = GS:BufferAdoptionRecord(descId, omit)
+    assertEq(stOmit, "rejected", "val: B omitted pinned count rejected")
+    assertEq(reasonOmit, "source_changed", "val: B omit reason source_changed")
+    assertEq(GS:GetPendingAdoption(), nil, "val: B adoption cleared on omit")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B live dataset preserved")
+    assertTrue(GS:GetCurrentRecord().valuations.byTxn["ctx:pin-keep"] ~= nil,
+        "val: B failed adoption did not overwrite valuations")
+
+    -- Same positive count remains valid; explicit zero pin is distinct from absent.
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B same-count begin")
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, baseDesc)), "accepted", "val: B re-pin")
+    local same = deepCopy(baseDesc)
+    -- Non-pin field change with the same valuationCount must remain valid.
+    same.bankTab = 2
+    local stSame = select(1, GS:BufferAdoptionRecord(descId, same))
+    assertEq(stSame, "accepted", "val: B same positive count accepted")
+    assertEq(GS._adoption.pinnedValuationCount, 2, "val: B pin unchanged")
+    assertEq(GS:GetPendingAdoption() ~= nil and true or false, true,
+        "val: B adoption remains after same-count descriptor")
+    GS._adoption = nil
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B zero-pin begin")
+    local zeroDesc = deepCopy(baseDesc)
+    zeroDesc.valuationCount = 0
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, zeroDesc)), "accepted", "val: B pin zero")
+    assertEq(GS._adoption.pinnedValuationCount, 0, "val: B pinned zero")
+    local omitZero = deepCopy(zeroDesc)
+    omitZero.valuationCount = nil
+    local stOmitZero, reasonOmitZero = GS:BufferAdoptionRecord(descId, omitZero)
+    assertEq(stOmitZero, "rejected", "val: B omitting pinned zero rejected")
+    assertEq(reasonOmitZero, "source_changed", "val: B omit-zero reason")
+
+    -- Legacy never-pinned descriptors still complete with zero valuations.
+    GS._adoption = nil
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B legacy begin")
+    local legacyDesc = {
+        kind = "dataset-desc",
+        schemaVersion = 1,
+        guildKey = "club:42",
+        datasetId = sourceDataset,
+        editorRankPosition = 3,
+        permissionRevisionId = "rev-legacy-b",
+        bootstrapEditorRankPosition = 3,
+        activation = "staged",
+        acceptedOpCount = 0,
+        transferOpCount = 0,
+        campaignCount = 0,
+        archiveCount = 0,
+    }
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, legacyDesc)), "accepted",
+        "val: B legacy descriptor")
+    assertEq(GS._adoption.pinnedValuationCount, nil, "val: B legacy never pinned")
+    local complete, completeReason = GS:IsAdoptionTransferComplete()
+    assertEq(complete, true, "val: B legacy zero-valuation complete " .. tostring(completeReason))
+
+    -- Malformed gs-valuation must not buffer/count toward completeness.
+    GS._adoption = nil
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B malformed begin")
+    local pinOne = deepCopy(baseDesc)
+    pinOne.valuationCount = 1
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, pinOne)), "accepted", "val: B pin one")
+    local stMal, reasonMal = GS:BufferAdoptionRecord("gs:val:ctx:malformed-9821", {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = sourceDataset,
+        guildKey = "club:42",
+        assignment = "not-a-table",
+    })
+    assertEq(stMal, "rejected", "val: B malformed valuation rejected")
+    assertEq(reasonMal, "malformed", "val: B malformed reason")
+    local buf = GS._adoption and GS._adoption._bufCounts
+    assertEq(buf and (tonumber(buf.valuations) or 0) or 0, 0,
+        "val: B malformed did not increment valuation count")
+    local incomplete = select(1, GS:IsAdoptionTransferComplete())
+    assertEq(incomplete, false, "val: B pinned count still incomplete without body")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B live intact after malformed")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: B stays chat-free")
+end
+
+do
+    -- Group C: bank-snapshot batch coalesces valuation NotifyProviderChanged / NotifyUI
+    -- and reuses DBMarket reads per distinct price-query key (discussion_r4364379664).
+    valuationTsmCalls = 0
+    local tsmByKey = {}
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function(item)
+            valuationTsmCalls = valuationTsmCalls + 1
+            local key = type(item) == "number" and ("n:" .. item) or ("s:" .. tostring(item))
+            tsmByKey[key] = (tsmByKey[key] or 0) + 1
+            if type(valuationTsmValue) == "function" then
+                return valuationTsmValue(item)
+            end
+            return valuationTsmValue
+        end,
+    }
+    local itemId = 9822
+    local otherItemId = 9824
+    local record = activateValuationGuild(itemId)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Include a second item id in the snapshot requested set / rows. Campaign
+    -- eligibility may or may not admit it; same-item caching is the primary assert.
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    local O = SF.ConsumablesObservation
+    assertTrue(BankLog and BankLog.AdmitGuildSuppliesSnapshot, "val: C BankLog loaded")
+    assertTrue(O and O.ListEligibleEvidenceFromSnapshot, "val: C observation loaded")
+    record = GS:GetCurrentRecord()
+    local cfg = record.accounting._consumables
+    -- Plant a second campaign item so the snapshot can admit a distinct key.
+    if type(cfg.requestedItems) ~= "table" then
+        cfg.requestedItems = {}
+    end
+    cfg.requestedItems[tostring(otherItemId)] = { itemId = otherItemId, goal = 10 }
+    if type(cfg.eligibility) ~= "table" then
+        cfg.eligibility = { items = {} }
+    end
+    if type(cfg.eligibility.items) ~= "table" then
+        cfg.eligibility.items = {}
+    end
+    cfg.eligibility.items[tostring(otherItemId)] =
+        tonumber(cfg.eligibility.tabEligibleFrom) or (world.time or 1)
+    local n = 5
+    local rows = {}
+    for i = 1, n do
+        rows[i] = {
+            type = "deposit",
+            name = "Donor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    rows[#rows + 1] = {
+        type = "deposit",
+        name = "DonorOther-Garona",
+        itemLink = "|cffffffff|Hitem:" .. otherItemId .. "::::::::|h[Other]|h|r",
+        itemID = otherItemId,
+        count = 2,
+        year = 0, month = 0, day = 0, hour = 0,
+        ageHours = 0,
+        index = n + 1,
+    }
+    local snapshot = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true, [otherItemId] = true },
+        rows = rows,
+    }
+    local ctx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = snapshot.bankTab,
+        guildGuid = snapshot.guildGuid,
+        generation = snapshot.generation,
+        profileId = "gs",
+        requestedSet = snapshot.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    assertTrue(#O.ListEligibleEvidenceFromSnapshot(snapshot) >= n,
+        "val: C snapshot yields eligible deposits")
+
+    world.notifyChanged = 0
+    local uiCount = 0
+    GS.RegisterUIListener(function()
+        uiCount = uiCount + 1
+    end)
+    valuationTsmCalls = 0
+    tsmByKey = {}
+    local stats = BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
+    flushTimers()
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local priced = valuationCount(record)
+    assertTrue((stats and (stats.admitted or 0) or 0) >= 3
+            or priced >= 3,
+        "val: C snapshot admitted/priced several admitted="
+            .. tostring(stats and stats.admitted) .. " priced=" .. tostring(priced))
+    assertTrue(priced >= 3, "val: C snapshot priced several got=" .. tostring(priced))
+    -- One TSM read per distinct price-query key in this completed snapshot.
+    local distinctKeys = 0
+    for _ in pairs(tsmByKey) do
+        distinctKeys = distinctKeys + 1
+    end
+    assertEq(distinctKeys, 2,
+        "val: C snapshot distinct TSM keys got=" .. tostring(distinctKeys))
+    assertEq(valuationTsmCalls, 2,
+        "val: C snapshot one TSM read per key calls=" .. tostring(valuationTsmCalls))
+    for key, count in pairs(tsmByKey) do
+        assertEq(count, 1, "val: C snapshot key queried once " .. tostring(key))
+    end
+    assertTrue(priced >= 6, "val: C both items priced got=" .. tostring(priced))
+    local notifyDelta = world.notifyChanged or 0
+    assertTrue(notifyDelta >= 1 and notifyDelta <= 4,
+        "val: C provider notifies coalesced got=" .. tostring(notifyDelta))
+    assertTrue(uiCount >= 1 and uiCount <= 6,
+        "val: C UI notifies coalesced got=" .. tostring(uiCount))
+
+    -- A later completed snapshot must query again (cache not shared).
+    local callsAfterFirst = valuationTsmCalls
+    world.time = (world.time or 0) + 60
+    local rows2 = {
+        {
+            type = "deposit",
+            name = "DonorLater-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = 1,
+        },
+    }
+    local snapshot2 = {
+        guildGuid = snapshot.guildGuid,
+        bankTab = snapshot.bankTab,
+        generation = snapshot.generation,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows2,
+    }
+    local ctx2 = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = snapshot2.bankTab,
+        guildGuid = snapshot2.guildGuid,
+        generation = snapshot2.generation,
+        profileId = "gs",
+        requestedSet = snapshot2.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(ctx2, snapshot2)
+    flushTimers()
+    assertTrue(valuationTsmCalls > callsAfterFirst,
+        "val: C second snapshot re-queries TSM got=" .. tostring(valuationTsmCalls))
+
+    -- Zero is a real cached price; nil miss is reused within one snapshot.
+    local zeroGuild = activateValuationGuild(9826)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    valuationTsmValue = 0
+    valuationTsmCalls = 0
+    tsmByKey = {}
+    local zeroRows = {}
+    for i = 1, 3 do
+        zeroRows[i] = {
+            type = "deposit",
+            name = "ZeroDonor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:9826::::::::|h[Zero]|h|r",
+            itemID = 9826,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    local zeroSnap = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [9826] = true },
+        rows = zeroRows,
+    }
+    local zeroCtx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = zeroSnap.bankTab,
+        guildGuid = zeroSnap.guildGuid,
+        generation = zeroSnap.generation,
+        profileId = "gs",
+        requestedSet = zeroSnap.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(zeroCtx, zeroSnap)
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationTsmCalls, 1, "val: C zero price queried once")
+    assertTrue(valuationCount(record) >= 3, "val: C zero priced donations")
+    local zeroEvent = valuationFindDonation(record, 9826, 1)
+    assertTrue(zeroEvent ~= nil, "val: C zero donation present")
+    local zeroSnapVal = valuationSnap(record, zeroEvent.txnId)
+    assertTrue(type(zeroSnapVal) == "table" and zeroSnapVal.unitCopper == 0,
+        "val: C zero is a real unit price")
+
+    local missGuild = activateValuationGuild(9827)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    record = GS:GetCurrentRecord()
+    cfg = record.accounting._consumables
+    valuationTsmValue = nil
+    valuationTsmCalls = 0
+    local missRows = {}
+    for i = 1, 3 do
+        missRows[i] = {
+            type = "deposit",
+            name = "MissDonor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:9827::::::::|h[Miss]|h|r",
+            itemID = 9827,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    local missSnap = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [9827] = true },
+        rows = missRows,
+    }
+    local missCtx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = missSnap.bankTab,
+        guildGuid = missSnap.guildGuid,
+        generation = missSnap.generation,
+        profileId = "gs",
+        requestedSet = missSnap.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(missCtx, missSnap)
+    flushTimers()
+    assertEq(valuationTsmCalls, 1, "val: C nil miss queried once")
+    assertEq(valuationCount(GS:GetCurrentRecord()), 0, "val: C nil miss leaves unpriced")
+
+    -- Restore priced snapshot state for peer export checks below.
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    record = activateValuationGuild(itemId)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    cfg = record.accounting._consumables
+    local peerRows = {}
+    for i = 1, n do
+        peerRows[i] = {
+            type = "deposit",
+            name = "Donor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    snapshot = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = peerRows,
+    }
+    ctx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = snapshot.bankTab,
+        guildGuid = snapshot.guildGuid,
+        generation = snapshot.generation,
+        profileId = "gs",
+        requestedSet = snapshot.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
+    flushTimers()
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    priced = valuationCount(record)
+    assertTrue(priced >= 3, "val: C peer-export source priced")
+    local exportBodies = collectAllExportBodies()
+    local aliceVals = filterExportBodies(exportBodies, "gs-valuation")
+    local aliceLedgers = filterExportBodies(exportBodies, "gs-ledger-event")
+    assertTrue(#aliceVals >= priced, "val: C exports all valuations")
+
+    -- Peer can receive every valuation through real export ids.
+    local configRoot = snapshotConfigRoot()
+    local peer = loadClientFromConfigRoot(configRoot, "Bob-Garona", "Player-1-Bob", 2)
+    for i = 1, #aliceLedgers do
+        local row = aliceLedgers[i]
+        GG.GetProvider(GS.PROVIDER_ID).api.ValidateAndApply({
+            id = row.id,
+            versionFp = GS.ContentFingerprint(row.body),
+            body = row.body,
+        }, { sender = "Alice-Garona" })
+    end
+    for i = 1, #aliceVals do
+        local row = aliceVals[i]
+        GG.GetProvider(GS.PROVIDER_ID).api.ValidateAndApply({
+            id = row.id,
+            versionFp = GS.ContentFingerprint(row.body),
+            body = row.body,
+        }, { sender = "Alice-Garona" })
+    end
+    peer = GS:GetCurrentRecord()
+    assertTrue(valuationCount(peer) >= 3,
+        "val: C peer received valuations got=" .. tostring(valuationCount(peer)))
+
+    -- Independent non-batch mint notifies immediately.
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local immediate = activateValuationGuild(9823)
+    GS:EnsureGossipProvider()
+    world.notifyChanged = 0
+    local immediateUi = 0
+    GS.RegisterUIListener(function()
+        immediateUi = immediateUi + 1
+    end)
+    creditValuationDeposit(immediate, { itemId = 9823, quantity = 2 })
+    flushTimers()
+    assertTrue((world.notifyChanged or 0) >= 1,
+        "val: C non-batch mint notifies provider immediately got="
+            .. tostring(world.notifyChanged))
+    assertTrue(immediateUi >= 1, "val: C non-batch mint notifies UI immediately")
+    immediate = GS:GetCurrentRecord()
+    local immEvent = valuationFindDonation(immediate, 9823, 2)
+    assertTrue(type(immEvent) == "table"
+            and type(valuationSnap(immediate, immEvent.txnId)) == "table",
+        "val: C non-batch price committed")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: C stays chat-free")
+end
+
+do
+    -- A1: bulk archive trim coalesces export-order compaction (discussion_r4364648454).
+    valuationTsmValue = 50
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local priorArch = GS.MAX_ARCHIVED_EVENTS
+    local priorLive = GS.MAX_LEDGER_EVENTS
+    GS.MAX_ARCHIVED_EVENTS = 40
+    GS.MAX_LEDGER_EVENTS = 200
+    local record = activateValuationGuild(9901)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local priced = 0
+    for n = 1, 96 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9901,
+            quantity = (n % 3) + 1,
+            donor = "A1Donor" .. n .. "-Garona",
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = n,
+            neighborsOlder = { "a1-old-" .. n },
+            neighborsNewer = { "a1-new-" .. n },
+        })
+        local st, reason = GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(st, "accepted", "val: A1 officer credit " .. n .. " " .. tostring(reason))
+        priced = priced + 1
+    end
+    drainExportMaint(256)
+    record = GS:GetCurrentRecord()
+    assertTrue(valuationCount(record) >= 80, "val: A1 many valued donations before trim got="
+        .. tostring(valuationCount(record)))
+    local orderCompactions = 0
+    local orderScanned = 0
+    GS._onGossipExportOrderCompaction = function(scanned)
+        orderCompactions = orderCompactions + 1
+        orderScanned = orderScanned + (tonumber(scanned) or 0)
+    end
+    startCampaign()
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    local archive = record.accounting and record.accounting._consumableEventArchive
+    assertTrue(type(archive) == "table" and #archive <= GS.MAX_ARCHIVED_EVENTS,
+        "val: A1 archive at cap got=" .. tostring(archive and #archive))
+    GS._onGossipExportOrderCompaction = nil
+    GS.MAX_ARCHIVED_EVENTS = priorArch
+    GS.MAX_LEDGER_EVENTS = priorLive
+    -- >64 evictions would have been many chunked ledger+valuation full-order
+    -- scans; coalesced trim must compact once (or a small constant).
+    assertTrue(orderCompactions <= 2,
+        "val: A1 order compactions bounded got=" .. tostring(orderCompactions)
+            .. " scanned=" .. tostring(orderScanned))
+    assertTrue(orderCompactions >= 1, "val: A1 performed coalesced compaction")
+    -- Old path: ceil(evictions/64) ledger + ceil(vals/64) valuation passes.
+    local oldLowerBound = math.floor(80 / 64) + math.floor(40 / 64) + 2
+    assertTrue(orderCompactions < oldLowerBound,
+        "val: A1 better than chunk×index lower bound old>=" .. tostring(oldLowerBound)
+            .. " got=" .. tostring(orderCompactions))
+    drainExportMaint(256)
+    record = GS:GetCurrentRecord()
+    local descCount = nil
+    local exportVal = 0
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "dataset-desc" then
+            descCount = row.body.valuationCount
+        elseif row.body and row.body.kind == "gs-valuation" then
+            exportVal = exportVal + 1
+        end
+    end
+    assertEq(descCount, valuationCount(record),
+        "val: A1 descriptor matches retained winners")
+    assertEq(exportVal, valuationCount(record),
+        "val: A1 export coverage matches winners")
+    -- Ordinary small removal still works and stays single-pass.
+    local smallCompactions = 0
+    GS._onGossipExportOrderCompaction = function()
+        smallCompactions = smallCompactions + 1
+    end
+    local keepTxn = nil
+    for txn in pairs(record.valuations.byTxn or {}) do
+        keepTxn = txn
+        break
+    end
+    assertTrue(type(keepTxn) == "string", "val: A1 has a winner to forget")
+    GS.ForgetDonationValuations(record, { keepTxn })
+    GS._onGossipExportOrderCompaction = nil
+    assertEq(smallCompactions, 1, "val: A1 ordinary forget one compaction")
+    assertEq(#world.chat, 0, "val: A1 chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- A2: incremental assignment-binding index (discussion_r4364648460).
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: A2 provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9902)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local rebuilds = 0
+    GS._onAssignmentBindingRebuild = function()
+        rebuilds = rebuilds + 1
+    end
+    local n = 120
+    local bodies = {}
+    for i = 1, n do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9902,
+            quantity = 1,
+            donor = "A2Donor" .. i .. "-Garona",
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = i,
+            neighborsOlder = { "a2-old-" .. i },
+            neighborsNewer = { "a2-new-" .. i },
+        })
+        local stCred, reasonCred = GS:_AdmitObservationForTests(
+            evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(stCred, "accepted", "val: A2 officer credit " .. i .. " " .. tostring(reasonCred))
+        record = GS:GetCurrentRecord()
+        local ev = nil
+        local lists = {
+            record.accounting._consumableEvents,
+            record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for j = #list, 1, -1 do
+                    local row = list[j]
+                    if type(row) == "table" and tonumber(row.itemId) == 9902
+                        and tonumber(row.quantity) == 1
+                        and tonumber(row.occurrenceIndex) == i then
+                        ev = row
+                        break
+                    end
+                end
+            end
+            if ev then break end
+        end
+        assertTrue(ev ~= nil, "val: A2 donation " .. i)
+        -- Without TSM, mint does not run; admit valuations through the provider.
+        local assignId = string.format("gsv1:%024x:%08x", i, 9902)
+        local body = craftValuation(record, ev, {
+            assignmentId = assignId,
+            assignedAt = 1000 + i,
+            unitCopper = 3,
+            txnId = ev.txnId,
+        })
+        bodies[#bodies + 1] = { id = "gs:val:" .. ev.txnId, body = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = body,
+        } }
+        local st, reason = providerApplyWithId(bodies[#bodies].id, bodies[#bodies].body, "Alice-Garona")
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: A2 admit " .. i .. " " .. tostring(st) .. " " .. tostring(reason))
+        if i % 17 == 0 then
+            local loser = deepCopy(bodies[#bodies].body)
+            loser.assignment = deepCopy(body)
+            loser.assignment.assignmentId = string.format("gsv1:%024x:%08x", i + 5000, 9902)
+            loser.assignment.assignedAt = 2000 + i
+            local stL = select(1, providerApplyWithId(bodies[#bodies].id, loser, "Alice-Garona"))
+            assertTrue(stL == "duplicate" or stL == "accepted",
+                "val: A2 loser " .. i .. " " .. tostring(stL))
+        end
+    end
+    assertTrue(rebuilds <= 3,
+        "val: A2 binding rebuilds bounded during admits got=" .. tostring(rebuilds))
+    local afterAdmits = rebuilds
+    local evidenceOther = makeDepositEvidence(record, {
+        itemId = 9902, quantity = 2, donor = "A2Clash-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = n + 1,
+        neighborsOlder = { "a2-clash-old" }, neighborsNewer = { "a2-clash-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceOther, "Player-1-Alice", "Alice-Garona")), "accepted", "val: A2 clash credit")
+    record = GS:GetCurrentRecord()
+    local other = valuationFindDonation(record, 9902, 2)
+    assertTrue(other ~= nil, "val: A2 clash donation")
+    local borrowed = deepCopy(bodies[1].body)
+    borrowed.assignment = deepCopy(bodies[1].body.assignment)
+    borrowed.assignment.txnId = other.txnId
+    borrowed.assignment.quantity = 2
+    borrowed.assignment.totalCopper = borrowed.assignment.unitCopper * 2
+    borrowed.assignment.itemId = 9902
+    local stBound, reasonBound = providerApplyWithId("gs:val:" .. other.txnId, borrowed, "Alice-Garona")
+    assertEq(stBound, "rejected", "val: A2 borrowed assignment rejected")
+    assertEq(reasonBound, "assignment_bound", "val: A2 assignment_bound")
+    assertTrue(rebuilds - afterAdmits <= 1,
+        "val: A2 clash did not quadratic-rebuild got=" .. tostring(rebuilds - afterAdmits))
+    local beforeForget = rebuilds
+    local drop = {}
+    for i = 1, 20 do
+        drop[#drop + 1] = bodies[i].body.assignment.txnId
+    end
+    GS.ForgetDonationValuations(record, drop)
+    assertEq(rebuilds, beforeForget, "val: A2 forget stays incremental")
+    GS._onAssignmentBindingRebuild = nil
+    assertEq(#world.chat, 0, "val: A2 chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- B1: PROVIDER_SCHEMA advanced for valuation-aware wire (discussion_r4364648464).
+    assertEq(GS.PROVIDER_SCHEMA, 3, "val: B1 PROVIDER_SCHEMA is 3")
+    local record = activateValuationGuild(9903)
+    assertEq(GS:EnsureGossipProvider(), true, "val: B1 provider")
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    assertTrue(type(prov) == "table", "val: B1 provider registered")
+    assertEq(tonumber(prov.schema), 3, "val: B1 registered schema 3")
+    local wireCaps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
+    assertTrue(type(wireCaps) == "table", "val: B1 provider GetCapabilities")
+    assertEq(tonumber(wireCaps.schema), 3, "val: B1 wire capabilities schema 3")
+    drainExportMaint(32)
+    local descSchema = nil
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "dataset-desc"
+            and row.body.datasetId == record.datasetId then
+            descSchema = row.body.schemaVersion
+        end
+    end
+    assertEq(descSchema, 3, "val: B1 descriptor schemaVersion 3")
+    -- Strict GG equality: older schemas are incompatible with local schema 3.
+    local localSchema = tonumber(prov.schema)
+    assertEq(localSchema, 3, "val: B1 local schema 3")
+    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 3")
+    assertEq(tonumber(3) == localSchema, true, "val: B1 new/new compatible")
+    -- Persisted local schema stays 1 across the wire bump.
+    assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, GS.SCHEMA_VERSION,
+        "val: B1 persisted root schema unchanged")
+    assertEq(GS.SCHEMA_VERSION, 1, "val: B1 SCHEMA_VERSION remains 1")
+    assertEq(#world.chat, 0, "val: B1 chat-free")
+end
+
+do
+    -- B2: existing-ID handling before adoption capacity (conversation disposition).
+    valuationTsmValue = 9
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9904)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9904, quantity = 2 })
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9904, 2)
+    assertTrue(event ~= nil, "val: B2 source donation")
+    local canonical = event.txnId
+    local snap = valuationSnap(record, canonical)
+    assertTrue(type(snap) == "table", "val: B2 priced")
+    local sourceDataset = record.datasetId
+    local exportBodies = collectAllExportBodies()
+    local descId = "gs:desc:" .. sourceDataset
+    local baseDesc = nil
+    local valBody = nil
+    local others = {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        if row.id == descId then
+            baseDesc = deepCopy(row.body)
+        elseif row.body and row.body.kind == "gs-valuation" then
+            valBody = deepCopy(row.body)
+        else
+            others[#others + 1] = row
+        end
+    end
+    assertTrue(type(baseDesc) == "table", "val: B2 descriptor")
+    assertTrue(type(valBody) == "table", "val: B2 valuation body")
+    assertEq(tonumber(baseDesc.valuationCount), 1, "val: B2 pin count 1")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    local liveDataset = GS:GetCurrentRecord().datasetId
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B2 begin")
+    local savedCap = GS.MAX_ADOPTION_PENDING_RECORDS
+    -- Fill to exact capacity with descriptor + valuation + others truncated.
+    GS.MAX_ADOPTION_PENDING_RECORDS = 3
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, deepCopy(baseDesc))), "accepted",
+        "val: B2 buffer desc")
+    assertEq(select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody))),
+        "accepted", "val: B2 buffer val")
+    -- One filler to reach capacity.
+    local filler = others[1]
+    assertTrue(filler ~= nil, "val: B2 filler export")
+    assertEq(select(1, GS:BufferAdoptionRecord(filler.id, deepCopy(filler.body))), "accepted",
+        "val: B2 filler")
+    assertEq(#GS._adoption.order, GS.MAX_ADOPTION_PENDING_RECORDS, "val: B2 buffer full")
+    local ready = select(1, GS:IsAdoptionTransferComplete())
+    -- May or may not be ready depending on filler; capacity is what matters.
+    local stDup = select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody)))
+    assertEq(stDup, "duplicate", "val: B2 exact duplicate at capacity")
+    assertTrue(GS._adoption ~= nil, "val: B2 adoption remains after duplicate")
+    local omit = deepCopy(baseDesc)
+    omit.valuationCount = nil
+    local stOmit, reasonOmit = GS:BufferAdoptionRecord(descId, omit)
+    assertEq(stOmit, "rejected", "val: B2 omit count at capacity rejected")
+    assertEq(reasonOmit, "source_changed", "val: B2 omit reason")
+    assertEq(GS:GetPendingAdoption(), nil, "val: B2 cleared on omit")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B2 live preserved after omit")
+
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B2 begin again")
+    GS.MAX_ADOPTION_PENDING_RECORDS = 3
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, deepCopy(baseDesc))), "accepted",
+        "val: B2 re-pin")
+    assertEq(select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody))),
+        "accepted", "val: B2 re-val")
+    assertEq(select(1, GS:BufferAdoptionRecord(filler.id, deepCopy(filler.body))), "accepted",
+        "val: B2 re-filler")
+    local changed = deepCopy(valBody)
+    changed.assignment = deepCopy(valBody.assignment)
+    changed.assignment.assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00009904"
+    changed.assignment.assignedAt = (tonumber(valBody.assignment.assignedAt) or 10) - 5
+    local stChg, reasonChg = GS:BufferAdoptionRecord("gs:val:" .. canonical, changed)
+    assertEq(stChg, "rejected", "val: B2 changed winner at capacity rejected")
+    assertEq(reasonChg, "source_changed", "val: B2 changed reason")
+    assertEq(GS:GetPendingAdoption(), nil, "val: B2 cleared on winner change")
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B2 live preserved after change")
+
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: B2 begin for full")
+    GS.MAX_ADOPTION_PENDING_RECORDS = 3
+    assertEq(select(1, GS:BufferAdoptionRecord(descId, deepCopy(baseDesc))), "accepted",
+        "val: B2 fill desc")
+    assertEq(select(1, GS:BufferAdoptionRecord("gs:val:" .. canonical, deepCopy(valBody))),
+        "accepted", "val: B2 fill val")
+    assertEq(select(1, GS:BufferAdoptionRecord(filler.id, deepCopy(filler.body))), "accepted",
+        "val: B2 fill filler")
+    local stFull, reasonFull = GS:BufferAdoptionRecord("gs:le:ctx:brand-new-full-9904", {
+        kind = "gs-ledger-event",
+        datasetId = sourceDataset,
+        event = { type = "donation", id = "ctx:brand-new-full-9904", txnId = "ctx:brand-new-full-9904" },
+    })
+    assertEq(stFull, "rejected", "val: B2 genuinely new still full")
+    assertEq(reasonFull, "full", "val: B2 full reason")
+    assertTrue(GS._adoption ~= nil, "val: B2 adoption remains after full")
+    GS:CancelDatasetAdoption()
+    assertEq(GS:GetCurrentRecord().datasetId, liveDataset, "val: B2 abort did not replace live")
+    GS.MAX_ADOPTION_PENDING_RECORDS = savedCap
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: B2 chat-free")
+end
+
+do
+    -- C1: competing-ID alias requires full officer-history preflight
+    -- (discussion_r4364653917 PARTIALLY FIXED closure).
+    SF.TSM = nil
+    local record = activateValuationGuild(9905)
+    GS:EnsureGossipProvider()
+    creditValuationDeposit(record, { itemId = 9905, quantity = 4 })
+    drainExportMaint(32)
+    record = GS:GetCurrentRecord()
+    local eventA = valuationFindDonation(record, 9905, 4)
+    assertTrue(eventA ~= nil, "val: C1 donation A")
+    local txnA = eventA.txnId
+    local txnX = "ctx:c1-competing-x-9905"
+    local marker = record.liveCutover and record.liveCutover.cutoverMarker
+    assertTrue(type(marker) == "string" and marker ~= "", "val: C1 live marker")
+    local assignId = "gsv1:cccccccccccccccccccccccc:00009905"
+    local pending = craftValuation(record, eventA, {
+        assignmentId = assignId,
+        assignedAt = 40,
+        unitCopper = 15,
+        txnId = txnX,
+    })
+    local stPend, reasonPend = applyValuationBody(pending, "Alice-Garona")
+    assertEq(stPend, "pending", "val: C1 pending on X " .. tostring(reasonPend))
+    record = GS:GetCurrentRecord()
+    local pendingSnap = record.valuations.pending[txnX]
+    assertTrue(type(pendingSnap) == "table", "val: C1 pending[X] stored")
+    assertEq(valuationSnap(record, txnA), nil, "val: C1 A not priced yet")
+    local pendingFp = GS.ContentFingerprint({
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = pendingSnap.assignmentId,
+            assignedAt = pendingSnap.assignedAt,
+            unitCopper = pendingSnap.unitCopper,
+            quantity = pendingSnap.quantity,
+            totalCopper = pendingSnap.totalCopper,
+            itemId = pendingSnap.itemId,
+            txnId = pendingSnap.txnId,
+            datasetId = pendingSnap.datasetId,
+            guildKey = pendingSnap.guildKey,
+        },
+    })
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, vals = nil, 0
+        for i = 1, #bodies do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            elseif type(body) == "table" and body.kind == "gs-valuation" then
+                vals = vals + 1
+            end
+        end
+        return descCount, vals
+    end
+    local function registryHasAlias(rec, primary, alias)
+        local cfg = rec.accounting and rec.accounting._consumables
+        if type(cfg) ~= "table" or type(cfg.txnRegistry) ~= "table" then
+            return false
+        end
+        for i = 1, #cfg.txnRegistry do
+            local row = cfg.txnRegistry[i]
+            if type(row) == "table" and row.txnId == primary and type(row.aliases) == "table" then
+                for j = 1, #row.aliases do
+                    if row.aliases[j] == alias then
+                        return true
+                    end
+                end
+            end
+            if type(row) == "table" and row.txnId == alias and row.status == "alias" then
+                return true
+            end
+        end
+        return false
+    end
+    local function assertNoAliasSideEffects(label)
+        record = GS:GetCurrentRecord()
+        assertTrue(type(record.valuations.pending[txnX]) == "table",
+            "val: C1 " .. label .. " pending[X] unchanged")
+        assertEq(record.valuations.pending[txnX].assignmentId, assignId,
+            "val: C1 " .. label .. " assignment id intact")
+        assertEq(record.valuations.pending[txnX].unitCopper, 15,
+            "val: C1 " .. label .. " unit intact")
+        assertEq(valuationSnap(record, txnA), nil, "val: C1 " .. label .. " no winner on A")
+        assertEq(valuationSnap(record, txnX), nil, "val: C1 " .. label .. " no winner on X")
+        assertEq(registryHasAlias(record, txnA, txnX), false,
+            "val: C1 " .. label .. " no A→X alias")
+        assertEq(valuationCount(record), 0, "val: C1 " .. label .. " no published winner")
+        local descCount, exportVals = valuationExportSummary(
+            collectAllExportBodies(), record.datasetId)
+        assertEq(tonumber(descCount) or 0, 0, "val: C1 " .. label .. " descriptor count 0")
+        assertEq(exportVals, 0, "val: C1 " .. label .. " no valuation exports")
+    end
+
+    local evidence = {
+        donor = eventA.actor or eventA.donor,
+        itemId = eventA.itemId,
+        quantity = eventA.quantity,
+        generation = eventA.generation,
+        approxTxnTime = eventA.timestamp or eventA.approxTxnTime,
+        ageHours = 0,
+        coreSignature = eventA.coreSignature,
+        occurrenceIndex = eventA.occurrenceIndex,
+        guildGuid = eventA.guildGuid,
+        bankTab = eventA.bankTab,
+        neighborsOlder = eventA.neighborsOlder,
+        neighborsNewer = eventA.neighborsNewer,
+    }
+    -- Shape-complete officer claim (writer==verifier) but NO cutoverMarker.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local shapeOnly = officerLedgerEvent(record, evidence, txnX, {
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        verifierRankOrder = 1,
+        verification = "officer",
+    })
+    local stNoMark, reasonNoMark = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = shapeOnly,
+    }, "Dave-Garona")
+    assertEq(stNoMark, "duplicate", "val: C1 no-marker still occurrence_duplicate")
+    assertEq(reasonNoMark, "occurrence_duplicate", "val: C1 no-marker reason")
+    assertNoAliasSideEffects("no-marker")
+
+    -- Same shape-complete claim with a divergent cutoverMarker.
+    local stDiv, reasonDiv = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = "gsc1:divergent-marker-9905",
+        event = deepCopy(shapeOnly),
+    }, "Dave-Garona")
+    assertEq(stDiv, "duplicate", "val: C1 divergent still occurrence_duplicate")
+    assertEq(reasonDiv, "occurrence_duplicate", "val: C1 divergent reason")
+    assertTrue(reasonDiv ~= "officer_history", "val: C1 divergent not officer credit")
+    assertNoAliasSideEffects("divergent")
+
+    -- Fully eligible canonical-marked officer history relayed by ordinary
+    -- guildmate Dave while original officer Alice is offline.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS:GetCapabilities().canEdit, false, "val: C1 Dave is non-editor carrier")
+    local hist = deepCopy(shapeOnly)
+    local stOk, reasonOk = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = marker,
+        event = hist,
+    }, "Dave-Garona")
+    assertTrue(stOk == "duplicate" or stOk == "accepted",
+        "val: C1 trusted officer history st=" .. tostring(stOk) .. " " .. tostring(reasonOk))
+    record = GS:GetCurrentRecord()
+    local moved = valuationSnap(record, txnA)
+    assertTrue(type(moved) == "table", "val: C1 trusted alias moves valuation to A")
+    assertEq(moved.unitCopper, 15, "val: C1 moved unit")
+    assertEq(moved.totalCopper, 60, "val: C1 moved total")
+    assertEq(moved.txnId, txnX, "val: C1 keeps immutable assignment txnId")
+    assertEq(moved.assignmentId, assignId, "val: C1 assignment id unchanged")
+    assertEq(record.valuations.pending[txnX], nil, "val: C1 pending[X] cleared once")
+    assertEq(valuationCount(record), 1, "val: C1 one winner after trusted convergence")
+    assertEq(registryHasAlias(record, txnA, txnX), true, "val: C1 A→X alias after trusted relay")
+    local afterFp = GS.ContentFingerprint({
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = moved.assignmentId,
+            assignedAt = moved.assignedAt,
+            unitCopper = moved.unitCopper,
+            quantity = moved.quantity,
+            totalCopper = moved.totalCopper,
+            itemId = moved.itemId,
+            txnId = moved.txnId,
+            datasetId = moved.datasetId,
+            guildKey = moved.guildKey,
+        },
+    })
+    assertEq(afterFp, pendingFp, "val: C1 immutable fingerprint unchanged")
+
+    -- Redelivery is idempotent.
+    local stDup, reasonDup = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = marker,
+        event = deepCopy(hist),
+    }, "Dave-Garona")
+    assertTrue(stDup == "duplicate" or stDup == "accepted",
+        "val: C1 redelivery st=" .. tostring(stDup) .. " " .. tostring(reasonDup))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 1, "val: C1 redelivery keeps one winner")
+    assertEq(valuationSnap(record, txnA).assignmentId, assignId,
+        "val: C1 redelivery keeps assignment")
+    assertEq(valuationSnap(record, txnA).unitCopper, 15, "val: C1 redelivery unit")
+
+    -- Unrelated competing id with divergent marker remains fail-closed.
+    local txnY = "ctx:c1-divergent-y-9905"
+    local badHist = officerLedgerEvent(record, evidence, txnY, {
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        verifierRankOrder = 1,
+        verification = "officer",
+    })
+    local stY, reasonY = providerApply({
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        cutoverMarker = "gsc1:divergent-marker-9905",
+        event = badHist,
+    }, "Dave-Garona")
+    assertTrue(reasonY ~= "officer_history",
+        "val: C1 second divergent not officer credit st="
+            .. tostring(stY) .. " " .. tostring(reasonY))
+    assertEq(valuationCount(GS:GetCurrentRecord()), 1, "val: C1 still one winner")
+    assertEq(registryHasAlias(GS:GetCurrentRecord(), txnA, txnY), false,
+        "val: C1 no A→Y alias from divergent")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: C1 chat-free")
+end
+
+do
+    -- C2: snapshot market cache cleanup on exception (discussion_r4364648470).
+    local tsmByKey = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function(item)
+            valuationTsmCalls = valuationTsmCalls + 1
+            local key = type(item) == "number" and ("n:" .. item) or ("s:" .. tostring(item))
+            tsmByKey[key] = (tsmByKey[key] or 0) + 1
+            if type(valuationTsmValue) == "function" then
+                return valuationTsmValue(item)
+            end
+            return valuationTsmValue
+        end,
+    }
+    local itemId = 9906
+    local record = activateValuationGuild(itemId)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesObservation.lua")
+    loadModule("SpectrumFederation/modules/LootHelper/ConsumablesBankLog.lua")
+    local BankLog = SF.ConsumablesBankLog
+    local O = SF.ConsumablesObservation
+    record = GS:GetCurrentRecord()
+    local cfg = record.accounting._consumables
+    local rows = {}
+    for i = 1, 4 do
+        rows[i] = {
+            type = "deposit",
+            name = "C2Donor" .. i .. "-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 1,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = i,
+        }
+    end
+    local snapshot = {
+        guildGuid = tostring(cfg.guild and cfg.guild.guid or "42"),
+        bankTab = tonumber(cfg.bankTab) or 2,
+        generation = tonumber(cfg.generation) or 1,
+        observedBy = "Alice-Garona",
+        observedAt = world.time,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows,
+    }
+    local ctx = {
+        source = "guildSupplies",
+        sampleOnly = false,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        bankTab = snapshot.bankTab,
+        guildGuid = snapshot.guildGuid,
+        generation = snapshot.generation,
+        profileId = "gs",
+        requestedSet = snapshot.requestedSet,
+        observedBy = "Alice-Garona",
+        eligibility = cfg.eligibility,
+    }
+    local realAdmit = GS.AdmitDirectObservation
+    local calls = 0
+    GS.AdmitDirectObservation = function(self, evidence, opts)
+        calls = calls + 1
+        if calls == 2 then
+            error("forced-c2-admit-exception")
+        end
+        return realAdmit(self, evidence, opts)
+    end
+    local ok, err = pcall(function()
+        BankLog:AdmitGuildSuppliesSnapshot(ctx, snapshot)
+    end)
+    GS.AdmitDirectObservation = realAdmit
+    assertEq(ok, false, "val: C2 exception propagated")
+    assertTrue(tostring(err):find("forced-c2-admit-exception", 1, true) ~= nil,
+        "val: C2 original error preserved got=" .. tostring(err))
+    -- Later snapshot must re-query TSM (including a prior nil miss) rather than
+    -- reuse a stranded depth-1 cache.
+    valuationTsmCalls = 0
+    tsmByKey = {}
+    local phase = 0
+    valuationTsmValue = function(item)
+        phase = phase + 1
+        if phase == 1 then
+            return nil
+        end
+        return 777
+    end
+    local rows2 = {
+        {
+            type = "deposit",
+            name = "C2LaterA-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 2,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = 1,
+        },
+        {
+            type = "deposit",
+            name = "C2LaterB-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId,
+            count = 3,
+            year = 0, month = 0, day = 0, hour = 0,
+            ageHours = 0,
+            index = 2,
+        },
+    }
+    local snap2 = {
+        guildGuid = snapshot.guildGuid,
+        bankTab = snapshot.bankTab,
+        generation = snapshot.generation,
+        observedBy = "Alice-Garona",
+        observedAt = world.time + 10,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows2,
+    }
+    ctx.observedAt = snap2.observedAt
+    local stats2 = BankLog:AdmitGuildSuppliesSnapshot(ctx, snap2)
+    assertTrue(type(stats2) == "table", "val: C2 later snapshot returns stats")
+    assertTrue(valuationTsmCalls >= 1, "val: C2 later snapshot re-queries TSM")
+    -- Normal batching: two same-item deposits after a fresh begin query once per key
+    -- when the price is stable.
+    valuationTsmCalls = 0
+    valuationTsmValue = 42
+    local rows3 = {
+        {
+            type = "deposit", name = "C2Batch1-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId, count = 1,
+            year = 0, month = 0, day = 0, hour = 0, ageHours = 0, index = 1,
+        },
+        {
+            type = "deposit", name = "C2Batch2-Garona",
+            itemLink = "|cffffffff|Hitem:" .. itemId .. "::::::::|h[Item]|h|r",
+            itemID = itemId, count = 1,
+            year = 0, month = 0, day = 0, hour = 0, ageHours = 0, index = 2,
+        },
+    }
+    local snap3 = {
+        guildGuid = snapshot.guildGuid,
+        bankTab = snapshot.bankTab,
+        generation = snapshot.generation,
+        observedBy = "Alice-Garona",
+        observedAt = world.time + 20,
+        eligibility = cfg.eligibility,
+        requestedSet = { [itemId] = true },
+        rows = rows3,
+    }
+    BankLog:AdmitGuildSuppliesSnapshot(ctx, snap3)
+    assertEq(valuationTsmCalls, 1, "val: C2 normal batch one query per key got="
+        .. tostring(valuationTsmCalls))
+    assertEq(#world.chat, 0, "val: C2 chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- Group A (discussion_r4365058306): bounded txn→event index for valuation admit.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idx provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9911)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local visits = 0
+    local rebuilds = 0
+    GS._onDonationEventIndexVisit = function()
+        visits = visits + 1
+    end
+    GS._onDonationEventIndexRebuild = function()
+        rebuilds = rebuilds + 1
+    end
+    local n = 160
+    local events = {}
+    for i = 1, n do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9911,
+            quantity = 1,
+            donor = "IdxDonor" .. i .. "-Garona",
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = i,
+            neighborsOlder = { "idx-old-" .. i },
+            neighborsNewer = { "idx-new-" .. i },
+        })
+        local stCred, reasonCred = GS:_AdmitObservationForTests(
+            evidence, "Player-1-Alice", "Alice-Garona")
+        assertEq(stCred, "accepted", "val: idx officer credit " .. i .. " " .. tostring(reasonCred))
+        record = GS:GetCurrentRecord()
+        local ev = nil
+        local lists = {
+            record.accounting._consumableEvents,
+            record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for j = #list, 1, -1 do
+                    local row = list[j]
+                    if type(row) == "table" and tonumber(row.itemId) == 9911
+                        and tonumber(row.occurrenceIndex) == i then
+                        ev = row
+                        break
+                    end
+                end
+            end
+            if ev then break end
+        end
+        assertTrue(ev ~= nil, "val: idx donation " .. i)
+        events[i] = ev
+    end
+    local afterLedgerVisits = visits
+    local afterLedgerRebuilds = rebuilds
+    assertTrue(afterLedgerRebuilds <= 2,
+        "val: idx cold rebuilds bounded before valuations got=" .. tostring(afterLedgerRebuilds))
+    for i = 1, n do
+        local ev = events[i]
+        local assignId = string.format("gsv1:%024x:%08x", i, 9911)
+        local body = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, ev, {
+                assignmentId = assignId,
+                assignedAt = 3000 + i,
+                unitCopper = 7,
+                txnId = ev.txnId,
+            }),
+        }
+        local st, reason = providerApplyWithId("gs:val:" .. ev.txnId, body, "Alice-Garona")
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: idx admit " .. i .. " " .. tostring(st) .. " " .. tostring(reason))
+    end
+    local admitVisits = visits - afterLedgerVisits
+    -- Near-linear: one cold/incremental pass over the ledger, not O(n²) per valuation.
+    assertTrue(admitVisits <= (n * 3) + 32,
+        "val: idx admit visits near-linear got=" .. tostring(admitVisits)
+            .. " n=" .. tostring(n))
+    assertTrue(rebuilds - afterLedgerRebuilds <= 1,
+        "val: idx no per-valuation cold rebuild got="
+            .. tostring(rebuilds - afterLedgerRebuilds))
+    -- Late credit / alias path: note alias without rescanning the ledger.
+    local beforeAlias = visits
+    local primary = events[1].txnId
+    local aliasTxn = "ctx:idx-alias-9911"
+    GS.NoteDonationEventTxnAlias(record, primary, aliasTxn)
+    assertEq(visits, beforeAlias, "val: idx alias note is O(1)")
+    -- Yieldable adoption with reverse valuation/ledger order still converges.
+    drainExportMaint(128)
+    local aliceExport = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    local configRoot = snapshotConfigRoot()
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idx adopt begins")
+    local vals, leds, other = {}, {}, {}
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-valuation" then
+            vals[#vals + 1] = row
+        elseif kind == "gs-ledger-event" then
+            leds[#leds + 1] = row
+        elseif kind ~= "gs-evidence" then
+            other[#other + 1] = row
+        end
+    end
+    local function kindOf(row)
+        return row and row.body and row.body.kind or "?"
+    end
+    local function bufferRow(row)
+        local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: idx buffer " .. tostring(kindOf(row)) .. " " .. tostring(st)
+                .. " " .. tostring(reason))
+    end
+    for i = 1, #other do bufferRow(other[i]) end
+    -- Reverse valuations, then ledgers (interleaved-hostile order).
+    for i = #vals, 1, -1 do bufferRow(vals[i]) end
+    for i = #leds, 1, -1 do bufferRow(leds[i]) end
+    local adop = GS._adoption
+    if type(adop) == "table" and type(adop.records) == "table" then
+        local desc = adop.records["gs:desc:" .. sourceDataset]
+        if type(desc) == "table" then
+            desc.donationEvidenceCount = 0
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    local adoptVisits = 0
+    GS._onDonationEventIndexVisit = function()
+        adoptVisits = adoptVisits + 1
+    end
+    -- Yieldable commit: timers may finish the transfer; do not re-Commit after idle.
+    GS._adoptionReplaySyncDrain = false
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: idx adopt transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertTrue(stAdopt == "pending" or stAdopt == "accepted",
+        "val: idx adopt commit starts " .. tostring(stAdopt) .. " " .. tostring(reasonAdopt))
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 12000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertTrue(guard >= 1 or stAdopt == "accepted",
+        "val: idx adopt yielded or drained slices=" .. tostring(guard))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idx adopt idle")
+    assertTrue(adoptVisits <= (n * 4) + 64,
+        "val: idx adopt visits near-linear got=" .. tostring(adoptVisits))
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: idx adopt dataset")
+    assertTrue(valuationCount(adopted) >= n - 2,
+        "val: idx adopt retained valuations got=" .. tostring(valuationCount(adopted)))
+    GS._adoptionReplaySyncDrain = true
+    GS._onDonationEventIndexVisit = nil
+    GS._onDonationEventIndexRebuild = nil
+    GS._onDonationEventIndexCallback = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idx chat-free")
+end
+
+do
+    -- Group A remainder (discussion_r4365058306): per-callback index budget.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxb provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function plantLedgerRows(record, liveCount, archCount, itemId)
+        local accounting = record.accounting
+        -- Replace array identities at exact counts (do not append onto seed
+        -- rows — over-cap fails ValidateGuildRecord / GetCurrentRecord).
+        local live, arch = {}, {}
+        local function push(list, n, prefix)
+            for i = 1, n do
+                local txn = string.format("ctx:%s-%s-%04d", prefix, tostring(itemId), i)
+                list[#list + 1] = {
+                    type = "donation",
+                    id = txn,
+                    txnId = txn,
+                    itemId = itemId,
+                    quantity = 1,
+                    generation = 1,
+                    gsProductionCredit = true,
+                    verification = "officer",
+                    writer = "Player-1-Alice",
+                    verifierGuid = "Player-1-Alice",
+                    datasetId = record.datasetId,
+                    campaignId = record.currentCampaignId,
+                    approxTxnTime = world.time,
+                    timestamp = world.time,
+                    occurrenceIndex = 100000 + #list + i,
+                }
+            end
+        end
+        push(arch, archCount, "arch")
+        push(live, liveCount, "live")
+        accounting._consumableEventArchive = arch
+        accounting._consumableEvents = live
+        accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+        return live, arch
+    end
+
+    SF.TSM = nil
+    local record = activateValuationGuild(9914)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local budget = GS.DONATION_EVENT_INDEX_BUDGET or 512
+    assertEq(budget, 512, "val: idxb documented budget 512")
+    local maxLive = GS.MAX_LEDGER_EVENTS or 4096
+    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    -- Near-capacity cold ledger (fresh array identities → cold index).
+    local live, arch = plantLedgerRows(record, maxLive, maxArch, 9914)
+    assertTrue(#live >= maxLive - 8, "val: idxb live near capacity")
+    assertTrue(#arch >= maxArch - 8, "val: idxb archive near capacity")
+    local totalRows = #live + #arch
+    local callbackVisits = {}
+    local totalVisits = 0
+    local rebuilds = 0
+    GS._onDonationEventIndexVisit = function()
+        totalVisits = totalVisits + 1
+    end
+    GS._onDonationEventIndexRebuild = function()
+        rebuilds = rebuilds + 1
+    end
+    GS._onDonationEventIndexCallback = function(visited, complete)
+        callbackVisits[#callbackVisits + 1] = {
+            visited = tonumber(visited) or 0,
+            complete = complete and true or false,
+        }
+    end
+
+    -- Yieldable warm: one budgeted chunk per callback (sync; no timer flush —
+    -- flushing can run unrelated catch-up/adoption work from prior groups).
+    local warmGuard = 0
+    local complete = false
+    while not complete and warmGuard < 64 do
+        warmGuard = warmGuard + 1
+        complete = select(1, GS.WarmDonationEventIndex(record, budget))
+    end
+    assertEq(complete, true, "val: idxb cold warm converges")
+    assertTrue(warmGuard >= 2, "val: idxb cold warm yielded across callbacks")
+    local maxCb = 0
+    for i = 1, #callbackVisits do
+        if callbackVisits[i].visited > maxCb then
+            maxCb = callbackVisits[i].visited
+        end
+    end
+    assertTrue(maxCb <= budget,
+        "val: idxb max per-callback visits <= budget got=" .. tostring(maxCb)
+            .. " budget=" .. tostring(budget))
+    assertTrue(totalVisits <= totalRows + budget,
+        "val: idxb total visits near-linear got=" .. tostring(totalVisits)
+            .. " rows=" .. tostring(totalRows))
+    assertTrue(rebuilds <= 2, "val: idxb cold rebuilds bounded got=" .. tostring(rebuilds))
+
+    -- Ordinary Gossip + large in-place append tail (same array identities):
+    -- index extends incrementally; valuation retained via local deferral drain
+    -- without a second provider delivery. Stay within MAX_LEDGER_EVENTS so
+    -- ValidateGuildRecord / GetCurrentRecord remain usable.
+    local tailN = 600
+    record = GS:GetCurrentRecord() or record
+    assertTrue(type(record) == "table", "val: idxb live record after cold warm")
+    live, arch = plantLedgerRows(record, maxLive - tailN, maxArch, 9915)
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record) == "table", "val: idxb record under append headroom")
+    -- Warm the under-cap plant so the subsequent append is incremental.
+    complete = false
+    warmGuard = 0
+    while not complete and warmGuard < 64 do
+        warmGuard = warmGuard + 1
+        complete = select(1, GS.WarmDonationEventIndex(record, budget))
+    end
+    assertEq(complete, true, "val: idxb under-cap warm converges")
+    local beforeAppendCb = #callbackVisits
+    local beforeAppendVisits = totalVisits
+    local beforeAppendRebuilds = rebuilds
+    local accounting = record.accounting
+    local liveArr = accounting._consumableEvents
+    assertTrue(type(liveArr) == "table", "val: idxb live array")
+    local liveBeforeAppend = #liveArr
+    for i = 1, tailN do
+        local txn = string.format("ctx:tail-9915-%04d", i)
+        liveArr[#liveArr + 1] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9915,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = world.time,
+            occurrenceIndex = 200000 + i,
+        }
+    end
+    accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+    assertEq(#liveArr, liveBeforeAppend + tailN, "val: idxb append length")
+    assertTrue(#liveArr <= maxLive, "val: idxb append stays within live cap")
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxb append needs warm")
+    local appendTarget = liveArr[#liveArr]
+    -- Per After(0)/admit wall: sum visits across Ensure calls in one drain tick.
+    local wallMax = 0
+    local wallBucket = 0
+    GS._onDonationEventIndexCallback = function(visited, completeFlag)
+        local v = tonumber(visited) or 0
+        callbackVisits[#callbackVisits + 1] = {
+            visited = v,
+            complete = completeFlag and true or false,
+        }
+        wallBucket = wallBucket + v
+    end
+    local body = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, appendTarget, {
+            assignmentId = "gsv1:ccccccccccccccdddddddddd:00000011",
+            assignedAt = 7000,
+            unitCopper = 9,
+            txnId = appendTarget.txnId,
+        }),
+    }
+    wallBucket = 0
+    local st1, reason1 = providerApplyWithId("gs:val:" .. appendTarget.txnId, body, "Alice-Garona")
+    if wallBucket > wallMax then
+        wallMax = wallBucket
+    end
+    assertTrue(st1 == "accepted" or st1 == "pending" or st1 == "duplicate",
+        "val: idxb first admit st=" .. tostring(st1) .. " " .. tostring(reason1))
+    local drainGuard = 0
+    while drainGuard < 64 do
+        drainGuard = drainGuard + 1
+        wallBucket = 0
+        flushTimers()
+        if wallBucket > wallMax then
+            wallMax = wallBucket
+        end
+        world.time = (world.time or 0) + 1
+        wallBucket = 0
+        flushTimers()
+        if wallBucket > wallMax then
+            wallMax = wallBucket
+        end
+        record = GS:GetCurrentRecord()
+        if valuationSnap(record, appendTarget.txnId)
+            or (record.valuations and record.valuations.pending
+                and record.valuations.pending[appendTarget.txnId]) then
+            break
+        end
+        if st1 == "accepted" or st1 == "duplicate" then
+            break
+        end
+    end
+    record = GS:GetCurrentRecord()
+    local kept = valuationSnap(record, appendTarget.txnId)
+        or (record.valuations and record.valuations.pending and record.valuations.pending[appendTarget.txnId])
+    assertTrue(type(kept) == "table",
+        "val: idxb assignment retained without external redelivery")
+    local maxCb2 = 0
+    for i = beforeAppendCb + 1, #callbackVisits do
+        if callbackVisits[i].visited > maxCb2 then
+            maxCb2 = callbackVisits[i].visited
+        end
+    end
+    assertTrue(maxCb2 <= budget,
+        "val: idxb append/admit per-callback <= budget got=" .. tostring(maxCb2))
+    assertTrue(wallMax <= budget,
+        "val: idxb append wall per drain/admit <= budget got=" .. tostring(wallMax))
+    assertTrue((totalVisits - beforeAppendVisits) <= (tailN * 3) + budget,
+        "val: idxb append visits near-linear delta="
+            .. tostring(totalVisits - beforeAppendVisits))
+    assertTrue((rebuilds - beforeAppendRebuilds) <= 1,
+        "val: idxb append does not full-rebuild per valuation got="
+            .. tostring(rebuilds - beforeAppendRebuilds))
+
+    -- Fresh source-backed adoption export (do not ship planted capacity stubs).
+    drainExportMaint(64)
+    record = activateValuationGuild(9920)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9920, quantity = 2, donor = "IdxbDonor-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 1,
+        neighborsOlder = { "idxb-old" }, neighborsNewer = { "idxb-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: idxb adopt source credit")
+    record = GS:GetCurrentRecord()
+    local realEv = valuationFindDonation(record, 9920, 2)
+    assertTrue(realEv ~= nil, "val: idxb adopt source donation")
+    local valBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, realEv, {
+            assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00000022",
+            assignedAt = 8000,
+            unitCopper = 4,
+            txnId = realEv.txnId,
+        }),
+    }
+    local stSrc = select(1, providerApplyWithId("gs:val:" .. realEv.txnId, valBody, "Alice-Garona"))
+    assertTrue(stSrc == "accepted" or stSrc == "duplicate" or stSrc == "pending",
+        "val: idxb source valuation " .. tostring(stSrc))
+    flushTimers()
+    drainExportMaint(64)
+    local aliceExport = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idxb adopt begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: idxb buffer " .. tostring(row.body and row.body.kind)
+                    .. " " .. tostring(st) .. " " .. tostring(reason))
+        end
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" then
+        if type(adop.records) == "table" then
+            local desc = adop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+        -- Plant a cold near-capacity ledger onto the adoption temp before replay
+        -- so WarmDonationEventIndex must yield inside ReplayAdoptionSlice.
+        if type(adop.replayTemp) ~= "table" then
+            -- Commit will create temp; plant after first pending slice instead.
+        end
+    end
+    -- Source-backed adoption must commit (no junk ledger plant).
+    GS._onDonationEventIndexVisit = nil
+    GS._onDonationEventIndexRebuild = nil
+    GS._onDonationEventIndexCallback = nil
+    GS._adoptionReplaySyncDrain = false
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: idxb adopt ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local adoptGuard = 0
+    while GS._adoption and GS._adoption.replayTemp and adoptGuard < 12000 do
+        adoptGuard = adoptGuard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        if not GS._adoption then
+            local bobRec = GS:GetCurrentRecord()
+            if bobRec and bobRec.datasetId == sourceDataset then
+                stAdopt, reasonAdopt = "accepted", nil
+            else
+                stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+            end
+        else
+            stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+        end
+    end
+    assertEq(stAdopt, "accepted",
+        "val: idxb adopt commits got=" .. tostring(stAdopt) .. " " .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxb adopt idle")
+    local bobAdopted = GS:GetCurrentRecord()
+    assertEq(bobAdopted and bobAdopted.datasetId, sourceDataset, "val: idxb adopt dataset")
+    GS._adoptionReplaySyncDrain = true
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idxb chat-free")
+end
+
+do
+    -- Group A remainder (discussion_r4365058306 @ d5d0884a): per-callback bounds
+    -- for deferred Gossip admits and reconcile without full-ledger fallback.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxc provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function plantLedgerRows(record, liveCount, archCount, itemId)
+        local accounting = record.accounting
+        local live, arch = {}, {}
+        local function push(list, n, prefix)
+            for i = 1, n do
+                local txn = string.format("ctx:%s-%s-%04d", prefix, tostring(itemId), i)
+                list[#list + 1] = {
+                    type = "donation",
+                    id = txn,
+                    txnId = txn,
+                    itemId = itemId,
+                    quantity = 1,
+                    generation = 1,
+                    gsProductionCredit = true,
+                    verification = "officer",
+                    writer = "Player-1-Alice",
+                    verifierGuid = "Player-1-Alice",
+                    datasetId = record.datasetId,
+                    campaignId = record.currentCampaignId,
+                    approxTxnTime = world.time,
+                    timestamp = math.floor(world.time or 0),
+                    occurrenceIndex = 300000 + #list + i,
+                }
+            end
+        end
+        push(arch, archCount, "arch")
+        push(live, liveCount, "live")
+        accounting._consumableEventArchive = arch
+        accounting._consumableEvents = live
+        accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+        return live, arch
+    end
+
+    SF.TSM = nil
+    local record = activateValuationGuild(9917)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local budget = GS.DONATION_EVENT_INDEX_BUDGET or 512
+    local admitBudget = GS.DEFERRED_VALUATION_ADMIT_BUDGET
+        or GS.MAX_ADMISSION_WORK_PER_SLICE
+        or 32
+    assertEq(admitBudget, 32, "val: idxc deferred admit budget 32")
+    local maxLive = GS.MAX_LEDGER_EVENTS or 4096
+    local maxArch = GS.MAX_ARCHIVED_EVENTS or 4096
+    local live, arch = plantLedgerRows(record, maxLive, maxArch, 9917)
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record) == "table", "val: idxc near-cap record")
+    assertTrue(#live >= maxLive - 8 and #arch >= maxArch - 8, "val: idxc near capacity")
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxc index starts cold")
+
+    local indexCbMax, fallbackCbMax, admitCbMax = 0, 0, 0
+    local indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+    local totalIndex, totalFallback, totalAdmits = 0, 0, 0
+    local drainCallbacks = 0
+    local function rollCallbackBuckets()
+        if indexCbBucket > indexCbMax then indexCbMax = indexCbBucket end
+        if fallbackCbBucket > fallbackCbMax then fallbackCbMax = fallbackCbBucket end
+        if admitCbBucket > admitCbMax then admitCbMax = admitCbBucket end
+        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+    end
+    GS._onDonationEventIndexVisit = function()
+        totalIndex = totalIndex + 1
+        indexCbBucket = indexCbBucket + 1
+    end
+    GS._onDonationEventFallbackVisit = function()
+        totalFallback = totalFallback + 1
+        fallbackCbBucket = fallbackCbBucket + 1
+    end
+    GS._onDeferredValuationAdmit = function()
+        totalAdmits = totalAdmits + 1
+        admitCbBucket = admitCbBucket + 1
+    end
+    -- flushTimers may chain many After(0) drains; roll per drain start.
+    GS._onDeferredValuationDrainCallback = function()
+        if drainCallbacks > 0 then
+            rollCallbackBuckets()
+        end
+        drainCallbacks = drainCallbacks + 1
+        indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+    end
+
+    local nDefer = 80
+    local targets = {}
+    indexCbBucket, fallbackCbBucket, admitCbBucket = 0, 0, 0
+    for i = 1, nDefer do
+        targets[i] = live[#live - nDefer + i]
+        assertTrue(type(targets[i]) == "table", "val: idxc target " .. i)
+        local body = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, targets[i], {
+                assignmentId = string.format("gsv1:%024x:%08x", i + 100, 9917),
+                assignedAt = 9000 + i,
+                unitCopper = 11,
+                txnId = targets[i].txnId,
+            }),
+        }
+        local st, reason = providerApplyWithId(
+            "gs:val:" .. targets[i].txnId, body, "Alice-Garona")
+        assertTrue(st == "pending" or st == "accepted" or st == "duplicate",
+            "val: idxc enqueue st=" .. tostring(st) .. " " .. tostring(reason))
+    end
+    -- Burst enqueue wall: at most one index budget before the drain is scheduled.
+    rollCallbackBuckets()
+    assertTrue(indexCbMax <= budget,
+        "val: idxc burst enqueue index/callback <= budget got=" .. tostring(indexCbMax))
+
+    local drainGuard = 0
+    while drainGuard < 256 do
+        drainGuard = drainGuard + 1
+        flushTimers()
+        rollCallbackBuckets()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        rollCallbackBuckets()
+        record = GS:GetCurrentRecord()
+        local kept = 0
+        for i = 1, nDefer do
+            if valuationSnap(record, targets[i].txnId)
+                or (record.valuations and record.valuations.pending
+                    and record.valuations.pending[targets[i].txnId]) then
+                kept = kept + 1
+            end
+        end
+        if kept >= nDefer then
+            break
+        end
+    end
+    record = GS:GetCurrentRecord()
+    local accepted = 0
+    for i = 1, nDefer do
+        if valuationSnap(record, targets[i].txnId) then
+            accepted = accepted + 1
+        end
+    end
+    assertEq(accepted, nDefer,
+        "val: idxc all deferred valuations retained without redelivery got="
+            .. tostring(accepted))
+    assertTrue(admitCbMax <= admitBudget,
+        "val: idxc max admits/callback <= budget got=" .. tostring(admitCbMax)
+            .. " budget=" .. tostring(admitBudget)
+            .. " drains=" .. tostring(drainCallbacks))
+    assertTrue(indexCbMax <= budget,
+        "val: idxc max index visits/callback <= budget got=" .. tostring(indexCbMax))
+    assertTrue(fallbackCbMax <= 0,
+        "val: idxc no full-ledger fallback during defer drain got="
+            .. tostring(fallbackCbMax))
+    assertTrue(drainCallbacks >= 2,
+        "val: idxc deferred drain yielded across callbacks got="
+            .. tostring(drainCallbacks))
+    assertTrue(totalIndex <= (#live + #arch) + budget,
+        "val: idxc total index near-linear got=" .. tostring(totalIndex))
+
+    -- Cold reconcile: pending valuations + several new credits with knownEvent.
+    plantLedgerRows(record, 64, 64, 9918)
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record) == "table", "val: idxc reconcile plant")
+    -- Force cold index on new array identities.
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxc reconcile cold")
+    local creditN = 8
+    local pendingTxns = {}
+    for i = 1, creditN do
+        pendingTxns[i] = string.format("ctx:idxc-credit-%04d", i)
+        local store = record.valuations
+        if type(store) ~= "table" then
+            record.valuations = { schemaVersion = 1, nextSeq = 1, byTxn = {}, pending = {} }
+            store = record.valuations
+        end
+        store.pending = store.pending or {}
+        store.pending[pendingTxns[i]] = {
+            assignmentId = string.format("gsv1:%024x:%08x", i + 200, 9918),
+            assignedAt = 10000 + i,
+            unitCopper = 13,
+            quantity = 1,
+            totalCopper = 13,
+            itemId = 9918,
+            txnId = pendingTxns[i],
+            canonicalTxnId = pendingTxns[i],
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            seen = {},
+        }
+    end
+    totalFallback = 0
+    fallbackCbMax = 0
+    for i = 1, creditN do
+        fallbackCbBucket = 0
+        indexCbBucket = 0
+        local ev = {
+            type = "donation",
+            id = pendingTxns[i],
+            txnId = pendingTxns[i],
+            itemId = 9918,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 400000 + i,
+        }
+        local liveArr = record.accounting._consumableEvents
+        liveArr[#liveArr + 1] = ev
+        record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+        GS.ReconcilePendingValuations(record, pendingTxns[i], ev)
+        if fallbackCbBucket > fallbackCbMax then
+            fallbackCbMax = fallbackCbBucket
+        end
+        if indexCbBucket > indexCbMax then
+            indexCbMax = indexCbBucket
+        end
+    end
+    assertTrue(fallbackCbMax <= 0,
+        "val: idxc reconcile credits use knownEvent (no fallback) got="
+            .. tostring(fallbackCbMax))
+    record = GS:GetCurrentRecord()
+    for i = 1, creditN do
+        assertTrue(type(valuationSnap(record, pendingTxns[i])) == "table",
+            "val: idxc credit " .. i .. " promoted")
+    end
+
+    -- Large source-backed adoption must COMMIT with all advertised valuations.
+    drainExportMaint(64)
+    local adoptN = 48
+    record = activateValuationGuild(9919)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adoptEvents = {}
+    for i = 1, adoptN do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9919, quantity = 1, donor = "IdxcDonor" .. i .. "-Garona",
+            observedAt = world.time, ageHours = 0, occurrenceIndex = i,
+            neighborsOlder = { "idxc-old-" .. i }, neighborsNewer = { "idxc-new-" .. i },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+            "accepted", "val: idxc adopt seed credit " .. i)
+        record = GS:GetCurrentRecord()
+        local ev = nil
+        local lists = {
+            record.accounting._consumableEvents,
+            record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for j = #list, 1, -1 do
+                    local row = list[j]
+                    if type(row) == "table" and tonumber(row.itemId) == 9919
+                        and tonumber(row.occurrenceIndex) == i then
+                        ev = row
+                        break
+                    end
+                end
+            end
+            if ev then break end
+        end
+        assertTrue(ev ~= nil, "val: idxc adopt seed donation " .. i)
+        adoptEvents[i] = ev
+        local body = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, ev, {
+                assignmentId = string.format("gsv1:%024x:%08x", i + 300, 9919),
+                assignedAt = 11000 + i,
+                unitCopper = 15,
+                txnId = ev.txnId,
+            }),
+        }
+        local st = select(1, providerApplyWithId("gs:val:" .. ev.txnId, body, "Alice-Garona"))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: idxc adopt seed valuation " .. i .. " " .. tostring(st))
+    end
+    flushTimers()
+    drainExportMaint(64)
+    local aliceExport = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    local sourceCount = valuationCount(record)
+    assertTrue(sourceCount >= adoptN, "val: idxc source valuations got=" .. tostring(sourceCount))
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idxc adopt begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: idxc buffer " .. tostring(row.body and row.body.kind)
+                    .. " " .. tostring(st) .. " " .. tostring(reason))
+        end
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" then
+        if type(adop.records) == "table" then
+            local desc = adop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    totalIndex, totalFallback = 0, 0
+    indexCbMax, fallbackCbMax = 0, 0
+    GS._onDonationEventIndexVisit = function()
+        totalIndex = totalIndex + 1
+        indexCbBucket = indexCbBucket + 1
+    end
+    GS._onDonationEventFallbackVisit = function()
+        totalFallback = totalFallback + 1
+        fallbackCbBucket = fallbackCbBucket + 1
+    end
+    GS._adoptionReplaySyncDrain = false
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: idxc adopt ready")
+    indexCbMax, fallbackCbMax = 0, 0
+    totalIndex, totalFallback = 0, 0
+    local stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+    local adoptGuard2 = 0
+    while GS._adoption and GS._adoption.replayTemp and adoptGuard2 < 12000 do
+        adoptGuard2 = adoptGuard2 + 1
+        indexCbBucket, fallbackCbBucket = 0, 0
+        flushTimers()
+        if indexCbBucket > indexCbMax then indexCbMax = indexCbBucket end
+        if fallbackCbBucket > fallbackCbMax then fallbackCbMax = fallbackCbBucket end
+        world.time = (world.time or 0) + 1
+        indexCbBucket, fallbackCbBucket = 0, 0
+        flushTimers()
+        if indexCbBucket > indexCbMax then indexCbMax = indexCbBucket end
+        if fallbackCbBucket > fallbackCbMax then fallbackCbMax = fallbackCbBucket end
+    end
+    if stAdopt2 == "pending" then
+        if not GS._adoption then
+            local bobRec = GS:GetCurrentRecord()
+            if bobRec and bobRec.datasetId == sourceDataset then
+                stAdopt2, reasonAdopt2 = "accepted", nil
+            else
+                stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+            end
+        else
+            stAdopt2, reasonAdopt2 = GS:CommitDatasetAdoption()
+        end
+    end
+    assertEq(stAdopt2, "accepted",
+        "val: idxc large adopt commits got=" .. tostring(stAdopt2)
+            .. " " .. tostring(reasonAdopt2))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxc adopt idle")
+    local adopted = GS:GetCurrentRecord()
+    assertEq(adopted and adopted.datasetId, sourceDataset, "val: idxc adopt dataset")
+    assertTrue(valuationCount(adopted) >= adoptN,
+        "val: idxc adopt retained valuations got=" .. tostring(valuationCount(adopted)))
+    assertTrue(indexCbMax <= budget,
+        "val: idxc adopt max index/callback <= budget got=" .. tostring(indexCbMax))
+    assertTrue(fallbackCbMax <= 0,
+        "val: idxc adopt no full-ledger fallback got=" .. tostring(fallbackCbMax))
+    assertTrue(totalIndex <= (adoptN * 4) + budget,
+        "val: idxc adopt index near-linear got=" .. tostring(totalIndex))
+    GS._adoptionReplaySyncDrain = true
+    GS._onDonationEventIndexVisit = nil
+    GS._onDonationEventFallbackVisit = nil
+    GS._onDeferredValuationAdmit = nil
+    GS._onDeferredValuationDrainCallback = nil
+    GS._onDonationEventIndexCallback = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idxc chat-free")
+end
+
+do
+    -- Group B (discussion_r4365058308): rejected canonical fold is atomic.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: fold provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9912)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local aliasTxn = "ctx:fold-alias-9912"
+    local canonical = "ctx:fold-canon-9912"
+    local assignX = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00000001"
+    local pendingBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = assignX,
+            assignedAt = 4000,
+            unitCopper = 11,
+            quantity = 2,
+            totalCopper = 22,
+            itemId = 9912,
+            txnId = aliasTxn,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        },
+    }
+    -- Unbound pending[A] (no ledger yet).
+    local stPend, reasonPend = providerApplyWithId("gs:val:" .. aliasTxn, pendingBody, "Alice-Garona")
+    assertTrue(stPend == "pending" or stPend == "accepted",
+        "val: fold pending[A] st=" .. tostring(stPend) .. " " .. tostring(reasonPend))
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[aliasTxn]) == "table", "val: fold has pending[A]")
+    local before = deepCopy(record.valuations.pending[aliasTxn])
+    local beforePendingKeys = 0
+    for _ in pairs(record.valuations.pending) do
+        beforePendingKeys = beforePendingKeys + 1
+    end
+    local conflictBody = deepCopy(pendingBody)
+    conflictBody.assignment.unitCopper = 99
+    conflictBody.assignment.totalCopper = 198
+    local stRej, reasonRej = providerApplyWithId("gs:val:" .. canonical, conflictBody, "Alice-Garona")
+    assertEq(stRej, "rejected", "val: fold divergent gs:val:C rejected")
+    assertEq(reasonRej, "id_conflict", "val: fold divergent id_conflict")
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[aliasTxn]) == "table",
+        "val: fold pending[A] retained after reject")
+    assertEq(record.valuations.pending[canonical], nil, "val: fold no pending[C] after reject")
+    local after = record.valuations.pending[aliasTxn]
+    assertEq(after.assignmentId, before.assignmentId, "val: fold assignment id intact")
+    assertEq(after.unitCopper, before.unitCopper, "val: fold unit intact")
+    assertEq(after.totalCopper, before.totalCopper, "val: fold total intact")
+    assertEq(after.txnId, before.txnId, "val: fold txn intact")
+    assertEq(after.assignedAt, before.assignedAt, "val: fold assignedAt intact")
+    local afterPendingKeys = 0
+    for _ in pairs(record.valuations.pending) do
+        afterPendingKeys = afterPendingKeys + 1
+    end
+    assertEq(afterPendingKeys, beforePendingKeys, "val: fold pending cardinality unchanged")
+    -- Identical fold still succeeds.
+    local stFold, reasonFold = providerApplyWithId("gs:val:" .. canonical, pendingBody, "Alice-Garona")
+    assertTrue(stFold == "pending" or stFold == "duplicate",
+        "val: fold identical st=" .. tostring(stFold) .. " " .. tostring(reasonFold))
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[canonical]) == "table", "val: fold pending[C]")
+    assertEq(record.valuations.pending[aliasTxn], nil, "val: fold cleared A")
+    assertEq(record.valuations.pending[canonical].assignmentId, assignX, "val: fold keeps X")
+    assertEq(record.valuations.pending[canonical].txnId, aliasTxn, "val: fold immutable A")
+    -- Existing pending[C] conflict fails without side effects.
+    local assignY = "gsv1:bbbbbbbbbbbbbbbbbbbbbbbb:00000002"
+    local otherA = "ctx:fold-other-a-9912"
+    local otherBody = deepCopy(pendingBody)
+    otherBody.assignment.assignmentId = assignY
+    otherBody.assignment.assignedAt = 5000
+    otherBody.assignment.txnId = otherA
+    otherBody.assignment.unitCopper = 5
+    otherBody.assignment.totalCopper = 10
+    assertEq(select(1, providerApplyWithId("gs:val:" .. otherA, otherBody, "Alice-Garona")),
+        "pending", "val: fold park other A")
+    record = GS:GetCurrentRecord()
+    local priorC = deepCopy(record.valuations.pending[canonical])
+    local clash = deepCopy(otherBody)
+    clash.assignment.unitCopper = 6
+    clash.assignment.totalCopper = 12
+    -- Same assignment Y, divergent copper, bound to existing C via export id:
+    -- must not clobber pending[C] when fingerprint conflicts with a folded prior.
+    -- Use same assignment id as pending[C] with divergent payload under another alias.
+    local clashSame = deepCopy(pendingBody)
+    clashSame.assignment.unitCopper = 12
+    clashSame.assignment.totalCopper = 24
+    local stClash, reasonClash = providerApplyWithId("gs:val:" .. canonical, clashSame, "Alice-Garona")
+    assertEq(stClash, "rejected", "val: fold existing C conflict rejected")
+    assertEq(reasonClash, "id_conflict", "val: fold existing C id_conflict")
+    record = GS:GetCurrentRecord()
+    assertEq(record.valuations.pending[canonical].unitCopper, priorC.unitCopper,
+        "val: fold existing C unchanged")
+    assertEq(record.valuations.pending[canonical].assignmentId, priorC.assignmentId,
+        "val: fold existing C id unchanged")
+    -- Different-ID earliest-wins under C.
+    local earlier = deepCopy(pendingBody)
+    earlier.assignment.assignmentId = "gsv1:cccccccccccccccccccccccc:00000003"
+    earlier.assignment.assignedAt = 1000
+    earlier.assignment.unitCopper = 3
+    earlier.assignment.totalCopper = 6
+    local stEarly = select(1, providerApplyWithId("gs:val:" .. canonical, earlier, "Alice-Garona"))
+    assertTrue(stEarly == "pending" or stEarly == "accepted" or stEarly == "duplicate",
+        "val: fold earlier-wins st=" .. tostring(stEarly))
+    record = GS:GetCurrentRecord()
+    assertEq(record.valuations.pending[canonical].assignmentId,
+        "gsv1:cccccccccccccccccccccccc:00000003", "val: fold earlier assignment wins")
+    -- Later donation A still promotes the retained winner after a prior reject path.
+    -- Credit a matching donation under canonical and reconcile.
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9912, quantity = 2, donor = "FoldDonor-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 1,
+        neighborsOlder = { "fold-old" }, neighborsNewer = { "fold-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: fold credit canonical donation")
+    record = GS:GetCurrentRecord()
+    local donation = valuationFindDonation(record, 9912, 2)
+    assertTrue(donation ~= nil, "val: fold donation present")
+    -- Rebind export under the real donation txn and ensure pending can promote.
+    local realTxn = donation.txnId
+    local promoteBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, donation, {
+            assignmentId = "gsv1:dddddddddddddddddddddddd:00000004",
+            assignedAt = 6000,
+            unitCopper = 8,
+            txnId = realTxn,
+        }),
+    }
+    local stPromo, reasonPromo = providerApplyWithId("gs:val:" .. realTxn, promoteBody, "Alice-Garona")
+    assertTrue(stPromo == "accepted" or stPromo == "duplicate",
+        "val: fold promote st=" .. tostring(stPromo) .. " " .. tostring(reasonPromo))
+    assertTrue(type(valuationSnap(GS:GetCurrentRecord(), realTxn)) == "table",
+        "val: fold donation promotes valuation")
+    assertEq(#world.chat, 0, "val: fold chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- Group C (discussion_r4365058311): nextSeq advances past adopted local-nonce IDs.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: seq provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    valuationTsmValue = 40
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9913)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local writer = GS._root.localWriter
+    assertTrue(type(writer) == "table" and type(writer.nonce) == "string"
+        and #writer.nonce == 24, "val: seq localWriter nonce")
+    local nonce = writer.nonce
+    -- Mint several local assignments (officer credit auto-mints when TSM is set).
+    local minted = {}
+    for i = 1, 4 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9913, quantity = 1, donor = "SeqDonor" .. i .. "-Garona",
+            observedAt = world.time, ageHours = 0, occurrenceIndex = i,
+            neighborsOlder = { "seq-old-" .. i }, neighborsNewer = { "seq-new-" .. i },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(
+            evidence, "Player-1-Alice", "Alice-Garona")), "accepted",
+            "val: seq credit " .. i)
+        flushTimers()
+        record = GS:GetCurrentRecord()
+        local ev = nil
+        local lists = {
+            record.accounting._consumableEvents,
+            record.accounting._consumableEventArchive,
+        }
+        for li = 1, #lists do
+            local list = lists[li]
+            if type(list) == "table" then
+                for j = #list, 1, -1 do
+                    local row = list[j]
+                    if type(row) == "table" and tonumber(row.itemId) == 9913
+                        and tonumber(row.occurrenceIndex) == i then
+                        ev = row
+                        break
+                    end
+                end
+            end
+            if ev then break end
+        end
+        assertTrue(ev ~= nil, "val: seq donation " .. i)
+        local snap = valuationSnap(record, ev.txnId)
+        assertTrue(type(snap) == "table", "val: seq mint " .. i)
+        assertTrue(type(snap.assignmentId) == "string"
+            and snap.assignmentId:sub(1, 5 + #nonce) == ("gsv1:" .. nonce),
+            "val: seq minted with local nonce")
+        minted[#minted + 1] = { txnId = ev.txnId, assignmentId = snap.assignmentId, event = ev }
+        if i == 2 then
+            -- Later assignedAt so this stays a remembered loser, not an earlier winner.
+            local loserId = string.format("gsv1:%s:%08x", nonce, 90)
+            local loser = {
+                kind = "gs-valuation",
+                schemaVersion = 1,
+                datasetId = record.datasetId,
+                guildKey = "club:42",
+                assignment = craftValuation(record, ev, {
+                    assignmentId = loserId,
+                    assignedAt = (tonumber(snap.assignedAt) or world.time) + 50000,
+                    unitCopper = snap.unitCopper,
+                    totalCopper = snap.totalCopper,
+                    txnId = ev.txnId,
+                }),
+            }
+            local stL = select(1, providerApplyWithId("gs:val:" .. ev.txnId, loser, "Alice-Garona"))
+            assertTrue(stL == "duplicate" or stL == "accepted",
+                "val: seq remember loser st=" .. tostring(stL))
+            record = GS:GetCurrentRecord()
+            local seen = record.valuations.byTxn[ev.txnId]
+                and record.valuations.byTxn[ev.txnId].seen
+            local hasLoser = false
+            if type(seen) == "table" then
+                for si = 1, #seen do
+                    if type(seen[si]) == "table" and seen[si].id == loserId then
+                        hasLoser = true
+                    end
+                end
+            end
+            assertTrue(hasLoser, "val: seq retained loser id")
+            -- Local observe must raise nextSeq past the loser without a full rescan.
+            local beforeLosers = tonumber(record.valuations.nextSeq) or 1
+            GS.AdvanceValuationSeqForLocalWriter(record)
+            assertTrue((tonumber(record.valuations.nextSeq) or 0) >= 91,
+                "val: seq advance past loser got="
+                    .. tostring(record.valuations.nextSeq)
+                    .. " before=" .. tostring(beforeLosers))
+        end
+    end
+    local aliceNextSeq = tonumber(record.valuations.nextSeq)
+    assertTrue(aliceNextSeq and aliceNextSeq >= 91, "val: seq advanced on Alice")
+    drainExportMaint(64)
+    local aliceExport = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    -- Peer Bob adopts Alice's dataset (different writer nonce) and retains winners.
+    SF.TSM = nil
+    SpectrumFederationDB = {}
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._pendingRelay = {}
+    initGS()
+    GS._root.localWriter = { nonce = "bbbbbbbbbbbbbbbbbbbbbbbb", nextSeq = 1 }
+    assertEq(GS:GetCurrentRecord(), nil, "val: seq Bob fresh")
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: seq Bob adopt begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: seq Bob buffer " .. tostring(row.body.kind)
+                    .. " " .. tostring(st) .. " " .. tostring(reason))
+        end
+    end
+    local bobAdop = GS._adoption
+    if type(bobAdop) == "table" then
+        if type(bobAdop.records) == "table" then
+            local desc = bobAdop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(bobAdop.pinnedDonationEvidenceCount) == "number" then
+            bobAdop.pinnedDonationEvidenceCount = 0
+        end
+        if type(bobAdop._bufCounts) == "table" then
+            bobAdop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: seq Bob transfer ready")
+    local stBob, reasonBob = GS:CommitDatasetAdoption()
+    local bobGuard = 0
+    while GS._adoption and GS._adoption.replayTemp and bobGuard < 8000 do
+        bobGuard = bobGuard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stBob == "pending" then
+        stBob, reasonBob = GS:CommitDatasetAdoption()
+    end
+    assertEq(stBob, "accepted", "val: seq Bob adopt commits " .. tostring(reasonBob))
+    local bob = GS:GetCurrentRecord()
+    assertTrue(bob ~= nil and valuationCount(bob) >= 3,
+        "val: seq Bob retained winners got=" .. tostring(valuationCount(bob)))
+    -- Fresh Alice keeps the same writer nonce and explicitly adopts the peer-retained
+    -- dataset (same export Bob just committed), so PublishAdoptionTemp must advance
+    -- nextSeq past imported same-nonce winners before the first post-adopt mint.
+    SpectrumFederationDB = {}
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._pendingRelay = {}
+    initGS()
+    GS._root.localWriter = { nonce = nonce, nextSeq = 1 }
+    assertEq(GS:GetCurrentRecord(), nil, "val: seq Alice fresh before adopt")
+    GS:EnsureGossipProvider()
+    -- Keep TSM off during adoption replay so officer-ledger credit cannot
+    -- locally mint a competing assignment before buffered gs:val bodies apply.
+    SF.TSM = nil
+    -- Export bodies are still Alice-authored; authenticate the source peer as
+    -- Alice even though Bob is the peer that retained/adopted the dataset.
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: seq adopt begins")
+    for i = 1, #aliceExport do
+        local row = aliceExport[i]
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st, reason = GS:BufferAdoptionRecord(row.id, row.body)
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: seq adopt buffer " .. tostring(row.body.kind)
+                    .. " " .. tostring(st) .. " " .. tostring(reason))
+        end
+    end
+    local adop = GS._adoption
+    if type(adop) == "table" then
+        if type(adop.records) == "table" then
+            local desc = adop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: seq adopt transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: seq adopt commits " .. tostring(reasonAdopt))
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "val: seq adopted record present")
+    assertEq(GS._root.localWriter.nonce, nonce, "val: seq nonce survived adoption")
+    local nextAfter = tonumber(record.valuations.nextSeq)
+    assertTrue(nextAfter and nextAfter > 4,
+        "val: seq nextSeq past imported winners got=" .. tostring(nextAfter))
+    -- Wire export does not carry seen[]; when a same-nonce loser is present on the
+    -- adopted record, AdvanceValuationSeqForLocalWriter must raise nextSeq past it.
+    local anyTxn = minted[2].txnId
+    local anySnap = record.valuations.byTxn[anyTxn]
+    assertTrue(type(anySnap) == "table", "val: seq adopted snap for loser plant")
+    if type(anySnap.seen) ~= "table" then
+        anySnap.seen = {}
+    end
+    local loserId = string.format("gsv1:%s:%08x", nonce, 90)
+    anySnap.seen[#anySnap.seen + 1] = { id = loserId, fp = "planted-loser" }
+    GS.AdvanceValuationSeqForLocalWriter(record)
+    nextAfter = tonumber(record.valuations.nextSeq)
+    assertTrue(nextAfter and nextAfter >= 91,
+        "val: seq nextSeq past remembered loser got=" .. tostring(nextAfter))
+    -- First mint on a new donation must succeed with a fresh id.
+    valuationTsmValue = 55
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local evidenceNew = makeDepositEvidence(record, {
+        itemId = 9913, quantity = 3, donor = "SeqNew-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 50,
+        neighborsOlder = { "seq-new-old" }, neighborsNewer = { "seq-new-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceNew, "Player-1-Alice", "Alice-Garona")), "accepted", "val: seq new credit")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local newEv = valuationFindDonation(record, 9913, 3)
+    assertTrue(newEv ~= nil, "val: seq new donation")
+    local newSnap = valuationSnap(record, newEv.txnId)
+    if type(newSnap) ~= "table" then
+        assertEq(GS.TryAssignDonationValuation(record, newEv, evidenceNew), true,
+            "val: seq first post-adopt mint succeeds")
+        record = GS:GetCurrentRecord()
+        newSnap = valuationSnap(record, newEv.txnId)
+    end
+    assertTrue(type(newSnap) == "table", "val: seq first post-adopt mint succeeds")
+    for i = 1, #minted do
+        assertTrue(newSnap.assignmentId ~= minted[i].assignmentId,
+            "val: seq new id differs from imported " .. i)
+    end
+    assertTrue(newSnap.assignmentId ~= loserId, "val: seq new id differs from loser")
+    assertTrue(newSnap.assignmentId:find("^gsv1:" .. nonce .. ":", 1) ~= nil,
+        "val: seq new id uses local nonce")
+    drainExportMaint(32)
+    local exported = false
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "gs-valuation"
+            and row.body.assignment and row.body.assignment.assignmentId == newSnap.assignmentId then
+            exported = true
+        end
+    end
+    assertTrue(exported, "val: seq new assignment exported")
+    -- /reload preserves advanced nextSeq and does not reissue.
+    local reloadRoot = snapshotConfigRoot()
+    SpectrumFederationDB = { guildSupplies = deepCopy(reloadRoot) }
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    record = GS:GetCurrentRecord()
+    assertEq(tonumber(record.valuations.nextSeq),
+        tonumber(reloadRoot.guilds["club:42"].valuations.nextSeq),
+        "val: seq nextSeq survives reload")
+    assertEq(#world.chat, 0, "val: seq chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- idxd: cold valuation export sorted-key snapshot (discussion_r4368029061).
+    SF.TSM = nil
+    local record = activateValuationGuild(9920)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    record = GS:GetCurrentRecord()
+    local n = 160
+    local byTxn = {}
+    for i = 1, n do
+        local txn = string.format("ctx:idxd-export-%04d", i)
+        byTxn[txn] = {
+            assignmentId = string.format("gsv1:%024d:00009920", i),
+            assignedAt = i,
+            unitCopper = 10,
+            quantity = 1,
+            totalCopper = 10,
+            itemId = 9920,
+            txnId = txn,
+            canonicalTxnId = txn,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            seen = {},
+        }
+    end
+    record.valuations = {
+        schemaVersion = 1,
+        nextSeq = n + 1,
+        byTxn = byTxn,
+        pending = {},
+    }
+    -- Matching credited ledger rows so adoption completeness can accept the set.
+    local liveDonations = {}
+    for i = 1, n do
+        local txn = string.format("ctx:idxd-export-%04d", i)
+        liveDonations[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9920,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 800000 + i,
+        }
+    end
+    record.accounting._consumableEvents = liveDonations
+    record.accounting._consumableEventArchive = {}
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local sorts = 0
+    GS._onValuationBuildKeysSort = function(count)
+        sorts = sorts + 1
+        assertTrue((tonumber(count) or 0) >= n - 2,
+            "val: idxd sort covers near-capacity keys got=" .. tostring(count))
+    end
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    record = GS:GetCurrentRecord()
+    local slices = math.ceil(n / (GS.MAX_EXPORT_MAINT_PER_SLICE or 32))
+    assertTrue(slices >= 4, "val: idxd expects multi-slice export got=" .. tostring(slices))
+    assertTrue(sorts <= 2, "val: idxd cold export sorts once got=" .. tostring(sorts)
+        .. " slices~" .. tostring(slices))
+    local function valuationExportSummary(bodies, datasetId)
+        local descCount, vals = nil, 0
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                vals = vals + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                descCount = body.valuationCount
+            end
+        end
+        return descCount, vals
+    end
+    local descCount, exportVals = valuationExportSummary(
+        collectAllExportBodies(), record.datasetId)
+    assertEq(tonumber(descCount), n, "val: idxd descriptor count")
+    assertEq(exportVals, n, "val: idxd exported valuation bodies")
+    -- Interleaved winner add/remove must invalidate the snapshot without
+    -- re-sorting every remaining slice, and still converge to idle.
+    sorts = 0
+    local removeTxn = "ctx:idxd-export-0001"
+    local addTxn = "ctx:idxd-export-new"
+    GS.ForgetDonationValuations(record, { removeTxn })
+    record = GS:GetCurrentRecord()
+    do
+        local live = record.accounting._consumableEvents
+        if type(live) == "table" then
+            for i = #live, 1, -1 do
+                if live[i] and live[i].txnId == removeTxn then
+                    table.remove(live, i)
+                end
+            end
+            record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+        end
+    end
+    record.valuations.byTxn[addTxn] = {
+        assignmentId = "gsv1:999999999999999999999999:00009920",
+        assignedAt = 9999,
+        unitCopper = 11,
+        quantity = 1,
+        totalCopper = 11,
+        itemId = 9920,
+        txnId = addTxn,
+        canonicalTxnId = addTxn,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    local live = record.accounting._consumableEvents
+    if type(live) == "table" then
+        live[#live + 1] = {
+            type = "donation",
+            id = addTxn,
+            txnId = addTxn,
+            itemId = 9920,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 800000 + n + 1,
+        }
+        record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    end
+    GS.NoteValuationExported(record, addTxn)
+    GS.NotifyLocalDurableChange("dataset")
+    drainExportMaint(64)
+    assertTrue(sorts <= 4, "val: idxd mutation rebuilds keys bounded got=" .. tostring(sorts))
+    record = GS:GetCurrentRecord()
+    descCount, exportVals = valuationExportSummary(
+        collectAllExportBodies(), record.datasetId)
+    local expected = n -- removed one, added one
+    assertEq(tonumber(descCount), expected, "val: idxd descriptor after add/remove")
+    assertEq(exportVals, expected, "val: idxd bodies after add/remove")
+    assertEq(GS._exportMaintIsIdle and GS._exportMaintIsIdle(), true, "val: idxd export idle")
+    local sourceDataset = record.datasetId
+    local exportBodies = collectAllExportBodies()
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 3 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idxd adopt begins")
+    for i = #exportBodies, 1, -1 do
+        local st = select(1, GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body))
+        assertTrue(st == "accepted" or st == "duplicate",
+            "val: idxd buffer " .. tostring(exportBodies[i].body and exportBodies[i].body.kind))
+    end
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted", "val: idxd adopt commits " .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxd adopt idle")
+    GS._onValuationBuildKeysSort = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idxd chat-free")
+end
+
+do
+    -- idxd: deferred ingress keep-first conflict (discussion_r4368029064).
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxd-defer provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function plantColdWithTarget(record, archCount, target)
+        local accounting = record.accounting
+        local arch, live = {}, {}
+        for i = 1, archCount do
+            local txn = string.format("ctx:idxd-defer-arch-%04d", i)
+            arch[i] = {
+                type = "donation",
+                id = txn,
+                txnId = txn,
+                itemId = 9921,
+                quantity = 1,
+                generation = 1,
+                gsProductionCredit = true,
+                verification = "officer",
+                writer = "Player-1-Alice",
+                verifierGuid = "Player-1-Alice",
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                approxTxnTime = world.time,
+                timestamp = math.floor(world.time or 0),
+                occurrenceIndex = 400000 + i,
+            }
+        end
+        live[1] = target
+        accounting._consumableEventArchive = arch
+        accounting._consumableEvents = live
+        accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+    end
+
+    SF.TSM = nil
+    local record = activateValuationGuild(9921)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    creditValuationDeposit(record, { itemId = 9921, quantity = 3 })
+    record = GS:GetCurrentRecord()
+    local event = valuationFindDonation(record, 9921, 3)
+    assertTrue(event ~= nil, "val: idxd-defer target donation")
+    local txnId = event.txnId
+    local target = deepCopy(event)
+    target.gsProductionCredit = true
+    plantColdWithTarget(record, (GS.DONATION_EVENT_INDEX_BUDGET or 512) + 32, target)
+    record = GS:GetCurrentRecord()
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxd-defer index cold")
+
+    local assignId = "gsv1:dddddddddddddddddddddddd:00009921"
+    local first = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target, {
+            assignmentId = assignId,
+            assignedAt = 20,
+            unitCopper = 25,
+            txnId = txnId,
+        }),
+    }
+    local conflict = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target, {
+            assignmentId = assignId,
+            assignedAt = 20,
+            unitCopper = 99,
+            txnId = txnId,
+        }),
+    }
+    local exportId = "gs:val:" .. txnId
+    local st1, reason1 = providerApplyWithId(exportId, first, "Alice-Garona")
+    assertEq(st1, "pending", "val: idxd-defer first queues " .. tostring(reason1))
+    assertEq(reason1, "awaiting_index", "val: idxd-defer first awaiting_index")
+    local st2, reason2 = providerApplyWithId(exportId, conflict, "Alice-Garona")
+    assertEq(st2, "rejected", "val: idxd-defer conflict rejected")
+    assertEq(reason2, "id_conflict", "val: idxd-defer conflict reason")
+    local st3, reason3 = providerApplyWithId(exportId, deepCopy(first), "Alice-Garona")
+    assertEq(st3, "pending", "val: idxd-defer identical redelivery " .. tostring(reason3))
+    assertEq(reason3, "awaiting_index", "val: idxd-defer identical still deferred")
+
+    local guard = 0
+    while guard < 64 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        record = GS:GetCurrentRecord()
+        if valuationSnap(record, txnId) ~= nil then
+            break
+        end
+    end
+    record = GS:GetCurrentRecord()
+    local snap = valuationSnap(record, txnId)
+    assertTrue(type(snap) == "table", "val: idxd-defer first body promoted")
+    assertEq(snap.unitCopper, 25, "val: idxd-defer retained first unit")
+    assertEq(snap.totalCopper, 75, "val: idxd-defer retained first total")
+    assertEq(snap.assignmentId, assignId, "val: idxd-defer assignment id")
+    local stDup = select(1, providerApplyWithId(exportId, conflict, "Alice-Garona"))
+    assertEq(stDup, "rejected", "val: idxd-defer warm-path conflict still rejects")
+    assertEq(#world.chat, 0, "val: idxd-defer chat-free")
+end
+
+do
+    -- idxd: cutover credit-reconcile continuation (discussion_r4368029069).
+    SF.TSM = nil
+    local record = activateValuationGuild(9922)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local pendingN = 6
+    local exportBodies = {}
+    local seenTxn = {}
+    for i = 1, pendingN do
+        local qty = 1 + i
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9922, quantity = qty, observedAt = world.time, ageHours = 0,
+            occurrenceIndex = 50 + i,
+            neighborsOlder = { "idxd-cut-old-" .. i },
+            neighborsNewer = { "idxd-cut-new-" .. i },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+            "accepted", "val: idxd-cut seed credit " .. i)
+        GS.NotifyLocalDurableChange("ledger")
+        drainExportMaint(64)
+        local body = nil
+        for _, row in ipairs(filterExportBodies(collectAllExportBodies(), "gs-ledger-event")) do
+            local ev = row.body and row.body.event
+            if ev and tonumber(ev.itemId) == 9922 and tonumber(ev.quantity) == qty
+                and not seenTxn[ev.txnId] then
+                body = row.body
+                seenTxn[ev.txnId] = true
+                break
+            end
+        end
+        assertTrue(type(body) == "table", "val: idxd-cut export body " .. i)
+        exportBodies[i] = deepCopy(body)
+    end
+    local function loadStaged(name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+    local bob = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    GS:EnsureGossipProvider()
+    local marker = cutover.cutoverMarker
+    local retained = {}
+    for i = 1, pendingN do
+        local st, reason = applyExportBody(exportBodies[i], "Bob-Garona")
+        assertEq(st, "accepted", "val: idxd-cut staged ledger " .. i .. " " .. tostring(reason))
+        bob = GS:GetCurrentRecord()
+        local ev = nil
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = bob.accounting[listName]
+            if type(list) == "table" then
+                for j = 1, #list do
+                    if list[j] and list[j].txnId == exportBodies[i].event.txnId then
+                        ev = list[j]
+                    end
+                end
+            end
+        end
+        assertTrue(ev ~= nil, "val: idxd-cut retained event " .. i)
+        retained[i] = deepCopy(ev)
+        local qty = tonumber(ev.quantity) or (1 + i)
+        local pend = craftValuation(bob, ev, {
+            assignmentId = string.format("gsv1:%024d:00009922", i),
+            assignedAt = 10 + i,
+            unitCopper = 30 + i,
+            txnId = ev.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        })
+        local pst, preason = applyValuationBody(pend, "Bob-Garona")
+        assertEq(pst, "pending", "val: idxd-cut pending " .. i .. " " .. tostring(preason))
+        assertEq(preason, "awaiting_credit", "val: idxd-cut awaits credit " .. i)
+        retained[i].quantity = qty
+    end
+    bob = GS:GetCurrentRecord()
+    -- Cold index: filler archive before retained donations so first 512 warm misses them.
+    local arch = {}
+    local filler = (GS.DONATION_EVENT_INDEX_BUDGET or 512) + 16
+    for i = 1, filler do
+        local txn = string.format("ctx:idxd-cut-fill-%04d", i)
+        arch[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9922,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = false,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = bob.datasetId,
+            campaignId = bob.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 500000 + i,
+        }
+    end
+    for i = 1, pendingN do
+        local ev = retained[i]
+        ev.gsProductionCredit = false
+        ev.gsSourceCutoverMarker = marker
+        arch[#arch + 1] = ev
+    end
+    bob.accounting._consumableEventArchive = arch
+    bob.accounting._consumableEvents = {}
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    assertEq(GS.DonationEventIndexReady(bob), false, "val: idxd-cut index cold")
+
+    local cbMaxVisits, cbMaxProcessed = 0, 0
+    local totalCallbacks = 0
+    local fallbackVisits = 0
+    GS._onDonationEventIndexCallback = function(visited, complete)
+        local v = tonumber(visited) or 0
+        if v > cbMaxVisits then cbMaxVisits = v end
+        totalCallbacks = totalCallbacks + 1
+    end
+    GS._onDonationEventFallbackVisit = function()
+        fallbackVisits = fallbackVisits + 1
+    end
+    GS._onCreditReconcileCallback = function(info)
+        local p = tonumber(info and info.processed) or 0
+        if p > cbMaxProcessed then cbMaxProcessed = p end
+    end
+    local cutSt, cutReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(cutSt, "accepted", "val: idxd-cut installs " .. tostring(cutReason))
+    -- First inline chunk cannot see donations past the warm window.
+    bob = GS:GetCurrentRecord()
+    local promotedEarly = 0
+    for i = 1, pendingN do
+        if valuationSnap(bob, retained[i].txnId) ~= nil then
+            promotedEarly = promotedEarly + 1
+        end
+    end
+    assertTrue(promotedEarly < pendingN,
+        "val: idxd-cut cold first chunk leaves work pending got=" .. tostring(promotedEarly))
+    local guard = 0
+    while guard < 128 and not (GS._creditReconcileIsIdle and GS._creditReconcileIsIdle()) do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertTrue(GS._creditReconcileIsIdle and GS._creditReconcileIsIdle(),
+        "val: idxd-cut reconcile idle")
+    bob = GS:GetCurrentRecord()
+    for i = 1, pendingN do
+        local snap = valuationSnap(bob, retained[i].txnId)
+        local qty = tonumber(retained[i].quantity) or (1 + i)
+        assertTrue(type(snap) == "table", "val: idxd-cut promoted " .. i)
+        assertEq(snap.unitCopper, 30 + i, "val: idxd-cut unit " .. i)
+        assertEq(snap.totalCopper, (30 + i) * qty, "val: idxd-cut total " .. i)
+        assertEq(bob.valuations.pending[retained[i].txnId], nil,
+            "val: idxd-cut pending cleared " .. i)
+    end
+    assertTrue(cbMaxVisits <= (GS.DONATION_EVENT_INDEX_BUDGET or 512),
+        "val: idxd-cut max index/callback <= budget got=" .. tostring(cbMaxVisits))
+    assertTrue(cbMaxProcessed <= (GS.DEFERRED_VALUATION_ADMIT_BUDGET or 32),
+        "val: idxd-cut max pending/callback <= budget got=" .. tostring(cbMaxProcessed))
+    assertTrue(fallbackVisits <= 0,
+        "val: idxd-cut no full-ledger fallback got=" .. tostring(fallbackVisits))
+    assertTrue(totalCallbacks >= 2, "val: idxd-cut yielded across callbacks")
+    -- Dataset replacement cancels an in-flight continuation.
+    bob = GS:GetCurrentRecord()
+    bob.valuations.pending = bob.valuations.pending or {}
+    for i = 1, 3 do
+        local txn = "ctx:idxd-cut-cancel-" .. i
+        bob.valuations.pending[txn] = {
+            assignmentId = string.format("gsv1:%024d:00009922", 100 + i),
+            assignedAt = 100 + i,
+            unitCopper = 1,
+            quantity = 1,
+            totalCopper = 1,
+            itemId = 9922,
+            txnId = txn,
+            datasetId = bob.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            seen = {},
+        }
+    end
+    local coldArch = {}
+    for i = 1, filler + 8 do
+        local txn = string.format("ctx:idxd-cut-cancel-fill-%04d", i)
+        coldArch[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9922,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = bob.datasetId,
+            campaignId = bob.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 700000 + i,
+        }
+    end
+    bob.accounting._consumableEventArchive = coldArch
+    bob.accounting._consumableEvents = {}
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    GS.ReconcileValuationsAfterCreditChange(bob)
+    assertTrue(not (GS._creditReconcileIsIdle and GS._creditReconcileIsIdle())
+        or #timers > 0, "val: idxd-cut continuation scheduled")
+    -- Store replacement cancels the dataset-scoped continuation.
+    bob.valuations = {
+        schemaVersion = 1,
+        nextSeq = 1,
+        byTxn = {},
+        pending = {},
+    }
+    world.time = (world.time or 0) + 1
+    flushTimers()
+    assertTrue(GS._creditReconcileIsIdle and GS._creditReconcileIsIdle(),
+        "val: idxd-cut cancel on store replacement")
+    GS._onDonationEventIndexCallback = nil
+    GS._onDonationEventFallbackVisit = nil
+    GS._onCreditReconcileCallback = nil
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(#world.chat, 0, "val: idxd-cut chat-free")
+end
+
+do
+    -- idxd: cold competing-ID alias knownEvent (discussion_r4365058306 @ 4367992203).
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxd-alias provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function registryHasAlias(rec, primary, alias)
+        local cfg = rec.accounting and rec.accounting._consumables
+        if type(cfg) ~= "table" or type(cfg.txnRegistry) ~= "table" then
+            return false
+        end
+        for i = 1, #cfg.txnRegistry do
+            local row = cfg.txnRegistry[i]
+            if type(row) == "table" and row.txnId == primary and type(row.aliases) == "table" then
+                for j = 1, #row.aliases do
+                    if row.aliases[j] == alias then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end
+    local function plantColdAround(record, eventA, archFiller)
+        local accounting = record.accounting
+        local arch = {}
+        for i = 1, archFiller do
+            local txn = string.format("ctx:idxd-alias-fill-%04d", i)
+            arch[i] = {
+                type = "donation",
+                id = txn,
+                txnId = txn,
+                itemId = eventA.itemId,
+                quantity = 1,
+                generation = 1,
+                gsProductionCredit = true,
+                verification = "officer",
+                writer = "Player-1-Alice",
+                verifierGuid = "Player-1-Alice",
+                datasetId = record.datasetId,
+                campaignId = record.currentCampaignId,
+                approxTxnTime = world.time,
+                timestamp = math.floor(world.time or 0),
+                occurrenceIndex = 600000 + i,
+            }
+        end
+        arch[#arch + 1] = deepCopy(eventA)
+        accounting._consumableEventArchive = arch
+        accounting._consumableEvents = {}
+        accounting._mutationSeq = (tonumber(accounting._mutationSeq) or 0) + 1
+    end
+    local function runColdAliasPath(label, clearRegistry)
+        SF.TSM = nil
+        local record = activateValuationGuild(9923)
+        GS:EnsureGossipProvider()
+        creditValuationDeposit(record, {
+            itemId = 9923, quantity = 4,
+            occurrenceIndex = 700 + (clearRegistry and 2 or 1),
+            neighborsOlder = { "idxd-alias-old-" .. label },
+            neighborsNewer = { "idxd-alias-new-" .. label },
+        })
+        drainExportMaint(32)
+        record = GS:GetCurrentRecord()
+        local eventA = valuationFindDonation(record, 9923, 4)
+        assertTrue(eventA ~= nil, "val: idxd-alias " .. label .. " donation A")
+        local txnA = eventA.txnId
+        local txnX = "ctx:idxd-alias-x-" .. label
+        local marker = record.liveCutover and record.liveCutover.cutoverMarker
+        assertTrue(type(marker) == "string" and marker ~= "", "val: idxd-alias " .. label .. " marker")
+        local assignId = "gsv1:eeeeeeeeeeeeeeeeeeeeeeee:00009923"
+        local pending = craftValuation(record, eventA, {
+            assignmentId = assignId,
+            assignedAt = 40,
+            unitCopper = 15,
+            txnId = txnX,
+        })
+        local stPend, reasonPend = applyValuationBody(pending, "Alice-Garona")
+        assertEq(stPend, "pending", "val: idxd-alias " .. label .. " pending "
+            .. tostring(reasonPend))
+        record = GS:GetCurrentRecord()
+        assertTrue(type(record.valuations.pending[txnX]) == "table",
+            "val: idxd-alias " .. label .. " pending[X]")
+        local keptEvent = deepCopy(eventA)
+        keptEvent.gsProductionCredit = true
+        if clearRegistry then
+            record.accounting._consumables.txnRegistry = {}
+        end
+        plantColdAround(record, keptEvent, (GS.DONATION_EVENT_INDEX_BUDGET or 512) + 8)
+        record = GS:GetCurrentRecord()
+        assertEq(GS.DonationEventIndexReady(record), false,
+            "val: idxd-alias " .. label .. " cold")
+        local evidence = {
+            donor = keptEvent.actor or keptEvent.donor,
+            itemId = keptEvent.itemId,
+            quantity = keptEvent.quantity,
+            generation = keptEvent.generation,
+            approxTxnTime = keptEvent.timestamp or keptEvent.approxTxnTime,
+            ageHours = 0,
+            coreSignature = keptEvent.coreSignature,
+            occurrenceIndex = keptEvent.occurrenceIndex,
+            guildGuid = keptEvent.guildGuid,
+            bankTab = keptEvent.bankTab,
+            neighborsOlder = keptEvent.neighborsOlder,
+            neighborsNewer = keptEvent.neighborsNewer,
+        }
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        assertEq(GS:GetCapabilities().canEdit, false,
+            "val: idxd-alias " .. label .. " Dave non-editor")
+        local hist = officerLedgerEvent(record, evidence, txnX, {
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            verifierRankOrder = 1,
+            verification = "officer",
+        })
+        local stOk, reasonOk = providerApply({
+            kind = "gs-ledger-event",
+            datasetId = record.datasetId,
+            cutoverMarker = marker,
+            event = hist,
+        }, "Dave-Garona")
+        assertTrue(stOk == "duplicate" or stOk == "accepted",
+            "val: idxd-alias " .. label .. " st=" .. tostring(stOk)
+                .. " " .. tostring(reasonOk))
+        -- No timer / redelivery: knownEvent must promote immediately.
+        record = GS:GetCurrentRecord()
+        local moved = valuationSnap(record, txnA)
+        assertTrue(type(moved) == "table",
+            "val: idxd-alias " .. label .. " promoted to A without redelivery")
+        assertEq(moved.unitCopper, 15, "val: idxd-alias " .. label .. " unit")
+        assertEq(moved.txnId, txnX, "val: idxd-alias " .. label .. " immutable txn")
+        assertEq(record.valuations.pending[txnX], nil,
+            "val: idxd-alias " .. label .. " pending[X] cleared")
+        assertEq(record.valuations.pending[txnA], nil,
+            "val: idxd-alias " .. label .. " pending[A] cleared")
+        assertEq(valuationCount(record), 1,
+            "val: idxd-alias " .. label .. " one winner")
+        if not clearRegistry then
+            assertEq(registryHasAlias(record, txnA, txnX), true,
+                "val: idxd-alias " .. label .. " A→X alias")
+        end
+        drainExportMaint(32)
+        local exported = 0
+        for _, row in ipairs(collectAllExportBodies()) do
+            if row.body and row.body.kind == "gs-valuation" then
+                exported = exported + 1
+                assertEq(row.body.assignment.assignmentId, assignId,
+                    "val: idxd-alias " .. label .. " export assignment")
+            end
+        end
+        assertTrue(exported >= 1, "val: idxd-alias " .. label .. " export present")
+        switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    runColdAliasPath("registry", false)
+    runColdAliasPath("ledger", true)
+    assertEq(#world.chat, 0, "val: idxd-alias chat-free")
+end
+
+do
+    -- idxe: ledger-first then gs:val:X (discussion_r4368429497).
+    -- Independent Gossip order: authenticated competing-ID ledger X arrives
+    -- before the separately exported valuation bound as gs:val:X.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxe provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function registryHasAlias(rec, primary, alias)
+        local cfg = rec.accounting and rec.accounting._consumables
+        if type(cfg) ~= "table" or type(cfg.txnRegistry) ~= "table" then
+            return false
+        end
+        for i = 1, #cfg.txnRegistry do
+            local row = cfg.txnRegistry[i]
+            if type(row) == "table" and row.txnId == primary and type(row.aliases) == "table" then
+                for j = 1, #row.aliases do
+                    if row.aliases[j] == alias then
+                        return true
+                    end
+                end
+            end
+            if type(row) == "table" and row.txnId == alias and row.status == "alias"
+                and row.aliasOf == primary then
+                return true
+            end
+        end
+        return false
+    end
+    local function runLedgerFirstValuation(label, clearRegistry)
+        SF.TSM = nil
+        local record = activateValuationGuild(9924)
+        GS:EnsureGossipProvider()
+        creditValuationDeposit(record, {
+            itemId = 9924, quantity = 5,
+            occurrenceIndex = 810 + (clearRegistry and 2 or 1),
+            neighborsOlder = { "idxe-old-" .. label },
+            neighborsNewer = { "idxe-new-" .. label },
+        })
+        drainExportMaint(32)
+        record = GS:GetCurrentRecord()
+        local eventA = valuationFindDonation(record, 9924, 5)
+        assertTrue(eventA ~= nil, "val: idxe " .. label .. " donation A")
+        local txnA = eventA.txnId
+        local txnX = "ctx:idxe-x-" .. label
+        local marker = record.liveCutover and record.liveCutover.cutoverMarker
+        assertTrue(type(marker) == "string" and marker ~= "", "val: idxe " .. label .. " marker")
+        local creditsBefore = 0
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = record.accounting[listName]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    if list[i] and list[i].gsProductionCredit == true then
+                        creditsBefore = creditsBefore + 1
+                    end
+                end
+            end
+        end
+        local keptEvent = deepCopy(eventA)
+        keptEvent.gsProductionCredit = true
+        if clearRegistry then
+            record.accounting._consumables.txnRegistry = {}
+        end
+        local evidence = {
+            donor = keptEvent.actor or keptEvent.donor,
+            itemId = keptEvent.itemId,
+            quantity = keptEvent.quantity,
+            generation = keptEvent.generation,
+            approxTxnTime = keptEvent.timestamp or keptEvent.approxTxnTime,
+            ageHours = 0,
+            coreSignature = keptEvent.coreSignature,
+            occurrenceIndex = keptEvent.occurrenceIndex,
+            guildGuid = keptEvent.guildGuid,
+            bankTab = keptEvent.bankTab,
+            neighborsOlder = keptEvent.neighborsOlder,
+            neighborsNewer = keptEvent.neighborsNewer,
+        }
+        -- Ledger X first (ordinary-member relay), no valuation yet.
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        assertEq(GS:GetCapabilities().canEdit, false,
+            "val: idxe " .. label .. " Dave non-editor")
+        local hist = officerLedgerEvent(record, evidence, txnX, {
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            verifierRankOrder = 1,
+            verification = "officer",
+        })
+        local stLed, reasonLed = providerApply({
+            kind = "gs-ledger-event",
+            datasetId = record.datasetId,
+            cutoverMarker = marker,
+            event = hist,
+        }, "Dave-Garona")
+        assertTrue(stLed == "duplicate" or stLed == "accepted",
+            "val: idxe " .. label .. " ledger X st=" .. tostring(stLed)
+                .. " " .. tostring(reasonLed))
+        record = GS:GetCurrentRecord()
+        assertEq(valuationCount(record), 0,
+            "val: idxe " .. label .. " no price before valuation")
+        assertEq(registryHasAlias(record, txnA, txnX), true,
+            "val: idxe " .. label .. " lasting A→X after ledger X")
+        local creditsAfter = 0
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = record.accounting[listName]
+            if type(list) == "table" then
+                for i = 1, #list do
+                    if list[i] and list[i].gsProductionCredit == true then
+                        creditsAfter = creditsAfter + 1
+                    end
+                end
+            end
+        end
+        assertEq(creditsAfter, creditsBefore,
+            "val: idxe " .. label .. " no second production credit")
+
+        -- Later authenticated gs:val:X (immutable assignment.txnId=X).
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        local assignId = "gsv1:fffffffffffffffffffffff1:00009924"
+        local valBody = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, eventA, {
+                assignmentId = assignId,
+                assignedAt = 55,
+                unitCopper = 18,
+                txnId = txnX,
+            }),
+        }
+        local stVal, reasonVal = providerApplyWithId("gs:val:" .. txnX, valBody, "Alice-Garona")
+        assertEq(stVal, "accepted",
+            "val: idxe " .. label .. " gs:val:X accepted got="
+                .. tostring(stVal) .. " " .. tostring(reasonVal))
+        record = GS:GetCurrentRecord()
+        local snap = valuationSnap(record, txnA)
+        assertTrue(type(snap) == "table",
+            "val: idxe " .. label .. " winner on A")
+        assertEq(snap.unitCopper, 18, "val: idxe " .. label .. " unit")
+        assertEq(snap.totalCopper, 90, "val: idxe " .. label .. " total")
+        assertEq(snap.txnId, txnX, "val: idxe " .. label .. " immutable txnId")
+        assertEq(snap.assignmentId, assignId, "val: idxe " .. label .. " assignment id")
+        assertEq(record.valuations.byTxn[txnX], nil,
+            "val: idxe " .. label .. " no winner under X")
+        assertEq(record.valuations.pending[txnX], nil,
+            "val: idxe " .. label .. " pending[X] cleared")
+        assertEq(valuationCount(record), 1, "val: idxe " .. label .. " one winner")
+        local desc = GS.DescribeDonationValuation(record, eventA)
+        assertEq(desc.priced, true, "val: idxe " .. label .. " Logs priced")
+        assertEq(desc.totalCopper, 90, "val: idxe " .. label .. " Logs total")
+        drainExportMaint(32)
+        local descCount, exportVals = 0, 0
+        for _, row in ipairs(collectAllExportBodies()) do
+            local body = row.body
+            if type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == record.datasetId then
+                descCount = tonumber(body.valuationCount) or 0
+            elseif type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == record.datasetId then
+                exportVals = exportVals + 1
+                assertEq(body.assignment.assignmentId, assignId,
+                    "val: idxe " .. label .. " export assignment")
+                assertEq(body.assignment.txnId, txnX,
+                    "val: idxe " .. label .. " export immutable txn")
+            end
+        end
+        assertEq(descCount, 1, "val: idxe " .. label .. " descriptor count")
+        assertEq(exportVals, 1, "val: idxe " .. label .. " export bodies")
+
+        -- /reload keeps the A→X relation and the priced winner.
+        -- Use a full SavedVariables copy (snapshotConfigRoot clears txnRegistry).
+        local reloadRoot = deepCopy(SpectrumFederationDB.guildSupplies)
+        SpectrumFederationDB = { guildSupplies = deepCopy(reloadRoot) }
+        switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+        settleRoster()
+        initGS()
+        GS:EnsureGossipProvider()
+        record = GS:GetCurrentRecord()
+        assertEq(registryHasAlias(record, txnA, txnX), true,
+            "val: idxe " .. label .. " alias survives reload")
+        local reloaded = valuationSnap(record, txnA)
+        assertTrue(type(reloaded) == "table",
+            "val: idxe " .. label .. " winner survives reload")
+        assertEq(reloaded.assignmentId, assignId,
+            "val: idxe " .. label .. " reload assignment")
+        assertEq(reloaded.txnId, txnX, "val: idxe " .. label .. " reload txn")
+        assertEq(valuationCount(record), 1,
+            "val: idxe " .. label .. " reload one winner")
+        -- Post-reload gs:val:X redelivery still folds onto A (no redelivery of ledger).
+        local stReloadDup = select(1, providerApplyWithId("gs:val:" .. txnX, valBody, "Alice-Garona"))
+        assertTrue(stReloadDup == "duplicate" or stReloadDup == "accepted",
+            "val: idxe " .. label .. " post-reload gs:val:X st=" .. tostring(stReloadDup))
+        assertEq(valuationCount(GS:GetCurrentRecord()), 1,
+            "val: idxe " .. label .. " post-reload still one winner")
+
+        -- Unrelated / unmarked competing ids stay fail-closed.
+        local txnY = "ctx:idxe-y-" .. label
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        local badHist = officerLedgerEvent(record, evidence, txnY, {
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            verifierRankOrder = 1,
+            verification = "officer",
+        })
+        local stBad, reasonBad = providerApply({
+            kind = "gs-ledger-event",
+            datasetId = record.datasetId,
+            cutoverMarker = "gsc1:idxe-divergent-" .. label,
+            event = badHist,
+        }, "Dave-Garona")
+        assertTrue(reasonBad ~= "officer_history",
+            "val: idxe " .. label .. " divergent not officer credit st="
+                .. tostring(stBad) .. " " .. tostring(reasonBad))
+        assertEq(registryHasAlias(GS:GetCurrentRecord(), txnA, txnY), false,
+            "val: idxe " .. label .. " no A→Y from divergent")
+        setPlayer("Alice-Garona", "Player-1-Alice", 1)
+        local badVal = {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            assignment = craftValuation(record, eventA, {
+                assignmentId = "gsv1:fffffffffffffffffffffff2:00009924",
+                assignedAt = 1,
+                unitCopper = 3,
+                txnId = txnY,
+            }),
+        }
+        local stBadVal = select(1, providerApplyWithId("gs:val:" .. txnY, badVal, "Alice-Garona"))
+        assertTrue(stBadVal == "pending" or stBadVal == "rejected",
+            "val: idxe " .. label .. " unbound Y not accepted onto A")
+        assertEq(valuationCount(GS:GetCurrentRecord()), 1,
+            "val: idxe " .. label .. " still one winner")
+        assertEq(valuationSnap(GS:GetCurrentRecord(), txnA).assignmentId, assignId,
+            "val: idxe " .. label .. " earliest winner intact")
+        switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    end
+    runLedgerFirstValuation("registry", false)
+    runLedgerFirstValuation("evicted", true)
+    assertEq(#world.chat, 0, "val: idxe chat-free")
+end
+
+do
+    -- idxf (discussion_r4368627572): priceable admit merges held pending before clear.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxf provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9925)
+    local configRoot = snapshotConfigRoot()
+    local cutover = deepCopy(record.liveCutover)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local admitBudget = GS.DEFERRED_VALUATION_ADMIT_BUDGET or 32
+    local pendingN = admitBudget + 8
+    local exportBodies = {}
+    local seenTxn = {}
+    for i = 1, pendingN do
+        local qty = 1 + (i % 5)
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9925, quantity = qty, observedAt = world.time, ageHours = 0,
+            occurrenceIndex = 80 + i,
+            neighborsOlder = { "idxf-old-" .. i },
+            neighborsNewer = { "idxf-new-" .. i },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+            "accepted", "val: idxf seed credit " .. i)
+        GS.NotifyLocalDurableChange("ledger")
+        drainExportMaint(64)
+        local body = nil
+        for _, row in ipairs(filterExportBodies(collectAllExportBodies(), "gs-ledger-event")) do
+            local ev = row.body and row.body.event
+            if ev and tonumber(ev.itemId) == 9925 and tonumber(ev.quantity) == qty
+                and not seenTxn[ev.txnId] then
+                body = row.body
+                seenTxn[ev.txnId] = true
+                break
+            end
+        end
+        assertTrue(type(body) == "table", "val: idxf export body " .. i)
+        exportBodies[i] = deepCopy(body)
+    end
+    local function loadStaged(name, guid, rank)
+        local copy = deepCopy(configRoot)
+        local guild = copy.guilds["club:42"]
+        guild.activation = GS.ACTIVATION_STAGED
+        guild.liveCutover = nil
+        guild.valuations = nil
+        return loadClientFromConfigRoot(copy, name, guid, rank)
+    end
+    local bob = loadStaged("Bob-Garona", "Player-1-Bob", 2)
+    GS:EnsureGossipProvider()
+    local marker = cutover.cutoverMarker
+    local retained = {}
+    -- Sorted pending keys: first admitBudget keys are a01..; targets sort after.
+    for i = 1, pendingN do
+        local st, reason = applyExportBody(exportBodies[i], "Bob-Garona")
+        assertEq(st, "accepted", "val: idxf staged ledger " .. i .. " " .. tostring(reason))
+        bob = GS:GetCurrentRecord()
+        local ev = nil
+        for _, listName in ipairs({ "_consumableEvents", "_consumableEventArchive" }) do
+            local list = bob.accounting[listName]
+            if type(list) == "table" then
+                for j = 1, #list do
+                    if list[j] and list[j].txnId == exportBodies[i].event.txnId then
+                        ev = list[j]
+                    end
+                end
+            end
+        end
+        assertTrue(ev ~= nil, "val: idxf retained event " .. i)
+        retained[i] = deepCopy(ev)
+        retained[i].quantity = tonumber(ev.quantity) or (1 + (i % 5))
+    end
+    -- Rewrite txn ids so collect/sort leaves the last eight after the first slice.
+    bob = GS:GetCurrentRecord()
+    local arch = {}
+    for i = 1, pendingN do
+        local ev = retained[i]
+        local prefix = (i <= admitBudget) and "a" or "z"
+        local idx = (i <= admitBudget) and i or (i - admitBudget)
+        local newTxn = string.format("ctx:idxf-%s-%04d", prefix, idx)
+        ev.txnId = newTxn
+        ev.id = newTxn
+        ev.gsProductionCredit = false
+        ev.gsSourceCutoverMarker = marker
+        arch[#arch + 1] = ev
+        retained[i] = ev
+    end
+    -- Install rewritten ledger first so staged admit finds the donation and
+    -- parks under awaiting_credit (not awaiting_donation).
+    bob.accounting._consumableEventArchive = arch
+    bob.accounting._consumableEvents = {}
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    for i = 1, pendingN do
+        local ev = retained[i]
+        local earlyId = string.format("gsv1:%024x:%08x", 0xa000 + i, 0x9925)
+        local pend = craftValuation(bob, ev, {
+            assignmentId = earlyId,
+            assignedAt = 100 + i,
+            unitCopper = 40 + i,
+            txnId = ev.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        })
+        local pst, preason = providerApplyWithId("gs:val:" .. ev.txnId, {
+            kind = "gs-valuation",
+            schemaVersion = 1,
+            datasetId = bob.datasetId,
+            guildKey = "club:42",
+            assignment = pend,
+        }, "Bob-Garona")
+        assertEq(pst, "pending", "val: idxf pending " .. i .. " " .. tostring(preason))
+        assertEq(preason, "awaiting_credit", "val: idxf awaits credit " .. i)
+        retained[i].earlyId = earlyId
+        retained[i].earlyAt = 100 + i
+        retained[i].earlyUnit = 40 + i
+    end
+
+    local cutSt, cutReason = GS.InstallRemoteLiveCutover(bob, cutover, "club:42", {
+        member = {
+            guid = "Player-1-Bob", name = "Bob-Garona",
+            guildKey = "club:42", rankOrder = 2,
+        },
+        bindActorToSender = false,
+    })
+    assertEq(cutSt, "accepted", "val: idxf cutover " .. tostring(cutReason))
+    bob = GS:GetCurrentRecord()
+    -- First inline slice promotes ≤ admitBudget; z-* targets remain pending.
+    local stillPending = {}
+    for i = admitBudget + 1, pendingN do
+        local txn = retained[i].txnId
+        assertEq(bob.valuations.byTxn[txn], nil, "val: idxf target still pending " .. i)
+        assertTrue(type(bob.valuations.pending[txn]) == "table",
+            "val: idxf held pending " .. i)
+        stillPending[#stillPending + 1] = i
+    end
+    assertTrue(#stillPending >= 2, "val: idxf >32 leaves post-slice pending")
+
+    -- Later authorized price for a donation still awaiting reconcile: earlier wins.
+    local laterIdx = stillPending[1]
+    local laterEv = retained[laterIdx]
+    local laterBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, laterEv, {
+            assignmentId = string.format("gsv1:%024x:%08x", 0xb000 + laterIdx, 0x9925),
+            assignedAt = laterEv.earlyAt + 5000,
+            unitCopper = laterEv.earlyUnit + 100,
+            txnId = laterEv.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stLater, reasonLater = providerApplyWithId("gs:val:" .. laterEv.txnId, laterBody, "Bob-Garona")
+    assertTrue(stLater == "accepted" or stLater == "duplicate",
+        "val: idxf later admit st=" .. tostring(stLater) .. " " .. tostring(reasonLater))
+    bob = GS:GetCurrentRecord()
+    local snapLater = valuationSnap(bob, laterEv.txnId)
+    assertTrue(type(snapLater) == "table", "val: idxf later-path winner present")
+    assertEq(snapLater.assignmentId, laterEv.earlyId, "val: idxf earlier pending wins")
+    assertEq(snapLater.unitCopper, laterEv.earlyUnit, "val: idxf earlier unit")
+    assertEq(snapLater.assignedAt, laterEv.earlyAt, "val: idxf earlier assignedAt")
+    assertEq(snapLater.txnId, laterEv.txnId, "val: idxf immutable txn")
+    assertEq(bob.valuations.pending[laterEv.txnId], nil, "val: idxf pending cleared on admit")
+    local seenLater = false
+    if type(snapLater.seen) == "table" then
+        for si = 1, #snapLater.seen do
+            if snapLater.seen[si] and snapLater.seen[si].id == laterBody.assignment.assignmentId then
+                seenLater = true
+            end
+        end
+    end
+    assertTrue(seenLater, "val: idxf later id retained in bounded seen")
+
+    -- Reverse: earlier incoming beats later held pending.
+    local earlierIdx = stillPending[2]
+    local earlierEv = retained[earlierIdx]
+    local earlierBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, earlierEv, {
+            assignmentId = string.format("gsv1:%024x:%08x", 0xc000 + earlierIdx, 0x9925),
+            assignedAt = earlierEv.earlyAt - 50,
+            unitCopper = 7,
+            txnId = earlierEv.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stEarly, reasonEarly = providerApplyWithId("gs:val:" .. earlierEv.txnId, earlierBody, "Bob-Garona")
+    assertTrue(stEarly == "accepted" or stEarly == "duplicate",
+        "val: idxf earlier incoming st=" .. tostring(stEarly) .. " " .. tostring(reasonEarly))
+    bob = GS:GetCurrentRecord()
+    local snapEarly = valuationSnap(bob, earlierEv.txnId)
+    assertEq(snapEarly.assignmentId, earlierBody.assignment.assignmentId,
+        "val: idxf earlier incoming wins")
+    assertEq(snapEarly.unitCopper, 7, "val: idxf earlier incoming unit")
+    local seenHeld = false
+    if type(snapEarly.seen) == "table" then
+        for si = 1, #snapEarly.seen do
+            if snapEarly.seen[si] and snapEarly.seen[si].id == earlierEv.earlyId then
+                seenHeld = true
+            end
+        end
+    end
+    assertTrue(seenHeld, "val: idxf later held pending remembered")
+
+    -- Alias pending key: held pending[alias] merges when gs:val:canonical admits later.
+    local aliasTxn = "ctx:idxf-alias-src"
+    local canonTxn = "ctx:idxf-alias-dst"
+    local aliasEvent = {
+        type = "donation",
+        id = canonTxn,
+        txnId = canonTxn,
+        itemId = 9925,
+        quantity = 2,
+        generation = 1,
+        gsProductionCredit = true,
+        verification = "officer",
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        datasetId = bob.datasetId,
+        campaignId = bob.currentCampaignId,
+        approxTxnTime = world.time,
+        timestamp = math.floor(world.time or 0),
+        occurrenceIndex = 900001,
+    }
+    bob.accounting._consumableEvents = bob.accounting._consumableEvents or {}
+    bob.accounting._consumableEvents[#bob.accounting._consumableEvents + 1] = aliasEvent
+    bob.accounting._mutationSeq = (tonumber(bob.accounting._mutationSeq) or 0) + 1
+    local cfg = bob.accounting._consumables
+    if type(cfg) ~= "table" then
+        bob.accounting._consumables = {}
+        cfg = bob.accounting._consumables
+    end
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = canonTxn,
+        status = "committed",
+        aliases = { aliasTxn },
+        itemId = 9925,
+        quantity = 2,
+    }
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = aliasTxn,
+        status = "alias",
+        aliasOf = canonTxn,
+    }
+    local aliasEarlyId = "gsv1:aaaaaaaaaaaaaaaaaaaaaa01:00009925"
+    bob.valuations.pending = bob.valuations.pending or {}
+    bob.valuations.pending[aliasTxn] = {
+        assignmentId = aliasEarlyId,
+        assignedAt = 50,
+        unitCopper = 11,
+        quantity = 2,
+        totalCopper = 22,
+        itemId = 9925,
+        txnId = aliasTxn,
+        canonicalTxnId = aliasTxn,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        seen = {},
+    }
+    local aliasLater = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, aliasEvent, {
+            assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbb02:00009925",
+            assignedAt = 500,
+            unitCopper = 99,
+            txnId = aliasTxn,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stAlias, reasonAlias = providerApplyWithId("gs:val:" .. canonTxn, aliasLater, "Bob-Garona")
+    assertTrue(stAlias == "accepted" or stAlias == "duplicate",
+        "val: idxf alias admit st=" .. tostring(stAlias) .. " " .. tostring(reasonAlias))
+    bob = GS:GetCurrentRecord()
+    local aliasSnap = valuationSnap(bob, canonTxn)
+    assertTrue(type(aliasSnap) == "table", "val: idxf alias winner under canonical")
+    assertEq(aliasSnap.assignmentId, aliasEarlyId, "val: idxf alias earlier pending wins")
+    assertEq(aliasSnap.txnId, aliasTxn, "val: idxf alias immutable txnId")
+    assertEq(bob.valuations.pending[aliasTxn], nil, "val: idxf alias pending cleared")
+    assertEq(bob.valuations.byTxn[aliasTxn], nil, "val: idxf no second alias winner")
+
+    -- Duplicate identical redelivery.
+    local stDup = select(1, providerApplyWithId("gs:val:" .. laterEv.txnId, laterBody, "Bob-Garona"))
+    assertEq(stDup, "duplicate", "val: idxf identical later redelivery duplicate")
+    assertEq(valuationSnap(bob, laterEv.txnId).assignmentId, laterEv.earlyId,
+        "val: idxf duplicate leaves earlier winner")
+
+    -- Same-ID divergent conflict leaves accepted/pending authority intact.
+    local conflictIdx = stillPending[4] or stillPending[1]
+    local conflictEv = retained[conflictIdx]
+    bob = GS:GetCurrentRecord()
+    local beforeConflictPending = deepCopy(bob.valuations.pending[conflictEv.txnId])
+    local beforeConflictWinner = deepCopy(bob.valuations.byTxn[conflictEv.txnId])
+    local beforeNextSeq = tonumber(bob.valuations.nextSeq)
+    assertTrue(type(beforeConflictPending) == "table", "val: idxf conflict still pending")
+    local conflictBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = bob.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(bob, conflictEv, {
+            assignmentId = conflictEv.earlyId,
+            assignedAt = conflictEv.earlyAt,
+            unitCopper = conflictEv.earlyUnit + 77,
+            txnId = conflictEv.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stConflict, reasonConflict = providerApplyWithId(
+        "gs:val:" .. conflictEv.txnId, conflictBody, "Bob-Garona")
+    assertEq(stConflict, "rejected", "val: idxf same-id conflict rejected")
+    assertEq(reasonConflict, "id_conflict", "val: idxf same-id conflict reason")
+    bob = GS:GetCurrentRecord()
+    assertEq(bob.valuations.byTxn[conflictEv.txnId], beforeConflictWinner,
+        "val: idxf conflict no byTxn mutation")
+    local afterPend = bob.valuations.pending[conflictEv.txnId]
+    assertTrue(type(afterPend) == "table", "val: idxf conflict pending retained")
+    assertEq(afterPend.assignmentId, beforeConflictPending.assignmentId, "val: idxf conflict id")
+    assertEq(afterPend.unitCopper, beforeConflictPending.unitCopper, "val: idxf conflict unit")
+    assertEq(afterPend.totalCopper, beforeConflictPending.totalCopper, "val: idxf conflict total")
+    assertEq(tonumber(bob.valuations.nextSeq), beforeNextSeq, "val: idxf conflict nextSeq intact")
+
+    -- Drain remaining reconcile; eventual idle; exports/Logs/descriptor match winners.
+    local guard = 0
+    while guard < 128 and not (GS._creditReconcileIsIdle and GS._creditReconcileIsIdle()) do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    assertTrue(GS._creditReconcileIsIdle and GS._creditReconcileIsIdle(), "val: idxf reconcile idle")
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, laterEv.txnId).assignmentId, laterEv.earlyId,
+        "val: idxf winner survives reconcile")
+    drainExportMaint(64)
+    local exportVals, descCount = 0, nil
+    for _, row in ipairs(collectAllExportBodies()) do
+        local body = row.body
+        if type(body) == "table" and body.kind == "gs-valuation"
+            and body.datasetId == bob.datasetId then
+            exportVals = exportVals + 1
+            if body.assignment and body.assignment.assignmentId == laterEv.earlyId then
+                assertEq(body.assignment.unitCopper, laterEv.earlyUnit,
+                    "val: idxf export earlier unit")
+                assertEq(body.assignment.txnId, laterEv.txnId, "val: idxf export immutable txn")
+            end
+        elseif type(body) == "table" and body.kind == "dataset-desc"
+            and body.datasetId == bob.datasetId then
+            descCount = body.valuationCount or body.valuationsCount
+        end
+    end
+    assertTrue(exportVals >= 1, "val: idxf export valuations present")
+    assertEq(descCount, valuationCount(bob), "val: idxf descriptor matches winners")
+    local desc = GS.DescribeDonationValuation and GS.DescribeDonationValuation(bob, laterEv)
+    if type(desc) == "table" then
+        assertEq(desc.priced, true, "val: idxf Logs priced")
+        assertEq(desc.totalCopper, laterEv.earlyUnit * (tonumber(laterEv.quantity) or 1),
+            "val: idxf Logs total")
+    end
+
+    -- /reload preserves winners without redelivery.
+    local reloadRoot = snapshotConfigRoot()
+    -- Preserve accounting events for reload assertions (snapshot clears them).
+    reloadRoot.guilds["club:42"].accounting = deepCopy(bob.accounting)
+    reloadRoot.guilds["club:42"].valuations = deepCopy(bob.valuations)
+    SpectrumFederationDB = { guildSupplies = deepCopy(reloadRoot) }
+    switchPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    initGS()
+    bob = GS:GetCurrentRecord()
+    assertEq(valuationSnap(bob, laterEv.txnId).assignmentId, laterEv.earlyId,
+        "val: idxf reload earlier winner")
+    assertEq(valuationCount(bob), valuationCount(reloadRoot.guilds["club:42"]),
+        "val: idxf reload winner count")
+    assertEq(#world.chat, 0, "val: idxf chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- idxg (discussion_r4368627575): oversized same-nonce IDs cannot exhaust nextSeq.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxg provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    valuationTsmValue = 33
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9926)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local nonce = "dddddddddddddddddddddddd"
+    GS._root.localWriter = { nonce = nonce, nextSeq = 1 }
+    record.valuations = record.valuations or {
+        schemaVersion = 1, nextSeq = 1, byTxn = {}, pending = {},
+    }
+    record.valuations.nextSeq = 1
+    -- Valid same-nonce import advances the allocator.
+    local evidence = makeDepositEvidence(record, {
+        itemId = 9926, quantity = 2, donor = "IdxgDonor-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 1,
+        neighborsOlder = { "idxg-old" }, neighborsNewer = { "idxg-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Alice", "Alice-Garona")),
+        "accepted", "val: idxg credit donation")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local ev = valuationFindDonation(record, 9926, 2)
+    assertTrue(ev ~= nil, "val: idxg donation")
+    -- Clear any auto-mint so the imported id is the controlled sequence source.
+    if type(record.valuations) == "table" then
+        record.valuations.byTxn = {}
+        record.valuations.pending = {}
+        record.valuations.nextSeq = 1
+    end
+    local validId = string.format("gsv1:%s:%08x", nonce, 0x10)
+    local validBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, ev, {
+            assignmentId = validId,
+            assignedAt = 200,
+            unitCopper = 33,
+            txnId = ev.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stValid, reasonValid = providerApplyWithId("gs:val:" .. ev.txnId, validBody, "Alice-Garona")
+    assertTrue(stValid == "accepted" or stValid == "duplicate",
+        "val: idxg valid import st=" .. tostring(stValid) .. " " .. tostring(reasonValid))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, ev.txnId).assignmentId, validId, "val: idxg valid winner")
+    assertTrue((tonumber(record.valuations.nextSeq) or 0) >= 0x11,
+        "val: idxg nextSeq advanced past valid import got="
+            .. tostring(record.valuations.nextSeq))
+    local nextAfterValid = tonumber(record.valuations.nextSeq)
+
+    local oversizedId = string.format("gsv1:%s:fffffffff", nonce) -- 9 hex chars
+    local overBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, ev, {
+            assignmentId = oversizedId,
+            assignedAt = 201,
+            unitCopper = 33,
+            txnId = ev.txnId,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stOver, reasonOver = providerApplyWithId("gs:val:" .. ev.txnId, overBody, "Alice-Garona")
+    assertEq(stOver, "rejected", "val: idxg oversized rejected")
+    assertEq(reasonOver, "invalid_assignment", "val: idxg oversized reason")
+    record = GS:GetCurrentRecord()
+    assertEq(tonumber(record.valuations.nextSeq), nextAfterValid,
+        "val: idxg oversized did not poison nextSeq")
+    assertEq(valuationSnap(record, ev.txnId).assignmentId, validId,
+        "val: idxg oversized left winner intact")
+
+    local exhaustId = string.format("gsv1:%s:ffffffff", nonce)
+    local exhaustBody = deepCopy(overBody)
+    exhaustBody.assignment.assignmentId = exhaustId
+    local stEx, reasonEx = providerApplyWithId("gs:val:" .. ev.txnId, exhaustBody, "Alice-Garona")
+    assertEq(stEx, "rejected", "val: idxg unmintable ffffffff rejected")
+    assertEq(reasonEx, "invalid_assignment", "val: idxg unmintable reason")
+    record = GS:GetCurrentRecord()
+    assertEq(tonumber(record.valuations.nextSeq), nextAfterValid,
+        "val: idxg ffffffff did not exhaust allocator")
+
+    local zeroBody = deepCopy(overBody)
+    zeroBody.assignment.assignmentId = string.format("gsv1:%s:00000000", nonce)
+    assertEq(select(1, providerApplyWithId("gs:val:" .. ev.txnId, zeroBody, "Alice-Garona")),
+        "rejected", "val: idxg zero seq rejected")
+    local shortNonce = deepCopy(overBody)
+    shortNonce.assignment.assignmentId = "gsv1:abcd:00000002"
+    assertEq(select(1, providerApplyWithId("gs:val:" .. ev.txnId, shortNonce, "Alice-Garona")),
+        "rejected", "val: idxg short nonce rejected")
+
+    -- Adoption path: oversized same-nonce body cannot poison nextSeq.
+    drainExportMaint(32)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = record.datasetId
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 3)
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    GS._pendingRelay = {}
+    initGS()
+    GS._root.localWriter = { nonce = nonce, nextSeq = 1 }
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "val: idxg adopt begins")
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        if row.body and row.body.kind ~= "gs-evidence" then
+            local st = select(1, GS:BufferAdoptionRecord(row.id, row.body))
+            assertTrue(st == "accepted" or st == "duplicate",
+                "val: idxg buffer " .. tostring(row.body.kind))
+        end
+    end
+    -- Oversized same-nonce valuation must fail closed at adoption buffer.
+    local overAdoptId = "gs:val:ctx:idxg-over-adopt"
+    local overAdoptBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = sourceDataset,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = oversizedId,
+            assignedAt = 999,
+            unitCopper = 1,
+            quantity = 1,
+            totalCopper = 1,
+            itemId = 9926,
+            txnId = "ctx:idxg-over-adopt",
+            datasetId = sourceDataset,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        },
+    }
+    local stBuf, reasonBuf = GS:BufferAdoptionRecord(overAdoptId, overAdoptBody)
+    assertEq(stBuf, "rejected", "val: idxg oversized buffer rejected")
+    assertEq(reasonBuf, "invalid_assignment", "val: idxg oversized buffer reason")
+    local adop = GS._adoption
+    if type(adop) == "table" then
+        if type(adop.records) == "table" then
+            local desc = adop.records["gs:desc:" .. sourceDataset]
+            if type(desc) == "table" then
+                desc.donationEvidenceCount = 0
+            end
+        end
+        if type(adop.pinnedDonationEvidenceCount) == "number" then
+            adop.pinnedDonationEvidenceCount = 0
+        end
+        if type(adop._bufCounts) == "table" then
+            adop._bufCounts.donationEvidence = 0
+        end
+    end
+    GS._adoptionReplaySyncDrain = true
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "val: idxg adopt ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    local guard = 0
+    while GS._adoption and GS._adoption.replayTemp and guard < 8000 do
+        guard = guard + 1
+        flushTimers()
+        world.time = (world.time or 0) + 1
+        flushTimers()
+    end
+    if stAdopt == "pending" then
+        stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    end
+    assertEq(stAdopt, "accepted", "val: idxg adopt commits " .. tostring(reasonAdopt))
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "val: idxg adopted record")
+    assertEq(GS._root.localWriter.nonce, nonce, "val: idxg nonce survived")
+    local adoptedNext = tonumber(record.valuations and record.valuations.nextSeq) or 1
+    assertTrue(adoptedNext < 4294967295, "val: idxg adopt nextSeq not exhausted got="
+        .. tostring(adoptedNext))
+    -- Even if a corrupt same-nonce oversized id were planted into seen, observe must ignore it.
+    local anyTxn, anySnap = next(record.valuations.byTxn or {})
+    if type(anySnap) == "table" then
+        anySnap.seen = anySnap.seen or {}
+        anySnap.seen[#anySnap.seen + 1] = { id = oversizedId, fp = "bad" }
+        GS.AdvanceValuationSeqForLocalWriter(record)
+        assertTrue((tonumber(record.valuations.nextSeq) or 0) < 4294967295,
+            "val: idxg planted oversized seen ignored")
+    end
+
+    -- Eligible officer prices the next donation on the first attempt.
+    valuationTsmValue = 44
+    SF.TSM = {
+        GetMarketValue = function()
+            return valuationTsmValue
+        end,
+    }
+    local evidenceNew = makeDepositEvidence(record, {
+        itemId = 9926, quantity = 3, donor = "IdxgNew-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 40,
+        neighborsOlder = { "idxg-new-old" }, neighborsNewer = { "idxg-new-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceNew, "Player-1-Carol", "Carol-Garona")), "accepted", "val: idxg new credit")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local newEv = valuationFindDonation(record, 9926, 3)
+    assertTrue(newEv ~= nil, "val: idxg new donation")
+    local newSnap = valuationSnap(record, newEv.txnId)
+    if type(newSnap) ~= "table" then
+        assertEq(GS.TryAssignDonationValuation(record, newEv, evidenceNew), true,
+            "val: idxg first mint succeeds")
+        record = GS:GetCurrentRecord()
+        newSnap = valuationSnap(record, newEv.txnId)
+    end
+    assertTrue(type(newSnap) == "table", "val: idxg first mint stored")
+    assertTrue(newSnap.assignmentId:find("^gsv1:" .. nonce .. ":", 1) ~= nil,
+        "val: idxg mint uses local nonce")
+    assertTrue(newSnap.assignmentId ~= oversizedId, "val: idxg mint not oversized")
+    assertTrue(newSnap.assignmentId ~= exhaustId, "val: idxg mint not exhaustion id")
+    assertEq(#world.chat, 0, "val: idxg chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- idxh (discussion_r4373011801): pendingClear must not strip promoted bindings.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxh provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    local function snapshotAuthority(record, txnA, txnB)
+        return {
+            snapA = deepCopy(valuationSnap(record, txnA)),
+            snapB = deepCopy(valuationSnap(record, txnB)),
+            pendingA = deepCopy(record.valuations and record.valuations.pending
+                and record.valuations.pending[txnA]),
+            pendingB = deepCopy(record.valuations and record.valuations.pending
+                and record.valuations.pending[txnB]),
+            count = valuationCount(record),
+            nextSeq = tonumber(record.valuations and record.valuations.nextSeq),
+        }
+    end
+    local function assertAuthorityUnchanged(before, record, txnA, txnB, label)
+        local after = snapshotAuthority(record, txnA, txnB)
+        assertEq(after.count, before.count, "val: idxh " .. label .. " winner count")
+        assertEq(after.nextSeq, before.nextSeq, "val: idxh " .. label .. " nextSeq")
+        local a = valuationSnap(record, txnA)
+        assertTrue(type(a) == "table", "val: idxh " .. label .. " A present")
+        assertEq(a.assignmentId, before.snapA.assignmentId, "val: idxh " .. label .. " A id")
+        assertEq(a.unitCopper, before.snapA.unitCopper, "val: idxh " .. label .. " A unit")
+        assertEq(a.totalCopper, before.snapA.totalCopper, "val: idxh " .. label .. " A total")
+        assertEq(valuationSnap(record, txnB), before.snapB, "val: idxh " .. label .. " B absent")
+        assertEq(record.valuations.pending[txnA], before.pendingA,
+            "val: idxh " .. label .. " pending A")
+        assertEq(record.valuations.pending[txnB], before.pendingB,
+            "val: idxh " .. label .. " pending B")
+    end
+
+    SF.TSM = nil
+    local record = activateValuationGuild(9927)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local rebuilds = 0
+    GS._onAssignmentBindingRebuild = function()
+        rebuilds = rebuilds + 1
+    end
+
+    -- Donation A: credit, park earlier pending[canonical], remember a loser, then
+    -- promote via a later authorized body while the binding cache is warm.
+    local evidenceA = makeDepositEvidence(record, {
+        itemId = 9927, quantity = 2, donor = "IdxhA-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 1,
+        neighborsOlder = { "idxh-a-old" }, neighborsNewer = { "idxh-a-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceA, "Player-1-Alice", "Alice-Garona")), "accepted", "val: idxh credit A")
+    record = GS:GetCurrentRecord()
+    local evA = valuationFindDonation(record, 9927, 2)
+    assertTrue(evA ~= nil, "val: idxh donation A")
+    local txnA = evA.txnId
+    -- Force A into unpublished pending by temporarily clearing production credit.
+    evA.gsProductionCredit = false
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local winnerId = "gsv1:aaaaaaaaaaaaaaaaaaaaaa01:00009927"
+    local loserId = "gsv1:bbbbbbbbbbbbbbbbbbbbbb02:00009927"
+    local earlyBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evA, {
+            assignmentId = winnerId,
+            assignedAt = 100,
+            unitCopper = 15,
+            txnId = txnA,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stPend, reasonPend = providerApplyWithId("gs:val:" .. txnA, earlyBody, "Alice-Garona")
+    assertEq(stPend, "pending", "val: idxh park pending A " .. tostring(reasonPend))
+    assertEq(reasonPend, "awaiting_credit", "val: idxh A awaiting_credit")
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[txnA]) == "table", "val: idxh pending[A]")
+    -- Warm the binding cache before promotion (AssignmentBoundElsewhere cold-builds once).
+    local warmBefore = rebuilds
+    local laterBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evA, {
+            assignmentId = loserId,
+            assignedAt = 500,
+            unitCopper = 15,
+            txnId = txnA,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stLaterPend = select(1, providerApplyWithId("gs:val:" .. txnA, laterBody, "Alice-Garona"))
+    assertTrue(stLaterPend == "pending" or stLaterPend == "duplicate",
+        "val: idxh later pending remembered st=" .. tostring(stLaterPend))
+    record = GS:GetCurrentRecord()
+    local pendSnap = record.valuations.pending[txnA]
+    assertEq(pendSnap.assignmentId, winnerId, "val: idxh pending keeps earlier winner")
+    local hasLoser = false
+    if type(pendSnap.seen) == "table" then
+        for i = 1, #pendSnap.seen do
+            if pendSnap.seen[i] and pendSnap.seen[i].id == loserId then
+                hasLoser = true
+            end
+        end
+    end
+    assertTrue(hasLoser, "val: idxh pending retains loser in seen")
+    assertTrue(rebuilds >= warmBefore, "val: idxh binding cache warmed")
+    local rebuildsAfterWarm = rebuilds
+
+    -- Restore credit and promote via another later authorized body (or identical).
+    evA.gsProductionCredit = true
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local promoteBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evA, {
+            assignmentId = "gsv1:cccccccccccccccccccccc03:00009927",
+            assignedAt = 900,
+            unitCopper = 15,
+            txnId = txnA,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local promoteLoserId = promoteBody.assignment.assignmentId
+    local stPromo, reasonPromo = providerApplyWithId("gs:val:" .. txnA, promoteBody, "Alice-Garona")
+    assertTrue(stPromo == "accepted" or stPromo == "duplicate",
+        "val: idxh promote st=" .. tostring(stPromo) .. " " .. tostring(reasonPromo))
+    record = GS:GetCurrentRecord()
+    local snapA = valuationSnap(record, txnA)
+    assertTrue(type(snapA) == "table", "val: idxh A promoted")
+    assertEq(snapA.assignmentId, winnerId, "val: idxh earlier pending wins")
+    assertEq(record.valuations.pending[txnA], nil, "val: idxh pending cleared")
+    local seenPendingLoser, seenPromoteLoser = false, false
+    if type(snapA.seen) == "table" then
+        for i = 1, #snapA.seen do
+            local id = snapA.seen[i] and snapA.seen[i].id
+            if id == loserId then
+                seenPendingLoser = true
+            elseif id == promoteLoserId then
+                seenPromoteLoser = true
+            end
+        end
+    end
+    assertTrue(seenPendingLoser, "val: idxh promoted seen keeps pending-era loser")
+    assertTrue(seenPromoteLoser, "val: idxh promoted seen retains later loser")
+    -- Promotion must stay incremental (no cold rebuild required for correctness).
+    assertEq(rebuilds, rebuildsAfterWarm,
+        "val: idxh promote stayed incremental got=" .. tostring(rebuilds))
+
+    -- Second credited donation B.
+    local evidenceB = makeDepositEvidence(record, {
+        itemId = 9927, quantity = 3, donor = "IdxhB-Garona",
+        observedAt = world.time, ageHours = 0, occurrenceIndex = 2,
+        neighborsOlder = { "idxh-b-old" }, neighborsNewer = { "idxh-b-new" },
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(
+        evidenceB, "Player-1-Alice", "Alice-Garona")), "accepted", "val: idxh credit B")
+    record = GS:GetCurrentRecord()
+    local evB = valuationFindDonation(record, 9927, 3)
+    assertTrue(evB ~= nil, "val: idxh donation B")
+    local txnB = evB.txnId
+    local beforeBound = snapshotAuthority(record, txnA, txnB)
+    local rebuildsBeforeBound = rebuilds
+    drainExportMaint(32)
+    local exportBefore = collectAllExportBodies()
+    local function valuationExportCount(bodies, datasetId)
+        local n, desc = 0, nil
+        for i = 1, #(bodies or {}) do
+            local body = bodies[i].body
+            if type(body) == "table" and body.kind == "gs-valuation"
+                and body.datasetId == datasetId then
+                n = n + 1
+            elseif type(body) == "table" and body.kind == "dataset-desc"
+                and body.datasetId == datasetId then
+                desc = body.valuationCount or body.valuationsCount
+            end
+        end
+        return n, desc
+    end
+    local exportCountBefore, descBefore = valuationExportCount(exportBefore, record.datasetId)
+
+    -- Reuse promoted winner ID on B → assignment_bound; warm cache, no rebuild needed.
+    local reuseWinner = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evB, {
+            assignmentId = winnerId,
+            assignedAt = 1000,
+            unitCopper = 20,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stReuse, reasonReuse = providerApplyWithId("gs:val:" .. txnB, reuseWinner, "Alice-Garona")
+    assertEq(stReuse, "rejected", "val: idxh reused winner rejected")
+    assertEq(reasonReuse, "assignment_bound", "val: idxh reused winner assignment_bound")
+    record = GS:GetCurrentRecord()
+    assertAuthorityUnchanged(beforeBound, record, txnA, txnB, "reuse-winner")
+    assertEq(rebuilds, rebuildsBeforeBound,
+        "val: idxh reuse-winner no cold rebuild got=" .. tostring(rebuilds))
+
+    -- Reuse retained loser IDs from the accepted winner's seen list on B.
+    for _, seenId in ipairs({ loserId, promoteLoserId }) do
+        local reuseLoser = deepCopy(reuseWinner)
+        reuseLoser.assignment.assignmentId = seenId
+        reuseLoser.assignment.assignedAt = 1001
+        local stLoser, reasonLoser = providerApplyWithId(
+            "gs:val:" .. txnB, reuseLoser, "Alice-Garona")
+        assertEq(stLoser, "rejected",
+            "val: idxh reused loser rejected " .. tostring(seenId))
+        assertEq(reasonLoser, "assignment_bound",
+            "val: idxh reused loser assignment_bound " .. tostring(seenId))
+        record = GS:GetCurrentRecord()
+        assertAuthorityUnchanged(beforeBound, record, txnA, txnB,
+            "reuse-loser-" .. tostring(seenId))
+        assertEq(rebuilds, rebuildsBeforeBound,
+            "val: idxh reuse-loser no cold rebuild " .. tostring(seenId)
+                .. " got=" .. tostring(rebuilds))
+    end
+
+    drainExportMaint(16)
+    local exportCountAfter, descAfter = valuationExportCount(collectAllExportBodies(), record.datasetId)
+    assertEq(exportCountAfter, exportCountBefore, "val: idxh export count unchanged")
+    assertEq(descAfter, descBefore, "val: idxh descriptor unchanged")
+    assertEq(descAfter, valuationCount(record), "val: idxh descriptor matches winners")
+
+    -- Legitimate unique assignment for B still succeeds.
+    local uniqueId = "gsv1:dddddddddddddddddddddd04:00009927"
+    local uniqueBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evB, {
+            assignmentId = uniqueId,
+            assignedAt = 1100,
+            unitCopper = 21,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stUnique, reasonUnique = providerApplyWithId("gs:val:" .. txnB, uniqueBody, "Alice-Garona")
+    assertTrue(stUnique == "accepted" or stUnique == "duplicate",
+        "val: idxh unique B st=" .. tostring(stUnique) .. " " .. tostring(reasonUnique))
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnB).assignmentId, uniqueId, "val: idxh unique B wins")
+    assertEq(valuationSnap(record, txnA).assignmentId, winnerId, "val: idxh A intact after B")
+    assertEq(rebuilds, rebuildsBeforeBound,
+        "val: idxh unique B stayed incremental got=" .. tostring(rebuilds))
+
+    -- Alias-key pending promotion: pending[alias] → byTxn[canonical], then bound check.
+    local aliasTxn = "ctx:idxh-alias-src"
+    local canonTxn = "ctx:idxh-alias-dst"
+    local aliasEvent = {
+        type = "donation",
+        id = canonTxn,
+        txnId = canonTxn,
+        itemId = 9927,
+        quantity = 4,
+        generation = 1,
+        gsProductionCredit = false,
+        verification = "officer",
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        approxTxnTime = world.time,
+        timestamp = math.floor(world.time or 0),
+        occurrenceIndex = 900010,
+    }
+    record.accounting._consumableEvents = record.accounting._consumableEvents or {}
+    record.accounting._consumableEvents[#record.accounting._consumableEvents + 1] = aliasEvent
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local cfg = record.accounting._consumables
+    if type(cfg) ~= "table" then
+        record.accounting._consumables = {}
+        cfg = record.accounting._consumables
+    end
+    if type(cfg.txnRegistry) ~= "table" then
+        cfg.txnRegistry = {}
+    end
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = canonTxn, status = "committed", aliases = { aliasTxn },
+        itemId = 9927, quantity = 4,
+    }
+    cfg.txnRegistry[#cfg.txnRegistry + 1] = {
+        txnId = aliasTxn, status = "alias", aliasOf = canonTxn,
+    }
+    local aliasWinner = "gsv1:eeeeeeeeeeeeeeeeeeeeee05:00009927"
+    local aliasPendBody = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, aliasEvent, {
+            assignmentId = aliasWinner,
+            assignedAt = 50,
+            unitCopper = 9,
+            txnId = aliasTxn,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    local stAliasPend, reasonAliasPend = providerApplyWithId(
+        "gs:val:" .. canonTxn, aliasPendBody, "Alice-Garona")
+    assertEq(stAliasPend, "pending",
+        "val: idxh alias pending st=" .. tostring(stAliasPend) .. " " .. tostring(reasonAliasPend))
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.valuations.pending[canonTxn]) == "table"
+        or type(record.valuations.pending[aliasTxn]) == "table",
+        "val: idxh alias pending parked")
+    aliasEvent.gsProductionCredit = true
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    local aliasLater = deepCopy(aliasPendBody)
+    aliasLater.assignment.assignmentId = "gsv1:ffffffffffffffffffffff06:00009927"
+    aliasLater.assignment.assignedAt = 800
+    aliasLater.assignment.unitCopper = 9
+    aliasLater.assignment.totalCopper = 36
+    local rebuildsBeforeAlias = rebuilds
+    local stAliasPromo = select(1, providerApplyWithId(
+        "gs:val:" .. canonTxn, aliasLater, "Alice-Garona"))
+    assertTrue(stAliasPromo == "accepted" or stAliasPromo == "duplicate",
+        "val: idxh alias promote st=" .. tostring(stAliasPromo))
+    record = GS:GetCurrentRecord()
+    local aliasSnap = valuationSnap(record, canonTxn)
+    assertTrue(type(aliasSnap) == "table", "val: idxh alias winner")
+    assertEq(aliasSnap.assignmentId, aliasWinner, "val: idxh alias earlier wins")
+    assertEq(aliasSnap.txnId, aliasTxn, "val: idxh alias immutable txn")
+    assertEq(rebuilds, rebuildsBeforeAlias,
+        "val: idxh alias promote incremental got=" .. tostring(rebuilds))
+    local reuseAlias = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, evB, {
+            assignmentId = aliasWinner,
+            assignedAt = 1200,
+            unitCopper = 21,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }
+    -- B already priced; reuse must still be assignment_bound (not overwrite B).
+    local beforeAliasReuse = deepCopy(valuationSnap(record, txnB))
+    local stAliasReuse, reasonAliasReuse = providerApplyWithId(
+        "gs:val:" .. txnB, reuseAlias, "Alice-Garona")
+    assertEq(stAliasReuse, "rejected", "val: idxh alias winner reuse rejected")
+    assertEq(reasonAliasReuse, "assignment_bound", "val: idxh alias winner assignment_bound")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnB).assignmentId, beforeAliasReuse.assignmentId,
+        "val: idxh B intact after alias reuse reject")
+
+    -- /reload: durable winners still enforce assignment_bound after cold rebuild.
+    local reloadRoot = snapshotConfigRoot()
+    reloadRoot.guilds["club:42"].accounting = deepCopy(record.accounting)
+    reloadRoot.guilds["club:42"].valuations = deepCopy(record.valuations)
+    SpectrumFederationDB = { guildSupplies = deepCopy(reloadRoot) }
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+    settleRoster()
+    initGS()
+    GS:EnsureGossipProvider()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, txnA).assignmentId, winnerId, "val: idxh reload A")
+    assertEq(valuationSnap(record, txnB).assignmentId, uniqueId, "val: idxh reload B")
+    assertEq(valuationSnap(record, canonTxn).assignmentId, aliasWinner, "val: idxh reload alias")
+    local stReloadBound, reasonReloadBound = providerApplyWithId("gs:val:" .. txnB, {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, valuationFindDonation(record, 9927, 3), {
+            assignmentId = winnerId,
+            assignedAt = 2000,
+            unitCopper = 21,
+            txnId = txnB,
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        }),
+    }, "Alice-Garona")
+    assertEq(stReloadBound, "rejected", "val: idxh reload reuse rejected")
+    assertEq(reasonReloadBound, "assignment_bound", "val: idxh reload assignment_bound")
+    GS._onAssignmentBindingRebuild = nil
+    assertEq(#world.chat, 0, "val: idxh chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- idxi (discussion_r4380534080): catch-up must stop when adoption begins.
+    SF.TSM = nil
+    local record = activateValuationGuild(9928)
+    local oldDataset = record.datasetId
+    local credited = 0
+    for n = 1, 40 do
+        local evidence = makeDepositEvidence(record, {
+            itemId = 9928,
+            quantity = (n % 2) + 1,
+            observedAt = world.time,
+            ageHours = 0,
+            occurrenceIndex = n,
+            neighborsOlder = { "idxi-old-" .. n },
+            neighborsNewer = { "idxi-new-" .. n },
+        })
+        assertEq(select(1, GS:_AdmitObservationForTests(
+            evidence, "Player-1-Alice", "Alice-Garona")), "accepted",
+            "val: idxi seed " .. n)
+        credited = credited + 1
+    end
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), 0, "val: idxi starts unpriced")
+    assertTrue(credited > (GS.VALUATION_CATCHUP_BATCH or 8),
+        "val: idxi backlog exceeds one catch-up batch")
+    timers = {}
+    valuationTsmCalls = 0
+    valuationTsmValue = 55
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    assertEq(GS.StartValuationCatchup("idxi-logs"), true, "val: idxi catch-up starts")
+    assertEq(runOneDueTimer(), true, "val: idxi first catch-up slice")
+    record = GS:GetCurrentRecord()
+    local afterSlice = valuationCount(record)
+    assertTrue(afterSlice > 0 and afterSlice < credited,
+        "val: idxi partial slice priced got=" .. tostring(afterSlice))
+    local callsAfterSlice = valuationTsmCalls
+    local catchState = GS.GetValuationCatchupState()
+    assertEq(catchState.active, true, "val: idxi catch-up still active")
+    local genBefore = catchState.generation
+
+    -- Different-dataset asynchronous adoption begins while catch-up is mid-pass.
+    local otherDataset = "ds-idxi-other-9928"
+    GS.NotePeerDataset("Bob-Garona", otherDataset, { editorRankPosition = 2 })
+    local adop, stBegin, reasonBegin = GS:BeginDatasetAdoption("Bob-Garona", otherDataset)
+    assertEq(stBegin, "accepted", "val: idxi begin adoption " .. tostring(reasonBegin))
+    assertTrue(type(adop) == "table", "val: idxi adoption session")
+    assertTrue(GS:GetPendingAdoption() ~= nil, "val: idxi pending adoption")
+    local catchAfterBegin = GS.GetValuationCatchupState()
+    assertEq(catchAfterBegin.active, false, "val: idxi catch-up cancelled on begin")
+    assertTrue(catchAfterBegin.generation > genBefore,
+        "val: idxi catch-up generation advanced")
+    assertEq(GS.StartValuationCatchup("idxi-logs-reopen"), false,
+        "val: idxi Logs reopen during adoption refused")
+    -- already_pending must not revive catch-up.
+    local _, stAgain = GS:BeginDatasetAdoption("Bob-Garona", otherDataset)
+    assertEq(stAgain, "accepted", "val: idxi already_pending")
+    assertEq(GS.StartValuationCatchup("idxi-already-pending"), false,
+        "val: idxi catch-up stays blocked while already_pending")
+
+    local countAtBegin = valuationCount(GS:GetCurrentRecord())
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, oldDataset, "val: idxi old dataset retained during adoption")
+    assertEq(valuationCount(record), countAtBegin,
+        "val: idxi no further old-dataset mints after begin")
+    assertEq(valuationTsmCalls, callsAfterSlice,
+        "val: idxi no further TSM queries after begin")
+    drainExportMaint(16)
+    local exportVals = 0
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "gs-valuation"
+            and row.body.datasetId == oldDataset then
+            exportVals = exportVals + 1
+        end
+    end
+    assertEq(exportVals, countAtBegin, "val: idxi export matches pre-begin winners")
+
+    -- Cancelled adoption restores prior record; user-triggered catch-up works again.
+    assertEq(select(1, GS:CancelDatasetAdoption()), "accepted", "val: idxi cancel adoption")
+    assertEq(GS:GetPendingAdoption(), nil, "val: idxi adoption cleared")
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, oldDataset, "val: idxi prior record valid after cancel")
+    assertEq(valuationCount(record), countAtBegin, "val: idxi winners retained after cancel")
+    timers = {}
+    assertEq(GS.StartValuationCatchup("idxi-after-cancel"), true,
+        "val: idxi catch-up restarts after cancel")
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationCount(record), credited, "val: idxi catch-up finishes after cancel")
+    assertEq(GS.GetValuationCatchupState().active, false, "val: idxi catch-up idle")
+    assertEq(#world.chat, 0, "val: idxi chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- idxj (discussion_r4380534091): deferred drain reauthenticates transport sender.
+    local function providerApplyWithId(recordId, body, sender)
+        local entry = GG.GetProvider(GS.PROVIDER_ID)
+        assertTrue(entry and entry.api and entry.api.ValidateAndApply,
+            "val: idxj provider registered")
+        return entry.api.ValidateAndApply({
+            id = recordId,
+            versionFp = GS.ContentFingerprint(body),
+            body = body,
+        }, { sender = sender })
+    end
+    SF.TSM = nil
+    local record = activateValuationGuild(9929)
+    GS:EnsureGossipProvider()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    -- Cold ledger so valuation defers awaiting_index (>512 archive fillers).
+    local budget = GS.DONATION_EVENT_INDEX_BUDGET or 512
+    local arch = {}
+    for i = 1, budget + 32 do
+        local txn = string.format("ctx:idxj-fill-%04d", i)
+        arch[i] = {
+            type = "donation",
+            id = txn,
+            txnId = txn,
+            itemId = 9929,
+            quantity = 1,
+            generation = 1,
+            gsProductionCredit = true,
+            verification = "officer",
+            writer = "Player-1-Alice",
+            verifierGuid = "Player-1-Alice",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+            approxTxnTime = world.time,
+            timestamp = math.floor(world.time or 0),
+            occurrenceIndex = 600000 + i,
+        }
+    end
+    local targetTxn = "ctx:idxj-target-0001"
+    local target = {
+        type = "donation",
+        id = targetTxn,
+        txnId = targetTxn,
+        itemId = 9929,
+        quantity = 2,
+        generation = 1,
+        gsProductionCredit = true,
+        verification = "officer",
+        writer = "Player-1-Alice",
+        verifierGuid = "Player-1-Alice",
+        datasetId = record.datasetId,
+        campaignId = record.currentCampaignId,
+        approxTxnTime = world.time,
+        timestamp = math.floor(world.time or 0),
+        occurrenceIndex = 700001,
+    }
+    arch[#arch + 1] = target
+    record.accounting._consumableEventArchive = arch
+    record.accounting._consumableEvents = {}
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxj index cold")
+
+    local assignId = "gsv1:aaaaaaaaaaaaaaaaaaaaaa11:00009929"
+    local body = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target, {
+            assignmentId = assignId,
+            assignedAt = 100,
+            unitCopper = 17,
+            txnId = targetTxn,
+            actorGuid = "Player-1-Bob",
+            actorName = "Bob-Garona",
+        }),
+    }
+    timers = {}
+    local authRejects = 0
+    GS._onDeferredValuationAuthReject = function()
+        authRejects = authRejects + 1
+    end
+    local stPend, reasonPend = providerApplyWithId("gs:val:" .. targetTxn, body, "Bob-Garona")
+    assertEq(stPend, "pending", "val: idxj defers while cold " .. tostring(reasonPend))
+    assertEq(reasonPend, "awaiting_index", "val: idxj awaiting_index")
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, targetTxn), nil, "val: idxj no winner yet")
+    assertEq(record.valuations and record.valuations.pending
+        and record.valuations.pending[targetTxn], nil,
+        "val: idxj no pending price yet")
+    assertTrue(#timers >= 1, "val: idxj deferred drain scheduled")
+
+    -- Demote Bob below editor threshold before the deferred drain runs.
+    for _, m in ipairs(world.guild.members) do
+        if m.name == "Bob-Garona" then
+            m.rankOrder = 5
+        end
+    end
+    settleRoster()
+    local countBeforeDrain = valuationCount(record)
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, targetTxn), nil, "val: idxj demoted no winner")
+    assertTrue(record.valuations == nil
+        or record.valuations.pending == nil
+        or record.valuations.pending[targetTxn] == nil,
+        "val: idxj demoted no pending")
+    assertEq(valuationCount(record), countBeforeDrain, "val: idxj demoted no new winners")
+    assertTrue(authRejects >= 1, "val: idxj auth reject observed")
+    drainExportMaint(16)
+    local exportedDemoted = false
+    for _, row in ipairs(collectAllExportBodies()) do
+        if row.body and row.body.kind == "gs-valuation"
+            and row.body.assignment
+            and row.body.assignment.assignmentId == assignId then
+            exportedDemoted = true
+        end
+    end
+    assertEq(exportedDemoted, false, "val: idxj demoted no export")
+
+    -- Control: restore editor authority; a fresh delivery converges without relying
+    -- on the discarded deferred body.
+    for _, m in ipairs(world.guild.members) do
+        if m.name == "Bob-Garona" then
+            m.rankOrder = 2
+        end
+    end
+    settleRoster()
+    -- Warm enough of the index so a new admit can complete (or defer then drain).
+    timers = {}
+    authRejects = 0
+    local stOk, reasonOk = providerApplyWithId("gs:val:" .. targetTxn, body, "Bob-Garona")
+    assertTrue(stOk == "accepted" or stOk == "pending" or stOk == "duplicate",
+        "val: idxj restored admit st=" .. tostring(stOk) .. " " .. tostring(reasonOk))
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    local guard = 0
+    while valuationSnap(record, targetTxn) == nil and guard < 64 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        record = GS:GetCurrentRecord()
+    end
+    assertTrue(type(valuationSnap(record, targetTxn)) == "table",
+        "val: idxj authorized delivery converges")
+    assertEq(valuationSnap(record, targetTxn).assignmentId, assignId,
+        "val: idxj authorized winner")
+    assertEq(authRejects, 0, "val: idxj authorized path no auth reject")
+
+    -- Missing roster proof fails closed on a second cold-deferred body.
+    local target2 = deepCopy(target)
+    target2.txnId = "ctx:idxj-target-0002"
+    target2.id = target2.txnId
+    target2.occurrenceIndex = 700002
+    -- Replace archive identity (+ append target2) so the ephemeral index is cold.
+    local arch2 = deepCopy(record.accounting._consumableEventArchive or {})
+    arch2[#arch2 + 1] = target2
+    record.accounting._consumableEventArchive = arch2
+    record.accounting._consumableEvents = {}
+    record.accounting._mutationSeq = (tonumber(record.accounting._mutationSeq) or 0) + 1
+    assertEq(GS.DonationEventIndexReady(record), false, "val: idxj second body cold")
+    local body2 = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = craftValuation(record, target2, {
+            assignmentId = "gsv1:bbbbbbbbbbbbbbbbbbbbbb12:00009929",
+            assignedAt = 200,
+            unitCopper = 19,
+            txnId = target2.txnId,
+            actorGuid = "Player-1-Bob",
+            actorName = "Bob-Garona",
+        }),
+    }
+    timers = {}
+    authRejects = 0
+    local st2, reason2 = providerApplyWithId("gs:val:" .. target2.txnId, body2, "Bob-Garona")
+    assertEq(st2, "pending", "val: idxj second defers " .. tostring(reason2))
+    assertEq(reason2, "awaiting_index", "val: idxj second awaiting_index")
+    -- Remove Bob from the native roster before drain.
+    local kept = {}
+    for _, m in ipairs(world.guild.members) do
+        if m.name ~= "Bob-Garona" then
+            kept[#kept + 1] = m
+        end
+    end
+    world.guild.members = kept
+    settleRoster()
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    assertEq(valuationSnap(record, target2.txnId), nil, "val: idxj removed no winner")
+    assertTrue(authRejects >= 1, "val: idxj removed auth reject")
+    -- Re-add Bob as editor; a new legitimate delivery succeeds.
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    settleRoster()
+    timers = {}
+    local st3 = select(1, providerApplyWithId("gs:val:" .. target2.txnId, body2, "Bob-Garona"))
+    assertTrue(st3 == "accepted" or st3 == "pending" or st3 == "duplicate",
+        "val: idxj rejoin admit st=" .. tostring(st3))
+    flushTimers()
+    record = GS:GetCurrentRecord()
+    guard = 0
+    while valuationSnap(record, target2.txnId) == nil and guard < 64 do
+        guard = guard + 1
+        world.time = (world.time or 0) + 1
+        flushTimers()
+        record = GS:GetCurrentRecord()
+    end
+    assertTrue(type(valuationSnap(record, target2.txnId)) == "table",
+        "val: idxj rejoin converges")
+    GS._onDeferredValuationAuthReject = nil
+    assertEq(#world.chat, 0, "val: idxj chat-free")
+    switchPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    local src = io.open("SpectrumFederation/modules/GuildSupplies/Valuation.lua", "r")
+    assertTrue(src ~= nil, "val: module readable")
+    local text = src:read("*a")
+    src:close()
+    assertTrue(text:find("TSM_API", 1, true) == nil, "val: feature code does not call TSM_API")
+    assertTrue(text:find("GetMarketValue", 1, true) ~= nil, "val: feature code uses SF.TSM.GetMarketValue")
+    assertTrue(text:find("ReauthDeferredSender", 1, true) ~= nil,
+        "val: deferred drain reauthenticates senders")
+    assertTrue(text:find("AdoptionInProgress", 1, true) ~= nil,
+        "val: catch-up guards adoption in progress")
+    local adm = io.open("SpectrumFederation/modules/GuildSupplies/Admission.lua", "r")
+    assertTrue(adm ~= nil, "val: Admission readable")
+    local admText = adm:read("*a")
+    adm:close()
+    assertTrue(admText:find('CancelValuationCatchup("adoption_begin")', 1, true) ~= nil,
+        "val: BeginDatasetAdoption cancels catch-up")
+    assertEq(#world.chat, 0, "val: suite section stays chat-free")
+end
+
+---------------------------------------------------------------------------
+-- #424) Campaign display names — authority, LWW sync, archives, adoption
+---------------------------------------------------------------------------
+
+do
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    local camp1 = startCampaign()
+    local record = GS:GetCurrentRecord()
+    local camp1Id = record.currentCampaignId
+    assertEq(GS.GetCampaignDisplayName(record, camp1Id), camp1Id,
+        "424: new campaign falls back to ID")
+    assertEq(GS.PROVIDER_SCHEMA, 3, "424: provider schema is 3")
+
+    -- Ordinary member cannot rename.
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local opDenied, stDenied, reasonDenied = GS:NewRenameCampaignOperation(camp1Id, "Denied")
+    assertNil(opDenied, "424: member prepare denied")
+    assertEq(stDenied, "rejected", "424: member rejected")
+    assertEq(reasonDenied, "unauthorized", "424: member unauthorized")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local badOp, badSt, badReason = GS:NewRenameCampaignOperation(camp1Id, "Bad|cFF0000")
+    assertNil(badOp, "424: escape sequence rejected")
+    assertEq(badReason, "invalid_campaign_name", "424: invalid_campaign_name for escapes")
+    badOp, badSt, badReason = GS:NewRenameCampaignOperation(camp1Id, string.rep("x", 65))
+    assertNil(badOp, "424: oversize rejected")
+    assertEq(badReason, "invalid_campaign_name", "424: oversize invalid_campaign_name")
+
+    world.time = 6000
+    local renameOp, renamePrep = GS:NewRenameCampaignOperation(camp1Id, "  Alpha Run  ")
+    assertEq(renamePrep, "accepted", "424: rename prepared")
+    assertEq(renameOp.value, "Alpha Run", "424: name trimmed")
+    assertEq(GS:ApplyStagedConfigOperation(renameOp), "accepted", "424: rename accepted")
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, camp1Id), "Alpha Run", "424: custom name shown")
+    assertEq(record.currentCampaignId, camp1Id, "424: current campaign unchanged by rename")
+    local genBefore = record.accounting._consumables.generation
+    local itemsBefore = record.accounting._consumables.requestedItems
+    assertEq(record.campaignNames[camp1Id].revisionId, renameOp.id, "424: revision stored")
+
+    -- Clear restores ID fallback without discarding revision metadata.
+    world.time = 6001
+    local clearOp = select(1, GS:NewRenameCampaignOperation(camp1Id, "   "))
+    assertEq(GS:ApplyStagedConfigOperation(clearOp), "accepted", "424: clear accepted")
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, camp1Id), camp1Id, "424: clear falls back to ID")
+    assertEq(record.campaignNames[camp1Id].revisionId, clearOp.id, "424: clear keeps revision")
+    assertNil(record.campaignNames[camp1Id].name, "424: cleared name is nil")
+    assertEq(record.accounting._consumables.generation, genBefore, "424: generation unchanged")
+    assertTrue(record.accounting._consumables.requestedItems == itemsBefore,
+        "424: requestedItems table identity unchanged")
+
+    -- Duplicate names across campaigns are allowed; archived rename works.
+    local itemOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 19019 }, {
+        itemId = 19019, goal = 5, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "424: seed item before archive")
+    world.time = 6100
+    local camp2 = startCampaign()
+    record = GS:GetCurrentRecord()
+    local camp2Id = record.currentCampaignId
+    assertTrue(camp2Id ~= camp1Id, "424: second campaign id differs")
+    assertTrue(type(record.campaignArchives[camp1Id]) == "table", "424: prior campaign archived")
+    world.time = 6101
+    local archRename = select(1, GS:NewRenameCampaignOperation(camp1Id, "Legacy Alpha"))
+    assertEq(archRename.target, camp1Id, "424: archived target is camp1")
+    assertEq(archRename.campaignId, camp2Id, "424: authorship is current campaign")
+    assertEq(GS:ApplyStagedConfigOperation(archRename), "accepted", "424: archived rename accepted")
+    record = GS:GetCurrentRecord()
+    assertEq(record.currentCampaignId, camp2Id, "424: archived rename does not switch current")
+    assertEq(GS.GetCampaignDisplayName(record, camp1Id), "Legacy Alpha", "424: archived name set")
+    world.time = 6102
+    local dupName = select(1, GS:NewRenameCampaignOperation(camp2Id, "Legacy Alpha"))
+    assertEq(GS:ApplyStagedConfigOperation(dupName), "accepted", "424: duplicate names allowed")
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, camp2Id), "Legacy Alpha", "424: current also Legacy Alpha")
+    local list = GS:ListInspectableCampaigns()
+    local sawArch, sawCur = false, false
+    for i = 1, #list do
+        if list[i].campaignId == camp1Id then
+            sawArch = true
+            assertEq(list[i].displayName, "Legacy Alpha", "424: list shows archived custom name")
+            assertEq(list[i].hasCustomName, true, "424: archived hasCustomName")
+            assertEq(list[i].isCurrent, false, "424: archived not current")
+        elseif list[i].campaignId == camp2Id then
+            sawCur = true
+            assertEq(list[i].isCurrent, true, "424: current flagged")
+        end
+    end
+    assertTrue(sawArch and sawCur, "424: both campaigns inspectable")
+
+    -- Persistence across reload (re-init root from SavedVariables).
+    local savedRoot = SpectrumFederationDB.guildSupplies
+    SpectrumFederationDB = { guildSupplies = savedRoot }
+    initGS()
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, camp1Id), "Legacy Alpha", "424: name survives reload")
+    assertEq(GS.GetCampaignDisplayName(record, camp2Id), "Legacy Alpha", "424: current name survives reload")
+
+    -- Older saves without campaignNames remain usable.
+    record.campaignNames = nil
+    assertTrue(select(1, GS:GetCurrentRecord()) ~= nil, "424: absent campaignNames still valid")
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), camp2Id), camp2Id,
+        "424: absent names fall back to ID")
+end
+
+-- #424 LWW convergence: equal-time ties, reverse delivery, delayed after clear
+do
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local campId = record.currentCampaignId
+    local ds = record.datasetId
+    local pol = record.permission.revisionId
+    local nameKey = "name:" .. campId
+
+    world.time = 7000
+    local aliceRename = select(1, GS:NewRenameCampaignOperation(campId, "AliceName"))
+    assertEq(GS:ApplyStagedConfigOperation(aliceRename), "accepted", "424-lww: alice local")
+    local aliceStored = snapshotOp(aliceRename)
+    local bobId = "gs1:Player-1-Bob:zzzzzzzzzzzzzzzzzzzzzzzz:00000002"
+    assertTrue(bobId > aliceStored.id, "424-lww: bob id sorts after alice for tie-break")
+    local bobBody = {
+        schemaVersion = 1,
+        id = bobId,
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "BobName",
+        actorGuid = "Player-1-Bob",
+        actorName = "Bob-Garona",
+        timestamp = aliceStored.timestamp,
+        baseTargetRevision = aliceStored.baseTargetRevision,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    local stBob, reasonBob = GS:AdmitRemoteOperation(bobBody, { sender = "Bob-Garona" })
+    assertEq(stBob, "accepted", "424-lww: equal-time higher id accepted reason=" .. tostring(reasonBob))
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), "BobName", "424-lww: bob wins equal-time")
+    assertEq(record.operations.heads[nameKey], bobId, "424-lww: head is bob")
+    assertTrue(record.operations.openConflicts == nil
+        or record.operations.openConflicts[nameKey] == nil,
+        "424-lww: no open conflict for names")
+
+    -- Reverse order + clear + delayed older name on a fresh record.
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    campId = record.currentCampaignId
+    ds = record.datasetId
+    pol = record.permission.revisionId
+    nameKey = "name:" .. campId
+
+    local early = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Alice:aaaaaaaaaaaaaaaaaaaaaaaa:00000010",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "Early",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 8000,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    local late = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Bob:bbbbbbbbbbbbbbbbbbbbbbbb:00000011",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "Late",
+        actorGuid = "Player-1-Bob",
+        actorName = "Bob-Garona",
+        timestamp = 8001,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    local clear = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Alice:cccccccccccccccccccccccc:00000012",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = nil,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 8002,
+        baseTargetRevision = late.id,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+
+    assertEq(GS:AdmitRemoteOperation(late, { sender = "Bob-Garona" }), "accepted",
+        "424-order: late first")
+    local stEarly, reasonEarly = GS:AdmitRemoteOperation(early, { sender = "Alice-Garona" })
+    assertEq(stEarly, "rejected", "424-order: early after late rejected")
+    assertEq(reasonEarly, "stale_name", "424-order: early stale_name")
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), "Late", "424-order: still Late")
+
+    assertEq(GS:AdmitRemoteOperation(clear, { sender = "Alice-Garona" }), "accepted",
+        "424-order: clear accepted")
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), campId, "424-order: cleared to ID")
+    local delayedEarly = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Bob:dddddddddddddddddddddddd:00000009",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "Zombie",
+        actorGuid = "Player-1-Bob",
+        actorName = "Bob-Garona",
+        timestamp = 7999,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    local stZombie, reasonZombie = GS:AdmitRemoteOperation(delayedEarly, { sender = "Bob-Garona" })
+    assertEq(stZombie, "rejected", "424-order: delayed older rejected")
+    assertEq(reasonZombie, "stale_name", "424-order: delayed stale_name")
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), campId,
+        "424-order: clear survives delayed older name")
+    assertTrue(record.operations.openConflicts == nil
+        or record.operations.openConflicts[nameKey] == nil,
+        "424-order: still no name conflict")
+
+    -- Unrelated bank-tab conflict behavior unchanged.
+    local tabA = select(1, GS:NewConfigOperation("set-bank-tab", "bankTab", 1))
+    assertEq(GS:ApplyStagedConfigOperation(tabA), "accepted", "424-order: tab A")
+    local tabB = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Bob:eeeeeeeeeeeeeeeeeeeeeeee:00000020",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = 2,
+        actorGuid = "Player-1-Bob",
+        actorName = "Bob-Garona",
+        timestamp = 9000,
+        baseTargetRevision = tabA.baseTargetRevision,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    local stTab, reasonTab = GS:AdmitRemoteOperation(tabB, { sender = "Bob-Garona" })
+    assertTrue(stTab == "pending" or stTab == "rejected",
+        "424-order: divergent tab not silently LWW st=" .. tostring(stTab))
+    assertTrue(reasonTab == "divergent_edit" or reasonTab == "open_conflict"
+        or reasonTab == "stale_base",
+        "424-order: tab conflict reason=" .. tostring(reasonTab))
+    record = GS:GetCurrentRecord()
+    assertTrue(type(record.operations.openConflicts) == "table"
+        and record.operations.openConflicts["config:bankTab"] ~= nil,
+        "424-order: bank tab still opens Troubleshooting conflict")
+end
+
+-- #424 rename authored under prior campaign converges after rollover
+do
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local camp1 = record.currentCampaignId
+    local ds = record.datasetId
+    local pol = record.permission.revisionId
+    world.time = 11000
+    local renameBefore = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Alice:rolloveraaaaaaaaaaaaaaa:00000040",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = camp1,
+        kind = "rename-campaign",
+        target = camp1,
+        value = "PreRollover",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 11000,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = camp1,
+    }
+    -- Peer rolls to camp2 before the rename arrives.
+    startCampaign()
+    local camp2 = GS:GetCurrentRecord().currentCampaignId
+    assertTrue(camp2 ~= camp1, "424-rollover: new campaign current")
+    local stRoll, reasonRoll = GS:AdmitRemoteOperation(renameBefore, { sender = "Alice-Garona" })
+    assertEq(stRoll, "accepted", "424-rollover: archived rename accepted reason=" .. tostring(reasonRoll))
+    record = GS:GetCurrentRecord()
+    assertEq(record.currentCampaignId, camp2, "424-rollover: current unchanged")
+    assertEq(GS.GetCampaignDisplayName(record, camp1), "PreRollover",
+        "424-rollover: archived name converges")
+    assertEq(GS.GetCampaignDisplayName(record, camp2), camp2,
+        "424-rollover: current still ID fallback")
+    -- Unrelated causality still rejects a stale bank-tab from camp1 authorship.
+    local staleTab = {
+        schemaVersion = 1,
+        id = "gs1:Player-1-Alice:rolloverbbbbbbbbbbbbbbb:00000041",
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = camp1,
+        kind = "set-bank-tab",
+        target = "bankTab",
+        value = 3,
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 11001,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = camp1,
+    }
+    local beforeTab = GS:GetCurrentRecord().accounting._consumables.bankTab
+    local stTab, reasonTab = GS:AdmitRemoteOperation(staleTab, { sender = "Alice-Garona" })
+    assertTrue(stTab ~= "accepted",
+        "424-rollover: unrelated kind not accepted st=" .. tostring(stTab))
+    assertTrue(reasonTab == "stale_campaign" or reasonTab == "campaign_conflict"
+        or reasonTab == "open_conflict" or reasonTab == "divergent_edit",
+        "424-rollover: unrelated campaign causality reason=" .. tostring(reasonTab))
+    assertEq(GS:GetCurrentRecord().accounting._consumables.bankTab, beforeTab,
+        "424-rollover: bank tab unchanged")
+end
+
+-- #424 multi-rename adoption newest-first retains losers; projects LWW winner
+-- #424 adoption carries names; wrong dataset rejected; provider schema is 3
+do
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local campId = record.currentCampaignId
+    local ds = record.datasetId
+    world.time = 10000
+    local renameOp = select(1, GS:NewRenameCampaignOperation(campId, "AdoptMe"))
+    assertEq(GS:ApplyStagedConfigOperation(renameOp), "accepted", "424-adopt: source rename")
+    assertEq(GS.GetCampaignDisplayName(GS:GetCurrentRecord(), campId), "AdoptMe",
+        "424-adopt: source shows name")
+
+    local wrongDs = snapshotOp(renameOp)
+    wrongDs.datasetId = "gs1:other:000000000000000000000000:00000001"
+    wrongDs.id = "gs1:Player-1-Alice:ffffffffffffffffffffffff:00000099"
+    local stWrong, reasonWrong = GS:AdmitRemoteOperation(wrongDs, { sender = "Alice-Garona" })
+    assertEq(stWrong, "rejected", "424-adopt: wrong dataset rejected")
+    assertEq(reasonWrong, "dataset_mismatch", "424-adopt: dataset_mismatch")
+
+    -- Export Alice's provider bodies and adopt onto Bob.
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("config")
+    end
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 2, "424-adopt: exported bodies present")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+    local _, stBegin = GS:BeginDatasetAdoption("Alice-Garona", ds)
+    assertEq(stBegin, "accepted", "424-adopt: begin")
+    for i = #exportBodies, 1, -1 do
+        GS:BufferAdoptionRecord(exportBodies[i].id, exportBodies[i].body)
+    end
+    local adop = GS:GetPendingAdoption()
+    assertTrue(adop and adop.ready, "424-adopt: transfer ready")
+    local stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    assertEq(stCommit, "accepted", "424-adopt: commit " .. tostring(reasonCommit))
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, ds, "424-adopt: dataset replaced")
+    assertEq(GS.GetCampaignDisplayName(record, campId), "AdoptMe", "424-adopt: name adopted")
+    assertEq(record.campaignNames[campId].name, "AdoptMe", "424-adopt: name metadata")
+    assertEq(GS.PROVIDER_SCHEMA, 3, "424-adopt: schema is 3")
+end
+
+local function adoptExportNewestFirstRenames(exportBodies, preferLaterRename)
+    local nonRename, renames = {}, {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        local body = row.body
+        if type(body) == "table" and body.kind == "gs-op"
+            and type(body.op) == "table" and body.op.kind == "rename-campaign" then
+            renames[#renames + 1] = row
+        else
+            nonRename[#nonRename + 1] = row
+        end
+    end
+    table.sort(renames, function(a, b)
+        local oa, ob = a.body.op, b.body.op
+        local ta, tb = tonumber(oa.timestamp) or 0, tonumber(ob.timestamp) or 0
+        if ta ~= tb then
+            if preferLaterRename then
+                return ta > tb
+            end
+            return ta < tb
+        end
+        if preferLaterRename then
+            return tostring(oa.id) > tostring(ob.id)
+        end
+        return tostring(oa.id) < tostring(ob.id)
+    end)
+    for i = 1, #nonRename do
+        GS:BufferAdoptionRecord(nonRename[i].id, nonRename[i].body)
+    end
+    for i = 1, #renames do
+        GS:BufferAdoptionRecord(renames[i].id, renames[i].body)
+    end
+    return renames
+end
+
+do
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local campId = record.currentCampaignId
+    local ds = record.datasetId
+    world.time = 12000
+    local earlyOp = select(1, GS:NewRenameCampaignOperation(campId, "EarlyAdopt"))
+    assertEq(GS:ApplyStagedConfigOperation(earlyOp), "accepted", "424-adopt-lww: early")
+    world.time = 12001
+    local lateOp = select(1, GS:NewRenameCampaignOperation(campId, "LateAdopt"))
+    assertEq(GS:ApplyStagedConfigOperation(lateOp), "accepted", "424-adopt-lww: late")
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("config")
+    end
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+    local _, stBegin = GS:BeginDatasetAdoption("Alice-Garona", ds)
+    assertEq(stBegin, "accepted", "424-adopt-lww: begin")
+    local renames = adoptExportNewestFirstRenames(exportBodies, true)
+    assertTrue(#renames >= 2, "424-adopt-lww: two renames buffered")
+    local adop = GS:GetPendingAdoption()
+    assertTrue(adop and adop.ready, "424-adopt-lww: ready")
+    local stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    assertEq(stCommit, "accepted", "424-adopt-lww: commit " .. tostring(reasonCommit))
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), "LateAdopt",
+        "424-adopt-lww: winner projected")
+    assertTrue(record.operations.records[earlyOp.id] ~= nil,
+        "424-adopt-lww: early retained in history")
+    assertTrue(record.operations.records[lateOp.id] ~= nil,
+        "424-adopt-lww: late retained in history")
+    assertEq(record.operations.heads["name:" .. campId], lateOp.id,
+        "424-adopt-lww: head is winner")
+    assertEq(record.campaignNames[campId].name, "LateAdopt",
+        "424-adopt-lww: projection name")
+end
+
+-- Equal-timestamp tie + clear variants under newest-first adoption
+do
+    resetDb()
+    switchPlayer("Alice", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    startCampaign()
+    local record = GS:GetCurrentRecord()
+    local campId = record.currentCampaignId
+    local ds = record.datasetId
+    local pol = record.permission.revisionId
+    world.time = 13000
+    local lowId = "gs1:Player-1-Alice:tieaaaaaaaaaaaaaaaaaaaa:00000050"
+    local highId = "gs1:Player-1-Alice:tiezzzzzzzzzzzzzzzzzzzz:00000051"
+    assertTrue(highId > lowId, "424-adopt-tie: high id sorts after")
+    local tieLow = {
+        schemaVersion = 1,
+        id = lowId,
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "TieLow",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 13000,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    local tieHigh = {
+        schemaVersion = 1,
+        id = highId,
+        guildKey = "club:42",
+        datasetId = ds,
+        campaignId = campId,
+        kind = "rename-campaign",
+        target = campId,
+        value = "TieHigh",
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = 13000,
+        baseTargetRevision = ds,
+        basePolicyRevision = pol,
+        baseCampaignId = campId,
+    }
+    assertEq(GS:AdmitRemoteOperation(tieLow, { sender = "Alice-Garona" }), "accepted",
+        "424-adopt-tie: low local")
+    assertEq(GS:AdmitRemoteOperation(tieHigh, { sender = "Alice-Garona" }), "accepted",
+        "424-adopt-tie: high wins")
+    world.time = 13002
+    local clearOp = select(1, GS:NewRenameCampaignOperation(campId, ""))
+    assertEq(GS:ApplyStagedConfigOperation(clearOp), "accepted", "424-adopt-tie: clear")
+    if GS.NotifyLocalDurableChange then
+        GS.NotifyLocalDurableChange("config")
+    end
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+
+    SpectrumFederationDB = {}
+    switchPlayer("Bob", "Player-1-Bob", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._pendingCampaignBoundaries = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", ds, { editorRankPosition = 1 })
+    local _, stBegin = GS:BeginDatasetAdoption("Alice-Garona", ds)
+    assertEq(stBegin, "accepted", "424-adopt-tie: begin")
+    local renames = adoptExportNewestFirstRenames(exportBodies, true)
+    assertTrue(#renames >= 3, "424-adopt-tie: three renames")
+    local adop = GS:GetPendingAdoption()
+    assertTrue(adop and adop.ready, "424-adopt-tie: ready")
+    local stCommit, reasonCommit = GS:CommitDatasetAdoption()
+    assertEq(stCommit, "accepted", "424-adopt-tie: commit " .. tostring(reasonCommit))
+    record = GS:GetCurrentRecord()
+    assertEq(GS.GetCampaignDisplayName(record, campId), campId,
+        "424-adopt-tie: clear wins projection")
+    assertTrue(record.operations.records[lowId] ~= nil, "424-adopt-tie: low retained")
+    assertTrue(record.operations.records[highId] ~= nil, "424-adopt-tie: high retained")
+    assertTrue(record.operations.records[clearOp.id] ~= nil, "424-adopt-tie: clear retained")
+    assertEq(record.operations.heads["name:" .. campId], clearOp.id,
+        "424-adopt-tie: head is clear")
+    assertEq(record.campaignNames[campId].name, nil, "424-adopt-tie: cleared name")
+    assertEq(record.campaignNames[campId].revisionId, clearOp.id,
+        "424-adopt-tie: clear revision kept")
+end
+
+do
+    -- #426) Apply Adjustment: parse rules, goal ceiling, membership, confirmation.
+    assertTrue(type(GS.ParseAdjustmentQuantity) == "function", "426: parser exported")
+    assertTrue(type(GS.FormatAdjustmentConfirmation) == "function", "426: confirm helper exported")
+    assertTrue(type(GS.IsCurrentRequestedItem) == "function", "426: membership helper exported")
+
+    local function assertParse(text, expectQty, label)
+        local qty, err = GS.ParseAdjustmentQuantity(text)
+        if expectQty == nil then
+            assertEq(qty, nil, "426 parse reject qty " .. label)
+            assertEq(err, "invalid_quantity", "426 parse reject err " .. label)
+        else
+            assertEq(qty, expectQty, "426 parse accept " .. label .. " got=" .. tostring(qty))
+        end
+    end
+    assertParse("10", 10, "positive")
+    assertParse("-10", -10, "negative")
+    assertParse(" 10 ", 10, "trimmed")
+    assertParse("+10", nil, "leading-plus")
+    assertParse("0", nil, "zero")
+    assertParse("-0", nil, "neg-zero")
+    assertParse("10.5", nil, "decimal")
+    assertParse("10a", nil, "trailing-junk")
+    assertParse("abc", nil, "alpha")
+    assertParse("", nil, "empty")
+    assertParse("100001", nil, "over-magnitude")
+    assertParse("-100001", nil, "over-magnitude-neg")
+    assertParse("100000", 100000, "max-magnitude")
+    assertParse("-100000", -100000, "max-magnitude-neg")
+
+    local record = seedStagedCampaignWithItem(9426, 100)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Seed 90 toward a goal of 100.
+    local evidence = makeDepositEvidence(record, { itemId = 9426, quantity = 90, donor = "Donor-Garona" })
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, guidName[1], guidName[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0,
+        90, "426: seed total 90")
+
+    local ok10 = select(1, GS:NewAdjustmentOperation(9426, 10, nil))
+    assertTrue(ok10 ~= nil, "426: +10 to exact goal prepares")
+    assertEq(GS:ApplyStagedConfigOperation(ok10), "accepted", "426: +10 accepted")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0,
+        100, "426: total reaches goal")
+
+    local over, overSt, overReason = GS:NewAdjustmentOperation(9426, 1, nil)
+    assertEq(over, nil, "426: over-goal rejected")
+    assertEq(overSt, "rejected", "426: over-goal status")
+    assertEq(overReason, "item_over_goal", "426: over-goal reason")
+
+    -- Push total over goal via a second donation so negative partial corrections
+    -- can be exercised while still above the goal.
+    local more = makeDepositEvidence(record, {
+        itemId = 9426, quantity = 20, donor = "Extra-Garona",
+        observedAt = (world.time or 0) + 10,
+    })
+    -- Force a distinct occurrence so quorum can credit another 20 (120 total).
+    more.occurrenceIndex = 2
+    for _, guidName in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(more, guidName[1], guidName[2])
+    end
+    local totalAfterExtra = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0
+    assertTrue(totalAfterExtra >= 100, "426: total at/above goal after extra got=" .. tostring(totalAfterExtra))
+    if totalAfterExtra < 120 then
+        -- If donation admission did not stack, synthesize over-goal with an
+        -- already-accepted path by temporarily relaxing through ledger append
+        -- is out of scope; instead seed a fresh campaign for the over-goal case.
+        record = seedStagedCampaignWithItem(9427, 100)
+        local seed90 = makeDepositEvidence(record, { itemId = 9427, quantity = 90 })
+        for _, guidName in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(seed90, guidName[1], guidName[2])
+        end
+        -- Accept an adjustment that reaches goal, then use ApplyAdjustmentMutation
+        -- is blocked for further positives. Build over-goal by accepting donations
+        -- that do not enforce the goal ceiling (automatic tracking unchanged).
+        local boost = makeDepositEvidence(record, {
+            itemId = 9427, quantity = 30, donor = "Boost-Garona",
+            observedAt = (world.time or 0) + 20,
+        })
+        boost.occurrenceIndex = 2
+        for _, guidName in ipairs({
+            { "Player-1-Alice", "Alice-Garona" },
+            { "Player-1-Bob", "Bob-Garona" },
+            { "Player-1-Carol", "Carol-Garona" },
+        }) do
+            GS:_AdmitObservationForTests(boost, guidName[1], guidName[2])
+        end
+        totalAfterExtra = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9427]) or 0
+        local overItem = 9427
+        assertTrue(totalAfterExtra > 100,
+            "426: donation can exceed goal got=" .. tostring(totalAfterExtra))
+        local posBlocked = select(1, GS:NewAdjustmentOperation(overItem, 1, nil))
+        assertEq(posBlocked, nil, "426: positive blocked while over goal")
+        local negPartial = select(1, GS:NewAdjustmentOperation(overItem, -10, nil))
+        assertTrue(negPartial ~= nil, "426: partial negative while over goal prepares")
+        assertEq(GS:ApplyStagedConfigOperation(negPartial), "accepted", "426: partial negative accepted")
+        local afterNeg = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[overItem]) or 0
+        assertEq(afterNeg, totalAfterExtra - 10, "426: partial negative result")
+        assertTrue(afterNeg > 100, "426: result may remain above goal")
+    else
+        local posBlocked = select(1, GS:NewAdjustmentOperation(9426, 1, nil))
+        assertEq(posBlocked, nil, "426: positive blocked while over goal")
+        local negPartial = select(1, GS:NewAdjustmentOperation(9426, -10, nil))
+        assertTrue(negPartial ~= nil, "426: partial negative while over goal prepares")
+        assertEq(GS:ApplyStagedConfigOperation(negPartial), "accepted", "426: partial negative accepted")
+        local afterNeg = tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9426]) or 0
+        assertEq(afterNeg, totalAfterExtra - 10, "426: partial negative result")
+        assertTrue(afterNeg > 100, "426: result may remain above goal")
+    end
+
+    -- Zero goal blocks positive adjustments.
+    record = seedStagedCampaignWithItem(9428, 0)
+    local zeroPos, zeroSt, zeroReason = GS:NewAdjustmentOperation(9428, 5, nil)
+    assertEq(zeroPos, nil, "426: zero-goal positive rejected")
+    assertEq(zeroSt, "rejected", "426: zero-goal status")
+    assertEq(zeroReason, "item_over_goal", "426: zero-goal reason")
+
+    -- Membership: unknown / removed item cannot prepare.
+    local missing, missSt, missReason = GS:NewAdjustmentOperation(9999426, 1, nil)
+    assertEq(missing, nil, "426: non-requested rejected")
+    assertEq(missSt, "rejected", "426: non-requested status")
+    assertEq(missReason, "item_not_requested", "426: non-requested reason")
+
+    -- Zero-progress and completed items remain adjustable (membership only).
+    record = seedStagedCampaignWithItem(9429, 50)
+    local zeroProgress = select(1, GS:NewAdjustmentOperation(9429, 1, nil))
+    assertTrue(zeroProgress ~= nil, "426: zero-progress item prepares")
+    assertEq(GS:ApplyStagedConfigOperation(zeroProgress), "accepted", "426: zero-progress apply")
+    local fill = select(1, GS:NewAdjustmentOperation(9429, 49, nil))
+    assertTrue(fill ~= nil, "426: fill to completed prepares")
+    assertEq(GS:ApplyStagedConfigOperation(fill), "accepted", "426: completed apply")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9429]) or 0,
+        50, "426: completed total")
+    local completedNeg = select(1, GS:NewAdjustmentOperation(9429, -5, nil))
+    assertTrue(completedNeg ~= nil, "426: completed item still adjustable")
+    assertEq(GS:ApplyStagedConfigOperation(completedNeg), "accepted", "426: completed negative")
+
+    -- Confirmation copy: Unassigned + before/after totals.
+    record = seedStagedCampaignWithItem(9430, 100)
+    local preview = GS:PreviewAdjustment(9430, 10, nil)
+    assertTrue(type(preview) == "table", "426: preview for confirm")
+    local confirm = GS.FormatAdjustmentConfirmation(preview, "Test Rose (#9430)")
+    assertTrue(confirm:find("Test Rose (#9430)", 1, true) ~= nil, "426: confirm item name")
+    assertTrue(confirm:find("+10", 1, true) ~= nil, "426: confirm signed change")
+    assertTrue(confirm:find("0 → 10", 1, true) ~= nil, "426: confirm before/after")
+    assertTrue(confirm:find("Unassigned", 1, true) ~= nil, "426: confirm Unassigned")
+    local previewNamed = GS:PreviewAdjustment(9430, -1, "Alice-Garona")
+    -- Negative from zero fails floor; seed one first.
+    local seedOne = select(1, GS:NewAdjustmentOperation(9430, 5, "Alice-Garona"))
+    assertTrue(seedOne ~= nil, "426: attributed seed prepares")
+    assertEq(GS:ApplyStagedConfigOperation(seedOne), "accepted", "426: attributed seed")
+    previewNamed = GS:PreviewAdjustment(9430, -2, "Alice-Garona")
+    assertTrue(type(previewNamed) == "table", "426: attributed preview")
+    local confirmNamed = GS.FormatAdjustmentConfirmation(previewNamed, "Test Rose")
+    assertTrue(confirmNamed:find("Alice-Garona", 1, true) ~= nil, "426: confirm named credit")
+    assertTrue(confirmNamed:find("Character contribution", 1, true) ~= nil,
+        "426: confirm player before/after")
+
+    -- Item-total and attributed floors still hold.
+    local floorItem, floorItemSt, floorItemReason = GS:NewAdjustmentOperation(9430, -100, nil)
+    assertEq(floorItem, nil, "426: item floor rejects")
+    assertEq(floorItemReason, "item_negative", "426: item floor reason")
+    local floorPlayer, _, floorPlayerReason = GS:NewAdjustmentOperation(9430, -100, "Alice-Garona")
+    assertEq(floorPlayer, nil, "426: player floor rejects")
+    assertTrue(floorPlayerReason == "player_negative" or floorPlayerReason == "item_negative",
+        "426: player/item floor reason got=" .. tostring(floorPlayerReason))
+
+    -- Local commit revalidates membership when the item is removed mid-flight.
+    record = seedStagedCampaignWithItem(9431, 100)
+    local pendingOp = select(1, GS:NewAdjustmentOperation(9431, 3, nil))
+    assertTrue(pendingOp ~= nil, "426: pending op prepared")
+    local removeOp = GS:NewConfigOperation("set-requested-item", { itemId = 9431 }, { removed = true })
+    assertEq(GS:ApplyStagedConfigOperation(removeOp), "accepted", "426: item removed")
+    local stGone, reasonGone = GS:ApplyStagedConfigOperation(pendingOp)
+    assertEq(stGone, "rejected", "426: removed-item commit rejected")
+    assertEq(reasonGone, "item_not_requested", "426: removed-item reason")
+end
+
+do
+    -- #430-1) Goal ceiling is local-authoring only; remote/history admission converges.
+    local record = seedStagedCampaignWithItem(9501, 100)
+    local evidence = makeDepositEvidence(record, { itemId = 9501, quantity = 90 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(evidence, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        90, "430-1: seed 90")
+
+    -- Author prepares +10 while under goal; snapshot the real authored body, then a
+    -- donation arrives first (reorder). Deliver through AdmitRemoteOperation.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9501, 10, nil))
+    assertTrue(adjOp ~= nil, "430-1: +10 prepared under goal")
+    local authoredAdj = snapshotOp(adjOp)
+    assertTrue(type(authoredAdj) == "table" and type(authoredAdj.id) == "string",
+        "430-1: authored adjustment snapshot")
+    local authoredAdjId = authoredAdj.id
+    local authoredDataset = authoredAdj.datasetId
+    local authoredCampaign = authoredAdj.campaignId
+    local extra = makeDepositEvidence(record, {
+        itemId = 9501, quantity = 20, donor = "LateDonor-Garona",
+        observedAt = (world.time or 0) + 5,
+    })
+    extra.occurrenceIndex = 2
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(extra, pair[1], pair[2])
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        110, "430-1: donation first raises total over authored base")
+
+    -- Floor without ceiling allows the historical +10; with ceiling it would reject.
+    local floorRemote = select(1, GS.AdjustmentFloorOk(
+        record, 9501, 10, nil, record.currentCampaignId, nil))
+    assertEq(floorRemote, true, "430-1: remote floor (no ceiling) accepts over-goal history")
+    local floorLocal = select(1, GS.AdjustmentFloorOk(
+        record, 9501, 10, nil, record.currentCampaignId, { enforceGoalCeiling = true }))
+    assertEq(floorLocal, false, "430-1: local ceiling still blocks new +10 at 110/100")
+
+    local stRemote, reasonRemote = GS:AdmitRemoteOperation(authoredAdj, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stRemote, "accepted",
+        "430-1: AdmitRemoteOperation after donation err=" .. tostring(reasonRemote))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        120, "430-1: donation+adjustment converge to 120")
+    assertTrue(record.operations and record.operations.records
+        and record.operations.records[authoredAdjId] ~= nil,
+        "430-1: authenticated remote adjustment retained")
+
+    local stDup, reasonDup = GS:AdmitRemoteOperation(authoredAdj, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stDup, "duplicate",
+        "430-1: duplicate AdmitRemoteOperation credits once got=" .. tostring(reasonDup))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        120, "430-1: total unchanged after duplicate")
+
+    -- Local authoring ceiling still blocks new positives while over goal.
+    local refill = select(1, GS:NewAdjustmentOperation(9501, -5, nil))
+    assertTrue(refill ~= nil, "430-1: negative prepares")
+    assertEq(GS:ApplyStagedConfigOperation(refill), "accepted", "430-1: negative local apply")
+    local remotePos = select(1, GS:NewAdjustmentOperation(9501, 3, nil))
+    assertEq(remotePos, nil, "430-1: local prep still rejects over-goal positive")
+    record = GS:GetCurrentRecord()
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9501]) or 0,
+        115, "430-1: after negative correction")
+    assertEq(authoredAdj.datasetId, authoredDataset, "430-1: authored body dataset stable")
+    assertEq(authoredAdj.campaignId, authoredCampaign, "430-1: authored body campaign stable")
+
+    -- Lowered/zero goal must not block authenticated historical admission.
+    -- Keep the originally authored dataset/campaign/event identity unchanged.
+    record = seedStagedCampaignWithItem(9502, 100)
+    local seed90 = makeDepositEvidence(record, { itemId = 9502, quantity = 90 })
+    for _, pair in ipairs({
+        { "Player-1-Alice", "Alice-Garona" },
+        { "Player-1-Bob", "Bob-Garona" },
+        { "Player-1-Carol", "Carol-Garona" },
+    }) do
+        GS:_AdmitObservationForTests(seed90, pair[1], pair[2])
+    end
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local histAdj = select(1, GS:NewAdjustmentOperation(9502, 10, nil))
+    assertTrue(histAdj ~= nil, "430-1: hist +10 prepared")
+    local histStored = snapshotOp(histAdj)
+    assertTrue(type(histStored) == "table" and type(histStored.id) == "string",
+        "430-1: hist +10 snapshot")
+    local histId = histStored.id
+    local histDataset = histStored.datasetId
+    local histCampaign = histStored.campaignId
+    assertEq(histDataset, record.datasetId, "430-1: hist snapshot keeps dataset")
+    assertEq(histCampaign, record.currentCampaignId, "430-1: hist snapshot keeps campaign")
+
+    -- Same dataset/campaign: later goal reduction, then admit the unchanged body.
+    local goalOp = GS:NewConfigOperation("set-requested-item", { itemId = 9502 }, {
+        itemId = 9502, goal = 0, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(goalOp), "accepted", "430-1: goal lowered to 0")
+    record = GS:GetCurrentRecord()
+    assertEq(record.datasetId, histDataset, "430-1: dataset unchanged after goal lower")
+    assertEq(record.currentCampaignId, histCampaign, "430-1: campaign unchanged after goal lower")
+    local localBlocked = select(1, GS:NewAdjustmentOperation(9502, 1, nil))
+    assertEq(localBlocked, nil, "430-1: new local positive still blocked by zero goal")
+
+    local stZero, reasonZero = GS:AdmitRemoteOperation(histStored, {
+        sender = "Alice-Garona",
+    })
+    assertEq(stZero, "accepted",
+        "430-1: historical +10 admitted after goal lowered to 0 err=" .. tostring(reasonZero))
+    assertEq(histStored.id, histId, "430-1: admitted body kept original op id")
+    assertEq(histStored.datasetId, histDataset, "430-1: admitted body kept original dataset")
+    assertEq(histStored.campaignId, histCampaign, "430-1: admitted body kept original campaign")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9502]) or 0,
+        100, "430-1: zero-goal peer converges with history")
+    assertTrue(record.operations and record.operations.records
+        and record.operations.records[histId] ~= nil,
+        "430-1: historical adjustment retained under original id")
+
+    local stZeroDup = select(1, GS:AdmitRemoteOperation(histStored, {
+        sender = "Alice-Garona",
+    }))
+    assertEq(stZeroDup, "duplicate", "430-1: zero-goal history duplicate credits once")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[9502]) or 0,
+        100, "430-1: zero-goal total unchanged after duplicate")
+end
+
+do
+    -- #430-2/3/4) Attribution autocomplete beyond 256 + tonumber multi-return + Apply button.
+    if type(CopyTable) ~= "function" then
+        function CopyTable(t)
+            if type(t) ~= "table" then return t end
+            local out = {}
+            for k, v in pairs(t) do
+                out[k] = type(v) == "table" and CopyTable(v) or v
+            end
+            return out
+        end
+    end
+    local created = {}
+    local function makeRegion(objectType, name, parent, template)
+        local region = {
+            _shown = true,
+            _text = "",
+            _enabled = true,
+            _alpha = 1,
+            _scripts = {},
+            _hooks = {},
+            _points = {},
+            _width = 180,
+            _height = 20,
+            parent = parent,
+            name = name,
+            objectType = objectType or "Frame",
+            registeredEvents = {},
+        }
+        function region:GetObjectType() return self.objectType end
+        function region:SetShown(v) self._shown = v and true or false end
+        function region:IsShown() return self._shown end
+        function region:Show() self._shown = true end
+        function region:Hide() self._shown = false end
+        function region:SetSize(w, h)
+            self._width = tonumber(w) or self._width
+            self._height = tonumber(h) or self._height
+        end
+        function region:SetWidth(w) self._width = tonumber(w) or self._width end
+        function region:SetHeight(h) self._height = tonumber(h) or self._height end
+        function region:GetWidth() return self._width end
+        function region:GetHeight() return self._height end
+        function region:SetPoint(...) self._points[#self._points + 1] = { ... } end
+        function region:ClearAllPoints() self._points = {} end
+        function region:SetAllPoints() end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetText(t) self._text = tostring(t or "") end
+        function region:GetText() return self._text end
+        function region:SetTextColor() end
+        function region:SetHighlightColor() end
+        function region:SetAutoFocus() end
+        function region:SetMaxLetters() end
+        function region:SetNumeric() end
+        function region:SetEnabled(v) self._enabled = v and true or false end
+        function region:IsEnabled() return self._enabled end
+        function region:Enable() self._enabled = true end
+        function region:Disable() self._enabled = false end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:SetAlpha(a) self._alpha = a end
+        function region:SetScript(ev, fn) self._scripts[ev] = fn end
+        function region:GetScript(ev) return self._scripts[ev] end
+        function region:HookScript(ev, fn)
+            self._hooks[ev] = self._hooks[ev] or {}
+            self._hooks[ev][#self._hooks[ev] + 1] = fn
+        end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterEvent(e) self.registeredEvents[e] = nil end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:HasFocus() return self._focused end
+        function region:SetFocus() self._focused = true end
+        function region:ClearFocus()
+            self._focused = false
+            local fn = self._scripts.OnEditFocusLost
+            if fn then fn(self) end
+        end
+        function region:Click(...)
+            local fn = self._scripts.OnClick
+            if fn then fn(self, ...) end
+        end
+        function region:SetCursorPosition() end
+        function region:GetCursorPosition() return 0 end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:GetFrameLevel() return 0 end
+        function region:SetClampedToScreen() end
+        function region:SetClipsChildren() end
+        function region:SetScrollChild(child) self.scrollChild = child end
+        function region:SetVerticalScroll() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetNonSpaceWrap() end
+        function region:GetStringWidth() return 40 end
+        function region:GetStringHeight() return 12 end
+        function region:SetFontObject() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:RegisterForClicks() end
+        function region:SetMinMaxValues() end
+        function region:SetValueStep() end
+        function region:SetValue() end
+        function region:GetValue() return self.value or 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:SetColorTexture() end
+        function region:SetTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetVertexColor() end
+        function region:SetBlendMode() end
+        function region:SetDefaultText() end
+        function region:SetupMenu() end
+        function region:GenerateMenu() end
+        function region:SetBackdrop() end
+        function region:SetBackdropColor() end
+        function region:SetBackdropBorderColor() end
+        function region:CreateFontString()
+            return makeRegion("FontString", nil, self)
+        end
+        function region:CreateTexture()
+            return makeRegion("Texture", nil, self)
+        end
+        function region:CreateFrame(ft, n, p, tmpl)
+            return CreateFrame(ft, n, p or self, tmpl)
+        end
+        -- Simulate user typing into an EditBox.
+        function region:TypeText(text)
+            self._text = tostring(text or "")
+            local fn = self._scripts.OnTextChanged
+            if fn then fn(self, true) end
+        end
+        if template and tostring(template):find("ScrollFrame", 1, true) then
+            region.ScrollBar = makeRegion("Slider", nil, region)
+            region.ScrollBar:SetWidth(20)
+            region.ScrollBar._shown = false
+        end
+        if template and tostring(template):find("InputBox", 1, true) then
+            region.objectType = "EditBox"
+            region.Instructions = makeRegion("FontString", nil, region)
+            function region.Instructions:SetText(t) self._text = tostring(t or "") end
+        end
+        if template and tostring(template):find("UIPanelButton", 1, true) then
+            region.objectType = "Button"
+        end
+        if objectType == "Button" or (template and tostring(template):find("Button", 1, true)) then
+            region.objectType = region.objectType ~= "Frame" and region.objectType or "Button"
+        end
+        if objectType == "EditBox" then
+            region.objectType = "EditBox"
+        end
+        created[#created + 1] = region
+        return region
+    end
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        return makeRegion(frameType or "Frame", name, parent, template)
+    end
+    UIParent = UIParent or makeRegion("Frame", "UIParent")
+
+    -- Force-reload Controls so buttonEnabled / OnTextChanged repairs are present
+    -- even when an earlier harness already registered AddEditBoxWithButton.
+    loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    if not (SF.SettingsUI and SF.SettingsUI.DefinitionRenderer) then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    end
+    -- Capture production Definition via Page:Build without requiring every chrome
+    -- widget. EnsureRosterListener still runs under this CreateFrame stub.
+    SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {}
+    local realRendererBuild = SF.SettingsUI.DefinitionRenderer.Build
+    SF.SettingsUI.DefinitionRenderer.Build = function(_, panel, pageDef)
+        panel.__sfPageDef = pageDef
+        panel.__sfPageBuilder = panel.__sfPageBuilder or {
+            RegisterRefresh = function() end,
+            Refresh = function() end,
+            FireRefresh = function() end,
+        }
+        return panel
+    end
+    -- Reload Configuration so helpers and definition pick up repairs.
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pagesById.guildSuppliesConfiguration = nil
+    local buildLoadOk, buildLoadErr = pcall(function()
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    end)
+    assertEq(buildLoadOk, true,
+        "430-ui: config module loads under multi-return-safe CreateFrame: " .. tostring(buildLoadErr))
+    local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
+    assertTrue(configPage ~= nil, "430-ui: config page registered")
+
+    resetDb()
+    initGS()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.guild.clubId = 42
+    -- Build a roster larger than 256 with a distinctive late member.
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+        { name = "Bob-Garona", guid = "Player-1-Bob", rankOrder = 2, online = true },
+        { name = "Carol-Garona", guid = "Player-1-Carol", rankOrder = 3, online = true },
+    }
+    for i = 1, 300 do
+        world.guild.members[#world.guild.members + 1] = {
+            name = string.format("Member%03d-Garona", i),
+            guid = string.format("Player-1-M%03d", i),
+            rankOrder = 4,
+            online = (i % 2 == 0),
+        }
+    end
+    world.guild.members[#world.guild.members + 1] = {
+        name = "ZedLast-Garona",
+        guid = "Player-1-ZedLast",
+        rankOrder = 4,
+        online = true,
+    }
+    -- Multi-return online count > 36 reproduces the tonumber base bug.
+    local priorGetNum = GetNumGuildMembers
+    function GetNumGuildMembers()
+        local total = #world.guild.members
+        local online = 50
+        return total, online, online
+    end
+    settleRoster()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 9503 }, {
+        itemId = 9503, goal = 50, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "430-ui: item seeded")
+
+    local panel = makeRegion("Frame", "ConfigPanel")
+    function panel:IsVisible() return true end
+    local buildOk, buildErr = pcall(function()
+        configPage:Build(panel)
+    end)
+    SF.SettingsUI.DefinitionRenderer.Build = realRendererBuild
+    assertEq(buildOk, true, "430-ui: Build with multi-return guild count: " .. tostring(buildErr))
+    local pageDef = panel.__sfPageDef
+    assertTrue(type(pageDef) == "table", "430-ui: page definition stored")
+
+    local attrSuggest, attrResolved, attrGet, attrSet
+    local qtyEnabled, qtyButtonEnabled, qtyOnTextChanged, qtyOnSubmit, qtyGet
+    local itemOnChanged
+    for _, sec in ipairs(pageDef.sections or {}) do
+        if sec.id == "gsAdjust" then
+            for _, item in ipairs(sec.items or {}) do
+                if item.type == "autocomplete" then
+                    attrSuggest = item.getSuggestions
+                    attrResolved = item.onResolved
+                    attrGet = item.get
+                    attrSet = item.set
+                    assertEq(item.onTextChanged, nil,
+                        "430-ui: attribution has no redundant onTextChanged")
+                elseif item.type == "editboxButton"
+                    and item.label
+                    and tostring(item.label):find("Quantity", 1, true) then
+                    qtyEnabled = item.enabled
+                    qtyButtonEnabled = item.buttonEnabled
+                    qtyOnTextChanged = item.onTextChanged
+                    qtyOnSubmit = item.onSubmit
+                    qtyGet = item.get
+                elseif item.type == "dropdown"
+                    and item.label
+                    and tostring(item.label):find("Requested item", 1, true) then
+                    itemOnChanged = item.onValueChanged
+                end
+            end
+        end
+    end
+    assertTrue(type(attrSuggest) == "function", "430-ui: attribution getSuggestions")
+    assertTrue(type(attrSet) == "function", "430-ui: attribution bound setter")
+    assertTrue(type(qtyButtonEnabled) == "function", "430-ui: quantity buttonEnabled")
+    assertTrue(type(qtyOnTextChanged) == "function", "430-ui: quantity onTextChanged")
+
+    -- Suggestions must reach members beyond roster row 256 without error.
+    local suggestOk, suggestions = pcall(attrSuggest, nil, "ZedLast")
+    assertEq(suggestOk, true, "430-ui: suggestions with multi-return count: " .. tostring(suggestions))
+    local foundZed = false
+    for i = 1, #(suggestions or {}) do
+        if suggestions[i].value == "ZedLast-Garona" or suggestions[i].text == "ZedLast-Garona" then
+            foundZed = true
+        end
+    end
+    assertEq(foundZed, true, "430-ui: ZedLast beyond row 256 is selectable")
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona", label = "ZedLast-Garona" })
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved attribution retained")
+
+    -- Unassigned remains the empty default and is restored on clear.
+    attrSet("")
+    assertEq(attrGet(), "", "430-ui: cleared attribution shows empty/Unassigned draft")
+    local emptySuggestions = attrSuggest(nil, "")
+    assertTrue(type(emptySuggestions) == "table" and #emptySuggestions >= 1,
+        "430-ui: empty prefix yields suggestions")
+    assertEq(emptySuggestions[1].value, false, "430-ui: Unassigned is first empty suggestion")
+
+    -- Typing after roster reorder keeps an explicit selection until cleared.
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona" })
+    -- Move ZedLast earlier without losing the draft selection value.
+    world.guild.members[2], world.guild.members[#world.guild.members] =
+        world.guild.members[#world.guild.members], world.guild.members[2]
+    if GS and configPage.Refresh then
+        -- Invalidate cache via roster event path.
+        fireEvent("GUILD_ROSTER_UPDATE")
+    end
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: selection survives roster reorder")
+
+    -- Select item so quantity row enables; Apply tracks validity live.
+    local sectionMessages = {}
+    local section = {
+        ClearMessage = function() end,
+        SetMessage = function(_, msg, sev)
+            sectionMessages[#sectionMessages + 1] = { msg = msg, sev = sev }
+        end,
+    }
+    local ctx = { section = section, pageBuilder = panel.__sfPageBuilder }
+    assertTrue(type(itemOnChanged) == "function", "430-ui: item onValueChanged")
+    itemOnChanged(ctx, 9503)
+    assertEq(qtyEnabled(), true, "430-ui: quantity edit enables with item selected")
+    assertEq(qtyButtonEnabled(""), false, "430-ui: Apply disabled for empty quantity")
+    qtyOnTextChanged("+10")
+    assertEq(qtyGet(), "+10", "430-ui: draft preserves invalid +10 text")
+    assertEq(qtyButtonEnabled("+10"), false, "430-ui: Apply disabled for +10")
+    qtyOnTextChanged("0")
+    assertEq(qtyButtonEnabled("0"), false, "430-ui: Apply disabled for zero")
+    qtyOnTextChanged("10.5")
+    assertEq(qtyButtonEnabled("10.5"), false, "430-ui: Apply disabled for decimal")
+    qtyOnTextChanged("10")
+    assertEq(qtyButtonEnabled("10"), true, "430-ui: Apply enabled for valid 10")
+    qtyOnTextChanged("-10")
+    assertEq(qtyButtonEnabled("-10"), true, "430-ui: Apply enabled for valid -10")
+
+    -- #430 connected controls: attribution autocomplete drives the real Apply button
+    -- through production RefreshPageControls → RegisterRefresh (not direct validators).
+    local sharedPB = {
+        _refresh = {},
+        RegisterRefresh = function(self, fn)
+            self._refresh[#self._refresh + 1] = fn
+        end,
+        FireRefresh = function(self)
+            for i = 1, #self._refresh do self._refresh[i]() end
+        end,
+    }
+    local sharedSection = {
+        __sfPageBuilder = sharedPB,
+        AddRow = function(self, _, builder)
+            local row = makeRegion("Frame", "SharedRow", nil)
+            builder(row)
+            return row
+        end,
+    }
+    -- Production attribution handlers call RefreshPageControls via Page:Refresh.
+    configPage.panel = makeRegion("Frame", "ConnectedConfigPanel")
+    function configPage.panel:IsVisible() return true end
+    function configPage:Refresh()
+        sharedPB:FireRefresh()
+    end
+
+    local connectedBefore = #created
+    SF.SettingsUI.Controls:AddEditBoxWithButton(sharedSection, {
+        label = "Quantity change",
+        buttonText = "Apply adjustment",
+        get = qtyGet,
+        getSelectionKey = function() return "adj-connected" end,
+        enabled = qtyEnabled,
+        buttonEnabled = qtyButtonEnabled,
+        onTextChanged = qtyOnTextChanged,
+        onSubmit = function() end,
+    })
+    SF.SettingsUI.Controls:AddAutocomplete(sharedSection, {
+        label = "Attribution",
+        get = attrGet,
+        set = attrSet,
+        getSuggestions = function(prefix)
+            return attrSuggest(nil, prefix)
+        end,
+        onResolved = function(item)
+            attrResolved(nil, item)
+        end,
+        -- Production path: bound set only (no redundant onTextChanged).
+        maxSuggestions = 8,
+    })
+    local attrEdit, qtyEdit, applyBtn
+    for i = connectedBefore + 1, #created do
+        local obj = created[i]
+        if obj.GetObjectType and obj:GetObjectType() == "EditBox" then
+            if not qtyEdit then
+                qtyEdit = obj
+            elseif not attrEdit then
+                attrEdit = obj
+            end
+        elseif obj.GetObjectType and obj:GetObjectType() == "Button" and not applyBtn then
+            applyBtn = obj
+        end
+    end
+    assertTrue(attrEdit ~= nil and qtyEdit ~= nil and applyBtn ~= nil,
+        "430-ui: connected attribution+quantity controls created")
+
+    local function clickSuggestionLabeled(label)
+        for i = 1, #created do
+            local obj = created[i]
+            if obj.Text and tostring(obj.Text._text or "") == label and obj._scripts and obj._scripts.OnClick then
+                obj:Click()
+                return true
+            end
+        end
+        return false
+    end
+
+    local beforeProgress = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    local beforeTotal = tonumber(beforeProgress.itemTotals[9503]) or 0
+    local beforeZed = 0
+    if beforeProgress.contributions and beforeProgress.contributions["Zed-Garona"] then
+        beforeZed = tonumber(beforeProgress.contributions["Zed-Garona"][9503]) or 0
+    end
+    local beforeZedLast = 0
+    if beforeProgress.contributions and beforeProgress.contributions["ZedLast-Garona"] then
+        beforeZedLast = tonumber(beforeProgress.contributions["ZedLast-Garona"][9503]) or 0
+    end
+    local confirmCallsPartial = 0
+    local priorConfirmPartial = SF.SettingsUI.Dialogs and SF.SettingsUI.Dialogs.Confirm
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.Confirm = function()
+        confirmCallsPartial = confirmCallsPartial + 1
+    end
+    sectionMessages = {}
+
+    -- Unresolved prefix then valid quantity: real Apply stays disabled.
+    attrEdit:TypeText("Zed")
+    assertEq(attrGet(), "Zed", "430-ui: partial search draft retained")
+    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete edit shows partial search")
+    local partialSuggestions = attrSuggest(nil, "Zed")
+    local phantomPrefix = false
+    local foundZedLastPartial = false
+    for i = 1, #(partialSuggestions or {}) do
+        local value = partialSuggestions[i].value
+        if value == "Zed" or value == "Zed-Garona" then
+            phantomPrefix = true
+        end
+        if value == "ZedLast-Garona" then
+            foundZedLastPartial = true
+        end
+    end
+    assertEq(phantomPrefix, false, "430-ui: unmatched prefix is not a suggestion")
+    assertEq(foundZedLastPartial, true, "430-ui: real ZedLast still suggested for prefix")
+    qtyEdit:TypeText("8")
+    assertEq(qtyEdit:GetText(), "8", "430-ui: quantity draft typed while attribution unresolved")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: real Apply disabled for unresolved attribution")
+    -- Blur/refresh keeps unresolved search without crediting it.
+    attrEdit:ClearFocus()
+    assertEq(attrGet(), "Zed", "430-ui: unresolved search survives blur")
+    assertEq(attrEdit:GetText(), "Zed", "430-ui: autocomplete blur keeps unresolved text")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: Apply still disabled after unresolved blur")
+    qtyOnSubmit(ctx, "8")
+    assertEq(confirmCallsPartial, 0, "430-ui: unresolved attribution blocks confirm")
+    assertTrue(#sectionMessages >= 1 and sectionMessages[#sectionMessages].sev == "error",
+        "430-ui: unresolved attribution shows localized error")
+    assertTrue(tostring(sectionMessages[#sectionMessages].msg):find("Select Unassigned", 1, true)
+        or tostring(sectionMessages[#sectionMessages].msg):find("suggestions", 1, true),
+        "430-ui: unresolved attribution error explains selection requirement")
+    local afterPartial = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    assertEq(tonumber(afterPartial.itemTotals[9503]) or 0, beforeTotal,
+        "430-ui: unresolved submit creates no item total change")
+    local afterZed = 0
+    if afterPartial.contributions and afterPartial.contributions["Zed-Garona"] then
+        afterZed = tonumber(afterPartial.contributions["Zed-Garona"][9503]) or 0
+    end
+    assertEq(afterZed, beforeZed, "430-ui: unresolved submit creates no Zed-Garona phantom credit")
+
+    -- Click the real suggestion: Apply enables without retyping quantity.
+    attrEdit:SetFocus()
+    attrEdit:TypeText("Zed")
+    assertEq(clickSuggestionLabeled("ZedLast-Garona"), true,
+        "430-ui: clicked ZedLast suggestion beyond row 256")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: suggestion click resolves attribution")
+    assertEq(qtyEdit:GetText(), "8", "430-ui: quantity draft preserved across suggestion click")
+    assertEq(applyBtn:IsEnabled(), true,
+        "430-ui: real Apply enables after suggestion without qty retype")
+
+    -- Reverse: typing unresolved text disables the live Apply button.
+    attrEdit:TypeText("Zed")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: real Apply disables when attribution becomes unresolved")
+    -- Clearing restores Unassigned and re-enables Apply for valid quantity.
+    attrEdit:TypeText("")
+    assertEq(attrGet(), "", "430-ui: clear restores Unassigned display")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: real Apply enables for Unassigned + valid qty")
+    -- Exact typed name resolves without a click and updates Apply.
+    attrEdit:TypeText("ZedLast-Garona")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: exact typed name resolves without click")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: exact resolve enables real Apply")
+
+    -- Roster lag: unchanged blur must not invalidate a resolved selection.
+    local savedMembers = world.guild.members
+    world.guild.members = {
+        { name = "Alice-Garona", guid = "Player-1-Alice", rankOrder = 1, online = true },
+    }
+    fireEvent("GUILD_ROSTER_UPDATE")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: resolved selection survives roster lag")
+    local lagSuggestions = attrSuggest(nil, "Zed")
+    local lagHasResolved = false
+    for i = 1, #(lagSuggestions or {}) do
+        if lagSuggestions[i].value == "ZedLast-Garona" then
+            lagHasResolved = true
+        end
+    end
+    assertEq(lagHasResolved, true, "430-ui: lag suggestions keep resolved credit")
+    attrEdit:ClearFocus()
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: lag blur preserves resolved identity")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: lag blur keeps Apply enabled")
+    -- Retained suggestion selection + ClearFocus also preserves identity.
+    attrEdit:SetFocus()
+    attrEdit:TypeText("Zed")
+    assertEq(applyBtn:IsEnabled(), false, "430-ui: typing during lag unresolved disables Apply")
+    assertEq(clickSuggestionLabeled("ZedLast-Garona"), true,
+        "430-ui: clicked retained lag suggestion")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: lag suggestion re-resolves attribution")
+    assertEq(applyBtn:IsEnabled(), true, "430-ui: lag suggestion click enables Apply")
+    world.guild.members = savedMembers
+    fireEvent("GUILD_ROSTER_UPDATE")
+
+    -- Submit with resolved attribution still applies exact credit.
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        confirmCallsPartial = confirmCallsPartial + 1
+        if type(accept) == "function" then accept() end
+    end
+    qtyOnSubmit(ctx, "8")
+    assertTrue(confirmCallsPartial >= 1, "430-ui: resolved attribution reaches confirm/apply")
+    local afterSelect = GS:ProjectCampaignProgress(GS:GetCurrentRecord().currentCampaignId)
+    assertEq(tonumber(afterSelect.itemTotals[9503]) or 0, beforeTotal + 8,
+        "430-ui: resolved ZedLast adjustment applied to item total")
+    local afterZedLast = 0
+    if afterSelect.contributions and afterSelect.contributions["ZedLast-Garona"] then
+        afterZedLast = tonumber(afterSelect.contributions["ZedLast-Garona"][9503]) or 0
+    end
+    assertEq(afterZedLast, beforeZedLast + 8,
+        "430-ui: resolved credit is exact ZedLast-Garona")
+    local afterZed2 = 0
+    if afterSelect.contributions and afterSelect.contributions["Zed-Garona"] then
+        afterZed2 = tonumber(afterSelect.contributions["Zed-Garona"][9503]) or 0
+    end
+    assertEq(afterZed2, beforeZed, "430-ui: still no Zed-Garona phantom after real select")
+    SF.SettingsUI.Dialogs.Confirm = priorConfirmPartial
+    qtyOnTextChanged("10")
+    sharedPB:FireRefresh()
+    assertEq(qtyEdit:GetText(), "10", "430-ui: quantity draft retained after connected refresh")
+
+    -- Isolated quantity editboxButton: edit stays enabled while Apply toggles.
+    local btnSection = {
+        __sfPageBuilder = {
+            _refresh = {},
+            RegisterRefresh = function(self, fn)
+                self._refresh[#self._refresh + 1] = fn
+            end,
+            FireRefresh = function(self)
+                for i = 1, #self._refresh do self._refresh[i]() end
+            end,
+        },
+        AddRow = function(self, _, builder)
+            local row = makeRegion("Frame", "QtyRow", nil)
+            builder(row)
+            return row
+        end,
+    }
+    local liveDraft = { text = "" }
+    local createdBefore = #created
+    SF.SettingsUI.Controls:AddEditBoxWithButton(btnSection, {
+        label = "Quantity change",
+        buttonText = "Apply adjustment",
+        get = function() return liveDraft.text end,
+        getSelectionKey = function() return "qty-key" end,
+        enabled = function() return true end,
+        buttonEnabled = function(text)
+            return GS.ParseAdjustmentQuantity(text or "") ~= nil
+        end,
+        onTextChanged = function(text)
+            liveDraft.text = tostring(text or "")
+        end,
+        onSubmit = function() end,
+    })
+    local editBox, isolatedApply
+    for i = createdBefore + 1, #created do
+        local obj = created[i]
+        if obj.GetObjectType and obj:GetObjectType() == "EditBox" and not editBox then
+            editBox = obj
+        elseif obj.GetObjectType and obj:GetObjectType() == "Button" and not isolatedApply then
+            isolatedApply = obj
+        end
+    end
+    assertTrue(editBox ~= nil and isolatedApply ~= nil, "430-ui: edit+button created")
+    assertEq(editBox:IsEnabled(), true, "430-ui: edit enabled initially")
+    assertEq(isolatedApply:IsEnabled(), false, "430-ui: Apply disabled initially")
+    editBox:TypeText("10")
+    assertEq(editBox:IsEnabled(), true, "430-ui: edit stays editable after valid text")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: Apply enables on valid text")
+    editBox:TypeText("+10")
+    assertEq(editBox:IsEnabled(), true, "430-ui: edit stays editable on invalid text")
+    assertEq(isolatedApply:IsEnabled(), false, "430-ui: Apply disables on invalid text")
+    editBox:TypeText("7")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: Apply re-enables on corrected text")
+    -- Ordinary refresh preserves draft and button state.
+    btnSection.__sfPageBuilder:FireRefresh()
+    assertEq(editBox:GetText(), "7", "430-ui: refresh preserves quantity draft")
+    assertEq(isolatedApply:IsEnabled(), true, "430-ui: refresh keeps Apply enabled for valid draft")
+
+    -- Async confirmation: cancel preserves; success clears quantity via page submit path.
+    attrResolved(nil, { value = "ZedLast-Garona", text = "ZedLast-Garona" })
+    qtyOnTextChanged("5")
+    local confirmCalls = 0
+    local capturedAccept
+    local priorConfirm = SF.SettingsUI.Dialogs and SF.SettingsUI.Dialogs.Confirm
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.Dialogs = SF.SettingsUI.Dialogs or {}
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        confirmCalls = confirmCalls + 1
+        capturedAccept = accept
+        -- Cancel: do not invoke accept.
+    end
+    qtyOnSubmit(ctx, "5")
+    assertEq(confirmCalls, 1, "430-ui: confirm shown")
+    assertEq(qtyGet(), "5", "430-ui: cancel path preserves quantity draft")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: cancel path preserves attribution")
+
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        confirmCalls = confirmCalls + 1
+        if type(accept) == "function" then accept() end
+    end
+    qtyOnTextChanged("4")
+    qtyOnSubmit(ctx, "4")
+    assertTrue(confirmCalls >= 2, "430-ui: success confirm invoked")
+    assertEq(qtyGet(), "", "430-ui: success clears quantity")
+    assertEq(attrGet(), "ZedLast-Garona", "430-ui: success retains attribution/item context text")
+
+    -- Failure path: remove item then confirm accept → reject, draft preserved.
+    qtyOnTextChanged("3")
+    local pendingAccept
+    SF.SettingsUI.Dialogs.Confirm = function(_, _, _, accept)
+        pendingAccept = accept
+    end
+    qtyOnSubmit(ctx, "3")
+    assertTrue(type(pendingAccept) == "function", "430-ui: failure-case confirm captured")
+    local removeOp = GS:NewConfigOperation("set-requested-item", { itemId = 9503 }, { removed = true })
+    assertEq(GS:ApplyStagedConfigOperation(removeOp), "accepted", "430-ui: remove item before accept")
+    pendingAccept()
+    assertEq(qtyGet(), "3", "430-ui: failure preserves quantity draft")
+
+    SF.SettingsUI.Dialogs.Confirm = priorConfirm
+    GetNumGuildMembers = priorGetNum
+    CreateFrame = priorCreateFrame
+end
+
+---------------------------------------------------------------------------
+-- #427 Guild Info attribution + witness readiness
+---------------------------------------------------------------------------
+
+do
+    -- Alt donation retains source actor; logs/totals project to current main.
+    local record = seedStagedCampaignWithItem(42701, 100)
+    ensureNonOfficerRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "427-attr: assign")
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42701, quantity = 6, donor = "Eve-Garona",
+    })
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-attr: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-attr: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-attr: w3")
+
+    local events = record.accounting._consumableEvents
+    local donation = nil
+    for i = 1, #(events or {}) do
+        if tonumber(events[i].itemId) == 42701 then
+            donation = events[i]
+            break
+        end
+    end
+    assertTrue(donation ~= nil, "427-attr: donation row present")
+    assertEq(donation.actor, "Eve-Garona", "427-attr: durable actor is original alt")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42701]) or 0, 6, "427-attr: item total")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42701]) or 0, 6,
+        "427-attr: totals under current main")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42701]) or 0, 0,
+        "427-attr: alt key not separately counted")
+    local rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertTrue(type(rows) == "table" and #rows >= 1, "427-attr: history rows")
+    assertEq(rows[1].actor, "Eve-Garona", "427-attr: history keeps original actor")
+    assertEq(rows[1].displayActor, "Dave-Garona", "427-attr: history displays main")
+    assertTrue(rows[1].text:find("Dave%-Garona", 1) ~= nil, "427-attr: text names main")
+
+    -- Main donation on same group aggregates once; grand total is exact sum.
+    local e2 = makeDepositEvidence(record, {
+        itemId = 42701, quantity = 4, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "a" }, neighborsNewer = { "b" },
+        observedAt = (world.time or 0) + 5000,
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(e2, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-agg: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(e2, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-agg: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(e2, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-agg: w3")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42701]) or 0, 10, "427-agg: no grand-total drift")
+    assertEq(tonumber(progress.contributions["Dave-Garona"][42701]) or 0, 10,
+        "427-agg: main+alt once under main")
+
+    -- Change Main → historical display/totals follow new main without rewriting events.
+    assertEq(changeMainGuid("Player-1-Dave", "Player-1-Eve"), "accepted", "427-move: change main")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42701]) or 0, 10, "427-move: item total stable")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42701]) or 0, 10,
+        "427-move: totals under new main")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42701]) or 0, 0,
+        "427-move: old main key empty")
+    rows = GS:ListCampaignHistory(record.currentCampaignId, 5, 0)
+    assertEq(rows[1].actor == "Eve-Garona" or rows[1].actor == "Dave-Garona", true,
+        "427-move: durable actors unchanged")
+    local sawEveDisplay = false
+    for i = 1, #rows do
+        if tonumber(rows[i].itemId) == 42701 then
+            assertEq(rows[i].displayActor, "Eve-Garona", "427-move: display under Eve")
+            sawEveDisplay = true
+        end
+    end
+    assertTrue(sawEveDisplay, "427-move: projected rows present")
+    -- Durable event still has original Eve donation actor.
+    assertEq(donation.actor, "Eve-Garona", "427-move: original donation actor immutable")
+
+    -- Unassign former main (now alt Dave) restores Dave's own display identity for his gift.
+    assertEq(unassignAltGuid("Player-1-Dave", "Player-1-Eve"), "accepted", "427-un: unassign dave")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42701]) or 0, 10, "427-un: item total stable")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42701]) or 0, 6,
+        "427-un: eve keeps her 6")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42701]) or 0, 4,
+        "427-un: dave regains his 4")
+end
+
+do
+    -- Incomplete Guild Info keeps three-witness pending; officer-direct still works.
+    local record = seedStagedCampaignWithItem(42702, 50)
+    ensureNonOfficerRoster()
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    assertTrue(giRec ~= nil, "427-sync: gi record")
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = false
+    assertEq(GS.WitnessRelationshipsReady(record), false, "427-sync: not ready")
+    local evidence = makeDepositEvidence(record, { itemId = 42702, quantity = 3 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-sync: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-sync: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-sync: w3 still pending while syncing")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42702]) or 0,
+        0, "427-sync: no three-witness credit while syncing")
+
+    -- Officer-direct is not blocked by incomplete relationships.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local officerEv = makeDepositEvidence(record, {
+        itemId = 42702, quantity = 2, occurrenceIndex = 2,
+        neighborsOlder = { "o1" }, neighborsNewer = { "o2" },
+        observedAt = (world.time or 0) + 8000,
+    })
+    local stOff, rOff = GS:_AdmitObservationForTests(officerEv, "Player-1-Alice", "Alice-Garona")
+    assertEq(stOff, "accepted", "427-sync: officer-direct accepted r=" .. tostring(rOff))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42702]) or 0,
+        2, "427-sync: officer credited once")
+
+    -- Completing baseline reevaluates pending three-witness cluster.
+    giRec.baseline.complete = true
+    if GI.NotifyUI then
+        GI.NotifyUI("baseline-complete")
+    elseif GS.ReevaluatePendingEvidence then
+        GS.ReevaluatePendingEvidence(record)
+    end
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42702]) or 0,
+        5, "427-sync: pending witnesses credited after ready")
+end
+
+do
+    -- Legacy identityLinks remain loadable but are not witness authority.
+    local record = seedStagedCampaignWithItem(42703, 20)
+    ensureNonOfficerRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local linkOp = GS:NewLinkCharactersOperation("Player-1-Dave", "Player-1-Eve")
+    assertEq(GS:ApplyStagedConfigOperation(linkOp), "accepted", "427-legacy: inert link op")
+    assertEq(GS.ValidateIdentityLinks(record.identityLinks), true, "427-legacy: links valid")
+    assertEq(GS.AreSameWitnessIdentity(record, "Player-1-Dave", "Player-1-Eve"), false,
+        "427-legacy: links do not drive witness identity")
+    assertEq(GS.PROVIDER_SCHEMA, 3, "427-schema: provider schema 3")
+    assertEq(GS.SCHEMA_VERSION, 1, "427-schema: durable root schema unchanged")
+end
+
+do
+    -- Settings page no longer exposes witness character links.
+    local conf = io.open(
+        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r")
+    assertTrue(conf ~= nil, "427-ui: config readable")
+    local body = conf:read("*a")
+    conf:close()
+    assertTrue(not body:find('id = "gsLinks"', 1, true), "427-ui: gsLinks gone")
+    assertTrue(not body:find("Witness character links", 1, true), "427-ui: title gone")
+end
+
+---------------------------------------------------------------------------
+-- #427 repair batch: publish / projection context / actorGuid / adj floors
+---------------------------------------------------------------------------
+
+do
+    -- Repair-1: pending cluster verified after Guild Info ready publishes ledger.
+    local record = seedStagedCampaignWithItem(42711, 40)
+    ensureNonOfficerRoster()
+    GS:EnsureGossipProvider()
+    assertTrue(GS.EnsureGuildInfoBridge(), "427-r1: bridge registered")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    assertTrue(giRec ~= nil, "427-r1: gi record")
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = false
+    local evidence = makeDepositEvidence(record, { itemId = 42711, quantity = 7 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-r1: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-r1: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r1: w3 still pending")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42711]) or 0,
+        0, "427-r1: no credit while syncing")
+
+    local ledgerNotifies = 0
+    local prevNotify = GS.NotifyLocalDurableChange
+    GS.NotifyLocalDurableChange = function(reason)
+        if reason == "ledger" then
+            ledgerNotifies = ledgerNotifies + 1
+        end
+        if prevNotify then
+            return prevNotify(reason)
+        end
+    end
+    giRec.baseline.complete = true
+    GI.NotifyUI("baseline-complete")
+    drainExportMaint(32)
+    GS.NotifyLocalDurableChange = prevNotify
+
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42711]) or 0,
+        7, "427-r1: credited after ready")
+    assertTrue(ledgerNotifies >= 1, "427-r1: durable ledger notify fired")
+    local sawDonationExport = false
+    local bodies = collectAllExportBodies()
+    for i = 1, #bodies do
+        local body = bodies[i].body
+        if body and body.kind == "gs-ledger-event" and type(body.event) == "table"
+            and tonumber(body.event.itemId) == 42711 then
+            sawDonationExport = true
+            break
+        end
+    end
+    assertTrue(sawDonationExport, "427-r1: verified donation exported for sync")
+
+    -- No durable publish when reevaluation verifies nothing.
+    ledgerNotifies = 0
+    GS.NotifyLocalDurableChange = function(reason)
+        if reason == "ledger" then
+            ledgerNotifies = ledgerNotifies + 1
+        end
+        if prevNotify then
+            return prevNotify(reason)
+        end
+    end
+    GI.NotifyUI("noop-reeval")
+    GS.NotifyLocalDurableChange = prevNotify
+    assertEq(ledgerNotifies, 0, "427-r1: no ledger notify without verification")
+end
+
+do
+    -- Repair-2: projection context avoids per-event full relationship validation.
+    local record = seedStagedCampaignWithItem(42712, 500)
+    ensureNonOfficerRoster()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "427-r2: assign")
+    local gen = tonumber(record.accounting._consumables.generation) or 1
+    local events = record.accounting._consumableEvents
+    for i = 1, 120 do
+        local donor = (i % 2 == 0) and "Eve-Garona" or "Dave-Garona"
+        events[#events + 1] = {
+            type = "donation",
+            id = "ctx:42712:" .. tostring(i),
+            txnId = "ctx:42712:" .. tostring(i),
+            itemId = 42712,
+            quantity = 1,
+            actor = donor,
+            generation = gen,
+            timestamp = (world.time or 0) + i,
+            source = "guildbank",
+            datasetId = record.datasetId,
+            campaignId = record.currentCampaignId,
+        }
+    end
+
+    local readinessCalls = 0
+    local prevReady = GI.GetRelationshipReadiness
+    GI.GetRelationshipReadiness = function(self, guildKey)
+        readinessCalls = readinessCalls + 1
+        return prevReady(self, guildKey)
+    end
+    local progress = GS.ProjectCampaignProgressOnRecord(record, record.currentCampaignId)
+    GI.GetRelationshipReadiness = prevReady
+
+    assertEq(tonumber(progress.itemTotals[42712]) or 0, 120, "427-r2: item total exact")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42712]) or 0, 120,
+        "427-r2: projected under main")
+    -- One readiness check in BeginContributorProjectionContext, plus a small
+    -- number inside unique name/identity resolves — never one per event.
+    assertTrue(readinessCalls <= 16,
+        "427-r2: readiness bounded got=" .. tostring(readinessCalls))
+    assertTrue(readinessCalls < 120,
+        "427-r2: not per-event full validation got=" .. tostring(readinessCalls))
+end
+
+do
+    -- Repair-3: persist verified donor GUID; rename + reassign keep attribution.
+    local record = seedStagedCampaignWithItem(42713, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "427-r3: assign")
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42713, quantity = 9, donor = "Eve-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r3: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r3: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r3: w3")
+    local donation = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if tonumber(ev.itemId) == 42713 then
+            donation = ev
+            break
+        end
+    end
+    assertTrue(donation ~= nil, "427-r3: donation present")
+    assertEq(donation.actor, "Eve-Garona", "427-r3: durable name unchanged")
+    assertEq(donation.actorGuid, "Player-1-Eve", "427-r3: donor GUID persisted")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42713]) or 0, 9,
+        "427-r3: totals under Dave")
+
+    -- Rename Eve in roster + Guild Info character cache; durable actor stays Eve.
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Eve" then
+            m.name = "Eva-Garona"
+        end
+    end
+    local giRec = select(1, GI:GetCurrentRecord())
+    if giRec and giRec.characters and giRec.characters["Player-1-Eve"] then
+        giRec.characters["Player-1-Eve"].nameRealm = "Eva-Garona"
+    end
+    if giRec and giRec.members and giRec.members["Player-1-Eve"] then
+        giRec.members["Player-1-Eve"].nameRealm = "Eva-Garona"
+    end
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+    assertEq(changeMainGuid("Player-1-Dave", "Player-1-Eve"), "accepted", "427-r3: change main")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(donation.actor, "Eve-Garona", "427-r3: original actor immutable after rename")
+    assertEq(donation.actorGuid, "Player-1-Eve", "427-r3: GUID stable after rename")
+    assertEq(tonumber(progress.itemTotals[42713]) or 0, 9, "427-r3: item total stable")
+    -- Display follows Eva (renamed main) via GUID-first resolution.
+    assertEq(tonumber(progress.contributions["Eva-Garona"]
+        and progress.contributions["Eva-Garona"][42713]) or 0, 9,
+        "427-r3: contribution under renamed main")
+end
+
+do
+    -- Repair-4: personal adjustment floors survive grouping / unassign / reassign.
+    local record = seedStagedCampaignWithItem(42714, 100)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "427-r4: assign")
+
+    -- Dave alone donated; attributing a negative to Eve must not borrow Dave's total.
+    local eDave = makeDepositEvidence(record, {
+        itemId = 42714, quantity = 10, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(eDave, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r4: dave w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(eDave, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r4: dave w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(eDave, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r4: dave w3")
+    local borrow, borrowSt, borrowReason = GS:NewAdjustmentOperation(42714, -5, "Eve-Garona")
+    assertEq(borrow, nil, "427-r4: cannot spend Dave via Eve attribution")
+    assertEq(borrowReason, "player_negative", "427-r4: personal floor reason")
+
+    -- Eve's own donation supports an attributed negative; projection stays under Dave.
+    local eEve = makeDepositEvidence(record, {
+        itemId = 42714, quantity = 8, donor = "Eve-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "e1" }, neighborsNewer = { "e2" },
+        observedAt = (world.time or 0) + 9000,
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(eEve, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r4: eve w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(eEve, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r4: eve w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(eEve, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r4: eve w3")
+    local adjOp = select(1, GS:NewAdjustmentOperation(42714, -3, "Eve-Garona"))
+    assertTrue(adjOp ~= nil, "427-r4: eve adjust prepares")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "427-r4: eve adjust")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42714]) or 0, 15, "427-r4: item total 10+8-3")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42714]) or 0, 15,
+        "427-r4: grouped under Dave")
+
+    -- Unassign Eve: personal nets stay non-negative; item total unchanged.
+    assertEq(unassignAltGuid("Player-1-Eve", "Player-1-Dave"), "accepted", "427-r4: unassign")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42714]) or 0, 15, "427-r4: item total after unassign")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42714]) or 0, 10,
+        "427-r4: dave keeps own 10")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42714]) or 0, 5,
+        "427-r4: eve keeps 8-3")
+
+    -- Subsequent validation: Eve cannot go below her personal remainder.
+    local over, _, overReason = GS:NewAdjustmentOperation(42714, -6, "Eve-Garona")
+    assertEq(over, nil, "427-r4: subsequent overdraw blocked")
+    assertEq(overReason, "player_negative", "427-r4: subsequent floor")
+
+    -- Reassign Eve under Dave again; further valid adjust still works on personal.
+    assertEq(assignMainAlt("Dave-Garona", "Eve-Garona"), "accepted", "427-r4: reassign")
+    local adj2 = select(1, GS:NewAdjustmentOperation(42714, -2, "Eve-Garona"))
+    assertTrue(adj2 ~= nil, "427-r4: reassign adjust prepares")
+    assertEq(GS:ApplyStagedConfigOperation(adj2), "accepted", "427-r4: reassign adjust")
+    progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42714]) or 0, 13, "427-r4: item after second adj")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42714]) or 0, 13,
+        "427-r4: regrouped under Dave")
+end
+
+---------------------------------------------------------------------------
+-- #427 repair batch 2: init reeval / sync coalesce / GUID reconcile / mismatch
+---------------------------------------------------------------------------
+
+do
+    -- Repair-5: saved pending quorum is reevaluated when GI initializes ready.
+    local record = seedStagedCampaignWithItem(42721, 40)
+    ensureNonOfficerRoster()
+    GS:EnsureGossipProvider()
+    assertTrue(GS.EnsureGuildInfoBridge(), "427-r5: bridge")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = false
+    local evidence = makeDepositEvidence(record, { itemId = 42721, quantity = 5 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-r5: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-r5: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r5: w3 pending while incomplete")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42721]) or 0,
+        0, "427-r5: uncredited before init")
+
+    -- Persist ready baseline in SV without NotifyUI (reload gap before GI init).
+    giRec.baseline.complete = true
+    local ledgerNotifies = 0
+    local prevNotify = GS.NotifyLocalDurableChange
+    GS.NotifyLocalDurableChange = function(reason)
+        if reason == "ledger" then
+            ledgerNotifies = ledgerNotifies + 1
+        end
+        if prevNotify then
+            return prevNotify(reason)
+        end
+    end
+    -- Production order: GS already initialized; GI:Initialize alone must credit.
+    assertTrue(select(1, GI:Initialize(SpectrumFederationDB)), "427-r5: gi init")
+    drainExportMaint(32)
+    GS.NotifyLocalDurableChange = prevNotify
+
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42721]) or 0,
+        5, "427-r5: credited after GI init")
+    assertTrue(ledgerNotifies >= 1, "427-r5: durable ledger publish after init")
+end
+
+do
+    -- Repair-6: incomplete GI sync does not reevaluate pending on every remote notify.
+    local record = seedStagedCampaignWithItem(42722, 40)
+    ensureNonOfficerRoster()
+    GS:EnsureGossipProvider()
+    assertTrue(GS.EnsureGuildInfoBridge(), "427-r6: bridge")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = false
+    local evidence = makeDepositEvidence(record, { itemId = 42722, quantity = 4 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-r6: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-r6: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r6: w3 still pending while incomplete")
+
+    local reevalCalls = 0
+    local prevReeval = GS.ReevaluatePendingEvidence
+    GS.ReevaluatePendingEvidence = function(rec)
+        reevalCalls = reevalCalls + 1
+        return prevReeval(rec)
+    end
+    for i = 1, 24 do
+        GI.NotifyUI("remote-" .. tostring(i))
+    end
+    assertEq(reevalCalls, 0, "427-r6: no pending reeval while incomplete")
+
+    giRec.baseline.complete = true
+    GI.NotifyUI("remote-complete")
+    local afterReady = reevalCalls
+    GS.ReevaluatePendingEvidence = prevReeval
+    assertTrue(afterReady >= 1, "427-r6: reeval once when ready got=" .. tostring(afterReady))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42722]) or 0,
+        4, "427-r6: converges after completion")
+end
+
+do
+    -- Repair-7: op-first adjustment later enriched with ledger attributedGuid.
+    local record = seedStagedCampaignWithItem(42723, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42723, quantity = 12, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r7: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r7: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r7: w3")
+    local adjOp = select(1, GS:NewAdjustmentOperation(42723, -2, "Dave-Garona"))
+    assertTrue(adjOp ~= nil, "427-r7: adjust prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "427-r7: op-first")
+    local stored = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and (ev.id == adjOp.id or ev.opId == adjOp.id) then
+            stored = ev
+            break
+        end
+    end
+    assertTrue(stored ~= nil, "427-r7: adjustment row present")
+    -- Simulate op-first row authored while GUID could not be resolved.
+    stored.attributedGuid = nil
+    local stDup, rDup = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = adjOp.id,
+        txnId = "ctx:42723:ledger:1",
+        opId = adjOp.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42723,
+        quantity = -2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stDup, "duplicate", "427-r7: ledger after op is duplicate r=" .. tostring(rDup))
+    assertEq(stored.attributedGuid, "Player-1-Dave", "427-r7: attributedGuid enriched")
+    assertEq(stored.attributed, "Dave-Garona", "427-r7: attributed name unchanged")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42723]) or 0,
+        10, "427-r7: no duplicate quantity")
+end
+
+do
+    -- Repair-8: remote attributed name/GUID mismatch cannot bypass personal floor.
+    local record = seedStagedCampaignWithItem(42724, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42724, quantity = 10, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r8: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r8: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r8: w3")
+
+    local stBad, rBad = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "gs1:Player-1-Alice:deadbeef42724:1",
+        txnId = "gs1:Player-1-Alice:deadbeef42724:1",
+        opId = "gs1:Player-1-Alice:deadbeef42724:1",
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42724,
+        quantity = -10,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Eve",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stBad, "rejected", "427-r8: mismatched attribution rejected")
+    assertEq(rBad, "attribution_mismatch", "427-r8: mismatch reason")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42724]) or 0, 10, "427-r8: item total unchanged")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42724]) or 0, 0,
+        "427-r8: Eve not credited with Dave's floor")
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42724]) or 0, 10,
+        "427-r8: Dave balance intact")
+end
+
+---------------------------------------------------------------------------
+-- #427 repair batch 3: bind donor GUID / rename floors / unknown group / coalesce
+---------------------------------------------------------------------------
+
+do
+    -- Repair-9: conflicting relayed donor GUID cannot redirect projected credit.
+    local record = seedStagedCampaignWithItem(42731, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42731, quantity = 6, donor = "Dave-Garona",
+    })
+    evidence.donorGuid = "Player-1-Eve"
+    evidence.actorGuid = "Player-1-Eve"
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r9: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r9: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r9: w3")
+    local donation = findDonation(record, 42731)
+    assertTrue(donation ~= nil, "427-r9: donation present")
+    assertEq(donation.actor, "Dave-Garona", "427-r9: durable donor name")
+    assertEq(donation.actorGuid, "Player-1-Dave", "427-r9: bound to Dave not Eve")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42731]) or 0, 6,
+        "427-r9: Dave credited")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42731]) or 0, 0,
+        "427-r9: Eve not credited")
+end
+
+do
+    -- Repair-10: rename-safe historical adjustment + legacy name-only personal floor.
+    local record = seedStagedCampaignWithItem(42732, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42732, quantity = 10, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r10: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r10: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r10: w3")
+    local donation = findDonation(record, 42732)
+    assertTrue(donation ~= nil, "427-r10: donation")
+    -- Legacy name-only provenance: strip stored GUID after credit.
+    donation.actorGuid = nil
+    assertEq(GS.PersonalContributorItemTotal(record, "Dave-Garona", "Player-1-Dave", 42732),
+        10, "427-r10: name-only row counts under established GUID")
+
+    -- Rename Dave → David while GUID remains retained.
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == "Player-1-Dave" then
+            m.name = "David-Garona"
+        end
+    end
+    local giRec = select(1, GI:GetCurrentRecord())
+    if giRec and giRec.characters and giRec.characters["Player-1-Dave"] then
+        giRec.characters["Player-1-Dave"].nameRealm = "David-Garona"
+    end
+    if giRec and giRec.members and giRec.members["Player-1-Dave"] then
+        giRec.members["Player-1-Dave"].nameRealm = "David-Garona"
+    end
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+
+    local stAdj, rAdj = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "gs1:Player-1-Alice:deadbeef42732:1",
+        txnId = "gs1:Player-1-Alice:deadbeef42732:1",
+        opId = "gs1:Player-1-Alice:deadbeef42732:1",
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42732,
+        quantity = -3,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stAdj, "accepted", "427-r10: rename historical adj accepted r=" .. tostring(rAdj))
+    -- No local name↔GUID provenance after stripping the donation GUID: claim dropped.
+    local adjRow = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and ev.id == "gs1:Player-1-Alice:deadbeef42732:1" then
+            adjRow = ev
+            break
+        end
+    end
+    assertTrue(adjRow ~= nil, "427-r10: adj row present")
+    assertEq(adjRow.attributed, "Dave-Garona", "427-r10: durable attributed name kept")
+    assertEq(adjRow.attributedGuid, nil, "427-r10: unverified GUID discarded without provenance")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42732]) or 0,
+        7, "427-r10: item after rename adj")
+
+    -- Current resolved name + foreign GUID remains a hard mismatch.
+    local stBad, rBad = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "gs1:Player-1-Alice:deadbeef42732:2",
+        txnId = "gs1:Player-1-Alice:deadbeef42732:2",
+        opId = "gs1:Player-1-Alice:deadbeef42732:2",
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42732,
+        quantity = -1,
+        attributed = "David-Garona",
+        attributedGuid = "Player-1-Eve",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stBad, "rejected", "427-r10: current-name mismatch still rejected")
+    assertEq(rBad, "attribution_mismatch", "427-r10: mismatch reason")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42732]) or 0,
+        7, "427-r10: mismatch leaves balance unchanged")
+end
+
+do
+    -- Repair-11: ledger-first then op-first (and reverse) converge without dup qty.
+    local record = seedStagedCampaignWithItem(42733, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42733, quantity = 12, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r11: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r11: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r11: w3")
+
+    -- Path A: ledger-first adjustment, then same-id op must not double quantity.
+    local adjLedgerFirst = select(1, GS:NewAdjustmentOperation(42733, -2, "Dave-Garona"))
+    assertTrue(adjLedgerFirst ~= nil, "427-r11: ledger-first op prepared")
+    local stLe, rLe = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = adjLedgerFirst.id,
+        txnId = adjLedgerFirst.id,
+        opId = adjLedgerFirst.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42733,
+        quantity = -2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stLe, "accepted", "427-r11: ledger-first r=" .. tostring(rLe))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42733]) or 0,
+        10, "427-r11: ledger-first qty")
+    assertEq(GS:ApplyStagedConfigOperation(adjLedgerFirst), "accepted",
+        "427-r11: op after ledger")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42733]) or 0,
+        10, "427-r11: no double apply after ledger-first")
+
+    -- Path B: op-first then ledger enrich (no quantity dup).
+    local adjOp = select(1, GS:NewAdjustmentOperation(42733, -1, "Dave-Garona"))
+    assertTrue(adjOp ~= nil, "427-r11: op-first prepare")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "427-r11: op-first")
+    local stored = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and (ev.id == adjOp.id or ev.opId == adjOp.id) then
+            stored = ev
+            break
+        end
+    end
+    assertTrue(stored ~= nil, "427-r11: op-first row")
+    stored.attributedGuid = nil
+    local stDup, rDup = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = adjOp.id,
+        txnId = "ctx:42733:ledger:2",
+        opId = adjOp.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42733,
+        quantity = -1,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stDup, "duplicate", "427-r11: ledger after op duplicate r=" .. tostring(rDup))
+    assertEq(stored.attributedGuid, "Player-1-Dave", "427-r11: GUID enriched")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42733]) or 0,
+        9, "427-r11: op-first then ledger qty once")
+end
+
+do
+    -- Repair-12: unresolved GI group membership cannot satisfy witness quorum.
+    local record = seedStagedCampaignWithItem(42734, 40)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Orphan-Garona", "Player-1-OrphanRel", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertTrue(GS.EnsureGuildInfoBridge(), "427-r12: bridge")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    giRec.members = giRec.members or {}
+    giRec.members["Player-1-OrphanRel"] = {
+        guid = "Player-1-OrphanRel",
+        groupId = "gig:missing-rel-42734",
+        ver = { n = 1, w = "w" },
+        at = 1,
+        nameRealm = "Orphan-Garona",
+    }
+    if GI.RebuildDerived then
+        GI.RebuildDerived(giRec)
+    end
+    local orphanInfo = GI:ResolveContributorIdentity("Player-1-OrphanRel")
+    assertEq(orphanInfo.status, "unknown", "427-r12: unresolved unknown")
+
+    local evidence = makeDepositEvidence(record, { itemId = 42734, quantity = 4 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-r12: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-r12: w2")
+    local stOrphan, rOrphan = GS:_AdmitObservationForTests(
+        evidence, "Player-1-OrphanRel", "Orphan-Garona")
+    assertTrue(stOrphan == "pending" or stOrphan == "duplicate",
+        "427-r12: orphan does not complete quorum st=" .. tostring(stOrphan)
+            .. " r=" .. tostring(rOrphan))
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42734]) or 0,
+        0, "427-r12: no credit with unresolved witness")
+
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r12: third independent accepts")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42734]) or 0,
+        4, "427-r12: credited after real third")
+end
+
+do
+    -- Repair-13: ready-state remote GI bursts coalesce; empty pending skips scans.
+    local record = seedStagedCampaignWithItem(42735, 40)
+    ensureNonOfficerRoster()
+    GS:EnsureGossipProvider()
+    assertTrue(GS.EnsureGuildInfoBridge(), "427-r13: bridge")
+    local giRec = select(1, GI:EnsureGuildRecord("club:42"))
+    giRec.baseline = giRec.baseline or {}
+    giRec.baseline.complete = true
+    -- Prime lastReady so subsequent remotes are coalesced (not becameReady).
+    if GS.MaybeReevaluatePendingAfterGuildInfoReady then
+        GS.MaybeReevaluatePendingAfterGuildInfoReady("prime-ready")
+    end
+    flushTimers()
+
+    local evidence = makeDepositEvidence(record, { itemId = 42735, quantity = 3 })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "427-r13: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "427-r13: w2")
+    assertTrue(GS.HasUnfinishedPendingEvidence(record), "427-r13: unfinished pending present")
+
+    local reevalCalls = 0
+    local prevReeval = GS.ReevaluatePendingEvidence
+    GS.ReevaluatePendingEvidence = function(rec)
+        reevalCalls = reevalCalls + 1
+        return prevReeval(rec)
+    end
+
+    for i = 1, 40 do
+        GI.NotifyUI("remote-burst-" .. tostring(i))
+    end
+    assertEq(reevalCalls, 0, "427-r13: no sync reeval during remote burst")
+    flushTimers()
+    assertEq(reevalCalls, 1, "427-r13: one coalesced reeval got=" .. tostring(reevalCalls))
+
+    -- Completing quorum outside GI still converges; further remotes skip scans.
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "accepted", "427-r13: third witness")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42735]) or 0,
+        3, "427-r13: credited")
+    assertTrue(not GS.HasUnfinishedPendingEvidence(record), "427-r13: pending drained")
+
+    local afterCredit = reevalCalls
+    for i = 1, 20 do
+        GI.NotifyUI("remote-idle-" .. tostring(i))
+    end
+    flushTimers()
+    assertEq(reevalCalls, afterCredit,
+        "427-r13: empty pending skips expensive reeval got=" .. tostring(reevalCalls))
+    GS.ReevaluatePendingEvidence = prevReeval
+end
+
+---------------------------------------------------------------------------
+-- #427 repair: provenance-gated donor name/GUID trust (Codex security follow-up)
+---------------------------------------------------------------------------
+
+local function renameGuildCharacter(guid, newName)
+    for _, m in ipairs(world.guild.members) do
+        if m.guid == guid then
+            m.name = newName
+        end
+    end
+    local giRec = select(1, GI:GetCurrentRecord())
+    if giRec and giRec.characters and giRec.characters[guid] then
+        giRec.characters[guid].nameRealm = newName
+    end
+    if giRec and giRec.members and giRec.members[guid] then
+        giRec.members[guid].nameRealm = newName
+    end
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+end
+
+do
+    -- Repair-14: unresolved donor name + unrelated retained GUID cannot redirect credit.
+    local record = seedStagedCampaignWithItem(42741, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Departed-looking donor name that no longer resolves on roster/GI.
+    renameGuildCharacter("Player-1-Dave", "David-Garona")
+
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42741, quantity = 5, donor = "Dave-Garona",
+    })
+    evidence.donorGuid = "Player-1-Eve"
+    evidence.actorGuid = "Player-1-Eve"
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r14: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r14: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r14: w3")
+    local donation = findDonation(record, 42741)
+    assertTrue(donation ~= nil, "427-r14: donation present")
+    assertEq(donation.actor, "Dave-Garona", "427-r14: immutable donor name")
+    assertEq(donation.actorGuid, nil, "427-r14: unrelated retained GUID discarded")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42741]) or 0, 5,
+        "427-r14: credit stays under durable name")
+    assertEq(tonumber(progress.contributions["Eve-Garona"]
+        and progress.contributions["Eve-Garona"][42741]) or 0, 0,
+        "427-r14: Eve main not credited")
+    assertEq(tonumber(progress.contributions["David-Garona"]
+        and progress.contributions["David-Garona"][42741]) or 0, 0,
+        "427-r14: renamed GUID not claimed by forged bind")
+end
+
+do
+    -- Repair-15: legitimate rename keeps GUID when local ledger already linked it.
+    local record = seedStagedCampaignWithItem(42742, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42742, quantity = 8, donor = "Dave-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r15: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r15: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r15: w3")
+    local donation = findDonation(record, 42742)
+    assertEq(donation.actorGuid, "Player-1-Dave", "427-r15: donation GUID stored while name resolved")
+    renameGuildCharacter("Player-1-Dave", "David-Garona")
+
+    local stAdj, rAdj = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "gs1:Player-1-Alice:deadbeef42742:1",
+        txnId = "gs1:Player-1-Alice:deadbeef42742:1",
+        opId = "gs1:Player-1-Alice:deadbeef42742:1",
+        generation = record.accounting._consumables.generation,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 42742,
+        quantity = -2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stAdj, "accepted", "427-r15: rename adj with ledger provenance r=" .. tostring(rAdj))
+    local adjRow = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local ev = record.accounting._consumableEvents[i]
+        if ev and ev.id == "gs1:Player-1-Alice:deadbeef42742:1" then
+            adjRow = ev
+            break
+        end
+    end
+    assertTrue(adjRow ~= nil, "427-r15: adj present")
+    assertEq(adjRow.attributed, "Dave-Garona", "427-r15: original attributed name")
+    assertEq(adjRow.attributedGuid, "Player-1-Dave", "427-r15: GUID kept via ledger provenance")
+    local progress = GS:ProjectCampaignProgress(record.currentCampaignId)
+    assertEq(tonumber(progress.itemTotals[42742]) or 0, 6, "427-r15: item total")
+    -- Unassigned contributors keep the durable original name in projection while
+    -- GUID provenance remains for floors/future main assignment.
+    assertEq(tonumber(progress.contributions["Dave-Garona"]
+        and progress.contributions["Dave-Garona"][42742]) or 0, 6,
+        "427-r15: durable name projection intact")
+    assertEq(GS.PersonalContributorItemTotal(record, "Dave-Garona", "Player-1-Dave", 42742),
+        6, "427-r15: personal floor follows GUID provenance")
+end
+
+do
+    -- Repair-16: cross-client replay — forged GUID dropped; later duplicate stays name-only.
+    local record = seedStagedCampaignWithItem(42743, 80)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    renameGuildCharacter("Player-1-Dave", "David-Garona")
+    local evidence = makeDepositEvidence(record, {
+        itemId = 42743, quantity = 4, donor = "Dave-Garona",
+    })
+    evidence.actorGuid = "Player-1-Eve"
+    evidence.donorGuid = "Player-1-Eve"
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "pending", "427-r16: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Grace", "Grace-Garona")),
+        "pending", "427-r16: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Hank", "Hank-Garona")),
+        "accepted", "427-r16: w3")
+    local first = findDonation(record, 42743)
+    assertEq(first.actorGuid, nil, "427-r16: first admit drops forged GUID")
+
+    -- Replay with a different retained GUID still cannot attach one.
+    evidence.actorGuid = "Player-1-Alice"
+    evidence.donorGuid = "Player-1-Alice"
+    local stDup, rDup = GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")
+    assertTrue(stDup == "duplicate" or stDup == "accepted",
+        "427-r16: replay status=" .. tostring(stDup) .. " r=" .. tostring(rDup))
+    assertEq(findDonation(record, 42743).actorGuid, nil, "427-r16: replay does not attach forged GUID")
+    assertEq(tonumber(GS:ProjectCampaignProgress(record.currentCampaignId).itemTotals[42743]) or 0,
+        4, "427-r16: single credit")
+end
+
+do
+    -- Repair-17: legacy/ambiguous unresolved name cannot invent a GUID from membership.
+    local record = seedStagedCampaignWithItem(42744, 40)
+    ensureNonOfficerRoster()
+    ensureRankedMember("Hank-Garona", "Player-1-Hank", 5)
+    ensureRankedMember("Dave-Area52", "Player-1-DaveAlt", 5)
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    if GI.InvalidateRosterSnapshot then
+        GI.InvalidateRosterSnapshot()
+    end
+    local amb, ambErr = GI:ResolveCharacterGuidByName("Dave")
+    assertTrue(amb == nil, "427-r17: short name ambiguous at GI err=" .. tostring(ambErr))
+
+    -- Departed/legacy durable name: does not resolve, no ledger provenance.
+    local legacy = "LegacyTwin-Garona"
+    assertEq(GS.ResolveUniqueCharacterGuid(record, legacy, nil), nil,
+        "427-r17: legacy name unresolved")
+    local name, guid, err = GS.BindCharacterIdentity(record, legacy, "Player-1-Eve", nil)
+    assertEq(name, legacy, "427-r17: name preserved")
+    assertEq(guid, nil, "427-r17: unresolved legacy drops claimed GUID")
+    assertEq(err, nil, "427-r17: not a hard mismatch when unresolved")
+
+    local softName, softGuid = GS.ResolveDonorIdentity(record, legacy, "Player-1-Eve")
+    assertEq(softName, legacy, "427-r17: donor soft name")
+    assertEq(softGuid, nil, "427-r17: donor soft drops unverified GUID")
+
+    -- Proven current-name mismatch remains hard-reject for adjustments.
+    local _, _, hardErr = GS.BindCharacterIdentity(
+        record, "Eve-Garona", "Player-1-Dave", nil)
+    assertEq(hardErr, "attribution_mismatch", "427-r17: resolved mismatch still hard")
+end
+
+SF.TSM = nil
+world.impersonationActive = false
+setPlayer("Alice-Garona", "Player-1-Alice", 1)
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

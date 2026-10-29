@@ -2086,7 +2086,12 @@ local function PreparationFromCaptured(captured, cfg)
 		return nil, "policy"
 	end
 	local result = Policy.EvaluateObservation(BuildPolicyObservation(captured), cfg)
-	if type(result) ~= "table" or result.complete ~= true then
+	-- Early Preparation may warn on a confirmed miss before the observation is
+	-- fully evaluated. Raid Check acquisition still requires complete=true.
+	if type(result) ~= "table" then
+		return nil, "incomplete"
+	end
+	if result.complete ~= true and result.knownUnprepared ~= true then
 		return nil, "incomplete"
 	end
 	return result, "fresh"
@@ -4432,7 +4437,9 @@ end
 
 local function ReadinessFromPolicyResult(policy)
 	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
-	if Policy and Policy.ReadinessFromObservation and type(policy) == "table" and policy.complete then
+	if Policy and Policy.ReadinessFromObservation and type(policy) == "table"
+		and (policy.complete or policy.knownUnprepared)
+	then
 		local readiness = {
 			state = policy.prepared and "ready" or "not_ready",
 			missing = policy.missing or {},

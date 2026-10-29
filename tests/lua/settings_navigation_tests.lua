@@ -197,6 +197,16 @@ local function productionFixture()
             order = 19.2,
         }),
         page({
+            id = "guildSuppliesTroubleshooting",
+            categoryId = "guildSupplies",
+            name = "Troubleshooting",
+            navLabel = "Troubleshooting",
+            contentHeading = "Raid Supplies Troubleshooting",
+            group = "Raid Tools",
+            description = "Recover from staged dataset mismatches and resolve configuration conflicts.",
+            order = 19.3,
+        }),
+        page({
             id = "debugging",
             name = "Debugging",
             navLabel = "Debugging",
@@ -604,8 +614,8 @@ assertEq(showGuildSettingsPage.pageId, "guildInfoMainAlt", "ShowPage(guildInfoMa
 
 assertDeepEq(
     idsOf(Model.GetContentPages(registry, "guildSupplies")),
-    { "guildSuppliesConfiguration", "guildSuppliesLogs" },
-    "Raid Supplies keeps Configuration then Logs"
+    { "guildSuppliesConfiguration", "guildSuppliesLogs", "guildSuppliesTroubleshooting" },
+    "Raid Supplies keeps Configuration, Logs, then Troubleshooting"
 )
 assertEq(registry.pagesById.lootHelperConsumables, nil,
     "legacy Loot Helper Consumables page is not registered")
@@ -637,16 +647,28 @@ assertEq(
     "Raid Supplies Logs",
     "Raid Supplies Logs heading follows the category rename"
 )
+assertEq(
+    Model.GetPageContentHeading(registry.pagesById.guildSuppliesTroubleshooting),
+    "Raid Supplies Troubleshooting",
+    "Raid Supplies Troubleshooting heading is registered"
+)
 local showRaidSupplies = Model.ResolveShowPage(registry, {}, "guildSupplies")
 assertEq(showRaidSupplies.categoryId, "guildSupplies", "ShowPage(guildSupplies) stays on the original category")
 assertEq(showRaidSupplies.pageId, "guildSuppliesConfiguration", "ShowPage(guildSupplies) opens Configuration")
 local showRaidSuppliesLogs = Model.ResolveShowPage(registry, session, "guildSuppliesLogs")
 assertEq(showRaidSuppliesLogs.categoryId, "guildSupplies", "ShowPage(guildSuppliesLogs) stays on Raid Supplies")
 assertEq(showRaidSuppliesLogs.pageId, "guildSuppliesLogs", "ShowPage(guildSuppliesLogs) opens Logs")
+local showRaidSuppliesTs = Model.ResolveShowPage(registry, session, "guildSuppliesTroubleshooting")
+assertEq(showRaidSuppliesTs.categoryId, "guildSupplies", "ShowPage(guildSuppliesTroubleshooting) stays on Raid Supplies")
+assertEq(showRaidSuppliesTs.pageId, "guildSuppliesTroubleshooting", "ShowPage(guildSuppliesTroubleshooting) opens Troubleshooting")
 local raidSuppliesTabs = Model.ResolveSidebarSelect(registry, {
     lastPageByCategory = { guildSupplies = "guildSuppliesLogs" },
 }, "guildSupplies")
 assertEq(raidSuppliesTabs.pageId, "guildSuppliesLogs", "Raid Supplies sidebar restores the Logs tab")
+local raidSuppliesTsTabs = Model.ResolveSidebarSelect(registry, {
+    lastPageByCategory = { guildSupplies = "guildSuppliesTroubleshooting" },
+}, "guildSupplies")
+assertEq(raidSuppliesTsTabs.pageId, "guildSuppliesTroubleshooting", "Raid Supplies sidebar restores the Troubleshooting tab")
 
 assertEq(Model.GetPage(registry, "lootLogs").categoryId, "lootLogs", "Loot Logs page belongs to its own category")
 local lootHelperIds = idsOf(Model.GetContentPages(registry, "lootHelper"))
@@ -670,6 +692,7 @@ assertTrue(not Model.CategoryMatchesQuery(registry, "guildInfo", "Raid Tools"), 
 assertTrue(Model.CategoryMatchesQuery(registry, "guildSupplies", "Raid Supplies"), "Quick Find matches Raid Supplies")
 assertTrue(Model.CategoryMatchesQuery(registry, "guildSupplies", "Configuration"), "Quick Find matches the Configuration tab")
 assertTrue(Model.CategoryMatchesQuery(registry, "guildSupplies", "Logs"), "Quick Find matches the Logs tab")
+assertTrue(Model.CategoryMatchesQuery(registry, "guildSupplies", "Troubleshooting"), "Quick Find matches the Troubleshooting tab")
 assertTrue(Model.CategoryMatchesQuery(registry, "lootLogs", "Loot Logs"), "Quick Find matches Loot Logs")
 local lootLogsEnter = Model.ResolveSearchEnter(registry, session, "Loot Logs")
 assertEq(lootLogsEnter.categoryId, "lootLogs", "Quick Find Enter opens Loot Logs as its own category")
@@ -678,6 +701,8 @@ local guildSettingsEnter = Model.ResolveSearchEnter(registry, {}, "Guild Setting
 assertEq(guildSettingsEnter.pageId, "guildInfoMainAlt", "Quick Find Enter opens the Guild Settings page")
 local raidSuppliesClick = Model.ResolveSearchCategoryClick(registry, {}, "guildSupplies", "Logs")
 assertEq(raidSuppliesClick.pageId, "guildSuppliesLogs", "Quick Find click opens the Raid Supplies Logs tab")
+local raidSuppliesTsClick = Model.ResolveSearchCategoryClick(registry, {}, "guildSupplies", "Troubleshooting")
+assertEq(raidSuppliesTsClick.pageId, "guildSuppliesTroubleshooting", "Quick Find click opens the Raid Supplies Troubleshooting tab")
 
 -- Title prefix strip
 assertEq(

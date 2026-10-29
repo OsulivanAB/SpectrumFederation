@@ -467,11 +467,25 @@ local function CountSocketsAndLimitedGems(slot)
 	return total, filled, limited, nil
 end
 
+-- A definitive missing requirement proves Unprepared for Early Preparation and
+-- readiness. That is not the same as a fully evaluated observation: Raid Check
+-- treats complete as terminal and must keep inspecting while other required
+-- fields remain unresolved.
+local function MarkKnownUnprepared(result)
+	if type(result) ~= "table" or type(result.missing) ~= "table" or #result.missing == 0 then
+		return false
+	end
+	result.knownUnprepared = true
+	result.prepared = false
+	return true
+end
+
 function Policy.EvaluateObservation(observation, config)
 	local result = {
 		complete = false,
 		incompleteReason = nil,
 		prepared = false,
+		knownUnprepared = false,
 		missing = {},
 		usableSockets = 0,
 		limitedGems = 0,
@@ -491,92 +505,121 @@ function Policy.EvaluateObservation(observation, config)
 
 	local usableSockets = 0
 	local limitedGems = 0
+	local hadUnresolved = false
+	local unresolvedReason = nil
+
+	local function NoteUnresolved(reason)
+		hadUnresolved = true
+		if unresolvedReason == nil then
+			unresolvedReason = reason or "unresolved_slot"
+		end
+	end
 
 	for _, def in ipairs(Policy.TRACKED_SLOTS) do
 		local slot = slots[def.inventorySlot]
 		local presence, reason = Policy.DescribeSlotPresence(slot)
 		if presence == "unresolved" then
-			result.incompleteReason = reason or "unresolved_slot"
-			return result
-		end
-
-		if presence == "empty" then
+			NoteUnresolved(reason or "unresolved_slot")
+		elseif presence == "empty" then
 			local allowsEmptyOffHand = false
 			if def.key == "offHand" then
 				allowsEmptyOffHand = Policy.MainHandAllowsEmptyOffHand(mainHand, mainHandLoc)
 				if allowsEmptyOffHand == nil then
-					result.incompleteReason = "unresolved_mainhand_weapon"
-					return result
+					NoteUnresolved("unresolved_mainhand_weapon")
+				elseif not allowsEmptyOffHand then
+					table.insert(result.missing, def.label .. " Item")
 				end
-			end
-			if not allowsEmptyOffHand then
+			else
 				table.insert(result.missing, def.label .. " Item")
 			end
 		else
 			local equipLoc = slot.equipLoc or Policy.GetItemEquipLocation(slot.link or slot.itemId)
+			local skipSlot = false
 			if def.key == "offHand" then
 				if equipLoc == nil then
-					result.incompleteReason = "unresolved_offhand_type"
-					return result
+					NoteUnresolved("unresolved_offhand_type")
+					skipSlot = true
 				end
 			end
 
-			local needsEnchant = def.enchantRequired == true
-			if def.enchantRequired == "weapon" then
-				local required = Policy.RequiresOffHandEnchant(equipLoc)
-				if required == nil then
-					result.incompleteReason = "unresolved_offhand_type"
-					return result
+			if not skipSlot then
+				local needsEnchant = def.enchantRequired == true
+				if def.enchantRequired == "weapon" then
+					local required = Policy.RequiresOffHandEnchant(equipLoc)
+					if required == nil then
+						NoteUnresolved("unresolved_offhand_type")
+						skipSlot = true
+					else
+						needsEnchant = required
+					end
 				end
-				needsEnchant = required
-			end
 
-			if needsEnchant then
-				if slot.hasEnchant == nil and slot.enchantId == nil then
-					result.incompleteReason = "unresolved_enchant"
-					return result
-				end
-				local hasEnchant = slot.hasEnchant
-				if hasEnchant == nil then
-					local enchantId = tonumber(slot.enchantId)
-					hasEnchant = enchantId ~= nil and enchantId > 0
-				end
-				if not hasEnchant then
-					table.insert(result.missing, def.label .. " Enchant")
-				end
-			end
+				if not skipSlot then
+					if needsEnchant then
+						if slot.hasEnchant == nil and slot.enchantId == nil then
+							NoteUnresolved("unresolved_enchant")
+						else
+							local hasEnchant = slot.hasEnchant
+							if hasEnchant == nil then
+								local enchantId = tonumber(slot.enchantId)
+								hasEnchant = enchantId ~= nil and enchantId > 0
+							end
+							if not hasEnchant then
+								table.insert(result.missing, def.label .. " Enchant")
+							end
+						end
+					end
 
-			local socketTotal, socketFilled, socketLimited, socketErr = CountSocketsAndLimitedGems(slot)
-			if socketErr then
-				result.incompleteReason = socketErr
-				return result
-			end
-			if socketTotal and socketTotal > 0 then
-				usableSockets = usableSockets + socketTotal
-				if socketFilled < socketTotal then
-					table.insert(result.missing, def.label .. " Gem")
+					local socketTotal, socketFilled, socketLimited, socketErr = CountSocketsAndLimitedGems(slot)
+					if socketErr then
+						NoteUnresolved(socketErr)
+					elseif socketTotal and socketTotal > 0 then
+						usableSockets = usableSockets + socketTotal
+						if socketFilled < socketTotal then
+							table.insert(result.missing, def.label .. " Gem")
+						end
+						limitedGems = limitedGems + (socketLimited or 0)
+					end
 				end
-				limitedGems = limitedGems + (socketLimited or 0)
 			end
 		end
 	end
 
 	result.usableSockets = usableSockets
 	result.limitedGems = limitedGems
-	local requiredLimited = 0
-	if Policy.LIMITED_GEM.epicGemAvailable and usableSockets > 0 then
-		requiredLimited = math.min(Policy.LIMITED_GEM.maxEpicGems, usableSockets)
-	end
-	if requiredLimited > 0 and limitedGems < requiredLimited then
-		table.insert(result.missing, "Limited Gem")
+	-- Limited-gem accounting needs every resolved socket. Skip it when any slot
+	-- was unresolved so an under-count cannot invent a false Limited Gem miss
+	-- after a known enchant/gem failure already proved Unprepared.
+	if not hadUnresolved then
+		local requiredLimited = 0
+		if Policy.LIMITED_GEM.epicGemAvailable and usableSockets > 0 then
+			requiredLimited = math.min(Policy.LIMITED_GEM.maxEpicGems, usableSockets)
+		end
+		if requiredLimited > 0 and limitedGems < requiredLimited then
+			table.insert(result.missing, "Limited Gem")
+		end
 	end
 
 	-- Item level is optional profile configuration. A known low value is one more
-	-- missing requirement. An unknown value makes the observation incomplete
-	-- instead of Unprepared, and only when the requirement is actually active.
+	-- missing requirement. An unknown value makes a still-prepared observation
+	-- incomplete instead of Unprepared, and only when the requirement is active.
+	-- Prefer a pending-slot reason over unresolved_item_level so link-loading
+	-- keeps spaced retries instead of burning the ordinary incomplete cap.
 	if Policy.ItemLevelRequirementActive(config) then
 		local canonical = Policy.CanonicalOverallItemLevel(observation.overallEquippedItemLevel)
 		if not canonical then
+			if MarkKnownUnprepared(result) then
+				if hadUnresolved then
+					result.incompleteReason = unresolvedReason or "unresolved_slot"
+				else
+					result.incompleteReason = "unresolved_item_level"
+				end
+				return result
+			end
+			if hadUnresolved then
+				result.incompleteReason = unresolvedReason or "unresolved_slot"
+				return result
+			end
 			result.incompleteReason = "unresolved_item_level"
 			return result
 		end
@@ -586,8 +629,24 @@ function Policy.EvaluateObservation(observation, config)
 		end
 	end
 
+	if #result.missing > 0 then
+		MarkKnownUnprepared(result)
+		if hadUnresolved then
+			result.incompleteReason = unresolvedReason or "unresolved_slot"
+			return result
+		end
+		result.complete = true
+		result.incompleteReason = nil
+		return result
+	end
+
+	if hadUnresolved then
+		result.incompleteReason = unresolvedReason or "unresolved_slot"
+		return result
+	end
+
 	result.complete = true
-	result.prepared = #result.missing == 0
+	result.prepared = true
 	return result
 end
 
@@ -610,6 +669,19 @@ function Policy.ReadinessFromObservation(observation, config)
 		}
 	end
 	local result = Policy.EvaluateObservation(observation, config)
+	-- Confirmed Unprepared is Not Ready even while other fields are still
+	-- loading. Incomplete without a confirmed miss stays Unknown.
+	if result.knownUnprepared then
+		local missing = {}
+		for i = 1, #(result.missing or {}) do
+			missing[i] = result.missing[i]
+		end
+		return {
+			state = "not_ready",
+			missing = missing,
+			incompleteReason = nil,
+		}
+	end
 	if not result.complete then
 		return {
 			state = "unknown",

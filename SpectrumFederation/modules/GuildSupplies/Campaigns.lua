@@ -669,8 +669,16 @@ function GS:ListInspectableCampaigns()
             local ok = GS.ValidateCampaignBoundary(header, record, guildKey)
             if ok and header.campaignId == campaignId
                 and CampaignArchiveInspectable(record, campaignId, header) then
+                local displayName = GS.GetCampaignDisplayName
+                    and GS.GetCampaignDisplayName(record, campaignId)
+                    or campaignId
+                local custom = GS.GetCampaignCustomName
+                    and GS.GetCampaignCustomName(record, campaignId)
+                    or ""
                 list[#list + 1] = {
                     campaignId = campaignId,
+                    displayName = displayName,
+                    hasCustomName = type(custom) == "string" and custom ~= "",
                     startedAt = header.startedAt,
                     boundaryKind = header.boundaryKind,
                     contextStatus = header.contextStatus,
@@ -835,6 +843,9 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
 
     local itemTotals = {}
     local contributions = {}
+    -- One read-only resolution context for the whole projection (not per event).
+    local resolveCtx = GS.BeginContributorProjectionContext
+        and GS.BeginContributorProjectionContext(record) or nil
     ForEachCampaignLedgerEvent(record, generation, function(event)
         -- Active datasets exclude pre-activation staged accounting from live totals.
         if GS.EventCountsTowardLiveProgress
@@ -849,7 +860,13 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
         if IsDonationEvent(event) then
             if qty > 0 then
                 itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
-                local actor = BoundedActorName(event.actor)
+                -- Project to current Guild Info main without rewriting durable actor.
+                local actor = nil
+                if GS.ResolveDisplayContributor then
+                    actor = select(1, GS.ResolveDisplayContributor(
+                        record, event.actor, event.actorGuid or event.donorGuid, resolveCtx))
+                end
+                actor = BoundedActorName(actor) or BoundedActorName(event.actor)
                 if actor then
                     contributions[actor] = contributions[actor] or {}
                     contributions[actor][itemId] = (contributions[actor][itemId] or 0) + qty
@@ -857,7 +874,12 @@ function GS.ProjectCampaignProgressOnRecord(record, campaignId)
             end
         elseif IsAdjustmentEvent(event) then
             itemTotals[itemId] = (itemTotals[itemId] or 0) + qty
-            local credit = BoundedActorName(event.attributed)
+            local credit = nil
+            if GS.ResolveDisplayContributor then
+                credit = select(1, GS.ResolveDisplayContributor(
+                    record, event.attributed, event.attributedGuid, resolveCtx))
+            end
+            credit = BoundedActorName(credit) or BoundedActorName(event.attributed)
             if credit then
                 contributions[credit] = contributions[credit] or {}
                 contributions[credit][itemId] = (contributions[credit][itemId] or 0) + qty
@@ -881,6 +903,84 @@ function GS:ProjectCampaignProgress(campaignId)
     return GS.ProjectCampaignProgressOnRecord(record, campaignId)
 end
 
+--- Overall / per-item goal progress matching Consumables.GoalProgress semantics.
+-- Caps each positive-goal item at its own goal for the overall bar, excludes
+-- goal-0 items from the overall denominator, and floors percentages. Pure math
+-- over already-projected totals — does not walk the ledger again.
+-- @param requestedItems table|nil map/list of { itemId, goal }
+-- @param itemTotals table|nil itemId → donated quantity
+-- @return table GoalProgress model
+function GS.ComputeGoalProgress(requestedItems, itemTotals)
+    itemTotals = type(itemTotals) == "table" and itemTotals or {}
+    local items = {}
+    local sumCapped = 0
+    local sumGoal = 0
+    if type(requestedItems) == "table" then
+        local C = SF.Consumables
+        for _, row in pairs(requestedItems) do
+            if type(row) == "table" then
+                local itemId = tonumber(row.itemId)
+                if itemId and itemId == itemId and itemId == math.floor(itemId) and itemId >= 1 then
+                    local goal
+                    if C and type(C.ValidGoal) == "function" then
+                        goal = C.ValidGoal(row.goal) or 0
+                    else
+                        goal = tonumber(row.goal) or 0
+                        if goal ~= goal or goal ~= math.floor(goal) or goal < 0 then
+                            goal = 0
+                        end
+                    end
+                    local donated = tonumber(itemTotals[itemId]) or 0
+                    local entry = {
+                        itemId = itemId,
+                        goal = goal,
+                        donated = donated,
+                        noGoal = goal == 0,
+                        percent = nil,
+                    }
+                    if goal > 0 then
+                        entry.percent = math.floor((100 * donated) / goal)
+                        sumCapped = sumCapped + math.min(donated, goal)
+                        sumGoal = sumGoal + goal
+                    end
+                    items[#items + 1] = entry
+                end
+            end
+        end
+    end
+    table.sort(items, function(a, b)
+        return a.itemId < b.itemId
+    end)
+    local hasPositiveGoal = sumGoal > 0
+    local overallPercent = nil
+    if hasPositiveGoal then
+        overallPercent = math.floor((100 * sumCapped) / sumGoal)
+    end
+    return {
+        items = items,
+        hasPositiveGoal = hasPositiveGoal,
+        overallPercent = overallPercent,
+        overallEmptyText = Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."),
+        sumCapped = sumCapped,
+        sumGoal = sumGoal,
+    }
+end
+
+--- Campaign-scoped GoalProgress from Guild Supplies accounting (live or archive).
+-- Prefer ComputeGoalProgress with already-projected parts when a UI pass already
+-- fetched items/totals, to avoid a second full ledger projection.
+function GS:CampaignGoalProgress(campaignId)
+    local items, err = self:GetCampaignRequestedItems(campaignId)
+    if type(items) ~= "table" then
+        return nil, err or "missing_campaign"
+    end
+    local progress, perr = self:ProjectCampaignProgress(campaignId)
+    if type(progress) ~= "table" then
+        return nil, perr or "not_ready"
+    end
+    return GS.ComputeGoalProgress(items, progress.itemTotals)
+end
+
 local function FormatHistoryTimestamp(event)
     local ts = tonumber(event and event.timestamp)
     if not ts or ts ~= ts or ts < 0 then
@@ -895,7 +995,41 @@ local function FormatHistoryTimestamp(event)
     return tostring(math.floor(ts))
 end
 
-local function FormatCampaignHistoryText(event, itemName, markUncredited)
+local function HistoryDisplayActor(record, event)
+    -- Prefer a precomputed projection on history rows; otherwise resolve live.
+    local pre = BoundedActorName(event and event.displayActor)
+    if pre then
+        return pre
+    end
+    if type(record) == "table" and GS.ResolveDisplayContributor then
+        local projected = select(1, GS.ResolveDisplayContributor(
+            record, event and event.actor, event and (event.actorGuid or event.donorGuid)))
+        projected = BoundedActorName(projected)
+        if projected then
+            return projected
+        end
+    end
+    return BoundedActorName(event and event.actor)
+end
+
+local function HistoryDisplayAttribution(record, event)
+    local pre = BoundedActorName(event and event.displayAttributed)
+    if pre then
+        return pre
+    end
+    if type(record) == "table" and GS.ResolveDisplayContributor
+        and event and event.attributed then
+        local projected = select(1, GS.ResolveDisplayContributor(
+            record, event.attributed, event.attributedGuid))
+        projected = BoundedActorName(projected)
+        if projected then
+            return projected
+        end
+    end
+    return BoundedActorName(event and event.attributed)
+end
+
+local function FormatCampaignHistoryText(record, event, itemName, markUncredited)
     local itemId = tonumber(event.itemId)
     local qty = tonumber(event.quantity) or 0
     local name = itemName
@@ -904,9 +1038,29 @@ local function FormatCampaignHistoryText(event, itemName, markUncredited)
     end
     local body
     if IsDonationEvent(event) then
-        local who = BoundedActorName(event.actor) or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
-        body = Loc("GUILD_SUPPLIES_HISTORY_DONATION", "%s donated %d %s.")
-            :format(who, qty, name)
+        local who = HistoryDisplayActor(record, event)
+            or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
+        local described = type(record) == "table" and GS.DescribeDonationValuation
+            and GS.DescribeDonationValuation(record, event) or nil
+        local totalText = described and described.priced and described.totalText or nil
+        local unitText = described and described.priced and described.unitText or nil
+        if (type(totalText) ~= "string" or type(unitText) ~= "string")
+            and type(event.valuationTotalText) == "string"
+            and type(event.valuationUnitText) == "string"
+            and #event.valuationTotalText > 0 and #event.valuationTotalText <= 120
+            and #event.valuationUnitText > 0 and #event.valuationUnitText <= 120 then
+            totalText = event.valuationTotalText
+            unitText = event.valuationUnitText
+        end
+        if type(totalText) == "string" and type(unitText) == "string" then
+            body = Loc("GUILD_SUPPLIES_HISTORY_DONATION_VALUED",
+                "%s donated %d %s — %s total (%s each).")
+                :format(who, qty, name, totalText, unitText)
+        else
+            body = Loc("GUILD_SUPPLIES_HISTORY_DONATION_UNPRICED",
+                "%s donated %d %s — unpriced.")
+                :format(who, qty, name)
+        end
         if event.verification == "officer" then
             body = body .. " " .. Loc("GUILD_SUPPLIES_HISTORY_VERIFIED_OFFICER",
                 "Verified by one officer Guild Bank observation.")
@@ -917,7 +1071,7 @@ local function FormatCampaignHistoryText(event, itemName, markUncredited)
     elseif IsAdjustmentEvent(event) then
         local who = BoundedActorName(event.actor)
             or Loc("GUILD_SUPPLIES_HISTORY_ADMIN", "An admin")
-        local credit = BoundedActorName(event.attributed)
+        local credit = HistoryDisplayAttribution(record, event)
         if credit then
             body = Loc("GUILD_SUPPLIES_HISTORY_ADJUST_ATTRIBUTED",
                 "%s adjusted %s by %+d (credited to %s).")
@@ -994,7 +1148,7 @@ function GS.FormatCampaignHistoryCompact(event, itemName, icon)
     name = NameWithAdjacentIcon(name, icon)
     local qty = WholeQuantity(event.quantity)
     if IsDonationEvent(event) then
-        local who = BoundedActorName(event.actor)
+        local who = HistoryDisplayActor(nil, event)
             or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
         return Loc("GUILD_SUPPLIES_HISTORY_COMPACT_DONATION", "%s ×%d — %s")
             :format(who, math.abs(qty), name)
@@ -1016,7 +1170,9 @@ function GS.FormatCampaignHistoryDetail(event, itemName)
     if type(event) ~= "table" then
         return nil
     end
-    return FormatCampaignHistoryText(event, itemName, event.uncredited == true)
+    -- The row already carries any priced text from ListCampaignHistory. Do not
+    -- read the guild record again; history paging must stay bounded.
+    return FormatCampaignHistoryText(nil, event, itemName, event.uncredited == true)
 end
 
 --- Bounded read-only donation/adjustment history for one campaign.
@@ -1087,6 +1243,8 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         if last > total then last = total end
     end
     local rows = {}
+    local resolveCtx = GS.BeginContributorProjectionContext
+        and GS.BeginContributorProjectionContext(record) or nil
     for i = offset + 1, last do
         local event = ordered[i]
         local itemName = nil
@@ -1098,8 +1256,26 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
         end
         local markUncredited = isArchived and GS.IsLiveActive(record)
             and event.gsProductionCredit ~= true
-        local text = FormatCampaignHistoryText(event, itemName, markUncredited)
+        local displayActor = nil
+        local displayAttributed = nil
+        if IsDonationEvent(event) and GS.ResolveDisplayContributor then
+            displayActor = select(1, GS.ResolveDisplayContributor(
+                record, event.actor, event.actorGuid or event.donorGuid, resolveCtx))
+        elseif IsAdjustmentEvent(event) and event.attributed and GS.ResolveDisplayContributor then
+            displayAttributed = select(1, GS.ResolveDisplayContributor(
+                record, event.attributed, event.attributedGuid, resolveCtx))
+        end
+        -- Project display names onto a shallow copy; keep txn/valuation fields
+        -- from the durable event so priced history stays intact.
+        local projected = {}
+        for k, v in pairs(event) do
+            projected[k] = v
+        end
+        projected.displayActor = displayActor
+        projected.displayAttributed = displayAttributed
+        local text = FormatCampaignHistoryText(record, projected, itemName, markUncredited)
         if text and text ~= "" then
+            local described = GS.DescribeDonationValuation and GS.DescribeDonationValuation(record, event)
             rows[#rows + 1] = {
                 text = text,
                 id = event.id,
@@ -1107,10 +1283,16 @@ function GS:ListCampaignHistory(campaignId, limit, offset, itemNameFn)
                 itemId = event.itemId,
                 quantity = event.quantity,
                 actor = event.actor,
+                displayActor = displayActor or event.actor,
                 attributed = event.attributed,
+                displayAttributed = displayAttributed or event.attributed,
                 timestamp = event.timestamp,
                 generation = event.generation,
                 uncredited = markUncredited and true or nil,
+                valuationTotal = described and described.priced and described.totalCopper or nil,
+                valuationUnit = described and described.priced and described.unitCopper or nil,
+                valuationTotalText = described and described.priced and described.totalText or nil,
+                valuationUnitText = described and described.priced and described.unitText or nil,
                 verification = type(event.verification) == "string" and event.verification or nil,
             }
         end
@@ -1221,7 +1403,7 @@ function GS.FormatReasonText(reason)
         same_dataset = Loc("GUILD_SUPPLIES_REASON_SAME_DATASET",
             "that peer already shares this client's staged dataset"),
         divergent_edit = Loc("GUILD_SUPPLIES_REASON_DIVERGENT_EDIT",
-            "conflicting edits need an explicit choice in Configuration"),
+            "conflicting edits need an explicit choice in Troubleshooting"),
         campaign_conflict = Loc("GUILD_SUPPLIES_REASON_CAMPAIGN_CONFLICT",
             "concurrent New Campaign operations need an explicit choice"),
         untrusted_relay = Loc("GUILD_SUPPLIES_REASON_UNTRUSTED_RELAY",
@@ -1244,6 +1426,12 @@ function GS.FormatReasonText(reason)
             "the active character changed"),
         no_campaign = Loc("GUILD_SUPPLIES_REASON_NO_CAMPAIGN",
             "start a New Campaign before changing requested items"),
+        missing_campaign = Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
+            "that campaign is not available on this dataset"),
+        invalid_campaign_name = Loc("GUILD_SUPPLIES_REASON_INVALID_CAMPAIGN_NAME",
+            "enter a plain campaign name up to 64 characters, or clear the name"),
+        stale_name = Loc("GUILD_SUPPLIES_REASON_STALE_NAME",
+            "a newer campaign name revision already applied"),
         already_requested = Loc("GUILD_SUPPLIES_REASON_ALREADY_REQUESTED",
             "that item is already on the current campaign"),
         server_time_unavailable = Loc("GUILD_SUPPLIES_REASON_SERVER_TIME",
@@ -1270,6 +1458,14 @@ function GS.FormatReasonText(reason)
             "that player's contribution cannot become negative"),
         adjustment_floor = Loc("GUILD_SUPPLIES_REASON_ADJUSTMENT_FLOOR",
             "that adjustment would make totals negative"),
+        item_over_goal = Loc("GUILD_SUPPLIES_REASON_ITEM_OVER_GOAL",
+            "that adjustment would exceed the item's configured goal"),
+        invalid_item = Loc("GUILD_SUPPLIES_REASON_INVALID_ITEM",
+            "choose a requested campaign item"),
+        invalid_quantity = Loc("GUILD_SUPPLIES_REASON_INVALID_QUANTITY",
+            "enter a non-zero whole-number quantity without a leading plus sign"),
+        stale_campaign = Loc("GUILD_SUPPLIES_REASON_STALE_CAMPAIGN",
+            "the current campaign changed — refresh and try again"),
         awaiting_witnesses = Loc("GUILD_SUPPLIES_REASON_AWAITING_WITNESSES",
             "waiting for additional independent Guild Bank observers"),
         ambiguous = Loc("GUILD_SUPPLIES_REASON_AMBIGUOUS",

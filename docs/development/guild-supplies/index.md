@@ -1,8 +1,8 @@
 # Guild Supplies Foundation (Phase 2A + 2B + 3A + 3B + 3C)
 
-Part **2A** (#385) delivers a **dormant, guild-keyed staged foundation**. Part **2B** (#386) adds **fresh-start campaigns**, local eligibility cutoffs, and **visible standalone Settings**. Part **3A** (#387) connects staged configuration to the Guild Gossip provider for authenticated exchange, conflict resolution, and explicit dataset adoption. Part **3B** (#388) adds **staged donation evidence**, automatic verification, guild-owned **character links**, and **ledger gossip** (including editor quantity adjustments). **#411** verifies a donation from one current officer's direct Guild Bank observation, and otherwise keeps the three-witness quorum. Part **3C** (#389) performs **guarded live activation**, publishes the agreed bank cutover boundary, rewires production bank/helper consumers to guild-owned state, and retires legacy profile Consumables writers for the activated guild.
+Part **2A** (#385) delivers a **dormant, guild-keyed staged foundation**. Part **2B** (#386) adds **fresh-start campaigns**, local eligibility cutoffs, and **visible standalone Settings**. Part **3A** (#387) connects staged configuration to the Guild Gossip provider for authenticated exchange, conflict resolution, and explicit dataset adoption. Part **3B** (#388) adds **staged donation evidence**, automatic verification, and **ledger gossip** (including editor quantity adjustments). **#411** verifies a donation from one current officer's direct Guild Bank observation, and otherwise keeps the three-witness quorum. **#427** retires Raid Supplies witness-link editing: Guild Info main/alt assignments are the sole identity authority for witness independence and donation display attribution (original donor identity stays immutable in the ledger). Part **3C** (#389) performs **guarded live activation**, publishes the agreed bank cutover boundary, rewires production bank/helper consumers to guild-owned state, and retires legacy profile Consumables writers for the activated guild.
 
-Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/385), [#386](https://github.com/OsulivanAB/SpectrumFederation/issues/386), [#387](https://github.com/OsulivanAB/SpectrumFederation/issues/387), [#388](https://github.com/OsulivanAB/SpectrumFederation/issues/388), [#389](https://github.com/OsulivanAB/SpectrumFederation/issues/389). Parent roadmap: [#384](https://github.com/OsulivanAB/SpectrumFederation/issues/384) / [#379](https://github.com/OsulivanAB/SpectrumFederation/issues/379). Transport dependency: [#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378).
+Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/385), [#386](https://github.com/OsulivanAB/SpectrumFederation/issues/386), [#387](https://github.com/OsulivanAB/SpectrumFederation/issues/387), [#388](https://github.com/OsulivanAB/SpectrumFederation/issues/388), [#389](https://github.com/OsulivanAB/SpectrumFederation/issues/389), [#427](https://github.com/OsulivanAB/SpectrumFederation/issues/427). Parent roadmap: [#384](https://github.com/OsulivanAB/SpectrumFederation/issues/384) / [#379](https://github.com/OsulivanAB/SpectrumFederation/issues/379). Transport dependency: [#378](https://github.com/OsulivanAB/SpectrumFederation/issues/378).
 
 **Hard release invariant:** Until an authorized editor successfully activates a guild dataset, legacy profile-scoped Consumables remains the live writer. After activation, Guild Supplies is the sole production writer for that guild.
 
@@ -17,8 +17,10 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Authenticated remote admission / adoption / conflicts | `Admission` (`AdmitRemote*`, adoption APIs) |
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
 | Guarded live activation + cutover marker | `Activation` (`ActivateCanonicalDataset`, `InstallRemoteLiveCutover`) |
-| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`) via Guild Gossip API |
-| Donation evidence / officer or three-witness ledger / identity links | `Ledger` |
+| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 3`) via Guild Gossip API |
+| Campaign display names (#424) | `rename-campaign` ops + `campaignNames` projection; LWW by `(timestamp, op.id)`; no Troubleshooting conflict |
+| Donation evidence / officer or three-witness ledger | `Ledger` |
+| Witness identity + contribution attribution (#427) | Guild Info main/alt (read-only); durable donor fields unchanged; legacy `identityLinks` inert |
 | Configuration / Logs Settings pages | `UI/Settings/Pages/GuildSupplies*.lua` |
 | Live bank observation after activation | `ConsumablesBankLog` → `AdmitDirectObservation` |
 | Legacy profile writer isolation | `Consumables.LegacyWritersAllowed` + sync handler gates |
@@ -56,16 +58,25 @@ SpectrumFederationDB.guildSupplies = {
       campaigns = { -- [campaignId] = immutable boundary header },
       campaignArchives = { -- [campaignId] = frozen requestedItems + generation },
       campaignContext = { -- [campaignId] = bounded bank anchors (not gossip envelopes) },
+      campaignNames = nil | { -- #424 optional guild-owned display names; absent on older saves
+        [campaignId] = { name = "<string or nil clear>", revisionId = "<op id>", renamedAt = <GetServerTime> },
+      },
       accounting = {
         _consumables = { guild = { guid, name, realm }, bankTab, requestedItems, eligibility, txnRegistry, ... },
         _consumableEvents = {},
         _consumableEventArchive = {},
       },
       observations = { byCampaign = {} },
-      identityLinks = { schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil },
+      identityLinks = { schemaVersion = 1, groups = {}, byGuid = {}, revisionId = nil }, -- inert legacy (#427); Guild Info owns identity
       operations = { records = {}, order = {}, heads = {}, pending = {}, conflicts = {}, openConflicts = {} },
       confirmationRefs = {},
       migration = nil,
+      valuations = nil | { -- #397 accepted DBMarket snapshots only; absent on older saves
+        schemaVersion = 1,
+        nextSeq = 1,
+        byTxn = {}, -- [canonicalTxnId] = immutable winner + local seen fingerprints
+        pending = {}, -- bounded assignments waiting for the donation to verify
+      },
     },
   },
 }
@@ -75,6 +86,10 @@ SpectrumFederationDB.guildSupplies = {
 - `permission.editorRankPosition` and `set-editor-rank` history remain so existing datasets, revisions, and operation ancestry still validate. They are not a second live authorization source. Current edits use the shared officer rank. A corrupt permission record can still be repaired by the Guild Master without resetting campaigns, donation logs, or accounting. The old editor-rank setting is not migrated.
 - Absent root → empty defaults. Unsupported/malformed root or guild records are retained read-only.
 - Active records without a valid `liveCutover` fail closed (unavailable), never silently rewritten.
+
+## Donation valuation (#397)
+
+Eligible officers on the exact guild home realm assign one TSM DBMarket snapshot when a live, production-credited donation is verified. That includes a new officer direct credit and a three-witness credit, and an eligible officer who accepts officer-trusted history can price it without opening Logs. Logs open discovers unpriced rows in bounded slices and then queries TSM in bounded batches (`C_Timer.After(0)` catch-up: at most 32 discoveries and 8 price attempts per callback, with per-pass DBMarket reuse, cancellation, and eventual idle — a narrow #397 exception to the usual no-timer TSM rule; not recurring polling, login scans, or chat). Earliest assignment time wins, with the assignment id breaking same-second ties, including when both an alias and its canonical id already hold a candidate. The donation ledger itself is not edited. Values travel as `gs-valuation` records on the existing Guild Supplies gossip provider. **#427** advances `PROVIDER_SCHEMA` to **3** so older link-based witness peers cannot silently share quorum with Guild Info–aware clients (schema 2 was valuation-aware). Guild Gossip matches provider schemas by strict equality — update peers before Guild Supplies synchronization resumes. Persisted `GS.SCHEMA_VERSION` is unchanged; local SavedVariables remain usable across the upgrade. The dataset descriptor advertises `valuationCount`, and adoption pins and checks that count before commit. Publishing or removing a winner, including a later Logs catch-up price, updates that count in place without a separate dataset rebuild. Removing a tracked valuation drops its manifest ID even when the cold paced export has not yet materialized its `gs:val` body. A current editor may relay an offline author's accepted assignment; claimed author fields are not proof. Ordinary members can read the winning total and cannot mint one. Missing TSM leaves the row unpriced. Zero is a real price. Only the accepted snapshot is stored — not a general TSM price cache. Unit copper must stay an exact integer whose product with the donated quantity is strictly below 2^53. A same-dataset peer that is still staged holds an authorized matching assignment as pending until the installed cutover classifies the donation, and does not export it before then. An unmarked accepted donation that can still receive late authenticated canonical-marker provenance keeps that pending price after cutover install until credit settles; a false→true credit transition reconciles the original immutable assignment (and may attempt a local price only if still unpriced). An alias created before the donation arrives, or while that credit is still unresolved, keeps the earliest valid pending candidate under the canonical lookup key without rewriting that assignment's original transaction id. Export maintenance reuses the tracked valuation manifest while that winner set is unchanged. Valuation cleanup for a temporary adoption record stays on that record. An unexpected TSM adapter exception is debug-logged and leaves the row unpriced. Fresh-client adoption replay reuses the guarded `allowBootstrapInstall` editor check when the live guild slot is absent; ordinary Gossip ingress does not.
 
 ## Public API (`SF.GuildSupplies`) — activation (#389)
 
@@ -93,14 +108,15 @@ Mutation statuses remain `accepted` / `duplicate` / `pending` / `rejected`. Acti
 
 | Area | Access |
 | --- | --- |
-| **Raid Supplies → Configuration** | Initialize, bank tab, New Campaign, items/goals, character links, adjustments, adoption, conflict resolution, **Activate Guild Supplies**. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
-| **Raid Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history |
-| **Personal preferences** | Account-local reminder checkbox |
+| **Raid Supplies → Configuration** | Initialize, bank tab, New Campaign, rename target (current/archived), items/goals, adjustments, **Activate Guild Supplies**, and the personal reminder checkbox. Main/alt edits live under **Guild Settings → Main / Alt Assignments** (#427). Status/campaign/next-step/warnings (including dataset mismatch and adoption-in-progress) stay here. Who can edit follows the shared officer rank. A historical permission repair control appears only when that stored record is corrupt. The category id remains `guildSupplies`. |
+| **Raid Supplies → Logs** | Campaign inspection, progress, pending evidence, donation/adjustment history (read-only; no rename or personal preferences) |
+| **Raid Supplies → Troubleshooting** | Staged dataset adoption and configuration-conflict resolution (#422). Same editor/authority restrictions as before; ordinary members can navigate. |
+| **Personal preferences** | Account-local reminder checkbox on Configuration only (#428) |
 | **Loot Helper → Consumables / Consumable Logs** | Removed from the packaged addon (#415). They are not registered before or after activation, including across profile switches. Legacy profile writers, SavedVariables, and the #389 eligibility gates stay in place. |
 
-## Donation verification (#411)
+## Donation verification (#411 / #427)
 
-Officer eligibility is the established Guild Info threshold at the moment a new local Guild Bank snapshot is admitted: verified `rankOrder <= effectiveThreshold`. One such local observation commits a single canonical credit with `verification = "officer"`, the observer's GUID, and an explicit `verifierGuid` equal to that writer. Remote `gs-evidence` remains a witness. One or two non-officer observations stay pending until a third independent witness or a later local officer snapshot of the same deposit. Rank or policy changes do not revoke an accepted credit and do not upgrade an old report until a newer local snapshot while the character qualifies.
+Officer eligibility is the established Guild Info threshold at the moment a new local Guild Bank snapshot is admitted: verified `rankOrder <= effectiveThreshold`. One such local observation commits a single canonical credit with `verification = "officer"`, the observer's GUID, and an explicit `verifierGuid` equal to that writer. Remote `gs-evidence` remains a witness. One or two non-officer observations stay pending until a third independent witness or a later local officer snapshot of the same deposit. **Independence** follows Guild Info main/alt groups (main+alts = one witness). When Guild Info is unavailable or `generation_syncing`, three-witness evidence stays pending rather than treating distinct GUIDs as independent people; officer-direct credit is not blocked. Pending clusters reevaluate when Guild Info relationships change. Accepted ledger rows keep the original donor; Logs and contribution totals project to the current main. Rank or policy changes do not revoke an accepted credit and do not upgrade an old report until a newer local snapshot while the character qualifies.
 
 Accepted officer-trusted rows sync through the existing Guild Gossip ledger export. A guildmate who already has the row can serve a late peer after the original officer logs off. Live receivers credit that relay only when the authenticated canonical cutover marker matches. A staged receiver keeps marked accepted history so installing that same marker later classifies it. Competing authenticated markers for one occurrence are retained without last-writer-wins (primary plus one bounded alternate); the established cutover selects the canonical marker. Only a complete officer-history duplicate may attach those markers. A missing or different marker alone is not promoted into live credit. An unverified ledger candidate does not block a later valid officer row for the same occurrence, and that admission clears the matching pending cluster and candidate without dropping unrelated ambiguous or repeated deposits. Catch-up and adoption do not invent a missing `verifierGuid`. Three-witness ledger rows still do not self-credit from gossip. Dataset adoption replays stored witness exports as votes and does not turn one of them into an officer credit. A bare `verification`, `writer`, `rankOrder`, `isAdmin`, or `observedBy` claim is not authority. **v1 limit:** there is no cryptographic proof of which officer saw Blizzard's bank log. An authenticated guild member who sends a complete, eligible officer-provenance row is treated as relaying accepted history.
 
@@ -133,3 +149,4 @@ Automated production-Lua tests do **not** replace Retail QA.
 11. Profile switch/delete, snapshot import, and old-client `CONSUMABLES_*` session traffic must not mutate canonical Guild Supplies or double-credit.
 12. New Campaign after activation archives prior goals and starts empty; shared tab/editor policy/cutover identity remain.
 13. Disconnect/rejoin, rank demotion, combat/FPS, and normal Loot Helper raid loot behavior remain intact; no game Chat from Guild Supplies paths.
+14. **Valuation:** a same-realm officer with TSM prices a new donation; a different-realm officer and an ordinary member do not. Two disconnected officers converge on the earlier assignment after reconnect, in either arrival order. Missing TSM stays unpriced. Archived campaigns and `/reload` keep the winning total. No game Chat and no continuous pricing work while Logs is closed.

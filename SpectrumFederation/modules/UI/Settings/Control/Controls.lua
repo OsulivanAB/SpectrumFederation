@@ -904,10 +904,15 @@ function Controls:AddEditBoxWithButton(section, opts)
 		local _, control = self:InitRow(row, opts)
 
 		local bound = false
+		local displayFromGet = false
 		local get, set
 		if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
 			bound = true
 			get, set = ResolveGetSet(opts)
+		elseif type(opts.get) == "function" then
+			-- Display the current value; commit only through onSubmit / button.
+			displayFromGet = true
+			get = opts.get
 		end
 
 		local edit = CreateFrame("EditBox", nil, control, "InputBoxTemplate")
@@ -934,6 +939,28 @@ function Controls:AddEditBoxWithButton(section, opts)
 		btn:SetPoint("LEFT", edit, "RIGHT", 8, 0)
 
 		local ignore = false
+		-- Getter-only rename fields: keep unfinished drafts across unrelated
+		-- refreshes; reload when the backing selection key changes.
+		local lastLoadedText = nil
+		local lastSelectionKey = nil
+
+		local function CurrentSelectionKey()
+			if type(opts.getSelectionKey) == "function" then
+				return opts.getSelectionKey()
+			end
+			return nil
+		end
+
+		local function LoadFromGet()
+			local nextText = tostring(get() or "")
+			ignore = true
+			edit:SetText(nextText)
+			if edit.SetCursorPosition then
+				edit:SetCursorPosition(0)
+			end
+			ignore = false
+			lastLoadedText = nextText
+		end
 
 		local function Commit()
 			if not bound then return end
@@ -949,18 +976,71 @@ function Controls:AddEditBoxWithButton(section, opts)
 		end
 
 		local function DoSubmit()
-			if (btn.IsEnabled and not btn:IsEnabled()) then return end	
+			if (btn.IsEnabled and not btn:IsEnabled()) then return end
+			-- Getter-only fields with getSelectionKey: if the backing selection
+			-- changed before a deferred Refresh ran, the edit still holds the
+			-- previous campaign's text. Reload and abort rather than submitting
+			-- that text against the newly resolved target (#434 / #428).
+			if displayFromGet and type(opts.getSelectionKey) == "function" then
+				local selectionKey = CurrentSelectionKey()
+				if selectionKey ~= lastSelectionKey then
+					LoadFromGet()
+					lastSelectionKey = selectionKey
+					return
+				end
+			end
 			local text = edit:GetText()
 			if opts.onSubmit then
 				opts.onSubmit(text, edit, btn)
 			elseif bound then
 				Commit()
 			end
+			if displayFromGet then
+				-- After an explicit submit, converge to the durable getter value
+				-- (success) or keep a failed draft only when get() still differs.
+				local fromGet = tostring(get() or "")
+				local cur = edit:GetText() or ""
+				if cur == fromGet or not (edit.HasFocus and edit:HasFocus()) then
+					LoadFromGet()
+					if type(opts.getSelectionKey) == "function" then
+						lastSelectionKey = CurrentSelectionKey()
+					end
+				else
+					lastLoadedText = cur
+				end
+			end
+		end
+
+		local function SyncButtonEnabled(text)
+			-- Row-level enabled still gates the edit box. Optional buttonEnabled
+			-- lets Apply stay disabled for invalid text while the input remains
+			-- editable (#426 / #430).
+			local _, rowEnabled = self:_ApplyRowState(row, section, opts, { edit })
+			local buttonOk = rowEnabled and true or false
+			if buttonOk and type(opts.buttonEnabled) == "function" then
+				buttonOk = opts.buttonEnabled(text or (edit:GetText() or "")) and true or false
+			end
+			if btn.SetEnabled then
+				btn:SetEnabled(buttonOk)
+			elseif buttonOk and btn.Enable then
+				btn:Enable()
+			elseif (not buttonOk) and btn.Disable then
+				btn:Disable()
+			end
+			btn:SetAlpha(buttonOk and 1 or 0.45)
+			-- Disabled-tip overlay follows the Apply button when present.
+			SyncDisabledTooltipOverlay(btn, buttonOk, opts)
+			local c = rowEnabled and 1 or 0.6
+			edit:SetTextColor(c, c, c)
+			return rowEnabled, buttonOk
 		end
 
 		btn:SetScript("OnClick", DoSubmit)
 		edit:SetScript("OnEnterPressed", function(selfEdit)
-			if bound then
+			-- Prefer explicit submit handlers over silent set() commits.
+			if opts.onSubmit then
+				DoSubmit()
+			elseif bound then
 				Commit()
 			else
 				DoSubmit()
@@ -968,24 +1048,58 @@ function Controls:AddEditBoxWithButton(section, opts)
 			selfEdit:ClearFocus()
 		end)
 		edit:SetScript("OnEditFocusLost", function()
-			if bound then
+			if bound and not opts.onSubmit then
 				Commit()
+			end
+		end)
+		edit:SetScript("OnTextChanged", function(selfEdit, userInput)
+			if ignore then
+				return
+			end
+			local text = selfEdit:GetText() or ""
+			if userInput and type(opts.onTextChanged) == "function" then
+				opts.onTextChanged(text, selfEdit, btn)
+			end
+			if type(opts.buttonEnabled) == "function" then
+				SyncButtonEnabled(text)
 			end
 		end)
 
 		local function Refresh()
 			if bound then
-				ignore = true
-				edit:SetText(tostring(get() or ""))
-				if edit.SetCursorPosition then
-					edit:SetCursorPosition(0)
+				LoadFromGet()
+			elseif displayFromGet then
+				local selectionKey = CurrentSelectionKey()
+				local selectionChanged = selectionKey ~= lastSelectionKey
+				local focused = edit.HasFocus and edit:HasFocus()
+				local cur = edit:GetText() or ""
+				local dirty = cur ~= (lastLoadedText or "")
+				if selectionChanged then
+					LoadFromGet()
+					lastSelectionKey = selectionKey
+				elseif focused or dirty then
+					-- Preserve unfinished text under roster/durable/item refreshes.
+					if selectionKey ~= nil then
+						lastSelectionKey = selectionKey
+					end
+					if not focused and dirty and cur == tostring(get() or "") then
+						lastLoadedText = cur
+					end
+				else
+					LoadFromGet()
+					if selectionKey ~= nil then
+						lastSelectionKey = selectionKey
+					end
 				end
-				ignore = false
 			end
 
-			local _, enabled = self:_ApplyRowState(row, section, opts, {edit, btn})
-			local c = enabled and 1 or 0.6
-			edit:SetTextColor(c, c, c)
+			if type(opts.buttonEnabled) == "function" then
+				SyncButtonEnabled(edit:GetText() or "")
+			else
+				local _, enabled = self:_ApplyRowState(row, section, opts, {edit, btn})
+				local c = enabled and 1 or 0.6
+				edit:SetTextColor(c, c, c)
+			end
 		end
 		Refresh()
 		RegisterRefresh(section, Refresh)
@@ -2359,6 +2473,85 @@ function Controls:AddConsumableGoalSummary(section, opts)
 	end)
 end
 
+-- Read-only overall progress bar only (no per-item summary). Matches Guild Bank
+-- assistant bar appearance/percentage clamp for Raid Supplies Logs (#429).
+-- @param section table Section to add row into
+-- @param opts table Options with getProgress returning GoalProgress model
+-- @return Frame The created row
+function Controls:AddOverallProgressBar(section, opts)
+	opts = opts or {}
+
+	local getProgress = opts.getProgress
+	if type(getProgress) ~= "function" then
+		getProgress = function() return nil end
+	end
+
+	local barHeight = opts.barHeight or 14
+	local rowHeight = opts.height or (barHeight + 12)
+
+	local function Loc(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default or key
+	end
+
+	return section:AddRow(rowHeight, function(row)
+		local _, control = self:InitRow(row, opts)
+
+		local emptyText = control:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+		emptyText:SetPoint("LEFT", control, "LEFT", 0, 0)
+		emptyText:SetPoint("RIGHT", control, "RIGHT", 0, 0)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:SetText(Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."))
+
+		local bar = CreateFrame("StatusBar", nil, control)
+		bar:SetPoint("LEFT", control, "LEFT", 0, 0)
+		bar:SetPoint("RIGHT", control, "RIGHT", 0, 0)
+		bar:SetHeight(barHeight)
+		if bar.SetMinMaxValues then bar:SetMinMaxValues(0, 100) end
+		if bar.SetValue then bar:SetValue(0) end
+		if bar.SetStatusBarTexture then
+			bar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+		end
+		if bar.SetStatusBarColor then
+			bar:SetStatusBarColor(0.2, 0.7, 0.3, 1)
+		end
+		local barBg = bar:CreateTexture(nil, "BACKGROUND")
+		if barBg.SetAllPoints then barBg:SetAllPoints(bar) end
+		if barBg.SetTexture then barBg:SetTexture("Interface\\Buttons\\WHITE8x8") end
+		if barBg.SetVertexColor then barBg:SetVertexColor(0.15, 0.15, 0.15, 0.8) end
+		local barText = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		barText:SetPoint("CENTER", bar, "CENTER", 0, 0)
+		bar.Text = barText
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, { bar, emptyText })
+			local progress = getProgress() or {}
+			if progress.hasPositiveGoal then
+				emptyText:Hide()
+				bar:Show()
+				local pct = tonumber(progress.overallPercent) or 0
+				pct = math.max(0, math.min(100, pct))
+				if bar.SetValue then bar:SetValue(pct) end
+				if bar.Text then
+					bar.Text:SetText(string.format("%d%%", pct))
+				end
+			else
+				bar:Hide()
+				emptyText:Show()
+				emptyText:SetText(
+					progress.overallEmptyText
+						or Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured.")
+				)
+			end
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 function Controls:AddLogTable(section, opts)
 	opts = opts or {}
 
@@ -3286,8 +3479,12 @@ function Controls:AddAutocomplete(section, opts)
 		end
 
 		local drop = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
-		drop:SetFrameStrata("TOOLTIP")
-		drop:SetClampedToScreen(true)
+		if drop.SetFrameStrata then
+			drop:SetFrameStrata("TOOLTIP")
+		end
+		if drop.SetClampedToScreen then
+			drop:SetClampedToScreen(true)
+		end
 		drop:Hide()
 		if drop.SetBackdrop then
 			drop:SetBackdrop({

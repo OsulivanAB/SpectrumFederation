@@ -251,6 +251,9 @@ function R:Build(panel, pageDef)
 			elseif t == "consumableGoalSummary" then
 				controls:AddConsumableGoalSummary(sec, item)
 
+			elseif t == "overallProgressBar" then
+				controls:AddOverallProgressBar(sec, item)
+
 			elseif t == "button" then
 				local opts = item
 				if type(opts.onClick) == "function" then

@@ -4364,6 +4364,124 @@ local function checkDepositAssistantItemIcons()
     unchanged(p, "deposit assistant icons")
 end
 
+local function findShownItemRow(review, itemId)
+    local texture = "Interface\\Icons\\Item" .. tostring(itemId)
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.Icon and row.Icon.texture == texture then
+            return row
+        end
+    end
+    return nil
+end
+
+local function checkRuntimeGoalMetLabel()
+    -- Issue #435: Goal Met presentation for completed finite donation goals.
+    local p = runtimeFixture("rt-goal-met")
+    C.AddRequestedItem(p, admin, flask)
+    C.SetRequestedGoal(p, admin, aqirite, 100)
+    C.SetRequestedGoal(p, admin, flask, 0)
+    C.CommitEvents(p, "goal-met-seed", W.DepositEvents({
+        generation = 1, itemId = aqirite, donor = donor, requested = true,
+    }, 40))
+    world.bags[0] = {
+        [1] = { itemId = aqirite, count = 20 },
+        [2] = { itemId = flask, count = 5 },
+    }
+    world.bags[5] = {}
+    world.bankOpen = true
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(), "Goal Met fixture opens the donation helper")
+
+    local aqRow = findShownItemRow(review, aqirite)
+    local flaskRow = findShownItemRow(review, flask)
+    assertTrue(aqRow ~= nil, "incomplete finite-goal item is listed")
+    assertTrue(flaskRow ~= nil, "No Goal item is listed")
+    assertEq(aqRow.Progress.text, "40%", "incomplete goal keeps its floor percent")
+    assertTrue(aqRow.Edit:IsShown() and aqRow.Button:IsShown(), "incomplete goals show deposit controls")
+    assertFalse(aqRow.GoalMet:IsShown(), "incomplete goals hide Goal Met")
+    assertEq(flaskRow.Progress.text, "No Goal", "No Goal progress label is unchanged")
+    assertTrue(flaskRow.Edit:IsShown() and flaskRow.Button:IsShown(), "No Goal items remain depositable")
+    assertFalse(flaskRow.GoalMet:IsShown(), "No Goal items hide Goal Met")
+    assertEq(review.Rows[1].GoalMet:IsShown(), false, "group headers hide Goal Met")
+
+    -- Incomplete → complete while the helper stays open.
+    C.CommitEvents(p, "goal-met-complete", W.DepositEvents({
+        generation = 1, itemId = aqirite, donor = donor, requested = true,
+    }, 70))
+    RT:RebuildReview()
+    aqRow = findShownItemRow(review, aqirite)
+    flaskRow = findShownItemRow(review, flask)
+    assertEq(aqRow.Progress.text, "110%", "completed goals keep over-100 percents")
+    assertFalse(aqRow.Edit:IsShown(), "completed goals hide the quantity field")
+    assertFalse(aqRow.Button:IsShown(), "completed goals hide Deposit")
+    assertTrue(aqRow.GoalMet:IsShown(), "completed goals show Goal Met")
+    assertEq(aqRow.GoalMet.text, "Goal Met", "Goal Met text is exact")
+    assertTrue(aqRow.IconButton:IsShown(), "completed goals keep the icon")
+    assertTrue(flaskRow.Edit:IsShown() and flaskRow.Button:IsShown(),
+        "sibling No Goal row stays depositable after another item completes")
+    assertFalse(flaskRow.GoalMet:IsShown(), "sibling No Goal row does not show Goal Met")
+    assertEq(aqRow.Button.scripts.OnClick, nil, "completed binding clears Deposit OnClick")
+
+    -- Capture a completed-row OnClick was nil; raise goal → complete→incomplete restores handlers.
+    C.SetRequestedGoal(p, admin, aqirite, 200)
+    RT:RebuildReview()
+    aqRow = findShownItemRow(review, aqirite)
+    assertTrue(aqRow.Edit:IsShown() and aqRow.Button:IsShown(), "incomplete again restores deposit controls")
+    assertFalse(aqRow.GoalMet:IsShown(), "incomplete again hides Goal Met")
+    assertEq(aqRow.Progress.text, "55%", "percent recalculates after the goal increase")
+    assertTrue(aqRow.Button.scripts.OnClick ~= nil, "restored Deposit OnClick is bound")
+
+    -- Complete again, then reuse the pooled row as empty state.
+    C.CommitEvents(p, "goal-met-complete-2", W.DepositEvents({
+        generation = 1, itemId = aqirite, donor = donor, requested = true,
+    }, 100))
+    RT:RebuildReview()
+    aqRow = findShownItemRow(review, aqirite)
+    assertTrue(aqRow.GoalMet:IsShown(), "re-completed goals show Goal Met again")
+    local completedClick = aqRow.Button.scripts.OnClick
+    assertEq(completedClick, nil, "re-completed goals keep Deposit OnClick cleared")
+
+    world.bags[0][1].count = 0
+    world.bags[0][2].count = 0
+    RT:RebuildReview()
+    local empty = review.Rows[1]
+    assertEq(empty.Text.text, "No raid supplies to deposit.", "empty state reuses a pooled row")
+    assertFalse(empty.GoalMet:IsShown(), "empty state hides a stale Goal Met label")
+    assertFalse(empty.Edit:IsShown(), "empty state hides the quantity field")
+    assertFalse(empty.Button:IsShown(), "empty state hides Deposit")
+    assertEq(empty.Button.scripts.OnClick, nil, "empty state clears Deposit OnClick")
+    assertEq(empty.boundItemId, nil, "empty state clears the item binding")
+
+    -- Restore bags and complete aqirite; then remove it so the pooled data row becomes flask.
+    world.bags[0][1] = { itemId = aqirite, count = 4 }
+    world.bags[0][2] = { itemId = flask, count = 3 }
+    RT:RebuildReview()
+    aqRow = findShownItemRow(review, aqirite)
+    flaskRow = findShownItemRow(review, flask)
+    assertTrue(aqRow.GoalMet:IsShown(), "completed aqirite shows Goal Met before list shrink")
+    assertTrue(flaskRow.Edit:IsShown(), "flask stays depositable before list shrink")
+    assertTrue(select(1, C.RemoveRequestedItem(p, admin, aqirite)), "removing completed item rebinds the pool")
+    RT:RebuildReview()
+    assertEq(review.Rows[1].Text.text, "Guild Bank", "header remains after item removal")
+    assertFalse(review.Rows[1].GoalMet:IsShown(), "header binding hides Goal Met")
+    local rebound = review.Rows[2]
+    assertEq(rebound.boundItemId, flask, "pooled data row rebinds to the remaining No Goal item")
+    assertFalse(rebound.GoalMet:IsShown(), "rebound No Goal row hides a prior Goal Met label")
+    assertTrue(rebound.Edit:IsShown() and rebound.Button:IsShown(),
+        "rebound No Goal row shows deposit controls")
+    assertEq(rebound.Edit.text, "3", "rebound row shows the new item's suggestion")
+    assertTrue(rebound.Button.scripts.OnClick ~= nil, "rebound Deposit OnClick targets the new item")
+    rebound.Button.scripts.OnClick(rebound.Button)
+    assertEq(RT.qtyOverrides[flask], 3, "Deposit after Goal Met reuse uses the rebound item")
+    assertEq(RT.qtyOverrides[aqirite], nil, "Deposit after Goal Met reuse does not apply the removed item")
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    world.places = {}
+    unchanged(p, "runtime Goal Met label")
+end
+
 local function checkSmartDonationHelper()
     local p = runtimeFixture("rt-smart-donation")
     C.AddRequestedItem(p, admin, flask)
@@ -4426,9 +4544,12 @@ local function checkSmartDonationHelper()
     assertEq(aqRow.Progress.text, "87%", "finite-goal row shows the floor percent")
     assertEq(aqRow.Edit.text, "25", "finite-goal suggestion is min(available, remaining)")
     assertTrue(aqRow.Button:IsShown(), "incomplete finite goals keep Deposit")
+    assertTrue(aqRow.GoalMet ~= nil, "rows allocate a Goal Met label")
+    assertFalse(aqRow.GoalMet:IsShown(), "incomplete finite goals hide Goal Met")
     assertEq(flaskRow.Progress.text, "No Goal", "goal-0 row shows No Goal")
     assertEq(flaskRow.Edit.text, "12", "goal-0 suggestion uses carried quantity")
     assertTrue(flaskRow.Button:IsShown(), "goal-0 items remain depositable")
+    assertFalse(flaskRow.GoalMet:IsShown(), "No Goal items hide Goal Met and stay depositable")
 
     -- Manual over-donation while incomplete is allowed; inventory still clamps.
     aqRow.Edit:SetText("40")
@@ -4549,6 +4670,9 @@ local function checkSmartDonationHelper()
     assertEq(aqRow.Progress.text, "102%", "completed goals show percents above 100")
     assertFalse(aqRow.Edit:IsShown(), "completed goals hide the quantity field")
     assertFalse(aqRow.Button:IsShown(), "completed goals hide Deposit")
+    assertTrue(aqRow.GoalMet:IsShown(), "completed goals show Goal Met in the deposit control space")
+    assertEq(aqRow.GoalMet.text, "Goal Met", "Goal Met uses the exact localized label")
+    assertTrue(aqRow.IconButton and aqRow.IconButton:IsShown(), "completed goals keep the item icon")
     assertEq(review.ProgressBar.Text.text, "100%", "overall progress caps the completed item at its goal")
 
     -- Stale completed-goal deposit callback must not start work.
@@ -4563,8 +4687,10 @@ local function checkSmartDonationHelper()
     assertEq(RT.depositWork, nil, "completed goals reject BeginDeposit")
     assertEq(RT.depositIntent, nil, "completed goals create no deposit intent")
     assertTrue(#world.warnings > 0, "completed-goal deposit warns the player")
+    assertEq(aqRow.Button.scripts.OnClick, nil, "completed-goal rows clear Deposit OnClick")
+    assertEq(aqRow.Edit.scripts.OnEnterPressed, nil, "completed-goal rows clear qty OnEnterPressed")
 
-    -- Progress update while open: incomplete → complete hides controls.
+    -- Progress update while open: complete → incomplete restores controls and hides Goal Met.
     C.SetRequestedGoal(p, admin, aqirite, 300)
     RT:RebuildReview()
     for i = 1, #review.Rows do
@@ -4574,8 +4700,11 @@ local function checkSmartDonationHelper()
         end
     end
     assertTrue(aqRow.Edit:IsShown(), "raising the goal restores deposit controls")
+    assertTrue(aqRow.Button:IsShown(), "raising the goal restores Deposit")
+    assertFalse(aqRow.GoalMet:IsShown(), "raising the goal hides Goal Met")
     assertEq(aqRow.Edit.text, "8", "updated suggestion uses remaining need and bags")
     assertEq(aqRow.Progress.text, "68%", "progress updates while the helper is open")
+    assertTrue(aqRow.Button.scripts.OnClick ~= nil, "restored Deposit has an OnClick handler")
 
     -- Bounded lifecycle with the new Guild Bank size hook.
     local frames = frameCount
@@ -4776,6 +4905,8 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
         "TOC still loads Raid Supplies Configuration")
     assertTrue(toc:find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua", 1, true) ~= nil,
         "TOC still loads Raid Supplies Logs")
+    assertTrue(toc:find("modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua", 1, true) ~= nil,
+        "TOC still loads Raid Supplies Troubleshooting")
     assertTrue(toc:find("modules/LootHelper/Consumables.lua", 1, true) ~= nil,
         "TOC still loads the Consumables backend")
     assertTrue(readFile("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua") == nil,
@@ -4803,6 +4934,7 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
     end
     load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    load("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local ui = SF.SettingsUI
     local Nav = SF.SettingsNavigationModel
@@ -4810,6 +4942,8 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
         "Raid Supplies Configuration registers")
     assertTrue(ui.pagesById.guildSuppliesLogs ~= nil,
         "Raid Supplies Logs registers")
+    assertTrue(ui.pagesById.guildSuppliesTroubleshooting ~= nil,
+        "Raid Supplies Troubleshooting registers")
     assertTrue(ui.pagesById.lootHelperConsumables == nil,
         "legacy Consumables page does not register")
     assertTrue(ui.pagesById.lootHelperConsumableLogs == nil,
@@ -4818,16 +4952,20 @@ local function checkLegacyConsumablesSettingsPagesRemoved()
         "Raid Supplies Configuration stays available")
     assertEq(Nav.IsPageAvailable(ui.pagesById.guildSuppliesLogs), true,
         "Raid Supplies Logs stays available")
+    assertEq(Nav.IsPageAvailable(ui.pagesById.guildSuppliesTroubleshooting), true,
+        "Raid Supplies Troubleshooting stays available")
     assertEq(Nav.IsContentPage(ui, "lootHelperConsumables"), false,
         "legacy Consumables id is not a content page")
     assertEq(Nav.IsContentPage(ui, "lootHelperConsumableLogs"), false,
         "legacy Consumable Logs id is not a content page")
     local ids = Nav.GetContentPageIds(ui, "guildSupplies")
-    assertEq(#ids, 2, "Raid Supplies registers exactly two content pages")
+    assertEq(#ids, 3, "Raid Supplies registers exactly three content pages")
     assertEq(ids[1], "guildSuppliesConfiguration",
         "Configuration remains the first Raid Supplies page")
     assertEq(ids[2], "guildSuppliesLogs",
         "Logs remains the second Raid Supplies page")
+    assertEq(ids[3], "guildSuppliesTroubleshooting",
+        "Troubleshooting remains the third Raid Supplies page")
     local showRemoved = Nav.ResolveShowPage(ui, {
         currentCategoryId = "lootHelper",
         currentPageId = "lootHelperGeneral",
@@ -4969,6 +5107,7 @@ checkGoalsAndProgress()
 checkGoalCommitGate()
 checkSessionProfileNoticeRemoved()
 checkFocusedEditRowReuse()
+checkRuntimeGoalMetLabel()
 checkSmartDonationHelper()
 checkDepositAssistantItemIcons()
 

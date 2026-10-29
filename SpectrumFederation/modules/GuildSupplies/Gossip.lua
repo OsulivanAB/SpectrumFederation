@@ -9,7 +9,9 @@ local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
 
 GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 1
+-- Wire schema for sf.guildsupplies.config. Schema 3 (#427) is incompatible with
+-- older link-based witness peers; Guild Gossip matches by strict equality.
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 3
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -64,9 +66,29 @@ local exportState = {
     ledgerArchiveWarmPos = 0,
     donationEvidenceBuildNeeded = false,
     donationEvidenceBuildCursor = nil,
+    -- #397 paced cold construction for accepted donation valuations.
+    valuationBuildNeeded = false,
+    valuationBuildCursor = nil,
+    -- Session-only sorted byTxn keys for cold valuation export (invalidated on
+    -- dataset/store/revision change so slices do not re-sort every callback).
+    valuationBuildKeys = nil,
+    valuationBuildKeysStore = nil,
+    valuationBuildKeysDataset = nil,
+    valuationBuildKeysRev = nil,
     -- Invalidates queued maint closures after disable/replacement.
     maintGeneration = 0,
 }
+
+-- Declared before the export mutators that consult it. A later `local` would
+-- leave those closures bound to a nil global and skip valuation publication.
+local providerRegistered = false
+
+-- Bank-snapshot (and similar) notify batch. Forward-declared so
+-- NoteValuationExported can coalesce outward notifies without a later `local`
+-- shadowing the upvalue as a nil global.
+local durableNotifyBatchDepth = 0
+local durableNotifyBatchPending = nil
+local PreferDurableNotifyReason
 
 -- Runtime reassembly buffer for paged campaign archives and operation manifests
 -- (not SavedVariables). Scoped by datasetId; aggregate caps + TTL reclaim.
@@ -1600,6 +1622,138 @@ end
 -- Forward-declared: cold registration and Notify both schedule archive drain.
 local ScheduleExportMaintContinuation
 
+--- Replace the advertised valuation set from the winner map. One pass, used by
+-- cold rebuild and an already-running durable notification. Not used per price.
+local function TakeValuationManifest(byTxn)
+    local manifest = {}
+    local count = 0
+    if type(byTxn) == "table" then
+        for txnId in pairs(byTxn) do
+            if type(txnId) == "string" and txnId ~= "" then
+                manifest[txnId] = true
+                count = count + 1
+            end
+        end
+    end
+    exportState.valuationManifest = manifest
+    exportState.cachedValuationCount = count
+    return count
+end
+
+local function StampValuationManifest(record)
+    local store = type(record) == "table" and record.valuations or nil
+    exportState.valuationManifestStore = store
+    exportState.valuationManifestDataset = type(record) == "table" and record.datasetId or nil
+    local rev = 0
+    if type(store) == "table" and GS.ValuationStoreRevision then
+        rev = GS.ValuationStoreRevision(store)
+    end
+    exportState.valuationManifestRev = rev
+end
+
+local function ValuationManifestIsCurrent(record)
+    if type(exportState.valuationManifest) ~= "table" or type(record) ~= "table" then
+        return false
+    end
+    if exportState.valuationManifestDataset ~= record.datasetId then
+        return false
+    end
+    local store = record.valuations
+    if exportState.valuationManifestStore ~= store then
+        return false
+    end
+    local rev = 0
+    if type(store) == "table" and GS.ValuationStoreRevision then
+        rev = GS.ValuationStoreRevision(store)
+    end
+    return exportState.valuationManifestRev == rev
+end
+
+--- Full winner-map rebuild only when the tracked manifest is stale.
+-- GS._onValuationManifestRebuild is nil in production; tests count real rebuilds.
+local function ResolveValuationExportCount(record)
+    if ValuationManifestIsCurrent(record) then
+        return tonumber(exportState.cachedValuationCount) or 0
+    end
+    local byTxn = record and record.valuations and record.valuations.byTxn
+    local count = TakeValuationManifest(byTxn)
+    StampValuationManifest(record)
+    if type(GS._onValuationManifestRebuild) == "function" then
+        GS._onValuationManifestRebuild(record)
+    end
+    return count
+end
+
+local function StampCurrentValuationManifest()
+    if type(exportState.valuationManifest) ~= "table" then
+        return
+    end
+    local record = select(1, CurrentGuildRecord())
+    if type(record) ~= "table" or record.datasetId ~= exportState.datasetId then
+        return
+    end
+    StampValuationManifest(record)
+end
+
+--- Patch the already-exported dataset descriptor. O(1); does not rebuild.
+local function PublishValuationManifest()
+    local count = tonumber(exportState.cachedValuationCount) or 0
+    if count < 0 then
+        count = 0
+        exportState.cachedValuationCount = 0
+    end
+    local datasetId = exportState.datasetId
+    if type(datasetId) ~= "string" or datasetId == "" then
+        return
+    end
+    local entry = exportState.byId["gs:desc:" .. datasetId]
+    if type(entry) ~= "table" or type(entry.body) ~= "table" then
+        return
+    end
+    if entry.body.valuationCount == count and entry.needsFp ~= true
+        and type(entry.versionFp) == "string" then
+        return
+    end
+    entry.body.valuationCount = count
+    entry.needsFp = true
+    entry.versionFp = nil
+end
+
+local function NoteValuationManifestId(txnId)
+    if type(txnId) ~= "string" or txnId == "" then
+        return
+    end
+    local manifest = exportState.valuationManifest
+    if type(manifest) ~= "table" then
+        manifest = {}
+        exportState.valuationManifest = manifest
+    end
+    if manifest[txnId] then
+        StampCurrentValuationManifest()
+        return
+    end
+    manifest[txnId] = true
+    exportState.cachedValuationCount = (tonumber(exportState.cachedValuationCount) or 0) + 1
+    PublishValuationManifest()
+    StampCurrentValuationManifest()
+end
+
+local function DropValuationManifestId(txnId)
+    local manifest = exportState.valuationManifest
+    if type(manifest) ~= "table" or type(txnId) ~= "string" or txnId == ""
+        or not manifest[txnId] then
+        return false
+    end
+    manifest[txnId] = nil
+    local count = (tonumber(exportState.cachedValuationCount) or 1) - 1
+    if count < 0 then
+        count = 0
+    end
+    exportState.cachedValuationCount = count
+    StampCurrentValuationManifest()
+    return true
+end
+
 local function RebuildExportIndex()
     exportState.order = {}
     exportState.byId = {}
@@ -1670,6 +1824,7 @@ local function RebuildExportIndex()
         -- #388: immutable accounting manifest for adoption completeness.
         acceptedLedgerCount = 0,
         donationEvidenceCount = 0,
+        valuationCount = 0,
         -- Pin effective config head for adoption binding (nil is meaningful).
         bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil,
@@ -1780,6 +1935,13 @@ local function RebuildExportIndex()
     exportState.ledgerArchiveWarmPos = 0
     exportState.donationEvidenceBuildNeeded = donationEvidenceExportCount > 0
     exportState.donationEvidenceBuildCursor = nil
+    local valuationExportCount = ResolveValuationExportCount(record)
+    exportState.valuationBuildNeeded = valuationExportCount > 0
+    exportState.valuationBuildCursor = nil
+    exportState.valuationBuildKeys = nil
+    exportState.valuationBuildKeysStore = nil
+    exportState.valuationBuildKeysDataset = nil
+    exportState.valuationBuildKeysRev = nil
 
     local descId = "gs:desc:" .. record.datasetId
     local descEntry = exportState.byId[descId]
@@ -1790,6 +1952,7 @@ local function RebuildExportIndex()
         descEntry.body.archiveCount = archiveExportCount
         descEntry.body.acceptedLedgerCount = ledgerExportCount
         descEntry.body.donationEvidenceCount = donationEvidenceExportCount
+        descEntry.body.valuationCount = valuationExportCount
         descEntry.body.bankTab = record.accounting and record.accounting._consumables
             and record.accounting._consumables.bankTab or nil
         descEntry.body.hasBankTab = true
@@ -1802,6 +1965,7 @@ local function RebuildExportIndex()
     exportState.cachedArchiveCount = archiveExportCount
     exportState.cachedAcceptedLedgerCount = ledgerExportCount
     exportState.cachedDonationEvidenceCount = donationEvidenceExportCount
+    exportState.cachedValuationCount = valuationExportCount
     exportState.countsDirty = false
     exportState.appendPos = 0
     local needsMaint = exportState.archiveBuildNeeded
@@ -1809,6 +1973,7 @@ local function RebuildExportIndex()
         or exportState.evidenceBuildNeeded
         or exportState.ledgerBuildNeeded
         or exportState.donationEvidenceBuildNeeded
+        or exportState.valuationBuildNeeded
     exportState.maintIdle = not needsMaint
     exportState.maintScheduled = false
     -- Cold registration /reload must drain deferred construction without an
@@ -1886,6 +2051,67 @@ local function UpsertExportBody(id, body)
     end
 end
 
+--- Publish one accepted valuation without rebuilding the whole Guild Supplies export.
+-- Losers and pending rows are not exported. Cold rebuild drains any that this
+-- call cannot see yet (dataset mismatch).
+-- Storage, `gs:val:` upsert, and descriptor valuationCount stay immediate.
+-- Outward NotifyProviderChanged / NotifyUI coalesce inside an open
+-- BeginLocalDurableNotifyBatch (bank-log snapshot) and flush on End.
+function GS.NoteValuationExported(record, canonicalTxnId)
+    if type(record) ~= "table" or type(canonicalTxnId) ~= "string" or canonicalTxnId == "" then
+        return
+    end
+    if not providerRegistered then
+        if (tonumber(durableNotifyBatchDepth) or 0) > 0 then
+            durableNotifyBatchPending = PreferDurableNotifyReason(
+                durableNotifyBatchPending, "valuation")
+            return
+        end
+        if GS.NotifyUI then
+            GS.NotifyUI("valuation")
+        end
+        return
+    end
+    local body = GS.BuildValuationExportBody and GS.BuildValuationExportBody(record, canonicalTxnId)
+    if type(body) ~= "table" then
+        return
+    end
+    local exportId = "gs:val:" .. canonicalTxnId
+    if exportState.datasetId ~= record.datasetId or exportState.guildKey == nil then
+        exportState.valuationBuildNeeded = true
+        exportState.maintIdle = false
+        if ScheduleExportMaintContinuation then
+            ScheduleExportMaintContinuation()
+        end
+    else
+        local existing = exportState.byId[exportId]
+        local prev = existing and existing.body and existing.body.assignment
+        local nextA = body.assignment
+        local unchanged = type(prev) == "table" and type(nextA) == "table"
+            and prev.assignmentId == nextA.assignmentId
+            and prev.assignedAt == nextA.assignedAt
+            and prev.totalCopper == nextA.totalCopper
+            and prev.txnId == nextA.txnId
+        if not unchanged then
+            UpsertExportBody(exportId, body)
+        end
+        -- The winner set grew or this id was not yet advertised. Replacing an
+        -- existing id does not change the count. No history scan.
+        NoteValuationManifestId(canonicalTxnId)
+    end
+    if (tonumber(durableNotifyBatchDepth) or 0) > 0 then
+        durableNotifyBatchPending = PreferDurableNotifyReason(
+            durableNotifyBatchPending, "valuation")
+        return
+    end
+    if GG and GG.NotifyProviderChanged then
+        GG.NotifyProviderChanged(GS.PROVIDER_ID)
+    end
+    if GS.NotifyUI then
+        GS.NotifyUI("valuation")
+    end
+end
+
 --- Transport cutoverMarker only for rows with established live production provenance.
 -- Becoming active must not launder previously uncredited staged adjustments by
 -- attaching the canonical marker (#389 A2).
@@ -1943,50 +2169,142 @@ function GS.MarkLedgerArchiveExportStale()
     end
 end
 
---- Drop evicted durable export ids from the warm Gossip index (bounded).
--- Called when Ledger evicts directExports so descriptor counts and GetRecord
--- cannot keep serving removed bodies until a full rebuild.
-function GS.RemoveGossipExportBodies(ids)
-    if type(ids) ~= "table" or #ids < 1 then
-        return 0
+-- Coalesce trusted bulk export eviction (archive trim) into one order pass.
+local exportRemovalBatchDepth = 0
+local exportRemovalBatchDrop = nil
+local exportRemovalBatchRemoved = 0
+local exportRemovalBatchDroppedValuation = false
+
+--- Begin coalescing RemoveGossipExportBodies compaction/notify. Nested.
+function GS.BeginGossipExportBodyRemovalBatch()
+    exportRemovalBatchDepth = (tonumber(exportRemovalBatchDepth) or 0) + 1
+    if exportRemovalBatchDepth == 1 then
+        exportRemovalBatchDrop = {}
+        exportRemovalBatchRemoved = 0
+        exportRemovalBatchDroppedValuation = false
     end
-    local removed = 0
-    local drop = {}
-    local limit = math.min(#ids, 64)
-    for i = 1, limit do
-        local id = ids[i]
-        if type(id) == "string" and exportState.byId[id] then
-            exportState.byId[id] = nil
-            drop[id] = true
-            removed = removed + 1
-        end
+end
+
+local function CompactGossipExportOrder(drop)
+    if type(drop) ~= "table" then
+        return
     end
-    if removed < 1 then
-        return 0
-    end
+    local order = exportState.order
+    local scanned = #order
     local write = 1
-    for read = 1, #exportState.order do
-        local id = exportState.order[read]
+    for read = 1, scanned do
+        local id = order[read]
         if not drop[id] then
-            exportState.order[write] = id
+            order[write] = id
             write = write + 1
         end
     end
-    for i = write, #exportState.order do
-        exportState.order[i] = nil
+    for i = write, scanned do
+        order[i] = nil
     end
-    if exportState.enumPos and exportState.enumPos > #exportState.order then
-        exportState.enumPos = #exportState.order
+    if exportState.enumPos and exportState.enumPos > #order then
+        exportState.enumPos = #order
     end
     exportState.countsDirty = true
     exportState.maintIdle = false
-    if GG and GG.GetProvider and providerRegistered then
-        local prov = GG.GetProvider(GS.PROVIDER_ID)
-        if prov and prov.index then
-            prov.index.dirty = true
-            prov.index.buildComplete = false
+    -- GS._onGossipExportOrderCompaction is nil in production; tests count passes.
+    if type(GS._onGossipExportOrderCompaction) == "function" then
+        GS._onGossipExportOrderCompaction(scanned)
+    end
+end
+
+local function FinishGossipExportBodyRemovals(removed, droppedValuation)
+    if removed > 0 or droppedValuation then
+        if droppedValuation then
+            PublishValuationManifest()
+        end
+        if GG and GG.GetProvider and providerRegistered then
+            local prov = GG.GetProvider(GS.PROVIDER_ID)
+            if removed > 0 and prov and prov.index then
+                prov.index.dirty = true
+                prov.index.buildComplete = false
+            end
+            if droppedValuation and GG.NotifyProviderChanged then
+                GG.NotifyProviderChanged(GS.PROVIDER_ID)
+            end
         end
     end
+end
+
+--- Flush one coalesced order compaction + provider notify when outermost ends.
+function GS.EndGossipExportBodyRemovalBatch()
+    local depth = tonumber(exportRemovalBatchDepth) or 0
+    if depth <= 0 then
+        exportRemovalBatchDepth = 0
+        exportRemovalBatchDrop = nil
+        exportRemovalBatchRemoved = 0
+        exportRemovalBatchDroppedValuation = false
+        return
+    end
+    depth = depth - 1
+    exportRemovalBatchDepth = depth
+    if depth > 0 then
+        return
+    end
+    local drop = exportRemovalBatchDrop
+    local removed = tonumber(exportRemovalBatchRemoved) or 0
+    local droppedValuation = exportRemovalBatchDroppedValuation and true or false
+    exportRemovalBatchDrop = nil
+    exportRemovalBatchRemoved = 0
+    exportRemovalBatchDroppedValuation = false
+    if removed > 0 and type(drop) == "table" then
+        CompactGossipExportOrder(drop)
+    end
+    FinishGossipExportBodyRemovals(removed, droppedValuation)
+end
+
+--- Drop evicted durable export ids from the warm Gossip index (bounded).
+-- Ordinary callers: at most 64 ids, immediate order compaction + notify.
+-- Inside Begin/EndGossipExportBodyRemovalBatch (trusted archive trim): all ids
+-- in the call are applied to byId/manifest, and compaction/notify coalesce to
+-- one pass at End. opts.bulk permits >64 ids in a single non-batched call.
+function GS.RemoveGossipExportBodies(ids, opts)
+    if type(ids) ~= "table" or #ids < 1 then
+        return 0
+    end
+    opts = opts or {}
+    local batching = (tonumber(exportRemovalBatchDepth) or 0) > 0
+        and type(exportRemovalBatchDrop) == "table"
+    local bulk = opts.bulk == true or batching
+    local limit = bulk and #ids or math.min(#ids, 64)
+    local removed = 0
+    local drop = batching and exportRemovalBatchDrop or {}
+    local droppedValuation = false
+    for i = 1, limit do
+        local id = ids[i]
+        if type(id) == "string" then
+            -- Cold paced rebuild can advertise winners in valuationManifest
+            -- before gs:val bodies exist in byId. Drop the tracked manifest
+            -- entry even when the body has not been materialized yet.
+            if id:sub(1, 7) == "gs:val:" and DropValuationManifestId(id:sub(8)) then
+                droppedValuation = true
+            end
+            if exportState.byId[id] then
+                exportState.byId[id] = nil
+                drop[id] = true
+                removed = removed + 1
+            end
+        end
+    end
+    if batching then
+        exportRemovalBatchRemoved = (tonumber(exportRemovalBatchRemoved) or 0) + removed
+        if droppedValuation then
+            exportRemovalBatchDroppedValuation = true
+        end
+        return removed
+    end
+    if removed < 1 and not droppedValuation then
+        return 0
+    end
+    if removed > 0 then
+        CompactGossipExportOrder(drop)
+    end
+    FinishGossipExportBodyRemovals(removed, droppedValuation)
     return removed
 end
 
@@ -2146,6 +2464,7 @@ local function ValidateAndApply(record, ctx)
                 or (body.header and body.header.datasetId)
                 or (body.event and body.event.datasetId)
                 or (body.evidence and body.evidence.datasetId)
+                or (body.assignment and body.assignment.datasetId)
             if ds == adop.sourceDatasetId or body.kind == "dataset-desc" then
                 local st, reason = GS:BufferAdoptionRecord(tostring(record.id), body)
                 return st, reason
@@ -2819,14 +3138,33 @@ local function ValidateAndApply(record, ctx)
         })
     end
 
+    -- #397 immutable DBMarket assignment bound to one production donation.
+    if body.kind == "gs-valuation" then
+        if not localRecord then
+            return "pending", "awaiting_dataset"
+        end
+        if body.datasetId and body.datasetId ~= localRecord.datasetId then
+            return "rejected", "dataset_mismatch"
+        end
+        if type(body.assignment) ~= "table" then
+            return "rejected", "malformed"
+        end
+        return GS:AdmitValuationAssignment(body, {
+            sender = sender,
+            member = member,
+            offlineRecord = localRecord,
+            -- Provider record id `gs:val:<canonical>` binds the donation key
+            -- without rewriting the immutable assignment.txnId.
+            exportRecordId = tostring(record.id),
+        })
+    end
+
     return "rejected", "unsupported_kind"
 end
 
 ---------------------------------------------------------------------------
 -- Registration / notification
 ---------------------------------------------------------------------------
-
-local providerRegistered = false
 
 local function BuildProviderSpec()
     return {
@@ -2846,12 +3184,213 @@ local function BuildProviderSpec()
     }
 end
 
+-- One-shot Guild Info → Guild Supplies bridge (#427). GS may initialize before
+-- Guild Info; resolve lazily and reevaluate pending three-witness evidence when
+-- relationships become ready or change. No polling.
+local guildInfoListenerRegistered = false
+local guildInfoReevalBusy = false
+local guildInfoInitHooked = false
+-- Skip full pending scans while GI is incomplete; one reevaluation runs when
+-- readiness becomes true (init, seal, or a later ready notification).
+local guildInfoLastReady = nil
+-- Coalesce ready-state remote bursts into one deferred pending scan.
+local guildInfoCoalescePending = false
+local guildInfoCoalesceScheduled = false
+local guildInfoCoalesceReason = nil
+
+local function PublishGuildInfoReevaluate(reason, verified)
+    verified = tonumber(verified) or 0
+    if verified > 0 then
+        if GS.NotifyLocalDurableChange then
+            GS.NotifyLocalDurableChange("ledger")
+        elseif GS.NotifyUI then
+            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+        end
+    elseif GS.NotifyUI then
+        GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+    end
+end
+
+local function IsRemoteGuildInfoReason(reason)
+    reason = tostring(reason or "")
+    return reason == "remote" or reason:sub(1, 7) == "remote-"
+end
+
+local function RunGuildInfoPendingReevaluate(reason, becameReady)
+    local record = select(1, GS:GetCurrentRecord())
+    -- Cheap skip when already ready and nothing unfinished remains.
+    if not becameReady
+        and type(record) == "table"
+        and GS.HasUnfinishedPendingEvidence
+        and not GS.HasUnfinishedPendingEvidence(record) then
+        if GS.NotifyUI then
+            GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+        end
+        return
+    end
+    local verified = 0
+    if type(record) == "table" and GS.ReevaluatePendingEvidence then
+        verified = tonumber(GS.ReevaluatePendingEvidence(record)) or 0
+    end
+    PublishGuildInfoReevaluate(becameReady and "gi-ready" or reason, verified)
+end
+
+local function ScheduleCoalescedGuildInfoReevaluate(reason)
+    guildInfoCoalescePending = true
+    guildInfoCoalesceReason = reason or guildInfoCoalesceReason or "remote"
+    if guildInfoCoalesceScheduled then
+        return
+    end
+    guildInfoCoalesceScheduled = true
+    local function flush()
+        guildInfoCoalesceScheduled = false
+        if not guildInfoCoalescePending then
+            return
+        end
+        guildInfoCoalescePending = false
+        local queuedReason = guildInfoCoalesceReason or "remote"
+        guildInfoCoalesceReason = nil
+        if guildInfoReevalBusy then
+            -- Re-arm so the in-flight pass schedules one trailing flush.
+            ScheduleCoalescedGuildInfoReevaluate(queuedReason)
+            return
+        end
+        guildInfoReevalBusy = true
+        local ok, err = pcall(function()
+            RunGuildInfoPendingReevaluate(queuedReason, false)
+        end)
+        guildInfoReevalBusy = false
+        if not ok and DebugWarn then
+            DebugWarn("guildinfo coalesced reevaluate failed: %s", tostring(err))
+        end
+        if guildInfoCoalescePending then
+            ScheduleCoalescedGuildInfoReevaluate(guildInfoCoalesceReason)
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, flush)
+    else
+        flush()
+    end
+end
+
+local function OnGuildInfoDurableChange(reason)
+    if guildInfoReevalBusy then
+        -- Reentrancy during an in-flight scan: coalesce a trailing pass.
+        if IsRemoteGuildInfoReason(reason) then
+            ScheduleCoalescedGuildInfoReevaluate(reason)
+        end
+        return
+    end
+    guildInfoReevalBusy = true
+    local ok, err = pcall(function()
+        local record = select(1, GS:GetCurrentRecord())
+        local ready = false
+        if type(record) == "table" and GS.WitnessRelationshipsReady then
+            ready = GS.WitnessRelationshipsReady(record) and true or false
+        elseif SF.GuildInfo and SF.GuildInfo.GetRelationshipReadiness then
+            ready = SF.GuildInfo:GetRelationshipReadiness() == "ready"
+        end
+        local becameReady = ready and guildInfoLastReady ~= true
+        guildInfoLastReady = ready and true or false
+
+        -- Incomplete / synchronizing baselines cannot form independent witness
+        -- quorum; skip the full pending scan until readiness flips to ready.
+        if not ready then
+            if GS.NotifyUI then
+                GS.NotifyUI("guildinfo-" .. tostring(reason or "local"))
+            end
+            return
+        end
+
+        -- Ready remote membership/group bursts: coalesce into one deferred scan
+        -- so a large catch-up does not re-walk pending clusters per body.
+        if not becameReady and IsRemoteGuildInfoReason(reason) then
+            guildInfoReevalBusy = false
+            ScheduleCoalescedGuildInfoReevaluate(reason)
+            return
+        end
+
+        RunGuildInfoPendingReevaluate(reason, becameReady)
+    end)
+    guildInfoReevalBusy = false
+    if not ok and DebugWarn then
+        DebugWarn("guildinfo reevaluate failed: %s", tostring(err))
+    end
+end
+
+--- One bounded reevaluation when Guild Info is already ready (startup/reload).
+-- Safe to call repeatedly; no-ops while busy, unavailable, or incomplete.
+function GS.MaybeReevaluatePendingAfterGuildInfoReady(reason)
+    local GI = SF.GuildInfo
+    if not GI then
+        return false, "guildinfo_unavailable"
+    end
+    local ready = false
+    if GS.WitnessRelationshipsReady then
+        local record = select(1, GS:GetCurrentRecord())
+        if type(record) == "table" then
+            ready = GS.WitnessRelationshipsReady(record) and true or false
+        end
+    end
+    if not ready and type(GI.GetRelationshipReadiness) == "function" then
+        ready = GI:GetRelationshipReadiness() == "ready"
+    end
+    if not ready then
+        guildInfoLastReady = false
+        return false, "not_ready"
+    end
+    OnGuildInfoDurableChange(reason or "gi-ready")
+    return true
+end
+
+local function HookGuildInfoInitialize()
+    if guildInfoInitHooked then
+        return
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.Initialize) ~= "function" then
+        return
+    end
+    local previous = GI.Initialize
+    function GI:Initialize(db)
+        local ok, reason = previous(self, db)
+        -- GS initializes before GI in SpectrumFederation.lua; GI:Initialize does
+        -- not emit NotifyUI. Run one bounded pending reevaluation once the
+        -- persisted baseline is ready so reload/upgrade can credit saved quorum.
+        if ok and GS.MaybeReevaluatePendingAfterGuildInfoReady then
+            GS.MaybeReevaluatePendingAfterGuildInfoReady("gi-init")
+        end
+        return ok, reason
+    end
+    guildInfoInitHooked = true
+end
+
+function GS.EnsureGuildInfoBridge()
+    local GI = SF.GuildInfo
+    if not GI or type(GI.RegisterUIListener) ~= "function" then
+        return false, "guildinfo_unavailable"
+    end
+    HookGuildInfoInitialize()
+    local firstRegistration = not guildInfoListenerRegistered
+    if firstRegistration then
+        GI.RegisterUIListener(OnGuildInfoDurableChange)
+        guildInfoListenerRegistered = true
+        -- Catch up when GI already finished Initialize before the bridge existed
+        -- (tests / late provider registration). Normal addon order relies on the
+        -- GI.Initialize hook above instead.
+        GS.MaybeReevaluatePendingAfterGuildInfoReady("bridge-ready")
+    end
+    return true
+end
+
 --- Idempotent provider registration. Safe when Guild Gossip is not yet ready.
 function GS:EnsureGossipProvider()
     if not GG or not GG.RegisterProvider then
         return false, "gossip_unavailable"
     end
     if providerRegistered and GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID) then
+        GS.EnsureGuildInfoBridge()
         return true
     end
     if GG.Init then
@@ -2862,6 +3401,7 @@ function GS:EnsureGossipProvider()
         -- RegisterProvider is idempotent; treat success-ish outcomes as ok.
         if GG.GetProvider and GG.GetProvider(GS.PROVIDER_ID) then
             providerRegistered = true
+            GS.EnsureGuildInfoBridge()
             return true
         end
         DebugWarn("provider register failed: %s", tostring(err))
@@ -2872,6 +3412,7 @@ function GS:EnsureGossipProvider()
     end
     providerRegistered = true
     RebuildExportIndex()
+    GS.EnsureGuildInfoBridge()
     DebugInfo("registered staged config provider id=%s", GS.PROVIDER_ID)
     return true
 end
@@ -2890,6 +3431,12 @@ function GS:DisableGossipProvider()
     exportState.archiveBuildNeeded = false
     exportState.ledgerBuildNeeded = false
     exportState.donationEvidenceBuildNeeded = false
+    exportState.valuationBuildNeeded = false
+    exportState.valuationBuildCursor = nil
+    exportState.valuationBuildKeys = nil
+    exportState.valuationBuildKeysStore = nil
+    exportState.valuationBuildKeysDataset = nil
+    exportState.valuationBuildKeysRev = nil
     exportState.opBuildCursor = nil
     exportState.archiveBuildCursor = nil
     exportState.ledgerBuildCursor = nil
@@ -2957,11 +3504,8 @@ function GS._exportMaintIsIdle()
 end
 
 -- Coalesce NotifyLocalDurableChange during a completed bank-log snapshot (or
--- any other short local batch). Nested ledger/evidence notifies defer export
--- rebuild + NotifyProviderChanged until EndLocalDurableNotifyBatch.
-local durableNotifyBatchDepth = 0
-local durableNotifyBatchPending = nil
-
+-- any other short local batch). Nested ledger/evidence/valuation notifies defer
+-- export rebuild + NotifyProviderChanged until EndLocalDurableNotifyBatch.
 local DURABLE_NOTIFY_REASON_RANK = {
     ["export-maint"] = 0,
     evidence = 40,
@@ -2973,6 +3517,7 @@ local DURABLE_NOTIFY_REASON_RANK = {
     config = 45,
     campaign = 45,
     ["remote-op"] = 45,
+    valuation = 50,
     ledger = 50,
     create = 60,
     confirm = 60,
@@ -2982,7 +3527,7 @@ local DURABLE_NOTIFY_REASON_RANK = {
     dataset = 100,
 }
 
-local function PreferDurableNotifyReason(current, incoming)
+PreferDurableNotifyReason = function(current, incoming)
     if type(current) ~= "string" or current == "" then
         return incoming
     end
@@ -3140,7 +3685,8 @@ function GS.NotifyLocalDurableChange(reason)
             or exportState.opBuildNeeded
             or exportState.evidenceBuildNeeded
             or exportState.ledgerBuildNeeded
-            or exportState.donationEvidenceBuildNeeded then
+            or exportState.donationEvidenceBuildNeeded
+            or exportState.valuationBuildNeeded then
             exportState.maintIdle = false
             ScheduleExportMaintContinuation()
         end
@@ -3802,12 +4348,79 @@ function GS.NotifyLocalDurableChange(reason)
             end
         end
 
+        -- #397 cold/reload: pace accepted valuation snapshots. Updates to an
+        -- existing winner go through NoteValuationExported; this drain fills gaps.
+        -- Sorted keys are snapshotted for the active store revision so each
+        -- 32-body slice does not reallocate/sort the full byTxn map.
+        if exportState.valuationBuildNeeded and used < slice then
+            local byTxn = record.valuations and record.valuations.byTxn
+            if type(byTxn) == "table" then
+                local store = record.valuations
+                local rev = 0
+                if type(store) == "table" and GS.ValuationStoreRevision then
+                    rev = GS.ValuationStoreRevision(store)
+                end
+                local keys = exportState.valuationBuildKeys
+                local keysCurrent = type(keys) == "table"
+                    and exportState.valuationBuildKeysStore == store
+                    and exportState.valuationBuildKeysDataset == record.datasetId
+                    and exportState.valuationBuildKeysRev == rev
+                if not keysCurrent then
+                    keys = sortedKeys(byTxn)
+                    exportState.valuationBuildKeys = keys
+                    exportState.valuationBuildKeysStore = store
+                    exportState.valuationBuildKeysDataset = record.datasetId
+                    exportState.valuationBuildKeysRev = rev
+                    if type(GS._onValuationBuildKeysSort) == "function" then
+                        GS._onValuationBuildKeysSort(#keys)
+                    end
+                end
+                local startK = resumeAfterKey(keys, exportState.valuationBuildCursor, function(k)
+                    return "gs:val:" .. tostring(k)
+                end)
+                for ki = startK, #keys do
+                    if used >= slice then
+                        exportState.valuationBuildCursor = keys[math.max(1, ki - 1)]
+                        break
+                    end
+                    local txnId = keys[ki]
+                    used = used + 1
+                    local exportId = "gs:val:" .. tostring(txnId)
+                    if type(txnId) == "string" and not exportState.byId[exportId]
+                        and GS.BuildValuationExportBody then
+                        local valBody = GS.BuildValuationExportBody(record, txnId)
+                        if valBody then
+                            UpsertExportBody(exportId, valBody)
+                            NoteValuationManifestId(txnId)
+                        end
+                    end
+                    exportState.valuationBuildCursor = txnId
+                end
+                if used < slice then
+                    exportState.valuationBuildCursor = nil
+                    exportState.valuationBuildNeeded = false
+                    exportState.valuationBuildKeys = nil
+                    exportState.valuationBuildKeysStore = nil
+                    exportState.valuationBuildKeysDataset = nil
+                    exportState.valuationBuildKeysRev = nil
+                end
+            else
+                exportState.valuationBuildCursor = nil
+                exportState.valuationBuildNeeded = false
+                exportState.valuationBuildKeys = nil
+                exportState.valuationBuildKeysStore = nil
+                exportState.valuationBuildKeysDataset = nil
+                exportState.valuationBuildKeysRev = nil
+            end
+        end
+
         exportState.maintIdle = used < slice
             and not exportState.opBuildNeeded
             and not exportState.evidenceBuildNeeded
             and not exportState.archiveBuildNeeded
             and not exportState.ledgerBuildNeeded
             and not exportState.donationEvidenceBuildNeeded
+            and not exportState.valuationBuildNeeded
             and exportState.pendingCursor == nil
             and exportState.conflictCursor == nil
             and exportState.openConflictCursor == nil
@@ -3816,6 +4429,7 @@ function GS.NotifyLocalDurableChange(reason)
             and exportState.archiveBuildCursor == nil
             and exportState.ledgerBuildCursor == nil
             and exportState.donationEvidenceBuildCursor == nil
+            and exportState.valuationBuildCursor == nil
 
         -- Descriptor counts stay logical (durable store), not emitted-body counts.
         local acceptedOpCount = 0
@@ -3881,6 +4495,7 @@ function GS.NotifyLocalDurableChange(reason)
         exportState.cachedCampaignCount = campaignCount
         exportState.cachedArchiveCount = archiveCount
         exportState.cachedAcceptedLedgerCount = acceptedLedgerCount
+        local valuationCount = ResolveValuationExportCount(record)
         exportState.cachedDonationEvidenceCount = donationEvidenceCount
         exportState.countsDirty = false
         local desc = {
@@ -3904,6 +4519,7 @@ function GS.NotifyLocalDurableChange(reason)
             archiveCount = archiveCount,
             acceptedLedgerCount = acceptedLedgerCount,
             donationEvidenceCount = donationEvidenceCount,
+            valuationCount = valuationCount,
             bankTab = record.accounting and record.accounting._consumables
                 and record.accounting._consumables.bankTab or nil,
             hasBankTab = true,
@@ -3935,5 +4551,8 @@ function GS:Initialize(db)
     -- Always attempt provider registration on initialize; gossip may idle with
     -- zero peers. Failure is non-fatal for local staged editing.
     GS:EnsureGossipProvider()
+    -- GS loads before Guild Info in the TOC; bridge is idempotent and retries
+    -- when Guild Info later exposes RegisterUIListener.
+    GS.EnsureGuildInfoBridge()
     return ok, reason
 end

@@ -665,6 +665,45 @@ local function ValidateGuildRecordStructure(guildKey, record)
     if record.campaignContext ~= nil and type(record.campaignContext) ~= "table" then
         return false, "invalid_record_shape"
     end
+    -- Optional #424 campaign display names: absent on older saves; wrong shape fails closed.
+    if record.campaignNames ~= nil then
+        if type(record.campaignNames) ~= "table" then
+            return false, "invalid_record_shape"
+        end
+        local nameCount = 0
+        local maxCamps = GS.MAX_CAMPAIGNS or 64
+        local maxName = GS.MAX_CAMPAIGN_NAME_LEN or 64
+        for campaignId, entry in pairs(record.campaignNames) do
+            nameCount = nameCount + 1
+            if nameCount > maxCamps then
+                return false, "full"
+            end
+            if type(campaignId) ~= "string" or campaignId == "" or #campaignId > GS.MAX_OPERATION_ID then
+                return false, "invalid_campaign_name"
+            end
+            if type(entry) ~= "table" then
+                return false, "invalid_campaign_name"
+            end
+            if entry.name ~= nil then
+                if type(entry.name) ~= "string" or entry.name == "" or #entry.name > maxName then
+                    return false, "invalid_campaign_name"
+                end
+                if GS.NormalizeCampaignName then
+                    local canon, ok = GS.NormalizeCampaignName(entry.name)
+                    if not ok or canon ~= entry.name then
+                        return false, "invalid_campaign_name"
+                    end
+                end
+            end
+            if type(entry.revisionId) ~= "string" or entry.revisionId == ""
+                or #entry.revisionId > GS.MAX_OPERATION_ID then
+                return false, "invalid_campaign_name"
+            end
+            if not IsFiniteNonnegInt(entry.renamedAt) then
+                return false, "invalid_campaign_name"
+            end
+        end
+    end
     -- Optional #388 identity links: absent is fine for older staged records.
     if record.identityLinks ~= nil then
         if GS.ValidateIdentityLinks then
@@ -674,6 +713,17 @@ local function ValidateGuildRecordStructure(guildKey, record)
             end
         elseif type(record.identityLinks) ~= "table" then
             return false, "invalid_identity_links"
+        end
+    end
+    -- Optional #397 valuation snapshots: absent on older saves; wrong shape fails closed.
+    if record.valuations ~= nil then
+        if GS.ValidateValuationStore then
+            local valOk, valErr = GS.ValidateValuationStore(record.valuations, record, guildKey)
+            if not valOk then
+                return false, valErr or "invalid_valuations"
+            end
+        elseif type(record.valuations) ~= "table" then
+            return false, "invalid_valuations"
         end
     end
     if GS.CountCampaignHeaders and GS.CountCampaignHeaders(record) > (GS.MAX_CAMPAIGNS or 64) then
@@ -811,6 +861,9 @@ end
 
 --- Idempotently validate/load the separate root. No guild bootstrap or network.
 function GS:Initialize(db)
+    if GS.CancelValuationCatchup then
+        GS.CancelValuationCatchup("initialize")
+    end
     db = db or (type(SpectrumFederationDB) == "table" and SpectrumFederationDB) or nil
     if type(db) ~= "table" then
         GS._db = nil

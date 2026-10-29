@@ -54,6 +54,13 @@ function GS.CanonicalVerificationMode(mode)
     return GS.VERIFICATION.WITNESSES
 end
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 local function Debug(level, message, ...)
     if SF.Debug and SF.Debug[level] then
         SF.Debug[level](SF.Debug, "GUILD_SUPPLIES", message, ...)
@@ -121,7 +128,8 @@ local function CopyStringList(list, limit)
 end
 
 ---------------------------------------------------------------------------
--- Identity links (guild-owned; GUID based; not Loot Helper profiles)
+-- Legacy identityLinks storage (inert; Guild Info owns witness identity #427)
+-- Retained only so existing SavedVariables / historical link ops still load.
 ---------------------------------------------------------------------------
 
 function GS.EmptyIdentityLinks()
@@ -209,18 +217,53 @@ function GS.ValidateIdentityLinks(links)
     return true
 end
 
---- Collapse known guild-owned links: same group ⇒ same witness identity.
-function GS.AreSameWitnessIdentity(record, guidA, guidB)
-    guidA, guidB = ValidGuid(guidA), ValidGuid(guidB)
-    if not guidA or not guidB then return false end
-    if guidA == guidB then return true end
-    local links = record and record.identityLinks
-    if type(links) ~= "table" or type(links.byGuid) ~= "table" then
-        return false
+local function GuildKeyForRecord(record)
+    if type(record) ~= "table" then
+        return nil
     end
-    local ga = links.byGuid[guidA]
-    local gb = links.byGuid[guidB]
-    return type(ga) == "string" and ga ~= "" and ga == gb
+    if type(record._guildKey) == "string" and record._guildKey ~= "" then
+        return record._guildKey
+    end
+    if type(record.guildKey) == "string" and record.guildKey ~= "" then
+        return record.guildKey
+    end
+    return nil
+end
+
+--- True when Guild Info relationships are authoritative for this guild.
+-- Incomplete / synchronizing / unavailable baselines must not invent independence.
+function GS.WitnessRelationshipsReady(record)
+    local GI = SF.GuildInfo
+    if not GI or type(GI.GetRelationshipReadiness) ~= "function" then
+        return false, "unavailable"
+    end
+    local status = GI:GetRelationshipReadiness(GuildKeyForRecord(record))
+    return status == "ready", status
+end
+
+--- same | different | unknown for authenticated witness GUIDs via Guild Info.
+function GS.CompareWitnessIdentities(record, guidA, guidB)
+    guidA, guidB = ValidGuid(guidA), ValidGuid(guidB)
+    if not guidA or not guidB then
+        return "unknown"
+    end
+    if guidA == guidB then
+        return "same"
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.CompareWitnessIdentities) ~= "function" then
+        return "unknown"
+    end
+    local cmp = GI:CompareWitnessIdentities(guidA, guidB, GuildKeyForRecord(record))
+    if cmp == "same" or cmp == "different" or cmp == "unknown" then
+        return cmp
+    end
+    return "unknown"
+end
+
+--- Known-same only. Unknown relationship state is not "same".
+function GS.AreSameWitnessIdentity(record, guidA, guidB)
+    return GS.CompareWitnessIdentities(record, guidA, guidB) == "same"
 end
 
 function GS.WitnessAlreadyCounted(record, witnessMap, witnessGuid)
@@ -237,13 +280,32 @@ function GS.WitnessAlreadyCounted(record, witnessMap, witnessGuid)
     return false
 end
 
+--- Independent witness count under current Guild Info relationships.
+-- Returns 0 when relationships are unavailable/syncing so quorum stays pending.
+-- Witnesses whose contributor identity is unknown (e.g. unresolved group) are
+-- excluded so they cannot satisfy three-independent-witness quorum.
 function GS.CountIndependentWitnesses(record, witnessMap)
     if type(witnessMap) ~= "table" then return 0 end
+    local ready = GS.WitnessRelationshipsReady(record)
+    if not ready then
+        return 0
+    end
+    local GI = SF.GuildInfo
+    local guildKey = GuildKeyForRecord(record)
     local keys = {}
     for key, row in pairs(witnessMap) do
         local guid = type(row) == "table" and ValidGuid(row.guid or row.witnessGuid) or ValidGuid(key)
         if guid then
-            keys[#keys + 1] = guid
+            local usable = true
+            if GI and type(GI.ResolveContributorIdentity) == "function" then
+                local info = GI:ResolveContributorIdentity(guid, guildKey)
+                if type(info) ~= "table" or info.status == "unknown" then
+                    usable = false
+                end
+            end
+            if usable then
+                keys[#keys + 1] = guid
+            end
         end
     end
     table.sort(keys)
@@ -253,9 +315,13 @@ function GS.CountIndependentWitnesses(record, witnessMap)
         local guid = keys[i]
         local skip = false
         for j = 1, #counted do
-            if GS.AreSameWitnessIdentity(record, counted[j], guid) then
+            local cmp = GS.CompareWitnessIdentities(record, counted[j], guid)
+            if cmp == "same" then
                 skip = true
                 break
+            elseif cmp == "unknown" then
+                -- Fail closed: unresolved pairwise relationship cannot grow quorum.
+                return 0
             end
         end
         if not skip then
@@ -264,6 +330,445 @@ function GS.CountIndependentWitnesses(record, witnessMap)
         end
     end
     return n
+end
+
+---------------------------------------------------------------------------
+-- Donation / adjustment display attribution via Guild Info (#427)
+-- Durable actor/attributed strings stay immutable; projection is read-only.
+---------------------------------------------------------------------------
+
+--- Bounded read-only resolution context for one projection/history pass.
+-- Validates Guild Info readiness once and reuses name/GUID mappings. Not a
+-- second identity authority and not a persistent cache across operations.
+-- @return table ctx
+function GS.BeginContributorProjectionContext(record)
+    local guildKey = GuildKeyForRecord(record)
+    local ready, status = false, "unavailable"
+    local GI = SF.GuildInfo
+    if GI and type(GI.GetRelationshipReadiness) == "function" then
+        status = select(1, GI:GetRelationshipReadiness(guildKey))
+        ready = status == "ready"
+    end
+    return {
+        record = record,
+        guildKey = guildKey,
+        ready = ready and true or false,
+        status = status,
+        readinessChecked = true,
+        nameToGuid = {},
+        nameErr = {},
+        byGuid = {},
+        byKey = {},
+        readinessChecks = 1,
+        nameResolves = 0,
+        identityResolves = 0,
+    }
+end
+
+local function ContextResolveGuidByName(ctx, original)
+    if type(original) ~= "string" or original == "" then
+        return nil, "identity_unavailable"
+    end
+    if ctx.nameToGuid[original] ~= nil then
+        local cached = ctx.nameToGuid[original]
+        if cached == false then
+            return nil, ctx.nameErr[original]
+        end
+        return cached, nil
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.ResolveCharacterGuidByName) ~= "function" then
+        ctx.nameToGuid[original] = false
+        ctx.nameErr[original] = "unavailable"
+        return nil, "unavailable"
+    end
+    ctx.nameResolves = (ctx.nameResolves or 0) + 1
+    local resolved, err = GI:ResolveCharacterGuidByName(original, ctx.guildKey)
+    if type(resolved) == "string" then
+        local guid = ValidGuid(resolved)
+        ctx.nameToGuid[original] = guid or false
+        if not guid then
+            ctx.nameErr[original] = "invalid_guid"
+            return nil, "invalid_guid"
+        end
+        return guid, nil
+    end
+    ctx.nameToGuid[original] = false
+    ctx.nameErr[original] = err or "not_a_member"
+    return nil, err
+end
+
+local function ContextResolveIdentity(ctx, guid)
+    guid = ValidGuid(guid)
+    if not guid then
+        return nil
+    end
+    local cached = ctx.byGuid[guid]
+    if cached ~= nil then
+        return cached ~= false and cached or nil
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.ResolveContributorIdentity) ~= "function" then
+        ctx.byGuid[guid] = false
+        return nil
+    end
+    ctx.identityResolves = (ctx.identityResolves or 0) + 1
+    local info = GI:ResolveContributorIdentity(guid, ctx.guildKey)
+    if type(info) ~= "table" or info.status == "unknown" then
+        ctx.byGuid[guid] = false
+        return nil
+    end
+    ctx.byGuid[guid] = info
+    return info
+end
+
+--- Unique donor/attributed GUID when relationships are ready. Never guesses.
+-- @return string|nil guid
+function GS.ResolveUniqueCharacterGuid(record, name, hintGuid)
+    local guid = ValidGuid(hintGuid)
+    if guid then
+        return guid
+    end
+    name = NormName(name)
+    if not name then
+        return nil
+    end
+    if not GS.WitnessRelationshipsReady(record) then
+        return nil
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.ResolveCharacterGuidByName) ~= "function" then
+        return nil
+    end
+    local resolved, err = GI:ResolveCharacterGuidByName(name, GuildKeyForRecord(record))
+    if type(resolved) == "string" and err == nil then
+        return ValidGuid(resolved)
+    end
+    return nil
+end
+
+--- True when Guild Info currently displays `name` for `guid` (ready baseline).
+-- Membership alone is insufficient; the GUID's current nameRealm must match.
+local function GuidCurrentNameMatches(record, guid, name)
+    guid = ValidGuid(guid)
+    name = NormName(name)
+    if not guid or not name or not GS.WitnessRelationshipsReady(record) then
+        return false
+    end
+    local GI = SF.GuildInfo
+    if not GI or type(GI.GetRelationshipReadiness) ~= "function" then
+        return false
+    end
+    local readiness, giRec = GI:GetRelationshipReadiness(GuildKeyForRecord(record))
+    if readiness ~= "ready" or type(giRec) ~= "table" then
+        return false
+    end
+    local char = giRec.characters and giRec.characters[guid]
+    if type(char) == "table" and NormName(char.nameRealm) == name then
+        return true
+    end
+    local member = giRec.members and giRec.members[guid]
+    if type(member) == "table" and NormName(member.nameRealm) == name then
+        return true
+    end
+    return false
+end
+
+--- True when an already-accepted local ledger row links this durable name to GUID.
+-- Authenticated history is provenance; a bare remote claim is not. Bounded scan.
+local function LedgerEstablishesNameGuid(record, name, guid)
+    name = NormName(name)
+    guid = ValidGuid(guid)
+    if not name or not guid or type(record) ~= "table" or type(record.accounting) ~= "table" then
+        return false
+    end
+    local function rowLinks(ev)
+        if type(ev) ~= "table" then
+            return false
+        end
+        local sideGuid = ValidGuid(ev.actorGuid) or ValidGuid(ev.donorGuid)
+        if sideGuid == guid then
+            if NormName(ev.actor) == name or NormName(ev.donor) == name then
+                return true
+            end
+        end
+        if ValidGuid(ev.attributedGuid) == guid and NormName(ev.attributed) == name then
+            return true
+        end
+        return false
+    end
+    local lists = {
+        { record.accounting._consumableEvents, GS.MAX_LEDGER_EVENTS or 4096 },
+        { record.accounting._consumableEventArchive, GS.MAX_ARCHIVED_EVENTS or 4096 },
+    }
+    for li = 1, #lists do
+        local list, maxLen = lists[li][1], lists[li][2]
+        if type(list) == "table" then
+            local limit = math.min(#list, maxLen)
+            for i = 1, limit do
+                if rowLinks(list[i]) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+--- Bind a durable character name to an optional claimed GUID.
+-- Trust rule:
+--   1) Name uniquely resolves to claimed GUID → accept.
+--   2) Name uniquely resolves to a different GUID → hard mismatch (or soft
+--      replace with the name-bound GUID for donations).
+--   3) Name does not uniquely resolve → accept claimed GUID only with
+--      verifiable provenance: Guild Info currently displays that name for the
+--      GUID, or an accepted local ledger row already links the same name↔GUID.
+--   4) Otherwise discard the claimed GUID and keep the immutable name.
+-- Membership alone never establishes name↔GUID binding. Incomplete
+-- relationships drop claimed GUIDs rather than storing them.
+-- @param opts optional { softMismatch = boolean }
+-- @return string|nil name, string|nil guid, string|nil err
+function GS.BindCharacterIdentity(record, characterName, claimedGuid, opts)
+    opts = opts or {}
+    local name = NormName(characterName)
+    local guid = ValidGuid(claimedGuid)
+    if not name then
+        if guid then
+            return nil, nil, "invalid_attribution"
+        end
+        return nil, nil, nil
+    end
+    if not guid then
+        return name, GS.ResolveUniqueCharacterGuid(record, name, nil), nil
+    end
+    if not GS.WitnessRelationshipsReady(record) then
+        return name, nil, nil
+    end
+    local resolved = GS.ResolveUniqueCharacterGuid(record, name, nil)
+    if resolved then
+        if resolved ~= guid then
+            if opts.softMismatch then
+                -- Donation credit is already witness/officer authenticated by name;
+                -- keep the name-bound GUID and drop the conflicting claim.
+                return name, resolved, nil
+            end
+            return nil, nil, "attribution_mismatch"
+        end
+        return name, guid, nil
+    end
+    -- Unresolved name: require verifiable name↔GUID provenance, not membership.
+    if GuidCurrentNameMatches(record, guid, name)
+        or LedgerEstablishesNameGuid(record, name, guid) then
+        return name, guid, nil
+    end
+    -- Unverifiable claimed GUID: omit rather than redirect credit.
+    return name, nil, nil
+end
+
+--- Canonical attributed identity for floor checks and durable storage.
+-- @return string|nil name, string|nil guid, string|nil err
+function GS.ResolveAttributedIdentity(record, attributedName, attributedGuid)
+    return GS.BindCharacterIdentity(record, attributedName, attributedGuid, nil)
+end
+
+--- Donor identity for donation persistence. Mismatched claimed GUIDs are dropped
+-- (donation credit itself is already witness/officer authenticated).
+-- @return string|nil name, string|nil guid
+function GS.ResolveDonorIdentity(record, donorName, claimedGuid)
+    local name, guid = GS.BindCharacterIdentity(
+        record, donorName, claimedGuid, { softMismatch = true })
+    return name, guid
+end
+
+--- Resolve a ledger actor/attributed name (optional GUID) to the current
+-- contributor display identity. Never guesses from ambiguous names.
+-- Optional ctx from BeginContributorProjectionContext reuses readiness/mappings.
+-- @return string displayName, table meta
+function GS.ResolveDisplayContributor(record, actorName, actorGuid, ctx)
+    local original = NormName(actorName)
+    local meta = {
+        original = original,
+        guid = ValidGuid(actorGuid),
+        status = "provisional",
+        mainGuid = nil,
+        provisional = true,
+    }
+    if not original and not meta.guid then
+        return nil, meta
+    end
+    local cacheKey = (meta.guid or "") .. "\0" .. (original or "")
+    if type(ctx) == "table" and ctx.byKey and ctx.byKey[cacheKey] then
+        local hit = ctx.byKey[cacheKey]
+        return hit[1], hit[2]
+    end
+    local function finish(display, outMeta)
+        if type(ctx) == "table" and ctx.byKey then
+            ctx.byKey[cacheKey] = { display, outMeta }
+        end
+        return display, outMeta
+    end
+    local GI = SF.GuildInfo
+    if not GI then
+        return finish(original, meta)
+    end
+    local ready
+    if type(ctx) == "table" and ctx.readinessChecked ~= false and ctx.ready ~= nil then
+        ready = ctx.ready and true or false
+    else
+        ready = GS.WitnessRelationshipsReady(record)
+        if type(ctx) == "table" then
+            ctx.readinessChecks = (ctx.readinessChecks or 0) + 1
+            ctx.ready = ready
+        end
+    end
+    if not ready then
+        -- Provisional fallback: show the original donor without rewriting history.
+        return finish(original, meta)
+    end
+    local guid = meta.guid
+    if not guid and original then
+        if type(ctx) == "table" then
+            local resolved, err = ContextResolveGuidByName(ctx, original)
+            if type(resolved) == "string" then
+                guid = resolved
+                meta.guid = guid
+            elseif err == "ambiguous_name" then
+                meta.status = "ambiguous"
+                return finish(original, meta)
+            end
+        elseif type(GI.ResolveCharacterGuidByName) == "function" then
+            local resolved, err = GI:ResolveCharacterGuidByName(original, GuildKeyForRecord(record))
+            if type(resolved) == "string" then
+                guid = resolved
+                meta.guid = guid
+            elseif err == "ambiguous_name" then
+                meta.status = "ambiguous"
+                return finish(original, meta)
+            end
+        end
+    end
+    if not guid then
+        return finish(original, meta)
+    end
+    local info
+    if type(ctx) == "table" then
+        info = ContextResolveIdentity(ctx, guid)
+    elseif type(GI.ResolveContributorIdentity) == "function" then
+        info = GI:ResolveContributorIdentity(guid, GuildKeyForRecord(record))
+        if type(info) == "table" and info.status == "unknown" then
+            info = nil
+        end
+    end
+    if type(info) ~= "table" then
+        return finish(original, meta)
+    end
+    meta.status = info.status
+    meta.mainGuid = info.mainGuid
+    meta.provisional = false
+    local display = NormName(info.displayName) or original
+    if info.status == "unassigned" then
+        display = original or display
+    elseif type(display) ~= "string" or display == "" then
+        display = original
+    end
+    return finish(display, meta)
+end
+
+--- Personal (non-projected) item total for one durable identity.
+-- Used for attributed negative-adjustment floors so linked balances cannot be
+-- spent against another character and then go negative after unassign/move.
+-- GUID-first when present; exact normalized name fallback for legacy rows.
+function GS.PersonalContributorItemTotal(record, actorName, actorGuid, itemId, campaignId)
+    itemId = tonumber(itemId)
+    if type(record) ~= "table" or not IsItemId(itemId) then
+        return 0
+    end
+    campaignId = campaignId or record.currentCampaignId
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return 0
+    end
+    local identityName = NormName(actorName)
+    local identityGuid = ValidGuid(actorGuid)
+    if not identityName and not identityGuid then
+        return 0
+    end
+    local generation = nil
+    if record.currentCampaignId == campaignId then
+        local cfg = record.accounting and record.accounting._consumables
+        generation = cfg and tonumber(cfg.generation)
+    end
+    if not generation then
+        local archive = record.campaignArchives and record.campaignArchives[campaignId]
+        generation = archive and tonumber(archive.generation)
+    end
+    if not generation or generation < 1 then
+        return 0
+    end
+    local function sideMatches(sideName, sideGuid)
+        local g = ValidGuid(sideGuid)
+        if identityGuid and g then
+            return g == identityGuid
+        end
+        local side = NormName(sideName)
+        if identityGuid and not g then
+            if side and identityName and side == identityName then
+                return true
+            end
+            -- Legacy name-only rows: match when the durable name uniquely
+            -- resolves to this GUID (identity established without a stored GUID).
+            if side then
+                local resolved = GS.ResolveUniqueCharacterGuid(record, side, nil)
+                if resolved and resolved == identityGuid then
+                    return true
+                end
+            end
+            return false
+        end
+        return side ~= nil and identityName ~= nil and side == identityName
+    end
+    local total = 0
+    local function consider(event)
+        if type(event) ~= "table" then
+            return
+        end
+        if tonumber(event.generation) ~= generation then
+            return
+        end
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
+        if tonumber(event.itemId) ~= itemId then
+            return
+        end
+        local qty = tonumber(event.quantity) or 0
+        if qty == 0 then
+            return
+        end
+        local typ = event.type
+        if typ == GS.LEDGER_EVENT.DONATION or typ == "CONSUMABLE_DONATION" then
+            if qty > 0 and sideMatches(event.actor, event.actorGuid or event.donorGuid) then
+                total = total + qty
+            end
+        elseif typ == GS.LEDGER_EVENT.ADJUSTMENT or typ == "CONSUMABLE_ADJUSTMENT" then
+            if event.attributed and sideMatches(event.attributed, event.attributedGuid) then
+                total = total + qty
+            end
+        end
+    end
+    local live = record.accounting and record.accounting._consumableEvents
+    local archived = record.accounting and record.accounting._consumableEventArchive
+    if type(live) == "table" then
+        for i = 1, #live do
+            consider(live[i])
+        end
+    end
+    if type(archived) == "table" then
+        for i = 1, #archived do
+            consider(archived[i])
+        end
+    end
+    return total
 end
 
 local function CountLinkGroups(links)
@@ -1227,18 +1732,54 @@ local function RegisterTxn(cfg, entry)
     return true
 end
 
-local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId)
+local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId, record, knownEvent)
     primaryTxnId, aliasTxnId = ValidTxnId(primaryTxnId), ValidTxnId(aliasTxnId)
     if not primaryTxnId or not aliasTxnId or primaryTxnId == aliasTxnId then
         return false
     end
     local row = FindRegistryByTxn(cfg, primaryTxnId)
-    if not row then return false end
+    if not row and type(knownEvent) == "table" then
+        -- Registry eviction can drop the verified primary while the ledger still
+        -- holds the accepted donation. Re-anchor A from that known event so the
+        -- A→X alias survives /reload and a later gs:val:X can ResolveCanonical.
+        RegisterTxn(cfg, {
+            txnId = primaryTxnId,
+            status = "verified",
+            committed = true,
+            coreSignature = knownEvent.coreSignature,
+            approxTxnTime = knownEvent.approxTxnTime or knownEvent.timestamp,
+            donor = knownEvent.actor or knownEvent.donor,
+            itemId = knownEvent.itemId,
+            quantity = knownEvent.quantity,
+            guildGuid = knownEvent.guildGuid,
+            bankTab = knownEvent.bankTab,
+            generation = knownEvent.generation,
+            occurrenceIndex = knownEvent.occurrenceIndex,
+            neighborsOlder = knownEvent.neighborsOlder,
+            neighborsNewer = knownEvent.neighborsNewer,
+            verification = GS.CanonicalVerificationMode(knownEvent.verification),
+            decidedBy = ValidGuid(knownEvent.writer) or ValidGuid(knownEvent.verifierGuid),
+        })
+        row = FindRegistryByTxn(cfg, primaryTxnId)
+    end
+    if not row then
+        -- No durable primary to attach; still attempt a one-shot valuation fold
+        -- when a known accepted donation is supplied.
+        if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
+            GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+        end
+        return false
+    end
     if type(row.aliases) ~= "table" then
         row.aliases = {}
     end
     for i = 1, #row.aliases do
         if row.aliases[i] == aliasTxnId then
+            -- Alias already registered; still reconcile valuations when a known
+            -- accepted donation is supplied (cold competing-ID convergence).
+            if type(record) == "table" and GS.OnDonationTxnAlias and type(knownEvent) == "table" then
+                GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+            end
             return true
         end
     end
@@ -1264,6 +1805,9 @@ local function AddTxnAlias(cfg, primaryTxnId, aliasTxnId)
         neighborsOlder = row.neighborsOlder,
         neighborsNewer = row.neighborsNewer,
     })
+    if type(record) == "table" and GS.OnDonationTxnAlias then
+        GS.OnDonationTxnAlias(record, primaryTxnId, aliasTxnId, knownEvent)
+    end
     return true
 end
 
@@ -1305,6 +1849,35 @@ function GS.GetAccountingMutationSeq(record)
         return 0
     end
     return tonumber(record.accounting._mutationSeq) or 0
+end
+
+--- Enrich an op-first equivalent adjustment with a later ledger attributedGuid.
+-- Does not rewrite attributed name, quantity, or other immutable fields.
+local function ReconcileAdjustmentAttributedGuid(record, existing, incoming)
+    if type(existing) ~= "table" or type(incoming) ~= "table" then
+        return false
+    end
+    if ValidGuid(existing.attributedGuid) then
+        return false
+    end
+    local incomingGuid = ValidGuid(incoming.attributedGuid)
+    if not incomingGuid then
+        return false
+    end
+    local name = NormName(existing.attributed) or NormName(incoming.attributed)
+    local canonName, canonGuid, err = GS.ResolveAttributedIdentity(record, name, incomingGuid)
+    if err or not canonGuid then
+        return false
+    end
+    if canonName and existing.attributed and NormName(existing.attributed) ~= canonName then
+        return false
+    end
+    existing.attributedGuid = canonGuid
+    BumpAccountingMutation(record)
+    if GS._NotifyLocalDurableChange then
+        GS._NotifyLocalDurableChange("ledger")
+    end
+    return true
 end
 
 --- Attach authenticated active-exporter cutover provenance to an already-retained
@@ -1436,6 +2009,7 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
             return false
         end
     end
+    local wasCredited = existing.gsProductionCredit == true
     local changed = false
     if live then
         if CollapseDonationCutoverMarkers(existing, liveMarker) then
@@ -1478,6 +2052,17 @@ local function ReconcileDonationCutoverProvenance(record, existing, admissionCtx
         BumpAccountingMutation(record)
         if GS._NotifyLocalDurableChange then
             GS._NotifyLocalDurableChange("ledger")
+        end
+        -- Late authenticated marker repair: promote a preserved pending price,
+        -- or mint once when an eligible officer still has no assignment.
+        if not wasCredited and existing.gsProductionCredit == true then
+            local txnId = ValidTxnId(existing.txnId) or ValidTxnId(existing.id)
+            if txnId and GS.ReconcilePendingValuations then
+                GS.ReconcilePendingValuations(record, txnId, existing)
+            end
+            if GS.TryAssignDonationValuation then
+                GS.TryAssignDonationValuation(record, existing, nil)
+            end
         end
     end
     return changed
@@ -1589,8 +2174,14 @@ function GS.ValidateLedgerEventLists(accounting, datasetId)
     return true
 end
 
-local function RemoveEvictedLedgerExportIds(removedIds)
+local function RemoveEvictedLedgerExportIds(removedIds, opts)
     if type(removedIds) ~= "table" or #removedIds < 1 or not GS.RemoveGossipExportBodies then
+        return
+    end
+    opts = opts or {}
+    if opts.bulk == true then
+        -- Trusted archive trim: one pass over the full eviction set.
+        GS.RemoveGossipExportBodies(removedIds, { bulk = true })
         return
     end
     local offset = 1
@@ -1616,10 +2207,17 @@ local function TrimEventArchive(record)
         return false
     end
     local removedIds = {}
+    local removedTxn = {}
     for i = 1, overflow do
         local ev = archive[i]
         if type(ev) == "table" and type(ev.id) == "string" and ev.id ~= "" then
             removedIds[#removedIds + 1] = "gs:le:" .. ev.id
+        end
+        if type(ev) == "table" then
+            local txn = ev.txnId or ev.id
+            if type(txn) == "string" and txn ~= "" then
+                removedTxn[#removedTxn + 1] = txn
+            end
         end
     end
     local kept = {}
@@ -1628,7 +2226,20 @@ local function TrimEventArchive(record)
     end
     record.accounting._consumableEventArchive = kept
     BumpAccountingMutation(record)
-    RemoveEvictedLedgerExportIds(removedIds)
+    -- Coalesce ledger + valuation export drops into one order compaction and
+    -- one provider/manifest notification for this trusted retention trim.
+    local beganRemovalBatch = false
+    if GS.BeginGossipExportBodyRemovalBatch then
+        GS.BeginGossipExportBodyRemovalBatch()
+        beganRemovalBatch = true
+    end
+    RemoveEvictedLedgerExportIds(removedIds, { bulk = true })
+    if GS.ForgetDonationValuations then
+        GS.ForgetDonationValuations(record, removedTxn, { bulkExport = true })
+    end
+    if beganRemovalBatch and GS.EndGossipExportBodyRemovalBatch then
+        GS.EndGossipExportBodyRemovalBatch()
+    end
     -- Length may match the prior warm watermark after shelve+trim; still force
     -- archive paced rebuild so newly retained rows are exported and descriptor
     -- counts cannot exceed GetRecord coverage.
@@ -1739,7 +2350,7 @@ function GS.CountAcceptedLedgerEvents(record)
     return n
 end
 
-local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
+local function BuildDonationEvent(evidence, writerGuid, txnId, verification, record)
     txnId = ValidTxnId(txnId)
     writerGuid = ValidGuid(writerGuid)
     local donor = NormName(evidence.donor)
@@ -1748,7 +2359,7 @@ local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
     if not txnId or not writerGuid or not donor or not IsItemId(itemId) or quantity < 1 then
         return nil
     end
-    return {
+    local event = {
         type = GS.LEDGER_EVENT.DONATION,
         id = txnId,
         txnId = txnId,
@@ -1769,6 +2380,16 @@ local function BuildDonationEvent(evidence, writerGuid, txnId, verification)
         campaignId = evidence.campaignId,
         ageHours = tonumber(evidence.ageHours),
     }
+    -- Persist a uniquely known original donor GUID without rewriting actor name.
+    -- Relayed claimed GUIDs must bind to the donor name (soft-drop on mismatch).
+    if type(record) == "table" then
+        local claimed = ValidGuid(evidence.donorGuid) or ValidGuid(evidence.actorGuid)
+        local _, donorGuid = GS.ResolveDonorIdentity(record, donor, claimed)
+        if donorGuid then
+            event.actorGuid = donorGuid
+        end
+    end
+    return event
 end
 
 --- Read-only eligibility view floored to the immutable live cutover.
@@ -2107,7 +2728,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMo
     end
 
     local mode = GS.CanonicalVerificationMode(verificationMode)
-    local event = BuildDonationEvent(evidence, writerGuid, txnId, mode)
+    local event = BuildDonationEvent(evidence, writerGuid, txnId, mode, record)
     if not event then
         return false, "invalid_event"
     end
@@ -2163,7 +2784,7 @@ local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMo
                     status = "pending",
                 }, evidence)
                 if score and score >= ((O and O.MIN_MATCH_SCORE) or 100) then
-                    AddTxnAlias(cfg, txnId, candId)
+                    AddTxnAlias(cfg, txnId, candId, record, event)
                     pendingCands[candId] = nil
                 end
             elseif candId == txnId then
@@ -2185,6 +2806,12 @@ local function CommitVerifiedCluster(record, cluster, writerGuid, verificationMo
     Debug("Info", "donation committed txn=%s mode=%s witnesses=%s",
         tostring(txnId), tostring(mode),
         tostring(GS.CountIndependentWitnesses(record, cluster.witnesses)))
+    if GS.ReconcilePendingValuations then
+        GS.ReconcilePendingValuations(record, txnId, event)
+    end
+    if GS.TryAssignDonationValuation then
+        GS.TryAssignDonationValuation(record, event, evidence)
+    end
     return true, "accepted"
 end
 
@@ -2580,8 +3207,14 @@ function GS:AdmitDirectObservation(evidence, admissionCtx)
     return "pending", "awaiting_witnesses", cluster
 end
 
---- Reevaluate unfinished evidence after link-map changes (conservative).
--- Compaction may remove the current index; do not skip the shifted cluster.
+--- Cheap presence check for unfinished pending clusters (no verification work).
+function GS.HasUnfinishedPendingEvidence(record)
+    return CountTotalUnfinishedPending(record) > 0
+end
+
+--- Reevaluate unfinished evidence after Guild Info relationship changes
+-- (or inert legacy link-op replay). Compaction may remove the current index;
+-- do not skip the shifted cluster. Bounded by MAX_PENDING_EVIDENCE_TOTAL.
 function GS.ReevaluatePendingEvidence(record)
     if type(record) ~= "table" or type(record.observations) ~= "table" then
         return 0
@@ -2738,7 +3371,7 @@ local function SettleAcceptedOfficerOccurrence(record, cfg, txnId, evidence)
             end
             if clear then
                 if candId ~= txnId and ValidTxnId(candId) then
-                    AddTxnAlias(cfg, txnId, candId)
+                    AddTxnAlias(cfg, txnId, candId, record)
                 end
                 pendingCands[candId] = nil
                 changed = true
@@ -2774,16 +3407,14 @@ local function SettleAcceptedOfficerOccurrence(record, cfg, txnId, evidence)
     end
 end
 
---- Ordinary Guild Gossip catch-up of an already accepted officer-trusted donation.
--- The transport sender must be an authenticated same-guild member. The verification
--- field, writer, rank, or isAdmin claim is not authority by itself: occurrence,
--- eligibility, dataset, an explicit verifierGuid, and (when live) the canonical
--- cutover marker are required. v1 cannot prove the named writer saw Blizzard's
--- bank log. That limit is documented in GuildSupplies/AGENTS.md. Returns nil when
--- the row must stay an unverified candidate.
-local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cfg, senderName, admissionCtx)
+--- Non-mutating accepted officer-history preflight.
+-- Shared by catch-up credit and competing-ID alias authorization so valuation
+-- side effects cannot run when credit/provenance would refuse the same row.
+-- Returns writer, verifier, validated evidence row, sourceMarker, authedMember
+-- on success; otherwise nil. Does not mutate ledger, registry, or valuations.
+local function OfficerTrustedHistoryPreflight(record, event, candidate, txnId, senderName, admissionCtx)
     local writer, verifier = OfficerHistoryWriter(event)
-    if not writer or not verifier or not ValidTxnId(txnId) or type(cfg) ~= "table" then
+    if not writer or not verifier or not ValidTxnId(txnId) or type(candidate) ~= "table" then
         return nil
     end
     if type(GS.AuthenticateTransportSender) ~= "function" then
@@ -2841,8 +3472,26 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
             end
         end
     end
-    local eligOk = IsEvidenceEligible(record, row)
-    if not eligOk then
+    if not IsEvidenceEligible(record, row) then
+        return nil
+    end
+    return writer, verifier, row, sourceMarker, authed
+end
+
+--- Ordinary Guild Gossip catch-up of an already accepted officer-trusted donation.
+-- The transport sender must be an authenticated same-guild member. The verification
+-- field, writer, rank, or isAdmin claim is not authority by itself: occurrence,
+-- eligibility, dataset, an explicit verifierGuid, and (when live) the canonical
+-- cutover marker are required. v1 cannot prove the named writer saw Blizzard's
+-- bank log. That limit is documented in GuildSupplies/AGENTS.md. Returns nil when
+-- the row must stay an unverified candidate.
+local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cfg, senderName, admissionCtx)
+    if type(cfg) ~= "table" then
+        return nil
+    end
+    local writer, verifier, row, sourceMarker, authed = OfficerTrustedHistoryPreflight(
+        record, event, candidate, txnId, senderName, admissionCtx)
+    if not writer or not verifier or type(row) ~= "table" then
         return nil
     end
     local stored = {
@@ -2868,6 +3517,14 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
         datasetId = record.datasetId,
         ageHours = tonumber(row.ageHours),
     }
+    do
+        local claimed = ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
+            or ValidGuid(candidate.actorGuid) or ValidGuid(candidate.donorGuid)
+        local _, donorGuid = GS.ResolveDonorIdentity(record, row.donor, claimed)
+        if donorGuid then
+            stored.actorGuid = donorGuid
+        end
+    end
     if sourceMarker then
         stored.gsSourceCutoverMarker = sourceMarker
     end
@@ -2902,7 +3559,13 @@ local function TryAdmitOfficerTrustedHistory(record, event, candidate, txnId, cf
         GS._NotifyLocalDurableChange("ledger")
     end
     Debug("Info", "officer-trusted history accepted txn=%s writer=%s sender=%s",
-        tostring(txnId), tostring(writer), tostring(authed.name or senderName))
+        tostring(txnId), tostring(writer), tostring(authed and authed.name or senderName))
+    if GS.ReconcilePendingValuations then
+        GS.ReconcilePendingValuations(record, txnId, stored)
+    end
+    if GS.TryAssignDonationValuation then
+        GS.TryAssignDonationValuation(record, stored, row)
+    end
     return "accepted", "officer_history"
 end
 
@@ -3006,6 +3669,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                                     -- authenticated marked ledger body before duplicate.
                                     ReconcileAdjustmentCutoverProvenance(
                                         record, e, admissionCtx)
+                                    -- Same path: retain a validated attributedGuid from
+                                    -- the later ledger body without minting a second row.
+                                    ReconcileAdjustmentAttributedGuid(record, e, event)
                                     return "duplicate", "duplicate"
                                 end
                                 QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)
@@ -3050,6 +3716,14 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             approxTxnTime = tonumber(event.timestamp) or tonumber(event.approxTxnTime),
             donor = NormName(event.actor or event.donor),
         }
+        do
+            local claimed = ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
+            local _, donorGuid = GS.ResolveDonorIdentity(
+                record, candidate.actor or candidate.donor, claimed)
+            if donorGuid then
+                candidate.actorGuid = donorGuid
+            end
+        end
 
         -- Exact fingerprint ID may be shared by temporally distinct deposits.
         -- Only treat as duplicate when MatchScore agrees; otherwise remint the
@@ -3143,12 +3817,21 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             end
             if regHit and ValidTxnId(regHit.txnId) and regHit.txnId ~= txnId then
                 -- Same occurrence, competing ID: alias without second credit.
+                -- Only officer-history that would pass catch-up credit preflight
+                -- (live canonical marker + eligibility) may create A→X aliases
+                -- that move valuation state. Shape-only officer claims with a
+                -- missing/divergent marker must not redirect pending[X].
                 if regHit.status == "verified" then
-                    AddTxnAlias(cfg, regHit.txnId, txnId)
-                    local led = FindLedgerEventByTxnId(record, regHit.txnId)
-                    if led then
-                        ReconcileVerifiedDonationDuplicate(
-                            record, led, candidate, admissionCtx, event)
+                    if OfficerTrustedHistoryPreflight(
+                        record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
+                        -- Pass the accepted primary donation so cold-index alias
+                        -- reconcile can promote pending[X] without redelivery.
+                        local led = FindLedgerEventByTxnId(record, regHit.txnId)
+                        AddTxnAlias(cfg, regHit.txnId, txnId, record, led)
+                        if led then
+                            ReconcileVerifiedDonationDuplicate(
+                                record, led, candidate, admissionCtx, event)
+                        end
                     end
                     return "duplicate", "occurrence_duplicate"
                 end
@@ -3158,9 +3841,12 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 return "pending", "ambiguous"
             end
             if ledHit and (ledHit.txnId or ledHit.id) ~= txnId then
-                AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId)
-                ReconcileVerifiedDonationDuplicate(
-                    record, ledHit, candidate, admissionCtx, event)
+                if OfficerTrustedHistoryPreflight(
+                    record, event, candidate, txnId, admissionCtx.sender, admissionCtx) then
+                    AddTxnAlias(cfg, ledHit.txnId or ledHit.id, txnId, record, ledHit)
+                    ReconcileVerifiedDonationDuplicate(
+                        record, ledHit, candidate, admissionCtx, event)
+                end
                 return "duplicate", "occurrence_duplicate"
             end
             if ledHit and (ledHit.txnId or ledHit.id) == txnId then
@@ -3245,6 +3931,15 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 datasetId = record.datasetId,
                 ageHours = tonumber(event.ageHours),
             }
+            do
+                local claimed = ValidGuid(candidate.actorGuid) or ValidGuid(candidate.donorGuid)
+                    or ValidGuid(event.actorGuid) or ValidGuid(event.donorGuid)
+                local _, donorGuid = GS.ResolveDonorIdentity(
+                    record, candidate.actor or candidate.donor, claimed)
+                if donorGuid then
+                    stored.actorGuid = donorGuid
+                end
+            end
             if officerComplete then
                 stored.verifierGuid = explicitVerifier
                 local rankSnap = tonumber(event.verifierRankOrder)
@@ -3278,6 +3973,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                 neighborsNewer = stored.neighborsNewer,
                 verification = stored.verification,
             })
+            if GS.ReconcilePendingValuations then
+                GS.ReconcilePendingValuations(record, txnId, stored)
+            end
             return "accepted", "adoption_transfer"
         end
 
@@ -3312,7 +4010,11 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         end
         local eventGen = tonumber(event.generation)
         local curGen = tonumber(cfg.generation)
-        local attributed = NormName(event.attributed)
+        local attributed, attrGuid, attrErr = GS.ResolveAttributedIdentity(
+            record, event.attributed, event.attributedGuid)
+        if attrErr then
+            return "rejected", attrErr
+        end
         local qty = tonumber(event.quantity)
         local historicalAdoption = admissionCtx.adoptionReplay
             and admissionCtx.preserveAttribution
@@ -3335,8 +4037,10 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             if eventGen and curGen and eventGen ~= curGen then
                 return "rejected", "stale_generation"
             end
+            -- Floor and stored GUID share one authenticated attributed identity.
             local floorOk, floorErr = GS.AdjustmentFloorOk(
-                record, tonumber(event.itemId), qty, attributed, eventCampaign)
+                record, tonumber(event.itemId), qty, attributed, eventCampaign,
+                { attributedGuid = attrGuid })
             if not floorOk then
                 return "pending", floorErr or "adjustment_floor"
             end
@@ -3357,6 +4061,9 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
             campaignId = eventCampaign,
             datasetId = record.datasetId,
         }
+        if attrGuid then
+            stored.attributedGuid = attrGuid
+        end
         -- Authenticated active-exporter marker from transport body (never the
         -- self-declared event field). When already live, only the matching
         -- canonical marker is retained; divergent markers stay fail-closed.
@@ -3396,7 +4103,12 @@ end
 local function ActorItemTotal(record, actorName, itemId, campaignId)
     local progress = ProgressOnRecord(record, campaignId)
     if not progress then return 0 end
-    local contrib = progress.contributions and progress.contributions[actorName]
+    -- Floors use the same projected contributor key as progress totals (#427).
+    local key = actorName
+    if GS.ResolveDisplayContributor then
+        key = select(1, GS.ResolveDisplayContributor(record, actorName, nil)) or actorName
+    end
+    local contrib = progress.contributions and progress.contributions[key]
     return (contrib and tonumber(contrib[itemId])) or 0
 end
 
@@ -3406,10 +4118,82 @@ local function ItemTotal(record, itemId, campaignId)
     return tonumber(progress.itemTotals and progress.itemTotals[itemId]) or 0
 end
 
---- Floor against accepted authoritative projection at commit time.
+--- Strict signed-integer parse for Settings quantity input (#426).
+-- Accepts "10" and "-10". Rejects "+10", zero, decimals, whitespace-only,
+-- non-integers, and magnitudes above MAX_OBS_QUANTITY. Does not round.
+-- @return number|nil quantity, string|nil err
+function GS.ParseAdjustmentQuantity(text)
+    if type(text) ~= "string" then
+        return nil, "invalid_quantity"
+    end
+    local trimmed = text:match("^%s*(.-)%s*$") or ""
+    if trimmed == "" then
+        return nil, "invalid_quantity"
+    end
+    -- Explicit leading '+' is rejected even though tonumber would accept it.
+    if trimmed:sub(1, 1) == "+" then
+        return nil, "invalid_quantity"
+    end
+    local whole = trimmed:match("^(%-?%d+)$")
+    if not whole then
+        return nil, "invalid_quantity"
+    end
+    local quantity = tonumber(whole)
+    if not quantity or quantity ~= quantity or quantity ~= math.floor(quantity) or quantity == 0 then
+        return nil, "invalid_quantity"
+    end
+    if math.abs(quantity) > (GS.MAX_OBS_QUANTITY or 100000) then
+        return nil, "invalid_quantity"
+    end
+    return quantity
+end
+
+--- True when itemId is a configured requested item on the current campaign.
+function GS.IsCurrentRequestedItem(record, itemId)
+    itemId = tonumber(itemId)
+    if not IsItemId(itemId) or type(record) ~= "table" then
+        return false
+    end
+    if type(record.currentCampaignId) ~= "string" or record.currentCampaignId == "" then
+        return false
+    end
+    local items = record.accounting and record.accounting._consumables
+        and record.accounting._consumables.requestedItems
+    if type(items) ~= "table" then
+        return false
+    end
+    local row = items[tostring(itemId)]
+    return type(row) == "table" and tonumber(row.itemId) == itemId
+end
+
+local function CurrentItemGoal(record, itemId)
+    local items = record and record.accounting and record.accounting._consumables
+        and record.accounting._consumables.requestedItems
+    if type(items) ~= "table" then
+        return nil
+    end
+    local row = items[tostring(itemId)]
+    if type(row) ~= "table" then
+        return nil
+    end
+    local goal = tonumber(row.goal)
+    if not goal or goal ~= goal or goal ~= math.floor(goal) or goal < 0 then
+        return nil
+    end
+    return goal
+end
+
+--- Floor (and optional positive-goal ceiling) against accepted projection.
+-- Negative corrections of an already over-goal total remain allowed subject to
+-- existing floors. The goal ceiling is opt-in via opts.enforceGoalCeiling and is
+-- intended for new local preparation/commit only. Authenticated remote replay of
+-- previously accepted adjustments must not pass that flag: a peer that receives
+-- a later donation or lowered goal before the earlier adjustment would otherwise
+-- diverge permanently (#426 / #430).
 -- @param campaignId optional; defaults to record.currentCampaignId. Callers that
 --   cannot prove historical campaign provenance should reject before calling.
-function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId)
+-- @param opts optional { enforceGoalCeiling = boolean }
+function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId, opts)
     itemId = tonumber(itemId)
     quantity = tonumber(quantity)
     if not IsItemId(itemId) then
@@ -3439,12 +4223,31 @@ function GS.AdjustmentFloorOk(record, itemId, quantity, attributed, campaignId)
     if campaignId ~= record.currentCampaignId then
         return false, "stale_campaign"
     end
+    opts = opts or {}
     local currentItem = ItemTotal(record, itemId, campaignId)
-    if currentItem + quantity < 0 then
+    local nextItem = currentItem + quantity
+    if nextItem < 0 then
         return false, "item_negative"
     end
-    if attributed and ActorItemTotal(record, attributed, itemId, campaignId) + quantity < 0 then
-        return false, "player_negative"
+    -- Attributed negative floors use personal durable identity totals, not the
+    -- projected main aggregate. Grouped projection remains for display/logs;
+    -- personal floors prevent admitting corrections that go negative after an
+    -- alt moves or unassigns (#427 repair).
+    if attributed and quantity < 0 then
+        local attrGuid = GS.ResolveUniqueCharacterGuid and GS.ResolveUniqueCharacterGuid(
+            record, attributed, opts.attributedGuid) or nil
+        local personal = GS.PersonalContributorItemTotal
+            and GS.PersonalContributorItemTotal(record, attributed, attrGuid, itemId, campaignId)
+            or ActorItemTotal(record, attributed, itemId, campaignId)
+        if personal + quantity < 0 then
+            return false, "player_negative"
+        end
+    end
+    if opts.enforceGoalCeiling and quantity > 0 then
+        local goal = CurrentItemGoal(record, itemId)
+        if goal ~= nil and nextItem > goal then
+            return false, "item_over_goal"
+        end
     end
     return true, nil, attributed
 end
@@ -3454,14 +4257,19 @@ function GS:PreviewAdjustment(itemId, quantity, attributed)
     if not record then
         return nil, reason or "not_ready"
     end
-    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(record, itemId, quantity, attributed)
+    itemId = tonumber(itemId)
+    if not GS.IsCurrentRequestedItem(record, itemId) then
+        return nil, "item_not_requested"
+    end
+    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
+        record, itemId, quantity, attributed, nil, { enforceGoalCeiling = true })
     if not floorOk then
         return nil, floorErr
     end
-    itemId = tonumber(itemId)
     quantity = tonumber(quantity)
     local currentItem = ItemTotal(record, itemId)
     local currentPlayer = normAttr and ActorItemTotal(record, normAttr, itemId) or nil
+    local goal = CurrentItemGoal(record, itemId)
     return {
         itemId = itemId,
         quantity = quantity,
@@ -3470,7 +4278,42 @@ function GS:PreviewAdjustment(itemId, quantity, attributed)
         nextItem = currentItem + quantity,
         currentPlayer = currentPlayer,
         nextPlayer = currentPlayer and (currentPlayer + quantity) or nil,
+        goal = goal,
     }
+end
+
+--- Settings confirmation copy for a prepared adjustment preview (#426).
+-- Positive changes may show a leading '+' here; input parsing still rejects '+'.
+function GS.FormatAdjustmentConfirmation(preview, itemName)
+    if type(preview) ~= "table" then
+        return ""
+    end
+    local name = itemName
+    if type(name) ~= "string" or name == "" then
+        name = Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s")
+            :format(tostring(preview.itemId or "?"))
+    end
+    local qty = tonumber(preview.quantity) or 0
+    local credit
+    if preview.attributed then
+        credit = tostring(preview.attributed)
+    else
+        credit = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+    end
+    local lines = {
+        Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_HEADER", "Adjust %s by %+d?")
+            :format(name, qty),
+        Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_TOTAL", "Item total: %d → %d")
+            :format(tonumber(preview.currentItem) or 0, tonumber(preview.nextItem) or 0),
+    }
+    if preview.attributed then
+        lines[#lines + 1] = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_PLAYER",
+            "Character contribution: %d → %d")
+            :format(tonumber(preview.currentPlayer) or 0, tonumber(preview.nextPlayer) or 0)
+    end
+    lines[#lines + 1] = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM_CREDIT", "Attribution: %s")
+        :format(credit)
+    return table.concat(lines, "\n")
 end
 
 ---------------------------------------------------------------------------
@@ -3674,8 +4517,30 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
             end
         end
     end
-    local floorOk, floorErr, normAttr = GS.AdjustmentFloorOk(
-        record, itemId, quantity, attributed, record.currentCampaignId)
+    -- Local editor commits re-check current campaign membership so an item
+    -- removed while confirmation is open cannot apply. Remote admission of
+    -- already-authored ops must not fail solely because the item was later
+    -- removed (#426 / historical catch-up).
+    local isLocalCommit = opts.localProductionAuthority or opts.localWrite
+    if isLocalCommit then
+        if not GS.IsCurrentRequestedItem(record, itemId) then
+            return false, "item_not_requested"
+        end
+    end
+    -- Goal ceiling is local-authoring only. Remote/authenticated catch-up keeps
+    -- floors and campaign checks without replaying the authoring-time ceiling
+    -- against a peer's later donation or goal state (#430).
+    local normAttr, attrGuid, attrErr = GS.ResolveAttributedIdentity(
+        record, attributed, op.value and op.value.attributedGuid)
+    if attrErr then
+        return false, attrErr
+    end
+    local floorOpts = { attributedGuid = attrGuid }
+    if isLocalCommit then
+        floorOpts.enforceGoalCeiling = true
+    end
+    local floorOk, floorErr = GS.AdjustmentFloorOk(
+        record, itemId, quantity, normAttr, record.currentCampaignId, floorOpts)
     if not floorOk then
         return false, floorErr or "adjustment_floor"
     end
@@ -3694,6 +4559,9 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
         datasetId = record.datasetId,
         opId = op.id,
     }
+    if attrGuid then
+        event.attributedGuid = attrGuid
+    end
     -- Only the local authenticated editor path may mint live cutover provenance
     -- when this client is already active. Remote gs-op admission stays unmarked
     -- until a matching authenticated marked ledger event reconciles (#389 A2).

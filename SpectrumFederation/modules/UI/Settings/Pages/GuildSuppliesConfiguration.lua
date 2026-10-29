@@ -1,4 +1,5 @@
 -- Guild Supplies → Configuration (#386/#389). Guild setup, campaigns, and live activation.
+-- Adoption and configuration-conflict controls live on Troubleshooting (#422).
 local _, SF = ...
 
 local function Loc(key, default)
@@ -14,7 +15,7 @@ SF.SettingsUI:RegisterCategory({
 	navLabel = Loc("GUILD_SUPPLIES_CATEGORY_NAV", "Raid Supplies"),
 	group = "Raid Tools", -- sidebar heading; chrome displays this string
 	description = Loc("GUILD_SUPPLIES_CATEGORY_DESC",
-		"Guild-owned raid supply campaigns, configuration, and logs."),
+		"Guild-owned raid supply campaigns, configuration, logs, and troubleshooting."),
 	order = 32,
 })
 
@@ -340,19 +341,308 @@ local function RequestedItemRows()
 	return rows
 end
 
-local pendingAdoptionPeer = nil
-local pendingAdoptionDataset = nil
-local pendingConflictTarget = nil
-local pendingConflictChosen = nil
+---------------------------------------------------------------------------
+-- Session-local Apply Adjustment draft (#426). Never SavedVariables / Gossip.
+-- Cleared when dataset or current campaign identity changes. Ordinary refreshes
+-- and delayed item-name loads must not reset valid in-progress input.
+---------------------------------------------------------------------------
+local ADJUST_UNASSIGNED = false -- UI-only sentinel; stored attribution stays nil.
+-- attributed: Unassigned (false) or an explicitly/exactly resolved character name.
+-- attributionText: search-box draft, kept separate so prefixes are never credited.
+-- attributionResolved: false while nonempty search text has no exact resolution.
+local adjustDraft = {
+	itemId = nil,
+	quantityText = "",
+	attributed = ADJUST_UNASSIGNED,
+	attributionText = "",
+	attributionResolved = true,
+}
+local adjustDraftContextKey = nil
 
-local function ClearPendingAdoptionChoice()
-	pendingAdoptionPeer = nil
-	pendingAdoptionDataset = nil
+local function AdjustDraftContextKey()
+	local rec = CurrentRecord()
+	if not rec then
+		return "none"
+	end
+	return tostring(rec.datasetId or "") .. "|" .. tostring(rec.currentCampaignId or "")
 end
 
-local function ClearPendingConflictChoice()
-	pendingConflictTarget = nil
-	pendingConflictChosen = nil
+local function SyncAdjustDraftContext()
+	local key = AdjustDraftContextKey()
+	if key == adjustDraftContextKey then
+		return
+	end
+	adjustDraftContextKey = key
+	adjustDraft.itemId = nil
+	adjustDraft.quantityText = ""
+	adjustDraft.attributed = ADJUST_UNASSIGNED
+	adjustDraft.attributionText = ""
+	adjustDraft.attributionResolved = true
+end
+
+local function FormatAdjustItemLabel(itemId)
+	local id = tonumber(itemId)
+	if not id then
+		return Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item")
+	end
+	local described = DescribeItem(id)
+	local name = described and described.name
+	if type(name) ~= "string" or name == "" then
+		return Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(id))
+	end
+	-- Stable item IDs distinguish quality variants that share a display name.
+	return string.format("%s (#%d)", name, id)
+end
+
+local function AdjustItemOptions()
+	SyncAdjustDraftContext()
+	local options = {}
+	local rows = RequestedItemRows()
+	local selectedStillPresent = false
+	for i = 1, #rows do
+		local row = rows[i]
+		local itemId = tonumber(row and row.itemId)
+		if itemId then
+			if adjustDraft.itemId == itemId then
+				selectedStillPresent = true
+			end
+			options[#options + 1] = {
+				value = itemId,
+				label = FormatAdjustItemLabel(itemId),
+			}
+		end
+	end
+	if adjustDraft.itemId ~= nil and not selectedStillPresent then
+		adjustDraft.itemId = nil
+	end
+	return options
+end
+
+local function AdjustItemDefaultText()
+	SyncAdjustDraftContext()
+	local options = AdjustItemOptions()
+	if #options == 0 then
+		return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+			"Add requested items to the current campaign before applying an adjustment.")
+	end
+	if adjustDraft.itemId ~= nil then
+		return FormatAdjustItemLabel(adjustDraft.itemId)
+	end
+	return Loc("GUILD_SUPPLIES_ADJUST_ITEM_DEFAULT", "Select a requested item")
+end
+
+-- Session roster name cache for attribution autocomplete. Full scan once per
+-- guild/roster generation; getSuggestions filters the in-memory list only so
+-- keystrokes never rescan GetGuildRosterInfo (#430).
+local adjustRosterCache = {
+	guildKey = nil,
+	generation = nil,
+	names = {}, -- sorted normalized names
+	byLower = {}, -- lower(name) -> normalized name
+}
+
+local function AdjustRosterGeneration()
+	local GG = SF.GuildGossip
+	if GG and GG.GetGuildGeneration then
+		return tonumber(GG.GetGuildGeneration()) or 0
+	end
+	return 0
+end
+
+local function InvalidateAdjustRosterCache()
+	adjustRosterCache.guildKey = nil
+	adjustRosterCache.generation = nil
+	adjustRosterCache.names = {}
+	adjustRosterCache.byLower = {}
+end
+
+local function EnsureAdjustRosterCache()
+	local key = CurrentGuildKey() or "none"
+	local gen = AdjustRosterGeneration()
+	if adjustRosterCache.guildKey == key
+		and adjustRosterCache.generation == gen
+		and type(adjustRosterCache.names) == "table" then
+		return adjustRosterCache
+	end
+	local names = {}
+	local byLower = {}
+	if type(GetNumGuildMembers) == "function" and type(GetGuildRosterInfo) == "function" then
+		-- GetNumGuildMembers returns several numbers. Keep only the first before
+		-- tonumber; passing the rest makes Lua treat the second value as a base.
+		local total = GetNumGuildMembers()
+		total = tonumber(total) or 0
+		if total < 0 then
+			total = 0
+		end
+		for i = 1, total do
+			local rosterName = GetGuildRosterInfo(i)
+			local norm = rosterName
+			if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+				norm = SF.NameUtil.NormalizeNameRealm(rosterName) or rosterName
+			end
+			if type(norm) == "string" and norm ~= "" then
+				local lower = string.lower(norm)
+				if not byLower[lower] then
+					byLower[lower] = norm
+					names[#names + 1] = norm
+				end
+			end
+		end
+		table.sort(names)
+	end
+	adjustRosterCache.guildKey = key
+	adjustRosterCache.generation = gen
+	adjustRosterCache.names = names
+	adjustRosterCache.byLower = byLower
+	return adjustRosterCache
+end
+
+local function AdjustAttributionText()
+	SyncAdjustDraftContext()
+	-- Prefer the search draft so unfinished typing survives blur/refresh.
+	if type(adjustDraft.attributionText) == "string" then
+		return adjustDraft.attributionText
+	end
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= "" then
+		return adjustDraft.attributed
+	end
+	return ""
+end
+
+local function AdjustAttributionIsUnresolved()
+	SyncAdjustDraftContext()
+	return not adjustDraft.attributionResolved
+end
+
+local function AdjustAttributionSuggestions(prefix)
+	SyncAdjustDraftContext()
+	local cache = EnsureAdjustRosterCache()
+	local raw = tostring(prefix or "")
+	local needle = string.lower((raw:match("^%s*(.-)%s*$") or ""))
+	local out = {}
+	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local maxSuggestions = 8
+	-- Empty / Unassigned prefix keeps Unassigned selectable as the default.
+	if needle == "" or string.find(string.lower(unassignedLabel), needle, 1, true) == 1 then
+		out[#out + 1] = {
+			value = ADJUST_UNASSIGNED,
+			label = unassignedLabel,
+			text = "",
+		}
+	end
+	local names = cache.names or {}
+	for i = 1, #names do
+		if #out >= maxSuggestions then
+			break
+		end
+		local name = names[i]
+		local lower = string.lower(name)
+		if needle == "" or string.find(lower, needle, 1, true) == 1 then
+			out[#out + 1] = {
+				value = name,
+				label = name,
+				text = name,
+			}
+		end
+	end
+	-- Keep a previously resolved credit visible through temporary roster lag.
+	-- Never promote unresolved search prefixes into suggestions (#430).
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= "" then
+		local lowerSel = string.lower(adjustDraft.attributed)
+		if not cache.byLower[lowerSel]
+			and (needle == "" or string.find(lowerSel, needle, 1, true) == 1) then
+			local exists = false
+			for i = 1, #out do
+				if out[i].value == adjustDraft.attributed then
+					exists = true
+					break
+				end
+			end
+			if not exists and #out < maxSuggestions then
+				out[#out + 1] = {
+					value = adjustDraft.attributed,
+					label = adjustDraft.attributed,
+					text = adjustDraft.attributed,
+				}
+			end
+		end
+	end
+	return out
+end
+
+--- Update search draft. Only Unassigned or an exact roster match resolves.
+-- Unmatched nonempty text stays searchable and blocks Apply/submit; it is never
+-- stored as a credited identity (#430).
+local function SetAdjustAttributionFromText(text)
+	SyncAdjustDraftContext()
+	local trimmed = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+	if trimmed == "" then
+		adjustDraft.attributed = ADJUST_UNASSIGNED
+		adjustDraft.attributionText = ""
+		adjustDraft.attributionResolved = true
+		return
+	end
+	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	if string.lower(trimmed) == string.lower(unassignedLabel) then
+		adjustDraft.attributed = ADJUST_UNASSIGNED
+		adjustDraft.attributionText = ""
+		adjustDraft.attributionResolved = true
+		return
+	end
+	local cache = EnsureAdjustRosterCache()
+	local exact = cache.byLower[string.lower(trimmed)]
+	if exact then
+		adjustDraft.attributed = exact
+		adjustDraft.attributionText = exact
+		adjustDraft.attributionResolved = true
+		return
+	end
+	-- Unchanged display of an already-resolved identity survives temporary roster
+	-- incompleteness on blur / ClearFocus after selection (#430).
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= ""
+		and string.lower(trimmed) == string.lower(adjustDraft.attributed) then
+		adjustDraft.attributionText = adjustDraft.attributed
+		return
+	end
+	adjustDraft.attributionText = trimmed
+	adjustDraft.attributed = ADJUST_UNASSIGNED
+	adjustDraft.attributionResolved = false
+end
+
+local function AdjustCanEdit()
+	local rec = CurrentRecord()
+	return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+end
+
+local function AdjustHasRequestedItems()
+	return #AdjustItemOptions() > 0
+end
+
+local function AdjustQuantityValid(text)
+	local g = GS()
+	if not g or not g.ParseAdjustmentQuantity then
+		return false
+	end
+	return g.ParseAdjustmentQuantity(text or "") ~= nil
+end
+
+local function AdjustApplyButtonEnabled(text)
+	if not AdjustCanEdit() or not AdjustHasRequestedItems() then
+		return false
+	end
+	if adjustDraft.itemId == nil then
+		return false
+	end
+	if AdjustAttributionIsUnresolved() then
+		return false
+	end
+	return AdjustQuantityValid(text or adjustDraft.quantityText or "")
 end
 
 --- Compact Configuration status area: status / campaign / next step / warnings.
@@ -412,7 +702,8 @@ local function BuildStatusSnapshot()
 	snap.showCampaign = true
 	local campaignId = record.currentCampaignId
 	if type(campaignId) == "string" and campaignId ~= "" then
-		snap.campaign = campaignId
+		snap.campaign = (g and g.GetCampaignDisplayName and g.GetCampaignDisplayName(record, campaignId))
+			or campaignId
 	else
 		snap.campaign = Loc("GUILD_SUPPLIES_CAMPAIGN_NOT_STARTED", "Not started.")
 	end
@@ -422,7 +713,7 @@ local function BuildStatusSnapshot()
 	if mismatch and mismatch.blocked and mismatch.peers and mismatch.peers[1] then
 		local p = mismatch.peers[1]
 		AppendWarning(Loc("GUILD_SUPPLIES_ADOPTION_BLOCKED",
-			"A different staged dataset was advertised by %s (%s). Choose a source below to replace this client's local staged dataset, or cancel to keep the current one.")
+			"A different staged dataset was advertised by %s (%s). Open the Troubleshooting tab to choose a source to replace this client's local staged dataset, or cancel to keep the current one.")
 			:format(tostring(p.peerName), tostring(p.datasetId)))
 		warningCoversReason.dataset_mismatch = true
 	end
@@ -445,7 +736,7 @@ local function BuildStatusSnapshot()
 				"Blocked: a peer advertised a conflicting live cutover marker. Adopt one canonical source before continuing."))
 			warningCoversReason.live_activation_conflict = true
 			SetNextStep(Loc("GUILD_SUPPLIES_NEXT_STEP_RESOLVE_CUTOVER",
-				"Adopt one canonical live source below before continuing."))
+				"Open the Troubleshooting tab to adopt one canonical live source before continuing."))
 		end
 		return snap
 	end
@@ -515,254 +806,6 @@ local function WarningText()
 	return StatusSnapshot().warning or ""
 end
 
-local function AdoptionSourceOptions()
-	local opts = {}
-	local g = GS()
-	if not g or not g.ListPeerDatasets then
-		return opts
-	end
-	local localRecord = g.GetCurrentRecord and select(1, g:GetCurrentRecord()) or nil
-	local localMarker = localRecord and localRecord.liveCutover
-		and localRecord.liveCutover.cutoverMarker or nil
-	local conflict = g.GetLiveActivationConflictState
-		and g:GetLiveActivationConflictState() or nil
-	local conflictMarkers = {}
-	if conflict and conflict.blocked then
-		for i = 1, #(conflict.peers or {}) do
-			local cp = conflict.peers[i]
-			if cp and type(cp.peerName) == "string" and type(cp.cutoverMarker) == "string" then
-				conflictMarkers[cp.peerName] = cp.cutoverMarker
-			end
-		end
-	end
-	local peers = g:ListPeerDatasets()
-	for i = 1, #peers do
-		local p = peers[i]
-		if p then
-			local cutoverResolve = p.sameAsLocal
-				and conflictMarkers[p.peerName]
-				and conflictMarkers[p.peerName] ~= localMarker
-			if (not p.sameAsLocal) or cutoverResolve then
-				local label
-				if cutoverResolve then
-					label = Loc("GUILD_SUPPLIES_ADOPTION_CUTOVER_SOURCE_FMT",
-						"%s — resolve live cutover to %s")
-						:format(tostring(p.peerName), tostring(conflictMarkers[p.peerName]))
-				else
-					label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE_FMT", "%s — %s")
-						:format(tostring(p.peerName), tostring(p.datasetId))
-				end
-				opts[#opts + 1] = {
-					value = tostring(p.peerName) .. "\0" .. tostring(p.datasetId),
-					label = label,
-					peerName = p.peerName,
-					datasetId = p.datasetId,
-					cutoverResolution = cutoverResolve and true or false,
-				}
-			end
-		end
-	end
-	return opts
-end
-
-local function ConflictHelpText()
-	local g = GS()
-	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
-	if #conflicts == 0 then
-		return Loc("GUILD_SUPPLIES_CONFLICT_NONE", "No open configuration conflicts.")
-	end
-	return Loc("GUILD_SUPPLIES_CONFLICT_HELP",
-		"Both candidates are preserved. Choosing one creates a new authenticated resolution without rewriting the original operations.")
-end
-
-local function ConflictTargetOptions()
-	local opts = {}
-	local g = GS()
-	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
-	for i = 1, #conflicts do
-		local entry = conflicts[i]
-		if entry and type(entry.targetKey) == "string" then
-			opts[#opts + 1] = {
-				value = entry.targetKey,
-				label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_FMT", "Conflict: %s (%d candidates)")
-					:format(entry.targetKey, entry.candidates and #entry.candidates or 0),
-			}
-		end
-	end
-	return opts
-end
-
-local function ConflictCandidateOptions()
-	local opts = {}
-	local g = GS()
-	if not pendingConflictTarget then
-		return opts
-	end
-	local conflicts = g and g.ListOpenConflicts and g:ListOpenConflicts() or {}
-	local entry = nil
-	for i = 1, #conflicts do
-		if conflicts[i].targetKey == pendingConflictTarget then
-			entry = conflicts[i]
-			break
-		end
-	end
-	if not entry or type(entry.candidates) ~= "table" then
-		return opts
-	end
-	for i = 1, #entry.candidates do
-		local c = entry.candidates[i]
-		if c and type(c.id) == "string" then
-			local body = c.body
-			local summary = tostring(c.id)
-			if type(body) == "table" then
-				local author = body.actorName or "?"
-				local value = body.value
-				if type(value) == "table" then
-					value = value.goal or value.itemId or "?"
-				end
-				summary = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_FMT", "%s — %s (by %s)")
-					:format(tostring(c.id), tostring(value), tostring(author))
-			end
-			opts[#opts + 1] = {
-				value = c.id,
-				label = summary,
-			}
-		end
-	end
-	return opts
-end
-
-local function CommitConflictChoice(ctx, targetKey, chosenOpId, competingOpIds)
-	local g = GS()
-	if not g or not g.NewConflictResolutionOperation then
-		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
-		return
-	end
-	ctx.section:ClearMessage()
-	-- Revalidate the open conflict and chosen id before preparing resolution.
-	local conflicts = g:ListOpenConflicts() or {}
-	local entry = nil
-	for i = 1, #conflicts do
-		if conflicts[i].targetKey == targetKey then
-			entry = conflicts[i]
-			break
-		end
-	end
-	if not entry or type(entry.candidates) ~= "table" then
-		ReportStatus(ctx, "rejected", "no_open_conflict")
-		ClearPendingConflictChoice()
-		return
-	end
-	local ids = competingOpIds
-	if type(ids) ~= "table" then
-		ids = {}
-		for i = 1, #entry.candidates do
-			ids[#ids + 1] = entry.candidates[i].id
-		end
-	end
-	local found = false
-	for i = 1, #ids do
-		if ids[i] == chosenOpId then
-			found = true
-			break
-		end
-	end
-	if not found then
-		ReportStatus(ctx, "rejected", "invalid_resolution")
-		return
-	end
-	local op, prepStatus, prepReason = g:NewConflictResolutionOperation(targetKey, chosenOpId, ids)
-	if not op then
-		ReportStatus(ctx, prepStatus or "rejected", prepReason)
-		return
-	end
-	local status, reason = g:ApplyStagedConflictResolution(op)
-	if status == "accepted" then
-		ClearPendingConflictChoice()
-	end
-	ReportStatus(ctx, status, reason)
-end
-
---- Begin adoption transfer (does not commit). Commit is a separate control once ready.
-local function BeginAdoptionTransfer(ctx)
-	local g = GS()
-	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
-	if not g or not pendingAdoptionPeer or not pendingAdoptionDataset then
-		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
-		return
-	end
-	local peer = pendingAdoptionPeer
-	local datasetId = pendingAdoptionDataset
-	local cutoverResolution = false
-	do
-		local opts = AdoptionSourceOptions()
-		for i = 1, #opts do
-			if opts[i].peerName == peer and opts[i].datasetId == datasetId
-				and opts[i].cutoverResolution then
-				cutoverResolution = true
-				break
-			end
-		end
-	end
-	local accept = function()
-		ctx.section:ClearMessage()
-		local session, status, reason = g:BeginDatasetAdoption(peer, datasetId)
-		if status ~= "accepted" then
-			ReportStatus(ctx, status or "rejected", reason)
-			return
-		end
-		ReportStatus(ctx, "pending", "incomplete_transfer")
-		RefreshPageControls()
-	end
-	if dialogs and dialogs.Confirm then
-		local confirmText = cutoverResolution
-			and Loc("GUILD_SUPPLIES_ADOPTION_CUTOVER_CONFIRM",
-				"Replace this client's live Guild Supplies cutover with the selected peer's authenticated complete dataset and cutover marker? Local divergent live state is not merged. Cancel leaves the current blocked state unchanged.")
-			or Loc("GUILD_SUPPLIES_ADOPTION_CONFIRM",
-				"Replace this client's local staged Guild Supplies configuration/dataset with the selected source dataset? The two datasets are not merged. Cancel leaves local state unchanged. This does not activate live bank accounting.")
-		dialogs:Confirm(
-			confirmText,
-			Loc("GUILD_SUPPLIES_ADOPTION_BUTTON", "Adopt selected dataset"),
-			accept
-		)
-	else
-		ctx.section:SetMessage(
-			Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
-				"Confirmation is required and is unavailable right now."),
-			"error")
-	end
-end
-
-local function CommitAdoptionTransfer(ctx)
-	local g = GS()
-	if not g or not g.CommitDatasetAdoption then
-		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
-		return
-	end
-	ctx.section:ClearMessage()
-	local adop = g:GetPendingAdoption()
-	if type(adop) ~= "table" then
-		ReportStatus(ctx, "rejected", "no_adoption")
-		return
-	end
-	-- Overlapping commits while replay is already running are rejected.
-	if type(adop.replayTemp) == "table" then
-		ReportStatus(ctx, "pending", "replay_in_progress")
-		RefreshPageControls()
-		return
-	end
-	if not adop.ready then
-		ReportStatus(ctx, "pending", "incomplete_transfer")
-		return
-	end
-	local commitStatus, commitReason = g:CommitDatasetAdoption()
-	if commitStatus == "accepted" then
-		ClearPendingAdoptionChoice()
-	end
-	ReportStatus(ctx, commitStatus or "rejected", commitReason)
-	RefreshPageControls()
-end
-
 local function ItemsHelpText()
 	if not Caps().canRead then
 		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
@@ -791,6 +834,206 @@ local function CommitConfig(ctx, kind, target, value)
 		return
 	end
 	local status, reason = g:ApplyStagedConfigOperation(op)
+	ReportStatus(ctx, status, reason)
+end
+
+---------------------------------------------------------------------------
+-- Session-local rename target (#428). Never SavedVariables / Gossip.
+-- Selecting an archived campaign is rename-only: never activates it, never
+-- changes Logs selection, and never alters accounting. Cleared when the
+-- guild/dataset context changes; ordinary refreshes keep a valid target.
+--
+-- Follow vs pin (#434 repair): the default/implicit target follows the current
+-- campaign through local or remote rollover. Explicitly choosing a non-current
+-- (archived) campaign pins that immutable ID while it remains inspectable.
+---------------------------------------------------------------------------
+local renameTargetCampaignId = nil
+local renameTargetFollowCurrent = true
+local renameTargetContextKey = nil
+
+local function RenameTargetContextKey()
+	local rec = CurrentRecord()
+	if not rec then
+		return "none"
+	end
+	return tostring(CurrentGuildKey() or "") .. "|" .. tostring(rec.datasetId or "")
+end
+
+local function SyncRenameTargetContext()
+	local key = RenameTargetContextKey()
+	if key == renameTargetContextKey then
+		return
+	end
+	renameTargetContextKey = key
+	renameTargetCampaignId = nil
+	renameTargetFollowCurrent = true
+end
+
+local function InspectableCampaigns()
+	if passCache and passCache.campaignsChecked then
+		return passCache.campaigns
+	end
+	local g = GS()
+	local list
+	if Caps().canRead and g and g.ListInspectableCampaigns then
+		list = g:ListInspectableCampaigns()
+	end
+	if type(list) ~= "table" then
+		list = {}
+	end
+	if passCache then
+		passCache.campaignsChecked = true
+		passCache.campaigns = list
+	end
+	return list
+end
+
+local function FormatRenameTargetLabel(entry)
+	if type(entry) ~= "table" then
+		return "?"
+	end
+	local started = tonumber(entry.startedAt)
+	local when = started and date and date("%Y-%m-%d %H:%M", started) or tostring(entry.startedAt or "?")
+	local status = entry.isCurrent
+		and Loc("GUILD_SUPPLIES_CAMPAIGN_CURRENT", "Current")
+		or Loc("GUILD_SUPPLIES_CAMPAIGN_ARCHIVED", "Archived")
+	local label = entry.displayName or entry.campaignId or "?"
+	if not entry.hasCustomName then
+		label = tostring(label)
+		if #label > 24 then
+			label = label:sub(1, 21) .. "..."
+		end
+	end
+	return string.format("%s — %s (%s)", when, status, tostring(label))
+end
+
+local function RenameTargetOptions()
+	SyncRenameTargetContext()
+	local opts = {}
+	if not Caps().canRead then
+		return opts
+	end
+	local list = InspectableCampaigns()
+	for i = 1, #list do
+		local entry = list[i]
+		opts[#opts + 1] = {
+			value = entry.campaignId,
+			label = FormatRenameTargetLabel(entry),
+		}
+	end
+	return opts
+end
+
+local function CampaignIdInList(list, campaignId)
+	if type(campaignId) ~= "string" or campaignId == "" or type(list) ~= "table" then
+		return false
+	end
+	for i = 1, #list do
+		if list[i].campaignId == campaignId then
+			return true
+		end
+	end
+	return false
+end
+
+--- Apply a user or restore selection. Explicit picks of the current campaign
+-- stay in follow-current mode; explicit non-current picks pin that ID.
+local function SetRenameTarget(campaignId, explicit)
+	SyncRenameTargetContext()
+	if type(campaignId) ~= "string" or campaignId == "" then
+		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
+		return
+	end
+	renameTargetCampaignId = campaignId
+	if not explicit then
+		renameTargetFollowCurrent = true
+		return
+	end
+	local rec = CurrentRecord()
+	local currentId = rec and rec.currentCampaignId
+	renameTargetFollowCurrent = (type(currentId) == "string" and campaignId == currentId)
+end
+
+--- Resolve the ephemeral rename target by immutable campaignId.
+-- Implicit selection follows the current campaign through rollover. Explicit
+-- archived pins remain while valid. Never activates archived campaigns.
+local function ResolveRenameTarget()
+	SyncRenameTargetContext()
+	if not Caps().canRead then
+		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
+		return nil
+	end
+	local record = CurrentRecord()
+	if not record then
+		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
+		return nil
+	end
+	local list = InspectableCampaigns()
+	if #list == 0 then
+		renameTargetCampaignId = nil
+		renameTargetFollowCurrent = true
+		return nil
+	end
+	local currentId = record.currentCampaignId
+	if renameTargetFollowCurrent then
+		if type(currentId) == "string" and currentId ~= "" then
+			renameTargetCampaignId = currentId
+			return renameTargetCampaignId
+		end
+		if CampaignIdInList(list, renameTargetCampaignId) then
+			return renameTargetCampaignId
+		end
+		renameTargetCampaignId = list[1].campaignId
+		return renameTargetCampaignId
+	end
+	-- Pinned non-current selection: keep while inspectable.
+	if CampaignIdInList(list, renameTargetCampaignId) then
+		return renameTargetCampaignId
+	end
+	-- Stale pin: resume following the current campaign.
+	renameTargetFollowCurrent = true
+	if type(currentId) == "string" and currentId ~= "" then
+		renameTargetCampaignId = currentId
+		return renameTargetCampaignId
+	end
+	renameTargetCampaignId = list[1].campaignId
+	return renameTargetCampaignId
+end
+
+local function RenameTargetDefaultText()
+	local id = ResolveRenameTarget()
+	if not id then
+		return Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns")
+	end
+	local list = InspectableCampaigns()
+	for i = 1, #list do
+		if list[i].campaignId == id then
+			return FormatRenameTargetLabel(list[i])
+		end
+	end
+	return tostring(id)
+end
+
+local function CommitRenameCampaign(ctx, campaignId, text)
+	local g = GS()
+	if not g or not g.NewRenameCampaignOperation then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local op, prepStatus, prepReason = g:NewRenameCampaignOperation(campaignId, text)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local status, reason = g:ApplyStagedConfigOperation(op)
+	-- Keep the same immutable campaign id; preserve follow vs pin mode.
+	if type(campaignId) == "string" and campaignId ~= "" then
+		renameTargetCampaignId = campaignId
+	end
 	ReportStatus(ctx, status, reason)
 end
 
@@ -1071,136 +1314,6 @@ local function DisabledActivateTip()
 		"Cannot activate yet: %s."):format(formatReason(reason or "not_ready"))
 end
 
-local function DisabledAdoptionSourceTip()
-	local auth = DisabledAuthTip(
-		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
-	if auth then
-		return auth
-	end
-	local g = GS()
-	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-	if type(adop) == "table" then
-		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_IN_PROGRESS",
-			"Finish or cancel the current dataset adoption before selecting a new source.")
-	end
-	if #AdoptionSourceOptions() > 0 then
-		return nil
-	end
-	return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NO_SOURCES",
-		"No eligible peer datasets are currently available for adoption.")
-end
-
-local function DisabledAdoptionBeginTip()
-	local auth = DisabledAuthTip(
-		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
-	if auth then
-		return auth
-	end
-	local g = GS()
-	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-	if type(adop) == "table" then
-		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_IN_PROGRESS",
-			"Finish or cancel the current dataset adoption before selecting a new source.")
-	end
-	if pendingAdoptionPeer == nil or pendingAdoptionDataset == nil then
-		if #AdoptionSourceOptions() == 0 then
-			return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NO_SOURCES",
-				"No eligible peer datasets are currently available for adoption.")
-		end
-		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_SELECT_SOURCE",
-			"Select a source dataset first.")
-	end
-	return nil
-end
-
-local function DisabledAdoptionCommitTip()
-	local auth = DisabledAuthTip(
-		Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADOPTION", "adopting a dataset"), true)
-	if auth then
-		return auth
-	end
-	local g = GS()
-	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-	if type(adop) ~= "table" then
-		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NONE_COMMIT",
-			"There is no adoption ready to commit.")
-	end
-	if type(adop.replayTemp) == "table" then
-		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_REPLAY",
-			"Wait for the dataset transfer to finish applying before committing.")
-	end
-	if adop.ready ~= true then
-		return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_WAIT_TRANSFER",
-			"Wait for the dataset transfer to finish before committing.")
-	end
-	return nil
-end
-
-local function DisabledAdoptionCancelTip()
-	local g = GS()
-	local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-	if type(adop) == "table" then
-		return nil
-	end
-	return Loc("GUILD_SUPPLIES_DISABLED_ADOPTION_NONE_CANCEL",
-		"There is no adoption in progress.")
-end
-
-local function DisabledConflictTargetTip()
-	local auth = DisabledAuthTip(
-		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
-	if auth then
-		return auth
-	end
-	if #ConflictTargetOptions() > 0 then
-		return nil
-	end
-	return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
-		"There are no unresolved configuration conflicts.")
-end
-
-local function DisabledConflictCandidateTip()
-	local auth = DisabledAuthTip(
-		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
-	if auth then
-		return auth
-	end
-	if pendingConflictTarget == nil then
-		if #ConflictTargetOptions() == 0 then
-			return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
-				"There are no unresolved configuration conflicts.")
-		end
-		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_SELECT",
-			"Select an open configuration conflict first.")
-	end
-	if #ConflictCandidateOptions() < 2 then
-		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_CANDIDATES",
-			"Select a conflict that still has competing candidate values.")
-	end
-	return nil
-end
-
-local function DisabledConflictChooseTip()
-	local auth = DisabledAuthTip(
-		Loc("GUILD_SUPPLIES_DISABLED_ACTION_CONFLICTS", "resolving configuration conflicts"), false)
-	if auth then
-		return auth
-	end
-	if pendingConflictTarget == nil then
-		if #ConflictTargetOptions() == 0 then
-			return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_NONE",
-				"There are no unresolved configuration conflicts.")
-		end
-		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_SELECT",
-			"Select an open configuration conflict first.")
-	end
-	if pendingConflictChosen == nil or #ConflictCandidateOptions() < 2 then
-		return Loc("GUILD_SUPPLIES_DISABLED_CONFLICT_CHOOSE",
-			"Select a conflict and a candidate value before resolving it.")
-	end
-	return nil
-end
-
 local function Definition()
 	return {
 		isAdmin = function()
@@ -1427,210 +1540,110 @@ local function Definition()
 							CommitNewCampaign(ctx)
 						end,
 					},
-				},
-			},
-			{
-				id = "gsAdoption",
-				title = Loc("GUILD_SUPPLIES_ADOPTION_TITLE", "Staged dataset adoption"),
-				tooltip = Loc("GUILD_SUPPLIES_ADOPTION_TIP",
-					"When another authorized editor has a different staged dataset, choose one source. Adoption replaces this client's local staged Guild Supplies configuration; datasets are never merged."),
-				items = {
-					{
-						type = "help",
-						indent = "label",
-						getText = function()
-							local opts = AdoptionSourceOptions()
-							if #opts == 0 then
-								local g = GS()
-								local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-								if type(adop) == "table" then
-									return Loc("GUILD_SUPPLIES_ADOPTION_PENDING",
-										"Adoption in progress for dataset %s from %s. Waiting for a complete validated transfer before switching.")
-										:format(tostring(adop.sourceDatasetId), tostring(adop.sourcePeer))
-								end
-								return Loc("GUILD_SUPPLIES_ADOPTION_EMPTY",
-									"No conflicting peer datasets are available right now. Empty clients wait for an authenticated editor source.")
-							end
-							return Loc("GUILD_SUPPLIES_ADOPTION_HELP",
-								"Adoption is a local staged-development action. It does not activate live bank accounting or establish guild-wide production authority.")
-						end,
-					},
 					{
 						type = "dropdown",
-						label = Loc("GUILD_SUPPLIES_ADOPTION_SOURCE", "Source dataset"),
+						label = Loc("GUILD_SUPPLIES_RENAME_TARGET_LABEL", "Rename target"),
 						adminOnly = true,
-						defaultText = Loc("GUILD_SUPPLIES_ADOPTION_NONE", "Select a source"),
-						options = AdoptionSourceOptions,
-						get = function()
-							if pendingAdoptionPeer and pendingAdoptionDataset then
-								return tostring(pendingAdoptionPeer) .. "\0" .. tostring(pendingAdoptionDataset)
+						width = 280,
+						tooltip = Loc("GUILD_SUPPLIES_RENAME_TARGET_TIP",
+							"Choose which campaign to rename. Selecting an archived campaign does not activate it or change accounting."),
+						defaultText = RenameTargetDefaultText,
+						options = RenameTargetOptions,
+						get = ResolveRenameTarget,
+						set = function(value)
+							if type(value) == "string" and value ~= "" then
+								SetRenameTarget(value, true)
 							end
-							return nil
 						end,
-						set = function() end,
 						enabled = function()
-							local c = Caps()
-							return c.canEdit == true and #AdoptionSourceOptions() > 0
+							return Caps().canEdit and ResolveRenameTarget() ~= nil
 						end,
-						getDisabledTooltip = DisabledAdoptionSourceTip,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RENAME", "renaming the campaign"))
+						end,
 						onValueChanged = function(ctx, value)
-							if type(value) ~= "string" then
-								ClearPendingAdoptionChoice()
+							if type(value) ~= "string" or value == "" then
 								return
 							end
-							local peer, datasetId = value:match("^(.-)\0(.+)$")
-							if peer and datasetId then
-								pendingAdoptionPeer = peer
-								pendingAdoptionDataset = datasetId
-							else
-								ClearPendingAdoptionChoice()
+							-- Accept only inspectable campaign IDs; never activate.
+							local list = InspectableCampaigns()
+							if not CampaignIdInList(list, value) then
+								SetRenameTarget(nil, false)
+								ResolveRenameTarget()
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
+										"that campaign is not available on this dataset"),
+									"error")
+								RefreshPageControls()
+								return
 							end
+							SetRenameTarget(value, true)
 							RefreshPageControls()
 						end,
 					},
 					{
-						type = "button",
-						label = Loc("GUILD_SUPPLIES_ADOPTION_TITLE", "Staged dataset adoption"),
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_LABEL", "Campaign name"),
 						adminOnly = true,
-						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_BEGIN", "Start adoption transfer"),
-						width = 220,
-						enabled = function()
-							local c = Caps()
-							local g = GS()
-							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-							return c.canEdit == true
-								and pendingAdoptionPeer ~= nil
-								and pendingAdoptionDataset ~= nil
-								and type(adop) ~= "table"
-						end,
-						getDisabledTooltip = DisabledAdoptionBeginTip,
-						onClick = function(ctx)
-							BeginAdoptionTransfer(ctx)
-						end,
-					},
-					{
-						type = "button",
-						label = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
-						adminOnly = true,
-						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_COMMIT", "Commit adoption"),
-						width = 180,
-						enabled = function()
-							local c = Caps()
-							local g = GS()
-							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-							return c.canEdit == true
-								and type(adop) == "table"
-								and adop.ready == true
-								and type(adop.replayTemp) ~= "table"
-						end,
-						getDisabledTooltip = DisabledAdoptionCommitTip,
-						onClick = function(ctx)
-							CommitAdoptionTransfer(ctx)
-						end,
-					},
-					{
-						type = "button",
-						label = Loc("GUILD_SUPPLIES_ADOPTION_CANCEL", "Cancel adoption"),
-						adminOnly = true,
-						buttonText = Loc("GUILD_SUPPLIES_ADOPTION_CANCEL", "Cancel adoption"),
-						width = 160,
-						enabled = function()
-							local g = GS()
-							local adop = g and g.GetPendingAdoption and g:GetPendingAdoption()
-							return type(adop) == "table"
-						end,
-						getDisabledTooltip = DisabledAdoptionCancelTip,
-						onClick = function(ctx)
-							local g = GS()
-							ctx.section:ClearMessage()
-							if g and g.CancelDatasetAdoption then
-								g:CancelDatasetAdoption()
-							end
-							ClearPendingAdoptionChoice()
-							ctx.section:SetMessage(
-								Loc("GUILD_SUPPLIES_STATUS_ADOPTION_CANCELLED",
-									"Dataset adoption cancelled. Local staged configuration was left unchanged."),
-								"info")
-							RefreshPageControls()
-						end,
-					},
-				},
-			},
-			{
-				id = "gsConflicts",
-				title = Loc("GUILD_SUPPLIES_CONFLICT_TITLE", "Configuration conflicts"),
-				tooltip = Loc("GUILD_SUPPLIES_CONFLICT_TIP",
-					"Same-field or concurrent campaign edits stay unresolved until an authorized editor chooses a result."),
-				items = {
-					{
-						type = "help",
-						indent = "label",
-						getText = ConflictHelpText,
-					},
-					{
-						type = "dropdown",
-						label = Loc("GUILD_SUPPLIES_CONFLICT_TARGET", "Open conflict"),
-						adminOnly = true,
-						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_TARGET_NONE", "Select a conflict"),
-						options = ConflictTargetOptions,
+						hint = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_HINT", "Friendly name (blank clears)"),
+						buttonText = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_BUTTON", "Rename"),
+						buttonWidth = 90,
+						editWidth = 200,
+						maxLetters = 64,
+						tooltip = Loc("GUILD_SUPPLIES_RENAME_CAMPAIGN_TIP",
+							"Sets a guild-wide display name for the selected campaign, including archived campaigns. Clearing the name restores the campaign ID label. Accounting and which campaign is current stay unchanged."),
 						get = function()
-							return pendingConflictTarget
-						end,
-						set = function() end,
-						enabled = function()
-							return Caps().canEdit and #ConflictTargetOptions() > 0
-						end,
-						getDisabledTooltip = DisabledConflictTargetTip,
-						onValueChanged = function(ctx, value)
-							if type(value) == "string" and value ~= "" then
-								pendingConflictTarget = value
-								pendingConflictChosen = nil
-							else
-								ClearPendingConflictChoice()
+							local id = ResolveRenameTarget()
+							local rec = CurrentRecord()
+							local g = GS()
+							if not id or not rec or not g or not g.GetCampaignCustomName then
+								return ""
 							end
-							RefreshPageControls()
+							return g.GetCampaignCustomName(rec, id) or ""
 						end,
-					},
-					{
-						type = "dropdown",
-						label = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE", "Candidate"),
-						adminOnly = true,
-						defaultText = Loc("GUILD_SUPPLIES_CONFLICT_CANDIDATE_NONE", "Select a candidate"),
-						options = ConflictCandidateOptions,
-						get = function()
-							return pendingConflictChosen
+						getSelectionKey = function()
+							return ResolveRenameTarget()
 						end,
-						set = function() end,
 						enabled = function()
-							return Caps().canEdit
-								and pendingConflictTarget ~= nil
-								and #ConflictCandidateOptions() >= 2
+							return Caps().canEdit and ResolveRenameTarget() ~= nil
 						end,
-						getDisabledTooltip = DisabledConflictCandidateTip,
-						onValueChanged = function(ctx, value)
-							if type(value) == "string" and value ~= "" then
-								pendingConflictChosen = value
-							else
-								pendingConflictChosen = nil
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_RENAME", "renaming the campaign"))
+						end,
+						onSubmit = function(ctx, text)
+							-- Revalidate target and authorization at submit time.
+							if not Caps().canEdit then
+								ReportStatus(ctx, "rejected", "unauthorized")
+								return
 							end
-							RefreshPageControls()
-						end,
-					},
-					{
-						type = "button",
-						label = Loc("GUILD_SUPPLIES_CONFLICT_TITLE", "Configuration conflicts"),
-						adminOnly = true,
-						buttonText = Loc("GUILD_SUPPLIES_CONFLICT_CHOOSE", "Use this value"),
-						width = 160,
-						enabled = function()
-							return Caps().canEdit
-								and pendingConflictTarget ~= nil
-								and pendingConflictChosen ~= nil
-								and #ConflictCandidateOptions() >= 2
-						end,
-						getDisabledTooltip = DisabledConflictChooseTip,
-						onClick = function(ctx)
-							CommitConflictChoice(ctx, pendingConflictTarget, pendingConflictChosen, nil)
+							local campaignId = ResolveRenameTarget()
+							if type(campaignId) ~= "string" or campaignId == "" then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_REASON_NO_CAMPAIGN",
+										"start a New Campaign before changing requested items"),
+									"error")
+								return
+							end
+							local list = InspectableCampaigns()
+							local found = false
+							for i = 1, #list do
+								if list[i].campaignId == campaignId then
+									found = true
+									break
+								end
+							end
+							if not found then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_REASON_MISSING_CAMPAIGN",
+										"that campaign is not available on this dataset"),
+									"error")
+								SetRenameTarget(nil, false)
+								RefreshPageControls()
+								return
+							end
+							CommitRenameCampaign(ctx, campaignId, text)
 						end,
 					},
 				},
@@ -1747,65 +1760,266 @@ local function Definition()
 						type = "help",
 						indent = "label",
 						getText = function()
+							SyncAdjustDraftContext()
+							if AdjustCanEdit() and not AdjustHasRequestedItems() then
+								return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+									"Add requested items to the current campaign before applying an adjustment.")
+							end
 							return Loc("GUILD_SUPPLIES_ADJUST_HELP",
-								"Signed quantity changes apply to the guild-owned Guild Supplies ledger. Attribution may name a guild character or stay unattributed. Adjustments never verify Guild Bank deposits.")
+								"Choose a current campaign item, enter a whole-number change such as 10 or -10, and optionally credit a character. Leave attribution on Unassigned to change only the item total. Changes apply to the guild-owned Guild Supplies ledger and never verify Guild Bank deposits.")
 						end,
 					},
 					{
-						type = "editboxButton",
-						label = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_ADJUST_ITEM", "Requested item"),
 						adminOnly = true,
-						hint = Loc("GUILD_SUPPLIES_ADJUST_ITEM", "Item ID")
-							.. " / " .. Loc("GUILD_SUPPLIES_ADJUST_QTY", "Signed quantity")
-							.. " / " .. Loc("GUILD_SUPPLIES_ADJUST_ATTR", "Credit to (optional)"),
-						buttonText = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
-						buttonWidth = 140,
-						editWidth = 220,
+						width = 260,
+						defaultText = AdjustItemDefaultText,
+						options = AdjustItemOptions,
+						get = function()
+							SyncAdjustDraftContext()
+							return adjustDraft.itemId
+						end,
+						set = function() end,
 						enabled = function()
-							local rec = CurrentRecord()
-							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+							return AdjustCanEdit() and AdjustHasRequestedItems()
+						end,
+						getDisabledTooltip = function()
+							local tip = DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
+							if tip then
+								return tip
+							end
+							if not AdjustHasRequestedItems() then
+								return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+									"Add requested items to the current campaign before applying an adjustment.")
+							end
+							return nil
+						end,
+						onValueChanged = function(ctx, value)
+							SyncAdjustDraftContext()
+							local itemId = tonumber(value)
+							if not itemId then
+								return
+							end
+							-- Require the choice to still be a current requested item.
+							local options = AdjustItemOptions()
+							local found = false
+							for i = 1, #options do
+								if options[i].value == itemId then
+									found = true
+									break
+								end
+							end
+							if not found then
+								adjustDraft.itemId = nil
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
+										"Select a requested campaign item before applying an adjustment."),
+									"error")
+								RefreshPageControls()
+								return
+							end
+							adjustDraft.itemId = itemId
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "autocomplete",
+						label = Loc("GUILD_SUPPLIES_ADJUST_ATTR", "Attribution"),
+						adminOnly = true,
+						width = 220,
+						maxLetters = 96,
+						maxSuggestions = 8,
+						hint = Loc("GUILD_SUPPLIES_ADJUST_ATTR_HINT",
+							"Unassigned (type a guild character to credit)"),
+						enabled = function()
+							return AdjustCanEdit() and AdjustHasRequestedItems()
 						end,
 						getDisabledTooltip = function()
 							return DisabledNeedCampaignTip(
 								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
 						end,
+						get = AdjustAttributionText,
+						-- Bound setter alone owns typing / blur / selection text
+						-- updates. Do not also wire onTextChanged: AddAutocomplete
+						-- would run both and double the draft update + refresh (#430).
+						set = function(v)
+							SetAdjustAttributionFromText(v)
+							-- Quantity Apply depends on attribution validity; refresh
+							-- the bound editboxButton without requiring a qty retype.
+							RefreshPageControls()
+						end,
+						getSuggestions = function(_, prefix)
+							return AdjustAttributionSuggestions(prefix)
+						end,
+						onResolved = function(_, item)
+							SyncAdjustDraftContext()
+							-- Typing notifies nil before set. Do not refresh here:
+							-- get() still has the prior search draft and would
+							-- rewrite the edit mid-keystroke. set refreshes after
+							-- the draft catches up.
+							if not item then
+								adjustDraft.attributed = ADJUST_UNASSIGNED
+								adjustDraft.attributionResolved = false
+								return
+							end
+							if item.value == ADJUST_UNASSIGNED or item.value == nil then
+								adjustDraft.attributed = ADJUST_UNASSIGNED
+								adjustDraft.attributionText = ""
+								adjustDraft.attributionResolved = true
+								RefreshPageControls()
+								return
+							end
+							if type(item.value) == "string" and item.value ~= "" then
+								adjustDraft.attributed = item.value
+								adjustDraft.attributionText = item.text or item.label or item.value
+								adjustDraft.attributionResolved = true
+								RefreshPageControls()
+								return
+							end
+							SetAdjustAttributionFromText(item.text or item.label or "")
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_ADJUST_QTY", "Quantity change"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_ADJUST_QTY_HINT", "10 or -10"),
+						buttonText = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
+						buttonWidth = 140,
+						editWidth = 120,
+						maxLetters = 8,
+						get = function()
+							SyncAdjustDraftContext()
+							return adjustDraft.quantityText or ""
+						end,
+						getSelectionKey = function()
+							SyncAdjustDraftContext()
+							return AdjustDraftContextKey()
+						end,
+						enabled = function()
+							-- Keep the quantity input editable once an item is
+							-- selected; Apply uses buttonEnabled independently.
+							return AdjustCanEdit()
+								and AdjustHasRequestedItems()
+								and adjustDraft.itemId ~= nil
+						end,
+						buttonEnabled = function(text)
+							return AdjustApplyButtonEnabled(text)
+						end,
+						getDisabledTooltip = function()
+							local tip = DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
+							if tip then
+								return tip
+							end
+							if not AdjustHasRequestedItems() then
+								return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+									"Add requested items to the current campaign before applying an adjustment.")
+							end
+							if adjustDraft.itemId == nil then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
+									"Select a requested campaign item before applying an adjustment.")
+							end
+							if AdjustAttributionIsUnresolved() then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_ATTR",
+									"Select Unassigned or a guild character from the suggestions. Typed search text is not credited until you select a match.")
+							end
+							if not AdjustQuantityValid(adjustDraft.quantityText or "") then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
+									"Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign.")
+							end
+							return nil
+						end,
+						onTextChanged = function(text)
+							SyncAdjustDraftContext()
+							adjustDraft.quantityText = tostring(text or "")
+						end,
 						onSubmit = function(ctx, text)
+							SyncAdjustDraftContext()
 							local g = GS()
 							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
-							if not g or not g.NewAdjustmentOperation then
+							if not g or not g.NewAdjustmentOperation or not g.ParseAdjustmentQuantity then
 								ctx.section:SetMessage(
 									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
 									"error")
 								return
 							end
-							local itemPart, qtyPart, attrPart = tostring(text or "")
-								:match("^%s*(%S+)%s+([%-%+]?%d+)%s*(.-)%s*$")
-							local itemId = tonumber(itemPart)
-							local quantity = tonumber(qtyPart)
-							local attributed = attrPart
-							if attributed == "" then attributed = nil end
-							if not itemId or not quantity then
+							-- Preserve typed quantity across cancel/failure.
+							adjustDraft.quantityText = tostring(text or "")
+							local itemId = tonumber(adjustDraft.itemId)
+							if not itemId then
 								ctx.section:SetMessage(
-									Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
-										"Enter an item ID, a signed quantity, and an optional character name."),
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
+										"Select a requested campaign item before applying an adjustment."),
 									"error")
 								return
 							end
-							local op, prepStatus, prepReason = g:NewAdjustmentOperation(itemId, quantity, attributed)
-							if not op then
-								ReportStatus(ctx, prepStatus or "rejected", prepReason)
+							local quantity, qtyErr = g.ParseAdjustmentQuantity(adjustDraft.quantityText)
+							if not quantity then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
+										"Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign."),
+									"error")
 								return
 							end
-							local boundOp = op
+							if AdjustAttributionIsUnresolved() then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_ATTR",
+										"Select Unassigned or a guild character from the suggestions. Typed search text is not credited until you select a match."),
+									"error")
+								return
+							end
+							local attributed = nil
+							if type(adjustDraft.attributed) == "string" and adjustDraft.attributed ~= "" then
+								attributed = adjustDraft.attributed
+							end
+							-- Capture draft identity so success only clears when context matches.
+							local boundItemId = itemId
+							local boundContext = AdjustDraftContextKey()
+							local op, prepStatus, prepReason = g:NewAdjustmentOperation(
+								itemId, quantity, attributed)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason or qtyErr)
+								return
+							end
+							local preview = g.PreviewAdjustment
+								and g:PreviewAdjustment(itemId, quantity, attributed) or nil
+							local confirmMsg
+							if preview and g.FormatAdjustmentConfirmation then
+								confirmMsg = g.FormatAdjustmentConfirmation(
+									preview, FormatAdjustItemLabel(itemId))
+							else
+								confirmMsg = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM",
+									"Adjust item %s by %+d on the Guild Supplies ledger?")
+									:format(FormatAdjustItemLabel(itemId), quantity)
+							end
 							local accept = function()
+								-- Revalidate permissions/context/item/totals/goal at commit.
+								SyncAdjustDraftContext()
+								if AdjustDraftContextKey() ~= boundContext
+									or tonumber(adjustDraft.itemId) ~= boundItemId
+									or not AdjustCanEdit() then
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+											"the page is out of date — refresh and try again"),
+										"error")
+									RefreshPageControls()
+									return
+								end
 								ctx.section:ClearMessage()
-								local status, reason = g:ApplyStagedConfigOperation(boundOp)
+								local status, reason = g:ApplyStagedConfigOperation(op)
+								if status == "accepted" or status == "duplicate" then
+									if AdjustDraftContextKey() == boundContext
+										and tonumber(adjustDraft.itemId) == boundItemId then
+										adjustDraft.quantityText = ""
+									end
+								end
 								ReportStatus(ctx, status, reason)
 								RefreshPageControls()
 							end
-							local confirmMsg = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM",
-								"Adjust item %s by %+d on the Guild Supplies ledger?")
-								:format(tostring(itemId), quantity)
 							if dialogs and dialogs.Confirm then
 								dialogs:Confirm(confirmMsg,
 									Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"), accept)
@@ -1815,110 +2029,6 @@ local function Definition()
 										"Confirmation is required and is unavailable right now."),
 									"error")
 							end
-						end,
-					},
-				},
-			},
-			{
-				id = "gsLinks",
-				title = Loc("GUILD_SUPPLIES_LINKS_TITLE", "Witness character links"),
-				tooltip = Loc("GUILD_SUPPLIES_LINKS_TIP",
-					"Link known alternate characters so they count as one witness identity for donation quorum."),
-				items = {
-					{
-						type = "help",
-						indent = "label",
-						getText = function()
-							return Loc("GUILD_SUPPLIES_LINKS_HELP",
-								"Guild-owned links only. Linking does not rewrite accepted donations. Unlinked characters remain separate witnesses. Does not use Loot Helper profiles.")
-						end,
-					},
-					{
-						type = "editboxButton",
-						label = Loc("GUILD_SUPPLIES_LINKS_APPLY", "Link characters"),
-						adminOnly = true,
-						hint = Loc("GUILD_SUPPLIES_LINKS_GUID_A", "Character GUID A")
-							.. " " .. Loc("GUILD_SUPPLIES_LINKS_GUID_B", "Character GUID B"),
-						buttonText = Loc("GUILD_SUPPLIES_LINKS_APPLY", "Link characters"),
-						buttonWidth = 140,
-						editWidth = 260,
-						enabled = function()
-							return Caps().canEdit and CurrentRecord() ~= nil
-						end,
-						getDisabledTooltip = function()
-							return DisabledNeedRecordTip(
-								Loc("GUILD_SUPPLIES_DISABLED_ACTION_LINKS", "linking characters"))
-						end,
-						onSubmit = function(ctx, text)
-							local g = GS()
-							if not g or not g.NewLinkCharactersOperation then
-								ctx.section:SetMessage(
-									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
-									"error")
-								return
-							end
-							local a, b = tostring(text or ""):match("^%s*(%S+)%s+(%S+)%s*$")
-							local op, prepStatus, prepReason = g:NewLinkCharactersOperation(a, b)
-							if not op then
-								ReportStatus(ctx, prepStatus or "rejected", prepReason)
-								return
-							end
-							ctx.section:ClearMessage()
-							local status, reason = g:ApplyStagedConfigOperation(op)
-							ReportStatus(ctx, status, reason)
-							RefreshPageControls()
-						end,
-					},
-					{
-						type = "editboxButton",
-						label = Loc("GUILD_SUPPLIES_LINKS_UNLINK", "Unlink character"),
-						adminOnly = true,
-						hint = Loc("GUILD_SUPPLIES_LINKS_UNLINK_GUID", "Character GUID to unlink"),
-						buttonText = Loc("GUILD_SUPPLIES_LINKS_UNLINK", "Unlink character"),
-						buttonWidth = 140,
-						editWidth = 260,
-						enabled = function()
-							return Caps().canEdit and CurrentRecord() ~= nil
-						end,
-						getDisabledTooltip = function()
-							return DisabledNeedRecordTip(
-								Loc("GUILD_SUPPLIES_DISABLED_ACTION_UNLINK", "unlinking characters"))
-						end,
-						onSubmit = function(ctx, text)
-							local g = GS()
-							if not g or not g.NewUnlinkCharacterOperation then
-								ctx.section:SetMessage(
-									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
-									"error")
-								return
-							end
-							local guid = tostring(text or ""):match("^%s*(%S+)%s*$")
-							local op, prepStatus, prepReason = g:NewUnlinkCharacterOperation(guid)
-							if not op then
-								ReportStatus(ctx, prepStatus or "rejected", prepReason)
-								return
-							end
-							ctx.section:ClearMessage()
-							local status, reason = g:ApplyStagedConfigOperation(op)
-							ReportStatus(ctx, status, reason)
-							RefreshPageControls()
-						end,
-					},
-					{
-						type = "display",
-						label = Loc("GUILD_SUPPLIES_LINKS_TITLE", "Witness character links"),
-						get = function()
-							local rec = CurrentRecord()
-							local links = rec and rec.identityLinks
-							if type(links) ~= "table" or type(links.groups) ~= "table" then
-								return Loc("GUILD_SUPPLIES_LINKS_EMPTY", "No character links yet.")
-							end
-							local n = 0
-							for _ in pairs(links.groups) do n = n + 1 end
-							if n == 0 then
-								return Loc("GUILD_SUPPLIES_LINKS_EMPTY", "No character links yet.")
-							end
-							return Loc("GUILD_SUPPLIES_LINKS_COUNT", "%d link group(s)"):format(n)
 						end,
 					},
 				},
@@ -1980,6 +2090,7 @@ local function QueueRefresh()
 		if guildBankOpen then
 			ObserveGuildBankTabs()
 		end
+		-- Roster cache rebuilds lazily on next attribution suggestion request.
 		Page:Refresh(Page.panel)
 	end
 	if C_Timer and C_Timer.After then
@@ -2011,6 +2122,7 @@ local function EnsureRosterListener()
 	end
 	frame:SetScript("OnEvent", function()
 		SyncBankTabCatalogGuild()
+		InvalidateAdjustRosterCache()
 		QueueRefresh()
 	end)
 end
@@ -2102,6 +2214,24 @@ local function EnsureOfficerListener()
 	end)
 end
 
+--- Durable Guild Supplies updates (remote rename/campaign/config). Register once;
+-- QueueRefresh already gates on visibility and coalesces.
+local durableListenerRegistered = false
+local function EnsureDurableListener()
+	if durableListenerRegistered or Page.__sfGuildSuppliesDurableHook then
+		return
+	end
+	local supplies = SF.GuildSupplies
+	if not supplies or type(supplies.RegisterUIListener) ~= "function" then
+		return
+	end
+	durableListenerRegistered = true
+	Page.__sfGuildSuppliesDurableHook = true
+	supplies.RegisterUIListener(function()
+		QueueRefresh()
+	end)
+end
+
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if not renderer or not renderer.Build then
@@ -2111,6 +2241,7 @@ function Page:Build(panel)
 	EnsureBankListener()
 	EnsureAdoptionListener()
 	EnsureOfficerListener()
+	EnsureDurableListener()
 	EnsureItemDisplayListener()
 	BeginRenderPass()
 	renderer:Build(panel, Definition())
@@ -2145,6 +2276,7 @@ end
 EnsureRosterListener()
 EnsureBankListener()
 EnsureAdoptionListener()
+EnsureDurableListener()
 EnsureItemDisplayListener()
 
 SF.SettingsUI:RegisterPage(Page)

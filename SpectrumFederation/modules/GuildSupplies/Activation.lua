@@ -915,6 +915,9 @@ function GS:ActivateCanonicalDataset()
 
     DebugInfo("activated canonical dataset=%s marker=%s tab=%s status=%s",
         tostring(record.datasetId), tostring(marker), tostring(tab), tostring(sample.status))
+    if GS.ReconcileValuationsAfterCreditChange then
+        GS.ReconcileValuationsAfterCreditChange(record)
+    end
     if GS._NotifyLocalDurableChange then
         GS._NotifyLocalDurableChange("activation")
     end
@@ -1004,6 +1007,9 @@ function GS.InstallRemoteLiveCutover(record, cutover, guildKey, opts)
             end
             return "rejected", structErr or "invalid_record"
         end
+    end
+    if GS.ReconcileValuationsAfterCreditChange then
+        GS.ReconcileValuationsAfterCreditChange(record)
     end
     return "accepted", nil
 end

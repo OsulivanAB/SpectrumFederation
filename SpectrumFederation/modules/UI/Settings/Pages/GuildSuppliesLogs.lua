@@ -109,11 +109,15 @@ local function FormatCampaignLabel(entry)
 	local status = entry.isCurrent
 		and Loc("GUILD_SUPPLIES_CAMPAIGN_CURRENT", "Current")
 		or Loc("GUILD_SUPPLIES_CAMPAIGN_ARCHIVED", "Archived")
-	local shortId = tostring(entry.campaignId or "")
-	if #shortId > 24 then
-		shortId = shortId:sub(1, 21) .. "..."
+	-- Friendly name when set; otherwise the immutable ID (never both).
+	local label = entry.displayName or entry.campaignId or "?"
+	if not entry.hasCustomName then
+		label = tostring(label)
+		if #label > 24 then
+			label = label:sub(1, 21) .. "..."
+		end
 	end
-	return string.format("%s — %s (%s)", when, status, shortId)
+	return string.format("%s — %s (%s)", when, status, tostring(label))
 end
 
 local function CampaignOptions()
@@ -163,6 +167,44 @@ local function ResolveSelectedCampaign()
 	return selectedCampaignId
 end
 
+--- One projected pass for the selected campaign: items, ledger totals, overall bar.
+-- Reused by the progress bar and Goals list so Refresh does not walk the ledger twice.
+local function SelectedCampaignProjection()
+	if passCache and passCache.selectedProjectionChecked then
+		return passCache.selectedProjection
+	end
+	local projection = {
+		campaignId = nil,
+		items = nil,
+		progress = nil,
+		goalProgress = nil,
+	}
+	if Caps().canRead then
+		local campaignId = ResolveSelectedCampaign()
+		projection.campaignId = campaignId
+		local g = GS()
+		if g and campaignId then
+			if g.GetCampaignRequestedItems then
+				projection.items = g:GetCampaignRequestedItems(campaignId)
+			end
+			if g.ProjectCampaignProgress then
+				projection.progress = g:ProjectCampaignProgress(campaignId)
+			end
+			if type(projection.items) == "table" and g.ComputeGoalProgress then
+				local totals = projection.progress and projection.progress.itemTotals or {}
+				projection.goalProgress = g.ComputeGoalProgress(projection.items, totals)
+			elseif g.CampaignGoalProgress then
+				projection.goalProgress = g:CampaignGoalProgress(campaignId)
+			end
+		end
+	end
+	if passCache then
+		passCache.selectedProjectionChecked = true
+		passCache.selectedProjection = projection
+	end
+	return projection
+end
+
 local function MembershipHelpText()
 	local caps = Caps()
 	local g = GS()
@@ -191,39 +233,79 @@ local function DescribeItem(itemId)
 	}
 end
 
+--- Percent label left of the item icon (#437). Uses the shared pass projection.
+-- Positive-goal items keep uncapped whole-number percents (including >100% and
+-- signed adjustments). Goal-0 items show an em dash instead of a percentage.
+local function FormatGoalPercentLabel(progressEntry)
+	if type(progressEntry) == "table"
+		and not progressEntry.noGoal
+		and progressEntry.percent ~= nil then
+		return Loc("GUILD_SUPPLIES_LOGS_ITEM_PERCENT", "%d%%")
+			:format(tonumber(progressEntry.percent) or 0)
+	end
+	return Loc("GUILD_SUPPLIES_LOGS_ITEM_NO_PERCENT", "—")
+end
+
+local function NameWithGoalIcon(name, icon)
+	local g = GS()
+	if g and type(g.FormatHistoryInlineIcon) == "function" then
+		local markup = g.FormatHistoryInlineIcon(icon)
+		if type(markup) == "string" and markup ~= "" then
+			return markup .. " " .. name
+		end
+	end
+	return name
+end
+
 local function ItemRowsForSelected()
 	local rows = {}
 	if not Caps().canRead then
 		return rows
 	end
-	local g = GS()
-	local campaignId = ResolveSelectedCampaign()
-	if not g or not campaignId then
-		return rows
-	end
-	local items = g:GetCampaignRequestedItems(campaignId)
-	local progress = g:ProjectCampaignProgress(campaignId)
-	local totals = progress and progress.itemTotals or {}
+	local projection = SelectedCampaignProjection()
+	local items = projection.items
+	local totals = projection.progress and projection.progress.itemTotals or {}
 	if type(items) ~= "table" then
 		return rows
+	end
+	-- Index the already-computed GoalProgress items; do not walk the ledger again.
+	local progressByItemId = {}
+	local goalProgress = projection.goalProgress
+	if type(goalProgress) == "table" and type(goalProgress.items) == "table" then
+		for i = 1, #goalProgress.items do
+			local entry = goalProgress.items[i]
+			if type(entry) == "table" and tonumber(entry.itemId) then
+				progressByItemId[entry.itemId] = entry
+			end
+		end
 	end
 	for _, row in pairs(items) do
 		if type(row) == "table" and tonumber(row.itemId) then
 			local itemId = row.itemId
-			local goal = tonumber(row.goal) or 0
-			local got = tonumber(totals[itemId]) or 0
+			local progressEntry = progressByItemId[itemId]
+			local goal = (progressEntry and tonumber(progressEntry.goal))
+				or tonumber(row.goal)
+				or 0
+			local got = (progressEntry and tonumber(progressEntry.donated))
+				or tonumber(totals[itemId])
+				or 0
 			local described = DescribeItem(itemId)
+			local percentLabel = FormatGoalPercentLabel(progressEntry)
+			local namePart = NameWithGoalIcon(described.name, described.icon)
 			rows[#rows + 1] = {
+				-- Visual order: percent → inline icon → name → donated/goal.
 				text = string.format(
-					"%s — %d / %s",
-					described.name,
+					"%s %s — %d / %s",
+					percentLabel,
+					namePart,
 					got,
 					goal > 0 and tostring(goal) or "—"
 				),
-				icon = described.icon,
 				itemId = itemId,
 				goal = goal,
 				progress = got,
+				percent = progressEntry and progressEntry.percent or nil,
+				noGoal = goal <= 0 or (progressEntry and progressEntry.noGoal) or false,
 			}
 		end
 	end
@@ -231,6 +313,30 @@ local function ItemRowsForSelected()
 		return (a.itemId or 0) < (b.itemId or 0)
 	end)
 	return rows
+end
+
+local function OverallProgressForSelected()
+	if not Caps().canRead then
+		return {
+			hasPositiveGoal = false,
+			overallPercent = nil,
+			overallEmptyText = Loc("GUILD_SUPPLIES_LOGS_NO_READ",
+				"Join a guild with a verified membership to inspect Guild Supplies logs."),
+		}
+	end
+	if not ResolveSelectedCampaign() then
+		return {
+			hasPositiveGoal = false,
+			overallPercent = nil,
+			overallEmptyText = Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns"),
+		}
+	end
+	local projection = SelectedCampaignProjection()
+	return projection.goalProgress or {
+		hasPositiveGoal = false,
+		overallPercent = nil,
+		overallEmptyText = Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."),
+	}
 end
 
 local function ItemNameForHistory(itemId)
@@ -429,11 +535,24 @@ local function Definition()
 						end,
 					},
 					{
+						-- Immediately under the campaign selection controls; before Goals.
+						type = "overallProgressBar",
+						label = Loc("RAID_SUPPLIES_OVERALL_PROGRESS", "Overall progress"),
+						getProgress = function()
+							return OverallProgressForSelected()
+						end,
+						enabled = function()
+							return Caps().canRead
+						end,
+						getDisabledTooltip = DisabledLogsListTip,
+					},
+					{
 						type = "scrollList",
 						label = Loc("GUILD_SUPPLIES_LOGS_ITEMS", "Goals and progress"),
 						height = 160,
 						rowHeight = 20,
-						showItemIcons = true,
+						-- Percent sits left of the item; icon is inline via FormatHistoryInlineIcon (#437).
+						singleLine = true,
 						getItems = function()
 							if not Caps().canRead then
 								return {}
@@ -504,27 +623,6 @@ local function Definition()
 					},
 				},
 			},
-			{
-				id = "gsLogsPersonal",
-				title = Loc("GUILD_SUPPLIES_PERSONAL_TITLE", "Personal preferences"),
-				items = {
-					{
-						type = "checkbox",
-						label = Loc("GUILD_SUPPLIES_REMINDERS", "Show raid supply reminders"),
-						get = function()
-							local store = SF.SettingsStore
-							if not store or not store.Get then return true end
-							return store:Get("lootHelper.showRaidSupplyReminders") and true or false
-						end,
-						set = function(value)
-							local store = SF.SettingsStore
-							if store and store.Set then
-								store:Set("lootHelper.showRaidSupplyReminders", value and true or false)
-							end
-						end,
-					},
-				},
-			},
 		},
 	}
 end
@@ -540,6 +638,23 @@ local function PanelVisible(panel)
 		return panel:IsShown() and true or false
 	end
 	return false
+end
+
+local function MaybeStartValuationCatchup(panel)
+	if not PanelVisible(panel) then
+		return
+	end
+	local supplies = GS()
+	if supplies and supplies.StartValuationCatchup then
+		supplies.StartValuationCatchup("logs-show")
+	end
+end
+
+local function CancelValuationCatchup()
+	local supplies = GS()
+	if supplies and supplies.CancelValuationCatchup then
+		supplies.CancelValuationCatchup("logs-hide")
+	end
 end
 
 local function QueueRefresh()
@@ -620,8 +735,13 @@ function Page:Build(panel)
 		panel.__sfGuildSuppliesLogsHook = true
 		panel:HookScript("OnShow", function()
 			QueueRefresh()
+			MaybeStartValuationCatchup(panel)
+		end)
+		panel:HookScript("OnHide", function()
+			CancelValuationCatchup()
 		end)
 	end
+	MaybeStartValuationCatchup(panel)
 end
 
 function Page:Refresh(panel)
@@ -643,6 +763,7 @@ end
 function Page:OnHide()
 	refreshQueued = false
 	cachedHistoryItems = nil
+	CancelValuationCatchup()
 end
 
 EnsureRosterListener()
