@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.7] - 2026-10-29
+
+### Changed
+- Show Goal Met for completed Raid Supplies donation goals (#435)
+
 ## [1.5.16-beta.6] - 2026-10-29
 
 ### Added
