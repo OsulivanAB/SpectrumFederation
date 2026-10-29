@@ -816,17 +816,38 @@ SF.RaidCheck.GetAuthoritativePreparation = function()
 	prepCalls = prepCalls + 1
 	return { complete = true, prepared = false, missing = { "gem" } }, "fresh"
 end
+local deliveryFailInfos = 0
+SF.Debug = {
+	Info = function(_, category, message)
+		if category == "EARLY_PREP" and type(message) == "string"
+			and string.find(message, "whisper delivery failed", 1, true)
+		then
+			deliveryFailInfos = deliveryFailInfos + 1
+		end
+	end,
+	Verbose = function() end,
+}
 prepCalls = 0
 whispers = 0
 EarlyPrep:OnBackgroundPass()
 assertEq(prepCalls, 2, "a changed observation is evaluated")
 assertEq(whispers, 2, "a blocked whisper is still attempted")
 assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "a blocked whisper is not recorded")
+assertEq(deliveryFailInfos, 2, "each member logs one delivery-failure Info on first failure")
 prepCalls = 0
 whispers = 0
 EarlyPrep:OnBackgroundPass()
 assertEq(prepCalls, 2, "a blocked whisper is evaluated again")
 assertEq(whispers, 2, "a blocked whisper is retried")
+assertEq(deliveryFailInfos, 2, "repeated delivery failures do not re-log the same Info")
+-- A changed observation stamp is a new failure condition and may log again.
+observationStamp = "remote|3|ready|1|0|cfg"
+prepCalls = 0
+whispers = 0
+EarlyPrep:OnBackgroundPass()
+assertEq(whispers, 2, "a changed observation still retries delivery")
+assertEq(deliveryFailInfos, 4, "a changed observation stamp may log delivery failure again")
+SF.Debug = nil
 scans = 0
 EarlyPrep:Refresh("heartbeat")
 EarlyPrep:Refresh("roster")
@@ -835,6 +856,181 @@ EarlyPrep._windowOpen = false
 scans = 0
 EarlyPrep:Refresh("roster")
 assertEq(scans, 1, "a roster refresh scans when the window has just opened")
+
+-- NoteDeliveryFailure reuses the bounded skip log and returns whether it logged.
+EarlyPrep._evaluateSkipLogged = nil
+assertTrue(EarlyPrep:NoteDeliveryFailure("Dana-Realm", "stamp-a"), "first delivery failure for a stamp logs")
+assertTrue(not EarlyPrep:NoteDeliveryFailure("Dana-Realm", "stamp-a"), "same member and stamp does not re-log")
+assertTrue(EarlyPrep:NoteDeliveryFailure("Dana-Realm", "stamp-b"), "a new stamp may log again")
+assertTrue(EarlyPrep:NoteDeliveryFailure("Eli-Realm", "stamp-a"), "a different member may log")
+EarlyPrep._evaluateSkipLogged = nil
+
+-- #432 / #433: knownUnprepared (possibly still incomplete) may warn; incomplete
+-- without a confirmed miss must not; fully evaluated Unprepared still may.
+local issue432, issue432Why = EarlyPrep.ObservationShouldWarn({
+	eligible = true,
+	inRaid = true,
+	fresh = true,
+	complete = false,
+	knownUnprepared = true,
+	prepared = false,
+	alreadyWarned = false,
+})
+assertTrue(issue432, "a knownUnprepared observation should warn even while incomplete")
+assertEq(issue432Why, "send", "known Unprepared maps to send")
+local issue432Complete, issue432CompleteWhy = EarlyPrep.ObservationShouldWarn({
+	eligible = true,
+	inRaid = true,
+	fresh = true,
+	complete = true,
+	knownUnprepared = true,
+	prepared = false,
+	alreadyWarned = false,
+})
+assertTrue(issue432Complete, "a fully evaluated Unprepared observation should warn")
+assertEq(issue432CompleteWhy, "send", "complete Unprepared maps to send")
+local incompleteStill, incompleteWhy = EarlyPrep.ObservationShouldWarn({
+	eligible = true,
+	inRaid = true,
+	fresh = true,
+	complete = false,
+	knownUnprepared = false,
+	prepared = false,
+	alreadyWarned = false,
+})
+assertTrue(not incompleteStill, "incomplete observations without a confirmed miss still do not warn")
+assertEq(incompleteWhy, "incomplete", "incomplete observations keep the incomplete reason")
+local preparedIncomplete, preparedIncompleteWhy = EarlyPrep.ObservationShouldWarn({
+	eligible = true,
+	inRaid = true,
+	fresh = true,
+	complete = false,
+	knownUnprepared = false,
+	prepared = true,
+	alreadyWarned = false,
+})
+assertTrue(not preparedIncomplete, "prepared observations do not warn")
+assertEq(preparedIncompleteWhy, "prepared", "prepared observations keep the prepared reason")
+
+observationStamp = "remote|432|ready|1|0|cfg"
+local issue432Whispers = {}
+SF.LootHelperComm = SF.LootHelperComm or {}
+SF.LootHelperComm.Send = function()
+	return true
+end
+SF.LootHelperSync.MSG = SF.LootHelperSync.MSG or {}
+SF.LootHelperSync.MSG.PREP_WARN_CLAIM_GRANT = "PREP_WARN_CLAIM_GRANT"
+SF.LootHelperSync.MSG.PREP_NOTICE = "PREP_NOTICE"
+SF.LootHelperSync.GetGroupDistribution = function()
+	return "RAID"
+end
+SF.LootHelperSync._SelfId = function()
+	return "Helper-Realm"
+end
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+SF.LootHelperSync.state.coordEpoch = 7
+SF.LootHelperSync.state.isCoordinator = true
+SF.RaidCheck.GetAuthoritativePreparation = function(_, memberId)
+	prepCalls = prepCalls + 1
+	-- Shape Policy returns after the #433 representation split: known enchant
+	-- failure with knownUnprepared, while item level remains unresolved.
+	return {
+		complete = false,
+		knownUnprepared = true,
+		prepared = false,
+		missing = { "Chest Enchant" },
+		incompleteReason = "unresolved_item_level",
+	}, "fresh"
+end
+SF.RaidCheck.DeliverMissingRequirementsWhisper = function(_, memberId, _, missing)
+	issue432Whispers[#issue432Whispers + 1] = {
+		memberId = memberId,
+		missing = missing and missing[1] or nil,
+	}
+	return true
+end
+SF.RaidCheck.CollectGroupMemberIds = function()
+	return { "Bob-Realm" }
+end
+SF.LootHelperSync.FindLocalProfileById = function()
+	return {
+		id = "profile-a",
+		IsCurrentUserAdmin = function()
+			return true
+		end,
+		GetMemberByID = function(_, memberId)
+			if memberId == "Bob-Realm" then
+				return { id = memberId }
+			end
+			return nil
+		end,
+		GetRaidCheckConfig = function()
+			return {
+				checkGemsInSockets = true,
+				requireMinimumItemLevel = true,
+				minimumItemLevel = 650,
+				slots = { head = true },
+			}
+		end,
+	}
+end
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep._skipStamp = nil
+EarlyPrep._claims = nil
+EarlyPrep._pendingWhispers = nil
+EarlyPrep._windowOpen = true
+prepCalls = 0
+assertTrue(EarlyPrep:EvaluateMember("Bob-Realm"), "issue 432 EvaluateMember sends for known Unprepared")
+assertEq(#issue432Whispers, 1, "issue 432 delivers one missing-requirements whisper")
+assertEq(issue432Whispers[1].memberId, "Bob-Realm", "issue 432 whisper targets Bob")
+assertEq(issue432Whispers[1].missing, "Chest Enchant", "issue 432 whisper carries the known enchant failure")
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "issue 432 records the session warning")
+
+SF.RaidCheck.CollectGroupMemberIds = function()
+	return { "Bob-Realm", "Cara-Realm" }
+end
+SF.LootHelperSync.FindLocalProfileById = function()
+	return {
+		id = "profile-a",
+		IsCurrentUserAdmin = function()
+			return true
+		end,
+		GetMemberByID = function(_, memberId)
+			if memberId == "Bob-Realm" or memberId == "Cara-Realm" then
+				return { id = memberId }
+			end
+			return nil
+		end,
+		GetRaidCheckConfig = function()
+			return { checkGemsInSockets = true, slots = { head = true } }
+		end,
+	}
+end
+SF.RaidCheck.DeliverMissingRequirementsWhisper = function()
+	return false
+end
+SF.RaidCheck.GetAuthoritativePreparation = function()
+	prepCalls = prepCalls + 1
+	return { complete = true, prepared = true, missing = {} }, "fresh"
+end
+-- Isolate window-reason diagnostics from the #432 whisper path.
+EarlyPrep._windowOpen = true
+EarlyPrep._windowClosedWhy = "stale"
+assertTrue(EarlyPrep:ComputeWindow(), "issue 432 keep-alive still has an open window")
+assertEq(EarlyPrep._windowClosedWhy, nil, "an open window clears the closed reason")
+local savedAnnounced = SF.LootHelperSync.HasAnnouncedCurrentSession
+SF.LootHelperSync.HasAnnouncedCurrentSession = function()
+	return false
+end
+assertTrue(not EarlyPrep:ComputeWindow(), "an unannounced session closes the window")
+assertEq(EarlyPrep._windowClosedWhy, "announced", "a closed window records the WindowOpen reason")
+SF.LootHelperSync.HasAnnouncedCurrentSession = savedAnnounced
+EarlyPrep:OnSessionReset("issue-432-cleanup")
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
 
 local SyncSF = {}
 assert(loadfile("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua"))("SpectrumFederation", SyncSF)
