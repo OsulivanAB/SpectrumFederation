@@ -816,17 +816,38 @@ SF.RaidCheck.GetAuthoritativePreparation = function()
 	prepCalls = prepCalls + 1
 	return { complete = true, prepared = false, missing = { "gem" } }, "fresh"
 end
+local deliveryFailInfos = 0
+SF.Debug = {
+	Info = function(_, category, message)
+		if category == "EARLY_PREP" and type(message) == "string"
+			and string.find(message, "whisper delivery failed", 1, true)
+		then
+			deliveryFailInfos = deliveryFailInfos + 1
+		end
+	end,
+	Verbose = function() end,
+}
 prepCalls = 0
 whispers = 0
 EarlyPrep:OnBackgroundPass()
 assertEq(prepCalls, 2, "a changed observation is evaluated")
 assertEq(whispers, 2, "a blocked whisper is still attempted")
 assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "a blocked whisper is not recorded")
+assertEq(deliveryFailInfos, 2, "each member logs one delivery-failure Info on first failure")
 prepCalls = 0
 whispers = 0
 EarlyPrep:OnBackgroundPass()
 assertEq(prepCalls, 2, "a blocked whisper is evaluated again")
 assertEq(whispers, 2, "a blocked whisper is retried")
+assertEq(deliveryFailInfos, 2, "repeated delivery failures do not re-log the same Info")
+-- A changed observation stamp is a new failure condition and may log again.
+observationStamp = "remote|3|ready|1|0|cfg"
+prepCalls = 0
+whispers = 0
+EarlyPrep:OnBackgroundPass()
+assertEq(whispers, 2, "a changed observation still retries delivery")
+assertEq(deliveryFailInfos, 4, "a changed observation stamp may log delivery failure again")
+SF.Debug = nil
 scans = 0
 EarlyPrep:Refresh("heartbeat")
 EarlyPrep:Refresh("roster")
@@ -835,6 +856,14 @@ EarlyPrep._windowOpen = false
 scans = 0
 EarlyPrep:Refresh("roster")
 assertEq(scans, 1, "a roster refresh scans when the window has just opened")
+
+-- NoteDeliveryFailure reuses the bounded skip log and returns whether it logged.
+EarlyPrep._evaluateSkipLogged = nil
+assertTrue(EarlyPrep:NoteDeliveryFailure("Dana-Realm", "stamp-a"), "first delivery failure for a stamp logs")
+assertTrue(not EarlyPrep:NoteDeliveryFailure("Dana-Realm", "stamp-a"), "same member and stamp does not re-log")
+assertTrue(EarlyPrep:NoteDeliveryFailure("Dana-Realm", "stamp-b"), "a new stamp may log again")
+assertTrue(EarlyPrep:NoteDeliveryFailure("Eli-Realm", "stamp-a"), "a different member may log")
+EarlyPrep._evaluateSkipLogged = nil
 
 -- #432 / #433: knownUnprepared (possibly still incomplete) may warn; incomplete
 -- without a confirmed miss must not; fully evaluated Unprepared still may.

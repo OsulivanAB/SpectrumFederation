@@ -2182,6 +2182,34 @@ function EarlyPrep:NoteEvaluateSkip(memberId, reason, detail)
 	end
 end
 
+-- Delivery can fail repeatedly (for example chat lockdown) while Early Prep keeps
+-- retrying. Log Info once per member and observation stamp; a changed stamp or a
+-- cleared skip log may emit again.
+function EarlyPrep:NoteDeliveryFailure(memberId, stamp)
+	if type(memberId) ~= "string" or memberId == "" then
+		return false
+	end
+	local condition = "-"
+	if type(stamp) == "string" and stamp ~= "" then
+		condition = stamp
+	end
+	self._evaluateSkipLogged = self._evaluateSkipLogged or {}
+	local key = memberId .. ":send_failed:" .. condition
+	if self._evaluateSkipLogged[key] then
+		return false
+	end
+	local count = 0
+	for _ in pairs(self._evaluateSkipLogged) do
+		count = count + 1
+		if count >= EarlyPrep.MAX_NOTICE_MEMBERS then
+			return false
+		end
+	end
+	self._evaluateSkipLogged[key] = true
+	DebugInfo("Missing-requirements whisper delivery failed for %s", tostring(memberId))
+	return true
+end
+
 function EarlyPrep:EvaluateMember(memberId)
 	if not self:ComputeWindow() then
 		return false
@@ -2255,7 +2283,7 @@ function EarlyPrep:EvaluateMember(memberId)
 	end
 	local sent = raidCheck:DeliverMissingRequirementsWhisper(memberId, cfg, result.missing, profile, "pre")
 	if not sent then
-		DebugInfo("Missing-requirements whisper delivery failed for %s", tostring(memberId))
+		self:NoteDeliveryFailure(memberId, stamp)
 		self:AbandonWarningClaim(memberId, "send_failed")
 		return false
 	end
