@@ -233,6 +233,30 @@ local function DescribeItem(itemId)
 	}
 end
 
+--- Percent label left of the item icon (#437). Uses the shared pass projection.
+-- Positive-goal items keep uncapped whole-number percents (including >100% and
+-- signed adjustments). Goal-0 items show an em dash instead of a percentage.
+local function FormatGoalPercentLabel(progressEntry)
+	if type(progressEntry) == "table"
+		and not progressEntry.noGoal
+		and progressEntry.percent ~= nil then
+		return Loc("GUILD_SUPPLIES_LOGS_ITEM_PERCENT", "%d%%")
+			:format(tonumber(progressEntry.percent) or 0)
+	end
+	return Loc("GUILD_SUPPLIES_LOGS_ITEM_NO_PERCENT", "—")
+end
+
+local function NameWithGoalIcon(name, icon)
+	local g = GS()
+	if g and type(g.FormatHistoryInlineIcon) == "function" then
+		local markup = g.FormatHistoryInlineIcon(icon)
+		if type(markup) == "string" and markup ~= "" then
+			return markup .. " " .. name
+		end
+	end
+	return name
+end
+
 local function ItemRowsForSelected()
 	local rows = {}
 	if not Caps().canRead then
@@ -244,23 +268,44 @@ local function ItemRowsForSelected()
 	if type(items) ~= "table" then
 		return rows
 	end
+	-- Index the already-computed GoalProgress items; do not walk the ledger again.
+	local progressByItemId = {}
+	local goalProgress = projection.goalProgress
+	if type(goalProgress) == "table" and type(goalProgress.items) == "table" then
+		for i = 1, #goalProgress.items do
+			local entry = goalProgress.items[i]
+			if type(entry) == "table" and tonumber(entry.itemId) then
+				progressByItemId[entry.itemId] = entry
+			end
+		end
+	end
 	for _, row in pairs(items) do
 		if type(row) == "table" and tonumber(row.itemId) then
 			local itemId = row.itemId
-			local goal = tonumber(row.goal) or 0
-			local got = tonumber(totals[itemId]) or 0
+			local progressEntry = progressByItemId[itemId]
+			local goal = (progressEntry and tonumber(progressEntry.goal))
+				or tonumber(row.goal)
+				or 0
+			local got = (progressEntry and tonumber(progressEntry.donated))
+				or tonumber(totals[itemId])
+				or 0
 			local described = DescribeItem(itemId)
+			local percentLabel = FormatGoalPercentLabel(progressEntry)
+			local namePart = NameWithGoalIcon(described.name, described.icon)
 			rows[#rows + 1] = {
+				-- Visual order: percent → inline icon → name → donated/goal.
 				text = string.format(
-					"%s — %d / %s",
-					described.name,
+					"%s %s — %d / %s",
+					percentLabel,
+					namePart,
 					got,
 					goal > 0 and tostring(goal) or "—"
 				),
-				icon = described.icon,
 				itemId = itemId,
 				goal = goal,
 				progress = got,
+				percent = progressEntry and progressEntry.percent or nil,
+				noGoal = goal <= 0 or (progressEntry and progressEntry.noGoal) or false,
 			}
 		end
 	end
@@ -506,7 +551,8 @@ local function Definition()
 						label = Loc("GUILD_SUPPLIES_LOGS_ITEMS", "Goals and progress"),
 						height = 160,
 						rowHeight = 20,
-						showItemIcons = true,
+						-- Percent sits left of the item; icon is inline via FormatHistoryInlineIcon (#437).
+						singleLine = true,
 						getItems = function()
 							if not Caps().canRead then
 								return {}
