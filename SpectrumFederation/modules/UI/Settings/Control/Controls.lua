@@ -1563,7 +1563,7 @@ Controls.SCROLL_LIST_LEADING_DEFAULTS = {
 --- Shared leading-column width for opt-in scroll lists (#440).
 -- Right-justified leading labels share one width (widest measured string).
 -- Clamped on narrow viewports so the remainder text keeps a usable budget.
--- @param maxLeadingWidth number Widest Leading:GetStringWidth() among rows
+-- @param maxLeadingWidth number Widest unconstrained leading label width among rows
 -- @param availableWidth number Visible content width for the list
 -- @param sizes table|nil Overrides for SCROLL_LIST_LEADING_DEFAULTS fields
 -- @return number leadingWidth, number gap
@@ -1764,7 +1764,16 @@ function Controls:AddScrollList(section, opts)
 
 				if leadingColumn and r.Leading then
 					r.Leading:SetText(item.leadingText or "")
-					maxLeadingWidth = math.max(maxLeadingWidth, r.Leading:GetStringWidth() or 0)
+					-- Prefer unconstrained width: Leading keeps the prior refresh's
+					-- SetWidth, so GetStringWidth() can report truncated text and
+					-- block short→long percent expansion (#440 / Codex).
+					local leadingMeasure
+					if type(r.Leading.GetUnboundedStringWidth) == "function" then
+						leadingMeasure = r.Leading:GetUnboundedStringWidth() or 0
+					else
+						leadingMeasure = r.Leading:GetStringWidth() or 0
+					end
+					maxLeadingWidth = math.max(maxLeadingWidth, leadingMeasure)
 				end
 				r.Text:SetText(item.text or "")
 				maxTextWidth = math.max(maxTextWidth, r.Text:GetStringWidth() or 0)

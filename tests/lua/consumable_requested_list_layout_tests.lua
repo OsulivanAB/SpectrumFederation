@@ -244,8 +244,20 @@ local function makeRegion(kind, name, parent, template)
         fireEvent(self, "OnEditFocusLost")
     end
 
-    function region:GetStringWidth()
+    function region:GetUnboundedStringWidth()
         return math.max(1, #(self.text or "") * 7)
+    end
+
+    -- Default GetStringWidth stays unbounded so existing shared-column name
+    -- measurements keep working. Leading-column regressions opt into Retail-like
+    -- truncation via __sfMeasureTruncated after the FontString has a SetWidth.
+    function region:GetStringWidth()
+        local full = self:GetUnboundedStringWidth()
+        local constrained = tonumber(self.width) or 0
+        if self.__sfMeasureTruncated and constrained > 0 then
+            return math.min(full, constrained)
+        end
+        return full
     end
 
     function region:GetStringHeight()
@@ -976,6 +988,46 @@ do
     assertTrue(plainRows[1].Leading == nil, "440: lists without the flag stay single-text")
     assertEq(leftAnchor(plainRows[1].Text).x, 0, "440: plain text still starts at the edge")
 
+    -- Short→long percent on the same list: prior Leading:SetWidth must not trap
+    -- measurement via truncated GetStringWidth (Codex #4418529769).
+    items[1].leadingText = "20%"
+    items[2].leadingText = "20%"
+    items[3].leadingText = "20%"
+    items[4].leadingText = "—"
+    items[1].text = "|T111:16|t Short — 0 / 40"
+    fireEvent(scroll, "OnSizeChanged", 420, 120)
+    rows = scrollRows(scroll)
+    for i = 1, #rows do
+        if rows[i].Leading then
+            -- Opt into Retail-like constrained measurement for this regression.
+            rows[i].Leading.__sfMeasureTruncated = true
+        end
+    end
+    local shortWidth = math.max(1, #"20%" * 7)
+    local longWidth = math.max(1, #"100%" * 7)
+    assertTrue(longWidth > shortWidth, "440: 100% is wider than 20%")
+    assertEq(rows[1].Leading.width, shortWidth, "440: short percents share a short column")
+    -- While still constrained to the short column, a longer label is truncated by
+    -- GetStringWidth but visible to GetUnboundedStringWidth.
+    rows[1].Leading:SetText("100%")
+    assertEq(rows[1].Leading:GetStringWidth(), shortWidth,
+        "440: constrained GetStringWidth truncates 100% to the prior short width")
+    assertEq(rows[1].Leading:GetUnboundedStringWidth(), longWidth,
+        "440: unbounded measure sees the full 100% label while still constrained")
+    items[1].leadingText = "100%"
+    local callsBeforeExpand = calls
+    fireEvent(scroll, "OnSizeChanged", 420, 120)
+    rows = scrollRows(scroll)
+    assertEq(rows[1].Leading.width, longWidth,
+        "440: column expands from 20% to 100% using unbounded measurement")
+    local expandStart = leftAnchor(rows[1].Text).x
+    assertEq(expandStart, longWidth + 6, "440: remainder follows the expanded leading column")
+    for i = 2, #rows do
+        assertEq(leftAnchor(rows[i].Text).x, expandStart,
+            "440: icons stay aligned after 20%→100% expansion on row " .. tostring(i))
+    end
+    assertTrue(calls - callsBeforeExpand <= 4, "440: short→long expand stays bounded")
+
     -- Refresh + narrow resize: actually change the mock viewport width, force
     -- clamp with an overwide leading percent, and keep the remainder budget.
     local overwideLeading = "999999999%"
@@ -1010,6 +1062,27 @@ do
     assertTrue(remainderBudget >= 40,
         "440: remainder keeps its intended width budget after clamp: " .. tostring(remainderBudget))
     assertTrue(calls - callsBefore <= 4, "440: resize refresh does not storm getItems")
+
+    -- Narrow→wide: column must expand back to the unconstrained label width.
+    scroll:SetSize(420, 120)
+    rows = scrollRows(scroll)
+    local wideContentWidth = scroll.scrollChild:GetWidth()
+    local wideExpected = Controls.ScrollListLeadingColumnWidth(measuredLeading, wideContentWidth, {
+        gap = 6,
+    })
+    assertEq(rows[1].Leading.width, wideExpected,
+        "440: narrow→wide restores the unconstrained leading width")
+    assertTrue(rows[1].Leading.width > expectedLeading,
+        "440: leading column expands after widening the viewport")
+    local wideStart = leftAnchor(rows[1].Text).x
+    assertEq(wideStart, wideExpected + 6,
+        "440: remainder follows the expanded column after widening")
+    for i = 2, #rows do
+        assertEq(leftAnchor(rows[i].Text).x, wideStart,
+            "440: icons stay aligned after narrow→wide on row " .. tostring(i))
+    end
+    assertTrue(wideContentWidth - wideStart >= 40,
+        "440: remainder budget remains after narrow→wide expand")
 
     for _ = 1, 8 do
         scroll:SetSize(420, 120)
