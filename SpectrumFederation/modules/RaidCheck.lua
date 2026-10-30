@@ -24,6 +24,13 @@ local EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS = 24 * 60 * 60
 local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
+-- NotifyInspect often triggers UNIT_INVENTORY_CHANGED for the inspected unit.
+-- While the matching request is inside this grace window, treat that event as
+-- inspect-payload noise rather than a gear-change authority invalidation.
+local INSPECT_INVENTORY_GRACE_SECONDS = 2.0
+-- Separate NotifyInspect generations must independently observe a blank before
+-- copied prior equipped evidence for that slot is retired.
+local INDEPENDENT_BLANK_CONFIRMATIONS = 2
 local BACKGROUND_INSPECT_POLL_SECONDS = 5
 local MANUAL_INSPECT_INTENT_PAUSE_SECONDS = 30
 local MANUAL_INSPECT_POST_HIDE_PAUSE_SECONDS = 2
@@ -1105,6 +1112,10 @@ function RC:_GetInspectState()
 		snapshotVersion = 0,
 		itemDataGeneration = 0,
 		localEquipmentGeneration = 0,
+		-- Per-member runtime generation for equipment authority. Bumped on known
+		-- gear-change invalidation so in-flight inspect responses stamped earlier
+		-- cannot restore lastGood / freshObservation.
+		equipmentAuthorityByKey = {},
 		lastNotifiedVersion = -1,
 		backgroundInspectEnabled = false,
 		backgroundInspectConsumers = {},
@@ -1115,6 +1126,7 @@ function RC:_GetInspectState()
 	}
 	self._inspectState.lastGood = self._inspectState.lastGood or {}
 	self._inspectState.lastIssuedGeneration = self._inspectState.lastIssuedGeneration or 0
+	self._inspectState.equipmentAuthorityByKey = self._inspectState.equipmentAuthorityByKey or {}
 	self._inspectState.backgroundInspectConsumers = self._inspectState.backgroundInspectConsumers or {}
 	return self._inspectState
 end
@@ -1577,6 +1589,163 @@ function RC:CountTroubleshootingListeners()
 	return count
 end
 
+-- Equipment observation authority (runtime inspect pipeline):
+-- 1) Authority: only a complete, non-blended capture from an inspect request
+--    whose stamped equipmentAuthorityGeneration still matches the member's
+--    current generation may write lastGood / freshObservation.
+-- 2) Invalidation: known gear-change signals clear member-scoped lastGood/fresh
+--    and bump that generation so earlier in-flight responses cannot restore
+--    authority. Inspect-driven UNIT_INVENTORY_CHANGED inside the active
+--    request's inventory grace is noise and does not invalidate.
+-- 3) Copied evidence: blending may copy prior equipped slots into temporary
+--    blanks for troubleshooting (never authoritative emptiness). Independent
+--    blank observations across separate inspect generations retire that copy
+--    after INDEPENDENT_BLANK_CONFIRMATIONS reads so legitimate empty slots
+--    (including 2H + empty off-hand) can become authoritative.
+
+function RC:_EquipmentAuthorityKeys(aliases)
+	local keys = {}
+	for _, alias in ipairs(aliases or {}) do
+		if type(alias) == "string" and alias ~= "" then
+			keys[#keys + 1] = alias
+		end
+	end
+	return keys
+end
+
+function RC:_CurrentEquipmentAuthorityGeneration(aliases)
+	local state = self:_GetInspectState()
+	state.equipmentAuthorityByKey = state.equipmentAuthorityByKey or {}
+	local generation = 0
+	for _, key in ipairs(self:_EquipmentAuthorityKeys(aliases)) do
+		local value = tonumber(state.equipmentAuthorityByKey[key]) or 0
+		if value > generation then
+			generation = value
+		end
+	end
+	return generation
+end
+
+function RC:_BumpEquipmentAuthorityGeneration(aliases)
+	local state = self:_GetInspectState()
+	state.equipmentAuthorityByKey = state.equipmentAuthorityByKey or {}
+	local nextGeneration = self:_CurrentEquipmentAuthorityGeneration(aliases) + 1
+	for _, key in ipairs(self:_EquipmentAuthorityKeys(aliases)) do
+		state.equipmentAuthorityByKey[key] = nextGeneration
+	end
+	return nextGeneration
+end
+
+function RC:_RequestMatchesUnit(request, unit)
+	if type(request) ~= "table" or not unit then
+		return false
+	end
+	if request.unit and UnitIsUnit and UnitIsUnit(request.unit, unit) then
+		return true
+	end
+	if IsSelfUnit(unit) and request.unit and IsSelfUnit(request.unit) then
+		return true
+	end
+
+	local unitAliases = self:_GetInspectAliases(unit)
+	local unitGuid = GetAccessibleUnitGUID(unit) or (UnitGUID and UnitGUID(unit)) or nil
+	if type(request.guid) == "string" and request.guid ~= "" and request.guid == unitGuid then
+		return true
+	end
+	for _, requestAlias in ipairs(request.aliases or {}) do
+		if type(requestAlias) == "string" and requestAlias ~= "" then
+			if requestAlias == unitGuid then
+				return true
+			end
+			for _, unitAlias in ipairs(unitAliases or {}) do
+				if requestAlias == unitAlias then
+					return true
+				end
+				if SF.NameUtil and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(requestAlias, unitAlias) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+function RC:_IsWithinInspectInventoryGrace(unit, now)
+	if not unit then
+		return false
+	end
+	local state = self:_GetInspectState()
+	now = now or (GetTime and GetTime() or 0)
+	local candidates = {}
+	if state.active then
+		candidates[#candidates + 1] = state.active
+	end
+	-- Late INSPECT_READY after an ordinary timeout still binds to the retired
+	-- current generation; keep its inventory grace so accompanying inspect
+	-- payload notifications do not bump authority underneath it.
+	if state.retired and state.retired.generation == (state.lastIssuedGeneration or 0) then
+		candidates[#candidates + 1] = state.retired
+	end
+	for _, request in ipairs(candidates) do
+		if self:_RequestMatchesUnit(request, unit) then
+			local graceUntil = tonumber(request.inventoryGraceUntil)
+			if graceUntil and now <= graceUntil then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function RC:_StampInspectRequestAuthority(request, now)
+	if type(request) ~= "table" then
+		return
+	end
+	now = now or (GetTime and GetTime() or 0)
+	request.equipmentAuthorityGeneration = self:_CurrentEquipmentAuthorityGeneration(request.aliases)
+	request.inventoryGraceUntil = now + INSPECT_INVENTORY_GRACE_SECONDS
+end
+
+function RC:_InspectRequestHasEquipmentAuthority(request)
+	if type(request) ~= "table" then
+		return false
+	end
+	local stamped = tonumber(request.equipmentAuthorityGeneration)
+	if stamped == nil then
+		return false
+	end
+	return stamped == self:_CurrentEquipmentAuthorityGeneration(request.aliases)
+end
+
+local function NoteIndependentBlankObservation(entry, inventorySlot, generation)
+	if type(entry) ~= "table" or type(inventorySlot) ~= "number" then
+		return 0
+	end
+	entry.independentBlankCounts = entry.independentBlankCounts or {}
+	entry.independentBlankGenerations = entry.independentBlankGenerations or {}
+	if generation ~= nil and entry.independentBlankGenerations[inventorySlot] == generation then
+		return entry.independentBlankCounts[inventorySlot] or 0
+	end
+	local count = (entry.independentBlankCounts[inventorySlot] or 0) + 1
+	entry.independentBlankCounts[inventorySlot] = count
+	if generation ~= nil then
+		entry.independentBlankGenerations[inventorySlot] = generation
+	end
+	return count
+end
+
+local function ClearIndependentBlankObservation(entry, inventorySlot)
+	if type(entry) ~= "table" or type(inventorySlot) ~= "number" then
+		return
+	end
+	if entry.independentBlankCounts then
+		entry.independentBlankCounts[inventorySlot] = nil
+	end
+	if entry.independentBlankGenerations then
+		entry.independentBlankGenerations[inventorySlot] = nil
+	end
+end
+
 function RC:_InvalidateInspectAliases(aliases)
 	local state = self:_GetInspectState()
 	for _, key in ipairs(aliases or {}) do
@@ -1657,6 +1826,8 @@ end
 --   true  → clear member-scoped lastGood (equipment change)
 --   false → keep lastGood (bag-only local inventory noise)
 --   nil   → clear for remote units; keep for self (self bag events use this path)
+-- opts.forceEquipmentAuthorityInvalidate:
+--   true → apply clearLastGood / generation bump even inside inspect inventory grace
 function RC:_InvalidateInspectUnit(unit, opts)
 	if not unit then
 		return
@@ -1667,9 +1838,36 @@ function RC:_InvalidateInspectUnit(unit, opts)
 		clearLastGood = not IsSelfUnit(unit)
 	end
 
+	-- Inspect-driven inventory notifications for the active (or retired-current)
+	-- request must not clear lastGood or bump authority generation; the matching
+	-- INSPECT_READY still owns completion. Genuine gear-change invalidation
+	-- outside that grace bumps generation so a delayed pre-change response
+	-- cannot restore authority.
+	if clearLastGood
+		and not opts.forceEquipmentAuthorityInvalidate
+		and self:_IsWithinInspectInventoryGrace(unit)
+	then
+		self:_MarkTroubleshootingDirty()
+		self:_NotifyTroubleshootingListeners()
+		return
+	end
+
 	if IsSelfUnit(unit) then
 		self:_InvalidateLocalTroubleshootingSnapshot()
 		if clearLastGood then
+			local aliases = {}
+			local selfId = SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier() or nil
+			if type(selfId) == "string" and selfId ~= "" then
+				aliases[#aliases + 1] = selfId
+			end
+			local guid = GetAccessibleUnitGUID and GetAccessibleUnitGUID("player") or nil
+			if type(guid) ~= "string" or guid == "" then
+				guid = UnitGUID and UnitGUID("player") or nil
+			end
+			if type(guid) == "string" and guid ~= "" then
+				aliases[#aliases + 1] = guid
+			end
+			self:_BumpEquipmentAuthorityGeneration(aliases)
 			self:_InvalidateLastGoodForUnit("player")
 		end
 		self:_MarkTroubleshootingDirty()
@@ -1683,6 +1881,7 @@ function RC:_InvalidateInspectUnit(unit, opts)
 	local aliases = self:_GetInspectAliases(unit)
 	self:_InvalidateInspectAliases(aliases)
 	if clearLastGood then
+		self:_BumpEquipmentAuthorityGeneration(aliases)
 		self:_InvalidateLastGoodForAliases(aliases)
 	end
 	self:_MarkTroubleshootingDirty()
@@ -2363,41 +2562,56 @@ function RC:_HandleInspectReady(guid)
 		-- 1) First blank for a tracked slot stays non-authoritative (blended):
 		--    inspect data may still be arriving.
 		-- 2) Copying previously equipped evidence into a blank slot keeps the
-		--    capture blended; never manufacture authoritative emptiness from a
-		--    temporary blank over old gear.
+		--    capture blended and marks copiedEvidence. Independent blank
+		--    observations across separate inspect generations may later retire
+		--    that copy so a real empty slot can become authoritative.
 		-- 3) Two consecutive independent blanks for the same slot (prior blank +
-		--    current blank, with no copied equipped evidence) confirm the slot
-		--    is empty. That confirmation alone does not force blended=true, so a
-		--    legitimate empty off-hand with a two-handed main-hand can become
-		--    authoritative. Policy then decides Prepared vs Unprepared.
+		--    current blank, with no remaining copied equipped evidence) confirm
+		--    the slot is empty. That confirmation alone does not force
+		--    blended=true, so a legitimate empty off-hand with a two-handed
+		--    main-hand can become authoritative. Policy then decides Prepared
+		--    vs Unprepared.
 		local blended = false
 		local fallbackEntry = RC.InspectFallbackEntry(entry)
 		local unresolvedEntry = RC.InspectUnresolvedEntry(entry)
 		local sourceEntry = fallbackEntry or unresolvedEntry
 		local fallbackSlots = sourceEntry and sourceEntry.slotsByInventory or nil
+		local inspectGeneration = active.generation
 		if type(fallbackSlots) == "table" then
 			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
 				if type(inventorySlot) == "number" and type(fallbackSlot) == "table" then
 					local nextSlot = captured.slotsByInventory[inventorySlot]
 					local hasNext = SlotHasAnyItemData(nextSlot) or (type(nextSlot) == "table" and nextSlot.texture) or false
 					local hasFallback = SlotHasAnyItemData(fallbackSlot) or fallbackSlot.texture or false
-					if (not hasNext) and hasFallback then
-						-- Copying prior equipped evidence, including from a blended
-						-- entry, keeps the observation non-authoritative until a
-						-- later inspect independently shows equipped data again or
-						-- cache invalidation clears the old evidence.
-						blended = true
-						local copy = {}
-						for key, value in pairs(fallbackSlot) do
-							copy[key] = value
+					if hasNext then
+						ClearIndependentBlankObservation(entry, inventorySlot)
+						NormalizeSlotData(nextSlot)
+					elseif hasFallback then
+						local blankCount = NoteIndependentBlankObservation(entry, inventorySlot, inspectGeneration)
+						if blankCount >= INDEPENDENT_BLANK_CONFIRMATIONS then
+							-- Independently confirmed emptiness retires obsolete
+							-- copied equipment for this slot. Leave the fresh blank
+							-- in place and re-evaluate the resulting gear under Policy.
+							ClearIndependentBlankObservation(entry, inventorySlot)
+							NormalizeSlotData(nextSlot)
+						else
+							-- Keep troubleshooting evidence, but never treat a single
+							-- temporary blank over old gear as authoritative emptiness.
+							blended = true
+							local copy = {}
+							for key, value in pairs(fallbackSlot) do
+								copy[key] = value
+							end
+							copy.copiedEvidence = true
+							NormalizeSlotData(copy)
+							captured.slotsByInventory[inventorySlot] = copy
 						end
-						NormalizeSlotData(copy)
-						captured.slotsByInventory[inventorySlot] = copy
-					elseif (not hasNext) and unresolvedEntry then
-						-- hasFallback is false here (otherwise the copy branch above
-						-- already ran). Prior blank + current blank: consecutive
-						-- independent empty observations confirm emptiness for this
-						-- slot without keeping the whole capture blended.
+					elseif unresolvedEntry then
+						-- hasFallback is false here. Prior blank + current blank:
+						-- consecutive independent empty observations confirm
+						-- emptiness for this slot without keeping the whole capture
+						-- blended.
+						NoteIndependentBlankObservation(entry, inventorySlot, inspectGeneration)
 						NormalizeSlotData(nextSlot)
 					else
 						NormalizeSlotData(nextSlot)
@@ -2417,6 +2631,7 @@ function RC:_HandleInspectReady(guid)
 					or (type(slotData) == "table" and slotData.texture)
 					or false
 				if not hasSlot then
+					NoteIndependentBlankObservation(entry, column.inventorySlot, inspectGeneration)
 					blended = true
 					break
 				end
@@ -2453,11 +2668,15 @@ function RC:_HandleInspectReady(guid)
 		local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
 		local policyConfig = (state.adhocRun and state.adhocRun.cfg) or GetLiveItemLevelConfig()
 		local policyResult = Policy and policyObs and Policy.EvaluateObservation(policyObs, policyConfig) or nil
+		local hasEquipmentAuthority = self:_InspectRequestHasEquipmentAuthority(active)
 		-- Blended captures merge prior partial evidence and must not become
-		-- authoritative fresh or same-session last-good observations.
+		-- authoritative fresh or same-session last-good observations. In-flight
+		-- responses stamped before a later equipment authority invalidation are
+		-- also non-authoritative even when the capture looks complete.
 		local authoritativeComplete = policyResult
 			and policyResult.complete == true
 			and captured.blended ~= true
+			and hasEquipmentAuthority
 		if authoritativeComplete and active.id then
 			state.lastGood = state.lastGood or {}
 			state.lastGood[active.id] = {
@@ -2485,7 +2704,8 @@ function RC:_HandleInspectReady(guid)
 					player.lastGood = state.lastGood[active.id]
 					CheckRun.NoteProgress(state.adhocRun, now)
 				else
-					local reason = (captured.blended == true and "blended")
+					local reason = (not hasEquipmentAuthority and "authority_invalidated")
+						or (captured.blended == true and "blended")
 						or (policyResult and policyResult.incompleteReason)
 						or "incomplete"
 					player.lastIncompleteReason = reason
@@ -2504,15 +2724,21 @@ function RC:_HandleInspectReady(guid)
 					elseif player.nextPendingRetryAt then
 						entry.nextRetryAt = player.nextPendingRetryAt
 					end
+					-- Authority-invalidated in-flight work should retry soon so a
+					-- post-change inspect can converge without waiting a full TTL.
+					if not hasEquipmentAuthority and not entry.nextRetryAt then
+						entry.nextRetryAt = now + 0.25
+					end
 					if SF.Debug and SF.Debug.Verbose then
 						SF.Debug:Verbose(
 							"RAID_CHECK",
-							"Inspect attempt %s for %s (reason=%s blended=%s nextRetry=%s progress=%s)",
+							"Inspect attempt %s for %s (reason=%s blended=%s authority=%s nextRetry=%s progress=%s)",
 							tostring(kind),
 							tostring(active.id),
 							tostring(reason),
 							tostring(entry.blended == true),
-							tostring(player.nextPendingRetryAt),
+							tostring(hasEquipmentAuthority),
+							tostring(player.nextPendingRetryAt or entry.nextRetryAt),
 							tostring(countsAsProgress)
 						)
 					end
@@ -2614,6 +2840,7 @@ function RC:_ProcessInspectQueue()
 					})
 					issued.unit = unit
 					issued.source = item.source
+					self:_StampInspectRequestAuthority(issued, now)
 				else
 					state.active = {
 						key = item.key,
@@ -2624,6 +2851,7 @@ function RC:_ProcessInspectQueue()
 						requestedAt = now,
 						source = item.source,
 					}
+					self:_StampInspectRequestAuthority(state.active, now)
 				end
 
 				local entry = self:_GetInspectCacheEntryByAliases(item.aliases) or {}

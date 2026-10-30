@@ -322,6 +322,7 @@ local function beginAdhocInspect(state, memberId, guid)
 		runId = state.adhocRun.id,
 	})
 	state.active.unit = "raid1"
+	RC:_StampInspectRequestAuthority(state.active, nowTime)
 end
 
 local function inspectReadyOnce(state, memberId, guid)
@@ -329,6 +330,13 @@ local function inspectReadyOnce(state, memberId, guid)
 	RC:_HandleInspectReady(guid)
 	nowTime = nowTime + 1
 	return state.cache[memberId], state.lastGood[memberId], state.adhocRun.players[memberId]
+end
+
+local function expireInspectInventoryGrace(state)
+	local req = state.active or state.retired
+	if req then
+		req.inventoryGraceUntil = (nowTime or 0) - 1
+	end
 end
 
 -- ---------------------------------------------------------------------------
@@ -425,14 +433,7 @@ state.adhocRun = CheckRun.NewRun({
 	expectedSessionId = "SES-A",
 	now = nowTime,
 })
-CheckRun.IssueInspect(state, {
-	guid = guid,
-	id = memberId,
-	aliases = { guid, memberId },
-	requestedAt = nowTime,
-	runId = state.adhocRun.id,
-})
-state.active.unit = "raid1"
+beginAdhocInspect(state, memberId, guid)
 
 RC:_HandleInspectReady(guid)
 
@@ -451,15 +452,8 @@ assertEq(blendedClass.class, CheckRun.CLASS.INSPECTION_FAILED, "blended capture 
 inventoryByUnit.raid1 = fillAllSlots()
 state.cache[memberId] = nil
 state.cache[guid] = nil
-CheckRun.IssueInspect(state, {
-	guid = guid,
-	id = memberId,
-	aliases = { guid, memberId },
-	requestedAt = nowTime + 1,
-	runId = state.adhocRun.id,
-})
-state.active.unit = "raid1"
 nowTime = nowTime + 1
+beginAdhocInspect(state, memberId, guid)
 RC:_HandleInspectReady(guid)
 
 assertTrue(state.lastGood[memberId] ~= nil, "complete non-blended InspectReady writes lastGood")
@@ -478,13 +472,7 @@ inventoryByUnit.raid1 = {
 	[INVSLOT_HEAD] = slotLink(INVSLOT_HEAD),
 	-- remaining tracked slots intentionally empty / unresolved
 }
-CheckRun.IssueInspect(state, {
-	guid = guid,
-	id = memberId,
-	aliases = { guid, memberId },
-	requestedAt = nowTime,
-})
-state.active.unit = "raid1"
+beginAdhocInspect(state, memberId, guid)
 RC:_HandleInspectReady(guid)
 assertEq(state.lastGood[memberId], nil, "first partial capture with empty tracked slots does not invent complete lastGood")
 assertEq(state.cache[memberId].blended, true, "first partial capture with empty tracked slots remains blended/unresolved")
@@ -587,6 +575,295 @@ assertTrue(missingOhGood.policy and missingOhGood.policy.prepared == false, "mis
 local missingOhClass = CheckRun.ClassifyPlayer(missingOhPlayer, nowTime, missingOhGood, "SES-A")
 assertEq(missingOhClass.class, CheckRun.CLASS.UNPREPARED, "authoritative missing off-hand classifies Unprepared")
 assertTrue(missingOhClass.countsForPot, "authoritative missing off-hand counts for Reward Pot")
+
+-- ---------------------------------------------------------------------------
+-- 6) Equipped off-hand -> 2H out of range (no UNIT_INVENTORY_CHANGED) retires
+--    copied evidence after independent blank inspects
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+memberId = "Remote-Realm"
+guid = "Player-1-REMOTE"
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, priorGood, priorPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(priorGood ~= nil, "1H+off-hand baseline writes authoritative lastGood")
+assertEq(priorGood.policy and priorGood.policy.prepared, true, "1H+off-hand baseline is Prepared")
+local oldPolicyPrepared = priorGood.policy.prepared
+priorPlayer.freshObservation = {
+	complete = true,
+	policy = priorGood.policy,
+	observation = priorGood.observation,
+	capturedAt = priorGood.capturedAt,
+}
+
+-- Player switches to 2H out of observable range: no inventory invalidation.
+setMainHandIdentity("INVTYPE_2HWEAPON", 2, 8)
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+
+local firstBlankCache = inspectReadyOnce(state, memberId, guid)
+assertEq(firstBlankCache.blended, true, "first blank over previously equipped off-hand stays blended (copied evidence)")
+assertTrue(
+	type(firstBlankCache.slotsByInventory[INVSLOT_OFFHAND]) == "table"
+		and firstBlankCache.slotsByInventory[INVSLOT_OFFHAND].copiedEvidence == true,
+	"first blank copies prior off-hand and marks copiedEvidence"
+)
+assertEq(state.lastGood[memberId], priorGood, "first blank does not replace same-session lastGood yet")
+
+local secondBlankCache, secondBlankGood, secondBlankPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(secondBlankCache.blended ~= true, "second independent blank retires copied off-hand evidence")
+local retiredOffHand = secondBlankCache.slotsByInventory[INVSLOT_OFFHAND]
+assertTrue(
+	type(retiredOffHand) ~= "table"
+		or (not retiredOffHand.link and not retiredOffHand.texture and not retiredOffHand.copiedEvidence),
+	"retired off-hand slot is genuinely empty after two independent blanks"
+)
+assertTrue(secondBlankGood ~= nil, "confirmed 2H empty-offhand after retiring copy writes new lastGood")
+assertEq(secondBlankGood.complete, true, "confirmed 2H empty-offhand after retiring copy is complete")
+assertTrue(
+	secondBlankPlayer.freshObservation and secondBlankPlayer.freshObservation.complete == true,
+	"confirmed 2H empty-offhand sets fresh complete observation"
+)
+local switchedClass = CheckRun.ClassifyPlayer(secondBlankPlayer, nowTime, secondBlankGood, "SES-A")
+assertEq(switchedClass.class, CheckRun.CLASS.PREPARED, "authoritative current 2H empty-offhand classifies Prepared")
+assertEq(switchedClass.verified, CheckRun.VERIFIED.FRESH, "authoritative current 2H empty-offhand is Fresh Verified")
+assertTrue(
+	secondBlankGood ~= priorGood,
+	"confirmed equipment replaces the previous same-session lastGood entry"
+)
+assertTrue(oldPolicyPrepared == true, "baseline Prepared flag preserved for comparison sanity")
+
+-- Existing same-session lastGood cannot override subsequently confirmed different equipment.
+secondBlankPlayer.freshObservation = nil
+CheckRun.MarkAttempt(secondBlankPlayer, "timeout", true, nowTime)
+secondBlankPlayer.currentlyInspectable = false
+secondBlankPlayer.rangeOnlyFailure = true
+local afterConfirmFallback = CheckRun.ClassifyPlayer(secondBlankPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(afterConfirmFallback.class, CheckRun.CLASS.PREPARED, "fallback after 2H confirmation uses the new observation")
+assertEq(afterConfirmFallback.verified, CheckRun.VERIFIED.RECENT, "fallback after 2H confirmation is Recently Verified")
+
+-- ---------------------------------------------------------------------------
+-- 7) Temporary missing equipment data does not produce a false empty conclusion
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+prior = makePriorEntry(memberId, guid)
+RC:_StoreInspectCacheEntry(prior, prior.aliases)
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local oneBlankCache = inspectReadyOnce(state, memberId, guid)
+assertEq(oneBlankCache.blended, true, "single temporary blank over equipped off-hand stays blended")
+assertEq(state.lastGood[memberId], nil, "single temporary blank does not write authoritative emptiness")
+assertTrue(
+	oneBlankCache.slotsByInventory[INVSLOT_OFFHAND]
+		and oneBlankCache.slotsByInventory[INVSLOT_OFFHAND].copiedEvidence == true,
+	"single temporary blank retains copied equipped evidence"
+)
+
+-- ---------------------------------------------------------------------------
+-- 8) Gear change while NotifyInspect is outstanding: delayed obsolete response
+--    cannot restore stale lastGood / freshObservation
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, liveGood, livePlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(liveGood ~= nil, "pre-change inspect writes lastGood")
+livePlayer.freshObservation = {
+	complete = true,
+	policy = liveGood.policy,
+	observation = liveGood.observation,
+	capturedAt = liveGood.capturedAt,
+}
+
+-- Outstanding NotifyInspect stamped at the pre-change authority generation.
+beginAdhocInspect(state, memberId, guid)
+local outstandingGeneration = state.active.equipmentAuthorityGeneration
+assertTrue(outstandingGeneration ~= nil, "outstanding inspect is stamped with equipment authority generation")
+
+-- Genuine gear-change signal after inspect inventory grace: clears lastGood and
+-- bumps authority so the delayed pre-change response is non-authoritative.
+expireInspectInventoryGrace(state)
+RC:_InvalidateInspectUnit("raid1")
+assertEq(state.lastGood[memberId], nil, "gear change during outstanding inspect clears lastGood")
+assertEq(livePlayer.freshObservation, nil, "gear change during outstanding inspect clears freshObservation")
+assertTrue(
+	RC:_CurrentEquipmentAuthorityGeneration({ guid, memberId }) > outstandingGeneration,
+	"gear change during outstanding inspect bumps equipment authority generation"
+)
+assertTrue(state.active ~= nil, "gear change does not cancel the outstanding inspect request itself")
+assertEq(
+	RC:_InspectRequestHasEquipmentAuthority(state.active),
+	false,
+	"outstanding inspect loses equipment authority after gear-change invalidation"
+)
+
+-- Delayed pre-change response still describes the old full kit.
+inventoryByUnit.raid1 = fillAllSlots()
+RC:_HandleInspectReady(guid)
+assertEq(state.lastGood[memberId], nil, "delayed obsolete INSPECT_READY does not restore lastGood")
+assertTrue(
+	not (state.adhocRun.players[memberId].freshObservation
+		and state.adhocRun.players[memberId].freshObservation.complete),
+	"delayed obsolete INSPECT_READY does not restore fresh complete observation"
+)
+assertTrue(type(state.cache[memberId]) == "table", "delayed obsolete INSPECT_READY may still update troubleshooting cache")
+assertEq(
+	state.adhocRun.players[memberId].lastIncompleteReason,
+	"authority_invalidated",
+	"delayed obsolete INSPECT_READY records authority_invalidated"
+)
+
+-- A later inspect under the new generation can become authoritative again.
+nowTime = nowTime + 1
+inventoryByUnit.raid1 = fillAllSlots()
+local _, recoveredGood2, recoveredPlayer2 = inspectReadyOnce(state, memberId, guid)
+assertTrue(recoveredGood2 ~= nil, "post-invalidation inspect under new authority generation writes lastGood")
+assertTrue(
+	recoveredPlayer2.freshObservation and recoveredPlayer2.freshObservation.complete == true,
+	"post-invalidation inspect sets fresh complete observation"
+)
+
+-- ---------------------------------------------------------------------------
+-- 9) Normal inspect-related inventory notifications still allow INSPECT_READY
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+beginAdhocInspect(state, memberId, guid)
+local stampedBeforeNoise = state.active.equipmentAuthorityGeneration
+-- Inventory notification inside grace (NotifyInspect payload noise).
+RC:_InvalidateInspectUnit("raid1")
+assertEq(
+	RC:_CurrentEquipmentAuthorityGeneration({ guid, memberId }),
+	stampedBeforeNoise,
+	"inspect-driven inventory noise does not bump equipment authority generation"
+)
+assertTrue(state.active ~= nil, "inspect-driven inventory noise leaves the active inspect intact")
+RC:_HandleInspectReady(guid)
+assertTrue(state.lastGood[memberId] ~= nil, "INSPECT_READY after inspect-driven inventory noise writes lastGood")
+assertTrue(
+	state.adhocRun.players[memberId].freshObservation
+		and state.adhocRun.players[memberId].freshObservation.complete == true,
+	"INSPECT_READY after inspect-driven inventory noise sets fresh complete observation"
+)
+
+-- ---------------------------------------------------------------------------
+-- 10) Ordinary late-ready-after-timeout remains safe
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+beginAdhocInspect(state, memberId, guid)
+local lateKey = state.active.key or guid
+local lateRequestedAt = state.active.requestedAt
+CheckRun.RetireActive(state, "timeout")
+assertEq(state.active, nil, "timeout retires the active inspect")
+assertTrue(state.retired ~= nil, "timeout keeps retired current request for late ready")
+-- Keep grace so accompanying inspect inventory noise cannot bump under the late ready.
+assertTrue(
+	RC:_IsWithinInspectInventoryGrace("raid1", nowTime),
+	"retired-current request retains inventory grace for late ready"
+)
+local canAccept, acceptReason = CheckRun.CanAcceptInspectReady(state, guid)
+assertEq(canAccept, true, "late ready after timeout remains acceptable")
+assertEq(acceptReason, "retired_current", "late ready binds to retired current generation")
+RC:_HandleInspectReady(guid)
+assertTrue(state.lastGood[memberId] ~= nil, "late ready after timeout can still write authoritative lastGood")
+assertTrue(
+	state.adhocRun.players[memberId].freshObservation
+		and state.adhocRun.players[memberId].freshObservation.complete == true,
+	"late ready after timeout sets fresh complete observation"
+)
+-- Old timeout callback must not disrupt newer work: issue a successor, then fire the old timeout.
+beginAdhocInspect(state, memberId, guid)
+local successorGeneration = state.active.generation
+RC:_HandleInspectTimeout(lateKey, lateRequestedAt)
+assertTrue(state.active ~= nil, "stale timeout callback does not clear a newer active inspect")
+assertEq(state.active.generation, successorGeneration, "stale timeout callback leaves successor generation intact")
+state.active = nil
+state.retired = nil
+
+-- ---------------------------------------------------------------------------
+-- 11) Retries terminate; no request/timer storms after authority invalidation
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local notifyCount = 0
+local originalNotify = NotifyInspect
+NotifyInspect = function()
+	notifyCount = notifyCount + 1
+end
+local timerCount = 0
+C_Timer = {
+	After = function(_, cb)
+		timerCount = timerCount + 1
+		-- Do not auto-fire callbacks; assert scheduling stays bounded.
+		if type(cb) ~= "function" then
+			fail("timeout callback should be a function")
+		end
+	end,
+}
+
+for _ = 1, 6 do
+	RC:_QueueInspectForUnit("raid1", { id = memberId }, nil)
+	if state.active then
+		expireInspectInventoryGrace(state)
+		RC:_InvalidateInspectUnit("raid1", { clearLastGood = true })
+		inventoryByUnit.raid1 = fillAllSlots()
+		RC:_HandleInspectReady(guid)
+	end
+	nowTime = nowTime + 1
+	-- Allow pending retry gates to elapse between forced attempts.
+	local cacheEntry = state.cache[memberId]
+	if cacheEntry then
+		cacheEntry.nextRetryAt = nil
+	end
+	local player = state.adhocRun.players[memberId]
+	if player then
+		player.nextPendingRetryAt = nil
+	end
+end
+NotifyInspect = originalNotify
+C_Timer = nil
+assertTrue(notifyCount <= CheckRun.PER_TARGET_ATTEMPT_CAP + 2, "NotifyInspect remains bounded across invalidation retries")
+assertTrue(timerCount <= notifyCount + 2, "inspect timeout timers remain bounded with NotifyInspect")
+assertTrue(notifyCount >= 1, "invalidation recovery still issues at least one inspect")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
