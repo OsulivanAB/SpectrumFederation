@@ -2358,6 +2358,18 @@ function RC:_HandleInspectReady(guid)
 		-- slots missing link/texture temporarily). Prefer the new snapshot where
 		-- it has real data, but do not overwrite a previously-known slot with a
 		-- completely blank result.
+		--
+		-- Empty-slot authority:
+		-- 1) First blank for a tracked slot stays non-authoritative (blended):
+		--    inspect data may still be arriving.
+		-- 2) Copying previously equipped evidence into a blank slot keeps the
+		--    capture blended; never manufacture authoritative emptiness from a
+		--    temporary blank over old gear.
+		-- 3) Two consecutive independent blanks for the same slot (prior blank +
+		--    current blank, with no copied equipped evidence) confirm the slot
+		--    is empty. That confirmation alone does not force blended=true, so a
+		--    legitimate empty off-hand with a two-handed main-hand can become
+		--    authoritative. Policy then decides Prepared vs Unprepared.
 		local blended = false
 		local fallbackEntry = RC.InspectFallbackEntry(entry)
 		local unresolvedEntry = RC.InspectUnresolvedEntry(entry)
@@ -2372,7 +2384,8 @@ function RC:_HandleInspectReady(guid)
 					if (not hasNext) and hasFallback then
 						-- Copying prior equipped evidence, including from a blended
 						-- entry, keeps the observation non-authoritative until a
-						-- later inspect independently confirms the slot is empty.
+						-- later inspect independently shows equipped data again or
+						-- cache invalidation clears the old evidence.
 						blended = true
 						local copy = {}
 						for key, value in pairs(fallbackSlot) do
@@ -2381,9 +2394,10 @@ function RC:_HandleInspectReady(guid)
 						NormalizeSlotData(copy)
 						captured.slotsByInventory[inventorySlot] = copy
 					elseif (not hasNext) and unresolvedEntry then
-						-- A prior blended blank followed by another blank is not
-						-- proof the slot is empty; keep the observation unresolved.
-						blended = true
+						-- hasFallback is false here (otherwise the copy branch above
+						-- already ran). Prior blank + current blank: consecutive
+						-- independent empty observations confirm emptiness for this
+						-- slot without keeping the whole capture blended.
 						NormalizeSlotData(nextSlot)
 					else
 						NormalizeSlotData(nextSlot)

@@ -77,7 +77,7 @@ Raid Check still attempts a fresh inspect first. When that refresh cannot comple
 
 Rules that keep the fallback honest:
 
-- Incomplete or blended inspections are never treated as complete authoritative evidence.
+- Incomplete or blended inspections are never treated as complete authoritative evidence. A first blank for a tracked slot stays non-authoritative; two consecutive independent blanks confirm emptiness (so a two-handed main-hand with a genuine empty off-hand can become authoritative). Copying previously equipped items into a blank slot keeps the capture blended.
 - Observations from a previous Loot Helper session are never reused on any fallback path.
 - A known equipped-gear change for that member invalidates their reusable last-good observation.
 - A fresh complete observation from this check always takes precedence.

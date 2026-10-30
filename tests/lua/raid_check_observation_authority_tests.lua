@@ -233,6 +233,16 @@ local function fillAllSlots()
 	return bag
 end
 
+local function fillSlotsExceptOffHand()
+	local bag = fillAllSlots()
+	bag[INVSLOT_OFFHAND] = nil
+	return bag
+end
+
+local function setMainHandIdentity(equipLoc, classId, subClassId)
+	SLOT_IDENTITY[INVSLOT_MAINHAND] = { equipLoc, classId, subClassId }
+end
+
 local function makePriorEntry(memberId, guid)
 	local slots = {}
 	for _, slot in ipairs(TRACKED_SLOTS) do
@@ -264,6 +274,17 @@ end
 function SF:GetActiveProfile()
 	return nil
 end
+SF.LootHelperSync = {
+	IsSessionActive = function()
+		return true
+	end,
+	GetSessionId = function()
+		return "SES-A"
+	end,
+	GetSessionProfileId = function()
+		return "profile-1"
+	end,
+}
 
 assert(loadfile("SpectrumFederation/modules/LootHelper/SpecWeapons.lua"))("SpectrumFederation", SF)
 assert(loadfile("SpectrumFederation/modules/RaidEquipment/Policy.lua"))("SpectrumFederation", SF)
@@ -281,6 +302,33 @@ local function resetState()
 		player = fillAllSlots(),
 		raid1 = fillAllSlots(),
 	}
+end
+
+local function beginAdhocInspect(state, memberId, guid)
+	state.adhocRun = state.adhocRun or CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	if not state.adhocRun.players[memberId] then
+		state.adhocRun.players[memberId] = CheckRun.NewPlayer(memberId)
+		state.adhocRun.targetIds[#state.adhocRun.targetIds + 1] = memberId
+	end
+	CheckRun.IssueInspect(state, {
+		guid = guid,
+		id = memberId,
+		aliases = { guid, memberId },
+		requestedAt = nowTime,
+		runId = state.adhocRun.id,
+	})
+	state.active.unit = "raid1"
+end
+
+local function inspectReadyOnce(state, memberId, guid)
+	beginAdhocInspect(state, memberId, guid)
+	RC:_HandleInspectReady(guid)
+	nowTime = nowTime + 1
+	return state.cache[memberId], state.lastGood[memberId], state.adhocRun.players[memberId]
 end
 
 -- ---------------------------------------------------------------------------
@@ -448,6 +496,97 @@ local fakeComplete = Policy.EvaluateObservation({
 	},
 }, { checkGemsInSockets = false, slots = {} })
 assertTrue(type(fakeComplete) == "table", "policy evaluation returns a result for the blended gate check")
+
+-- ---------------------------------------------------------------------------
+-- 3) Legitimate empty off-hand with two-handed main-hand can become authoritative
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_2HWEAPON", 2, 8)
+state = RC:_GetInspectState()
+memberId = "Remote-Realm"
+guid = "Player-1-REMOTE"
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+
+local firstCache = inspectReadyOnce(state, memberId, guid)
+assertEq(firstCache.blended, true, "first 2H empty-offhand capture stays blended/unresolved")
+assertEq(state.lastGood[memberId], nil, "first 2H empty-offhand capture is not yet authoritative")
+
+local secondCache, secondGood, secondPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(secondCache.blended ~= true, "second consecutive 2H empty-offhand capture is not blended")
+assertTrue(secondGood ~= nil, "second consecutive 2H empty-offhand capture writes lastGood")
+assertEq(secondGood.complete, true, "confirmed empty off-hand with 2H main-hand is a complete observation")
+assertTrue(
+	secondPlayer.freshObservation and secondPlayer.freshObservation.complete == true,
+	"confirmed empty off-hand sets fresh complete observation"
+)
+assertEq(secondPlayer.technicalFailure, false, "authoritative 2H empty-offhand clears technical failure")
+local twoHandClass = CheckRun.ClassifyPlayer(secondPlayer, nowTime, secondGood, "SES-A")
+assertEq(twoHandClass.class, CheckRun.CLASS.PREPARED, "authoritative 2H empty-offhand can classify Prepared")
+assertEq(twoHandClass.verified, CheckRun.VERIFIED.FRESH, "authoritative 2H empty-offhand is Fresh Verified")
+
+-- Out-of-range refresh failure still falls back to the same-session observation.
+CheckRun.MarkAttempt(secondPlayer, "timeout", true, nowTime)
+secondPlayer.currentlyInspectable = false
+secondPlayer.rangeOnlyFailure = true
+secondPlayer.freshObservation = nil
+local fallbackClass = CheckRun.ClassifyPlayer(secondPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(fallbackClass.class, CheckRun.CLASS.PREPARED, "same-session fallback works after authoritative 2H empty-offhand observation")
+assertEq(fallbackClass.verified, CheckRun.VERIFIED.RECENT, "post-authoritative OOR fallback is Recently Verified")
+
+-- ---------------------------------------------------------------------------
+-- 4) Previously equipped off-hand temporarily blank must not become authoritative
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+prior = makePriorEntry(memberId, guid)
+RC:_StoreInspectCacheEntry(prior, prior.aliases)
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local tempBlankCache = inspectReadyOnce(state, memberId, guid)
+assertEq(tempBlankCache.blended, true, "temporary blank over previously equipped off-hand stays blended")
+assertEq(state.lastGood[memberId], nil, "copied prior off-hand evidence does not manufacture authoritative completeness")
+
+-- A later full independent inspection recovers.
+inventoryByUnit.raid1 = fillAllSlots()
+local recoveredCache, recoveredGood, recoveredPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(recoveredCache.blended ~= true, "full inspection after blended state is not blended")
+assertTrue(recoveredGood ~= nil, "full inspection after blended state writes lastGood")
+assertTrue(
+	recoveredPlayer.freshObservation and recoveredPlayer.freshObservation.complete == true,
+	"full inspection after blended state sets fresh complete observation"
+)
+
+-- ---------------------------------------------------------------------------
+-- 5) One-handed main-hand with confirmed empty off-hand is authoritative Unprepared
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+inspectReadyOnce(state, memberId, guid)
+local missingOhCache, missingOhGood, missingOhPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(missingOhCache.blended ~= true, "confirmed empty off-hand on 1H setup is not blended")
+assertTrue(missingOhGood ~= nil, "confirmed empty off-hand on 1H setup writes lastGood")
+assertEq(missingOhGood.complete, true, "confirmed missing required off-hand is still a complete observation")
+assertTrue(missingOhGood.policy and missingOhGood.policy.prepared == false, "missing required off-hand is Unprepared")
+local missingOhClass = CheckRun.ClassifyPlayer(missingOhPlayer, nowTime, missingOhGood, "SES-A")
+assertEq(missingOhClass.class, CheckRun.CLASS.UNPREPARED, "authoritative missing off-hand classifies Unprepared")
+assertTrue(missingOhClass.countsForPot, "authoritative missing off-hand counts for Reward Pot")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
