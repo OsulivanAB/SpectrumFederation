@@ -1590,6 +1590,9 @@ function RC:CountTroubleshootingListeners()
 end
 
 -- Equipment observation authority (runtime inspect pipeline):
+-- Central fallback rule: a failed/incomplete refresh may reuse a prior complete
+-- same-session observation only when no sufficiently reliable newer evidence
+-- contradicts that observation.
 -- 1) Authority: only a complete, non-blended capture from an inspect request
 --    whose stamped equipmentAuthorityGeneration still matches the member's
 --    current generation may write lastGood / freshObservation. Cache entries
@@ -1597,19 +1600,19 @@ end
 --    exposed as verified equipment to Raid Check / Early Preparation consumers.
 -- 2) Invalidation: known gear-change signals clear member-scoped lastGood/fresh
 --    and bump that generation so earlier in-flight responses cannot restore
---    authority. During the active request's inventory grace, a remote
---    UNIT_INVENTORY_CHANGED invalidates only when live equipped item identity
---    observably conflicts with the request baseline (timing alone is not proof
---    of a benign inspect-payload update). Ready-time live-vs-capture reconcile
---    rejects a payload that disagrees with currently observable slot identity.
---    Residual Retail limit: when a real swap never yields a conflicting live
---    item id before an obsolete ready arrives, that ready may still look
---    consistent; document rather than invent a false guarantee.
--- 3) Copied evidence: blending may copy prior equipped slots into temporary
---    blanks for troubleshooting (never authoritative emptiness). Independent
---    blank observations across separate inspect generations retire that copy
---    after INDEPENDENT_BLANK_CONFIRMATIONS reads so legitimate empty slots
---    (including 2H + empty off-hand) can become authoritative.
+--    authority. During inventory grace, invalidate on observable equipped-id
+--    conflicts or newly equipped items over a previously confirmed-empty
+--    baseline (timing alone is not proof of benign inspect noise; live nil is
+--    not confirmed emptiness). Ready-time reconcile and reliable capture-vs-
+--    prior-lastGood comparison also retire contradicted fallback. Residual
+--    Retail limit: swaps that never expose conflicting live identity or
+--    independently confirmed presence changes before an obsolete ready may
+--    still look consistent.
+-- 3) Copied evidence / blanks: blending may copy prior equipped slots into
+--    temporary blanks for troubleshooting. Every tracked blank is counted per
+--    distinct inspect generation; the whole capture stays non-authoritative
+--    while any blank is below INDEPENDENT_BLANK_CONFIRMATIONS. Confirmed empty
+--    retires copied equipment and participates in presence-transition checks.
 
 local function SlotItemIdentity(slotData)
 	if type(slotData) ~= "table" then
@@ -1641,6 +1644,7 @@ local function BuildEquipmentSlotIdentityMapFromSlots(slotsByInventory)
 	return map
 end
 
+-- Equipped identity conflict when both sides report a positive item id.
 local function EquipmentSlotIdentityConflict(baseline, observed)
 	if type(baseline) ~= "table" or type(observed) ~= "table" then
 		return false
@@ -1654,6 +1658,45 @@ local function EquipmentSlotIdentityConflict(baseline, observed)
 	return false
 end
 
+-- Broader evidence conflict used for authority / fallback retirement:
+-- different equipped ids, confirmed-empty vs previously equipped, or newly
+-- equipped vs previously confirmed-empty. Unresolved/nil blanks are not
+-- confirmed emptiness and must not trigger this path alone.
+local function EquipmentEvidenceConflicts(priorEquipped, priorConfirmedEmpty, observedEquipped, observedConfirmedEmpty)
+	priorEquipped = priorEquipped or {}
+	priorConfirmedEmpty = priorConfirmedEmpty or {}
+	observedEquipped = observedEquipped or {}
+	observedConfirmedEmpty = observedConfirmedEmpty or {}
+
+	if EquipmentSlotIdentityConflict(priorEquipped, observedEquipped) then
+		return true
+	end
+	for inventorySlot, priorId in pairs(priorEquipped) do
+		if priorId and observedConfirmedEmpty[inventorySlot] then
+			return true
+		end
+	end
+	for inventorySlot in pairs(priorConfirmedEmpty) do
+		if observedEquipped[inventorySlot] then
+			return true
+		end
+	end
+	return false
+end
+
+local function CopyConfirmedEmptySlots(source)
+	local copy = {}
+	if type(source) ~= "table" then
+		return copy
+	end
+	for inventorySlot, confirmed in pairs(source) do
+		if confirmed and type(inventorySlot) == "number" then
+			copy[inventorySlot] = true
+		end
+	end
+	return copy
+end
+
 local function MarkCacheEntryAuthorityInvalidated(entry, now)
 	if type(entry) ~= "table" then
 		return
@@ -1661,6 +1704,7 @@ local function MarkCacheEntryAuthorityInvalidated(entry, now)
 	entry.authorityInvalidated = true
 	entry.independentBlankCounts = nil
 	entry.independentBlankGenerations = nil
+	entry.confirmedEmptySlots = nil
 	now = now or (GetTime and GetTime() or 0)
 	if not entry.nextRetryAt or entry.nextRetryAt > now + 0.25 then
 		entry.nextRetryAt = now + 0.25
@@ -1796,8 +1840,9 @@ end
 function RC:_BuildEquipmentBaselineForAliases(aliases)
 	local entry = self:_GetInspectCacheEntryByAliases(aliases)
 	local baseline = self:_BuildEquipmentSlotIdentityMapFromEntry(entry)
-	if next(baseline) then
-		return baseline
+	local confirmedEmpty = CopyConfirmedEmptySlots(entry and entry.confirmedEmptySlots)
+	if next(baseline) or next(confirmedEmpty) then
+		return baseline, confirmedEmpty
 	end
 	local state = self:_GetInspectState()
 	state.lastGood = state.lastGood or {}
@@ -1805,11 +1850,21 @@ function RC:_BuildEquipmentBaselineForAliases(aliases)
 		local lastGood = state.lastGood[alias]
 		local observation = lastGood and lastGood.observation or nil
 		baseline = BuildEquipmentSlotIdentityMapFromSlots(observation and observation.slotsByInventory)
-		if next(baseline) then
-			return baseline
+		confirmedEmpty = {}
+		if type(observation) == "table" and type(observation.slotsByInventory) == "table" then
+			for inventorySlot, slotData in pairs(observation.slotsByInventory) do
+				-- Prefer explicit empty markers from policy observations only.
+				-- Unresolved blanks must not be treated as confirmed emptiness.
+				if type(inventorySlot) == "number" and type(slotData) == "table" and slotData.empty == true then
+					confirmedEmpty[inventorySlot] = true
+				end
+			end
+		end
+		if next(baseline) or next(confirmedEmpty) then
+			return baseline, confirmedEmpty
 		end
 	end
-	return baseline
+	return baseline, confirmedEmpty
 end
 
 function RC:_StampInspectRequestAuthority(request, now)
@@ -1819,7 +1874,9 @@ function RC:_StampInspectRequestAuthority(request, now)
 	now = now or (GetTime and GetTime() or 0)
 	request.equipmentAuthorityGeneration = self:_CurrentEquipmentAuthorityGeneration(request.aliases)
 	request.inventoryGraceUntil = now + INSPECT_INVENTORY_GRACE_SECONDS
-	request.equipmentBaselineBySlot = self:_BuildEquipmentBaselineForAliases(request.aliases)
+	local baseline, confirmedEmpty = self:_BuildEquipmentBaselineForAliases(request.aliases)
+	request.equipmentBaselineBySlot = baseline
+	request.equipmentBaselineConfirmedEmpty = confirmedEmpty
 	request.inventoryObservedDuringGrace = nil
 end
 
@@ -1977,9 +2034,12 @@ function RC:_InvalidateInspectUnit(unit, opts)
 		local graceRequest = self:_GetInspectInventoryGraceRequest(unit)
 		if graceRequest then
 			local baseline = graceRequest.equipmentBaselineBySlot or {}
+			local baselineConfirmedEmpty = graceRequest.equipmentBaselineConfirmedEmpty or {}
 			local liveMap = self:_SampleLiveEquipmentSlotIdentityMap(unit)
-			if EquipmentSlotIdentityConflict(baseline, liveMap) then
-				opts = opts or {}
+			-- Live nil/blank slots are not confirmed emptiness (inspect data may
+			-- still be loading). Only conflicting equipped ids or newly observed
+			-- items over a previously confirmed-empty baseline invalidate here.
+			if EquipmentEvidenceConflicts(baseline, baselineConfirmedEmpty, liveMap, {}) then
 				-- Fall through into the normal clearLastGood / bump path.
 			else
 				graceRequest.inventoryObservedDuringGrace = true
@@ -2726,6 +2786,7 @@ function RC:_HandleInspectReady(guid)
 		local sourceEntry = fallbackEntry or unresolvedEntry
 		local fallbackSlots = sourceEntry and sourceEntry.slotsByInventory or nil
 		local inspectGeneration = active.generation
+		entry.confirmedEmptySlots = entry.confirmedEmptySlots or {}
 		if type(fallbackSlots) == "table" then
 			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
 				if type(inventorySlot) == "number" and type(fallbackSlot) == "table" then
@@ -2734,6 +2795,7 @@ function RC:_HandleInspectReady(guid)
 					local hasFallback = SlotHasAnyItemData(fallbackSlot) or fallbackSlot.texture or false
 					if hasNext then
 						ClearIndependentBlankObservation(entry, inventorySlot)
+						entry.confirmedEmptySlots[inventorySlot] = nil
 						NormalizeSlotData(nextSlot)
 					elseif hasFallback then
 						local blankCount = NoteIndependentBlankObservation(entry, inventorySlot, inspectGeneration)
@@ -2741,7 +2803,7 @@ function RC:_HandleInspectReady(guid)
 							-- Independently confirmed emptiness retires obsolete
 							-- copied equipment for this slot. Leave the fresh blank
 							-- in place and re-evaluate the resulting gear under Policy.
-							ClearIndependentBlankObservation(entry, inventorySlot)
+							entry.confirmedEmptySlots[inventorySlot] = true
 							NormalizeSlotData(nextSlot)
 						else
 							-- Keep troubleshooting evidence, but never treat a single
@@ -2757,11 +2819,14 @@ function RC:_HandleInspectReady(guid)
 						end
 					elseif unresolvedEntry then
 						-- hasFallback is false here. Prior blank + current blank:
-						-- consecutive independent empty observations confirm
-						-- emptiness for this slot without keeping the whole capture
-						-- blended.
-						NoteIndependentBlankObservation(entry, inventorySlot, inspectGeneration)
+						-- consecutive independent empty observations for this slot.
+						local blankCount = NoteIndependentBlankObservation(entry, inventorySlot, inspectGeneration)
 						NormalizeSlotData(nextSlot)
+						if blankCount >= INDEPENDENT_BLANK_CONFIRMATIONS then
+							entry.confirmedEmptySlots[inventorySlot] = true
+						else
+							blended = true
+						end
 					else
 						NormalizeSlotData(nextSlot)
 					end
@@ -2771,18 +2836,34 @@ function RC:_HandleInspectReady(guid)
 			for _, slotData in pairs(captured.slotsByInventory) do
 				NormalizeSlotData(slotData)
 			end
-			-- First capture has no prior evidence. A blank tracked slot may still
-			-- be an unequipped item whose inspect data has not arrived, so keep
-			-- the observation non-authoritative until a later inspect confirms it.
-			for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
-				local slotData = captured.slotsByInventory[column.inventorySlot]
-				local hasSlot = SlotHasAnyItemData(slotData)
+		end
+
+		-- Every tracked blank must be noted and remain non-authoritative until
+		-- that slot reaches INDEPENDENT_BLANK_CONFIRMATIONS distinct inspect
+		-- generations. Do not stop after the first blank. Copied fallback
+		-- evidence is still an unresolved blank for confirmation purposes.
+		for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+			local inventorySlot = column.inventorySlot
+			local slotData = captured.slotsByInventory[inventorySlot]
+			local copied = type(slotData) == "table" and slotData.copiedEvidence == true
+			local hasSlot = (not copied)
+				and (
+					SlotHasAnyItemData(slotData)
 					or (type(slotData) == "table" and slotData.texture)
 					or false
-				if not hasSlot then
-					NoteIndependentBlankObservation(entry, column.inventorySlot, inspectGeneration)
+				)
+			if hasSlot then
+				ClearIndependentBlankObservation(entry, inventorySlot)
+				entry.confirmedEmptySlots[inventorySlot] = nil
+			elseif entry.confirmedEmptySlots[inventorySlot] then
+				-- Already independently confirmed empty; keep authority eligibility
+				-- for this slot without reopening the streak.
+			else
+				local blankCount = NoteIndependentBlankObservation(entry, inventorySlot, inspectGeneration)
+				if (not copied) and blankCount >= INDEPENDENT_BLANK_CONFIRMATIONS then
+					entry.confirmedEmptySlots[inventorySlot] = true
+				else
 					blended = true
-					break
 				end
 			end
 		end
@@ -2818,14 +2899,102 @@ function RC:_HandleInspectReady(guid)
 		local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
 		local policyConfig = (state.adhocRun and state.adhocRun.cfg) or GetLiveItemLevelConfig()
 		local policyResult = Policy and policyObs and Policy.EvaluateObservation(policyObs, policyConfig) or nil
+
+		-- Reliable evidence from this capture (exclude copied troubleshooting fills).
+		local reliableEquipped = {}
+		for inventorySlot, slotData in pairs(captured.slotsByInventory or {}) do
+			if type(inventorySlot) == "number"
+				and type(slotData) == "table"
+				and slotData.copiedEvidence ~= true
+			then
+				local itemId = SlotItemIdentity(slotData)
+				if itemId then
+					reliableEquipped[inventorySlot] = itemId
+				end
+			end
+		end
+		local reliableConfirmedEmpty = CopyConfirmedEmptySlots(entry.confirmedEmptySlots)
+
+		-- Central fallback rule: retire member-scoped lastGood / attached fresh
+		-- snapshots when newer trustworthy evidence contradicts the prior
+		-- authoritative observation. Unresolved stubs and copied fills do not
+		-- count as contradictions.
+		local priorEquipped = active.equipmentBaselineBySlot or {}
+		local priorConfirmedEmpty = active.equipmentBaselineConfirmedEmpty or {}
+		local priorGood = active.id and state.lastGood and state.lastGood[active.id] or nil
+		if priorGood and priorGood.observation and priorGood.observation.slotsByInventory then
+			local fromGood = BuildEquipmentSlotIdentityMapFromSlots(priorGood.observation.slotsByInventory)
+			if next(fromGood) then
+				priorEquipped = fromGood
+			end
+			for inventorySlot, slotData in pairs(priorGood.observation.slotsByInventory) do
+				if type(inventorySlot) == "number" and type(slotData) == "table" and slotData.empty == true then
+					priorConfirmedEmpty[inventorySlot] = true
+				end
+			end
+		end
+
+		local contradictedPrior = EquipmentEvidenceConflicts(
+			priorEquipped,
+			priorConfirmedEmpty,
+			reliableEquipped,
+			reliableConfirmedEmpty
+		)
+		if not contradictedPrior and priorGood and priorGood.observation then
+			-- Policy-relevant reliable property change on the same item (for
+			-- example a fully resolved link that lost a required enchant).
+			for inventorySlot, priorSlot in pairs(priorGood.observation.slotsByInventory or {}) do
+				local nextSlot = captured.slotsByInventory and captured.slotsByInventory[inventorySlot]
+				if type(inventorySlot) == "number"
+					and type(priorSlot) == "table"
+					and type(nextSlot) == "table"
+					and nextSlot.copiedEvidence ~= true
+				then
+					local priorId = SlotItemIdentity(priorSlot) or tonumber(priorSlot.itemId)
+					local nextId = SlotItemIdentity(nextSlot)
+					if priorId and nextId and priorId == nextId
+						and type(nextSlot.link) == "string"
+						and nextSlot.link ~= ""
+						and not IsSlotLinkPotentiallyIncomplete(captured.slotsByInventory, inventorySlot)
+					then
+						local priorHadEnchant = priorSlot.hasEnchant == true
+							or (tonumber(priorSlot.enchantId) or 0) > 0
+						if priorHadEnchant and not HasEnchant(nextSlot.link) then
+							contradictedPrior = true
+							break
+						end
+					end
+				end
+			end
+		end
+		if contradictedPrior then
+			local aliases = active.aliases
+			if active.id then
+				aliases = { active.id }
+				for _, key in ipairs(active.aliases or {}) do
+					aliases[#aliases + 1] = key
+				end
+			end
+			self:_InvalidateLastGoodForAliases(aliases)
+		end
+
 		local hasEquipmentAuthority = self:_InspectRequestHasEquipmentAuthority(active)
 		-- Ready-time reconcile: if currently observable equipped identity already
 		-- disagrees with this payload, the response is obsolete relative to live
 		-- gear even when the request generation was not bumped earlier.
 		if hasEquipmentAuthority and unit then
 			local captureIdentity = BuildEquipmentSlotIdentityMapFromSlots(captured.slotsByInventory)
+			-- Ignore copied fills when comparing the capture side.
+			for inventorySlot, slotData in pairs(captured.slotsByInventory or {}) do
+				if type(slotData) == "table" and slotData.copiedEvidence == true then
+					captureIdentity[inventorySlot] = nil
+				end
+			end
 			local liveIdentity = self:_SampleLiveEquipmentSlotIdentityMap(unit)
-			if EquipmentSlotIdentityConflict(captureIdentity, liveIdentity) then
+			local captureConfirmedEmpty = CopyConfirmedEmptySlots(entry.confirmedEmptySlots)
+			-- Live nil blanks are not confirmed emptiness. Confirmed-empty in the
+			-- capture versus a newly live equipped item is a presence conflict.
+			if EquipmentEvidenceConflicts(captureIdentity, captureConfirmedEmpty, liveIdentity, {}) then
 				self:_BumpEquipmentAuthorityGeneration(active.aliases)
 				if active.id then
 					self:_InvalidateLastGoodForAliases({ active.id })
@@ -4368,10 +4537,13 @@ function RC:_ApplyCheckConsequences(run)
 			end
 			summaryMissing[#summaryMissing + 1] = entry
 		elseif classId == CheckRun.CLASS.PREPARED then
-			if classified.verified == CheckRun.VERIFIED.RECENT then
+			if classified.verified == CheckRun.VERIFIED.SESSION
+				or classified.verified == CheckRun.VERIFIED.RECENT
+			then
 				summaryRecent[#summaryRecent + 1] = {
 					name = info.short or ShortName(memberId),
 					displayName = displayName,
+					verified = classified.verified,
 				}
 			end
 			if mode == "raid" and member then
@@ -4468,9 +4640,32 @@ function RC:_ApplyCheckConsequences(run)
 	local label = ModeLabel(mode)
 	EmitAdminMissingSummary(label, summaryMissing)
 	EmitAdminInspectionFailedSummary(label, summaryFailed)
-	if #summaryRecent > 0 then
-		EmitAdminDebug(string.format("[%s] Recently Verified (range-only, last-good within 120s):", label))
-		for _, entry in ipairs(summaryRecent) do
+	local summarySession = {}
+	local summaryLegacyRecent = {}
+	for _, entry in ipairs(summaryRecent) do
+		if entry.verified == CheckRun.VERIFIED.SESSION then
+			summarySession[#summarySession + 1] = entry
+		else
+			summaryLegacyRecent[#summaryLegacyRecent + 1] = entry
+		end
+	end
+	if #summarySession > 0 then
+		EmitAdminDebug(string.format(
+			"[%s] Recently Verified (same-session, last-good within %dm):",
+			label,
+			math.floor((CheckRun.SESSION_LAST_GOOD_SECONDS or 0) / 60)
+		))
+		for _, entry in ipairs(summarySession) do
+			EmitAdminDebug(string.format("  %s", entry.displayName or entry.name))
+		end
+	end
+	if #summaryLegacyRecent > 0 then
+		EmitAdminDebug(string.format(
+			"[%s] Recently Verified (range-only, last-good within %ds):",
+			label,
+			tonumber(CheckRun.RECENT_GOOD_SECONDS) or 120
+		))
+		for _, entry in ipairs(summaryLegacyRecent) do
 			EmitAdminDebug(string.format("  %s", entry.displayName or entry.name))
 		end
 	end

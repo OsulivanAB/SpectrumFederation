@@ -540,7 +540,7 @@ secondPlayer.rangeOnlyFailure = true
 secondPlayer.freshObservation = nil
 local fallbackClass = CheckRun.ClassifyPlayer(secondPlayer, nowTime, state.lastGood[memberId], "SES-A")
 assertEq(fallbackClass.class, CheckRun.CLASS.PREPARED, "same-session fallback works after authoritative 2H empty-offhand observation")
-assertEq(fallbackClass.verified, CheckRun.VERIFIED.RECENT, "post-authoritative OOR fallback is Recently Verified")
+assertEq(fallbackClass.verified, CheckRun.VERIFIED.SESSION, "post-authoritative OOR fallback is same-session Recently Verified")
 
 -- ---------------------------------------------------------------------------
 -- 4) Previously equipped off-hand temporarily blank must not become authoritative
@@ -661,7 +661,7 @@ secondBlankPlayer.currentlyInspectable = false
 secondBlankPlayer.rangeOnlyFailure = true
 local afterConfirmFallback = CheckRun.ClassifyPlayer(secondBlankPlayer, nowTime, state.lastGood[memberId], "SES-A")
 assertEq(afterConfirmFallback.class, CheckRun.CLASS.PREPARED, "fallback after 2H confirmation uses the new observation")
-assertEq(afterConfirmFallback.verified, CheckRun.VERIFIED.RECENT, "fallback after 2H confirmation is Recently Verified")
+assertEq(afterConfirmFallback.verified, CheckRun.VERIFIED.SESSION, "fallback after 2H confirmation is same-session Recently Verified")
 
 -- ---------------------------------------------------------------------------
 -- 7) Temporary missing equipment data does not produce a false empty conclusion
@@ -977,7 +977,187 @@ state.active = nil
 state.retired = nil
 
 -- ---------------------------------------------------------------------------
--- 11) Retries terminate; no request/timer storms after authority invalidation
+-- 11) Multiple blank tracked slots are confirmed independently
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_2HWEAPON", 2, 8)
+state = RC:_GetInspectState()
+memberId = "Remote-Realm"
+guid = "Player-1-REMOTE"
+local multiBlank = fillSlotsExceptOffHand()
+multiBlank[INVSLOT_TRINKET2] = nil
+inventoryByUnit.raid1 = multiBlank
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local firstMulti = inspectReadyOnce(state, memberId, guid)
+assertEq(firstMulti.blended, true, "first multi-blank capture stays blended")
+assertTrue(
+	(firstMulti.independentBlankCounts[INVSLOT_OFFHAND] or 0) >= 1
+		and (firstMulti.independentBlankCounts[INVSLOT_TRINKET2] or 0) >= 1,
+	"first inspect records independent blank counts for every blank tracked slot"
+)
+assertEq(state.lastGood[memberId], nil, "first multi-blank capture is not authoritative")
+
+-- Second inspect still blanks both: both can confirm. Keep 2H for OH legitimacy.
+local secondMulti, secondMultiGood = inspectReadyOnce(state, memberId, guid)
+-- Off-hand can confirm with 2H, but missing trinket should make policy Unprepared
+-- only once both blanks are confirmed and the capture is non-blended.
+assertTrue(secondMulti.blended ~= true, "second inspect confirms every previously blank slot")
+assertTrue(secondMultiGood ~= nil, "fully confirmed multi-blank capture can write lastGood")
+assertTrue(secondMulti.confirmedEmptySlots[INVSLOT_OFFHAND], "off-hand is independently confirmed empty")
+assertTrue(secondMulti.confirmedEmptySlots[INVSLOT_TRINKET2], "trinket2 is independently confirmed empty")
+
+-- New blank appearing only on a later inspect needs its own two generations.
+resetState()
+setMainHandIdentity("INVTYPE_2HWEAPON", 2, 8)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+inspectReadyOnce(state, memberId, guid)
+local _, confirmedOhGood = inspectReadyOnce(state, memberId, guid)
+assertTrue(confirmedOhGood ~= nil, "confirmed 2H empty-offhand writes lastGood before a new blank appears")
+
+-- Third inspect: introduce a new blank trinket while OH stays empty.
+local withNewBlank = fillSlotsExceptOffHand()
+withNewBlank[INVSLOT_TRINKET2] = nil
+inventoryByUnit.raid1 = withNewBlank
+local lastGoodBeforeNewBlank = state.lastGood[memberId]
+local newBlankCache = inspectReadyOnce(state, memberId, guid)
+assertEq(newBlankCache.blended, true, "new blank slot on later inspect keeps capture non-authoritative")
+assertTrue(
+	(newBlankCache.independentBlankCounts[INVSLOT_TRINKET2] or 0) == 1,
+	"new blank slot starts its own independent confirmation streak"
+)
+assertTrue(
+	not (newBlankCache.confirmedEmptySlots and newBlankCache.confirmedEmptySlots[INVSLOT_TRINKET2]),
+	"new blank slot is not confirmed empty after only one independent observation"
+)
+assertTrue(
+	state.lastGood[memberId] == lastGoodBeforeNewBlank
+		or state.lastGood[memberId] == nil,
+	"unconfirmed new blank does not write a fabricated complete observation for the new empty slot"
+)
+local secondNewBlank, secondNewBlankGood = inspectReadyOnce(state, memberId, guid)
+assertTrue(secondNewBlank.blended ~= true, "new blank becomes authoritative only after its second independent confirmation")
+assertTrue(secondNewBlank.confirmedEmptySlots[INVSLOT_TRINKET2], "new blank slot is confirmed empty on its second generation")
+assertTrue(secondNewBlankGood ~= nil, "second confirmation of the new blank can write authoritative lastGood")
+assertTrue(
+	secondNewBlankGood.policy and secondNewBlankGood.policy.prepared == false,
+	"confirmed missing trinket is Unprepared rather than reusing prior Prepared"
+)
+
+-- ---------------------------------------------------------------------------
+-- 12) Equipped <-> confirmed-empty transitions retire contradicted lastGood
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, equippedGood, equippedPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(equippedGood ~= nil, "equipped baseline writes lastGood")
+assertEq(equippedGood.policy and equippedGood.policy.prepared, true, "equipped baseline is Prepared")
+
+-- Independently confirm empty off-hand (1H setup => Unprepared once authoritative).
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+inspectReadyOnce(state, memberId, guid)
+local _, emptyOhGood, emptyOhPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(emptyOhGood ~= nil, "confirmed empty off-hand over prior equipped writes new lastGood")
+assertTrue(emptyOhGood.policy and emptyOhGood.policy.prepared == false, "confirmed missing required off-hand is Unprepared")
+assertTrue(
+	emptyOhPlayer.freshObservation and emptyOhPlayer.freshObservation.complete == true,
+	"confirmed empty-offhand transition sets fresh complete observation"
+)
+-- Stale Prepared must not remain as fallback after confirmed transition.
+emptyOhPlayer.freshObservation = nil
+CheckRun.MarkAttempt(emptyOhPlayer, "timeout", true, nowTime)
+emptyOhPlayer.currentlyInspectable = false
+emptyOhPlayer.rangeOnlyFailure = true
+local afterEmptyTransition = CheckRun.ClassifyPlayer(emptyOhPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(afterEmptyTransition.class, CheckRun.CLASS.UNPREPARED, "after equipped->empty confirmation, fallback uses the new Unprepared observation")
+assertEq(afterEmptyTransition.verified, CheckRun.VERIFIED.SESSION, "post-transition fallback uses SESSION provenance")
+
+-- Confirmed empty -> newly equipped recovers Prepared.
+inventoryByUnit.raid1 = fillAllSlots()
+local _, reequippedGood, reequippedPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(reequippedGood ~= nil, "empty->equipped transition writes authoritative lastGood")
+assertTrue(reequippedGood.policy and reequippedGood.policy.prepared == true, "empty->equipped transition is Prepared")
+assertTrue(
+	state.cache[memberId].confirmedEmptySlots == nil
+		or state.cache[memberId].confirmedEmptySlots[INVSLOT_OFFHAND] ~= true,
+	"reequipping clears confirmed-empty for that slot"
+)
+
+-- ---------------------------------------------------------------------------
+-- 13) Partial inspect with reliable changed item retires Prepared fallback
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, preparedGood, preparedPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(preparedGood ~= nil and preparedGood.policy.prepared == true, "setup Prepared same-session lastGood")
+
+-- Partial capture: identifiable different item in one slot, other slots blank/copied.
+inventoryByUnit.raid1 = fillAlternateKit()
+inventoryByUnit.raid1[INVSLOT_TRINKET2] = nil
+local partialChanged = inspectReadyOnce(state, memberId, guid)
+assertEq(partialChanged.blended, true, "partial changed-item capture stays blended/non-authoritative")
+assertEq(state.lastGood[memberId], nil, "reliable changed equipped item retires contradicted same-session lastGood")
+assertEq(preparedPlayer.lastGood, nil, "player-attached lastGood is cleared on reliable contradiction")
+assertEq(preparedPlayer.freshObservation, nil, "player freshObservation is cleared on reliable contradiction")
+CheckRun.MarkAttempt(preparedPlayer, "incomplete", true, nowTime)
+preparedPlayer.technicalFailure = true
+local contradictedClass = CheckRun.ClassifyPlayer(preparedPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(
+	contradictedClass.class,
+	CheckRun.CLASS.INSPECTION_FAILED,
+	"after reliable contradiction, failed refresh cannot reuse stale Prepared"
+)
+assertTrue(not contradictedClass.countsForPot, "Inspection Failed after contradiction does not count for Reward Pot")
+
+-- Genuinely incomplete refresh with unchanged known gear still allows fallback.
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, stableGood, stablePlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(stableGood ~= nil, "stable Prepared baseline exists")
+-- Temporary blank over same kit (copied evidence): no reliable contradiction.
+inventoryByUnit.raid1 = fillSlotsExceptOffHand()
+local tempPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(tempPartial.blended, true, "temporary blank over unchanged kit stays blended")
+assertTrue(state.lastGood[memberId] ~= nil, "temporary blank without reliable contradiction keeps same-session lastGood")
+CheckRun.MarkAttempt(stablePlayer, "incomplete", true, nowTime)
+stablePlayer.technicalFailure = true
+stablePlayer.freshObservation = nil
+local stableFallback = CheckRun.ClassifyPlayer(stablePlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(stableFallback.class, CheckRun.CLASS.PREPARED, "incomplete refresh with unchanged known gear still uses same-session fallback")
+assertEq(stableFallback.verified, CheckRun.VERIFIED.SESSION, "unchanged-gear incomplete refresh uses SESSION provenance")
+
+-- ---------------------------------------------------------------------------
+-- 14) Retries terminate; no request/timer storms after authority invalidation
 -- ---------------------------------------------------------------------------
 resetState()
 setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)

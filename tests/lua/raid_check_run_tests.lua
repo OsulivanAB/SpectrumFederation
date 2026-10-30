@@ -648,7 +648,7 @@ local failedSameSessionClass = CheckRun.ClassifyPlayer(failedSameSession, 50, {
     policy = { prepared = true, missing = {} },
 }, "SES-FALLBACK")
 assertEq(failedSameSessionClass.class, CheckRun.CLASS.PREPARED, "same-session last-good overrides technical failure when refresh cannot complete")
-assertEq(failedSameSessionClass.verified, CheckRun.VERIFIED.RECENT, "same-session fallback is Recently Verified")
+assertEq(failedSameSessionClass.verified, CheckRun.VERIFIED.SESSION, "same-session fallback uses SESSION provenance")
 
 local rangeOnly = CheckRun.NewPlayer("E")
 rangeOnly.rangeOnlyFailure = true
@@ -703,7 +703,7 @@ local sameSessionClass = CheckRun.ClassifyPlayer(sameSessionFallback, 20, {
     policy = { prepared = true, missing = {} },
 }, "SES-A")
 assertEq(sameSessionClass.class, CheckRun.CLASS.PREPARED, "same-session complete last-good overrides technical failure")
-assertEq(sameSessionClass.verified, CheckRun.VERIFIED.RECENT, "same-session technical-failure fallback is Recently Verified")
+assertEq(sameSessionClass.verified, CheckRun.VERIFIED.SESSION, "same-session technical-failure fallback uses SESSION provenance")
 
 local otherSession = CheckRun.ClassifyPlayer(sameSessionFallback, 20, {
     complete = true,
@@ -732,7 +732,7 @@ local preRaidSameSessionClass = CheckRun.ClassifyPlayer(preRaidSameSession, 10 +
     policy = { prepared = false, missing = { "Missing enchant: Finger1" } },
 }, "SES-A")
 assertEq(preRaidSameSessionClass.class, CheckRun.CLASS.UNPREPARED, "same-session last-good remains usable after a normal ~15 minute pre-raid wait")
-assertEq(preRaidSameSessionClass.verified, CheckRun.VERIFIED.RECENT, "pre-raid same-session fallback stays Recently Verified")
+assertEq(preRaidSameSessionClass.verified, CheckRun.VERIFIED.SESSION, "pre-raid same-session fallback stays SESSION provenance")
 assertTrue(preRaidSameSessionClass.countsForPot, "same-session Unprepared still counts for Reward Pot")
 
 local expiredSameSession = CheckRun.NewPlayer("F3-EXP")

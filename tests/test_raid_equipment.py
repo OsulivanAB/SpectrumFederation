@@ -265,7 +265,8 @@ def test_early_preparation_whispers_production_lua():
     assert "RC.InspectUnresolvedEntry(entry)" in inspect_ready_fn
     assert "entry and entry.slotsByInventory" not in inspect_ready_fn
     assert "entry and entry.overallEquippedItemLevel" not in inspect_ready_fn
-    assert "First capture has no prior evidence" in inspect_ready_fn
+    assert "Every tracked blank must be noted" in inspect_ready_fn
+    assert "INDEPENDENT_BLANK_CONFIRMATIONS" in inspect_ready_fn
     assert "SenderIsCoordinator" in source
     assert "OUTBOUND_BACKOFF_HEARTBEATS" in source
     assert "MAX_OUTBOUND_BURST" in source

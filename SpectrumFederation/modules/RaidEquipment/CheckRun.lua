@@ -31,7 +31,10 @@ CheckRun.CLASS = {
 
 CheckRun.VERIFIED = {
 	FRESH = "fresh",
+	-- Legacy no-session / unscoped OOR fallback within RECENT_GOOD_SECONDS.
 	RECENT = "recent",
+	-- Same-session complete last-good within SESSION_LAST_GOOD_SECONDS.
+	SESSION = "session",
 }
 
 function CheckRun.ComputeActiveBudget(targetCount)
@@ -454,12 +457,12 @@ function CheckRun.UsableSameSessionLastGood(good, expectedSessionId, now)
 	return CheckRun.IsFreshEnoughLastGood(good, now, CheckRun.SESSION_LAST_GOOD_SECONDS)
 end
 
-local function ClassificationFromLastGood(good, player, age)
+local function ClassificationFromLastGood(good, player, age, verifiedKind)
 	local policy = (good and good.policy) or (player and player.policyResult)
 	local prepared = policy and policy.prepared == true
 	return {
 		class = prepared and CheckRun.CLASS.PREPARED or CheckRun.CLASS.UNPREPARED,
-		verified = CheckRun.VERIFIED.RECENT,
+		verified = verifiedKind or CheckRun.VERIFIED.RECENT,
 		missing = (policy and policy.missing) or {},
 		countsForPot = not prepared,
 		verifiedAge = age,
@@ -493,9 +496,11 @@ function CheckRun.ClassifyPlayer(player, now, lastGood, expectedSessionId)
 	-- 2) Same-session complete last-good within the session freshness bound:
 	-- usable even when this run's refresh timed out, returned incomplete, or
 	-- the player is now out of range. Expired same-session data falls through.
+	-- A later inspect that proved contradictory reliable evidence must already
+	-- have cleared this entry via member-scoped invalidation.
 	local usableSameSession = CheckRun.UsableSameSessionLastGood(good, expectedSessionId, now)
 	if usableSameSession then
-		return ClassificationFromLastGood(good, player, age)
+		return ClassificationFromLastGood(good, player, age, CheckRun.VERIFIED.SESSION)
 	end
 
 	-- 3) A technical failure without a usable same-session fallback stays Inspection Failed.
@@ -518,7 +523,7 @@ function CheckRun.ClassifyPlayer(player, now, lastGood, expectedSessionId)
 		and age <= CheckRun.RECENT_GOOD_SECONDS
 	then
 		if player.rangeOnlyFailure or not player.currentlyInspectable then
-			return ClassificationFromLastGood(good, player, age)
+			return ClassificationFromLastGood(good, player, age, CheckRun.VERIFIED.RECENT)
 		end
 	end
 
