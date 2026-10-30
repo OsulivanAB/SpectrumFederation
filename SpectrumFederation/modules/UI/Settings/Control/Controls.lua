@@ -1552,6 +1552,54 @@ end
 --   - height: Height of the scroll list control (default: 160)
 --   - rowHeight: Height of each row in the list (default: 20)
 --   - removeAtlas: Atlas name for the remove button icon (default: "common-icon-redx")
+-- Defaults for the opt-in shared leading column on AddScrollList (#440).
+-- textRightInset matches the non-compact Text RIGHT anchor (-24) so the clamp
+-- reserves drawable remainder after that inset, not only contentWidth - textLeft.
+Controls.SCROLL_LIST_LEADING_DEFAULTS = {
+	gap = 6,
+	minWidth = 0,
+	edgePad = 4,
+	minRemainderWidth = 40,
+	textRightInset = 24,
+}
+
+--- Shared leading-column width for opt-in scroll lists (#440).
+-- Right-justified leading labels share one width (widest measured string).
+-- Clamped on narrow viewports so the remainder text keeps a usable budget
+-- after gap, edge pad, and the non-compact text right inset.
+-- @param maxLeadingWidth number Widest unconstrained leading label width among rows
+-- @param availableWidth number Visible content width for the list
+-- @param sizes table|nil Overrides for SCROLL_LIST_LEADING_DEFAULTS fields
+-- @return number leadingWidth, number gap
+function Controls.ScrollListLeadingColumnWidth(maxLeadingWidth, availableWidth, sizes)
+	sizes = sizes or {}
+	local d = Controls.SCROLL_LIST_LEADING_DEFAULTS
+	local gap = sizes.gap or d.gap
+	local minWidth = sizes.minWidth or d.minWidth
+	local edgePad = sizes.edgePad or d.edgePad
+	local minRemainder = sizes.minRemainderWidth or d.minRemainderWidth
+	local textRightInset = sizes.textRightInset
+	if textRightInset == nil then
+		textRightInset = d.textRightInset
+	end
+	local measured = math.max(minWidth, tonumber(maxLeadingWidth) or 0)
+	local avail = tonumber(availableWidth) or 0
+	if avail <= 0 then
+		return measured, gap
+	end
+	-- Prefer the full remainder budget when the viewport can honor it. On
+	-- extremely narrow widths, fall back to minWidth (never negative).
+	local reserved = gap + minRemainder + edgePad + textRightInset
+	local maxAllowed = avail - reserved
+	if maxAllowed < minWidth then
+		maxAllowed = minWidth
+	end
+	if maxAllowed < 0 then
+		maxAllowed = 0
+	end
+	return math.min(measured, maxAllowed), gap
+end
+
 -- @Return The created scroll list control
 -- Add a scrollable list control with optional remove buttons
 -- @param section table Section to add row into
@@ -1576,6 +1624,12 @@ function Controls:AddScrollList(section, opts)
 	local itemIconSize = opts.itemIconSize or 16
 	local itemIconGap = opts.itemIconGap or 4
 	local iconReserve = showItemIcons and (itemIconSize + itemIconGap) or 0
+	-- Opt-in shared leading column (right-justified). Goals percent uses this (#440).
+	-- Lists that omit leadingColumn keep a single text FontString.
+	local leadingColumn = opts.leadingColumn and true or false
+	local leadingDefaults = Controls.SCROLL_LIST_LEADING_DEFAULTS
+	local leadingColumnGap = opts.leadingColumnGap or leadingDefaults.gap
+	local leadingColumnMinWidth = opts.leadingColumnMinWidth or leadingDefaults.minWidth
 	-- History uses an inline texture and a tooltip instead of a leading icon column.
 	local singleLine = opts.singleLine and true or false
 	local showDetailTooltip = opts.showDetailTooltip and true or false
@@ -1649,14 +1703,25 @@ function Controls:AddScrollList(section, opts)
 			selected:Hide()
 			r.Selected = selected
 
-			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-			fs:SetPoint("LEFT", r, "LEFT", 0, 0)
-			fs:SetJustifyH("LEFT")
-			if showItemIcons or singleLine then
+			local function ApplySingleLine(fs)
 				if fs.SetWordWrap then fs:SetWordWrap(false) end
 				if fs.SetNonSpaceWrap then fs:SetNonSpaceWrap(false) end
 				if fs.SetMaxLines then fs:SetMaxLines(1) end
 				if fs.SetJustifyV then fs:SetJustifyV("MIDDLE") end
+			end
+
+			if leadingColumn then
+				local leading = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+				leading:SetJustifyH("RIGHT")
+				ApplySingleLine(leading)
+				r.Leading = leading
+			end
+
+			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			fs:SetPoint("LEFT", r, "LEFT", 0, 0)
+			fs:SetJustifyH("LEFT")
+			if showItemIcons or singleLine or leadingColumn then
+				ApplySingleLine(fs)
 			end
 			if showItemIcons then
 				local icon = r:CreateTexture(nil, "ARTWORK")
@@ -1704,7 +1769,7 @@ function Controls:AddScrollList(section, opts)
 
 			local y = 0
 			local maxTextWidth = 0
-			local availableWidth = (content:GetWidth() or scroll:GetWidth() or 0)
+			local maxLeadingWidth = 0
 
 			for i = 1, #items do
 				local item = items[i]
@@ -1714,13 +1779,100 @@ function Controls:AddScrollList(section, opts)
 				r:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
 				r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
 
+				if leadingColumn and r.Leading then
+					r.Leading:SetText(item.leadingText or "")
+					-- Prefer unconstrained width: Leading keeps the prior refresh's
+					-- SetWidth, so GetStringWidth() can report truncated text and
+					-- block short→long percent expansion (#440 / Codex).
+					local leadingMeasure
+					if type(r.Leading.GetUnboundedStringWidth) == "function" then
+						leadingMeasure = r.Leading:GetUnboundedStringWidth() or 0
+					else
+						leadingMeasure = r.Leading:GetStringWidth() or 0
+					end
+					maxLeadingWidth = math.max(maxLeadingWidth, leadingMeasure)
+				end
 				r.Text:SetText(item.text or "")
 				maxTextWidth = math.max(maxTextWidth, r.Text:GetStringWidth() or 0)
 				r:Show()
 				y = y + rowHeight + rowSpacing
 			end
 
+			for i = #items + 1, #rows do
+				rows[i]:Hide()
+			end
+
+			local contentH = (y > 0) and (y - rowSpacing) or 0
+			content:SetHeight(math.max(1, contentH))
+
+			-- Resolve scrollbar before measuring width so the leading-column
+			-- clamp uses the live viewport, not a stale content:GetWidth() (#440).
+			local sbw = 0
+			if resize then
+				local maxVisible = math.max(rowHeight, maxHeight - (borderInset * 2))
+				local needVisible = math.max(rowHeight, contentH)
+
+				local showScroll = needVisible > maxVisible
+				sbw = SetScrollBarShown(showScroll)
+
+				local targetVisible = math.min(needVisible, maxVisible)
+				local targetRowH = targetVisible + (borderInset * 2)
+
+				-- Only apply if changed, then request reflow so stacking updates
+				if math.abs((row:GetHeight() or 0) - targetRowH) > 0.5 then
+					row:SetHeight(targetRowH)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+			else
+				SetScrollBarShown(true)
+
+				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
+					row:SetHeight(fixedHeight)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+
+				local sb = scroll.ScrollBar
+				sbw = (sb and sb:GetWidth()) or 20
+			end
+
+			-- Measure from the live scroll viewport (minus scrollbar). Initial
+			-- zero-width layout keeps availableWidth at 0 so clamping is a no-op
+			-- until OnSizeChanged supplies a real viewport.
+			local w = scroll:GetWidth() or 0
+			local availableWidth = 0
+			if w > 0 then
+				availableWidth = math.max(1, w - sbw - 4)
+				content:SetWidth(availableWidth)
+			end
+
+			local leadingWidth, leadingGap = 0, leadingColumnGap
+			if leadingColumn then
+				-- Compact lists size text explicitly; non-compact Goals text uses
+				-- RIGHT=-24, which must be reserved in the leading clamp.
+				local textRightInset = 0
+				if not compactColumns then
+					textRightInset = leadingDefaults.textRightInset or 24
+				end
+				leadingWidth, leadingGap = Controls.ScrollListLeadingColumnWidth(
+					maxLeadingWidth,
+					availableWidth,
+					{
+						gap = leadingColumnGap,
+						minWidth = leadingColumnMinWidth,
+						textRightInset = textRightInset,
+					}
+				)
+			end
+			local leadingReserve = leadingColumn and (leadingWidth + leadingGap) or 0
+
 			local textBudget = availableWidth
+			if leadingReserve > 0 and textBudget > 0 then
+				textBudget = math.max(1, textBudget - leadingReserve)
+			end
 			if showItemIcons and textBudget > 0 then
 				textBudget = math.max(1, textBudget - iconReserve)
 			end
@@ -1729,13 +1881,15 @@ function Controls:AddScrollList(section, opts)
 				compactTextWidth = math.min(compactTextWidth, math.max(1, textBudget - removeButtonSize - removeColumnGap))
 			end
 
-			y = 0
 			for i = 1, #items do
 				local item = items[i]
 				local r = rows[i]
 
 				r.Text:ClearAllPoints()
 				r.Remove:ClearAllPoints()
+				if r.Leading then
+					r.Leading:ClearAllPoints()
+				end
 
 				local canRemove = item.canRemove and true or false
 				r.Remove:SetShown(canRemove)
@@ -1770,10 +1924,19 @@ function Controls:AddScrollList(section, opts)
 					r:SetScript("OnClick", nil)
 				end
 
+				if leadingColumn and r.Leading then
+					r.Leading:SetPoint("LEFT", r, "LEFT", 0, 0)
+					r.Leading:SetWidth(leadingWidth)
+					r.Leading:Show()
+				elseif r.Leading then
+					r.Leading:Hide()
+				end
+
+				local iconLeft = leadingReserve
 				if showItemIcons and r.Icon then
 					r.Icon:ClearAllPoints()
 					r.Icon:SetSize(itemIconSize, itemIconSize)
-					r.Icon:SetPoint("LEFT", r, "LEFT", 0, 0)
+					r.Icon:SetPoint("LEFT", r, "LEFT", iconLeft, 0)
 					if item.icon ~= nil and item.icon ~= false and item.icon ~= "" then
 						r.Icon:SetTexture(item.icon)
 						r.Icon:Show()
@@ -1808,63 +1971,16 @@ function Controls:AddScrollList(section, opts)
 					end
 				end
 
+				local textLeft = leadingReserve + iconReserve
 				if compactColumns and availableWidth > 0 then
-					r.Text:SetPoint("LEFT", r, "LEFT", iconReserve, 0)
+					r.Text:SetPoint("LEFT", r, "LEFT", textLeft, 0)
 					r.Text:SetWidth(compactTextWidth)
 					r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
 				else
-					r.Text:SetPoint("LEFT", r, "LEFT", iconReserve, 0)
+					r.Text:SetPoint("LEFT", r, "LEFT", textLeft, 0)
 					r.Text:SetPoint("RIGHT", r, "RIGHT", -24, 0)
 					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 				end
-
-				y = y + rowHeight + rowSpacing
-			end
-
-			for i = #items + 1, #rows do
-				rows[i]:Hide()
-			end
-
-			local contentH = (y > 0) and (y - rowSpacing) or 0
-			content:SetHeight(math.max(1, contentH))
-
-			-- Resize behavior
-			local sbw = 0
-			if resize then
-				local maxVisible = math.max(rowHeight, maxHeight - (borderInset * 2))
-				local needVisible = math.max(rowHeight, contentH)
-
-				local showScroll = needVisible > maxVisible
-				sbw = SetScrollBarShown(showScroll)
-
-				local targetVisible = math.min(needVisible, maxVisible)
-				local targetRowH = targetVisible + (borderInset * 2)
-
-				-- Only apply if changed, then request reflow so stacking updates
-				if math.abs((row:GetHeight() or 0) - targetRowH) > 0.5 then
-					row:SetHeight(targetRowH)
-					if section.RequestReflow then
-						section:RequestReflow()
-					end
-				end
-			else
-				SetScrollBarShown(true)
-
-				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
-					row:SetHeight(fixedHeight)
-					if section.RequestReflow then
-						section:RequestReflow()
-					end
-				end
-
-				local sb = scroll.ScrollBar
-				sbw = (sb and sb:GetWidth()) or 20
-			end
-
-			-- Width management
-			local w = scroll:GetWidth() or 0
-			if w > 0 then
-				content:SetWidth(math.max(1, w - sbw - 4))
 			end
 
 			row.__sfScrollListRefreshing = false
