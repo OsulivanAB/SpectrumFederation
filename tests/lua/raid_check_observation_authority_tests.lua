@@ -150,14 +150,23 @@ UnitClass = function()
 	return "Warrior", "WARRIOR"
 end
 
-local function slotLink(slot)
+local function slotLink(slot, itemId)
 	-- Include a non-zero enchant field so remote links are not treated as TWW
 	-- inspect stubs by IsSlotLinkPotentiallyIncomplete.
+	itemId = itemId or (1000 + slot)
 	return string.format(
 		"|cffffffff|Hitem:%d:1:::::::80:72:::::::::|h[Item%d]|h|r",
-		1000 + slot,
+		itemId,
 		slot
 	)
+end
+
+local function fillAlternateKit()
+	local bag = {}
+	for _, slot in ipairs(TRACKED_SLOTS) do
+		bag[slot] = slotLink(slot, 1050 + slot)
+	end
+	return bag
 end
 
 GetInventoryItemLink = function(unit, slot)
@@ -172,7 +181,7 @@ GetInventoryItemID = function(unit, slot)
 	if not link then
 		return nil
 	end
-	return 1000 + slot
+	return tonumber(string.match(link, "item:(%d+)"))
 end
 GetInventoryItemTexture = function(unit, slot)
 	if GetInventoryItemLink(unit, slot) then
@@ -208,8 +217,15 @@ GetItemInfoInstant = function(link)
 	if not itemId then
 		return nil
 	end
-	local slot = itemId - 1000
-	local identity = SLOT_IDENTITY[slot]
+	local slot = nil
+	-- Default kit: 1000+slot. Alternate gear-change kit: 1050+slot.
+	for _, tracked in ipairs(TRACKED_SLOTS) do
+		if itemId == 1000 + tracked or itemId == 1050 + tracked then
+			slot = tracked
+			break
+		end
+	end
+	local identity = slot and SLOT_IDENTITY[slot] or nil
 	if not identity then
 		return nil
 	end
@@ -724,6 +740,15 @@ assertTrue(
 	"delayed obsolete INSPECT_READY does not restore fresh complete observation"
 )
 assertTrue(type(state.cache[memberId]) == "table", "delayed obsolete INSPECT_READY may still update troubleshooting cache")
+assertEq(state.cache[memberId].authorityInvalidated, true, "delayed obsolete INSPECT_READY marks cache authorityInvalidated")
+assertEq(
+	RC.CacheEntryHasEquipmentAuthority(state.cache[memberId]),
+	false,
+	"authority-invalidated cache is not treated as verified equipment"
+)
+local prepAfterObsolete, prepWhy = RC:GetAuthoritativePreparation(memberId, {})
+assertEq(prepAfterObsolete, nil, "GetAuthoritativePreparation rejects authority-invalidated cache")
+assertEq(prepWhy, "authority_invalidated", "GetAuthoritativePreparation reports authority_invalidated")
 assertEq(
 	state.adhocRun.players[memberId].lastIncompleteReason,
 	"authority_invalidated",
@@ -739,6 +764,12 @@ assertTrue(
 	recoveredPlayer2.freshObservation and recoveredPlayer2.freshObservation.complete == true,
 	"post-invalidation inspect sets fresh complete observation"
 )
+assertTrue(
+	state.cache[memberId].authorityInvalidated ~= true,
+	"authoritative recovery clears authorityInvalidated on the cache entry"
+)
+local prepRecovered = RC:GetAuthoritativePreparation(memberId, {})
+assertTrue(prepRecovered ~= nil, "GetAuthoritativePreparation accepts recovered authoritative cache")
 
 -- ---------------------------------------------------------------------------
 -- 9) Normal inspect-related inventory notifications still allow INSPECT_READY
@@ -752,9 +783,14 @@ state.adhocRun = CheckRun.NewRun({
 	expectedSessionId = "SES-A",
 	now = nowTime,
 })
+local _, noiseBaselineGood = inspectReadyOnce(state, memberId, guid)
+assertTrue(noiseBaselineGood ~= nil, "noise-path baseline inspect writes lastGood")
 beginAdhocInspect(state, memberId, guid)
 local stampedBeforeNoise = state.active.equipmentAuthorityGeneration
--- Inventory notification inside grace (NotifyInspect payload noise).
+assertTrue(next(state.active.equipmentBaselineBySlot or {}) ~= nil, "outstanding inspect stamps an equipment baseline")
+local lastGoodBeforeNoise = state.lastGood[memberId]
+-- Inventory notification inside grace with the same equipped identities
+-- (NotifyInspect payload noise / still-loading blanks do not conflict).
 RC:_InvalidateInspectUnit("raid1")
 assertEq(
 	RC:_CurrentEquipmentAuthorityGeneration({ guid, memberId }),
@@ -762,6 +798,7 @@ assertEq(
 	"inspect-driven inventory noise does not bump equipment authority generation"
 )
 assertTrue(state.active ~= nil, "inspect-driven inventory noise leaves the active inspect intact")
+assertTrue(state.lastGood[memberId] == lastGoodBeforeNoise, "same-identity inventory noise does not clear lastGood")
 RC:_HandleInspectReady(guid)
 assertTrue(state.lastGood[memberId] ~= nil, "INSPECT_READY after inspect-driven inventory noise writes lastGood")
 assertTrue(
@@ -769,6 +806,133 @@ assertTrue(
 		and state.adhocRun.players[memberId].freshObservation.complete == true,
 	"INSPECT_READY after inspect-driven inventory noise sets fresh complete observation"
 )
+assertTrue(RC:GetAuthoritativePreparation(memberId, {}) ~= nil, "GetAuthoritativePreparation accepts post-noise ready")
+
+-- ---------------------------------------------------------------------------
+-- 9b) Genuine remote gear change inside inventory grace invalidates authority
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, graceGood, gracePlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(graceGood ~= nil, "pre-change baseline for within-grace swap writes lastGood")
+gracePlayer.freshObservation = {
+	complete = true,
+	policy = graceGood.policy,
+	observation = graceGood.observation,
+	capturedAt = graceGood.capturedAt,
+}
+
+beginAdhocInspect(state, memberId, guid)
+local graceGeneration = state.active.equipmentAuthorityGeneration
+assertTrue(RC:_IsWithinInspectInventoryGrace("raid1", nowTime), "request is still inside inventory grace")
+-- Observable equipped identity conflict while still inside grace.
+inventoryByUnit.raid1 = fillAlternateKit()
+RC:_InvalidateInspectUnit("raid1")
+assertEq(state.lastGood[memberId], nil, "observable gear change inside grace clears lastGood")
+assertEq(gracePlayer.freshObservation, nil, "observable gear change inside grace clears freshObservation")
+assertTrue(
+	RC:_CurrentEquipmentAuthorityGeneration({ guid, memberId }) > graceGeneration,
+	"observable gear change inside grace bumps equipment authority generation"
+)
+assertEq(
+	RC:_InspectRequestHasEquipmentAuthority(state.active),
+	false,
+	"outstanding inspect loses authority after observable within-grace gear change"
+)
+
+-- Delayed obsolete ready still describes the pre-change kit.
+inventoryByUnit.raid1 = fillAllSlots()
+RC:_HandleInspectReady(guid)
+assertEq(state.lastGood[memberId], nil, "within-grace change: obsolete ready does not restore lastGood")
+assertEq(state.cache[memberId].authorityInvalidated, true, "within-grace change: obsolete ready marks cache non-authoritative")
+assertEq(RC:GetAuthoritativePreparation(memberId, {}), nil, "within-grace change: GetAuthoritativePreparation rejects obsolete cache")
+
+-- Fresh post-change inspect becomes authoritative.
+nowTime = nowTime + 1
+inventoryByUnit.raid1 = fillAlternateKit()
+local _, postGraceGood, postGracePlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(postGraceGood ~= nil, "fresh inspect after within-grace change writes lastGood")
+assertTrue(
+	postGracePlayer.freshObservation and postGracePlayer.freshObservation.complete == true,
+	"fresh inspect after within-grace change sets fresh complete observation"
+)
+assertTrue(RC:GetAuthoritativePreparation(memberId, {}) ~= nil, "GetAuthoritativePreparation accepts post-change authoritative cache")
+
+-- ---------------------------------------------------------------------------
+-- 9c) Ready-time live-vs-capture identity conflict refuses authority
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+beginAdhocInspect(state, memberId, guid)
+local originalSample = RC._SampleLiveEquipmentSlotIdentityMap
+RC._SampleLiveEquipmentSlotIdentityMap = function()
+	local map = {}
+	for _, slot in ipairs(TRACKED_SLOTS) do
+		map[slot] = 1050 + slot
+	end
+	return map
+end
+RC:_HandleInspectReady(guid)
+RC._SampleLiveEquipmentSlotIdentityMap = originalSample
+assertEq(state.lastGood[memberId], nil, "ready-time identity conflict does not write lastGood")
+assertEq(state.cache[memberId].authorityInvalidated, true, "ready-time identity conflict marks cache authorityInvalidated")
+assertEq(RC:GetAuthoritativePreparation(memberId, {}), nil, "ready-time identity conflict rejected by GetAuthoritativePreparation")
+
+-- ---------------------------------------------------------------------------
+-- 9d) Authority-invalidated cache does not block background refresh for full TTL
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+beginAdhocInspect(state, memberId, guid)
+expireInspectInventoryGrace(state)
+RC:_InvalidateInspectUnit("raid1")
+RC:_HandleInspectReady(guid)
+assertEq(state.cache[memberId].authorityInvalidated, true, "setup: cache is authority-invalidated")
+assertTrue(
+	state.cache[memberId].updatedAt and (nowTime - state.cache[memberId].updatedAt) <= 30,
+	"setup: invalidated cache still has a recent updatedAt"
+)
+state.adhocRun = nil
+state.backgroundInspectEnabled = true
+state.queue = {}
+state.queueHead = 1
+state.queued = {}
+state.active = nil
+state.retired = nil
+nowTime = nowTime + 1
+if state.cache[memberId] then
+	state.cache[memberId].nextRetryAt = nil
+end
+local queuedBackground = 0
+local originalQueue = RC._QueueInspectForUnit
+RC._QueueInspectForUnit = function(self, unit, info, cacheEntry)
+	queuedBackground = queuedBackground + 1
+	return originalQueue(self, unit, info, cacheEntry)
+end
+RC:_PrimeBackgroundInspectQueue()
+RC._QueueInspectForUnit = originalQueue
+assertTrue(queuedBackground >= 1, "background inspection requeues authority-invalidated members without waiting full TTL")
 
 -- ---------------------------------------------------------------------------
 -- 10) Ordinary late-ready-after-timeout remains safe

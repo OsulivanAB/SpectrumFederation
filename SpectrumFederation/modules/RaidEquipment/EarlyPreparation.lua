@@ -897,9 +897,14 @@ function EarlyPrep.PrepNoticeSenderState(profilePresent, authorized)
 	return "reject"
 end
 
--- A cache entry that reused an older slot or item level is not a fresh observation.
+-- A cache entry that reused an older slot or item level, or that came from an
+-- inspect request whose equipment authority was invalidated, is not a fresh
+-- verified observation for Early Preparation.
 function EarlyPrep.ObservationAuthoritative(entry)
 	if type(entry) ~= "table" then
+		return false
+	end
+	if entry.authorityInvalidated == true then
 		return false
 	end
 	return entry.blended ~= true

@@ -424,6 +424,10 @@ assertEq(EarlyPrep.PrepNoticeSenderState(true, true), "apply", "an authorized se
 assertEq(EarlyPrep.PrepNoticeSenderState(true, false), "reject", "a known non-admin is rejected")
 assertTrue(not EarlyPrep.ObservationAuthoritative({ blended = true }), "a blended inspect is not authoritative")
 assertTrue(EarlyPrep.ObservationAuthoritative({ status = "ready" }), "an unblended inspect stays authoritative")
+assertTrue(
+	not EarlyPrep.ObservationAuthoritative({ status = "ready", authorityInvalidated = true }),
+	"an authority-invalidated inspect is not authoritative for Early Preparation"
+)
 
 EarlyPrep._deferredNotices = nil
 EarlyPrep.notice = EarlyPrep.NewNotice()
