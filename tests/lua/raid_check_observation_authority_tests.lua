@@ -150,12 +150,35 @@ UnitClass = function()
 	return "Warrior", "WARRIOR"
 end
 
-local function slotLink(slot, itemId)
+local socketCountByItemId = {}
+
+local function slotLink(slot, itemId, opts)
 	-- Include a non-zero enchant field so remote links are not treated as TWW
 	-- inspect stubs by IsSlotLinkPotentiallyIncomplete.
+	opts = opts or {}
+	itemId = itemId or (1000 + slot)
+	local enchant = opts.enchant
+	if enchant == nil then
+		enchant = 1
+	end
+	local gem = opts.gem
+	if gem == nil then
+		gem = ""
+	end
+	return string.format(
+		"|cffffffff|Hitem:%d:%s:%s::::::80:72:::::::::|h[Item%d]|h|r",
+		itemId,
+		tostring(enchant),
+		tostring(gem),
+		slot
+	)
+end
+
+local function slotLinkStub(slot, itemId)
+	-- All modification fields empty: TWW inspect stub / incomplete link.
 	itemId = itemId or (1000 + slot)
 	return string.format(
-		"|cffffffff|Hitem:%d:1:::::::80:72:::::::::|h[Item%d]|h|r",
+		"|cffffffff|Hitem:%d::::::::::::::|h[Item%d]|h|r",
 		itemId,
 		slot
 	)
@@ -232,12 +255,25 @@ GetItemInfoInstant = function(link)
 	-- itemID, itemType, itemSubType, itemEquipLoc, icon, classID, subclassID
 	return itemId, "Armor", "Misc", identity[1], "Interface\\Icons\\INV_Misc_QuestionMark", identity[2], identity[3]
 end
+local inspectItemLevel = 700
 C_PaperDollInfo = {
 	GetInspectItemLevel = function()
-		return 700
+		return inspectItemLevel
 	end,
 	GetAverageItemLevel = function()
-		return 700, 700
+		return inspectItemLevel, inspectItemLevel
+	end,
+}
+C_Item = {
+	GetItemNumSockets = function(link)
+		if type(link) ~= "string" then
+			return 0
+		end
+		local itemId = tonumber(string.match(link, "item:(%d+)"))
+		if not itemId then
+			return 0
+		end
+		return tonumber(socketCountByItemId[itemId]) or 0
 	end,
 }
 
@@ -314,9 +350,23 @@ local Policy = SF.RaidEquipment.Policy
 local function resetState()
 	RC._inspectState = nil
 	nowTime = 1000
+	inspectItemLevel = 700
+	socketCountByItemId = {}
 	inventoryByUnit = {
 		player = fillAllSlots(),
 		raid1 = fillAllSlots(),
+	}
+end
+
+local function enableMinimumItemLevel(state, minimum)
+	state.adhocRun = state.adhocRun or CheckRun.NewRun({
+		targetIds = { "Remote-Realm" },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	state.adhocRun.cfg = {
+		requireMinimumItemLevel = true,
+		minimumItemLevel = minimum or 690,
 	}
 end
 
@@ -1208,6 +1258,212 @@ C_Timer = nil
 assertTrue(notifyCount <= CheckRun.PER_TARGET_ATTEMPT_CAP + 2, "NotifyInspect remains bounded across invalidation retries")
 assertTrue(timerCount <= notifyCount + 2, "inspect timeout timers remain bounded with NotifyInspect")
 assertTrue(notifyCount >= 1, "invalidation recovery still issues at least one inspect")
+
+-- ---------------------------------------------------------------------------
+-- 15) Fresh below-minimum item level on partial inspect retires Prepared
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+enableMinimumItemLevel(state, 690)
+inspectItemLevel = 700
+local _, ilvlPreparedGood, ilvlPreparedPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(ilvlPreparedGood ~= nil and ilvlPreparedGood.policy.prepared == true, "item-level baseline is Prepared")
+
+-- Partial refresh: fresh IL below minimum, unrelated slot still unresolved.
+inspectItemLevel = 640
+inventoryByUnit.raid1 = fillAllSlots()
+inventoryByUnit.raid1[INVSLOT_TRINKET2] = nil
+local lowIlvlPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(lowIlvlPartial.blended, true, "low item-level partial capture stays blended/incomplete")
+assertEq(state.lastGood[memberId], nil, "fresh below-minimum item level retires contradicted Prepared lastGood")
+assertEq(ilvlPreparedPlayer.lastGood, nil, "player-attached lastGood cleared on fresh item-level contradiction")
+assertEq(ilvlPreparedPlayer.freshObservation, nil, "player freshObservation cleared on fresh item-level contradiction")
+CheckRun.MarkAttempt(ilvlPreparedPlayer, "incomplete", true, nowTime)
+ilvlPreparedPlayer.technicalFailure = true
+local lowIlvlClass = CheckRun.ClassifyPlayer(ilvlPreparedPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(
+	lowIlvlClass.class,
+	CheckRun.CLASS.INSPECTION_FAILED,
+	"partial low item-level contradiction does not award stale Prepared"
+)
+assertTrue(not lowIlvlClass.countsForPot, "item-level contradiction Inspection Failed does not count for Reward Pot")
+assertTrue(
+	lowIlvlClass.class ~= CheckRun.CLASS.UNPREPARED,
+	"partial capture with one known violation is not fabricated complete Unprepared"
+)
+
+-- ---------------------------------------------------------------------------
+-- 16) Same-ID confirmed missing gem on partial inspect retires Prepared
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+local chestId = 1000 + INVSLOT_CHEST
+socketCountByItemId[chestId] = 1
+local gemmedKit = fillAllSlots()
+gemmedKit[INVSLOT_CHEST] = slotLink(INVSLOT_CHEST, chestId, { gem = "240967" })
+inventoryByUnit.raid1 = gemmedKit
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, gemPreparedGood, gemPreparedPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(gemPreparedGood ~= nil and gemPreparedGood.policy.prepared == true, "gemmed baseline is Prepared")
+assertTrue(
+	gemPreparedGood.observation.slotsByInventory[INVSLOT_CHEST]
+		and #(gemPreparedGood.observation.slotsByInventory[INVSLOT_CHEST].sockets or {}) == 1
+		and gemPreparedGood.observation.slotsByInventory[INVSLOT_CHEST].sockets[1].filled == true,
+	"baseline chest socket is recorded as filled"
+)
+
+-- Same chest item ID, fully resolved empty socket, unrelated slot incomplete.
+local missingGemKit = fillAllSlots()
+missingGemKit[INVSLOT_CHEST] = slotLink(INVSLOT_CHEST, chestId, { gem = "" })
+missingGemKit[INVSLOT_TRINKET2] = nil
+inventoryByUnit.raid1 = missingGemKit
+local missingGemPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(missingGemPartial.blended, true, "missing-gem partial capture stays blended")
+assertEq(state.lastGood[memberId], nil, "confirmed missing required gem retires contradicted Prepared lastGood")
+assertEq(gemPreparedPlayer.freshObservation, nil, "missing-gem contradiction clears player freshObservation")
+CheckRun.MarkAttempt(gemPreparedPlayer, "incomplete", true, nowTime)
+gemPreparedPlayer.technicalFailure = true
+local missingGemClass = CheckRun.ClassifyPlayer(gemPreparedPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(
+	missingGemClass.class,
+	CheckRun.CLASS.INSPECTION_FAILED,
+	"partial missing-gem contradiction does not award stale Prepared"
+)
+assertTrue(not missingGemClass.countsForPot, "missing-gem contradiction does not award Reward Pot credit")
+
+-- Control: still-loading gem/link stub must not invent a contradiction.
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+socketCountByItemId[chestId] = 1
+inventoryByUnit.raid1 = gemmedKit
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, stubBaselineGood, stubBaselinePlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(stubBaselineGood ~= nil, "stub-control baseline Prepared exists")
+local stubKit = fillAllSlots()
+stubKit[INVSLOT_CHEST] = slotLinkStub(INVSLOT_CHEST, chestId)
+stubKit[INVSLOT_TRINKET2] = nil
+inventoryByUnit.raid1 = stubKit
+local stubPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(stubPartial.blended, true, "incomplete chest stub partial stays blended")
+assertTrue(state.lastGood[memberId] ~= nil, "incomplete gem/link stub without reliable contradiction keeps lastGood")
+CheckRun.MarkAttempt(stubBaselinePlayer, "incomplete", true, nowTime)
+stubBaselinePlayer.technicalFailure = true
+stubBaselinePlayer.freshObservation = nil
+local stubFallback = CheckRun.ClassifyPlayer(stubBaselinePlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(stubFallback.class, CheckRun.CLASS.PREPARED, "incomplete link/gem stub still allows same-session fallback")
+assertEq(stubFallback.verified, CheckRun.VERIFIED.SESSION, "stub-control fallback uses SESSION provenance")
+
+-- ---------------------------------------------------------------------------
+-- 17) Same-ID resolved enchant change during grace invalidates authority
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+local fingerId = 1000 + INVSLOT_FINGER1
+-- Non-zero gem *field* keeps enchant=0 links from looking like TWW stubs, but
+-- do not register socket counts so Policy does not require limited gems.
+local enchantedKit = fillAllSlots()
+enchantedKit[INVSLOT_FINGER1] = slotLink(INVSLOT_FINGER1, fingerId, { enchant = 1, gem = "" })
+inventoryByUnit.raid1 = enchantedKit
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, enchantGood, enchantPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(enchantGood ~= nil and enchantGood.policy.prepared == true, "same-ID enchant baseline is Prepared")
+enchantPlayer.freshObservation = {
+	complete = true,
+	policy = enchantGood.policy,
+	observation = enchantGood.observation,
+	capturedAt = enchantGood.capturedAt,
+}
+
+beginAdhocInspect(state, memberId, guid)
+local enchantGraceGeneration = state.active.equipmentAuthorityGeneration
+assertTrue(RC:_IsWithinInspectInventoryGrace("raid1", nowTime), "same-ID enchant change is inside inventory grace")
+-- Same base item ID; resolved live link lost the required enchant.
+inventoryByUnit.raid1 = fillAllSlots()
+inventoryByUnit.raid1[INVSLOT_FINGER1] = slotLink(INVSLOT_FINGER1, fingerId, { enchant = 0, gem = "1" })
+RC:_InvalidateInspectUnit("raid1")
+assertEq(state.lastGood[memberId], nil, "same-ID resolved enchant loss during grace clears lastGood")
+assertEq(enchantPlayer.freshObservation, nil, "same-ID enchant loss during grace clears freshObservation")
+assertTrue(
+	RC:_CurrentEquipmentAuthorityGeneration({ guid, memberId }) > enchantGraceGeneration,
+	"same-ID enchant loss during grace bumps equipment authority generation"
+)
+assertEq(
+	RC:_InspectRequestHasEquipmentAuthority(state.active),
+	false,
+	"outstanding inspect loses authority after same-ID enchant loss in grace"
+)
+
+-- Obsolete ready with the old enchanted payload must not restore authority.
+inventoryByUnit.raid1 = enchantedKit
+RC:_HandleInspectReady(guid)
+assertEq(state.lastGood[memberId], nil, "obsolete ready after same-ID grace change does not restore lastGood")
+assertEq(state.cache[memberId].authorityInvalidated, true, "obsolete ready after same-ID grace change is non-authoritative")
+
+-- Fresh retry recovers the post-change (Unprepared) observation.
+nowTime = nowTime + 1
+inventoryByUnit.raid1 = fillAllSlots()
+inventoryByUnit.raid1[INVSLOT_FINGER1] = slotLink(INVSLOT_FINGER1, fingerId, { enchant = 0, gem = "1" })
+local _, postEnchantGood, postEnchantPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(postEnchantGood ~= nil, "fresh inspect after same-ID enchant change writes lastGood")
+assertTrue(
+	postEnchantGood.policy and postEnchantGood.policy.prepared == false,
+	"fresh inspect after enchant loss is Unprepared rather than stale Prepared"
+)
+assertTrue(
+	postEnchantPlayer.freshObservation and postEnchantPlayer.freshObservation.complete == true,
+	"fresh inspect after same-ID enchant change sets fresh complete observation"
+)
+
+-- Ordinary inspect-driven inventory event without a proven change still completes.
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, noise2Good = inspectReadyOnce(state, memberId, guid)
+assertTrue(noise2Good ~= nil, "ordinary-noise baseline writes lastGood")
+beginAdhocInspect(state, memberId, guid)
+local noise2Generation = state.active.equipmentAuthorityGeneration
+RC:_InvalidateInspectUnit("raid1")
+assertEq(
+	RC:_CurrentEquipmentAuthorityGeneration({ guid, memberId }),
+	noise2Generation,
+	"ordinary inspect-driven inventory event without proven change does not bump authority"
+)
+assertTrue(state.lastGood[memberId] ~= nil, "ordinary inspect-driven inventory event keeps lastGood")
+RC:_HandleInspectReady(guid)
+assertTrue(state.lastGood[memberId] ~= nil, "ordinary inspect completes after inspect-driven inventory event")
+assertTrue(
+	state.adhocRun.players[memberId].freshObservation
+		and state.adhocRun.players[memberId].freshObservation.complete == true,
+	"ordinary inspect after inventory event sets fresh complete observation"
+)
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
