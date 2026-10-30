@@ -19,6 +19,9 @@ FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snaps
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
 EARLY_PREP_TESTS = REPO_ROOT / "tests" / "lua" / "early_preparation_tests.lua"
 BACKGROUND_QUEUE_TESTS = REPO_ROOT / "tests" / "lua" / "background_inspect_queue_tests.lua"
+OBSERVATION_AUTHORITY_TESTS = (
+    REPO_ROOT / "tests" / "lua" / "raid_check_observation_authority_tests.lua"
+)
 EARLY_PREP = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "EarlyPreparation.lua"
 PRESENCE_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_presence_tests.lua"
 ITEM_LEVEL_CONFIG_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_item_level_config_tests.lua"
@@ -144,6 +147,21 @@ def test_raid_equipment_auto_refresh_defaults_off():
 
 def test_background_inspect_queue_stops_with_last_consumer():
     _run_lua(BACKGROUND_QUEUE_TESTS, "background inspect queue")
+
+
+def test_raid_check_observation_authority_production_lua():
+    _run_lua(OBSERVATION_AUTHORITY_TESTS, "Raid Check observation authority")
+    raid_check = (REPO_ROOT / "SpectrumFederation" / "modules" / "RaidCheck.lua").read_text(
+        encoding="utf-8"
+    )
+    check_run = CHECK_RUN.read_text(encoding="utf-8")
+    assert "function RC:_InvalidateLastGoodForAliases(aliases)" in raid_check
+    assert "clearLastGood = true" in raid_check
+    assert "authoritativeComplete" in raid_check
+    assert "captured.blended ~= true" in raid_check
+    assert "SESSION_LAST_GOOD_SECONDS = 20 * 60" in check_run
+    assert "UsableSameSessionLastGood" in check_run
+    assert "IsUnscopedLastGood" in check_run
 
 
 def test_early_preparation_whispers_production_lua():
@@ -343,6 +361,7 @@ def test_raid_check_does_not_consume_persisted_equipment_snapshots():
     assert "sessionId = GetActiveLootHelperSessionId()" in raid_check
     assert "sessionId = good.sessionId" in raid_check
     assert "function CheckRun.SameSessionLastGood(good, expectedSessionId)" in check_run
+    assert "CheckRun.UsableSameSessionLastGood" in check_run
     assert "CheckRun.ClassifyPlayer(player, now, lastGoodById[id], expectedSessionId)" in check_run
     assert "GetProfileEquipmentSnapshot(" not in raid_check.split(
         "function RC:_SettleAdhocRun", 1

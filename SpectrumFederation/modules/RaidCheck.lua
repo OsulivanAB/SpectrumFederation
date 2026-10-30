@@ -1587,13 +1587,91 @@ function RC:_InvalidateInspectAliases(aliases)
 	end
 end
 
-function RC:_InvalidateInspectUnit(unit)
+-- Drop reusable last-good observations for the affected member aliases only.
+-- Known gear changes must not leave a stale complete observation eligible for
+-- same-session Raid Check fallback.
+function RC:_InvalidateLastGoodForAliases(aliases)
+	local state = self:_GetInspectState()
+	state.lastGood = state.lastGood or {}
+	if type(aliases) ~= "table" or #aliases == 0 then
+		return
+	end
+
+	local clearIds = {}
+	for id in pairs(state.lastGood) do
+		if type(id) == "string" and id ~= "" then
+			for _, alias in ipairs(aliases) do
+				if type(alias) == "string" and alias ~= "" then
+					local same = id == alias
+					if not same and SF.NameUtil and SF.NameUtil.SamePlayer then
+						same = SF.NameUtil.SamePlayer(id, alias) and true or false
+					end
+					if same then
+						clearIds[id] = true
+						break
+					end
+				end
+			end
+		end
+	end
+
+	local adhocPlayers = state.adhocRun and state.adhocRun.players or nil
+	for id in pairs(clearIds) do
+		state.lastGood[id] = nil
+		local player = adhocPlayers and adhocPlayers[id] or nil
+		if player then
+			player.lastGood = nil
+			-- A known equipment change also invalidates any complete observation
+			-- already attached to this run for the same member.
+			player.freshObservation = nil
+			player.policyResult = nil
+		end
+	end
+end
+
+function RC:_InvalidateLastGoodForUnit(unit)
 	if not unit then
 		return
 	end
 
+	local aliases = {}
+	if IsSelfUnit(unit) then
+		local selfId = SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier() or nil
+		if type(selfId) == "string" and selfId ~= "" then
+			aliases[#aliases + 1] = selfId
+		end
+		local guid = GetAccessibleUnitGUID and GetAccessibleUnitGUID("player") or nil
+		if type(guid) ~= "string" or guid == "" then
+			guid = UnitGUID and UnitGUID("player") or nil
+		end
+		if type(guid) == "string" and guid ~= "" then
+			aliases[#aliases + 1] = guid
+		end
+	else
+		aliases = self:_GetInspectAliases(unit)
+	end
+	self:_InvalidateLastGoodForAliases(aliases)
+end
+
+-- opts.clearLastGood:
+--   true  → clear member-scoped lastGood (equipment change)
+--   false → keep lastGood (bag-only local inventory noise)
+--   nil   → clear for remote units; keep for self (self bag events use this path)
+function RC:_InvalidateInspectUnit(unit, opts)
+	if not unit then
+		return
+	end
+	opts = opts or {}
+	local clearLastGood = opts.clearLastGood
+	if clearLastGood == nil then
+		clearLastGood = not IsSelfUnit(unit)
+	end
+
 	if IsSelfUnit(unit) then
 		self:_InvalidateLocalTroubleshootingSnapshot()
+		if clearLastGood then
+			self:_InvalidateLastGoodForUnit("player")
+		end
 		self:_MarkTroubleshootingDirty()
 		if SF.Debug then
 			SF.Debug:Verbose("RAID_CHECK", "Player inventory changed; notifying troubleshooting listeners")
@@ -1604,6 +1682,9 @@ function RC:_InvalidateInspectUnit(unit)
 
 	local aliases = self:_GetInspectAliases(unit)
 	self:_InvalidateInspectAliases(aliases)
+	if clearLastGood then
+		self:_InvalidateLastGoodForAliases(aliases)
+	end
 	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 end
@@ -1838,8 +1919,12 @@ function RC:EnsureInspectSupport()
 			if SF.Debug then
 				SF.Debug:Verbose("RAID_CHECK", "PLAYER_EQUIPMENT_CHANGED fired for slot %s; invalidating player inventory state and notifying troubleshooting listeners", tostring(arg1))
 			end
-			self:_InvalidateInspectUnit("player")
+			-- Local equipment slot changes are authoritative gear-change signals.
+			self:_InvalidateInspectUnit("player", { clearLastGood = true })
 		elseif event == "UNIT_INVENTORY_CHANGED" then
+			-- Remote units: inventory changes are the available gear-change signal.
+			-- Self: bag-only noise shares this event; keep lastGood until
+			-- PLAYER_EQUIPMENT_CHANGED proves an equipped-slot change.
 			self:_InvalidateInspectUnit(arg1)
 		elseif event == "TOOLTIP_DATA_UPDATE" then
 			self:_ScheduleTooltipDataRefresh()
@@ -2354,7 +2439,12 @@ function RC:_HandleInspectReady(guid)
 		local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
 		local policyConfig = (state.adhocRun and state.adhocRun.cfg) or GetLiveItemLevelConfig()
 		local policyResult = Policy and policyObs and Policy.EvaluateObservation(policyObs, policyConfig) or nil
-		if policyResult and policyResult.complete and active.id then
+		-- Blended captures merge prior partial evidence and must not become
+		-- authoritative fresh or same-session last-good observations.
+		local authoritativeComplete = policyResult
+			and policyResult.complete == true
+			and captured.blended ~= true
+		if authoritativeComplete and active.id then
 			state.lastGood = state.lastGood or {}
 			state.lastGood[active.id] = {
 				capturedAt = now,
@@ -2367,7 +2457,7 @@ function RC:_HandleInspectReady(guid)
 		if state.adhocRun and CheckRun and active.id then
 			local player = state.adhocRun.players and state.adhocRun.players[active.id]
 			if player then
-				if policyResult and policyResult.complete then
+				if authoritativeComplete then
 					CheckRun.MarkAttempt(player, "complete", true, now)
 					player.lastIncompleteReason = nil
 					player.freshObservation = {
@@ -2381,7 +2471,9 @@ function RC:_HandleInspectReady(guid)
 					player.lastGood = state.lastGood[active.id]
 					CheckRun.NoteProgress(state.adhocRun, now)
 				else
-					local reason = (policyResult and policyResult.incompleteReason) or "incomplete"
+					local reason = (captured.blended == true and "blended")
+						or (policyResult and policyResult.incompleteReason)
+						or "incomplete"
 					player.lastIncompleteReason = reason
 					local kind = CheckRun.AttemptKindForIncompleteReason
 						and CheckRun.AttemptKindForIncompleteReason(reason)

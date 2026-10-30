@@ -53,6 +53,7 @@ assertEq(CheckRun.ComputeActiveBudget(0), CheckRun.BASE_OVERALL_SECONDS, "zero t
 assertEq(CheckRun.ComputeActiveBudget(1000), CheckRun.SAFETY_CEILING_SECONDS, "final safety ceiling caps huge raids")
 assertEq(CheckRun.PER_TARGET_ATTEMPT_CAP, 4, "per-target attempt cap is 4")
 assertEq(CheckRun.RECENT_GOOD_SECONDS, 120, "recent-good window is 120s")
+assertEq(CheckRun.SESSION_LAST_GOOD_SECONDS, 20 * 60, "same-session freshness supports ~15 minute pre-raid collection")
 
 -- Inspect generation
 local inspectState = CheckRun.NewInspectState()
@@ -719,19 +720,33 @@ local missingSessionStamp = CheckRun.ClassifyPlayer(sameSessionFallback, 20, {
 }, "SES-A")
 assertEq(missingSessionStamp.class, CheckRun.CLASS.INSPECTION_FAILED, "last-good without session provenance is rejected for session-backed checks")
 
-local agedSameSession = CheckRun.NewPlayer("F3")
-CheckRun.MarkAttempt(agedSameSession, "timeout", true)
-agedSameSession.currentlyInspectable = false
-agedSameSession.rangeOnlyFailure = true
-local agedSameSessionClass = CheckRun.ClassifyPlayer(agedSameSession, 500, {
+local preRaidSameSession = CheckRun.NewPlayer("F3")
+CheckRun.MarkAttempt(preRaidSameSession, "timeout", true)
+preRaidSameSession.currentlyInspectable = false
+preRaidSameSession.rangeOnlyFailure = true
+local preRaidAge = 15 * 60
+local preRaidSameSessionClass = CheckRun.ClassifyPlayer(preRaidSameSession, 10 + preRaidAge, {
     complete = true,
     capturedAt = 10,
     sessionId = "SES-A",
     policy = { prepared = false, missing = { "Missing enchant: Finger1" } },
 }, "SES-A")
-assertEq(agedSameSessionClass.class, CheckRun.CLASS.UNPREPARED, "same-session last-good remains usable beyond the 120s window")
-assertEq(agedSameSessionClass.verified, CheckRun.VERIFIED.RECENT, "aged same-session fallback stays Recently Verified")
-assertTrue(agedSameSessionClass.countsForPot, "same-session Unprepared still counts for Reward Pot")
+assertEq(preRaidSameSessionClass.class, CheckRun.CLASS.UNPREPARED, "same-session last-good remains usable after a normal ~15 minute pre-raid wait")
+assertEq(preRaidSameSessionClass.verified, CheckRun.VERIFIED.RECENT, "pre-raid same-session fallback stays Recently Verified")
+assertTrue(preRaidSameSessionClass.countsForPot, "same-session Unprepared still counts for Reward Pot")
+
+local expiredSameSession = CheckRun.NewPlayer("F3-EXP")
+CheckRun.MarkAttempt(expiredSameSession, "timeout", true)
+expiredSameSession.currentlyInspectable = false
+expiredSameSession.rangeOnlyFailure = true
+local expiredAge = CheckRun.SESSION_LAST_GOOD_SECONDS + 1
+local expiredSameSessionClass = CheckRun.ClassifyPlayer(expiredSameSession, 10 + expiredAge, {
+    complete = true,
+    capturedAt = 10,
+    sessionId = "SES-A",
+    policy = { prepared = true, missing = {} },
+}, "SES-A")
+assertEq(expiredSameSessionClass.class, CheckRun.CLASS.INSPECTION_FAILED, "expired same-session last-good does not assert Prepared")
 
 local freshBeatsSameSession = CheckRun.NewPlayer("F4")
 freshBeatsSameSession.freshObservation = {
@@ -760,6 +775,76 @@ assertTrue(
     not CheckRun.SameSessionLastGood({ complete = true, sessionId = "SES-A" }, "SES-B"),
     "SameSessionLastGood rejects mismatched sessions"
 )
+assertTrue(
+    CheckRun.UsableSameSessionLastGood({
+        complete = true,
+        sessionId = "SES-A",
+        capturedAt = 100,
+    }, "SES-A", 100 + preRaidAge),
+    "UsableSameSessionLastGood accepts a fresh enough same-session observation"
+)
+assertTrue(
+    not CheckRun.UsableSameSessionLastGood({
+        complete = true,
+        sessionId = "SES-A",
+        capturedAt = 100,
+    }, "SES-A", 100 + expiredAge),
+    "UsableSameSessionLastGood rejects an expired same-session observation"
+)
+
+-- Prior-session observations must not ride the legacy 120s OOR path when the
+-- current check is session-backed, even without a technical failure.
+local priorSessionRun = CheckRun.NewRun({
+    targetIds = { "PRIOR" },
+    expectedSessionId = "SES-B",
+    now = 50,
+})
+priorSessionRun.players.PRIOR.rangeOnlyFailure = true
+priorSessionRun.players.PRIOR.currentlyInspectable = false
+priorSessionRun.players.PRIOR.wasReachable = true
+local priorSessionResults = CheckRun.ClassifyRun(priorSessionRun, 50, {
+    PRIOR = {
+        complete = true,
+        capturedAt = 10,
+        sessionId = "SES-A",
+        policy = { prepared = true, missing = {} },
+    },
+})
+assertEq(
+    priorSessionResults.PRIOR.class,
+    CheckRun.CLASS.INSPECTION_FAILED,
+    "ClassifyRun rejects previous-session last-good on the legacy OOR path"
+)
+assertTrue(
+    priorSessionResults.PRIOR.verified == nil,
+    "previous-session last-good is not Recently Verified"
+)
+
+-- Legitimate no-session checks may still use unscoped last-good within 120s.
+local noSessionRun = CheckRun.NewRun({
+    targetIds = { "NOS" },
+    now = 50,
+})
+noSessionRun.players.NOS.rangeOnlyFailure = true
+noSessionRun.players.NOS.currentlyInspectable = false
+local noSessionResults = CheckRun.ClassifyRun(noSessionRun, 50, {
+    NOS = {
+        complete = true,
+        capturedAt = 10,
+        policy = { prepared = true, missing = {} },
+    },
+})
+assertEq(noSessionResults.NOS.class, CheckRun.CLASS.PREPARED, "no-session ClassifyRun keeps unscoped 120s OOR fallback")
+assertEq(noSessionResults.NOS.verified, CheckRun.VERIFIED.RECENT, "no-session unscoped fallback is Recently Verified")
+
+-- Session-stamped last-good is not unscoped, even during a no-session check.
+local stampedNoSession = CheckRun.ClassifyPlayer(noSessionRun.players.NOS, 50, {
+    complete = true,
+    capturedAt = 10,
+    sessionId = "SES-OLD",
+    policy = { prepared = true, missing = {} },
+}, nil)
+assertEq(stampedNoSession.class, CheckRun.CLASS.UNPREPARED_AVAILABILITY, "session-stamped last-good is not reused by the no-session legacy path")
 
 -- Combat pause does not consume active bounds
 local pausedRun = CheckRun.NewRun({ targetIds = { "A" }, now = 0 })

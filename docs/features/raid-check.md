@@ -73,9 +73,18 @@ Someone who joins after freeze is ignored. Someone who leaves stays in the run a
 
 ### Recently Verified
 
-Raid Check still attempts a fresh inspect first. When that refresh cannot complete, a **complete** equipment observation already collected during the **same active Loot Helper session** may be reused as **Recently Verified**. That includes cases where the current attempt timed out, returned incomplete data, or the player is out of range. Incomplete observations are never treated as complete, observations from a previous Loot Helper session are not reused, and a fresh complete observation from this check always takes precedence. Reused equipment is evaluated against the current check's frozen readiness configuration.
+Raid Check still attempts a fresh inspect first. When that refresh cannot complete, a **complete**, **non-blended** equipment observation already collected during the **same active Loot Helper session** may be reused as **Recently Verified** when it is still within the session freshness window (about 20 minutes; sized for the typical ~15 minute pre-raid collection workflow). That includes cases where the current attempt timed out, returned incomplete data, or the player is out of range.
 
-Without a matching same-session observation, the older short-window fallback still applies: if a player cannot be refreshed only because they are out of range, and a complete runtime last-good result is at most about 120 seconds old, the check may treat them as **Recently Verified**. A technical inspect failure without same-session fallback remains **Inspection Failed**.
+Rules that keep the fallback honest:
+
+- Incomplete or blended inspections are never treated as complete authoritative evidence.
+- Observations from a previous Loot Helper session are never reused on any fallback path.
+- A known equipped-gear change for that member invalidates their reusable last-good observation.
+- A fresh complete observation from this check always takes precedence.
+- Reused equipment is evaluated against the current check's frozen readiness configuration.
+- Once a same-session observation is older than the freshness window, the check keeps the normal Inspection Failed / unknown handling rather than asserting Prepared or Unprepared from that stale cache.
+
+Without an active session-backed observation, the short no-session fallback still applies only to **unscoped** last-good data: if a player cannot be refreshed only because they are out of range, and that complete unscoped result is at most about 120 seconds old, the check may treat them as **Recently Verified**. A technical inspect failure without a usable same-session fallback remains **Inspection Failed**.
 
 ### Inspection Failed
 
