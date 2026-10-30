@@ -340,6 +340,10 @@ def test_raid_check_does_not_consume_persisted_equipment_snapshots():
     assert "_raidCheckEquipmentSnapshots" not in check_run
     assert "local frozenLastGood = ReevaluateFrozenRunPolicies(run, state.lastGood)" in raid_check
     assert "CheckRun.ClassifyRun(run, now, frozenLastGood)" in raid_check
+    assert "sessionId = GetActiveLootHelperSessionId()" in raid_check
+    assert "sessionId = good.sessionId" in raid_check
+    assert "function CheckRun.SameSessionLastGood(good, expectedSessionId)" in check_run
+    assert "CheckRun.ClassifyPlayer(player, now, lastGoodById[id], expectedSessionId)" in check_run
     assert "GetProfileEquipmentSnapshot(" not in raid_check.split(
         "function RC:_SettleAdhocRun", 1
     )[1]

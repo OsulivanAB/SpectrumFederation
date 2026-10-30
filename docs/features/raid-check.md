@@ -73,7 +73,9 @@ Someone who joins after freeze is ignored. Someone who leaves stays in the run a
 
 ### Recently Verified
 
-If a player cannot be refreshed only because they are out of range, and a complete runtime observation from this session is at most about 120 seconds old, the check may treat them as **Recently Verified** using that last-good result. A technical inspect failure in this run is not replaced by that fallback.
+Raid Check still attempts a fresh inspect first. When that refresh cannot complete, a **complete** equipment observation already collected during the **same active Loot Helper session** may be reused as **Recently Verified**. That includes cases where the current attempt timed out, returned incomplete data, or the player is out of range. Incomplete observations are never treated as complete, observations from a previous Loot Helper session are not reused, and a fresh complete observation from this check always takes precedence. Reused equipment is evaluated against the current check's frozen readiness configuration.
+
+Without a matching same-session observation, the older short-window fallback still applies: if a player cannot be refreshed only because they are out of range, and a complete runtime last-good result is at most about 120 seconds old, the check may treat them as **Recently Verified**. A technical inspect failure without same-session fallback remains **Inspection Failed**.
 
 ### Inspection Failed
 

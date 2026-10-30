@@ -647,6 +647,23 @@ local function HasActiveLootHelperSession()
 	return SF.LootHelperSync:IsSessionActive()
 end
 
+-- Session id for stamping runtime last-good equipment observations. Nil when no
+-- Loot Helper session is active so previous-session data cannot match a later check.
+local function GetActiveLootHelperSessionId()
+	if not HasActiveLootHelperSession() then
+		return nil
+	end
+	local sync = SF.LootHelperSync
+	if type(sync.GetSessionId) ~= "function" then
+		return nil
+	end
+	local sessionId = sync:GetSessionId()
+	if type(sessionId) ~= "string" or sessionId == "" then
+		return nil
+	end
+	return sessionId
+end
+
 local function CanInspectUnitNow(unit)
 	return unit
 		and UnitExists and UnitExists(unit)
@@ -2344,6 +2361,7 @@ function RC:_HandleInspectReady(guid)
 				complete = true,
 				policy = policyResult,
 				observation = policyObs,
+				sessionId = GetActiveLootHelperSessionId(),
 			}
 		end
 		if state.adhocRun and CheckRun and active.id then
@@ -3623,6 +3641,7 @@ local function QueueFrozenInspectTargets(self, run)
 								complete = true,
 								policy = policyResult,
 								observation = observation,
+								sessionId = GetActiveLootHelperSessionId(),
 							}
 							player.lastGood = state.lastGood[memberId]
 							CheckRun.NoteProgress(run, now)
@@ -4022,6 +4041,7 @@ local function ReevaluateFrozenRunPolicies(run, lastGoodById)
 				observation = good.observation,
 				policy = result,
 				complete = result ~= nil and result.complete == true,
+				sessionId = good.sessionId,
 			}
 		else
 			derived[id] = good
