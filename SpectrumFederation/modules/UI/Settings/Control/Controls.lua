@@ -1553,16 +1553,20 @@ end
 --   - rowHeight: Height of each row in the list (default: 20)
 --   - removeAtlas: Atlas name for the remove button icon (default: "common-icon-redx")
 -- Defaults for the opt-in shared leading column on AddScrollList (#440).
+-- textRightInset matches the non-compact Text RIGHT anchor (-24) so the clamp
+-- reserves drawable remainder after that inset, not only contentWidth - textLeft.
 Controls.SCROLL_LIST_LEADING_DEFAULTS = {
 	gap = 6,
 	minWidth = 0,
 	edgePad = 4,
 	minRemainderWidth = 40,
+	textRightInset = 24,
 }
 
 --- Shared leading-column width for opt-in scroll lists (#440).
 -- Right-justified leading labels share one width (widest measured string).
--- Clamped on narrow viewports so the remainder text keeps a usable budget.
+-- Clamped on narrow viewports so the remainder text keeps a usable budget
+-- after gap, edge pad, and the non-compact text right inset.
 -- @param maxLeadingWidth number Widest unconstrained leading label width among rows
 -- @param availableWidth number Visible content width for the list
 -- @param sizes table|nil Overrides for SCROLL_LIST_LEADING_DEFAULTS fields
@@ -1574,12 +1578,25 @@ function Controls.ScrollListLeadingColumnWidth(maxLeadingWidth, availableWidth, 
 	local minWidth = sizes.minWidth or d.minWidth
 	local edgePad = sizes.edgePad or d.edgePad
 	local minRemainder = sizes.minRemainderWidth or d.minRemainderWidth
+	local textRightInset = sizes.textRightInset
+	if textRightInset == nil then
+		textRightInset = d.textRightInset
+	end
 	local measured = math.max(minWidth, tonumber(maxLeadingWidth) or 0)
 	local avail = tonumber(availableWidth) or 0
 	if avail <= 0 then
 		return measured, gap
 	end
-	local maxAllowed = math.max(minWidth, avail - gap - minRemainder - edgePad)
+	-- Prefer the full remainder budget when the viewport can honor it. On
+	-- extremely narrow widths, fall back to minWidth (never negative).
+	local reserved = gap + minRemainder + edgePad + textRightInset
+	local maxAllowed = avail - reserved
+	if maxAllowed < minWidth then
+		maxAllowed = minWidth
+	end
+	if maxAllowed < 0 then
+		maxAllowed = 0
+	end
 	return math.min(measured, maxAllowed), gap
 end
 
@@ -1834,12 +1851,19 @@ function Controls:AddScrollList(section, opts)
 
 			local leadingWidth, leadingGap = 0, leadingColumnGap
 			if leadingColumn then
+				-- Compact lists size text explicitly; non-compact Goals text uses
+				-- RIGHT=-24, which must be reserved in the leading clamp.
+				local textRightInset = 0
+				if not compactColumns then
+					textRightInset = leadingDefaults.textRightInset or 24
+				end
 				leadingWidth, leadingGap = Controls.ScrollListLeadingColumnWidth(
 					maxLeadingWidth,
 					availableWidth,
 					{
 						gap = leadingColumnGap,
 						minWidth = leadingColumnMinWidth,
+						textRightInset = textRightInset,
 					}
 				)
 			end

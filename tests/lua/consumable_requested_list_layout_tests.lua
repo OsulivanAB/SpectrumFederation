@@ -872,13 +872,31 @@ do
     local width, gap = Controls.ScrollListLeadingColumnWidth(28, 400, { gap = 6 })
     assertEq(width, 28, "leading helper keeps the measured width when the viewport is wide")
     assertEq(gap, 6, "leading helper returns the configured gap")
-    local clamped = Controls.ScrollListLeadingColumnWidth(200, 80, {
-        gap = 6,
-        minRemainderWidth = 40,
-        edgePad = 4,
+    local textRightInset = Controls.SCROLL_LIST_LEADING_DEFAULTS.textRightInset or 24
+    assertEq(textRightInset, 24, "leading defaults reserve the non-compact text right inset")
+    -- Demonstrate the old clamp (no right inset) leaves under 40px drawable.
+    local demoAvail = 96
+    local demoGap, demoMin, demoEdge = 6, 40, 4
+    local oldMax = demoAvail - demoGap - demoMin - demoEdge
+    local oldDrawable = demoAvail - (oldMax + demoGap) - textRightInset
+    assertTrue(oldDrawable < 40,
+        "440: old clamp without right inset leaves under 40 drawable: " .. tostring(oldDrawable))
+    local clamped = Controls.ScrollListLeadingColumnWidth(200, demoAvail, {
+        gap = demoGap,
+        minRemainderWidth = demoMin,
+        edgePad = demoEdge,
+        textRightInset = textRightInset,
     })
     assertTrue(clamped < 200, "leading helper clamps on a narrow viewport")
     assertTrue(clamped >= 0, "leading helper never goes negative")
+    local newDrawable = demoAvail - (clamped + demoGap) - textRightInset
+    assertTrue(newDrawable >= 40,
+        "440: clamp with right inset keeps >=40 drawable: " .. tostring(newDrawable))
+    local tiny = Controls.ScrollListLeadingColumnWidth(200, 20, {
+        gap = 6,
+        textRightInset = textRightInset,
+    })
+    assertTrue(tiny >= 0, "440: extremely narrow viewports never yield a negative leading width")
 
     local panel = CreateFrame("Frame")
     panel:SetSize(700, 400)
@@ -1046,6 +1064,7 @@ do
         "440: content width follows the live viewport after narrow resize")
     local expectedLeading = Controls.ScrollListLeadingColumnWidth(measuredLeading, contentWidth, {
         gap = 6,
+        textRightInset = textRightInset,
     })
     assertEq(rows[1].Leading.width, expectedLeading,
         "440: leading width clamps against the new viewport")
@@ -1054,13 +1073,19 @@ do
     local narrowStart = leftAnchor(rows[1].Text).x
     assertEq(narrowStart, expectedLeading + 6,
         "440: remainder starts after the clamped leading column")
+    local rightPt = rightAnchor(rows[1].Text)
+    assertTrue(rightPt ~= nil, "440: non-compact remainder keeps a RIGHT anchor")
+    assertEq(rightPt.x, -textRightInset, "440: remainder RIGHT inset is 24px")
     for i = 2, #rows do
         assertEq(leftAnchor(rows[i].Text).x, narrowStart,
             "440: narrow resize keeps a shared remainder start on row " .. tostring(i))
+        assertEq(rightAnchor(rows[i].Text).x, -textRightInset,
+            "440: narrow resize keeps the RIGHT inset on row " .. tostring(i))
     end
-    local remainderBudget = contentWidth - narrowStart
-    assertTrue(remainderBudget >= 40,
-        "440: remainder keeps its intended width budget after clamp: " .. tostring(remainderBudget))
+    -- Drawable remainder accounts for the RIGHT inset, not only contentWidth - textLeft.
+    local drawableRemainder = contentWidth - narrowStart - textRightInset
+    assertTrue(drawableRemainder >= 40,
+        "440: drawable remainder keeps >=40 after right inset: " .. tostring(drawableRemainder))
     assertTrue(calls - callsBefore <= 4, "440: resize refresh does not storm getItems")
 
     -- Narrow→wide: column must expand back to the unconstrained label width.
@@ -1069,6 +1094,7 @@ do
     local wideContentWidth = scroll.scrollChild:GetWidth()
     local wideExpected = Controls.ScrollListLeadingColumnWidth(measuredLeading, wideContentWidth, {
         gap = 6,
+        textRightInset = textRightInset,
     })
     assertEq(rows[1].Leading.width, wideExpected,
         "440: narrow→wide restores the unconstrained leading width")
@@ -1081,8 +1107,9 @@ do
         assertEq(leftAnchor(rows[i].Text).x, wideStart,
             "440: icons stay aligned after narrow→wide on row " .. tostring(i))
     end
-    assertTrue(wideContentWidth - wideStart >= 40,
-        "440: remainder budget remains after narrow→wide expand")
+    local wideDrawable = wideContentWidth - wideStart - textRightInset
+    assertTrue(wideDrawable >= 40,
+        "440: drawable remainder remains after narrow→wide: " .. tostring(wideDrawable))
 
     for _ = 1, 8 do
         scroll:SetSize(420, 120)
@@ -1099,6 +1126,7 @@ do
     local finalContentWidth = scroll.scrollChild:GetWidth()
     local finalExpected = Controls.ScrollListLeadingColumnWidth(measuredLeading, finalContentWidth, {
         gap = 6,
+        textRightInset = textRightInset,
     })
     assertEq(rows[1].Leading.width, finalExpected,
         "440: repeated resize reconverges on the clamped leading width")
@@ -1106,7 +1134,12 @@ do
     for i = 1, #rows do
         assertEq(leftAnchor(rows[i].Text).x, finalStart,
             "440: repeated resize keeps aligned remainder starts on row " .. tostring(i))
+        assertEq(rightAnchor(rows[i].Text).x, -textRightInset,
+            "440: repeated resize keeps the RIGHT inset on row " .. tostring(i))
     end
+    local finalDrawable = finalContentWidth - finalStart - textRightInset
+    assertTrue(finalDrawable >= 40,
+        "440: repeated narrow resize keeps drawable remainder: " .. tostring(finalDrawable))
     assertTrue(calls <= 80, "440: repeated refreshes stay bounded")
 end
 
