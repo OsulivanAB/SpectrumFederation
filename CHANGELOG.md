@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.16-beta.9] - 2026-10-30
+
+### Changed
+- Align Raid Supplies Logs goal percents in a shared column (#440)
+
 ## [1.5.16] - 2026-10-29
 
 ### Added
