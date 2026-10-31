@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.17-beta.1] - 2026-10-31
+
+### Fixed
+- Fix Raid Check same-session equipment fallback (#339)
+
 ## [1.5.16-beta.9] - 2026-10-30
 
 ### Changed
