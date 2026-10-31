@@ -1607,7 +1607,8 @@ end
 --    (enchant / gem / fresh equipped item level) against a prior complete
 --    Prepared *or* Unprepared observation. First-inspect grace may retain a
 --    bounded per-request reliable slot snapshot to reconcile with INSPECT_READY
---    when no baseline/lastGood exists yet. Copied fills, inspect stubs,
+--    when no baseline/lastGood exists yet (item IDs and same-ID enchant/gem/
+--    fresh item-level policy evidence). Copied fills, inspect stubs,
 --    unresolved gem/link data, and KeepKnownOverallItemLevel carry-forward
 --    alone are not proof. Timing alone is not proof of benign inspect noise;
 --    live nil is not confirmed emptiness. Residual Retail limit: same-ID swaps
@@ -2823,6 +2824,70 @@ local function SlotHasConfirmedGemsFilled(slot)
 	return true
 end
 
+-- Compare two independently built reliable Policy observations (grace vs ready).
+-- Detects same-ID required enchant/gem contradictions and fresh item levels on
+-- opposite sides of the active minimum. Unresolved/stub evidence never counts.
+local function ReliableGraceReadyPolicyEvidenceConflicts(graceObs, readyObs, policyConfig)
+	if type(graceObs) ~= "table" or type(readyObs) ~= "table" then
+		return false
+	end
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if not Policy then
+		return false
+	end
+
+	if Policy.ItemLevelRequirementActive and Policy.ItemLevelRequirementActive(policyConfig) then
+		local minimum = Policy.NormalizeMinimumItemLevel(policyConfig.minimumItemLevel)
+		local graceLevel = CanonicalOverallItemLevel(graceObs.overallEquippedItemLevel)
+		local readyLevel = CanonicalOverallItemLevel(readyObs.overallEquippedItemLevel)
+		if minimum and graceLevel and readyLevel then
+			local graceBelow = graceLevel < minimum
+			local readyBelow = readyLevel < minimum
+			if graceBelow ~= readyBelow then
+				return true
+			end
+		end
+	end
+
+	local graceSlots = graceObs.slotsByInventory
+	local readySlots = readyObs.slotsByInventory
+	if type(graceSlots) ~= "table" or type(readySlots) ~= "table" then
+		return false
+	end
+
+	for _, def in ipairs(Policy.TRACKED_SLOTS or {}) do
+		local inventorySlot = def.inventorySlot
+		local graceSlot = graceSlots[inventorySlot]
+		local readySlot = readySlots[inventorySlot]
+		if type(graceSlot) == "table" and type(readySlot) == "table" then
+			local gracePresence = Policy.DescribeSlotPresence and select(1, Policy.DescribeSlotPresence(graceSlot))
+			local readyPresence = Policy.DescribeSlotPresence and select(1, Policy.DescribeSlotPresence(readySlot))
+			if gracePresence == "equipped" and readyPresence == "equipped" then
+				local graceId = tonumber(graceSlot.itemId)
+				local readyId = tonumber(readySlot.itemId)
+				if graceId and readyId and graceId == readyId then
+					local graceHasEnchant = SlotHasConfirmedEnchant(graceSlot)
+					local graceMissEnchant = SlotHadRequiredEnchantMiss(graceSlot, def, Policy)
+					local readyHasEnchant = SlotHasConfirmedEnchant(readySlot)
+					local readyMissEnchant = SlotHadRequiredEnchantMiss(readySlot, def, Policy)
+					if (graceHasEnchant and readyMissEnchant) or (graceMissEnchant and readyHasEnchant) then
+						return true
+					end
+
+					local graceGemsFilled = SlotHasConfirmedGemsFilled(graceSlot)
+					local graceGemMiss = SlotHadRequiredGemMiss(graceSlot)
+					local readyGemsFilled = SlotHasConfirmedGemsFilled(readySlot)
+					local readyGemMiss = SlotHadRequiredGemMiss(readySlot)
+					if (graceGemsFilled and readyGemMiss) or (graceGemMiss and readyGemsFilled) then
+						return true
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
 -- Reliable evidence disproves a previously recorded complete Unprepared failure
 -- (enchant/gem restored, or fresh item level restored above minimum). Unresolved
 -- slots/stubs and KeepKnown carry-forward alone are never treated as a fix.
@@ -3315,7 +3380,10 @@ function RC:_HandleInspectReady(guid)
 		end
 		-- First-inspect / no-baseline grace evidence: if a prior UNIT_INVENTORY
 		-- event retained a reliably identified kit that conflicts with this
-		-- ready payload, reject authority rather than guessing which is newer.
+		-- ready payload (different item IDs, or same-ID policy-relevant
+		-- enchant/gem/fresh item-level contradictions), reject authority rather
+		-- than guessing which snapshot is newer. Incomplete/stub metadata is
+		-- never treated as a confirmed conflict.
 		if hasEquipmentAuthority
 			and type(active.graceReliableEquipmentBySlot) == "table"
 			and next(active.graceReliableEquipmentBySlot) ~= nil
@@ -3329,6 +3397,15 @@ function RC:_HandleInspectReady(guid)
 			end
 			if EquipmentEvidenceConflicts(graceIdentity, {}, captureIdentity, {}) then
 				RejectReadyAuthority()
+			else
+				local graceObs = BuildReliablePolicyObservationFromCaptured(
+					{ slotsByInventory = active.graceReliableEquipmentBySlot },
+					active.graceFreshItemLevel
+				)
+				local readyObs = BuildReliablePolicyObservationFromCaptured(captured, freshItemLevel)
+				if ReliableGraceReadyPolicyEvidenceConflicts(graceObs, readyObs, policyConfig) then
+					RejectReadyAuthority()
+				end
 			end
 		end
 		-- Blended captures merge prior partial evidence and must not become

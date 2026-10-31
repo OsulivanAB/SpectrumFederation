@@ -1675,83 +1675,262 @@ assertTrue(
 	"benign first-inspect ready sets fresh complete observation"
 )
 
+-- Same-ID / item-level first-inspect grace vs ready policy contradictions.
+-- Nested function keeps Lua 5.1 main-chunk local limits under control.
+local function runFirstInspectSameIdGracePolicyTests()
+	local fingerSameId = 1000 + INVSLOT_FINGER1
+	local chestSameId = 1000 + INVSLOT_CHEST
+
+	-- Same base item ID, grace/ready disagree on required enchant → reject authority.
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	local localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	beginAdhocInspect(localState, memberId, guid)
+	local graceEnchantKit = fillAllSlots()
+	graceEnchantKit[INVSLOT_FINGER1] = slotLink(INVSLOT_FINGER1, fingerSameId, { enchant = 1, gem = "" })
+	inventoryByUnit.raid1 = graceEnchantKit
+	RC:_InvalidateInspectUnit("raid1")
+	assertTrue(
+		localState.active.graceReliableEquipmentBySlot
+			and localState.active.graceReliableEquipmentBySlot[INVSLOT_FINGER1] ~= nil,
+		"same-ID enchant grace retains finger evidence"
+	)
+	local readyMissingEnchantKit = fillAllSlots()
+	readyMissingEnchantKit[INVSLOT_FINGER1] = slotLink(INVSLOT_FINGER1, fingerSameId, { enchant = 0, gem = "1" })
+	inventoryByUnit.raid1 = readyMissingEnchantKit
+	RC:_HandleInspectReady(guid)
+	assertEq(localState.lastGood[memberId], nil, "same-ID enchant grace/ready conflict does not write lastGood")
+	assertEq(
+		localState.cache[memberId].authorityInvalidated,
+		true,
+		"same-ID enchant grace/ready conflict rejects ready authority"
+	)
+	assertTrue(
+		not (
+			localState.adhocRun.players[memberId].freshObservation
+			and localState.adhocRun.players[memberId].freshObservation.complete == true
+		),
+		"same-ID enchant conflict does not set complete freshObservation"
+	)
+	nowTime = nowTime + 1
+	inventoryByUnit.raid1 = readyMissingEnchantKit
+	local _, recoveredEnchantGood, recoveredEnchantPlayer = inspectReadyOnce(localState, memberId, guid)
+	assertTrue(recoveredEnchantGood ~= nil, "fresh inspect recovers after same-ID enchant grace conflict")
+	assertTrue(
+		recoveredEnchantPlayer.freshObservation and recoveredEnchantPlayer.freshObservation.complete == true,
+		"recovery after same-ID enchant conflict sets fresh complete observation"
+	)
+	assertEq(
+		recoveredEnchantGood.policy and recoveredEnchantGood.policy.prepared,
+		false,
+		"recovery after enchant conflict reflects the missing-enchant kit"
+	)
+
+	-- Same-ID gem-state disagreement → reject authority.
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	localState = RC:_GetInspectState()
+	socketCountByItemId[chestSameId] = 1
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	beginAdhocInspect(localState, memberId, guid)
+	local graceGemKit = fillAllSlots()
+	graceGemKit[INVSLOT_CHEST] = slotLink(INVSLOT_CHEST, chestSameId, { gem = "240967" })
+	inventoryByUnit.raid1 = graceGemKit
+	RC:_InvalidateInspectUnit("raid1")
+	local readyEmptyGemKit = fillAllSlots()
+	readyEmptyGemKit[INVSLOT_CHEST] = slotLink(INVSLOT_CHEST, chestSameId, { gem = "" })
+	inventoryByUnit.raid1 = readyEmptyGemKit
+	RC:_HandleInspectReady(guid)
+	assertEq(localState.lastGood[memberId], nil, "same-ID gem grace/ready conflict does not write lastGood")
+	assertEq(localState.cache[memberId].authorityInvalidated, true, "same-ID gem grace/ready conflict rejects ready authority")
+
+	-- Fresh item levels on opposite sides of the configured minimum → reject.
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	enableMinimumItemLevel(localState, 690)
+	beginAdhocInspect(localState, memberId, guid)
+	inspectItemLevel = 700
+	inventoryByUnit.raid1 = fillAllSlots()
+	RC:_InvalidateInspectUnit("raid1")
+	assertEq(localState.active.graceFreshItemLevel, 700, "grace retains fresh item level above minimum")
+	inspectItemLevel = 640
+	RC:_HandleInspectReady(guid)
+	assertEq(localState.lastGood[memberId], nil, "item-level grace/ready conflict across minimum does not write lastGood")
+	assertEq(
+		localState.cache[memberId].authorityInvalidated,
+		true,
+		"item-level grace/ready conflict across minimum rejects ready authority"
+	)
+	nowTime = nowTime + 1
+	inspectItemLevel = 640
+	local _, recoveredIlvlGood = inspectReadyOnce(localState, memberId, guid)
+	assertTrue(recoveredIlvlGood ~= nil, "fresh inspect recovers after item-level grace conflict")
+	assertEq(
+		recoveredIlvlGood.policy and recoveredIlvlGood.policy.prepared,
+		false,
+		"recovery after IL conflict is Unprepared below minimum"
+	)
+
+	-- Incomplete grace metadata must not falsely invalidate a matching ready kit.
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	beginAdhocInspect(localState, memberId, guid)
+	-- Manually retain only a stub link as "grace" evidence (would not normally be
+	-- filtered in, but guards against incomplete comparisons if present).
+	localState.active.graceReliableEquipmentBySlot = {
+		[INVSLOT_FINGER1] = {
+			link = slotLinkStub(INVSLOT_FINGER1, fingerSameId),
+			itemId = fingerSameId,
+			hasItem = true,
+			texture = "Interface\\Icons\\INV_Misc_QuestionMark",
+		},
+	}
+	localState.active.inventoryObservedDuringGrace = true
+	inventoryByUnit.raid1 = fillAllSlots()
+	RC:_HandleInspectReady(guid)
+	assertTrue(
+		localState.lastGood[memberId] ~= nil,
+		"incomplete grace stub metadata does not falsely invalidate a valid ready inspection"
+	)
+	assertTrue(
+		localState.adhocRun.players[memberId].freshObservation
+			and localState.adhocRun.players[memberId].freshObservation.complete == true,
+		"valid ready after incomplete grace stub remains authoritative"
+	)
+
+	-- Matching resolved grace/ready observations remain authoritative (control).
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	beginAdhocInspect(localState, memberId, guid)
+	inspectItemLevel = 700
+	inventoryByUnit.raid1 = fillAllSlots()
+	RC:_InvalidateInspectUnit("raid1")
+	RC:_HandleInspectReady(guid)
+	assertTrue(localState.lastGood[memberId] ~= nil, "matching resolved grace/ready observations remain authoritative")
+	assertEq(
+		localState.cache[memberId].authorityInvalidated ~= true,
+		true,
+		"matching resolved grace/ready does not mark cache authorityInvalidated"
+	)
+
+	state = localState
+end
+runFirstInspectSameIdGracePolicyTests()
+
 -- ---------------------------------------------------------------------------
 -- 20) GetCachedEquipmentReadiness hides authority-invalidated captures
 -- ---------------------------------------------------------------------------
-resetState()
-setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
-state = RC:_GetInspectState()
-inventoryByUnit.raid1 = fillAllSlots()
-state.adhocRun = CheckRun.NewRun({
-	targetIds = { memberId },
-	expectedSessionId = "SES-A",
-	now = nowTime,
-})
-local _, readyCacheGood = inspectReadyOnce(state, memberId, guid)
-assertTrue(readyCacheGood ~= nil, "readiness valid-cache baseline exists")
-local validReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
-assertEq(validReadiness.state, "ready", "valid authoritative cache yields Ready")
+local function runCachedReadinessAuthorityTests()
+	local fingerId = 1000 + INVSLOT_FINGER1
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	local localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = fillAllSlots()
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	local _, readyCacheGood = inspectReadyOnce(localState, memberId, guid)
+	assertTrue(readyCacheGood ~= nil, "readiness valid-cache baseline exists")
+	local validReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+	assertEq(validReadiness.state, "ready", "valid authoritative cache yields Ready")
 
--- Populate a complete but authority-invalidated cache (troubleshooting retained).
-state.cache[memberId].authorityInvalidated = true
-state.lastGood[memberId] = nil
-local invalidatedReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
-assertEq(
-	invalidatedReadiness.state,
-	"unknown",
-	"authority-invalidated complete cache yields Unknown readiness"
-)
+	-- Populate a complete but authority-invalidated cache (troubleshooting retained).
+	localState.cache[memberId].authorityInvalidated = true
+	localState.lastGood[memberId] = nil
+	local invalidatedReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+	assertEq(
+		invalidatedReadiness.state,
+		"unknown",
+		"authority-invalidated complete cache yields Unknown readiness"
+	)
 
--- Non-invalidated blended known-Unprepared remains usable as Not Ready.
--- Alias keys (guid + memberId) must reference the same entry object.
-local blendedSlots = {}
-for _, slot in ipairs(TRACKED_SLOTS) do
-	blendedSlots[slot] = {
-		link = slotLink(slot),
-		itemId = 1000 + slot,
+	-- Non-invalidated blended known-Unprepared remains usable as Not Ready.
+	-- Alias keys (guid + memberId) must reference the same entry object.
+	local blendedSlots = {}
+	for _, slot in ipairs(TRACKED_SLOTS) do
+		blendedSlots[slot] = {
+			link = slotLink(slot),
+			itemId = 1000 + slot,
+			texture = "Interface\\Icons\\INV_Misc_QuestionMark",
+			hasItem = true,
+		}
+	end
+	blendedSlots[INVSLOT_FINGER1] = {
+		link = slotLink(INVSLOT_FINGER1, fingerId, { enchant = 0, gem = "1" }),
+		itemId = fingerId,
 		texture = "Interface\\Icons\\INV_Misc_QuestionMark",
 		hasItem = true,
+		copiedEvidence = false,
 	}
-end
-blendedSlots[INVSLOT_FINGER1] = {
-	link = slotLink(INVSLOT_FINGER1, fingerIdFix, { enchant = 0, gem = "1" }),
-	itemId = fingerIdFix,
-	texture = "Interface\\Icons\\INV_Misc_QuestionMark",
-	hasItem = true,
-	copiedEvidence = false,
-}
-local blendedEntry = {
-	guid = guid,
-	id = memberId,
-	status = "ready",
-	updatedAt = nowTime,
-	capturedAt = nowTime,
-	overallEquippedItemLevel = 700,
-	averageItemLevel = 700,
-	slotsByInventory = blendedSlots,
-	blended = true,
-	authorityInvalidated = false,
-	aliases = { guid, memberId },
-}
-state.cache[memberId] = blendedEntry
-state.cache[guid] = blendedEntry
-local blendedReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
-assertEq(
-	blendedReadiness.state,
-	"not_ready",
-	"blended non-invalidated known-Unprepared remains Not Ready"
-)
+	local blendedEntry = {
+		guid = guid,
+		id = memberId,
+		status = "ready",
+		updatedAt = nowTime,
+		capturedAt = nowTime,
+		overallEquippedItemLevel = 700,
+		averageItemLevel = 700,
+		slotsByInventory = blendedSlots,
+		blended = true,
+		authorityInvalidated = false,
+		aliases = { guid, memberId },
+	}
+	localState.cache[memberId] = blendedEntry
+	localState.cache[guid] = blendedEntry
+	local blendedReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+	assertEq(
+		blendedReadiness.state,
+		"not_ready",
+		"blended non-invalidated known-Unprepared remains Not Ready"
+	)
 
--- RosterModel readiness consumer reflects Unknown for invalidated cache.
-local rosterChunk = assert(loadfile("SpectrumFederation/modules/UI/LootHelper/RosterModel.lua"))
-rosterChunk("SpectrumFederation", SF)
-SF.LootHelperWindow = SF.LootHelperWindow or {}
-local Model = SF.LootHelperWindow.RosterModel
-assertTrue(Model and type(Model.Build) == "function", "RosterModel loads for readiness consumer check")
-blendedEntry.authorityInvalidated = true
-blendedEntry.blended = false
-local rosterReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
-assertEq(rosterReadiness.state, "unknown", "Loot Helper roster readiness source is Unknown for invalidated cache")
+	-- RosterModel readiness consumer reflects Unknown for invalidated cache.
+	local rosterChunk = assert(loadfile("SpectrumFederation/modules/UI/LootHelper/RosterModel.lua"))
+	rosterChunk("SpectrumFederation", SF)
+	SF.LootHelperWindow = SF.LootHelperWindow or {}
+	local Model = SF.LootHelperWindow.RosterModel
+	assertTrue(Model and type(Model.Build) == "function", "RosterModel loads for readiness consumer check")
+	blendedEntry.authorityInvalidated = true
+	blendedEntry.blended = false
+	local rosterReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+	assertEq(rosterReadiness.state, "unknown", "Loot Helper roster readiness source is Unknown for invalidated cache")
+	state = localState
+end
+runCachedReadinessAuthorityTests()
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
