@@ -6,6 +6,10 @@ local CheckRun = {}
 SF.RaidEquipment.CheckRun = CheckRun
 
 CheckRun.RECENT_GOOD_SECONDS = 120
+-- Same-session last-good may back a Raid Check for this long after capture.
+-- Sized for the typical ~15 minute pre-raid collection window with margin; not
+-- a return to the short 120s legacy OOR window.
+CheckRun.SESSION_LAST_GOOD_SECONDS = 20 * 60
 CheckRun.PER_TARGET_ATTEMPT_CAP = 4
 CheckRun.PER_INSPECT_ACTIVE_WAIT = 2.0
 -- Minimum gap between remote/local retries after a still-loading (pending) result.
@@ -27,7 +31,10 @@ CheckRun.CLASS = {
 
 CheckRun.VERIFIED = {
 	FRESH = "fresh",
+	-- Legacy no-session / unscoped OOR fallback within RECENT_GOOD_SECONDS.
 	RECENT = "recent",
+	-- Same-session complete last-good within SESSION_LAST_GOOD_SECONDS.
+	SESSION = "session",
 }
 
 function CheckRun.ComputeActiveBudget(targetCount)
@@ -415,7 +422,54 @@ local function AgeSeconds(capturedAt, now)
 	return now - capturedAt
 end
 
-function CheckRun.ClassifyPlayer(player, now, lastGood)
+local function HasExpectedSession(expectedSessionId)
+	return type(expectedSessionId) == "string" and expectedSessionId ~= ""
+end
+
+local function IsUnscopedLastGood(good)
+	return type(good) == "table"
+		and (good.sessionId == nil or good.sessionId == "")
+end
+
+-- Complete last-good observations stamped with the active Loot Helper session may
+-- back a Raid Check classification when a fresh inspect cannot complete.
+function CheckRun.SameSessionLastGood(good, expectedSessionId)
+	return HasExpectedSession(expectedSessionId)
+		and type(good) == "table"
+		and good.complete == true
+		and type(good.sessionId) == "string"
+		and good.sessionId == expectedSessionId
+end
+
+function CheckRun.IsFreshEnoughLastGood(good, now, maxAgeSeconds)
+	local age = good and AgeSeconds(good.capturedAt, now)
+	maxAgeSeconds = tonumber(maxAgeSeconds)
+	if age == nil or maxAgeSeconds == nil then
+		return false, age
+	end
+	return age <= maxAgeSeconds, age
+end
+
+function CheckRun.UsableSameSessionLastGood(good, expectedSessionId, now)
+	if not CheckRun.SameSessionLastGood(good, expectedSessionId) then
+		return false, good and AgeSeconds(good.capturedAt, now) or nil
+	end
+	return CheckRun.IsFreshEnoughLastGood(good, now, CheckRun.SESSION_LAST_GOOD_SECONDS)
+end
+
+local function ClassificationFromLastGood(good, player, age, verifiedKind)
+	local policy = (good and good.policy) or (player and player.policyResult)
+	local prepared = policy and policy.prepared == true
+	return {
+		class = prepared and CheckRun.CLASS.PREPARED or CheckRun.CLASS.UNPREPARED,
+		verified = verifiedKind or CheckRun.VERIFIED.RECENT,
+		missing = (policy and policy.missing) or {},
+		countsForPot = not prepared,
+		verifiedAge = age,
+	}
+end
+
+function CheckRun.ClassifyPlayer(player, now, lastGood, expectedSessionId)
 	if type(player) ~= "table" then
 		return {
 			class = CheckRun.CLASS.INSPECTION_FAILED,
@@ -424,6 +478,7 @@ function CheckRun.ClassifyPlayer(player, now, lastGood)
 		}
 	end
 
+	-- 1) Fresh complete observation from this Raid Check wins.
 	if player.freshObservation and player.freshObservation.complete then
 		local policy = player.policyResult or player.freshObservation.policy
 		local prepared = policy and policy.prepared == true
@@ -435,6 +490,20 @@ function CheckRun.ClassifyPlayer(player, now, lastGood)
 		}
 	end
 
+	local good = lastGood or player.lastGood
+	local age = good and AgeSeconds(good.capturedAt, now)
+
+	-- 2) Same-session complete last-good within the session freshness bound:
+	-- usable even when this run's refresh timed out, returned incomplete, or
+	-- the player is now out of range. Expired same-session data falls through.
+	-- A later inspect that proved contradictory reliable evidence must already
+	-- have cleared this entry via member-scoped invalidation.
+	local usableSameSession = CheckRun.UsableSameSessionLastGood(good, expectedSessionId, now)
+	if usableSameSession then
+		return ClassificationFromLastGood(good, player, age, CheckRun.VERIFIED.SESSION)
+	end
+
+	-- 3) A technical failure without a usable same-session fallback stays Inspection Failed.
 	if player.technicalFailure then
 		return {
 			class = CheckRun.CLASS.INSPECTION_FAILED,
@@ -444,19 +513,17 @@ function CheckRun.ClassifyPlayer(player, now, lastGood)
 		}
 	end
 
-	local good = lastGood or player.lastGood
-	local age = good and AgeSeconds(good.capturedAt, now)
-	if good and good.complete and age ~= nil and age <= CheckRun.RECENT_GOOD_SECONDS then
+	-- 4) Legacy recently-verified path: only truly unscoped last-good during a
+	-- no-session check, within 120s, when the only obstacle is range.
+	-- Prior-session observations are never reused here.
+	if not HasExpectedSession(expectedSessionId)
+		and IsUnscopedLastGood(good)
+		and good.complete
+		and age ~= nil
+		and age <= CheckRun.RECENT_GOOD_SECONDS
+	then
 		if player.rangeOnlyFailure or not player.currentlyInspectable then
-			local policy = good.policy or player.policyResult
-			local prepared = policy and policy.prepared == true
-			return {
-				class = prepared and CheckRun.CLASS.PREPARED or CheckRun.CLASS.UNPREPARED,
-				verified = CheckRun.VERIFIED.RECENT,
-				missing = (policy and policy.missing) or {},
-				countsForPot = not prepared,
-				verifiedAge = age,
-			}
+			return ClassificationFromLastGood(good, player, age, CheckRun.VERIFIED.RECENT)
 		end
 	end
 
@@ -491,9 +558,10 @@ end
 function CheckRun.ClassifyRun(run, now, lastGoodById)
 	lastGoodById = lastGoodById or {}
 	local results = {}
+	local expectedSessionId = run and run.expectedSessionId or nil
 	for _, id in ipairs(run.targetIds or {}) do
 		local player = run.players[id]
-		results[id] = CheckRun.ClassifyPlayer(player, now, lastGoodById[id])
+		results[id] = CheckRun.ClassifyPlayer(player, now, lastGoodById[id], expectedSessionId)
 		if player then
 			player.terminal = results[id].class
 			player.verified = results[id].verified
