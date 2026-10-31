@@ -1465,6 +1465,294 @@ assertTrue(
 	"ordinary inspect after inventory event sets fresh complete observation"
 )
 
+-- ---------------------------------------------------------------------------
+-- 18) Symmetric invalidation: confirmed Unprepared fixes retire stale fallback
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+local fingerIdFix = 1000 + INVSLOT_FINGER1
+local missingEnchantKit = fillAllSlots()
+missingEnchantKit[INVSLOT_FINGER1] = slotLink(INVSLOT_FINGER1, fingerIdFix, { enchant = 0, gem = "1" })
+inventoryByUnit.raid1 = missingEnchantKit
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, unpreparedEnchantGood, unpreparedEnchantPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(unpreparedEnchantGood ~= nil, "missing-enchant baseline writes lastGood")
+assertEq(unpreparedEnchantGood.policy and unpreparedEnchantGood.policy.prepared, false, "missing-enchant baseline is Unprepared")
+assertEq(unpreparedEnchantGood.policy and unpreparedEnchantGood.policy.complete, true, "missing-enchant baseline is complete")
+
+-- Partial follow-up independently confirms the enchant is restored; other slot unresolved.
+inventoryByUnit.raid1 = fillAllSlots()
+inventoryByUnit.raid1[INVSLOT_FINGER1] = slotLink(INVSLOT_FINGER1, fingerIdFix, { enchant = 1, gem = "" })
+inventoryByUnit.raid1[INVSLOT_TRINKET2] = nil
+local fixedEnchantPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(fixedEnchantPartial.blended, true, "enchant-fix partial capture stays blended/incomplete")
+assertEq(state.lastGood[memberId], nil, "confirmed enchant fix retires contradicted Unprepared lastGood")
+assertEq(unpreparedEnchantPlayer.freshObservation, nil, "enchant fix clears player freshObservation")
+CheckRun.MarkAttempt(unpreparedEnchantPlayer, "timeout", true, nowTime)
+unpreparedEnchantPlayer.technicalFailure = true
+unpreparedEnchantPlayer.currentlyInspectable = false
+unpreparedEnchantPlayer.rangeOnlyFailure = true
+local afterEnchantFix = CheckRun.ClassifyPlayer(
+	unpreparedEnchantPlayer,
+	nowTime,
+	state.lastGood[memberId],
+	"SES-A"
+)
+assertEq(
+	afterEnchantFix.class,
+	CheckRun.CLASS.INSPECTION_FAILED,
+	"after confirmed enchant fix, incomplete/timeout does not reuse stale Unprepared"
+)
+assertTrue(not afterEnchantFix.countsForPot, "stale Unprepared after enchant fix does not deduct Reward Pot")
+
+-- Gem fix (same-ID) retires Unprepared; unresolved control keeps fallback.
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+local chestIdFix = 1000 + INVSLOT_CHEST
+socketCountByItemId[chestIdFix] = 1
+local missingGemBaseline = fillAllSlots()
+missingGemBaseline[INVSLOT_CHEST] = slotLink(INVSLOT_CHEST, chestIdFix, { gem = "" })
+inventoryByUnit.raid1 = missingGemBaseline
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, unpreparedGemGood, unpreparedGemPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(unpreparedGemGood ~= nil and unpreparedGemGood.policy.prepared == false, "missing-gem baseline is Unprepared")
+
+local fixedGemPartialKit = fillAllSlots()
+fixedGemPartialKit[INVSLOT_CHEST] = slotLink(INVSLOT_CHEST, chestIdFix, { gem = "240967" })
+fixedGemPartialKit[INVSLOT_TRINKET2] = nil
+inventoryByUnit.raid1 = fixedGemPartialKit
+local fixedGemPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(fixedGemPartial.blended, true, "gem-fix partial capture stays blended")
+assertEq(state.lastGood[memberId], nil, "confirmed gem fill retires contradicted Unprepared lastGood")
+CheckRun.MarkAttempt(unpreparedGemPlayer, "incomplete", true, nowTime)
+unpreparedGemPlayer.technicalFailure = true
+local afterGemFix = CheckRun.ClassifyPlayer(unpreparedGemPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(afterGemFix.class, CheckRun.CLASS.INSPECTION_FAILED, "after gem fix, incomplete refresh is not stale Unprepared")
+
+-- Item-level restore with fresh value retires Unprepared.
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+enableMinimumItemLevel(state, 690)
+inspectItemLevel = 640
+local _, lowIlvlUnprepared, lowIlvlPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(lowIlvlUnprepared ~= nil and lowIlvlUnprepared.policy.prepared == false, "low item-level baseline is Unprepared")
+inspectItemLevel = 700
+inventoryByUnit.raid1 = fillAllSlots()
+inventoryByUnit.raid1[INVSLOT_TRINKET2] = nil
+local fixedIlvlPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(fixedIlvlPartial.blended, true, "item-level fix partial stays blended")
+assertEq(state.lastGood[memberId], nil, "fresh restored item level retires contradicted Unprepared lastGood")
+CheckRun.MarkAttempt(lowIlvlPlayer, "timeout", true, nowTime)
+lowIlvlPlayer.technicalFailure = true
+local afterIlvlFix = CheckRun.ClassifyPlayer(lowIlvlPlayer, nowTime, state.lastGood[memberId], "SES-A")
+assertEq(afterIlvlFix.class, CheckRun.CLASS.INSPECTION_FAILED, "after item-level fix, timeout is not stale Unprepared")
+
+-- Unresolved stub after Unprepared does not invent a correction.
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = missingEnchantKit
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, keepUnpreparedGood, keepUnpreparedPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(keepUnpreparedGood ~= nil and keepUnpreparedGood.policy.prepared == false, "unresolved-control Unprepared baseline exists")
+local unresolvedFixKit = fillAllSlots()
+unresolvedFixKit[INVSLOT_FINGER1] = slotLinkStub(INVSLOT_FINGER1, fingerIdFix)
+unresolvedFixKit[INVSLOT_TRINKET2] = nil
+inventoryByUnit.raid1 = unresolvedFixKit
+local unresolvedPartial = inspectReadyOnce(state, memberId, guid)
+assertEq(unresolvedPartial.blended, true, "unresolved stub partial stays blended")
+assertTrue(state.lastGood[memberId] ~= nil, "unresolved stub without proven correction keeps Unprepared lastGood")
+CheckRun.MarkAttempt(keepUnpreparedPlayer, "incomplete", true, nowTime)
+keepUnpreparedPlayer.technicalFailure = true
+keepUnpreparedPlayer.freshObservation = nil
+local keepUnpreparedClass = CheckRun.ClassifyPlayer(
+	keepUnpreparedPlayer,
+	nowTime,
+	state.lastGood[memberId],
+	"SES-A"
+)
+assertEq(keepUnpreparedClass.class, CheckRun.CLASS.UNPREPARED, "unresolved stub still allows legitimate Unprepared fallback")
+assertEq(keepUnpreparedClass.verified, CheckRun.VERIFIED.SESSION, "preserved Unprepared fallback uses SESSION provenance")
+
+-- ---------------------------------------------------------------------------
+-- 19) First-inspect grace evidence reconciled with conflicting ready payload
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+-- No cache / lastGood: stamp an empty-baseline first inspect.
+inventoryByUnit.raid1 = {}
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+beginAdhocInspect(state, memberId, guid)
+assertTrue(next(state.active.equipmentBaselineBySlot or {}) == nil, "first inspect has empty equipment baseline")
+assertEq(state.lastGood[memberId], nil, "first inspect has no lastGood")
+assertTrue(RC:_IsWithinInspectInventoryGrace("raid1", nowTime), "first inspect is inside inventory grace")
+
+-- Credible grace-time kit A.
+inventoryByUnit.raid1 = fillAlternateKit()
+RC:_InvalidateInspectUnit("raid1")
+assertEq(state.lastGood[memberId], nil, "first-inspect grace retain does not invent lastGood")
+assertTrue(
+	state.active.graceReliableEquipmentBySlot
+		and next(state.active.graceReliableEquipmentBySlot) ~= nil,
+	"first-inspect grace retains reliable slot evidence on the request"
+)
+assertEq(
+	RC:_InspectRequestHasEquipmentAuthority(state.active),
+	true,
+	"first-inspect grace retain without conflict keeps request authority"
+)
+
+-- Conflicting ready-time kit B must not become authoritative.
+inventoryByUnit.raid1 = fillAllSlots()
+RC:_HandleInspectReady(guid)
+assertEq(state.lastGood[memberId], nil, "conflicting first-inspect ready does not write lastGood")
+assertEq(state.cache[memberId].authorityInvalidated, true, "conflicting first-inspect ready is authority-invalidated")
+local firstConflictPlayer = state.adhocRun.players[memberId]
+assertTrue(
+	not (firstConflictPlayer.freshObservation and firstConflictPlayer.freshObservation.complete == true),
+	"conflicting first-inspect ready does not set complete freshObservation"
+)
+
+-- Fresh subsequent inspect recovers.
+nowTime = nowTime + 1
+inventoryByUnit.raid1 = fillAllSlots()
+local _, recoveredFirstGood, recoveredFirstPlayer = inspectReadyOnce(state, memberId, guid)
+assertTrue(recoveredFirstGood ~= nil, "fresh inspect after first-inspect conflict writes lastGood")
+assertTrue(
+	recoveredFirstPlayer.freshObservation and recoveredFirstPlayer.freshObservation.complete == true,
+	"fresh inspect after first-inspect conflict sets fresh complete observation"
+)
+
+-- Benign first-inspect inventory notification still completes.
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = {}
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+beginAdhocInspect(state, memberId, guid)
+inventoryByUnit.raid1 = fillAllSlots()
+RC:_InvalidateInspectUnit("raid1")
+assertTrue(
+	state.active.graceReliableEquipmentBySlot
+		and next(state.active.graceReliableEquipmentBySlot) ~= nil,
+	"benign first-inspect grace retains matching kit evidence"
+)
+RC:_HandleInspectReady(guid)
+assertTrue(state.lastGood[memberId] ~= nil, "benign first-inspect inventory notification still completes authoritatively")
+assertTrue(
+	state.adhocRun.players[memberId].freshObservation
+		and state.adhocRun.players[memberId].freshObservation.complete == true,
+	"benign first-inspect ready sets fresh complete observation"
+)
+
+-- ---------------------------------------------------------------------------
+-- 20) GetCachedEquipmentReadiness hides authority-invalidated captures
+-- ---------------------------------------------------------------------------
+resetState()
+setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+state = RC:_GetInspectState()
+inventoryByUnit.raid1 = fillAllSlots()
+state.adhocRun = CheckRun.NewRun({
+	targetIds = { memberId },
+	expectedSessionId = "SES-A",
+	now = nowTime,
+})
+local _, readyCacheGood = inspectReadyOnce(state, memberId, guid)
+assertTrue(readyCacheGood ~= nil, "readiness valid-cache baseline exists")
+local validReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+assertEq(validReadiness.state, "ready", "valid authoritative cache yields Ready")
+
+-- Populate a complete but authority-invalidated cache (troubleshooting retained).
+state.cache[memberId].authorityInvalidated = true
+state.lastGood[memberId] = nil
+local invalidatedReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+assertEq(
+	invalidatedReadiness.state,
+	"unknown",
+	"authority-invalidated complete cache yields Unknown readiness"
+)
+
+-- Non-invalidated blended known-Unprepared remains usable as Not Ready.
+-- Alias keys (guid + memberId) must reference the same entry object.
+local blendedSlots = {}
+for _, slot in ipairs(TRACKED_SLOTS) do
+	blendedSlots[slot] = {
+		link = slotLink(slot),
+		itemId = 1000 + slot,
+		texture = "Interface\\Icons\\INV_Misc_QuestionMark",
+		hasItem = true,
+	}
+end
+blendedSlots[INVSLOT_FINGER1] = {
+	link = slotLink(INVSLOT_FINGER1, fingerIdFix, { enchant = 0, gem = "1" }),
+	itemId = fingerIdFix,
+	texture = "Interface\\Icons\\INV_Misc_QuestionMark",
+	hasItem = true,
+	copiedEvidence = false,
+}
+local blendedEntry = {
+	guid = guid,
+	id = memberId,
+	status = "ready",
+	updatedAt = nowTime,
+	capturedAt = nowTime,
+	overallEquippedItemLevel = 700,
+	averageItemLevel = 700,
+	slotsByInventory = blendedSlots,
+	blended = true,
+	authorityInvalidated = false,
+	aliases = { guid, memberId },
+}
+state.cache[memberId] = blendedEntry
+state.cache[guid] = blendedEntry
+local blendedReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+assertEq(
+	blendedReadiness.state,
+	"not_ready",
+	"blended non-invalidated known-Unprepared remains Not Ready"
+)
+
+-- RosterModel readiness consumer reflects Unknown for invalidated cache.
+local rosterChunk = assert(loadfile("SpectrumFederation/modules/UI/LootHelper/RosterModel.lua"))
+rosterChunk("SpectrumFederation", SF)
+SF.LootHelperWindow = SF.LootHelperWindow or {}
+local Model = SF.LootHelperWindow.RosterModel
+assertTrue(Model and type(Model.Build) == "function", "RosterModel loads for readiness consumer check")
+blendedEntry.authorityInvalidated = true
+blendedEntry.blended = false
+local rosterReadiness = RC:GetCachedEquipmentReadiness("raid1", memberId)
+assertEq(rosterReadiness.state, "unknown", "Loot Helper roster readiness source is Unknown for invalidated cache")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)

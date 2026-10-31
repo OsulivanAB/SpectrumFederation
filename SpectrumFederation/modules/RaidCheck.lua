@@ -1597,19 +1597,23 @@ end
 --    whose stamped equipmentAuthorityGeneration still matches the member's
 --    current generation may write lastGood / freshObservation. Cache entries
 --    from invalidated requests are marked authorityInvalidated and are never
---    exposed as verified equipment to Raid Check / Early Preparation consumers.
+--    exposed as verified equipment to Raid Check / Early Preparation / Loot
+--    Helper roster readiness consumers (troubleshooting may still show them).
 -- 2) Invalidation: known gear-change signals clear member-scoped lastGood/fresh
 --    and bump that generation so earlier in-flight responses cannot restore
 --    authority. During inventory grace and at INSPECT_READY, Spectrum retires
 --    fallback when live/capture evidence conflicts on equipped identity,
 --    confirmed presence, or reliably resolved policy-relevant properties
 --    (enchant / gem / fresh equipped item level) against a prior complete
---    Prepared observation. Copied fills, inspect stubs, unresolved gem/link
---    data, and KeepKnownOverallItemLevel carry-forward alone are not proof.
---    Timing alone is not proof of benign inspect noise; live nil is not
---    confirmed emptiness. Residual Retail limit: same-ID swaps that never
---    expose a conflicting live link/property (or independently confirmed
---    presence change) before an obsolete ready may still look consistent.
+--    Prepared *or* Unprepared observation. First-inspect grace may retain a
+--    bounded per-request reliable slot snapshot to reconcile with INSPECT_READY
+--    when no baseline/lastGood exists yet. Copied fills, inspect stubs,
+--    unresolved gem/link data, and KeepKnownOverallItemLevel carry-forward
+--    alone are not proof. Timing alone is not proof of benign inspect noise;
+--    live nil is not confirmed emptiness. Residual Retail limit: same-ID swaps
+--    that never expose a conflicting live link/property (or independently
+--    confirmed presence change) before an obsolete ready may still look
+--    consistent.
 -- 3) Copied evidence / blanks: blending may copy prior equipped slots into
 --    temporary blanks for troubleshooting. Every tracked blank is counted per
 --    distinct inspect generation; the whole capture stays non-authoritative
@@ -1887,6 +1891,56 @@ function RC:_LookupCompleteLastGoodForAliases(aliases)
 	return nil
 end
 
+-- Retain only fully resolved live slot evidence on the in-flight request.
+-- Fixed tracked-slot map (overwrite, never grow); no global/persistent cache.
+local function FilterReliableEquipmentSlotEvidence(slotsByInventory)
+	local filtered = {}
+	if type(slotsByInventory) ~= "table" then
+		return filtered
+	end
+	local envelope = { slotsByInventory = slotsByInventory }
+	for inventorySlot, slotData in pairs(slotsByInventory) do
+		if type(inventorySlot) == "number" and type(slotData) == "table" then
+			local hasItem = SlotHasAnyItemData(slotData) or slotData.texture or false
+			if hasItem
+				and type(slotData.link) == "string"
+				and slotData.link ~= ""
+				and not IsSlotItemDataPending(envelope.slotsByInventory, inventorySlot)
+				and not IsSlotLinkPotentiallyIncomplete(envelope.slotsByInventory, inventorySlot)
+			then
+				local itemId = tonumber(slotData.itemId)
+				if not itemId or itemId <= 0 then
+					itemId = tonumber(string.match(slotData.link, "item:(%d+)"))
+				end
+				filtered[inventorySlot] = {
+					link = slotData.link,
+					itemId = itemId,
+					texture = slotData.texture,
+					hasItem = true,
+				}
+			end
+		end
+	end
+	return filtered
+end
+
+function RC:_RetainGraceReliableEquipmentEvidence(request, liveSlots, freshItemLevel)
+	if type(request) ~= "table" then
+		return
+	end
+	local reliable = FilterReliableEquipmentSlotEvidence(liveSlots)
+	if next(reliable) then
+		request.graceReliableEquipmentBySlot = request.graceReliableEquipmentBySlot or {}
+		for inventorySlot, slotData in pairs(reliable) do
+			request.graceReliableEquipmentBySlot[inventorySlot] = slotData
+		end
+	end
+	local canonical = CanonicalOverallItemLevel(freshItemLevel)
+	if canonical then
+		request.graceFreshItemLevel = canonical
+	end
+end
+
 function RC:_BuildEquipmentBaselineForAliases(aliases)
 	local entry = self:_GetInspectCacheEntryByAliases(aliases)
 	local baseline = self:_BuildEquipmentSlotIdentityMapFromEntry(entry)
@@ -1928,6 +1982,8 @@ function RC:_StampInspectRequestAuthority(request, now)
 	request.equipmentBaselineBySlot = baseline
 	request.equipmentBaselineConfirmedEmpty = confirmedEmpty
 	request.inventoryObservedDuringGrace = nil
+	request.graceReliableEquipmentBySlot = nil
+	request.graceFreshItemLevel = nil
 end
 
 function RC:_InspectRequestHasEquipmentAuthority(request)
@@ -2079,16 +2135,20 @@ function RC:_InvalidateInspectUnit(unit, opts)
 	-- During inspect inventory grace, timing alone does not prove the event is
 	-- benign NotifyInspect payload noise. Invalidate immediately only when live
 	-- equipped identity/presence conflicts with the request baseline, or when
-	-- reliably resolved live modifiers contradict a prior complete Prepared
-	-- observation (same evidence rule as INSPECT_READY). Blank/still-loading
-	-- slots and incomplete links are not treated as conflicts, so ordinary
-	-- NotifyInspect-driven UNIT_INVENTORY_CHANGED stays non-destructive.
+	-- reliably resolved live modifiers contradict a prior complete Prepared or
+	-- Unprepared observation (same evidence rule as INSPECT_READY). Blank /
+	-- still-loading slots and incomplete links are not treated as conflicts, so
+	-- ordinary NotifyInspect-driven UNIT_INVENTORY_CHANGED stays non-destructive.
+	-- When there is no baseline/lastGood yet, retain a bounded reliable grace
+	-- snapshot on the request for ready-time reconciliation.
 	if clearLastGood and not opts.forceEquipmentAuthorityInvalidate then
 		local graceRequest = self:_GetInspectInventoryGraceRequest(unit)
 		if graceRequest then
 			local baseline = graceRequest.equipmentBaselineBySlot or {}
 			local baselineConfirmedEmpty = graceRequest.equipmentBaselineConfirmedEmpty or {}
 			local liveMap = self:_SampleLiveEquipmentSlotIdentityMap(unit)
+			local liveSlots = self:_SampleLiveEquipmentSlotEvidence(unit)
+			local freshItemLevel = ReadAuthoritativeEquippedItemLevel(unit)
 			local identityConflict = EquipmentEvidenceConflicts(
 				baseline,
 				baselineConfirmedEmpty,
@@ -2098,17 +2158,11 @@ function RC:_InvalidateInspectUnit(unit, opts)
 			local policyConflict = false
 			if not identityConflict then
 				local priorGood = self:_LookupCompleteLastGoodForAliases(graceRequest.aliases)
-				if priorGood
-					and priorGood.policy
-					and priorGood.policy.prepared == true
-					and priorGood.policy.complete == true
-				then
-					local liveSlots = self:_SampleLiveEquipmentSlotEvidence(unit)
-					local freshItemLevel = ReadAuthoritativeEquippedItemLevel(unit)
+				if priorGood and priorGood.policy and priorGood.policy.complete == true then
 					local inspectState = self:_GetInspectState()
 					local policyConfig = (inspectState.adhocRun and inspectState.adhocRun.cfg)
 						or GetLiveItemLevelConfig()
-					policyConflict = self:_ReliablePreparedEvidenceContradicted(
+					policyConflict = self:_ReliableEvidenceContradictsPriorObservation(
 						priorGood,
 						{ slotsByInventory = liveSlots },
 						freshItemLevel,
@@ -2119,6 +2173,7 @@ function RC:_InvalidateInspectUnit(unit, opts)
 			if identityConflict or policyConflict then
 				-- Fall through into the normal clearLastGood / bump path.
 			else
+				self:_RetainGraceReliableEquipmentEvidence(graceRequest, liveSlots, freshItemLevel)
 				graceRequest.inventoryObservedDuringGrace = true
 				self:_MarkTroubleshootingDirty()
 				self:_NotifyTroubleshootingListeners()
@@ -2707,14 +2762,125 @@ local function BuildReliablePolicyObservationFromCaptured(captured, freshItemLev
 	})
 end
 
--- True when reliable current evidence proves a policy failure that contradicts a
--- prior complete Prepared observation. Incomplete captures stay incomplete:
--- knownUnprepared here only retires contradicted fallback authority.
-function RC:_ReliablePreparedEvidenceContradicted(priorGood, captured, freshItemLevel, policyConfig)
+local function SlotHadRequiredEnchantMiss(slot, def, Policy)
+	if type(slot) ~= "table" or type(def) ~= "table" or type(Policy) ~= "table" then
+		return false
+	end
+	local needsEnchant = def.enchantRequired == true
+	if def.enchantRequired == "weapon" then
+		local equipLoc = slot.equipLoc
+		local required = Policy.RequiresOffHandEnchant and Policy.RequiresOffHandEnchant(equipLoc)
+		if required == nil then
+			return false
+		end
+		needsEnchant = required
+	end
+	if not needsEnchant then
+		return false
+	end
+	if slot.hasEnchant == true or (tonumber(slot.enchantId) or 0) > 0 then
+		return false
+	end
+	-- Unresolved enchant state is not a recorded miss.
+	if slot.hasEnchant == nil and slot.enchantId == nil then
+		return false
+	end
+	return true
+end
+
+local function SlotHadRequiredGemMiss(slot)
+	if type(slot) ~= "table" or type(slot.sockets) ~= "table" or #slot.sockets == 0 then
+		return false
+	end
+	local sawEmpty = false
+	for i = 1, #slot.sockets do
+		local gem = slot.sockets[i]
+		if type(gem) ~= "table" or gem.filled == nil then
+			return false
+		end
+		if gem.filled ~= true then
+			sawEmpty = true
+		end
+	end
+	return sawEmpty
+end
+
+local function SlotHasConfirmedEnchant(slot)
+	return type(slot) == "table"
+		and (slot.hasEnchant == true or (tonumber(slot.enchantId) or 0) > 0)
+end
+
+local function SlotHasConfirmedGemsFilled(slot)
+	if type(slot) ~= "table" or type(slot.sockets) ~= "table" or #slot.sockets == 0 then
+		return false
+	end
+	for i = 1, #slot.sockets do
+		local gem = slot.sockets[i]
+		if type(gem) ~= "table" or gem.filled ~= true then
+			return false
+		end
+	end
+	return true
+end
+
+-- Reliable evidence disproves a previously recorded complete Unprepared failure
+-- (enchant/gem restored, or fresh item level restored above minimum). Unresolved
+-- slots/stubs and KeepKnown carry-forward alone are never treated as a fix.
+local function ReliableEvidenceDisprovesPriorUnprepared(priorGood, reliableObs, freshItemLevel, policyConfig)
+	local priorPolicy = priorGood and priorGood.policy
+	local priorObs = priorGood and priorGood.observation
+	if type(priorPolicy) ~= "table"
+		or priorPolicy.complete ~= true
+		or priorPolicy.prepared ~= false
+		or type(priorObs) ~= "table"
+		or type(priorObs.slotsByInventory) ~= "table"
+		or type(reliableObs) ~= "table"
+		or type(reliableObs.slotsByInventory) ~= "table"
+	then
+		return false
+	end
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if not Policy then
+		return false
+	end
+
+	if Policy.ItemLevelRequirementActive and Policy.ItemLevelRequirementActive(policyConfig) then
+		local minimum = Policy.NormalizeMinimumItemLevel(policyConfig.minimumItemLevel)
+		local priorLevel = CanonicalOverallItemLevel(priorObs.overallEquippedItemLevel)
+		local freshLevel = CanonicalOverallItemLevel(freshItemLevel)
+		if minimum and priorLevel and priorLevel < minimum and freshLevel and freshLevel >= minimum then
+			return true
+		end
+	end
+
+	for _, def in ipairs(Policy.TRACKED_SLOTS or {}) do
+		local inventorySlot = def.inventorySlot
+		local priorSlot = priorObs.slotsByInventory[inventorySlot]
+		local nextSlot = reliableObs.slotsByInventory[inventorySlot]
+		if type(priorSlot) == "table" and type(nextSlot) == "table" then
+			local priorPresence = Policy.DescribeSlotPresence and select(1, Policy.DescribeSlotPresence(priorSlot))
+			local nextPresence = Policy.DescribeSlotPresence and select(1, Policy.DescribeSlotPresence(nextSlot))
+			if priorPresence == "equipped" and nextPresence == "equipped" then
+				if SlotHadRequiredEnchantMiss(priorSlot, def, Policy) and SlotHasConfirmedEnchant(nextSlot) then
+					return true
+				end
+				if SlotHadRequiredGemMiss(priorSlot) and SlotHasConfirmedGemsFilled(nextSlot) then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- True when reliable current evidence contradicts a prior complete observation:
+-- either a new knownUnprepared failure against Prepared, or a confirmed fix of a
+-- previously recorded Unprepared requirement. Does not invent complete Prepared
+-- from a partial capture; only retires contradicted fallback authority.
+function RC:_ReliableEvidenceContradictsPriorObservation(priorGood, captured, freshItemLevel, policyConfig)
 	if type(priorGood) ~= "table"
 		or priorGood.complete ~= true
 		or type(priorGood.policy) ~= "table"
-		or priorGood.policy.prepared ~= true
 		or priorGood.policy.complete ~= true
 	then
 		return false
@@ -2724,8 +2890,29 @@ function RC:_ReliablePreparedEvidenceContradicted(priorGood, captured, freshItem
 		return false
 	end
 	local reliableObs = BuildReliablePolicyObservationFromCaptured(captured, freshItemLevel)
-	local reliableResult = Policy.EvaluateObservation(reliableObs, policyConfig)
-	return type(reliableResult) == "table" and reliableResult.knownUnprepared == true
+	if priorGood.policy.prepared == true then
+		local reliableResult = Policy.EvaluateObservation(reliableObs, policyConfig)
+		return type(reliableResult) == "table" and reliableResult.knownUnprepared == true
+	end
+	if priorGood.policy.prepared == false then
+		return ReliableEvidenceDisprovesPriorUnprepared(
+			priorGood,
+			reliableObs,
+			freshItemLevel,
+			policyConfig
+		)
+	end
+	return false
+end
+
+-- Compatibility alias used by older call sites / tests.
+function RC:_ReliablePreparedEvidenceContradicted(priorGood, captured, freshItemLevel, policyConfig)
+	return self:_ReliableEvidenceContradictsPriorObservation(
+		priorGood,
+		captured,
+		freshItemLevel,
+		policyConfig
+	)
 end
 
 local PREPARATION_STAMP_SLOT_LIMIT = 32
@@ -3075,11 +3262,11 @@ function RC:_HandleInspectReady(guid)
 		)
 		if not contradictedPrior then
 			-- Same coherent rule as grace-time invalidation: independently
-			-- observed, fully resolved policy failures (missing enchant/gem or
-			-- a fresh below-minimum item level) retire a contradicted Prepared
-			-- fallback. Copied fills and KeepKnown item-level carry-forward
-			-- alone never count.
-			contradictedPrior = self:_ReliablePreparedEvidenceContradicted(
+			-- observed, fully resolved policy failures against Prepared, or
+			-- confirmed fixes of prior Unprepared requirements, retire
+			-- contradicted fallback. Copied fills and KeepKnown item-level
+			-- carry-forward alone never count.
+			contradictedPrior = self:_ReliableEvidenceContradictsPriorObservation(
 				priorGood,
 				captured,
 				freshItemLevel,
@@ -3098,6 +3285,15 @@ function RC:_HandleInspectReady(guid)
 		end
 
 		local hasEquipmentAuthority = self:_InspectRequestHasEquipmentAuthority(active)
+		local function RejectReadyAuthority()
+			self:_BumpEquipmentAuthorityGeneration(active.aliases)
+			if active.id then
+				self:_InvalidateLastGoodForAliases({ active.id })
+			elseif active.aliases then
+				self:_InvalidateLastGoodForAliases(active.aliases)
+			end
+			hasEquipmentAuthority = false
+		end
 		-- Ready-time reconcile: if currently observable equipped identity already
 		-- disagrees with this payload, the response is obsolete relative to live
 		-- gear even when the request generation was not bumped earlier.
@@ -3114,13 +3310,25 @@ function RC:_HandleInspectReady(guid)
 			-- Live nil blanks are not confirmed emptiness. Confirmed-empty in the
 			-- capture versus a newly live equipped item is a presence conflict.
 			if EquipmentEvidenceConflicts(captureIdentity, captureConfirmedEmpty, liveIdentity, {}) then
-				self:_BumpEquipmentAuthorityGeneration(active.aliases)
-				if active.id then
-					self:_InvalidateLastGoodForAliases({ active.id })
-				elseif active.aliases then
-					self:_InvalidateLastGoodForAliases(active.aliases)
+				RejectReadyAuthority()
+			end
+		end
+		-- First-inspect / no-baseline grace evidence: if a prior UNIT_INVENTORY
+		-- event retained a reliably identified kit that conflicts with this
+		-- ready payload, reject authority rather than guessing which is newer.
+		if hasEquipmentAuthority
+			and type(active.graceReliableEquipmentBySlot) == "table"
+			and next(active.graceReliableEquipmentBySlot) ~= nil
+		then
+			local graceIdentity = BuildEquipmentSlotIdentityMapFromSlots(active.graceReliableEquipmentBySlot)
+			local captureIdentity = BuildEquipmentSlotIdentityMapFromSlots(captured.slotsByInventory)
+			for inventorySlot, slotData in pairs(captured.slotsByInventory or {}) do
+				if type(slotData) == "table" and slotData.copiedEvidence == true then
+					captureIdentity[inventorySlot] = nil
 				end
-				hasEquipmentAuthority = false
+			end
+			if EquipmentEvidenceConflicts(graceIdentity, {}, captureIdentity, {}) then
+				RejectReadyAuthority()
 			end
 		end
 		-- Blended captures merge prior partial evidence and must not become
@@ -5330,13 +5538,20 @@ function RC:GetCachedEquipmentReadiness(unit, memberId)
 		if (not entry or not entry.slotsByInventory) and memberId then
 			entry = self:_GetInspectCacheEntryByAliases({ memberId })
 		end
-		if entry and entry.slotsByInventory and HasEquipmentData(entry.slotsByInventory) then
+		-- Authority-invalidated cache may still hold troubleshooting slots, but
+		-- must never drive definitive Ready/Not Ready. Blended non-invalidated
+		-- entries remain eligible so partial known-Unprepared can show Not Ready.
+		local cacheUsable = entry
+			and entry.slotsByInventory
+			and HasEquipmentData(entry.slotsByInventory)
+			and entry.authorityInvalidated ~= true
+		if cacheUsable then
 			observation = BuildPolicyObservation(entry)
 		elseif memberId and state.lastGood and state.lastGood[memberId] then
 			local lastGood = state.lastGood[memberId]
-			if lastGood.observation then
+			if lastGood.complete == true and lastGood.observation then
 				observation = lastGood.observation
-			else
+			elseif lastGood.complete == true then
 				local liveCfg = GetLiveItemLevelConfig()
 				if Policy.ItemLevelRequirementActive and Policy.ItemLevelRequirementActive(liveCfg) then
 					-- A policy result captured without an observation cannot be
