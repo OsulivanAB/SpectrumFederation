@@ -1845,6 +1845,120 @@ local function runFirstInspectSameIdGracePolicyTests()
 		"matching resolved grace/ready does not mark cache authorityInvalidated"
 	)
 
+	-- Grace retains only a valid fresh item level (no resolved links); ready
+	-- crosses the configured minimum → reject authority.
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	enableMinimumItemLevel(localState, 690)
+	beginAdhocInspect(localState, memberId, guid)
+	inspectItemLevel = 700
+	-- No resolved links during grace; only the fresh item-level reading is retained.
+	inventoryByUnit.raid1 = {}
+	RC:_InvalidateInspectUnit("raid1")
+	assertEq(
+		localState.active.graceReliableEquipmentBySlot == nil
+			or next(localState.active.graceReliableEquipmentBySlot) == nil,
+		true,
+		"grace with unresolved links retains no slot map"
+	)
+	assertEq(localState.active.graceFreshItemLevel, 700, "grace retains fresh item level without resolved links")
+	inspectItemLevel = 640
+	inventoryByUnit.raid1 = fillAllSlots()
+	RC:_HandleInspectReady(guid)
+	assertEq(localState.lastGood[memberId], nil, "IL-only grace conflict does not write lastGood")
+	assertEq(
+		localState.cache[memberId].authorityInvalidated,
+		true,
+		"IL-only grace conflict rejects ready authority"
+	)
+	assertTrue(
+		not (
+			localState.adhocRun.players[memberId].freshObservation
+			and localState.adhocRun.players[memberId].freshObservation.complete == true
+		),
+		"IL-only grace conflict does not set complete freshObservation"
+	)
+	CheckRun.MarkAttempt(localState.adhocRun.players[memberId], "incomplete", true, nowTime)
+	localState.adhocRun.players[memberId].technicalFailure = true
+	local ilOnlyClass = CheckRun.ClassifyPlayer(
+		localState.adhocRun.players[memberId],
+		nowTime,
+		localState.lastGood[memberId],
+		"SES-A"
+	)
+	assertEq(
+		ilOnlyClass.class,
+		CheckRun.CLASS.INSPECTION_FAILED,
+		"IL-only grace conflict cannot award Prepared/Unprepared from rejected ready"
+	)
+	assertTrue(not ilOnlyClass.countsForPot, "IL-only grace conflict does not count for Reward Pot")
+	nowTime = nowTime + 1
+	inspectItemLevel = 640
+	inventoryByUnit.raid1 = fillAllSlots()
+	local _, recoveredIlOnlyGood, recoveredIlOnlyPlayer = inspectReadyOnce(localState, memberId, guid)
+	assertTrue(recoveredIlOnlyGood ~= nil, "fresh inspect recovers after IL-only grace conflict")
+	assertTrue(
+		recoveredIlOnlyPlayer.freshObservation and recoveredIlOnlyPlayer.freshObservation.complete == true,
+		"recovery after IL-only grace conflict sets fresh complete observation"
+	)
+
+	-- Matching item-level control: grace IL-only 700, ready 700 stays authoritative.
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	enableMinimumItemLevel(localState, 690)
+	beginAdhocInspect(localState, memberId, guid)
+	inspectItemLevel = 700
+	inventoryByUnit.raid1 = {}
+	RC:_InvalidateInspectUnit("raid1")
+	assertEq(localState.active.graceFreshItemLevel, 700, "matching IL-only control retains grace item level")
+	inspectItemLevel = 700
+	inventoryByUnit.raid1 = fillAllSlots()
+	RC:_HandleInspectReady(guid)
+	assertTrue(localState.lastGood[memberId] ~= nil, "matching IL-only grace/ready remains authoritative")
+	assertEq(
+		localState.cache[memberId].authorityInvalidated ~= true,
+		true,
+		"matching IL-only grace/ready does not mark authorityInvalidated"
+	)
+
+	-- Missing grace item-level control: no graceFreshItemLevel, ready below minimum
+	-- still completes normally (no fabricated grace contradiction).
+	resetState()
+	setMainHandIdentity("INVTYPE_WEAPONMAINHAND", 2, 7)
+	localState = RC:_GetInspectState()
+	inventoryByUnit.raid1 = {}
+	localState.adhocRun = CheckRun.NewRun({
+		targetIds = { memberId },
+		expectedSessionId = "SES-A",
+		now = nowTime,
+	})
+	enableMinimumItemLevel(localState, 690)
+	beginAdhocInspect(localState, memberId, guid)
+	assertEq(localState.active.graceFreshItemLevel, nil, "missing-level control starts with no grace item level")
+	inspectItemLevel = 640
+	inventoryByUnit.raid1 = fillAllSlots()
+	RC:_HandleInspectReady(guid)
+	assertTrue(localState.lastGood[memberId] ~= nil, "missing grace item level does not invent a contradiction")
+	assertEq(
+		localState.lastGood[memberId].policy and localState.lastGood[memberId].policy.prepared,
+		false,
+		"missing-level control ready below minimum is Unprepared"
+	)
+
 	state = localState
 end
 runFirstInspectSameIdGracePolicyTests()

@@ -3379,32 +3379,40 @@ function RC:_HandleInspectReady(guid)
 			end
 		end
 		-- First-inspect / no-baseline grace evidence: if a prior UNIT_INVENTORY
-		-- event retained a reliably identified kit that conflicts with this
-		-- ready payload (different item IDs, or same-ID policy-relevant
-		-- enchant/gem/fresh item-level contradictions), reject authority rather
-		-- than guessing which snapshot is newer. Incomplete/stub metadata is
-		-- never treated as a confirmed conflict.
-		if hasEquipmentAuthority
-			and type(active.graceReliableEquipmentBySlot) == "table"
-			and next(active.graceReliableEquipmentBySlot) ~= nil
-		then
-			local graceIdentity = BuildEquipmentSlotIdentityMapFromSlots(active.graceReliableEquipmentBySlot)
-			local captureIdentity = BuildEquipmentSlotIdentityMapFromSlots(captured.slotsByInventory)
-			for inventorySlot, slotData in pairs(captured.slotsByInventory or {}) do
-				if type(slotData) == "table" and slotData.copiedEvidence == true then
-					captureIdentity[inventorySlot] = nil
+		-- event retained a reliably identified kit and/or a valid fresh item
+		-- level that conflicts with this ready payload (different item IDs,
+		-- same-ID enchant/gem contradictions, or fresh item levels on opposite
+		-- sides of the active minimum), reject authority rather than guessing
+		-- which snapshot is newer. Incomplete/stub metadata and absent links
+		-- are never treated as confirmed missing gear.
+		if hasEquipmentAuthority then
+			local graceSlots = active.graceReliableEquipmentBySlot
+			local hasGraceSlots = type(graceSlots) == "table" and next(graceSlots) ~= nil
+			local graceItemLevel = CanonicalOverallItemLevel(active.graceFreshItemLevel)
+			if hasGraceSlots or graceItemLevel then
+				local rejected = false
+				if hasGraceSlots then
+					local graceIdentity = BuildEquipmentSlotIdentityMapFromSlots(graceSlots)
+					local captureIdentity = BuildEquipmentSlotIdentityMapFromSlots(captured.slotsByInventory)
+					for inventorySlot, slotData in pairs(captured.slotsByInventory or {}) do
+						if type(slotData) == "table" and slotData.copiedEvidence == true then
+							captureIdentity[inventorySlot] = nil
+						end
+					end
+					if EquipmentEvidenceConflicts(graceIdentity, {}, captureIdentity, {}) then
+						RejectReadyAuthority()
+						rejected = true
+					end
 				end
-			end
-			if EquipmentEvidenceConflicts(graceIdentity, {}, captureIdentity, {}) then
-				RejectReadyAuthority()
-			else
-				local graceObs = BuildReliablePolicyObservationFromCaptured(
-					{ slotsByInventory = active.graceReliableEquipmentBySlot },
-					active.graceFreshItemLevel
-				)
-				local readyObs = BuildReliablePolicyObservationFromCaptured(captured, freshItemLevel)
-				if ReliableGraceReadyPolicyEvidenceConflicts(graceObs, readyObs, policyConfig) then
-					RejectReadyAuthority()
+				if not rejected then
+					local graceObs = BuildReliablePolicyObservationFromCaptured(
+						{ slotsByInventory = hasGraceSlots and graceSlots or {} },
+						graceItemLevel
+					)
+					local readyObs = BuildReliablePolicyObservationFromCaptured(captured, freshItemLevel)
+					if ReliableGraceReadyPolicyEvidenceConflicts(graceObs, readyObs, policyConfig) then
+						RejectReadyAuthority()
+					end
 				end
 			end
 		end
