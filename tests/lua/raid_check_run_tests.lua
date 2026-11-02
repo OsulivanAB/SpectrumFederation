@@ -141,6 +141,23 @@ local distinctControl = CheckRun.IntersectMembershipAndGroup(
 )
 assertEq(#distinctControl, 2, "genuinely distinct characters remain separate targets")
 
+-- Sorted GetMemberIds order can differ from getMemberByID insertion resolution.
+-- Without resolveId, UniqueProfileMemberIds keeps the sorted spelling.
+local sortedThenLower = { "Alice-Garona", "alice-Garona", "Bob-Garona" }
+local insertionFirst = {
+    ["Alice-Garona"] = "alice-Garona",
+    ["alice-Garona"] = "alice-Garona",
+    ["Bob-Garona"] = "Bob-Garona",
+}
+local sortedOnly = CheckRun.UniqueProfileMemberIds(sortedThenLower)
+assertEq(sortedOnly[1], "Alice-Garona", "without resolveId, sorted Alice spelling wins")
+local resolvedIds = CheckRun.UniqueProfileMemberIds(sortedThenLower, function(candidate)
+    return insertionFirst[candidate] or candidate
+end)
+assertEq(resolvedIds[1], "alice-Garona", "resolveId keeps the awarding Member identifier")
+assertEq(resolvedIds[2], "Bob-Garona", "resolveId still keeps distinct Bob")
+assertEq(#resolvedIds, 2, "resolveId still collapses SamePlayer aliases once")
+
 -- 15 present raid players against a 22-member selected profile (#442 report shape).
 local profile22 = {}
 local group15 = {}

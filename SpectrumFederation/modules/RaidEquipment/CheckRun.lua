@@ -152,28 +152,6 @@ function CheckRun.IsPresentInGroup(memberId, groupIds)
 	return false
 end
 
--- Keep the first authoritative profile ID for each SameMemberId equivalence
--- class. LootProfile:AddMember can leave case/realm aliases in GetMemberIds();
--- Raid Check must treat those as one logical character for targets and eligibility.
-function CheckRun.UniqueProfileMemberIds(memberIds)
-	local out = {}
-	for _, memberId in ipairs(memberIds or {}) do
-		if type(memberId) == "string" and memberId ~= "" then
-			local already = false
-			for i = 1, #out do
-				if CheckRun.SameMemberId(out[i], memberId) then
-					already = true
-					break
-				end
-			end
-			if not already then
-				out[#out + 1] = memberId
-			end
-		end
-	end
-	return out
-end
-
 local function AlreadySameMember(list, candidate)
 	for i = 1, #(list or {}) do
 		if CheckRun.SameMemberId(list[i], candidate) then
@@ -181,6 +159,30 @@ local function AlreadySameMember(list, candidate)
 		end
 	end
 	return false
+end
+
+-- Collapse SameMemberId-equivalent roster aliases to one ID per logical character.
+-- Optional resolveId(candidate) maps a GetMemberIds() spelling onto the exact
+-- identifier of the Member object consequence processing will award (for example
+-- profile:GetMemberByID(candidate):GetFullIdentifier()). Without resolveId, the
+-- first surviving candidate spelling is kept.
+function CheckRun.UniqueProfileMemberIds(memberIds, resolveId)
+	local out = {}
+	for _, memberId in ipairs(memberIds or {}) do
+		if type(memberId) == "string" and memberId ~= "" then
+			local canonical = memberId
+			if type(resolveId) == "function" then
+				local resolved = resolveId(memberId)
+				if type(resolved) == "string" and resolved ~= "" then
+					canonical = resolved
+				end
+			end
+			if not AlreadySameMember(out, canonical) then
+				out[#out + 1] = canonical
+			end
+		end
+	end
+	return out
 end
 
 -- Intersection of profile roster and live group. Returns profile member IDs

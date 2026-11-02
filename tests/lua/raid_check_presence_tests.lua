@@ -626,6 +626,152 @@ assertEq(#controlTargets, 15, "15/22 control still yields fifteen targets")
 local controlPresent = CheckRun.CanonicalizePresentMembers(controlGroup, controlUnique)
 assertEq(#controlPresent, 16, "15/22 control present is fifteen profile members plus guest")
 
+-- #442 Codex P2 follow-up: lowercase Alice inserted before uppercase Alice.
+-- GetMemberIds sorts uppercase first; getMemberByID still returns the first insert.
+-- Use a non-Alice owner so creation does not pre-insert an Alice spelling.
+function SF:GetPlayerFullIdentifier()
+    return "Tester-Garona"
+end
+local orderProfile = SF.LootProfile.new("Insertion Order Alias")
+assertTrue(orderProfile ~= nil, "insertion-order profile was created")
+local lowerAlice = SF.Member.new("alice-Garona", "admin", "WARRIOR")
+local upperAlice = SF.Member.new("Alice-Garona", "member", "WARRIOR")
+local orderBob = SF.Member.new(BOB, "member", "WARRIOR")
+assertTrue(orderProfile:AddMember(lowerAlice), "lowercase alice inserted first")
+assertTrue(orderProfile:AddMember(upperAlice), "uppercase Alice inserted second")
+assertTrue(orderProfile:AddMember(orderBob), "Bob inserted for distinct-player control")
+SF.lootHelperDB.profiles[orderProfile:GetProfileId()] = orderProfile
+
+local sortedIds = orderProfile:GetMemberIds()
+local sortedAlice = nil
+for i = 1, #sortedIds do
+    if CheckRun.SameMemberId(sortedIds[i], ALICE) and not sortedAlice then
+        sortedAlice = sortedIds[i]
+    end
+end
+assertEq(sortedAlice, "Alice-Garona", "GetMemberIds sorts uppercase Alice before lowercase")
+local resolvedMember = orderProfile:GetMemberByID(sortedAlice)
+assertTrue(resolvedMember ~= nil, "getMemberByID resolves the sorted Alice spelling")
+local awardingId = resolvedMember:GetFullIdentifier()
+assertEq(awardingId, "alice-Garona", "getMemberByID returns the first-inserted lowercase Member")
+assertTrue(sortedAlice ~= awardingId, "sorted GetMemberIds spelling differs from awarding Member ID")
+
+local brokenFrozen = CheckRun.UniqueProfileMemberIds(sortedIds)
+local brokenAlice = nil
+for i = 1, #brokenFrozen do
+    if CheckRun.SameMemberId(brokenFrozen[i], ALICE) then
+        brokenAlice = brokenFrozen[i]
+        break
+    end
+end
+assertEq(brokenAlice, "Alice-Garona", "without resolveId, frozen ID keeps the sorted uppercase spelling")
+assertTrue(brokenAlice ~= awardingId, "pre-fix frozen ID mismatches the awarding Member row")
+
+local function resolveAwardingId(candidate)
+    local member = orderProfile:GetMemberByID(candidate)
+    if member and member.GetFullIdentifier then
+        local id = member:GetFullIdentifier()
+        if type(id) == "string" and id ~= "" then
+            return id
+        end
+    end
+    return candidate
+end
+
+-- Mirror RC:_StartAdhocRun resolve path using the profile GetMemberByID API.
+local frozenIds = CheckRun.UniqueProfileMemberIds(sortedIds, resolveAwardingId)
+local frozenAlice = nil
+local aliceCount = 0
+for i = 1, #frozenIds do
+    if CheckRun.SameMemberId(frozenIds[i], ALICE) then
+        aliceCount = aliceCount + 1
+        frozenAlice = frozenIds[i]
+    end
+end
+assertEq(aliceCount, 1, "resolved freeze keeps one Alice identity")
+assertEq(frozenAlice, awardingId, "production resolve path freezes the awarding Member identifier")
+
+local orderGroup = { "Alice-Garona", "Guest-Garona" }
+local orderTargets = CheckRun.IntersectMembershipAndGroup(frozenIds, orderGroup)
+assertEq(#orderTargets, 1, "insertion-order profile yields exactly one Alice target")
+assertEq(orderTargets[1], awardingId, "target ID equals awarding Member GetFullIdentifier")
+
+local orderResults = {
+    [orderTargets[1]] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+}
+
+-- Point-mode award through the resolved Member (production consequence path).
+local pointMember = orderProfile:GetMemberByID(orderTargets[1])
+assertTrue(pointMember ~= nil, "point-mode consequences resolve the frozen target")
+assertEq(pointMember:GetFullIdentifier(), awardingId, "point-mode resolved Member matches frozen target")
+assertTrue(pointMember:IncrementPoints({
+    amount = 1,
+    logAuthor = "Raid Check",
+    reason = "RAID_CHECK",
+    profile = orderProfile,
+    skipBroadcast = true,
+}), "point-mode Prepared award succeeds once")
+assertEq(pointMember:GetPointBalance(), 1, "point-mode records exactly one Prepared point on awarding Member")
+
+-- Reward Pot attendance award on the same Member.
+assertTrue(pointMember:IncrementAttendance({
+    amount = 1,
+    logAuthor = "Raid Check",
+    reason = "RAID_CHECK",
+    profile = orderProfile,
+    skipBroadcast = true,
+}), "Reward Pot attendance award succeeds once")
+assertEq(pointMember:GetAttendanceBalance(), 1, "Reward Pot mode records exactly one attendance on awarding Member")
+
+local orderOpportunity = orderProfile:GetProfileId() .. ":insertion-order"
+local orderPresent = CheckRun.CanonicalizePresentMembers(orderGroup, frozenIds)
+local orderPrepared = CheckRun.CollectPreparedPresentMembers(orderResults, orderGroup)
+assertTrue(orderProfile:RecordRaidCheckPresence({
+    opportunityId = orderOpportunity,
+    presentMembers = orderPresent,
+    eligibleMembers = frozenIds,
+    preparedMembers = orderPrepared,
+    logAuthor = "Raid Check",
+    skipBroadcast = true,
+    skipPermission = true,
+}), "insertion-order profile records presence with awarding IDs")
+
+local orderPresence = nil
+for i = 1, #(orderProfile:GetLootLogs() or {}) do
+    local log = orderProfile:GetLootLogs()[i]
+    local eventType = log.GetEventType and log:GetEventType() or log._eventType
+    if eventType == "RAID_CHECK_PRESENCE" then
+        local data = log.GetEventData and log:GetEventData() or log._data
+        if data and data.opportunityId == orderOpportunity then
+            orderPresence = log
+        end
+    end
+end
+assertTrue(orderPresence ~= nil, "insertion-order presence event persisted")
+local orderData = orderPresence.GetEventData and orderPresence:GetEventData() or orderPresence._data
+local function listHasExact(list, needle)
+    for i = 1, #(list or {}) do
+        if list[i] == needle then
+            return true
+        end
+    end
+    return false
+end
+assertTrue(listHasExact(orderData.eligibleMembers, awardingId), "eligibleMembers uses awarding Member ID")
+assertTrue(not listHasExact(orderData.eligibleMembers, "Alice-Garona"), "eligibleMembers drops the mismatched sorted spelling")
+assertTrue(listHasExact(orderData.presentMembers, awardingId), "presentMembers uses awarding Member ID")
+assertTrue(listHasExact(orderData.preparedMembers, awardingId), "preparedMembers uses awarding Member ID")
+assertEq(#(orderData.preparedMembers or {}), 1, "preparedMembers lists Alice once")
+assertTrue(listHasExact(orderData.presentMembers, "Guest-Garona"), "guest remains in presentMembers")
+assertTrue(listHasExact(orderData.eligibleMembers, BOB), "distinct Bob remains eligible")
+
+local orderReplay = Identity.Replay({ orderPresence }, { owner = awardingId })
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, awardingId), "100%", "replay credits attendance on awarding Member row")
+assertEq(Identity.FormatRaidCheckPreparedness(orderReplay, awardingId), "100%", "replay credits preparedness on awarding Member row")
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, "Alice-Garona"), "—", "mismatched sorted spelling has no separate attendance history row")
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, BOB), "0%", "Bob remains absent in insertion-order scenario")
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, "Guest-Garona"), "100%", "guest remains present in insertion-order scenario")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
