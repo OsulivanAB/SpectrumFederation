@@ -271,7 +271,12 @@ end
 assertTrue(api and not api:find("_QueueInspectForUnit", 1, true), "cached readiness does not queue inspects")
 assertTrue(raidCheck:find("RecordRaidCheckPresence", 1, true) ~= nil, "Raid Check records presence on raid-mode consequences")
 assertTrue(raidCheck:find("preparedMembers", 1, true) ~= nil, "Raid Check records prepared members on the same presence log")
-assertTrue(raidCheck:find("classified.class == CheckRun.CLASS.PREPARED", 1, true) ~= nil, "prepared members use CheckRun PREPARED only")
+assertTrue(raidCheck:find("CollectPreparedPresentMembers", 1, true) ~= nil, "prepared members use CheckRun CollectPreparedPresentMembers")
+local checkRunSource = (io.open("SpectrumFederation/modules/RaidEquipment/CheckRun.lua", "r")):read("*a")
+assertTrue(
+    checkRunSource:find("classified.class == CheckRun.CLASS.PREPARED", 1, true) ~= nil,
+    "prepared members use CheckRun PREPARED only"
+)
 assertTrue(raidCheck:find('if not unit or type(unit) ~= "string"', 1, true) ~= nil, "UnitGUID helper rejects a nil unit")
 assertTrue(api and api:find("unit and self:_GetInspectAliases", 1, true) ~= nil, "cached readiness does not inspect with a nil unit")
 

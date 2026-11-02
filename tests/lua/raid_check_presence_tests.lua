@@ -193,6 +193,56 @@ local malformedThenValid = Identity.Replay({
 assertEq(Identity.FormatRaidCheckAttendance(malformedThenValid, ALICE), "100%", "malformed first write does not occupy the opportunity id")
 assertEq(Identity.FormatRaidCheckAttendance(malformedThenValid, BOB), "0%", "first valid write still counts the opportunity")
 
+-- #442: 15 present / 22 eligible remains the attendance shape; wording is
+-- separate. Preparedness still requires an explicit preparedMembers list.
+local raid15profile22Present = {}
+local raid15profile22Eligible = {}
+local raid15profile22Prepared = {}
+for i = 1, 22 do
+    raid15profile22Eligible[i] = string.format("Raider%02d-Garona", i)
+end
+for i = 1, 15 do
+    raid15profile22Present[i] = raid15profile22Eligible[i]
+end
+for i = 1, 12 do
+    raid15profile22Prepared[i] = raid15profile22Eligible[i]
+end
+local raid15 = Identity.Replay({
+    presenceLog("p442:1", raid15profile22Present, raid15profile22Eligible, 1, raid15profile22Prepared),
+}, { owner = ALICE })
+assertEq(select(1, Identity.RaidCheckAttendanceCounts(raid15, "Raider01-Garona")), 1, "15/22: present profile member counts present")
+assertEq(select(2, Identity.RaidCheckAttendanceCounts(raid15, "Raider01-Garona")), 1, "15/22: present profile member counts eligible")
+assertEq(select(1, Identity.RaidCheckAttendanceCounts(raid15, "Raider16-Garona")), 0, "15/22: absent eligible member is not present")
+assertEq(select(2, Identity.RaidCheckAttendanceCounts(raid15, "Raider16-Garona")), 1, "15/22: absent eligible member still counts eligible")
+assertEq(Identity.FormatRaidCheckPreparedness(raid15, "Raider01-Garona"), "100%", "15/22: verified prepared member is 100%")
+assertEq(Identity.FormatRaidCheckPreparedness(raid15, "Raider13-Garona"), "0%", "15/22: present unprepared member is 0%")
+assertEq(Identity.FormatRaidCheckPreparedness(raid15, "Raider16-Garona"), "0%", "15/22: absent eligible member is 0% prepared")
+
+function strtrim(s)
+    return tostring(s or ""):match("^%s*(.-)%s*$") or ""
+end
+function GetRealmName()
+    return "Garona"
+end
+assert(loadfile("SpectrumFederation/modules/NameUtil.lua"))("SpectrumFederation", SF)
+assert(loadfile("SpectrumFederation/modules/RaidEquipment/CheckRun.lua"))("SpectrumFederation", SF)
+local CheckRun = SF.RaidEquipment.CheckRun
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, 12),
+    "Raid Check: 15 present · 22 eligible profile members · 12 verified prepared",
+    "15/22 presence summary spells out present, eligible, and verified prepared"
+)
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, nil),
+    "Raid Check: 15 present · 22 eligible profile members",
+    "legacy presence summary omits prepared when preparedMembers is missing"
+)
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, 0),
+    "Raid Check: 15 present · 22 eligible profile members · 0 verified prepared",
+    "explicit empty preparedMembers still shows zero verified prepared"
+)
+
 local validatorsChunk = assert(loadfile("SpectrumFederation/modules/LootHelper/LootLogValidators.lua"))
 validatorsChunk("SpectrumFederation", SF)
 local Validators = SF.LootLogValidators

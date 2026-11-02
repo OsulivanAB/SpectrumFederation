@@ -560,6 +560,10 @@ L["GUILD_SUPPLIES_DISABLED_POLICY_UNKNOWN"] = "Officer rank is not available yet
 L["SETTINGS_WINDOW_OPACITY_LABEL"] = "Settings Window Opacity"
 L["SETTINGS_WINDOW_OPACITY_TOOLTIP"] = "Adjust the opacity of the settings window background only. Text and controls stay fully opaque. 100% is fully opaque; lower values show more of the game underneath."
 
+-- Raid Check presence log summary (#442)
+L["RAID_CHECK_PRESENCE_SUMMARY"] = "Raid Check: %d present · %d eligible profile members"
+L["RAID_CHECK_PRESENCE_SUMMARY_PREPARED"] = "Raid Check: %d present · %d eligible profile members · %d verified prepared"
+
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)
 	local value = L[key]

@@ -125,20 +125,117 @@ function CheckRun.FreezeTargetIds(memberIds)
 	return order, frozen
 end
 
-function CheckRun.IntersectMembershipAndGroup(memberIds, groupIds)
-	local inGroup = {}
+-- Canonical character identity for Raid Check membership matching.
+-- Exact equality first; otherwise NameUtil.SamePlayer (case/realm normalization).
+function CheckRun.SameMemberId(a, b)
+	if a == b then
+		return true
+	end
+	if type(a) ~= "string" or type(b) ~= "string" or a == "" or b == "" then
+		return false
+	end
+	if SF.NameUtil and SF.NameUtil.SamePlayer then
+		return SF.NameUtil.SamePlayer(a, b) and true or false
+	end
+	return false
+end
+
+function CheckRun.IsPresentInGroup(memberId, groupIds)
+	if type(memberId) ~= "string" or memberId == "" then
+		return false
+	end
 	for _, id in ipairs(groupIds or {}) do
-		if type(id) == "string" then
-			inGroup[id] = true
+		if CheckRun.SameMemberId(memberId, id) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Intersection of profile roster and live group. Returns profile member IDs
+-- (authoritative for targets, classification, awards, and preparedMembers).
+-- Case/realm aliases match via SameMemberId; non-profile group members are omitted.
+function CheckRun.IntersectMembershipAndGroup(memberIds, groupIds)
+	local groupList = {}
+	for _, id in ipairs(groupIds or {}) do
+		if type(id) == "string" and id ~= "" then
+			groupList[#groupList + 1] = id
 		end
 	end
 	local out = {}
-	for _, id in ipairs(memberIds or {}) do
-		if inGroup[id] then
-			out[#out + 1] = id
+	local seen = {}
+	for _, memberId in ipairs(memberIds or {}) do
+		if type(memberId) == "string" and memberId ~= "" and not seen[memberId] then
+			local matched = false
+			for i = 1, #groupList do
+				if CheckRun.SameMemberId(memberId, groupList[i]) then
+					matched = true
+					break
+				end
+			end
+			if matched then
+				seen[memberId] = true
+				out[#out + 1] = memberId
+			end
 		end
 	end
 	return out
+end
+
+-- Present profile targets classified Prepared. Presence uses SameMemberId so
+-- group alias casing cannot drop a verified Prepared player from the log.
+function CheckRun.CollectPreparedPresentMembers(results, groupMemberIds)
+	local prepared = {}
+	local seen = {}
+	if type(results) ~= "table" then
+		return prepared
+	end
+	for memberId, classified in pairs(results) do
+		if type(memberId) == "string"
+			and memberId ~= ""
+			and not seen[memberId]
+			and CheckRun.IsPresentInGroup(memberId, groupMemberIds)
+			and classified
+			and classified.class == CheckRun.CLASS.PREPARED
+		then
+			seen[memberId] = true
+			prepared[#prepared + 1] = memberId
+		end
+	end
+	return prepared
+end
+
+-- Loot Logs presence summary. preparedCount == nil omits the Prepared clause
+-- (legacy records without preparedMembers). An explicit 0 still shows zero.
+function CheckRun.FormatPresenceLogSummary(presentCount, eligibleCount, preparedCount)
+	presentCount = tonumber(presentCount) or 0
+	eligibleCount = tonumber(eligibleCount) or 0
+	local function text(key, default)
+		if SF.LocaleText then
+			return SF.LocaleText(key, default)
+		end
+		return default
+	end
+	if preparedCount == nil then
+		return string.format(
+			text(
+				"RAID_CHECK_PRESENCE_SUMMARY",
+				"Raid Check: %d present · %d eligible profile members"
+			),
+			presentCount,
+			eligibleCount
+		)
+	end
+	preparedCount = tonumber(preparedCount) or 0
+	return string.format(
+		text(
+			"RAID_CHECK_PRESENCE_SUMMARY_PREPARED",
+			"Raid Check: %d present · %d eligible profile members · %d verified prepared"
+		),
+		presentCount,
+		eligibleCount,
+		preparedCount
+	)
 end
 
 function CheckRun.NewPlayer(memberId)

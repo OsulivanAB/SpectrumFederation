@@ -1043,7 +1043,11 @@ local function FindUnitByGuidOrId(guid, id)
 	if id then
 		for _, unit in ipairs(CollectUnits()) do
 			local name, realm = UnitFullName(unit)
-			if NormalizeNameRealm(name, realm) == id then
+			local unitId = NormalizeNameRealm(name, realm)
+			if unitId == id then
+				return unit
+			end
+			if unitId and SF.NameUtil and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(unitId, id) then
 				return unit
 			end
 		end
@@ -4990,21 +4994,9 @@ function RC:_ApplyCheckConsequences(run)
 			opportunityId = run.profileId .. ":" .. opportunityId
 		end
 		if opportunityId ~= "" then
-			local preparedMembers = {}
-			local presentSet = {}
-			for _, memberId in ipairs(run.groupMemberIds or {}) do
-				if type(memberId) == "string" and memberId ~= "" then
-					presentSet[memberId] = true
-				end
-			end
-			for memberId, classified in pairs(results) do
-				if presentSet[memberId]
-					and classified
-					and classified.class == CheckRun.CLASS.PREPARED
-				then
-					preparedMembers[#preparedMembers + 1] = memberId
-				end
-			end
+			local preparedMembers = CheckRun.CollectPreparedPresentMembers
+					and CheckRun.CollectPreparedPresentMembers(results, run.groupMemberIds or {})
+				or {}
 			local recorded = profile:RecordRaidCheckPresence({
 				opportunityId = opportunityId,
 				presentMembers = run.groupMemberIds or {},
