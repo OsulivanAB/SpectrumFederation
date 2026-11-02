@@ -104,6 +104,43 @@ assertEq(aliasIntersect[2], "Bob-Garona", "second profile member is retained onc
 assertTrue(not CheckRun.IsPresentInGroup("Carol-Garona", { "alice-Garona", "BOB-garona" }), "absent profile member is not present")
 assertTrue(CheckRun.IsPresentInGroup("Alice-Garona", { "alice-Garona" }), "profile id matches group alias")
 
+-- #442 Codex P2: duplicate SamePlayer roster aliases must collapse to one target.
+local duplicateRoster = { "Alice-Garona", "alice-Garona", "Bob-Garona" }
+local brokenTargets = {}
+do
+    -- Reconstruct the pre-fix exact-string seen + SamePlayer match defect.
+    local groupList = { "Alice-Garona" }
+    local seen = {}
+    for _, memberId in ipairs(duplicateRoster) do
+        if type(memberId) == "string" and memberId ~= "" and not seen[memberId] then
+            local matched = false
+            for i = 1, #groupList do
+                if CheckRun.SameMemberId(memberId, groupList[i]) then
+                    matched = true
+                    break
+                end
+            end
+            if matched then
+                seen[memberId] = true
+                brokenTargets[#brokenTargets + 1] = memberId
+            end
+        end
+    end
+end
+assertEq(#brokenTargets, 2, "pre-fix exact-string seen still yields two SamePlayer targets")
+local uniqueRoster = CheckRun.UniqueProfileMemberIds(duplicateRoster)
+assertEq(#uniqueRoster, 2, "UniqueProfileMemberIds keeps Alice once and Bob")
+assertEq(uniqueRoster[1], "Alice-Garona", "first authoritative Alice spelling is retained")
+assertEq(uniqueRoster[2], "Bob-Garona", "distinct Bob remains")
+local fixedTargets = CheckRun.IntersectMembershipAndGroup(duplicateRoster, { "Alice-Garona", "Guest-Garona" })
+assertEq(#fixedTargets, 1, "IntersectMembershipAndGroup collapses SamePlayer aliases to one target")
+assertEq(fixedTargets[1], "Alice-Garona", "collapsed target keeps the first authoritative profile ID")
+local distinctControl = CheckRun.IntersectMembershipAndGroup(
+    { "Alice-Garona", "Bob-Garona" },
+    { "Alice-Garona", "Bob-Garona" }
+)
+assertEq(#distinctControl, 2, "genuinely distinct characters remain separate targets")
+
 -- 15 present raid players against a 22-member selected profile (#442 report shape).
 local profile22 = {}
 local group15 = {}

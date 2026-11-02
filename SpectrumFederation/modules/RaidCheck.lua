@@ -5254,6 +5254,11 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	if profile.GetMemberIds then
 		memberIds = profile:GetMemberIds() or {}
 	end
+	-- Collapse SamePlayer-equivalent roster aliases to one authoritative ID so
+	-- frozen targets, eligibleMembers, and Prepared awards cannot double-count.
+	if CheckRun.UniqueProfileMemberIds then
+		memberIds = CheckRun.UniqueProfileMemberIds(memberIds)
+	end
 	local groupMemberIds = CollectGroupMemberIds()
 	local targetIds = CheckRun.IntersectMembershipAndGroup(memberIds, groupMemberIds)
 	local now = GetTime and GetTime() or 0

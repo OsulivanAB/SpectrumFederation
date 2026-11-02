@@ -152,9 +152,41 @@ function CheckRun.IsPresentInGroup(memberId, groupIds)
 	return false
 end
 
+-- Keep the first authoritative profile ID for each SameMemberId equivalence
+-- class. LootProfile:AddMember can leave case/realm aliases in GetMemberIds();
+-- Raid Check must treat those as one logical character for targets and eligibility.
+function CheckRun.UniqueProfileMemberIds(memberIds)
+	local out = {}
+	for _, memberId in ipairs(memberIds or {}) do
+		if type(memberId) == "string" and memberId ~= "" then
+			local already = false
+			for i = 1, #out do
+				if CheckRun.SameMemberId(out[i], memberId) then
+					already = true
+					break
+				end
+			end
+			if not already then
+				out[#out + 1] = memberId
+			end
+		end
+	end
+	return out
+end
+
+local function AlreadySameMember(list, candidate)
+	for i = 1, #(list or {}) do
+		if CheckRun.SameMemberId(list[i], candidate) then
+			return true
+		end
+	end
+	return false
+end
+
 -- Intersection of profile roster and live group. Returns profile member IDs
 -- (authoritative for targets, classification, awards, and preparedMembers).
 -- Case/realm aliases match via SameMemberId; non-profile group members are omitted.
+-- SameMemberId-equivalent roster aliases collapse to one target.
 function CheckRun.IntersectMembershipAndGroup(memberIds, groupIds)
 	local groupList = {}
 	for _, id in ipairs(groupIds or {}) do
@@ -163,9 +195,8 @@ function CheckRun.IntersectMembershipAndGroup(memberIds, groupIds)
 		end
 	end
 	local out = {}
-	local seen = {}
 	for _, memberId in ipairs(memberIds or {}) do
-		if type(memberId) == "string" and memberId ~= "" and not seen[memberId] then
+		if type(memberId) == "string" and memberId ~= "" and not AlreadySameMember(out, memberId) then
 			local matched = false
 			for i = 1, #groupList do
 				if CheckRun.SameMemberId(memberId, groupList[i]) then
@@ -174,7 +205,6 @@ function CheckRun.IntersectMembershipAndGroup(memberIds, groupIds)
 				end
 			end
 			if matched then
-				seen[memberId] = true
 				out[#out + 1] = memberId
 			end
 		end
@@ -220,21 +250,20 @@ end
 
 -- Present profile targets classified Prepared. Presence uses SameMemberId so
 -- group alias casing cannot drop a verified Prepared player from the log.
+-- SameMemberId-equivalent result keys collapse to one prepared entry.
 function CheckRun.CollectPreparedPresentMembers(results, groupMemberIds)
 	local prepared = {}
-	local seen = {}
 	if type(results) ~= "table" then
 		return prepared
 	end
 	for memberId, classified in pairs(results) do
 		if type(memberId) == "string"
 			and memberId ~= ""
-			and not seen[memberId]
+			and not AlreadySameMember(prepared, memberId)
 			and CheckRun.IsPresentInGroup(memberId, groupMemberIds)
 			and classified
 			and classified.class == CheckRun.CLASS.PREPARED
 		then
-			seen[memberId] = true
 			prepared[#prepared + 1] = memberId
 		end
 	end
