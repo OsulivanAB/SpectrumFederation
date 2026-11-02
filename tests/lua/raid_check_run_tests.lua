@@ -1242,6 +1242,21 @@ assertEq(
     "explicit empty preparedMembers still displays zero"
 )
 
+-- #442: canonicalize presentMembers onto profile IDs before logging.
+local canon15 = CheckRun.CanonicalizePresentMembers(group15, profile22)
+assertEq(#canon15, 16, "15 profile-present members plus one non-profile guest")
+assertEq(canon15[1], "Raider01-Garona", "first present alias rewrites to the profile ID")
+assertEq(canon15[5], "Raider05-Garona", "fifth present alias rewrites to the profile ID")
+assertEq(canon15[15], "Raider15-Garona", "fifteenth present member keeps the profile ID")
+assertEq(canon15[16], "GuestOnly-Garona", "non-profile guest remains in presentMembers")
+local duplicateCanon = CheckRun.CanonicalizePresentMembers(
+    { "alice-Garona", "Alice-Garona", "Guest-Garona" },
+    { "Alice-Garona" }
+)
+assertEq(#duplicateCanon, 2, "duplicate spellings of one profile member collapse to one present entry")
+assertEq(duplicateCanon[1], "Alice-Garona", "duplicate aliases prefer the profile ID")
+assertEq(duplicateCanon[2], "Guest-Garona", "guest remains after alias dedupe")
+
 -- Preserve #443 same-session fallback for Prepared; do not credit invalid last-good.
 local sessionPlayer = CheckRun.NewPlayer("SessionReady-Garona")
 sessionPlayer.inspectableAtLeastOnce = true

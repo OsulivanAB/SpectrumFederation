@@ -4994,13 +4994,21 @@ function RC:_ApplyCheckConsequences(run)
 			opportunityId = run.profileId .. ":" .. opportunityId
 		end
 		if opportunityId ~= "" then
+			local groupMemberIds = run.groupMemberIds or {}
+			local rosterMemberIds = run.rosterMemberIds or {}
+			-- Identity.Replay keys present/eligible/prepared by exact string.
+			-- Map profile-matching group aliases onto roster IDs so Prepared and
+			-- attendance credit the canonical profile row; keep non-profile guests.
+			local presentMembers = CheckRun.CanonicalizePresentMembers
+					and CheckRun.CanonicalizePresentMembers(groupMemberIds, rosterMemberIds)
+				or groupMemberIds
 			local preparedMembers = CheckRun.CollectPreparedPresentMembers
-					and CheckRun.CollectPreparedPresentMembers(results, run.groupMemberIds or {})
+					and CheckRun.CollectPreparedPresentMembers(results, groupMemberIds)
 				or {}
 			local recorded = profile:RecordRaidCheckPresence({
 				opportunityId = opportunityId,
-				presentMembers = run.groupMemberIds or {},
-				eligibleMembers = run.rosterMemberIds or {},
+				presentMembers = presentMembers,
+				eligibleMembers = rosterMemberIds,
 				preparedMembers = preparedMembers,
 				logAuthor = "Raid Check",
 				skipBroadcast = skipBroadcast,
@@ -5010,8 +5018,8 @@ function RC:_ApplyCheckConsequences(run)
 					"RAID_CHECK",
 					"Raid Check presence %s (present=%d eligible=%d prepared=%d skipBroadcast=%s)",
 					recorded and opportunityId or "skipped",
-					#(run.groupMemberIds or {}),
-					#(run.rosterMemberIds or {}),
+					#presentMembers,
+					#rosterMemberIds,
 					#preparedMembers,
 					tostring(skipBroadcast)
 				)

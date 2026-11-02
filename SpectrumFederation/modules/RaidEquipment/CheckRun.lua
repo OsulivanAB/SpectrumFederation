@@ -182,6 +182,42 @@ function CheckRun.IntersectMembershipAndGroup(memberIds, groupIds)
 	return out
 end
 
+-- Rewrite live group IDs that match the selected profile onto the authoritative
+-- profile member ID before persisting RAID_CHECK_PRESENCE. Non-profile guests
+-- stay as reported. Alias spellings of one character appear once.
+function CheckRun.CanonicalizePresentMembers(groupMemberIds, rosterMemberIds)
+	local roster = {}
+	for _, id in ipairs(rosterMemberIds or {}) do
+		if type(id) == "string" and id ~= "" then
+			roster[#roster + 1] = id
+		end
+	end
+	local out = {}
+	local function alreadyPresent(candidate)
+		for i = 1, #out do
+			if CheckRun.SameMemberId(out[i], candidate) then
+				return true
+			end
+		end
+		return false
+	end
+	for _, groupId in ipairs(groupMemberIds or {}) do
+		if type(groupId) == "string" and groupId ~= "" then
+			local canonical = groupId
+			for i = 1, #roster do
+				if CheckRun.SameMemberId(groupId, roster[i]) then
+					canonical = roster[i]
+					break
+				end
+			end
+			if not alreadyPresent(canonical) then
+				out[#out + 1] = canonical
+			end
+		end
+	end
+	return out
+end
+
 -- Present profile targets classified Prepared. Presence uses SameMemberId so
 -- group alias casing cannot drop a verified Prepared player from the log.
 function CheckRun.CollectPreparedPresentMembers(results, groupMemberIds)
