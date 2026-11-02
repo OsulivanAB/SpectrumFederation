@@ -38,7 +38,16 @@ local function assertAlmost(actual, expected, epsilon, message)
     end
 end
 
+function strtrim(s)
+    return tostring(s or ""):match("^%s*(.-)%s*$") or ""
+end
+
+function GetRealmName()
+    return "Garona"
+end
+
 local SF = {}
+assert(loadfile("SpectrumFederation/modules/NameUtil.lua"))("SpectrumFederation", SF)
 assert(loadfile("SpectrumFederation/modules/RaidEquipment/CheckRun.lua"))("SpectrumFederation", SF)
 assert(loadfile("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua"))("SpectrumFederation", SF)
 assert(loadfile("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua"))("SpectrumFederation", SF)
@@ -79,6 +88,104 @@ local intersected = CheckRun.IntersectMembershipAndGroup({ "A", "B", "C" }, { "B
 assertEq(intersected[1], "A", "intersection preserves profile order")
 assertEq(intersected[2], "B", "joiner D is ignored")
 assertEq(#intersected, 2, "C is omitted because they are not in the group")
+
+-- #442: exact-string intersection missed case/realm aliases; SamePlayer maps them
+-- to the authoritative profile member ID once and ignores non-profile raiders.
+assertTrue(CheckRun.SameMemberId("Alice-Garona", "alice-Garona"), "SameMemberId is case-insensitive")
+assertTrue(CheckRun.SameMemberId("Bob-Area 52", "Bob-Area52"), "SameMemberId strips realm spaces")
+assertTrue(not CheckRun.SameMemberId("Alice-Garona", "Bob-Garona"), "SameMemberId rejects different players")
+local aliasIntersect = CheckRun.IntersectMembershipAndGroup(
+    { "Alice-Garona", "Bob-Garona", "Carol-Garona" },
+    { "alice-Garona", "Guest-Garona", "BOB-garona" }
+)
+assertEq(#aliasIntersect, 2, "case-variant group ids still intersect profile members")
+assertEq(aliasIntersect[1], "Alice-Garona", "intersection keeps the profile member ID casing")
+assertEq(aliasIntersect[2], "Bob-Garona", "second profile member is retained once")
+assertTrue(not CheckRun.IsPresentInGroup("Carol-Garona", { "alice-Garona", "BOB-garona" }), "absent profile member is not present")
+assertTrue(CheckRun.IsPresentInGroup("Alice-Garona", { "alice-Garona" }), "profile id matches group alias")
+
+-- #442 Codex P2: duplicate SamePlayer roster aliases must collapse to one target.
+local duplicateRoster = { "Alice-Garona", "alice-Garona", "Bob-Garona" }
+local brokenTargets = {}
+do
+    -- Reconstruct the pre-fix exact-string seen + SamePlayer match defect.
+    local groupList = { "Alice-Garona" }
+    local seen = {}
+    for _, memberId in ipairs(duplicateRoster) do
+        if type(memberId) == "string" and memberId ~= "" and not seen[memberId] then
+            local matched = false
+            for i = 1, #groupList do
+                if CheckRun.SameMemberId(memberId, groupList[i]) then
+                    matched = true
+                    break
+                end
+            end
+            if matched then
+                seen[memberId] = true
+                brokenTargets[#brokenTargets + 1] = memberId
+            end
+        end
+    end
+end
+assertEq(#brokenTargets, 2, "pre-fix exact-string seen still yields two SamePlayer targets")
+local uniqueRoster = CheckRun.UniqueProfileMemberIds(duplicateRoster)
+assertEq(#uniqueRoster, 2, "UniqueProfileMemberIds keeps Alice once and Bob")
+assertEq(uniqueRoster[1], "Alice-Garona", "first authoritative Alice spelling is retained")
+assertEq(uniqueRoster[2], "Bob-Garona", "distinct Bob remains")
+local fixedTargets = CheckRun.IntersectMembershipAndGroup(duplicateRoster, { "Alice-Garona", "Guest-Garona" })
+assertEq(#fixedTargets, 1, "IntersectMembershipAndGroup collapses SamePlayer aliases to one target")
+assertEq(fixedTargets[1], "Alice-Garona", "collapsed target keeps the first authoritative profile ID")
+local distinctControl = CheckRun.IntersectMembershipAndGroup(
+    { "Alice-Garona", "Bob-Garona" },
+    { "Alice-Garona", "Bob-Garona" }
+)
+assertEq(#distinctControl, 2, "genuinely distinct characters remain separate targets")
+
+-- Sorted GetMemberIds order can differ from getMemberByID insertion resolution.
+-- Without resolveId, UniqueProfileMemberIds keeps the sorted spelling.
+local sortedThenLower = { "Alice-Garona", "alice-Garona", "Bob-Garona" }
+local insertionFirst = {
+    ["Alice-Garona"] = "alice-Garona",
+    ["alice-Garona"] = "alice-Garona",
+    ["Bob-Garona"] = "Bob-Garona",
+}
+local sortedOnly = CheckRun.UniqueProfileMemberIds(sortedThenLower)
+assertEq(sortedOnly[1], "Alice-Garona", "without resolveId, sorted Alice spelling wins")
+local resolvedIds = CheckRun.UniqueProfileMemberIds(sortedThenLower, function(candidate)
+    return insertionFirst[candidate] or candidate
+end)
+assertEq(resolvedIds[1], "alice-Garona", "resolveId keeps the awarding Member identifier")
+assertEq(resolvedIds[2], "Bob-Garona", "resolveId still keeps distinct Bob")
+assertEq(#resolvedIds, 2, "resolveId still collapses SamePlayer aliases once")
+
+-- 15 present raid players against a 22-member selected profile (#442 report shape).
+local profile22 = {}
+local group15 = {}
+for i = 1, 22 do
+    profile22[i] = string.format("Raider%02d-Garona", i)
+end
+for i = 1, 15 do
+    -- Mix exact casing with lower-case aliases for the first five.
+    if i <= 5 then
+        group15[i] = string.format("raider%02d-garona", i)
+    else
+        group15[i] = profile22[i]
+    end
+end
+group15[#group15 + 1] = "GuestOnly-Garona"
+local targets15 = CheckRun.IntersectMembershipAndGroup(profile22, group15)
+assertEq(#targets15, 15, "15-of-22 intersection yields fifteen profile targets")
+assertEq(#profile22, 22, "eligible roster remains twenty-two profile members")
+assertEq(targets15[1], "Raider01-Garona", "first target stays the profile ID")
+assertEq(targets15[5], "Raider05-Garona", "case-aliased fifth target stays the profile ID")
+assertEq(targets15[15], "Raider15-Garona", "fifteenth present profile member is included")
+local guestOnly = false
+for i = 1, #targets15 do
+    if targets15[i] == "GuestOnly-Garona" then
+        guestOnly = true
+    end
+end
+assertTrue(not guestOnly, "non-profile raider is not added as a check target")
 
 local run = CheckRun.NewRun({
     id = "run1",
@@ -1142,6 +1249,111 @@ assertTrue(not CheckRun.NoteSessionStartFailed(failedRun), "session-start failur
 Sync._ResetSessionState = originalReset
 SF.RaidCheck = nil
 SF.LootHelperComm = nil
+
+-- #442: preparedMembers lists only verified Prepared present profile members.
+local mixedResults = {
+    ["Raider01-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    ["Raider02-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.SESSION },
+    ["Raider03-Garona"] = { class = CheckRun.CLASS.UNPREPARED, verified = CheckRun.VERIFIED.FRESH, countsForPot = true },
+    ["Raider04-Garona"] = { class = CheckRun.CLASS.INSPECTION_FAILED, verified = nil, countsForPot = false },
+    ["Raider05-Garona"] = { class = CheckRun.CLASS.UNPREPARED_AVAILABILITY, verified = nil, countsForPot = true },
+    ["Raider16-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH }, -- not present
+}
+local mixedGroup = {
+    "raider01-garona",
+    "Raider02-Garona",
+    "Raider03-Garona",
+    "Raider04-Garona",
+    "Raider05-Garona",
+}
+local preparedPresent = CheckRun.CollectPreparedPresentMembers(mixedResults, mixedGroup)
+table.sort(preparedPresent)
+assertEq(#preparedPresent, 2, "only verified Prepared present members enter preparedMembers")
+assertEq(preparedPresent[1], "Raider01-Garona", "first prepared member keeps the profile ID")
+assertEq(preparedPresent[2], "Raider02-Garona", "session-verified Prepared is included")
+local preparedSet = {}
+for i = 1, #preparedPresent do
+    preparedSet[preparedPresent[i]] = true
+end
+assertTrue(not preparedSet["Raider03-Garona"], "verified Unprepared is not prepared")
+assertTrue(not preparedSet["Raider04-Garona"], "inspection failure is not prepared")
+assertTrue(not preparedSet["Raider05-Garona"], "availability Unprepared is not prepared")
+assertTrue(not preparedSet["Raider16-Garona"], "absent Prepared classification is not logged as present prepared")
+
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, 12),
+    "Raid Check: 15 present · 22 eligible profile members · 12 verified prepared",
+    "presence summary names present, eligible profile members, and verified prepared"
+)
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, nil),
+    "Raid Check: 15 present · 22 eligible profile members",
+    "legacy absence of preparedMembers omits the prepared clause"
+)
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, 0),
+    "Raid Check: 15 present · 22 eligible profile members · 0 verified prepared",
+    "explicit empty preparedMembers still displays zero"
+)
+
+-- #442: canonicalize presentMembers onto profile IDs before logging.
+local canon15 = CheckRun.CanonicalizePresentMembers(group15, profile22)
+assertEq(#canon15, 16, "15 profile-present members plus one non-profile guest")
+assertEq(canon15[1], "Raider01-Garona", "first present alias rewrites to the profile ID")
+assertEq(canon15[5], "Raider05-Garona", "fifth present alias rewrites to the profile ID")
+assertEq(canon15[15], "Raider15-Garona", "fifteenth present member keeps the profile ID")
+assertEq(canon15[16], "GuestOnly-Garona", "non-profile guest remains in presentMembers")
+local duplicateCanon = CheckRun.CanonicalizePresentMembers(
+    { "alice-Garona", "Alice-Garona", "Guest-Garona" },
+    { "Alice-Garona" }
+)
+assertEq(#duplicateCanon, 2, "duplicate spellings of one profile member collapse to one present entry")
+assertEq(duplicateCanon[1], "Alice-Garona", "duplicate aliases prefer the profile ID")
+assertEq(duplicateCanon[2], "Guest-Garona", "guest remains after alias dedupe")
+
+-- Preserve #443 same-session fallback for Prepared; do not credit invalid last-good.
+local sessionPlayer = CheckRun.NewPlayer("SessionReady-Garona")
+sessionPlayer.inspectableAtLeastOnce = true
+sessionPlayer.technicalFailure = true
+sessionPlayer.freshObservation = nil
+local validSessionGood = {
+    complete = true,
+    capturedAt = 100,
+    sessionId = "SES-A",
+    policy = { prepared = true, missing = {} },
+}
+local sessionClass = CheckRun.ClassifyPlayer(sessionPlayer, 200, validSessionGood, "SES-A")
+assertEq(sessionClass.class, CheckRun.CLASS.PREPARED, "valid same-session last-good remains Prepared")
+assertEq(sessionClass.verified, CheckRun.VERIFIED.SESSION, "valid same-session last-good is SESSION verified")
+local staleSessionGood = {
+    complete = true,
+    capturedAt = 100,
+    sessionId = "SES-A",
+    policy = { prepared = true, missing = {} },
+}
+local staleClass = CheckRun.ClassifyPlayer(
+    sessionPlayer,
+    100 + CheckRun.SESSION_LAST_GOOD_SECONDS + 1,
+    staleSessionGood,
+    "SES-A"
+)
+assertEq(staleClass.class, CheckRun.CLASS.INSPECTION_FAILED, "stale same-session last-good is not Prepared")
+local otherSessionGood = {
+    complete = true,
+    capturedAt = 100,
+    sessionId = "SES-OTHER",
+    policy = { prepared = true, missing = {} },
+}
+local otherClass = CheckRun.ClassifyPlayer(sessionPlayer, 200, otherSessionGood, "SES-A")
+assertEq(otherClass.class, CheckRun.CLASS.INSPECTION_FAILED, "prior-session last-good is not Prepared")
+local incompleteGood = {
+    complete = false,
+    capturedAt = 100,
+    sessionId = "SES-A",
+    policy = { prepared = true, missing = {} },
+}
+local incompleteClass = CheckRun.ClassifyPlayer(sessionPlayer, 200, incompleteGood, "SES-A")
+assertEq(incompleteClass.class, CheckRun.CLASS.INSPECTION_FAILED, "incomplete last-good is not Prepared")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

@@ -1043,7 +1043,11 @@ local function FindUnitByGuidOrId(guid, id)
 	if id then
 		for _, unit in ipairs(CollectUnits()) do
 			local name, realm = UnitFullName(unit)
-			if NormalizeNameRealm(name, realm) == id then
+			local unitId = NormalizeNameRealm(name, realm)
+			if unitId == id then
+				return unit
+			end
+			if unitId and SF.NameUtil and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(unitId, id) then
 				return unit
 			end
 		end
@@ -4990,25 +4994,21 @@ function RC:_ApplyCheckConsequences(run)
 			opportunityId = run.profileId .. ":" .. opportunityId
 		end
 		if opportunityId ~= "" then
-			local preparedMembers = {}
-			local presentSet = {}
-			for _, memberId in ipairs(run.groupMemberIds or {}) do
-				if type(memberId) == "string" and memberId ~= "" then
-					presentSet[memberId] = true
-				end
-			end
-			for memberId, classified in pairs(results) do
-				if presentSet[memberId]
-					and classified
-					and classified.class == CheckRun.CLASS.PREPARED
-				then
-					preparedMembers[#preparedMembers + 1] = memberId
-				end
-			end
+			local groupMemberIds = run.groupMemberIds or {}
+			local rosterMemberIds = run.rosterMemberIds or {}
+			-- Identity.Replay keys present/eligible/prepared by exact string.
+			-- Map profile-matching group aliases onto roster IDs so Prepared and
+			-- attendance credit the canonical profile row; keep non-profile guests.
+			local presentMembers = CheckRun.CanonicalizePresentMembers
+					and CheckRun.CanonicalizePresentMembers(groupMemberIds, rosterMemberIds)
+				or groupMemberIds
+			local preparedMembers = CheckRun.CollectPreparedPresentMembers
+					and CheckRun.CollectPreparedPresentMembers(results, groupMemberIds)
+				or {}
 			local recorded = profile:RecordRaidCheckPresence({
 				opportunityId = opportunityId,
-				presentMembers = run.groupMemberIds or {},
-				eligibleMembers = run.rosterMemberIds or {},
+				presentMembers = presentMembers,
+				eligibleMembers = rosterMemberIds,
 				preparedMembers = preparedMembers,
 				logAuthor = "Raid Check",
 				skipBroadcast = skipBroadcast,
@@ -5018,8 +5018,8 @@ function RC:_ApplyCheckConsequences(run)
 					"RAID_CHECK",
 					"Raid Check presence %s (present=%d eligible=%d prepared=%d skipBroadcast=%s)",
 					recorded and opportunityId or "skipped",
-					#(run.groupMemberIds or {}),
-					#(run.rosterMemberIds or {}),
+					#presentMembers,
+					#rosterMemberIds,
 					#preparedMembers,
 					tostring(skipBroadcast)
 				)
@@ -5253,6 +5253,22 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	local memberIds = {}
 	if profile.GetMemberIds then
 		memberIds = profile:GetMemberIds() or {}
+	end
+	-- Collapse SamePlayer-equivalent roster aliases onto the exact identifier of
+	-- the Member getMemberByID resolves (insertion order), not the sorted
+	-- GetMemberIds() spelling. Targets, eligibleMembers, and Prepared awards
+	-- then share one profile row.
+	if CheckRun.UniqueProfileMemberIds then
+		memberIds = CheckRun.UniqueProfileMemberIds(memberIds, function(candidate)
+			local member = FindMember(profile, candidate)
+			if member then
+				local id = member.GetFullIdentifier and member:GetFullIdentifier() or member.identifier
+				if type(id) == "string" and id ~= "" then
+					return id
+				end
+			end
+			return candidate
+		end)
 	end
 	local groupMemberIds = CollectGroupMemberIds()
 	local targetIds = CheckRun.IntersectMembershipAndGroup(memberIds, groupMemberIds)
