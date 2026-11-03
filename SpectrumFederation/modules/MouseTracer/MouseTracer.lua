@@ -777,6 +777,12 @@ function Tracer:Init()
 		end
 		store:RegisterCallback("sf.reset", function()
 			self:ReloadCacheFromStore()
+			-- ResetAll only emits sf.reset, not per-key edgeSoftness. Reload the
+			-- cache (softness → 0) and refresh any existing pool so re-enable
+			-- renders the original hard circular stamps.
+			if poolReady then
+				ApplyAllStampTextures()
+			end
 			self:ApplyEnabled(cache.enabled)
 			self:FlushSnapshot()
 		end)

@@ -630,11 +630,22 @@ local charSettings = {
     edgeSoftness = C.DEFAULT_EDGE_SOFTNESS,
 }
 local settingCallbacks = {}
+local resetCallbacks = {}
 SF.NameUtil = {
     GetSelfId = function()
         return "Tester-Realm"
     end,
 }
+local function ApplyCharacterMouseTracerDefaults()
+    -- Mirror Store:ResetAll → MergeDefaults(CHARACTER_DEFAULTS.mouseTracer).
+    charSettings.enabled = false
+    charSettings.trailLength = C.DEFAULT_TRAIL_LENGTH
+    charSettings.fadeDuration = C.DEFAULT_FADE_DURATION
+    charSettings.thickness = C.DEFAULT_THICKNESS
+    charSettings.rainbowSpeed = C.DEFAULT_RAINBOW_SPEED
+    charSettings.opacity = C.DEFAULT_OPACITY
+    charSettings.edgeSoftness = C.DEFAULT_EDGE_SOFTNESS
+end
 SF.SettingsStore = {
     Get = function(_, key)
         if key == "mouseTracerCopies" then
@@ -673,7 +684,19 @@ SF.SettingsStore = {
         if key then
             settingCallbacks[key] = settingCallbacks[key] or {}
             settingCallbacks[key][#settingCallbacks[key] + 1] = fn
+            return
         end
+        if path == "sf.reset" then
+            resetCallbacks[#resetCallbacks + 1] = fn
+        end
+    end,
+    -- Production Store:ResetAll clears character DB, merges defaults, then fires sf.reset.
+    ResetAll = function()
+        ApplyCharacterMouseTracerDefaults()
+        for i = 1, #resetCallbacks do
+            resetCallbacks[i](true, false)
+        end
+        return true
     end,
 }
 
@@ -1155,6 +1178,56 @@ assertEq(
 
 Tracer:ApplyEnabled(false)
 assertTrue(host.scripts.OnUpdate == nil, "edge-softness suite disables cleanly")
+
+-- Reset All must restore the original 0% stamp appearance after soft textures were applied.
+-- Store:ResetAll only fires sf.reset (not per-key edgeSoftness); the production callback must
+-- refresh pooled textures after ReloadCacheFromStore.
+assertTrue(#resetCallbacks >= 1, "Init registers the production sf.reset callback")
+currentScale = 1
+local texturesBeforeResetSuite = #stampTextures
+local framesBeforeResetSuite = createdFrames
+Tracer:ApplyEnabled(true)
+host = hostFrame()
+assertTrue(host.scripts.OnUpdate ~= nil, "reset suite enables OnUpdate")
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
+assertEq(
+    stampTextures[1].texture,
+    "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga",
+    "reset suite starts from a nonzero soft texture"
+)
+assertEq(#stampTextures, texturesBeforeResetSuite, "selecting softness does not grow the stamp pool")
+
+local okReset = SF.SettingsStore:ResetAll()
+assertTrue(okReset, "ResetAll succeeds")
+assertEq(charSettings.edgeSoftness, 0, "ResetAll restores edgeSoftness default 0")
+assertEq(charSettings.enabled, false, "ResetAll restores enabled default false")
+assertTrue(host.scripts.OnUpdate == nil, "sf.reset disable path removes OnUpdate")
+assertEq(#stampTextures, texturesBeforeResetSuite, "sf.reset does not grow the stamp pool")
+assertEq(createdFrames, framesBeforeResetSuite, "sf.reset does not create frames")
+
+Tracer:ApplyEnabled(true)
+host = hostFrame()
+assertTrue(host.scripts.OnUpdate ~= nil, "re-enable after reset installs OnUpdate")
+assertEq(#stampTextures, texturesBeforeResetSuite, "re-enable after reset reuses the existing pool")
+pumpCursor(0, 0)
+pumpCursor(60, 0)
+assertTrue(Tracer.engine.count > 0, "movement after reset draws a new trail")
+local hardCount = 0
+for i = 1, #stampTextures do
+    if stampTextures[i].texture == C.CIRCLE_TEXTURE then
+        hardCount = hardCount + 1
+    end
+end
+assertEq(hardCount, C.MAX_POINTS, "after sf.reset, re-enable renders the original 0% circular texture")
+local newestAfterReset = Tracer.engine:ChronoIndex(Tracer.engine.count)
+assertEq(
+    stampTextures[newestAfterReset].texture,
+    C.CIRCLE_TEXTURE,
+    "new stamps after reset use the original hard circular texture"
+)
+
+Tracer:ApplyEnabled(false)
+assertTrue(host.scripts.OnUpdate == nil, "reset suite disables cleanly")
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then
