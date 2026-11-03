@@ -811,6 +811,9 @@ function SettingsWindow:OnImpersonationChanged()
         return
     end
     self:UpdateImpersonationBanner()
+    -- Officer-only conditional pages (e.g. Raid Supplies Rankings) consult
+    -- Preview as Non-Admin via canEdit; revalidate tabs/selection before refresh.
+    self:HandleDurableAvailabilityChange()
     if self.frame.IsShown and self.frame:IsShown() then
         self:RefreshCurrentPage()
     end
@@ -1172,6 +1175,16 @@ function SettingsWindow:Init()
             SettingsWindow:HandleDurableAvailabilityChange()
         end)
         self._gsDurableListener = true
+    end
+
+    -- Shared officer-policy changes grant/revoke Rankings availability without a
+    -- Guild Supplies durable write. Same selection/tab revalidation path.
+    local GO = SF.GuildOfficer
+    if GO and GO.RegisterUIListener and not self._goDurableListener then
+        GO.RegisterUIListener(function()
+            SettingsWindow:HandleDurableAvailabilityChange()
+        end)
+        self._goDurableListener = true
     end
 
     self:BuildNavItemsFromRegistry()

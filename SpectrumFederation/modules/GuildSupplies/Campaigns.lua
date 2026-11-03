@@ -903,6 +903,184 @@ function GS:ProjectCampaignProgress(campaignId)
     return GS.ProjectCampaignProgressOnRecord(record, campaignId)
 end
 
+---------------------------------------------------------------------------
+-- Campaign contribution rankings (#447) — derived view only; never persisted.
+---------------------------------------------------------------------------
+
+local function RankingSortKey(name)
+    if type(name) ~= "string" then
+        return ""
+    end
+    return name:lower()
+end
+
+local function DonationRankingCopper(record, event)
+    if type(GS.DescribeDonationValuation) ~= "function" then
+        return 0
+    end
+    local described = GS.DescribeDonationValuation(record, event)
+    if type(described) == "table" and described.priced
+        and type(described.totalCopper) == "number" then
+        return described.totalCopper
+    end
+    return 0
+end
+
+local function AdjustmentRankingCopper(event)
+    -- Unattributed adjustments are excluded by the caller. Missing/legacy prices
+    -- contribute zero without an incomplete-price indicator (#447).
+    if type(GS.AdjustmentRankingCopper) == "function" then
+        return GS.AdjustmentRankingCopper(event)
+    end
+    local unit = tonumber(event and event.unitCopper)
+    local qty = tonumber(event and event.quantity)
+    if unit == nil or qty == nil or qty ~= qty or unit ~= unit then
+        return 0
+    end
+    if unit < 0 or unit ~= math.floor(unit) or qty ~= math.floor(qty) or qty == 0 then
+        return 0
+    end
+    local absQty = math.abs(qty)
+    local absTotal = unit * absQty
+    if absTotal ~= math.floor(absTotal) or absTotal >= 9007199254740992 then
+        return 0
+    end
+    if qty < 0 then
+        return -absTotal
+    end
+    return absTotal
+end
+
+--- Derived copper contribution rankings for one campaign (#447).
+-- Groups under current Guild Info mains. Counts production-credited donations
+-- (saved valuation or zero) and attributed adjustments (unitCopper × signed qty
+-- or zero). Unattributed adjustments are omitted. Dedupes by event id across
+-- live+archive inputs. Never persists a leaderboard.
+-- @return table|nil { campaignId, generation, rows, maxPositive, hasHistory,
+--   emptyReason }, string|nil err
+function GS.ProjectCampaignRankingsOnRecord(record, campaignId)
+    if type(record) ~= "table" then
+        return nil, "not_ready"
+    end
+    if type(campaignId) ~= "string" or campaignId == "" then
+        return nil, "invalid_campaign"
+    end
+
+    local generation, genErr = ResolveCampaignGeneration(record, campaignId)
+    if genErr then
+        return nil, genErr
+    end
+    if not generation or generation < 1 then
+        return {
+            campaignId = campaignId,
+            generation = generation or 0,
+            rows = {},
+            maxPositive = 0,
+            hasHistory = false,
+            emptyReason = "no_campaign",
+        }
+    end
+
+    local totals = {}
+    local names = {}
+    local hasHistory = false
+    local resolveCtx = GS.BeginContributorProjectionContext
+        and GS.BeginContributorProjectionContext(record) or nil
+
+    ForEachCampaignLedgerEvent(record, generation, function(event)
+        if GS.EventCountsTowardLiveProgress
+            and not GS.EventCountsTowardLiveProgress(record, event) then
+            return
+        end
+        local copper = nil
+        local actorName = nil
+        local actorGuid = nil
+        if IsDonationEvent(event) then
+            hasHistory = true
+            copper = DonationRankingCopper(record, event)
+            actorName = event.actor
+            actorGuid = event.actorGuid or event.donorGuid
+        elseif IsAdjustmentEvent(event) then
+            if not event.attributed then
+                -- Unattributed manual adjustments never appear on Rankings.
+                return
+            end
+            hasHistory = true
+            copper = AdjustmentRankingCopper(event)
+            actorName = event.attributed
+            actorGuid = event.attributedGuid
+        else
+            return
+        end
+        if type(copper) ~= "number" then
+            return
+        end
+        local display = nil
+        if GS.ResolveDisplayContributor then
+            display = select(1, GS.ResolveDisplayContributor(
+                record, actorName, actorGuid, resolveCtx))
+        end
+        display = BoundedActorName(display) or BoundedActorName(actorName)
+        if not display then
+            return
+        end
+        totals[display] = (totals[display] or 0) + copper
+        names[display] = true
+    end)
+
+    local rows = {}
+    for name in pairs(names) do
+        rows[#rows + 1] = {
+            name = name,
+            totalCopper = totals[name] or 0,
+        }
+    end
+    table.sort(rows, function(a, b)
+        local ta = tonumber(a.totalCopper) or 0
+        local tb = tonumber(b.totalCopper) or 0
+        if ta ~= tb then
+            return ta > tb
+        end
+        local ka = RankingSortKey(a.name)
+        local kb = RankingSortKey(b.name)
+        if ka ~= kb then
+            return ka < kb
+        end
+        return tostring(a.name) < tostring(b.name)
+    end)
+
+    local maxPositive = 0
+    for i = 1, #rows do
+        local v = tonumber(rows[i].totalCopper) or 0
+        if v > maxPositive then
+            maxPositive = v
+        end
+    end
+
+    local emptyReason = nil
+    if not hasHistory then
+        emptyReason = "no_contributions"
+    end
+
+    return {
+        campaignId = campaignId,
+        generation = generation,
+        rows = rows,
+        maxPositive = maxPositive,
+        hasHistory = hasHistory,
+        emptyReason = emptyReason,
+    }
+end
+
+--- Officer-facing derived rankings for the current guild record (#447).
+function GS:ProjectCampaignRankings(campaignId)
+    local record, reason = GS:GetCurrentRecord()
+    if not record then
+        return nil, reason or "not_ready"
+    end
+    return GS.ProjectCampaignRankingsOnRecord(record, campaignId)
+end
+
 --- Overall / per-item goal progress matching Consumables.GoalProgress semantics.
 -- Caps each positive-goal item at its own goal for the overall bar, excludes
 -- goal-0 items from the overall denominator, and floors percentages. Pure math

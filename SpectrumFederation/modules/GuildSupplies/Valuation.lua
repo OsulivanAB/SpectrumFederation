@@ -3266,3 +3266,115 @@ function GS.GetValuationCatchupState()
         scanDone = catchup.scanDone == true,
     }
 end
+
+---------------------------------------------------------------------------
+-- Attributed adjustment unit-price snapshots (#447)
+--
+-- Donation AdmitValuationAssignment stays donation-only (positive qty, matching
+-- production-credited donation, nonnegative total). Attributed adjustments are
+-- signed and are not donations; routing them through that path would weaken
+-- donation validation. Instead, newly created attributed adjustments capture an
+-- immutable nonnegative unitCopper on the ledger event at authoring time when
+-- the same officer/home-realm/TSM eligibility used for donations succeeds.
+-- Missing price never blocks the quantity adjustment. Ranking copper is
+-- unitCopper × signed quantity (computed at read time). No historical backfill.
+---------------------------------------------------------------------------
+
+--- Normalize a nonnegative unit-copper snapshot for an adjustment quantity.
+-- Uses abs(quantity) so negative adjustments keep a valid unit bound.
+function GS.NormalizeAdjustmentUnitCopper(unitCopper, quantity)
+    local qty = tonumber(quantity)
+    if type(qty) ~= "number" or qty ~= qty or qty == 0 or qty ~= math.floor(qty) then
+        return nil
+    end
+    local absQty = math.abs(qty)
+    if absQty < 1 or absQty > MAX_QTY then
+        return nil
+    end
+    local maxUnit = math.floor((MAX_EXACT - 1) / absQty)
+    return NormalizeCopper(unitCopper, maxUnit)
+end
+
+--- Signed ranking copper for one attributed adjustment event.
+-- Missing/invalid unitCopper → 0. Does not indicate incomplete pricing.
+function GS.AdjustmentRankingCopper(event)
+    if type(event) ~= "table" then
+        return 0
+    end
+    local qty = tonumber(event.quantity)
+    local unit = GS.NormalizeAdjustmentUnitCopper(event.unitCopper, qty)
+    if not unit or not qty then
+        return 0
+    end
+    local absQty = math.abs(qty)
+    local absTotal = unit * absQty
+    if type(absTotal) ~= "number" or absTotal ~= math.floor(absTotal)
+        or absTotal < 0 or absTotal >= MAX_EXACT then
+        return 0
+    end
+    if qty < 0 then
+        return -absTotal
+    end
+    return absTotal
+end
+
+--- Query DBMarket for an adjustment item when the local officer is eligible.
+-- Returns nonnegative copper or nil. Never raises into callers; TSM failures
+-- leave the adjustment unpriced (ranking zero) without blocking the mutation.
+function GS.TrySnapshotAdjustmentUnitCopper(itemRef, quantity)
+    if not GS.ValuationOfficerEligible() then
+        return nil
+    end
+    if itemRef == nil then
+        return nil
+    end
+    local copper = QueryMarket(itemRef)
+    if copper == nil then
+        return nil
+    end
+    return GS.NormalizeAdjustmentUnitCopper(copper, quantity)
+end
+
+--- Attach a create-time unitCopper to a newly authored attributed adjustment.
+-- No-op when unattributed, already priced, ineligible, or TSM unavailable.
+-- Returns true when a snapshot was written onto the event table.
+function GS.AttachAdjustmentUnitCopperSnapshot(event, itemRef)
+    if type(event) ~= "table" then
+        return false
+    end
+    if type(event.attributed) ~= "string" or event.attributed == "" then
+        return false
+    end
+    if event.unitCopper ~= nil then
+        return false
+    end
+    local unit = GS.TrySnapshotAdjustmentUnitCopper(
+        itemRef or event.itemId, event.quantity)
+    if unit == nil then
+        return false
+    end
+    event.unitCopper = unit
+    return true
+end
+
+--- Enrich an op-first equivalent adjustment with a later ledger unitCopper.
+-- Never overwrites an existing immutable snapshot or changes quantity/identity.
+function GS.ReconcileAdjustmentUnitCopper(existing, incoming)
+    if type(existing) ~= "table" or type(incoming) ~= "table" then
+        return false
+    end
+    if existing.unitCopper ~= nil then
+        return false
+    end
+    if type(existing.attributed) ~= "string" or existing.attributed == "" then
+        return false
+    end
+    local unit = GS.NormalizeAdjustmentUnitCopper(incoming.unitCopper, existing.quantity)
+    if unit == nil then
+        return false
+    end
+    -- Incoming quantity must match the retained signed quantity (body equivalence
+    -- already checked by the caller); re-normalize against existing.quantity.
+    existing.unitCopper = unit
+    return true
+end

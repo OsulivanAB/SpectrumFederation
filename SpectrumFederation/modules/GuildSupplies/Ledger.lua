@@ -3345,6 +3345,17 @@ function GS.ValidateLedgerEventBody(event, guildKey, datasetId)
     if not tonumber(event.generation) or tonumber(event.generation) < 1 then
         return false, "invalid_generation"
     end
+    -- Optional create-time DBMarket unit snapshot on attributed adjustments (#447).
+    -- Donation valuation admission is unchanged; this field is ledger-local.
+    if event.unitCopper ~= nil then
+        if isDonation then
+            return false, "invalid_event"
+        end
+        if type(GS.NormalizeAdjustmentUnitCopper) ~= "function"
+            or GS.NormalizeAdjustmentUnitCopper(event.unitCopper, qty) == nil then
+            return false, "invalid_unit_copper"
+        end
+    end
     return true
 end
 
@@ -3672,6 +3683,15 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                                     -- Same path: retain a validated attributedGuid from
                                     -- the later ledger body without minting a second row.
                                     ReconcileAdjustmentAttributedGuid(record, e, event)
+                                    -- Create-time unitCopper travels with the ledger body.
+                                    -- Fill once when the op-first row was unpriced (#447).
+                                    if GS.ReconcileAdjustmentUnitCopper
+                                        and GS.ReconcileAdjustmentUnitCopper(e, event) then
+                                        BumpAccountingMutation(record)
+                                        if GS._NotifyLocalDurableChange then
+                                            GS._NotifyLocalDurableChange("ledger")
+                                        end
+                                    end
                                     return "duplicate", "duplicate"
                                 end
                                 QuarantineConflictBody(cfg, adjustmentEventId or txnId, event)
@@ -4063,6 +4083,14 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
         }
         if attrGuid then
             stored.attributedGuid = attrGuid
+        end
+        -- Retain create-time DBMarket unit snapshot when present and attributed (#447).
+        if attributed and event.unitCopper ~= nil
+            and GS.NormalizeAdjustmentUnitCopper then
+            local unit = GS.NormalizeAdjustmentUnitCopper(event.unitCopper, qty)
+            if unit ~= nil then
+                stored.unitCopper = unit
+            end
         end
         -- Authenticated active-exporter marker from transport body (never the
         -- self-declared event field). When already live, only the matching
@@ -4571,6 +4599,13 @@ function GS.ApplyAdjustmentMutation(record, op, opts)
         and type(record.liveCutover.cutoverMarker) == "string"
         and record.liveCutover.cutoverMarker ~= "" then
         event.gsSourceCutoverMarker = record.liveCutover.cutoverMarker
+    end
+    -- #447: local attributed adjustments may capture an immutable DBMarket unit
+    -- snapshot. Missing TSM / ineligible clients leave the row unpriced (zero
+    -- ranking value) without blocking the quantity adjustment. Donation
+    -- gs-valuation admission is not used here.
+    if isLocalCommit and normAttr and GS.AttachAdjustmentUnitCopperSnapshot then
+        GS.AttachAdjustmentUnitCopperSnapshot(event, event.itemId)
     end
     local ok, err = AppendLedgerEvent(record, event)
     if not ok then

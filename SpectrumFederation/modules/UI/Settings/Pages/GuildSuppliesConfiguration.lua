@@ -15,7 +15,7 @@ SF.SettingsUI:RegisterCategory({
 	navLabel = Loc("GUILD_SUPPLIES_CATEGORY_NAV", "Raid Supplies"),
 	group = "Raid Tools", -- sidebar heading; chrome displays this string
 	description = Loc("GUILD_SUPPLIES_CATEGORY_DESC",
-		"Guild-owned raid supply campaigns, configuration, logs, and troubleshooting."),
+		"Guild-owned raid supply campaigns, configuration, logs, rankings, and troubleshooting."),
 	order = 32,
 })
 

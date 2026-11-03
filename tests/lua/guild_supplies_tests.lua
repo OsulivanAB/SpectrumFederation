@@ -5056,18 +5056,24 @@ do
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    local rankingsPage = SF.SettingsUI.pagesById.guildSuppliesRankings
     local troubleshootingPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
     assertTrue(configPage ~= nil, "Configuration page registered")
     assertTrue(logsPage ~= nil, "Logs page registered")
+    assertTrue(rankingsPage ~= nil, "Rankings page registered")
     assertTrue(troubleshootingPage ~= nil, "Troubleshooting page registered")
     assertTrue(type(configPage.Build) == "function" and type(configPage.Refresh) == "function",
         "Configuration exposes Build/Refresh")
     assertTrue(type(logsPage.Build) == "function" and type(logsPage.Refresh) == "function",
         "Logs exposes Build/Refresh")
+    assertTrue(type(rankingsPage.Build) == "function" and type(rankingsPage.Refresh) == "function",
+        "Rankings exposes Build/Refresh")
+    assertTrue(type(rankingsPage.available) == "function", "Rankings has available hook")
     assertTrue(type(troubleshootingPage.Build) == "function"
             and type(troubleshootingPage.Refresh) == "function",
         "Troubleshooting exposes Build/Refresh")
@@ -42908,6 +42914,441 @@ do
     local _, _, hardErr = GS.BindCharacterIdentity(
         record, "Eve-Garona", "Player-1-Dave", nil)
     assertEq(hardErr, "attribution_mismatch", "427-r17: resolved mismatch still hard")
+end
+
+---------------------------------------------------------------------------
+-- #447 Rankings: aggregation, adjustment valuation, access, lifecycle
+---------------------------------------------------------------------------
+
+local function rankingsFindAdj(record, itemId, quantity)
+    local lists = {
+        record and record.accounting and record.accounting._consumableEvents,
+        record and record.accounting and record.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and (not itemId or tonumber(ev.itemId) == itemId)
+                    and (not quantity or tonumber(ev.quantity) == quantity) then
+                    return ev
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function rankingsByName(projected)
+    local map = {}
+    if type(projected) ~= "table" or type(projected.rows) ~= "table" then
+        return map
+    end
+    for i = 1, #projected.rows do
+        local row = projected.rows[i]
+        if type(row) == "table" and type(row.name) == "string" then
+            map[row.name] = tonumber(row.totalCopper) or 0
+        end
+    end
+    return map
+end
+
+do
+    -- 447-1) Production donation valuation + attributed signed adjustments aggregate
+    -- under current mains; unattributed and unpriced count correctly; no board persisted.
+    valuationTsmCalls = 0
+    valuationTsmValue = 1000
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9447)
+    creditValuationDeposit(record, {
+        itemId = 9447, quantity = 5, donor = "Bob-Garona",
+    })
+    record = GS:GetCurrentRecord()
+    local donation = valuationFindDonation(record, 9447, 5)
+    assertTrue(donation ~= nil, "447-1: donation present")
+    assertEq(donation.gsProductionCredit, true, "447-1: donation credited")
+    assertTrue(valuationSnap(record, donation.txnId) ~= nil, "447-1: donation priced")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjPos = select(1, GS:NewAdjustmentOperation(9447, 3, "Carol-Garona"))
+    assertTrue(adjPos ~= nil, "447-1: +3 attributed prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjPos), "accepted", "447-1: +3 applied")
+    local adjNeg = select(1, GS:NewAdjustmentOperation(9447, -2, "Carol-Garona"))
+    assertTrue(adjNeg ~= nil, "447-1: -2 attributed prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjNeg), "accepted", "447-1: -2 applied")
+    local adjMisc = select(1, GS:NewAdjustmentOperation(9447, 1, nil))
+    assertTrue(adjMisc ~= nil, "447-1: unattributed prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjMisc), "accepted", "447-1: unattributed applied")
+
+    record = GS:GetCurrentRecord()
+    local pricedAdj = rankingsFindAdj(record, 9447, 3)
+    assertTrue(pricedAdj ~= nil, "447-1: +3 adj row")
+    assertEq(tonumber(pricedAdj.unitCopper), 1000, "447-1: create-time unitCopper")
+    assertEq(pricedAdj.attributed, "Carol-Garona", "447-1: attributed preserved")
+    local unattr = rankingsFindAdj(record, 9447, 1)
+    assertTrue(unattr ~= nil and unattr.attributed == nil, "447-1: unattributed retained")
+    assertEq(unattr.unitCopper, nil, "447-1: unattributed has no unitCopper")
+
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    assertTrue(type(ranking) == "table", "447-1: ranking projection")
+    assertEq(ranking.hasHistory, true, "447-1: has history")
+    local byName = rankingsByName(ranking)
+    -- Bob donation: 5 * 1000 = 5000; Carol adjustments: (3-2)*1000 = 1000; misc excluded.
+    assertEq(byName["Bob-Garona"], 5000, "447-1: Bob donation copper")
+    assertEq(byName["Carol-Garona"], 1000, "447-1: Carol signed adjustment copper")
+    assertEq(byName["Unassigned"], nil, "447-1: unattributed excluded")
+    assertTrue(record.rankings == nil, "447-1: no persisted rankings table")
+    assertTrue(record.leaderboard == nil, "447-1: no leaderboard field")
+
+    -- Missing TSM must not block quantity adjustments; ranking value stays zero.
+    SF.TSM = nil
+    local unpricedOp = select(1, GS:NewAdjustmentOperation(9447, 2, "Dave-Garona"))
+    assertTrue(unpricedOp ~= nil, "447-1: unpriced adj prepared without TSM")
+    assertEq(GS:ApplyStagedConfigOperation(unpricedOp), "accepted", "447-1: unpriced adj applied")
+    record = GS:GetCurrentRecord()
+    local unpricedAdj = rankingsFindAdj(record, 9447, 2)
+    assertTrue(unpricedAdj ~= nil, "447-1: unpriced adj retained")
+    assertEq(unpricedAdj.unitCopper, nil, "447-1: missing TSM leaves unitCopper nil")
+    ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    byName = rankingsByName(ranking)
+    assertEq(byName["Dave-Garona"], 0, "447-1: unpriced attributed counts as zero")
+    assertTrue(#ranking.rows >= 3, "447-1: zero-valued contributor still listed")
+end
+
+do
+    -- 447-2) Main/alt reassignment regroups historical contributions without rewrite.
+    valuationTsmValue = 500
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9448)
+    creditValuationDeposit(record, {
+        itemId = 9448, quantity = 4, donor = "Dave-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local stAssign = select(1, assignMainAlt("Bob-Garona", "Dave-Garona"))
+    assertEq(stAssign, "accepted", "447-2: Dave alt of Bob")
+    record = GS:GetCurrentRecord()
+    local donation = valuationFindDonation(record, 9448, 4)
+    assertEq(donation.actor, "Dave-Garona", "447-2: durable donor unchanged")
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    local byName = rankingsByName(ranking)
+    assertEq(byName["Bob-Garona"], 2000, "447-2: Dave gift under Bob main")
+    assertEq(byName["Dave-Garona"], nil, "447-2: Dave not separate while assigned")
+
+    local stUn = select(1, unassignAltGuid("Player-1-Dave", "Player-1-Bob"))
+    assertEq(stUn, "accepted", "447-2: unassign Dave")
+    ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    byName = rankingsByName(ranking)
+    assertEq(byName["Dave-Garona"], 2000, "447-2: regroups to Dave after unassign")
+    assertEq(byName["Bob-Garona"], nil, "447-2: Bob no longer carries Dave gift")
+    assertEq(valuationFindDonation(record, 9448, 4).actor, "Dave-Garona",
+        "447-2: ledger identity still Dave")
+end
+
+do
+    -- 447-3) Campaign isolation + event-id dedupe across live/archive overlap.
+    valuationTsmValue = 200
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9449)
+    creditValuationDeposit(record, {
+        itemId = 9449, quantity = 3, donor = "Bob-Garona",
+    })
+    local firstCampaign = record.currentCampaignId
+    local rankingA = GS:ProjectCampaignRankings(firstCampaign)
+    assertEq(rankingsByName(rankingA)["Bob-Garona"], 600, "447-3: campaign A total")
+
+    -- Archive the campaign and start a new one, then request the item again.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= firstCampaign, "447-3: campaign rolled")
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 9449 }, {
+        itemId = 9449, goal = 80, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "447-3: request item on new campaign")
+    world.time = (world.time or 0) + 7200
+    creditValuationDeposit(record, {
+        itemId = 9449, quantity = 1, donor = "Carol-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9449|1" },
+        neighborsNewer = { "newer|2" },
+    })
+    local rankingB = GS:ProjectCampaignRankings(record.currentCampaignId)
+    local rankingArchived = GS:ProjectCampaignRankings(firstCampaign)
+    assertEq(rankingsByName(rankingB)["Carol-Garona"], 200, "447-3: current campaign isolated")
+    assertEq(rankingsByName(rankingB)["Bob-Garona"], nil, "447-3: prior campaign not mixed")
+    assertEq(rankingsByName(rankingArchived)["Bob-Garona"], 600, "447-3: archived totals intact")
+
+    -- Duplicate event id across archive+live inputs must not double-count.
+    record = GS:GetCurrentRecord()
+    local live = record.accounting._consumableEvents
+    local archive = record.accounting._consumableEventArchive
+    assertTrue(type(live) == "table" and type(archive) == "table", "447-3: both lists")
+    local bobDonation = nil
+    for i = 1, #archive do
+        local ev = archive[i]
+        if ev and tonumber(ev.itemId) == 9449 and tonumber(ev.quantity) == 3 then
+            bobDonation = ev
+            break
+        end
+    end
+    if bobDonation == nil then
+        -- Some rollover paths keep the prior donation live; search both lists.
+        for i = 1, #live do
+            local ev = live[i]
+            if ev and tonumber(ev.itemId) == 9449 and tonumber(ev.quantity) == 3 then
+                bobDonation = ev
+                break
+            end
+        end
+    end
+    assertTrue(bobDonation ~= nil, "447-3: Bob donation retained somewhere")
+    -- Force an overlapping identity into the live list for the archived generation.
+    live[#live + 1] = bobDonation
+    local rankingDup = GS.ProjectCampaignRankingsOnRecord(record, firstCampaign)
+    assertEq(rankingsByName(rankingDup)["Bob-Garona"], 600, "447-3: deduped overlapping id")
+end
+
+do
+    -- 447-4) Adjustment unitCopper survives reload; donation valuation path unchanged.
+    valuationTsmValue = 750
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9450)
+    creditValuationDeposit(record, {
+        itemId = 9450, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adj = select(1, GS:NewAdjustmentOperation(9450, -1, "Bob-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "447-4: adj applied")
+    record = GS:GetCurrentRecord()
+    local donationBefore = valuationCount(record)
+    local adjRow = rankingsFindAdj(record, 9450, -1)
+    assertEq(tonumber(adjRow.unitCopper), 750, "447-4: unitCopper before reload")
+    assertEq(GS.AdjustmentRankingCopper(adjRow), -750, "447-4: signed ranking copper")
+
+    -- Reload from SavedVariables root (same pattern as 3C4).
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-4: reload init")
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "447-4: record after reload")
+    adjRow = rankingsFindAdj(record, 9450, -1)
+    assertTrue(adjRow ~= nil, "447-4: adj present after reload")
+    assertEq(tonumber(adjRow.unitCopper), 750, "447-4: unitCopper after reload")
+    assertEq(valuationCount(record), donationBefore, "447-4: donation valuation count stable")
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    -- Donation 2*750=1500 plus adj -750 → 750 under Bob.
+    assertEq(rankingsByName(ranking)["Bob-Garona"], 750, "447-4: reload ranking")
+
+    -- Donation AdmitValuationAssignment still rejects adjustment-shaped misuse.
+    local bad = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00000001",
+            assignedAt = math.floor(world.time),
+            unitCopper = 10,
+            quantity = 1,
+            totalCopper = 10,
+            itemId = 9450,
+            txnId = adjRow.txnId or adjRow.id,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        },
+    }
+    local stBad, rBad = GS:AdmitValuationAssignment(bad, {
+        localMint = true,
+        offlineRecord = record,
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+    })
+    assertTrue(stBad == "rejected" or stBad == "pending",
+        "447-4: donation valuation does not admit adjustment txn st="
+            .. tostring(stBad) .. " r=" .. tostring(rBad))
+end
+
+do
+    -- 447-5) Officer-only page.available; Preview/member hide; direct nav fallback.
+    local Nav = SF.SettingsNavigationModel
+    local ui = SF.SettingsUI
+    assertTrue(type(Nav) == "table" and type(ui) == "table", "447-5: nav+ui")
+    -- Ensure Rankings page is registered (production TOC load in this harness).
+    local rankingsPage = ui.pagesById and ui.pagesById.guildSuppliesRankings
+    if not rankingsPage then
+        -- Harness may not load Settings pages; register the production available hook.
+        rankingsPage = {
+            id = "guildSuppliesRankings",
+            categoryId = "guildSupplies",
+            name = "Rankings",
+            order = 19.25,
+            available = function()
+                local caps = GS:GetCapabilities()
+                return type(caps) == "table" and caps.canEdit == true
+            end,
+        }
+        ui.pagesById = ui.pagesById or {}
+        ui.pages = ui.pages or {}
+        ui.pagesById[rankingsPage.id] = rankingsPage
+        ui.pages[#ui.pages + 1] = rankingsPage
+    end
+    assertTrue(type(rankingsPage.available) == "function", "447-5: available hook")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = false
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-5: officer can see Rankings")
+
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-5: member cannot see Rankings")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesRankings"), false,
+        "447-5: member content page false")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = true
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-5: Preview hides Rankings")
+    world.impersonationActive = false
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-5: Preview off restores")
+
+    -- Direct ShowPage of unavailable Rankings falls back to an available page.
+    local session = {
+        currentCategoryId = "guildSupplies",
+        currentPageId = "guildSuppliesLogs",
+    }
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local resolved = Nav.ResolveShowPage(ui, session, "guildSuppliesRankings")
+    assertTrue(resolved.pageId ~= "guildSuppliesRankings",
+        "447-5: ShowPage(rankings) does not expose contents got=" .. tostring(resolved.pageId))
+end
+
+do
+    -- 447-6) Bounded UI lifecycle: coalesced refresh while visible; idle when hidden.
+    SF.SettingsUI = SF.SettingsUI or {}
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    if not SF.SettingsUI.RegisterPage then
+        function SF.SettingsUI:RegisterPage(page)
+            self.pagesById[page.id] = page
+            self.pages[#self.pages + 1] = page
+        end
+    end
+    if not SF.SettingsUI.RegisterCategory then
+        function SF.SettingsUI:RegisterCategory() end
+    end
+    if not SF.SettingsUI.pagesById.guildSuppliesRankings then
+        if not SF.SettingsUI.DefinitionRenderer then
+            loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+        end
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
+    end
+    local page = SF.SettingsUI.pagesById.guildSuppliesRankings
+    assertTrue(type(page) == "table" and type(page.Build) == "function",
+        "447-6: rankings page loaded")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = false
+    local panel = CreateFrame("Frame", "SF_TestRankingsPanel")
+    panel.__visible = true
+    panel.IsVisible = function(self) return self.__visible end
+    panel.IsShown = function(self) return self.__visible end
+    panel.HookScript = function(self, script, fn)
+        self["__" .. script] = fn
+    end
+    local refreshCount = 0
+    local priorRefresh = page.Refresh
+    page.Refresh = function(self, p)
+        refreshCount = refreshCount + 1
+        if priorRefresh then
+            return priorRefresh(self, p)
+        end
+    end
+    page.panel = panel
+    pcall(function() page:Build(panel) end)
+    pcall(function() page:Build(panel) end) -- second Build must not double-register
+
+    local before = refreshCount
+    GS.NotifyUI("valuation")
+    GS.NotifyUI("ledger")
+    flushTimers()
+    assertTrue(refreshCount > before, "447-6: visible page refreshes on durable notify")
+
+    panel.__visible = false
+    if page.OnHide then page:OnHide() end
+    flushTimers()
+    local mid = refreshCount
+    for _ = 1, 5 do
+        GS.NotifyUI("valuation")
+    end
+    flushTimers()
+    assertEq(refreshCount, mid, "447-6: hidden page stays idle on durable notifies")
+
+    for _ = 1, 8 do
+        panel.__visible = true
+        pcall(function() page:Build(panel) end)
+        if panel.__OnShow then panel.__OnShow(panel) end
+        flushTimers()
+        panel.__visible = false
+        if panel.__OnHide then panel.__OnHide(panel) end
+        if page.OnHide then page:OnHide() end
+        flushTimers()
+    end
+    local afterCycles = refreshCount
+    GS.NotifyUI("valuation")
+    flushTimers()
+    assertEq(refreshCount, afterCycles,
+        "447-6: after close cycles, hidden page still ignores NotifyUI")
+    page.Refresh = priorRefresh
+end
+
+do
+    -- 447-7) Negative totals: high-price signed adjustment can dominate a cheap donation.
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9451)
+    creditValuationDeposit(record, {
+        itemId = 9451, quantity = 1, donor = "Dave-Garona",
+    })
+    creditValuationDeposit(record, {
+        itemId = 9451, quantity = 5, donor = "Bob-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9451|5" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    valuationTsmValue = 5000
+    local neg = select(1, GS:NewAdjustmentOperation(9451, -1, "Dave-Garona"))
+    assertTrue(neg ~= nil, "447-7: high-price negative prepared")
+    assertEq(GS:ApplyStagedConfigOperation(neg), "accepted", "447-7: high-price negative applied")
+    record = GS:GetCurrentRecord()
+    local adj = rankingsFindAdj(record, 9451, -1)
+    assertEq(tonumber(adj and adj.unitCopper), 5000, "447-7: expensive unit snapshot")
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    local byName = rankingsByName(ranking)
+    -- Dave: donation 100 + adj -5000 = -4900.
+    assertEq(byName["Dave-Garona"], -4900, "447-7: signed negative total preserved")
+    assertEq(byName["Bob-Garona"], 500, "447-7: Bob positive total")
+    assertEq(tonumber(ranking.maxPositive), 500, "447-7: maxPositive is largest positive")
+    assertTrue(ranking.rows[1].name == "Bob-Garona", "447-7: positive sorts above negative")
 end
 
 SF.TSM = nil
