@@ -46,6 +46,7 @@ SF.SettingsSchema = {
 			thickness = 16,
 			rainbowSpeed = 0.25,
 			opacity = 0.70,
+			edgeSoftness = 0,
 		},
 	},
 

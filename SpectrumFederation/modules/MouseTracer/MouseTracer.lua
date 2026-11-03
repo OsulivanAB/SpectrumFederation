@@ -15,6 +15,7 @@ local cache = {
 	thickness = C.DEFAULT_THICKNESS,
 	rainbowSpeed = C.DEFAULT_RAINBOW_SPEED,
 	opacity = C.DEFAULT_OPACITY,
+	edgeSoftness = C.DEFAULT_EDGE_SOFTNESS,
 	scale = 1,
 }
 
@@ -66,6 +67,8 @@ local function ClampSetting(key, value)
 		return Engine.ClampNumber(value, C.MIN_RAINBOW_SPEED, C.MAX_RAINBOW_SPEED, C.DEFAULT_RAINBOW_SPEED)
 	elseif key == "opacity" then
 		return Engine.ClampNumber(value, C.MIN_OPACITY, C.MAX_OPACITY, C.DEFAULT_OPACITY)
+	elseif key == "edgeSoftness" then
+		return Engine.NormalizeEdgeSoftness(value)
 	end
 	return value
 end
@@ -113,6 +116,7 @@ function Tracer:PersistSnapshot()
 	snap.thickness = cache.thickness
 	snap.rainbowSpeed = cache.rainbowSpeed
 	snap.opacity = cache.opacity
+	snap.edgeSoftness = cache.edgeSoftness
 	local store = SF.SettingsStore
 	if store and store.Set then
 		store:Set("mouseTracerCopies", copies)
@@ -209,6 +213,28 @@ end
 
 local function StampSize(idx, newestDist, oldestDist)
 	return Engine.TaperedSize(cache.thickness, newestDist, oldestDist, engine.pdist[idx])
+end
+
+-- Select the stamp texture for the cached softness. Softness 0 keeps the
+-- Blizzard circular mask path; higher steps use precomputed soft TGA stamps.
+-- The hard circular mask stays applied so soft falloff feathers inward only.
+local function ApplyStampTexture(stamp)
+	if not stamp or not stamp.SetTexture then
+		return
+	end
+	stamp:SetTexture(Engine.StampTextureForEdgeSoftness(cache.edgeSoftness))
+	if stamp.SetMask then
+		pcall(stamp.SetMask, stamp, C.CIRCLE_TEXTURE)
+	end
+end
+
+local function ApplyAllStampTextures()
+	if not stamps then
+		return
+	end
+	for idx = 1, C.MAX_POINTS do
+		ApplyStampTexture(stamps[idx])
+	end
 end
 
 local function PlaceStamp(idx, newestDist, oldestDist)
@@ -441,12 +467,7 @@ local function EnsurePool()
 	stampLastAlpha = {}
 	for idx = 1, C.MAX_POINTS do
 		local stamp = host:CreateTexture(nil, "ARTWORK")
-		if stamp.SetTexture then
-			stamp:SetTexture(C.CIRCLE_TEXTURE)
-		end
-		if stamp.SetMask then
-			pcall(stamp.SetMask, stamp, C.CIRCLE_TEXTURE)
-		end
+		ApplyStampTexture(stamp)
 		if stamp.SetBlendMode then
 			pcall(stamp.SetBlendMode, stamp, "ADD")
 		end
@@ -587,6 +608,7 @@ function Tracer:ReloadCacheFromStore()
 	cache.thickness = ClampSetting("thickness", store:GetCharacter("mouseTracer.thickness"))
 	cache.rainbowSpeed = ClampSetting("rainbowSpeed", store:GetCharacter("mouseTracer.rainbowSpeed"))
 	cache.opacity = ClampSetting("opacity", store:GetCharacter("mouseTracer.opacity"))
+	cache.edgeSoftness = ClampSetting("edgeSoftness", store:GetCharacter("mouseTracer.edgeSoftness"))
 	SyncEngineConfig()
 end
 
@@ -606,12 +628,17 @@ local function OnSettingChanged(key, newValue)
 	if key == "trailLength" or key == "fadeDuration" or key == "rainbowSpeed" or key == "thickness" then
 		SyncEngineConfig()
 	end
+	if key == "edgeSoftness" then
+		-- Refresh every pooled stamp so live and later-emitted stamps share the
+		-- new softness without resetting age or replaying the trail.
+		ApplyAllStampTextures()
+	end
 	if engine and engine.count > 0 then
 		if key == "trailLength" or key == "fadeDuration" then
 			engine:ProcessFade(Now())
 			ApplyReleased()
 		end
-		if key == "rainbowSpeed" or key == "thickness" or key == "opacity" or key == "fadeDuration" or key == "trailLength" then
+		if key == "rainbowSpeed" or key == "thickness" or key == "opacity" or key == "fadeDuration" or key == "trailLength" or key == "edgeSoftness" then
 			ReconfigureActiveStamps()
 		end
 	end
@@ -695,16 +722,20 @@ function Tracer:CopyFromCharacter(sourceId)
 		return false, "Settings storage is not available."
 	end
 
+	-- Always write every Mouse Tracer key. Missing fields in older snapshots
+	-- resolve through ClampSetting defaults (edgeSoftness → 0%) so the
+	-- destination cannot keep a stale softness value.
 	applySuspended = true
 	for i = 1, #KEYS do
 		local key = KEYS[i]
-		if src[key] ~= nil then
-			store:SetCharacter("mouseTracer." .. key, ClampSetting(key, src[key]))
-		end
+		store:SetCharacter("mouseTracer." .. key, ClampSetting(key, src[key]))
 	end
 	applySuspended = false
 
 	self:ReloadCacheFromStore()
+	if poolReady then
+		ApplyAllStampTextures()
+	end
 	self:ApplyEnabled(cache.enabled)
 	if cache.enabled and engine and engine.count > 0 then
 		ReconfigureActiveStamps()
