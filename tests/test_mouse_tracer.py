@@ -16,6 +16,8 @@ ENGINE = REPO_ROOT / "SpectrumFederation" / "modules" / "MouseTracer" / "TrailEn
 RUNTIME = REPO_ROOT / "SpectrumFederation" / "modules" / "MouseTracer" / "MouseTracer.lua"
 SCHEMA = REPO_ROOT / "SpectrumFederation" / "modules" / "Settings" / "Schema.lua"
 NICHE_FEATURES = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "NicheFeatures.lua"
+LOCALE = REPO_ROOT / "SpectrumFederation" / "locale" / "enUS.lua"
+SOFT_MEDIA = REPO_ROOT / "SpectrumFederation" / "media" / "MouseTracer"
 
 
 def _lua51() -> str:
@@ -56,18 +58,32 @@ def test_schema_and_slider_match_new_mouse_tracer_defaults():
     schema = SCHEMA.read_text(encoding="utf-8")
     page = NICHE_FEATURES.read_text(encoding="utf-8")
     constants = CONSTANTS.read_text(encoding="utf-8")
+    locale = LOCALE.read_text(encoding="utf-8")
     assert "enabled = false" in schema
     assert "trailLength = 400" in schema
     assert "fadeDuration = 0.50" in schema
     assert "thickness = 16" in schema
     assert "rainbowSpeed = 0.25" in schema
     assert "opacity = 0.70" in schema
+    assert "edgeSoftness = 0" in schema
     assert "DEFAULT_TRAIL_LENGTH = 400" in constants
     assert "DEFAULT_FADE_DURATION = 0.50" in constants
     assert "DEFAULT_THICKNESS = 16" in constants
     assert "DEFAULT_RAINBOW_SPEED = 0.25" in constants
     assert "DEFAULT_OPACITY = 0.70" in constants
+    assert "DEFAULT_EDGE_SOFTNESS = 0" in constants
+    assert "MAX_EDGE_SOFTNESS = 100" in constants
+    assert "EDGE_SOFTNESS_STEP = 10" in constants
     assert "MAX_TRAIL_LENGTH = 1200" in constants
     assert "TAPER_MIN_RATIO = 0.40" in constants
+    assert "SoftCircle_%d.tga" in constants
     assert "max = 1200" in page
     assert "label = \"Trail Length\"" in page
+    assert "mouseTracer.edgeSoftness" in page
+    assert "MOUSE_TRACER_EDGE_SOFTNESS_LABEL" in page
+    assert 'L["MOUSE_TRACER_EDGE_SOFTNESS_LABEL"]' in locale
+    assert 'L["MOUSE_TRACER_EDGE_SOFTNESS_TOOLTIP"]' in locale
+    for pct in range(10, 101, 10):
+        asset = SOFT_MEDIA / f"SoftCircle_{pct}.tga"
+        assert asset.is_file(), f"missing soft circle asset for {pct}%"
+        assert asset.stat().st_size > 18, f"soft circle asset for {pct}% looks empty"

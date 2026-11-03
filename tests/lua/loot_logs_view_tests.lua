@@ -119,6 +119,7 @@ end
 
 loadModule("SpectrumFederation/modules/NameUtil.lua")
 loadModule("SpectrumFederation/modules/core.lua")
+loadModule("SpectrumFederation/modules/RaidEquipment/CheckRun.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Members.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogValidators.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogs.lua")
@@ -515,6 +516,71 @@ assertEq(#(profile:GetLootLogs() or {}), storedCount, "rendering does not append
 assertEq(notBisOutcome:GetEventType(), "BIS_OUTCOME", "hidden NOT_BIS remains BIS_OUTCOME")
 assertEq(overflowOutcome:GetEventType(), "BIS_OUTCOME", "visible overflow remains BIS_OUTCOME")
 assertEq(unresolvedOutcome:GetEventType(), "BIS_OUTCOME", "visible unresolved remains BIS_OUTCOME")
+
+-- #442: Loot Logs presence action text names present / eligible / verified prepared.
+local presentMembers = {}
+local eligibleMembers = {}
+local preparedMembers = {}
+for i = 1, 22 do
+    eligibleMembers[i] = string.format("Raider%02d-Garona", i)
+end
+for i = 1, 15 do
+    presentMembers[i] = eligibleMembers[i]
+end
+for i = 1, 12 do
+    preparedMembers[i] = eligibleMembers[i]
+end
+local function presenceRow(data)
+    return view.BuildRow({
+        GetTimestamp = function()
+            return 1700008000
+        end,
+        GetEventType = function()
+            return "RAID_CHECK_PRESENCE"
+        end,
+        GetAuthor = function()
+            return "Raid Check"
+        end,
+        GetEventData = function()
+            return data
+        end,
+        GetID = function()
+            return "Raid Check:presence"
+        end,
+    })
+end
+local withPrepared = presenceRow({
+    opportunityId = "p442:1",
+    presentMembers = presentMembers,
+    eligibleMembers = eligibleMembers,
+    preparedMembers = preparedMembers,
+})
+assertEq(
+    withPrepared.action,
+    "Raid Check: 15 present · 22 eligible profile members · 12 verified prepared",
+    "Loot Logs presence row spells out the 15/22 prepared counts"
+)
+local legacy = presenceRow({
+    opportunityId = "p442:legacy",
+    presentMembers = presentMembers,
+    eligibleMembers = eligibleMembers,
+})
+assertEq(
+    legacy.action,
+    "Raid Check: 15 present · 22 eligible profile members",
+    "Loot Logs legacy presence row omits prepared instead of inventing zero"
+)
+local emptyPrepared = presenceRow({
+    opportunityId = "p442:empty",
+    presentMembers = presentMembers,
+    eligibleMembers = eligibleMembers,
+    preparedMembers = {},
+})
+assertEq(
+    emptyPrepared.action,
+    "Raid Check: 15 present · 22 eligible profile members · 0 verified prepared",
+    "Loot Logs explicit empty preparedMembers still shows zero"
+)
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

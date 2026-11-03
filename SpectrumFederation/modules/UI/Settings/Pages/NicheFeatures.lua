@@ -1,5 +1,12 @@
 local _, SF = ...
 
+local function Loc(key, default)
+	if SF.LocaleText then
+		return SF.LocaleText(key, default)
+	end
+	return default or key
+end
+
 SF.SettingsUI:RegisterCategory({
 	id = "nicheFeatures",
 	name = "Gameplay",
@@ -127,6 +134,20 @@ function Page:Build(panel)
 						step = 0.05,
 						get = CharacterGet("mouseTracer.opacity"),
 						set = CharacterSet("mouseTracer.opacity"),
+						enabled = TracerEnabled,
+					},
+					{
+						type = "slider",
+						label = Loc("MOUSE_TRACER_EDGE_SOFTNESS_LABEL", "Edge Softness"),
+						tooltip = Loc(
+							"MOUSE_TRACER_EDGE_SOFTNESS_TOOLTIP",
+							"Softens the trail's edges by gradually fading them to transparent. 0% keeps the original appearance."
+						),
+						min = 0,
+						max = 100,
+						step = 10,
+						get = CharacterGet("mouseTracer.edgeSoftness"),
+						set = CharacterSet("mouseTracer.edgeSoftness"),
 						enabled = TracerEnabled,
 					},
 					{

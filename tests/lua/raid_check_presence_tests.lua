@@ -193,6 +193,56 @@ local malformedThenValid = Identity.Replay({
 assertEq(Identity.FormatRaidCheckAttendance(malformedThenValid, ALICE), "100%", "malformed first write does not occupy the opportunity id")
 assertEq(Identity.FormatRaidCheckAttendance(malformedThenValid, BOB), "0%", "first valid write still counts the opportunity")
 
+-- #442: 15 present / 22 eligible remains the attendance shape; wording is
+-- separate. Preparedness still requires an explicit preparedMembers list.
+local raid15profile22Present = {}
+local raid15profile22Eligible = {}
+local raid15profile22Prepared = {}
+for i = 1, 22 do
+    raid15profile22Eligible[i] = string.format("Raider%02d-Garona", i)
+end
+for i = 1, 15 do
+    raid15profile22Present[i] = raid15profile22Eligible[i]
+end
+for i = 1, 12 do
+    raid15profile22Prepared[i] = raid15profile22Eligible[i]
+end
+local raid15 = Identity.Replay({
+    presenceLog("p442:1", raid15profile22Present, raid15profile22Eligible, 1, raid15profile22Prepared),
+}, { owner = ALICE })
+assertEq(select(1, Identity.RaidCheckAttendanceCounts(raid15, "Raider01-Garona")), 1, "15/22: present profile member counts present")
+assertEq(select(2, Identity.RaidCheckAttendanceCounts(raid15, "Raider01-Garona")), 1, "15/22: present profile member counts eligible")
+assertEq(select(1, Identity.RaidCheckAttendanceCounts(raid15, "Raider16-Garona")), 0, "15/22: absent eligible member is not present")
+assertEq(select(2, Identity.RaidCheckAttendanceCounts(raid15, "Raider16-Garona")), 1, "15/22: absent eligible member still counts eligible")
+assertEq(Identity.FormatRaidCheckPreparedness(raid15, "Raider01-Garona"), "100%", "15/22: verified prepared member is 100%")
+assertEq(Identity.FormatRaidCheckPreparedness(raid15, "Raider13-Garona"), "0%", "15/22: present unprepared member is 0%")
+assertEq(Identity.FormatRaidCheckPreparedness(raid15, "Raider16-Garona"), "0%", "15/22: absent eligible member is 0% prepared")
+
+function strtrim(s)
+    return tostring(s or ""):match("^%s*(.-)%s*$") or ""
+end
+function GetRealmName()
+    return "Garona"
+end
+assert(loadfile("SpectrumFederation/modules/NameUtil.lua"))("SpectrumFederation", SF)
+assert(loadfile("SpectrumFederation/modules/RaidEquipment/CheckRun.lua"))("SpectrumFederation", SF)
+local CheckRun = SF.RaidEquipment.CheckRun
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, 12),
+    "Raid Check: 15 present · 22 eligible profile members · 12 verified prepared",
+    "15/22 presence summary spells out present, eligible, and verified prepared"
+)
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, nil),
+    "Raid Check: 15 present · 22 eligible profile members",
+    "legacy presence summary omits prepared when preparedMembers is missing"
+)
+assertEq(
+    CheckRun.FormatPresenceLogSummary(15, 22, 0),
+    "Raid Check: 15 present · 22 eligible profile members · 0 verified prepared",
+    "explicit empty preparedMembers still shows zero verified prepared"
+)
+
 local validatorsChunk = assert(loadfile("SpectrumFederation/modules/LootHelper/LootLogValidators.lua"))
 validatorsChunk("SpectrumFederation", SF)
 local Validators = SF.LootLogValidators
@@ -279,6 +329,448 @@ local badPrepWire = presenceWire({
 })
 assertTrue(not select(1, SF.LootLog.ValidateTable(badPrepWire)), "ValidateTable rejects a string preparedMembers list")
 assertEq(badPrepWire._data.preparedMembers, "Alice-Garona", "ValidateTable does not rewrite rejected preparedMembers")
+
+-- #442 Codex P1: raw group alias casing vs profile IDs breaks Identity.Replay.
+local mismatchedPresent = Identity.Replay({
+    presenceLog("mismatch", { "alice-Garona", "Guest-Garona" }, { ALICE, BOB }, 1, { ALICE }),
+}, { owner = ALICE })
+assertEq(
+    Identity.FormatRaidCheckAttendance(mismatchedPresent, ALICE),
+    "0%",
+    "raw group alias without canonicalization incorrectly marks the profile member absent"
+)
+assertEq(
+    Identity.FormatRaidCheckPreparedness(mismatchedPresent, ALICE),
+    "0%",
+    "raw group alias without canonicalization incorrectly marks the profile member unprepared"
+)
+
+local rosterIds = { ALICE, BOB, CAROL }
+local liveGroup = { "alice-Garona", "Guest-Garona", "BOB-garona", "alice-Garona" }
+local canonicalPresent = CheckRun.CanonicalizePresentMembers(liveGroup, rosterIds)
+assertEq(#canonicalPresent, 3, "canonical present keeps two profile members plus one guest")
+assertEq(canonicalPresent[1], ALICE, "case-variant group id maps to the authoritative profile ID")
+assertEq(canonicalPresent[2], "Guest-Garona", "non-profile guest is preserved")
+assertEq(canonicalPresent[3], BOB, "second profile alias maps to the roster ID")
+local aliceCount = 0
+for i = 1, #canonicalPresent do
+    if canonicalPresent[i] == ALICE then
+        aliceCount = aliceCount + 1
+    end
+end
+assertEq(aliceCount, 1, "duplicate group spellings of one character appear once")
+
+-- Production path: CanonicalizePresentMembers -> RecordRaidCheckPresence -> Identity.Replay.
+function UnitName(unit)
+    if unit == "player" then
+        return ALICE:match("^([^%-]+)")
+    end
+    return "Unknown"
+end
+function UnitFullName(unit)
+    if unit == "player" then
+        return ALICE:match("^([^%-]+)"), "Garona"
+    end
+    return "Unknown", "Garona"
+end
+function UnitClass()
+    return "Warrior", "WARRIOR"
+end
+function GetServerTime()
+    return 1700009000
+end
+function time()
+    return 1700009000
+end
+function GetTime()
+    return 0
+end
+SpectrumFederationDB = { lootHelper = { profiles = {}, syncSession = {}, window = {} } }
+SpectrumFederationDebugDB = { enabled = false, logs = {} }
+SF.Debug = setmetatable({
+    Info = function() end,
+    Warn = function() end,
+    Error = function() end,
+    Verbose = function() end,
+    Log = function() end,
+}, { __call = function() end })
+SF.WOW_CLASSES = SF.WOW_CLASSES or {
+    WARRIOR = { colorCode = { r = 0.78, g = 0.61, b = 0.43 } },
+}
+assert(loadfile("SpectrumFederation/modules/core.lua"))("SpectrumFederation", SF)
+assert(loadfile("SpectrumFederation/modules/LootHelper/Members.lua"))("SpectrumFederation", SF)
+assert(loadfile("SpectrumFederation/modules/LootHelper/Profiles.lua"))("SpectrumFederation", SF)
+function SF:GetPlayerFullIdentifier()
+    return ALICE
+end
+function SF:GetPlayerClass()
+    return "WARRIOR"
+end
+SF.lootHelperDB = {
+    enabled = true,
+    profiles = {},
+    activeProfileId = nil,
+    activeProfile = nil,
+    window = {},
+    syncSession = {},
+}
+SpectrumFederationDB.lootHelper = SF.lootHelperDB
+local profile = SF.LootProfile.new("Presence Canonicalize")
+assertTrue(profile ~= nil, "profile was created for presence record/replay")
+assertTrue(profile:AddMember(SF.Member.new(ALICE, "admin", "WARRIOR")), "alice added to profile")
+assertTrue(profile:AddMember(SF.Member.new(BOB, "member", "WARRIOR")), "bob added to profile")
+assertTrue(profile:AddMember(SF.Member.new(CAROL, "member", "WARRIOR")), "carol added to profile")
+SF.lootHelperDB.profiles[profile:GetProfileId()] = profile
+SF.lootHelperDB.activeProfileId = profile:GetProfileId()
+SF.lootHelperDB.activeProfile = profile
+
+local opportunityId = profile:GetProfileId() .. ":raid-check-alias"
+local recordedPresent = CheckRun.CanonicalizePresentMembers(
+    { "alice-Garona", "Guest-Garona", "BOB-garona" },
+    { ALICE, BOB, CAROL }
+)
+local recordedPrepared = CheckRun.CollectPreparedPresentMembers({
+    [ALICE] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    [BOB] = { class = CheckRun.CLASS.UNPREPARED, verified = CheckRun.VERIFIED.FRESH },
+}, { "alice-Garona", "Guest-Garona", "BOB-garona" })
+assertTrue(profile:RecordRaidCheckPresence({
+    opportunityId = opportunityId,
+    presentMembers = recordedPresent,
+    eligibleMembers = { ALICE, BOB, CAROL },
+    preparedMembers = recordedPrepared,
+    logAuthor = "Raid Check",
+    skipBroadcast = true,
+    skipPermission = true,
+}), "RecordRaidCheckPresence accepts the canonicalized presence payload")
+assertTrue(not profile:RecordRaidCheckPresence({
+    opportunityId = opportunityId,
+    presentMembers = recordedPresent,
+    eligibleMembers = { ALICE, BOB, CAROL },
+    preparedMembers = recordedPrepared,
+    logAuthor = "Raid Check",
+    skipBroadcast = true,
+    skipPermission = true,
+}), "duplicate opportunity id is rejected by RecordRaidCheckPresence")
+
+local storedLogs = profile:GetLootLogs() or {}
+local presenceEvent = nil
+for i = 1, #storedLogs do
+    local log = storedLogs[i]
+    local eventType = log.GetEventType and log:GetEventType() or log._eventType
+    if eventType == "RAID_CHECK_PRESENCE" then
+        presenceEvent = log
+    end
+end
+assertTrue(presenceEvent ~= nil, "persisted RAID_CHECK_PRESENCE event exists")
+local persisted = presenceEvent.GetEventData and presenceEvent:GetEventData() or presenceEvent._data
+assertTrue(type(persisted) == "table", "persisted presence event data is a table")
+local presentSet = {}
+for i = 1, #(persisted.presentMembers or {}) do
+    presentSet[persisted.presentMembers[i]] = true
+end
+assertTrue(presentSet[ALICE] == true, "persisted presentMembers uses the authoritative Alice profile ID")
+assertTrue(presentSet["alice-Garona"] ~= true, "persisted presentMembers does not keep the live alias spelling")
+assertTrue(presentSet["Guest-Garona"] == true, "persisted presentMembers keeps the non-profile guest")
+assertTrue(presentSet[BOB] == true, "persisted presentMembers uses the authoritative Bob profile ID")
+assertEq(#(persisted.eligibleMembers or {}), 3, "persisted eligibleMembers remains the 3-member profile roster")
+assertEq(#(persisted.presentMembers or {}), 3, "persisted present count is 2 profile + 1 guest")
+
+local replayed = Identity.Replay({ presenceEvent }, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckAttendance(replayed, ALICE), "100%", "canonical present credits Alice attendance")
+assertEq(Identity.FormatRaidCheckPreparedness(replayed, ALICE), "100%", "canonical present credits Alice preparedness")
+assertEq(Identity.FormatRaidCheckAttendance(replayed, BOB), "100%", "canonical present credits Bob attendance")
+assertEq(Identity.FormatRaidCheckPreparedness(replayed, BOB), "0%", "unprepared Bob is 0% prepared")
+assertEq(Identity.FormatRaidCheckAttendance(replayed, CAROL), "0%", "absent Carol remains 0% attendance")
+assertEq(Identity.FormatRaidCheckAttendance(replayed, "Guest-Garona"), "100%", "non-profile guest still receives presence credit")
+assertTrue(Identity.HasRaidCheckPresenceOpportunity(replayed, opportunityId), "opportunity id remains recorded once")
+
+-- #442 Codex P2: real profile with SamePlayer-equivalent IDs must award once.
+local aliasProfile = SF.LootProfile.new("Duplicate Alias Roster")
+assertTrue(aliasProfile ~= nil, "duplicate-alias profile was created")
+local alicePrimary = SF.Member.new(ALICE, "admin", "WARRIOR")
+local aliceAlias = SF.Member.new("alice-Garona", "member", "WARRIOR")
+local bobMember = SF.Member.new(BOB, "member", "WARRIOR")
+assertTrue(aliasProfile:AddMember(alicePrimary), "primary Alice added")
+assertTrue(aliasProfile:AddMember(aliceAlias), "SamePlayer Alice alias still inserts via AddMember")
+assertTrue(aliasProfile:AddMember(bobMember), "Bob added")
+SF.lootHelperDB.profiles[aliasProfile:GetProfileId()] = aliasProfile
+local rawIds = aliasProfile:GetMemberIds()
+local aliceSpellings = 0
+for i = 1, #rawIds do
+    if CheckRun.SameMemberId(rawIds[i], ALICE) then
+        aliceSpellings = aliceSpellings + 1
+    end
+end
+assertTrue(aliceSpellings >= 2, "GetMemberIds still exposes both Alice spellings before Raid Check uniquify")
+local uniquedIds = CheckRun.UniqueProfileMemberIds(rawIds)
+assertEq(#uniquedIds, 2, "Raid Check uniquify keeps one Alice and Bob")
+local liveGroup = { "Alice-Garona", "Guest-Garona" }
+local preFixTargets = {}
+do
+    local seen = {}
+    for _, memberId in ipairs(rawIds) do
+        if not seen[memberId] then
+            for _, groupId in ipairs(liveGroup) do
+                if CheckRun.SameMemberId(memberId, groupId) then
+                    seen[memberId] = true
+                    preFixTargets[#preFixTargets + 1] = memberId
+                    break
+                end
+            end
+        end
+    end
+end
+assertEq(#preFixTargets, 2, "pre-fix intersection against raw GetMemberIds yields two Alice targets")
+
+local targetIds = CheckRun.IntersectMembershipAndGroup(uniquedIds, liveGroup)
+assertEq(#targetIds, 1, "production uniquify+intersect yields exactly one Alice target")
+assertTrue(CheckRun.SameMemberId(targetIds[1], ALICE), "single target is Alice")
+
+-- Simulate RC:_ApplyCheckConsequences Prepared awards over frozen targets.
+local classifiedResults = {
+    [targetIds[1]] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+}
+local awardCounts = {}
+local whisperCounts = {}
+local function resolveMember(memberId)
+    return aliasProfile:GetMemberByID(memberId)
+end
+local function awardPreparedOnce(memberId)
+    local member = resolveMember(memberId)
+    assertTrue(member ~= nil, "consequences resolve a profile member for " .. tostring(memberId))
+    local key = member.GetFullIdentifier and member:GetFullIdentifier() or member.identifier
+    awardCounts[key] = (awardCounts[key] or 0) + 1
+    whisperCounts[key] = (whisperCounts[key] or 0) + 1
+    return true
+end
+-- Broken path: award once per pre-fix target (both aliases resolve to first Member).
+local brokenAwards = {}
+for i = 1, #preFixTargets do
+    local member = resolveMember(preFixTargets[i])
+    local key = member.GetFullIdentifier and member:GetFullIdentifier() or member.identifier
+    brokenAwards[key] = (brokenAwards[key] or 0) + 1
+end
+assertEq(brokenAwards[ALICE] or brokenAwards["alice-Garona"] or 0, 2, "pre-fix dual targets award the same Member twice")
+
+for i = 1, #targetIds do
+    local classified = classifiedResults[targetIds[i]]
+    if classified and classified.class == CheckRun.CLASS.PREPARED then
+        awardPreparedOnce(targetIds[i])
+    end
+end
+local aliceAwardKey = nil
+local aliceAwardTotal = 0
+for key, count in pairs(awardCounts) do
+    if CheckRun.SameMemberId(key, ALICE) then
+        aliceAwardKey = key
+        aliceAwardTotal = aliceAwardTotal + count
+    end
+end
+assertEq(aliceAwardTotal, 1, "fixed consequences award Alice Prepared exactly once")
+assertEq(whisperCounts[aliceAwardKey], 1, "fixed consequences whisper Alice Prepared exactly once")
+assertTrue(awardCounts[BOB] == nil, "absent Bob receives no Prepared award")
+
+local aliasOpportunity = aliasProfile:GetProfileId() .. ":duplicate-alias"
+local aliasPresent = CheckRun.CanonicalizePresentMembers(liveGroup, uniquedIds)
+local aliasPrepared = CheckRun.CollectPreparedPresentMembers(classifiedResults, liveGroup)
+assertTrue(aliasProfile:RecordRaidCheckPresence({
+    opportunityId = aliasOpportunity,
+    presentMembers = aliasPresent,
+    eligibleMembers = uniquedIds,
+    preparedMembers = aliasPrepared,
+    logAuthor = "Raid Check",
+    skipBroadcast = true,
+    skipPermission = true,
+}), "duplicate-alias profile records a presence event")
+local aliasPresence = nil
+for i = 1, #(aliasProfile:GetLootLogs() or {}) do
+    local log = aliasProfile:GetLootLogs()[i]
+    local eventType = log.GetEventType and log:GetEventType() or log._eventType
+    if eventType == "RAID_CHECK_PRESENCE" then
+        aliasPresence = log
+    end
+end
+assertTrue(aliasPresence ~= nil, "duplicate-alias presence event persisted")
+local aliasData = aliasPresence.GetEventData and aliasPresence:GetEventData() or aliasPresence._data
+assertEq(#(aliasData.eligibleMembers or {}), 2, "eligibleMembers has one Alice and Bob, not both Alice spellings")
+assertEq(#(aliasData.presentMembers or {}), 2, "presentMembers has canonical Alice plus guest")
+assertEq(#(aliasData.preparedMembers or {}), 1, "preparedMembers lists Alice once")
+local eligibleAlice = 0
+for i = 1, #(aliasData.eligibleMembers or {}) do
+    if CheckRun.SameMemberId(aliasData.eligibleMembers[i], ALICE) then
+        eligibleAlice = eligibleAlice + 1
+    end
+end
+assertEq(eligibleAlice, 1, "persisted eligibleMembers contains one Alice identity")
+local aliasReplay = Identity.Replay({ aliasPresence }, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckAttendance(aliasReplay, ALICE), "100%", "duplicate-alias presence credits Alice attendance once")
+assertEq(Identity.FormatRaidCheckPreparedness(aliasReplay, ALICE), "100%", "duplicate-alias presence credits Alice preparedness once")
+assertEq(Identity.FormatRaidCheckAttendance(aliasReplay, BOB), "0%", "Bob remains absent")
+assertEq(Identity.FormatRaidCheckAttendance(aliasReplay, "Guest-Garona"), "100%", "non-profile guest remains present")
+assertTrue(Identity.HasRaidCheckPresenceOpportunity(aliasReplay, aliasOpportunity), "duplicate-alias opportunity id recorded")
+
+-- Control: 15 present / 22 distinct eligible still holds with uniquify.
+local controlEligible = {}
+local controlGroup = {}
+for i = 1, 22 do
+    controlEligible[i] = string.format("Raider%02d-Garona", i)
+end
+for i = 1, 15 do
+    controlGroup[i] = controlEligible[i]
+end
+controlGroup[#controlGroup + 1] = "GuestOnly-Garona"
+local controlUnique = CheckRun.UniqueProfileMemberIds(controlEligible)
+assertEq(#controlUnique, 22, "15/22 control keeps twenty-two distinct eligible members")
+local controlTargets = CheckRun.IntersectMembershipAndGroup(controlUnique, controlGroup)
+assertEq(#controlTargets, 15, "15/22 control still yields fifteen targets")
+local controlPresent = CheckRun.CanonicalizePresentMembers(controlGroup, controlUnique)
+assertEq(#controlPresent, 16, "15/22 control present is fifteen profile members plus guest")
+
+-- #442 Codex P2 follow-up: lowercase Alice inserted before uppercase Alice.
+-- GetMemberIds sorts uppercase first; getMemberByID still returns the first insert.
+-- Use a non-Alice owner so creation does not pre-insert an Alice spelling.
+function SF:GetPlayerFullIdentifier()
+    return "Tester-Garona"
+end
+local orderProfile = SF.LootProfile.new("Insertion Order Alias")
+assertTrue(orderProfile ~= nil, "insertion-order profile was created")
+local lowerAlice = SF.Member.new("alice-Garona", "admin", "WARRIOR")
+local upperAlice = SF.Member.new("Alice-Garona", "member", "WARRIOR")
+local orderBob = SF.Member.new(BOB, "member", "WARRIOR")
+assertTrue(orderProfile:AddMember(lowerAlice), "lowercase alice inserted first")
+assertTrue(orderProfile:AddMember(upperAlice), "uppercase Alice inserted second")
+assertTrue(orderProfile:AddMember(orderBob), "Bob inserted for distinct-player control")
+SF.lootHelperDB.profiles[orderProfile:GetProfileId()] = orderProfile
+
+local sortedIds = orderProfile:GetMemberIds()
+local sortedAlice = nil
+for i = 1, #sortedIds do
+    if CheckRun.SameMemberId(sortedIds[i], ALICE) and not sortedAlice then
+        sortedAlice = sortedIds[i]
+    end
+end
+assertEq(sortedAlice, "Alice-Garona", "GetMemberIds sorts uppercase Alice before lowercase")
+local resolvedMember = orderProfile:GetMemberByID(sortedAlice)
+assertTrue(resolvedMember ~= nil, "getMemberByID resolves the sorted Alice spelling")
+local awardingId = resolvedMember:GetFullIdentifier()
+assertEq(awardingId, "alice-Garona", "getMemberByID returns the first-inserted lowercase Member")
+assertTrue(sortedAlice ~= awardingId, "sorted GetMemberIds spelling differs from awarding Member ID")
+
+local brokenFrozen = CheckRun.UniqueProfileMemberIds(sortedIds)
+local brokenAlice = nil
+for i = 1, #brokenFrozen do
+    if CheckRun.SameMemberId(brokenFrozen[i], ALICE) then
+        brokenAlice = brokenFrozen[i]
+        break
+    end
+end
+assertEq(brokenAlice, "Alice-Garona", "without resolveId, frozen ID keeps the sorted uppercase spelling")
+assertTrue(brokenAlice ~= awardingId, "pre-fix frozen ID mismatches the awarding Member row")
+
+local function resolveAwardingId(candidate)
+    local member = orderProfile:GetMemberByID(candidate)
+    if member and member.GetFullIdentifier then
+        local id = member:GetFullIdentifier()
+        if type(id) == "string" and id ~= "" then
+            return id
+        end
+    end
+    return candidate
+end
+
+-- Mirror RC:_StartAdhocRun resolve path using the profile GetMemberByID API.
+local frozenIds = CheckRun.UniqueProfileMemberIds(sortedIds, resolveAwardingId)
+local frozenAlice = nil
+local aliceCount = 0
+for i = 1, #frozenIds do
+    if CheckRun.SameMemberId(frozenIds[i], ALICE) then
+        aliceCount = aliceCount + 1
+        frozenAlice = frozenIds[i]
+    end
+end
+assertEq(aliceCount, 1, "resolved freeze keeps one Alice identity")
+assertEq(frozenAlice, awardingId, "production resolve path freezes the awarding Member identifier")
+
+local orderGroup = { "Alice-Garona", "Guest-Garona" }
+local orderTargets = CheckRun.IntersectMembershipAndGroup(frozenIds, orderGroup)
+assertEq(#orderTargets, 1, "insertion-order profile yields exactly one Alice target")
+assertEq(orderTargets[1], awardingId, "target ID equals awarding Member GetFullIdentifier")
+
+local orderResults = {
+    [orderTargets[1]] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+}
+
+-- Point-mode award through the resolved Member (production consequence path).
+local pointMember = orderProfile:GetMemberByID(orderTargets[1])
+assertTrue(pointMember ~= nil, "point-mode consequences resolve the frozen target")
+assertEq(pointMember:GetFullIdentifier(), awardingId, "point-mode resolved Member matches frozen target")
+assertTrue(pointMember:IncrementPoints({
+    amount = 1,
+    logAuthor = "Raid Check",
+    reason = "RAID_CHECK",
+    profile = orderProfile,
+    skipBroadcast = true,
+}), "point-mode Prepared award succeeds once")
+assertEq(pointMember:GetPointBalance(), 1, "point-mode records exactly one Prepared point on awarding Member")
+
+-- Reward Pot attendance award on the same Member.
+assertTrue(pointMember:IncrementAttendance({
+    amount = 1,
+    logAuthor = "Raid Check",
+    reason = "RAID_CHECK",
+    profile = orderProfile,
+    skipBroadcast = true,
+}), "Reward Pot attendance award succeeds once")
+assertEq(pointMember:GetAttendanceBalance(), 1, "Reward Pot mode records exactly one attendance on awarding Member")
+
+local orderOpportunity = orderProfile:GetProfileId() .. ":insertion-order"
+local orderPresent = CheckRun.CanonicalizePresentMembers(orderGroup, frozenIds)
+local orderPrepared = CheckRun.CollectPreparedPresentMembers(orderResults, orderGroup)
+assertTrue(orderProfile:RecordRaidCheckPresence({
+    opportunityId = orderOpportunity,
+    presentMembers = orderPresent,
+    eligibleMembers = frozenIds,
+    preparedMembers = orderPrepared,
+    logAuthor = "Raid Check",
+    skipBroadcast = true,
+    skipPermission = true,
+}), "insertion-order profile records presence with awarding IDs")
+
+local orderPresence = nil
+for i = 1, #(orderProfile:GetLootLogs() or {}) do
+    local log = orderProfile:GetLootLogs()[i]
+    local eventType = log.GetEventType and log:GetEventType() or log._eventType
+    if eventType == "RAID_CHECK_PRESENCE" then
+        local data = log.GetEventData and log:GetEventData() or log._data
+        if data and data.opportunityId == orderOpportunity then
+            orderPresence = log
+        end
+    end
+end
+assertTrue(orderPresence ~= nil, "insertion-order presence event persisted")
+local orderData = orderPresence.GetEventData and orderPresence:GetEventData() or orderPresence._data
+local function listHasExact(list, needle)
+    for i = 1, #(list or {}) do
+        if list[i] == needle then
+            return true
+        end
+    end
+    return false
+end
+assertTrue(listHasExact(orderData.eligibleMembers, awardingId), "eligibleMembers uses awarding Member ID")
+assertTrue(not listHasExact(orderData.eligibleMembers, "Alice-Garona"), "eligibleMembers drops the mismatched sorted spelling")
+assertTrue(listHasExact(orderData.presentMembers, awardingId), "presentMembers uses awarding Member ID")
+assertTrue(listHasExact(orderData.preparedMembers, awardingId), "preparedMembers uses awarding Member ID")
+assertEq(#(orderData.preparedMembers or {}), 1, "preparedMembers lists Alice once")
+assertTrue(listHasExact(orderData.presentMembers, "Guest-Garona"), "guest remains in presentMembers")
+assertTrue(listHasExact(orderData.eligibleMembers, BOB), "distinct Bob remains eligible")
+
+local orderReplay = Identity.Replay({ orderPresence }, { owner = awardingId })
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, awardingId), "100%", "replay credits attendance on awarding Member row")
+assertEq(Identity.FormatRaidCheckPreparedness(orderReplay, awardingId), "100%", "replay credits preparedness on awarding Member row")
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, "Alice-Garona"), "—", "mismatched sorted spelling has no separate attendance history row")
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, BOB), "0%", "Bob remains absent in insertion-order scenario")
+assertEq(Identity.FormatRaidCheckAttendance(orderReplay, "Guest-Garona"), "100%", "guest remains present in insertion-order scenario")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

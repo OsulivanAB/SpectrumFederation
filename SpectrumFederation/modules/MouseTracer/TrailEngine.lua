@@ -23,6 +23,32 @@ function Engine.ClampNumber(value, minValue, maxValue, fallback)
 	return Clamp(value, minValue, maxValue, fallback)
 end
 
+-- Bound and snap Edge Softness to the supported 0–100% slider steps.
+function Engine.NormalizeEdgeSoftness(value)
+	local n = tonumber(value)
+	if not n then
+		return C.DEFAULT_EDGE_SOFTNESS
+	end
+	local step = C.EDGE_SOFTNESS_STEP
+	n = math.floor((n / step) + 0.5) * step
+	if n < C.MIN_EDGE_SOFTNESS then
+		return C.MIN_EDGE_SOFTNESS
+	end
+	if n > C.MAX_EDGE_SOFTNESS then
+		return C.MAX_EDGE_SOFTNESS
+	end
+	return n
+end
+
+-- Stamp texture for the given softness. Softness 0 keeps the hard circular mask path.
+function Engine.StampTextureForEdgeSoftness(softness)
+	softness = Engine.NormalizeEdgeSoftness(softness)
+	if softness <= 0 then
+		return C.CIRCLE_TEXTURE
+	end
+	return string.format(C.SOFT_CIRCLE_TEXTURE_FMT, softness)
+end
+
 function Engine.HSVToRGB(h, s, v)
 	if h ~= h then
 		return v, v, v

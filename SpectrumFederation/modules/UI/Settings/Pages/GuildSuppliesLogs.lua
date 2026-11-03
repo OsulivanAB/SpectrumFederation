@@ -257,6 +257,22 @@ local function NameWithGoalIcon(name, icon)
 	return name
 end
 
+-- Prefer the resolved icon; keep a question-mark placeholder so inline icons
+-- stay at a consistent horizontal start when item data is still loading (#440).
+local function GoalRowIcon(described)
+	if type(described) == "table" then
+		local icon = described.icon
+		if icon ~= nil and icon ~= false and icon ~= "" then
+			return icon
+		end
+	end
+	local display = SF.ItemDisplay
+	if display and display.QUESTION_MARK then
+		return display.QUESTION_MARK
+	end
+	return nil
+end
+
 local function ItemRowsForSelected()
 	local rows = {}
 	if not Caps().canRead then
@@ -291,12 +307,13 @@ local function ItemRowsForSelected()
 				or 0
 			local described = DescribeItem(itemId)
 			local percentLabel = FormatGoalPercentLabel(progressEntry)
-			local namePart = NameWithGoalIcon(described.name, described.icon)
+			local namePart = NameWithGoalIcon(described.name, GoalRowIcon(described))
 			rows[#rows + 1] = {
-				-- Visual order: percent → inline icon → name → donated/goal.
+				-- Percent is a shared right-justified leading column (#440).
+				-- Remainder keeps inline icon → name → donated/goal (#437).
+				leadingText = percentLabel,
 				text = string.format(
-					"%s %s — %d / %s",
-					percentLabel,
+					"%s — %d / %s",
 					namePart,
 					got,
 					goal > 0 and tostring(goal) or "—"
@@ -551,7 +568,9 @@ local function Definition()
 						label = Loc("GUILD_SUPPLIES_LOGS_ITEMS", "Goals and progress"),
 						height = 160,
 						rowHeight = 20,
-						-- Percent sits left of the item; icon is inline via FormatHistoryInlineIcon (#437).
+						-- Percent uses the shared right-justified leading column (#440).
+						-- Item icon stays inline via FormatHistoryInlineIcon (#437).
+						leadingColumn = true,
 						singleLine = true,
 						getItems = function()
 							if not Caps().canRead then

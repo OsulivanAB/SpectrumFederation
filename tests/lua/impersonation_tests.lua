@@ -791,6 +791,7 @@ function SF.Debug:Verbose() end
 local missingId = "Missing-Garona"
 local failedId = "Failed-Garona"
 local recentId = "Recent-Garona"
+local sessionId = "Session-Garona"
 local membersById = {
     [missingId] = {
         GetFullIdentifier = function() return missingId end,
@@ -804,6 +805,9 @@ local membersById = {
     },
     [recentId] = {
         GetFullIdentifier = function() return recentId end,
+    },
+    [sessionId] = {
+        GetFullIdentifier = function() return sessionId end,
     },
 }
 function p1.GetRaidCheckConfig()
@@ -867,12 +871,17 @@ local summaryRun = {
             class = CheckRun.CLASS.PREPARED,
             verified = CheckRun.VERIFIED.RECENT,
         },
+        [sessionId] = {
+            class = CheckRun.CLASS.PREPARED,
+            verified = CheckRun.VERIFIED.SESSION,
+        },
     },
-    targetIds = { missingId, failedId, recentId },
+    targetIds = { missingId, failedId, recentId, sessionId },
     players = {
         [missingId] = { guid = "Player-missing" },
         [failedId] = { guid = "Player-failed" },
         [recentId] = { guid = "Player-recent" },
+        [sessionId] = { guid = "Player-session" },
     },
     mode = "pre",
     cfg = p1:GetRaidCheckConfig(),
@@ -908,7 +917,8 @@ assertFalse(chatHas("Inspection Failed"), "inspection-failed summary is not chat
 assertFalse(chatHas("Recently Verified"), "recently-verified summary is not chat")
 assertFalse(chatHas("Complete."), "raid-check Complete is not chat")
 assertTrue(debugHas("Inspection Failed"), "inspection-failed summary is debug-only")
-assertTrue(debugHas("Recently Verified"), "recently-verified summary is debug-only")
+assertTrue(debugHas("Recently Verified (range-only, last-good within 120s)"), "legacy range-only summary is debug-only")
+assertTrue(debugHas("Recently Verified (same-session, last-good within 20m)"), "same-session summary is debug-only")
 assertTrue(debugHas("Complete."), "raid-check Complete is debug-only")
 
 -- Waiting-on-announce message is debug-only and does not reach chat.

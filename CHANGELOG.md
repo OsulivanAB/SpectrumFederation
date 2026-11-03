@@ -2,6 +2,29 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.17-beta.3] - 2026-11-03
+
+### Added
+- Add Mouse Tracer Edge Softness (#444)
+
+## [1.5.17-beta.2] - 2026-11-02
+
+### Changed
+- Clarify Raid Check presence counts and identity matching (#442)
+
+### Fixed
+- Fix Raid Check same-session equipment fallback (#339)
+
+## [1.5.17-beta.1] - 2026-10-31
+
+### Fixed
+- Fix Raid Check same-session equipment fallback (#339)
+
+## [1.5.16-beta.9] - 2026-10-30
+
+### Changed
+- Align Raid Supplies Logs goal percents in a shared column (#440)
+
 ## [1.5.16] - 2026-10-29
 
 ### Added

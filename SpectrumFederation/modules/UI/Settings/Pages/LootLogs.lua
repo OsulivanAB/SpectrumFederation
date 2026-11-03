@@ -438,10 +438,24 @@ local function BuildActionText(eventType, data, author)
 	elseif eventType == "RAID_CHECK_PRESENCE" then
 		local present = type(data.presentMembers) == "table" and #data.presentMembers or 0
 		local eligible = type(data.eligibleMembers) == "table" and #data.eligibleMembers or 0
+		local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+		local preparedCount = nil
 		if type(data.preparedMembers) == "table" then
-			return string.format("Raid Check presence %d/%d prepared %d", present, eligible, #data.preparedMembers)
+			preparedCount = #data.preparedMembers
 		end
-		return string.format("Raid Check presence %d/%d", present, eligible)
+		if CheckRun and CheckRun.FormatPresenceLogSummary then
+			return CheckRun.FormatPresenceLogSummary(present, eligible, preparedCount)
+		end
+		-- Fallback when CheckRun is unavailable (should not happen in TOC order).
+		if preparedCount ~= nil then
+			return string.format(
+				"Raid Check: %d present · %d eligible profile members · %d verified prepared",
+				present,
+				eligible,
+				preparedCount
+			)
+		end
+		return string.format("Raid Check: %d present · %d eligible profile members", present, eligible)
 	elseif eventType == "RC_LOOT_COUNCIL" then
 		local item = tostring(data.itemLink or "")
 		local response = tostring(data.response or "")
