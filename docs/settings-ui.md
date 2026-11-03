@@ -46,6 +46,7 @@ Mouse Tracer can leave a fading circular rainbow trail behind the mouse cursor. 
 - **Trail Thickness** — visual width of the trail.
 - **Rainbow Cycle Speed** — how quickly rainbow colors travel along the trail. This does not change how long the trail is.
 - **Trail Opacity** — overall visibility. Lower values keep more of the UI readable underneath.
+- **Edge Softness** — softens each stamp's edges by fading them to transparent (0–100% in 10% steps). 0% keeps the original hard circular appearance. Softness does not change Trail Thickness, Trail Opacity, or Fade Duration.
 - **Copy From Character** — replace this character's Mouse Tracer settings with another character's last saved settings. The other character must have logged in with Spectrum Federation so a snapshot exists. The current character is not listed. Copy cannot be undone except by copying back or changing the controls again.
 
 The sliders update the visible trail while you drag them. Copy overwrites every Mouse Tracer setting on this character, including whether the trail is enabled.

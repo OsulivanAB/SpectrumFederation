@@ -20,12 +20,17 @@ SF.MouseTracer.Constants = {
 	MAX_RAINBOW_SPEED = 3.0,
 	MIN_OPACITY = 0.2,
 	MAX_OPACITY = 1.0,
+	MIN_EDGE_SOFTNESS = 0,
+	MAX_EDGE_SOFTNESS = 100,
+	EDGE_SOFTNESS_STEP = 10,
 
 	DEFAULT_TRAIL_LENGTH = 400,
 	DEFAULT_FADE_DURATION = 0.50,
 	DEFAULT_THICKNESS = 16,
 	DEFAULT_RAINBOW_SPEED = 0.25,
 	DEFAULT_OPACITY = 0.70,
+	-- 0% keeps TempPortraitAlphaMask; soft TGA stamps feather inward only.
+	DEFAULT_EDGE_SOFTNESS = 0,
 	TAPER_MIN_RATIO = 0.40,
 
 	MIN_SPACING = MIN_SPACING_FLOOR,
@@ -46,6 +51,8 @@ SF.MouseTracer.Constants = {
 
 	HUE_PER_PIXEL = 1 / 200,
 	CIRCLE_TEXTURE = "Interface\\CharacterFrame\\TempPortraitAlphaMask",
+	-- Softness steps 10–100 map to precomputed 64x64 TGA stamps. 0% uses CIRCLE_TEXTURE.
+	SOFT_CIRCLE_TEXTURE_FMT = "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_%d.tga",
 
 	SETTING_KEYS = {
 		"enabled",
@@ -54,5 +61,6 @@ SF.MouseTracer.Constants = {
 		"thickness",
 		"rainbowSpeed",
 		"opacity",
+		"edgeSoftness",
 	},
 }
