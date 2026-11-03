@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.17-beta.3] - 2026-11-03
+
+### Added
+- Add Mouse Tracer Edge Softness (#444)
+
 ## [1.5.17-beta.2] - 2026-11-02
 
 ### Changed
