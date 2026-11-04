@@ -198,15 +198,23 @@ local function LookupClassFile(guid, nameRealm)
 end
 
 --- Color the displayed contributor identity (#453).
--- Prefer the resolved display name (current main) over the ledger's original
--- alt GUID so linked alts do not paint the main's name in the alt's class.
+-- Class must belong to the same identity as the displayed name. Prefer the
+-- resolved display name; allow a GUID fallback only when that GUID's character
+-- row is the displayed name (never a linked alt's class for a main name).
 local function ColorizeContributor(name, guid)
 	if type(name) ~= "string" or name == "" then
 		return name
 	end
 	local classFile = LookupClassFile(nil, name)
-	if not classFile then
-		classFile = LookupClassFile(guid, nil)
+	if not classFile and type(guid) == "string" and guid ~= "" then
+		local lookup = GuildClassLookup()
+		local row = type(lookup.byGuid) == "table" and lookup.byGuid[guid] or nil
+		if type(row) == "table"
+			and type(row.nameRealm) == "string" and row.nameRealm ~= ""
+			and string.lower(row.nameRealm) == string.lower(name)
+			and type(row.classFile) == "string" and row.classFile ~= "" then
+			classFile = row.classFile
+		end
 	end
 	local GI = SF.GuildInfo
 	if GI and type(GI.ColorizeName) == "function" then

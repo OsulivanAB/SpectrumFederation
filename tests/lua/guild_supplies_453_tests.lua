@@ -1630,6 +1630,43 @@ do
         "453: attributed adjustment does not use alt class for main name")
     assertTrue((adjustment.tooltip or ""):find("Alice-Garona", 1, true),
         "453: officer attribution retained on adjustment tooltip")
+
+    -- Main name/relationship intact, but main class metadata absent: stay neutral
+    -- rather than falling back to the linked alt's known class (#453).
+    SF.GuildInfo.GetCurrentRecord = function()
+        giCalls = giCalls + 1
+        return {
+            characters = {
+                ["Player-1-BobAlt"] = { nameRealm = "BobAlt-Garona", classFile = "MAGE" },
+                ["Player-1-BobMain"] = { nameRealm = "BobMain-Garona" },
+                ["Player-1-CarolAlt"] = { nameRealm = "CarolAlt-Garona", classFile = "WARRIOR" },
+                ["Player-1-CarolMain"] = { nameRealm = "CarolMain-Garona" },
+            },
+        }
+    end
+    rows, lookupCalls = hooks.ProjectWithGuildLookupStats()
+    assertEq(lookupCalls, 1, "453: missing-main-class projection one GI lookup")
+    donation, adjustment = nil, nil
+    for i = 1, #rows do
+        if rows[i].id == "link-donation-alt" then donation = rows[i] end
+        if rows[i].id == "link-adjust-alt" then adjustment = rows[i] end
+    end
+    assertTrue(donation ~= nil and adjustment ~= nil,
+        "453: missing-main-class rows still projected")
+    assertEq(donation.contributorKey, "BobMain-Garona",
+        "453: missing-main-class donation keeps resolved main name")
+    assertEq(donation.contributor, "BobMain-Garona",
+        "453: missing-main-class donation stays neutral got=" .. tostring(donation.contributor))
+    assertTrue(not (donation.contributor or ""):find("%[", 1),
+        "453: missing-main-class donation does not use alt class")
+    assertEq(adjustment.contributorKey, "CarolMain-Garona",
+        "453: missing-main-class adjustment keeps resolved main name")
+    assertTrue((adjustment.contributor or ""):find("CarolMain-Garona", 1, true)
+        and not (adjustment.contributor or ""):find("%[", 1),
+        "453: missing-main-class adjustment stays neutral got="
+            .. tostring(adjustment.contributor))
+    assertTrue((adjustment.tooltip or ""):find("Alice-Garona", 1, true),
+        "453: missing-main-class officer attribution retained")
     SF.GuildInfo = nil
 end
 
