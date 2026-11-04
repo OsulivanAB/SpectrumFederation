@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.1] - 2026-11-04
+
+### Added
+- Add officer-only Raid Supplies Rankings (#447)
+
 ## [1.5.17] - 2026-11-03
 
 ### Added
