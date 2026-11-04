@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.3] - 2026-11-04
+
+### Fixed
+- Fix Rankings first-row currency value clipping at scroll top
+
 ## [1.5.18-beta.2] - 2026-11-04
 
 ### Changed
