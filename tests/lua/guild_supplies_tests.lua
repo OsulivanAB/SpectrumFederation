@@ -44518,15 +44518,6 @@ do
         maxPositive = 1000,
         hasHistory = true,
     }
-    local capturedControl = nil
-    local priorInit = Controls.InitRow
-    Controls.InitRow = function(self, row, opts)
-        local control = CreateFrame("Frame", nil, row)
-        control:SetWidth(400)
-        control:SetHeight(320)
-        capturedControl = control
-        return row, control
-    end
     -- Avoid production _ApplyRowState needing full Settings chrome.
     local priorApply = Controls._ApplyRowState
     Controls._ApplyRowState = function() return true, true end
@@ -44548,7 +44539,14 @@ do
             return rankingsPayload
         end,
     })
+    -- #450: unlabeled chart uses full-width row.Control (no InitRow label column).
+    local capturedControl = row and row.Control
+    if capturedControl then
+        capturedControl:SetWidth(400)
+        capturedControl:SetHeight(320)
+    end
     assertTrue(row ~= nil and capturedControl ~= nil, "447-r6: chart row created")
+    assertEq(capturedControl.__sfRankingHasLabel, false, "447-r6: no InitRow label column")
     local dataBefore = projectCalls
     assertTrue(dataBefore >= 1, "447-r6: initial Refresh projects once")
     local layoutBefore = capturedControl.__sfRankingLayoutPass
@@ -44582,14 +44580,6 @@ do
     }
     projectCalls = 0
     frameCreateCount = 0
-    local largeControl = nil
-    Controls.InitRow = function(self, row, opts)
-        local control = CreateFrame("Frame", nil, row)
-        control:SetWidth(400)
-        control:SetHeight(280)
-        largeControl = control
-        return row, control
-    end
     local largeSection = {
         AddRow = function(self, height, buildFn, opts)
             local row = CreateFrame("Frame", "SF_TestRankingRowLarge")
@@ -44599,7 +44589,7 @@ do
             return row
         end,
     }
-    Controls:AddContributionRankingChart(largeSection, {
+    local largeRow = Controls:AddContributionRankingChart(largeSection, {
         height = 280,
         rowHeight = 28,
         fillHeight = true,
@@ -44608,6 +44598,15 @@ do
             return largePayload
         end,
     })
+    local largeControl = largeRow and largeRow.Control
+    if largeControl then
+        largeControl:SetWidth(400)
+        largeControl:SetHeight(280)
+        -- Re-run layout against sized control (initial build may use fallbacks).
+        for _, hook in ipairs(largeControl.hooks.OnSizeChanged or {}) do
+            hook(largeControl, 400, 280)
+        end
+    end
     assertTrue(largeControl ~= nil, "447-r9: large chart created")
     assertTrue(projectCalls >= 1, "447-r9: initial data refresh")
     local poolAfterBuild = largeControl.__sfRankingPoolCount
@@ -44675,7 +44674,6 @@ do
 
     -- List shrink / campaign change: Refresh clamps scroll; empty/hidden/access-loss
     -- clears pool rows. Capture Refresh via section.__sfPageBuilder.
-    local mutControl = nil
     local mutRefresh = nil
     local mutPayload = { rows = {}, maxPositive = 0, hasHistory = true }
     for i = 1, 80 do
@@ -44685,13 +44683,6 @@ do
         }
     end
     mutPayload.maxPositive = 999
-    Controls.InitRow = function(self, row, opts)
-        local control = CreateFrame("Frame", nil, row)
-        control:SetWidth(400)
-        control:SetHeight(280)
-        mutControl = control
-        return row, control
-    end
     local mutSection = {
         AddRow = function(self, height, buildFn, opts)
             local row = CreateFrame("Frame", "SF_TestRankingMut")
@@ -44706,7 +44697,7 @@ do
             end,
         },
     }
-    Controls:AddContributionRankingChart(mutSection, {
+    local mutRow = Controls:AddContributionRankingChart(mutSection, {
         height = 280,
         rowHeight = 28,
         fillHeight = true,
@@ -44714,6 +44705,14 @@ do
             return mutPayload
         end,
     })
+    local mutControl = mutRow and mutRow.Control
+    if mutControl then
+        mutControl:SetWidth(400)
+        mutControl:SetHeight(280)
+        for _, hook in ipairs(mutControl.hooks.OnSizeChanged or {}) do
+            hook(mutControl, 400, 280)
+        end
+    end
     assertTrue(mutControl ~= nil and type(mutRefresh) == "function",
         "447-r9: refresh captured")
     local mutScroll = mutControl.__sfRankingScroll
@@ -44783,7 +44782,6 @@ do
         end
     end
 
-    local syncControl = nil
     local syncRefresh = nil
     local syncProject = 0
     local syncRows = {}
@@ -44794,13 +44792,6 @@ do
         }
     end
     local syncPayload = { rows = syncRows, maxPositive = 1199, hasHistory = true }
-    Controls.InitRow = function(self, row, opts)
-        local control = CreateFrame("Frame", nil, row)
-        control:SetWidth(400)
-        control:SetHeight(280)
-        syncControl = control
-        return row, control
-    end
     local syncSection = {
         AddRow = function(self, height, buildFn, opts)
             local row = CreateFrame("Frame", "SF_TestRankingSync")
@@ -44815,7 +44806,7 @@ do
             end,
         },
     }
-    Controls:AddContributionRankingChart(syncSection, {
+    local syncRow = Controls:AddContributionRankingChart(syncSection, {
         height = 280,
         rowHeight = 28,
         fillHeight = true,
@@ -44824,6 +44815,14 @@ do
             return syncPayload
         end,
     })
+    local syncControl = syncRow and syncRow.Control
+    if syncControl then
+        syncControl:SetWidth(400)
+        syncControl:SetHeight(280)
+        for _, hook in ipairs(syncControl.hooks.OnSizeChanged or {}) do
+            hook(syncControl, 400, 280)
+        end
+    end
     assertTrue(syncControl ~= nil and type(syncRefresh) == "function",
         "447-r10: sync chart created")
     local syncScroll = syncControl.__sfRankingScroll
@@ -44921,7 +44920,6 @@ do
     assertTrue(syncControl.__sfRankingPoolCount() <= 20,
         "447-r10: pool bounded after resize clamp")
 
-    Controls.InitRow = priorInit
     Controls._ApplyRowState = priorApply
     CreateFrame = priorCreateFrame
 end
@@ -44974,6 +44972,336 @@ do
     local resolved = Nav.ResolveShowPage(ui, session, "guildSuppliesRankings")
     assertTrue(resolved.pageId ~= "guildSuppliesRankings",
         "447-r7: demoted direct nav falls back got=" .. tostring(resolved.pageId))
+end
+
+do
+    -- #450 Rankings UI cleanup: active campaign only, blank without campaign,
+    -- full-width chart, amount BOTTOMRIGHT placement, coin icons, bounded resize.
+    local rankSrc = io.open(
+        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua", "r")
+    assertTrue(rankSrc ~= nil, "450: Rankings page readable")
+    local rankBody = rankSrc:read("*a")
+    rankSrc:close()
+    assertTrue(not rankBody:find("selectedCampaignId", 1, true),
+        "450: no independent Rankings campaign selection")
+    assertTrue(rankBody:find("ActiveCampaignId", 1, true),
+        "450: ActiveCampaignId helper present")
+    assertTrue(rankBody:find("currentCampaignId", 1, true),
+        "450: follows guild record currentCampaignId")
+    assertTrue(not rankBody:find('type = "help"', 1, true),
+        "450: explanatory help removed")
+    assertTrue(not rankBody:find('type = "dropdown"', 1, true),
+        "450: campaign dropdown removed")
+    assertTrue(not rankBody:find("GUILD_SUPPLIES_CAMPAIGN_DETAIL", 1, true),
+        "450: Selection row removed")
+    assertTrue(not rankBody:find("GUILD_SUPPLIES_RANKINGS_CHART", 1, true),
+        "450: Contributors label removed")
+    assertTrue(not rankBody:find("renameTarget", 1, true),
+        "450: does not use Configuration rename-target")
+    assertTrue(rankBody:find("RankingsForActiveCampaign", 1, true),
+        "450: projects active campaign only")
+
+    local ctrlSrc = io.open(
+        "SpectrumFederation/modules/UI/Settings/Control/Controls.lua", "r")
+    assertTrue(ctrlSrc ~= nil, "450: Controls readable")
+    local ctrlBody = ctrlSrc:read("*a")
+    ctrlSrc:close()
+    assertTrue(ctrlBody:find('SetPoint("BOTTOMRIGHT", entry.bar, "TOPLEFT"', 1, true)
+            or ctrlBody:find('SetPoint("BOTTOMRIGHT", bar, "TOPRIGHT"', 1, true),
+        "450: amount BOTTOMRIGHT placement present")
+    assertTrue(ctrlBody:find("C_CurrencyInfo", 1, true)
+            and ctrlBody:find("GetCoinTextureString", 1, true),
+        "450: Retail coin texture API used in chart formatter")
+    assertTrue(ctrlBody:find("hasLabel", 1, true),
+        "450: InitRow label column is optional for full-width chart")
+
+    -- Behavioral: active campaign + rollover; blank without campaign.
+    valuationTsmValue = 250
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9452)
+    creditValuationDeposit(record, {
+        itemId = 9452, quantity = 2, donor = "Bob-Garona",
+    })
+    record = GS:GetCurrentRecord()
+    local firstCampaign = record.currentCampaignId
+    assertTrue(type(firstCampaign) == "string" and firstCampaign ~= "",
+        "450: active campaign exists")
+    local rankingActive = GS:ProjectCampaignRankings(firstCampaign)
+    assertEq(rankingsByName(rankingActive)["Bob-Garona"], 500,
+        "450: active campaign rankings intact")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= firstCampaign, "450: campaign rolled over")
+    local rankingAfter = GS:ProjectCampaignRankings(record.currentCampaignId)
+    assertEq(rankingsByName(rankingAfter)["Bob-Garona"], nil,
+        "450: rankings follow new empty active campaign after rollover")
+    local rankingArchived = GS:ProjectCampaignRankings(firstCampaign)
+    assertEq(rankingsByName(rankingArchived)["Bob-Garona"], 500,
+        "450: archived campaign still projectable (UI no longer selects it)")
+
+    -- Chart control: blank no_campaign, amount placement, coin icons, layout-only resize.
+    local function makeUiRegion(kind, name, parent)
+        local region = {
+            kind = kind, name = name, parent = parent, shown = true,
+            height = 0, width = 0, scripts = {}, hooks = {}, children = {},
+            text = "", enabled = true, points = {},
+        }
+        function region:SetPoint(a, rel, b, x, y)
+            self.points[#self.points + 1] = { a, rel, b, x, y }
+            self._lastPoint = { a, rel, b, x, y }
+        end
+        function region:ClearAllPoints()
+            self.points = {}
+            self._lastPoint = nil
+        end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = w end
+        function region:GetWidth() return self.width end
+        function region:SetHeight(h) self.height = h end
+        function region:SetSize(w, h) self.width = w; self.height = h end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:GetScript(event) return self.scripts[event] end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:SetAllPoints() end
+        function region:SetParent(p) self.parent = p end
+        function region:CreateFontString()
+            local fs = makeUiRegion("FontString", nil, self)
+            self.children[#self.children + 1] = fs
+            return fs
+        end
+        function region:CreateTexture()
+            local t = makeUiRegion("Texture", nil, self)
+            self.children[#self.children + 1] = t
+            return t
+        end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH(j) self.justifyH = j end
+        function region:SetWordWrap() end
+        function region:SetMaxLines() end
+        function region:SetFontObject() end
+        function region:SetScrollChild(c) self.scrollChild = c end
+        function region:GetVerticalScroll() return self._vscroll or 0 end
+        function region:SetVerticalScroll(v) self._vscroll = tonumber(v) or 0 end
+        function region:SetMinMaxValues() end
+        function region:SetValue() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:SetTexture() end
+        function region:SetVertexColor() end
+        function region:SetColorTexture() end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:SetAlpha() end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:GetParent() return self.parent end
+        function region:GetStringWidth()
+            return math.max(1, #(self.text or "") * 7)
+        end
+        return region
+    end
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        local region = makeUiRegion(frameType or "Frame", name, parent)
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeUiRegion("Slider", nil, region)
+        end
+        return region
+    end
+    if not SF.SettingsUI.Controls then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    end
+    local Controls = SF.SettingsUI.Controls
+    local priorApply = Controls._ApplyRowState
+    Controls._ApplyRowState = function() return true, true end
+
+    local priorCurrency = C_CurrencyInfo
+    C_CurrencyInfo = {
+        GetCoinTextureString = function(amount, fontHeight)
+            return string.format("|Tcoin:%d|t%d", tonumber(fontHeight) or 12, tonumber(amount) or 0)
+        end,
+    }
+
+    local blankRefresh = nil
+    local blankPayload = {
+        rows = {},
+        maxPositive = 0,
+        hasHistory = false,
+        emptyReason = "no_campaign",
+    }
+    local blankSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingBlank450")
+            row:SetWidth(500)
+            row:SetHeight(height or 320)
+            buildFn(row)
+            return row
+        end,
+        __sfPageBuilder = {
+            RegisterRefresh = function(_, fn)
+                blankRefresh = fn
+            end,
+        },
+    }
+    local blankRow = Controls:AddContributionRankingChart(blankSection, {
+        height = 320,
+        fillHeight = true,
+        getRankings = function()
+            return blankPayload
+        end,
+    })
+    local blankControl = blankRow and blankRow.Control
+    assertTrue(blankControl ~= nil, "450: blank chart control")
+    assertEq(blankControl.__sfRankingHasLabel, false, "450: blank chart unlabeled")
+    local emptyFS = blankControl.__sfRankingEmptyText
+    assertTrue(emptyFS ~= nil, "450: empty text widget")
+    assertEq(emptyFS:IsShown(), false, "450: no_campaign leaves content blank")
+    assertEq(emptyFS:GetText(), "", "450: no_campaign empty text cleared")
+    assertEq(#blankControl.__sfRankingVisibleNames(), 0, "450: no_campaign shows no rows")
+    assertEq(blankControl.__sfRankingScroll:IsShown(), false, "450: no_campaign hides scroll")
+
+    -- Amount placement + coin icons for long / short / zero / negative bars.
+    local placePayload = {
+        rows = {
+            { name = "Long-Garona", totalCopper = 100000 },
+            { name = "Short-Garona", totalCopper = 1 },
+            { name = "Zero-Garona", totalCopper = 0 },
+            { name = "Neg-Garona", totalCopper = -2500 },
+        },
+        maxPositive = 100000,
+        hasHistory = true,
+    }
+    local placeRefresh = nil
+    local placeSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingPlace450")
+            row:SetWidth(520)
+            row:SetHeight(280)
+            buildFn(row)
+            return row
+        end,
+        __sfPageBuilder = {
+            RegisterRefresh = function(_, fn)
+                placeRefresh = fn
+            end,
+        },
+    }
+    local placeRow = Controls:AddContributionRankingChart(placeSection, {
+        height = 280,
+        rowHeight = 28,
+        fillHeight = true,
+        getRankings = function()
+            return placePayload
+        end,
+    })
+    local placeControl = placeRow and placeRow.Control
+    assertTrue(placeControl ~= nil and type(placeRefresh) == "function",
+        "450: placement chart created")
+    placeControl:SetWidth(520)
+    placeControl:SetHeight(280)
+    for _, hook in ipairs(placeControl.hooks.OnSizeChanged or {}) do
+        hook(placeControl, 520, 280)
+    end
+    local fmt = placeControl.__sfRankingFormatCopper
+    assertTrue(type(fmt) == "function", "450: format hook exposed")
+    local coinPos = fmt(12345)
+    assertTrue(type(coinPos) == "string" and coinPos:find("|Tcoin:", 1, true),
+        "450: positive amounts use coin texture string")
+    local coinNeg = fmt(-99)
+    assertTrue(coinNeg:sub(1, 1) == "-", "450: negative sign preserved")
+    assertTrue(coinNeg:find("|Tcoin:", 1, true), "450: negative uses coin icons")
+
+    -- Payload order is Long, Short, Zero, Neg (chart does not re-sort).
+    local amounts = placeControl.__sfRankingVisibleAmounts()
+    assertTrue(#amounts >= 4, "450: visible amount slots got=" .. tostring(#amounts))
+    assertTrue(amounts[1].text:find("|Tcoin:", 1, true) ~= nil,
+        "450: long bar amount uses coin icons")
+    assertTrue(amounts[1].text:find("100000", 1, true) ~= nil,
+        "450: long bar preserves copper magnitude")
+    assertTrue((tonumber(amounts[1].anchorX) or 0) >= (tonumber(amounts[1].barWidth) or 0) - 0.01,
+        "450: long amount anchored at/after bar end")
+    assertTrue((tonumber(amounts[2].anchorX) or 0) >= (tonumber(amounts[2].barWidth) or 0),
+        "450: short amount clamped into plot (>= bar width)")
+    assertTrue((tonumber(amounts[3].anchorX) or 0) >= (tonumber(amounts[3].barWidth) or 0),
+        "450: zero amount clamped into plot")
+    assertTrue(amounts[4].text:sub(1, 1) == "-", "450: negative amount keeps sign")
+    assertTrue(amounts[4].text:find("|Tcoin:", 1, true) ~= nil,
+        "450: negative amount uses coin icons")
+    assertTrue((tonumber(amounts[4].anchorX) or 0) >= (tonumber(amounts[4].barWidth) or 0),
+        "450: negative amount clamped into plot")
+
+    -- Bounded open/close + resize: layout-only, no aggregation restart.
+    local projectCalls = 0
+    local resizePayload = {
+        rows = {
+            { name = "A-Garona", totalCopper = 900 },
+            { name = "B-Garona", totalCopper = 300 },
+        },
+        maxPositive = 900,
+        hasHistory = true,
+    }
+    local resizeSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingResize450")
+            row:SetWidth(400)
+            row:SetHeight(height or 300)
+            buildFn(row)
+            return row
+        end,
+    }
+    local resizeRow = Controls:AddContributionRankingChart(resizeSection, {
+        height = 300,
+        fillHeight = true,
+        getRankings = function()
+            projectCalls = projectCalls + 1
+            return resizePayload
+        end,
+    })
+    local resizeControl = resizeRow and resizeRow.Control
+    assertTrue(resizeControl ~= nil, "450: resize chart")
+    resizeControl:SetWidth(400)
+    resizeControl:SetHeight(300)
+    local dataBefore = projectCalls
+    local layoutBefore = resizeControl.__sfRankingLayoutPass()
+    for w = 400, 560, 40 do
+        resizeControl:SetWidth(w)
+        for _, hook in ipairs(resizeControl.hooks.OnSizeChanged or {}) do
+            hook(resizeControl, w, 300)
+        end
+    end
+    assertEq(projectCalls, dataBefore, "450: resize does not rebuild rankings")
+    assertTrue(resizeControl.__sfRankingLayoutPass() > layoutBefore,
+        "450: resize performs layout passes")
+    for _ = 1, 6 do
+        resizeControl:Hide()
+        resizeControl:Show()
+        for _, hook in ipairs(resizeControl.hooks.OnSizeChanged or {}) do
+            hook(resizeControl, resizeControl:GetWidth(), resizeControl:GetHeight())
+        end
+    end
+    assertEq(projectCalls, dataBefore, "450: open/close resize stays layout-only")
+
+    C_CurrencyInfo = priorCurrency
+    Controls._ApplyRowState = priorApply
+    CreateFrame = priorCreateFrame
 end
 
 ---------------------------------------------------------------------------

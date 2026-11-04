@@ -2668,11 +2668,12 @@ function Controls:AddOverallProgressBar(section, opts)
 	end)
 end
 
---- Horizontally proportional contribution ranking chart (#447).
+--- Horizontally proportional contribution ranking chart (#447/#450).
 -- Names on the left, bars fill plotting width relative to maxPositive, amount
--- labels sit above the bar with bottom-left at the bar's top-right. A right
--- gutter keeps the max label inside the page. Nonpositive totals get a
--- zero-width bar. Vertically scrolls; does not shrink rows to fit.
+-- labels sit above the bar with BOTTOMRIGHT at the bar's TOPRIGHT. Short, zero,
+-- and negative bars clamp amount text into the plot area so names stay clear.
+-- Omitting opts.label skips InitRow's reserved label column and uses full row
+-- width. Vertically scrolls; does not shrink rows to fit.
 -- @param section table Section to add into
 -- @param opts table getRankings() → { rows, maxPositive, emptyReason, emptyText }
 -- @return Frame The created row
@@ -2686,10 +2687,14 @@ function Controls:AddContributionRankingChart(section, opts)
 
 	local rowHeight = opts.rowHeight or 28
 	local nameWidth = opts.nameWidth or 140
-	local labelGutter = opts.labelGutter or 110
+	-- Amounts sit above bars (#450); keep a small end pad for scrollbar/clipping
+	-- instead of the prior large right label gutter.
+	local endPad = opts.endPad or opts.labelGutter or 8
 	local barHeight = opts.barHeight or 12
 	local minHeight = opts.minHeight or opts.height or 280
 	local nameGap = opts.nameGap or 8
+	local coinIconHeight = opts.coinIconHeight or 12
+	local hasLabel = opts.label and opts.label ~= ""
 
 	local function Loc(key, default)
 		if SF.LocaleText then
@@ -2698,13 +2703,18 @@ function Controls:AddContributionRankingChart(section, opts)
 		return default or key
 	end
 
+	--- Prefer Retail C_CurrencyInfo coin icons; legacy GetCoinTextureString was
+	-- removed in 12.1.5. Scope this formatter to Rankings only (#450).
 	local function FormatSignedCopper(copper)
 		copper = math.floor(tonumber(copper) or 0)
 		local negative = copper < 0
 		local absCopper = negative and -copper or copper
 		local text
-		if SF.FormatMoney then
-			text = SF.FormatMoney(absCopper)
+		local currency = C_CurrencyInfo
+		if currency and type(currency.GetCoinTextureString) == "function" then
+			text = currency.GetCoinTextureString(absCopper, coinIconHeight)
+		elseif GetCoinTextureString then
+			text = GetCoinTextureString(absCopper, coinIconHeight)
 		else
 			local gold = math.floor(absCopper / 10000)
 			local remain = absCopper - (gold * 10000)
@@ -2719,7 +2729,17 @@ function Controls:AddContributionRankingChart(section, opts)
 	end
 
 	return section:AddRow(minHeight, function(row)
-		local _, control = self:InitRow(row, opts)
+		local control
+		if hasLabel then
+			local _
+			_, control = self:InitRow(row, opts)
+		else
+			-- Full-width chart: reclaim InitRow's reserved label column (#450).
+			control = CreateFrame("Frame", nil, row)
+			control:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+			control:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+			row.Control = control
+		end
 
 		local emptyText = control:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
 		emptyText:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
@@ -2780,9 +2800,10 @@ function Controls:AddContributionRankingChart(section, opts)
 			if barBg.SetTexture then barBg:SetTexture("Interface\\Buttons\\WHITE8x8") end
 			if barBg.SetVertexColor then barBg:SetVertexColor(0.15, 0.15, 0.15, 0.8) end
 			local amountFS = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-			-- Bottom-left of the amount anchored to the bar's top-right (#447).
-			amountFS:SetPoint("BOTTOMLEFT", bar, "TOPRIGHT", 2, 0)
-			amountFS:SetJustifyH("LEFT")
+			-- BOTTOMRIGHT of the amount at the bar's TOPRIGHT (#450). Short bars
+			-- re-anchor in BindRow so text stays in the plot area.
+			amountFS:SetPoint("BOTTOMRIGHT", bar, "TOPRIGHT", 0, 0)
+			amountFS:SetJustifyH("RIGHT")
 			entry = {
 				frame = frame,
 				name = nameFS,
@@ -2820,7 +2841,7 @@ function Controls:AddContributionRankingChart(section, opts)
 			if width < 1 and row.GetWidth then
 				width = row:GetWidth() or 0
 			end
-			local plotWidth = width - nameWidth - nameGap - labelGutter - 24
+			local plotWidth = width - nameWidth - nameGap - endPad - 24
 			if plotWidth < 40 then
 				plotWidth = 40
 			end
@@ -2843,17 +2864,27 @@ function Controls:AddContributionRankingChart(section, opts)
 			end
 			local barW = math.floor(plotWidth * frac + 0.5)
 			if barW < 0 then barW = 0 end
-			entry.bar:SetWidth(math.max(barW, 0.001))
+			-- Keep a measurable bar edge for amount anchoring on nonpositive rows.
+			local drawnBarW = math.max(barW, 0.001)
+			entry.bar:SetWidth(drawnBarW)
 			if entry.bar.SetValue then
 				entry.bar:SetValue(frac > 0 and 1 or 0)
 			end
-			if frac > 0 then
-				entry.bar:Show()
-			else
-				-- Nonpositive totals: zero-width bar, amount still shown.
-				entry.bar:SetWidth(0.001)
-				entry.bar:Show()
+			entry.bar:Show()
+
+			-- Place amount above the bar end; clamp short/zero/negative bars so
+			-- the label stays inside the plot and clear of contributor names.
+			local textW = 0
+			if entry.amount.GetStringWidth then
+				textW = tonumber(entry.amount:GetStringWidth()) or 0
 			end
+			local anchorX = math.max(drawnBarW, textW)
+			entry.amount:ClearAllPoints()
+			entry.amount:SetPoint("BOTTOMRIGHT", entry.bar, "TOPLEFT", anchorX, 0)
+			entry.amount:SetJustifyH("RIGHT")
+			entry._sfAmountAnchorX = anchorX
+			entry._sfBarWidth = drawnBarW
+			entry._sfAmountText = entry.amount:GetText()
 			entry.frame:Show()
 		end
 
@@ -2933,15 +2964,20 @@ function Controls:AddContributionRankingChart(section, opts)
 				content:SetHeight(1)
 				return
 			end
-			if emptyReason == "no_campaign" or (#rows == 0 and emptyReason == "no_contributions") then
+			-- No active campaign: blank content area; retain page navigation (#450).
+			if emptyReason == "no_campaign" then
+				scroll:Hide()
+				emptyText:Hide()
+				emptyText:SetText("")
+				HideUnused(1)
+				content:SetHeight(1)
+				return
+			end
+			if #rows == 0 and emptyReason == "no_contributions" then
 				scroll:Hide()
 				emptyText:Show()
-				emptyText:SetText(
-					emptyReason == "no_campaign"
-						and Loc("GUILD_SUPPLIES_RANKINGS_NO_CAMPAIGN", "No campaigns are available to rank yet.")
-						or Loc("GUILD_SUPPLIES_RANKINGS_NO_HISTORY",
-							"No credited contributions are recorded for this campaign yet.")
-				)
+				emptyText:SetText(Loc("GUILD_SUPPLIES_RANKINGS_NO_HISTORY",
+					"No credited contributions are recorded for this campaign yet."))
 				HideUnused(1)
 				content:SetHeight(1)
 				return
@@ -2992,6 +3028,9 @@ function Controls:AddContributionRankingChart(section, opts)
 		control.__sfRankingPoolCount = function() return #pool end
 		control.__sfRankingScroll = scroll
 		control.__sfRankingContent = content
+		control.__sfRankingEmptyText = emptyText
+		control.__sfRankingHasLabel = hasLabel and true or false
+		control.__sfRankingFormatCopper = FormatSignedCopper
 		control.__sfRankingVisibleNames = function()
 			local names = {}
 			for i = 1, #pool do
@@ -3001,6 +3040,20 @@ function Controls:AddContributionRankingChart(section, opts)
 				end
 			end
 			return names
+		end
+		control.__sfRankingVisibleAmounts = function()
+			local amounts = {}
+			for i = 1, #pool do
+				local entry = pool[i]
+				if entry and entry.frame and entry.frame:IsShown() then
+					amounts[#amounts + 1] = {
+						text = entry._sfAmountText or (entry.amount and entry.amount:GetText()) or "",
+						anchorX = entry._sfAmountAnchorX,
+						barWidth = entry._sfBarWidth,
+					}
+				end
+			end
+			return amounts
 		end
 
 		if control.HookScript and not control.__sfRankingSizeHook then
