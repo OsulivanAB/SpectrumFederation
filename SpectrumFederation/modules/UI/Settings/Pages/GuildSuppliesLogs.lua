@@ -434,12 +434,33 @@ local function ItemFilterOptions()
 		end
 	end
 	table.sort(items)
+	-- Distinct IDs can share a display name or unresolved placeholder; keep the
+	-- filter value as itemId and disambiguate via localized ID tooltip (#453).
+	local nameCounts = {}
+	local labels = {}
 	for i = 1, #items do
 		local itemId = items[i]
 		local described = DescribeItem(itemId)
+		local name = described.name
+		if type(name) ~= "string" or name == "" then
+			name = Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item")
+		end
+		labels[itemId] = name
+		nameCounts[name] = (nameCounts[name] or 0) + 1
+	end
+	for i = 1, #items do
+		local itemId = items[i]
+		local name = labels[itemId]
+		local label = name
+		if nameCounts[name] > 1 then
+			label = Loc("GUILD_SUPPLIES_LOGS_FILTER_ITEM_LABEL_ID", "%s (%d)")
+				:format(name, itemId)
+		end
 		opts[#opts + 1] = {
 			value = itemId,
-			label = described.name or tostring(itemId),
+			label = label,
+			tooltip = Loc("GUILD_SUPPLIES_LOGS_FILTER_ITEM_ID_TIP", "Item ID: %d")
+				:format(itemId),
 		}
 	end
 	return opts
@@ -749,6 +770,7 @@ Page.__sfTest = {
 	ClassifyHistoryRow = ClassifyHistoryRow,
 	ScrollContextKey = ScrollContextKey,
 	EmptyLogsText = EmptyLogsText,
+	ItemFilterOptions = ItemFilterOptions,
 	--- Project rows and return (rows, guildInfoGetCurrentRecordCalls) for #453.
 	ProjectWithGuildLookupStats = function()
 		cachedProjectedRows = nil

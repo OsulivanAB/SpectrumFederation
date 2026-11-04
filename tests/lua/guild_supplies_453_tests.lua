@@ -356,6 +356,9 @@ SF.L = {
     GUILD_SUPPLIES_LOGS_ADJUST_OFFICER = "Adjusted by %s.",
     GUILD_SUPPLIES_LOGS_QTY_SIGNED = "%+d",
     GUILD_SUPPLIES_LOGS_QTY_PLAIN = "%d",
+    GUILD_SUPPLIES_LOGS_FILTER_ITEM_ID_TIP = "Item ID: %d",
+    GUILD_SUPPLIES_LOGS_FILTER_ITEM_LABEL_ID = "%s (%d)",
+    GUILD_SUPPLIES_ITEM_UNKNOWN = "Unknown item",
 }
 function SF.LocaleText(key, default)
     local v = SF.L[key]
@@ -1499,6 +1502,258 @@ do
     assertTrue(status == "rejected" or reason ~= nil,
         "453: member mutation returns rejection status got="
             .. tostring(status) .. "/" .. tostring(reason))
+end
+
+do
+    -- Linked main/alt of different classes: display name class, not alt GUID class.
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local seed = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 30 }, {
+        itemId = 30, goal = 5, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(seed), "accepted", "453: linked-identity seed item")
+    local rec = GS:GetCurrentRecord()
+    local gen = rec.accounting._consumables.generation
+    rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+        id = "link-donation-alt",
+        type = "donation",
+        itemId = 30,
+        quantity = 2,
+        actor = "BobAlt-Garona",
+        actorGuid = "Player-1-BobAlt",
+        generation = gen,
+        timestamp = world.time + 1,
+        source = "guildbank",
+        gsProductionCredit = true,
+    }
+    rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+        id = "link-adjust-alt",
+        type = "adjustment",
+        itemId = 30,
+        quantity = 3,
+        actor = "Alice-Garona",
+        attributed = "CarolAlt-Garona",
+        attributedGuid = "Player-1-CarolAlt",
+        generation = gen,
+        timestamp = world.time + 2,
+    }
+
+    local giCalls = 0
+    local byName = {
+        ["bobalt-garona"] = "Player-1-BobAlt",
+        ["bobmain-garona"] = "Player-1-BobMain",
+        ["carolalt-garona"] = "Player-1-CarolAlt",
+        ["carolmain-garona"] = "Player-1-CarolMain",
+    }
+    local identities = {
+        ["Player-1-BobAlt"] = {
+            status = "assigned",
+            displayName = "BobMain-Garona",
+            mainGuid = "Player-1-BobMain",
+        },
+        ["Player-1-BobMain"] = {
+            status = "assigned",
+            displayName = "BobMain-Garona",
+            mainGuid = "Player-1-BobMain",
+        },
+        ["Player-1-CarolAlt"] = {
+            status = "assigned",
+            displayName = "CarolMain-Garona",
+            mainGuid = "Player-1-CarolMain",
+        },
+        ["Player-1-CarolMain"] = {
+            status = "assigned",
+            displayName = "CarolMain-Garona",
+            mainGuid = "Player-1-CarolMain",
+        },
+    }
+    SF.GuildInfo = {
+        GetRelationshipReadiness = function()
+            return "ready"
+        end,
+        ResolveCharacterGuidByName = function(_, name)
+            if type(name) ~= "string" then
+                return nil, "not_a_member"
+            end
+            return byName[string.lower(name)], nil
+        end,
+        ResolveContributorIdentity = function(_, guid)
+            return identities[guid]
+        end,
+        GetCurrentRecord = function()
+            giCalls = giCalls + 1
+            return {
+                characters = {
+                    ["Player-1-BobAlt"] = { nameRealm = "BobAlt-Garona", classFile = "MAGE" },
+                    ["Player-1-BobMain"] = { nameRealm = "BobMain-Garona", classFile = "PRIEST" },
+                    ["Player-1-CarolAlt"] = { nameRealm = "CarolAlt-Garona", classFile = "WARRIOR" },
+                    ["Player-1-CarolMain"] = { nameRealm = "CarolMain-Garona", classFile = "DRUID" },
+                },
+            }
+        end,
+        ColorizeName = function(name, classFile)
+            if type(classFile) == "string" and classFile ~= "" then
+                return "[" .. classFile .. "]" .. name
+            end
+            return name
+        end,
+    }
+
+    local hooks = logsPage.__sfTest
+    local rows, lookupCalls = hooks.ProjectWithGuildLookupStats()
+    assertEq(lookupCalls, 1, "453: linked-identity projection one GI lookup")
+    assertEq(giCalls, 1, "453: linked-identity does not re-validate per row")
+
+    local donation, adjustment
+    for i = 1, #rows do
+        if rows[i].id == "link-donation-alt" then donation = rows[i] end
+        if rows[i].id == "link-adjust-alt" then adjustment = rows[i] end
+    end
+    assertTrue(donation ~= nil, "453: linked donation projected")
+    assertTrue(adjustment ~= nil, "453: linked adjustment projected")
+    assertEq(donation.contributorKey, "BobMain-Garona",
+        "453: donation displays resolved main name")
+    assertTrue((donation.contributor or ""):find("%[PRIEST%]", 1)
+        and (donation.contributor or ""):find("BobMain-Garona", 1, true),
+        "453: donation uses main class with main name got=" .. tostring(donation.contributor))
+    assertTrue(not (donation.contributor or ""):find("%[MAGE%]", 1),
+        "453: donation does not use alt class for main name")
+    assertEq(adjustment.contributorKey, "CarolMain-Garona",
+        "453: adjustment credits resolved main name")
+    assertTrue((adjustment.contributor or ""):find("%[DRUID%]", 1)
+        and (adjustment.contributor or ""):find("CarolMain-Garona", 1, true),
+        "453: attributed adjustment uses main class got=" .. tostring(adjustment.contributor))
+    assertTrue(not (adjustment.contributor or ""):find("%[WARRIOR%]", 1),
+        "453: attributed adjustment does not use alt class for main name")
+    assertTrue((adjustment.tooltip or ""):find("Alice-Garona", 1, true),
+        "453: officer attribution retained on adjustment tooltip")
+    SF.GuildInfo = nil
+end
+
+do
+    -- Item filter: distinct IDs sharing a display name (and unresolved placeholders).
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local seedA = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
+        itemId = 501, goal = 1, removed = false,
+    }))
+    local seedB = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 502 }, {
+        itemId = 502, goal = 1, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(seedA), "accepted", "453: filter seed A")
+    assertEq(GS:ApplyStagedConfigOperation(seedB), "accepted", "453: filter seed B")
+    local rec = GS:GetCurrentRecord()
+    local gen = rec.accounting._consumables.generation
+    rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+        id = "filter-a",
+        type = "donation",
+        itemId = 501,
+        quantity = 1,
+        actor = "Bob-Garona",
+        generation = gen,
+        timestamp = world.time + 1,
+        source = "guildbank",
+        gsProductionCredit = true,
+    }
+    rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+        id = "filter-b",
+        type = "donation",
+        itemId = 502,
+        quantity = 1,
+        actor = "Carol-Garona",
+        generation = gen,
+        timestamp = world.time + 2,
+        source = "guildbank",
+        gsProductionCredit = true,
+    }
+    rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+        id = "filter-u1",
+        type = "donation",
+        itemId = 901,
+        quantity = 1,
+        actor = "Bob-Garona",
+        generation = gen,
+        timestamp = world.time + 3,
+        source = "guildbank",
+        gsProductionCredit = true,
+    }
+    rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+        id = "filter-u2",
+        type = "donation",
+        itemId = 902,
+        quantity = 1,
+        actor = "Carol-Garona",
+        generation = gen,
+        timestamp = world.time + 4,
+        source = "guildbank",
+        gsProductionCredit = true,
+    }
+    -- Removed from Requested Items; history must stay filterable.
+    local removeA = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 501 }, {
+        removed = true,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(removeA), "accepted", "453: remove requested 501")
+
+    SF.ItemDisplay.Describe = function(itemId)
+        itemId = tonumber(itemId)
+        if itemId == 501 or itemId == 502 then
+            return { itemId = itemId, status = "ready", name = "Shared Flask" }
+        end
+        return {
+            itemId = itemId,
+            status = "unknown",
+            name = "Unknown item",
+        }
+    end
+
+    local hooks = logsPage.__sfTest
+    hooks.ClearFilters()
+    local options = hooks.ItemFilterOptions()
+    local byValue = {}
+    for i = 1, #options do
+        local opt = options[i]
+        if type(opt) == "table" and type(opt.value) == "number" then
+            byValue[opt.value] = opt
+        end
+    end
+    assertTrue(byValue[501] ~= nil and byValue[502] ~= nil,
+        "453: both same-name item IDs appear in filter options")
+    assertTrue(byValue[501].label ~= byValue[502].label,
+        "453: same-name item choices are distinguishable by label")
+    assertTrue(byValue[501].tooltip ~= byValue[502].tooltip,
+        "453: same-name item choices are distinguishable by tooltip")
+    assertTrue((byValue[501].tooltip or ""):find("501", 1, true),
+        "453: tooltip includes item ID 501")
+    assertTrue((byValue[502].tooltip or ""):find("502", 1, true),
+        "453: tooltip includes item ID 502")
+    assertTrue(byValue[901] ~= nil and byValue[902] ~= nil,
+        "453: unresolved-name item IDs remain filterable")
+    assertTrue(byValue[901].label ~= byValue[902].label,
+        "453: unresolved placeholders are distinguishable")
+    assertTrue((byValue[901].tooltip or ""):find("901", 1, true)
+        and (byValue[902].tooltip or ""):find("902", 1, true),
+        "453: unresolved tooltips include distinct item IDs")
+
+    hooks.SetFilters(hooks.FilterAll, 501)
+    local onlyA = hooks.FilteredRows()
+    assertEq(#onlyA, 1, "453: selecting item 501 returns only its rows")
+    assertEq(onlyA[1].id, "filter-a", "453: filter 501 row id")
+    hooks.SetFilters(hooks.FilterAll, 502)
+    local onlyB = hooks.FilteredRows()
+    assertEq(#onlyB, 1, "453: selecting item 502 returns only its rows")
+    assertEq(onlyB[1].id, "filter-b", "453: filter 502 row id")
+    hooks.SetFilters(hooks.FilterAll, 901)
+    local onlyU = hooks.FilteredRows()
+    assertEq(#onlyU, 1, "453: selecting unresolved 901 returns only its rows")
+    assertEq(onlyU[1].id, "filter-u1", "453: unresolved filter row id")
+    hooks.ClearFilters()
+    SF.ItemDisplay.Describe = nil
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
