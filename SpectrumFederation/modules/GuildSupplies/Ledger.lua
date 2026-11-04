@@ -1853,6 +1853,7 @@ end
 
 --- Enrich an op-first equivalent adjustment with a later ledger attributedGuid.
 -- Does not rewrite attributed name, quantity, or other immutable fields.
+-- Caller refreshes the affected export after all allowed enrichment (#447).
 local function ReconcileAdjustmentAttributedGuid(record, existing, incoming)
     if type(existing) ~= "table" or type(incoming) ~= "table" then
         return false
@@ -1874,15 +1875,13 @@ local function ReconcileAdjustmentAttributedGuid(record, existing, incoming)
     end
     existing.attributedGuid = canonGuid
     BumpAccountingMutation(record)
-    if GS._NotifyLocalDurableChange then
-        GS._NotifyLocalDurableChange("ledger")
-    end
     return true
 end
 
 --- Attach authenticated active-exporter cutover provenance to an already-retained
 -- immutable-equivalent adjustment without reapplying quantity (#389 A2).
 -- Never trusts self-declared event.gsProductionCredit / event.gsSourceCutoverMarker.
+-- Caller refreshes the affected export from the final accepted state (#447).
 local function ReconcileAdjustmentCutoverProvenance(record, existing, admissionCtx)
     if type(existing) ~= "table" or type(admissionCtx) ~= "table" then
         return false
@@ -1925,12 +1924,27 @@ local function ReconcileAdjustmentCutoverProvenance(record, existing, admissionC
     end
     if changed then
         BumpAccountingMutation(record)
-        -- Refresh Gossip export so newly reconciled provenance is advertised.
-        if GS._NotifyLocalDurableChange then
-            GS._NotifyLocalDurableChange("ledger")
-        end
     end
     return changed
+end
+
+--- True when both sides already carry conflicting non-nil unitCopper snapshots.
+-- Non-mutating probe so rejectable conflicts are caught before accepted-state
+-- enrichment (#447).
+local function AdjustmentUnitCopperConflicts(existing, incoming)
+    if type(existing) ~= "table" or type(incoming) ~= "table" then
+        return false
+    end
+    if existing.unitCopper == nil or incoming.unitCopper == nil then
+        return false
+    end
+    if type(GS.NormalizeAdjustmentUnitCopper) ~= "function" then
+        return false
+    end
+    local qty = tonumber(existing.quantity)
+    local existingUnit = GS.NormalizeAdjustmentUnitCopper(existing.unitCopper, qty)
+    local incomingUnit = GS.NormalizeAdjustmentUnitCopper(incoming.unitCopper, qty)
+    return existingUnit ~= nil and incomingUnit ~= nil and existingUnit ~= incomingUnit
 end
 
 local function FindLedgerEventByTxnId(record, txnId)
@@ -3677,31 +3691,43 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                         if idHit then
                             if isAdjustment then
                                 if AdjustmentBodiesEquivalent(e, event) then
-                                    -- Op-first delivery may have stored the row without
-                                    -- transport cutover provenance; reconcile from this
-                                    -- authenticated marked ledger body before duplicate.
-                                    ReconcileAdjustmentCutoverProvenance(
-                                        record, e, admissionCtx)
-                                    -- Same path: retain a validated attributedGuid from
-                                    -- the later ledger body without minting a second row.
-                                    ReconcileAdjustmentAttributedGuid(record, e, event)
-                                    -- Create-time unitCopper: nil→priced fill, or quarantine
-                                    -- conflicting non-nil snapshots (#447).
+                                    -- Rejectable duplicate fields first: a conflicting
+                                    -- price may quarantine, but must not mutate accepted
+                                    -- price/attribution/cutover/credit or the export (#447).
+                                    if AdjustmentUnitCopperConflicts(e, event) then
+                                        QuarantineConflictBody(
+                                            cfg, adjustmentEventId or txnId, event)
+                                        return "rejected", "id_conflict"
+                                    end
+                                    -- Allowed enrichment against the retained row, then
+                                    -- one export refresh from the final accepted state.
+                                    local exportRelevant = false
+                                    if ReconcileAdjustmentCutoverProvenance(
+                                        record, e, admissionCtx) then
+                                        exportRelevant = true
+                                    end
+                                    if ReconcileAdjustmentAttributedGuid(record, e, event) then
+                                        exportRelevant = true
+                                    end
                                     if GS.ReconcileAdjustmentUnitCopper then
                                         local enriched, enrichErr =
                                             GS.ReconcileAdjustmentUnitCopper(e, event)
                                         if enrichErr == "price_conflict" then
+                                            -- Defense in depth; probe above should catch.
                                             QuarantineConflictBody(
                                                 cfg, adjustmentEventId or txnId, event)
                                             return "rejected", "id_conflict"
                                         end
                                         if enriched then
                                             BumpAccountingMutation(record)
-                                            if GS.RefreshLedgerEventExport then
-                                                GS.RefreshLedgerEventExport(record, e)
-                                            elseif GS._NotifyLocalDurableChange then
-                                                GS._NotifyLocalDurableChange("ledger")
-                                            end
+                                            exportRelevant = true
+                                        end
+                                    end
+                                    if exportRelevant then
+                                        if GS.RefreshLedgerEventExport then
+                                            GS.RefreshLedgerEventExport(record, e)
+                                        elseif GS._NotifyLocalDurableChange then
+                                            GS._NotifyLocalDurableChange("ledger")
                                         end
                                     end
                                     return "duplicate", "duplicate"

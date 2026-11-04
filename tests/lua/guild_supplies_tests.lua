@@ -43896,6 +43896,297 @@ do
 end
 
 do
+    -- 447-r11) Adjustment duplicate reconciliation: rejectable fields before mutate;
+    -- export refresh from final accepted state (price conflict + provenance-only).
+    valuationTsmValue = 1800
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local record = activateValuationGuild(9459)
+    creditValuationDeposit(record, {
+        itemId = 9459, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9459, 1, "Carol-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "447-r11: priced adj")
+    record = GS:GetCurrentRecord()
+    local archivedCampaignId = record.currentCampaignId
+    local archivedGen = tonumber(record.accounting._consumables.generation)
+    local liveMarker = record.liveCutover and record.liveCutover.cutoverMarker
+    assertTrue(type(liveMarker) == "string" and liveMarker ~= "", "447-r11: live marker")
+    local stored = rankingsFindAdj(record, 9459, 1)
+    assertTrue(stored ~= nil, "447-r11: stored adj")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11: create-time price")
+    -- Strip provenance so the archived row is priced but uncredited; keep price.
+    stored.gsSourceCutoverMarker = nil
+    stored.gsProductionCredit = false
+    assertEq(GS:EnsureGossipProvider(), true, "447-r11: provider")
+    drainExportMaint(32)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= archivedCampaignId, "447-r11: rolled over")
+    local arch = nil
+    for i = 1, #(record.accounting._consumableEventArchive or {}) do
+        local e = record.accounting._consumableEventArchive[i]
+        if e and (e.id == stored.id or e.opId == stored.id) then
+            arch = e
+            break
+        end
+    end
+    assertTrue(arch == stored, "447-r11: shelved same row")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11: price retained after shelve")
+    assertEq(stored.gsProductionCredit, false, "447-r11: still uncredited")
+    drainExportMaint(64)
+    local exportId = "gs:le:" .. tostring(stored.id)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local beforeRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(beforeRec) == "table", "447-r11: warm export present")
+    local beforeFp = beforeRec.versionFp
+    assertTrue(type(beforeFp) == "string" and beforeFp ~= "", "447-r11: warm fingerprint")
+    assertEq(beforeRec.body.cutoverMarker, nil, "447-r11: export unmarked while uncredited")
+    local rankingBefore = rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))
+    assertEq(rankingBefore["Carol-Garona"], nil,
+        "447-r11: uncredited adj excluded from rankings")
+
+    local function adjBody(opts)
+        opts = opts or {}
+        return {
+            type = "adjustment",
+            id = stored.id,
+            txnId = stored.txnId or stored.id,
+            opId = stored.opId or stored.id,
+            generation = archivedGen,
+            timestamp = stored.timestamp or world.time or 1,
+            actor = stored.actor or "Alice-Garona",
+            writer = stored.writer or "Player-1-Alice",
+            itemId = 9459,
+            quantity = 1,
+            attributed = "Carol-Garona",
+            attributedGuid = opts.attributedGuid or "Player-1-Carol",
+            unitCopper = opts.unitCopper,
+            campaignId = archivedCampaignId,
+            datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    local function authCtx(extra)
+        local ctx = {
+            sender = "Alice-Garona",
+            member = {
+                guid = "Player-1-Alice", name = "Alice-Garona",
+                guildKey = "club:42", rankOrder = 1,
+            },
+            offlineRecord = record,
+            localWrite = false,
+            sourceCutoverMarker = liveMarker,
+        }
+        if type(extra) == "table" then
+            for k, v in pairs(extra) do
+                ctx[k] = v
+            end
+        end
+        return ctx
+    end
+
+    -- Regression A: conflicting price + enrichment payload must not mutate accepted state.
+    local priorAttrGuid = stored.attributedGuid
+    local stConflict, rConflict = GS:AdmitLedgerEvent(adjBody({ unitCopper = 9999 }), authCtx())
+    assertEq(stConflict, "rejected", "447-r11-A: conflict rejected")
+    assertEq(rConflict, "id_conflict", "447-r11-A: conflict reason")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11-A: accepted price unchanged")
+    assertEq(stored.gsProductionCredit, false, "447-r11-A: credit unchanged")
+    assertEq(stored.gsSourceCutoverMarker, nil, "447-r11-A: marker unchanged")
+    assertEq(stored.attributedGuid, priorAttrGuid, "447-r11-A: attribution unchanged")
+    local conflicts = record.accounting._consumables.txnConflicts
+    local q = conflicts and conflicts[stored.id or stored.opId]
+    assertTrue(q and type(q.bodies) == "table" and #q.bodies >= 1,
+        "447-r11-A: quarantine recorded")
+    assertEq(rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))["Carol-Garona"], nil,
+        "447-r11-A: ranking unchanged")
+    drainExportMaint(8)
+    local afterConflictRec = prov.api.GetRecordBody(exportId)
+    assertEq(afterConflictRec.versionFp, beforeFp, "447-r11-A: export fingerprint unchanged")
+    assertEq(afterConflictRec.body.cutoverMarker, nil, "447-r11-A: export marker unchanged")
+    assertEq(tonumber(afterConflictRec.body.event.unitCopper), 1800,
+        "447-r11-A: export body price unchanged")
+
+    -- Regression B: identical price + valid missing provenance updates credit/export.
+    local stProv, rProv = GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), authCtx())
+    assertEq(stProv, "duplicate", "447-r11-B: provenance enrich duplicate r=" .. tostring(rProv))
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11-B: price unchanged")
+    assertEq(stored.gsSourceCutoverMarker, liveMarker, "447-r11-B: marker applied")
+    assertEq(stored.gsProductionCredit, true, "447-r11-B: production credit applied")
+    assertEq(rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))["Carol-Garona"], 1800,
+        "447-r11-B: ranking includes credited adj")
+    drainExportMaint(8)
+    local afterProvRec = prov.api.GetRecordBody(exportId)
+    assertTrue(afterProvRec.versionFp ~= beforeFp, "447-r11-B: fingerprint changed")
+    assertEq(afterProvRec.body.cutoverMarker, liveMarker, "447-r11-B: export advertises marker")
+    assertEq(tonumber(afterProvRec.body.event.unitCopper), 1800, "447-r11-B: export price intact")
+
+    -- Downstream relay: strip credit/marker locally, re-admit priced+marked body.
+    local markedFp = afterProvRec.versionFp
+    stored.gsProductionCredit = false
+    stored.gsSourceCutoverMarker = nil
+    assertEq(GS.RefreshLedgerEventExport(record, stored), true, "447-r11-B: strip export")
+    drainExportMaint(8)
+    local strippedRec = prov.api.GetRecordBody(exportId)
+    assertEq(strippedRec.body.cutoverMarker, nil, "447-r11-B: stripped unmarked")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local stRelay, rRelay = GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), {
+        sender = "Carol-Garona",
+        member = {
+            guid = "Player-1-Carol", name = "Carol-Garona",
+            guildKey = "club:42", rankOrder = 3,
+        },
+        offlineRecord = record,
+        localWrite = false,
+        sourceCutoverMarker = liveMarker,
+    })
+    assertEq(stRelay, "duplicate", "447-r11-B: relay duplicate r=" .. tostring(rRelay))
+    assertEq(stored.gsProductionCredit, true, "447-r11-B: relay restores credit")
+    assertEq(stored.gsSourceCutoverMarker, liveMarker, "447-r11-B: relay restores marker")
+    drainExportMaint(8)
+    local relayRec = prov.api.GetRecordBody(exportId)
+    assertEq(relayRec.body.cutoverMarker, liveMarker, "447-r11-B: relayed export marked")
+    assertTrue(relayRec.versionFp ~= strippedRec.versionFp, "447-r11-B: relay fingerprint moves")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Unchanged duplicate idempotency (same price + same marker).
+    local fpStable = relayRec.versionFp
+    local stIdem = select(1, GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), authCtx()))
+    assertEq(stIdem, "duplicate", "447-r11: idempotent duplicate")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11: idempotent price")
+    assertEq(stored.gsProductionCredit, true, "447-r11: idempotent credit")
+    drainExportMaint(4)
+    assertEq(prov.api.GetRecordBody(exportId).versionFp, fpStable,
+        "447-r11: idempotent export fingerprint")
+
+    -- Nil→priced still succeeds on a fresh unpriced archived row.
+    SF.TSM = nil
+    record = GS:GetCurrentRecord()
+    local addItem = select(1, GS:NewConfigOperation(
+        "set-requested-item", { itemId = 9459 }, { itemId = 9459, goal = 80 }))
+    assertEq(GS:ApplyStagedConfigOperation(addItem), "accepted", "447-r11: request item on current")
+    local adj2, adj2st, adj2err = GS:NewAdjustmentOperation(9459, 2, "Dave-Garona")
+    assertTrue(adj2 ~= nil, "447-r11: adj2 prepared st=" .. tostring(adj2st) .. " err=" .. tostring(adj2err))
+    local applySt, applyReason = GS:ApplyStagedConfigOperation(adj2)
+    assertEq(applySt, "accepted", "447-r11: unpriced adj2 st=" .. tostring(applySt) .. " r=" .. tostring(applyReason))
+    record = GS:GetCurrentRecord()
+    local stored2 = rankingsFindAdj(record, 9459, 2)
+    assertTrue(stored2 ~= nil, "447-r11: adj2 present")
+    assertEq(stored2.unitCopper, nil, "447-r11: adj2 unpriced")
+    local camp2 = record.currentCampaignId
+    local gen2 = tonumber(record.accounting._consumables.generation)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    local stNilPrice = select(1, GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = stored2.id,
+        txnId = stored2.txnId or stored2.id,
+        opId = stored2.opId or stored2.id,
+        generation = gen2,
+        timestamp = stored2.timestamp or world.time or 1,
+        actor = stored2.actor or "Alice-Garona",
+        writer = stored2.writer or "Player-1-Alice",
+        itemId = 9459,
+        quantity = 2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        unitCopper = 700,
+        campaignId = camp2,
+        datasetId = record.datasetId,
+    }, authCtx({ sourceCutoverMarker = liveMarker })))
+    assertEq(stNilPrice, "duplicate", "447-r11: nil→priced duplicate")
+    assertEq(tonumber(stored2.unitCopper), 700, "447-r11: nil→priced enrichment")
+
+    -- Unauthorized delivery cannot enrich.
+    stored2.unitCopper = nil
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local stUnauth = select(1, GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = stored2.id,
+        txnId = stored2.txnId or stored2.id,
+        opId = stored2.opId or stored2.id,
+        generation = gen2,
+        timestamp = stored2.timestamp or world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9459,
+        quantity = 2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        unitCopper = 700,
+        campaignId = camp2,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Dave-Garona",
+        member = {
+            guid = "Player-1-Dave", name = "Dave-Garona",
+            guildKey = "club:42", rankOrder = 4,
+        },
+        offlineRecord = record,
+        localWrite = false,
+        sourceCutoverMarker = liveMarker,
+    }))
+    assertTrue(stUnauth == "pending" or stUnauth == "rejected",
+        "447-r11: unauthorized not accepted st=" .. tostring(stUnauth))
+    assertEq(stored2.unitCopper, nil, "447-r11: unauthorized did not price")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Divergent marker leaves fail-closed (no provenance rewrite).
+    stored.gsSourceCutoverMarker = liveMarker
+    stored.gsProductionCredit = true
+    local priorGuid = stored.attributedGuid
+    local stDiv = select(1, GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), authCtx({
+        sourceCutoverMarker = "gsc1:divergent:forged:marker",
+    })))
+    assertEq(stDiv, "duplicate", "447-r11: divergent marker still duplicate body")
+    assertEq(stored.gsSourceCutoverMarker, liveMarker, "447-r11: divergent marker not applied")
+    assertEq(stored.gsProductionCredit, true, "447-r11: credit retained on divergent")
+    assertEq(stored.attributedGuid, priorGuid, "447-r11: attribution retained on divergent")
+
+    -- Offline adoption temporary record must not mutate the live export index.
+    local liveFp = prov.api.GetRecordBody(exportId).versionFp
+    local offlineAdj = {}
+    for k, v in pairs(stored) do
+        offlineAdj[k] = v
+    end
+    offlineAdj.gsSourceCutoverMarker = nil
+    offlineAdj.gsProductionCredit = false
+    local offlineRecord = {
+        datasetId = record.datasetId,
+        activation = record.activation,
+        liveCutover = record.liveCutover,
+        accounting = {
+            _consumables = {
+                generation = archivedGen,
+                txnConflicts = {},
+            },
+            _consumableEvents = {},
+            _consumableEventArchive = { offlineAdj },
+        },
+    }
+    local stOff = select(1, GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), {
+        sender = "Alice-Garona",
+        member = {
+            guid = "Player-1-Alice", name = "Alice-Garona",
+            guildKey = "club:42", rankOrder = 1,
+        },
+        offlineRecord = offlineRecord,
+        localWrite = false,
+        adoptionReplay = true,
+        preserveAttribution = true,
+        sourceCutoverMarker = liveMarker,
+    }))
+    assertTrue(stOff == "duplicate" or stOff == "accepted" or stOff == "rejected",
+        "447-r11: offline admit returned st=" .. tostring(stOff))
+    drainExportMaint(8)
+    assertEq(prov.api.GetRecordBody(exportId).versionFp, liveFp,
+        "447-r11: offline adoption did not change live export")
+    -- Live retained row remains the previously credited archived original.
+    assertEq(stored.gsProductionCredit, true, "447-r11: live row credit intact after offline")
+end
+
+do
     -- 447-r4) Rankings exclude staged/non-production credit before activation,
     -- include production after activation, and keep archived production totals.
     valuationTsmValue = 400
