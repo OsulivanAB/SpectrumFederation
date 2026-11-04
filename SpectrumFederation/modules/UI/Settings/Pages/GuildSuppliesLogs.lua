@@ -1,5 +1,5 @@
--- Guild Supplies → Logs (#386). Member-readable goals/progress and campaign inspection.
--- No privileged mutation controls. Live verification remains #388/#389.
+-- Guild Supplies → Logs (#453). Current-campaign contribution table.
+-- Member-readable. Goals/progress live on Configuration. Archived history retained.
 local _, SF = ...
 
 local function Loc(key, default)
@@ -17,24 +17,26 @@ local Page = {
 	contentHeading = Loc("GUILD_SUPPLIES_LOGS_HEADING", "Raid Supplies Logs"),
 	group = "Raid Tools",
 	description = Loc("GUILD_SUPPLIES_LOGS_DESC",
-		"Inspect current and archived campaign goals, progress, and history."),
+		"Review current-campaign donations and quantity adjustments."),
 	order = 19.2,
+	layout = {
+		disablePageScroll = true,
+	},
 }
 
 local function GS()
 	return SF.GuildSupplies
 end
 
--- Ephemeral UI selection / history pagination only; never persisted.
-local selectedCampaignId = nil
-local historyOffset = 0
-local historyCampaignId = nil
-local HISTORY_PAGE_SIZE = 25
-local cachedHistoryItems = nil
+-- Ephemeral filter / scroll identity only; never persisted.
+local FILTER_ALL = false
+local filterContributor = FILTER_ALL
+local filterItemId = FILTER_ALL
+local filterContextKey = nil
+local cachedProjectedRows = nil
+local cachedProjectionKey = nil
 local refreshQueued = false
 local rosterFrame = nil
-
--- Per build/refresh pass only: reuse validated read context across controls.
 local passCache = nil
 
 local function BeginRenderPass()
@@ -81,143 +83,40 @@ local function CurrentRecord()
 	return record, reason
 end
 
-local function InspectableCampaigns()
-	if passCache and passCache.campaignsChecked then
-		return passCache.campaigns
-	end
-	local g = GS()
-	local list
-	if g and g.ListInspectableCampaigns then
-		list = g:ListInspectableCampaigns()
-	end
-	if type(list) ~= "table" then
-		list = {}
-	end
-	if passCache then
-		passCache.campaignsChecked = true
-		passCache.campaigns = list
-	end
-	return list
-end
-
-local function FormatCampaignLabel(entry)
-	if type(entry) ~= "table" then
-		return "?"
-	end
-	local started = tonumber(entry.startedAt)
-	local when = started and date and date("%Y-%m-%d %H:%M", started) or tostring(entry.startedAt or "?")
-	local status = entry.isCurrent
-		and Loc("GUILD_SUPPLIES_CAMPAIGN_CURRENT", "Current")
-		or Loc("GUILD_SUPPLIES_CAMPAIGN_ARCHIVED", "Archived")
-	-- Friendly name when set; otherwise the immutable ID (never both).
-	local label = entry.displayName or entry.campaignId or "?"
-	if not entry.hasCustomName then
-		label = tostring(label)
-		if #label > 24 then
-			label = label:sub(1, 21) .. "..."
-		end
-	end
-	return string.format("%s — %s (%s)", when, status, tostring(label))
-end
-
-local function CampaignOptions()
-	local opts = {}
+--- Always the guild record's active campaign; follows rollover automatically (#453).
+local function ActiveCampaignId()
 	if not Caps().canRead then
-		return opts
-	end
-	local list = InspectableCampaigns()
-	for i = 1, #list do
-		local entry = list[i]
-		opts[#opts + 1] = {
-			value = entry.campaignId,
-			label = FormatCampaignLabel(entry),
-		}
-	end
-	return opts
-end
-
-local function ResolveSelectedCampaign()
-	if not Caps().canRead then
-		selectedCampaignId = nil
 		return nil
 	end
 	local record = CurrentRecord()
 	if not record then
-		selectedCampaignId = nil
 		return nil
 	end
-	local list = InspectableCampaigns()
-	if #list == 0 then
-		selectedCampaignId = nil
-		return nil
+	local id = record.currentCampaignId
+	if type(id) == "string" and id ~= "" then
+		return id
 	end
-	if selectedCampaignId then
-		for i = 1, #list do
-			if list[i].campaignId == selectedCampaignId then
-				return selectedCampaignId
-			end
-		end
-	end
-	-- Default to current, else newest inspectable.
-	if type(record.currentCampaignId) == "string" then
-		selectedCampaignId = record.currentCampaignId
-		return selectedCampaignId
-	end
-	selectedCampaignId = list[1].campaignId
-	return selectedCampaignId
+	return nil
 end
 
---- One projected pass for the selected campaign: items, ledger totals, overall bar.
--- Reused by the progress bar and Goals list so Refresh does not walk the ledger twice.
-local function SelectedCampaignProjection()
-	if passCache and passCache.selectedProjectionChecked then
-		return passCache.selectedProjection
+local function FilterContextKey()
+	local rec = CurrentRecord()
+	if not rec then
+		return "none"
 	end
-	local projection = {
-		campaignId = nil,
-		items = nil,
-		progress = nil,
-		goalProgress = nil,
-	}
-	if Caps().canRead then
-		local campaignId = ResolveSelectedCampaign()
-		projection.campaignId = campaignId
-		local g = GS()
-		if g and campaignId then
-			if g.GetCampaignRequestedItems then
-				projection.items = g:GetCampaignRequestedItems(campaignId)
-			end
-			if g.ProjectCampaignProgress then
-				projection.progress = g:ProjectCampaignProgress(campaignId)
-			end
-			if type(projection.items) == "table" and g.ComputeGoalProgress then
-				local totals = projection.progress and projection.progress.itemTotals or {}
-				projection.goalProgress = g.ComputeGoalProgress(projection.items, totals)
-			elseif g.CampaignGoalProgress then
-				projection.goalProgress = g:CampaignGoalProgress(campaignId)
-			end
-		end
-	end
-	if passCache then
-		passCache.selectedProjectionChecked = true
-		passCache.selectedProjection = projection
-	end
-	return projection
+	return tostring(rec.datasetId or "") .. "|" .. tostring(rec.currentCampaignId or "")
 end
 
-local function MembershipHelpText()
-	local caps = Caps()
-	local g = GS()
-	local formatReason = g and g.FormatReasonText or function(r)
-		return tostring(r or "unknown")
+local function SyncFilterContext()
+	local key = FilterContextKey()
+	if key == filterContextKey then
+		return
 	end
-	if caps.canRead then
-		return Loc("GUILD_SUPPLIES_LOGS_HELP",
-			"Members can inspect current and archived campaign goals, progress, and history. Privileged edits live on Configuration.")
-	end
-	return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
-		"Join a guild with a verified membership to inspect Guild Supplies logs.")
-		.. " (" .. formatReason(caps.reason or "not_ready") .. ")"
+	filterContextKey = key
+	filterContributor = FILTER_ALL
+	filterItemId = FILTER_ALL
+	cachedProjectedRows = nil
+	cachedProjectionKey = nil
 end
 
 local function DescribeItem(itemId)
@@ -233,32 +132,83 @@ local function DescribeItem(itemId)
 	}
 end
 
---- Percent label left of the item icon (#437). Uses the shared pass projection.
--- Positive-goal items keep uncapped whole-number percents (including >100% and
--- signed adjustments). Goal-0 items show an em dash instead of a percentage.
-local function FormatGoalPercentLabel(progressEntry)
-	if type(progressEntry) == "table"
-		and not progressEntry.noGoal
-		and progressEntry.percent ~= nil then
-		return Loc("GUILD_SUPPLIES_LOGS_ITEM_PERCENT", "%d%%")
-			:format(tonumber(progressEntry.percent) or 0)
+local function ItemNameForHistory(itemId)
+	local described = DescribeItem(itemId)
+	if type(described.name) == "string" and described.name ~= "" then
+		return described.name
 	end
-	return Loc("GUILD_SUPPLIES_LOGS_ITEM_NO_PERCENT", "—")
+	return nil
 end
 
-local function NameWithGoalIcon(name, icon)
-	local g = GS()
-	if g and type(g.FormatHistoryInlineIcon) == "function" then
-		local markup = g.FormatHistoryInlineIcon(icon)
-		if type(markup) == "string" and markup ~= "" then
-			return markup .. " " .. name
+local function LookupClassFile(guid, nameRealm)
+	local GI = SF.GuildInfo
+	if not GI then
+		return nil
+	end
+	local record = GI.GetCurrentRecord and GI:GetCurrentRecord() or nil
+	if type(record) == "table" and type(record.characters) == "table" then
+		if type(guid) == "string" and guid ~= "" then
+			local row = record.characters[guid]
+			if type(row) == "table" and type(row.classFile) == "string" and row.classFile ~= "" then
+				return row.classFile
+			end
 		end
+		if type(nameRealm) == "string" and nameRealm ~= "" then
+			local needle = string.lower(nameRealm)
+			for _, row in pairs(record.characters) do
+				if type(row) == "table" and type(row.nameRealm) == "string"
+					and string.lower(row.nameRealm) == needle
+					and type(row.classFile) == "string" and row.classFile ~= "" then
+					return row.classFile
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function ColorizeContributor(name, guid)
+	if type(name) ~= "string" or name == "" then
+		return name
+	end
+	local classFile = LookupClassFile(guid, name)
+	local GI = SF.GuildInfo
+	if GI and type(GI.ColorizeName) == "function" then
+		return GI.ColorizeName(name, classFile)
+	end
+	local C = SF.Consumables
+	if C and type(C.ColorizeCharacterName) == "function" then
+		return C.ColorizeCharacterName(name, classFile)
 	end
 	return name
 end
 
--- Prefer the resolved icon; keep a question-mark placeholder so inline icons
--- stay at a consistent horizontal start when item data is still loading (#440).
+local function ClassifyHistoryRow(row)
+	if type(row) ~= "table" then
+		return nil
+	end
+	local t = row.type
+	if t == "adjustment" or t == "CONSUMABLE_ADJUSTMENT" then
+		return "adjustment"
+	end
+	if t == "donation" or t == "CONSUMABLE_DONATION" then
+		return "donation"
+	end
+	-- History projection only emits donation/adjustment rows; prefer attribution
+	-- and verification hints when type is unexpectedly missing.
+	if row.attributed ~= nil or row.displayAttributed ~= nil then
+		return "adjustment"
+	end
+	if type(row.verification) == "string" then
+		return "donation"
+	end
+	local qty = tonumber(row.quantity)
+	if qty and qty < 0 then
+		return "adjustment"
+	end
+	return "donation"
+end
+
 local function GoalRowIcon(described)
 	if type(described) == "table" then
 		local icon = described.icon
@@ -273,372 +223,308 @@ local function GoalRowIcon(described)
 	return nil
 end
 
-local function ItemRowsForSelected()
+local function FormatItemCell(itemId)
+	local described = DescribeItem(itemId)
+	local name = described.name or Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item")
+	local g = GS()
+	if g and g.FormatHistoryInlineIcon then
+		local markup = g.FormatHistoryInlineIcon(GoalRowIcon(described))
+		if type(markup) == "string" and markup ~= "" then
+			return markup .. " " .. name
+		end
+	end
+	return name
+end
+
+local function BuildProjectedRows()
+	SyncFilterContext()
+	local key = FilterContextKey()
+	if cachedProjectedRows and cachedProjectionKey == key then
+		return cachedProjectedRows
+	end
 	local rows = {}
 	if not Caps().canRead then
+		cachedProjectedRows = rows
+		cachedProjectionKey = key
 		return rows
 	end
-	local projection = SelectedCampaignProjection()
-	local items = projection.items
-	local totals = projection.progress and projection.progress.itemTotals or {}
-	if type(items) ~= "table" then
+	local campaignId = ActiveCampaignId()
+	local g = GS()
+	if not campaignId or not g or not g.ListCampaignHistory then
+		cachedProjectedRows = rows
+		cachedProjectionKey = key
 		return rows
 	end
-	-- Index the already-computed GoalProgress items; do not walk the ledger again.
-	local progressByItemId = {}
-	local goalProgress = projection.goalProgress
-	if type(goalProgress) == "table" and type(goalProgress.items) == "table" then
-		for i = 1, #goalProgress.items do
-			local entry = goalProgress.items[i]
-			if type(entry) == "table" and tonumber(entry.itemId) then
-				progressByItemId[entry.itemId] = entry
+	-- No limit: every retained current-campaign entry must remain reachable (#453).
+	local history = g:ListCampaignHistory(campaignId, nil, 0, ItemNameForHistory)
+	if type(history) ~= "table" then
+		cachedProjectedRows = rows
+		cachedProjectionKey = key
+		return rows
+	end
+	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local adjustPrefix = Loc("GUILD_SUPPLIES_LOGS_ADJUST_MARK", "Adjustment")
+	for i = 1, #history do
+		local event = history[i]
+		local kind = ClassifyHistoryRow(event)
+		local contributorName
+		local contributorGuid
+		local quantityText
+		if kind == "adjustment" then
+			local credited = event.displayAttributed or event.attributed
+			if type(credited) == "string" and credited ~= "" then
+				contributorName = credited
+				contributorGuid = event.attributedGuid
+			else
+				contributorName = unassigned
+				contributorGuid = nil
+			end
+			local qty = tonumber(event.quantity) or 0
+			quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_SIGNED", "%+d"):format(qty)
+		else
+			contributorName = event.displayActor or event.actor
+				or Loc("GUILD_SUPPLIES_HISTORY_SOMEONE", "Someone")
+			contributorGuid = event.actorGuid or event.donorGuid
+			local qty = math.abs(tonumber(event.quantity) or 0)
+			quantityText = Loc("GUILD_SUPPLIES_LOGS_QTY_PLAIN", "%d"):format(qty)
+		end
+		local contributorDisplay = ColorizeContributor(contributorName, contributorGuid)
+		if kind == "adjustment" then
+			contributorDisplay = Loc("GUILD_SUPPLIES_LOGS_ADJUST_CONTRIBUTOR", "%s · %s")
+				:format(adjustPrefix, contributorDisplay)
+		end
+		local itemId = tonumber(event.itemId)
+		local itemText = FormatItemCell(itemId)
+		local detail = g.FormatCampaignHistoryDetail
+			and g.FormatCampaignHistoryDetail(event, ItemNameForHistory(itemId))
+		if kind == "adjustment" then
+			local officer = event.actor
+			if type(officer) == "string" and officer ~= "" then
+				local officerLine = Loc("GUILD_SUPPLIES_LOGS_ADJUST_OFFICER",
+					"Adjusted by %s."):format(officer)
+				if type(detail) == "string" and detail ~= "" then
+					detail = detail .. "\n" .. officerLine
+				else
+					detail = officerLine
+				end
 			end
 		end
+		rows[#rows + 1] = {
+			contributor = contributorDisplay,
+			contributorKey = contributorName,
+			quantity = quantityText,
+			item = itemText,
+			itemId = itemId,
+			tooltip = detail,
+			id = event.id,
+			kind = kind,
+			timestamp = event.timestamp,
+		}
 	end
-	for _, row in pairs(items) do
-		if type(row) == "table" and tonumber(row.itemId) then
-			local itemId = row.itemId
-			local progressEntry = progressByItemId[itemId]
-			local goal = (progressEntry and tonumber(progressEntry.goal))
-				or tonumber(row.goal)
-				or 0
-			local got = (progressEntry and tonumber(progressEntry.donated))
-				or tonumber(totals[itemId])
-				or 0
-			local described = DescribeItem(itemId)
-			local percentLabel = FormatGoalPercentLabel(progressEntry)
-			local namePart = NameWithGoalIcon(described.name, GoalRowIcon(described))
-			rows[#rows + 1] = {
-				-- Percent is a shared right-justified leading column (#440).
-				-- Remainder keeps inline icon → name → donated/goal (#437).
-				leadingText = percentLabel,
-				text = string.format(
-					"%s — %d / %s",
-					namePart,
-					got,
-					goal > 0 and tostring(goal) or "—"
-				),
-				itemId = itemId,
-				goal = goal,
-				progress = got,
-				percent = progressEntry and progressEntry.percent or nil,
-				noGoal = goal <= 0 or (progressEntry and progressEntry.noGoal) or false,
-			}
-		end
-	end
-	table.sort(rows, function(a, b)
-		return (a.itemId or 0) < (b.itemId or 0)
-	end)
+	cachedProjectedRows = rows
+	cachedProjectionKey = key
 	return rows
 end
 
-local function OverallProgressForSelected()
-	if not Caps().canRead then
-		return {
-			hasPositiveGoal = false,
-			overallPercent = nil,
-			overallEmptyText = Loc("GUILD_SUPPLIES_LOGS_NO_READ",
-				"Join a guild with a verified membership to inspect Guild Supplies logs."),
-		}
-	end
-	if not ResolveSelectedCampaign() then
-		return {
-			hasPositiveGoal = false,
-			overallPercent = nil,
-			overallEmptyText = Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns"),
-		}
-	end
-	local projection = SelectedCampaignProjection()
-	return projection.goalProgress or {
-		hasPositiveGoal = false,
-		overallPercent = nil,
-		overallEmptyText = Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."),
-	}
-end
-
-local function ItemNameForHistory(itemId)
-	local name = nil
-	if C_Item and C_Item.GetItemInfo then
-		name = C_Item.GetItemInfo(itemId)
-	end
-	if type(name) ~= "string" and GetItemInfo then
-		name = GetItemInfo(itemId)
-	end
-	if type(name) == "string" and name ~= "" then
-		return name
-	end
-	return nil
-end
-
---- Sync selected-campaign history total/offset before pager enablement runs.
-local function EnsureHistoryState()
-	local g = GS()
-	local campaignId = ResolveSelectedCampaign()
-	if not Caps().canRead or not g or not campaignId or not g.ListCampaignHistory then
-		historyOffset = 0
-		historyCampaignId = campaignId
-		Page.historyTotal = 0
-		Page.historyOffset = 0
-		cachedHistoryItems = {}
-		return cachedHistoryItems
-	end
-	if campaignId ~= historyCampaignId then
-		historyCampaignId = campaignId
-		historyOffset = 0
-	end
-	local rows, total = g:ListCampaignHistory(campaignId, HISTORY_PAGE_SIZE, historyOffset, ItemNameForHistory)
-	total = tonumber(total) or (rows and #rows) or 0
-	if historyOffset > 0 and historyOffset >= total then
-		historyOffset = 0
-		rows, total = g:ListCampaignHistory(campaignId, HISTORY_PAGE_SIZE, 0, ItemNameForHistory)
-		total = tonumber(total) or (rows and #rows) or 0
-	end
-	Page.historyTotal = total
-	Page.historyOffset = historyOffset
-	local items = {}
-	if type(rows) == "table" then
-		for i = 1, #rows do
-			local row = rows[i]
-			local described = DescribeItem(row.itemId)
-			local compact = g.FormatCampaignHistoryCompact
-				and g.FormatCampaignHistoryCompact(row, described.name, described.icon)
-			local detail = g.FormatCampaignHistoryDetail
-				and g.FormatCampaignHistoryDetail(row, described.name)
-			items[#items + 1] = {
-				text = compact or row.text,
-				tooltip = detail or row.text,
-				itemId = row.itemId,
-				id = row.id,
-				canRemove = false,
-			}
+local function FilteredRows()
+	local all = BuildProjectedRows()
+	local out = {}
+	for i = 1, #all do
+		local row = all[i]
+		if (filterContributor == FILTER_ALL or row.contributorKey == filterContributor)
+			and (filterItemId == FILTER_ALL or row.itemId == filterItemId) then
+			out[#out + 1] = row
 		end
 	end
-	cachedHistoryItems = items
-	return items
+	return out
 end
 
-local function HistoryRowsForSelected()
-	if cachedHistoryItems then
-		return cachedHistoryItems
-	end
-	return EnsureHistoryState()
-end
-
-local function ShiftHistory(delta)
-	EnsureHistoryState()
-	local total = Page.historyTotal or 0
-	local nextOffset = historyOffset + (delta * HISTORY_PAGE_SIZE)
-	if nextOffset < 0 then nextOffset = 0 end
-	if nextOffset > 0 and nextOffset >= total then return end
-	historyOffset = nextOffset
-	cachedHistoryItems = nil
-	if Page.Refresh and Page.panel then
-		Page:Refresh(Page.panel)
-	end
-end
-
-local function HistoryHelpText()
-	return Loc("GUILD_SUPPLIES_LOGS_HISTORY_HELP",
-		"Newest donation and adjustment entries for the selected campaign are first. Each page shows up to %d entries.")
-		:format(HISTORY_PAGE_SIZE)
-end
-
-local function DisabledLogsMembershipTip()
-	return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
-		"Join a guild with a verified membership to inspect Guild Supplies logs.")
-end
-
-local function DisabledCampaignSelectTip()
+local function ContributorFilterOptions()
+	SyncFilterContext()
+	local opts = {
+		{
+			value = FILTER_ALL,
+			label = Loc("GUILD_SUPPLIES_LOGS_FILTER_ALL_CONTRIBUTORS", "All contributors"),
+		},
+	}
 	if not Caps().canRead then
-		return DisabledLogsMembershipTip()
+		return opts
 	end
-	if #CampaignOptions() > 0 then
-		return nil
+	local seen = {}
+	local names = {}
+	local rows = BuildProjectedRows()
+	for i = 1, #rows do
+		local key = rows[i].contributorKey
+		if type(key) == "string" and key ~= "" and not seen[key] then
+			seen[key] = true
+			names[#names + 1] = key
+		end
 	end
-	return Loc("GUILD_SUPPLIES_DISABLED_LOGS_NO_CAMPAIGNS",
-		"No campaigns are available to inspect yet.")
+	table.sort(names)
+	for i = 1, #names do
+		opts[#opts + 1] = { value = names[i], label = names[i] }
+	end
+	return opts
 end
 
-local function DisabledLogsListTip()
-	if Caps().canRead then
-		return nil
-	end
-	return DisabledLogsMembershipTip()
-end
-
-local function DisabledHistoryNewerTip()
+local function ItemFilterOptions()
+	SyncFilterContext()
+	local opts = {
+		{
+			value = FILTER_ALL,
+			label = Loc("GUILD_SUPPLIES_LOGS_FILTER_ALL_ITEMS", "All items"),
+		},
+	}
 	if not Caps().canRead then
-		return DisabledLogsMembershipTip()
+		return opts
 	end
-	if historyOffset > 0 then
-		return nil
+	local seen = {}
+	local items = {}
+	local rows = BuildProjectedRows()
+	for i = 1, #rows do
+		local itemId = tonumber(rows[i].itemId)
+		if itemId and not seen[itemId] then
+			seen[itemId] = true
+			items[#items + 1] = itemId
+		end
 	end
-	return Loc("GUILD_SUPPLIES_DISABLED_HISTORY_FIRST",
-		"You're already on the first page.")
+	table.sort(items)
+	for i = 1, #items do
+		local itemId = items[i]
+		local described = DescribeItem(itemId)
+		opts[#opts + 1] = {
+			value = itemId,
+			label = described.name or tostring(itemId),
+		}
+	end
+	return opts
 end
 
-local function DisabledHistoryOlderTip()
+local function EmptyLogsText()
 	if not Caps().canRead then
-		return DisabledLogsMembershipTip()
+		return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
+			"Join a guild with a verified membership to inspect Guild Supplies logs.")
 	end
-	if historyOffset + HISTORY_PAGE_SIZE < (Page.historyTotal or 0) then
-		return nil
+	if not ActiveCampaignId() then
+		return Loc("GUILD_SUPPLIES_LOGS_EMPTY_NO_CAMPAIGN",
+			"No current campaign is available yet.")
 	end
-	return Loc("GUILD_SUPPLIES_DISABLED_HISTORY_LAST",
-		"You're already on the last page.")
+	local all = BuildProjectedRows()
+	if #all == 0 then
+		return Loc("GUILD_SUPPLIES_LOGS_EMPTY_HISTORY",
+			"No donations or adjustments are recorded for the current campaign yet.")
+	end
+	return Loc("GUILD_SUPPLIES_LOGS_EMPTY_FILTERED",
+		"No logs match the selected contributor and item filters.")
 end
 
 local function Definition()
 	return {
 		sections = {
 			{
-				id = "gsLogsStatus",
-				title = Loc("GUILD_SUPPLIES_LOGS_TITLE", "Campaign inspection"),
+				id = "gsLogsTable",
+				title = Loc("GUILD_SUPPLIES_LOGS_TITLE", "Campaign history"),
+				fillHeight = true,
 				items = {
 					{
-						type = "help",
-						indent = "label",
-						getText = MembershipHelpText,
+						type = "inlineControls",
+						spacing = 10,
+						items = {
+							{
+								type = "dropdown",
+								tooltip = Loc("GUILD_SUPPLIES_LOGS_FILTER_CONTRIBUTOR_TIP",
+									"Show only entries for one contributor. Applies together with the item filter."),
+								defaultText = Loc("GUILD_SUPPLIES_LOGS_FILTER_ALL_CONTRIBUTORS", "All contributors"),
+								width = 200,
+								options = ContributorFilterOptions,
+								get = function()
+									SyncFilterContext()
+									return filterContributor
+								end,
+								set = function(value)
+									SyncFilterContext()
+									filterContributor = value
+								end,
+								enabled = function()
+									return Caps().canRead
+								end,
+								onValueChanged = function()
+									if Page.Refresh and Page.panel then
+										Page:Refresh(Page.panel)
+									end
+								end,
+							},
+							{
+								type = "dropdown",
+								tooltip = Loc("GUILD_SUPPLIES_LOGS_FILTER_ITEM_TIP",
+									"Show only entries for one item, including items later removed from Requested Items."),
+								defaultText = Loc("GUILD_SUPPLIES_LOGS_FILTER_ALL_ITEMS", "All items"),
+								width = 200,
+								options = ItemFilterOptions,
+								get = function()
+									SyncFilterContext()
+									return filterItemId
+								end,
+								set = function(value)
+									SyncFilterContext()
+									filterItemId = value
+								end,
+								enabled = function()
+									return Caps().canRead
+								end,
+								onValueChanged = function()
+									if Page.Refresh and Page.panel then
+										Page:Refresh(Page.panel)
+									end
+								end,
+							},
+							{
+								type = "button",
+								buttonText = Loc("GUILD_SUPPLIES_LOGS_FILTER_CLEAR", "Clear"),
+								tooltip = Loc("GUILD_SUPPLIES_LOGS_FILTER_CLEAR_TIP",
+									"Clear contributor and item filters."),
+								width = 90,
+								onClick = function()
+									SyncFilterContext()
+									filterContributor = FILTER_ALL
+									filterItemId = FILTER_ALL
+									if Page.Refresh and Page.panel then
+										Page:Refresh(Page.panel)
+									end
+								end,
+							},
+						},
 					},
 					{
-						type = "dropdown",
-						label = Loc("GUILD_SUPPLIES_CAMPAIGN_SELECT", "Campaign"),
-						defaultText = Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns"),
-						options = function()
-							return CampaignOptions()
-						end,
-						get = function()
-							return ResolveSelectedCampaign()
-						end,
-						set = function(value)
-							selectedCampaignId = value
-							historyOffset = 0
-							historyCampaignId = value
-							cachedHistoryItems = nil
-						end,
-						enabled = function()
-							return Caps().canRead and #CampaignOptions() > 0
-						end,
-						getDisabledTooltip = DisabledCampaignSelectTip,
-						onValueChanged = function(ctx)
-							historyOffset = 0
-							cachedHistoryItems = nil
-							if Page.Refresh and Page.panel then
-								Page:Refresh(Page.panel)
-							elseif ctx.pageBuilder and ctx.pageBuilder.Refresh then
-								ctx.pageBuilder:Refresh()
-							end
-						end,
-					},
-					{
-						type = "display",
-						label = Loc("GUILD_SUPPLIES_CAMPAIGN_DETAIL", "Selection"),
-						get = function()
-							if not Caps().canRead then
-								return Loc("GUILD_SUPPLIES_LOGS_NO_READ",
-									"Join a guild with a verified membership to inspect Guild Supplies logs.")
-							end
-							local id = ResolveSelectedCampaign()
-							if not id then
-								return Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns")
-							end
-							local list = InspectableCampaigns()
-							for i = 1, #list do
-								if list[i].campaignId == id then
-									return FormatCampaignLabel(list[i])
-								end
-							end
-							return id
-						end,
-					},
-					{
-						-- Immediately under the campaign selection controls; before Goals.
-						type = "overallProgressBar",
-						label = Loc("RAID_SUPPLIES_OVERALL_PROGRESS", "Overall progress"),
-						getProgress = function()
-							return OverallProgressForSelected()
-						end,
-						enabled = function()
-							return Caps().canRead
-						end,
-						getDisabledTooltip = DisabledLogsListTip,
-					},
-					{
-						type = "scrollList",
-						label = Loc("GUILD_SUPPLIES_LOGS_ITEMS", "Goals and progress"),
-						height = 160,
-						rowHeight = 20,
-						-- Percent uses the shared right-justified leading column (#440).
-						-- Item icon stays inline via FormatHistoryInlineIcon (#437).
-						leadingColumn = true,
-						singleLine = true,
-						getItems = function()
-							if not Caps().canRead then
-								return {}
-							end
-							return ItemRowsForSelected()
-						end,
-						enabled = function()
-							return Caps().canRead
-						end,
-						getDisabledTooltip = DisabledLogsListTip,
-					},
-					{
-						type = "help",
-						indent = "label",
-						getText = HistoryHelpText,
-					},
-					{
-						type = "scrollList",
-						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY", "Campaign history"),
-						height = 180,
-						rowHeight = 20,
-						singleLine = true,
-						showDetailTooltip = true,
-						getItems = function()
+						type = "logTable",
+						fillHeight = true,
+						minHeight = 280,
+						rowHeight = 22,
+						virtualize = true,
+						columns = {
+							{
+								key = "contributor",
+								label = Loc("GUILD_SUPPLIES_LOGS_COL_CONTRIBUTOR", "Contributor"),
+								width = 200,
+							},
+							{
+								key = "quantity",
+								label = Loc("GUILD_SUPPLIES_LOGS_COL_QUANTITY", "Quantity"),
+								width = 90,
+								justifyH = "RIGHT",
+							},
+							{
+								key = "item",
+								label = Loc("GUILD_SUPPLIES_LOGS_COL_ITEM", "Item"),
+							},
+						},
+						emptyText = EmptyLogsText,
+						getRows = function()
 							if not Caps().canRead then
 								return {}
 							end
-							return HistoryRowsForSelected()
+							return FilteredRows()
 						end,
-						enabled = function()
-							return Caps().canRead
-						end,
-						getDisabledTooltip = DisabledLogsListTip,
-					},
-					{
-						type = "button",
-						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY_PREV", "Newer"),
-						buttonText = Loc("GUILD_SUPPLIES_LOGS_HISTORY_PREV", "Newer"),
-						width = 90,
-						enabled = function()
-							-- Page.historyTotal is synced in Page:Refresh before control refresh.
-							return Caps().canRead and historyOffset > 0
-						end,
-						getDisabledTooltip = DisabledHistoryNewerTip,
-						onClick = function()
-							ShiftHistory(-1)
-						end,
-					},
-					{
-						type = "button",
-						label = Loc("GUILD_SUPPLIES_LOGS_HISTORY_NEXT", "Older"),
-						buttonText = Loc("GUILD_SUPPLIES_LOGS_HISTORY_NEXT", "Older"),
-						width = 90,
-						enabled = function()
-							return Caps().canRead
-								and historyOffset + HISTORY_PAGE_SIZE < (Page.historyTotal or 0)
-						end,
-						getDisabledTooltip = DisabledHistoryOlderTip,
-						onClick = function()
-							ShiftHistory(1)
-						end,
-					},
-					{
-						type = "help",
-						indent = "label",
-						text = Loc("GUILD_SUPPLIES_LOGS_EMPTY_NOTE",
-							"A New Campaign starts with zero progress. Archived campaigns keep their own configuration and history."),
 					},
 				},
 			},
@@ -646,8 +532,6 @@ local function Definition()
 	}
 end
 
--- Standalone Settings can hide the parent while the page panel stays IsShown.
--- Prefer IsVisible so roster-driven work does not run against a closed window.
 local function PanelVisible(panel)
 	if not panel then return false end
 	if panel.IsVisible then
@@ -701,6 +585,8 @@ local function EnsureItemDisplayListener()
 		return
 	end
 	display.RegisterRefresh("guildSuppliesLogs", function()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
 		QueueRefresh()
 	end)
 end
@@ -716,6 +602,8 @@ local function EnsureRosterListener()
 		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
 	end
 	frame:SetScript("OnEvent", function()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
 		QueueRefresh()
 	end)
 end
@@ -725,12 +613,13 @@ local function EnsureDurableListener()
 	if durableListenerRegistered then
 		return
 	end
-	local GS = SF.GuildSupplies
-	if not GS or type(GS.RegisterUIListener) ~= "function" then
+	local supplies = SF.GuildSupplies
+	if not supplies or type(supplies.RegisterUIListener) ~= "function" then
 		return
 	end
-	GS.RegisterUIListener(function()
-		-- QueueRefresh already gates on PanelVisible and coalesces.
+	supplies.RegisterUIListener(function()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
 		QueueRefresh()
 	end)
 	durableListenerRegistered = true
@@ -746,7 +635,8 @@ function Page:Build(panel)
 		return
 	end
 	BeginRenderPass()
-	EnsureHistoryState()
+	SyncFilterContext()
+	cachedProjectedRows = nil
 	renderer:Build(panel, Definition())
 	EndRenderPass()
 	self.panel = panel
@@ -771,9 +661,8 @@ function Page:Refresh(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if renderer and renderer.Refresh then
 		BeginRenderPass()
-		-- Derive history total/offset before pager enablement callbacks run.
-		cachedHistoryItems = nil
-		EnsureHistoryState()
+		SyncFilterContext()
+		-- Rebuild projection when refresh is requested; durable hooks clear the cache.
 		renderer:Refresh(panel)
 		EndRenderPass()
 	end
@@ -781,9 +670,38 @@ end
 
 function Page:OnHide()
 	refreshQueued = false
-	cachedHistoryItems = nil
+	cachedProjectedRows = nil
+	cachedProjectionKey = nil
 	CancelValuationCatchup()
 end
+
+-- Test hooks for behavioral coverage (#453).
+Page.__sfTest = {
+	ActiveCampaignId = function()
+		return ActiveCampaignId()
+	end,
+	BuildProjectedRows = function()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
+		return BuildProjectedRows()
+	end,
+	FilteredRows = function()
+		return FilteredRows()
+	end,
+	SetFilters = function(contributor, itemId)
+		SyncFilterContext()
+		filterContributor = contributor == nil and FILTER_ALL or contributor
+		filterItemId = itemId == nil and FILTER_ALL or itemId
+	end,
+	ClearFilters = function()
+		SyncFilterContext()
+		filterContributor = FILTER_ALL
+		filterItemId = FILTER_ALL
+	end,
+	FilterAll = FILTER_ALL,
+	SyncFilterContext = SyncFilterContext,
+	ClassifyHistoryRow = ClassifyHistoryRow,
+}
 
 EnsureRosterListener()
 EnsureDurableListener()

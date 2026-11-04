@@ -669,16 +669,23 @@ function GS:ListInspectableCampaigns()
             local ok = GS.ValidateCampaignBoundary(header, record, guildKey)
             if ok and header.campaignId == campaignId
                 and CampaignArchiveInspectable(record, campaignId, header) then
-                local displayName = GS.GetCampaignDisplayName
-                    and GS.GetCampaignDisplayName(record, campaignId)
-                    or campaignId
                 local custom = GS.GetCampaignCustomName
                     and GS.GetCampaignCustomName(record, campaignId)
                     or ""
+                local hasCustomName = type(custom) == "string" and custom ~= ""
+                -- displayName keeps #424 ID fallback for internal callers/tests.
+                -- friendlyName is the player-facing label (#453).
+                local displayName = GS.GetCampaignDisplayName
+                    and GS.GetCampaignDisplayName(record, campaignId)
+                    or campaignId
+                local friendlyName = GS.GetCampaignFriendlyName
+                    and GS.GetCampaignFriendlyName(record, campaignId)
+                    or Loc("GUILD_SUPPLIES_CAMPAIGN_UNNAMED", "Unnamed campaign")
                 list[#list + 1] = {
                     campaignId = campaignId,
                     displayName = displayName,
-                    hasCustomName = type(custom) == "string" and custom ~= "",
+                    friendlyName = friendlyName,
+                    hasCustomName = hasCustomName,
                     startedAt = header.startedAt,
                     boundaryKind = header.boundaryKind,
                     contextStatus = header.contextStatus,
@@ -698,6 +705,45 @@ function GS:ListInspectableCampaigns()
         return tostring(a.campaignId) > tostring(b.campaignId)
     end)
     return list
+end
+
+--- Dropdown label: friendly name, with " (Current)" only for the active campaign.
+-- Outside dropdowns, use friendlyName / GetCampaignFriendlyName alone (#453).
+function GS.FormatCampaignDropdownLabel(entry)
+    if type(entry) ~= "table" then
+        return Loc("GUILD_SUPPLIES_CAMPAIGN_UNNAMED", "Unnamed campaign")
+    end
+    local name = entry.friendlyName
+    if type(name) ~= "string" or name == "" then
+        if entry.hasCustomName and type(entry.displayName) == "string" and entry.displayName ~= "" then
+            name = entry.displayName
+        else
+            name = Loc("GUILD_SUPPLIES_CAMPAIGN_UNNAMED", "Unnamed campaign")
+        end
+    end
+    if entry.isCurrent then
+        return Loc("GUILD_SUPPLIES_CAMPAIGN_DROPDOWN_CURRENT", "%s (Current)"):format(name)
+    end
+    return name
+end
+
+--- Tooltip body that disambiguates unnamed or duplicate-name campaigns by start time.
+function GS.FormatCampaignDisambiguationTooltip(entry)
+    if type(entry) ~= "table" then
+        return nil
+    end
+    local started = tonumber(entry.startedAt)
+    local when = nil
+    if started and date then
+        local ok, formatted = pcall(date, "%Y-%m-%d %H:%M", started)
+        if ok and type(formatted) == "string" and formatted ~= "" then
+            when = formatted
+        end
+    end
+    if not when then
+        when = tostring(entry.startedAt or "?")
+    end
+    return Loc("GUILD_SUPPLIES_CAMPAIGN_TOOLTIP_STARTED", "Started: %s"):format(when)
 end
 
 --- Read-only view of a campaign's requested items (current live or archived).

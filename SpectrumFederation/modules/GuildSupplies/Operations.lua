@@ -425,7 +425,16 @@ function GS.RenameRevisionWins(incoming, incumbent)
     return tostring(incoming.id) > tostring(incumbent.id)
 end
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 --- Visible label for a campaign: custom name when set, else immutable ID.
+-- Internal/ops and #424 rename tests keep the ID fallback. Player-facing UI
+-- uses GetCampaignFriendlyName (#453) instead of showing raw technical IDs.
 local function CampaignDisplayName(record, campaignId)
     if type(campaignId) ~= "string" or campaignId == "" then
         return ""
@@ -461,6 +470,16 @@ function GS.GetCampaignCustomName(record, campaignId)
         return entry.name
     end
     return ""
+end
+
+--- Player-facing campaign name: custom name when set, else a friendly unnamed label.
+-- Never returns the immutable technical campaign ID (#453).
+function GS.GetCampaignFriendlyName(record, campaignId)
+    local custom = GS.GetCampaignCustomName(record, campaignId)
+    if type(custom) == "string" and custom ~= "" then
+        return custom
+    end
+    return Loc("GUILD_SUPPLIES_CAMPAIGN_UNNAMED", "Unnamed campaign")
 end
 
 --- Shared target-key helper for durable head validation (State load order is earlier).
