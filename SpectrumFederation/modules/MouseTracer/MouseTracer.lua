@@ -268,8 +268,10 @@ local function ApplyStampAppearance(stamp, idx)
 		stampAppliedTexture[idx] = texture
 		changed = true
 	end
+	-- mask is always a string identity here: CIRCLE_TEXTURE or CLEARED_MASK ("").
+	-- Do not treat "" as absent — Retail requires SetMask("") to clear a legacy mask.
 	if stampAppliedMask[idx] ~= mask then
-		if stamp.SetMask and mask then
+		if stamp.SetMask then
 			pcall(stamp.SetMask, stamp, mask)
 		end
 		stampAppliedMask[idx] = mask

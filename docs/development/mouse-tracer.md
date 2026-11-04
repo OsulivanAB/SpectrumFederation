@@ -52,9 +52,11 @@ No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to
 
 ### Resources
 
-`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask` with `ADD` blending (original hard circular look). Steps `10`–`100` swap each stamp to a precomputed soft TGA under `media/MouseTracer/`, neutralize the hard circular mask with `WHITE8X8`, and use `BLEND` as a **provisional** production choice so overlapping stamps do not ADD-saturate the soft rim into a hard-looking edge. SoftCircle alpha still defines the circular feather; do not return to square `CreateLine` quads. Treat the nonzero `BLEND` path as unproven until Retail confirms the mechanism; do not invent additional rendering machinery without that evidence.
+`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask` with `ADD` blending (original hard circular look). Steps `10`–`100` use the SoftCircle TGA with `BLEND` and clear any legacy mask via `SetMask("")` (`CLEARED_MASK`). SoftCircle alpha defines the circular feather; do not return to square `CreateLine` quads.
 
-Appearance is resolved once per effective softness change. Live stamps refresh immediately; hidden pool slots adopt the cached texture/mask/blend on the next `Show`/reuse. Softness-only updates must not rewrite the whole pool, reconfigure geometry, or reset fade alpha. When applying appearance, skip unchanged per-slot texture, mask, and blend setters independently (nonzero→nonzero must not reissue mask/blend). The sample/fade hot path stays allocation-free and must not format texture paths or read the settings Store.
+Retail (#454) confirmed: SoftCircle + BLEND with no active mask renders a soft glow; `SetMask("Interface\\Buttons\\WHITE8X8")` immediately turns that sample into a hard square; `SetTexture` does not remove an active mask; `SetMask("")` restores the soft glow. Do not use WHITE8X8 (or any opaque rect) as a soft-stamp mask.
+
+Appearance is resolved once per effective softness change. Live stamps refresh immediately; hidden pool slots adopt the cached texture/mask/blend on the next `Show`/reuse. Softness-only updates must not rewrite the whole pool, reconfigure geometry, or reset fade alpha. When applying appearance, skip unchanged per-slot texture, mask, and blend setters independently (nonzero→nonzero must not reissue mask/blend). Applied cleared-mask state is the empty string, distinct from an uninitialized per-slot cache entry (`nil`). The sample/fade hot path stays allocation-free and must not format texture paths or read the settings Store.
 
 The checked-in SoftCircle_10..100.tga files are the authoritative soft assets. There is no checked-in generator recipe for them; do not invent or run a formula that would overwrite those files.
 
@@ -119,6 +121,6 @@ It reuses one bounded panel with fixed-role SoftCircle_100 samples:
 - isolated **ADD / circular mask**
 - overlapping copies under each of those three conditions
 
-`SF.Debug` records texture load success/path, whether SetMask was called, mask outcome, and actual blend mode. Clear only hides the panel; repeated open/close must not grow frames or textures. Localized via `locale/enUS.lua`. Remove this diagnostic after Retail QA.
+Retail used this panel to prove WHITE8X8 masking causes hard squares and that `SetMask("")` clears them. Production soft stamps now clear via `SetMask("")` rather than leaving no-mask-only diagnostic samples as the sole path. `SF.Debug` records texture load success/path, whether SetMask was called, mask outcome, and actual blend mode. Clear only hides the panel; repeated open/close must not grow frames or textures. Localized via `locale/enUS.lua`. Remove this diagnostic after final Retail QA of the live trail.
 
-Human comparison should also include live trail crossings and ring-buffer wraparound after a long stroke, not only the diagnostic panel.
+Human comparison should also include live trail slow/fast movement, crossings, stationary fading, 0/50/100%, soft↔hard transitions, and ring-buffer wraparound.

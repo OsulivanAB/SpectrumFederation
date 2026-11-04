@@ -51,10 +51,11 @@ SF.MouseTracer.Constants = {
 
 	HUE_PER_PIXEL = 1 / 200,
 	CIRCLE_TEXTURE = "Interface\\CharacterFrame\\TempPortraitAlphaMask",
-	-- Fully opaque rect used as SetMask target for nonzero softness so the hard
-	-- circular portrait mask cannot clip soft TGA falloff. SoftCircle alpha
-	-- still defines the circular feather; this is not an extra per-stamp layer.
-	FULL_RECT_MASK = "Interface\\Buttons\\WHITE8X8",
+	-- Softness 10–100 clears any legacy SetMask via SetMask(""). Retail (#454)
+	-- showed WHITE8X8 as a mask forces hard squares, and SetTexture does not
+	-- remove an active mask. Empty string is distinct from an uninitialized
+	-- per-slot cache entry (nil).
+	CLEARED_MASK = "",
 	-- Softness steps 10–100 map to precomputed 64x64 TGA stamps. 0% uses CIRCLE_TEXTURE.
 	SOFT_CIRCLE_TEXTURE_FMT = "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_%d.tga",
 

@@ -119,15 +119,22 @@ def test_schema_and_slider_match_new_mouse_tracer_defaults():
     assert "MAX_TRAIL_LENGTH = 1200" in constants
     assert "TAPER_MIN_RATIO = 0.40" in constants
     assert "SoftCircle_%d.tga" in constants
-    assert "FULL_RECT_MASK" in constants
-    assert "WHITE8X8" in constants
-    assert "StampAppearanceForEdgeSoftness" in ENGINE.read_text(encoding="utf-8")
+    assert "CLEARED_MASK" in constants
+    assert 'CLEARED_MASK = ""' in constants
+    assert "FULL_RECT_MASK" not in constants
+    engine = ENGINE.read_text(encoding="utf-8")
+    assert "StampAppearanceForEdgeSoftness" in engine
+    assert "C.CLEARED_MASK" in engine
+    assert "FULL_RECT_MASK" not in engine
     assert "RefreshLiveStampAppearances" in RUNTIME.read_text(encoding="utf-8")
     runtime = RUNTIME.read_text(encoding="utf-8")
     assert "RunEdgeSoftnessDiagnostic" in runtime
     assert "stampAppliedTexture[idx] ~= texture" in runtime
     assert "stampAppliedMask[idx] ~= mask" in runtime
     assert "stampAppliedBlend[idx] ~= blend" in runtime
+    # Soft path must call SetMask even when clearing ("" is falsy in Lua).
+    assert "pcall(stamp.SetMask, stamp, mask)" in runtime
+    assert "if stamp.SetMask and mask then" not in runtime
     assert "max = 1200" in page
     assert "label = \"Trail Length\"" in page
     assert "mouseTracer.edgeSoftness" in page
