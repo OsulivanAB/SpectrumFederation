@@ -52,7 +52,9 @@ No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to
 
 ### Resources
 
-`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask`; steps `10`–`100` swap each stamp to a precomputed soft TGA under `media/MouseTracer/` while retaining the hard circular mask so feathering stays inside the stamp bounds. Do not return to square `CreateLine` quads.
+`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask` with `ADD` blending (original hard circular look). Steps `10`–`100` swap each stamp to a precomputed soft TGA under `media/MouseTracer/`, neutralize the hard circular mask with `WHITE8X8`, and use `BLEND` so overlapping stamps do not ADD-saturate the soft rim into a hard-looking edge. SoftCircle alpha still defines the circular feather; do not return to square `CreateLine` quads.
+
+Appearance is resolved once per effective softness change. Live stamps refresh immediately; hidden pool slots adopt the cached texture/mask/blend on the next `Show`/reuse. Softness-only updates must not rewrite the whole pool, reconfigure geometry, or reset fade alpha. The sample/fade hot path stays allocation-free and must not format texture paths or read the settings Store.
 
 Cadence constants:
 
@@ -98,3 +100,14 @@ python -m pytest tests/test_mouse_tracer.py
 PR validation on `beta` and `main` runs that file beside the Settings navigation and Cursed Surge Tracker tests.
 
 In-game profiler checks must use isolated `C_AddOnProfiler.MeasureCall` around Mouse Tracer work. Addon-wide LastTime is not a Mouse Tracer pass/fail signal.
+
+### Temporary Edge Softness diagnostic (#454)
+
+Until Retail confirms the soft-edge mechanism, a temporary on-screen comparison is available:
+
+```text
+/run SpectrumFederation.MouseTracer:RunEdgeSoftnessDiagnostic()
+/run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()
+```
+
+It draws three fresh SoftCircle_100 stamps (BLEND+rect mask, ADD+rect mask, ADD+circular mask) on a dark panel and logs texture/mask/blend outcomes through `SF.Debug`. Remove this diagnostic after Retail QA.

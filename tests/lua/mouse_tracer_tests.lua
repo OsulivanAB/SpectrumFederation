@@ -99,6 +99,28 @@ assertEq(
     "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga",
     "near-50 values snap before selecting a soft TGA"
 )
+assertEq(C.FULL_RECT_MASK, "Interface\\Buttons\\WHITE8X8", "nonzero softness neutralizes the hard mask with WHITE8X8")
+do
+    local soft, tex, mask, blend = Engine.StampAppearanceForEdgeSoftness(0)
+    assertEq(soft, 0, "0% appearance softens to 0")
+    assertEq(tex, C.CIRCLE_TEXTURE, "0% appearance keeps the circular texture")
+    assertEq(mask, C.CIRCLE_TEXTURE, "0% appearance keeps the circular mask")
+    assertEq(blend, "ADD", "0% appearance keeps ADD blending")
+end
+do
+    local soft, tex, mask, blend = Engine.StampAppearanceForEdgeSoftness(100)
+    assertEq(soft, 100, "100% appearance softens to 100")
+    assertEq(tex, "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_100.tga", "100% appearance selects SoftCircle_100")
+    assertEq(mask, C.FULL_RECT_MASK, "100% appearance uses the full-rect mask")
+    assertEq(blend, "BLEND", "100% appearance uses BLEND to preserve soft rims under overlap")
+end
+do
+    local soft, tex, mask, blend = Engine.StampAppearanceForEdgeSoftness(47)
+    assertEq(soft, 50, "appearance softens snaps like NormalizeEdgeSoftness")
+    assertEq(tex, "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga", "appearance texture snaps with softness")
+    assertEq(mask, C.FULL_RECT_MASK, "nonzero snapped appearance uses the full-rect mask")
+    assertEq(blend, "BLEND", "nonzero snapped appearance uses BLEND")
+end
 assertEq(C.MIN_TRAIL_LENGTH, 80, "minimum trail length stays 80")
 assertAlmost(C.TAPER_MIN_RATIO, 0.40, 1e-9, "oldest stamp is 40% of configured thickness")
 assertEq(C.MAX_POINTS, 1202, "MAX_POINTS is derived from 1200/1 + 2")
@@ -807,6 +829,19 @@ local frames = {}
 local cursorX, cursorY = 0, 0
 
 local stampTextures = {}
+local textureSetCount = 0
+local maskSetCount = 0
+local blendSetCount = 0
+
+local function resetAppearanceOpCounts()
+    textureSetCount = 0
+    maskSetCount = 0
+    blendSetCount = 0
+end
+
+local function appearanceOpCounts()
+    return textureSetCount, maskSetCount, blendSetCount
+end
 
 local function textureWidget()
     local tex = {
@@ -814,6 +849,7 @@ local function textureWidget()
         alpha = 0,
         texture = nil,
         mask = nil,
+        blend = nil,
         width = 0,
         height = 0,
         vertex = nil,
@@ -823,13 +859,22 @@ local function textureWidget()
             if key == "SetTexture" then
                 return function(_, path)
                     self.texture = path
+                    textureSetCount = textureSetCount + 1
                 end
             elseif key == "SetMask" then
                 return function(_, path)
                     self.mask = path
+                    maskSetCount = maskSetCount + 1
                 end
             elseif key == "SetBlendMode" then
-                return function() end
+                return function(_, mode)
+                    self.blend = mode
+                    blendSetCount = blendSetCount + 1
+                end
+            elseif key == "GetBlendMode" then
+                return function()
+                    return self.blend
+                end
             elseif key == "SetSize" then
                 return function(_, w, h)
                     self.width = w
@@ -1101,87 +1146,171 @@ assertEq(createdFrames, framesBeforeReinit, "re-init does not create another eve
 assertEq(eventFrame.events.DISPLAY_SIZE_CHANGED, 1, "re-init does not register display-size twice")
 assertEq(eventFrame.events.UI_SCALE_CHANGED, 1, "re-init does not register UI-scale twice")
 
--- Live Edge Softness updates must swap stamp textures without resetting age/fade.
+-- Edge Softness: appearance identity, live vs idle cost, reuse, and reset.
 currentScale = 1
+local soft50 = "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga"
+local soft90 = "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_90.tga"
+local soft100 = "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_100.tga"
+
+local function assertLiveAppearance(path, mask, blend, message)
+    assertTrue(Tracer.engine.count > 0, message .. " has live stamps")
+    for chrono = 1, Tracer.engine.count do
+        local _, _, _, _, idx = Tracer.engine:GetPoint(chrono)
+        local stamp = stampTextures[idx]
+        assertEq(stamp.texture, path, message .. " texture")
+        assertEq(stamp.mask, mask, message .. " mask")
+        assertEq(stamp.blend, blend, message .. " blend")
+    end
+end
+
+-- Idle pool: softness changes must not rewrite hidden slots or allocate.
 Tracer:ApplyEnabled(true)
 host = hostFrame()
 assertTrue(host ~= nil, "edge-softness suite has a tracer host")
 assertEq(#stampTextures, C.MAX_POINTS, "edge-softness suite sees the fixed stamp pool")
 assertEq(stampTextures[1].texture, C.CIRCLE_TEXTURE, "pool starts on the hard circular texture")
-assertEq(stampTextures[1].mask, C.CIRCLE_TEXTURE, "pool keeps the hard circular mask")
+assertEq(stampTextures[1].mask, C.CIRCLE_TEXTURE, "pool starts with the hard circular mask")
+assertEq(stampTextures[1].blend, "ADD", "pool starts with ADD blending")
+assertEq(Tracer.engine.count, 0, "fresh enable has no live stamps before movement")
 
+local framesBeforeIdleSoft = createdFrames
+local texturesBeforeIdleSoft = createdTextures
+resetAppearanceOpCounts()
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
+assertEq(charSettings.edgeSoftness, 50, "store keeps the idle edgeSoftness write")
+local idleTex, idleMask, idleBlend = appearanceOpCounts()
+assertEq(idleTex, 0, "idle softness change performs no SetTexture writes")
+assertEq(idleMask, 0, "idle softness change performs no SetMask writes")
+assertEq(idleBlend, 0, "idle softness change performs no SetBlendMode writes")
+assertEq(createdFrames, framesBeforeIdleSoft, "idle softness change creates no frames")
+assertEq(createdTextures, texturesBeforeIdleSoft, "idle softness change creates no textures")
+assertEq(stampTextures[1].texture, C.CIRCLE_TEXTURE, "hidden slots may stay stale while unused")
+
+-- Equivalent normalized value must skip appearance work even with a live trail.
 pumpCursor(0, 0)
 pumpCursor(40, 0)
 assertTrue(Tracer.engine.count > 0, "edge-softness suite draws a live trail")
+-- First emit after idle softness=50 must adopt soft appearance on Show/reuse.
+assertLiveAppearance(soft50, C.FULL_RECT_MASK, "BLEND", "first live stamps after idle soft write")
+
 local liveCount = Tracer.engine.count
 local agesBefore = {}
 local alphasBefore = {}
+local sizesBefore = {}
 local shownBefore = 0
 for chrono = 1, liveCount do
     local _, _, pt, _, idx = Tracer.engine:GetPoint(chrono)
     agesBefore[chrono] = pt
     local stamp = stampTextures[idx]
     alphasBefore[chrono] = stamp and stamp.alpha or nil
+    sizesBefore[chrono] = stamp and stamp.width or nil
     if stamp and stamp.shown then
         shownBefore = shownBefore + 1
     end
 end
 assertTrue(shownBefore > 0, "live trail shows at least one stamp before softness change")
 
+resetAppearanceOpCounts()
 SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
-assertEq(charSettings.edgeSoftness, 50, "store keeps the live edgeSoftness write")
-assertEq(
-    stampTextures[1].texture,
-    "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga",
-    "live softness update swaps the first stamp texture"
-)
-local softCount = 0
-for i = 1, #stampTextures do
-    if stampTextures[i].texture == "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga" then
-        softCount = softCount + 1
-    end
-    assertEq(stampTextures[i].mask, C.CIRCLE_TEXTURE, "softness update retains the hard circular mask")
-end
-assertEq(softCount, C.MAX_POINTS, "live softness update refreshes every pooled stamp texture")
+local eqTex, eqMask, eqBlend = appearanceOpCounts()
+assertEq(eqTex, 0, "equivalent softness 50 performs no SetTexture writes")
+assertEq(eqMask, 0, "equivalent softness 50 performs no SetMask writes")
+assertEq(eqBlend, 0, "equivalent softness 50 performs no SetBlendMode writes")
+
+-- Live softness change refreshes only the live set, preserves geometry/age/alpha.
+resetAppearanceOpCounts()
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 100)
+assertEq(charSettings.edgeSoftness, 100, "store keeps the live edgeSoftness write")
+local liveTex, liveMask, liveBlend = appearanceOpCounts()
+assertTrue(liveTex > 0, "live softness change writes textures")
+assertTrue(liveTex <= liveCount, "live softness change does not exceed the live stamp count")
+assertTrue(liveMask <= liveCount, "live softness mask writes stay within the live set")
+assertTrue(liveBlend <= liveCount, "live softness blend writes stay within the live set")
+assertTrue(liveTex < C.MAX_POINTS, "live softness change does not sweep the full pool")
+assertLiveAppearance(soft100, C.FULL_RECT_MASK, "BLEND", "live 100% softness")
 assertEq(Tracer.engine.count, liveCount, "softness update does not drop or replay trail points")
 for chrono = 1, liveCount do
     local _, _, pt, _, idx = Tracer.engine:GetPoint(chrono)
     assertEq(pt, agesBefore[chrono], "softness update preserves stamp birth times")
     local stamp = stampTextures[idx]
     assertAlmost(stamp.alpha, alphasBefore[chrono], 1e-9, "softness update preserves stamp fade alpha")
+    assertAlmost(stamp.width, sizesBefore[chrono], 1e-9, "softness-only update preserves stamp size")
 end
 
--- Subsequent emission also uses the soft texture without a reload.
+-- Rapid scrubbing across steps stays bounded by the live set each step.
+resetAppearanceOpCounts()
+local scrubLive = Tracer.engine.count
+for _, pct in ipairs({ 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 50, 0 }) do
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", pct)
+end
+local scrubTex = appearanceOpCounts()
+assertTrue(scrubTex <= scrubLive * 14, "rapid scrubbing texture writes stay within live×steps")
+assertTrue(scrubTex < C.MAX_POINTS * 3, "rapid scrubbing does not approach full-pool × steps cost")
+assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "scrub ends at 0%")
+
+-- 0 → 100 → 0 restores hard circular ADD appearance on live stamps.
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 100)
+assertLiveAppearance(soft100, C.FULL_RECT_MASK, "BLEND", "0→100")
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
+assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "100→0")
+
+-- New emission after a softness change uses the cached appearance.
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
 local countBeforeEmit = Tracer.engine.count
 pumpCursor(80, 0)
 assertTrue(Tracer.engine.count > countBeforeEmit, "movement after softness change still emits stamps")
 local newestIdx = Tracer.engine:ChronoIndex(Tracer.engine.count)
-assertEq(
-    stampTextures[newestIdx].texture,
-    "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga",
-    "new stamps after softness change keep the soft texture"
-)
-
-SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
-assertEq(stampTextures[1].texture, C.CIRCLE_TEXTURE, "returning to 0% restores the hard circular texture")
-assertEq(Tracer.engine.count > 0, true, "returning to 0% softness keeps the live trail")
+assertEq(stampTextures[newestIdx].texture, soft50, "new stamps after softness change keep the soft texture")
+assertEq(stampTextures[newestIdx].mask, C.FULL_RECT_MASK, "new stamps use the full-rect mask")
+assertEq(stampTextures[newestIdx].blend, "BLEND", "new stamps use BLEND")
 
 -- Malformed softness values normalize through the live callback path.
 SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 87)
 assertEq(charSettings.edgeSoftness, 87, "store may temporarily hold the raw slider write")
--- OnSettingChanged clamps into cache and selects the snapped texture.
-assertEq(
-    stampTextures[1].texture,
-    "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_90.tga",
-    "live softness normalizes 87 to the 90% soft TGA"
-)
+assertEq(stampTextures[newestIdx].texture, soft90, "live softness normalizes 87 to the 90% soft TGA")
+assertEq(stampTextures[newestIdx].blend, "BLEND", "normalized nonzero softness keeps BLEND")
 
+-- Hidden-slot reuse: change softness while stamps are hidden, then re-show via movement.
 Tracer:ApplyEnabled(false)
 assertTrue(host.scripts.OnUpdate == nil, "edge-softness suite disables cleanly")
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
+assertEq(stampTextures[1].texture, soft90, "disabled softness write leaves prior slot identity until reuse")
+local framesBeforeDisabledSoft = createdFrames
+resetAppearanceOpCounts()
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 100)
+local disabledTex = select(1, appearanceOpCounts())
+assertEq(disabledTex, 0, "disabled softness change performs no appearance writes")
+assertEq(createdFrames, framesBeforeDisabledSoft, "disabled softness change creates no frames")
+
+Tracer:ApplyEnabled(true)
+host = hostFrame()
+pumpCursor(0, 0)
+pumpCursor(50, 0)
+assertTrue(Tracer.engine.count > 0, "re-enable after disabled soft write draws a trail")
+assertLiveAppearance(soft100, C.FULL_RECT_MASK, "BLEND", "hidden slots adopt newest appearance on reuse")
+
+-- Copy From Character while live must adopt source softness without pool growth.
+local texturesBeforeCopy = #stampTextures
+copies["SoftLive-Realm"] = {
+    enabled = true,
+    trailLength = 400,
+    fadeDuration = 0.5,
+    thickness = 16,
+    rainbowSpeed = 0.25,
+    opacity = 0.7,
+    edgeSoftness = 50,
+}
+assertTrue(Tracer:CopyFromCharacter("SoftLive-Realm"), "CopyFromCharacter succeeds while live")
+assertEq(charSettings.edgeSoftness, 50, "copy applies edgeSoftness 50")
+assertLiveAppearance(soft50, C.FULL_RECT_MASK, "BLEND", "copy refreshes live appearance")
+assertEq(#stampTextures, texturesBeforeCopy, "copy does not grow the stamp pool")
+
+Tracer:ApplyEnabled(false)
+assertTrue(host.scripts.OnUpdate == nil, "copy suite disables cleanly")
 
 -- Reset All must restore the original 0% stamp appearance after soft textures were applied.
 -- Store:ResetAll only fires sf.reset (not per-key edgeSoftness); the production callback must
--- refresh pooled textures after ReloadCacheFromStore.
+-- resolve appearance after ReloadCacheFromStore so reuse shows hard circular ADD stamps.
 assertTrue(#resetCallbacks >= 1, "Init registers the production sf.reset callback")
 currentScale = 1
 local texturesBeforeResetSuite = #stampTextures
@@ -1190,11 +1319,9 @@ Tracer:ApplyEnabled(true)
 host = hostFrame()
 assertTrue(host.scripts.OnUpdate ~= nil, "reset suite enables OnUpdate")
 SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
-assertEq(
-    stampTextures[1].texture,
-    "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga",
-    "reset suite starts from a nonzero soft texture"
-)
+pumpCursor(0, 0)
+pumpCursor(40, 0)
+assertLiveAppearance(soft50, C.FULL_RECT_MASK, "BLEND", "reset suite starts from a nonzero soft texture")
 assertEq(#stampTextures, texturesBeforeResetSuite, "selecting softness does not grow the stamp pool")
 
 local okReset = SF.SettingsStore:ResetAll()
@@ -1212,22 +1339,23 @@ assertEq(#stampTextures, texturesBeforeResetSuite, "re-enable after reset reuses
 pumpCursor(0, 0)
 pumpCursor(60, 0)
 assertTrue(Tracer.engine.count > 0, "movement after reset draws a new trail")
-local hardCount = 0
-for i = 1, #stampTextures do
-    if stampTextures[i].texture == C.CIRCLE_TEXTURE then
-        hardCount = hardCount + 1
-    end
-end
-assertEq(hardCount, C.MAX_POINTS, "after sf.reset, re-enable renders the original 0% circular texture")
+assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "after sf.reset, re-enable renders original 0%")
 local newestAfterReset = Tracer.engine:ChronoIndex(Tracer.engine.count)
-assertEq(
-    stampTextures[newestAfterReset].texture,
-    C.CIRCLE_TEXTURE,
-    "new stamps after reset use the original hard circular texture"
-)
+assertEq(stampTextures[newestAfterReset].texture, C.CIRCLE_TEXTURE, "new stamps after reset use hard circular texture")
+assertEq(stampTextures[newestAfterReset].blend, "ADD", "new stamps after reset use ADD")
 
-Tracer:ApplyEnabled(false)
-assertTrue(host.scripts.OnUpdate == nil, "reset suite disables cleanly")
+-- Repeated enable/disable + softness scrub settles without growing resources.
+local framesBeforeRepeatSoft = createdFrames
+local texturesBeforeRepeatSoft = #stampTextures
+for _ = 1, 20 do
+    Tracer:ApplyEnabled(true)
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 100)
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
+    Tracer:ApplyEnabled(false)
+end
+assertEq(createdFrames, framesBeforeRepeatSoft, "repeated soft enable/disable creates no frames")
+assertEq(#stampTextures, texturesBeforeRepeatSoft, "repeated soft enable/disable does not grow the pool")
+assertTrue(hostFrame().scripts.OnUpdate == nil, "final disable leaves OnUpdate cleared")
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then

@@ -23,6 +23,11 @@ local engine
 local host
 local stamps
 local stampLastAlpha
+-- Per-slot last applied appearance identity (texture/mask/blend). Kept small and
+-- complete so soft transitions cannot leave a stale hard mask or ADD blend.
+local stampAppliedTexture
+local stampAppliedMask
+local stampAppliedBlend
 local poolReady = false
 local applySuspended = false
 local sampleElapsed = 0
@@ -34,6 +39,15 @@ local snapshotDue = 0
 local snapshotTicker
 local copySource
 local started = false
+
+-- Resolved once per effective softness change. Sampling/fading reuse these
+-- references and never format paths or read the settings Store.
+local appearance = {
+	softness = nil,
+	texture = nil,
+	mask = nil,
+	blend = nil,
+}
 
 local function DebugInfo(message, ...)
 	if SF.Debug then
@@ -215,25 +229,66 @@ local function StampSize(idx, newestDist, oldestDist)
 	return Engine.TaperedSize(cache.thickness, newestDist, oldestDist, engine.pdist[idx])
 end
 
--- Select the stamp texture for the cached softness. Softness 0 keeps the
--- Blizzard circular mask path; higher steps use precomputed soft TGA stamps.
--- The hard circular mask stays applied so soft falloff feathers inward only.
-local function ApplyStampTexture(stamp)
-	if not stamp or not stamp.SetTexture then
-		return
+-- Resolve cached appearance from cache.edgeSoftness. Returns true when the
+-- effective texture/mask/blend identity changed and visual work is required.
+local function SyncAppearanceCache()
+	local softness, texture, mask, blend = Engine.StampAppearanceForEdgeSoftness(cache.edgeSoftness)
+	if appearance.softness == softness
+		and appearance.texture == texture
+		and appearance.mask == mask
+		and appearance.blend == blend then
+		return false
 	end
-	stamp:SetTexture(Engine.StampTextureForEdgeSoftness(cache.edgeSoftness))
-	if stamp.SetMask then
-		pcall(stamp.SetMask, stamp, C.CIRCLE_TEXTURE)
-	end
+	appearance.softness = softness
+	appearance.texture = texture
+	appearance.mask = mask
+	appearance.blend = blend
+	return true
 end
 
-local function ApplyAllStampTextures()
-	if not stamps then
+-- Apply the cached appearance to one stamp when its identity is stale.
+-- Returns true when a texture/mask/blend write occurred.
+local function ApplyStampAppearance(stamp, idx)
+	if not stamp or not idx then
+		return false
+	end
+	local texture = appearance.texture
+	local mask = appearance.mask
+	local blend = appearance.blend
+	if not texture then
+		return false
+	end
+	if stampAppliedTexture[idx] == texture
+		and stampAppliedMask[idx] == mask
+		and stampAppliedBlend[idx] == blend then
+		return false
+	end
+	if stamp.SetTexture then
+		stamp:SetTexture(texture)
+	end
+	if stamp.SetMask and mask then
+		pcall(stamp.SetMask, stamp, mask)
+	end
+	if stamp.SetBlendMode and blend then
+		pcall(stamp.SetBlendMode, stamp, blend)
+	end
+	stampAppliedTexture[idx] = texture
+	stampAppliedMask[idx] = mask
+	stampAppliedBlend[idx] = blend
+	return true
+end
+
+-- Softness-only updates refresh live stamps. Hidden slots stay stale until
+-- PlaceStamp / reuse applies the cached appearance before Show.
+local function RefreshLiveStampAppearances()
+	if not poolReady or not engine or not stamps then
 		return
 	end
-	for idx = 1, C.MAX_POINTS do
-		ApplyStampTexture(stamps[idx])
+	for chrono = 1, engine.count do
+		local idx = engine:ChronoIndex(chrono)
+		if idx then
+			ApplyStampAppearance(stamps[idx], idx)
+		end
 	end
 end
 
@@ -245,6 +300,9 @@ local function PlaceStamp(idx, newestDist, oldestDist)
 	if not stamp then
 		return
 	end
+	-- Ring-buffer reuse and first show must adopt the latest appearance before
+	-- becoming visible. Softness-only changes never reset alpha or birth time.
+	ApplyStampAppearance(stamp, idx)
 	if newestDist == nil or oldestDist == nil then
 		newestDist, oldestDist = TrailDistRange()
 	end
@@ -465,12 +523,13 @@ local function EnsurePool()
 
 	stamps = {}
 	stampLastAlpha = {}
+	stampAppliedTexture = {}
+	stampAppliedMask = {}
+	stampAppliedBlend = {}
+	SyncAppearanceCache()
 	for idx = 1, C.MAX_POINTS do
 		local stamp = host:CreateTexture(nil, "ARTWORK")
-		ApplyStampTexture(stamp)
-		if stamp.SetBlendMode then
-			pcall(stamp.SetBlendMode, stamp, "ADD")
-		end
+		ApplyStampAppearance(stamp, idx)
 		stamp:SetSize(cache.thickness, cache.thickness)
 		stamp:Hide()
 		stamps[idx] = stamp
@@ -610,6 +669,7 @@ function Tracer:ReloadCacheFromStore()
 	cache.opacity = ClampSetting("opacity", store:GetCharacter("mouseTracer.opacity"))
 	cache.edgeSoftness = ClampSetting("edgeSoftness", store:GetCharacter("mouseTracer.edgeSoftness"))
 	SyncEngineConfig()
+	SyncAppearanceCache()
 end
 
 local function OnSettingChanged(key, newValue)
@@ -629,16 +689,19 @@ local function OnSettingChanged(key, newValue)
 		SyncEngineConfig()
 	end
 	if key == "edgeSoftness" then
-		-- Refresh every pooled stamp so live and later-emitted stamps share the
-		-- new softness without resetting age or replaying the trail.
-		ApplyAllStampTextures()
+		-- Resolve once. Skip redundant work when the normalized appearance is
+		-- unchanged. Softness-only updates refresh live stamps' texture/mask/
+		-- blend without reconfiguring geometry or resetting fade alpha.
+		if SyncAppearanceCache() then
+			RefreshLiveStampAppearances()
+		end
 	end
 	if engine and engine.count > 0 then
 		if key == "trailLength" or key == "fadeDuration" then
 			engine:ProcessFade(Now())
 			ApplyReleased()
 		end
-		if key == "rainbowSpeed" or key == "thickness" or key == "opacity" or key == "fadeDuration" or key == "trailLength" or key == "edgeSoftness" then
+		if key == "rainbowSpeed" or key == "thickness" or key == "opacity" or key == "fadeDuration" or key == "trailLength" then
 			ReconfigureActiveStamps()
 		end
 	end
@@ -733,11 +796,10 @@ function Tracer:CopyFromCharacter(sourceId)
 	applySuspended = false
 
 	self:ReloadCacheFromStore()
-	if poolReady then
-		ApplyAllStampTextures()
-	end
+	SyncAppearanceCache()
 	self:ApplyEnabled(cache.enabled)
 	if cache.enabled and engine and engine.count > 0 then
+		RefreshLiveStampAppearances()
 		ReconfigureActiveStamps()
 	end
 	self:FlushSnapshot()
@@ -776,13 +838,10 @@ function Tracer:Init()
 			end)
 		end
 		store:RegisterCallback("sf.reset", function()
+			-- ResetAll only emits sf.reset, not per-key edgeSoftness.
+			-- ReloadCacheFromStore resolves appearance (softness → 0) so re-enable
+			-- / reuse applies the original hard circular stamps before Show.
 			self:ReloadCacheFromStore()
-			-- ResetAll only emits sf.reset, not per-key edgeSoftness. Reload the
-			-- cache (softness → 0) and refresh any existing pool so re-enable
-			-- renders the original hard circular stamps.
-			if poolReady then
-				ApplyAllStampTextures()
-			end
 			self:ApplyEnabled(cache.enabled)
 			self:FlushSnapshot()
 		end)
@@ -815,4 +874,121 @@ function Tracer:Init()
 	end
 
 	DebugInfo("Mouse Tracer module initialized")
+end
+
+-- Temporary Retail diagnostic for issue #454. Creates three fresh, stationary,
+-- non-overlapping SoftCircle_100 stamps over a dark backdrop so a human can
+-- separate mask clipping from ADD overlap wash-out. Not a permanent preview UI.
+-- Invoke: /run SpectrumFederation.MouseTracer:RunEdgeSoftnessDiagnostic()
+-- Dismiss: /run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()
+-- Remove after Retail confirmation of the soft-edge mechanism.
+local softnessDiagFrame
+
+function Tracer:ClearEdgeSoftnessDiagnostic()
+	if softnessDiagFrame then
+		softnessDiagFrame:Hide()
+		softnessDiagFrame:SetParent(nil)
+		softnessDiagFrame = nil
+	end
+	DebugInfo("Edge Softness diagnostic cleared")
+end
+
+function Tracer:RunEdgeSoftnessDiagnostic()
+	if not CreateFrame or not UIParent then
+		DebugWarn("Edge Softness diagnostic requires CreateFrame/UIParent")
+		return
+	end
+	self:ClearEdgeSoftnessDiagnostic()
+
+	local softPath = Engine.StampTextureForEdgeSoftness(100)
+	local root = CreateFrame("Frame", "SF_MouseTracerSoftnessDiag", UIParent)
+	root:SetFrameStrata("TOOLTIP")
+	root:SetFrameLevel(20000)
+	root:SetSize(420, 180)
+	root:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+	root:EnableMouse(true)
+	if root.SetBackdrop then
+		root:SetBackdrop({
+			bgFile = "Interface\\Buttons\\WHITE8X8",
+			edgeFile = "Interface\\Buttons\\WHITE8X8",
+			edgeSize = 1,
+		})
+		root:SetBackdropColor(0.05, 0.05, 0.05, 0.95)
+		root:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+	else
+		local bg = root:CreateTexture(nil, "BACKGROUND")
+		bg:SetAllPoints(root)
+		bg:SetColorTexture(0.05, 0.05, 0.05, 0.95)
+	end
+
+	local title = root:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	title:SetPoint("TOP", root, "TOP", 0, -8)
+	title:SetText("Mouse Tracer Softness Diag (temporary #454)")
+
+	local function makeSample(label, x, blend, maskPath)
+		local tex = root:CreateTexture(nil, "ARTWORK")
+		tex:SetSize(64, 64)
+		tex:SetPoint("CENTER", root, "LEFT", x, -8)
+		local texOk = false
+		if tex.SetTexture then
+			texOk = tex:SetTexture(softPath) ~= false
+			if tex.GetTexture then
+				texOk = tex:GetTexture() ~= nil
+			end
+		end
+		local maskOk = false
+		local maskErr = nil
+		if maskPath and tex.SetMask then
+			maskOk, maskErr = pcall(tex.SetMask, tex, maskPath)
+		elseif not maskPath then
+			maskOk = true
+		end
+		local blendOk = false
+		local actualBlend = nil
+		if tex.SetBlendMode then
+			blendOk = pcall(tex.SetBlendMode, tex, blend)
+		end
+		if tex.GetBlendMode then
+			actualBlend = tex:GetBlendMode()
+		else
+			actualBlend = blend
+		end
+		if tex.SetVertexColor then
+			tex:SetVertexColor(1, 0.35, 0.85, 1)
+		end
+		tex:SetAlpha(0.70)
+		tex:Show()
+
+		local caption = root:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		caption:SetPoint("TOP", tex, "BOTTOM", 0, -6)
+		caption:SetText(label)
+
+		DebugInfo(
+			"softness-diag %s texture=%s texOk=%s mask=%s maskOk=%s maskErr=%s blendWant=%s blendOk=%s blendActual=%s",
+			label,
+			tostring(softPath),
+			tostring(texOk),
+			tostring(maskPath),
+			tostring(maskOk),
+			tostring(maskErr),
+			tostring(blend),
+			tostring(blendOk),
+			tostring(actualBlend)
+		)
+		return tex
+	end
+
+	-- Isolated comparisons from #454: (a) BLEND / no hard mask, (b) ADD / no hard
+	-- mask, (c) ADD / current circular mask. Soft TGA is the color texture in all.
+	makeSample("BLEND\nrect mask", 70, "BLEND", C.FULL_RECT_MASK)
+	makeSample("ADD\nrect mask", 210, "ADD", C.FULL_RECT_MASK)
+	makeSample("ADD\ncircle mask", 350, "ADD", C.CIRCLE_TEXTURE)
+
+	local hint = root:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	hint:SetPoint("BOTTOM", root, "BOTTOM", 0, 8)
+	hint:SetText("Compare edges on this dark panel, then overlapping trail in settings. /run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()")
+
+	softnessDiagFrame = root
+	root:Show()
+	DebugInfo("Edge Softness diagnostic shown using %s", tostring(softPath))
 end
