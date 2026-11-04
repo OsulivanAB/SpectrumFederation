@@ -123,14 +123,24 @@ def test_schema_and_slider_match_new_mouse_tracer_defaults():
     assert "WHITE8X8" in constants
     assert "StampAppearanceForEdgeSoftness" in ENGINE.read_text(encoding="utf-8")
     assert "RefreshLiveStampAppearances" in RUNTIME.read_text(encoding="utf-8")
-    assert "RunEdgeSoftnessDiagnostic" in RUNTIME.read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
+    assert "RunEdgeSoftnessDiagnostic" in runtime
+    assert "stampAppliedTexture[idx] ~= texture" in runtime
+    assert "stampAppliedMask[idx] ~= mask" in runtime
+    assert "stampAppliedBlend[idx] ~= blend" in runtime
     assert "max = 1200" in page
     assert "label = \"Trail Length\"" in page
     assert "mouseTracer.edgeSoftness" in page
     assert "MOUSE_TRACER_EDGE_SOFTNESS_LABEL" in page
     assert 'L["MOUSE_TRACER_EDGE_SOFTNESS_LABEL"]' in locale
     assert 'L["MOUSE_TRACER_EDGE_SOFTNESS_TOOLTIP"]' in locale
-    assert SOFT_GENERATOR.is_file(), "soft-circle generation recipe must remain checked in"
+    assert 'L["MOUSE_TRACER_SOFTNESS_DIAG_TITLE"]' in locale
+    assert 'L["MOUSE_TRACER_SOFTNESS_DIAG_BLEND_NONE"]' in locale
+    assert 'L["MOUSE_TRACER_SOFTNESS_DIAG_ADD_NONE"]' in locale
+    assert 'L["MOUSE_TRACER_SOFTNESS_DIAG_ADD_CIRCLE"]' in locale
+    assert 'L["MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_BLEND_NONE"]' in locale
+    # Checked-in SoftCircle assets are authoritative; do not ship an inaccurate generator.
+    assert not SOFT_GENERATOR.exists(), "inaccurate soft-circle generator must not remain checked in"
 
 
 def test_soft_circle_assets_have_progressive_alpha_feather():

@@ -52,9 +52,11 @@ No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to
 
 ### Resources
 
-`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask` with `ADD` blending (original hard circular look). Steps `10`–`100` swap each stamp to a precomputed soft TGA under `media/MouseTracer/`, neutralize the hard circular mask with `WHITE8X8`, and use `BLEND` so overlapping stamps do not ADD-saturate the soft rim into a hard-looking edge. SoftCircle alpha still defines the circular feather; do not return to square `CreateLine` quads.
+`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask` with `ADD` blending (original hard circular look). Steps `10`–`100` swap each stamp to a precomputed soft TGA under `media/MouseTracer/`, neutralize the hard circular mask with `WHITE8X8`, and use `BLEND` as a **provisional** production choice so overlapping stamps do not ADD-saturate the soft rim into a hard-looking edge. SoftCircle alpha still defines the circular feather; do not return to square `CreateLine` quads. Treat the nonzero `BLEND` path as unproven until Retail confirms the mechanism; do not invent additional rendering machinery without that evidence.
 
-Appearance is resolved once per effective softness change. Live stamps refresh immediately; hidden pool slots adopt the cached texture/mask/blend on the next `Show`/reuse. Softness-only updates must not rewrite the whole pool, reconfigure geometry, or reset fade alpha. The sample/fade hot path stays allocation-free and must not format texture paths or read the settings Store.
+Appearance is resolved once per effective softness change. Live stamps refresh immediately; hidden pool slots adopt the cached texture/mask/blend on the next `Show`/reuse. Softness-only updates must not rewrite the whole pool, reconfigure geometry, or reset fade alpha. When applying appearance, skip unchanged per-slot texture, mask, and blend setters independently (nonzero→nonzero must not reissue mask/blend). The sample/fade hot path stays allocation-free and must not format texture paths or read the settings Store.
+
+The checked-in SoftCircle_10..100.tga files are the authoritative soft assets. There is no checked-in generator recipe for them; do not invent or run a formula that would overwrite those files.
 
 Cadence constants:
 
@@ -110,4 +112,13 @@ Until Retail confirms the soft-edge mechanism, a temporary on-screen comparison 
 /run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()
 ```
 
-It draws three fresh SoftCircle_100 stamps (BLEND+rect mask, ADD+rect mask, ADD+circular mask) on a dark panel and logs texture/mask/blend outcomes through `SF.Debug`. Remove this diagnostic after Retail QA.
+It reuses one bounded panel with fixed-role SoftCircle_100 samples:
+
+- isolated **BLEND / no mask** (SetMask never called)
+- isolated **ADD / no mask**
+- isolated **ADD / circular mask**
+- overlapping copies under each of those three conditions
+
+`SF.Debug` records texture load success/path, whether SetMask was called, mask outcome, and actual blend mode. Clear only hides the panel; repeated open/close must not grow frames or textures. Localized via `locale/enUS.lua`. Remove this diagnostic after Retail QA.
+
+Human comparison should also include live trail crossings and ring-buffer wraparound after a long stroke, not only the diagnostic panel.

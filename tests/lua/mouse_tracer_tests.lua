@@ -832,15 +832,25 @@ local stampTextures = {}
 local textureSetCount = 0
 local maskSetCount = 0
 local blendSetCount = 0
+local sizeSetCount = 0
+local vertexSetCount = 0
+local alphaSetCount = 0
 
 local function resetAppearanceOpCounts()
     textureSetCount = 0
     maskSetCount = 0
     blendSetCount = 0
+    sizeSetCount = 0
+    vertexSetCount = 0
+    alphaSetCount = 0
 end
 
 local function appearanceOpCounts()
     return textureSetCount, maskSetCount, blendSetCount
+end
+
+local function geometryOpCounts()
+    return sizeSetCount, vertexSetCount, alphaSetCount
 end
 
 local function textureWidget()
@@ -879,14 +889,17 @@ local function textureWidget()
                 return function(_, w, h)
                     self.width = w
                     self.height = h
+                    sizeSetCount = sizeSetCount + 1
                 end
             elseif key == "SetVertexColor" then
                 return function(_, r, g, b, a)
                     self.vertex = { r, g, b, a }
+                    vertexSetCount = vertexSetCount + 1
                 end
             elseif key == "SetAlpha" then
                 return function(_, a)
                     self.alpha = a
+                    alphaSetCount = alphaSetCount + 1
                 end
             elseif key == "SetPoint" then
                 return function() end
@@ -1217,15 +1230,15 @@ assertEq(eqTex, 0, "equivalent softness 50 performs no SetTexture writes")
 assertEq(eqMask, 0, "equivalent softness 50 performs no SetMask writes")
 assertEq(eqBlend, 0, "equivalent softness 50 performs no SetBlendMode writes")
 
--- Live softness change refreshes only the live set, preserves geometry/age/alpha.
+-- Nonzero→nonzero: texture updates only; unchanged mask/blend must not rewrite.
 resetAppearanceOpCounts()
 SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 100)
 assertEq(charSettings.edgeSoftness, 100, "store keeps the live edgeSoftness write")
 local liveTex, liveMask, liveBlend = appearanceOpCounts()
-assertTrue(liveTex > 0, "live softness change writes textures")
-assertTrue(liveTex <= liveCount, "live softness change does not exceed the live stamp count")
-assertTrue(liveMask <= liveCount, "live softness mask writes stay within the live set")
-assertTrue(liveBlend <= liveCount, "live softness blend writes stay within the live set")
+assertTrue(liveTex > 0, "nonzero→nonzero writes textures")
+assertEq(liveTex, liveCount, "nonzero→nonzero updates each live stamp texture once")
+assertEq(liveMask, 0, "nonzero→nonzero performs zero unchanged mask writes")
+assertEq(liveBlend, 0, "nonzero→nonzero performs zero unchanged blend writes")
 assertTrue(liveTex < C.MAX_POINTS, "live softness change does not sweep the full pool")
 assertLiveAppearance(soft100, C.FULL_RECT_MASK, "BLEND", "live 100% softness")
 assertEq(Tracer.engine.count, liveCount, "softness update does not drop or replay trail points")
@@ -1237,20 +1250,45 @@ for chrono = 1, liveCount do
     assertAlmost(stamp.width, sizesBefore[chrono], 1e-9, "softness-only update preserves stamp size")
 end
 
--- Rapid scrubbing across steps stays bounded by the live set each step.
+-- Additional nonzero→nonzero scrub (100→50) still skips mask/blend.
+resetAppearanceOpCounts()
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
+local nzTex, nzMask, nzBlend = appearanceOpCounts()
+assertEq(nzTex, liveCount, "100→50 updates live textures")
+assertEq(nzMask, 0, "100→50 performs zero mask writes")
+assertEq(nzBlend, 0, "100→50 performs zero blend writes")
+assertLiveAppearance(soft50, C.FULL_RECT_MASK, "BLEND", "live 50% after nonzero scrub")
+
+-- Rapid nonzero scrubbing: mask/blend stay zero while textures follow steps.
 resetAppearanceOpCounts()
 local scrubLive = Tracer.engine.count
-for _, pct in ipairs({ 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 90, 50, 0 }) do
+for _, pct in ipairs({ 60, 70, 80, 90, 100, 90, 50 }) do
     SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", pct)
 end
-local scrubTex = appearanceOpCounts()
-assertTrue(scrubTex <= scrubLive * 14, "rapid scrubbing texture writes stay within live×steps")
-assertTrue(scrubTex < C.MAX_POINTS * 3, "rapid scrubbing does not approach full-pool × steps cost")
-assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "scrub ends at 0%")
+local scrubTex, scrubMask, scrubBlend = appearanceOpCounts()
+assertTrue(scrubTex > 0, "rapid nonzero scrubbing still updates textures")
+assertTrue(scrubTex <= scrubLive * 7, "rapid scrubbing texture writes stay within live×steps")
+assertEq(scrubMask, 0, "rapid nonzero scrubbing performs zero mask writes")
+assertEq(scrubBlend, 0, "rapid nonzero scrubbing performs zero blend writes")
+assertLiveAppearance(soft50, C.FULL_RECT_MASK, "BLEND", "nonzero scrub ends at 50%")
 
--- 0 → 100 → 0 restores hard circular ADD appearance on live stamps.
+-- 0 ↔ nonzero applies every genuinely changed property.
+resetAppearanceOpCounts()
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
+local toZeroTex, toZeroMask, toZeroBlend = appearanceOpCounts()
+assertEq(toZeroTex, scrubLive, "nonzero→0 updates textures")
+assertEq(toZeroMask, scrubLive, "nonzero→0 updates masks")
+assertEq(toZeroBlend, scrubLive, "nonzero→0 updates blends")
+assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "50→0")
+
+resetAppearanceOpCounts()
 SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 100)
+local toSoftTex, toSoftMask, toSoftBlend = appearanceOpCounts()
+assertEq(toSoftTex, scrubLive, "0→100 updates textures")
+assertEq(toSoftMask, scrubLive, "0→100 updates masks")
+assertEq(toSoftBlend, scrubLive, "0→100 updates blends")
 assertLiveAppearance(soft100, C.FULL_RECT_MASK, "BLEND", "0→100")
+
 SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
 assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "100→0")
 
@@ -1356,6 +1394,182 @@ end
 assertEq(createdFrames, framesBeforeRepeatSoft, "repeated soft enable/disable creates no frames")
 assertEq(#stampTextures, texturesBeforeRepeatSoft, "repeated soft enable/disable does not grow the pool")
 assertTrue(hostFrame().scripts.OnUpdate == nil, "final disable leaves OnUpdate cleared")
+
+;(function()
+    -- Partial fade then softness: no birth-time reset, brightening, or geometry/color rewrite.
+    charSettings.edgeSoftness = 0
+    charSettings.opacity = C.DEFAULT_OPACITY
+    charSettings.fadeDuration = C.DEFAULT_FADE_DURATION
+    charSettings.thickness = C.DEFAULT_THICKNESS
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
+    SF.SettingsStore:SetCharacter("mouseTracer.opacity", C.DEFAULT_OPACITY)
+    SF.SettingsStore:SetCharacter("mouseTracer.fadeDuration", C.DEFAULT_FADE_DURATION)
+    Tracer:ApplyEnabled(true)
+    host = hostFrame()
+    now = now + 1
+    pumpCursor(0, 0)
+    pumpCursor(40, 0)
+    assertTrue(Tracer.engine.count > 0, "fade suite draws a live trail")
+    local fadeLive = Tracer.engine.count
+    local birthBefore = {}
+    local alphaFresh = {}
+    local sizeFresh = {}
+    local vertexFresh = {}
+    for chrono = 1, fadeLive do
+        local _, _, pt, _, idx = Tracer.engine:GetPoint(chrono)
+        birthBefore[chrono] = pt
+        local stamp = stampTextures[idx]
+        alphaFresh[chrono] = stamp.alpha
+        sizeFresh[chrono] = stamp.width
+        vertexFresh[chrono] = stamp.vertex and { stamp.vertex[1], stamp.vertex[2], stamp.vertex[3], stamp.vertex[4] } or nil
+    end
+    assertAlmost(alphaFresh[fadeLive], C.DEFAULT_OPACITY, 1e-6, "fresh stamps start near full opacity")
+
+    now = now + 0.25
+    host.scripts.OnUpdate(host, 1)
+    local fadedAlphas = {}
+    local partiallyFaded = 0
+    for chrono = 1, Tracer.engine.count do
+        local _, _, pt, _, idx = Tracer.engine:GetPoint(chrono)
+        assertEq(pt, birthBefore[chrono], "time advance alone preserves birth times")
+        local stamp = stampTextures[idx]
+        fadedAlphas[chrono] = stamp.alpha
+        if stamp.alpha < C.DEFAULT_OPACITY - 0.05 and stamp.alpha > 0 then
+            partiallyFaded = partiallyFaded + 1
+        end
+    end
+    assertTrue(partiallyFaded > 0, "production fade leaves at least one stamp partially faded")
+
+    resetAppearanceOpCounts()
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
+    local fadeTex, fadeMask, fadeBlend = appearanceOpCounts()
+    local fadeSize, fadeVertex, fadeAlphaWrites = geometryOpCounts()
+    assertTrue(fadeTex > 0, "partial-fade softness change still updates soft textures")
+    assertEq(fadeMask, Tracer.engine.count, "0→soft while faded updates masks")
+    assertEq(fadeBlend, Tracer.engine.count, "0→soft while faded updates blends")
+    assertEq(fadeSize, 0, "softness-only change while faded does not rewrite sizes")
+    assertEq(fadeVertex, 0, "softness-only change while faded does not rewrite vertex colors")
+    assertEq(fadeAlphaWrites, 0, "softness-only change while faded does not rewrite alpha")
+    assertEq(Tracer.engine.count, fadeLive, "softness while faded keeps the live point count")
+    for chrono = 1, fadeLive do
+        local _, _, pt, _, idx = Tracer.engine:GetPoint(chrono)
+        assertEq(pt, birthBefore[chrono], "softness while faded preserves birth times")
+        local stamp = stampTextures[idx]
+        assertAlmost(stamp.alpha, fadedAlphas[chrono], 1e-9, "softness while faded does not brighten fade alpha")
+        assertAlmost(stamp.width, sizeFresh[chrono], 1e-9, "softness while faded preserves stamp size")
+        assertEq(stamp.texture, soft50, "softness while faded applies soft texture")
+        assertEq(stamp.blend, "BLEND", "softness while faded applies BLEND")
+        if vertexFresh[chrono] then
+            assertAlmost(stamp.vertex[1], vertexFresh[chrono][1], 1e-9, "softness while faded preserves vertex r")
+            assertAlmost(stamp.vertex[2], vertexFresh[chrono][2], 1e-9, "softness while faded preserves vertex g")
+            assertAlmost(stamp.vertex[3], vertexFresh[chrono][3], 1e-9, "softness while faded preserves vertex b")
+        end
+    end
+
+    now = now + C.DEFAULT_FADE_DURATION + 0.05
+    host.scripts.OnUpdate(host, 1)
+    host.scripts.OnUpdate(host, 1)
+    assertEq(Tracer.engine.count, 0, "trail expires to idle after fade completes")
+    assertTrue(host.scripts.OnUpdate ~= nil, "runtime stays enabled after trail expires")
+    local shownAfterExpire = 0
+    for i = 1, #stampTextures do
+        if stampTextures[i].shown then
+            shownAfterExpire = shownAfterExpire + 1
+        end
+    end
+    assertEq(shownAfterExpire, 0, "expired trail hides all stamps")
+end)()
+
+;(function()
+    -- Production ring-buffer wrap while changing softness.
+    local framesBeforeWrap = createdFrames
+    local texturesBeforeWrap = #stampTextures
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
+    SF.SettingsStore:SetCharacter("mouseTracer.thickness", 6)
+    SF.SettingsStore:SetCharacter("mouseTracer.trailLength", C.MAX_TRAIL_LENGTH)
+    Tracer:ApplyEnabled(true)
+    host = hostFrame()
+    now = now + 1
+    local cursorXWrap = 0
+    pumpCursor(cursorXWrap, 0)
+    local guard = 0
+    -- Trail length 1200 at 1px spacing saturates near MAX_POINTS-1; further
+    -- motion reuses slots via length trim / ring advance without growing the pool.
+    while Tracer.engine.count < (C.MAX_POINTS - 1) and guard < 40 do
+        cursorXWrap = cursorXWrap + 200
+        pumpCursor(cursorXWrap, 0)
+        guard = guard + 1
+    end
+    local filledCount = Tracer.engine.count
+    assertTrue(filledCount >= C.MAX_POINTS - 1, "wrap suite fills near the fixed point pool")
+    assertTrue(filledCount <= C.MAX_POINTS, "wrap suite never exceeds MAX_POINTS")
+    local headBeforeWrap = Tracer.engine.head
+    local oldestBefore = Tracer.engine:ChronoIndex(1)
+    assertEq(stampTextures[oldestBefore].texture, C.CIRCLE_TEXTURE, "near-full pool starts on hard circular texture")
+    assertEq(stampTextures[oldestBefore].blend, "ADD", "near-full pool starts on ADD")
+
+    resetAppearanceOpCounts()
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 100)
+    local wrapSoftTex, wrapSoftMask, wrapSoftBlend = appearanceOpCounts()
+    assertEq(wrapSoftTex, filledCount, "softness on a near-full pool updates every live texture")
+    assertEq(wrapSoftMask, filledCount, "softness on a near-full pool updates every live mask")
+    assertEq(wrapSoftBlend, filledCount, "softness on a near-full pool updates every live blend")
+    assertLiveAppearance(soft100, C.FULL_RECT_MASK, "BLEND", "near-full pool after soft change")
+
+    cursorXWrap = cursorXWrap + 200
+    now = now + 0.05
+    pumpCursor(cursorXWrap, 0)
+    assertTrue(
+        Tracer.engine.head ~= headBeforeWrap or Tracer.engine:ChronoIndex(1) ~= oldestBefore,
+        "emit after saturation reuses slots via ring/length advance"
+    )
+    assertTrue(Tracer.engine.count <= C.MAX_POINTS, "wrap keeps count within MAX_POINTS")
+    assertEq(#stampTextures, texturesBeforeWrap, "wrap does not grow the stamp pool")
+    assertEq(createdFrames, framesBeforeWrap, "wrap does not create frames")
+
+    local newestWrap = Tracer.engine:ChronoIndex(Tracer.engine.count)
+    local newestStamp = stampTextures[newestWrap]
+    assertEq(newestStamp.texture, soft100, "reused/newest wrap slot uses current soft texture")
+    assertEq(newestStamp.mask, C.FULL_RECT_MASK, "reused/newest wrap slot uses current soft mask")
+    assertEq(newestStamp.blend, "BLEND", "reused/newest wrap slot uses current soft blend")
+    assertTrue(newestStamp.shown, "reused wrap slot is shown")
+
+    -- Softness after wrap: preserve chrono birth times and skip unchanged mask/blend.
+    local birthsAfterWrap = {}
+    local alphasAfterWrap = {}
+    local sizesAfterWrap = {}
+    for chrono = 1, Tracer.engine.count do
+        local _, _, pt, _, idx = Tracer.engine:GetPoint(chrono)
+        birthsAfterWrap[chrono] = pt
+        alphasAfterWrap[chrono] = stampTextures[idx].alpha
+        sizesAfterWrap[chrono] = stampTextures[idx].width
+    end
+    local liveAfterWrap = Tracer.engine.count
+
+    resetAppearanceOpCounts()
+    SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
+    local postWrapTex, postWrapMask, postWrapBlend = appearanceOpCounts()
+    local postWrapSize, postWrapVertex, postWrapAlpha = geometryOpCounts()
+    assertEq(postWrapTex, liveAfterWrap, "post-wrap nonzero→nonzero updates each live texture")
+    assertEq(postWrapMask, 0, "post-wrap nonzero→nonzero skips unchanged masks")
+    assertEq(postWrapBlend, 0, "post-wrap nonzero→nonzero skips unchanged blends")
+    assertEq(postWrapSize, 0, "post-wrap softness skips size rewrites")
+    assertEq(postWrapVertex, 0, "post-wrap softness skips vertex rewrites")
+    assertEq(postWrapAlpha, 0, "post-wrap softness skips alpha rewrites")
+    assertEq(Tracer.engine.count, liveAfterWrap, "post-wrap softness keeps the live count")
+    for chrono = 1, liveAfterWrap do
+        local _, _, pt, _, idx = Tracer.engine:GetPoint(chrono)
+        assertEq(pt, birthsAfterWrap[chrono], "post-wrap softness preserves birth times")
+        assertAlmost(stampTextures[idx].alpha, alphasAfterWrap[chrono], 1e-9, "post-wrap softness preserves fade alpha")
+        assertAlmost(stampTextures[idx].width, sizesAfterWrap[chrono], 1e-9, "post-wrap softness preserves size")
+    end
+    assertLiveAppearance(soft50, C.FULL_RECT_MASK, "BLEND", "post-wrap soft appearance")
+    assertEq(#stampTextures, texturesBeforeWrap, "post-wrap softness keeps the fixed pool")
+    assertEq(createdFrames, framesBeforeWrap, "post-wrap softness creates no frames")
+
+    Tracer:ApplyEnabled(false)
+    assertTrue(hostFrame().scripts.OnUpdate == nil, "wrap suite disables cleanly")
+end)()
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then

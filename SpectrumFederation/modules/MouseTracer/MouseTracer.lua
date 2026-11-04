@@ -247,7 +247,9 @@ local function SyncAppearanceCache()
 end
 
 -- Apply the cached appearance to one stamp when its identity is stale.
--- Returns true when a texture/mask/blend write occurred.
+-- Each property is compared independently so nonzero→nonzero texture swaps do
+-- not reissue unchanged SetMask / SetBlendMode calls.
+-- Returns true when any texture/mask/blend write occurred.
 local function ApplyStampAppearance(stamp, idx)
 	if not stamp or not idx then
 		return false
@@ -258,24 +260,29 @@ local function ApplyStampAppearance(stamp, idx)
 	if not texture then
 		return false
 	end
-	if stampAppliedTexture[idx] == texture
-		and stampAppliedMask[idx] == mask
-		and stampAppliedBlend[idx] == blend then
-		return false
+	local changed = false
+	if stampAppliedTexture[idx] ~= texture then
+		if stamp.SetTexture then
+			stamp:SetTexture(texture)
+		end
+		stampAppliedTexture[idx] = texture
+		changed = true
 	end
-	if stamp.SetTexture then
-		stamp:SetTexture(texture)
+	if stampAppliedMask[idx] ~= mask then
+		if stamp.SetMask and mask then
+			pcall(stamp.SetMask, stamp, mask)
+		end
+		stampAppliedMask[idx] = mask
+		changed = true
 	end
-	if stamp.SetMask and mask then
-		pcall(stamp.SetMask, stamp, mask)
+	if stampAppliedBlend[idx] ~= blend then
+		if stamp.SetBlendMode and blend then
+			pcall(stamp.SetBlendMode, stamp, blend)
+		end
+		stampAppliedBlend[idx] = blend
+		changed = true
 	end
-	if stamp.SetBlendMode and blend then
-		pcall(stamp.SetBlendMode, stamp, blend)
-	end
-	stampAppliedTexture[idx] = texture
-	stampAppliedMask[idx] = mask
-	stampAppliedBlend[idx] = blend
-	return true
+	return changed
 end
 
 -- Softness-only updates refresh live stamps. Hidden slots stay stale until
@@ -876,35 +883,86 @@ function Tracer:Init()
 	DebugInfo("Mouse Tracer module initialized")
 end
 
--- Temporary Retail diagnostic for issue #454. Creates three fresh, stationary,
--- non-overlapping SoftCircle_100 stamps over a dark backdrop so a human can
--- separate mask clipping from ADD overlap wash-out. Not a permanent preview UI.
+-- Temporary Retail diagnostic for issue #454. Fresh SoftCircle_100 samples with
+-- true no-mask (SetMask never called), ADD/no-mask, and ADD/circular-mask, plus
+-- overlapping copies under the same three conditions. Fixed roles reuse one
+-- panel/texture set; Clear only hides. Remove after Retail confirmation.
 -- Invoke: /run SpectrumFederation.MouseTracer:RunEdgeSoftnessDiagnostic()
 -- Dismiss: /run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()
--- Remove after Retail confirmation of the soft-edge mechanism.
-local softnessDiagFrame
+local softnessDiag
 
-function Tracer:ClearEdgeSoftnessDiagnostic()
-	if softnessDiagFrame then
-		softnessDiagFrame:Hide()
-		softnessDiagFrame:SetParent(nil)
-		softnessDiagFrame = nil
+local function SoftnessDiagText(key, default)
+	if SF.LocaleText then
+		return SF.LocaleText(key, default)
 	end
-	DebugInfo("Edge Softness diagnostic cleared")
+	return default
 end
 
-function Tracer:RunEdgeSoftnessDiagnostic()
-	if not CreateFrame or not UIParent then
-		DebugWarn("Edge Softness diagnostic requires CreateFrame/UIParent")
-		return
+local function SoftnessDiagProbeTexture(tex, softPath, blend, maskPath, label)
+	local texOk = false
+	local texPath = nil
+	if tex.SetTexture then
+		local setResult = tex:SetTexture(softPath)
+		texOk = setResult ~= false
 	end
-	self:ClearEdgeSoftnessDiagnostic()
+	if tex.GetTexture then
+		texPath = tex:GetTexture()
+		texOk = texPath ~= nil and texPath ~= ""
+	else
+		texPath = softPath
+	end
 
-	local softPath = Engine.StampTextureForEdgeSoftness(100)
+	local maskCalled = maskPath ~= nil
+	local maskOk = true
+	local maskErr = nil
+	if maskCalled then
+		if tex.SetMask then
+			maskOk, maskErr = pcall(tex.SetMask, tex, maskPath)
+		else
+			maskOk = false
+			maskErr = "SetMask unavailable"
+		end
+	end
+
+	local blendOk = false
+	local actualBlend = nil
+	if tex.SetBlendMode then
+		blendOk = pcall(tex.SetBlendMode, tex, blend)
+	end
+	if tex.GetBlendMode then
+		actualBlend = tex:GetBlendMode()
+	else
+		actualBlend = blend
+	end
+
+	DebugInfo(
+		"softness-diag %s texture=%s texOk=%s texPath=%s maskRequested=%s maskCalled=%s maskOk=%s maskErr=%s blendWant=%s blendOk=%s blendActual=%s",
+		label,
+		tostring(softPath),
+		tostring(texOk),
+		tostring(texPath),
+		tostring(maskPath),
+		tostring(maskCalled),
+		tostring(maskOk),
+		tostring(maskErr),
+		tostring(blend),
+		tostring(blendOk),
+		tostring(actualBlend)
+	)
+end
+
+local function EnsureSoftnessDiagnostic()
+	if softnessDiag and softnessDiag.root then
+		return softnessDiag
+	end
+	if not CreateFrame or not UIParent then
+		return nil
+	end
+
 	local root = CreateFrame("Frame", "SF_MouseTracerSoftnessDiag", UIParent)
 	root:SetFrameStrata("TOOLTIP")
 	root:SetFrameLevel(20000)
-	root:SetSize(420, 180)
+	root:SetSize(520, 280)
 	root:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 	root:EnableMouse(true)
 	if root.SetBackdrop then
@@ -923,72 +981,156 @@ function Tracer:RunEdgeSoftnessDiagnostic()
 
 	local title = root:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	title:SetPoint("TOP", root, "TOP", 0, -8)
-	title:SetText("Mouse Tracer Softness Diag (temporary #454)")
-
-	local function makeSample(label, x, blend, maskPath)
-		local tex = root:CreateTexture(nil, "ARTWORK")
-		tex:SetSize(64, 64)
-		tex:SetPoint("CENTER", root, "LEFT", x, -8)
-		local texOk = false
-		if tex.SetTexture then
-			texOk = tex:SetTexture(softPath) ~= false
-			if tex.GetTexture then
-				texOk = tex:GetTexture() ~= nil
-			end
-		end
-		local maskOk = false
-		local maskErr = nil
-		if maskPath and tex.SetMask then
-			maskOk, maskErr = pcall(tex.SetMask, tex, maskPath)
-		elseif not maskPath then
-			maskOk = true
-		end
-		local blendOk = false
-		local actualBlend = nil
-		if tex.SetBlendMode then
-			blendOk = pcall(tex.SetBlendMode, tex, blend)
-		end
-		if tex.GetBlendMode then
-			actualBlend = tex:GetBlendMode()
-		else
-			actualBlend = blend
-		end
-		if tex.SetVertexColor then
-			tex:SetVertexColor(1, 0.35, 0.85, 1)
-		end
-		tex:SetAlpha(0.70)
-		tex:Show()
-
-		local caption = root:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-		caption:SetPoint("TOP", tex, "BOTTOM", 0, -6)
-		caption:SetText(label)
-
-		DebugInfo(
-			"softness-diag %s texture=%s texOk=%s mask=%s maskOk=%s maskErr=%s blendWant=%s blendOk=%s blendActual=%s",
-			label,
-			tostring(softPath),
-			tostring(texOk),
-			tostring(maskPath),
-			tostring(maskOk),
-			tostring(maskErr),
-			tostring(blend),
-			tostring(blendOk),
-			tostring(actualBlend)
-		)
-		return tex
-	end
-
-	-- Isolated comparisons from #454: (a) BLEND / no hard mask, (b) ADD / no hard
-	-- mask, (c) ADD / current circular mask. Soft TGA is the color texture in all.
-	makeSample("BLEND\nrect mask", 70, "BLEND", C.FULL_RECT_MASK)
-	makeSample("ADD\nrect mask", 210, "ADD", C.FULL_RECT_MASK)
-	makeSample("ADD\ncircle mask", 350, "ADD", C.CIRCLE_TEXTURE)
 
 	local hint = root:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	hint:SetPoint("BOTTOM", root, "BOTTOM", 0, 8)
-	hint:SetText("Compare edges on this dark panel, then overlapping trail in settings. /run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()")
+	hint:SetWidth(500)
 
-	softnessDiagFrame = root
-	root:Show()
-	DebugInfo("Edge Softness diagnostic shown using %s", tostring(softPath))
+	-- Fixed-role samples. No-mask roles never call SetMask so they stay true
+	-- no-mask controls even after repeated show/hide. Overlap groups keep three
+	-- copies each under identical blend/mask conditions.
+	local roles = {
+		{
+			key = "blend_none",
+			labelKey = "MOUSE_TRACER_SOFTNESS_DIAG_BLEND_NONE",
+			labelDefault = "BLEND / no mask",
+			blend = "BLEND",
+			mask = nil,
+			x = 70,
+			y = 55,
+			overlap = false,
+		},
+		{
+			key = "add_none",
+			labelKey = "MOUSE_TRACER_SOFTNESS_DIAG_ADD_NONE",
+			labelDefault = "ADD / no mask",
+			blend = "ADD",
+			mask = nil,
+			x = 210,
+			y = 55,
+			overlap = false,
+		},
+		{
+			key = "add_circle",
+			labelKey = "MOUSE_TRACER_SOFTNESS_DIAG_ADD_CIRCLE",
+			labelDefault = "ADD / circle mask",
+			blend = "ADD",
+			mask = C.CIRCLE_TEXTURE,
+			x = 350,
+			y = 55,
+			overlap = false,
+		},
+		{
+			key = "overlap_blend_none",
+			labelKey = "MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_BLEND_NONE",
+			labelDefault = "Overlap BLEND / no mask",
+			blend = "BLEND",
+			mask = nil,
+			x = 70,
+			y = -55,
+			overlap = true,
+		},
+		{
+			key = "overlap_add_none",
+			labelKey = "MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_ADD_NONE",
+			labelDefault = "Overlap ADD / no mask",
+			blend = "ADD",
+			mask = nil,
+			x = 210,
+			y = -55,
+			overlap = true,
+		},
+		{
+			key = "overlap_add_circle",
+			labelKey = "MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_ADD_CIRCLE",
+			labelDefault = "Overlap ADD / circle mask",
+			blend = "ADD",
+			mask = C.CIRCLE_TEXTURE,
+			x = 350,
+			y = -55,
+			overlap = true,
+		},
+	}
+
+	local samples = {}
+	for i = 1, #roles do
+		local role = roles[i]
+		local group = {
+			role = role,
+			textures = {},
+			caption = root:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"),
+		}
+		local copies = role.overlap and 3 or 1
+		for copy = 1, copies do
+			local tex = root:CreateTexture(nil, "ARTWORK")
+			tex:SetSize(64, 64)
+			local ox = (copy - 1) * 8
+			local oy = (copy - 1) * -6
+			tex:SetPoint("CENTER", root, "CENTER", role.x - 260 + ox, role.y + oy)
+			group.textures[copy] = tex
+		end
+		group.caption:SetPoint("TOP", group.textures[1], "BOTTOM", 0, role.overlap and -18 or -6)
+		samples[i] = group
+	end
+
+	softnessDiag = {
+		root = root,
+		title = title,
+		hint = hint,
+		samples = samples,
+		configured = false,
+	}
+	root:Hide()
+	return softnessDiag
+end
+
+function Tracer:ClearEdgeSoftnessDiagnostic()
+	local diag = softnessDiag
+	if diag and diag.root then
+		diag.root:Hide()
+	end
+	DebugInfo("Edge Softness diagnostic cleared")
+end
+
+function Tracer:RunEdgeSoftnessDiagnostic()
+	local diag = EnsureSoftnessDiagnostic()
+	if not diag then
+		DebugWarn("Edge Softness diagnostic requires CreateFrame/UIParent")
+		return
+	end
+
+	local softPath = Engine.StampTextureForEdgeSoftness(100)
+	diag.title:SetText(SoftnessDiagText(
+		"MOUSE_TRACER_SOFTNESS_DIAG_TITLE",
+		"Mouse Tracer Softness Diag (temporary #454)"
+	))
+	diag.hint:SetText(SoftnessDiagText(
+		"MOUSE_TRACER_SOFTNESS_DIAG_HINT",
+		"Compare isolated and overlapping SoftCircle_100 samples, then the live trail. Clear: /run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()"
+	))
+
+	for i = 1, #diag.samples do
+		local group = diag.samples[i]
+		local role = group.role
+		local label = SoftnessDiagText(role.labelKey, role.labelDefault)
+		group.caption:SetText(label)
+		for copy = 1, #group.textures do
+			local tex = group.textures[copy]
+			-- Configure mask/blend only once per fixed-role texture so no-mask
+			-- samples never receive SetMask on later invocations.
+			if not diag.configured then
+				SoftnessDiagProbeTexture(tex, softPath, role.blend, role.mask, role.key .. "#" .. copy)
+				if tex.SetVertexColor then
+					tex:SetVertexColor(1, 0.35, 0.85, 1)
+				end
+				tex:SetAlpha(0.70)
+			elseif tex.SetTexture then
+				tex:SetTexture(softPath)
+			end
+			tex:Show()
+		end
+	end
+	diag.configured = true
+	diag.root:Show()
+	DebugInfo("Edge Softness diagnostic shown using %s (configured=%s)", tostring(softPath), tostring(diag.configured))
 end
