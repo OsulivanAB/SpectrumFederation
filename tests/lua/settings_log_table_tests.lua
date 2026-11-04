@@ -185,7 +185,13 @@ local function makeRegion(kind, name, parent, template)
     end
 
     function region:SetText(text)
-        self.text = tostring(text or "")
+        -- Mirror WoW FontString:SetText — reject non-string/number so callable
+        -- emptyText must be resolved before the first SetText (#453).
+        local valueType = type(text)
+        if valueType ~= "string" and valueType ~= "number" and text ~= nil then
+            error("FontString:SetText invalid argument type: " .. valueType, 2)
+        end
+        self.text = text == nil and "" or tostring(text)
     end
 
     function region:SetTextColor()
@@ -223,7 +229,13 @@ local function makeRegion(kind, name, parent, template)
     function region:SetBlendMode()
     end
 
-    function region:SetVerticalScroll()
+    function region:SetVerticalScroll(offset)
+        self.verticalScroll = tonumber(offset) or 0
+        fireEvent(self, "OnVerticalScroll", self.verticalScroll)
+    end
+
+    function region:GetVerticalScroll()
+        return self.verticalScroll or 0
     end
 
     function region:SetScrollChild(child)
@@ -245,6 +257,12 @@ local function makeRegion(kind, name, parent, template)
     if template == "UIPanelScrollFrameTemplate" then
         region.ScrollBar = makeRegion("Slider", nil, region)
         region.ScrollBar:SetWidth(20)
+        function region.ScrollBar:GetValue()
+            return self.value or 0
+        end
+        function region.ScrollBar:SetValue(v)
+            self.value = tonumber(v) or 0
+        end
     end
 
     return region
@@ -374,6 +392,169 @@ do
     fireEvent(scroll, "OnSizeChanged", 560, scroll:GetHeight())
     assertEq(getCalls(), afterFirst + 2, "same-size notifications still invoke Refresh but each call terminates")
     assertTrue(getCalls() <= afterFirst + 2, "repeated same-size Refresh stays bounded")
+end
+
+local function findLogTableRow(section)
+    for _, row in ipairs(section._rows or {}) do
+        if type(row.__sfLogTableRefresh) == "function" then
+            return row
+        end
+    end
+    return nil
+end
+
+local function visibleRowTexts(row)
+    local texts = {}
+    local scroll = row.__sfLogTableScroll
+    local content = scroll and scroll.scrollChild
+    if not content then
+        return texts
+    end
+    for _, child in ipairs(content.children or {}) do
+        if child.kind == "Button" and child:IsShown() and child.Cells then
+            local cell = child.Cells[1]
+            local value = cell and cell.Text and cell.Text.text or nil
+            if type(value) == "string" then
+                texts[#texts + 1] = value
+            end
+        end
+    end
+    return texts
+end
+
+-- #453: callable emptyText must resolve during construction (FontString rejects functions).
+do
+    local panel = CreateFrame("Frame")
+    panel:SetSize(600, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("Callable empty")
+    section.Content:SetWidth(560)
+    local emptyCalls = 0
+    local ok, err = pcall(function()
+        SF.SettingsUI.Controls:AddLogTable(section, {
+            columns = { { key = "text", label = "Log" } },
+            rowHeight = ROW_HEIGHT,
+            height = 180,
+            emptyText = function()
+                emptyCalls = emptyCalls + 1
+                return "No matching logs yet."
+            end,
+            getRows = function()
+                return {}
+            end,
+        })
+    end)
+    assertTrue(ok, "callable emptyText constructs without FontString type error: " .. tostring(err))
+    assertTrue(emptyCalls >= 1, "callable emptyText invoked during construction")
+    local row = findLogTableRow(section)
+    assertTrue(row ~= nil, "callable emptyText log table row exists")
+    pageBuilder:Finalize()
+    if row and row.__sfLogTableRefresh then
+        row.__sfLogTableRefresh()
+    end
+    assertTrue(emptyCalls >= 2, "callable emptyText resolves again on refresh")
+end
+
+-- #453: scroll context reset/clamp while preserving ordinary same-context refresh.
+do
+    local panel = CreateFrame("Frame")
+    panel:SetSize(600, 400)
+    panel.__sfPageLayout = { disablePageScroll = true }
+    local pageBuilder = SF.SettingsUI:CreatePage(panel)
+    local section = pageBuilder:AddSection("Scroll context")
+    section.Content:SetWidth(560)
+
+    local contextKey = "campaign-a|all|all"
+    local dataCount = 40
+    SF.SettingsUI.Controls:AddLogTable(section, {
+        columns = { { key = "text", label = "Log" } },
+        rowHeight = ROW_HEIGHT,
+        rowSpacing = ROW_SPACING,
+        headerHeight = HEADER_HEIGHT,
+        height = 180,
+        fillHeight = true,
+        virtualize = true,
+        getScrollContextKey = function()
+            return contextKey
+        end,
+        getRows = function()
+            return makeRows(dataCount)
+        end,
+    })
+
+    local row = findLogTableRow(section)
+    local scroll = row and row.__sfLogTableScroll
+    assertTrue(row ~= nil and scroll ~= nil, "virtualized log table exposes scroll hooks")
+    local visibleHeight = VIEWPORT_ROWS * (ROW_HEIGHT + ROW_SPACING)
+    scroll:SetSize(560, visibleHeight)
+    pageBuilder:Finalize()
+    row.__sfLogTableRefresh()
+
+    local stride = ROW_HEIGHT + ROW_SPACING
+    local contentHeight = dataCount * stride - ROW_SPACING
+    local maxScroll = math.max(0, contentHeight - visibleHeight)
+    assertTrue(maxScroll > stride * 20, "40 rows require scrolling past 25 entries")
+
+    row.__sfLogTableSetVerticalScroll(maxScroll)
+    assertEq(row.__sfLogTableGetVerticalScroll(), maxScroll, "scroll reaches oldest entries")
+    local bottomTexts = visibleRowTexts(row)
+    local sawOldest = false
+    for i = 1, #bottomTexts do
+        if bottomTexts[i] == "Log 40" then
+            sawOldest = true
+        end
+    end
+    assertTrue(sawOldest, "scrolled window includes oldest entry (Log 40)")
+
+    local beforePreserve = row.__sfLogTableGetVerticalScroll()
+    row.__sfLogTableRefresh()
+    assertEq(row.__sfLogTableGetVerticalScroll(), beforePreserve,
+        "same-context refresh preserves scroll offset")
+
+    contextKey = "campaign-b|all|all"
+    row.__sfLogTableRefresh()
+    assertEq(row.__sfLogTableGetVerticalScroll(), 0,
+        "campaign/dataset context change resets scroll")
+
+    row.__sfLogTableSetVerticalScroll(maxScroll)
+    contextKey = "campaign-b|Bob|10"
+    row.__sfLogTableRefresh()
+    assertEq(row.__sfLogTableGetVerticalScroll(), 0,
+        "filter context change resets scroll")
+
+    row.__sfLogTableSetVerticalScroll(maxScroll)
+    local beforeShrink = row.__sfLogTableGetVerticalScroll()
+    dataCount = 8
+    row.__sfLogTableRefresh()
+    -- Match AddLogTable's viewport: scroll:GetHeight() - 2.
+    local shrunkVisible = math.max(1, (scroll:GetHeight() or 0) - 2)
+    local shrunkMax = math.max(0, (dataCount * stride - ROW_SPACING) - shrunkVisible)
+    local afterShrink = row.__sfLogTableGetVerticalScroll()
+    assertTrue(afterShrink <= shrunkMax,
+        "shrinking results clamps scroll into range")
+    assertTrue(afterShrink < beforeShrink,
+        "shrink clamp moves offset down from the prior oversized scroll")
+
+    dataCount = 40
+    row.__sfLogTableRefresh()
+    row.__sfLogTableSetVerticalScroll(maxScroll)
+    dataCount = 0
+    row.__sfLogTableRefresh()
+    assertEq(row.__sfLogTableGetVerticalScroll(), 0, "empty results reset scroll")
+
+    -- Pool stays bounded across large histories and open/close-style refreshes.
+    dataCount = 40
+    local poolBefore = row.__sfLogTableRowCount()
+    for _ = 1, 6 do
+        row.__sfLogTableRefresh()
+        row.__sfLogTableSetVerticalScroll(maxScroll)
+        row.__sfLogTableSetVerticalScroll(0)
+    end
+    local poolAfter = row.__sfLogTableRowCount()
+    assertTrue(poolBefore > 0, "virtualize creates a row pool")
+    assertTrue(poolAfter <= poolBefore + 2, "row-frame pool stays bounded across refreshes")
+    assertTrue(poolAfter < 25, "pool is far smaller than a 40-row history")
 end
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))

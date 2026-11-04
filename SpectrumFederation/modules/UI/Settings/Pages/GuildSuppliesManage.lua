@@ -1,0 +1,1269 @@
+-- Guild Supplies → Manage (#453). Officer-only requested items and quantity adjustments.
+-- Campaign setup, bank tab, and personal preferences stay on Configuration.
+local _, SF = ...
+
+local function Loc(key, default)
+	if SF.LocaleText then
+		return SF.LocaleText(key, default)
+	end
+	return default or key
+end
+
+local Page = {
+	id = "guildSuppliesManage",
+	categoryId = "guildSupplies",
+	name = Loc("GUILD_SUPPLIES_MANAGE_NAME", "Manage"),
+	navLabel = Loc("GUILD_SUPPLIES_MANAGE_NAV", "Manage"),
+	contentHeading = Loc("GUILD_SUPPLIES_MANAGE_HEADING", "Raid Supplies Manage"),
+	group = "Raid Tools",
+	description = Loc("GUILD_SUPPLIES_MANAGE_DESC",
+		"Officer tools for requested items and quantity adjustments."),
+	order = 19.15,
+	-- Shared officer threshold via Guild Supplies canEdit (Preview as Non-Admin
+	-- and unknown policy fail closed). Tabs/search/direct nav all consult this.
+	available = function()
+		local g = SF.GuildSupplies
+		if not g or type(g.GetCapabilities) ~= "function" then
+			return false
+		end
+		local caps = g:GetCapabilities()
+		return type(caps) == "table" and caps.canEdit == true
+	end,
+}
+
+local function GS()
+	return SF.GuildSupplies
+end
+
+-- Per build/refresh pass only: reuse validated read context across controls.
+local passCache = nil
+
+local function BeginRenderPass()
+	passCache = {}
+end
+
+local function EndRenderPass()
+	passCache = nil
+end
+
+local function CurrentRecord()
+	if passCache and passCache.recordChecked then
+		return passCache.record, passCache.recordReason
+	end
+	local g = GS()
+	local record, reason
+	if g and g.GetCurrentRecord then
+		record, reason = g:GetCurrentRecord()
+	else
+		reason = "not_ready"
+	end
+	if passCache then
+		passCache.recordChecked = true
+		passCache.record = record
+		passCache.recordReason = reason
+	end
+	return record, reason
+end
+
+local function Caps()
+	if passCache and passCache.caps then
+		return passCache.caps
+	end
+	local g = GS()
+	local caps
+	if not g or not g.GetCapabilities then
+		caps = { canEdit = false, canRead = false, canRecoverPolicy = false, reason = "not_ready" }
+	else
+		caps = g:GetCapabilities()
+	end
+	if passCache then
+		passCache.caps = caps
+	end
+	return caps
+end
+
+local refreshQueued = false
+local rosterFrame = nil
+
+local function RefreshPageControls()
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
+local function ReportStatus(ctx, status, reason)
+	local g = GS()
+	local message, severity
+	if g and g.FormatMutationFeedback then
+		message, severity = g.FormatMutationFeedback(status, reason)
+	else
+		message = tostring(status or "rejected")
+		severity = (status == "accepted" and "success")
+			or (status == "duplicate" and "info")
+			or (status == "pending" and "warn")
+			or "error"
+	end
+	ctx.section:SetMessage(message, severity)
+	RefreshPageControls()
+end
+
+--- True only for first-time setup (no dataset). Permission-only nil records are recovery.
+local function IsNotConfigured()
+	local _, reason = CurrentRecord()
+	return reason == "not_configured"
+end
+
+local function CurrentGuildKey()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	if ctx and type(ctx.guildKey) == "string" and ctx.guildKey ~= "" then
+		return ctx.guildKey
+	end
+	return nil
+end
+
+local function DescribeItem(itemId)
+	local display = SF.ItemDisplay
+	if display and type(display.Describe) == "function" then
+		return display.Describe(itemId)
+	end
+	return {
+		itemId = itemId,
+		status = "unknown",
+		name = Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item"),
+		icon = nil,
+	}
+end
+
+--- True only for first-time setup (no dataset). Permission-only nil records are recovery.
+local function IsNotConfigured()
+	local _, reason = CurrentRecord()
+	return reason == "not_configured"
+end
+
+local function CurrentBankTab()
+	if not Caps().canRead then
+		return nil
+	end
+	local rec = CurrentRecord()
+	local tab = rec and rec.accounting and rec.accounting._consumables
+		and rec.accounting._consumables.bankTab
+	return tab ~= nil and tonumber(tab) or nil
+end
+
+local function CurrentGuildKey()
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext() or nil
+	if ctx and type(ctx.guildKey) == "string" and ctx.guildKey ~= "" then
+		return ctx.guildKey
+	end
+	return nil
+end
+
+local function ClearBankTabCatalog()
+	bankTabCatalog.guildKey = nil
+	bankTabCatalog.loaded = false
+	bankTabCatalog.entries = {}
+end
+
+--- Drop catalog entries when the player changes guilds.
+local function SyncBankTabCatalogGuild()
+	local key = CurrentGuildKey()
+	if key == nil then
+		if bankTabCatalog.guildKey ~= nil or bankTabCatalog.loaded then
+			ClearBankTabCatalog()
+		end
+		return
+	end
+	if bankTabCatalog.guildKey ~= nil and bankTabCatalog.guildKey ~= key then
+		ClearBankTabCatalog()
+	end
+end
+
+--- Read purchased, named Guild Bank tabs. Only marks loaded when the API returns
+-- coherent names; never invents labels. Caches viewable names for Settings.
+-- @return boolean true when the catalog was refreshed from live API data
+local function ObserveGuildBankTabs()
+	SyncBankTabCatalogGuild()
+	local key = CurrentGuildKey()
+	if key == nil then
+		return false
+	end
+	if type(GetNumGuildBankTabs) ~= "function" or type(GetGuildBankTabInfo) ~= "function" then
+		return false
+	end
+	local okNum, num = pcall(GetNumGuildBankTabs)
+	if not okNum or type(num) ~= "number" or num ~= math.floor(num) or num < 0 then
+		return false
+	end
+	local maxTab = 8
+	local g = GS()
+	if g and tonumber(g.MAX_BANK_TAB) then
+		maxTab = tonumber(g.MAX_BANK_TAB)
+	end
+	num = math.min(num, maxTab)
+	local nextEntries = {}
+	for i = 1, num do
+		local ok, name, _, isViewable = pcall(GetGuildBankTabInfo, i)
+		if not ok then
+			return false
+		end
+		-- Purchased tabs must expose a non-empty name; empty means data not ready.
+		if type(name) ~= "string" or name == "" then
+			return false
+		end
+		nextEntries[i] = {
+			name = name,
+			viewable = isViewable == true,
+		}
+	end
+	bankTabCatalog.guildKey = key
+	bankTabCatalog.entries = nextEntries
+	bankTabCatalog.loaded = true
+	return true
+end
+
+local function BankTabCatalogLoaded()
+	SyncBankTabCatalogGuild()
+	return bankTabCatalog.loaded == true
+		and bankTabCatalog.guildKey ~= nil
+		and bankTabCatalog.guildKey == CurrentGuildKey()
+end
+
+local function FormatBankTabLabel(index, name)
+	if type(name) == "string" and name ~= "" then
+		return Loc("GUILD_SUPPLIES_BANK_TAB_OPTION_FMT", "Tab %d — %s")
+			:format(index, name)
+	end
+	return Loc("GUILD_SUPPLIES_BANK_TAB_NUMBER_FMT", "Tab %d"):format(index)
+end
+
+--- Dropdown options: clear sentinel + purchased viewable tabs only.
+local function BankTabOptions()
+	local opts = {}
+	if not BankTabCatalogLoaded() then
+		return opts
+	end
+	opts[#opts + 1] = {
+		value = BANK_TAB_UNSET,
+		label = Loc("GUILD_SUPPLIES_BANK_TAB_CLEAR", "Not configured"),
+	}
+	local indices = {}
+	for index, entry in pairs(bankTabCatalog.entries) do
+		if entry and entry.viewable and type(entry.name) == "string" and entry.name ~= "" then
+			indices[#indices + 1] = index
+		end
+	end
+	table.sort(indices)
+	for i = 1, #indices do
+		local index = indices[i]
+		local entry = bankTabCatalog.entries[index]
+		opts[#opts + 1] = {
+			value = index,
+			label = FormatBankTabLabel(index, entry.name),
+		}
+	end
+	return opts
+end
+
+--- Default button text when the configured value is not among selectable options.
+local function BankTabDefaultText()
+	local tab = CurrentBankTab()
+	if tab == nil then
+		if BankTabCatalogLoaded() then
+			return Loc("GUILD_SUPPLIES_BANK_TAB_CLEAR", "Not configured")
+		end
+		return Loc("GUILD_SUPPLIES_BANK_TAB_SELECT", "Select a bank tab")
+	end
+	SyncBankTabCatalogGuild()
+	local entry = bankTabCatalog.entries[tab]
+	if entry and type(entry.name) == "string" and entry.name ~= "" then
+		if entry.viewable then
+			return FormatBankTabLabel(tab, entry.name)
+		end
+		-- Known but not selectable for this character: show number only, no private name.
+		return Loc("GUILD_SUPPLIES_BANK_TAB_UNAVAILABLE_FMT", "Tab %d — unavailable")
+			:format(tab)
+	end
+	-- Configured value preserved without inventing a name.
+	return Loc("GUILD_SUPPLIES_BANK_TAB_NUMBER_FMT", "Tab %d"):format(tab)
+end
+
+local function BankTabDropdownValue()
+	local tab = CurrentBankTab()
+	if tab == nil then
+		return BANK_TAB_UNSET
+	end
+	return tab
+end
+
+local function RequestedItemRows()
+	local rows = {}
+	-- Shared campaign/item data stays redacted until membership canRead is verified.
+	if not Caps().canRead then
+		return rows
+	end
+	local record = CurrentRecord()
+	if not record or type(record.currentCampaignId) ~= "string" then
+		return rows
+	end
+	local items = record.accounting and record.accounting._consumables
+		and record.accounting._consumables.requestedItems
+	if type(items) ~= "table" then
+		return rows
+	end
+	-- Cap before constructing controls. Count every raw entry, including invalid;
+	-- over-cap maps stay unavailable rather than becoming a truncated UI list.
+	local C = SF.Consumables
+	local maxItems = (C and C.MAX_REQUESTED_ITEMS) or 256
+	local inspected = 0
+	local canEdit = Caps().canEdit
+	for _, row in pairs(items) do
+		inspected = inspected + 1
+		if inspected > maxItems then
+			return {}
+		end
+		if type(row) == "table" and tonumber(row.itemId) then
+			local described = DescribeItem(row.itemId)
+			rows[#rows + 1] = {
+				text = described.name,
+				icon = described.icon,
+				itemId = row.itemId,
+				goal = tonumber(row.goal) or 0,
+				canRemove = canEdit,
+				canEditGoal = canEdit,
+			}
+		end
+	end
+	table.sort(rows, function(a, b)
+		return (a.itemId or 0) < (b.itemId or 0)
+	end)
+	return rows
+end
+
+---------------------------------------------------------------------------
+-- Session-local Apply Adjustment draft (#426). Never SavedVariables / Gossip.
+-- Cleared when dataset or current campaign identity changes. Ordinary refreshes
+-- and delayed item-name loads must not reset valid in-progress input.
+---------------------------------------------------------------------------
+local ADJUST_UNASSIGNED = false -- UI-only sentinel; stored attribution stays nil.
+-- attributed: Unassigned (false) or an explicitly/exactly resolved character name.
+-- attributionText: search-box draft, kept separate so prefixes are never credited.
+-- attributionResolved: false while nonempty search text has no exact resolution.
+local adjustDraft = {
+	itemId = nil,
+	quantityText = "",
+	attributed = ADJUST_UNASSIGNED,
+	attributionText = "",
+	attributionResolved = true,
+}
+local adjustDraftContextKey = nil
+
+local function AdjustDraftContextKey()
+	local rec = CurrentRecord()
+	if not rec then
+		return "none"
+	end
+	return tostring(rec.datasetId or "") .. "|" .. tostring(rec.currentCampaignId or "")
+end
+
+local function SyncAdjustDraftContext()
+	local key = AdjustDraftContextKey()
+	if key == adjustDraftContextKey then
+		return
+	end
+	adjustDraftContextKey = key
+	adjustDraft.itemId = nil
+	adjustDraft.quantityText = ""
+	adjustDraft.attributed = ADJUST_UNASSIGNED
+	adjustDraft.attributionText = ""
+	adjustDraft.attributionResolved = true
+end
+
+local function FormatAdjustItemLabel(itemId)
+	local id = tonumber(itemId)
+	if not id then
+		return Loc("GUILD_SUPPLIES_ITEM_UNKNOWN", "Unknown item")
+	end
+	local described = DescribeItem(id)
+	local name = described and described.name
+	if type(name) ~= "string" or name == "" then
+		return Loc("GUILD_SUPPLIES_ITEM_FALLBACK", "item %s"):format(tostring(id))
+	end
+	-- Stable item IDs distinguish quality variants that share a display name.
+	return string.format("%s (#%d)", name, id)
+end
+
+local function AdjustItemOptions()
+	SyncAdjustDraftContext()
+	local options = {}
+	local rows = RequestedItemRows()
+	local selectedStillPresent = false
+	for i = 1, #rows do
+		local row = rows[i]
+		local itemId = tonumber(row and row.itemId)
+		if itemId then
+			if adjustDraft.itemId == itemId then
+				selectedStillPresent = true
+			end
+			options[#options + 1] = {
+				value = itemId,
+				label = FormatAdjustItemLabel(itemId),
+			}
+		end
+	end
+	if adjustDraft.itemId ~= nil and not selectedStillPresent then
+		adjustDraft.itemId = nil
+	end
+	return options
+end
+
+local function AdjustItemDefaultText()
+	SyncAdjustDraftContext()
+	local options = AdjustItemOptions()
+	if #options == 0 then
+		return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+			"Add requested items to the current campaign before applying an adjustment.")
+	end
+	if adjustDraft.itemId ~= nil then
+		return FormatAdjustItemLabel(adjustDraft.itemId)
+	end
+	return Loc("GUILD_SUPPLIES_ADJUST_ITEM_DEFAULT", "Select a requested item")
+end
+
+-- Session roster name cache for attribution autocomplete. Full scan once per
+-- guild/roster generation; getSuggestions filters the in-memory list only so
+-- keystrokes never rescan GetGuildRosterInfo (#430).
+local adjustRosterCache = {
+	guildKey = nil,
+	generation = nil,
+	names = {}, -- sorted normalized names
+	byLower = {}, -- lower(name) -> normalized name
+}
+
+local function AdjustRosterGeneration()
+	local GG = SF.GuildGossip
+	if GG and GG.GetGuildGeneration then
+		return tonumber(GG.GetGuildGeneration()) or 0
+	end
+	return 0
+end
+
+local function InvalidateAdjustRosterCache()
+	adjustRosterCache.guildKey = nil
+	adjustRosterCache.generation = nil
+	adjustRosterCache.names = {}
+	adjustRosterCache.byLower = {}
+end
+
+local function EnsureAdjustRosterCache()
+	local key = CurrentGuildKey() or "none"
+	local gen = AdjustRosterGeneration()
+	if adjustRosterCache.guildKey == key
+		and adjustRosterCache.generation == gen
+		and type(adjustRosterCache.names) == "table" then
+		return adjustRosterCache
+	end
+	local names = {}
+	local byLower = {}
+	if type(GetNumGuildMembers) == "function" and type(GetGuildRosterInfo) == "function" then
+		-- GetNumGuildMembers returns several numbers. Keep only the first before
+		-- tonumber; passing the rest makes Lua treat the second value as a base.
+		local total = GetNumGuildMembers()
+		total = tonumber(total) or 0
+		if total < 0 then
+			total = 0
+		end
+		for i = 1, total do
+			local rosterName = GetGuildRosterInfo(i)
+			local norm = rosterName
+			if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+				norm = SF.NameUtil.NormalizeNameRealm(rosterName) or rosterName
+			end
+			if type(norm) == "string" and norm ~= "" then
+				local lower = string.lower(norm)
+				if not byLower[lower] then
+					byLower[lower] = norm
+					names[#names + 1] = norm
+				end
+			end
+		end
+		table.sort(names)
+	end
+	adjustRosterCache.guildKey = key
+	adjustRosterCache.generation = gen
+	adjustRosterCache.names = names
+	adjustRosterCache.byLower = byLower
+	return adjustRosterCache
+end
+
+local function AdjustAttributionText()
+	SyncAdjustDraftContext()
+	-- Prefer the search draft so unfinished typing survives blur/refresh.
+	if type(adjustDraft.attributionText) == "string" then
+		return adjustDraft.attributionText
+	end
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= "" then
+		return adjustDraft.attributed
+	end
+	return ""
+end
+
+local function AdjustAttributionIsUnresolved()
+	SyncAdjustDraftContext()
+	return not adjustDraft.attributionResolved
+end
+
+local function AdjustAttributionSuggestions(prefix)
+	SyncAdjustDraftContext()
+	local cache = EnsureAdjustRosterCache()
+	local raw = tostring(prefix or "")
+	local needle = string.lower((raw:match("^%s*(.-)%s*$") or ""))
+	local out = {}
+	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	local maxSuggestions = 8
+	-- Empty / Unassigned prefix keeps Unassigned selectable as the default.
+	if needle == "" or string.find(string.lower(unassignedLabel), needle, 1, true) == 1 then
+		out[#out + 1] = {
+			value = ADJUST_UNASSIGNED,
+			label = unassignedLabel,
+			text = "",
+		}
+	end
+	local names = cache.names or {}
+	for i = 1, #names do
+		if #out >= maxSuggestions then
+			break
+		end
+		local name = names[i]
+		local lower = string.lower(name)
+		if needle == "" or string.find(lower, needle, 1, true) == 1 then
+			out[#out + 1] = {
+				value = name,
+				label = name,
+				text = name,
+			}
+		end
+	end
+	-- Keep a previously resolved credit visible through temporary roster lag.
+	-- Never promote unresolved search prefixes into suggestions (#430).
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= "" then
+		local lowerSel = string.lower(adjustDraft.attributed)
+		if not cache.byLower[lowerSel]
+			and (needle == "" or string.find(lowerSel, needle, 1, true) == 1) then
+			local exists = false
+			for i = 1, #out do
+				if out[i].value == adjustDraft.attributed then
+					exists = true
+					break
+				end
+			end
+			if not exists and #out < maxSuggestions then
+				out[#out + 1] = {
+					value = adjustDraft.attributed,
+					label = adjustDraft.attributed,
+					text = adjustDraft.attributed,
+				}
+			end
+		end
+	end
+	return out
+end
+
+--- Update search draft. Only Unassigned or an exact roster match resolves.
+-- Unmatched nonempty text stays searchable and blocks Apply/submit; it is never
+-- stored as a credited identity (#430).
+local function SetAdjustAttributionFromText(text)
+	SyncAdjustDraftContext()
+	local trimmed = tostring(text or ""):match("^%s*(.-)%s*$") or ""
+	if trimmed == "" then
+		adjustDraft.attributed = ADJUST_UNASSIGNED
+		adjustDraft.attributionText = ""
+		adjustDraft.attributionResolved = true
+		return
+	end
+	local unassignedLabel = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
+	if string.lower(trimmed) == string.lower(unassignedLabel) then
+		adjustDraft.attributed = ADJUST_UNASSIGNED
+		adjustDraft.attributionText = ""
+		adjustDraft.attributionResolved = true
+		return
+	end
+	local cache = EnsureAdjustRosterCache()
+	local exact = cache.byLower[string.lower(trimmed)]
+	if exact then
+		adjustDraft.attributed = exact
+		adjustDraft.attributionText = exact
+		adjustDraft.attributionResolved = true
+		return
+	end
+	-- Unchanged display of an already-resolved identity survives temporary roster
+	-- incompleteness on blur / ClearFocus after selection (#430).
+	if adjustDraft.attributionResolved
+		and type(adjustDraft.attributed) == "string"
+		and adjustDraft.attributed ~= ""
+		and string.lower(trimmed) == string.lower(adjustDraft.attributed) then
+		adjustDraft.attributionText = adjustDraft.attributed
+		return
+	end
+	adjustDraft.attributionText = trimmed
+	adjustDraft.attributed = ADJUST_UNASSIGNED
+	adjustDraft.attributionResolved = false
+end
+
+local function AdjustCanEdit()
+	local rec = CurrentRecord()
+	return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+end
+
+local function AdjustHasRequestedItems()
+	return #AdjustItemOptions() > 0
+end
+
+local function AdjustQuantityValid(text)
+	local g = GS()
+	if not g or not g.ParseAdjustmentQuantity then
+		return false
+	end
+	return g.ParseAdjustmentQuantity(text or "") ~= nil
+end
+
+local function AdjustApplyButtonEnabled(text)
+	if not AdjustCanEdit() or not AdjustHasRequestedItems() then
+		return false
+	end
+	if adjustDraft.itemId == nil then
+		return false
+	end
+	if AdjustAttributionIsUnresolved() then
+		return false
+	end
+	return AdjustQuantityValid(text or adjustDraft.quantityText or "")
+end
+
+local function ItemsHelpText()
+	if not Caps().canRead then
+		return Loc("GUILD_SUPPLIES_STATUS_MEMBERSHIP_PENDING",
+			"Guild membership is still being verified. Shared Guild Supplies details stay hidden until then.")
+	end
+	local record = CurrentRecord()
+	local hasCampaign = record and type(record.currentCampaignId) == "string" and record.currentCampaignId ~= ""
+	if hasCampaign then
+		return Loc("GUILD_SUPPLIES_ITEMS_HELP",
+			"Add exact item IDs for the current campaign. Goal edits keep contribution history.")
+	end
+	return Loc("GUILD_SUPPLIES_ITEMS_NEED_CAMPAIGN",
+		"Start a New Campaign before adding requested items.")
+end
+
+local function CommitConfig(ctx, kind, target, value)
+	local g = GS()
+	if not g then
+		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
+		return
+	end
+	ctx.section:ClearMessage()
+	local op, prepStatus, prepReason = g:NewConfigOperation(kind, target, value)
+	if not op then
+		ReportStatus(ctx, prepStatus or "rejected", prepReason)
+		return
+	end
+	local status, reason = g:ApplyStagedConfigOperation(op)
+	ReportStatus(ctx, status, reason)
+end
+
+local function DisabledMembershipTip()
+	return Loc("GUILD_SUPPLIES_DISABLED_MEMBERSHIP",
+		"Join a guild with a verified membership before using Guild Supplies.")
+end
+
+local function DisabledUnauthorizedTip(action)
+	return Loc("GUILD_SUPPLIES_DISABLED_UNAUTHORIZED_FMT",
+		"Your guild rank does not permit %s."):format(action)
+end
+
+--- Permission/membership gate shared by privileged Configuration controls.
+-- @param action string short action phrase for unauthorized copy
+-- @param allowRecover boolean|nil also accept canRecoverPolicy
+-- @return string|nil tip when blocked, else nil
+local function DisabledAuthTip(action, allowRecover)
+	local c = Caps()
+	if not c.canRead then
+		return DisabledMembershipTip()
+	end
+	if c.canEdit then
+		return nil
+	end
+	if allowRecover and c.canRecoverPolicy then
+		return nil
+	end
+	return DisabledUnauthorizedTip(action)
+end
+
+local function DisabledNeedRecordTip(actionNoun)
+	local auth = DisabledAuthTip(actionNoun, false)
+	if auth then
+		return auth
+	end
+	if CurrentRecord() ~= nil then
+		return nil
+	end
+	if IsNotConfigured() then
+		return Loc("GUILD_SUPPLIES_DISABLED_NEED_INIT",
+			"Initialize Guild Supplies for this guild first.")
+	end
+	-- canRead but record unavailable (permission-only / redacted): no guild detail.
+	return Loc("GUILD_SUPPLIES_DISABLED_DATA_UNAVAILABLE",
+		"Guild Supplies data is unavailable right now.")
+end
+
+local function DisabledNeedCampaignTip(actionNoun)
+	local tip = DisabledNeedRecordTip(actionNoun)
+	if tip then
+		return tip
+	end
+	local rec = CurrentRecord()
+	if rec and type(rec.currentCampaignId) == "string" then
+		return nil
+	end
+	return Loc("GUILD_SUPPLIES_DISABLED_NEED_CAMPAIGN",
+		"Start a New Campaign before continuing.")
+end
+
+
+local function Definition()
+	return {
+		isAdmin = function()
+			return Caps().canEdit == true
+		end,
+		sections = {
+			{
+				id = "gsItems",
+				title = Loc("GUILD_SUPPLIES_ITEMS_TITLE", "Requested items"),
+				tooltip = Loc("GUILD_SUPPLIES_ITEMS_TIP",
+					"Campaign-owned. A New Campaign starts with an empty list."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = ItemsHelpText,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_ADD_ITEM", "Add item"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_ADD_ITEM_HINT", "Item ID or link"),
+						buttonText = Loc("GUILD_SUPPLIES_ADD_ITEM_BUTTON", "Add"),
+						buttonWidth = 90,
+						editWidth = 170,
+						enabled = function()
+							local rec = CurrentRecord()
+							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ITEMS", "editing requested items"))
+						end,
+						onSubmit = function(ctx, text)
+							local C = SF.Consumables
+							local itemId = C and C.ItemIdFromText and C.ItemIdFromText(text) or tonumber(text)
+							if not itemId then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ITEM", "Enter an item ID or paste an item link."),
+									"error")
+								return
+							end
+							-- Fresh mutation-time read (not the render pass cache).
+							local g = GS()
+							local live = g and select(1, g:GetCurrentRecord())
+							local items = live and live.accounting and live.accounting._consumables
+								and live.accounting._consumables.requestedItems
+							if type(items) == "table" and type(items[tostring(itemId)]) == "table" then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ITEM_EXISTS",
+										"That item is already requested. Change its goal in the list instead of adding it again."),
+									"warn")
+								return
+							end
+							CommitConfig(ctx, "set-requested-item", { itemId = itemId }, {
+								itemId = itemId,
+								goal = 0,
+								removed = false,
+							})
+						end,
+					},
+					{
+						type = "consumableRequestedList",
+						label = Loc("GUILD_SUPPLIES_ITEM_LIST", "Current campaign items"),
+						adminOnly = true,
+						height = 180,
+						showItemIcons = true,
+						getItems = RequestedItemRows,
+						enabled = function()
+							local rec = CurrentRecord()
+							return Caps().canEdit and rec and type(rec.currentCampaignId) == "string"
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ITEMS", "editing requested items"))
+						end,
+						onRemove = function(ctx, item)
+							if not item or not item.itemId then return end
+							CommitConfig(ctx, "set-requested-item", { itemId = item.itemId }, { removed = true })
+						end,
+						onGoalCommit = function(ctx, item, goal)
+							if not item or not item.itemId then return end
+							local C = SF.Consumables
+							local gnum = C and C.ValidGoal and C.ValidGoal(goal) or nil
+							if gnum == nil then
+								local maxGoal = (C and tonumber(C.MAX_GOAL)) or 100000
+								local raw = tonumber(goal)
+								if raw and raw == math.floor(raw) and raw >= 0 and raw > maxGoal then
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_ERR_GOAL_RANGE",
+											"Enter a whole-number goal from 0 to %d."):format(maxGoal),
+										"error")
+								else
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_ERR_GOAL", "Enter a non-negative whole-number goal."),
+										"error")
+								end
+								return
+							end
+							CommitConfig(ctx, "set-requested-item", { itemId = item.itemId }, {
+								itemId = item.itemId,
+								goal = gnum,
+								removed = false,
+							})
+						end,
+					},
+				},
+			},
+			{
+				id = "gsAdjust",
+				title = Loc("GUILD_SUPPLIES_ADJUST_TITLE", "Quantity adjustment"),
+				tooltip = Loc("GUILD_SUPPLIES_ADJUST_TIP",
+					"Authenticated editors may adjust item totals. Adjustments never verify Guild Bank deposits."),
+				items = {
+					{
+						type = "help",
+						indent = "label",
+						getText = function()
+							SyncAdjustDraftContext()
+							if AdjustCanEdit() and not AdjustHasRequestedItems() then
+								return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+									"Add requested items to the current campaign before applying an adjustment.")
+							end
+							return Loc("GUILD_SUPPLIES_ADJUST_HELP",
+								"Choose a current campaign item, enter a whole-number change such as 10 or -10, and optionally credit a character. Leave attribution on Unassigned to change only the item total. Changes apply to the guild-owned Guild Supplies ledger and never verify Guild Bank deposits.")
+						end,
+					},
+					{
+						type = "dropdown",
+						label = Loc("GUILD_SUPPLIES_ADJUST_ITEM", "Requested item"),
+						adminOnly = true,
+						width = 260,
+						defaultText = AdjustItemDefaultText,
+						options = AdjustItemOptions,
+						get = function()
+							SyncAdjustDraftContext()
+							return adjustDraft.itemId
+						end,
+						set = function() end,
+						enabled = function()
+							return AdjustCanEdit() and AdjustHasRequestedItems()
+						end,
+						getDisabledTooltip = function()
+							local tip = DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
+							if tip then
+								return tip
+							end
+							if not AdjustHasRequestedItems() then
+								return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+									"Add requested items to the current campaign before applying an adjustment.")
+							end
+							return nil
+						end,
+						onValueChanged = function(ctx, value)
+							SyncAdjustDraftContext()
+							local itemId = tonumber(value)
+							if not itemId then
+								return
+							end
+							-- Require the choice to still be a current requested item.
+							local options = AdjustItemOptions()
+							local found = false
+							for i = 1, #options do
+								if options[i].value == itemId then
+									found = true
+									break
+								end
+							end
+							if not found then
+								adjustDraft.itemId = nil
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
+										"Select a requested campaign item before applying an adjustment."),
+									"error")
+								RefreshPageControls()
+								return
+							end
+							adjustDraft.itemId = itemId
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "autocomplete",
+						label = Loc("GUILD_SUPPLIES_ADJUST_ATTR", "Attribution"),
+						adminOnly = true,
+						width = 220,
+						maxLetters = 96,
+						maxSuggestions = 8,
+						hint = Loc("GUILD_SUPPLIES_ADJUST_ATTR_HINT",
+							"Unassigned (type a guild character to credit)"),
+						enabled = function()
+							return AdjustCanEdit() and AdjustHasRequestedItems()
+						end,
+						getDisabledTooltip = function()
+							return DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
+						end,
+						get = AdjustAttributionText,
+						-- Bound setter alone owns typing / blur / selection text
+						-- updates. Do not also wire onTextChanged: AddAutocomplete
+						-- would run both and double the draft update + refresh (#430).
+						set = function(v)
+							SetAdjustAttributionFromText(v)
+							-- Quantity Apply depends on attribution validity; refresh
+							-- the bound editboxButton without requiring a qty retype.
+							RefreshPageControls()
+						end,
+						getSuggestions = function(_, prefix)
+							return AdjustAttributionSuggestions(prefix)
+						end,
+						onResolved = function(_, item)
+							SyncAdjustDraftContext()
+							-- Typing notifies nil before set. Do not refresh here:
+							-- get() still has the prior search draft and would
+							-- rewrite the edit mid-keystroke. set refreshes after
+							-- the draft catches up.
+							if not item then
+								adjustDraft.attributed = ADJUST_UNASSIGNED
+								adjustDraft.attributionResolved = false
+								return
+							end
+							if item.value == ADJUST_UNASSIGNED or item.value == nil then
+								adjustDraft.attributed = ADJUST_UNASSIGNED
+								adjustDraft.attributionText = ""
+								adjustDraft.attributionResolved = true
+								RefreshPageControls()
+								return
+							end
+							if type(item.value) == "string" and item.value ~= "" then
+								adjustDraft.attributed = item.value
+								adjustDraft.attributionText = item.text or item.label or item.value
+								adjustDraft.attributionResolved = true
+								RefreshPageControls()
+								return
+							end
+							SetAdjustAttributionFromText(item.text or item.label or "")
+							RefreshPageControls()
+						end,
+					},
+					{
+						type = "editboxButton",
+						label = Loc("GUILD_SUPPLIES_ADJUST_QTY", "Quantity change"),
+						adminOnly = true,
+						hint = Loc("GUILD_SUPPLIES_ADJUST_QTY_HINT", "10 or -10"),
+						buttonText = Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"),
+						buttonWidth = 140,
+						editWidth = 120,
+						maxLetters = 8,
+						get = function()
+							SyncAdjustDraftContext()
+							return adjustDraft.quantityText or ""
+						end,
+						getSelectionKey = function()
+							SyncAdjustDraftContext()
+							return AdjustDraftContextKey()
+						end,
+						enabled = function()
+							-- Keep the quantity input editable once an item is
+							-- selected; Apply uses buttonEnabled independently.
+							return AdjustCanEdit()
+								and AdjustHasRequestedItems()
+								and adjustDraft.itemId ~= nil
+						end,
+						buttonEnabled = function(text)
+							return AdjustApplyButtonEnabled(text)
+						end,
+						getDisabledTooltip = function()
+							local tip = DisabledNeedCampaignTip(
+								Loc("GUILD_SUPPLIES_DISABLED_ACTION_ADJUST", "adjusting quantities"))
+							if tip then
+								return tip
+							end
+							if not AdjustHasRequestedItems() then
+								return Loc("GUILD_SUPPLIES_ADJUST_EMPTY",
+									"Add requested items to the current campaign before applying an adjustment.")
+							end
+							if adjustDraft.itemId == nil then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
+									"Select a requested campaign item before applying an adjustment.")
+							end
+							if AdjustAttributionIsUnresolved() then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_ATTR",
+									"Select Unassigned or a guild character from the suggestions. Typed search text is not credited until you select a match.")
+							end
+							if not AdjustQuantityValid(adjustDraft.quantityText or "") then
+								return Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
+									"Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign.")
+							end
+							return nil
+						end,
+						onTextChanged = function(text)
+							SyncAdjustDraftContext()
+							adjustDraft.quantityText = tostring(text or "")
+						end,
+						onSubmit = function(ctx, text)
+							SyncAdjustDraftContext()
+							local g = GS()
+							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+							if not g or not g.NewAdjustmentOperation or not g.ParseAdjustmentQuantity then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."),
+									"error")
+								return
+							end
+							-- Preserve typed quantity across cancel/failure.
+							adjustDraft.quantityText = tostring(text or "")
+							local itemId = tonumber(adjustDraft.itemId)
+							if not itemId then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_ITEM",
+										"Select a requested campaign item before applying an adjustment."),
+									"error")
+								return
+							end
+							local quantity, qtyErr = g.ParseAdjustmentQuantity(adjustDraft.quantityText)
+							if not quantity then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_FORMAT",
+										"Enter a whole-number quantity such as 10 or -10. Do not use a leading plus sign."),
+									"error")
+								return
+							end
+							if AdjustAttributionIsUnresolved() then
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_ADJUST_ATTR",
+										"Select Unassigned or a guild character from the suggestions. Typed search text is not credited until you select a match."),
+									"error")
+								return
+							end
+							local attributed = nil
+							if type(adjustDraft.attributed) == "string" and adjustDraft.attributed ~= "" then
+								attributed = adjustDraft.attributed
+							end
+							-- Capture draft identity so success only clears when context matches.
+							local boundItemId = itemId
+							local boundContext = AdjustDraftContextKey()
+							local op, prepStatus, prepReason = g:NewAdjustmentOperation(
+								itemId, quantity, attributed)
+							if not op then
+								ReportStatus(ctx, prepStatus or "rejected", prepReason or qtyErr)
+								return
+							end
+							local preview = g.PreviewAdjustment
+								and g:PreviewAdjustment(itemId, quantity, attributed) or nil
+							local confirmMsg
+							if preview and g.FormatAdjustmentConfirmation then
+								confirmMsg = g.FormatAdjustmentConfirmation(
+									preview, FormatAdjustItemLabel(itemId))
+							else
+								confirmMsg = Loc("GUILD_SUPPLIES_ADJUST_CONFIRM",
+									"Adjust item %s by %+d on the Guild Supplies ledger?")
+									:format(FormatAdjustItemLabel(itemId), quantity)
+							end
+							local accept = function()
+								-- Revalidate permissions/context/item/totals/goal at commit.
+								SyncAdjustDraftContext()
+								if AdjustDraftContextKey() ~= boundContext
+									or tonumber(adjustDraft.itemId) ~= boundItemId
+									or not AdjustCanEdit() then
+									ctx.section:SetMessage(
+										Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+											"the page is out of date — refresh and try again"),
+										"error")
+									RefreshPageControls()
+									return
+								end
+								ctx.section:ClearMessage()
+								local status, reason = g:ApplyStagedConfigOperation(op)
+								if status == "accepted" or status == "duplicate" then
+									if AdjustDraftContextKey() == boundContext
+										and tonumber(adjustDraft.itemId) == boundItemId then
+										adjustDraft.quantityText = ""
+									end
+								end
+								ReportStatus(ctx, status, reason)
+								RefreshPageControls()
+							end
+							if dialogs and dialogs.Confirm then
+								dialogs:Confirm(confirmMsg,
+									Loc("GUILD_SUPPLIES_ADJUST_APPLY", "Apply adjustment"), accept)
+							else
+								ctx.section:SetMessage(
+									Loc("GUILD_SUPPLIES_ERR_CONFIRM_UNAVAILABLE",
+										"Confirmation is required and is unavailable right now."),
+									"error")
+							end
+						end,
+					},
+				},
+			},
+
+		},
+	}
+end
+
+local function PanelVisible(panel)
+	if not panel then return false end
+	if panel.IsVisible then
+		return panel:IsVisible() and true or false
+	end
+	if panel.IsShown then
+		return panel:IsShown() and true or false
+	end
+	return false
+end
+
+local function QueueRefresh()
+	local panel = Page.panel
+	if not panel or not Page.Refresh then return end
+	if not PanelVisible(panel) then return end
+	if refreshQueued then return end
+	refreshQueued = true
+	local function run()
+		refreshQueued = false
+		if not Page.panel or not Page.Refresh then return end
+		if not PanelVisible(Page.panel) then return end
+		Page:Refresh(Page.panel)
+	end
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, run)
+	else
+		run()
+	end
+end
+
+local function EnsureItemDisplayListener()
+	local display = SF.ItemDisplay
+	if not display or type(display.RegisterRefresh) ~= "function" then
+		return
+	end
+	display.RegisterRefresh("guildSuppliesManage", function()
+		QueueRefresh()
+	end)
+end
+
+local function EnsureRosterListener()
+	if rosterFrame or type(CreateFrame) ~= "function" then
+		return
+	end
+	local frame = CreateFrame("Frame")
+	rosterFrame = frame
+	frame:RegisterEvent("GUILD_ROSTER_UPDATE")
+	if frame.RegisterEvent then
+		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
+	end
+	frame:SetScript("OnEvent", function()
+		InvalidateAdjustRosterCache()
+		QueueRefresh()
+	end)
+end
+
+local officerHooked = false
+local function EnsureOfficerListener()
+	if officerHooked or Page.__sfOfficerHook then
+		return
+	end
+	local GO = SF.GuildOfficer
+	if not GO or type(GO.RegisterUIListener) ~= "function" then
+		return
+	end
+	officerHooked = true
+	Page.__sfOfficerHook = true
+	GO.RegisterUIListener(function()
+		QueueRefresh()
+	end)
+end
+
+local durableListenerRegistered = false
+local function EnsureDurableListener()
+	if durableListenerRegistered or Page.__sfGuildSuppliesDurableHook then
+		return
+	end
+	local supplies = SF.GuildSupplies
+	if not supplies or type(supplies.RegisterUIListener) ~= "function" then
+		return
+	end
+	durableListenerRegistered = true
+	Page.__sfGuildSuppliesDurableHook = true
+	supplies.RegisterUIListener(function()
+		QueueRefresh()
+	end)
+end
+
+function Page:Build(panel)
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if not renderer or not renderer.Build then
+		return
+	end
+	EnsureRosterListener()
+	EnsureOfficerListener()
+	EnsureDurableListener()
+	EnsureItemDisplayListener()
+	BeginRenderPass()
+	renderer:Build(panel, Definition())
+	EndRenderPass()
+	self.panel = panel
+	if panel.HookScript and not panel.__sfGuildSuppliesManageHook then
+		panel.__sfGuildSuppliesManageHook = true
+		panel:HookScript("OnShow", function()
+			QueueRefresh()
+		end)
+	end
+end
+
+function Page:Refresh(panel)
+	panel = panel or self.panel
+	if not PanelVisible(panel) then
+		return
+	end
+	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+	if renderer and renderer.Refresh then
+		BeginRenderPass()
+		renderer:Refresh(panel)
+		EndRenderPass()
+	end
+end
+
+function Page:OnHide()
+	refreshQueued = false
+end
+
+-- Test hooks for behavioral coverage (#453).
+Page.__sfTest = {
+	Definition = Definition,
+}
+
+EnsureRosterListener()
+EnsureDurableListener()
+EnsureItemDisplayListener()
+
+SF.SettingsUI:RegisterPage(Page)

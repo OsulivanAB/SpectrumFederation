@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PARENT_TOC = REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc"
 LUA_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_tests.lua"
 LUA_RENAME_424_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_rename_424_tests.lua"
+LUA_UI_453_TESTS = REPO_ROOT / "tests" / "lua" / "guild_supplies_453_tests.lua"
 GS_DIR = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildSupplies"
 DOCS = REPO_ROOT / "docs" / "development" / "guild-supplies" / "index.md"
 ADAPTER = REPO_ROOT / "SpectrumFederation" / "modules" / "GuildGossip" / "05_GuildAdapter.lua"
@@ -67,6 +68,33 @@ def test_guild_supplies_campaign_rename_424():
     assert "424-adopt-tie: clear revision kept" in result.stdout
 
 
+def test_guild_supplies_raid_supply_ui_453():
+    """Focused #453 Configuration/Manage/Logs presentation coverage."""
+    assert LUA_UI_453_TESTS.exists()
+    result = subprocess.run(
+        [_lua51(), str(LUA_UI_453_TESTS)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            "lua5.1 Guild Supplies #453 UI tests failed\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    assert "0 failed" in result.stdout
+    assert "453: Initialize on first-time setup" in result.stdout
+    assert "453: Activate hidden after activation" in result.stdout
+    assert "453: Manage hosts gsItems" in result.stdout
+    assert "453: Preview as Non-Admin hides Manage" in result.stdout
+    assert "453: dropdown appends (Current)" in result.stdout
+    assert "453: unassigned adjustment contributor" in result.stdout
+    assert "453: all retained entries projected (>25)" in result.stdout
+    assert "453: combined filters cover removed-item donations" in result.stdout
+
+
 def test_parent_toc_loads_guild_supplies_after_gossip():
     toc = PARENT_TOC.read_text(encoding="utf-8")
     gossip = toc.find("modules/GuildGossip/10_PublicAPI.lua")
@@ -81,14 +109,15 @@ def test_parent_toc_loads_guild_supplies_after_gossip():
     gs_gossip = toc.find("modules/GuildSupplies/Gossip.lua")
     item_display = toc.find("modules/UI/Settings/ItemDisplay.lua")
     config_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    manage_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesManage.lua")
     logs_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
     rankings_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
     troubleshooting_page = toc.find("modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
-    assert 0 <= item_display < config_page < logs_page < rankings_page < troubleshooting_page
+    assert 0 <= item_display < config_page < manage_page < logs_page < rankings_page < troubleshooting_page
     obs = toc.find("modules/LootHelper/ConsumablesObservation.lua")
     assert 0 <= obs
     assert 0 <= gossip < state < authority < operations < campaigns < activation < ledger < admission < valuation < gs_gossip
-    assert 0 <= config_page < logs_page < rankings_page < troubleshooting_page
+    assert 0 <= config_page < manage_page < logs_page < rankings_page < troubleshooting_page
 
 
 def test_demand_driven_guild_apis_exist():

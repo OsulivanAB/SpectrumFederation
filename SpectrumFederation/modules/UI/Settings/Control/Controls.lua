@@ -522,17 +522,37 @@ end
 					for _, option in ipairs(GetOptions()) do
 						local value
 						local label
+						local tip
 
 						if type(option) == "table" then
 							value = option.value
 							label = option.label
+							tip = option.tooltip
 						else
 							value = option
 							label = tostring(option)
 						end
 
 						if value ~= nil then
-							rootDescription:CreateRadio(tostring(label or value), IsSelected, SetSelected, value)
+							local radio = rootDescription:CreateRadio(
+								tostring(label or value), IsSelected, SetSelected, value)
+							if radio and tip and type(tip) == "string" and tip ~= ""
+								and type(radio.SetTooltip) == "function" then
+								local tipText = tip
+								local tipTitle = tostring(label or value)
+								radio:SetTooltip(function(tooltip)
+									if type(GameTooltip_SetTitle) == "function" then
+										GameTooltip_SetTitle(tooltip, tipTitle)
+									elseif tooltip and tooltip.SetText then
+										tooltip:SetText(tipTitle, 1, 1, 1)
+									end
+									if type(GameTooltip_AddNormalLine) == "function" then
+										GameTooltip_AddNormalLine(tooltip, tipText, true)
+									elseif tooltip and tooltip.AddLine then
+										tooltip:AddLine(tipText, nil, nil, nil, true)
+									end
+								end)
+							end
 						end
 					end
 				end)
@@ -1215,18 +1235,37 @@ function Controls:AddDropdown(section, opts)
 
 		local function Generator(owner, rootDescription)
 			for _, opt in ipairs(GetOptions()) do
-				local value, label
+				local value, label, tip
 
 				if type(opt) == "table" then
 					value = opt.value
 					label = opt.label
+					tip = opt.tooltip
 				else
 					value = opt
 					label = tostring(opt)
 				end
 
 				if value ~= nil then
-					rootDescription:CreateRadio(tostring(label or value), IsSelected, SetSelected, value)
+					local radio = rootDescription:CreateRadio(
+						tostring(label or value), IsSelected, SetSelected, value)
+					if radio and tip and type(tip) == "string" and tip ~= ""
+						and type(radio.SetTooltip) == "function" then
+						local tipText = tip
+						local tipTitle = tostring(label or value)
+						radio:SetTooltip(function(tooltip)
+							if type(GameTooltip_SetTitle) == "function" then
+								GameTooltip_SetTitle(tooltip, tipTitle)
+							elseif tooltip and tooltip.SetText then
+								tooltip:SetText(tipTitle, 1, 1, 1)
+							end
+							if type(GameTooltip_AddNormalLine) == "function" then
+								GameTooltip_AddNormalLine(tooltip, tipText, true)
+							elseif tooltip and tooltip.AddLine then
+								tooltip:AddLine(tipText, nil, nil, nil, true)
+							end
+						end)
+					end
 				end
 			end
 		end
@@ -3132,8 +3171,26 @@ function Controls:AddLogTable(section, opts)
 		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
 		emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
 		emptyText:SetJustifyH("LEFT")
-		emptyText:SetText(opts.emptyText or "No logs found matching the selected filters.")
 		emptyText:Hide()
+
+		--- Resolve opts.emptyText whether it is a string or a callable (#453).
+		-- Must run before the first SetText so FontString never receives a function.
+		local function ResolveEmptyText()
+			local empty = opts.emptyText
+			if type(empty) == "function" then
+				local ok, value = pcall(empty)
+				if ok then
+					empty = value
+				else
+					empty = nil
+				end
+			end
+			if type(empty) ~= "string" or empty == "" then
+				empty = "No logs found matching the selected filters."
+			end
+			return empty
+		end
+		emptyText:SetText(ResolveEmptyText())
 
 		local headerCells = {}
 		for index, column in ipairs(columns) do
@@ -3151,6 +3208,15 @@ function Controls:AddLogTable(section, opts)
 		end
 
 		local rows = {}
+		-- When virtualize is set, only a bounded pool of row frames is created and
+		-- rebound to the visible scroll window. Full-history access remains via scroll.
+		local virtualize = opts.virtualize and true or false
+		local stride = rowHeight + rowSpacing
+		local cachedDataRows = {}
+		local cachedEnabled = true
+		local lastAvailableWidth = 0
+		-- Scroll identity for campaign/dataset/filter changes (#453).
+		local lastScrollContextKey = nil
 
 		local function LayoutCells(parent, cells, availableWidth)
 			local fixedWidth = 0
@@ -3183,6 +3249,19 @@ function Controls:AddLogTable(section, opts)
 			end
 		end
 
+		local function ShowRowTooltip(dataRow)
+			local tip = dataRow.__sfTooltip
+			if type(tip) ~= "string" or tip == "" then
+				return
+			end
+			if not GameTooltip then
+				return
+			end
+			GameTooltip:SetOwner(dataRow, "ANCHOR_RIGHT")
+			GameTooltip:SetText(tip, 1, 1, 1, 1, true)
+			GameTooltip:Show()
+		end
+
 		local function EnsureRow(index)
 			if rows[index] then
 				return rows[index]
@@ -3200,9 +3279,13 @@ function Controls:AddLogTable(section, opts)
 
 			dataRow:SetScript("OnEnter", function(self)
 				self.Hover:Show()
+				ShowRowTooltip(self)
 			end)
 			dataRow:SetScript("OnLeave", function(self)
 				self.Hover:Hide()
+				if GameTooltip and GameTooltip.Hide then
+					GameTooltip:Hide()
+				end
 			end)
 
 			dataRow.Cells = {}
@@ -3226,6 +3309,8 @@ function Controls:AddLogTable(section, opts)
 						GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
 						GameTooltip:SetHyperlink(cell.hyperlink)
 						GameTooltip:Show()
+					elseif dataRow.__sfTooltip then
+						ShowRowTooltip(dataRow)
 					end
 				end)
 				cell:SetScript("OnLeave", function()
@@ -3250,6 +3335,31 @@ function Controls:AddLogTable(section, opts)
 			return dataRow
 		end
 
+		local function BindRow(dataRow, rowData, enabled, availableWidth)
+			dataRow:SetAlpha(enabled and 1 or 0.45)
+			dataRow.__sfTooltip = type(rowData) == "table" and rowData.tooltip or nil
+			for columnIndex, column in ipairs(columns) do
+				local value = rowData and rowData[column.key]
+				local cell = dataRow.Cells[columnIndex]
+				cell.Text:SetText(value or "")
+				local hyperlink
+				local itemRef
+				if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
+					hyperlink = SF.LootLog.ExtractItemHyperlink(value)
+				end
+				if SF.LootLog and SF.LootLog.ExtractItemRef then
+					itemRef = SF.LootLog.ExtractItemRef(value)
+				end
+				cell.hyperlink = hyperlink
+				cell.itemRef = itemRef
+				cell.itemLinkText = hyperlink and value or nil
+			end
+			if availableWidth and availableWidth > 0 then
+				LayoutCells(dataRow, dataRow.Cells, availableWidth)
+			end
+			dataRow:Show()
+		end
+
 		local function SetScrollBarShown(show)
 			local scrollBar = scroll.ScrollBar
 			if not scrollBar then return 0 end
@@ -3272,6 +3382,107 @@ function Controls:AddLogTable(section, opts)
 			return scrollBar:GetWidth() or 20
 		end
 
+		local function ResolveScrollContextKey()
+			local keyFn = opts.getScrollContextKey
+			if type(keyFn) ~= "function" then
+				return nil
+			end
+			local ok, value = pcall(keyFn)
+			if not ok or type(value) ~= "string" then
+				return ""
+			end
+			return value
+		end
+
+		--- Reset scroll on context change; otherwise clamp to the valid range.
+		-- Ordinary refreshes with an unchanged context keep the user's offset.
+		local function SyncScrollOffset(contentHeight, forceReset)
+			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+			local maxScroll = math.max(0, (tonumber(contentHeight) or 0) - visibleHeight)
+			local scrollOffset = 0
+			if not forceReset and scroll.GetVerticalScroll then
+				scrollOffset = tonumber(scroll:GetVerticalScroll()) or 0
+			end
+			if scrollOffset < 0 then
+				scrollOffset = 0
+			elseif scrollOffset > maxScroll then
+				scrollOffset = maxScroll
+			end
+			if scroll.SetVerticalScroll then
+				local current = scroll.GetVerticalScroll and (tonumber(scroll:GetVerticalScroll()) or 0) or nil
+				if current == nil or current ~= scrollOffset then
+					scroll:SetVerticalScroll(scrollOffset)
+				end
+			end
+			local scrollBar = scroll.ScrollBar
+			if scrollBar and scrollBar.SetValue and (forceReset or scrollOffset == 0 or scrollOffset == maxScroll) then
+				local barValue = scrollBar.GetValue and tonumber(scrollBar:GetValue()) or nil
+				if barValue == nil or barValue ~= scrollOffset then
+					scrollBar:SetValue(scrollOffset)
+				end
+			end
+			return scrollOffset
+		end
+
+		local function RenderVirtualWindow(availableWidth)
+			local dataRows = cachedDataRows
+			local total = #dataRows
+			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+			local contentHeight = (total > 0) and (total * stride - rowSpacing) or 1
+			local scrollOffset = SyncScrollOffset(contentHeight, false)
+			local firstIndex = 1
+			if stride > 0 then
+				firstIndex = math.floor(scrollOffset / stride) + 1
+			end
+			if firstIndex < 1 then
+				firstIndex = 1
+			end
+			-- One extra row above/below so scrolling stays continuous.
+			local visibleCount = math.ceil(visibleHeight / math.max(1, stride)) + 2
+			if visibleCount < 4 then
+				visibleCount = 4
+			end
+			-- Hard cap so repeated refreshes cannot allocate unbounded frames.
+			local maxPool = opts.maxVirtualRows or 48
+			if visibleCount > maxPool then
+				visibleCount = maxPool
+			end
+			if firstIndex > total then
+				firstIndex = math.max(1, total - visibleCount + 1)
+			end
+			local lastIndex = math.min(total, firstIndex + visibleCount - 1)
+			local poolIndex = 0
+			for dataIndex = firstIndex, lastIndex do
+				poolIndex = poolIndex + 1
+				local dataRow = EnsureRow(poolIndex)
+				local yOffset = (dataIndex - 1) * stride
+				dataRow:ClearAllPoints()
+				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
+				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
+				BindRow(dataRow, dataRows[dataIndex], cachedEnabled, availableWidth)
+			end
+			for index = poolIndex + 1, #rows do
+				rows[index]:Hide()
+			end
+		end
+
+		local function RefreshVirtualWindowOnly()
+			if row.__sfLogTableRefreshing then
+				return
+			end
+			if not virtualize then
+				return
+			end
+			row.__sfLogTableRefreshing = true
+			local ok, err = pcall(function()
+				RenderVirtualWindow(lastAvailableWidth)
+			end)
+			row.__sfLogTableRefreshing = false
+			if not ok then
+				error(tostring(err or "AddLogTable virtual window failed"), 0)
+			end
+		end
+
 		local function Refresh()
 			if row.__sfLogTableRefreshing then
 				return
@@ -3280,42 +3491,44 @@ function Controls:AddLogTable(section, opts)
 			local ok, err = pcall(function()
 			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 			local dataRows = getRows() or {}
-			local yOffset = 0
+			cachedDataRows = dataRows
+			cachedEnabled = enabled and true or false
 
-			for index, rowData in ipairs(dataRows) do
-				local dataRow = EnsureRow(index)
-				dataRow:ClearAllPoints()
-				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
-				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
-				dataRow:SetAlpha(enabled and 1 or 0.45)
-
-				for columnIndex, column in ipairs(columns) do
-					local value = rowData[column.key]
-					local cell = dataRow.Cells[columnIndex]
-					cell.Text:SetText(value or "")
-					local hyperlink
-					local itemRef
-					if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
-						hyperlink = SF.LootLog.ExtractItemHyperlink(value)
-					end
-					if SF.LootLog and SF.LootLog.ExtractItemRef then
-						itemRef = SF.LootLog.ExtractItemRef(value)
-					end
-					cell.hyperlink = hyperlink
-					cell.itemRef = itemRef
-					cell.itemLinkText = hyperlink and value or nil
+			local contentHeight
+			if virtualize then
+				local total = #dataRows
+				contentHeight = (total > 0) and (total * stride - rowSpacing) or 1
+				content:SetHeight(math.max(1, contentHeight))
+			else
+				local yOffset = 0
+				for index, rowData in ipairs(dataRows) do
+					local dataRow = EnsureRow(index)
+					dataRow:ClearAllPoints()
+					dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
+					dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
+					BindRow(dataRow, rowData, enabled, nil)
+					yOffset = yOffset + stride
 				end
-
-				dataRow:Show()
-				yOffset = yOffset + rowHeight + rowSpacing
+				for index = #dataRows + 1, #rows do
+					rows[index]:Hide()
+				end
+				contentHeight = (#dataRows > 0) and (yOffset - rowSpacing) or 1
+				content:SetHeight(math.max(1, contentHeight))
 			end
 
-			for index = #dataRows + 1, #rows do
-				rows[index]:Hide()
+			-- Campaign/dataset/filter identity changes reset scroll; shrinking
+			-- results only clamp. Unchanged-context refreshes keep the offset.
+			local ctxKey = ResolveScrollContextKey()
+			local forceReset = (#dataRows == 0)
+			if ctxKey ~= nil then
+				if lastScrollContextKey ~= nil and ctxKey ~= lastScrollContextKey then
+					forceReset = true
+				end
+				lastScrollContextKey = ctxKey
 			end
+			SyncScrollOffset(contentHeight, forceReset)
 
-			local contentHeight = (#dataRows > 0) and (yOffset - rowSpacing) or 1
-			content:SetHeight(math.max(1, contentHeight))
+			emptyText:SetText(ResolveEmptyText())
 			emptyText:SetShown(#dataRows == 0)
 
 			local function ApplyScrollAndColumns()
@@ -3330,12 +3543,17 @@ function Controls:AddLogTable(section, opts)
 
 				local availableWidth = math.max(1, tableArea:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
 				content:SetWidth(availableWidth)
+				lastAvailableWidth = availableWidth
 
 				LayoutCells(header, headerCells, availableWidth)
-				for index = 1, #dataRows do
-					local dataRow = rows[index]
-					if dataRow and dataRow:IsShown() then
-						LayoutCells(dataRow, dataRow.Cells, availableWidth)
+				if virtualize then
+					RenderVirtualWindow(availableWidth)
+				else
+					for index = 1, #dataRows do
+						local dataRow = rows[index]
+						if dataRow and dataRow:IsShown() then
+							LayoutCells(dataRow, dataRow.Cells, availableWidth)
+						end
 					end
 				end
 			end
@@ -3355,6 +3573,41 @@ function Controls:AddLogTable(section, opts)
 		RegisterRefresh(section, Refresh)
 		row:HookScript("OnSizeChanged", Refresh)
 		scroll:HookScript("OnSizeChanged", Refresh)
+		if virtualize then
+			-- Rebind the pooled rows as the user scrolls without rebuilding getRows().
+			if scroll.HookScript then
+				scroll:HookScript("OnVerticalScroll", function()
+					RefreshVirtualWindowOnly()
+				end)
+			end
+			local scrollBar = scroll.ScrollBar
+			if scrollBar and scrollBar.HookScript then
+				scrollBar:HookScript("OnValueChanged", function()
+					RefreshVirtualWindowOnly()
+				end)
+			end
+		end
+		-- Expose pool/scroll hooks for lifecycle and #453 behavioral tests.
+		row.__sfLogTableRowCount = function()
+			return #rows
+		end
+		row.__sfLogTableVirtualize = virtualize
+		row.__sfLogTableScroll = scroll
+		row.__sfLogTableGetVerticalScroll = function()
+			if scroll.GetVerticalScroll then
+				return tonumber(scroll:GetVerticalScroll()) or 0
+			end
+			return 0
+		end
+		row.__sfLogTableSetVerticalScroll = function(offset)
+			if scroll.SetVerticalScroll then
+				scroll:SetVerticalScroll(tonumber(offset) or 0)
+			end
+			if virtualize then
+				RefreshVirtualWindowOnly()
+			end
+		end
+		row.__sfLogTableRefresh = Refresh
 	end, { fillHeight = opts.fillHeight })
 end
 
