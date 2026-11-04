@@ -3853,14 +3853,16 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             end
             local function indexLedgerRowLe(e)
                 if type(e) ~= "table" then return end
+                -- Store the event table (truthy) so completeness can verify
+                -- adjustment unitCopper without a second full-ledger scan (#447).
                 if type(e.id) == "string" and e.id ~= "" then
-                    state.acctIndex.byId[e.id] = true
+                    state.acctIndex.byId[e.id] = e
                 end
                 if type(e.txnId) == "string" and e.txnId ~= "" then
-                    state.acctIndex.byId[e.txnId] = true
+                    state.acctIndex.byId[e.txnId] = e
                 end
                 if type(e.opId) == "string" and e.opId ~= "" then
-                    state.acctIndex.byId[e.opId] = true
+                    state.acctIndex.byId[e.opId] = e
                 end
                 rememberOccLe(state.acctIndex.byOcc, e)
             end
@@ -3903,6 +3905,15 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 state.sliceUsed = sliceUsed
                 return true, nil, progress
             end
+            local function isAdjustmentEventLe(ev)
+                if type(ev) ~= "table" then
+                    return false
+                end
+                local typ = ev.type
+                return typ == "adjustment"
+                    or typ == "CONSUMABLE_ADJUSTMENT"
+                    or (GS.LEDGER_EVENT and typ == GS.LEDGER_EVENT.ADJUSTMENT)
+            end
             local alreadyLe = false
             -- byId is exact-ID only (never collapses distinct reminted txn ids).
             if type(eid) == "string" and eid ~= "" and state.acctIndex.byId[eid] then
@@ -3927,9 +3938,21 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     alreadyLe = true
                 end
             end
-            if alreadyLe then
-                -- settled
-            else
+            -- Exactly once per buffered provider record: donations settle on ID
+            -- presence; adjustments must still AdmitLedgerEvent so op-first
+            -- unpriced rows reconcile unitCopper from the priced source body
+            -- (#447). RefreshLedgerEventExport is live-record-gated and will
+            -- not mutate exports for this temporary offline record.
+            state.ledgerBodySettled = state.ledgerBodySettled or {}
+            local settledKey = tostring(recordId)
+            local needsAdmit = true
+            if state.ledgerBodySettled[settledKey] then
+                needsAdmit = false
+            elseif alreadyLe and not isAdjustmentEventLe(event) then
+                state.ledgerBodySettled[settledKey] = true
+                needsAdmit = false
+            end
+            if needsAdmit then
                 if sliceUsed >= sliceBudget then
                     return yieldReplayCursorLe()
                 end
@@ -3953,10 +3976,44 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 sliceUsed = sliceUsed + 1
                 if stLe == "accepted" or stLe == "duplicate" then
                     progress = true
-                    indexLedgerRowLe(event)
-                    -- Keep tails consistent with lists that grew via Admit.
+                    state.ledgerBodySettled[settledKey] = true
+                    -- Index the durable installed row (enriched in place on
+                    -- op-first duplicates), never the transport body alone —
+                    -- completeness must observe installed unitCopper (#447).
                     local live = temp.accounting and temp.accounting._consumableEvents
                     local arch = temp.accounting and temp.accounting._consumableEventArchive
+                    local installedRef = nil
+                    if type(eid) == "string" and eid ~= "" then
+                        installedRef = state.acctIndex.byId[eid]
+                    end
+                    if type(installedRef) ~= "table" or installedRef == event then
+                        installedRef = nil
+                        if type(event.txnId) == "string" and event.txnId ~= "" then
+                            installedRef = state.acctIndex.byId[event.txnId]
+                        end
+                        if (type(installedRef) ~= "table" or installedRef == event)
+                            and type(event.opId) == "string" and event.opId ~= "" then
+                            installedRef = state.acctIndex.byId[event.opId]
+                        end
+                        if type(installedRef) ~= "table" or installedRef == event then
+                            installedRef = nil
+                        end
+                    end
+                    if installedRef == nil and type(live) == "table" and #live > 0 then
+                        local tip = live[#live]
+                        if type(tip) == "table" and (
+                            (type(eid) == "string" and eid ~= ""
+                                and (tip.id == eid or tip.txnId == eid or tip.opId == eid))
+                            or (type(event.txnId) == "string" and event.txnId ~= ""
+                                and (tip.id == event.txnId or tip.txnId == event.txnId))
+                            or (type(event.opId) == "string" and event.opId ~= ""
+                                and (tip.opId == event.opId or tip.id == event.opId))
+                        ) then
+                            installedRef = tip
+                        end
+                    end
+                    indexLedgerRowLe(installedRef or event)
+                    -- Keep tails consistent with lists that grew via Admit.
                     if type(live) == "table" then
                         state.acctIndexLiveTail = #live
                     end
@@ -3965,6 +4022,7 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                     end
                 else
                     -- Floor-held adjustments / rejected bodies remain unsettled.
+                    -- Price conflicts (id_conflict) must not publish incomplete.
                     unsettledSeen = true
                 end
             end
@@ -4539,14 +4597,16 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             end
             local function indexLedgerRowLe(e)
                 if type(e) ~= "table" then return end
+                -- Event refs (truthy) so adjustment unitCopper can be checked
+                -- without an extra full-ledger scan (#447).
                 if type(e.id) == "string" and e.id ~= "" then
-                    opts.acctIndex.byId[e.id] = true
+                    opts.acctIndex.byId[e.id] = e
                 end
                 if type(e.txnId) == "string" and e.txnId ~= "" then
-                    opts.acctIndex.byId[e.txnId] = true
+                    opts.acctIndex.byId[e.txnId] = e
                 end
                 if type(e.opId) == "string" and e.opId ~= "" then
-                    opts.acctIndex.byId[e.opId] = true
+                    opts.acctIndex.byId[e.opId] = e
                 end
                 rememberOccLe(opts.acctIndex.byOcc, e)
             end
@@ -4589,27 +4649,66 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 end
                 return true
             end
+            local function isAdjustmentEventComp(row)
+                if type(row) ~= "table" then
+                    return false
+                end
+                local typ = row.type
+                return typ == "adjustment"
+                    or typ == "CONSUMABLE_ADJUSTMENT"
+                    or (GS.LEDGER_EVENT and typ == GS.LEDGER_EVENT.ADJUSTMENT)
+            end
+            --- Source and installed adjustment unitCopper must match after
+            -- normalize (both nil = legacy unpriced zero). ID presence alone
+            -- is insufficient when op-first replay left an unpriced row (#447).
+            local function AdjustmentUnitCopperSurvived(installed, source)
+                if type(installed) ~= "table" or type(source) ~= "table" then
+                    return false
+                end
+                local srcQty = tonumber(source.quantity) or tonumber(installed.quantity)
+                local dstQty = tonumber(installed.quantity) or srcQty
+                local srcUnit = nil
+                local dstUnit = nil
+                if GS.NormalizeAdjustmentUnitCopper then
+                    srcUnit = GS.NormalizeAdjustmentUnitCopper(source.unitCopper, srcQty)
+                    dstUnit = GS.NormalizeAdjustmentUnitCopper(installed.unitCopper, dstQty)
+                else
+                    srcUnit = tonumber(source.unitCopper)
+                    dstUnit = tonumber(installed.unitCopper)
+                end
+                if srcUnit == nil and dstUnit == nil then
+                    return true
+                end
+                return srcUnit ~= nil and dstUnit ~= nil and srcUnit == dstUnit
+            end
             local found = false
+            local installed = nil
             if type(eid) == "string" and eid ~= "" and opts.acctIndex.byId[eid] then
                 found = true
+                installed = opts.acctIndex.byId[eid]
             elseif type(ev.txnId) == "string" and ev.txnId ~= ""
                 and opts.acctIndex.byId[ev.txnId] then
                 found = true
+                installed = opts.acctIndex.byId[ev.txnId]
             elseif type(ev.opId) == "string" and ev.opId ~= ""
                 and opts.acctIndex.byId[ev.opId] then
                 found = true
+                installed = opts.acctIndex.byId[ev.opId]
             else
                 if not catchUpAcctIndexLe() then
                     return false, "budget"
                 end
                 if type(eid) == "string" and eid ~= "" and opts.acctIndex.byId[eid] then
                     found = true
+                    installed = opts.acctIndex.byId[eid]
                 elseif type(ev.txnId) == "string" and ev.txnId ~= ""
                     and opts.acctIndex.byId[ev.txnId] then
                     found = true
+                    installed = opts.acctIndex.byId[ev.txnId]
                 elseif type(ev.opId) == "string" and ev.opId ~= ""
                     and opts.acctIndex.byId[ev.opId] then
                     found = true
+                    installed = opts.acctIndex.byId[ev.opId]
                 end
             end
             if not found then
@@ -4617,6 +4716,15 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 opts.budgetExhausted = false
                 publishCompletenessStats()
                 return false, "incomplete_transfer"
+            end
+            if isAdjustmentEventComp(ev) then
+                if type(installed) ~= "table"
+                    or not AdjustmentUnitCopperSurvived(installed, ev) then
+                    opts.cursor = nil
+                    opts.budgetExhausted = false
+                    publishCompletenessStats()
+                    return false, "incomplete_transfer"
+                end
             end
         elseif type(body) == "table" and body.kind == "gs-evidence"
             and type(body.evidence) == "table" then
@@ -5009,6 +5117,10 @@ local function ReplayAdoptionIntoTemp(temp, adop, member, opts)
         until status == "done"
     end
 
+    -- Test-only hook after replay settles, before completeness (#447).
+    if type(GS._adoptionBeforeCompletenessForTest) == "function" then
+        GS._adoptionBeforeCompletenessForTest(temp, adop, state)
+    end
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
     local seedIndex = state.acctIndex
@@ -5222,6 +5334,10 @@ local function ContinueAdoptionReplay(adop)
     -- Final completeness is indexed/resumable; source-authored ops skip searches.
     -- Optional test override keeps replay slice size unchanged while forcing
     -- mid-archive completeness yields (GS._adoptionCompletenessBudgetForTest).
+    -- Test-only hook after replay settles, before completeness (#447).
+    if type(GS._adoptionBeforeCompletenessForTest) == "function" then
+        GS._adoptionBeforeCompletenessForTest(temp, adop, state)
+    end
     local compBudget = tonumber(GS._adoptionCompletenessBudgetForTest)
         or GS.MAX_ADMISSION_WORK_PER_SLICE or 32
     local seedIndex = state.acctIndex

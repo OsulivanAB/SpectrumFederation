@@ -2167,6 +2167,16 @@ function GS.RefreshLedgerEventExport(record, event)
     if type(event.id) ~= "string" or event.id == "" then
         return false
     end
+    -- Temporary adoption offline records must not mutate the live export index
+    -- or notify peers before atomic publish (#447). Identity check against the
+    -- current guild record — datasetId alone is insufficient during replace.
+    local current = nil
+    if GS.GetCurrentRecord then
+        current = select(1, GS:GetCurrentRecord())
+    end
+    if current == nil or record ~= current then
+        return false
+    end
     local exportId = "gs:le:" .. event.id
     local liveMarker = nil
     if GS.IsLiveActive and GS.IsLiveActive(record)

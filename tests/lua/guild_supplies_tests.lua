@@ -44052,6 +44052,436 @@ do
         "447-r7: demoted direct nav falls back got=" .. tostring(resolved.pageId))
 end
 
+---------------------------------------------------------------------------
+-- #447 adoption: preserve adjustment unitCopper across Begin/Buffer/Commit
+---------------------------------------------------------------------------
+
+local function rankingsAdoptFindAdj(record, itemId, quantity)
+    local lists = {
+        record and record.accounting and record.accounting._consumableEvents,
+        record and record.accounting and record.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and tonumber(ev.itemId) == itemId
+                    and tonumber(ev.quantity) == quantity then
+                    return ev
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function bufferAdoptionOrdered(exportBodies, mode)
+    -- mode: "natural" | "op_first" | "ledger_first"
+    local ops, ledgers, other = {}, {}, {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-op" then
+            ops[#ops + 1] = row
+        elseif kind == "gs-ledger-event" then
+            ledgers[#ledgers + 1] = row
+        else
+            other[#other + 1] = row
+        end
+    end
+    local order = {}
+    if mode == "op_first" then
+        for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #ops do order[#order + 1] = ops[i] end
+        for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
+    elseif mode == "ledger_first" then
+        for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
+        for i = 1, #ops do order[#order + 1] = ops[i] end
+    else
+        order = exportBodies
+    end
+    for i = 1, #order do
+        local st = GS:BufferAdoptionRecord(order[i].id, order[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "447-adopt: buffer " .. tostring(order[i].id) .. " st=" .. tostring(st))
+    end
+end
+
+local function adoptFromExport(sourceDataset, exportBodies, mode, label)
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        label .. ": begin")
+    bufferAdoptionOrdered(exportBodies, mode)
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        label .. ": transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted",
+        label .. ": commit st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, label .. ": idle after commit")
+    local installed = GS:GetCurrentRecord()
+    assertEq(installed.datasetId, sourceDataset, label .. ": dataset replaced")
+    return installed
+end
+
+do
+    -- 447-adopt-1) Op-first and ledger-first adoption preserve priced ± adjustments;
+    -- rankings match source; reload retains prices; duplicate buffer is idempotent.
+    valuationTsmValue = 2500
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local source = activateValuationGuild(9460)
+    creditValuationDeposit(source, {
+        itemId = 9460, quantity = 5, donor = "Bob-Garona",
+    })
+    creditValuationDeposit(source, {
+        itemId = 9460, quantity = 2, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9460|2" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjPos = select(1, GS:NewAdjustmentOperation(9460, 2, "Carol-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjPos), "accepted", "447-adopt-1: +2")
+    local adjNeg = select(1, GS:NewAdjustmentOperation(9460, -1, "Dave-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjNeg), "accepted", "447-adopt-1: -1")
+    source = GS:GetCurrentRecord()
+    local srcPos = rankingsAdoptFindAdj(source, 9460, 2)
+    local srcNeg = rankingsAdoptFindAdj(source, 9460, -1)
+    assertEq(tonumber(srcPos and srcPos.unitCopper), 2500, "447-adopt-1: source +2 priced")
+    assertEq(tonumber(srcNeg and srcNeg.unitCopper), 2500, "447-adopt-1: source -1 priced")
+    local sourceRanking = GS:ProjectCampaignRankings(source.currentCampaignId)
+    local sourceByName = rankingsByName(sourceRanking)
+    -- Bob 5*2500=12500; Carol +2*2500=5000; Dave donation 2*2500 + adj -1*2500=2500.
+    assertEq(sourceByName["Bob-Garona"], 12500, "447-adopt-1: source Bob")
+    assertEq(sourceByName["Carol-Garona"], 5000, "447-adopt-1: source Carol")
+    assertEq(sourceByName["Dave-Garona"], 2500, "447-adopt-1: source Dave")
+
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-1: provider")
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 3, "447-adopt-1: export bodies")
+    local sourceDataset = source.datasetId
+    local sourceCampaign = source.currentCampaignId
+
+    -- Capture export snapshot before wiping DB.
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    local installed = adoptFromExport(sourceDataset, exportCopy, "op_first", "447-adopt-1-op")
+    local instPos = rankingsAdoptFindAdj(installed, 9460, 2)
+    local instNeg = rankingsAdoptFindAdj(installed, 9460, -1)
+    assertEq(tonumber(instPos and instPos.unitCopper), 2500,
+        "447-adopt-1-op: +2 unitCopper survived")
+    assertEq(tonumber(instNeg and instNeg.unitCopper), 2500,
+        "447-adopt-1-op: -1 unitCopper survived")
+    local instRanking = GS:ProjectCampaignRankings(installed.currentCampaignId)
+    local instByName = rankingsByName(instRanking)
+    assertEq(instByName["Bob-Garona"], sourceByName["Bob-Garona"], "447-adopt-1-op: Bob ranks")
+    assertEq(instByName["Carol-Garona"], sourceByName["Carol-Garona"], "447-adopt-1-op: Carol ranks")
+    assertEq(instByName["Dave-Garona"], sourceByName["Dave-Garona"], "447-adopt-1-op: Dave ranks")
+
+    -- Reload preserves installed prices.
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-adopt-1-op: reload")
+    installed = GS:GetCurrentRecord()
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9460, 2).unitCopper), 2500,
+        "447-adopt-1-op: +2 after reload")
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9460, -1).unitCopper), 2500,
+        "447-adopt-1-op: -1 after reload")
+
+    -- Ledger-first delivery order.
+    valuationTsmValue = 2500
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    source = activateValuationGuild(9461)
+    creditValuationDeposit(source, {
+        itemId = 9461, quantity = 3, donor = "Bob-Garona",
+    })
+    creditValuationDeposit(source, {
+        itemId = 9461, quantity = 3, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9461|3" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9461, 1, "Carol-Garona"))), "accepted",
+        "447-adopt-1-le: +1")
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9461, -2, "Dave-Garona"))), "accepted",
+        "447-adopt-1-le: -2")
+    source = GS:GetCurrentRecord()
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-1-le: provider")
+    drainExportMaint(64)
+    exportBodies = collectAllExportBodies()
+    sourceDataset = source.datasetId
+    exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+    local sourceRank2 = rankingsByName(GS:ProjectCampaignRankings(source.currentCampaignId))
+    installed = adoptFromExport(sourceDataset, exportCopy, "ledger_first", "447-adopt-1-le")
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9461, 1).unitCopper), 2500,
+        "447-adopt-1-le: +1 survived")
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9461, -2).unitCopper), 2500,
+        "447-adopt-1-le: -2 survived")
+    local instRank2 = rankingsByName(GS:ProjectCampaignRankings(installed.currentCampaignId))
+    assertEq(instRank2["Bob-Garona"], sourceRank2["Bob-Garona"], "447-adopt-1-le: Bob")
+    assertEq(instRank2["Carol-Garona"], sourceRank2["Carol-Garona"], "447-adopt-1-le: Carol")
+    assertEq(instRank2["Dave-Garona"], sourceRank2["Dave-Garona"], "447-adopt-1-le: Dave")
+end
+
+do
+    -- 447-adopt-2) Conflicting/mismatched adjustment snapshots cannot publish;
+    -- active data and exports stay unchanged. Post-adopt conflict quarantines.
+    valuationTsmValue = 1000
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9462)
+    creditValuationDeposit(source, {
+        itemId = 9462, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9462, 1, "Carol-Garona"))), "accepted",
+        "447-adopt-2: adj")
+    source = GS:GetCurrentRecord()
+    local srcAdj = rankingsAdoptFindAdj(source, 9462, 1)
+    assertEq(tonumber(srcAdj and srcAdj.unitCopper), 1000, "447-adopt-2: source priced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-2: provider")
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    local beforeEvents = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-2: begin")
+    bufferAdoptionOrdered(exportCopy, "op_first")
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "447-adopt-2: ready")
+    -- After successful enrich, corrupt installed unitCopper so completeness
+    -- sees installed≠source and refuses to publish.
+    GS._adoptionBeforeCompletenessForTest = function(temp)
+        local adj = rankingsAdoptFindAdj(temp, 9462, 1)
+        assertTrue(type(adj) == "table", "447-adopt-2: temp adj after replay")
+        assertEq(tonumber(adj.unitCopper), 1000,
+            "447-adopt-2: enrich ran before completeness hook")
+        adj.unitCopper = 1777
+        -- Keep acctIndex in sync with the corrupted installed row.
+        local adop = GS:GetPendingAdoption()
+        local st = adop and adop.replayState
+        if st and st.acctIndex and st.acctIndex.byId and adj.id then
+            st.acctIndex.byId[adj.id] = adj
+            if adj.txnId then st.acctIndex.byId[adj.txnId] = adj end
+            if adj.opId then st.acctIndex.byId[adj.opId] = adj end
+        end
+    end
+    local stFail, reasonFail = GS:CommitDatasetAdoption()
+    GS._adoptionBeforeCompletenessForTest = nil
+    assertEq(stFail, "rejected",
+        "447-adopt-2: mismatched snapshot rejected st=" .. tostring(stFail)
+            .. " r=" .. tostring(reasonFail))
+    assertEq(reasonFail, "incomplete_transfer",
+        "447-adopt-2: incomplete_transfer got=" .. tostring(reasonFail))
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+        "447-adopt-2: active dataset unchanged")
+    assertEq(#(GS:GetCurrentRecord().accounting._consumableEvents or {}), beforeEvents,
+        "447-adopt-2: active ledger unchanged")
+    assertEq(#collectAllExportBodies(), beforeExportCount,
+        "447-adopt-2: exports unchanged after reject")
+    if GS:GetPendingAdoption() then
+        assertEq(select(1, GS:CancelDatasetAdoption()), "accepted",
+            "447-adopt-2: cancel leftover")
+    end
+
+    -- Successful adopt, then conflicting price on the installed row.
+    local installed = adoptFromExport(sourceDataset, exportCopy, "op_first", "447-adopt-2-ok")
+    local instAdj = rankingsAdoptFindAdj(installed, 9462, 1)
+    assertEq(tonumber(instAdj.unitCopper), 1000, "447-adopt-2-ok: price installed")
+    local stClash, rClash = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = instAdj.id,
+        txnId = instAdj.txnId or instAdj.id,
+        opId = instAdj.opId or instAdj.id,
+        generation = instAdj.generation,
+        timestamp = instAdj.timestamp or world.time or 1,
+        actor = instAdj.actor or "Alice-Garona",
+        writer = instAdj.writer or "Player-1-Alice",
+        itemId = 9462,
+        quantity = 1,
+        attributed = instAdj.attributed,
+        attributedGuid = instAdj.attributedGuid,
+        unitCopper = 1777,
+        campaignId = installed.currentCampaignId,
+        datasetId = installed.datasetId,
+        gsProductionCredit = true,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = installed,
+        localWrite = false,
+    })
+    assertEq(stClash, "rejected", "447-adopt-2-ok: conflict rejected")
+    assertEq(rClash, "id_conflict", "447-adopt-2-ok: conflict reason")
+    assertEq(tonumber(instAdj.unitCopper), 1000, "447-adopt-2-ok: price not overwritten")
+end
+
+do
+    -- 447-adopt-3) Cancelled adoption leaves active data/exports unchanged;
+    -- successful replay stays bounded/idle; unpriced attributed adj still zeros;
+    -- duplicate buffer/delivery does not double-count.
+    valuationTsmValue = 400
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9463)
+    creditValuationDeposit(source, {
+        itemId = 9463, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    SF.TSM = nil -- unpriced attributed adjustment
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9463, 1, "Eve-Garona"))), "accepted",
+        "447-adopt-3: unpriced adj")
+    source = GS:GetCurrentRecord()
+    assertEq(rankingsAdoptFindAdj(source, 9463, 1).unitCopper, nil,
+        "447-adopt-3: source unpriced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-3: provider")
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    -- Cancel path on a fresh adopter with prior staged data.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-3: begin")
+    for i = 1, math.min(3, #exportCopy) do
+        GS:BufferAdoptionRecord(exportCopy[i].id, exportCopy[i].body)
+    end
+    assertEq(select(1, GS:CancelDatasetAdoption()), "accepted", "447-adopt-3: cancel")
+    assertEq(GS:GetPendingAdoption(), nil, "447-adopt-3: cleared")
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs, "447-adopt-3: dataset intact")
+    assertEq(#collectAllExportBodies(), beforeExportCount, "447-adopt-3: exports intact")
+
+    -- Full successful op-first adopt of unpriced zero + donation.
+    -- Duplicate-buffer every body once more before commit (idempotent).
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-3-full: begin")
+    bufferAdoptionOrdered(exportCopy, "op_first")
+    -- Second delivery of every body must stay duplicate/accepted without
+    -- growing the buffer order (idempotent redelivery).
+    local orderBefore = #(GS:GetPendingAdoption().order or {})
+    for i = 1, #exportCopy do
+        local st = GS:BufferAdoptionRecord(exportCopy[i].id, exportCopy[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "447-adopt-3-full: redelivery st=" .. tostring(st))
+    end
+    assertEq(#(GS:GetPendingAdoption().order or {}), orderBefore,
+        "447-adopt-3-full: redelivery did not grow order")
+    assertTrue(GS:GetPendingAdoption().ready, "447-adopt-3-full: ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted",
+        "447-adopt-3-full: commit st=" .. tostring(stAdopt)
+            .. " r=" .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, "447-adopt-3-full: idle after commit")
+    local installed = GS:GetCurrentRecord()
+    assertEq(installed.datasetId, sourceDataset, "447-adopt-3-full: dataset replaced")
+    assertEq(rankingsAdoptFindAdj(installed, 9463, 1).unitCopper, nil,
+        "447-adopt-3-full: unpriced preserved as nil")
+    local byName = rankingsByName(GS:ProjectCampaignRankings(installed.currentCampaignId))
+    assertEq(byName["Eve-Garona"], 0, "447-adopt-3-full: unpriced counts as zero")
+    assertEq(byName["Bob-Garona"], 800, "447-adopt-3-full: donation ranked")
+    -- Single adjustment row (no double-count from duplicate delivery).
+    local adjCount = 0
+    local lists = {
+        installed.accounting._consumableEvents,
+        installed.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and tonumber(ev.itemId) == 9463
+                    and tonumber(ev.quantity) == 1 then
+                    adjCount = adjCount + 1
+                end
+            end
+        end
+    end
+    assertEq(adjCount, 1, "447-adopt-3-full: single adjustment row")
+    local stats = GS._lastAdoptionWorkStats
+    assertTrue(type(stats) == "table", "447-adopt-3-full: work stats")
+    local visited = tonumber(stats.completenessVisited) or 0
+    local indexVisited = tonumber(stats.indexVisited) or 0
+    assertTrue(visited < 10000 and indexVisited < 10000,
+        "447-adopt-3-full: bounded visited c=" .. tostring(visited)
+            .. " i=" .. tostring(indexVisited))
+end
+
 SF.TSM = nil
 world.impersonationActive = false
 setPlayer("Alice-Garona", "Player-1-Alice", 1)
