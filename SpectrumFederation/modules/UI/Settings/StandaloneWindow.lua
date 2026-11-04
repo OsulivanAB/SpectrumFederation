@@ -1187,6 +1187,37 @@ function SettingsWindow:Init()
         self._goDurableListener = true
     end
 
+    -- Roster/guild membership can flip officer rank (and Rankings availability)
+    -- before any GS/GO durable notify. Coalesce onto the same revalidation path
+    -- so tabs/search/selection update while the window stays open (#447).
+    if not self._rosterAvailabilityFrame and type(CreateFrame) == "function" then
+        local frame = CreateFrame("Frame")
+        self._rosterAvailabilityFrame = frame
+        local pending = false
+        local function queue()
+            if pending then
+                return
+            end
+            pending = true
+            local function run()
+                pending = false
+                SettingsWindow:HandleDurableAvailabilityChange()
+            end
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0, run)
+            else
+                run()
+            end
+        end
+        if frame.RegisterEvent then
+            pcall(frame.RegisterEvent, frame, "GUILD_ROSTER_UPDATE")
+            pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
+        end
+        frame:SetScript("OnEvent", function()
+            queue()
+        end)
+    end
+
     self:BuildNavItemsFromRegistry()
     self:CreateWindow()
 

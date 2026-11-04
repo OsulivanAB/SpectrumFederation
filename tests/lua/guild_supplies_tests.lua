@@ -35972,16 +35972,16 @@ do
 end
 
 do
-    -- B1: PROVIDER_SCHEMA advanced for valuation-aware wire (discussion_r4364648464).
-    assertEq(GS.PROVIDER_SCHEMA, 3, "val: B1 PROVIDER_SCHEMA is 3")
+    -- B1: PROVIDER_SCHEMA tracks the current wire gate (#447 bumps to 4).
+    assertEq(GS.PROVIDER_SCHEMA, 4, "val: B1 PROVIDER_SCHEMA is 4")
     local record = activateValuationGuild(9903)
     assertEq(GS:EnsureGossipProvider(), true, "val: B1 provider")
     local prov = GG.GetProvider(GS.PROVIDER_ID)
     assertTrue(type(prov) == "table", "val: B1 provider registered")
-    assertEq(tonumber(prov.schema), 3, "val: B1 registered schema 3")
+    assertEq(tonumber(prov.schema), 4, "val: B1 registered schema 4")
     local wireCaps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
     assertTrue(type(wireCaps) == "table", "val: B1 provider GetCapabilities")
-    assertEq(tonumber(wireCaps.schema), 3, "val: B1 wire capabilities schema 3")
+    assertEq(tonumber(wireCaps.schema), 4, "val: B1 wire capabilities schema 4")
     drainExportMaint(32)
     local descSchema = nil
     for _, row in ipairs(collectAllExportBodies()) do
@@ -35990,12 +35990,13 @@ do
             descSchema = row.body.schemaVersion
         end
     end
-    assertEq(descSchema, 3, "val: B1 descriptor schemaVersion 3")
-    -- Strict GG equality: older schemas are incompatible with local schema 3.
+    assertEq(descSchema, 4, "val: B1 descriptor schemaVersion 4")
+    -- Strict GG equality: older schemas are incompatible with local schema 4.
     local localSchema = tonumber(prov.schema)
-    assertEq(localSchema, 3, "val: B1 local schema 3")
-    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 3")
-    assertEq(tonumber(3) == localSchema, true, "val: B1 new/new compatible")
+    assertEq(localSchema, 4, "val: B1 local schema 4")
+    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 4")
+    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 4")
+    assertEq(tonumber(4) == localSchema, true, "val: B1 new/new compatible")
     -- Persisted local schema stays 1 across the wire bump.
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, GS.SCHEMA_VERSION,
         "val: B1 persisted root schema unchanged")
@@ -40239,7 +40240,7 @@ do
     local camp1Id = record.currentCampaignId
     assertEq(GS.GetCampaignDisplayName(record, camp1Id), camp1Id,
         "424: new campaign falls back to ID")
-    assertEq(GS.PROVIDER_SCHEMA, 3, "424: provider schema is 3")
+    assertEq(GS.PROVIDER_SCHEMA, 4, "424: provider schema is 4")
 
     -- Ordinary member cannot rename.
     setPlayer("Dave-Garona", "Player-1-Dave", 4)
@@ -40577,7 +40578,7 @@ do
 end
 
 -- #424 multi-rename adoption newest-first retains losers; projects LWW winner
--- #424 adoption carries names; wrong dataset rejected; provider schema is 3
+-- #424 adoption carries names; wrong dataset rejected; provider schema is 4
 do
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
@@ -40634,7 +40635,7 @@ do
     assertEq(record.datasetId, ds, "424-adopt: dataset replaced")
     assertEq(GS.GetCampaignDisplayName(record, campId), "AdoptMe", "424-adopt: name adopted")
     assertEq(record.campaignNames[campId].name, "AdoptMe", "424-adopt: name metadata")
-    assertEq(GS.PROVIDER_SCHEMA, 3, "424-adopt: schema is 3")
+    assertEq(GS.PROVIDER_SCHEMA, 4, "424-adopt: schema is 4")
 end
 
 local function adoptExportNewestFirstRenames(exportBodies, preferLaterRename)
@@ -41960,7 +41961,7 @@ do
     assertEq(GS.ValidateIdentityLinks(record.identityLinks), true, "427-legacy: links valid")
     assertEq(GS.AreSameWitnessIdentity(record, "Player-1-Dave", "Player-1-Eve"), false,
         "427-legacy: links do not drive witness identity")
-    assertEq(GS.PROVIDER_SCHEMA, 3, "427-schema: provider schema 3")
+    assertEq(GS.PROVIDER_SCHEMA, 4, "427-schema: provider schema 4")
     assertEq(GS.SCHEMA_VERSION, 1, "427-schema: durable root schema unchanged")
 end
 
@@ -43185,29 +43186,23 @@ end
 
 do
     -- 447-5) Officer-only page.available; Preview/member hide; direct nav fallback.
+    -- Load the actual Rankings page (no availability stub replacement).
     local Nav = SF.SettingsNavigationModel
     local ui = SF.SettingsUI
     assertTrue(type(Nav) == "table" and type(ui) == "table", "447-5: nav+ui")
-    -- Ensure Rankings page is registered (production TOC load in this harness).
-    local rankingsPage = ui.pagesById and ui.pagesById.guildSuppliesRankings
-    if not rankingsPage then
-        -- Harness may not load Settings pages; register the production available hook.
-        rankingsPage = {
-            id = "guildSuppliesRankings",
-            categoryId = "guildSupplies",
-            name = "Rankings",
-            order = 19.25,
-            available = function()
-                local caps = GS:GetCapabilities()
-                return type(caps) == "table" and caps.canEdit == true
-            end,
-        }
-        ui.pagesById = ui.pagesById or {}
-        ui.pages = ui.pages or {}
-        ui.pagesById[rankingsPage.id] = rankingsPage
-        ui.pages[#ui.pages + 1] = rankingsPage
+    if not (ui.pagesById and ui.pagesById.guildSuppliesRankings) then
+        if not SF.SettingsUI.DefinitionRenderer then
+            loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+        end
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
     end
-    assertTrue(type(rankingsPage.available) == "function", "447-5: available hook")
+    local rankingsPage = ui.pagesById and ui.pagesById.guildSuppliesRankings
+    assertTrue(type(rankingsPage) == "table" and type(rankingsPage.available) == "function",
+        "447-5: production Rankings page registered")
 
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.impersonationActive = false
@@ -43236,8 +43231,136 @@ do
 end
 
 do
-    -- 447-6) Bounded UI lifecycle: coalesced refresh while visible; idle when hidden.
-    SF.SettingsUI = SF.SettingsUI or {}
+    -- 447-6) Bounded UI lifecycle: real Build must succeed; idle when hidden.
+    -- Install a rich CreateFrame so DefinitionRenderer/Controls can build.
+    local function makeUiRegion(kind, name, parent)
+        local region = {
+            kind = kind, name = name, parent = parent, shown = true,
+            height = 0, width = 0, points = {}, scripts = {}, hooks = {},
+            children = {}, registeredEvents = {}, enabled = true, text = "",
+        }
+        local function fire(self, event, ...)
+            local fn = self.scripts[event]
+            if fn then fn(self, ...) end
+            for _, hook in ipairs(self.hooks[event] or {}) do
+                hook(self, ...)
+            end
+        end
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetHeight(h) self.height = h end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = w end
+        function region:GetWidth() return self.width end
+        function region:SetSize(w, h) self.width = w; self.height = h end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown end
+        function region:IsVisible() return self.shown end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:EnableMouse() end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetAllPoints() end
+        function region:CreateFontString()
+            local fs = makeUiRegion("FontString", nil, self)
+            self.children[#self.children + 1] = fs
+            return fs
+        end
+        function region:CreateTexture()
+            local t = makeUiRegion("Texture", nil, self)
+            self.children[#self.children + 1] = t
+            return t
+        end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetWordWrap() end
+        function region:SetMaxLines() end
+        function region:SetFontObject() end
+        function region:SetScrollChild(c) self.scrollChild = c end
+        function region:SetMinMaxValues() end
+        function region:SetValue() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:SetTexture() end
+        function region:SetVertexColor() end
+        function region:SetColorTexture() end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:GetName() return self.name end
+        function region:SetHitRectInsets() end
+        function region:EnableMouse() end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:GetFrameLevel() return 0 end
+        function region:SetClipsChildren() end
+        function region:SetPropagateKeyboardInput() end
+        function region:RegisterForClicks() end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetBlendMode() end
+        function region:SetVerticalScroll() end
+        function region:SetAlpha() end
+        function region:GetStringWidth() return math.max(1, #(self.text or "") * 7) end
+        function region:GetStringHeight() return 12 end
+        function region:SetJustifyV() end
+        function region:SetNonSpaceWrap() end
+        function region:SetAutoFocus() end
+        function region:SetNumeric() end
+        function region:SetMaxLetters() end
+        function region:SetHighlightColor() end
+        function region:SetCursorPosition() end
+        function region:HasFocus() return false end
+        function region:ClearFocus() end
+        function region:SetFocus() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:GetParent() return self.parent end
+        function region:SetChecked() end
+        function region:GetChecked() return false end
+        function region:SetDefaultText() end
+        function region:SetupMenu() end
+        function region:GenerateMenu() end
+        function region:Click() end
+        function region:IsMouseEnabled() return true end
+        function region:SetHitRectInsets() end
+        function region:SetObeyStepOnDrag() end
+        function region:SetValueStep() end
+        function region:GetValue() return 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:EnableDrawLayer() end
+        function region:DisableDrawLayer() end
+        return region
+    end
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        local region = makeUiRegion(frameType or "Frame", name, parent)
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeUiRegion("Slider", nil, region)
+            region.ScrollBar.width = 20
+            region.ScrollBar.shown = false
+        end
+        return region
+    end
+    if not SF.SettingsUI then SF.SettingsUI = {} end
     SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
     SF.SettingsUI.pages = SF.SettingsUI.pages or {}
     if not SF.SettingsUI.RegisterPage then
@@ -43246,17 +43369,14 @@ do
             self.pages[#self.pages + 1] = page
         end
     end
-    if not SF.SettingsUI.RegisterCategory then
-        function SF.SettingsUI:RegisterCategory() end
+    if not SF.SettingsUI.DefinitionRenderer then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
     end
     if not SF.SettingsUI.pagesById.guildSuppliesRankings then
-        if not SF.SettingsUI.DefinitionRenderer then
-            loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
-            loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
-            loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
-            loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
-            loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
-        end
         loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
     end
     local page = SF.SettingsUI.pagesById.guildSuppliesRankings
@@ -43266,12 +43386,10 @@ do
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.impersonationActive = false
     local panel = CreateFrame("Frame", "SF_TestRankingsPanel")
+    panel:SetSize(700, 600)
     panel.__visible = true
     panel.IsVisible = function(self) return self.__visible end
     panel.IsShown = function(self) return self.__visible end
-    panel.HookScript = function(self, script, fn)
-        self["__" .. script] = fn
-    end
     local refreshCount = 0
     local priorRefresh = page.Refresh
     page.Refresh = function(self, p)
@@ -43281,8 +43399,10 @@ do
         end
     end
     page.panel = panel
-    pcall(function() page:Build(panel) end)
-    pcall(function() page:Build(panel) end) -- second Build must not double-register
+    local okBuild, errBuild = pcall(function() page:Build(panel) end)
+    assertTrue(okBuild, "447-6: Build succeeds: " .. tostring(errBuild))
+    local okBuild2, errBuild2 = pcall(function() page:Build(panel) end)
+    assertTrue(okBuild2, "447-6: second Build succeeds: " .. tostring(errBuild2))
 
     local before = refreshCount
     GS.NotifyUI("valuation")
@@ -43302,11 +43422,18 @@ do
 
     for _ = 1, 8 do
         panel.__visible = true
-        pcall(function() page:Build(panel) end)
-        if panel.__OnShow then panel.__OnShow(panel) end
+        local okCyc, errCyc = pcall(function() page:Build(panel) end)
+        assertTrue(okCyc, "447-6: cycle Build ok: " .. tostring(errCyc))
+        local showHooks = panel.hooks and panel.hooks.OnShow
+        if showHooks then
+            for i = 1, #showHooks do showHooks[i](panel) end
+        end
         flushTimers()
         panel.__visible = false
-        if panel.__OnHide then panel.__OnHide(panel) end
+        local hideHooks = panel.hooks and panel.hooks.OnHide
+        if hideHooks then
+            for i = 1, #hideHooks do hideHooks[i](panel) end
+        end
         if page.OnHide then page:OnHide() end
         flushTimers()
     end
@@ -43315,7 +43442,13 @@ do
     flushTimers()
     assertEq(refreshCount, afterCycles,
         "447-6: after close cycles, hidden page still ignores NotifyUI")
+    local catchup = GS.GetValuationCatchupState and GS.GetValuationCatchupState()
+    if type(catchup) == "table" then
+        assertEq(catchup.active, false, "447-6: catch-up idle after hide")
+        assertEq(catchup.scheduled, false, "447-6: catch-up not scheduled after hide")
+    end
     page.Refresh = priorRefresh
+    CreateFrame = priorCreateFrame
 end
 
 do
@@ -43349,6 +43482,574 @@ do
     assertEq(byName["Bob-Garona"], 500, "447-7: Bob positive total")
     assertEq(tonumber(ranking.maxPositive), 500, "447-7: maxPositive is largest positive")
     assertTrue(ranking.rows[1].name == "Bob-Garona", "447-7: positive sorts above negative")
+end
+
+do
+    -- 447-r1) Provider schema 4 gates adjustment unitCopper; SV schema unchanged.
+    assertEq(GS.PROVIDER_SCHEMA, 4, "447-r1: PROVIDER_SCHEMA is 4")
+    assertEq(GS.SCHEMA_VERSION, 1, "447-r1: SCHEMA_VERSION stays 1")
+    local record = activateValuationGuild(9452)
+    assertEq(GS:EnsureGossipProvider(), true, "447-r1: provider")
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    assertEq(tonumber(prov.schema), 4, "447-r1: registered schema 4")
+    local caps = prov.api.GetCapabilities()
+    assertEq(tonumber(caps.schema), 4, "447-r1: wire caps schema 4")
+    assertTrue(tonumber(prov.schema) ~= 3, "447-r1: schema-3 incompatible")
+    assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, 1,
+        "447-r1: persisted root schema preserved")
+    assertTrue(type(GS.RefreshLedgerEventExport) == "function",
+        "447-r1: RefreshLedgerEventExport present")
+    assertTrue(type(GS.EnsureValuationCatchup) == "function",
+        "447-r1: EnsureValuationCatchup present")
+end
+
+do
+    -- 447-r2) Op-first enrichment refreshes export fingerprint; priced body relays
+    -- after the author goes offline (admission + GetRecordBody boundary).
+    valuationTsmValue = 1200
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9453)
+    creditValuationDeposit(record, {
+        itemId = 9453, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Author an attributed adjustment without create-time price (simulate op-first
+    -- peer that stored the row before the priced ledger body arrived).
+    SF.TSM = nil
+    local adjOp = select(1, GS:NewAdjustmentOperation(9453, 1, "Carol-Garona"))
+    assertTrue(adjOp ~= nil, "447-r2: unpriced adj prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "447-r2: unpriced adj applied")
+    record = GS:GetCurrentRecord()
+    local stored = rankingsFindAdj(record, 9453, 1)
+    assertTrue(stored ~= nil, "447-r2: stored adj")
+    assertEq(stored.unitCopper, nil, "447-r2: starts unpriced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-r2: provider")
+    drainExportMaint(64)
+    local exportId = "gs:le:" .. tostring(stored.id)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local beforeRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(beforeRec) == "table", "447-r2: unpriced export present")
+    local beforeFp = beforeRec.versionFp
+    assertTrue(type(beforeFp) == "string" and beforeFp ~= "", "447-r2: unpriced fingerprint")
+
+    -- Later authenticated priced ledger body enriches in place.
+    local stDup, rDup = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = stored.id,
+        txnId = stored.txnId or stored.id,
+        opId = stored.opId or stored.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = stored.timestamp or world.time or 1,
+        actor = stored.actor or "Alice-Garona",
+        writer = stored.writer or "Player-1-Alice",
+        itemId = 9453,
+        quantity = 1,
+        attributed = "Carol-Garona",
+        attributedGuid = "Player-1-Carol",
+        unitCopper = 1200,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stDup, "duplicate", "447-r2: priced ledger is duplicate r=" .. tostring(rDup))
+    assertEq(tonumber(stored.unitCopper), 1200, "447-r2: unitCopper enriched")
+    drainExportMaint(16)
+    local afterRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(afterRec) == "table", "447-r2: priced export present")
+    assertTrue(afterRec.versionFp ~= beforeFp,
+        "447-r2: fingerprint changed after enrichment")
+    assertEq(tonumber(afterRec.body.event.unitCopper), 1200,
+        "447-r2: export body carries unitCopper")
+
+    -- Carol relays a priced copy to a peer that already holds the unpriced row
+    -- after the original author is offline. Capture scalars before stripping —
+    -- export body.event is the same table as `stored`.
+    local pricedSnapshot = {
+        id = stored.id,
+        txnId = stored.txnId or stored.id,
+        opId = stored.opId or stored.id,
+        generation = stored.generation,
+        timestamp = stored.timestamp,
+        actor = stored.actor,
+        writer = stored.writer,
+        itemId = stored.itemId,
+        quantity = stored.quantity,
+        attributed = stored.attributed,
+        attributedGuid = stored.attributedGuid,
+        unitCopper = 1200,
+        campaignId = stored.campaignId,
+        datasetId = stored.datasetId,
+        type = "adjustment",
+        gsProductionCredit = true,
+    }
+    stored.unitCopper = nil
+    assertEq(GS.RefreshLedgerEventExport(record, stored), true,
+        "447-r2: stripped export refreshed")
+    drainExportMaint(8)
+    local strippedRec = prov.api.GetRecordBody(exportId)
+    assertEq(strippedRec.body.event.unitCopper, nil, "447-r2: stripped export unpriced")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local stRelay, rRelay = GS:AdmitLedgerEvent(pricedSnapshot, {
+        sender = "Carol-Garona",
+        member = { guid = "Player-1-Carol", name = "Carol-Garona", guildKey = "club:42", rankOrder = 3 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stRelay, "duplicate",
+        "447-r2: relay priced after strip is duplicate r=" .. tostring(rRelay))
+    assertEq(tonumber(stored.unitCopper), 1200, "447-r2: relay restores unitCopper")
+    drainExportMaint(8)
+    local relayRec = prov.api.GetRecordBody(exportId)
+    assertEq(tonumber(relayRec.body.event.unitCopper), 1200,
+        "447-r2: relayed export advertises priced body")
+    assertTrue(relayRec.versionFp ~= strippedRec.versionFp,
+        "447-r2: relay enrichment changes fingerprint again")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- 447-r3) Conflicting non-nil unitCopper quarantines; nil→priced and unpriced
+    -- redelivery remain duplicates. Exercise both delivery orders via AdmitLedgerEvent.
+    valuationTsmValue = 800
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9454)
+    creditValuationDeposit(record, {
+        itemId = 9454, quantity = 1, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adj = select(1, GS:NewAdjustmentOperation(9454, 2, "Dave-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "447-r3: priced adj")
+    record = GS:GetCurrentRecord()
+    local stored = rankingsFindAdj(record, 9454, 2)
+    assertEq(tonumber(stored.unitCopper), 800, "447-r3: accepted price 800")
+
+    local function ledgerBody(unit)
+        return {
+            type = "adjustment",
+            id = stored.id,
+            txnId = stored.txnId or stored.id,
+            opId = stored.opId or stored.id,
+            generation = record.accounting._consumables.generation,
+            timestamp = stored.timestamp or world.time or 1,
+            actor = stored.actor or "Alice-Garona",
+            writer = stored.writer or "Player-1-Alice",
+            itemId = 9454,
+            quantity = 2,
+            attributed = "Dave-Garona",
+            attributedGuid = "Player-1-Dave",
+            unitCopper = unit,
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    local ctx = {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    }
+    -- Harmless unpriced redelivery.
+    local stNil, rNil = GS:AdmitLedgerEvent(ledgerBody(nil), ctx)
+    assertEq(stNil, "duplicate", "447-r3: unpriced redelivery duplicate r=" .. tostring(rNil))
+    assertEq(tonumber(stored.unitCopper), 800, "447-r3: price unchanged after nil redelivery")
+    -- Conflicting non-nil snapshot.
+    local stConflict, rConflict = GS:AdmitLedgerEvent(ledgerBody(999), ctx)
+    assertEq(stConflict, "rejected", "447-r3: conflict rejected st")
+    assertEq(rConflict, "id_conflict", "447-r3: conflict reason")
+    assertEq(tonumber(stored.unitCopper), 800, "447-r3: accepted price not overwritten")
+
+    -- Reverse order on a fresh unpriced row: nil first, then price, then conflict.
+    SF.TSM = nil
+    local adj2 = select(1, GS:NewAdjustmentOperation(9454, 3, "Eve-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adj2), "accepted", "447-r3: unpriced adj2")
+    record = GS:GetCurrentRecord()
+    local stored2 = rankingsFindAdj(record, 9454, 3)
+    assertEq(stored2.unitCopper, nil, "447-r3: adj2 unpriced")
+    local function body2(unit)
+        return {
+            type = "adjustment",
+            id = stored2.id,
+            txnId = stored2.txnId or stored2.id,
+            opId = stored2.opId or stored2.id,
+            generation = record.accounting._consumables.generation,
+            timestamp = stored2.timestamp or world.time or 1,
+            actor = stored2.actor or "Alice-Garona",
+            writer = stored2.writer or "Player-1-Alice",
+            itemId = 9454,
+            quantity = 3,
+            attributed = "Eve-Garona",
+            attributedGuid = "Player-1-Eve",
+            unitCopper = unit,
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    ctx.offlineRecord = record
+    assertEq(select(1, GS:AdmitLedgerEvent(body2(nil), ctx)), "duplicate",
+        "447-r3: nil-nil duplicate")
+    assertEq(select(1, GS:AdmitLedgerEvent(body2(500), ctx)), "duplicate",
+        "447-r3: nil→priced enrichment")
+    assertEq(tonumber(stored2.unitCopper), 500, "447-r3: enriched to 500")
+    local stC2, rC2 = GS:AdmitLedgerEvent(body2(501), ctx)
+    assertEq(stC2, "rejected", "447-r3: later conflict rejected")
+    assertEq(rC2, "id_conflict", "447-r3: later conflict reason")
+    assertEq(tonumber(stored2.unitCopper), 500, "447-r3: enrichment retained")
+end
+
+do
+    -- 447-r4) Rankings exclude staged/non-production credit before activation,
+    -- include production after activation, and keep archived production totals.
+    valuationTsmValue = 400
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local staged = seedActivatableCampaign(9455, 80)
+    -- Staged deposits before activation: accepted but not production credit.
+    ensureNonOfficerRoster()
+    local evidence = makeDepositEvidence(staged, {
+        itemId = 9455, quantity = 4, donor = "Bob-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "447-r4: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "447-r4: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "accepted", "447-r4: w3 staged")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjStaged = select(1, GS:NewAdjustmentOperation(9455, 1, "Carol-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjStaged), "accepted", "447-r4: staged adj")
+    staged = GS:GetCurrentRecord()
+    assertEq(staged.activation, "staged", "447-r4: still staged")
+    local donation = nil
+    for i = 1, #(staged.accounting._consumableEvents or {}) do
+        local ev = staged.accounting._consumableEvents[i]
+        if ev and tonumber(ev.itemId) == 9455 and tonumber(ev.quantity) == 4 then
+            donation = ev
+            break
+        end
+    end
+    assertTrue(donation ~= nil, "447-r4: staged donation present")
+    assertTrue(donation.gsProductionCredit ~= true, "447-r4: staged donation not production")
+    local rankingStaged = GS:ProjectCampaignRankings(staged.currentCampaignId)
+    assertEq(rankingsByName(rankingStaged)["Bob-Garona"], nil,
+        "447-r4: staged donation excluded from rankings")
+    assertEq(rankingsByName(rankingStaged)["Carol-Garona"], nil,
+        "447-r4: staged adj excluded from rankings")
+    -- Progress still counts staged rows.
+    local progress = GS:ProjectCampaignProgress(staged.currentCampaignId)
+    assertTrue((tonumber(progress.itemTotals and progress.itemTotals[9455]) or 0) > 0,
+        "447-r4: preparation progress still counts staged")
+
+    armFreshBankSample(true)
+    local _, stAct, reasonAct = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted", "447-r4: activate " .. tostring(reasonAct))
+    local live = GS:GetCurrentRecord()
+    disarmFreshBankSample()
+    world.time = tonumber(live.liveCutover.contextObservedAt) + 7200
+    creditValuationDeposit(live, {
+        itemId = 9455, quantity = 2, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9455|2" },
+        neighborsNewer = { "newer|2" },
+    })
+    live = GS:GetCurrentRecord()
+    local liveDonation = valuationFindDonation(live, 9455, 2)
+    assertEq(liveDonation.gsProductionCredit, true, "447-r4: live donation credited")
+    local rankingLive = GS:ProjectCampaignRankings(live.currentCampaignId)
+    assertEq(rankingsByName(rankingLive)["Dave-Garona"], 800,
+        "447-r4: production donation ranks after activation")
+    assertEq(rankingsByName(rankingLive)["Bob-Garona"], nil,
+        "447-r4: pre-activation staged still excluded")
+
+    local archivedId = live.currentCampaignId
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    startCampaign()
+    live = GS:GetCurrentRecord()
+    local rankingArchived = GS:ProjectCampaignRankings(archivedId)
+    assertEq(rankingsByName(rankingArchived)["Dave-Garona"], 800,
+        "447-r4: archived production totals intact")
+end
+
+do
+    -- 447-r5) EnsureValuationCatchup does not restart an active scan from Refresh.
+    valuationTsmValue = 50
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9456)
+    for i = 1, 24 do
+        creditValuationDeposit(record, {
+            itemId = 9456,
+            quantity = 1,
+            donor = "Bob-Garona",
+            occurrenceIndex = i,
+            neighborsOlder = { "older|9456|" .. tostring(i) },
+            neighborsNewer = { "newer|" .. tostring(i) },
+        })
+    end
+    record = GS:GetCurrentRecord()
+    if type(record.valuations) == "table" then
+        record.valuations.byTxn = {}
+        record.valuations.pending = {}
+    end
+    assertEq(GS.StartValuationCatchup("447-r5-start"), true, "447-r5: catch-up started")
+    local state1 = GS.GetValuationCatchupState()
+    assertEq(state1.active, true, "447-r5: active after start")
+    local gen1 = state1.generation
+    local index1 = state1.index
+    assertEq(GS.EnsureValuationCatchup("447-r5-ensure"), false, "447-r5: Ensure no-ops while active")
+    local state2 = GS.GetValuationCatchupState()
+    assertEq(state2.generation, gen1, "447-r5: generation unchanged by Ensure")
+    assertTrue((tonumber(state2.index) or 0) >= (tonumber(index1) or 0),
+        "447-r5: scan index does not rewind on Ensure")
+
+    -- Rankings Refresh must call Ensure, not Start.
+    local page = SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesRankings
+    assertTrue(type(page) == "table", "447-r5: rankings page")
+    local panel = {
+        __visible = true,
+        IsVisible = function(self) return self.__visible end,
+        IsShown = function(self) return self.__visible end,
+        HookScript = function() end,
+    }
+    page.panel = panel
+    -- Controlled start, then Refresh/NotifyUI must not restart the job.
+    GS.CancelValuationCatchup("447-r5-pre-refresh")
+    assertEq(GS.StartValuationCatchup("447-r5-controlled"), true,
+        "447-r5: controlled start before Refresh storm")
+    local genBefore = GS.GetValuationCatchupState().generation
+    local indexBefore = GS.GetValuationCatchupState().index
+    for _ = 1, 6 do
+        GS.NotifyUI("valuation")
+        flushTimers()
+        local okR, errR = pcall(function() page:Refresh(panel) end)
+        assertTrue(okR, "447-r5: Refresh ok " .. tostring(errR))
+    end
+    local after = GS.GetValuationCatchupState()
+    assertEq(after.generation, genBefore,
+        "447-r5: Refresh/NotifyUI did not bump catch-up generation")
+    assertTrue((tonumber(after.index) or 0) >= (tonumber(indexBefore) or 0),
+        "447-r5: forward progress without prefix rescan")
+    -- Advance catch-up slices and confirm eventual idle without restart loops.
+    for _ = 1, 200 do
+        flushTimers()
+        local st = GS.GetValuationCatchupState()
+        if not st.active and not st.scheduled then
+            break
+        end
+    end
+    local idle = GS.GetValuationCatchupState()
+    assertEq(idle.active, false, "447-r5: catch-up eventually idle")
+    local genIdle = idle.generation
+    for _ = 1, 4 do
+        GS.NotifyUI("valuation")
+        flushTimers()
+        page:Refresh(panel)
+    end
+    assertEq(GS.GetValuationCatchupState().generation, genIdle,
+        "447-r5: completed pass is not re-run from Refresh")
+    GS.CancelValuationCatchup("447-r5-done")
+end
+
+do
+    -- 447-r6) Chart resize is layout-only (no extra getRankings / ledger projections).
+    local function makeUiRegion(kind, name, parent)
+        local region = {
+            kind = kind, name = name, parent = parent, shown = true,
+            height = 0, width = 0, scripts = {}, hooks = {}, children = {},
+            text = "", enabled = true,
+        }
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetHeight(h) self.height = h end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = w end
+        function region:GetWidth() return self.width end
+        function region:SetSize(w, h) self.width = w; self.height = h end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:SetAllPoints() end
+        function region:SetParent(p) self.parent = p end
+        function region:CreateFontString()
+            local fs = makeUiRegion("FontString", nil, self)
+            self.children[#self.children + 1] = fs
+            return fs
+        end
+        function region:CreateTexture()
+            local t = makeUiRegion("Texture", nil, self)
+            self.children[#self.children + 1] = t
+            return t
+        end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetWordWrap() end
+        function region:SetMaxLines() end
+        function region:SetFontObject() end
+        function region:SetScrollChild(c) self.scrollChild = c end
+        function region:SetMinMaxValues() end
+        function region:SetValue() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:SetTexture() end
+        function region:SetVertexColor() end
+        function region:SetColorTexture() end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:SetAlpha() end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:GetParent() return self.parent end
+        return region
+    end
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        local region = makeUiRegion(frameType or "Frame", name, parent)
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeUiRegion("Slider", nil, region)
+        end
+        return region
+    end
+    if not SF.SettingsUI.Controls then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    end
+    local Controls = SF.SettingsUI.Controls
+    assertTrue(type(Controls) == "table" and type(Controls.AddContributionRankingChart) == "function",
+        "447-r6: chart control present")
+    local projectCalls = 0
+    local rankingsPayload = {
+        rows = {
+            { name = "Bob-Garona", totalCopper = 1000 },
+            { name = "Carol-Garona", totalCopper = 500 },
+        },
+        maxPositive = 1000,
+        hasHistory = true,
+    }
+    local capturedControl = nil
+    local priorInit = Controls.InitRow
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(320)
+        capturedControl = control
+        return row, control
+    end
+    -- Avoid production _ApplyRowState needing full Settings chrome.
+    local priorApply = Controls._ApplyRowState
+    Controls._ApplyRowState = function() return true, true end
+    local section = {
+        AddRow = function(self, height, buildFn, opts)
+            assertEq(opts and opts.fillHeight, true, "447-r6: fillHeight opted in")
+            local row = CreateFrame("Frame", "SF_TestRankingRow")
+            row:SetWidth(400)
+            row:SetHeight(height)
+            buildFn(row)
+            return row
+        end,
+    }
+    local row = Controls:AddContributionRankingChart(section, {
+        height = 320,
+        fillHeight = true,
+        getRankings = function()
+            projectCalls = projectCalls + 1
+            return rankingsPayload
+        end,
+    })
+    assertTrue(row ~= nil and capturedControl ~= nil, "447-r6: chart row created")
+    local dataBefore = projectCalls
+    assertTrue(dataBefore >= 1, "447-r6: initial Refresh projects once")
+    local layoutBefore = capturedControl.__sfRankingLayoutPass
+        and capturedControl.__sfRankingLayoutPass() or 0
+    for w = 400, 520, 20 do
+        capturedControl:SetWidth(w)
+        for _, hook in ipairs(capturedControl.hooks.OnSizeChanged or {}) do
+            hook(capturedControl, w, 320)
+        end
+    end
+    assertEq(projectCalls, dataBefore,
+        "447-r6: resize does not call getRankings again got=" .. tostring(projectCalls))
+    local layoutAfter = capturedControl.__sfRankingLayoutPass
+        and capturedControl.__sfRankingLayoutPass() or 0
+    assertTrue(layoutAfter > layoutBefore, "447-r6: resize performed layout passes")
+    Controls.InitRow = priorInit
+    Controls._ApplyRowState = priorApply
+    CreateFrame = priorCreateFrame
+end
+
+do
+    -- 447-r7) Roster/guild changes route through Settings availability revalidation.
+    local winSrc = io.open("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua", "r")
+    assertTrue(winSrc ~= nil, "447-r7: StandaloneWindow readable")
+    local winBody = winSrc:read("*a")
+    winSrc:close()
+    assertTrue(winBody:find("GUILD_ROSTER_UPDATE", 1, true)
+            and winBody:find("HandleDurableAvailabilityChange", 1, true)
+            and winBody:find("_rosterAvailabilityFrame", 1, true),
+        "447-r7: StandaloneWindow roster → availability path")
+    local rankSrc = io.open(
+        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua", "r")
+    assertTrue(rankSrc ~= nil, "447-r7: Rankings page readable")
+    local rankBody = rankSrc:read("*a")
+    rankSrc:close()
+    assertTrue(rankBody:find("QueueAvailabilityRevalidation", 1, true),
+        "447-r7: Rankings queues availability revalidation")
+    assertTrue(rankBody:find("EnsureValuationCatchup", 1, true),
+        "447-r7: Rankings uses Ensure on show")
+    assertTrue(not rankBody:find("MaybeEnsureValuationCatchup", 1, true),
+        "447-r7: Rankings Refresh does not Ensure catch-up")
+    assertTrue(rankBody:find("fillHeight = true", 1, true),
+        "447-r7: Rankings opts into fillHeight")
+
+    -- Behavioral: unknown rank → officer flips available; demotion + Preview hide.
+    local Nav = SF.SettingsNavigationModel
+    local ui = SF.SettingsUI
+    local rankingsPage = ui.pagesById.guildSuppliesRankings
+    assertTrue(type(rankingsPage) == "table", "447-r7: rankings page")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = false
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-r7: officer available")
+    setPlayer("Alice-Garona", "Player-1-Alice", 5)
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-r7: demotion hides")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-r7: promotion restores")
+    world.impersonationActive = true
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-r7: Preview hides")
+    world.impersonationActive = false
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-r7: member unavailable")
+    local session = {
+        currentCategoryId = "guildSupplies",
+        currentPageId = "guildSuppliesLogs",
+    }
+    local resolved = Nav.ResolveShowPage(ui, session, "guildSuppliesRankings")
+    assertTrue(resolved.pageId ~= "guildSuppliesRankings",
+        "447-r7: demoted direct nav falls back got=" .. tostring(resolved.pageId))
 end
 
 SF.TSM = nil

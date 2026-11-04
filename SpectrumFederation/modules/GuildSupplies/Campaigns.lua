@@ -988,8 +988,10 @@ function GS.ProjectCampaignRankingsOnRecord(record, campaignId)
         and GS.BeginContributorProjectionContext(record) or nil
 
     ForEachCampaignLedgerEvent(record, generation, function(event)
-        if GS.EventCountsTowardLiveProgress
-            and not GS.EventCountsTowardLiveProgress(record, event) then
+        -- Rankings require durable production credit. Do not reuse
+        -- EventCountsTowardLiveProgress: that predicate deliberately includes
+        -- all accepted staged rows for preparation UI (#447).
+        if event.gsProductionCredit ~= true then
             return
         end
         local copper = nil

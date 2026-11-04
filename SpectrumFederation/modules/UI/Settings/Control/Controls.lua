@@ -2738,6 +2738,11 @@ function Controls:AddContributionRankingChart(section, opts)
 		scroll:SetScrollChild(content)
 
 		local pool = {}
+		-- Ephemeral display model from the last authoritative Refresh only.
+		-- OnSizeChanged recalculates geometry against this cache (#447).
+		local cachedRankings = nil
+		local layoutPass = 0
+		local dataPass = 0
 
 		local function AcquireRow(index)
 			local entry = pool[index]
@@ -2792,7 +2797,21 @@ function Controls:AddContributionRankingChart(section, opts)
 			end
 		end
 
+		local function ComputePlotWidth()
+			local width = control:GetWidth() or 0
+			if width < 1 and row.GetWidth then
+				width = row:GetWidth() or 0
+			end
+			local plotWidth = width - nameWidth - nameGap - labelGutter - 24
+			if plotWidth < 40 then
+				plotWidth = 40
+			end
+			content:SetWidth(math.max(1, width - 24))
+			return plotWidth
+		end
+
 		local function LayoutBars(rankings, plotWidth)
+			layoutPass = layoutPass + 1
 			local rows = type(rankings) == "table" and rankings.rows or nil
 			if type(rows) ~= "table" or #rows == 0 then
 				HideUnused(1)
@@ -2835,21 +2854,11 @@ function Controls:AddContributionRankingChart(section, opts)
 			content:SetHeight(math.max(1, y))
 		end
 
-		local function Refresh()
-			self:_ApplyRowState(row, section, opts, { scroll, emptyText })
-			local rankings = getRankings() or {}
-			local rows = type(rankings.rows) == "table" and rankings.rows or {}
-			local emptyReason = rankings.emptyReason
-			local customEmpty = rankings.emptyText
-			local width = control:GetWidth() or 0
-			if width < 1 and row.GetWidth then
-				width = row:GetWidth() or 0
-			end
-			local plotWidth = width - nameWidth - nameGap - labelGutter - 24
-			if plotWidth < 40 then
-				plotWidth = 40
-			end
-			content:SetWidth(math.max(1, width - 24))
+		local function ApplyEmptyOrBars(rankings)
+			local rows = type(rankings) == "table" and rankings.rows or {}
+			local emptyReason = rankings and rankings.emptyReason
+			local customEmpty = rankings and rankings.emptyText
+			local plotWidth = ComputePlotWidth()
 
 			if type(customEmpty) == "string" and customEmpty ~= "" then
 				scroll:Hide()
@@ -2883,18 +2892,46 @@ function Controls:AddContributionRankingChart(section, opts)
 			LayoutBars(rankings, plotWidth)
 		end
 
+		--- Authoritative data refresh (section RegisterRefresh / initial build).
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, { scroll, emptyText })
+			dataPass = dataPass + 1
+			local rankings = getRankings() or {}
+			cachedRankings = rankings
+			ApplyEmptyOrBars(rankings)
+		end
+
+		--- Resize-only: geometry against the cached ephemeral model. Never walks
+		-- the ledger again outside a page render pass (#447).
+		local function LayoutOnly()
+			if row.__sfRankingLayoutBusy then
+				return
+			end
+			row.__sfRankingLayoutBusy = true
+			local ok, err = pcall(function()
+				self:_ApplyRowState(row, section, opts, { scroll, emptyText })
+				ApplyEmptyOrBars(cachedRankings or {})
+			end)
+			row.__sfRankingLayoutBusy = false
+			if not ok then
+				error(tostring(err or "ranking layout failed"), 0)
+			end
+		end
+
+		-- Test hooks (nil in production consumers).
+		control.__sfRankingDataPass = function() return dataPass end
+		control.__sfRankingLayoutPass = function() return layoutPass end
+
 		if control.HookScript and not control.__sfRankingSizeHook then
 			control.__sfRankingSizeHook = true
 			control:HookScript("OnSizeChanged", function()
-				-- Coalesce via the section refresh path when available; otherwise
-				-- rebuild bars from the latest ranking snapshot only.
-				Refresh()
+				LayoutOnly()
 			end)
 		end
 
 		Refresh()
 		RegisterRefresh(section, Refresh)
-	end)
+	end, { fillHeight = opts.fillHeight })
 end
 
 function Controls:AddLogTable(section, opts)

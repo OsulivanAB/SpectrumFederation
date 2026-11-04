@@ -251,6 +251,8 @@ local function Definition()
 			{
 				id = "gsRankingsStatus",
 				title = Loc("GUILD_SUPPLIES_RANKINGS_TITLE", "Contribution rankings"),
+				-- Fill leftover Settings page height beneath campaign controls (#447).
+				fillHeight = true,
 				items = {
 					{
 						type = "help",
@@ -306,7 +308,9 @@ local function Definition()
 					{
 						type = "contributionRankingChart",
 						label = Loc("GUILD_SUPPLIES_RANKINGS_CHART", "Contributors"),
+						-- Base/min height; fillHeight expands into leftover page space.
 						height = 320,
+						fillHeight = true,
 						getRankings = function()
 							return RankingsForSelected()
 						end,
@@ -334,14 +338,19 @@ local function PanelVisible(panel)
 	return false
 end
 
+--- Legitimate show/context start only. Ordinary Page:Refresh / NotifyUI must not
+-- touch catch-up lifecycle — that cancels in-flight work or re-runs a completed
+-- pass (#447). Keep pricing-job start/cancel separate from rendering.
 local function MaybeStartValuationCatchup(panel)
 	if not PanelVisible(panel) or not CanViewRankings() then
 		return
 	end
 	local supplies = GS()
-	if supplies and supplies.StartValuationCatchup then
-		-- Reuse Logs donation catch-up eligibility/cancellation. Does not backfill
-		-- historical adjustment prices (#447).
+	-- Prefer Ensure so a still-running Logs/prior catch-up is not cancelled when
+	-- Rankings is shown; Start remains the fallback for older builds.
+	if supplies and supplies.EnsureValuationCatchup then
+		supplies.EnsureValuationCatchup("rankings-show")
+	elseif supplies and supplies.StartValuationCatchup then
 		supplies.StartValuationCatchup("rankings-show")
 	end
 end
@@ -372,6 +381,28 @@ local function QueueRefresh()
 	end
 end
 
+--- Roster/guild membership can grant or revoke Rankings without a GS durable
+-- write. Route through Settings availability revalidation (coalesced); page
+-- refresh alone cannot update tabs or fall back before the panel exists (#447).
+local availabilityQueued = false
+local function QueueAvailabilityRevalidation()
+	if availabilityQueued then return end
+	availabilityQueued = true
+	local function run()
+		availabilityQueued = false
+		local win = SF.SettingsWindow
+		if win and type(win.HandleDurableAvailabilityChange) == "function" then
+			win:HandleDurableAvailabilityChange()
+		end
+		QueueRefresh()
+	end
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, run)
+	else
+		run()
+	end
+end
+
 local function EnsureItemDisplayListener()
 	local display = SF.ItemDisplay
 	if not display or type(display.RegisterRefresh) ~= "function" then
@@ -393,7 +424,7 @@ local function EnsureRosterListener()
 		pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
 	end
 	frame:SetScript("OnEvent", function()
-		QueueRefresh()
+		QueueAvailabilityRevalidation()
 	end)
 end
 
@@ -417,7 +448,8 @@ local function EnsureDurableListener()
 	local GO = SF.GuildOfficer
 	if GO and type(GO.RegisterUIListener) == "function" then
 		GO.RegisterUIListener(function()
-			QueueRefresh()
+			-- Officer policy can flip canEdit without roster events.
+			QueueAvailabilityRevalidation()
 		end)
 	end
 	durableListenerRegistered = true
@@ -465,9 +497,9 @@ function Page:Refresh(panel)
 		renderer:Refresh(panel)
 		EndRenderPass()
 	end
-	if CanViewRankings() then
-		MaybeStartValuationCatchup(panel)
-	else
+	-- Access lost while visible: stop catch-up. Do not Ensure/Start here —
+	-- valuation NotifyUI would otherwise restart scans from Refresh (#447).
+	if not CanViewRankings() then
 		CancelValuationCatchup()
 	end
 end

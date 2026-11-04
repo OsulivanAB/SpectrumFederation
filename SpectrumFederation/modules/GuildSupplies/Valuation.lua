@@ -3254,6 +3254,29 @@ function GS.StartValuationCatchup(reason)
     return true
 end
 
+--- Start donation valuation catch-up only when idle for the current dataset.
+-- Ordinary UI refreshes must call this (or nothing) rather than Start, so an
+-- in-flight scan is not cancelled and restarted from the ledger prefix (#447).
+function GS.EnsureValuationCatchup(reason)
+    if AdoptionInProgress() then
+        return false
+    end
+    if not GS.ValuationOfficerEligible() then
+        return false
+    end
+    local record = select(1, GS:GetCurrentRecord())
+    if type(record) ~= "table" or not (GS.IsLiveActive and GS.IsLiveActive(record)) then
+        return false
+    end
+    if catchup.active and catchup.datasetId == record.datasetId then
+        return false
+    end
+    if catchup.scheduled and catchup.datasetId == record.datasetId then
+        return false
+    end
+    return GS.StartValuationCatchup(reason)
+end
+
 function GS.GetValuationCatchupState()
     return {
         active = catchup.active and true or false,
@@ -3358,23 +3381,29 @@ function GS.AttachAdjustmentUnitCopperSnapshot(event, itemRef)
 end
 
 --- Enrich an op-first equivalent adjustment with a later ledger unitCopper.
--- Never overwrites an existing immutable snapshot or changes quantity/identity.
+-- Returns true when a nil→priced fill was written.
+-- Returns false, "price_conflict" when both sides carry differing non-nil
+-- snapshots (caller must quarantine). Same/missing incoming prices are
+-- harmless duplicates and leave the accepted snapshot unchanged (#447).
 function GS.ReconcileAdjustmentUnitCopper(existing, incoming)
     if type(existing) ~= "table" or type(incoming) ~= "table" then
-        return false
-    end
-    if existing.unitCopper ~= nil then
         return false
     end
     if type(existing.attributed) ~= "string" or existing.attributed == "" then
         return false
     end
-    local unit = GS.NormalizeAdjustmentUnitCopper(incoming.unitCopper, existing.quantity)
-    if unit == nil then
+    local qty = tonumber(existing.quantity)
+    local incomingUnit = GS.NormalizeAdjustmentUnitCopper(incoming.unitCopper, qty)
+    if existing.unitCopper ~= nil then
+        local existingUnit = GS.NormalizeAdjustmentUnitCopper(existing.unitCopper, qty)
+        if incomingUnit ~= nil and existingUnit ~= nil and incomingUnit ~= existingUnit then
+            return false, "price_conflict"
+        end
         return false
     end
-    -- Incoming quantity must match the retained signed quantity (body equivalence
-    -- already checked by the caller); re-normalize against existing.quantity.
-    existing.unitCopper = unit
+    if incomingUnit == nil then
+        return false
+    end
+    existing.unitCopper = incomingUnit
     return true
 end

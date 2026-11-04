@@ -3683,13 +3683,23 @@ function GS:AdmitLedgerEvent(event, admissionCtx)
                                     -- Same path: retain a validated attributedGuid from
                                     -- the later ledger body without minting a second row.
                                     ReconcileAdjustmentAttributedGuid(record, e, event)
-                                    -- Create-time unitCopper travels with the ledger body.
-                                    -- Fill once when the op-first row was unpriced (#447).
-                                    if GS.ReconcileAdjustmentUnitCopper
-                                        and GS.ReconcileAdjustmentUnitCopper(e, event) then
-                                        BumpAccountingMutation(record)
-                                        if GS._NotifyLocalDurableChange then
-                                            GS._NotifyLocalDurableChange("ledger")
+                                    -- Create-time unitCopper: nil→priced fill, or quarantine
+                                    -- conflicting non-nil snapshots (#447).
+                                    if GS.ReconcileAdjustmentUnitCopper then
+                                        local enriched, enrichErr =
+                                            GS.ReconcileAdjustmentUnitCopper(e, event)
+                                        if enrichErr == "price_conflict" then
+                                            QuarantineConflictBody(
+                                                cfg, adjustmentEventId or txnId, event)
+                                            return "rejected", "id_conflict"
+                                        end
+                                        if enriched then
+                                            BumpAccountingMutation(record)
+                                            if GS.RefreshLedgerEventExport then
+                                                GS.RefreshLedgerEventExport(record, e)
+                                            elseif GS._NotifyLocalDurableChange then
+                                                GS._NotifyLocalDurableChange("ledger")
+                                            end
                                         end
                                     end
                                     return "duplicate", "duplicate"
