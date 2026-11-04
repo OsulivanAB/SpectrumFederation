@@ -384,14 +384,23 @@ end
 assertTrue(type(raidCheckOnClick) == "function", "Raid Check Settings button onClick exists")
 
 local messages = {}
+local cleared = 0
 local ctx = {
     section = {
         SetMessage = function(_, text, kind)
             messages[#messages + 1] = { tostring(text), kind }
         end,
-        ClearMessage = function() end,
+        ClearMessage = function()
+            cleared = cleared + 1
+            messages = {}
+        end,
     },
 }
+
+local function activeProfileId()
+    local active = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+    return active and active.GetProfileId and active:GetProfileId() or nil
+end
 
 local origRunRaidCheck = RC.RunRaidCheck
 function RC:RunRaidCheck()
@@ -403,10 +412,12 @@ function RC:RunRaidCheck()
         message = "[Raid Check] Complete: 2 Prepared · 0 Unprepared · 1 Inspection Failed",
         kind = "success",
         generation = state.uiStatusGeneration,
+        profileId = activeProfileId(),
     }
     return "started"
 end
 messages = {}
+cleared = 0
 raidCheckOnClick(ctx)
 assertEq(#messages, 1, "Settings writes one status message after Raid Check click")
 assertEq(
@@ -425,6 +436,7 @@ function RC:RunRaidCheck()
         message = "Raid Check started.",
         kind = "info",
         generation = state.uiStatusGeneration,
+        profileId = activeProfileId(),
     }
     return "started"
 end
@@ -448,14 +460,17 @@ local immediateStatus = RC:_StartAdhocRun("raid", emptyProfile, emptyProfile:Get
     startedSessionForCheck = false,
 })
 CheckRun.ShouldSettle = origShouldSettle
+local immediateExpected = "[Raid Check] Complete: 0 Prepared · 1 Unprepared · 0 Inspection Failed"
 assertEq(immediateStatus, "completed", "_StartAdhocRun reports completed when consequences already applied")
-assertEq(countPrinted("success", "Complete:"), 1, "immediate completion prints one summary")
-assertTrue(
-    countPrinted("success", "Inspection Failed") == 1 or countPrinted("success", "Prepared") == 1,
-    "immediate completion names Prepared/Unprepared/Inspection Failed outcomes"
+assertEq(
+    countPrinted("success", immediateExpected),
+    1,
+    "immediate completion prints the full three-count summary"
 )
 local immediateUi = RC:GetLastUiStatus()
 assertEq(immediateUi.status, "completed", "immediate completion overwrites started UI status")
+assertEq(immediateUi.message, immediateExpected, "immediate UI status stores the full three-count summary")
+assertEq(immediateUi.profileId, emptyProfile:GetProfileId(), "immediate UI status stays bound to the run profile")
 
 -- ---------------------------------------------------------------------------
 -- Session-announcement failure: local warning preserved + completion still fires
@@ -716,8 +731,14 @@ end
 resetPrintCapture()
 noCb()
 CheckRun.ShouldSettle = origShouldSettle3
-assertTrue(RC:GetLastUiStatus().status == "completed" or RC:GetLastUiStatus().status == "started",
-    "No-path starts the check without a session")
+local noPathExpected = "[Raid Check] Complete: 0 Prepared · 1 Unprepared · 0 Inspection Failed"
+assertEq(RC:GetLastUiStatus().status, "completed", "No-path settles immediately to completed")
+assertEq(
+    countPrinted("success", noPathExpected),
+    1,
+    "No-path prints exactly one expected three-count completion summary"
+)
+assertEq(RC:GetLastUiStatus().message, noPathExpected, "No-path UI status stores the expected completion summary")
 
 -- ---------------------------------------------------------------------------
 -- Page close/reopen: listeners converge; no duplicate completion chat
@@ -740,6 +761,231 @@ sessionPanel.hooks.OnShow()
 assertEq(countPrinted("success", "Complete:"), 0, "page reopen does not reprint completion chat")
 assertEq(RC:GetLastUiStatus().message, reopenUi and reopenUi.message or nil,
     "page reopen does not invent a new completion status")
+
+-- ---------------------------------------------------------------------------
+-- Profile scope: complete A, switch to B, reopen Session must clear stale text
+-- ---------------------------------------------------------------------------
+resetDB()
+local profileA = makeProfile("Scope A")
+local profileB = makeProfile("Scope B")
+setActive(profileA)
+local scopeSection = {
+    messages = {},
+    cleared = 0,
+    SetMessage = function(self, text, kind)
+        self.messages[#self.messages + 1] = { tostring(text), kind }
+    end,
+    ClearMessage = function(self)
+        self.cleared = self.cleared + 1
+        self.messages = {}
+    end,
+}
+sessionPanel.__sfSections.session = scopeSection
+sessionPanel.shown = true
+sessionPanel.hooks.OnShow()
+local scopeRun = {
+    id = "scope-a",
+    profileId = profileA:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    },
+    targetIds = { "Admin-Garona" },
+    groupMemberIds = { "Admin-Garona" },
+    rosterMemberIds = profileA:GetMemberIds(),
+    players = { ["Admin-Garona"] = { guid = "g-scope-a" } },
+    mode = "raid",
+    cfg = profileA:GetRaidCheckConfig(),
+}
+resetPrintCapture()
+RC:_ApplyCheckConsequences(scopeRun)
+assertEq(RC:GetLastUiStatus().status, "completed", "profile A completion records completed UI status")
+assertTrue(#scopeSection.messages >= 1, "open Session receives profile A completion")
+assertTrue(scopeSection.messages[#scopeSection.messages][1]:find("Complete:", 1, true),
+    "Session shows profile A completion summary")
+local aSummary = scopeSection.messages[#scopeSection.messages][1]
+setActive(profileB)
+sessionPanel.hooks.OnHide()
+scopeSection.cleared = 0
+scopeSection.messages = { { aSummary, "success" } }
+resetPrintCapture()
+sessionPanel.hooks.OnShow()
+assertTrue(scopeSection.cleared >= 1, "reopening Session under profile B clears stale Raid Check text")
+assertEq(#scopeSection.messages, 0, "profile B Session does not keep profile A completion text")
+assertEq(countPrinted("success", "Complete:"), 0, "profile switch reopen does not reprint completion chat")
+registeredPages.lootHelperSession:Refresh(sessionPanel)
+assertEq(#scopeSection.messages, 0, "Session Refresh under profile B keeps Raid Check text cleared")
+
+-- Switch profiles before delayed completion: in-flight run stays on A; B must not show it.
+resetDB()
+profileA = makeProfile("Delayed Scope A")
+profileB = makeProfile("Delayed Scope B")
+setActive(profileA)
+scopeSection.messages = {}
+scopeSection.cleared = 0
+sessionPanel.__sfSections.session = scopeSection
+sessionPanel.shown = true
+sessionPanel.hooks.OnShow()
+Sync.state.active = true
+Sync.state.sessionId = "SES-SCOPE"
+Sync.state.profileId = profileA:GetProfileId()
+Sync.state._sessionAnnounced = "SES-SCOPE"
+local origShouldSettleScope = CheckRun.ShouldSettle
+function CheckRun.ShouldSettle()
+    return false, "test_hold_scope"
+end
+resetPrintCapture()
+local held = RC:BeginCheck("raid")
+CheckRun.ShouldSettle = origShouldSettleScope
+assertEq(held, "started", "scoped delayed check starts on profile A")
+assertTrue(scopeSection.messages[#scopeSection.messages][1]:find("started", 1, true),
+    "open Settings shows started for profile A")
+local delayedScopeRun = RC:_GetInspectState().adhocRun
+assertTrue(delayedScopeRun ~= nil, "scoped delayed run remains in flight")
+assertEq(delayedScopeRun.profileId, profileA:GetProfileId(), "in-flight run stays bound to profile A")
+setActive(profileB)
+scopeSection.cleared = 0
+scopeSection.messages = { { "Raid Check started.", "info" } }
+sessionPanel.hooks.OnHide()
+sessionPanel.hooks.OnShow()
+assertTrue(scopeSection.cleared >= 1, "switching to B before completion clears A's started text")
+assertEq(#scopeSection.messages, 0, "profile B does not display A's in-flight started status")
+delayedScopeRun.classified = true
+delayedScopeRun.classifiedResults = {
+    ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+}
+delayedScopeRun.targetIds = { "Admin-Garona" }
+delayedScopeRun.groupMemberIds = { "Admin-Garona" }
+delayedScopeRun.rosterMemberIds = profileA:GetMemberIds()
+delayedScopeRun.players = { ["Admin-Garona"] = { guid = "g-scope-delay" } }
+scopeSection.cleared = 0
+scopeSection.messages = {}
+resetPrintCapture()
+RC:_ApplyCheckConsequences(delayedScopeRun)
+RC:_GetInspectState().adhocRun = nil
+assertEq(countPrinted("success", "[Raid Check] Complete: 1 Prepared · 0 Unprepared · 0 Inspection Failed"), 1,
+    "delayed A completion still prints exactly once while B is active")
+assertEq(RC:GetLastUiStatus().profileId, profileA:GetProfileId(), "delayed completion remains bound to profile A")
+assertEq(#scopeSection.messages, 0, "listener under profile B does not render A's delayed completion")
+assertTrue(scopeSection.cleared >= 1, "listener clears when delayed A status is rejected under B")
+
+-- Missing-profile failure: current attempt error still displays with no active profile.
+resetDB()
+local priorForMissing = makeProfile("Prior For Missing")
+setActive(priorForMissing)
+RC:_ApplyCheckConsequences({
+    id = "prior-missing",
+    profileId = priorForMissing:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    },
+    targetIds = { "Admin-Garona" },
+    groupMemberIds = { "Admin-Garona" },
+    rosterMemberIds = priorForMissing:GetMemberIds(),
+    players = { ["Admin-Garona"] = { guid = "g-prior-missing" } },
+    mode = "raid",
+    cfg = priorForMissing:GetRaidCheckConfig(),
+})
+SF.lootHelperDB.activeProfile = nil
+SF.lootHelperDB.activeProfileId = nil
+messages = {}
+cleared = 0
+local missingStatus = RC:BeginCheck("raid")
+assertEq(missingStatus, "error", "BeginCheck without a profile returns error")
+assertEq(RC:GetLastUiStatus().status, "error", "missing-profile attempt records error UI status")
+assertTrue(RC:GetLastUiStatus().profileId == nil or RC:GetLastUiStatus().profileId == "",
+    "missing-profile error is not attributed to a selected profile")
+raidCheckOnClick(ctx)
+assertEq(#messages, 1, "missing-profile failure still writes Settings status")
+assertTrue(messages[1][1]:find("could not be started", 1, true),
+    "missing-profile Settings shows the current attempt failure")
+assertEq(messages[1][2], "error", "missing-profile Settings kind is error")
+
+-- Localized started status for both check modes (distinct translated values).
+resetDB()
+local localeProfile = makeProfile("Locale Started")
+setActive(localeProfile)
+local origLocaleText = SF.LocaleText
+function SF.LocaleText(key, default)
+    if key == "RAID_CHECK_UI_STARTED" then
+        return "LOC_STARTED:%s"
+    end
+    if key == "RAID_CHECK_MODE_RAID" then
+        return "LOC_RAID"
+    end
+    if key == "RAID_CHECK_MODE_PRE" then
+        return "LOC_PRE"
+    end
+    if origLocaleText then
+        return origLocaleText(key, default)
+    end
+    return default
+end
+Sync.state.active = true
+Sync.state.sessionId = "SES-LOC"
+Sync.state.profileId = localeProfile:GetProfileId()
+Sync.state._sessionAnnounced = "SES-LOC"
+local origShouldSettleLoc = CheckRun.ShouldSettle
+function CheckRun.ShouldSettle()
+    return false, "test_hold_locale"
+end
+scopeSection.messages = {}
+sessionPanel.__sfSections.session = scopeSection
+sessionPanel.shown = true
+sessionPanel.hooks.OnShow()
+resetPrintCapture()
+local raidStarted = RC:BeginCheck("raid")
+assertEq(raidStarted, "started", "localized raid check starts")
+assertEq(RC:GetLastUiStatus().message, "LOC_STARTED:LOC_RAID",
+    "stored raid started status uses localized template and mode label")
+assertEq(scopeSection.messages[#scopeSection.messages][1], "LOC_STARTED:LOC_RAID",
+    "listener receives localized raid started status")
+RC:_GetInspectState().adhocRun = nil
+scopeSection.messages = {}
+local preStarted = RC:BeginCheck("pre")
+assertEq(preStarted, "started", "localized pre-raid check starts")
+assertEq(RC:GetLastUiStatus().message, "LOC_STARTED:LOC_PRE",
+    "stored pre-raid started status uses localized template and mode label")
+assertEq(scopeSection.messages[#scopeSection.messages][1], "LOC_STARTED:LOC_PRE",
+    "listener receives localized pre-raid started status")
+CheckRun.ShouldSettle = origShouldSettleLoc
+SF.LocaleText = origLocaleText
+RC:_GetInspectState().adhocRun = nil
+messages = {}
+function RC:RunRaidCheck()
+    local state = self:_GetInspectState()
+    state.uiStatusGeneration = (state.uiStatusGeneration or 0) + 1
+    state.lastUiStatus = {
+        status = "started",
+        message = "LOC_STARTED:LOC_RAID",
+        kind = "info",
+        generation = state.uiStatusGeneration,
+        profileId = activeProfileId(),
+    }
+    return "started"
+end
+function SF.LocaleText(key, default)
+    if key == "RAID_CHECK_UI_STARTED" then
+        return "LOC_STARTED:%s"
+    end
+    if key == "RAID_CHECK_MODE_RAID" then
+        return "LOC_RAID"
+    end
+    if key == "RAID_CHECK_MODE_PRE" then
+        return "LOC_PRE"
+    end
+    if origLocaleText then
+        return origLocaleText(key, default)
+    end
+    return default
+end
+raidCheckOnClick(ctx)
+assertEq(messages[1][1], "LOC_STARTED:LOC_RAID", "button path shows localized started status")
+RC.RunRaidCheck = origRunRaidCheck
+SF.LocaleText = origLocaleText
 
 -- ---------------------------------------------------------------------------
 -- Missing admin permission + completion with debug/whispers disabled

@@ -590,6 +590,8 @@ L["RAID_CHECK_PRESENCE_SUMMARY_PREPARED"] = "Raid Check: %d present · %d eligib
 L["RAID_CHECK_COMPLETION_SUMMARY"] = "[%s] Complete: %d Prepared · %d Unprepared · %d Inspection Failed"
 
 -- Raid Check Settings Session status (#449)
+L["RAID_CHECK_MODE_RAID"] = "Raid Check"
+L["RAID_CHECK_MODE_PRE"] = "Pre-Raid Check"
 L["RAID_CHECK_UI_PROMPT"] = "Choose Yes to start a session, No to run without one, or Cancel to abort."
 L["RAID_CHECK_UI_BUSY"] = "A Raid Check is already in progress."
 L["RAID_CHECK_UI_STARTED"] = "%s started."

@@ -250,24 +250,57 @@ end
 
 local function RaidCheckModeLabel(mode)
 	if mode == "pre" then
-		return "Pre-Raid Check"
+		return Loc("RAID_CHECK_MODE_PRE", "Pre-Raid Check")
 	end
-	return "Raid Check"
+	return Loc("RAID_CHECK_MODE_RAID", "Raid Check")
 end
 
+local function ActiveLootHelperProfileId()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.GetProfileId then
+		local id = profile:GetProfileId()
+		if type(id) == "string" and id ~= "" then
+			return id
+		end
+	end
+	return nil
+end
+
+-- Display only when the status belongs to both the current BeginCheck generation
+-- and the profile currently shown in Settings. Nil profileId is allowed only while
+-- no active profile is selected, so missing-profile attempt errors still show.
 local function UiStatusBelongsToCurrentInvocation(ui)
 	if type(ui) ~= "table" then
 		return false
 	end
-	if not (SF.RaidCheck and SF.RaidCheck.GetUiStatusGeneration) then
-		return type(ui.message) == "string" and ui.message ~= ""
+	if type(ui.message) ~= "string" or ui.message == "" then
+		return false
 	end
-	local generation = SF.RaidCheck:GetUiStatusGeneration()
-	return ui.generation == generation and type(ui.message) == "string" and ui.message ~= ""
+	if SF.RaidCheck and SF.RaidCheck.GetUiStatusGeneration then
+		if ui.generation ~= SF.RaidCheck:GetUiStatusGeneration() then
+			return false
+		end
+	end
+	local activeId = ActiveLootHelperProfileId()
+	local statusProfileId = ui.profileId
+	if type(statusProfileId) == "string" and statusProfileId ~= "" then
+		return activeId == statusProfileId
+	end
+	return activeId == nil
 end
 
 local function ApplyUiStatusToSection(section, ui)
-	if not section or not section.SetMessage or not UiStatusBelongsToCurrentInvocation(ui) then
+	if not section then
+		return false
+	end
+	if not UiStatusBelongsToCurrentInvocation(ui) then
+		-- Returning without clearing would leave profile A's Raid Check text under B.
+		if section.ClearMessage then
+			section:ClearMessage()
+		end
+		return false
+	end
+	if not section.SetMessage then
 		return false
 	end
 	local kind = ui.kind
@@ -1838,15 +1871,22 @@ function ProfilePage:Refresh(panel)
 	RefreshPage(panel)
 end
 
+local function SyncRaidCheckUiStatusToPanel(panel)
+	if not panel then
+		return
+	end
+	local section = panel.__sfSections and panel.__sfSections.session
+	local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
+	ApplyUiStatusToSection(section, ui)
+end
+
 function SessionPage:Build(panel)
 	BuildPage(panel, self.id, { "session" })
 	if panel and panel.HookScript and not panel.__sfRaidCheckUiStatusHooked then
 		panel.__sfRaidCheckUiStatusHooked = true
 		panel:HookScript("OnShow", function()
 			EnsureRaidCheckUiStatusListener(panel)
-			local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
-			local section = panel.__sfSections and panel.__sfSections.session
-			ApplyUiStatusToSection(section, ui)
+			SyncRaidCheckUiStatusToPanel(panel)
 		end)
 		panel:HookScript("OnHide", function()
 			ClearRaidCheckUiStatusListener(panel)
@@ -1854,6 +1894,7 @@ function SessionPage:Build(panel)
 	end
 	if panel and panel.IsShown and panel:IsShown() then
 		EnsureRaidCheckUiStatusListener(panel)
+		SyncRaidCheckUiStatusToPanel(panel)
 	else
 		ClearRaidCheckUiStatusListener(panel)
 	end
@@ -1861,6 +1902,9 @@ end
 
 function SessionPage:Refresh(panel)
 	RefreshPage(panel)
+	if panel and panel.IsShown and panel:IsShown() then
+		SyncRaidCheckUiStatusToPanel(panel)
+	end
 end
 
 function AdminPage:Build(panel)

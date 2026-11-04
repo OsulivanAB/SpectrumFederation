@@ -5457,7 +5457,16 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	end
 
 	local label = ModeLabel(mode)
-	local startedMessage = label .. " started."
+	-- Settings status + listener path prefer lastUiStatus; localize the stored
+	-- started message so translated clients are not stuck with hard-coded English.
+	local modeLabel
+	if mode == "pre" then
+		modeLabel = (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_PRE", "Pre-Raid Check")) or "Pre-Raid Check"
+	else
+		modeLabel = (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_RAID", "Raid Check")) or "Raid Check"
+	end
+	local startedTemplate = (SF.LocaleText and SF.LocaleText("RAID_CHECK_UI_STARTED", "%s started.")) or "%s started."
+	local startedMessage = startedTemplate:format(modeLabel)
 	-- Record started before inspection work so an immediate settle can replace it.
 	SetLastUiStatus("started", startedMessage, "info", {
 		mode = mode,
