@@ -1,5 +1,6 @@
--- Guild Supplies → Rankings (#447). Officer-only campaign contribution chart.
+-- Guild Supplies → Rankings (#447/#450). Officer-only campaign contribution chart.
 -- Derived view of retained logs + valuation snapshots; never persists a board.
+-- Always projects the guild record's active campaign; no independent selector (#450).
 local _, SF = ...
 
 local function Loc(key, default)
@@ -35,8 +36,6 @@ local function GS()
 	return SF.GuildSupplies
 end
 
--- Ephemeral UI selection only; never persisted.
-local selectedCampaignId = nil
 local refreshQueued = false
 local rosterFrame = nil
 local passCache = nil
@@ -89,88 +88,21 @@ local function CurrentRecord()
 	return record, reason
 end
 
-local function InspectableCampaigns()
-	if passCache and passCache.campaignsChecked then
-		return passCache.campaigns
-	end
-	local g = GS()
-	local list
-	if g and g.ListInspectableCampaigns then
-		list = g:ListInspectableCampaigns()
-	end
-	if type(list) ~= "table" then
-		list = {}
-	end
-	if passCache then
-		passCache.campaignsChecked = true
-		passCache.campaigns = list
-	end
-	return list
-end
-
-local function FormatCampaignLabel(entry)
-	if type(entry) ~= "table" then
-		return "?"
-	end
-	local started = tonumber(entry.startedAt)
-	local when = started and date and date("%Y-%m-%d %H:%M", started) or tostring(entry.startedAt or "?")
-	local status = entry.isCurrent
-		and Loc("GUILD_SUPPLIES_CAMPAIGN_CURRENT", "Current")
-		or Loc("GUILD_SUPPLIES_CAMPAIGN_ARCHIVED", "Archived")
-	local label = entry.displayName or entry.campaignId or "?"
-	if not entry.hasCustomName then
-		label = tostring(label)
-		if #label > 24 then
-			label = label:sub(1, 21) .. "..."
-		end
-	end
-	return string.format("%s — %s (%s)", when, status, tostring(label))
-end
-
-local function CampaignOptions()
-	local opts = {}
+--- Active campaign only. Follows guild-record rollover; never uses Configuration's
+-- rename-target selection, Logs campaign pickers, or Loot Helper profiles (#450).
+local function ActiveCampaignId()
 	if not CanViewRankings() then
-		return opts
-	end
-	local list = InspectableCampaigns()
-	for i = 1, #list do
-		local entry = list[i]
-		opts[#opts + 1] = {
-			value = entry.campaignId,
-			label = FormatCampaignLabel(entry),
-		}
-	end
-	return opts
-end
-
-local function ResolveSelectedCampaign()
-	if not CanViewRankings() then
-		selectedCampaignId = nil
 		return nil
 	end
 	local record = CurrentRecord()
 	if not record then
-		selectedCampaignId = nil
 		return nil
 	end
-	local list = InspectableCampaigns()
-	if #list == 0 then
-		selectedCampaignId = nil
-		return nil
+	local id = record.currentCampaignId
+	if type(id) == "string" and id ~= "" then
+		return id
 	end
-	if selectedCampaignId then
-		for i = 1, #list do
-			if list[i].campaignId == selectedCampaignId then
-				return selectedCampaignId
-			end
-		end
-	end
-	if type(record.currentCampaignId) == "string" then
-		selectedCampaignId = record.currentCampaignId
-		return selectedCampaignId
-	end
-	selectedCampaignId = list[1].campaignId
-	return selectedCampaignId
+	return nil
 end
 
 local function MembershipHelpText()
@@ -180,8 +112,7 @@ local function MembershipHelpText()
 		return tostring(r or "unknown")
 	end
 	if CanViewRankings() then
-		return Loc("GUILD_SUPPLIES_RANKINGS_HELP",
-			"Contribution value for the selected campaign, grouped under each character's current main. Unpriced entries count as zero.")
+		return nil
 	end
 	if caps.reason == "preview_non_admin" then
 		return Loc("GUILD_SUPPLIES_RANKINGS_PREVIEW",
@@ -192,7 +123,7 @@ local function MembershipHelpText()
 		.. " (" .. formatReason(caps.reason or "unauthorized") .. ")"
 end
 
-local function RankingsForSelected()
+local function RankingsForActiveCampaign()
 	if passCache and passCache.rankingsChecked then
 		return passCache.rankings
 	end
@@ -211,9 +142,10 @@ local function RankingsForSelected()
 		end
 		return result
 	end
-	local campaignId = ResolveSelectedCampaign()
+	local campaignId = ActiveCampaignId()
 	local g = GS()
 	if not campaignId or not g or not g.ProjectCampaignRankings then
+		-- No active campaign: leave chart content blank; keep page navigation (#450).
 		result.emptyReason = "no_campaign"
 		if passCache then
 			passCache.rankingsChecked = true
@@ -234,85 +166,22 @@ local function RankingsForSelected()
 	return result
 end
 
-local function DisabledCampaignSelectTip()
-	if not CanViewRankings() then
-		return MembershipHelpText()
-	end
-	if #CampaignOptions() == 0 then
-		return Loc("GUILD_SUPPLIES_RANKINGS_NO_CAMPAIGN",
-			"No campaigns are available to rank yet.")
-	end
-	return nil
-end
-
 local function Definition()
 	return {
 		sections = {
 			{
 				id = "gsRankingsStatus",
 				title = Loc("GUILD_SUPPLIES_RANKINGS_TITLE", "Contribution rankings"),
-				-- Fill leftover Settings page height beneath campaign controls (#447).
+				-- Fill leftover Settings page height (#447/#450).
 				fillHeight = true,
 				items = {
 					{
-						type = "help",
-						indent = "label",
-						getText = MembershipHelpText,
-					},
-					{
-						type = "dropdown",
-						label = Loc("GUILD_SUPPLIES_CAMPAIGN_SELECT", "Campaign"),
-						defaultText = Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns"),
-						options = function()
-							return CampaignOptions()
-						end,
-						get = function()
-							return ResolveSelectedCampaign()
-						end,
-						set = function(value)
-							selectedCampaignId = value
-						end,
-						enabled = function()
-							return CanViewRankings() and #CampaignOptions() > 0
-						end,
-						getDisabledTooltip = DisabledCampaignSelectTip,
-						onValueChanged = function(ctx)
-							if Page.Refresh and Page.panel then
-								Page:Refresh(Page.panel)
-							elseif ctx.pageBuilder and ctx.pageBuilder.Refresh then
-								ctx.pageBuilder:Refresh()
-							end
-						end,
-					},
-					{
-						type = "display",
-						label = Loc("GUILD_SUPPLIES_CAMPAIGN_DETAIL", "Selection"),
-						get = function()
-							if not CanViewRankings() then
-								return Loc("GUILD_SUPPLIES_RANKINGS_NO_ACCESS",
-									"Rankings are available to officers who meet the shared guild officer rank.")
-							end
-							local id = ResolveSelectedCampaign()
-							if not id then
-								return Loc("GUILD_SUPPLIES_CAMPAIGN_NONE", "No campaigns")
-							end
-							local list = InspectableCampaigns()
-							for i = 1, #list do
-								if list[i].campaignId == id then
-									return FormatCampaignLabel(list[i])
-								end
-							end
-							return id
-						end,
-					},
-					{
 						type = "contributionRankingChart",
-						label = Loc("GUILD_SUPPLIES_RANKINGS_CHART", "Contributors"),
-						-- Base/min height; fillHeight expands into leftover page space.
+						-- No InitRow label column: reclaim Contributors gutter (#450).
 						height = 320,
 						fillHeight = true,
 						getRankings = function()
-							return RankingsForSelected()
+							return RankingsForActiveCampaign()
 						end,
 						enabled = function()
 							return CanViewRankings()
@@ -485,11 +354,6 @@ function Page:Refresh(panel)
 	panel = panel or self.panel
 	if not PanelVisible(panel) then
 		return
-	end
-	-- Access lost while visible: clear restricted content. Window navigation
-	-- separately falls back off this page via page.available.
-	if not CanViewRankings() then
-		selectedCampaignId = nil
 	end
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if renderer and renderer.Refresh then
