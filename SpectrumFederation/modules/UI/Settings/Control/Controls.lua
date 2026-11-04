@@ -3171,8 +3171,26 @@ function Controls:AddLogTable(section, opts)
 		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
 		emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
 		emptyText:SetJustifyH("LEFT")
-		emptyText:SetText(opts.emptyText or "No logs found matching the selected filters.")
 		emptyText:Hide()
+
+		--- Resolve opts.emptyText whether it is a string or a callable (#453).
+		-- Must run before the first SetText so FontString never receives a function.
+		local function ResolveEmptyText()
+			local empty = opts.emptyText
+			if type(empty) == "function" then
+				local ok, value = pcall(empty)
+				if ok then
+					empty = value
+				else
+					empty = nil
+				end
+			end
+			if type(empty) ~= "string" or empty == "" then
+				empty = "No logs found matching the selected filters."
+			end
+			return empty
+		end
+		emptyText:SetText(ResolveEmptyText())
 
 		local headerCells = {}
 		for index, column in ipairs(columns) do
@@ -3197,6 +3215,8 @@ function Controls:AddLogTable(section, opts)
 		local cachedDataRows = {}
 		local cachedEnabled = true
 		local lastAvailableWidth = 0
+		-- Scroll identity for campaign/dataset/filter changes (#453).
+		local lastScrollContextKey = nil
 
 		local function LayoutCells(parent, cells, availableWidth)
 			local fixedWidth = 0
@@ -3362,28 +3382,54 @@ function Controls:AddLogTable(section, opts)
 			return scrollBar:GetWidth() or 20
 		end
 
-		local function ResolveEmptyText()
-			local empty = opts.emptyText
-			if type(empty) == "function" then
-				empty = empty()
+		local function ResolveScrollContextKey()
+			local keyFn = opts.getScrollContextKey
+			if type(keyFn) ~= "function" then
+				return nil
 			end
-			if type(empty) ~= "string" or empty == "" then
-				empty = "No logs found matching the selected filters."
+			local ok, value = pcall(keyFn)
+			if not ok or type(value) ~= "string" then
+				return ""
 			end
-			return empty
+			return value
+		end
+
+		--- Reset scroll on context change; otherwise clamp to the valid range.
+		-- Ordinary refreshes with an unchanged context keep the user's offset.
+		local function SyncScrollOffset(contentHeight, forceReset)
+			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+			local maxScroll = math.max(0, (tonumber(contentHeight) or 0) - visibleHeight)
+			local scrollOffset = 0
+			if not forceReset and scroll.GetVerticalScroll then
+				scrollOffset = tonumber(scroll:GetVerticalScroll()) or 0
+			end
+			if scrollOffset < 0 then
+				scrollOffset = 0
+			elseif scrollOffset > maxScroll then
+				scrollOffset = maxScroll
+			end
+			if scroll.SetVerticalScroll then
+				local current = scroll.GetVerticalScroll and (tonumber(scroll:GetVerticalScroll()) or 0) or nil
+				if current == nil or current ~= scrollOffset then
+					scroll:SetVerticalScroll(scrollOffset)
+				end
+			end
+			local scrollBar = scroll.ScrollBar
+			if scrollBar and scrollBar.SetValue and (forceReset or scrollOffset == 0 or scrollOffset == maxScroll) then
+				local barValue = scrollBar.GetValue and tonumber(scrollBar:GetValue()) or nil
+				if barValue == nil or barValue ~= scrollOffset then
+					scrollBar:SetValue(scrollOffset)
+				end
+			end
+			return scrollOffset
 		end
 
 		local function RenderVirtualWindow(availableWidth)
 			local dataRows = cachedDataRows
 			local total = #dataRows
 			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
-			local scrollOffset = 0
-			if scroll.GetVerticalScroll then
-				scrollOffset = tonumber(scroll:GetVerticalScroll()) or 0
-			end
-			if scrollOffset < 0 then
-				scrollOffset = 0
-			end
+			local contentHeight = (total > 0) and (total * stride - rowSpacing) or 1
+			local scrollOffset = SyncScrollOffset(contentHeight, false)
 			local firstIndex = 1
 			if stride > 0 then
 				firstIndex = math.floor(scrollOffset / stride) + 1
@@ -3470,6 +3516,18 @@ function Controls:AddLogTable(section, opts)
 				content:SetHeight(math.max(1, contentHeight))
 			end
 
+			-- Campaign/dataset/filter identity changes reset scroll; shrinking
+			-- results only clamp. Unchanged-context refreshes keep the offset.
+			local ctxKey = ResolveScrollContextKey()
+			local forceReset = (#dataRows == 0)
+			if ctxKey ~= nil then
+				if lastScrollContextKey ~= nil and ctxKey ~= lastScrollContextKey then
+					forceReset = true
+				end
+				lastScrollContextKey = ctxKey
+			end
+			SyncScrollOffset(contentHeight, forceReset)
+
 			emptyText:SetText(ResolveEmptyText())
 			emptyText:SetShown(#dataRows == 0)
 
@@ -3529,11 +3587,27 @@ function Controls:AddLogTable(section, opts)
 				end)
 			end
 		end
-		-- Expose pool size for lifecycle/convergence tests.
+		-- Expose pool/scroll hooks for lifecycle and #453 behavioral tests.
 		row.__sfLogTableRowCount = function()
 			return #rows
 		end
 		row.__sfLogTableVirtualize = virtualize
+		row.__sfLogTableScroll = scroll
+		row.__sfLogTableGetVerticalScroll = function()
+			if scroll.GetVerticalScroll then
+				return tonumber(scroll:GetVerticalScroll()) or 0
+			end
+			return 0
+		end
+		row.__sfLogTableSetVerticalScroll = function(offset)
+			if scroll.SetVerticalScroll then
+				scroll:SetVerticalScroll(tonumber(offset) or 0)
+			end
+			if virtualize then
+				RefreshVirtualWindowOnly()
+			end
+		end
+		row.__sfLogTableRefresh = Refresh
 	end, { fillHeight = opts.fillHeight })
 end
 

@@ -1370,13 +1370,135 @@ do
     hooks.SyncFilterContext()
     assertEq(#hooks.BuildProjectedRows(), 0, "453: new campaign empty history")
     assertEq(#hooks.FilteredRows(), 0, "453: stale filters cleared on rollover")
+    assertTrue((hooks.EmptyLogsText() or ""):find("No donations or adjustments", 1, true),
+        "453: empty current-campaign emptyText guidance")
 
+    -- Hidden page must not drive renderer work; open/close cycles settle.
+    local panel = CreateFrame("Frame")
+    panel.shown = false
+    panel.visible = false
+    logsPage.panel = panel
+    local rendererWork = 0
+    SF.SettingsUI.DefinitionRenderer.Refresh = function()
+        rendererWork = rendererWork + 1
+    end
+    logsPage:Refresh(panel)
+    assertEq(rendererWork, 0, "453: hidden Logs page skips renderer Refresh work")
+    panel.shown = true
+    panel.visible = true
     for _ = 1, 5 do
-        hooks.BuildProjectedRows()
-        hooks.FilteredRows()
+        local projected = hooks.BuildProjectedRows()
+        assertEq(#projected, 0, "453: open/close projection stays empty for new campaign")
+        assertEq(#hooks.FilteredRows(), 0, "453: open/close filtered rows stay empty")
+        logsPage:Refresh(panel)
         if logsPage.OnHide then logsPage:OnHide() end
     end
-    assertTrue(true, "453: repeated Logs projection lifecycle settles")
+    SF.SettingsUI.DefinitionRenderer.Refresh = nil
+    local afterHide = hooks.BuildProjectedRows()
+    assertEq(#afterHide, 0, "453: post-hide projection for empty campaign stays empty")
+    assertEq(rendererWork, 5, "453: visible Logs Refresh runs each open cycle")
+end
+
+do
+    -- Class colors: one GuildInfo:GetCurrentRecord validation per projection pass.
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local seed = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 20 }, {
+        itemId = 20, goal = 10, removed = false,
+    }))
+    assertEq(GS:ApplyStagedConfigOperation(seed), "accepted", "453: class-color seed item")
+    local rec = GS:GetCurrentRecord()
+    local gen = rec.accounting._consumables.generation
+    for i = 1, 12 do
+        rec.accounting._consumableEvents[#rec.accounting._consumableEvents + 1] = {
+            id = "class-hist-" .. i,
+            type = "donation",
+            itemId = 20,
+            quantity = 1,
+            actor = "Bob-Garona",
+            actorGuid = "Player-1-Bob",
+            generation = gen,
+            timestamp = world.time + i,
+            source = "guildbank",
+            gsProductionCredit = true,
+        }
+    end
+
+    local giCalls = 0
+    SF.GuildInfo = {
+        GetCurrentRecord = function()
+            giCalls = giCalls + 1
+            -- Simulate ValidateGuildRecord cost by scanning a members table.
+            local members = world.guild.members
+            for _ = 1, #members do
+            end
+            return {
+                characters = {
+                    ["Player-1-Bob"] = { nameRealm = "Bob-Garona", classFile = "MAGE" },
+                    ["Player-1-Carol"] = { nameRealm = "Carol-Garona", classFile = "PRIEST" },
+                },
+            }
+        end,
+        ColorizeName = function(name, classFile)
+            if type(classFile) == "string" and classFile ~= "" then
+                return "[" .. classFile .. "]" .. name
+            end
+            return name
+        end,
+    }
+
+    local hooks = logsPage.__sfTest
+    local rows, lookupCalls = hooks.ProjectWithGuildLookupStats()
+    assertTrue(#rows >= 12, "453: class-color projection covers repeated donors")
+    assertEq(lookupCalls, 1, "453: one GuildInfo:GetCurrentRecord per projection pass")
+    assertEq(giCalls, 1, "453: repeated history rows do not each validate guild")
+    local colored = 0
+    for i = 1, #rows do
+        if type(rows[i].contributor) == "string"
+            and rows[i].contributor:find("%[MAGE%]", 1) then
+            colored = colored + 1
+        end
+    end
+    assertTrue(colored >= 12, "453: class colors apply without Loot Helper profiles")
+    -- Independence from Loot Helper: no LH profile lookup in the path.
+    assertTrue(SF.LootHelper == nil or SF.LootHelper.GetProfile == nil,
+        "453: class colors do not require Loot Helper profiles")
+
+    -- Second projection with warm cache still only one GI call for a fresh pass.
+    giCalls = 0
+    rows, lookupCalls = hooks.ProjectWithGuildLookupStats()
+    assertEq(lookupCalls, 1, "453: fresh projection pass still one lookup")
+    assertEq(giCalls, 1, "453: second pass still one GI validation")
+    SF.GuildInfo = nil
+end
+
+do
+    -- Manage mutation-time authorization (production NewConfigOperation path).
+    resetDb()
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    assertEq(managePage.available(), true, "453: officer can open Manage before mutation")
+    local okOp = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 99 }, {
+        itemId = 99, goal = 3, removed = false,
+    }))
+    assertTrue(okOp ~= nil, "453: officer prepares requested-item mutation")
+    assertEq(GS:ApplyStagedConfigOperation(okOp), "accepted", "453: officer mutation accepted")
+
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    settleRoster()
+    assertEq(managePage.available(), false, "453: member Manage nav closed")
+    local denied, status, reason = GS:NewConfigOperation("set-requested-item", { itemId = 100 }, {
+        itemId = 100, goal = 1, removed = false,
+    })
+    assertTrue(denied == nil, "453: member mutation prepare fails closed")
+    assertTrue(status == "rejected" or reason ~= nil,
+        "453: member mutation returns rejection status got="
+            .. tostring(status) .. "/" .. tostring(reason))
 end
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

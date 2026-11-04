@@ -9306,7 +9306,18 @@ do
         assertTrue(goalLists[1].leadingColumn == true, "414/440: goals opt into the shared percent column")
         assertTrue(goalLists[1].singleLine == true, "414/437: goals stay on one line with inline icons")
         assertTrue(configLists[1].showItemIcons == true, "414: campaign items opt into icons")
-        local sawLogsHelp = false
+        -- #453 Logs uses the logTable empty-state callable instead of help getText.
+        local logTables = findDefItems(logsUi, function(item)
+            return item.type == "logTable"
+        end)
+        assertEq(#logTables, 1, "414/#453: Logs hosts one logTable")
+        assertTrue(type(logTables[1].emptyText) == "function",
+            "414/#453: Logs emptyText is callable guidance")
+        local okEmpty, emptyValue = pcall(logTables[1].emptyText)
+        assertTrue(okEmpty and type(emptyValue) == "string" and emptyValue ~= "",
+            "414/#453: Logs emptyText resolves to guidance copy")
+        assertTrue(emptyValue:find("pending evidence", 1, true) == nil,
+            "414: logs empty state does not promise pending evidence")
         local helpItems = findDefItems(logsUi, function(item)
             return type(item.getText) == "function"
         end)
@@ -9315,15 +9326,8 @@ do
             if okHelp and type(helpValue) == "string" then
                 assertTrue(helpValue:find("pending evidence", 1, true) == nil,
                     "414: logs help does not promise pending evidence")
-                if helpValue:find("Privileged edits", 1, true) then
-                    sawLogsHelp = true
-                    assertTrue(helpValue:find("history", 1, true) ~= nil,
-                        "414: logs help still mentions history")
-                end
             end
         end
-        -- #453 Logs is a filter+table page; membership empty-state may be table-only.
-        assertTrue(sawLogsHelp or true, "414: membership help optional after #453 Logs rewrite")
 
         icons[13467] = 200067
         icons[13468] = 200068

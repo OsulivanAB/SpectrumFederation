@@ -119,6 +119,14 @@ local function SyncFilterContext()
 	cachedProjectionKey = nil
 end
 
+--- Scroll identity includes campaign/dataset plus active filters (#453).
+local function ScrollContextKey()
+	SyncFilterContext()
+	return FilterContextKey()
+		.. "|" .. tostring(filterContributor)
+		.. "|" .. tostring(filterItemId)
+end
+
 local function DescribeItem(itemId)
 	local display = SF.ItemDisplay
 	if display and type(display.Describe) == "function" then
@@ -140,29 +148,51 @@ local function ItemNameForHistory(itemId)
 	return nil
 end
 
-local function LookupClassFile(guid, nameRealm)
-	local GI = SF.GuildInfo
-	if not GI then
-		return nil
+--- One validated Guild Info record + name index per projection pass (#453).
+-- Avoids calling GI:GetCurrentRecord (full validation) once per history row.
+local function GuildClassLookup()
+	if passCache and passCache.guildClassLookupChecked then
+		return passCache.guildClassLookup
 	end
-	local record = GI.GetCurrentRecord and GI:GetCurrentRecord() or nil
-	if type(record) == "table" and type(record.characters) == "table" then
-		if type(guid) == "string" and guid ~= "" then
-			local row = record.characters[guid]
-			if type(row) == "table" and type(row.classFile) == "string" and row.classFile ~= "" then
-				return row.classFile
-			end
-		end
-		if type(nameRealm) == "string" and nameRealm ~= "" then
-			local needle = string.lower(nameRealm)
+	local lookup = {
+		byGuid = nil,
+		byName = nil,
+		getCurrentRecordCalls = 0,
+	}
+	local GI = SF.GuildInfo
+	if GI and type(GI.GetCurrentRecord) == "function" then
+		lookup.getCurrentRecordCalls = lookup.getCurrentRecordCalls + 1
+		local record = GI:GetCurrentRecord()
+		if type(record) == "table" and type(record.characters) == "table" then
+			lookup.byGuid = record.characters
+			local byName = {}
 			for _, row in pairs(record.characters) do
-				if type(row) == "table" and type(row.nameRealm) == "string"
-					and string.lower(row.nameRealm) == needle
+				if type(row) == "table"
+					and type(row.nameRealm) == "string" and row.nameRealm ~= ""
 					and type(row.classFile) == "string" and row.classFile ~= "" then
-					return row.classFile
+					byName[string.lower(row.nameRealm)] = row.classFile
 				end
 			end
+			lookup.byName = byName
 		end
+	end
+	if passCache then
+		passCache.guildClassLookupChecked = true
+		passCache.guildClassLookup = lookup
+	end
+	return lookup
+end
+
+local function LookupClassFile(guid, nameRealm)
+	local lookup = GuildClassLookup()
+	if type(guid) == "string" and guid ~= "" and type(lookup.byGuid) == "table" then
+		local row = lookup.byGuid[guid]
+		if type(row) == "table" and type(row.classFile) == "string" and row.classFile ~= "" then
+			return row.classFile
+		end
+	end
+	if type(nameRealm) == "string" and nameRealm ~= "" and type(lookup.byName) == "table" then
+		return lookup.byName[string.lower(nameRealm)]
 	end
 	return nil
 end
@@ -242,28 +272,39 @@ local function BuildProjectedRows()
 	if cachedProjectedRows and cachedProjectionKey == key then
 		return cachedProjectedRows
 	end
-	local rows = {}
-	if not Caps().canRead then
+	-- Own a render pass only when called outside Page Build/Refresh (tests).
+	-- Nested BeginRenderPass would wipe the page's Caps/record cache mid-refresh.
+	local ownedPass = false
+	if not passCache then
+		BeginRenderPass()
+		ownedPass = true
+	end
+	local function finish(rows)
 		cachedProjectedRows = rows
 		cachedProjectionKey = key
+		if ownedPass then
+			EndRenderPass()
+		end
 		return rows
+	end
+	local rows = {}
+	if not Caps().canRead then
+		return finish(rows)
 	end
 	local campaignId = ActiveCampaignId()
 	local g = GS()
 	if not campaignId or not g or not g.ListCampaignHistory then
-		cachedProjectedRows = rows
-		cachedProjectionKey = key
-		return rows
+		return finish(rows)
 	end
 	-- No limit: every retained current-campaign entry must remain reachable (#453).
 	local history = g:ListCampaignHistory(campaignId, nil, 0, ItemNameForHistory)
 	if type(history) ~= "table" then
-		cachedProjectedRows = rows
-		cachedProjectionKey = key
-		return rows
+		return finish(rows)
 	end
 	local unassigned = Loc("GUILD_SUPPLIES_ADJUST_UNASSIGNED", "Unassigned")
 	local adjustPrefix = Loc("GUILD_SUPPLIES_LOGS_ADJUST_MARK", "Adjustment")
+	-- Warm the pass-scoped guild class lookup once before coloring rows.
+	GuildClassLookup()
 	for i = 1, #history do
 		local event = history[i]
 		local kind = ClassifyHistoryRow(event)
@@ -321,9 +362,7 @@ local function BuildProjectedRows()
 			timestamp = event.timestamp,
 		}
 	end
-	cachedProjectedRows = rows
-	cachedProjectionKey = key
-	return rows
+	return finish(rows)
 end
 
 local function FilteredRows()
@@ -519,6 +558,7 @@ local function Definition()
 							},
 						},
 						emptyText = EmptyLogsText,
+						getScrollContextKey = ScrollContextKey,
 						getRows = function()
 							if not Caps().canRead then
 								return {}
@@ -701,6 +741,19 @@ Page.__sfTest = {
 	FilterAll = FILTER_ALL,
 	SyncFilterContext = SyncFilterContext,
 	ClassifyHistoryRow = ClassifyHistoryRow,
+	ScrollContextKey = ScrollContextKey,
+	EmptyLogsText = EmptyLogsText,
+	--- Project rows and return (rows, guildInfoGetCurrentRecordCalls) for #453.
+	ProjectWithGuildLookupStats = function()
+		cachedProjectedRows = nil
+		cachedProjectionKey = nil
+		BeginRenderPass()
+		local rows = BuildProjectedRows()
+		local lookup = passCache and passCache.guildClassLookup
+		local calls = lookup and tonumber(lookup.getCurrentRecordCalls) or 0
+		EndRenderPass()
+		return rows, calls
+	end,
 }
 
 EnsureRosterListener()
