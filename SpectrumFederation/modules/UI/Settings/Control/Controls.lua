@@ -2737,14 +2737,18 @@ function Controls:AddContributionRankingChart(section, opts)
 		content:SetHeight(1)
 		scroll:SetScrollChild(content)
 
+		-- Viewport-sized reusable row pool (#447). Pool slots are reused across
+		-- scroll/resize; allocation stays O(viewport), not O(contributor count).
 		local pool = {}
+		local ROW_OVERSCAN = 2
 		-- Ephemeral display model from the last authoritative Refresh only.
-		-- OnSizeChanged recalculates geometry against this cache (#447).
+		-- OnSizeChanged / OnVerticalScroll recalculate geometry against this
+		-- cache without rebuilding aggregation (#447).
 		local cachedRankings = nil
 		local layoutPass = 0
 		local dataPass = 0
 
-		local function AcquireRow(index)
+		local function AcquirePoolSlot(index)
 			local entry = pool[index]
 			if entry then
 				entry.frame:Show()
@@ -2797,6 +2801,20 @@ function Controls:AddContributionRankingChart(section, opts)
 			end
 		end
 
+		local function ViewportHeight()
+			local h = 0
+			if scroll.GetHeight then
+				h = scroll:GetHeight() or 0
+			end
+			if h < 1 and control.GetHeight then
+				h = control:GetHeight() or 0
+			end
+			if h < 1 then
+				h = minHeight
+			end
+			return h
+		end
+
 		local function ComputePlotWidth()
 			local width = control:GetWidth() or 0
 			if width < 1 and row.GetWidth then
@@ -2810,48 +2828,95 @@ function Controls:AddContributionRankingChart(section, opts)
 			return plotWidth
 		end
 
+		local function BindRow(entry, rowData, y, plotWidth, maxPositive)
+			local total = tonumber(rowData.totalCopper) or 0
+			entry.frame:ClearAllPoints()
+			entry.frame:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
+			entry.frame:SetPoint("RIGHT", content, "RIGHT", 0, 0)
+			entry.name:SetText(tostring(rowData.name or ""))
+			entry.amount:SetText(FormatSignedCopper(total))
+			local frac = 0
+			if maxPositive > 0 and total > 0 then
+				frac = total / maxPositive
+				if frac > 1 then frac = 1 end
+				if frac < 0 then frac = 0 end
+			end
+			local barW = math.floor(plotWidth * frac + 0.5)
+			if barW < 0 then barW = 0 end
+			entry.bar:SetWidth(math.max(barW, 0.001))
+			if entry.bar.SetValue then
+				entry.bar:SetValue(frac > 0 and 1 or 0)
+			end
+			if frac > 0 then
+				entry.bar:Show()
+			else
+				-- Nonpositive totals: zero-width bar, amount still shown.
+				entry.bar:SetWidth(0.001)
+				entry.bar:Show()
+			end
+			entry.frame:Show()
+		end
+
 		local function LayoutBars(rankings, plotWidth)
 			layoutPass = layoutPass + 1
 			local rows = type(rankings) == "table" and rankings.rows or nil
 			if type(rows) ~= "table" or #rows == 0 then
 				HideUnused(1)
 				content:SetHeight(1)
+				if scroll.SetVerticalScroll then
+					scroll:SetVerticalScroll(0)
+				end
 				return
 			end
-			local maxPositive = tonumber(rankings.maxPositive) or 0
-			local y = 0
-			for i = 1, #rows do
-				local entry = AcquireRow(i)
-				local rowData = rows[i]
-				local total = tonumber(rowData.totalCopper) or 0
-				entry.frame:ClearAllPoints()
-				entry.frame:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -y)
-				entry.frame:SetPoint("RIGHT", content, "RIGHT", 0, 0)
-				entry.name:SetText(tostring(rowData.name or ""))
-				entry.amount:SetText(FormatSignedCopper(total))
-				local frac = 0
-				if maxPositive > 0 and total > 0 then
-					frac = total / maxPositive
-					if frac > 1 then frac = 1 end
-					if frac < 0 then frac = 0 end
-				end
-				local barW = math.floor(plotWidth * frac + 0.5)
-				if barW < 0 then barW = 0 end
-				entry.bar:SetWidth(math.max(barW, 0.001))
-				if entry.bar.SetValue then
-					entry.bar:SetValue(frac > 0 and 1 or 0)
-				end
-				if frac > 0 then
-					entry.bar:Show()
-				else
-					-- Nonpositive totals: zero-width bar, amount still shown.
-					entry.bar:SetWidth(0.001)
-					entry.bar:Show()
-				end
-				y = y + rowHeight
+			local totalRows = #rows
+			local contentHeight = math.max(1, totalRows * rowHeight)
+			content:SetHeight(contentHeight)
+
+			local viewportH = ViewportHeight()
+			local scrollY = 0
+			if scroll.GetVerticalScroll then
+				scrollY = tonumber(scroll:GetVerticalScroll()) or 0
 			end
-			HideUnused(#rows + 1)
-			content:SetHeight(math.max(1, y))
+			local maxScroll = math.max(0, contentHeight - viewportH)
+			if scrollY < 0 then
+				scrollY = 0
+			elseif scrollY > maxScroll then
+				scrollY = maxScroll
+			end
+			if scroll.SetVerticalScroll and (scroll.GetVerticalScroll == nil
+					or (tonumber(scroll:GetVerticalScroll()) or 0) ~= scrollY) then
+				-- Clamp without re-entering LayoutBars via OnVerticalScroll.
+				local priorBusy = row.__sfRankingLayoutBusy
+				row.__sfRankingLayoutBusy = true
+				scroll:SetVerticalScroll(scrollY)
+				row.__sfRankingLayoutBusy = priorBusy
+			end
+
+			local firstIdx = math.floor(scrollY / rowHeight) + 1 - ROW_OVERSCAN
+			if firstIdx < 1 then
+				firstIdx = 1
+			end
+			local visibleSlots = math.ceil(viewportH / rowHeight) + (ROW_OVERSCAN * 2)
+			if visibleSlots < 1 then
+				visibleSlots = 1
+			end
+			local lastIdx = firstIdx + visibleSlots - 1
+			if lastIdx > totalRows then
+				lastIdx = totalRows
+			end
+			if firstIdx > totalRows then
+				HideUnused(1)
+				return
+			end
+
+			local maxPositive = tonumber(rankings.maxPositive) or 0
+			local poolIdx = 1
+			for i = firstIdx, lastIdx do
+				local entry = AcquirePoolSlot(poolIdx)
+				BindRow(entry, rows[i], (i - 1) * rowHeight, plotWidth, maxPositive)
+				poolIdx = poolIdx + 1
+			end
+			HideUnused(poolIdx)
 		end
 
 		local function ApplyEmptyOrBars(rankings)
@@ -2865,6 +2930,7 @@ function Controls:AddContributionRankingChart(section, opts)
 				emptyText:Show()
 				emptyText:SetText(customEmpty)
 				HideUnused(1)
+				content:SetHeight(1)
 				return
 			end
 			if emptyReason == "no_campaign" or (#rows == 0 and emptyReason == "no_contributions") then
@@ -2877,6 +2943,7 @@ function Controls:AddContributionRankingChart(section, opts)
 							"No credited contributions are recorded for this campaign yet.")
 				)
 				HideUnused(1)
+				content:SetHeight(1)
 				return
 			end
 			if #rows == 0 then
@@ -2885,6 +2952,7 @@ function Controls:AddContributionRankingChart(section, opts)
 				emptyText:SetText(Loc("GUILD_SUPPLIES_RANKINGS_NO_HISTORY",
 					"No credited contributions are recorded for this campaign yet."))
 				HideUnused(1)
+				content:SetHeight(1)
 				return
 			end
 			emptyText:Hide()
@@ -2901,7 +2969,7 @@ function Controls:AddContributionRankingChart(section, opts)
 			ApplyEmptyOrBars(rankings)
 		end
 
-		--- Resize-only: geometry against the cached ephemeral model. Never walks
+		--- Resize/scroll layout against the cached ephemeral model. Never walks
 		-- the ledger again outside a page render pass (#447).
 		local function LayoutOnly()
 			if row.__sfRankingLayoutBusy then
@@ -2921,10 +2989,29 @@ function Controls:AddContributionRankingChart(section, opts)
 		-- Test hooks (nil in production consumers).
 		control.__sfRankingDataPass = function() return dataPass end
 		control.__sfRankingLayoutPass = function() return layoutPass end
+		control.__sfRankingPoolCount = function() return #pool end
+		control.__sfRankingScroll = scroll
+		control.__sfRankingContent = content
+		control.__sfRankingVisibleNames = function()
+			local names = {}
+			for i = 1, #pool do
+				local entry = pool[i]
+				if entry and entry.frame and entry.frame:IsShown() and entry.name then
+					names[#names + 1] = entry.name:GetText()
+				end
+			end
+			return names
+		end
 
 		if control.HookScript and not control.__sfRankingSizeHook then
 			control.__sfRankingSizeHook = true
 			control:HookScript("OnSizeChanged", function()
+				LayoutOnly()
+			end)
+		end
+		if scroll.SetScript and not scroll.__sfRankingScrollHook then
+			scroll.__sfRankingScrollHook = true
+			scroll:SetScript("OnVerticalScroll", function()
 				LayoutOnly()
 			end)
 		end

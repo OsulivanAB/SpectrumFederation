@@ -43708,6 +43708,194 @@ do
 end
 
 do
+    -- 447-r8) Ordinary gossip (not adoptionReplay): op-first → campaign rollover
+    -- shelves the unpriced adjustment; later authenticated priced ledger enriches
+    -- the already-retained archive row. Cover ranking, export fingerprint/relay,
+    -- reload, conflict, duplicate, unauthorized, and new stale rejection.
+    valuationTsmValue = 1500
+    SF.TSM = nil -- op creates unpriced attributed adjustment
+    local record = activateValuationGuild(9458)
+    creditValuationDeposit(record, {
+        itemId = 9458, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9458, 1, "Carol-Garona"))
+    assertTrue(adjOp ~= nil, "447-r8: unpriced adj prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "447-r8: unpriced adj applied")
+    record = GS:GetCurrentRecord()
+    local archivedCampaignId = record.currentCampaignId
+    local archivedGen = tonumber(record.accounting._consumables.generation)
+    local stored = rankingsFindAdj(record, 9458, 1)
+    assertTrue(stored ~= nil, "447-r8: stored adj")
+    assertEq(stored.unitCopper, nil, "447-r8: starts unpriced")
+    assertEq(tonumber(stored.generation), archivedGen, "447-r8: adj generation")
+    assertEq(GS:EnsureGossipProvider(), true, "447-r8: provider")
+    drainExportMaint(32)
+    local exportId = "gs:le:" .. tostring(stored.id)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local beforeRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(beforeRec) == "table", "447-r8: unpriced export present")
+    local beforeFp = beforeRec.versionFp
+    assertTrue(type(beforeFp) == "string" and beforeFp ~= "", "447-r8: unpriced fingerprint")
+
+    -- Campaign rollover shelves prior-generation rows into the archive.
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= archivedCampaignId, "447-r8: new campaign current")
+    local liveHit = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local e = record.accounting._consumableEvents[i]
+        if e and (e.id == stored.id or e.opId == stored.id) then
+            liveHit = e
+            break
+        end
+    end
+    assertNil(liveHit, "447-r8: adj no longer on live list")
+    local archHit = nil
+    for i = 1, #(record.accounting._consumableEventArchive or {}) do
+        local e = record.accounting._consumableEventArchive[i]
+        if e and (e.id == stored.id or e.opId == stored.id) then
+            archHit = e
+            break
+        end
+    end
+    assertTrue(archHit == stored, "447-r8: same row object shelved to archive")
+    assertEq(stored.unitCopper, nil, "447-r8: still unpriced after shelve")
+    local rankingBefore = GS:ProjectCampaignRankings(archivedCampaignId)
+    assertEq(rankingsByName(rankingBefore)["Carol-Garona"], 0,
+        "447-r8: unpriced archived adj ranks as zero")
+
+    local pricedBody = {
+        type = "adjustment",
+        id = stored.id,
+        txnId = stored.txnId or stored.id,
+        opId = stored.opId or stored.id,
+        generation = archivedGen,
+        timestamp = stored.timestamp or world.time or 1,
+        actor = stored.actor or "Alice-Garona",
+        writer = stored.writer or "Player-1-Alice",
+        itemId = 9458,
+        quantity = 1,
+        attributed = "Carol-Garona",
+        attributedGuid = "Player-1-Carol",
+        unitCopper = 1500,
+        campaignId = archivedCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }
+    local authCtx = {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+        -- Ordinary gossip: must not set adoptionReplay.
+    }
+    local stDup, rDup = GS:AdmitLedgerEvent(pricedBody, authCtx)
+    assertEq(stDup, "duplicate", "447-r8: priced ledger is duplicate r=" .. tostring(rDup))
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: archived unitCopper enriched")
+    local rankingAfter = GS:ProjectCampaignRankings(archivedCampaignId)
+    assertEq(rankingsByName(rankingAfter)["Carol-Garona"], 1500,
+        "447-r8: archived ranking uses saved price")
+    drainExportMaint(16)
+    local afterRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(afterRec) == "table", "447-r8: priced export present")
+    assertTrue(afterRec.versionFp ~= beforeFp,
+        "447-r8: fingerprint changed after archived enrichment")
+    assertEq(tonumber(afterRec.body.event.unitCopper), 1500,
+        "447-r8: export body carries unitCopper")
+
+    -- Idempotent duplicate of the same priced body.
+    assertEq(select(1, GS:AdmitLedgerEvent(pricedBody, authCtx)), "duplicate",
+        "447-r8: priced redelivery stays duplicate")
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: price stable after duplicate")
+
+    -- Conflicting non-nil price quarantines; retained archive price unchanged.
+    local conflictBody = {}
+    for k, v in pairs(pricedBody) do conflictBody[k] = v end
+    conflictBody.unitCopper = 9999
+    local stConflict, rConflict = GS:AdmitLedgerEvent(conflictBody, authCtx)
+    assertEq(stConflict, "rejected", "447-r8: conflict rejected")
+    assertEq(rConflict, "id_conflict", "447-r8: conflict reason")
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: archive price not overwritten")
+
+    -- Unauthorized / non-editor delivery cannot enrich or mutate.
+    stored.unitCopper = nil
+    assertEq(GS.RefreshLedgerEventExport(record, stored), true,
+        "447-r8: stripped for unauthorized probe")
+    drainExportMaint(8)
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local stUnauth, rUnauth = GS:AdmitLedgerEvent(pricedBody, {
+        sender = "Dave-Garona",
+        member = { guid = "Player-1-Dave", name = "Dave-Garona", guildKey = "club:42", rankOrder = 4 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertTrue(stUnauth == "pending" or stUnauth == "rejected",
+        "447-r8: unauthorized not accepted st=" .. tostring(stUnauth)
+            .. " r=" .. tostring(rUnauth))
+    assertEq(stored.unitCopper, nil, "447-r8: unauthorized did not enrich")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Authenticated relay restores price after strip (Carol relays).
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local stRelay, rRelay = GS:AdmitLedgerEvent(pricedBody, {
+        sender = "Carol-Garona",
+        member = { guid = "Player-1-Carol", name = "Carol-Garona", guildKey = "club:42", rankOrder = 3 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stRelay, "duplicate",
+        "447-r8: relay priced after strip is duplicate r=" .. tostring(rRelay))
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: relay restores archived unitCopper")
+    drainExportMaint(8)
+    local relayRec = prov.api.GetRecordBody(exportId)
+    assertEq(tonumber(relayRec.body.event.unitCopper), 1500,
+        "447-r8: relayed export advertises priced body")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Genuinely new stale-campaign adjustment (different id) remains rejected.
+    local stStale, rStale = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "op-stale-r8-new",
+        txnId = "op-stale-r8-new",
+        opId = "op-stale-r8-new",
+        generation = archivedGen,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9458,
+        quantity = 2,
+        attributed = "Eve-Garona",
+        attributedGuid = "Player-1-Eve",
+        unitCopper = 1500,
+        campaignId = archivedCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }, authCtx)
+    assertEq(stStale, "rejected", "447-r8: new stale event rejected")
+    assertEq(rStale, "stale_campaign", "447-r8: stale_campaign reason")
+    local newArch = nil
+    for i = 1, #(record.accounting._consumableEventArchive or {}) do
+        local e = record.accounting._consumableEventArchive[i]
+        if e and e.id == "op-stale-r8-new" then
+            newArch = e
+            break
+        end
+    end
+    assertNil(newArch, "447-r8: new stale row not admitted to archive")
+
+    -- Reload retains the enriched archived price and ranking total.
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-r8: reload")
+    record = GS:GetCurrentRecord()
+    local reloaded = rankingsFindAdj(record, 9458, 1)
+    assertTrue(reloaded ~= nil, "447-r8: adj present after reload")
+    assertEq(tonumber(reloaded.unitCopper), 1500, "447-r8: price after reload")
+    assertEq(rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))["Carol-Garona"], 1500,
+        "447-r8: ranking after reload")
+end
+
+do
     -- 447-r4) Rankings exclude staged/non-production credit before activation,
     -- include production after activation, and keep archived production totals.
     valuationTsmValue = 400
@@ -43907,6 +44095,13 @@ do
         function region:SetMaxLines() end
         function region:SetFontObject() end
         function region:SetScrollChild(c) self.scrollChild = c end
+        function region:GetVerticalScroll() return self._vscroll or 0 end
+        function region:SetVerticalScroll(v)
+            self._vscroll = tonumber(v) or 0
+            if self.scripts.OnVerticalScroll then
+                self.scripts.OnVerticalScroll(self, self._vscroll)
+            end
+        end
         function region:SetMinMaxValues() end
         function region:SetValue() end
         function region:SetStatusBarTexture() end
@@ -43926,10 +44121,13 @@ do
         return region
     end
     local priorCreateFrame = CreateFrame
+    local frameCreateCount = 0
     function CreateFrame(frameType, name, parent, template)
+        frameCreateCount = frameCreateCount + 1
         local region = makeUiRegion(frameType or "Frame", name, parent)
         if template == "UIPanelScrollFrameTemplate" then
             region.ScrollBar = makeUiRegion("Slider", nil, region)
+            region:SetHeight((parent and parent.GetHeight and parent:GetHeight()) or 320)
         end
         return region
     end
@@ -43997,6 +44195,203 @@ do
     local layoutAfter = capturedControl.__sfRankingLayoutPass
         and capturedControl.__sfRankingLayoutPass() or 0
     assertTrue(layoutAfter > layoutBefore, "447-r6: resize performed layout passes")
+
+    -- 447-r9) Viewport-bounded reusable pool for large contributor sets.
+    local largeRows = {}
+    for i = 1, 240 do
+        largeRows[i] = {
+            name = string.format("Contrib%03d-Garona", i),
+            totalCopper = (241 - i) * 100,
+        }
+    end
+    -- Include a nonpositive trailing contributor to preserve signed/zero-width bars.
+    largeRows[241] = { name = "Neg-Garona", totalCopper = -500 }
+    local largePayload = {
+        rows = largeRows,
+        maxPositive = 24000,
+        hasHistory = true,
+    }
+    projectCalls = 0
+    frameCreateCount = 0
+    local largeControl = nil
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(280)
+        largeControl = control
+        return row, control
+    end
+    local largeSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingRowLarge")
+            row:SetWidth(400)
+            row:SetHeight(height or 280)
+            buildFn(row)
+            return row
+        end,
+    }
+    Controls:AddContributionRankingChart(largeSection, {
+        height = 280,
+        rowHeight = 28,
+        fillHeight = true,
+        getRankings = function()
+            projectCalls = projectCalls + 1
+            return largePayload
+        end,
+    })
+    assertTrue(largeControl ~= nil, "447-r9: large chart created")
+    assertTrue(projectCalls >= 1, "447-r9: initial data refresh")
+    local poolAfterBuild = largeControl.__sfRankingPoolCount
+        and largeControl.__sfRankingPoolCount() or 0
+    -- Viewport 280 / row 28 = 10 visible + 2*2 overscan = 14 max slots.
+    assertTrue(poolAfterBuild > 0 and poolAfterBuild <= 20,
+        "447-r9: pool bounded by viewport got=" .. tostring(poolAfterBuild))
+    assertTrue(poolAfterBuild < #largeRows,
+        "447-r9: pool smaller than contributor count")
+    local content = largeControl.__sfRankingContent
+    assertTrue(content ~= nil, "447-r9: content frame exposed")
+    assertEq(content:GetHeight(), #largeRows * 28,
+        "447-r9: full logical scroll height")
+    local visibleTop = largeControl.__sfRankingVisibleNames()
+    assertEq(visibleTop[1], "Contrib001-Garona", "447-r9: first visible at top")
+    local framesAtTop = frameCreateCount
+
+    -- Middle scroll: reuse pool; no aggregation rebuild.
+    local dataAtTop = projectCalls
+    local scroll = largeControl.__sfRankingScroll
+    assertTrue(scroll ~= nil, "447-r9: scroll exposed")
+    scroll:SetHeight(280)
+    scroll:SetVerticalScroll(100 * 28) -- Contrib101 at top of window (before overscan)
+    local visibleMid = largeControl.__sfRankingVisibleNames()
+    local midHit = false
+    for i = 1, #visibleMid do
+        if visibleMid[i] == "Contrib101-Garona" then
+            midHit = true
+            break
+        end
+    end
+    assertTrue(midHit, "447-r9: middle scroll shows Contrib101")
+    assertEq(projectCalls, dataAtTop, "447-r9: scroll does not call getRankings")
+    assertEq(largeControl.__sfRankingPoolCount(), poolAfterBuild,
+        "447-r9: scroll reuses pool slots")
+    assertEq(frameCreateCount, framesAtTop, "447-r9: scroll allocates no new frames")
+
+    -- Last scroll window includes Neg-Garona.
+    local maxScroll = math.max(0, (#largeRows * 28) - 280)
+    scroll:SetVerticalScroll(maxScroll)
+    local visibleLast = largeControl.__sfRankingVisibleNames()
+    local lastHit = false
+    for i = 1, #visibleLast do
+        if visibleLast[i] == "Neg-Garona" then
+            lastHit = true
+            break
+        end
+    end
+    assertTrue(lastHit, "447-r9: last scroll shows Neg-Garona")
+    assertEq(projectCalls, dataAtTop, "447-r9: last scroll still layout-only")
+
+    -- Resize without aggregation.
+    local layoutBeforeResize = largeControl.__sfRankingLayoutPass()
+    largeControl:SetWidth(480)
+    largeControl:SetHeight(200)
+    scroll:SetHeight(200)
+    for _, hook in ipairs(largeControl.hooks.OnSizeChanged or {}) do
+        hook(largeControl, 480, 200)
+    end
+    assertEq(projectCalls, dataAtTop, "447-r9: resize does not rebuild rankings")
+    assertTrue(largeControl.__sfRankingLayoutPass() > layoutBeforeResize,
+        "447-r9: resize performed layout")
+    local poolAfterResize = largeControl.__sfRankingPoolCount()
+    assertTrue(poolAfterResize <= 20, "447-r9: pool still bounded after shrink viewport")
+
+    -- List shrink / campaign change: Refresh clamps scroll; empty/hidden/access-loss
+    -- clears pool rows. Capture Refresh via section.__sfPageBuilder.
+    local mutControl = nil
+    local mutRefresh = nil
+    local mutPayload = { rows = {}, maxPositive = 0, hasHistory = true }
+    for i = 1, 80 do
+        mutPayload.rows[i] = {
+            name = string.format("Mut%03d-Garona", i),
+            totalCopper = 1000 - i,
+        }
+    end
+    mutPayload.maxPositive = 999
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(280)
+        mutControl = control
+        return row, control
+    end
+    local mutSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingMut")
+            row:SetWidth(400)
+            row:SetHeight(280)
+            buildFn(row)
+            return row
+        end,
+        __sfPageBuilder = {
+            RegisterRefresh = function(_, fn)
+                mutRefresh = fn
+            end,
+        },
+    }
+    Controls:AddContributionRankingChart(mutSection, {
+        height = 280,
+        rowHeight = 28,
+        fillHeight = true,
+        getRankings = function()
+            return mutPayload
+        end,
+    })
+    assertTrue(mutControl ~= nil and type(mutRefresh) == "function",
+        "447-r9: refresh captured")
+    local mutScroll = mutControl.__sfRankingScroll
+    mutScroll:SetHeight(280)
+    local deep = math.max(0, (#mutPayload.rows * 28) - 280)
+    mutScroll:SetVerticalScroll(deep)
+    assertTrue((mutScroll:GetVerticalScroll() or 0) > 0, "447-r9: scrolled deep before shrink")
+    -- Campaign change / shorter list.
+    mutPayload = {
+        rows = {
+            { name = "OnlyA-Garona", totalCopper = 100 },
+            { name = "OnlyB-Garona", totalCopper = 50 },
+        },
+        maxPositive = 100,
+        hasHistory = true,
+    }
+    mutRefresh()
+    assertEq(mutScroll:GetVerticalScroll(), 0, "447-r9: scroll clamped after list shrink")
+    assertEq(mutControl.__sfRankingContent:GetHeight(), 2 * 28,
+        "447-r9: content height matches short list")
+    local shortNames = mutControl.__sfRankingVisibleNames()
+    assertEq(shortNames[1], "OnlyA-Garona", "447-r9: short list first row")
+    assertTrue(mutControl.__sfRankingPoolCount() <= 20,
+        "447-r9: pool still bounded after campaign shrink")
+
+    -- Empty / no-history hides bars and clears visible pool.
+    mutPayload = {
+        rows = {},
+        maxPositive = 0,
+        hasHistory = false,
+        emptyReason = "no_contributions",
+    }
+    mutRefresh()
+    assertEq(#mutControl.__sfRankingVisibleNames(), 0,
+        "447-r9: empty clears visible pool")
+    assertEq(mutControl.__sfRankingContent:GetHeight(), 1,
+        "447-r9: empty content height collapsed")
+
+    -- Access-loss / custom empty text path.
+    mutPayload = {
+        rows = {},
+        emptyText = "Rankings unavailable",
+    }
+    mutRefresh()
+    assertEq(#mutControl.__sfRankingVisibleNames(), 0,
+        "447-r9: access-loss clears visible pool")
+
     Controls.InitRow = priorInit
     Controls._ApplyRowState = priorApply
     CreateFrame = priorCreateFrame
