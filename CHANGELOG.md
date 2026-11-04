@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.2] - 2026-11-04
+
+### Changed
+- Raid Supplies Rankings: simplify layout and coin amounts (#450)
+
 ## [1.5.18-beta.1] - 2026-11-04
 
 ### Added
