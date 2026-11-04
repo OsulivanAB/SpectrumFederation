@@ -148,6 +148,8 @@ L["GUILD_SUPPLIES_LOGS_FILTER_ALL_CONTRIBUTORS"] = "All contributors"
 L["GUILD_SUPPLIES_LOGS_FILTER_ALL_ITEMS"] = "All items"
 L["GUILD_SUPPLIES_LOGS_FILTER_CONTRIBUTOR_TIP"] = "Show only entries for one contributor. Applies together with the item filter."
 L["GUILD_SUPPLIES_LOGS_FILTER_ITEM_TIP"] = "Show only entries for one item, including items later removed from Requested Items."
+L["GUILD_SUPPLIES_LOGS_FILTER_ITEM_ID_TIP"] = "Item ID: %d"
+L["GUILD_SUPPLIES_LOGS_FILTER_ITEM_LABEL_ID"] = "%s (%d)"
 L["GUILD_SUPPLIES_LOGS_FILTER_CLEAR"] = "Clear"
 L["GUILD_SUPPLIES_LOGS_FILTER_CLEAR_TIP"] = "Clear contributor and item filters."
 L["GUILD_SUPPLIES_LOGS_COL_CONTRIBUTOR"] = "Contributor"
@@ -598,6 +600,16 @@ L["SETTINGS_WINDOW_OPACITY_TOOLTIP"] = "Adjust the opacity of the settings windo
 -- Gameplay → UI Enhancements: Mouse Tracer Edge Softness (#444)
 L["MOUSE_TRACER_EDGE_SOFTNESS_LABEL"] = "Edge Softness"
 L["MOUSE_TRACER_EDGE_SOFTNESS_TOOLTIP"] = "Softens the trail's edges by gradually fading them to transparent. 0% keeps the original appearance."
+
+-- Temporary Mouse Tracer Edge Softness Retail diagnostic (#454). Remove with the diagnostic.
+L["MOUSE_TRACER_SOFTNESS_DIAG_TITLE"] = "Mouse Tracer Softness Diag (temporary #454)"
+L["MOUSE_TRACER_SOFTNESS_DIAG_HINT"] = "Compare isolated and overlapping SoftCircle_100 samples, then the live trail. Clear: /run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()"
+L["MOUSE_TRACER_SOFTNESS_DIAG_BLEND_NONE"] = "BLEND / no mask"
+L["MOUSE_TRACER_SOFTNESS_DIAG_ADD_NONE"] = "ADD / no mask"
+L["MOUSE_TRACER_SOFTNESS_DIAG_ADD_CIRCLE"] = "ADD / circle mask"
+L["MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_BLEND_NONE"] = "Overlap BLEND / no mask"
+L["MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_ADD_NONE"] = "Overlap ADD / no mask"
+L["MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_ADD_CIRCLE"] = "Overlap ADD / circle mask"
 
 -- Raid Check presence log summary (#442)
 L["RAID_CHECK_PRESENCE_SUMMARY"] = "Raid Check: %d present · %d eligible profile members"

@@ -14,7 +14,7 @@ Mouse Tracer is an optional per-character cursor trail. User-facing control desc
 
 `Init.lua` starts Mouse Tracer after `SettingsStore` and `SettingsApply`. Live values live in `SpectrumFederationCharDB`. Account-wide `mouseTracerCopies` exist only so **Copy From Character** can read another character's last saved settings. WoW cannot read another character's per-character SavedVariables.
 
-Character defaults (filled only when a key is unset): off, Trail Length 400, Fade Duration 0.50, Trail Thickness 16, Rainbow Cycle Speed 0.25, Trail Opacity 0.70, Edge Softness 0. Do not bump `SettingsSchema.VERSION` for these defaults. `MergeDefaults` fills missing character and account keys.
+Character defaults (filled only when a key is unset): off, Trail Length 400, Fade Duration 0.50, Trail Thickness 16, Rainbow Cycle Speed 0.25, Trail Opacity 0.70, Edge Softness 50. Do not bump `SettingsSchema.VERSION` for these defaults. `MergeDefaults` fills missing character and account keys. Existing saved Edge Softness values, including an explicit 0%, are preserved and are not migrated.
 
 ## Performance contract
 
@@ -52,7 +52,13 @@ No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to
 
 ### Resources
 
-`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask`; steps `10`–`100` swap each stamp to a precomputed soft TGA under `media/MouseTracer/` while retaining the hard circular mask so feathering stays inside the stamp bounds. Do not return to square `CreateLine` quads.
+`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures and must not grow at runtime. Softness `0` keeps `TempPortraitAlphaMask` with `ADD` blending (original hard circular look). Steps `10`–`100` use the SoftCircle TGA with `BLEND` and clear any legacy mask via `SetMask("")` (`CLEARED_MASK`). SoftCircle alpha defines the circular feather; do not return to square `CreateLine` quads.
+
+Retail (#454) confirmed: SoftCircle + BLEND with no active mask renders a soft glow; `SetMask("Interface\\Buttons\\WHITE8X8")` immediately turns that sample into a hard square; `SetTexture` does not remove an active mask; `SetMask("")` restores the soft glow. Do not use WHITE8X8 (or any opaque rect) as a soft-stamp mask.
+
+Appearance is resolved once per effective softness change. Live stamps refresh immediately; hidden pool slots adopt the cached texture/mask/blend on the next `Show`/reuse. Softness-only updates must not rewrite the whole pool, reconfigure geometry, or reset fade alpha. When applying appearance, skip unchanged per-slot texture, mask, and blend setters independently (nonzero→nonzero must not reissue mask/blend). Applied cleared-mask state is the empty string, distinct from an uninitialized per-slot cache entry (`nil`). The sample/fade hot path stays allocation-free and must not format texture paths or read the settings Store.
+
+The checked-in SoftCircle_10..100.tga files are the authoritative soft assets. There is no checked-in generator recipe for them; do not invent or run a formula that would overwrite those files.
 
 Cadence constants:
 
@@ -83,7 +89,7 @@ Cursor coordinates come from `GetCursorPosition()` divided by the host's effecti
 
 Sliders write character settings immediately so the visible trail updates while dragging. Account-wide copy snapshots are debounced (~0.35s) with one reusable ticker. Enable/disable, Copy From Character, login, and logout flush immediately.
 
-Copy From Character applies every character key under `SETTING_KEYS` (including Edge Softness) under `applySuspended` so the runtime reconfigures once, writes one snapshot, and refreshes the page once. Missing keys in older snapshots resolve to defaults (`edgeSoftness` → `0`) rather than leaving the destination's previous value.
+Copy From Character applies every character key under `SETTING_KEYS` (including Edge Softness) under `applySuspended` so the runtime reconfigures once, writes one snapshot, and refreshes the page once. Missing keys in older snapshots resolve to defaults (`edgeSoftness` → `50`) rather than leaving the destination's previous value.
 
 Identity keys for snapshots use `NameUtil.GetSelfId()` (`Name-Realm`). Compare identities with `NameUtil.SamePlayer`.
 
@@ -98,3 +104,23 @@ python -m pytest tests/test_mouse_tracer.py
 PR validation on `beta` and `main` runs that file beside the Settings navigation and Cursed Surge Tracker tests.
 
 In-game profiler checks must use isolated `C_AddOnProfiler.MeasureCall` around Mouse Tracer work. Addon-wide LastTime is not a Mouse Tracer pass/fail signal.
+
+### Temporary Edge Softness diagnostic (#454)
+
+Until Retail confirms the soft-edge mechanism, a temporary on-screen comparison is available:
+
+```text
+/run SpectrumFederation.MouseTracer:RunEdgeSoftnessDiagnostic()
+/run SpectrumFederation.MouseTracer:ClearEdgeSoftnessDiagnostic()
+```
+
+It reuses one bounded panel with fixed-role SoftCircle_100 samples:
+
+- isolated **BLEND / no mask** (SetMask never called)
+- isolated **ADD / no mask**
+- isolated **ADD / circular mask**
+- overlapping copies under each of those three conditions
+
+Retail used this panel to prove WHITE8X8 masking causes hard squares and that `SetMask("")` clears them. Production soft stamps now clear via `SetMask("")` rather than leaving no-mask-only diagnostic samples as the sole path. `SF.Debug` records texture load success/path, whether SetMask was called, mask outcome, and actual blend mode. Clear only hides the panel; repeated open/close must not grow frames or textures. Localized via `locale/enUS.lua`. Remove this diagnostic after final Retail QA of the live trail.
+
+Human comparison should also include live trail slow/fast movement, crossings, stationary fading, 0/50/100%, soft↔hard transitions, and ring-buffer wraparound.
