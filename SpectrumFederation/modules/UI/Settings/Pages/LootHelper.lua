@@ -241,38 +241,118 @@ local function GetRaidCheckConfig()
 	return nil
 end
 
--- Prefer RaidCheck's last UI status so an immediately completed run cannot be
--- overwritten by a late "started" SetMessage from this button handler.
+local function Loc(key, default)
+	if SF.LocaleText then
+		return SF.LocaleText(key, default)
+	end
+	return default
+end
+
+local function RaidCheckModeLabel(mode)
+	if mode == "pre" then
+		return "Pre-Raid Check"
+	end
+	return "Raid Check"
+end
+
+local function UiStatusBelongsToCurrentInvocation(ui)
+	if type(ui) ~= "table" then
+		return false
+	end
+	if not (SF.RaidCheck and SF.RaidCheck.GetUiStatusGeneration) then
+		return type(ui.message) == "string" and ui.message ~= ""
+	end
+	local generation = SF.RaidCheck:GetUiStatusGeneration()
+	return ui.generation == generation and type(ui.message) == "string" and ui.message ~= ""
+end
+
+local function ApplyUiStatusToSection(section, ui)
+	if not section or not section.SetMessage or not UiStatusBelongsToCurrentInvocation(ui) then
+		return false
+	end
+	local kind = ui.kind
+		or ((ui.status == "completed") and "success")
+		or ((ui.status == "error") and "error")
+		or ((ui.status == "busy") and "warn")
+		or "info"
+	section:SetMessage(ui.message, kind)
+	return true
+end
+
+-- Prefer RaidCheck's current-invocation UI status so an immediately completed run
+-- cannot be overwritten by a late "started" SetMessage, and a failed new attempt
+-- cannot reuse a prior success (Codex #458).
 local function ApplyRaidCheckButtonStatus(ctx, status, mode)
 	if not ctx or not ctx.section or not ctx.section.SetMessage then
 		return
 	end
-	local label = (mode == "pre") and "Pre-Raid Check" or "Raid Check"
-	if status == "prompt" then
-		ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info")
-		return
-	end
+	local label = RaidCheckModeLabel(mode)
 	if status == "busy" then
-		ctx.section:SetMessage("A Raid Check is already in progress.", "warn")
+		ctx.section:SetMessage(
+			Loc("RAID_CHECK_UI_BUSY", "A Raid Check is already in progress."),
+			"warn"
+		)
 		return
 	end
 	local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
-	if ui and type(ui.message) == "string" and ui.message ~= "" then
-		local kind = ui.kind or ((ui.status == "completed") and "success") or ((ui.status == "error") and "error") or "info"
-		ctx.section:SetMessage(ui.message, kind)
+	if ApplyUiStatusToSection(ctx.section, ui) then
+		return
+	end
+	if status == "prompt" then
+		ctx.section:SetMessage(
+			Loc("RAID_CHECK_UI_PROMPT", "Choose Yes to start a session, No to run without one, or Cancel to abort."),
+			"info"
+		)
 		return
 	end
 	if status == "completed" then
-		ctx.section:SetMessage(label .. " complete.", "success")
+		ctx.section:SetMessage(
+			Loc("RAID_CHECK_UI_COMPLETE_FALLBACK", "%s complete."):format(label),
+			"success"
+		)
 		return
 	end
 	if status == "started" then
-		ctx.section:SetMessage(label .. " started.", "info")
+		ctx.section:SetMessage(
+			Loc("RAID_CHECK_UI_STARTED", "%s started."):format(label),
+			"info"
+		)
 		return
 	end
 	if status == "error" then
-		ctx.section:SetMessage(label .. " could not be started.", "error")
+		ctx.section:SetMessage(
+			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(label),
+			"error"
+		)
 	end
+end
+
+local function EnsureRaidCheckUiStatusListener(panel)
+	if not panel or panel.__sfRaidCheckUiStatusRegistered then
+		return
+	end
+	if not (SF.RaidCheck and SF.RaidCheck.RegisterUiStatusListener) then
+		return
+	end
+	panel.__sfRaidCheckUiStatusKey = panel.__sfRaidCheckUiStatusKey or panel
+	SF.RaidCheck:RegisterUiStatusListener(panel.__sfRaidCheckUiStatusKey, function(ui)
+		if not panel.IsShown or not panel:IsShown() then
+			return
+		end
+		local section = panel.__sfSections and panel.__sfSections.session
+		ApplyUiStatusToSection(section, ui)
+	end)
+	panel.__sfRaidCheckUiStatusRegistered = true
+end
+
+local function ClearRaidCheckUiStatusListener(panel)
+	if not panel or not panel.__sfRaidCheckUiStatusRegistered then
+		return
+	end
+	if SF.RaidCheck and SF.RaidCheck.UnregisterUiStatusListener then
+		SF.RaidCheck:UnregisterUiStatusListener(panel.__sfRaidCheckUiStatusKey or panel)
+	end
+	panel.__sfRaidCheckUiStatusRegistered = false
 end
 
 local function GetRaidCheckPointsAwardPerCheck()
@@ -1760,6 +1840,23 @@ end
 
 function SessionPage:Build(panel)
 	BuildPage(panel, self.id, { "session" })
+	if panel and panel.HookScript and not panel.__sfRaidCheckUiStatusHooked then
+		panel.__sfRaidCheckUiStatusHooked = true
+		panel:HookScript("OnShow", function()
+			EnsureRaidCheckUiStatusListener(panel)
+			local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
+			local section = panel.__sfSections and panel.__sfSections.session
+			ApplyUiStatusToSection(section, ui)
+		end)
+		panel:HookScript("OnHide", function()
+			ClearRaidCheckUiStatusListener(panel)
+		end)
+	end
+	if panel and panel.IsShown and panel:IsShown() then
+		EnsureRaidCheckUiStatusListener(panel)
+	else
+		ClearRaidCheckUiStatusListener(panel)
+	end
 end
 
 function SessionPage:Refresh(panel)

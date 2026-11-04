@@ -83,7 +83,11 @@ def test_raid_check_completion_production_lua():
     ).read_text(encoding="utf-8")
     assert "EmitAdminCompletionSummary" in raid_check
     assert "GetLastUiStatus" in raid_check
+    assert "BeginUiStatusInvocation" in raid_check
+    assert "RegisterUiStatusListener" in raid_check
     assert "ApplyRaidCheckButtonStatus" in loot_helper
+    assert "EnsureRaidCheckUiStatusListener" in loot_helper
+    assert "UiStatusBelongsToCurrentInvocation" in loot_helper
     assert "FormatCompletionSummary" in CHECK_RUN.read_text(encoding="utf-8")
 
 

@@ -64,7 +64,9 @@ Someone who joins after freeze is ignored. Someone who leaves stays in the run a
 
 ## Results
 
-When a check finishes, the initiating admin receives exactly one local chat completion summary with Prepared, Unprepared, and Inspection Failed counts. That summary does not depend on debug logging or player whispers, and it does not imply every inspection succeeded. Local-only synchronization warnings and permission or profile failures keep their existing messages. The Loot Helper → Session status line prefers that final result over a stale "started" update, including when the check settles before the button handler returns.
+When a check finishes, the initiating admin receives exactly one local chat completion summary with Prepared, Unprepared, and Inspection Failed counts. That summary does not depend on debug logging or player whispers, and it does not imply every inspection succeeded. Local-only synchronization warnings and permission or profile failures keep their existing messages.
+
+The Loot Helper → Session status line follows the current check invocation: it prefers an immediate final result over a late "started" update, replaces prompt text when the session dialog is answered or cancelled, and updates an already-open page when completion or failure arrives after the button returns. A failed new attempt does not reuse a previous check's success. The page registers one status listener while shown and clears it on hide.
 
 **Pre-Raid Check** reports results. It does not award points, Attendance, or Reward Pot changes.
 

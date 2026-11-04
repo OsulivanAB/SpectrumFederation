@@ -589,6 +589,18 @@ L["RAID_CHECK_PRESENCE_SUMMARY_PREPARED"] = "Raid Check: %d present · %d eligib
 -- Raid Check initiating-admin completion summary (#449)
 L["RAID_CHECK_COMPLETION_SUMMARY"] = "[%s] Complete: %d Prepared · %d Unprepared · %d Inspection Failed"
 
+-- Raid Check Settings Session status (#449)
+L["RAID_CHECK_UI_PROMPT"] = "Choose Yes to start a session, No to run without one, or Cancel to abort."
+L["RAID_CHECK_UI_BUSY"] = "A Raid Check is already in progress."
+L["RAID_CHECK_UI_STARTED"] = "%s started."
+L["RAID_CHECK_UI_COMPLETE_FALLBACK"] = "%s complete."
+L["RAID_CHECK_UI_START_FAILED"] = "%s could not be started."
+L["RAID_CHECK_UI_CANCELLED"] = "%s cancelled."
+L["RAID_CHECK_UI_SESSION_UNAVAILABLE"] = "Loot Helper Sync is unavailable. The check was not started."
+L["RAID_CHECK_UI_SESSION_START_FAILED"] = "Could not start a Loot Helper session. The check was not started."
+L["RAID_CHECK_UI_PREFLIGHT_UNAVAILABLE"] = "Session preflight dialog is unavailable."
+L["RAID_CHECK_UI_PREFLIGHT_SHOW_FAILED"] = "Could not show the session prompt. The check was not started."
+
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)
 	local value = L[key]

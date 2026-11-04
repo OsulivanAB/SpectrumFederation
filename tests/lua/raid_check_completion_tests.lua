@@ -397,10 +397,12 @@ local origRunRaidCheck = RC.RunRaidCheck
 function RC:RunRaidCheck()
     -- Emulate the race: caller still sees "started", but completion already wrote lastUiStatus.
     local state = self:_GetInspectState()
+    state.uiStatusGeneration = (state.uiStatusGeneration or 0) + 1
     state.lastUiStatus = {
         status = "completed",
         message = "[Raid Check] Complete: 2 Prepared · 0 Unprepared · 1 Inspection Failed",
         kind = "success",
+        generation = state.uiStatusGeneration,
     }
     return "started"
 end
@@ -417,10 +419,12 @@ RC.RunRaidCheck = origRunRaidCheck
 
 function RC:RunRaidCheck()
     local state = self:_GetInspectState()
+    state.uiStatusGeneration = (state.uiStatusGeneration or 0) + 1
     state.lastUiStatus = {
         status = "started",
         message = "Raid Check started.",
         kind = "info",
+        generation = state.uiStatusGeneration,
     }
     return "started"
 end
@@ -531,7 +535,265 @@ local abortUi = RC:GetLastUiStatus()
 assertEq(abortUi.status, "error", "impersonation abort records error UI status")
 Imp:Disable("completion-tests-cleanup")
 
+-- ---------------------------------------------------------------------------
+-- Codex #458: successful check then failed new attempt must not reuse success
+-- ---------------------------------------------------------------------------
+resetDB()
+local priorProfile = makeProfile("Prior Success")
+setActive(priorProfile)
+local priorRun = {
+    id = "prior",
+    profileId = priorProfile:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    },
+    targetIds = { "Admin-Garona" },
+    groupMemberIds = { "Admin-Garona" },
+    rosterMemberIds = priorProfile:GetMemberIds(),
+    players = { ["Admin-Garona"] = { guid = "g-prior" } },
+    mode = "raid",
+    cfg = priorProfile:GetRaidCheckConfig(),
+}
+resetPrintCapture()
+RC:_ApplyCheckConsequences(priorRun)
+assertEq(RC:GetLastUiStatus().status, "completed", "prior success records completed UI status")
+local priorGen = RC:GetUiStatusGeneration()
+
+SF.lootHelperDB.activeProfile = nil
+SF.lootHelperDB.activeProfileId = nil
+messages = {}
+local failStatus = RC:BeginCheck("raid")
+assertEq(failStatus, "error", "missing profile fails a new BeginCheck")
+assertTrue(RC:GetUiStatusGeneration() > priorGen, "failed new attempt bumps UI status generation")
+assertEq(RC:GetLastUiStatus().status, "error", "failed new attempt records error UI status")
+assertTrue(not tostring(RC:GetLastUiStatus().message or ""):find("Complete:", 1, true),
+    "failed new attempt does not keep the prior Complete summary")
+
+-- Production Settings button path for Raid Check and Pre-Raid Check
+local preRaidOnClick
+raidCheckOnClick = nil
+for _, section in ipairs(capturedDef.sections or {}) do
+    for _, item in ipairs(section.items or {}) do
+        if item.type == "buttonRow" then
+            for _, button in ipairs(item) do
+                if type(button) == "table" and button.text == "Raid Check" then
+                    raidCheckOnClick = button.onClick
+                elseif type(button) == "table" and button.text == "Pre-Raid Check" then
+                    preRaidOnClick = button.onClick
+                end
+            end
+        end
+    end
+end
+assertTrue(type(raidCheckOnClick) == "function", "Raid Check onClick still available")
+assertTrue(type(preRaidOnClick) == "function", "Pre-Raid Check onClick exists")
+
+messages = {}
+raidCheckOnClick(ctx)
+assertEq(#messages, 1, "failed Raid Check click writes one Settings message")
+assertTrue(messages[1][1]:find("could not be started", 1, true),
+    "Raid Check Settings shows start failure instead of prior success")
+assertEq(messages[1][2], "error", "Raid Check failure Settings kind is error")
+
+messages = {}
+preRaidOnClick(ctx)
+assertEq(#messages, 1, "failed Pre-Raid Check click writes one Settings message")
+assertTrue(messages[1][1]:find("could not be started", 1, true),
+    "Pre-Raid Check Settings shows start failure instead of prior success")
+assertEq(messages[1][2], "error", "Pre-Raid Check failure Settings kind is error")
+
+-- ---------------------------------------------------------------------------
+-- Delayed completion updates an already-open Settings page via listener
+-- ---------------------------------------------------------------------------
+resetDB()
+local delayedProfile = makeProfile("Delayed Complete")
+setActive(delayedProfile)
+local sessionPanel = {
+    shown = true,
+    __sfSections = {
+        session = {
+            messages = {},
+            SetMessage = function(self, text, kind)
+                self.messages[#self.messages + 1] = { tostring(text), kind }
+            end,
+        },
+    },
+    IsShown = function(self) return self.shown end,
+    HookScript = function(self, event, fn)
+        self.hooks = self.hooks or {}
+        self.hooks[event] = fn
+    end,
+}
+local beforeListeners = RC:CountUiStatusListeners()
+registeredPages.lootHelperSession:Build(sessionPanel)
+assertTrue(type(sessionPanel.hooks) == "table", "Session page hooks OnShow/OnHide")
+sessionPanel.hooks.OnShow()
+assertEq(RC:CountUiStatusListeners(), beforeListeners + 1, "open Session page registers one UI status listener")
+
+-- Begin a real delayed run: start without settling, then apply later.
+Sync.state.active = true
+Sync.state.sessionId = "SES-DELAY"
+Sync.state.profileId = delayedProfile:GetProfileId()
+Sync.state._sessionAnnounced = "SES-DELAY"
+local origShouldSettle2 = CheckRun.ShouldSettle
+function CheckRun.ShouldSettle()
+    return false, "test_hold"
+end
+resetPrintCapture()
+sessionPanel.__sfSections.session.messages = {}
+local started = RC:BeginCheck("raid")
+CheckRun.ShouldSettle = origShouldSettle2
+assertEq(started, "started", "held check returns started")
+assertEq(RC:GetLastUiStatus().status, "started", "delayed path records started UI status")
+assertTrue(#sessionPanel.__sfSections.session.messages >= 1, "listener received started status")
+assertTrue(sessionPanel.__sfSections.session.messages[#sessionPanel.__sfSections.session.messages][1]:find("started", 1, true),
+    "open Settings shows started while check runs")
+
+local delayedRun = RC:_GetInspectState().adhocRun
+assertTrue(delayedRun ~= nil, "adhoc run remains for delayed completion")
+delayedRun.classified = true
+delayedRun.classifiedResults = {
+    ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+}
+delayedRun.targetIds = { "Admin-Garona" }
+delayedRun.groupMemberIds = { "Admin-Garona" }
+delayedRun.rosterMemberIds = delayedProfile:GetMemberIds()
+delayedRun.players = { ["Admin-Garona"] = { guid = "g-delay" } }
+sessionPanel.__sfSections.session.messages = {}
+resetPrintCapture()
+RC:_ApplyCheckConsequences(delayedRun)
+RC:_GetInspectState().adhocRun = nil
+assertEq(countPrinted("success", "Complete:"), 1, "delayed completion prints one chat summary")
+assertEq(RC:GetLastUiStatus().status, "completed", "delayed completion records completed UI status")
+assertEq(#sessionPanel.__sfSections.session.messages, 1, "listener updates Settings once on delayed completion")
+assertTrue(sessionPanel.__sfSections.session.messages[1][1]:find("Complete:", 1, true),
+    "open Settings replaces started with completion summary")
+
+-- ---------------------------------------------------------------------------
+-- Session-prompt choices, cancellation, and startup failure
+-- ---------------------------------------------------------------------------
+resetDB()
+local promptProfile = makeProfile("Prompt Flow")
+setActive(promptProfile)
+Sync.state.active = false
+local yesCb, noCb, cancelCb
+function SF.SettingsUI.Dialogs:ConfirmChoice(_msg, _yes, _no, onYes, onNo, onCancel)
+    yesCb, noCb, cancelCb = onYes, onNo, onCancel
+    return true
+end
+sessionPanel.__sfSections.session.messages = {}
+local promptStatus = RC:BeginCheck("raid")
+assertEq(promptStatus, "prompt", "no-session BeginCheck opens prompt")
+assertEq(RC:GetLastUiStatus().status, "prompt", "prompt records prompt UI status")
+assertTrue(type(cancelCb) == "function", "prompt captures Cancel callback")
+cancelCb()
+assertEq(RC:GetLastUiStatus().status, "cancelled", "Cancel records cancelled UI status")
+assertTrue(RC:GetLastUiStatus().message:find("cancelled", 1, true), "Cancel message is localized cancelled text")
+
+yesCb, noCb, cancelCb = nil, nil, nil
+promptStatus = RC:BeginCheck("pre")
+assertEq(promptStatus, "prompt", "Pre-Raid Check also opens prompt without a session")
+assertTrue(type(yesCb) == "function", "prompt captures Yes callback")
+function Sync:StartSession()
+    return nil
+end
+sessionPanel.__sfSections.session.messages = {}
+yesCb()
+assertEq(RC:GetLastUiStatus().status, "error", "Yes-path StartSession failure records error UI status")
+assertTrue(RC:GetLastUiStatus().message:find("Could not start a Loot Helper session", 1, true),
+    "Yes-path failure replaces prompt text with session-start failure")
+
+yesCb, noCb, cancelCb = nil, nil, nil
+promptStatus = RC:BeginCheck("raid")
+assertEq(promptStatus, "prompt", "prompt reopens after prior failure")
+assertTrue(type(noCb) == "function", "prompt captures No callback")
+local origShouldSettle3 = CheckRun.ShouldSettle
+function CheckRun.ShouldSettle()
+    return true, "test_no_path"
+end
+resetPrintCapture()
+noCb()
+CheckRun.ShouldSettle = origShouldSettle3
+assertTrue(RC:GetLastUiStatus().status == "completed" or RC:GetLastUiStatus().status == "started",
+    "No-path starts the check without a session")
+
+-- ---------------------------------------------------------------------------
+-- Page close/reopen: listeners converge; no duplicate completion chat
+-- ---------------------------------------------------------------------------
+local listenerBefore = RC:CountUiStatusListeners()
+sessionPanel.hooks.OnHide()
+assertEq(RC:CountUiStatusListeners(), listenerBefore - 1, "OnHide unregisters the UI status listener")
+sessionPanel.hooks.OnShow()
+assertEq(RC:CountUiStatusListeners(), listenerBefore, "OnShow re-registers exactly one listener")
+for _ = 1, 20 do
+    sessionPanel.hooks.OnHide()
+    sessionPanel.hooks.OnShow()
+end
+assertEq(RC:CountUiStatusListeners(), listenerBefore, "repeated open/close keeps listener count converged")
+
+resetPrintCapture()
+local reopenUi = RC:GetLastUiStatus()
+sessionPanel.hooks.OnHide()
+sessionPanel.hooks.OnShow()
+assertEq(countPrinted("success", "Complete:"), 0, "page reopen does not reprint completion chat")
+assertEq(RC:GetLastUiStatus().message, reopenUi and reopenUi.message or nil,
+    "page reopen does not invent a new completion status")
+
+-- ---------------------------------------------------------------------------
+-- Missing admin permission + completion with debug/whispers disabled
+-- ---------------------------------------------------------------------------
+resetDB()
+local whisperProfile = makeProfile("Whisper Off")
+setActive(whisperProfile)
+local cfgQuiet = whisperProfile:GetRaidCheckConfig()
+cfgQuiet.enableWhispersRaid = false
+cfgQuiet.enableWhispersRaidPrepared = false
+cfgQuiet.enableWhispersPreRaid = false
+local quietRun = {
+    id = "quiet",
+    profileId = whisperProfile:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+        ["Fail-Garona"] = { class = CheckRun.CLASS.INSPECTION_FAILED },
+    },
+    targetIds = { "Admin-Garona", "Fail-Garona" },
+    groupMemberIds = { "Admin-Garona", "Fail-Garona" },
+    rosterMemberIds = whisperProfile:GetMemberIds(),
+    players = {
+        ["Admin-Garona"] = { guid = "gq1" },
+        ["Fail-Garona"] = { guid = "gq2" },
+    },
+    mode = "raid",
+    cfg = cfgQuiet,
+}
+assertTrue(whisperProfile:AddMember(SF.Member.new("Fail-Garona", "member", "WARRIOR")), "add Fail member")
+quietRun.rosterMemberIds = whisperProfile:GetMemberIds()
+resetPrintCapture()
+RC:_ApplyCheckConsequences(quietRun)
+assertEq(
+    countPrinted("success", "[Raid Check] Complete: 1 Prepared · 0 Unprepared · 1 Inspection Failed"),
+    1,
+    "completion prints with whispers disabled"
+)
+assertTrue(#debugInfos >= 1, "debug logger still receives Complete diagnostics when enabled in test harness")
+
+resetDB()
+local noAdmin = makeProfile("No Admin")
+-- Remove current user from admins while keeping profile active.
+noAdmin._adminUsers = { "Other-Garona" }
+setActive(noAdmin)
+resetPrintCapture()
+local noAdminStatus = RC:BeginCheck("raid")
+assertEq(noAdminStatus, "error", "non-admin BeginCheck fails")
+assertEq(RC:GetLastUiStatus().status, "error", "non-admin failure records error UI status")
+assertEq(countPrinted("error", "Only admins can run raid checks."), 1, "non-admin prints permission error")
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
 end
+
