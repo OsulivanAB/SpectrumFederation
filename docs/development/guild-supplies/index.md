@@ -17,7 +17,7 @@ Issue contracts: [#385](https://github.com/OsulivanAB/SpectrumFederation/issues/
 | Authenticated remote admission / adoption / conflicts | `Admission` (`AdmitRemote*`, adoption APIs) |
 | Campaign reset, archives, bank-context capture, eligibility | `Campaigns` |
 | Guarded live activation + cutover marker | `Activation` (`ActivateCanonicalDataset`, `InstallRemoteLiveCutover`) |
-| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 3`) via Guild Gossip API |
+| Configuration + accounting gossip provider | `Gossip` (`sf.guildsupplies.config`, `PROVIDER_SCHEMA = 4`) via Guild Gossip API |
 | Campaign display names (#424) | `rename-campaign` ops + `campaignNames` projection; LWW by `(timestamp, op.id)`; no Troubleshooting conflict |
 | Donation evidence / officer or three-witness ledger | `Ledger` |
 | Witness identity + contribution attribution (#427) | Guild Info main/alt (read-only); durable donor fields unchanged; legacy `identityLinks` inert |

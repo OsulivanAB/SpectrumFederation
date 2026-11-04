@@ -811,6 +811,9 @@ function SettingsWindow:OnImpersonationChanged()
         return
     end
     self:UpdateImpersonationBanner()
+    -- Officer-only conditional pages (e.g. Raid Supplies Rankings) consult
+    -- Preview as Non-Admin via canEdit; revalidate tabs/selection before refresh.
+    self:HandleDurableAvailabilityChange()
     if self.frame.IsShown and self.frame:IsShown() then
         self:RefreshCurrentPage()
     end
@@ -1172,6 +1175,47 @@ function SettingsWindow:Init()
             SettingsWindow:HandleDurableAvailabilityChange()
         end)
         self._gsDurableListener = true
+    end
+
+    -- Shared officer-policy changes grant/revoke Rankings availability without a
+    -- Guild Supplies durable write. Same selection/tab revalidation path.
+    local GO = SF.GuildOfficer
+    if GO and GO.RegisterUIListener and not self._goDurableListener then
+        GO.RegisterUIListener(function()
+            SettingsWindow:HandleDurableAvailabilityChange()
+        end)
+        self._goDurableListener = true
+    end
+
+    -- Roster/guild membership can flip officer rank (and Rankings availability)
+    -- before any GS/GO durable notify. Coalesce onto the same revalidation path
+    -- so tabs/search/selection update while the window stays open (#447).
+    if not self._rosterAvailabilityFrame and type(CreateFrame) == "function" then
+        local frame = CreateFrame("Frame")
+        self._rosterAvailabilityFrame = frame
+        local pending = false
+        local function queue()
+            if pending then
+                return
+            end
+            pending = true
+            local function run()
+                pending = false
+                SettingsWindow:HandleDurableAvailabilityChange()
+            end
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0, run)
+            else
+                run()
+            end
+        end
+        if frame.RegisterEvent then
+            pcall(frame.RegisterEvent, frame, "GUILD_ROSTER_UPDATE")
+            pcall(frame.RegisterEvent, frame, "PLAYER_GUILD_UPDATE")
+        end
+        frame:SetScript("OnEvent", function()
+            queue()
+        end)
     end
 
     self:BuildNavItemsFromRegistry()

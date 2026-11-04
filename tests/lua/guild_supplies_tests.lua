@@ -5056,18 +5056,24 @@ do
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
 
     local configPage = SF.SettingsUI.pagesById.guildSuppliesConfiguration
     local logsPage = SF.SettingsUI.pagesById.guildSuppliesLogs
+    local rankingsPage = SF.SettingsUI.pagesById.guildSuppliesRankings
     local troubleshootingPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
     assertTrue(configPage ~= nil, "Configuration page registered")
     assertTrue(logsPage ~= nil, "Logs page registered")
+    assertTrue(rankingsPage ~= nil, "Rankings page registered")
     assertTrue(troubleshootingPage ~= nil, "Troubleshooting page registered")
     assertTrue(type(configPage.Build) == "function" and type(configPage.Refresh) == "function",
         "Configuration exposes Build/Refresh")
     assertTrue(type(logsPage.Build) == "function" and type(logsPage.Refresh) == "function",
         "Logs exposes Build/Refresh")
+    assertTrue(type(rankingsPage.Build) == "function" and type(rankingsPage.Refresh) == "function",
+        "Rankings exposes Build/Refresh")
+    assertTrue(type(rankingsPage.available) == "function", "Rankings has available hook")
     assertTrue(type(troubleshootingPage.Build) == "function"
             and type(troubleshootingPage.Refresh) == "function",
         "Troubleshooting exposes Build/Refresh")
@@ -35966,16 +35972,16 @@ do
 end
 
 do
-    -- B1: PROVIDER_SCHEMA advanced for valuation-aware wire (discussion_r4364648464).
-    assertEq(GS.PROVIDER_SCHEMA, 3, "val: B1 PROVIDER_SCHEMA is 3")
+    -- B1: PROVIDER_SCHEMA tracks the current wire gate (#447 bumps to 4).
+    assertEq(GS.PROVIDER_SCHEMA, 4, "val: B1 PROVIDER_SCHEMA is 4")
     local record = activateValuationGuild(9903)
     assertEq(GS:EnsureGossipProvider(), true, "val: B1 provider")
     local prov = GG.GetProvider(GS.PROVIDER_ID)
     assertTrue(type(prov) == "table", "val: B1 provider registered")
-    assertEq(tonumber(prov.schema), 3, "val: B1 registered schema 3")
+    assertEq(tonumber(prov.schema), 4, "val: B1 registered schema 4")
     local wireCaps = prov.api and prov.api.GetCapabilities and prov.api.GetCapabilities()
     assertTrue(type(wireCaps) == "table", "val: B1 provider GetCapabilities")
-    assertEq(tonumber(wireCaps.schema), 3, "val: B1 wire capabilities schema 3")
+    assertEq(tonumber(wireCaps.schema), 4, "val: B1 wire capabilities schema 4")
     drainExportMaint(32)
     local descSchema = nil
     for _, row in ipairs(collectAllExportBodies()) do
@@ -35984,12 +35990,13 @@ do
             descSchema = row.body.schemaVersion
         end
     end
-    assertEq(descSchema, 3, "val: B1 descriptor schemaVersion 3")
-    -- Strict GG equality: older schemas are incompatible with local schema 3.
+    assertEq(descSchema, 4, "val: B1 descriptor schemaVersion 4")
+    -- Strict GG equality: older schemas are incompatible with local schema 4.
     local localSchema = tonumber(prov.schema)
-    assertEq(localSchema, 3, "val: B1 local schema 3")
-    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 3")
-    assertEq(tonumber(3) == localSchema, true, "val: B1 new/new compatible")
+    assertEq(localSchema, 4, "val: B1 local schema 4")
+    assertTrue(localSchema ~= 3, "val: B1 old schema 3 incompatible with local 4")
+    assertTrue(localSchema ~= 2, "val: B1 old schema 2 incompatible with local 4")
+    assertEq(tonumber(4) == localSchema, true, "val: B1 new/new compatible")
     -- Persisted local schema stays 1 across the wire bump.
     assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, GS.SCHEMA_VERSION,
         "val: B1 persisted root schema unchanged")
@@ -40233,7 +40240,7 @@ do
     local camp1Id = record.currentCampaignId
     assertEq(GS.GetCampaignDisplayName(record, camp1Id), camp1Id,
         "424: new campaign falls back to ID")
-    assertEq(GS.PROVIDER_SCHEMA, 3, "424: provider schema is 3")
+    assertEq(GS.PROVIDER_SCHEMA, 4, "424: provider schema is 4")
 
     -- Ordinary member cannot rename.
     setPlayer("Dave-Garona", "Player-1-Dave", 4)
@@ -40571,7 +40578,7 @@ do
 end
 
 -- #424 multi-rename adoption newest-first retains losers; projects LWW winner
--- #424 adoption carries names; wrong dataset rejected; provider schema is 3
+-- #424 adoption carries names; wrong dataset rejected; provider schema is 4
 do
     resetDb()
     switchPlayer("Alice", "Player-1-Alice", 1)
@@ -40628,7 +40635,7 @@ do
     assertEq(record.datasetId, ds, "424-adopt: dataset replaced")
     assertEq(GS.GetCampaignDisplayName(record, campId), "AdoptMe", "424-adopt: name adopted")
     assertEq(record.campaignNames[campId].name, "AdoptMe", "424-adopt: name metadata")
-    assertEq(GS.PROVIDER_SCHEMA, 3, "424-adopt: schema is 3")
+    assertEq(GS.PROVIDER_SCHEMA, 4, "424-adopt: schema is 4")
 end
 
 local function adoptExportNewestFirstRenames(exportBodies, preferLaterRename)
@@ -41954,7 +41961,7 @@ do
     assertEq(GS.ValidateIdentityLinks(record.identityLinks), true, "427-legacy: links valid")
     assertEq(GS.AreSameWitnessIdentity(record, "Player-1-Dave", "Player-1-Eve"), false,
         "427-legacy: links do not drive witness identity")
-    assertEq(GS.PROVIDER_SCHEMA, 3, "427-schema: provider schema 3")
+    assertEq(GS.PROVIDER_SCHEMA, 4, "427-schema: provider schema 4")
     assertEq(GS.SCHEMA_VERSION, 1, "427-schema: durable root schema unchanged")
 end
 
@@ -42908,6 +42915,2842 @@ do
     local _, _, hardErr = GS.BindCharacterIdentity(
         record, "Eve-Garona", "Player-1-Dave", nil)
     assertEq(hardErr, "attribution_mismatch", "427-r17: resolved mismatch still hard")
+end
+
+---------------------------------------------------------------------------
+-- #447 Rankings: aggregation, adjustment valuation, access, lifecycle
+---------------------------------------------------------------------------
+
+local function rankingsFindAdj(record, itemId, quantity)
+    local lists = {
+        record and record.accounting and record.accounting._consumableEvents,
+        record and record.accounting and record.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and (not itemId or tonumber(ev.itemId) == itemId)
+                    and (not quantity or tonumber(ev.quantity) == quantity) then
+                    return ev
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function rankingsByName(projected)
+    local map = {}
+    if type(projected) ~= "table" or type(projected.rows) ~= "table" then
+        return map
+    end
+    for i = 1, #projected.rows do
+        local row = projected.rows[i]
+        if type(row) == "table" and type(row.name) == "string" then
+            map[row.name] = tonumber(row.totalCopper) or 0
+        end
+    end
+    return map
+end
+
+do
+    -- 447-1) Production donation valuation + attributed signed adjustments aggregate
+    -- under current mains; unattributed and unpriced count correctly; no board persisted.
+    valuationTsmCalls = 0
+    valuationTsmValue = 1000
+    SF.TSM = {
+        GetMarketValue = function()
+            valuationTsmCalls = valuationTsmCalls + 1
+            return valuationTsmValue
+        end,
+    }
+    local record = activateValuationGuild(9447)
+    creditValuationDeposit(record, {
+        itemId = 9447, quantity = 5, donor = "Bob-Garona",
+    })
+    record = GS:GetCurrentRecord()
+    local donation = valuationFindDonation(record, 9447, 5)
+    assertTrue(donation ~= nil, "447-1: donation present")
+    assertEq(donation.gsProductionCredit, true, "447-1: donation credited")
+    assertTrue(valuationSnap(record, donation.txnId) ~= nil, "447-1: donation priced")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjPos = select(1, GS:NewAdjustmentOperation(9447, 3, "Carol-Garona"))
+    assertTrue(adjPos ~= nil, "447-1: +3 attributed prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjPos), "accepted", "447-1: +3 applied")
+    local adjNeg = select(1, GS:NewAdjustmentOperation(9447, -2, "Carol-Garona"))
+    assertTrue(adjNeg ~= nil, "447-1: -2 attributed prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjNeg), "accepted", "447-1: -2 applied")
+    local adjMisc = select(1, GS:NewAdjustmentOperation(9447, 1, nil))
+    assertTrue(adjMisc ~= nil, "447-1: unattributed prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjMisc), "accepted", "447-1: unattributed applied")
+
+    record = GS:GetCurrentRecord()
+    local pricedAdj = rankingsFindAdj(record, 9447, 3)
+    assertTrue(pricedAdj ~= nil, "447-1: +3 adj row")
+    assertEq(tonumber(pricedAdj.unitCopper), 1000, "447-1: create-time unitCopper")
+    assertEq(pricedAdj.attributed, "Carol-Garona", "447-1: attributed preserved")
+    local unattr = rankingsFindAdj(record, 9447, 1)
+    assertTrue(unattr ~= nil and unattr.attributed == nil, "447-1: unattributed retained")
+    assertEq(unattr.unitCopper, nil, "447-1: unattributed has no unitCopper")
+
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    assertTrue(type(ranking) == "table", "447-1: ranking projection")
+    assertEq(ranking.hasHistory, true, "447-1: has history")
+    local byName = rankingsByName(ranking)
+    -- Bob donation: 5 * 1000 = 5000; Carol adjustments: (3-2)*1000 = 1000; misc excluded.
+    assertEq(byName["Bob-Garona"], 5000, "447-1: Bob donation copper")
+    assertEq(byName["Carol-Garona"], 1000, "447-1: Carol signed adjustment copper")
+    assertEq(byName["Unassigned"], nil, "447-1: unattributed excluded")
+    assertTrue(record.rankings == nil, "447-1: no persisted rankings table")
+    assertTrue(record.leaderboard == nil, "447-1: no leaderboard field")
+
+    -- Missing TSM must not block quantity adjustments; ranking value stays zero.
+    SF.TSM = nil
+    local unpricedOp = select(1, GS:NewAdjustmentOperation(9447, 2, "Dave-Garona"))
+    assertTrue(unpricedOp ~= nil, "447-1: unpriced adj prepared without TSM")
+    assertEq(GS:ApplyStagedConfigOperation(unpricedOp), "accepted", "447-1: unpriced adj applied")
+    record = GS:GetCurrentRecord()
+    local unpricedAdj = rankingsFindAdj(record, 9447, 2)
+    assertTrue(unpricedAdj ~= nil, "447-1: unpriced adj retained")
+    assertEq(unpricedAdj.unitCopper, nil, "447-1: missing TSM leaves unitCopper nil")
+    ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    byName = rankingsByName(ranking)
+    assertEq(byName["Dave-Garona"], 0, "447-1: unpriced attributed counts as zero")
+    assertTrue(#ranking.rows >= 3, "447-1: zero-valued contributor still listed")
+end
+
+do
+    -- 447-2) Main/alt reassignment regroups historical contributions without rewrite.
+    valuationTsmValue = 500
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9448)
+    creditValuationDeposit(record, {
+        itemId = 9448, quantity = 4, donor = "Dave-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local stAssign = select(1, assignMainAlt("Bob-Garona", "Dave-Garona"))
+    assertEq(stAssign, "accepted", "447-2: Dave alt of Bob")
+    record = GS:GetCurrentRecord()
+    local donation = valuationFindDonation(record, 9448, 4)
+    assertEq(donation.actor, "Dave-Garona", "447-2: durable donor unchanged")
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    local byName = rankingsByName(ranking)
+    assertEq(byName["Bob-Garona"], 2000, "447-2: Dave gift under Bob main")
+    assertEq(byName["Dave-Garona"], nil, "447-2: Dave not separate while assigned")
+
+    local stUn = select(1, unassignAltGuid("Player-1-Dave", "Player-1-Bob"))
+    assertEq(stUn, "accepted", "447-2: unassign Dave")
+    ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    byName = rankingsByName(ranking)
+    assertEq(byName["Dave-Garona"], 2000, "447-2: regroups to Dave after unassign")
+    assertEq(byName["Bob-Garona"], nil, "447-2: Bob no longer carries Dave gift")
+    assertEq(valuationFindDonation(record, 9448, 4).actor, "Dave-Garona",
+        "447-2: ledger identity still Dave")
+end
+
+do
+    -- 447-3) Campaign isolation + event-id dedupe across live/archive overlap.
+    valuationTsmValue = 200
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9449)
+    creditValuationDeposit(record, {
+        itemId = 9449, quantity = 3, donor = "Bob-Garona",
+    })
+    local firstCampaign = record.currentCampaignId
+    local rankingA = GS:ProjectCampaignRankings(firstCampaign)
+    assertEq(rankingsByName(rankingA)["Bob-Garona"], 600, "447-3: campaign A total")
+
+    -- Archive the campaign and start a new one, then request the item again.
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= firstCampaign, "447-3: campaign rolled")
+    local itemOp = GS:NewConfigOperation("set-requested-item", { itemId = 9449 }, {
+        itemId = 9449, goal = 80, removed = false,
+    })
+    assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "447-3: request item on new campaign")
+    world.time = (world.time or 0) + 7200
+    creditValuationDeposit(record, {
+        itemId = 9449, quantity = 1, donor = "Carol-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9449|1" },
+        neighborsNewer = { "newer|2" },
+    })
+    local rankingB = GS:ProjectCampaignRankings(record.currentCampaignId)
+    local rankingArchived = GS:ProjectCampaignRankings(firstCampaign)
+    assertEq(rankingsByName(rankingB)["Carol-Garona"], 200, "447-3: current campaign isolated")
+    assertEq(rankingsByName(rankingB)["Bob-Garona"], nil, "447-3: prior campaign not mixed")
+    assertEq(rankingsByName(rankingArchived)["Bob-Garona"], 600, "447-3: archived totals intact")
+
+    -- Duplicate event id across archive+live inputs must not double-count.
+    record = GS:GetCurrentRecord()
+    local live = record.accounting._consumableEvents
+    local archive = record.accounting._consumableEventArchive
+    assertTrue(type(live) == "table" and type(archive) == "table", "447-3: both lists")
+    local bobDonation = nil
+    for i = 1, #archive do
+        local ev = archive[i]
+        if ev and tonumber(ev.itemId) == 9449 and tonumber(ev.quantity) == 3 then
+            bobDonation = ev
+            break
+        end
+    end
+    if bobDonation == nil then
+        -- Some rollover paths keep the prior donation live; search both lists.
+        for i = 1, #live do
+            local ev = live[i]
+            if ev and tonumber(ev.itemId) == 9449 and tonumber(ev.quantity) == 3 then
+                bobDonation = ev
+                break
+            end
+        end
+    end
+    assertTrue(bobDonation ~= nil, "447-3: Bob donation retained somewhere")
+    -- Force an overlapping identity into the live list for the archived generation.
+    live[#live + 1] = bobDonation
+    local rankingDup = GS.ProjectCampaignRankingsOnRecord(record, firstCampaign)
+    assertEq(rankingsByName(rankingDup)["Bob-Garona"], 600, "447-3: deduped overlapping id")
+end
+
+do
+    -- 447-4) Adjustment unitCopper survives reload; donation valuation path unchanged.
+    valuationTsmValue = 750
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9450)
+    creditValuationDeposit(record, {
+        itemId = 9450, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adj = select(1, GS:NewAdjustmentOperation(9450, -1, "Bob-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "447-4: adj applied")
+    record = GS:GetCurrentRecord()
+    local donationBefore = valuationCount(record)
+    local adjRow = rankingsFindAdj(record, 9450, -1)
+    assertEq(tonumber(adjRow.unitCopper), 750, "447-4: unitCopper before reload")
+    assertEq(GS.AdjustmentRankingCopper(adjRow), -750, "447-4: signed ranking copper")
+
+    -- Reload from SavedVariables root (same pattern as 3C4).
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-4: reload init")
+    record = GS:GetCurrentRecord()
+    assertTrue(record ~= nil, "447-4: record after reload")
+    adjRow = rankingsFindAdj(record, 9450, -1)
+    assertTrue(adjRow ~= nil, "447-4: adj present after reload")
+    assertEq(tonumber(adjRow.unitCopper), 750, "447-4: unitCopper after reload")
+    assertEq(valuationCount(record), donationBefore, "447-4: donation valuation count stable")
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    -- Donation 2*750=1500 plus adj -750 → 750 under Bob.
+    assertEq(rankingsByName(ranking)["Bob-Garona"], 750, "447-4: reload ranking")
+
+    -- Donation AdmitValuationAssignment still rejects adjustment-shaped misuse.
+    local bad = {
+        kind = "gs-valuation",
+        schemaVersion = 1,
+        datasetId = record.datasetId,
+        guildKey = "club:42",
+        assignment = {
+            assignmentId = "gsv1:aaaaaaaaaaaaaaaaaaaaaaaa:00000001",
+            assignedAt = math.floor(world.time),
+            unitCopper = 10,
+            quantity = 1,
+            totalCopper = 10,
+            itemId = 9450,
+            txnId = adjRow.txnId or adjRow.id,
+            datasetId = record.datasetId,
+            guildKey = "club:42",
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+        },
+    }
+    local stBad, rBad = GS:AdmitValuationAssignment(bad, {
+        localMint = true,
+        offlineRecord = record,
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+    })
+    assertTrue(stBad == "rejected" or stBad == "pending",
+        "447-4: donation valuation does not admit adjustment txn st="
+            .. tostring(stBad) .. " r=" .. tostring(rBad))
+end
+
+do
+    -- 447-5) Officer-only page.available; Preview/member hide; direct nav fallback.
+    -- Load the actual Rankings page (no availability stub replacement).
+    local Nav = SF.SettingsNavigationModel
+    local ui = SF.SettingsUI
+    assertTrue(type(Nav) == "table" and type(ui) == "table", "447-5: nav+ui")
+    if not (ui.pagesById and ui.pagesById.guildSuppliesRankings) then
+        if not SF.SettingsUI.DefinitionRenderer then
+            loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+            loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+        end
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
+    end
+    local rankingsPage = ui.pagesById and ui.pagesById.guildSuppliesRankings
+    assertTrue(type(rankingsPage) == "table" and type(rankingsPage.available) == "function",
+        "447-5: production Rankings page registered")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = false
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-5: officer can see Rankings")
+
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-5: member cannot see Rankings")
+    assertEq(Nav.IsContentPage(ui, "guildSuppliesRankings"), false,
+        "447-5: member content page false")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = true
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-5: Preview hides Rankings")
+    world.impersonationActive = false
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-5: Preview off restores")
+
+    -- Direct ShowPage of unavailable Rankings falls back to an available page.
+    local session = {
+        currentCategoryId = "guildSupplies",
+        currentPageId = "guildSuppliesLogs",
+    }
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local resolved = Nav.ResolveShowPage(ui, session, "guildSuppliesRankings")
+    assertTrue(resolved.pageId ~= "guildSuppliesRankings",
+        "447-5: ShowPage(rankings) does not expose contents got=" .. tostring(resolved.pageId))
+end
+
+do
+    -- 447-6) Bounded UI lifecycle: real Build must succeed; idle when hidden.
+    -- Install a rich CreateFrame so DefinitionRenderer/Controls can build.
+    local function makeUiRegion(kind, name, parent)
+        local region = {
+            kind = kind, name = name, parent = parent, shown = true,
+            height = 0, width = 0, points = {}, scripts = {}, hooks = {},
+            children = {}, registeredEvents = {}, enabled = true, text = "",
+        }
+        local function fire(self, event, ...)
+            local fn = self.scripts[event]
+            if fn then fn(self, ...) end
+            for _, hook in ipairs(self.hooks[event] or {}) do
+                hook(self, ...)
+            end
+        end
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetHeight(h) self.height = h end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = w end
+        function region:GetWidth() return self.width end
+        function region:SetSize(w, h) self.width = w; self.height = h end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown end
+        function region:IsVisible() return self.shown end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:RegisterEvent(e) self.registeredEvents[e] = true end
+        function region:UnregisterAllEvents() self.registeredEvents = {} end
+        function region:EnableMouse() end
+        function region:SetParent(p) self.parent = p end
+        function region:GetParent() return self.parent end
+        function region:SetAllPoints() end
+        function region:CreateFontString()
+            local fs = makeUiRegion("FontString", nil, self)
+            self.children[#self.children + 1] = fs
+            return fs
+        end
+        function region:CreateTexture()
+            local t = makeUiRegion("Texture", nil, self)
+            self.children[#self.children + 1] = t
+            return t
+        end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetWordWrap() end
+        function region:SetMaxLines() end
+        function region:SetFontObject() end
+        function region:SetScrollChild(c) self.scrollChild = c end
+        function region:SetMinMaxValues() end
+        function region:SetValue() end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:SetTexture() end
+        function region:SetVertexColor() end
+        function region:SetColorTexture() end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:GetName() return self.name end
+        function region:SetHitRectInsets() end
+        function region:EnableMouse() end
+        function region:SetFrameStrata() end
+        function region:SetFrameLevel() end
+        function region:GetFrameLevel() return 0 end
+        function region:SetClipsChildren() end
+        function region:SetPropagateKeyboardInput() end
+        function region:RegisterForClicks() end
+        function region:SetNormalFontObject() end
+        function region:SetHighlightFontObject() end
+        function region:SetDisabledFontObject() end
+        function region:SetNormalTexture() end
+        function region:SetPushedTexture() end
+        function region:SetHighlightTexture() end
+        function region:SetAtlas() end
+        function region:SetTexCoord() end
+        function region:SetBlendMode() end
+        function region:SetVerticalScroll() end
+        function region:SetAlpha() end
+        function region:GetStringWidth() return math.max(1, #(self.text or "") * 7) end
+        function region:GetStringHeight() return 12 end
+        function region:SetJustifyV() end
+        function region:SetNonSpaceWrap() end
+        function region:SetAutoFocus() end
+        function region:SetNumeric() end
+        function region:SetMaxLetters() end
+        function region:SetHighlightColor() end
+        function region:SetCursorPosition() end
+        function region:HasFocus() return false end
+        function region:ClearFocus() end
+        function region:SetFocus() end
+        function region:SetFont() end
+        function region:GetFont() return "Fonts\\FRIZQT__.TTF", 12 end
+        function region:GetParent() return self.parent end
+        function region:SetChecked() end
+        function region:GetChecked() return false end
+        function region:SetDefaultText() end
+        function region:SetupMenu() end
+        function region:GenerateMenu() end
+        function region:Click() end
+        function region:IsMouseEnabled() return true end
+        function region:SetHitRectInsets() end
+        function region:SetObeyStepOnDrag() end
+        function region:SetValueStep() end
+        function region:GetValue() return 0 end
+        function region:SetOrientation() end
+        function region:SetThumbTexture() end
+        function region:EnableDrawLayer() end
+        function region:DisableDrawLayer() end
+        return region
+    end
+    local priorCreateFrame = CreateFrame
+    function CreateFrame(frameType, name, parent, template)
+        local region = makeUiRegion(frameType or "Frame", name, parent)
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeUiRegion("Slider", nil, region)
+            region.ScrollBar.width = 20
+            region.ScrollBar.shown = false
+        end
+        return region
+    end
+    if not SF.SettingsUI then SF.SettingsUI = {} end
+    SF.SettingsUI.pagesById = SF.SettingsUI.pagesById or {}
+    SF.SettingsUI.pages = SF.SettingsUI.pages or {}
+    if not SF.SettingsUI.RegisterPage then
+        function SF.SettingsUI:RegisterPage(page)
+            self.pagesById[page.id] = page
+            self.pages[#self.pages + 1] = page
+        end
+    end
+    if not SF.SettingsUI.DefinitionRenderer then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+    end
+    if not SF.SettingsUI.pagesById.guildSuppliesRankings then
+        loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
+    end
+    local page = SF.SettingsUI.pagesById.guildSuppliesRankings
+    assertTrue(type(page) == "table" and type(page.Build) == "function",
+        "447-6: rankings page loaded")
+
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = false
+    local panel = CreateFrame("Frame", "SF_TestRankingsPanel")
+    panel:SetSize(700, 600)
+    panel.__visible = true
+    panel.IsVisible = function(self) return self.__visible end
+    panel.IsShown = function(self) return self.__visible end
+    local refreshCount = 0
+    local priorRefresh = page.Refresh
+    page.Refresh = function(self, p)
+        refreshCount = refreshCount + 1
+        if priorRefresh then
+            return priorRefresh(self, p)
+        end
+    end
+    page.panel = panel
+    local okBuild, errBuild = pcall(function() page:Build(panel) end)
+    assertTrue(okBuild, "447-6: Build succeeds: " .. tostring(errBuild))
+    local okBuild2, errBuild2 = pcall(function() page:Build(panel) end)
+    assertTrue(okBuild2, "447-6: second Build succeeds: " .. tostring(errBuild2))
+
+    local before = refreshCount
+    GS.NotifyUI("valuation")
+    GS.NotifyUI("ledger")
+    flushTimers()
+    assertTrue(refreshCount > before, "447-6: visible page refreshes on durable notify")
+
+    panel.__visible = false
+    if page.OnHide then page:OnHide() end
+    flushTimers()
+    local mid = refreshCount
+    for _ = 1, 5 do
+        GS.NotifyUI("valuation")
+    end
+    flushTimers()
+    assertEq(refreshCount, mid, "447-6: hidden page stays idle on durable notifies")
+
+    for _ = 1, 8 do
+        panel.__visible = true
+        local okCyc, errCyc = pcall(function() page:Build(panel) end)
+        assertTrue(okCyc, "447-6: cycle Build ok: " .. tostring(errCyc))
+        local showHooks = panel.hooks and panel.hooks.OnShow
+        if showHooks then
+            for i = 1, #showHooks do showHooks[i](panel) end
+        end
+        flushTimers()
+        panel.__visible = false
+        local hideHooks = panel.hooks and panel.hooks.OnHide
+        if hideHooks then
+            for i = 1, #hideHooks do hideHooks[i](panel) end
+        end
+        if page.OnHide then page:OnHide() end
+        flushTimers()
+    end
+    local afterCycles = refreshCount
+    GS.NotifyUI("valuation")
+    flushTimers()
+    assertEq(refreshCount, afterCycles,
+        "447-6: after close cycles, hidden page still ignores NotifyUI")
+    local catchup = GS.GetValuationCatchupState and GS.GetValuationCatchupState()
+    if type(catchup) == "table" then
+        assertEq(catchup.active, false, "447-6: catch-up idle after hide")
+        assertEq(catchup.scheduled, false, "447-6: catch-up not scheduled after hide")
+    end
+    page.Refresh = priorRefresh
+    CreateFrame = priorCreateFrame
+end
+
+do
+    -- 447-7) Negative totals: high-price signed adjustment can dominate a cheap donation.
+    valuationTsmValue = 100
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9451)
+    creditValuationDeposit(record, {
+        itemId = 9451, quantity = 1, donor = "Dave-Garona",
+    })
+    creditValuationDeposit(record, {
+        itemId = 9451, quantity = 5, donor = "Bob-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9451|5" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    valuationTsmValue = 5000
+    local neg = select(1, GS:NewAdjustmentOperation(9451, -1, "Dave-Garona"))
+    assertTrue(neg ~= nil, "447-7: high-price negative prepared")
+    assertEq(GS:ApplyStagedConfigOperation(neg), "accepted", "447-7: high-price negative applied")
+    record = GS:GetCurrentRecord()
+    local adj = rankingsFindAdj(record, 9451, -1)
+    assertEq(tonumber(adj and adj.unitCopper), 5000, "447-7: expensive unit snapshot")
+    local ranking = GS:ProjectCampaignRankings(record.currentCampaignId)
+    local byName = rankingsByName(ranking)
+    -- Dave: donation 100 + adj -5000 = -4900.
+    assertEq(byName["Dave-Garona"], -4900, "447-7: signed negative total preserved")
+    assertEq(byName["Bob-Garona"], 500, "447-7: Bob positive total")
+    assertEq(tonumber(ranking.maxPositive), 500, "447-7: maxPositive is largest positive")
+    assertTrue(ranking.rows[1].name == "Bob-Garona", "447-7: positive sorts above negative")
+end
+
+do
+    -- 447-r1) Provider schema 4 gates adjustment unitCopper; SV schema unchanged.
+    assertEq(GS.PROVIDER_SCHEMA, 4, "447-r1: PROVIDER_SCHEMA is 4")
+    assertEq(GS.SCHEMA_VERSION, 1, "447-r1: SCHEMA_VERSION stays 1")
+    local record = activateValuationGuild(9452)
+    assertEq(GS:EnsureGossipProvider(), true, "447-r1: provider")
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    assertEq(tonumber(prov.schema), 4, "447-r1: registered schema 4")
+    local caps = prov.api.GetCapabilities()
+    assertEq(tonumber(caps.schema), 4, "447-r1: wire caps schema 4")
+    assertTrue(tonumber(prov.schema) ~= 3, "447-r1: schema-3 incompatible")
+    assertEq(SpectrumFederationDB.guildSupplies.schemaVersion, 1,
+        "447-r1: persisted root schema preserved")
+    assertTrue(type(GS.RefreshLedgerEventExport) == "function",
+        "447-r1: RefreshLedgerEventExport present")
+    assertTrue(type(GS.EnsureValuationCatchup) == "function",
+        "447-r1: EnsureValuationCatchup present")
+end
+
+do
+    -- 447-r2) Op-first enrichment refreshes export fingerprint; priced body relays
+    -- after the author goes offline (admission + GetRecordBody boundary).
+    valuationTsmValue = 1200
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9453)
+    creditValuationDeposit(record, {
+        itemId = 9453, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Author an attributed adjustment without create-time price (simulate op-first
+    -- peer that stored the row before the priced ledger body arrived).
+    SF.TSM = nil
+    local adjOp = select(1, GS:NewAdjustmentOperation(9453, 1, "Carol-Garona"))
+    assertTrue(adjOp ~= nil, "447-r2: unpriced adj prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "447-r2: unpriced adj applied")
+    record = GS:GetCurrentRecord()
+    local stored = rankingsFindAdj(record, 9453, 1)
+    assertTrue(stored ~= nil, "447-r2: stored adj")
+    assertEq(stored.unitCopper, nil, "447-r2: starts unpriced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-r2: provider")
+    drainExportMaint(64)
+    local exportId = "gs:le:" .. tostring(stored.id)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local beforeRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(beforeRec) == "table", "447-r2: unpriced export present")
+    local beforeFp = beforeRec.versionFp
+    assertTrue(type(beforeFp) == "string" and beforeFp ~= "", "447-r2: unpriced fingerprint")
+
+    -- Later authenticated priced ledger body enriches in place.
+    local stDup, rDup = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = stored.id,
+        txnId = stored.txnId or stored.id,
+        opId = stored.opId or stored.id,
+        generation = record.accounting._consumables.generation,
+        timestamp = stored.timestamp or world.time or 1,
+        actor = stored.actor or "Alice-Garona",
+        writer = stored.writer or "Player-1-Alice",
+        itemId = 9453,
+        quantity = 1,
+        attributed = "Carol-Garona",
+        attributedGuid = "Player-1-Carol",
+        unitCopper = 1200,
+        campaignId = record.currentCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stDup, "duplicate", "447-r2: priced ledger is duplicate r=" .. tostring(rDup))
+    assertEq(tonumber(stored.unitCopper), 1200, "447-r2: unitCopper enriched")
+    drainExportMaint(16)
+    local afterRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(afterRec) == "table", "447-r2: priced export present")
+    assertTrue(afterRec.versionFp ~= beforeFp,
+        "447-r2: fingerprint changed after enrichment")
+    assertEq(tonumber(afterRec.body.event.unitCopper), 1200,
+        "447-r2: export body carries unitCopper")
+
+    -- Carol relays a priced copy to a peer that already holds the unpriced row
+    -- after the original author is offline. Capture scalars before stripping —
+    -- export body.event is the same table as `stored`.
+    local pricedSnapshot = {
+        id = stored.id,
+        txnId = stored.txnId or stored.id,
+        opId = stored.opId or stored.id,
+        generation = stored.generation,
+        timestamp = stored.timestamp,
+        actor = stored.actor,
+        writer = stored.writer,
+        itemId = stored.itemId,
+        quantity = stored.quantity,
+        attributed = stored.attributed,
+        attributedGuid = stored.attributedGuid,
+        unitCopper = 1200,
+        campaignId = stored.campaignId,
+        datasetId = stored.datasetId,
+        type = "adjustment",
+        gsProductionCredit = true,
+    }
+    stored.unitCopper = nil
+    assertEq(GS.RefreshLedgerEventExport(record, stored), true,
+        "447-r2: stripped export refreshed")
+    drainExportMaint(8)
+    local strippedRec = prov.api.GetRecordBody(exportId)
+    assertEq(strippedRec.body.event.unitCopper, nil, "447-r2: stripped export unpriced")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local stRelay, rRelay = GS:AdmitLedgerEvent(pricedSnapshot, {
+        sender = "Carol-Garona",
+        member = { guid = "Player-1-Carol", name = "Carol-Garona", guildKey = "club:42", rankOrder = 3 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stRelay, "duplicate",
+        "447-r2: relay priced after strip is duplicate r=" .. tostring(rRelay))
+    assertEq(tonumber(stored.unitCopper), 1200, "447-r2: relay restores unitCopper")
+    drainExportMaint(8)
+    local relayRec = prov.api.GetRecordBody(exportId)
+    assertEq(tonumber(relayRec.body.event.unitCopper), 1200,
+        "447-r2: relayed export advertises priced body")
+    assertTrue(relayRec.versionFp ~= strippedRec.versionFp,
+        "447-r2: relay enrichment changes fingerprint again")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+end
+
+do
+    -- 447-r3) Conflicting non-nil unitCopper quarantines; nil→priced and unpriced
+    -- redelivery remain duplicates. Exercise both delivery orders via AdmitLedgerEvent.
+    valuationTsmValue = 800
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9454)
+    creditValuationDeposit(record, {
+        itemId = 9454, quantity = 1, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adj = select(1, GS:NewAdjustmentOperation(9454, 2, "Dave-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adj), "accepted", "447-r3: priced adj")
+    record = GS:GetCurrentRecord()
+    local stored = rankingsFindAdj(record, 9454, 2)
+    assertEq(tonumber(stored.unitCopper), 800, "447-r3: accepted price 800")
+
+    local function ledgerBody(unit)
+        return {
+            type = "adjustment",
+            id = stored.id,
+            txnId = stored.txnId or stored.id,
+            opId = stored.opId or stored.id,
+            generation = record.accounting._consumables.generation,
+            timestamp = stored.timestamp or world.time or 1,
+            actor = stored.actor or "Alice-Garona",
+            writer = stored.writer or "Player-1-Alice",
+            itemId = 9454,
+            quantity = 2,
+            attributed = "Dave-Garona",
+            attributedGuid = "Player-1-Dave",
+            unitCopper = unit,
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    local ctx = {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+    }
+    -- Harmless unpriced redelivery.
+    local stNil, rNil = GS:AdmitLedgerEvent(ledgerBody(nil), ctx)
+    assertEq(stNil, "duplicate", "447-r3: unpriced redelivery duplicate r=" .. tostring(rNil))
+    assertEq(tonumber(stored.unitCopper), 800, "447-r3: price unchanged after nil redelivery")
+    -- Conflicting non-nil snapshot.
+    local stConflict, rConflict = GS:AdmitLedgerEvent(ledgerBody(999), ctx)
+    assertEq(stConflict, "rejected", "447-r3: conflict rejected st")
+    assertEq(rConflict, "id_conflict", "447-r3: conflict reason")
+    assertEq(tonumber(stored.unitCopper), 800, "447-r3: accepted price not overwritten")
+
+    -- Reverse order on a fresh unpriced row: nil first, then price, then conflict.
+    SF.TSM = nil
+    local adj2 = select(1, GS:NewAdjustmentOperation(9454, 3, "Eve-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adj2), "accepted", "447-r3: unpriced adj2")
+    record = GS:GetCurrentRecord()
+    local stored2 = rankingsFindAdj(record, 9454, 3)
+    assertEq(stored2.unitCopper, nil, "447-r3: adj2 unpriced")
+    local function body2(unit)
+        return {
+            type = "adjustment",
+            id = stored2.id,
+            txnId = stored2.txnId or stored2.id,
+            opId = stored2.opId or stored2.id,
+            generation = record.accounting._consumables.generation,
+            timestamp = stored2.timestamp or world.time or 1,
+            actor = stored2.actor or "Alice-Garona",
+            writer = stored2.writer or "Player-1-Alice",
+            itemId = 9454,
+            quantity = 3,
+            attributed = "Eve-Garona",
+            attributedGuid = "Player-1-Eve",
+            unitCopper = unit,
+            campaignId = record.currentCampaignId,
+            datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    ctx.offlineRecord = record
+    assertEq(select(1, GS:AdmitLedgerEvent(body2(nil), ctx)), "duplicate",
+        "447-r3: nil-nil duplicate")
+    assertEq(select(1, GS:AdmitLedgerEvent(body2(500), ctx)), "duplicate",
+        "447-r3: nil→priced enrichment")
+    assertEq(tonumber(stored2.unitCopper), 500, "447-r3: enriched to 500")
+    local stC2, rC2 = GS:AdmitLedgerEvent(body2(501), ctx)
+    assertEq(stC2, "rejected", "447-r3: later conflict rejected")
+    assertEq(rC2, "id_conflict", "447-r3: later conflict reason")
+    assertEq(tonumber(stored2.unitCopper), 500, "447-r3: enrichment retained")
+end
+
+do
+    -- 447-r8) Ordinary gossip (not adoptionReplay): op-first → campaign rollover
+    -- shelves the unpriced adjustment; later authenticated priced ledger enriches
+    -- the already-retained archive row. Cover ranking, export fingerprint/relay,
+    -- reload, conflict, duplicate, unauthorized, and new stale rejection.
+    valuationTsmValue = 1500
+    SF.TSM = nil -- op creates unpriced attributed adjustment
+    local record = activateValuationGuild(9458)
+    creditValuationDeposit(record, {
+        itemId = 9458, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9458, 1, "Carol-Garona"))
+    assertTrue(adjOp ~= nil, "447-r8: unpriced adj prepared")
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "447-r8: unpriced adj applied")
+    record = GS:GetCurrentRecord()
+    local archivedCampaignId = record.currentCampaignId
+    local archivedGen = tonumber(record.accounting._consumables.generation)
+    local stored = rankingsFindAdj(record, 9458, 1)
+    assertTrue(stored ~= nil, "447-r8: stored adj")
+    assertEq(stored.unitCopper, nil, "447-r8: starts unpriced")
+    assertEq(tonumber(stored.generation), archivedGen, "447-r8: adj generation")
+    assertEq(GS:EnsureGossipProvider(), true, "447-r8: provider")
+    drainExportMaint(32)
+    local exportId = "gs:le:" .. tostring(stored.id)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local beforeRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(beforeRec) == "table", "447-r8: unpriced export present")
+    local beforeFp = beforeRec.versionFp
+    assertTrue(type(beforeFp) == "string" and beforeFp ~= "", "447-r8: unpriced fingerprint")
+
+    -- Campaign rollover shelves prior-generation rows into the archive.
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= archivedCampaignId, "447-r8: new campaign current")
+    local liveHit = nil
+    for i = 1, #(record.accounting._consumableEvents or {}) do
+        local e = record.accounting._consumableEvents[i]
+        if e and (e.id == stored.id or e.opId == stored.id) then
+            liveHit = e
+            break
+        end
+    end
+    assertNil(liveHit, "447-r8: adj no longer on live list")
+    local archHit = nil
+    for i = 1, #(record.accounting._consumableEventArchive or {}) do
+        local e = record.accounting._consumableEventArchive[i]
+        if e and (e.id == stored.id or e.opId == stored.id) then
+            archHit = e
+            break
+        end
+    end
+    assertTrue(archHit == stored, "447-r8: same row object shelved to archive")
+    assertEq(stored.unitCopper, nil, "447-r8: still unpriced after shelve")
+    local rankingBefore = GS:ProjectCampaignRankings(archivedCampaignId)
+    assertEq(rankingsByName(rankingBefore)["Carol-Garona"], 0,
+        "447-r8: unpriced archived adj ranks as zero")
+
+    local pricedBody = {
+        type = "adjustment",
+        id = stored.id,
+        txnId = stored.txnId or stored.id,
+        opId = stored.opId or stored.id,
+        generation = archivedGen,
+        timestamp = stored.timestamp or world.time or 1,
+        actor = stored.actor or "Alice-Garona",
+        writer = stored.writer or "Player-1-Alice",
+        itemId = 9458,
+        quantity = 1,
+        attributed = "Carol-Garona",
+        attributedGuid = "Player-1-Carol",
+        unitCopper = 1500,
+        campaignId = archivedCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }
+    local authCtx = {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = record,
+        localWrite = false,
+        -- Ordinary gossip: must not set adoptionReplay.
+    }
+    local stDup, rDup = GS:AdmitLedgerEvent(pricedBody, authCtx)
+    assertEq(stDup, "duplicate", "447-r8: priced ledger is duplicate r=" .. tostring(rDup))
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: archived unitCopper enriched")
+    local rankingAfter = GS:ProjectCampaignRankings(archivedCampaignId)
+    assertEq(rankingsByName(rankingAfter)["Carol-Garona"], 1500,
+        "447-r8: archived ranking uses saved price")
+    drainExportMaint(16)
+    local afterRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(afterRec) == "table", "447-r8: priced export present")
+    assertTrue(afterRec.versionFp ~= beforeFp,
+        "447-r8: fingerprint changed after archived enrichment")
+    assertEq(tonumber(afterRec.body.event.unitCopper), 1500,
+        "447-r8: export body carries unitCopper")
+
+    -- Idempotent duplicate of the same priced body.
+    assertEq(select(1, GS:AdmitLedgerEvent(pricedBody, authCtx)), "duplicate",
+        "447-r8: priced redelivery stays duplicate")
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: price stable after duplicate")
+
+    -- Conflicting non-nil price quarantines; retained archive price unchanged.
+    local conflictBody = {}
+    for k, v in pairs(pricedBody) do conflictBody[k] = v end
+    conflictBody.unitCopper = 9999
+    local stConflict, rConflict = GS:AdmitLedgerEvent(conflictBody, authCtx)
+    assertEq(stConflict, "rejected", "447-r8: conflict rejected")
+    assertEq(rConflict, "id_conflict", "447-r8: conflict reason")
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: archive price not overwritten")
+
+    -- Unauthorized / non-editor delivery cannot enrich or mutate.
+    stored.unitCopper = nil
+    assertEq(GS.RefreshLedgerEventExport(record, stored), true,
+        "447-r8: stripped for unauthorized probe")
+    drainExportMaint(8)
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local stUnauth, rUnauth = GS:AdmitLedgerEvent(pricedBody, {
+        sender = "Dave-Garona",
+        member = { guid = "Player-1-Dave", name = "Dave-Garona", guildKey = "club:42", rankOrder = 4 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertTrue(stUnauth == "pending" or stUnauth == "rejected",
+        "447-r8: unauthorized not accepted st=" .. tostring(stUnauth)
+            .. " r=" .. tostring(rUnauth))
+    assertEq(stored.unitCopper, nil, "447-r8: unauthorized did not enrich")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    -- Authenticated relay restores price after strip (Carol relays).
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local stRelay, rRelay = GS:AdmitLedgerEvent(pricedBody, {
+        sender = "Carol-Garona",
+        member = { guid = "Player-1-Carol", name = "Carol-Garona", guildKey = "club:42", rankOrder = 3 },
+        offlineRecord = record,
+        localWrite = false,
+    })
+    assertEq(stRelay, "duplicate",
+        "447-r8: relay priced after strip is duplicate r=" .. tostring(rRelay))
+    assertEq(tonumber(stored.unitCopper), 1500, "447-r8: relay restores archived unitCopper")
+    drainExportMaint(8)
+    local relayRec = prov.api.GetRecordBody(exportId)
+    assertEq(tonumber(relayRec.body.event.unitCopper), 1500,
+        "447-r8: relayed export advertises priced body")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Genuinely new stale-campaign adjustment (different id) remains rejected.
+    local stStale, rStale = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = "op-stale-r8-new",
+        txnId = "op-stale-r8-new",
+        opId = "op-stale-r8-new",
+        generation = archivedGen,
+        timestamp = world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9458,
+        quantity = 2,
+        attributed = "Eve-Garona",
+        attributedGuid = "Player-1-Eve",
+        unitCopper = 1500,
+        campaignId = archivedCampaignId,
+        datasetId = record.datasetId,
+        gsProductionCredit = true,
+    }, authCtx)
+    assertEq(stStale, "rejected", "447-r8: new stale event rejected")
+    assertEq(rStale, "stale_campaign", "447-r8: stale_campaign reason")
+    local newArch = nil
+    for i = 1, #(record.accounting._consumableEventArchive or {}) do
+        local e = record.accounting._consumableEventArchive[i]
+        if e and e.id == "op-stale-r8-new" then
+            newArch = e
+            break
+        end
+    end
+    assertNil(newArch, "447-r8: new stale row not admitted to archive")
+
+    -- Reload retains the enriched archived price and ranking total.
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-r8: reload")
+    record = GS:GetCurrentRecord()
+    local reloaded = rankingsFindAdj(record, 9458, 1)
+    assertTrue(reloaded ~= nil, "447-r8: adj present after reload")
+    assertEq(tonumber(reloaded.unitCopper), 1500, "447-r8: price after reload")
+    assertEq(rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))["Carol-Garona"], 1500,
+        "447-r8: ranking after reload")
+end
+
+do
+    -- 447-r11) Adjustment duplicate reconciliation: rejectable fields before mutate;
+    -- export refresh from final accepted state (price conflict + provenance-only).
+    valuationTsmValue = 1800
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local record = activateValuationGuild(9459)
+    creditValuationDeposit(record, {
+        itemId = 9459, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjOp = select(1, GS:NewAdjustmentOperation(9459, 1, "Carol-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjOp), "accepted", "447-r11: priced adj")
+    record = GS:GetCurrentRecord()
+    local archivedCampaignId = record.currentCampaignId
+    local archivedGen = tonumber(record.accounting._consumables.generation)
+    local liveMarker = record.liveCutover and record.liveCutover.cutoverMarker
+    assertTrue(type(liveMarker) == "string" and liveMarker ~= "", "447-r11: live marker")
+    local stored = rankingsFindAdj(record, 9459, 1)
+    assertTrue(stored ~= nil, "447-r11: stored adj")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11: create-time price")
+    -- Strip provenance so the archived row is priced but uncredited; keep price.
+    stored.gsSourceCutoverMarker = nil
+    stored.gsProductionCredit = false
+    assertEq(GS:EnsureGossipProvider(), true, "447-r11: provider")
+    drainExportMaint(32)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    assertTrue(record.currentCampaignId ~= archivedCampaignId, "447-r11: rolled over")
+    local arch = nil
+    for i = 1, #(record.accounting._consumableEventArchive or {}) do
+        local e = record.accounting._consumableEventArchive[i]
+        if e and (e.id == stored.id or e.opId == stored.id) then
+            arch = e
+            break
+        end
+    end
+    assertTrue(arch == stored, "447-r11: shelved same row")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11: price retained after shelve")
+    assertEq(stored.gsProductionCredit, false, "447-r11: still uncredited")
+    drainExportMaint(64)
+    local exportId = "gs:le:" .. tostring(stored.id)
+    local prov = GG.GetProvider(GS.PROVIDER_ID)
+    local beforeRec = prov.api.GetRecordBody(exportId)
+    assertTrue(type(beforeRec) == "table", "447-r11: warm export present")
+    local beforeFp = beforeRec.versionFp
+    assertTrue(type(beforeFp) == "string" and beforeFp ~= "", "447-r11: warm fingerprint")
+    assertEq(beforeRec.body.cutoverMarker, nil, "447-r11: export unmarked while uncredited")
+    local rankingBefore = rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))
+    assertEq(rankingBefore["Carol-Garona"], nil,
+        "447-r11: uncredited adj excluded from rankings")
+
+    local function adjBody(opts)
+        opts = opts or {}
+        return {
+            type = "adjustment",
+            id = stored.id,
+            txnId = stored.txnId or stored.id,
+            opId = stored.opId or stored.id,
+            generation = archivedGen,
+            timestamp = stored.timestamp or world.time or 1,
+            actor = stored.actor or "Alice-Garona",
+            writer = stored.writer or "Player-1-Alice",
+            itemId = 9459,
+            quantity = 1,
+            attributed = "Carol-Garona",
+            attributedGuid = opts.attributedGuid or "Player-1-Carol",
+            unitCopper = opts.unitCopper,
+            campaignId = archivedCampaignId,
+            datasetId = record.datasetId,
+            gsProductionCredit = true,
+        }
+    end
+    local function authCtx(extra)
+        local ctx = {
+            sender = "Alice-Garona",
+            member = {
+                guid = "Player-1-Alice", name = "Alice-Garona",
+                guildKey = "club:42", rankOrder = 1,
+            },
+            offlineRecord = record,
+            localWrite = false,
+            sourceCutoverMarker = liveMarker,
+        }
+        if type(extra) == "table" then
+            for k, v in pairs(extra) do
+                ctx[k] = v
+            end
+        end
+        return ctx
+    end
+
+    -- Regression A: conflicting price + enrichment payload must not mutate accepted state.
+    local priorAttrGuid = stored.attributedGuid
+    local stConflict, rConflict = GS:AdmitLedgerEvent(adjBody({ unitCopper = 9999 }), authCtx())
+    assertEq(stConflict, "rejected", "447-r11-A: conflict rejected")
+    assertEq(rConflict, "id_conflict", "447-r11-A: conflict reason")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11-A: accepted price unchanged")
+    assertEq(stored.gsProductionCredit, false, "447-r11-A: credit unchanged")
+    assertEq(stored.gsSourceCutoverMarker, nil, "447-r11-A: marker unchanged")
+    assertEq(stored.attributedGuid, priorAttrGuid, "447-r11-A: attribution unchanged")
+    local conflicts = record.accounting._consumables.txnConflicts
+    local q = conflicts and conflicts[stored.id or stored.opId]
+    assertTrue(q and type(q.bodies) == "table" and #q.bodies >= 1,
+        "447-r11-A: quarantine recorded")
+    assertEq(rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))["Carol-Garona"], nil,
+        "447-r11-A: ranking unchanged")
+    drainExportMaint(8)
+    local afterConflictRec = prov.api.GetRecordBody(exportId)
+    assertEq(afterConflictRec.versionFp, beforeFp, "447-r11-A: export fingerprint unchanged")
+    assertEq(afterConflictRec.body.cutoverMarker, nil, "447-r11-A: export marker unchanged")
+    assertEq(tonumber(afterConflictRec.body.event.unitCopper), 1800,
+        "447-r11-A: export body price unchanged")
+
+    -- Regression B: identical price + valid missing provenance updates credit/export.
+    local stProv, rProv = GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), authCtx())
+    assertEq(stProv, "duplicate", "447-r11-B: provenance enrich duplicate r=" .. tostring(rProv))
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11-B: price unchanged")
+    assertEq(stored.gsSourceCutoverMarker, liveMarker, "447-r11-B: marker applied")
+    assertEq(stored.gsProductionCredit, true, "447-r11-B: production credit applied")
+    assertEq(rankingsByName(GS:ProjectCampaignRankings(archivedCampaignId))["Carol-Garona"], 1800,
+        "447-r11-B: ranking includes credited adj")
+    drainExportMaint(8)
+    local afterProvRec = prov.api.GetRecordBody(exportId)
+    assertTrue(afterProvRec.versionFp ~= beforeFp, "447-r11-B: fingerprint changed")
+    assertEq(afterProvRec.body.cutoverMarker, liveMarker, "447-r11-B: export advertises marker")
+    assertEq(tonumber(afterProvRec.body.event.unitCopper), 1800, "447-r11-B: export price intact")
+
+    -- Downstream relay: strip credit/marker locally, re-admit priced+marked body.
+    local markedFp = afterProvRec.versionFp
+    stored.gsProductionCredit = false
+    stored.gsSourceCutoverMarker = nil
+    assertEq(GS.RefreshLedgerEventExport(record, stored), true, "447-r11-B: strip export")
+    drainExportMaint(8)
+    local strippedRec = prov.api.GetRecordBody(exportId)
+    assertEq(strippedRec.body.cutoverMarker, nil, "447-r11-B: stripped unmarked")
+    setPlayer("Carol-Garona", "Player-1-Carol", 3)
+    local stRelay, rRelay = GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), {
+        sender = "Carol-Garona",
+        member = {
+            guid = "Player-1-Carol", name = "Carol-Garona",
+            guildKey = "club:42", rankOrder = 3,
+        },
+        offlineRecord = record,
+        localWrite = false,
+        sourceCutoverMarker = liveMarker,
+    })
+    assertEq(stRelay, "duplicate", "447-r11-B: relay duplicate r=" .. tostring(rRelay))
+    assertEq(stored.gsProductionCredit, true, "447-r11-B: relay restores credit")
+    assertEq(stored.gsSourceCutoverMarker, liveMarker, "447-r11-B: relay restores marker")
+    drainExportMaint(8)
+    local relayRec = prov.api.GetRecordBody(exportId)
+    assertEq(relayRec.body.cutoverMarker, liveMarker, "447-r11-B: relayed export marked")
+    assertTrue(relayRec.versionFp ~= strippedRec.versionFp, "447-r11-B: relay fingerprint moves")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Unchanged duplicate idempotency (same price + same marker).
+    local fpStable = relayRec.versionFp
+    local stIdem = select(1, GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), authCtx()))
+    assertEq(stIdem, "duplicate", "447-r11: idempotent duplicate")
+    assertEq(tonumber(stored.unitCopper), 1800, "447-r11: idempotent price")
+    assertEq(stored.gsProductionCredit, true, "447-r11: idempotent credit")
+    drainExportMaint(4)
+    assertEq(prov.api.GetRecordBody(exportId).versionFp, fpStable,
+        "447-r11: idempotent export fingerprint")
+
+    -- Nil→priced still succeeds on a fresh unpriced archived row.
+    SF.TSM = nil
+    record = GS:GetCurrentRecord()
+    local addItem = select(1, GS:NewConfigOperation(
+        "set-requested-item", { itemId = 9459 }, { itemId = 9459, goal = 80 }))
+    assertEq(GS:ApplyStagedConfigOperation(addItem), "accepted", "447-r11: request item on current")
+    local adj2, adj2st, adj2err = GS:NewAdjustmentOperation(9459, 2, "Dave-Garona")
+    assertTrue(adj2 ~= nil, "447-r11: adj2 prepared st=" .. tostring(adj2st) .. " err=" .. tostring(adj2err))
+    local applySt, applyReason = GS:ApplyStagedConfigOperation(adj2)
+    assertEq(applySt, "accepted", "447-r11: unpriced adj2 st=" .. tostring(applySt) .. " r=" .. tostring(applyReason))
+    record = GS:GetCurrentRecord()
+    local stored2 = rankingsFindAdj(record, 9459, 2)
+    assertTrue(stored2 ~= nil, "447-r11: adj2 present")
+    assertEq(stored2.unitCopper, nil, "447-r11: adj2 unpriced")
+    local camp2 = record.currentCampaignId
+    local gen2 = tonumber(record.accounting._consumables.generation)
+    startCampaign()
+    record = GS:GetCurrentRecord()
+    local stNilPrice = select(1, GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = stored2.id,
+        txnId = stored2.txnId or stored2.id,
+        opId = stored2.opId or stored2.id,
+        generation = gen2,
+        timestamp = stored2.timestamp or world.time or 1,
+        actor = stored2.actor or "Alice-Garona",
+        writer = stored2.writer or "Player-1-Alice",
+        itemId = 9459,
+        quantity = 2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        unitCopper = 700,
+        campaignId = camp2,
+        datasetId = record.datasetId,
+    }, authCtx({ sourceCutoverMarker = liveMarker })))
+    assertEq(stNilPrice, "duplicate", "447-r11: nil→priced duplicate")
+    assertEq(tonumber(stored2.unitCopper), 700, "447-r11: nil→priced enrichment")
+
+    -- Unauthorized delivery cannot enrich.
+    stored2.unitCopper = nil
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    local stUnauth = select(1, GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = stored2.id,
+        txnId = stored2.txnId or stored2.id,
+        opId = stored2.opId or stored2.id,
+        generation = gen2,
+        timestamp = stored2.timestamp or world.time or 1,
+        actor = "Alice-Garona",
+        writer = "Player-1-Alice",
+        itemId = 9459,
+        quantity = 2,
+        attributed = "Dave-Garona",
+        attributedGuid = "Player-1-Dave",
+        unitCopper = 700,
+        campaignId = camp2,
+        datasetId = record.datasetId,
+    }, {
+        sender = "Dave-Garona",
+        member = {
+            guid = "Player-1-Dave", name = "Dave-Garona",
+            guildKey = "club:42", rankOrder = 4,
+        },
+        offlineRecord = record,
+        localWrite = false,
+        sourceCutoverMarker = liveMarker,
+    }))
+    assertTrue(stUnauth == "pending" or stUnauth == "rejected",
+        "447-r11: unauthorized not accepted st=" .. tostring(stUnauth))
+    assertEq(stored2.unitCopper, nil, "447-r11: unauthorized did not price")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+
+    -- Divergent marker leaves fail-closed (no provenance rewrite).
+    stored.gsSourceCutoverMarker = liveMarker
+    stored.gsProductionCredit = true
+    local priorGuid = stored.attributedGuid
+    local stDiv = select(1, GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), authCtx({
+        sourceCutoverMarker = "gsc1:divergent:forged:marker",
+    })))
+    assertEq(stDiv, "duplicate", "447-r11: divergent marker still duplicate body")
+    assertEq(stored.gsSourceCutoverMarker, liveMarker, "447-r11: divergent marker not applied")
+    assertEq(stored.gsProductionCredit, true, "447-r11: credit retained on divergent")
+    assertEq(stored.attributedGuid, priorGuid, "447-r11: attribution retained on divergent")
+
+    -- Offline adoption temporary record must not mutate the live export index.
+    local liveFp = prov.api.GetRecordBody(exportId).versionFp
+    local offlineAdj = {}
+    for k, v in pairs(stored) do
+        offlineAdj[k] = v
+    end
+    offlineAdj.gsSourceCutoverMarker = nil
+    offlineAdj.gsProductionCredit = false
+    local offlineRecord = {
+        datasetId = record.datasetId,
+        activation = record.activation,
+        liveCutover = record.liveCutover,
+        accounting = {
+            _consumables = {
+                generation = archivedGen,
+                txnConflicts = {},
+            },
+            _consumableEvents = {},
+            _consumableEventArchive = { offlineAdj },
+        },
+    }
+    local stOff = select(1, GS:AdmitLedgerEvent(adjBody({ unitCopper = 1800 }), {
+        sender = "Alice-Garona",
+        member = {
+            guid = "Player-1-Alice", name = "Alice-Garona",
+            guildKey = "club:42", rankOrder = 1,
+        },
+        offlineRecord = offlineRecord,
+        localWrite = false,
+        adoptionReplay = true,
+        preserveAttribution = true,
+        sourceCutoverMarker = liveMarker,
+    }))
+    assertTrue(stOff == "duplicate" or stOff == "accepted" or stOff == "rejected",
+        "447-r11: offline admit returned st=" .. tostring(stOff))
+    drainExportMaint(8)
+    assertEq(prov.api.GetRecordBody(exportId).versionFp, liveFp,
+        "447-r11: offline adoption did not change live export")
+    -- Live retained row remains the previously credited archived original.
+    assertEq(stored.gsProductionCredit, true, "447-r11: live row credit intact after offline")
+end
+
+do
+    -- 447-r4) Rankings exclude staged/non-production credit before activation,
+    -- include production after activation, and keep archived production totals.
+    valuationTsmValue = 400
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    setPlayer("Bob-Garona", "Player-1-Bob", 2)
+    local staged = seedActivatableCampaign(9455, 80)
+    -- Staged deposits before activation: accepted but not production credit.
+    ensureNonOfficerRoster()
+    local evidence = makeDepositEvidence(staged, {
+        itemId = 9455, quantity = 4, donor = "Bob-Garona",
+    })
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Dave", "Dave-Garona")),
+        "pending", "447-r4: w1")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Eve", "Eve-Garona")),
+        "pending", "447-r4: w2")
+    assertEq(select(1, GS:_AdmitObservationForTests(evidence, "Player-1-Frank", "Frank-Garona")),
+        "accepted", "447-r4: w3 staged")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjStaged = select(1, GS:NewAdjustmentOperation(9455, 1, "Carol-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjStaged), "accepted", "447-r4: staged adj")
+    staged = GS:GetCurrentRecord()
+    assertEq(staged.activation, "staged", "447-r4: still staged")
+    local donation = nil
+    for i = 1, #(staged.accounting._consumableEvents or {}) do
+        local ev = staged.accounting._consumableEvents[i]
+        if ev and tonumber(ev.itemId) == 9455 and tonumber(ev.quantity) == 4 then
+            donation = ev
+            break
+        end
+    end
+    assertTrue(donation ~= nil, "447-r4: staged donation present")
+    assertTrue(donation.gsProductionCredit ~= true, "447-r4: staged donation not production")
+    local rankingStaged = GS:ProjectCampaignRankings(staged.currentCampaignId)
+    assertEq(rankingsByName(rankingStaged)["Bob-Garona"], nil,
+        "447-r4: staged donation excluded from rankings")
+    assertEq(rankingsByName(rankingStaged)["Carol-Garona"], nil,
+        "447-r4: staged adj excluded from rankings")
+    -- Progress still counts staged rows.
+    local progress = GS:ProjectCampaignProgress(staged.currentCampaignId)
+    assertTrue((tonumber(progress.itemTotals and progress.itemTotals[9455]) or 0) > 0,
+        "447-r4: preparation progress still counts staged")
+
+    armFreshBankSample(true)
+    local _, stAct, reasonAct = GS:ActivateCanonicalDataset()
+    assertEq(stAct, "accepted", "447-r4: activate " .. tostring(reasonAct))
+    local live = GS:GetCurrentRecord()
+    disarmFreshBankSample()
+    world.time = tonumber(live.liveCutover.contextObservedAt) + 7200
+    creditValuationDeposit(live, {
+        itemId = 9455, quantity = 2, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9455|2" },
+        neighborsNewer = { "newer|2" },
+    })
+    live = GS:GetCurrentRecord()
+    local liveDonation = valuationFindDonation(live, 9455, 2)
+    assertEq(liveDonation.gsProductionCredit, true, "447-r4: live donation credited")
+    local rankingLive = GS:ProjectCampaignRankings(live.currentCampaignId)
+    assertEq(rankingsByName(rankingLive)["Dave-Garona"], 800,
+        "447-r4: production donation ranks after activation")
+    assertEq(rankingsByName(rankingLive)["Bob-Garona"], nil,
+        "447-r4: pre-activation staged still excluded")
+
+    local archivedId = live.currentCampaignId
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    startCampaign()
+    live = GS:GetCurrentRecord()
+    local rankingArchived = GS:ProjectCampaignRankings(archivedId)
+    assertEq(rankingsByName(rankingArchived)["Dave-Garona"], 800,
+        "447-r4: archived production totals intact")
+end
+
+do
+    -- 447-r5) EnsureValuationCatchup does not restart an active scan from Refresh.
+    valuationTsmValue = 50
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local record = activateValuationGuild(9456)
+    for i = 1, 24 do
+        creditValuationDeposit(record, {
+            itemId = 9456,
+            quantity = 1,
+            donor = "Bob-Garona",
+            occurrenceIndex = i,
+            neighborsOlder = { "older|9456|" .. tostring(i) },
+            neighborsNewer = { "newer|" .. tostring(i) },
+        })
+    end
+    record = GS:GetCurrentRecord()
+    if type(record.valuations) == "table" then
+        record.valuations.byTxn = {}
+        record.valuations.pending = {}
+    end
+    assertEq(GS.StartValuationCatchup("447-r5-start"), true, "447-r5: catch-up started")
+    local state1 = GS.GetValuationCatchupState()
+    assertEq(state1.active, true, "447-r5: active after start")
+    local gen1 = state1.generation
+    local index1 = state1.index
+    assertEq(GS.EnsureValuationCatchup("447-r5-ensure"), false, "447-r5: Ensure no-ops while active")
+    local state2 = GS.GetValuationCatchupState()
+    assertEq(state2.generation, gen1, "447-r5: generation unchanged by Ensure")
+    assertTrue((tonumber(state2.index) or 0) >= (tonumber(index1) or 0),
+        "447-r5: scan index does not rewind on Ensure")
+
+    -- Rankings Refresh must call Ensure, not Start.
+    local page = SF.SettingsUI.pagesById and SF.SettingsUI.pagesById.guildSuppliesRankings
+    assertTrue(type(page) == "table", "447-r5: rankings page")
+    local panel = {
+        __visible = true,
+        IsVisible = function(self) return self.__visible end,
+        IsShown = function(self) return self.__visible end,
+        HookScript = function() end,
+    }
+    page.panel = panel
+    -- Controlled start, then Refresh/NotifyUI must not restart the job.
+    GS.CancelValuationCatchup("447-r5-pre-refresh")
+    assertEq(GS.StartValuationCatchup("447-r5-controlled"), true,
+        "447-r5: controlled start before Refresh storm")
+    local genBefore = GS.GetValuationCatchupState().generation
+    local indexBefore = GS.GetValuationCatchupState().index
+    for _ = 1, 6 do
+        GS.NotifyUI("valuation")
+        flushTimers()
+        local okR, errR = pcall(function() page:Refresh(panel) end)
+        assertTrue(okR, "447-r5: Refresh ok " .. tostring(errR))
+    end
+    local after = GS.GetValuationCatchupState()
+    assertEq(after.generation, genBefore,
+        "447-r5: Refresh/NotifyUI did not bump catch-up generation")
+    assertTrue((tonumber(after.index) or 0) >= (tonumber(indexBefore) or 0),
+        "447-r5: forward progress without prefix rescan")
+    -- Advance catch-up slices and confirm eventual idle without restart loops.
+    for _ = 1, 200 do
+        flushTimers()
+        local st = GS.GetValuationCatchupState()
+        if not st.active and not st.scheduled then
+            break
+        end
+    end
+    local idle = GS.GetValuationCatchupState()
+    assertEq(idle.active, false, "447-r5: catch-up eventually idle")
+    local genIdle = idle.generation
+    for _ = 1, 4 do
+        GS.NotifyUI("valuation")
+        flushTimers()
+        page:Refresh(panel)
+    end
+    assertEq(GS.GetValuationCatchupState().generation, genIdle,
+        "447-r5: completed pass is not re-run from Refresh")
+    GS.CancelValuationCatchup("447-r5-done")
+end
+
+do
+    -- 447-r6) Chart resize is layout-only (no extra getRankings / ledger projections).
+    local function makeUiRegion(kind, name, parent)
+        local region = {
+            kind = kind, name = name, parent = parent, shown = true,
+            height = 0, width = 0, scripts = {}, hooks = {}, children = {},
+            text = "", enabled = true,
+        }
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = w end
+        function region:GetWidth() return self.width end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown end
+        function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:GetScript(event) return self.scripts[event] end
+        function region:HookScript(event, fn)
+            self.hooks[event] = self.hooks[event] or {}
+            self.hooks[event][#self.hooks[event] + 1] = fn
+        end
+        function region:SetAllPoints() end
+        function region:SetParent(p) self.parent = p end
+        function region:CreateFontString()
+            local fs = makeUiRegion("FontString", nil, self)
+            self.children[#self.children + 1] = fs
+            return fs
+        end
+        function region:CreateTexture()
+            local t = makeUiRegion("Texture", nil, self)
+            self.children[#self.children + 1] = t
+            return t
+        end
+        function region:SetText(t) self.text = tostring(t or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetWordWrap() end
+        function region:SetMaxLines() end
+        function region:SetFontObject() end
+        function region:SetScrollChild(c) self.scrollChild = c end
+        function region:GetVerticalScroll() return self._vscroll or 0 end
+        function region:GetVerticalScrollRange()
+            local child = self.scrollChild
+            local childH = child and child.GetHeight and child:GetHeight() or 0
+            local viewH = self:GetHeight() or 0
+            return math.max(0, childH - viewH)
+        end
+        -- Model ScrollFrame_OnScrollRangeChanged: keep slider range/arrows in sync
+        -- when the viewport or scroll child height changes.
+        local function syncScrollRange(scrollFrame)
+            if not scrollFrame or not scrollFrame.ScrollBar then
+                return
+            end
+            local range = scrollFrame:GetVerticalScrollRange() or 0
+            scrollFrame.ScrollBar:SetMinMaxValues(0, range)
+            local offset = tonumber(scrollFrame._vscroll) or 0
+            if offset < 0 then offset = 0 end
+            if offset > range then offset = range end
+            scrollFrame._vscroll = offset
+            if scrollFrame.scripts.OnVerticalScroll then
+                scrollFrame.scripts.OnVerticalScroll(scrollFrame, offset)
+            end
+        end
+        function region:SetHeight(h)
+            self.height = h
+            if self.ScrollBar and self.scrollChild then
+                syncScrollRange(self)
+            elseif self.parent and self.parent.scrollChild == self then
+                syncScrollRange(self.parent)
+            end
+        end
+        function region:SetSize(w, h)
+            self.width = w
+            self:SetHeight(h)
+        end
+        function region:SetVerticalScroll(v)
+            -- Model ScrollFrame: update range, then fire inherited script then hooks.
+            local range = 0
+            if self.GetVerticalScrollRange then
+                range = self:GetVerticalScrollRange() or 0
+            end
+            if self.ScrollBar and self.ScrollBar.SetMinMaxValues then
+                self.ScrollBar:SetMinMaxValues(0, range)
+            end
+            local offset = tonumber(v) or 0
+            if offset < 0 then offset = 0 end
+            if offset > range then offset = range end
+            self._vscroll = offset
+            if self.scripts.OnVerticalScroll then
+                self.scripts.OnVerticalScroll(self, offset)
+            end
+            for _, hook in ipairs(self.hooks.OnVerticalScroll or {}) do
+                hook(self, offset)
+            end
+        end
+        function region:SetMinMaxValues(a, b)
+            self._min = a or 0
+            self._max = b or 0
+        end
+        function region:GetMinMaxValues()
+            return self._min or 0, self._max or 0
+        end
+        function region:SetValue(v) self._value = tonumber(v) or 0 end
+        function region:GetValue() return self._value or 0 end
+        function region:SetStatusBarTexture() end
+        function region:SetStatusBarColor() end
+        function region:SetTexture() end
+        function region:SetVertexColor() end
+        function region:SetColorTexture() end
+        function region:SetShown(v) self.shown = v and true or false end
+        function region:SetAlpha() end
+        function region:EnableMouse() end
+        function region:SetHitRectInsets() end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetEnabled(v) self.enabled = v and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:GetParent() return self.parent end
+        return region
+    end
+    -- Model UIPanelScrollFrameTemplate → ScrollFrame_OnVerticalScroll
+    -- (SecureScrollTemplates.lua): syncs ScrollBar value and arrow buttons.
+    local function installInheritedScrollFrame(region)
+        local scrollbar = makeUiRegion("Slider", nil, region)
+        local up = makeUiRegion("Button", nil, scrollbar)
+        local down = makeUiRegion("Button", nil, scrollbar)
+        scrollbar.ScrollUpButton = up
+        scrollbar.ScrollDownButton = down
+        scrollbar._value = 0
+        scrollbar._min = 0
+        scrollbar._max = 0
+        up.enabled = false
+        down.enabled = false
+        region.ScrollBar = scrollbar
+        region.__sfInheritedOnVerticalScroll = function(self, offset)
+            local sb = self.ScrollBar
+            sb:SetValue(offset)
+            local _, maxV = sb:GetMinMaxValues()
+            sb.ScrollUpButton:SetEnabled(offset ~= 0)
+            sb.ScrollDownButton:SetEnabled((sb:GetValue() - maxV) ~= 0)
+        end
+        region:SetScript("OnVerticalScroll", region.__sfInheritedOnVerticalScroll)
+        region:SetHeight((region.parent and region.parent.GetHeight
+            and region.parent:GetHeight()) or 320)
+    end
+    local priorCreateFrame = CreateFrame
+    local frameCreateCount = 0
+    function CreateFrame(frameType, name, parent, template)
+        frameCreateCount = frameCreateCount + 1
+        local region = makeUiRegion(frameType or "Frame", name, parent)
+        if template == "UIPanelScrollFrameTemplate" then
+            installInheritedScrollFrame(region)
+        end
+        return region
+    end
+    if not SF.SettingsUI.Controls then
+        loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+        loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    end
+    local Controls = SF.SettingsUI.Controls
+    assertTrue(type(Controls) == "table" and type(Controls.AddContributionRankingChart) == "function",
+        "447-r6: chart control present")
+    local projectCalls = 0
+    local rankingsPayload = {
+        rows = {
+            { name = "Bob-Garona", totalCopper = 1000 },
+            { name = "Carol-Garona", totalCopper = 500 },
+        },
+        maxPositive = 1000,
+        hasHistory = true,
+    }
+    local capturedControl = nil
+    local priorInit = Controls.InitRow
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(320)
+        capturedControl = control
+        return row, control
+    end
+    -- Avoid production _ApplyRowState needing full Settings chrome.
+    local priorApply = Controls._ApplyRowState
+    Controls._ApplyRowState = function() return true, true end
+    local section = {
+        AddRow = function(self, height, buildFn, opts)
+            assertEq(opts and opts.fillHeight, true, "447-r6: fillHeight opted in")
+            local row = CreateFrame("Frame", "SF_TestRankingRow")
+            row:SetWidth(400)
+            row:SetHeight(height)
+            buildFn(row)
+            return row
+        end,
+    }
+    local row = Controls:AddContributionRankingChart(section, {
+        height = 320,
+        fillHeight = true,
+        getRankings = function()
+            projectCalls = projectCalls + 1
+            return rankingsPayload
+        end,
+    })
+    assertTrue(row ~= nil and capturedControl ~= nil, "447-r6: chart row created")
+    local dataBefore = projectCalls
+    assertTrue(dataBefore >= 1, "447-r6: initial Refresh projects once")
+    local layoutBefore = capturedControl.__sfRankingLayoutPass
+        and capturedControl.__sfRankingLayoutPass() or 0
+    for w = 400, 520, 20 do
+        capturedControl:SetWidth(w)
+        for _, hook in ipairs(capturedControl.hooks.OnSizeChanged or {}) do
+            hook(capturedControl, w, 320)
+        end
+    end
+    assertEq(projectCalls, dataBefore,
+        "447-r6: resize does not call getRankings again got=" .. tostring(projectCalls))
+    local layoutAfter = capturedControl.__sfRankingLayoutPass
+        and capturedControl.__sfRankingLayoutPass() or 0
+    assertTrue(layoutAfter > layoutBefore, "447-r6: resize performed layout passes")
+
+    -- 447-r9) Viewport-bounded reusable pool for large contributor sets.
+    local largeRows = {}
+    for i = 1, 240 do
+        largeRows[i] = {
+            name = string.format("Contrib%03d-Garona", i),
+            totalCopper = (241 - i) * 100,
+        }
+    end
+    -- Include a nonpositive trailing contributor to preserve signed/zero-width bars.
+    largeRows[241] = { name = "Neg-Garona", totalCopper = -500 }
+    local largePayload = {
+        rows = largeRows,
+        maxPositive = 24000,
+        hasHistory = true,
+    }
+    projectCalls = 0
+    frameCreateCount = 0
+    local largeControl = nil
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(280)
+        largeControl = control
+        return row, control
+    end
+    local largeSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingRowLarge")
+            row:SetWidth(400)
+            row:SetHeight(height or 280)
+            buildFn(row)
+            return row
+        end,
+    }
+    Controls:AddContributionRankingChart(largeSection, {
+        height = 280,
+        rowHeight = 28,
+        fillHeight = true,
+        getRankings = function()
+            projectCalls = projectCalls + 1
+            return largePayload
+        end,
+    })
+    assertTrue(largeControl ~= nil, "447-r9: large chart created")
+    assertTrue(projectCalls >= 1, "447-r9: initial data refresh")
+    local poolAfterBuild = largeControl.__sfRankingPoolCount
+        and largeControl.__sfRankingPoolCount() or 0
+    -- Viewport 280 / row 28 = 10 visible + 2*2 overscan = 14 max slots.
+    assertTrue(poolAfterBuild > 0 and poolAfterBuild <= 20,
+        "447-r9: pool bounded by viewport got=" .. tostring(poolAfterBuild))
+    assertTrue(poolAfterBuild < #largeRows,
+        "447-r9: pool smaller than contributor count")
+    local content = largeControl.__sfRankingContent
+    assertTrue(content ~= nil, "447-r9: content frame exposed")
+    assertEq(content:GetHeight(), #largeRows * 28,
+        "447-r9: full logical scroll height")
+    local visibleTop = largeControl.__sfRankingVisibleNames()
+    assertEq(visibleTop[1], "Contrib001-Garona", "447-r9: first visible at top")
+    local framesAtTop = frameCreateCount
+
+    -- Middle scroll: reuse pool; no aggregation rebuild.
+    local dataAtTop = projectCalls
+    local scroll = largeControl.__sfRankingScroll
+    assertTrue(scroll ~= nil, "447-r9: scroll exposed")
+    scroll:SetHeight(280)
+    scroll:SetVerticalScroll(100 * 28) -- Contrib101 at top of window (before overscan)
+    local visibleMid = largeControl.__sfRankingVisibleNames()
+    local midHit = false
+    for i = 1, #visibleMid do
+        if visibleMid[i] == "Contrib101-Garona" then
+            midHit = true
+            break
+        end
+    end
+    assertTrue(midHit, "447-r9: middle scroll shows Contrib101")
+    assertEq(projectCalls, dataAtTop, "447-r9: scroll does not call getRankings")
+    assertEq(largeControl.__sfRankingPoolCount(), poolAfterBuild,
+        "447-r9: scroll reuses pool slots")
+    assertEq(frameCreateCount, framesAtTop, "447-r9: scroll allocates no new frames")
+
+    -- Last scroll window includes Neg-Garona.
+    local maxScroll = math.max(0, (#largeRows * 28) - 280)
+    scroll:SetVerticalScroll(maxScroll)
+    local visibleLast = largeControl.__sfRankingVisibleNames()
+    local lastHit = false
+    for i = 1, #visibleLast do
+        if visibleLast[i] == "Neg-Garona" then
+            lastHit = true
+            break
+        end
+    end
+    assertTrue(lastHit, "447-r9: last scroll shows Neg-Garona")
+    assertEq(projectCalls, dataAtTop, "447-r9: last scroll still layout-only")
+
+    -- Resize without aggregation.
+    local layoutBeforeResize = largeControl.__sfRankingLayoutPass()
+    largeControl:SetWidth(480)
+    largeControl:SetHeight(200)
+    scroll:SetHeight(200)
+    for _, hook in ipairs(largeControl.hooks.OnSizeChanged or {}) do
+        hook(largeControl, 480, 200)
+    end
+    assertEq(projectCalls, dataAtTop, "447-r9: resize does not rebuild rankings")
+    assertTrue(largeControl.__sfRankingLayoutPass() > layoutBeforeResize,
+        "447-r9: resize performed layout")
+    local poolAfterResize = largeControl.__sfRankingPoolCount()
+    assertTrue(poolAfterResize <= 20, "447-r9: pool still bounded after shrink viewport")
+
+    -- List shrink / campaign change: Refresh clamps scroll; empty/hidden/access-loss
+    -- clears pool rows. Capture Refresh via section.__sfPageBuilder.
+    local mutControl = nil
+    local mutRefresh = nil
+    local mutPayload = { rows = {}, maxPositive = 0, hasHistory = true }
+    for i = 1, 80 do
+        mutPayload.rows[i] = {
+            name = string.format("Mut%03d-Garona", i),
+            totalCopper = 1000 - i,
+        }
+    end
+    mutPayload.maxPositive = 999
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(280)
+        mutControl = control
+        return row, control
+    end
+    local mutSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingMut")
+            row:SetWidth(400)
+            row:SetHeight(280)
+            buildFn(row)
+            return row
+        end,
+        __sfPageBuilder = {
+            RegisterRefresh = function(_, fn)
+                mutRefresh = fn
+            end,
+        },
+    }
+    Controls:AddContributionRankingChart(mutSection, {
+        height = 280,
+        rowHeight = 28,
+        fillHeight = true,
+        getRankings = function()
+            return mutPayload
+        end,
+    })
+    assertTrue(mutControl ~= nil and type(mutRefresh) == "function",
+        "447-r9: refresh captured")
+    local mutScroll = mutControl.__sfRankingScroll
+    mutScroll:SetHeight(280)
+    local deep = math.max(0, (#mutPayload.rows * 28) - 280)
+    mutScroll:SetVerticalScroll(deep)
+    assertTrue((mutScroll:GetVerticalScroll() or 0) > 0, "447-r9: scrolled deep before shrink")
+    -- Campaign change / shorter list.
+    mutPayload = {
+        rows = {
+            { name = "OnlyA-Garona", totalCopper = 100 },
+            { name = "OnlyB-Garona", totalCopper = 50 },
+        },
+        maxPositive = 100,
+        hasHistory = true,
+    }
+    mutRefresh()
+    assertEq(mutScroll:GetVerticalScroll(), 0, "447-r9: scroll clamped after list shrink")
+    assertEq(mutControl.__sfRankingContent:GetHeight(), 2 * 28,
+        "447-r9: content height matches short list")
+    local shortNames = mutControl.__sfRankingVisibleNames()
+    assertEq(shortNames[1], "OnlyA-Garona", "447-r9: short list first row")
+    assertTrue(mutControl.__sfRankingPoolCount() <= 20,
+        "447-r9: pool still bounded after campaign shrink")
+
+    -- Empty / no-history hides bars and clears visible pool.
+    mutPayload = {
+        rows = {},
+        maxPositive = 0,
+        hasHistory = false,
+        emptyReason = "no_contributions",
+    }
+    mutRefresh()
+    assertEq(#mutControl.__sfRankingVisibleNames(), 0,
+        "447-r9: empty clears visible pool")
+    assertEq(mutControl.__sfRankingContent:GetHeight(), 1,
+        "447-r9: empty content height collapsed")
+
+    -- Access-loss / custom empty text path.
+    mutPayload = {
+        rows = {},
+        emptyText = "Rankings unavailable",
+    }
+    mutRefresh()
+    assertEq(#mutControl.__sfRankingVisibleNames(), 0,
+        "447-r9: access-loss clears visible pool")
+
+    -- 447-r10) HookScript preserves UIPanelScrollFrameTemplate's inherited
+    -- ScrollFrame_OnVerticalScroll (scrollbar value + arrow enablement).
+    local function assertScrollChrome(scrollFrame, expectOffset, label)
+        local sb = scrollFrame.ScrollBar
+        assertTrue(type(sb) == "table", label .. ": scrollbar present")
+        assertEq(scrollFrame:GetVerticalScroll(), expectOffset, label .. ": scroll offset")
+        assertEq(sb:GetValue(), expectOffset, label .. ": slider value")
+        local range = scrollFrame:GetVerticalScrollRange() or 0
+        local _, maxV = sb:GetMinMaxValues()
+        assertEq(maxV, range, label .. ": slider max matches range")
+        if expectOffset <= 0 then
+            assertEq(sb.ScrollUpButton:IsEnabled(), false, label .. ": up disabled at top")
+        else
+            assertEq(sb.ScrollUpButton:IsEnabled(), true, label .. ": up enabled away from top")
+        end
+        if expectOffset >= range then
+            assertEq(sb.ScrollDownButton:IsEnabled(), false, label .. ": down disabled at bottom")
+        else
+            assertEq(sb.ScrollDownButton:IsEnabled(), true, label .. ": down enabled away from bottom")
+        end
+    end
+
+    local syncControl = nil
+    local syncRefresh = nil
+    local syncProject = 0
+    local syncRows = {}
+    for i = 1, 120 do
+        syncRows[i] = {
+            name = string.format("Sync%03d-Garona", i),
+            totalCopper = 1200 - i,
+        }
+    end
+    local syncPayload = { rows = syncRows, maxPositive = 1199, hasHistory = true }
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(280)
+        syncControl = control
+        return row, control
+    end
+    local syncSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingSync")
+            row:SetWidth(400)
+            row:SetHeight(280)
+            buildFn(row)
+            return row
+        end,
+        __sfPageBuilder = {
+            RegisterRefresh = function(_, fn)
+                syncRefresh = fn
+            end,
+        },
+    }
+    Controls:AddContributionRankingChart(syncSection, {
+        height = 280,
+        rowHeight = 28,
+        fillHeight = true,
+        getRankings = function()
+            syncProject = syncProject + 1
+            return syncPayload
+        end,
+    })
+    assertTrue(syncControl ~= nil and type(syncRefresh) == "function",
+        "447-r10: sync chart created")
+    local syncScroll = syncControl.__sfRankingScroll
+    assertTrue(syncScroll ~= nil, "447-r10: scroll frame")
+    syncScroll:SetHeight(280)
+    -- Inherited script must remain; layout is hooked after it.
+    assertTrue(syncScroll:GetScript("OnVerticalScroll") == syncScroll.__sfInheritedOnVerticalScroll,
+        "447-r10: inherited OnVerticalScroll preserved")
+    assertTrue(#(syncScroll.hooks.OnVerticalScroll or {}) >= 1,
+        "447-r10: layout hooked via HookScript")
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool remains viewport-bounded")
+
+    local projectBaseline = syncProject
+    local layoutBaseline = syncControl.__sfRankingLayoutPass()
+    assertScrollChrome(syncScroll, 0, "447-r10 top")
+
+    -- Wheel/slider movement away from top (mid).
+    local mid = 40 * 28
+    syncScroll:SetVerticalScroll(mid)
+    assertScrollChrome(syncScroll, mid, "447-r10 mid")
+    assertEq(syncProject, projectBaseline, "447-r10: mid scroll no aggregation")
+    local layoutAfterMid = syncControl.__sfRankingLayoutPass()
+    assertTrue(layoutAfterMid > layoutBaseline, "447-r10: mid scroll laid out once")
+    assertTrue(layoutAfterMid <= layoutBaseline + 2,
+        "447-r10: mid scroll no recursive layout storm got="
+            .. tostring(layoutAfterMid - layoutBaseline))
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool bounded after mid scroll")
+
+    -- Away from bottom endpoint as well (not quite max).
+    local rangeFull = syncScroll:GetVerticalScrollRange()
+    assertTrue(rangeFull > mid, "447-r10: scrollable range")
+    local nearBottom = rangeFull - 56
+    assertTrue(nearBottom > mid, "447-r10: near-bottom distinct")
+    syncScroll:SetVerticalScroll(nearBottom)
+    assertScrollChrome(syncScroll, nearBottom, "447-r10 near-bottom")
+    assertEq(syncScroll.ScrollBar.ScrollDownButton:IsEnabled(), true,
+        "447-r10: down still enabled before absolute bottom")
+
+    -- Absolute bottom: down disables, up enables.
+    syncScroll:SetVerticalScroll(rangeFull)
+    assertScrollChrome(syncScroll, rangeFull, "447-r10 bottom")
+    assertEq(syncProject, projectBaseline, "447-r10: bottom scroll no aggregation")
+
+    -- Programmatic clamp after list shrink: offset/slider/arrows stay synchronized.
+    syncScroll:SetVerticalScroll(rangeFull)
+    syncPayload = {
+        rows = {
+            { name = "TinyA-Garona", totalCopper = 10 },
+            { name = "TinyB-Garona", totalCopper = 5 },
+        },
+        maxPositive = 10,
+        hasHistory = true,
+    }
+    local layoutBeforeClamp = syncControl.__sfRankingLayoutPass()
+    syncRefresh()
+    assertEq(syncScroll:GetVerticalScroll(), 0, "447-r10: clamped to top after shrink")
+    assertScrollChrome(syncScroll, 0, "447-r10 after shrink")
+    assertTrue(syncControl.__sfRankingLayoutPass() > layoutBeforeClamp,
+        "447-r10: clamp refresh laid out")
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool bounded after clamp")
+
+    -- Rebuild a taller list, scroll deep, then shrink viewport via OnSizeChanged
+    -- so LayoutOnly clamps and chrome stays synchronized without aggregation.
+    syncPayload = { rows = {}, maxPositive = 0, hasHistory = true }
+    for i = 1, 90 do
+        syncPayload.rows[i] = {
+            name = string.format("Resize%03d", i),
+            totalCopper = 900 - i,
+        }
+    end
+    syncPayload.maxPositive = 899
+    syncRefresh()
+    syncScroll:SetHeight(280)
+    syncControl:SetHeight(280)
+    local deepRange = syncScroll:GetVerticalScrollRange()
+    syncScroll:SetVerticalScroll(deepRange)
+    assertScrollChrome(syncScroll, deepRange, "447-r10 deep before resize")
+    local projectBeforeResize = syncProject
+    local layoutBeforeResize = syncControl.__sfRankingLayoutPass()
+    syncControl:SetHeight(112) -- 4 rows visible
+    syncScroll:SetHeight(112)
+    for _, hook in ipairs(syncControl.hooks.OnSizeChanged or {}) do
+        hook(syncControl, 400, 112)
+    end
+    local clamped = syncScroll:GetVerticalScroll()
+    local newRange = syncScroll:GetVerticalScrollRange()
+    assertTrue(clamped <= newRange, "447-r10: resize clamp within range")
+    assertScrollChrome(syncScroll, clamped, "447-r10 after viewport resize")
+    assertEq(syncProject, projectBeforeResize, "447-r10: resize no aggregation")
+    assertTrue(syncControl.__sfRankingLayoutPass() > layoutBeforeResize,
+        "447-r10: resize performed layout")
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool bounded after resize clamp")
+
+    Controls.InitRow = priorInit
+    Controls._ApplyRowState = priorApply
+    CreateFrame = priorCreateFrame
+end
+
+do
+    -- 447-r7) Roster/guild changes route through Settings availability revalidation.
+    local winSrc = io.open("SpectrumFederation/modules/UI/Settings/StandaloneWindow.lua", "r")
+    assertTrue(winSrc ~= nil, "447-r7: StandaloneWindow readable")
+    local winBody = winSrc:read("*a")
+    winSrc:close()
+    assertTrue(winBody:find("GUILD_ROSTER_UPDATE", 1, true)
+            and winBody:find("HandleDurableAvailabilityChange", 1, true)
+            and winBody:find("_rosterAvailabilityFrame", 1, true),
+        "447-r7: StandaloneWindow roster → availability path")
+    local rankSrc = io.open(
+        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua", "r")
+    assertTrue(rankSrc ~= nil, "447-r7: Rankings page readable")
+    local rankBody = rankSrc:read("*a")
+    rankSrc:close()
+    assertTrue(rankBody:find("QueueAvailabilityRevalidation", 1, true),
+        "447-r7: Rankings queues availability revalidation")
+    assertTrue(rankBody:find("EnsureValuationCatchup", 1, true),
+        "447-r7: Rankings uses Ensure on show")
+    assertTrue(not rankBody:find("MaybeEnsureValuationCatchup", 1, true),
+        "447-r7: Rankings Refresh does not Ensure catch-up")
+    assertTrue(rankBody:find("fillHeight = true", 1, true),
+        "447-r7: Rankings opts into fillHeight")
+
+    -- Behavioral: unknown rank → officer flips available; demotion + Preview hide.
+    local Nav = SF.SettingsNavigationModel
+    local ui = SF.SettingsUI
+    local rankingsPage = ui.pagesById.guildSuppliesRankings
+    assertTrue(type(rankingsPage) == "table", "447-r7: rankings page")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    world.impersonationActive = false
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-r7: officer available")
+    setPlayer("Alice-Garona", "Player-1-Alice", 5)
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-r7: demotion hides")
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(Nav.IsPageAvailable(rankingsPage), true, "447-r7: promotion restores")
+    world.impersonationActive = true
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-r7: Preview hides")
+    world.impersonationActive = false
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(Nav.IsPageAvailable(rankingsPage), false, "447-r7: member unavailable")
+    local session = {
+        currentCategoryId = "guildSupplies",
+        currentPageId = "guildSuppliesLogs",
+    }
+    local resolved = Nav.ResolveShowPage(ui, session, "guildSuppliesRankings")
+    assertTrue(resolved.pageId ~= "guildSuppliesRankings",
+        "447-r7: demoted direct nav falls back got=" .. tostring(resolved.pageId))
+end
+
+---------------------------------------------------------------------------
+-- #447 adoption: preserve adjustment unitCopper across Begin/Buffer/Commit
+---------------------------------------------------------------------------
+
+local function rankingsAdoptFindAdj(record, itemId, quantity)
+    local lists = {
+        record and record.accounting and record.accounting._consumableEvents,
+        record and record.accounting and record.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and tonumber(ev.itemId) == itemId
+                    and tonumber(ev.quantity) == quantity then
+                    return ev
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function bufferAdoptionOrdered(exportBodies, mode)
+    -- mode: "natural" | "op_first" | "ledger_first" | "ops_evidence_ledger"
+    local ops, ledgers, evidence, other = {}, {}, {}, {}
+    for i = 1, #exportBodies do
+        local row = exportBodies[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-op" then
+            ops[#ops + 1] = row
+        elseif kind == "gs-ledger-event" then
+            ledgers[#ledgers + 1] = row
+        elseif kind == "gs-evidence" then
+            evidence[#evidence + 1] = row
+        else
+            other[#other + 1] = row
+        end
+    end
+    local order = {}
+    if mode == "op_first" then
+        for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #evidence do order[#order + 1] = evidence[i] end
+        for i = 1, #ops do order[#order + 1] = ops[i] end
+        for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
+    elseif mode == "ledger_first" then
+        for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #evidence do order[#order + 1] = evidence[i] end
+        for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
+        for i = 1, #ops do order[#order + 1] = ops[i] end
+    elseif mode == "ops_evidence_ledger" then
+        -- Reproduce evidence catch-up indexing adjustments before ledger bodies.
+        for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #ops do order[#order + 1] = ops[i] end
+        for i = 1, #evidence do order[#order + 1] = evidence[i] end
+        for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
+    else
+        order = exportBodies
+    end
+    for i = 1, #order do
+        local st = GS:BufferAdoptionRecord(order[i].id, order[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "447-adopt: buffer " .. tostring(order[i].id) .. " st=" .. tostring(st))
+    end
+end
+
+local function adoptFromExport(sourceDataset, exportBodies, mode, label)
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        label .. ": begin")
+    bufferAdoptionOrdered(exportBodies, mode)
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        label .. ": transfer ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted",
+        label .. ": commit st=" .. tostring(stAdopt) .. " r=" .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, label .. ": idle after commit")
+    local installed = GS:GetCurrentRecord()
+    assertEq(installed.datasetId, sourceDataset, label .. ": dataset replaced")
+    return installed
+end
+
+do
+    -- 447-adopt-1) Op-first and ledger-first adoption preserve priced ± adjustments;
+    -- rankings match source; reload retains prices; duplicate buffer is idempotent.
+    valuationTsmValue = 2500
+    SF.TSM = {
+        GetMarketValue = function() return valuationTsmValue end,
+    }
+    local source = activateValuationGuild(9460)
+    creditValuationDeposit(source, {
+        itemId = 9460, quantity = 5, donor = "Bob-Garona",
+    })
+    creditValuationDeposit(source, {
+        itemId = 9460, quantity = 2, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9460|2" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    local adjPos = select(1, GS:NewAdjustmentOperation(9460, 2, "Carol-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjPos), "accepted", "447-adopt-1: +2")
+    local adjNeg = select(1, GS:NewAdjustmentOperation(9460, -1, "Dave-Garona"))
+    assertEq(GS:ApplyStagedConfigOperation(adjNeg), "accepted", "447-adopt-1: -1")
+    source = GS:GetCurrentRecord()
+    local srcPos = rankingsAdoptFindAdj(source, 9460, 2)
+    local srcNeg = rankingsAdoptFindAdj(source, 9460, -1)
+    assertEq(tonumber(srcPos and srcPos.unitCopper), 2500, "447-adopt-1: source +2 priced")
+    assertEq(tonumber(srcNeg and srcNeg.unitCopper), 2500, "447-adopt-1: source -1 priced")
+    local sourceRanking = GS:ProjectCampaignRankings(source.currentCampaignId)
+    local sourceByName = rankingsByName(sourceRanking)
+    -- Bob 5*2500=12500; Carol +2*2500=5000; Dave donation 2*2500 + adj -1*2500=2500.
+    assertEq(sourceByName["Bob-Garona"], 12500, "447-adopt-1: source Bob")
+    assertEq(sourceByName["Carol-Garona"], 5000, "447-adopt-1: source Carol")
+    assertEq(sourceByName["Dave-Garona"], 2500, "447-adopt-1: source Dave")
+
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-1: provider")
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    assertTrue(#exportBodies >= 3, "447-adopt-1: export bodies")
+    local sourceDataset = source.datasetId
+    local sourceCampaign = source.currentCampaignId
+
+    -- Capture export snapshot before wiping DB.
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    local installed = adoptFromExport(sourceDataset, exportCopy, "op_first", "447-adopt-1-op")
+    local instPos = rankingsAdoptFindAdj(installed, 9460, 2)
+    local instNeg = rankingsAdoptFindAdj(installed, 9460, -1)
+    assertEq(tonumber(instPos and instPos.unitCopper), 2500,
+        "447-adopt-1-op: +2 unitCopper survived")
+    assertEq(tonumber(instNeg and instNeg.unitCopper), 2500,
+        "447-adopt-1-op: -1 unitCopper survived")
+    local instRanking = GS:ProjectCampaignRankings(installed.currentCampaignId)
+    local instByName = rankingsByName(instRanking)
+    assertEq(instByName["Bob-Garona"], sourceByName["Bob-Garona"], "447-adopt-1-op: Bob ranks")
+    assertEq(instByName["Carol-Garona"], sourceByName["Carol-Garona"], "447-adopt-1-op: Carol ranks")
+    assertEq(instByName["Dave-Garona"], sourceByName["Dave-Garona"], "447-adopt-1-op: Dave ranks")
+
+    -- Reload preserves installed prices.
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-adopt-1-op: reload")
+    installed = GS:GetCurrentRecord()
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9460, 2).unitCopper), 2500,
+        "447-adopt-1-op: +2 after reload")
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9460, -1).unitCopper), 2500,
+        "447-adopt-1-op: -1 after reload")
+
+    -- Ledger-first delivery order.
+    valuationTsmValue = 2500
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    source = activateValuationGuild(9461)
+    creditValuationDeposit(source, {
+        itemId = 9461, quantity = 3, donor = "Bob-Garona",
+    })
+    creditValuationDeposit(source, {
+        itemId = 9461, quantity = 3, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9461|3" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9461, 1, "Carol-Garona"))), "accepted",
+        "447-adopt-1-le: +1")
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9461, -2, "Dave-Garona"))), "accepted",
+        "447-adopt-1-le: -2")
+    source = GS:GetCurrentRecord()
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-1-le: provider")
+    drainExportMaint(64)
+    exportBodies = collectAllExportBodies()
+    sourceDataset = source.datasetId
+    exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+    local sourceRank2 = rankingsByName(GS:ProjectCampaignRankings(source.currentCampaignId))
+    installed = adoptFromExport(sourceDataset, exportCopy, "ledger_first", "447-adopt-1-le")
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9461, 1).unitCopper), 2500,
+        "447-adopt-1-le: +1 survived")
+    assertEq(tonumber(rankingsAdoptFindAdj(installed, 9461, -2).unitCopper), 2500,
+        "447-adopt-1-le: -2 survived")
+    local instRank2 = rankingsByName(GS:ProjectCampaignRankings(installed.currentCampaignId))
+    assertEq(instRank2["Bob-Garona"], sourceRank2["Bob-Garona"], "447-adopt-1-le: Bob")
+    assertEq(instRank2["Carol-Garona"], sourceRank2["Carol-Garona"], "447-adopt-1-le: Carol")
+    assertEq(instRank2["Dave-Garona"], sourceRank2["Dave-Garona"], "447-adopt-1-le: Dave")
+end
+
+do
+    -- 447-adopt-2) Conflicting/mismatched adjustment snapshots cannot publish;
+    -- active data and exports stay unchanged. Post-adopt conflict quarantines.
+    valuationTsmValue = 1000
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9462)
+    creditValuationDeposit(source, {
+        itemId = 9462, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9462, 1, "Carol-Garona"))), "accepted",
+        "447-adopt-2: adj")
+    source = GS:GetCurrentRecord()
+    local srcAdj = rankingsAdoptFindAdj(source, 9462, 1)
+    assertEq(tonumber(srcAdj and srcAdj.unitCopper), 1000, "447-adopt-2: source priced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-2: provider")
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    local beforeEvents = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-2: begin")
+    bufferAdoptionOrdered(exportCopy, "op_first")
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "447-adopt-2: ready")
+    -- After successful enrich, corrupt installed unitCopper in place only —
+    -- do not rewrite acctIndex.byId; completeness must observe the installed ref.
+    GS._adoptionBeforeCompletenessForTest = function(temp)
+        local adj = rankingsAdoptFindAdj(temp, 9462, 1)
+        assertTrue(type(adj) == "table", "447-adopt-2: temp adj after replay")
+        assertEq(tonumber(adj.unitCopper), 1000,
+            "447-adopt-2: enrich ran before completeness hook")
+        adj.unitCopper = 1777
+    end
+    local stFail, reasonFail = GS:CommitDatasetAdoption()
+    GS._adoptionBeforeCompletenessForTest = nil
+    assertEq(stFail, "rejected",
+        "447-adopt-2: mismatched snapshot rejected st=" .. tostring(stFail)
+            .. " r=" .. tostring(reasonFail))
+    assertEq(reasonFail, "incomplete_transfer",
+        "447-adopt-2: incomplete_transfer got=" .. tostring(reasonFail))
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+        "447-adopt-2: active dataset unchanged")
+    assertEq(#(GS:GetCurrentRecord().accounting._consumableEvents or {}), beforeEvents,
+        "447-adopt-2: active ledger unchanged")
+    assertEq(#collectAllExportBodies(), beforeExportCount,
+        "447-adopt-2: exports unchanged after reject")
+    if GS:GetPendingAdoption() then
+        assertEq(select(1, GS:CancelDatasetAdoption()), "accepted",
+            "447-adopt-2: cancel leftover")
+    end
+
+    -- Successful adopt, then conflicting price on the installed row.
+    local installed = adoptFromExport(sourceDataset, exportCopy, "op_first", "447-adopt-2-ok")
+    local instAdj = rankingsAdoptFindAdj(installed, 9462, 1)
+    assertEq(tonumber(instAdj.unitCopper), 1000, "447-adopt-2-ok: price installed")
+    local stClash, rClash = GS:AdmitLedgerEvent({
+        type = "adjustment",
+        id = instAdj.id,
+        txnId = instAdj.txnId or instAdj.id,
+        opId = instAdj.opId or instAdj.id,
+        generation = instAdj.generation,
+        timestamp = instAdj.timestamp or world.time or 1,
+        actor = instAdj.actor or "Alice-Garona",
+        writer = instAdj.writer or "Player-1-Alice",
+        itemId = 9462,
+        quantity = 1,
+        attributed = instAdj.attributed,
+        attributedGuid = instAdj.attributedGuid,
+        unitCopper = 1777,
+        campaignId = installed.currentCampaignId,
+        datasetId = installed.datasetId,
+        gsProductionCredit = true,
+    }, {
+        sender = "Alice-Garona",
+        member = { guid = "Player-1-Alice", name = "Alice-Garona", guildKey = "club:42", rankOrder = 1 },
+        offlineRecord = installed,
+        localWrite = false,
+    })
+    assertEq(stClash, "rejected", "447-adopt-2-ok: conflict rejected")
+    assertEq(rClash, "id_conflict", "447-adopt-2-ok: conflict reason")
+    assertEq(tonumber(instAdj.unitCopper), 1000, "447-adopt-2-ok: price not overwritten")
+end
+
+do
+    -- 447-adopt-3) Cancelled adoption leaves active data/exports unchanged;
+    -- successful replay stays bounded/idle; unpriced attributed adj still zeros;
+    -- duplicate buffer/delivery does not double-count.
+    valuationTsmValue = 400
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9463)
+    creditValuationDeposit(source, {
+        itemId = 9463, quantity = 2, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    SF.TSM = nil -- unpriced attributed adjustment
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9463, 1, "Eve-Garona"))), "accepted",
+        "447-adopt-3: unpriced adj")
+    source = GS:GetCurrentRecord()
+    assertEq(rankingsAdoptFindAdj(source, 9463, 1).unitCopper, nil,
+        "447-adopt-3: source unpriced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-3: provider")
+    drainExportMaint(64)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    -- Cancel path on a fresh adopter with prior staged data.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-3: begin")
+    for i = 1, math.min(3, #exportCopy) do
+        GS:BufferAdoptionRecord(exportCopy[i].id, exportCopy[i].body)
+    end
+    assertEq(select(1, GS:CancelDatasetAdoption()), "accepted", "447-adopt-3: cancel")
+    assertEq(GS:GetPendingAdoption(), nil, "447-adopt-3: cleared")
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs, "447-adopt-3: dataset intact")
+    assertEq(#collectAllExportBodies(), beforeExportCount, "447-adopt-3: exports intact")
+
+    -- Full successful op-first adopt of unpriced zero + donation.
+    -- Duplicate-buffer every body once more before commit (idempotent).
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    GS:EnsureGossipProvider()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-3-full: begin")
+    bufferAdoptionOrdered(exportCopy, "op_first")
+    -- Second delivery of every body must stay duplicate/accepted without
+    -- growing the buffer order (idempotent redelivery).
+    local orderBefore = #(GS:GetPendingAdoption().order or {})
+    for i = 1, #exportCopy do
+        local st = GS:BufferAdoptionRecord(exportCopy[i].id, exportCopy[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "447-adopt-3-full: redelivery st=" .. tostring(st))
+    end
+    assertEq(#(GS:GetPendingAdoption().order or {}), orderBefore,
+        "447-adopt-3-full: redelivery did not grow order")
+    assertTrue(GS:GetPendingAdoption().ready, "447-adopt-3-full: ready")
+    local stAdopt, reasonAdopt = GS:CommitDatasetAdoption()
+    assertEq(stAdopt, "accepted",
+        "447-adopt-3-full: commit st=" .. tostring(stAdopt)
+            .. " r=" .. tostring(reasonAdopt))
+    assertEq(GS:GetPendingAdoption(), nil, "447-adopt-3-full: idle after commit")
+    local installed = GS:GetCurrentRecord()
+    assertEq(installed.datasetId, sourceDataset, "447-adopt-3-full: dataset replaced")
+    assertEq(rankingsAdoptFindAdj(installed, 9463, 1).unitCopper, nil,
+        "447-adopt-3-full: unpriced preserved as nil")
+    local byName = rankingsByName(GS:ProjectCampaignRankings(installed.currentCampaignId))
+    assertEq(byName["Eve-Garona"], 0, "447-adopt-3-full: unpriced counts as zero")
+    assertEq(byName["Bob-Garona"], 800, "447-adopt-3-full: donation ranked")
+    -- Single adjustment row (no double-count from duplicate delivery).
+    local adjCount = 0
+    local lists = {
+        installed.accounting._consumableEvents,
+        installed.accounting._consumableEventArchive,
+    }
+    for li = 1, #lists do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local ev = list[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and tonumber(ev.itemId) == 9463
+                    and tonumber(ev.quantity) == 1 then
+                    adjCount = adjCount + 1
+                end
+            end
+        end
+    end
+    assertEq(adjCount, 1, "447-adopt-3-full: single adjustment row")
+    local stats = GS._lastAdoptionWorkStats
+    assertTrue(type(stats) == "table", "447-adopt-3-full: work stats")
+    local visited = tonumber(stats.completenessVisited) or 0
+    local indexVisited = tonumber(stats.indexVisited) or 0
+    assertTrue(visited < 10000 and indexVisited < 10000,
+        "447-adopt-3-full: bounded visited c=" .. tostring(visited)
+            .. " i=" .. tostring(indexVisited))
+end
+
+do
+    -- 447-adopt-4) ops → evidence → ledger with multiple attributed adjustments:
+    -- corrupting only a non-tip installed unitCopper (no index rewrite) must
+    -- reject as incomplete_transfer and leave active data/exports unchanged.
+    valuationTsmValue = 1500
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9464)
+    creditValuationDeposit(source, {
+        itemId = 9464, quantity = 4, donor = "Bob-Garona",
+    })
+    creditValuationDeposit(source, {
+        itemId = 9464, quantity = 2, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9464|2" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9464, 1, "Carol-Garona"))), "accepted",
+        "447-adopt-4: +1 Carol")
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9464, -1, "Dave-Garona"))), "accepted",
+        "447-adopt-4: -1 Dave")
+    source = GS:GetCurrentRecord()
+    local srcPos = rankingsAdoptFindAdj(source, 9464, 1)
+    local srcNeg = rankingsAdoptFindAdj(source, 9464, -1)
+    assertEq(tonumber(srcPos and srcPos.unitCopper), 1500, "447-adopt-4: +1 priced")
+    assertEq(tonumber(srcNeg and srcNeg.unitCopper), 1500, "447-adopt-4: -1 priced")
+    assertTrue(srcPos.id ~= srcNeg.id, "447-adopt-4: distinct adj ids")
+    local sourceRank = rankingsByName(GS:ProjectCampaignRankings(source.currentCampaignId))
+    -- Export as a deposit witness so local directExports include gs-evidence
+    -- (Alice-as-author does not own those witness rows).
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-4: provider")
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(128)
+    GS:DisableGossipProvider()
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-4: cold re-register")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local hasEvidence = false
+    for i = 1, #exportBodies do
+        if exportBodies[i].body and exportBodies[i].body.kind == "gs-evidence" then
+            hasEvidence = true
+            break
+        end
+    end
+    assertTrue(hasEvidence, "447-adopt-4: export includes gs-evidence")
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    -- Happy path: ops → evidence → ledger preserves both prices + rankings.
+    local installedOk = adoptFromExport(
+        sourceDataset, exportCopy, "ops_evidence_ledger", "447-adopt-4-ok")
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, 1).unitCopper), 1500,
+        "447-adopt-4-ok: +1 survived")
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, -1).unitCopper), 1500,
+        "447-adopt-4-ok: -1 survived")
+    local instRank = rankingsByName(GS:ProjectCampaignRankings(installedOk.currentCampaignId))
+    assertEq(instRank["Bob-Garona"], sourceRank["Bob-Garona"], "447-adopt-4-ok: Bob")
+    assertEq(instRank["Carol-Garona"], sourceRank["Carol-Garona"], "447-adopt-4-ok: Carol")
+    assertEq(instRank["Dave-Garona"], sourceRank["Dave-Garona"], "447-adopt-4-ok: Dave")
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-adopt-4-ok: reload")
+    installedOk = GS:GetCurrentRecord()
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, 1).unitCopper), 1500,
+        "447-adopt-4-ok: +1 after reload")
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, -1).unitCopper), 1500,
+        "447-adopt-4-ok: -1 after reload")
+
+    -- Mismatch path: corrupt only the non-tip adjustment; do not touch the index.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    local beforeEvents = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-4-mismatch: begin")
+    bufferAdoptionOrdered(exportCopy, "ops_evidence_ledger")
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "447-adopt-4-mismatch: ready")
+    GS._adoptionBeforeCompletenessForTest = function(temp)
+        local live = temp.accounting and temp.accounting._consumableEvents
+        assertTrue(type(live) == "table" and #live >= 2,
+            "447-adopt-4-mismatch: live list populated")
+        local tip = live[#live]
+        local nonTip = nil
+        for i = 1, #live - 1 do
+            local ev = live[i]
+            if type(ev) == "table"
+                and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                and tonumber(ev.unitCopper) == 1500 then
+                nonTip = ev
+                break
+            end
+        end
+        -- Prefer an adjustment that is not the tip; fall back to any non-tip priced adj.
+        if nonTip == nil then
+            for i = 1, #live do
+                local ev = live[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and ev ~= tip
+                    and tonumber(ev.unitCopper) == 1500 then
+                    nonTip = ev
+                    break
+                end
+            end
+        end
+        assertTrue(type(nonTip) == "table", "447-adopt-4-mismatch: found non-tip adj")
+        assertTrue(nonTip ~= tip, "447-adopt-4-mismatch: target is not tip")
+        assertEq(tonumber(nonTip.unitCopper), 1500,
+            "447-adopt-4-mismatch: enrich before corrupt")
+        nonTip.unitCopper = 1777
+        -- Intentionally do not rewrite acctIndex.byId.
+    end
+    local stFail, reasonFail = GS:CommitDatasetAdoption()
+    GS._adoptionBeforeCompletenessForTest = nil
+    assertEq(stFail, "rejected",
+        "447-adopt-4-mismatch: rejected st=" .. tostring(stFail)
+            .. " r=" .. tostring(reasonFail))
+    assertEq(reasonFail, "incomplete_transfer",
+        "447-adopt-4-mismatch: incomplete_transfer got=" .. tostring(reasonFail))
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+        "447-adopt-4-mismatch: active dataset unchanged")
+    assertEq(#(GS:GetCurrentRecord().accounting._consumableEvents or {}), beforeEvents,
+        "447-adopt-4-mismatch: active ledger unchanged")
+    assertEq(#collectAllExportBodies(), beforeExportCount,
+        "447-adopt-4-mismatch: exports unchanged")
+    if GS:GetPendingAdoption() then
+        assertEq(select(1, GS:CancelDatasetAdoption()), "accepted",
+            "447-adopt-4-mismatch: cancel leftover")
+    end
+end
+
+do
+    -- 447-adopt-5) Rolled-over campaign: ledger bodies that AppendArchivedLedgerEvent
+    -- during replay must settle under constrained async slices; archived prices and
+    -- campaign rankings survive; active data/exports stay unpublished until commit.
+    valuationTsmValue = 2200
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9465)
+    creditValuationDeposit(source, {
+        itemId = 9465, quantity = 3, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9465, 2, "Carol-Garona"))), "accepted",
+        "447-adopt-5: +2 before rollover")
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9465, -1, "Bob-Garona"))), "accepted",
+        "447-adopt-5: -1 before rollover")
+    source = GS:GetCurrentRecord()
+    local camp1 = source.currentCampaignId
+    local srcPos = rankingsAdoptFindAdj(source, 9465, 2)
+    local srcNeg = rankingsAdoptFindAdj(source, 9465, -1)
+    assertEq(tonumber(srcPos and srcPos.unitCopper), 2200, "447-adopt-5: +2 priced")
+    assertEq(tonumber(srcNeg and srcNeg.unitCopper), 2200, "447-adopt-5: -1 priced")
+    local camp1Rank = rankingsByName(GS:ProjectCampaignRankings(camp1))
+    assertEq(camp1Rank["Carol-Garona"], 4400, "447-adopt-5: Carol camp1")
+    assertEq(camp1Rank["Bob-Garona"], 3 * 2200 + (-1) * 2200, "447-adopt-5: Bob camp1")
+    -- Rollover archives prior generation.
+    startCampaign()
+    source = GS:GetCurrentRecord()
+    local camp2 = source.currentCampaignId
+    assertTrue(camp2 ~= camp1, "447-adopt-5: new campaign")
+    -- Prior adjustments must live in the event archive after shelve.
+    local srcArch = source.accounting and source.accounting._consumableEventArchive
+    local archPos = rankingsAdoptFindAdj(
+        { accounting = { _consumableEvents = srcArch } }, 9465, 2)
+    if not archPos then
+        archPos = rankingsAdoptFindAdj(source, 9465, 2)
+    end
+    assertTrue(type(archPos) == "table", "447-adopt-5: +2 retained after rollover")
+    assertEq(tonumber(archPos.unitCopper), 2200, "447-adopt-5: archived +2 priced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-5: provider")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    -- Split: structure ops first (campaigns/rollover), then ledgers (archive append
+    -- path for older-generation adjustments), then adjustment ops last.
+    local structureOps, adjustOps, ledgers, evidence, other = {}, {}, {}, {}, {}
+    for i = 1, #exportCopy do
+        local row = exportCopy[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-op" and row.body.op and row.body.op.kind == "adjust-quantity" then
+            adjustOps[#adjustOps + 1] = row
+        elseif kind == "gs-op" then
+            structureOps[#structureOps + 1] = row
+        elseif kind == "gs-ledger-event" then
+            ledgers[#ledgers + 1] = row
+        elseif kind == "gs-evidence" then
+            evidence[#evidence + 1] = row
+        else
+            other[#other + 1] = row
+        end
+    end
+    assertTrue(#adjustOps >= 2, "447-adopt-5: adjust ops exported")
+    assertTrue(#ledgers >= 2, "447-adopt-5: ledger bodies exported")
+    local adjLedgerCount = 0
+    for i = 1, #ledgers do
+        local ev = ledgers[i].body and ledgers[i].body.event
+        if type(ev) == "table"
+            and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT") then
+            adjLedgerCount = adjLedgerCount + 1
+        end
+    end
+    assertTrue(adjLedgerCount >= 2, "447-adopt-5: adjustment ledgers present")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    local beforeEvents = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-5: begin")
+    -- Active dataset must remain the pre-adoption one until commit finishes.
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs, "447-adopt-5: pre-buffer dataset")
+    local order = {}
+    for i = 1, #other do order[#order + 1] = other[i] end
+    for i = 1, #structureOps do order[#order + 1] = structureOps[i] end
+    for i = 1, #evidence do order[#order + 1] = evidence[i] end
+    for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
+    for i = 1, #adjustOps do order[#order + 1] = adjustOps[i] end
+    for i = 1, #order do
+        local st = GS:BufferAdoptionRecord(order[i].id, order[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "447-adopt-5: buffer " .. tostring(order[i].id))
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "447-adopt-5: ready")
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+        "447-adopt-5: dataset unchanged while buffered")
+    assertEq(#collectAllExportBodies(), beforeExportCount,
+        "447-adopt-5: exports unchanged while buffered")
+
+    local priorSlice = GS.MAX_ADMISSION_WORK_PER_SLICE
+    GS.MAX_ADMISSION_WORK_PER_SLICE = 4
+    GS._adoptionReplaySyncDrain = false
+    local sawArchiveAppend = false
+    GS._adoptionBeforeCompletenessForTest = function(temp)
+        local arch = temp.accounting and temp.accounting._consumableEventArchive
+        if type(arch) == "table" then
+            for i = 1, #arch do
+                local ev = arch[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and tonumber(ev.quantity) == 2
+                    and tonumber(ev.unitCopper) == 2200 then
+                    sawArchiveAppend = true
+                    break
+                end
+            end
+        end
+    end
+    local st1, reason1 = GS:CommitDatasetAdoption()
+    assertTrue(st1 == "pending" or st1 == "accepted",
+        "447-adopt-5: commit starts st=" .. tostring(st1) .. " r=" .. tostring(reason1))
+    -- While pending, active publication must not have replaced the live dataset.
+    if st1 == "pending" then
+        assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+            "447-adopt-5: no early publish during pending")
+        assertEq(#collectAllExportBodies(), beforeExportCount,
+            "447-adopt-5: no early export mutate during pending")
+    end
+    -- Drain one due timer per slice so a buggy endless reschedule cannot hang
+    -- inside coalesced flushTimers.
+    local slices = 0
+    local maxSlices = 400
+    while GS._adoption and GS._adoption.replayTemp and slices < maxSlices do
+        slices = slices + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+    end
+    GS._adoptionBeforeCompletenessForTest = nil
+    GS.MAX_ADMISSION_WORK_PER_SLICE = priorSlice
+    GS._adoptionReplaySyncDrain = true
+    assertTrue(slices < maxSlices,
+        "447-adopt-5: settled within drain limit slices=" .. tostring(slices))
+    assertEq(GS:GetPendingAdoption(), nil, "447-adopt-5: idle after commit")
+    local installed = GS:GetCurrentRecord()
+    assertEq(installed.datasetId, sourceDataset, "447-adopt-5: dataset replaced")
+    assertTrue(sawArchiveAppend,
+        "447-adopt-5: archive held priced +2 during completeness")
+    local instArch = installed.accounting and installed.accounting._consumableEventArchive
+    local instPos = nil
+    local instNeg = nil
+    if type(instArch) == "table" then
+        for i = 1, #instArch do
+            local ev = instArch[i]
+            if type(ev) == "table"
+                and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                and tonumber(ev.itemId) == 9465 then
+                if tonumber(ev.quantity) == 2 then instPos = ev end
+                if tonumber(ev.quantity) == -1 then instNeg = ev end
+            end
+        end
+    end
+    assertTrue(type(instPos) == "table", "447-adopt-5: +2 in installed archive")
+    assertTrue(type(instNeg) == "table", "447-adopt-5: -1 in installed archive")
+    assertEq(tonumber(instPos.unitCopper), 2200, "447-adopt-5: archived +2 price")
+    assertEq(tonumber(instNeg.unitCopper), 2200, "447-adopt-5: archived -1 price")
+    local instCamp1Rank = rankingsByName(GS:ProjectCampaignRankings(camp1))
+    assertEq(instCamp1Rank["Carol-Garona"], camp1Rank["Carol-Garona"],
+        "447-adopt-5: Carol camp1 ranks")
+    assertEq(instCamp1Rank["Bob-Garona"], camp1Rank["Bob-Garona"],
+        "447-adopt-5: Bob camp1 ranks")
+    assertEq(installed.currentCampaignId, camp2, "447-adopt-5: current is camp2")
 end
 
 SF.TSM = nil

@@ -9,9 +9,10 @@ local GS = SF.GuildSupplies
 local GG = SF.GuildGossip
 
 GS.PROVIDER_ID = GS.PROVIDER_ID or "sf.guildsupplies.config"
--- Wire schema for sf.guildsupplies.config. Schema 3 (#427) is incompatible with
--- older link-based witness peers; Guild Gossip matches by strict equality.
-GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 3
+-- Wire schema for sf.guildsupplies.config. Schema 4 (#447) carries attributed
+-- adjustment unitCopper on ledger events; schema-3 peers drop that field.
+-- Guild Gossip matches by strict equality.
+GS.PROVIDER_SCHEMA = GS.PROVIDER_SCHEMA or 4
 
 local function DebugInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info and SF.Debug.IsEnabled and SF.Debug:IsEnabled() then
@@ -2152,6 +2153,90 @@ local function UpsertLedgerEventExport(exportId, datasetId, event, cutoverMarker
         event = event,
         cutoverMarker = cutoverMarker,
     })
+end
+
+--- Force a single ledger-event export/fingerprint refresh after in-place mutation.
+-- Op-first enrichment mutates the same event table that the export index already
+-- holds; UpsertLedgerEventExport would otherwise no-op on `prev.event == event`
+-- and leave peers on the unpriced fingerprint. Touches only this id — no full
+-- history rebuild — including rows outside the recent warm window (#447).
+function GS.RefreshLedgerEventExport(record, event)
+    if type(record) ~= "table" or type(event) ~= "table" then
+        return false
+    end
+    if type(event.id) ~= "string" or event.id == "" then
+        return false
+    end
+    -- Temporary adoption offline records must not mutate the live export index
+    -- or notify peers before atomic publish (#447). Identity check against the
+    -- current guild record — datasetId alone is insufficient during replace.
+    local current = nil
+    if GS.GetCurrentRecord then
+        current = select(1, GS:GetCurrentRecord())
+    end
+    if current == nil or record ~= current then
+        return false
+    end
+    local exportId = "gs:le:" .. event.id
+    local liveMarker = nil
+    if GS.IsLiveActive and GS.IsLiveActive(record)
+        and type(record.liveCutover) == "table"
+        and type(record.liveCutover.cutoverMarker) == "string" then
+        liveMarker = record.liveCutover.cutoverMarker
+    end
+    local cutoverMarker = ExportCutoverMarkerForEvent(event, liveMarker)
+    local body = {
+        kind = "gs-ledger-event",
+        datasetId = record.datasetId,
+        event = event,
+        cutoverMarker = cutoverMarker,
+    }
+    if not providerRegistered then
+        if GS.NotifyUI then
+            GS.NotifyUI("ledger")
+        end
+        return false
+    end
+    if exportState.datasetId ~= record.datasetId or exportState.guildKey == nil then
+        -- Dataset export not warm yet; paced rebuild will pick the enriched body.
+        exportState.ledgerBuildNeeded = true
+        exportState.maintIdle = false
+        if ScheduleExportMaintContinuation then
+            ScheduleExportMaintContinuation()
+        end
+        if GS.NotifyUI then
+            GS.NotifyUI("ledger")
+        end
+        return true
+    end
+    local existing = exportState.byId[exportId]
+    if existing then
+        existing.body = body
+        existing.versionFp = nil
+        existing.needsFp = true
+        exportState.countsDirty = true
+        if GG and GG.GetProvider then
+            local prov = GG.GetProvider(GS.PROVIDER_ID)
+            if prov and prov.index then
+                prov.index.dirty = true
+                prov.index.buildComplete = false
+            end
+        end
+    else
+        UpsertExportBody(exportId, body)
+    end
+    if (tonumber(durableNotifyBatchDepth) or 0) > 0 then
+        durableNotifyBatchPending = PreferDurableNotifyReason(
+            durableNotifyBatchPending, "ledger")
+        return true
+    end
+    if GG and GG.NotifyProviderChanged then
+        GG.NotifyProviderChanged(GS.PROVIDER_ID)
+    end
+    if GS.NotifyUI then
+        GS.NotifyUI("ledger")
+    end
+    return true
 end
 
 --- Force paced archive→live ledger rebuild after TrimEventArchive removes IDs.
