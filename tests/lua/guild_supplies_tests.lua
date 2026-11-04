@@ -44062,15 +44062,14 @@ do
         }
         function region:SetPoint() end
         function region:ClearAllPoints() end
-        function region:SetHeight(h) self.height = h end
         function region:GetHeight() return self.height end
         function region:SetWidth(w) self.width = w end
         function region:GetWidth() return self.width end
-        function region:SetSize(w, h) self.width = w; self.height = h end
         function region:Show() self.shown = true end
         function region:Hide() self.shown = false end
         function region:IsShown() return self.shown end
         function region:SetScript(event, fn) self.scripts[event] = fn end
+        function region:GetScript(event) return self.scripts[event] end
         function region:HookScript(event, fn)
             self.hooks[event] = self.hooks[event] or {}
             self.hooks[event][#self.hooks[event] + 1] = fn
@@ -44096,14 +44095,69 @@ do
         function region:SetFontObject() end
         function region:SetScrollChild(c) self.scrollChild = c end
         function region:GetVerticalScroll() return self._vscroll or 0 end
-        function region:SetVerticalScroll(v)
-            self._vscroll = tonumber(v) or 0
-            if self.scripts.OnVerticalScroll then
-                self.scripts.OnVerticalScroll(self, self._vscroll)
+        function region:GetVerticalScrollRange()
+            local child = self.scrollChild
+            local childH = child and child.GetHeight and child:GetHeight() or 0
+            local viewH = self:GetHeight() or 0
+            return math.max(0, childH - viewH)
+        end
+        -- Model ScrollFrame_OnScrollRangeChanged: keep slider range/arrows in sync
+        -- when the viewport or scroll child height changes.
+        local function syncScrollRange(scrollFrame)
+            if not scrollFrame or not scrollFrame.ScrollBar then
+                return
+            end
+            local range = scrollFrame:GetVerticalScrollRange() or 0
+            scrollFrame.ScrollBar:SetMinMaxValues(0, range)
+            local offset = tonumber(scrollFrame._vscroll) or 0
+            if offset < 0 then offset = 0 end
+            if offset > range then offset = range end
+            scrollFrame._vscroll = offset
+            if scrollFrame.scripts.OnVerticalScroll then
+                scrollFrame.scripts.OnVerticalScroll(scrollFrame, offset)
             end
         end
-        function region:SetMinMaxValues() end
-        function region:SetValue() end
+        function region:SetHeight(h)
+            self.height = h
+            if self.ScrollBar and self.scrollChild then
+                syncScrollRange(self)
+            elseif self.parent and self.parent.scrollChild == self then
+                syncScrollRange(self.parent)
+            end
+        end
+        function region:SetSize(w, h)
+            self.width = w
+            self:SetHeight(h)
+        end
+        function region:SetVerticalScroll(v)
+            -- Model ScrollFrame: update range, then fire inherited script then hooks.
+            local range = 0
+            if self.GetVerticalScrollRange then
+                range = self:GetVerticalScrollRange() or 0
+            end
+            if self.ScrollBar and self.ScrollBar.SetMinMaxValues then
+                self.ScrollBar:SetMinMaxValues(0, range)
+            end
+            local offset = tonumber(v) or 0
+            if offset < 0 then offset = 0 end
+            if offset > range then offset = range end
+            self._vscroll = offset
+            if self.scripts.OnVerticalScroll then
+                self.scripts.OnVerticalScroll(self, offset)
+            end
+            for _, hook in ipairs(self.hooks.OnVerticalScroll or {}) do
+                hook(self, offset)
+            end
+        end
+        function region:SetMinMaxValues(a, b)
+            self._min = a or 0
+            self._max = b or 0
+        end
+        function region:GetMinMaxValues()
+            return self._min or 0, self._max or 0
+        end
+        function region:SetValue(v) self._value = tonumber(v) or 0 end
+        function region:GetValue() return self._value or 0 end
         function region:SetStatusBarTexture() end
         function region:SetStatusBarColor() end
         function region:SetTexture() end
@@ -44120,14 +44174,38 @@ do
         function region:GetParent() return self.parent end
         return region
     end
+    -- Model UIPanelScrollFrameTemplate → ScrollFrame_OnVerticalScroll
+    -- (SecureScrollTemplates.lua): syncs ScrollBar value and arrow buttons.
+    local function installInheritedScrollFrame(region)
+        local scrollbar = makeUiRegion("Slider", nil, region)
+        local up = makeUiRegion("Button", nil, scrollbar)
+        local down = makeUiRegion("Button", nil, scrollbar)
+        scrollbar.ScrollUpButton = up
+        scrollbar.ScrollDownButton = down
+        scrollbar._value = 0
+        scrollbar._min = 0
+        scrollbar._max = 0
+        up.enabled = false
+        down.enabled = false
+        region.ScrollBar = scrollbar
+        region.__sfInheritedOnVerticalScroll = function(self, offset)
+            local sb = self.ScrollBar
+            sb:SetValue(offset)
+            local _, maxV = sb:GetMinMaxValues()
+            sb.ScrollUpButton:SetEnabled(offset ~= 0)
+            sb.ScrollDownButton:SetEnabled((sb:GetValue() - maxV) ~= 0)
+        end
+        region:SetScript("OnVerticalScroll", region.__sfInheritedOnVerticalScroll)
+        region:SetHeight((region.parent and region.parent.GetHeight
+            and region.parent:GetHeight()) or 320)
+    end
     local priorCreateFrame = CreateFrame
     local frameCreateCount = 0
     function CreateFrame(frameType, name, parent, template)
         frameCreateCount = frameCreateCount + 1
         local region = makeUiRegion(frameType or "Frame", name, parent)
         if template == "UIPanelScrollFrameTemplate" then
-            region.ScrollBar = makeUiRegion("Slider", nil, region)
-            region:SetHeight((parent and parent.GetHeight and parent:GetHeight()) or 320)
+            installInheritedScrollFrame(region)
         end
         return region
     end
@@ -44391,6 +44469,166 @@ do
     mutRefresh()
     assertEq(#mutControl.__sfRankingVisibleNames(), 0,
         "447-r9: access-loss clears visible pool")
+
+    -- 447-r10) HookScript preserves UIPanelScrollFrameTemplate's inherited
+    -- ScrollFrame_OnVerticalScroll (scrollbar value + arrow enablement).
+    local function assertScrollChrome(scrollFrame, expectOffset, label)
+        local sb = scrollFrame.ScrollBar
+        assertTrue(type(sb) == "table", label .. ": scrollbar present")
+        assertEq(scrollFrame:GetVerticalScroll(), expectOffset, label .. ": scroll offset")
+        assertEq(sb:GetValue(), expectOffset, label .. ": slider value")
+        local range = scrollFrame:GetVerticalScrollRange() or 0
+        local _, maxV = sb:GetMinMaxValues()
+        assertEq(maxV, range, label .. ": slider max matches range")
+        if expectOffset <= 0 then
+            assertEq(sb.ScrollUpButton:IsEnabled(), false, label .. ": up disabled at top")
+        else
+            assertEq(sb.ScrollUpButton:IsEnabled(), true, label .. ": up enabled away from top")
+        end
+        if expectOffset >= range then
+            assertEq(sb.ScrollDownButton:IsEnabled(), false, label .. ": down disabled at bottom")
+        else
+            assertEq(sb.ScrollDownButton:IsEnabled(), true, label .. ": down enabled away from bottom")
+        end
+    end
+
+    local syncControl = nil
+    local syncRefresh = nil
+    local syncProject = 0
+    local syncRows = {}
+    for i = 1, 120 do
+        syncRows[i] = {
+            name = string.format("Sync%03d-Garona", i),
+            totalCopper = 1200 - i,
+        }
+    end
+    local syncPayload = { rows = syncRows, maxPositive = 1199, hasHistory = true }
+    Controls.InitRow = function(self, row, opts)
+        local control = CreateFrame("Frame", nil, row)
+        control:SetWidth(400)
+        control:SetHeight(280)
+        syncControl = control
+        return row, control
+    end
+    local syncSection = {
+        AddRow = function(self, height, buildFn, opts)
+            local row = CreateFrame("Frame", "SF_TestRankingSync")
+            row:SetWidth(400)
+            row:SetHeight(280)
+            buildFn(row)
+            return row
+        end,
+        __sfPageBuilder = {
+            RegisterRefresh = function(_, fn)
+                syncRefresh = fn
+            end,
+        },
+    }
+    Controls:AddContributionRankingChart(syncSection, {
+        height = 280,
+        rowHeight = 28,
+        fillHeight = true,
+        getRankings = function()
+            syncProject = syncProject + 1
+            return syncPayload
+        end,
+    })
+    assertTrue(syncControl ~= nil and type(syncRefresh) == "function",
+        "447-r10: sync chart created")
+    local syncScroll = syncControl.__sfRankingScroll
+    assertTrue(syncScroll ~= nil, "447-r10: scroll frame")
+    syncScroll:SetHeight(280)
+    -- Inherited script must remain; layout is hooked after it.
+    assertTrue(syncScroll:GetScript("OnVerticalScroll") == syncScroll.__sfInheritedOnVerticalScroll,
+        "447-r10: inherited OnVerticalScroll preserved")
+    assertTrue(#(syncScroll.hooks.OnVerticalScroll or {}) >= 1,
+        "447-r10: layout hooked via HookScript")
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool remains viewport-bounded")
+
+    local projectBaseline = syncProject
+    local layoutBaseline = syncControl.__sfRankingLayoutPass()
+    assertScrollChrome(syncScroll, 0, "447-r10 top")
+
+    -- Wheel/slider movement away from top (mid).
+    local mid = 40 * 28
+    syncScroll:SetVerticalScroll(mid)
+    assertScrollChrome(syncScroll, mid, "447-r10 mid")
+    assertEq(syncProject, projectBaseline, "447-r10: mid scroll no aggregation")
+    local layoutAfterMid = syncControl.__sfRankingLayoutPass()
+    assertTrue(layoutAfterMid > layoutBaseline, "447-r10: mid scroll laid out once")
+    assertTrue(layoutAfterMid <= layoutBaseline + 2,
+        "447-r10: mid scroll no recursive layout storm got="
+            .. tostring(layoutAfterMid - layoutBaseline))
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool bounded after mid scroll")
+
+    -- Away from bottom endpoint as well (not quite max).
+    local rangeFull = syncScroll:GetVerticalScrollRange()
+    assertTrue(rangeFull > mid, "447-r10: scrollable range")
+    local nearBottom = rangeFull - 56
+    assertTrue(nearBottom > mid, "447-r10: near-bottom distinct")
+    syncScroll:SetVerticalScroll(nearBottom)
+    assertScrollChrome(syncScroll, nearBottom, "447-r10 near-bottom")
+    assertEq(syncScroll.ScrollBar.ScrollDownButton:IsEnabled(), true,
+        "447-r10: down still enabled before absolute bottom")
+
+    -- Absolute bottom: down disables, up enables.
+    syncScroll:SetVerticalScroll(rangeFull)
+    assertScrollChrome(syncScroll, rangeFull, "447-r10 bottom")
+    assertEq(syncProject, projectBaseline, "447-r10: bottom scroll no aggregation")
+
+    -- Programmatic clamp after list shrink: offset/slider/arrows stay synchronized.
+    syncScroll:SetVerticalScroll(rangeFull)
+    syncPayload = {
+        rows = {
+            { name = "TinyA-Garona", totalCopper = 10 },
+            { name = "TinyB-Garona", totalCopper = 5 },
+        },
+        maxPositive = 10,
+        hasHistory = true,
+    }
+    local layoutBeforeClamp = syncControl.__sfRankingLayoutPass()
+    syncRefresh()
+    assertEq(syncScroll:GetVerticalScroll(), 0, "447-r10: clamped to top after shrink")
+    assertScrollChrome(syncScroll, 0, "447-r10 after shrink")
+    assertTrue(syncControl.__sfRankingLayoutPass() > layoutBeforeClamp,
+        "447-r10: clamp refresh laid out")
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool bounded after clamp")
+
+    -- Rebuild a taller list, scroll deep, then shrink viewport via OnSizeChanged
+    -- so LayoutOnly clamps and chrome stays synchronized without aggregation.
+    syncPayload = { rows = {}, maxPositive = 0, hasHistory = true }
+    for i = 1, 90 do
+        syncPayload.rows[i] = {
+            name = string.format("Resize%03d", i),
+            totalCopper = 900 - i,
+        }
+    end
+    syncPayload.maxPositive = 899
+    syncRefresh()
+    syncScroll:SetHeight(280)
+    syncControl:SetHeight(280)
+    local deepRange = syncScroll:GetVerticalScrollRange()
+    syncScroll:SetVerticalScroll(deepRange)
+    assertScrollChrome(syncScroll, deepRange, "447-r10 deep before resize")
+    local projectBeforeResize = syncProject
+    local layoutBeforeResize = syncControl.__sfRankingLayoutPass()
+    syncControl:SetHeight(112) -- 4 rows visible
+    syncScroll:SetHeight(112)
+    for _, hook in ipairs(syncControl.hooks.OnSizeChanged or {}) do
+        hook(syncControl, 400, 112)
+    end
+    local clamped = syncScroll:GetVerticalScroll()
+    local newRange = syncScroll:GetVerticalScrollRange()
+    assertTrue(clamped <= newRange, "447-r10: resize clamp within range")
+    assertScrollChrome(syncScroll, clamped, "447-r10 after viewport resize")
+    assertEq(syncProject, projectBeforeResize, "447-r10: resize no aggregation")
+    assertTrue(syncControl.__sfRankingLayoutPass() > layoutBeforeResize,
+        "447-r10: resize performed layout")
+    assertTrue(syncControl.__sfRankingPoolCount() <= 20,
+        "447-r10: pool bounded after resize clamp")
 
     Controls.InitRow = priorInit
     Controls._ApplyRowState = priorApply

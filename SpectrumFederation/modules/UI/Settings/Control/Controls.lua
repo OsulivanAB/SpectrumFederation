@@ -3009,9 +3009,12 @@ function Controls:AddContributionRankingChart(section, opts)
 				LayoutOnly()
 			end)
 		end
-		if scroll.SetScript and not scroll.__sfRankingScrollHook then
+		-- Hook rather than SetScript so UIPanelScrollFrameTemplate's inherited
+		-- ScrollFrame_OnVerticalScroll still syncs ScrollBar value and arrow
+		-- button enabled state (#447).
+		if scroll.HookScript and not scroll.__sfRankingScrollHook then
 			scroll.__sfRankingScrollHook = true
-			scroll:SetScript("OnVerticalScroll", function()
+			scroll:HookScript("OnVerticalScroll", function()
 				LayoutOnly()
 			end)
 		end
