@@ -3978,64 +3978,88 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                 admissions = admissions + 1
                 sliceUsed = sliceUsed + 1
                 if stLe == "accepted" or stLe == "duplicate" then
-                    progress = true
-                    state.ledgerBodySettled[settledKey] = true
-                    -- Index the durable installed row (enriched in place on
-                    -- op-first duplicates), never the transport body alone —
-                    -- completeness must observe installed unitCopper (#447).
+                    -- Resolve the durable installed row (live or archive) via
+                    -- budgeted catch-up. Never snap tails to list length — that
+                    -- skips unindexed archive appends from historical adoption
+                    -- and can leave adjustments unsettled while still reporting
+                    -- progress on every duplicate retry (#447).
                     local live = temp.accounting and temp.accounting._consumableEvents
                     local arch = temp.accounting and temp.accounting._consumableEventArchive
-                    local installedRef = nil
-                    if type(eid) == "string" and eid ~= "" then
-                        installedRef = state.acctIndex.byId[eid]
-                    end
-                    if type(installedRef) ~= "table" or installedRef == event then
-                        installedRef = nil
-                        if type(event.txnId) == "string" and event.txnId ~= "" then
-                            installedRef = state.acctIndex.byId[event.txnId]
+                    local function tipMatches(tip)
+                        if type(tip) ~= "table" or tip == event then
+                            return false
                         end
-                        if (type(installedRef) ~= "table" or installedRef == event)
-                            and type(event.opId) == "string" and event.opId ~= "" then
-                            installedRef = state.acctIndex.byId[event.opId]
-                        end
-                        if type(installedRef) ~= "table" or installedRef == event then
-                            installedRef = nil
-                        end
-                    end
-                    if (type(installedRef) ~= "table" or installedRef == event)
-                        and type(live) == "table" and #live > 0 then
-                        local tip = live[#live]
-                        if type(tip) == "table" and tip ~= event and (
-                            (type(eid) == "string" and eid ~= ""
+                        return (type(eid) == "string" and eid ~= ""
                                 and (tip.id == eid or tip.txnId == eid or tip.opId == eid))
                             or (type(event.txnId) == "string" and event.txnId ~= ""
                                 and (tip.id == event.txnId or tip.txnId == event.txnId))
                             or (type(event.opId) == "string" and event.opId ~= ""
                                 and (tip.opId == event.opId or tip.id == event.opId))
-                        ) then
-                            installedRef = tip
+                    end
+                    local function lookupInstalledRef()
+                        local installedRef = nil
+                        if type(eid) == "string" and eid ~= "" then
+                            installedRef = state.acctIndex.byId[eid]
                         end
+                        if type(installedRef) ~= "table" or installedRef == event then
+                            installedRef = nil
+                            if type(event.txnId) == "string" and event.txnId ~= "" then
+                                installedRef = state.acctIndex.byId[event.txnId]
+                            end
+                            if (type(installedRef) ~= "table" or installedRef == event)
+                                and type(event.opId) == "string" and event.opId ~= "" then
+                                installedRef = state.acctIndex.byId[event.opId]
+                            end
+                            if type(installedRef) ~= "table" or installedRef == event then
+                                installedRef = nil
+                            end
+                        end
+                        if type(installedRef) ~= "table" or installedRef == event then
+                            if type(live) == "table" and #live > 0 and tipMatches(live[#live]) then
+                                installedRef = live[#live]
+                            elseif type(arch) == "table" and #arch > 0
+                                and tipMatches(arch[#arch]) then
+                                installedRef = arch[#arch]
+                            else
+                                installedRef = nil
+                            end
+                        end
+                        return installedRef
+                    end
+                    local installedRef = lookupInstalledRef()
+                    if type(installedRef) ~= "table" or installedRef == event then
+                        if not catchUpAcctIndexLe() then
+                            -- Admission consumed budget mid catch-up: yield
+                            -- without settlement or progress so idle/stall
+                            -- detectors remain honest.
+                            unsettledSeen = true
+                            return yieldReplayCursorLe()
+                        end
+                        installedRef = lookupInstalledRef()
                     end
                     if isAdjustmentEventLe(event) then
                         -- Never index the transport body as installed proof —
                         -- completeness would compare the source snapshot to itself.
                         if type(installedRef) == "table" and installedRef ~= event then
                             indexLedgerRowLe(installedRef)
+                            state.ledgerBodySettled[settledKey] = true
+                            progress = true
                         else
+                            -- Unresolved install: do not claim progress on
+                            -- repeated duplicate admits (prevents stall reset).
                             state.ledgerBodySettled[settledKey] = nil
                             unsettledSeen = true
                         end
                     else
-                        indexLedgerRowLe(
-                            (type(installedRef) == "table" and installedRef ~= event)
-                                and installedRef or event)
-                    end
-                    -- Keep tails consistent with lists that grew via Admit.
-                    if type(live) == "table" then
-                        state.acctIndexLiveTail = #live
-                    end
-                    if type(arch) == "table" then
-                        state.acctIndexArchiveTail = #arch
+                        if type(installedRef) == "table" and installedRef ~= event then
+                            indexLedgerRowLe(installedRef)
+                        else
+                            -- Donations may settle on ID presence; catch-up
+                            -- already ran when the index missed the row.
+                            indexLedgerRowLe(event)
+                        end
+                        state.ledgerBodySettled[settledKey] = true
+                        progress = true
                     end
                 else
                     -- Floor-held adjustments / rejected bodies remain unsettled.

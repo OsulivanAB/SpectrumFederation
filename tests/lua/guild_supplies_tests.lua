@@ -44634,6 +44634,201 @@ do
     end
 end
 
+do
+    -- 447-adopt-5) Rolled-over campaign: ledger bodies that AppendArchivedLedgerEvent
+    -- during replay must settle under constrained async slices; archived prices and
+    -- campaign rankings survive; active data/exports stay unpublished until commit.
+    valuationTsmValue = 2200
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9465)
+    creditValuationDeposit(source, {
+        itemId = 9465, quantity = 3, donor = "Bob-Garona",
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9465, 2, "Carol-Garona"))), "accepted",
+        "447-adopt-5: +2 before rollover")
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9465, -1, "Bob-Garona"))), "accepted",
+        "447-adopt-5: -1 before rollover")
+    source = GS:GetCurrentRecord()
+    local camp1 = source.currentCampaignId
+    local srcPos = rankingsAdoptFindAdj(source, 9465, 2)
+    local srcNeg = rankingsAdoptFindAdj(source, 9465, -1)
+    assertEq(tonumber(srcPos and srcPos.unitCopper), 2200, "447-adopt-5: +2 priced")
+    assertEq(tonumber(srcNeg and srcNeg.unitCopper), 2200, "447-adopt-5: -1 priced")
+    local camp1Rank = rankingsByName(GS:ProjectCampaignRankings(camp1))
+    assertEq(camp1Rank["Carol-Garona"], 4400, "447-adopt-5: Carol camp1")
+    assertEq(camp1Rank["Bob-Garona"], 3 * 2200 + (-1) * 2200, "447-adopt-5: Bob camp1")
+    -- Rollover archives prior generation.
+    startCampaign()
+    source = GS:GetCurrentRecord()
+    local camp2 = source.currentCampaignId
+    assertTrue(camp2 ~= camp1, "447-adopt-5: new campaign")
+    -- Prior adjustments must live in the event archive after shelve.
+    local srcArch = source.accounting and source.accounting._consumableEventArchive
+    local archPos = rankingsAdoptFindAdj(
+        { accounting = { _consumableEvents = srcArch } }, 9465, 2)
+    if not archPos then
+        archPos = rankingsAdoptFindAdj(source, 9465, 2)
+    end
+    assertTrue(type(archPos) == "table", "447-adopt-5: +2 retained after rollover")
+    assertEq(tonumber(archPos.unitCopper), 2200, "447-adopt-5: archived +2 priced")
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-5: provider")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    -- Split: structure ops first (campaigns/rollover), then ledgers (archive append
+    -- path for older-generation adjustments), then adjustment ops last.
+    local structureOps, adjustOps, ledgers, evidence, other = {}, {}, {}, {}, {}
+    for i = 1, #exportCopy do
+        local row = exportCopy[i]
+        local kind = row.body and row.body.kind
+        if kind == "gs-op" and row.body.op and row.body.op.kind == "adjust-quantity" then
+            adjustOps[#adjustOps + 1] = row
+        elseif kind == "gs-op" then
+            structureOps[#structureOps + 1] = row
+        elseif kind == "gs-ledger-event" then
+            ledgers[#ledgers + 1] = row
+        elseif kind == "gs-evidence" then
+            evidence[#evidence + 1] = row
+        else
+            other[#other + 1] = row
+        end
+    end
+    assertTrue(#adjustOps >= 2, "447-adopt-5: adjust ops exported")
+    assertTrue(#ledgers >= 2, "447-adopt-5: ledger bodies exported")
+    local adjLedgerCount = 0
+    for i = 1, #ledgers do
+        local ev = ledgers[i].body and ledgers[i].body.event
+        if type(ev) == "table"
+            and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT") then
+            adjLedgerCount = adjLedgerCount + 1
+        end
+    end
+    assertTrue(adjLedgerCount >= 2, "447-adopt-5: adjustment ledgers present")
+
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    local beforeEvents = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-5: begin")
+    -- Active dataset must remain the pre-adoption one until commit finishes.
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs, "447-adopt-5: pre-buffer dataset")
+    local order = {}
+    for i = 1, #other do order[#order + 1] = other[i] end
+    for i = 1, #structureOps do order[#order + 1] = structureOps[i] end
+    for i = 1, #evidence do order[#order + 1] = evidence[i] end
+    for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
+    for i = 1, #adjustOps do order[#order + 1] = adjustOps[i] end
+    for i = 1, #order do
+        local st = GS:BufferAdoptionRecord(order[i].id, order[i].body)
+        assertTrue(st == "accepted" or st == "duplicate",
+            "447-adopt-5: buffer " .. tostring(order[i].id))
+    end
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "447-adopt-5: ready")
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+        "447-adopt-5: dataset unchanged while buffered")
+    assertEq(#collectAllExportBodies(), beforeExportCount,
+        "447-adopt-5: exports unchanged while buffered")
+
+    local priorSlice = GS.MAX_ADMISSION_WORK_PER_SLICE
+    GS.MAX_ADMISSION_WORK_PER_SLICE = 4
+    GS._adoptionReplaySyncDrain = false
+    local sawArchiveAppend = false
+    GS._adoptionBeforeCompletenessForTest = function(temp)
+        local arch = temp.accounting and temp.accounting._consumableEventArchive
+        if type(arch) == "table" then
+            for i = 1, #arch do
+                local ev = arch[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and tonumber(ev.quantity) == 2
+                    and tonumber(ev.unitCopper) == 2200 then
+                    sawArchiveAppend = true
+                    break
+                end
+            end
+        end
+    end
+    local st1, reason1 = GS:CommitDatasetAdoption()
+    assertTrue(st1 == "pending" or st1 == "accepted",
+        "447-adopt-5: commit starts st=" .. tostring(st1) .. " r=" .. tostring(reason1))
+    -- While pending, active publication must not have replaced the live dataset.
+    if st1 == "pending" then
+        assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+            "447-adopt-5: no early publish during pending")
+        assertEq(#collectAllExportBodies(), beforeExportCount,
+            "447-adopt-5: no early export mutate during pending")
+    end
+    -- Drain one due timer per slice so a buggy endless reschedule cannot hang
+    -- inside coalesced flushTimers.
+    local slices = 0
+    local maxSlices = 400
+    while GS._adoption and GS._adoption.replayTemp and slices < maxSlices do
+        slices = slices + 1
+        if not runOneDueTimer() then
+            world.time = (world.time or 0) + 1
+            if not runOneDueTimer() then
+                break
+            end
+        end
+    end
+    GS._adoptionBeforeCompletenessForTest = nil
+    GS.MAX_ADMISSION_WORK_PER_SLICE = priorSlice
+    GS._adoptionReplaySyncDrain = true
+    assertTrue(slices < maxSlices,
+        "447-adopt-5: settled within drain limit slices=" .. tostring(slices))
+    assertEq(GS:GetPendingAdoption(), nil, "447-adopt-5: idle after commit")
+    local installed = GS:GetCurrentRecord()
+    assertEq(installed.datasetId, sourceDataset, "447-adopt-5: dataset replaced")
+    assertTrue(sawArchiveAppend,
+        "447-adopt-5: archive held priced +2 during completeness")
+    local instArch = installed.accounting and installed.accounting._consumableEventArchive
+    local instPos = nil
+    local instNeg = nil
+    if type(instArch) == "table" then
+        for i = 1, #instArch do
+            local ev = instArch[i]
+            if type(ev) == "table"
+                and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                and tonumber(ev.itemId) == 9465 then
+                if tonumber(ev.quantity) == 2 then instPos = ev end
+                if tonumber(ev.quantity) == -1 then instNeg = ev end
+            end
+        end
+    end
+    assertTrue(type(instPos) == "table", "447-adopt-5: +2 in installed archive")
+    assertTrue(type(instNeg) == "table", "447-adopt-5: -1 in installed archive")
+    assertEq(tonumber(instPos.unitCopper), 2200, "447-adopt-5: archived +2 price")
+    assertEq(tonumber(instNeg.unitCopper), 2200, "447-adopt-5: archived -1 price")
+    local instCamp1Rank = rankingsByName(GS:ProjectCampaignRankings(camp1))
+    assertEq(instCamp1Rank["Carol-Garona"], camp1Rank["Carol-Garona"],
+        "447-adopt-5: Carol camp1 ranks")
+    assertEq(instCamp1Rank["Bob-Garona"], camp1Rank["Bob-Garona"],
+        "447-adopt-5: Bob camp1 ranks")
+    assertEq(installed.currentCampaignId, camp2, "447-adopt-5: current is camp2")
+end
+
 SF.TSM = nil
 world.impersonationActive = false
 setPlayer("Alice-Garona", "Player-1-Alice", 1)
