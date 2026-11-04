@@ -60,7 +60,7 @@ assertAlmost(C.DEFAULT_FADE_DURATION, 0.50, 1e-9, "default fade duration is 0.5"
 assertEq(C.DEFAULT_THICKNESS, 16, "default trail thickness is 16")
 assertAlmost(C.DEFAULT_RAINBOW_SPEED, 0.25, 1e-9, "default rainbow speed is 0.25")
 assertAlmost(C.DEFAULT_OPACITY, 0.70, 1e-9, "default trail opacity is 0.7")
-assertEq(C.DEFAULT_EDGE_SOFTNESS, 0, "default edge softness is 0%")
+assertEq(C.DEFAULT_EDGE_SOFTNESS, 50, "default edge softness is 50%")
 assertEq(C.MIN_EDGE_SOFTNESS, 0, "minimum edge softness is 0%")
 assertEq(C.MAX_EDGE_SOFTNESS, 100, "maximum edge softness is 100%")
 assertEq(C.EDGE_SOFTNESS_STEP, 10, "edge softness steps in 10% increments")
@@ -74,16 +74,21 @@ for i = 1, #C.SETTING_KEYS do
 end
 assertTrue(sawEdgeSoftnessKey, "SETTING_KEYS lists edgeSoftness")
 
-assertEq(Engine.NormalizeEdgeSoftness(nil), 0, "missing edge softness normalizes to 0%")
-assertEq(Engine.NormalizeEdgeSoftness("nope"), 0, "non-numeric edge softness normalizes to 0%")
+assertEq(Engine.NormalizeEdgeSoftness(nil), 50, "missing edge softness normalizes to the 50% default")
+assertEq(Engine.NormalizeEdgeSoftness("nope"), 50, "non-numeric edge softness normalizes to the 50% default")
 assertEq(Engine.NormalizeEdgeSoftness(-20), 0, "below-min edge softness clamps to 0%")
 assertEq(Engine.NormalizeEdgeSoftness(140), 100, "above-max edge softness clamps to 100%")
 assertEq(Engine.NormalizeEdgeSoftness(15), 20, "edge softness 15 snaps to the nearest 10% step")
 assertEq(Engine.NormalizeEdgeSoftness(14), 10, "edge softness 14 snaps down to 10%")
 assertEq(Engine.NormalizeEdgeSoftness(50), 50, "valid edge softness 50% is preserved")
 assertEq(Engine.NormalizeEdgeSoftness(100), 100, "valid edge softness 100% is preserved")
+assertEq(Engine.NormalizeEdgeSoftness(0), 0, "explicit 0% softness is preserved")
 assertEq(Engine.StampTextureForEdgeSoftness(0), C.CIRCLE_TEXTURE, "0% softness keeps the hard circular texture")
-assertEq(Engine.StampTextureForEdgeSoftness(nil), C.CIRCLE_TEXTURE, "nil softness keeps the hard circular texture")
+assertEq(
+    Engine.StampTextureForEdgeSoftness(nil),
+    "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga",
+    "nil softness selects the 50% default soft TGA"
+)
 assertEq(
     Engine.StampTextureForEdgeSoftness(50),
     "Interface\\AddOns\\SpectrumFederation\\media\\MouseTracer\\SoftCircle_50.tga",
@@ -724,7 +729,7 @@ SF.SettingsStore = {
     end,
 }
 
--- Older snapshot without edgeSoftness must resolve to 0% and not leave a stale destination value.
+-- Older snapshot without edgeSoftness must resolve to the 50% default and not leave a stale destination value.
 charSettings.edgeSoftness = 80
 copies["Other-Realm"] = {
     enabled = true,
@@ -737,11 +742,11 @@ copies["Other-Realm"] = {
 local copyOk, copyErr = Tracer:CopyFromCharacter("Other-Realm")
 assertTrue(copyOk, "CopyFromCharacter succeeds for a valid older snapshot")
 assertEq(copyErr, nil, "CopyFromCharacter reports no error for a valid snapshot")
-assertEq(charSettings.edgeSoftness, 0, "older snapshot missing edgeSoftness resolves to 0%")
+assertEq(charSettings.edgeSoftness, 50, "older snapshot missing edgeSoftness resolves to 50%")
 assertEq(charSettings.trailLength, 200, "CopyFromCharacter still applies present snapshot keys")
 assertEq(charSettings.enabled, true, "CopyFromCharacter applies enabled from the snapshot")
 assertTrue(copies["Tester-Realm"] ~= nil, "copy flushes a destination snapshot")
-assertEq(copies["Tester-Realm"].edgeSoftness, 0, "flushed snapshot records normalized edgeSoftness 0")
+assertEq(copies["Tester-Realm"].edgeSoftness, 50, "flushed snapshot records normalized edgeSoftness 50")
 
 charSettings.edgeSoftness = 40
 copies["Soft-Realm"] = {
@@ -1059,6 +1064,22 @@ assertEq(eventFrame.events.DISPLAY_SIZE_CHANGED, 1, "display-size event is regis
 assertEq(eventFrame.events.UI_SCALE_CHANGED, 1, "UI-scale event stays registered")
 assertEq(eventFrame.events.PLAYER_ENTERING_WORLD, 1, "world-entry event stays registered")
 assertEq(createdFrames, 1, "init creates only the event frame")
+
+-- Explicit saved values survive ReloadCacheFromStore into the runtime cache
+-- and are not overwritten to the 50% default.
+charSettings.edgeSoftness = 0
+Tracer:ReloadCacheFromStore()
+Tracer:FlushSnapshot()
+assertEq(charSettings.edgeSoftness, 0, "saved explicit 0% survives settings reload")
+assertEq(copies["Tester-Realm"].edgeSoftness, 0, "runtime cache keeps saved explicit 0%")
+charSettings.edgeSoftness = 100
+Tracer:ReloadCacheFromStore()
+Tracer:FlushSnapshot()
+assertEq(charSettings.edgeSoftness, 100, "saved explicit 100% survives settings reload")
+assertEq(copies["Tester-Realm"].edgeSoftness, 100, "runtime cache keeps saved explicit 100%")
+-- Runtime/scale suites start from explicit 0% so the first pool uses the hard circular path.
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
+assertEq(charSettings.edgeSoftness, 0, "runtime suite begins at explicit 0% softness")
 
 currentScale = 1
 Tracer:ApplyEnabled(true)
@@ -1389,9 +1410,9 @@ assertEq(#stampTextures, texturesBeforeCopy, "copy does not grow the stamp pool"
 Tracer:ApplyEnabled(false)
 assertTrue(host.scripts.OnUpdate == nil, "copy suite disables cleanly")
 
--- Reset All must restore the original 0% stamp appearance after soft textures were applied.
+-- Reset All restores the 50% default appearance after a non-default softness.
 -- Store:ResetAll only fires sf.reset (not per-key edgeSoftness); the production callback must
--- resolve appearance after ReloadCacheFromStore so reuse shows hard circular ADD stamps.
+-- resolve appearance after ReloadCacheFromStore so reuse shows SoftCircle_50 + cleared mask + BLEND.
 assertTrue(#resetCallbacks >= 1, "Init registers the production sf.reset callback")
 currentScale = 1
 local texturesBeforeResetSuite = #stampTextures
@@ -1399,15 +1420,15 @@ local framesBeforeResetSuite = createdFrames
 Tracer:ApplyEnabled(true)
 host = hostFrame()
 assertTrue(host.scripts.OnUpdate ~= nil, "reset suite enables OnUpdate")
-SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 50)
+SF.SettingsStore:SetCharacter("mouseTracer.edgeSoftness", 0)
 pumpCursor(0, 0)
 pumpCursor(40, 0)
-assertLiveAppearance(soft50, C.CLEARED_MASK, "BLEND", "reset suite starts from a nonzero soft texture")
+assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "reset suite starts from non-default 0%")
 assertEq(#stampTextures, texturesBeforeResetSuite, "selecting softness does not grow the stamp pool")
 
 local okReset = SF.SettingsStore:ResetAll()
 assertTrue(okReset, "ResetAll succeeds")
-assertEq(charSettings.edgeSoftness, 0, "ResetAll restores edgeSoftness default 0")
+assertEq(charSettings.edgeSoftness, 50, "ResetAll restores edgeSoftness default 50")
 assertEq(charSettings.enabled, false, "ResetAll restores enabled default false")
 assertTrue(host.scripts.OnUpdate == nil, "sf.reset disable path removes OnUpdate")
 assertEq(#stampTextures, texturesBeforeResetSuite, "sf.reset does not grow the stamp pool")
@@ -1420,10 +1441,11 @@ assertEq(#stampTextures, texturesBeforeResetSuite, "re-enable after reset reuses
 pumpCursor(0, 0)
 pumpCursor(60, 0)
 assertTrue(Tracer.engine.count > 0, "movement after reset draws a new trail")
-assertLiveAppearance(C.CIRCLE_TEXTURE, C.CIRCLE_TEXTURE, "ADD", "after sf.reset, re-enable renders original 0%")
+assertLiveAppearance(soft50, C.CLEARED_MASK, "BLEND", "after sf.reset, re-enable renders default SoftCircle_50")
 local newestAfterReset = Tracer.engine:ChronoIndex(Tracer.engine.count)
-assertEq(stampTextures[newestAfterReset].texture, C.CIRCLE_TEXTURE, "new stamps after reset use hard circular texture")
-assertEq(stampTextures[newestAfterReset].blend, "ADD", "new stamps after reset use ADD")
+assertEq(stampTextures[newestAfterReset].texture, soft50, "new stamps after reset use SoftCircle_50")
+assertEq(stampTextures[newestAfterReset].mask, C.CLEARED_MASK, "new stamps after reset use cleared mask")
+assertEq(stampTextures[newestAfterReset].blend, "BLEND", "new stamps after reset use BLEND")
 
 -- Repeated enable/disable + softness scrub settles without growing resources.
 local framesBeforeRepeatSoft = createdFrames

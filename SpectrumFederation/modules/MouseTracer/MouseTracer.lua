@@ -795,7 +795,7 @@ function Tracer:CopyFromCharacter(sourceId)
 	end
 
 	-- Always write every Mouse Tracer key. Missing fields in older snapshots
-	-- resolve through ClampSetting defaults (edgeSoftness → 0%) so the
+	-- resolve through ClampSetting defaults (edgeSoftness → 50%) so the
 	-- destination cannot keep a stale softness value.
 	applySuspended = true
 	for i = 1, #KEYS do

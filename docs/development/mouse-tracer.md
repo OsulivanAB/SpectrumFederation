@@ -14,7 +14,7 @@ Mouse Tracer is an optional per-character cursor trail. User-facing control desc
 
 `Init.lua` starts Mouse Tracer after `SettingsStore` and `SettingsApply`. Live values live in `SpectrumFederationCharDB`. Account-wide `mouseTracerCopies` exist only so **Copy From Character** can read another character's last saved settings. WoW cannot read another character's per-character SavedVariables.
 
-Character defaults (filled only when a key is unset): off, Trail Length 400, Fade Duration 0.50, Trail Thickness 16, Rainbow Cycle Speed 0.25, Trail Opacity 0.70, Edge Softness 0. Do not bump `SettingsSchema.VERSION` for these defaults. `MergeDefaults` fills missing character and account keys.
+Character defaults (filled only when a key is unset): off, Trail Length 400, Fade Duration 0.50, Trail Thickness 16, Rainbow Cycle Speed 0.25, Trail Opacity 0.70, Edge Softness 50. Do not bump `SettingsSchema.VERSION` for these defaults. `MergeDefaults` fills missing character and account keys. Existing saved Edge Softness values, including an explicit 0%, are preserved and are not migrated.
 
 ## Performance contract
 
@@ -89,7 +89,7 @@ Cursor coordinates come from `GetCursorPosition()` divided by the host's effecti
 
 Sliders write character settings immediately so the visible trail updates while dragging. Account-wide copy snapshots are debounced (~0.35s) with one reusable ticker. Enable/disable, Copy From Character, login, and logout flush immediately.
 
-Copy From Character applies every character key under `SETTING_KEYS` (including Edge Softness) under `applySuspended` so the runtime reconfigures once, writes one snapshot, and refreshes the page once. Missing keys in older snapshots resolve to defaults (`edgeSoftness` → `0`) rather than leaving the destination's previous value.
+Copy From Character applies every character key under `SETTING_KEYS` (including Edge Softness) under `applySuspended` so the runtime reconfigures once, writes one snapshot, and refreshes the page once. Missing keys in older snapshots resolve to defaults (`edgeSoftness` → `50`) rather than leaving the destination's previous value.
 
 Identity keys for snapshots use `NameUtil.GetSelfId()` (`Name-Realm`). Compare identities with `NameUtil.SamePlayer`.
 

@@ -29,8 +29,9 @@ SF.MouseTracer.Constants = {
 	DEFAULT_THICKNESS = 16,
 	DEFAULT_RAINBOW_SPEED = 0.25,
 	DEFAULT_OPACITY = 0.70,
-	-- 0% keeps TempPortraitAlphaMask; soft TGA stamps feather inward only.
-	DEFAULT_EDGE_SOFTNESS = 0,
+	-- Default SoftCircle_50 + BLEND with cleared mask. Explicit 0% still keeps
+	-- TempPortraitAlphaMask + ADD. Existing saved values are not migrated.
+	DEFAULT_EDGE_SOFTNESS = 50,
 	TAPER_MIN_RATIO = 0.40,
 
 	MIN_SPACING = MIN_SPACING_FLOOR,

@@ -107,13 +107,13 @@ def test_schema_and_slider_match_new_mouse_tracer_defaults():
     assert "thickness = 16" in schema
     assert "rainbowSpeed = 0.25" in schema
     assert "opacity = 0.70" in schema
-    assert "edgeSoftness = 0" in schema
+    assert "edgeSoftness = 50" in schema
     assert "DEFAULT_TRAIL_LENGTH = 400" in constants
     assert "DEFAULT_FADE_DURATION = 0.50" in constants
     assert "DEFAULT_THICKNESS = 16" in constants
     assert "DEFAULT_RAINBOW_SPEED = 0.25" in constants
     assert "DEFAULT_OPACITY = 0.70" in constants
-    assert "DEFAULT_EDGE_SOFTNESS = 0" in constants
+    assert "DEFAULT_EDGE_SOFTNESS = 50" in constants
     assert "MAX_EDGE_SOFTNESS = 100" in constants
     assert "EDGE_SOFTNESS_STEP = 10" in constants
     assert "MAX_TRAIL_LENGTH = 1200" in constants
