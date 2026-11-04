@@ -2694,6 +2694,15 @@ function Controls:AddContributionRankingChart(section, opts)
 	local minHeight = opts.minHeight or opts.height or 280
 	local nameGap = opts.nameGap or 8
 	local coinIconHeight = opts.coinIconHeight or 12
+	-- Amount BOTTOMRIGHT sits on the bar top and draws upward. Without a top
+	-- inset the first row's coin value is clipped by the ScrollFrame at y=0.
+	-- Include the same inset in scroll content height so the last row stays
+	-- reachable after the shift.
+	local amountTopPad = opts.amountTopPad
+	if amountTopPad == nil then
+		amountTopPad = coinIconHeight + 2
+	end
+	amountTopPad = math.max(0, tonumber(amountTopPad) or 0)
 	local hasLabel = opts.label and opts.label ~= ""
 
 	local function Loc(key, default)
@@ -2900,7 +2909,7 @@ function Controls:AddContributionRankingChart(section, opts)
 				return
 			end
 			local totalRows = #rows
-			local contentHeight = math.max(1, totalRows * rowHeight)
+			local contentHeight = math.max(1, amountTopPad + totalRows * rowHeight)
 			content:SetHeight(contentHeight)
 
 			local viewportH = ViewportHeight()
@@ -2923,7 +2932,8 @@ function Controls:AddContributionRankingChart(section, opts)
 				row.__sfRankingLayoutBusy = priorBusy
 			end
 
-			local firstIdx = math.floor(scrollY / rowHeight) + 1 - ROW_OVERSCAN
+			local firstIdx = math.floor(math.max(0, scrollY - amountTopPad) / rowHeight)
+				+ 1 - ROW_OVERSCAN
 			if firstIdx < 1 then
 				firstIdx = 1
 			end
@@ -2944,7 +2954,7 @@ function Controls:AddContributionRankingChart(section, opts)
 			local poolIdx = 1
 			for i = firstIdx, lastIdx do
 				local entry = AcquirePoolSlot(poolIdx)
-				BindRow(entry, rows[i], (i - 1) * rowHeight, plotWidth, maxPositive)
+				BindRow(entry, rows[i], amountTopPad + (i - 1) * rowHeight, plotWidth, maxPositive)
 				poolIdx = poolIdx + 1
 			end
 			HideUnused(poolIdx)
@@ -3030,6 +3040,7 @@ function Controls:AddContributionRankingChart(section, opts)
 		control.__sfRankingContent = content
 		control.__sfRankingEmptyText = emptyText
 		control.__sfRankingHasLabel = hasLabel and true or false
+		control.__sfRankingAmountTopPad = amountTopPad
 		control.__sfRankingFormatCopper = FormatSignedCopper
 		control.__sfRankingVisibleNames = function()
 			local names = {}
