@@ -805,14 +805,18 @@ assertTrue(#scopeSection.messages >= 1, "open Session receives profile A complet
 assertTrue(scopeSection.messages[#scopeSection.messages][1]:find("Complete:", 1, true),
     "Session shows profile A completion summary")
 local aSummary = scopeSection.messages[#scopeSection.messages][1]
+assertEq(scopeSection.__sfRaidCheckOwnedMessage, aSummary, "completion marks the Session message as Raid Check owned")
 setActive(profileB)
 sessionPanel.hooks.OnHide()
 scopeSection.cleared = 0
+-- Keep ownership so reopen can distinguish stale Raid Check text from other controls.
 scopeSection.messages = { { aSummary, "success" } }
+scopeSection.__sfRaidCheckOwnedMessage = aSummary
 resetPrintCapture()
 sessionPanel.hooks.OnShow()
 assertTrue(scopeSection.cleared >= 1, "reopening Session under profile B clears stale Raid Check text")
 assertEq(#scopeSection.messages, 0, "profile B Session does not keep profile A completion text")
+assertTrue(scopeSection.__sfRaidCheckOwnedMessage == nil, "clearing stale Raid Check text drops ownership")
 assertEq(countPrinted("success", "Complete:"), 0, "profile switch reopen does not reprint completion chat")
 registeredPages.lootHelperSession:Refresh(sessionPanel)
 assertEq(#scopeSection.messages, 0, "Session Refresh under profile B keeps Raid Check text cleared")
@@ -824,6 +828,7 @@ profileB = makeProfile("Delayed Scope B")
 setActive(profileA)
 scopeSection.messages = {}
 scopeSection.cleared = 0
+scopeSection.__sfRaidCheckOwnedMessage = nil
 sessionPanel.__sfSections.session = scopeSection
 sessionPanel.shown = true
 sessionPanel.hooks.OnShow()
@@ -841,16 +846,29 @@ CheckRun.ShouldSettle = origShouldSettleScope
 assertEq(held, "started", "scoped delayed check starts on profile A")
 assertTrue(scopeSection.messages[#scopeSection.messages][1]:find("started", 1, true),
     "open Settings shows started for profile A")
+local startedOwned = scopeSection.__sfRaidCheckOwnedMessage
+assertTrue(type(startedOwned) == "string" and startedOwned:find("started", 1, true),
+    "started status marks Session message ownership")
 local delayedScopeRun = RC:_GetInspectState().adhocRun
 assertTrue(delayedScopeRun ~= nil, "scoped delayed run remains in flight")
 assertEq(delayedScopeRun.profileId, profileA:GetProfileId(), "in-flight run stays bound to profile A")
 setActive(profileB)
 scopeSection.cleared = 0
-scopeSection.messages = { { "Raid Check started.", "info" } }
+scopeSection.messages = { { startedOwned, "info" } }
+scopeSection.__sfRaidCheckOwnedMessage = startedOwned
 sessionPanel.hooks.OnHide()
 sessionPanel.hooks.OnShow()
 assertTrue(scopeSection.cleared >= 1, "switching to B before completion clears A's started text")
 assertEq(#scopeSection.messages, 0, "profile B does not display A's in-flight started status")
+
+-- B shows newer Session Control feedback; A's delayed completion must not erase it.
+scopeSection.cleared = 0
+scopeSection:ClearMessage()
+scopeSection.__sfRaidCheckOwnedMessage = nil
+scopeSection:SetMessage("Session started successfully", "success")
+assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
+    "profile B Session Control feedback is visible")
+local sessionControlClears = scopeSection.cleared
 delayedScopeRun.classified = true
 delayedScopeRun.classifiedResults = {
     ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
@@ -859,16 +877,54 @@ delayedScopeRun.targetIds = { "Admin-Garona" }
 delayedScopeRun.groupMemberIds = { "Admin-Garona" }
 delayedScopeRun.rosterMemberIds = profileA:GetMemberIds()
 delayedScopeRun.players = { ["Admin-Garona"] = { guid = "g-scope-delay" } }
-scopeSection.cleared = 0
-scopeSection.messages = {}
 resetPrintCapture()
 RC:_ApplyCheckConsequences(delayedScopeRun)
 RC:_GetInspectState().adhocRun = nil
 assertEq(countPrinted("success", "[Raid Check] Complete: 1 Prepared · 0 Unprepared · 0 Inspection Failed"), 1,
     "delayed A completion still prints exactly once while B is active")
 assertEq(RC:GetLastUiStatus().profileId, profileA:GetProfileId(), "delayed completion remains bound to profile A")
-assertEq(#scopeSection.messages, 0, "listener under profile B does not render A's delayed completion")
-assertTrue(scopeSection.cleared >= 1, "listener clears when delayed A status is rejected under B")
+assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
+    "A's delayed completion does not erase B Session Control feedback")
+assertEq(scopeSection.cleared, sessionControlClears,
+    "rejected Raid Check status does not ClearMessage over unrelated Session feedback")
+assertTrue(scopeSection.__sfRaidCheckOwnedMessage == nil,
+    "rejected Raid Check status drops ownership when the row is unrelated")
+
+-- Refresh/reopen must preserve newer unrelated feedback instead of replaying A.
+sessionPanel.hooks.OnHide()
+sessionPanel.hooks.OnShow()
+assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
+    "Session reopen preserves unrelated Session Control feedback")
+registeredPages.lootHelperSession:Refresh(sessionPanel)
+assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
+    "Session Refresh does not replay an older Raid Check result over Session Control feedback")
+
+-- Same-profile live Raid Check completion may still replace Session Control feedback.
+setActive(profileA)
+scopeSection.cleared = 0
+scopeSection:ClearMessage()
+scopeSection.__sfRaidCheckOwnedMessage = nil
+scopeSection:SetMessage("Session ended successfully", "success")
+local liveRun = {
+    id = "scope-live-a",
+    profileId = profileA:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    },
+    targetIds = { "Admin-Garona" },
+    groupMemberIds = { "Admin-Garona" },
+    rosterMemberIds = profileA:GetMemberIds(),
+    players = { ["Admin-Garona"] = { guid = "g-scope-live" } },
+    mode = "raid",
+    cfg = profileA:GetRaidCheckConfig(),
+}
+resetPrintCapture()
+RC:_ApplyCheckConsequences(liveRun)
+assertTrue(scopeSection.messages[#scopeSection.messages][1]:find("Complete:", 1, true),
+    "live Raid Check completion for the displayed profile still updates Session status")
+assertEq(countPrinted("success", "Complete:"), 1, "live same-profile completion prints exactly once")
 
 -- Missing-profile failure: current attempt error still displays with no active profile.
 resetDB()

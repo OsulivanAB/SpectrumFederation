@@ -289,18 +289,81 @@ local function UiStatusBelongsToCurrentInvocation(ui)
 	return activeId == nil
 end
 
-local function ApplyUiStatusToSection(section, ui)
+-- Session controls share one section message row. Track only the Raid Check text we
+-- wrote so reject/refresh paths can clear stale RC status without erasing newer
+-- Session Control (or other) feedback.
+local function SectionMessageText(section)
+	if not section then
+		return nil
+	end
+	if section.MessageText and section.MessageText.GetText then
+		local text = section.MessageText:GetText()
+		if type(text) == "string" then
+			return text
+		end
+	end
+	local messages = section.messages
+	if type(messages) == "table" and #messages > 0 then
+		local last = messages[#messages]
+		if type(last) == "table" then
+			return last[1]
+		end
+	end
+	return nil
+end
+
+local function SetRaidCheckSectionMessage(section, message, kind)
+	if not section or not section.SetMessage then
+		return false
+	end
+	section:SetMessage(message, kind)
+	section.__sfRaidCheckOwnedMessage = message
+	return true
+end
+
+local function ClearOwnedRaidCheckSectionMessage(section)
 	if not section then
 		return false
 	end
-	if not UiStatusBelongsToCurrentInvocation(ui) then
-		-- Returning without clearing would leave profile A's Raid Check text under B.
-		if section.ClearMessage then
-			section:ClearMessage()
-		end
+	local owned = section.__sfRaidCheckOwnedMessage
+	if type(owned) ~= "string" or owned == "" then
 		return false
 	end
-	if not section.SetMessage then
+	local current = SectionMessageText(section)
+	-- Another Session control replaced the row; drop ownership and leave their text.
+	if type(current) == "string" and current ~= "" and current ~= owned then
+		section.__sfRaidCheckOwnedMessage = nil
+		return false
+	end
+	if section.ClearMessage then
+		section:ClearMessage()
+	end
+	section.__sfRaidCheckOwnedMessage = nil
+	return true
+end
+
+local function SectionHasUnrelatedMessage(section)
+	local current = SectionMessageText(section)
+	if type(current) ~= "string" or current == "" then
+		return false
+	end
+	local owned = section.__sfRaidCheckOwnedMessage
+	return not (type(owned) == "string" and owned ~= "" and current == owned)
+end
+
+-- opts.preserveUnrelated: OnShow/Refresh must not replay a cached Raid Check result
+-- over newer Session Control feedback. Live listener updates omit this so a current
+-- profile's new Raid Check status can still replace the row.
+local function ApplyUiStatusToSection(section, ui, opts)
+	if not section then
+		return false
+	end
+	opts = opts or {}
+	if not UiStatusBelongsToCurrentInvocation(ui) then
+		ClearOwnedRaidCheckSectionMessage(section)
+		return false
+	end
+	if opts.preserveUnrelated and SectionHasUnrelatedMessage(section) then
 		return false
 	end
 	local kind = ui.kind
@@ -308,8 +371,7 @@ local function ApplyUiStatusToSection(section, ui)
 		or ((ui.status == "error") and "error")
 		or ((ui.status == "busy") and "warn")
 		or "info"
-	section:SetMessage(ui.message, kind)
-	return true
+	return SetRaidCheckSectionMessage(section, ui.message, kind)
 end
 
 -- Prefer RaidCheck's current-invocation UI status so an immediately completed run
@@ -321,7 +383,8 @@ local function ApplyRaidCheckButtonStatus(ctx, status, mode)
 	end
 	local label = RaidCheckModeLabel(mode)
 	if status == "busy" then
-		ctx.section:SetMessage(
+		SetRaidCheckSectionMessage(
+			ctx.section,
 			Loc("RAID_CHECK_UI_BUSY", "A Raid Check is already in progress."),
 			"warn"
 		)
@@ -332,28 +395,32 @@ local function ApplyRaidCheckButtonStatus(ctx, status, mode)
 		return
 	end
 	if status == "prompt" then
-		ctx.section:SetMessage(
+		SetRaidCheckSectionMessage(
+			ctx.section,
 			Loc("RAID_CHECK_UI_PROMPT", "Choose Yes to start a session, No to run without one, or Cancel to abort."),
 			"info"
 		)
 		return
 	end
 	if status == "completed" then
-		ctx.section:SetMessage(
+		SetRaidCheckSectionMessage(
+			ctx.section,
 			Loc("RAID_CHECK_UI_COMPLETE_FALLBACK", "%s complete."):format(label),
 			"success"
 		)
 		return
 	end
 	if status == "started" then
-		ctx.section:SetMessage(
+		SetRaidCheckSectionMessage(
+			ctx.section,
 			Loc("RAID_CHECK_UI_STARTED", "%s started."):format(label),
 			"info"
 		)
 		return
 	end
 	if status == "error" then
-		ctx.section:SetMessage(
+		SetRaidCheckSectionMessage(
+			ctx.section,
 			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(label),
 			"error"
 		)
@@ -373,6 +440,8 @@ local function EnsureRaidCheckUiStatusListener(panel)
 			return
 		end
 		local section = panel.__sfSections and panel.__sfSections.session
+		-- Live updates for the displayed profile may replace the row; rejected
+		-- statuses only clear text still owned by Raid Check.
 		ApplyUiStatusToSection(section, ui)
 	end)
 	panel.__sfRaidCheckUiStatusRegistered = true
@@ -1877,7 +1946,9 @@ local function SyncRaidCheckUiStatusToPanel(panel)
 	end
 	local section = panel.__sfSections and panel.__sfSections.session
 	local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
-	ApplyUiStatusToSection(section, ui)
+	-- Reopen/refresh: clear stale Raid Check text for the wrong profile, but do
+	-- not wipe or overwrite newer Session Control feedback with a cached result.
+	ApplyUiStatusToSection(section, ui, { preserveUnrelated = true })
 end
 
 function SessionPage:Build(panel)
