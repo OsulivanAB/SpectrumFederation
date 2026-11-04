@@ -586,6 +586,9 @@ L["MOUSE_TRACER_SOFTNESS_DIAG_OVERLAP_ADD_CIRCLE"] = "Overlap ADD / circle mask"
 L["RAID_CHECK_PRESENCE_SUMMARY"] = "Raid Check: %d present · %d eligible profile members"
 L["RAID_CHECK_PRESENCE_SUMMARY_PREPARED"] = "Raid Check: %d present · %d eligible profile members · %d verified prepared"
 
+-- Raid Check initiating-admin completion summary (#449)
+L["RAID_CHECK_COMPLETION_SUMMARY"] = "[%s] Complete: %d Prepared · %d Unprepared · %d Inspection Failed"
+
 -- Resolve a locale key with an English fallback when the table is incomplete.
 function ns.LocaleText(key, default)
 	local value = L[key]

@@ -64,6 +64,8 @@ Someone who joins after freeze is ignored. Someone who leaves stays in the run a
 
 ## Results
 
+When a check finishes, the initiating admin receives exactly one local chat completion summary with Prepared, Unprepared, and Inspection Failed counts. That summary does not depend on debug logging or player whispers, and it does not imply every inspection succeeded. Local-only synchronization warnings and permission or profile failures keep their existing messages. The Loot Helper → Session status line prefers that final result over a stale "started" update, including when the check settles before the button handler returns.
+
 **Pre-Raid Check** reports results. It does not award points, Attendance, or Reward Pot changes.
 
 **Raid Check** additionally:
@@ -89,7 +91,7 @@ Without an active session-backed observation, the short no-session fallback stil
 
 ### Inspection Failed
 
-Inspection Failed means Spectrum attempted to inspect the player and the data was incomplete or the inspect timed out. It is reported separately to the admin. It does **not**:
+Inspection Failed means Spectrum attempted to inspect the player and the data was incomplete or the inspect timed out. The completion summary includes its count; per-player Inspection Failed details stay in debug. It does **not**:
 
 - award Prepared credit;
 - count as Unprepared for the Reward Pot;

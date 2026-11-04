@@ -241,6 +241,40 @@ local function GetRaidCheckConfig()
 	return nil
 end
 
+-- Prefer RaidCheck's last UI status so an immediately completed run cannot be
+-- overwritten by a late "started" SetMessage from this button handler.
+local function ApplyRaidCheckButtonStatus(ctx, status, mode)
+	if not ctx or not ctx.section or not ctx.section.SetMessage then
+		return
+	end
+	local label = (mode == "pre") and "Pre-Raid Check" or "Raid Check"
+	if status == "prompt" then
+		ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info")
+		return
+	end
+	if status == "busy" then
+		ctx.section:SetMessage("A Raid Check is already in progress.", "warn")
+		return
+	end
+	local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
+	if ui and type(ui.message) == "string" and ui.message ~= "" then
+		local kind = ui.kind or ((ui.status == "completed") and "success") or ((ui.status == "error") and "error") or "info"
+		ctx.section:SetMessage(ui.message, kind)
+		return
+	end
+	if status == "completed" then
+		ctx.section:SetMessage(label .. " complete.", "success")
+		return
+	end
+	if status == "started" then
+		ctx.section:SetMessage(label .. " started.", "info")
+		return
+	end
+	if status == "error" then
+		ctx.section:SetMessage(label .. " could not be started.", "error")
+	end
+end
+
 local function GetRaidCheckPointsAwardPerCheck()
 	local cfg = GetRaidCheckConfig()
 	if cfg ~= nil then
@@ -1366,7 +1400,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "checkbox", label = "Require Minimum Item Level", adminOnly = true, tooltip = "When enabled, a player whose overall equipped item level is below the minimum is Unprepared. The value is Blizzard's equipped item level. The requirement starts off and stays off until an admin enables it.", visible = function() return HasActiveProfile() end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.requireMinimumItemLevel or false end, set = function(value) SetRaidCheckMinimumItemLevelRequired(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
 				{ type = "editbox", label = "Minimum Item Level", adminOnly = true, tooltip = "Whole-number overall equipped item level required to pass Raid Check. A player exactly at this value passes. Leave this blank to keep the requirement from failing anyone until a number is set.", visible = function() local cfg = GetRaidCheckConfig() return HasActiveProfile() and cfg and cfg.requireMinimumItemLevel or false end, enabled = function() return ProfileActionsEnabled() end, maxLetters = 5, get = function() local cfg = GetRaidCheckConfig() if cfg and cfg.minimumItemLevel ~= nil then return tostring(cfg.minimumItemLevel) end return "" end, set = function(value) SetRaidCheckMinimumItemLevel(value) end },
 				{ type = "text", text = "Raid Checks..." },
-					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunPreRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Pre-Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end } },
+					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunPreRaidCheck() ApplyRaidCheckButtonStatus(ctx, status, "pre") end }, { text = "Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunRaidCheck() ApplyRaidCheckButtonStatus(ctx, status, "raid") end } },
 					{ type = "text", text = "Enable Whispers During..." },
 					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing equipment requirements.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
 					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point in Point Based mode, or an Attendance point in Reward Pot mode.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },

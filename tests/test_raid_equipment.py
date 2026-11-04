@@ -15,6 +15,7 @@ CHECK_RUN = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "Ch
 POLICY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_policy_tests.lua"
 RANGED_OFFHAND_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_ranged_offhand_tests.lua"
 RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
+COMPLETION_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_completion_tests.lua"
 FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
 EARLY_PREP_TESTS = REPO_ROOT / "tests" / "lua" / "early_preparation_tests.lua"
@@ -69,6 +70,21 @@ def test_raid_equipment_ranged_offhand_production_lua():
 def test_raid_check_run_production_lua():
     _run_lua(RUN_TESTS, "Raid Check run")
     assert CHECK_RUN.exists()
+
+
+def test_raid_check_completion_production_lua():
+    _run_lua(COMPLETION_TESTS, "Raid Check completion")
+    assert COMPLETION_TESTS.exists()
+    raid_check = (REPO_ROOT / "SpectrumFederation" / "modules" / "RaidCheck.lua").read_text(
+        encoding="utf-8"
+    )
+    loot_helper = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "LootHelper.lua"
+    ).read_text(encoding="utf-8")
+    assert "EmitAdminCompletionSummary" in raid_check
+    assert "GetLastUiStatus" in raid_check
+    assert "ApplyRaidCheckButtonStatus" in loot_helper
+    assert "FormatCompletionSummary" in CHECK_RUN.read_text(encoding="utf-8")
 
 
 def test_raid_equipment_fresh_install_snapshot_production_lua():

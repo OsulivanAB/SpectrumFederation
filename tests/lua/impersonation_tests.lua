@@ -913,13 +913,16 @@ end
 
 assertTrue(chatHas("Players missing requirements"), "missing-requirements summary stays in chat")
 assertTrue(chatHas("Missing"), "missing player line stays in chat")
-assertFalse(chatHas("Inspection Failed"), "inspection-failed summary is not chat")
+assertFalse(chatHas("Inspection Failed (not awarded"), "per-player inspection-failed detail summary is not chat")
 assertFalse(chatHas("Recently Verified"), "recently-verified summary is not chat")
-assertFalse(chatHas("Complete."), "raid-check Complete is not chat")
-assertTrue(debugHas("Inspection Failed"), "inspection-failed summary is debug-only")
+assertTrue(
+    chatHas("Complete: 2 Prepared · 1 Unprepared · 1 Inspection Failed"),
+    "initiating-admin completion summary is local chat (#449)"
+)
+assertTrue(debugHas("Inspection Failed"), "inspection-failed detail summary is debug-only")
 assertTrue(debugHas("Recently Verified (range-only, last-good within 120s)"), "legacy range-only summary is debug-only")
 assertTrue(debugHas("Recently Verified (same-session, last-good within 20m)"), "same-session summary is debug-only")
-assertTrue(debugHas("Complete."), "raid-check Complete is debug-only")
+assertTrue(debugHas("Complete."), "raid-check Complete debug line remains")
 
 -- Waiting-on-announce message is debug-only and does not reach chat.
 printed = {}

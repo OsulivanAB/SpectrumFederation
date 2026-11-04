@@ -4517,6 +4517,50 @@ local function EmitAdminDebug(message)
 	end
 end
 
+-- Settings button handlers read this after Run*/BeginCheck returns so an
+-- immediately settled run cannot be overwritten by a late "started" status.
+local function SetLastUiStatus(status, message, kind)
+	local state = RC:_GetInspectState()
+	state.lastUiStatus = {
+		status = status,
+		message = message,
+		kind = kind or "info",
+	}
+end
+
+function RC:GetLastUiStatus()
+	local state = self:_GetInspectState()
+	local ui = state.lastUiStatus
+	if type(ui) ~= "table" then
+		return nil
+	end
+	return {
+		status = ui.status,
+		message = ui.message,
+		kind = ui.kind,
+	}
+end
+
+local function EmitAdminCompletionSummary(modeLabel, results)
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun or not CheckRun.FormatCompletionSummary then
+		return nil
+	end
+	local prepared, unprepared, inspectionFailed = 0, 0, 0
+	if CheckRun.CountClassifiedResults then
+		prepared, unprepared, inspectionFailed = CheckRun.CountClassifiedResults(results)
+	end
+	local message = CheckRun.FormatCompletionSummary(modeLabel, prepared, unprepared, inspectionFailed)
+	if type(message) ~= "string" or message == "" then
+		return nil
+	end
+	-- Always local chat for the initiating admin: not gated on debug logging or
+	-- player whispers. PrintSuccess matches the historical Complete notification.
+	SF:PrintSuccess(message)
+	SetLastUiStatus("completed", message, "success")
+	return message
+end
+
 local function EmitAdminMissingSummary(modeLabel, summaryMissing)
 	if type(summaryMissing) ~= "table" or #summaryMissing == 0 then
 		return
@@ -4786,7 +4830,9 @@ function RC:_ApplyCheckConsequences(run)
 	local profile = GetProfileById(run.profileId)
 	if not profile then
 		run.consequencesApplied = true
-		SF:PrintError(string.format("[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.", ModeLabel(run.mode)))
+		local err = string.format("[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.", ModeLabel(run.mode))
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error")
 		return
 	end
 
@@ -4794,11 +4840,14 @@ function RC:_ApplyCheckConsequences(run)
 	-- awards, Reward Pot writes, logs, and admin whispers as a unit.
 	if not IsCurrentUserAdmin(profile) then
 		run.consequencesApplied = true
+		local err
 		if SF.LootHelperImpersonation and SF.LootHelperImpersonation.IsActive and SF.LootHelperImpersonation:IsActive() then
-			SF:PrintError("Raid Check results were not applied because you are viewing the profile as a non-admin.")
+			err = "Raid Check results were not applied because you are viewing the profile as a non-admin."
 		else
-			SF:PrintError("Raid Check results were not applied because you are not an admin of this profile.")
+			err = "Raid Check results were not applied because you are not an admin of this profile."
 		end
+		SF:PrintError(err)
+		SetLastUiStatus("error", err, "error")
 		return
 	end
 
@@ -5083,6 +5132,9 @@ function RC:_ApplyCheckConsequences(run)
 	end
 
 	run.consequencesApplied = true
+	-- One initiating-admin completion line. consequencesApplied above prevents
+	-- repeats from ticks, announce callbacks, or a second Apply call.
+	EmitAdminCompletionSummary(label, results)
 	if SF.Debug then
 		SF.Debug:Info("RAID_CHECK", "%s consequences applied (missing=%d failed=%d skipBroadcast=%s reason=%s)",
 			label, #summaryMissing, #summaryFailed, tostring(skipBroadcast), tostring(reason))
@@ -5312,8 +5364,11 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	end
 
 	local label = ModeLabel(mode)
+	local startedMessage = label .. " started."
+	-- Record started before inspection work so an immediate settle can replace it.
+	SetLastUiStatus("started", startedMessage, "info")
 	if SF.SystemMessage then
-		SF:SystemMessage(label .. " started.")
+		SF:SystemMessage(startedMessage)
 	else
 		SF:PrintInfo(string.format("[%s] Initiated.", label))
 	end
@@ -5330,6 +5385,11 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 
 	self:_EnsureAdhocTicker()
 	self:_TickAdhocRun()
+	-- Immediate settle (including zero targets / already-complete) must not leave
+	-- callers thinking the check is still in progress.
+	if run.consequencesApplied then
+		return "completed"
+	end
 	return "started"
 end
 
