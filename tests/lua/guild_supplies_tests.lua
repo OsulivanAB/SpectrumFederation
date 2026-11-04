@@ -44618,8 +44618,10 @@ do
         "447-r9: pool smaller than contributor count")
     local content = largeControl.__sfRankingContent
     assertTrue(content ~= nil, "447-r9: content frame exposed")
-    assertEq(content:GetHeight(), #largeRows * 28,
-        "447-r9: full logical scroll height")
+    local amountTopPad = tonumber(largeControl.__sfRankingAmountTopPad) or 0
+    assertTrue(amountTopPad > 0, "447-r9: amount top pad reserves coin-label clearance")
+    assertEq(content:GetHeight(), amountTopPad + #largeRows * 28,
+        "447-r9: full logical scroll height includes amount top pad")
     local visibleTop = largeControl.__sfRankingVisibleNames()
     assertEq(visibleTop[1], "Contrib001-Garona", "447-r9: first visible at top")
     local framesAtTop = frameCreateCount
@@ -44629,7 +44631,7 @@ do
     local scroll = largeControl.__sfRankingScroll
     assertTrue(scroll ~= nil, "447-r9: scroll exposed")
     scroll:SetHeight(280)
-    scroll:SetVerticalScroll(100 * 28) -- Contrib101 at top of window (before overscan)
+    scroll:SetVerticalScroll(amountTopPad + 100 * 28) -- Contrib101 at top of window (before overscan)
     local visibleMid = largeControl.__sfRankingVisibleNames()
     local midHit = false
     for i = 1, #visibleMid do
@@ -44645,7 +44647,7 @@ do
     assertEq(frameCreateCount, framesAtTop, "447-r9: scroll allocates no new frames")
 
     -- Last scroll window includes Neg-Garona.
-    local maxScroll = math.max(0, (#largeRows * 28) - 280)
+    local maxScroll = math.max(0, (amountTopPad + #largeRows * 28) - 280)
     scroll:SetVerticalScroll(maxScroll)
     local visibleLast = largeControl.__sfRankingVisibleNames()
     local lastHit = false
@@ -44717,7 +44719,8 @@ do
         "447-r9: refresh captured")
     local mutScroll = mutControl.__sfRankingScroll
     mutScroll:SetHeight(280)
-    local deep = math.max(0, (#mutPayload.rows * 28) - 280)
+    local mutTopPad = tonumber(mutControl.__sfRankingAmountTopPad) or 0
+    local deep = math.max(0, (mutTopPad + #mutPayload.rows * 28) - 280)
     mutScroll:SetVerticalScroll(deep)
     assertTrue((mutScroll:GetVerticalScroll() or 0) > 0, "447-r9: scrolled deep before shrink")
     -- Campaign change / shorter list.
@@ -44731,8 +44734,8 @@ do
     }
     mutRefresh()
     assertEq(mutScroll:GetVerticalScroll(), 0, "447-r9: scroll clamped after list shrink")
-    assertEq(mutControl.__sfRankingContent:GetHeight(), 2 * 28,
-        "447-r9: content height matches short list")
+    assertEq(mutControl.__sfRankingContent:GetHeight(), mutTopPad + 2 * 28,
+        "447-r9: content height matches short list plus amount top pad")
     local shortNames = mutControl.__sfRankingVisibleNames()
     assertEq(shortNames[1], "OnlyA-Garona", "447-r9: short list first row")
     assertTrue(mutControl.__sfRankingPoolCount() <= 20,
@@ -45009,6 +45012,9 @@ do
     assertTrue(ctrlBody:find('SetPoint("BOTTOMRIGHT", entry.bar, "TOPLEFT"', 1, true)
             or ctrlBody:find('SetPoint("BOTTOMRIGHT", bar, "TOPRIGHT"', 1, true),
         "450: amount BOTTOMRIGHT placement present")
+    assertTrue(ctrlBody:find("amountTopPad", 1, true)
+            and ctrlBody:find("amountTopPad + totalRows * rowHeight", 1, true),
+        "450: amount top pad included in scroll content height")
     assertTrue(ctrlBody:find("C_CurrencyInfo", 1, true)
             and ctrlBody:find("GetCoinTextureString", 1, true),
         "450: Retail coin texture API used in chart formatter")
@@ -45118,6 +45124,9 @@ do
     local priorCreateFrame = CreateFrame
     function CreateFrame(frameType, name, parent, template)
         local region = makeUiRegion(frameType or "Frame", name, parent)
+        if parent and parent.children then
+            parent.children[#parent.children + 1] = region
+        end
         if template == "UIPanelScrollFrameTemplate" then
             region.ScrollBar = makeUiRegion("Slider", nil, region)
         end
@@ -45220,6 +45229,27 @@ do
     for _, hook in ipairs(placeControl.hooks.OnSizeChanged or {}) do
         hook(placeControl, 520, 280)
     end
+    local placeTopPad = tonumber(placeControl.__sfRankingAmountTopPad) or 0
+    assertTrue(placeTopPad > 0, "450: amount top pad clears first-row coin label")
+    assertEq(placeControl.__sfRankingContent:GetHeight(), placeTopPad + 4 * 28,
+        "450: content height includes amount top pad")
+    -- First pool row is parented under the scroll child and shifted by the pad.
+    local firstRowY = nil
+    for _, child in ipairs(placeControl.__sfRankingContent.children or {}) do
+        if child and child.kind == "Frame" and child.shown and child.points then
+            for _, pt in ipairs(child.points) do
+                if pt[1] == "TOPLEFT" and pt[2] == placeControl.__sfRankingContent then
+                    firstRowY = pt[5]
+                    break
+                end
+            end
+            if firstRowY ~= nil then
+                break
+            end
+        end
+    end
+    assertEq(firstRowY, -placeTopPad,
+        "450: first row TOPLEFT y equals -amountTopPad (no clip at scroll top)")
     local fmt = placeControl.__sfRankingFormatCopper
     assertTrue(type(fmt) == "function", "450: format hook exposed")
     local coinPos = fmt(12345)
