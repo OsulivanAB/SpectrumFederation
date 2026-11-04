@@ -3658,14 +3658,17 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
             end
             local function indexLedgerRow(e)
                 if type(e) ~= "table" then return end
+                -- Store the installed event table (same contract as ledger/
+                -- completeness indexers). Boolean presence alone lets a later
+                -- gs-ledger-event treat transport bodies as installed (#447).
                 if type(e.id) == "string" and e.id ~= "" then
-                    state.acctIndex.byId[e.id] = true
+                    state.acctIndex.byId[e.id] = e
                 end
                 if type(e.txnId) == "string" and e.txnId ~= "" then
-                    state.acctIndex.byId[e.txnId] = true
+                    state.acctIndex.byId[e.txnId] = e
                 end
                 if type(e.opId) == "string" and e.opId ~= "" then
-                    state.acctIndex.byId[e.opId] = true
+                    state.acctIndex.byId[e.opId] = e
                 end
                 rememberOcc(state.acctIndex.byOcc, e)
             end
@@ -3999,9 +4002,10 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                             installedRef = nil
                         end
                     end
-                    if installedRef == nil and type(live) == "table" and #live > 0 then
+                    if (type(installedRef) ~= "table" or installedRef == event)
+                        and type(live) == "table" and #live > 0 then
                         local tip = live[#live]
-                        if type(tip) == "table" and (
+                        if type(tip) == "table" and tip ~= event and (
                             (type(eid) == "string" and eid ~= ""
                                 and (tip.id == eid or tip.txnId == eid or tip.opId == eid))
                             or (type(event.txnId) == "string" and event.txnId ~= ""
@@ -4012,7 +4016,20 @@ local function ReplayAdoptionSlice(temp, adop, member, state)
                             installedRef = tip
                         end
                     end
-                    indexLedgerRowLe(installedRef or event)
+                    if isAdjustmentEventLe(event) then
+                        -- Never index the transport body as installed proof —
+                        -- completeness would compare the source snapshot to itself.
+                        if type(installedRef) == "table" and installedRef ~= event then
+                            indexLedgerRowLe(installedRef)
+                        else
+                            state.ledgerBodySettled[settledKey] = nil
+                            unsettledSeen = true
+                        end
+                    else
+                        indexLedgerRowLe(
+                            (type(installedRef) == "table" and installedRef ~= event)
+                                and installedRef or event)
+                    end
                     -- Keep tails consistent with lists that grew via Admit.
                     if type(live) == "table" then
                         state.acctIndexLiveTail = #live
@@ -4718,7 +4735,10 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
                 return false, "incomplete_transfer"
             end
             if isAdjustmentEventComp(ev) then
+                -- installed must be a durable accounting row, not the buffered
+                -- transport body (same table reference) or a boolean marker.
                 if type(installed) ~= "table"
+                    or installed == ev
                     or not AdjustmentUnitCopperSurvived(installed, ev) then
                     opts.cursor = nil
                     opts.budgetExhausted = false
@@ -4775,14 +4795,16 @@ local function ValidateAdoptionCompleteness(temp, adop, member, opts)
             end
             local function indexLedgerRow(e)
                 if type(e) ~= "table" then return end
+                -- Installed event refs only — never boolean presence. Completeness
+                -- of later adjustment ledger bodies reads unitCopper from here (#447).
                 if type(e.id) == "string" and e.id ~= "" then
-                    opts.acctIndex.byId[e.id] = true
+                    opts.acctIndex.byId[e.id] = e
                 end
                 if type(e.txnId) == "string" and e.txnId ~= "" then
-                    opts.acctIndex.byId[e.txnId] = true
+                    opts.acctIndex.byId[e.txnId] = e
                 end
                 if type(e.opId) == "string" and e.opId ~= "" then
-                    opts.acctIndex.byId[e.opId] = true
+                    opts.acctIndex.byId[e.opId] = e
                 end
                 rememberOcc(opts.acctIndex.byOcc, e)
             end

@@ -44079,8 +44079,8 @@ local function rankingsAdoptFindAdj(record, itemId, quantity)
 end
 
 local function bufferAdoptionOrdered(exportBodies, mode)
-    -- mode: "natural" | "op_first" | "ledger_first"
-    local ops, ledgers, other = {}, {}, {}
+    -- mode: "natural" | "op_first" | "ledger_first" | "ops_evidence_ledger"
+    local ops, ledgers, evidence, other = {}, {}, {}, {}
     for i = 1, #exportBodies do
         local row = exportBodies[i]
         local kind = row.body and row.body.kind
@@ -44088,6 +44088,8 @@ local function bufferAdoptionOrdered(exportBodies, mode)
             ops[#ops + 1] = row
         elseif kind == "gs-ledger-event" then
             ledgers[#ledgers + 1] = row
+        elseif kind == "gs-evidence" then
+            evidence[#evidence + 1] = row
         else
             other[#other + 1] = row
         end
@@ -44095,12 +44097,20 @@ local function bufferAdoptionOrdered(exportBodies, mode)
     local order = {}
     if mode == "op_first" then
         for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #evidence do order[#order + 1] = evidence[i] end
         for i = 1, #ops do order[#order + 1] = ops[i] end
         for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
     elseif mode == "ledger_first" then
         for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #evidence do order[#order + 1] = evidence[i] end
         for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
         for i = 1, #ops do order[#order + 1] = ops[i] end
+    elseif mode == "ops_evidence_ledger" then
+        -- Reproduce evidence catch-up indexing adjustments before ledger bodies.
+        for i = 1, #other do order[#order + 1] = other[i] end
+        for i = 1, #ops do order[#order + 1] = ops[i] end
+        for i = 1, #evidence do order[#order + 1] = evidence[i] end
+        for i = 1, #ledgers do order[#order + 1] = ledgers[i] end
     else
         order = exportBodies
     end
@@ -44294,22 +44304,14 @@ do
     bufferAdoptionOrdered(exportCopy, "op_first")
     assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
         "447-adopt-2: ready")
-    -- After successful enrich, corrupt installed unitCopper so completeness
-    -- sees installed≠source and refuses to publish.
+    -- After successful enrich, corrupt installed unitCopper in place only —
+    -- do not rewrite acctIndex.byId; completeness must observe the installed ref.
     GS._adoptionBeforeCompletenessForTest = function(temp)
         local adj = rankingsAdoptFindAdj(temp, 9462, 1)
         assertTrue(type(adj) == "table", "447-adopt-2: temp adj after replay")
         assertEq(tonumber(adj.unitCopper), 1000,
             "447-adopt-2: enrich ran before completeness hook")
         adj.unitCopper = 1777
-        -- Keep acctIndex in sync with the corrupted installed row.
-        local adop = GS:GetPendingAdoption()
-        local st = adop and adop.replayState
-        if st and st.acctIndex and st.acctIndex.byId and adj.id then
-            st.acctIndex.byId[adj.id] = adj
-            if adj.txnId then st.acctIndex.byId[adj.txnId] = adj end
-            if adj.opId then st.acctIndex.byId[adj.opId] = adj end
-        end
     end
     local stFail, reasonFail = GS:CommitDatasetAdoption()
     GS._adoptionBeforeCompletenessForTest = nil
@@ -44480,6 +44482,156 @@ do
     assertTrue(visited < 10000 and indexVisited < 10000,
         "447-adopt-3-full: bounded visited c=" .. tostring(visited)
             .. " i=" .. tostring(indexVisited))
+end
+
+do
+    -- 447-adopt-4) ops → evidence → ledger with multiple attributed adjustments:
+    -- corrupting only a non-tip installed unitCopper (no index rewrite) must
+    -- reject as incomplete_transfer and leave active data/exports unchanged.
+    valuationTsmValue = 1500
+    SF.TSM = { GetMarketValue = function() return valuationTsmValue end }
+    local source = activateValuationGuild(9464)
+    creditValuationDeposit(source, {
+        itemId = 9464, quantity = 4, donor = "Bob-Garona",
+    })
+    creditValuationDeposit(source, {
+        itemId = 9464, quantity = 2, donor = "Dave-Garona",
+        occurrenceIndex = 2,
+        neighborsOlder = { "older|9464|2" },
+        neighborsNewer = { "newer|2" },
+    })
+    setPlayer("Alice-Garona", "Player-1-Alice", 1)
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9464, 1, "Carol-Garona"))), "accepted",
+        "447-adopt-4: +1 Carol")
+    assertEq(GS:ApplyStagedConfigOperation(
+        select(1, GS:NewAdjustmentOperation(9464, -1, "Dave-Garona"))), "accepted",
+        "447-adopt-4: -1 Dave")
+    source = GS:GetCurrentRecord()
+    local srcPos = rankingsAdoptFindAdj(source, 9464, 1)
+    local srcNeg = rankingsAdoptFindAdj(source, 9464, -1)
+    assertEq(tonumber(srcPos and srcPos.unitCopper), 1500, "447-adopt-4: +1 priced")
+    assertEq(tonumber(srcNeg and srcNeg.unitCopper), 1500, "447-adopt-4: -1 priced")
+    assertTrue(srcPos.id ~= srcNeg.id, "447-adopt-4: distinct adj ids")
+    local sourceRank = rankingsByName(GS:ProjectCampaignRankings(source.currentCampaignId))
+    -- Export as a deposit witness so local directExports include gs-evidence
+    -- (Alice-as-author does not own those witness rows).
+    setPlayer("Dave-Garona", "Player-1-Dave", 4)
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-4: provider")
+    GS.NotifyLocalDurableChange("ledger")
+    drainExportMaint(128)
+    GS:DisableGossipProvider()
+    assertEq(GS:EnsureGossipProvider(), true, "447-adopt-4: cold re-register")
+    drainExportMaint(128)
+    local exportBodies = collectAllExportBodies()
+    local hasEvidence = false
+    for i = 1, #exportBodies do
+        if exportBodies[i].body and exportBodies[i].body.kind == "gs-evidence" then
+            hasEvidence = true
+            break
+        end
+    end
+    assertTrue(hasEvidence, "447-adopt-4: export includes gs-evidence")
+    local sourceDataset = source.datasetId
+    local exportCopy = {}
+    for i = 1, #exportBodies do
+        exportCopy[i] = { id = exportBodies[i].id, body = exportBodies[i].body }
+    end
+
+    -- Happy path: ops → evidence → ledger preserves both prices + rankings.
+    local installedOk = adoptFromExport(
+        sourceDataset, exportCopy, "ops_evidence_ledger", "447-adopt-4-ok")
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, 1).unitCopper), 1500,
+        "447-adopt-4-ok: +1 survived")
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, -1).unitCopper), 1500,
+        "447-adopt-4-ok: -1 survived")
+    local instRank = rankingsByName(GS:ProjectCampaignRankings(installedOk.currentCampaignId))
+    assertEq(instRank["Bob-Garona"], sourceRank["Bob-Garona"], "447-adopt-4-ok: Bob")
+    assertEq(instRank["Carol-Garona"], sourceRank["Carol-Garona"], "447-adopt-4-ok: Carol")
+    assertEq(instRank["Dave-Garona"], sourceRank["Dave-Garona"], "447-adopt-4-ok: Dave")
+    GS._root = nil
+    GS._rootValid = false
+    assertEq(initGS(), true, "447-adopt-4-ok: reload")
+    installedOk = GS:GetCurrentRecord()
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, 1).unitCopper), 1500,
+        "447-adopt-4-ok: +1 after reload")
+    assertEq(tonumber(rankingsAdoptFindAdj(installedOk, 9464, -1).unitCopper), 1500,
+        "447-adopt-4-ok: -1 after reload")
+
+    -- Mismatch path: corrupt only the non-tip adjustment; do not touch the index.
+    SpectrumFederationDB = {}
+    switchPlayer("Carol-Garona", "Player-1-Carol", 2)
+    settleRoster()
+    GS._adoptionEpoch = 0
+    GS._peerDatasets = {}
+    GS._pendingRelay = {}
+    GS._adoption = nil
+    initGS()
+    GS:CreateStagedRecord()
+    startCampaign()
+    local beforeDs = GS:GetCurrentRecord().datasetId
+    local beforeEvents = #(GS:GetCurrentRecord().accounting._consumableEvents or {})
+    GS:EnsureGossipProvider()
+    drainExportMaint(8)
+    local beforeExportCount = #collectAllExportBodies()
+    GS.NotePeerDataset("Alice-Garona", sourceDataset, { editorRankPosition = 1 })
+    assertEq(select(2, GS:BeginDatasetAdoption("Alice-Garona", sourceDataset)), "accepted",
+        "447-adopt-4-mismatch: begin")
+    bufferAdoptionOrdered(exportCopy, "ops_evidence_ledger")
+    assertTrue(GS:GetPendingAdoption() and GS:GetPendingAdoption().ready,
+        "447-adopt-4-mismatch: ready")
+    GS._adoptionBeforeCompletenessForTest = function(temp)
+        local live = temp.accounting and temp.accounting._consumableEvents
+        assertTrue(type(live) == "table" and #live >= 2,
+            "447-adopt-4-mismatch: live list populated")
+        local tip = live[#live]
+        local nonTip = nil
+        for i = 1, #live - 1 do
+            local ev = live[i]
+            if type(ev) == "table"
+                and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                and tonumber(ev.unitCopper) == 1500 then
+                nonTip = ev
+                break
+            end
+        end
+        -- Prefer an adjustment that is not the tip; fall back to any non-tip priced adj.
+        if nonTip == nil then
+            for i = 1, #live do
+                local ev = live[i]
+                if type(ev) == "table"
+                    and (ev.type == "adjustment" or ev.type == "CONSUMABLE_ADJUSTMENT")
+                    and ev ~= tip
+                    and tonumber(ev.unitCopper) == 1500 then
+                    nonTip = ev
+                    break
+                end
+            end
+        end
+        assertTrue(type(nonTip) == "table", "447-adopt-4-mismatch: found non-tip adj")
+        assertTrue(nonTip ~= tip, "447-adopt-4-mismatch: target is not tip")
+        assertEq(tonumber(nonTip.unitCopper), 1500,
+            "447-adopt-4-mismatch: enrich before corrupt")
+        nonTip.unitCopper = 1777
+        -- Intentionally do not rewrite acctIndex.byId.
+    end
+    local stFail, reasonFail = GS:CommitDatasetAdoption()
+    GS._adoptionBeforeCompletenessForTest = nil
+    assertEq(stFail, "rejected",
+        "447-adopt-4-mismatch: rejected st=" .. tostring(stFail)
+            .. " r=" .. tostring(reasonFail))
+    assertEq(reasonFail, "incomplete_transfer",
+        "447-adopt-4-mismatch: incomplete_transfer got=" .. tostring(reasonFail))
+    assertEq(GS:GetCurrentRecord().datasetId, beforeDs,
+        "447-adopt-4-mismatch: active dataset unchanged")
+    assertEq(#(GS:GetCurrentRecord().accounting._consumableEvents or {}), beforeEvents,
+        "447-adopt-4-mismatch: active ledger unchanged")
+    assertEq(#collectAllExportBodies(), beforeExportCount,
+        "447-adopt-4-mismatch: exports unchanged")
+    if GS:GetPendingAdoption() then
+        assertEq(select(1, GS:CancelDatasetAdoption()), "accepted",
+            "447-adopt-4-mismatch: cancel leftover")
+    end
 end
 
 SF.TSM = nil
