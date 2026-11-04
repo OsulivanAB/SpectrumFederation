@@ -289,9 +289,9 @@ local function UiStatusBelongsToCurrentInvocation(ui)
 	return activeId == nil
 end
 
--- Session controls share one section message row. Track only the Raid Check text we
--- wrote so reject/refresh paths can clear stale RC status without erasing newer
--- Session Control (or other) feedback.
+-- Session controls share one section message row. Track Raid Check ownership and a
+-- shared monotonic seq so refresh can tell whether Session Control feedback is
+-- newer than a cached Raid Check transition (started vs completed need distinct seq).
 local function SectionMessageText(section)
 	if not section then
 		return nil
@@ -312,12 +312,58 @@ local function SectionMessageText(section)
 	return nil
 end
 
-local function SetRaidCheckSectionMessage(section, message, kind)
+local function NextSessionRowSeq()
+	if SF.RaidCheck and SF.RaidCheck.NextSharedMessageSeq then
+		return SF.RaidCheck:NextSharedMessageSeq()
+	end
+	return nil
+end
+
+-- Stamp non-Raid-Check SetMessage/ClearMessage so OnShow can compare age to lastUiStatus.seq.
+local function EnsureSessionMessageOrdering(section)
+	if not section or section.__sfRaidCheckMessageOrdering then
+		return
+	end
+	section.__sfRaidCheckMessageOrdering = true
+	local origSetMessage = section.SetMessage
+	local origClearMessage = section.ClearMessage
+	if type(origSetMessage) == "function" then
+		function section:SetMessage(text, kind)
+			local result = origSetMessage(self, text, kind)
+			if not self.__sfRaidCheckSettingMessage then
+				self.__sfRaidCheckOwnedMessage = nil
+				self.__sfRaidCheckOwnedSeq = nil
+				self.__sfSessionMessageSeq = NextSessionRowSeq()
+			end
+			return result
+		end
+	end
+	if type(origClearMessage) == "function" then
+		function section:ClearMessage()
+			local result = origClearMessage(self)
+			if not self.__sfRaidCheckSettingMessage then
+				self.__sfRaidCheckOwnedMessage = nil
+				self.__sfRaidCheckOwnedSeq = nil
+				self.__sfSessionMessageSeq = NextSessionRowSeq()
+			end
+			return result
+		end
+	end
+end
+
+local function SetRaidCheckSectionMessage(section, message, kind, seq)
 	if not section or not section.SetMessage then
 		return false
 	end
+	EnsureSessionMessageOrdering(section)
+	if seq == nil then
+		seq = NextSessionRowSeq()
+	end
+	section.__sfRaidCheckSettingMessage = true
 	section:SetMessage(message, kind)
+	section.__sfRaidCheckSettingMessage = nil
 	section.__sfRaidCheckOwnedMessage = message
+	section.__sfRaidCheckOwnedSeq = seq
 	return true
 end
 
@@ -325,6 +371,7 @@ local function ClearOwnedRaidCheckSectionMessage(section)
 	if not section then
 		return false
 	end
+	EnsureSessionMessageOrdering(section)
 	local owned = section.__sfRaidCheckOwnedMessage
 	if type(owned) ~= "string" or owned == "" then
 		return false
@@ -333,12 +380,16 @@ local function ClearOwnedRaidCheckSectionMessage(section)
 	-- Another Session control replaced the row; drop ownership and leave their text.
 	if type(current) == "string" and current ~= "" and current ~= owned then
 		section.__sfRaidCheckOwnedMessage = nil
+		section.__sfRaidCheckOwnedSeq = nil
 		return false
 	end
+	section.__sfRaidCheckSettingMessage = true
 	if section.ClearMessage then
 		section:ClearMessage()
 	end
+	section.__sfRaidCheckSettingMessage = nil
 	section.__sfRaidCheckOwnedMessage = nil
+	section.__sfRaidCheckOwnedSeq = nil
 	return true
 end
 
@@ -351,19 +402,26 @@ local function SectionHasUnrelatedMessage(section)
 	return not (type(owned) == "string" and owned ~= "" and current == owned)
 end
 
--- opts.preserveUnrelated: OnShow/Refresh must not replay a cached Raid Check result
--- over newer Session Control feedback. Live listener updates omit this so a current
--- profile's new Raid Check status can still replace the row.
+local function UnrelatedMessageIsNewerThanUi(section, ui)
+	local foreignSeq = tonumber(section and section.__sfSessionMessageSeq) or 0
+	local uiSeq = tonumber(ui and ui.seq) or 0
+	return foreignSeq >= uiSeq
+end
+
+-- opts.preserveUnrelated: OnShow/Refresh keep Session Control feedback only when it
+-- is at least as new as the cached Raid Check status. A same-profile completion that
+-- landed while the page was hidden (higher seq) still replaces older row text.
 local function ApplyUiStatusToSection(section, ui, opts)
 	if not section then
 		return false
 	end
+	EnsureSessionMessageOrdering(section)
 	opts = opts or {}
 	if not UiStatusBelongsToCurrentInvocation(ui) then
 		ClearOwnedRaidCheckSectionMessage(section)
 		return false
 	end
-	if opts.preserveUnrelated and SectionHasUnrelatedMessage(section) then
+	if opts.preserveUnrelated and SectionHasUnrelatedMessage(section) and UnrelatedMessageIsNewerThanUi(section, ui) then
 		return false
 	end
 	local kind = ui.kind
@@ -371,7 +429,7 @@ local function ApplyUiStatusToSection(section, ui, opts)
 		or ((ui.status == "error") and "error")
 		or ((ui.status == "busy") and "warn")
 		or "info"
-	return SetRaidCheckSectionMessage(section, ui.message, kind)
+	return SetRaidCheckSectionMessage(section, ui.message, kind, ui.seq)
 end
 
 -- Prefer RaidCheck's current-invocation UI status so an immediately completed run
@@ -381,6 +439,7 @@ local function ApplyRaidCheckButtonStatus(ctx, status, mode)
 	if not ctx or not ctx.section or not ctx.section.SetMessage then
 		return
 	end
+	EnsureSessionMessageOrdering(ctx.section)
 	local label = RaidCheckModeLabel(mode)
 	if status == "busy" then
 		SetRaidCheckSectionMessage(
@@ -440,6 +499,7 @@ local function EnsureRaidCheckUiStatusListener(panel)
 			return
 		end
 		local section = panel.__sfSections and panel.__sfSections.session
+		EnsureSessionMessageOrdering(section)
 		-- Live updates for the displayed profile may replace the row; rejected
 		-- statuses only clear text still owned by Raid Check.
 		ApplyUiStatusToSection(section, ui)
@@ -1945,9 +2005,10 @@ local function SyncRaidCheckUiStatusToPanel(panel)
 		return
 	end
 	local section = panel.__sfSections and panel.__sfSections.session
+	EnsureSessionMessageOrdering(section)
 	local ui = SF.RaidCheck and SF.RaidCheck.GetLastUiStatus and SF.RaidCheck:GetLastUiStatus() or nil
-	-- Reopen/refresh: clear stale Raid Check text for the wrong profile, but do
-	-- not wipe or overwrite newer Session Control feedback with a cached result.
+	-- Reopen/refresh: clear stale wrong-profile Raid Check text; keep Session
+	-- Control feedback only when it is newer than the cached status seq.
 	ApplyUiStatusToSection(section, ui, { preserveUnrelated = true })
 end
 

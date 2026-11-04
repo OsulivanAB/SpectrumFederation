@@ -4533,6 +4533,7 @@ local function CopyUiStatus(ui)
 		message = ui.message,
 		kind = ui.kind,
 		generation = ui.generation,
+		seq = ui.seq,
 		mode = ui.mode,
 		profileId = ui.profileId,
 		runId = ui.runId,
@@ -4549,6 +4550,15 @@ local function NotifyUiStatusListeners()
 	end
 end
 
+-- Monotonic sequence shared by Raid Check status transitions and Session row
+-- writes. Generation scopes an invocation; seq distinguishes started→completed
+-- (and Session Control feedback) within or across invocations for refresh ordering.
+local function NextSharedMessageSeq(state)
+	state = state or RC:_GetInspectState()
+	state.sharedMessageSeq = (state.sharedMessageSeq or 0) + 1
+	return state.sharedMessageSeq
+end
+
 -- Begin a new Settings-visible attempt. Busy/in-flight returns must not call this:
 -- only paths that attempt a new check. Clears prior success so error returns cannot
 -- prefer a stale completed summary (Codex #458).
@@ -4560,6 +4570,7 @@ local function BeginUiStatusInvocation(mode, profileId)
 		message = nil,
 		kind = "info",
 		generation = state.uiStatusGeneration,
+		seq = NextSharedMessageSeq(state),
 		mode = mode,
 		profileId = profileId,
 		runId = nil,
@@ -4577,6 +4588,7 @@ local function SetLastUiStatus(status, message, kind, opts)
 		message = message,
 		kind = kind or "info",
 		generation = generation,
+		seq = NextSharedMessageSeq(state),
 		mode = opts.mode or (previous and previous.mode) or nil,
 		profileId = opts.profileId or (previous and previous.profileId) or nil,
 		runId = opts.runId or (previous and previous.runId) or nil,
@@ -4592,6 +4604,15 @@ end
 function RC:GetUiStatusGeneration()
 	local state = self:_GetInspectState()
 	return state.uiStatusGeneration or 0
+end
+
+function RC:NextSharedMessageSeq()
+	return NextSharedMessageSeq(self:_GetInspectState())
+end
+
+function RC:GetSharedMessageSeq()
+	local state = self:_GetInspectState()
+	return state.sharedMessageSeq or 0
 end
 
 function RC:RegisterUiStatusListener(key, callback)
@@ -4781,6 +4802,15 @@ local function ModeLabel(mode)
 		return "Pre-Raid Check"
 	end
 	return "Raid Check"
+end
+
+-- Localized mode name for Settings-visible status and the initiating-admin
+-- completion summary. Legacy debug/sync diagnostics keep ModeLabel() English.
+local function LocalizedModeLabel(mode)
+	if mode == "pre" then
+		return (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_PRE", "Pre-Raid Check")) or "Pre-Raid Check"
+	end
+	return (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_RAID", "Raid Check")) or "Raid Check"
 end
 
 local function QueueFrozenInspectTargets(self, run)
@@ -5227,7 +5257,7 @@ function RC:_ApplyCheckConsequences(run)
 	run.consequencesApplied = true
 	-- One initiating-admin completion line. consequencesApplied above prevents
 	-- repeats from ticks, announce callbacks, or a second Apply call.
-	EmitAdminCompletionSummary(label, results, run)
+	EmitAdminCompletionSummary(LocalizedModeLabel(mode), results, run)
 	if SF.Debug then
 		SF.Debug:Info("RAID_CHECK", "%s consequences applied (missing=%d failed=%d skipBroadcast=%s reason=%s)",
 			label, #summaryMissing, #summaryFailed, tostring(skipBroadcast), tostring(reason))
@@ -5459,14 +5489,8 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	local label = ModeLabel(mode)
 	-- Settings status + listener path prefer lastUiStatus; localize the stored
 	-- started message so translated clients are not stuck with hard-coded English.
-	local modeLabel
-	if mode == "pre" then
-		modeLabel = (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_PRE", "Pre-Raid Check")) or "Pre-Raid Check"
-	else
-		modeLabel = (SF.LocaleText and SF.LocaleText("RAID_CHECK_MODE_RAID", "Raid Check")) or "Raid Check"
-	end
 	local startedTemplate = (SF.LocaleText and SF.LocaleText("RAID_CHECK_UI_STARTED", "%s started.")) or "%s started."
-	local startedMessage = startedTemplate:format(modeLabel)
+	local startedMessage = startedTemplate:format(LocalizedModeLabel(mode))
 	-- Record started before inspection work so an immediate settle can replace it.
 	SetLastUiStatus("started", startedMessage, "info", {
 		mode = mode,
@@ -5547,12 +5571,13 @@ function RC:BeginCheck(mode)
 	-- New attempt: scope/clear prior success before validation or prompt work.
 	local generation = BeginUiStatusInvocation(mode, profileId)
 	local label = ModeLabel(mode)
+	local uiLabel = LocalizedModeLabel(mode)
 
 	if decision.action == "error" then
 		ValidateCanRun(mode)
 		SetLastUiStatus(
 			"error",
-			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(label),
+			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(uiLabel),
 			"error",
 			{ generation = generation, mode = mode, profileId = profileId }
 		)
@@ -5563,7 +5588,7 @@ function RC:BeginCheck(mode)
 	if not profileObj then
 		SetLastUiStatus(
 			"error",
-			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(label),
+			Loc("RAID_CHECK_UI_START_FAILED", "%s could not be started."):format(uiLabel),
 			"error",
 			{ generation = generation, mode = mode, profileId = profileId }
 		)
@@ -5675,7 +5700,7 @@ function RC:BeginCheck(mode)
 		function()
 			local current = self:_GetInspectState()
 			current.preflightOpen = false
-			local cancelled = Loc("RAID_CHECK_UI_CANCELLED", "%s cancelled."):format(label)
+			local cancelled = Loc("RAID_CHECK_UI_CANCELLED", "%s cancelled."):format(uiLabel)
 			SF:PrintInfo(string.format("[%s] Cancelled.", label))
 			SetLastUiStatus("cancelled", cancelled, "info", {
 				generation = generation,

@@ -619,6 +619,32 @@ assertTrue(messages[1][1]:find("could not be started", 1, true),
     "Pre-Raid Check Settings shows start failure instead of prior success")
 assertEq(messages[1][2], "error", "Pre-Raid Check failure Settings kind is error")
 
+-- Session section fixture exercises the production MessageText:GetText surface.
+local function makeSessionSection()
+    local section = {
+        messages = {},
+        cleared = 0,
+        MessageText = { text = "" },
+    }
+    function section.MessageText:GetText()
+        return self.text
+    end
+    function section.MessageText:SetText(value)
+        self.text = tostring(value or "")
+    end
+    function section:SetMessage(text, kind)
+        text = tostring(text or "")
+        self.MessageText:SetText(text)
+        self.messages[#self.messages + 1] = { text, kind }
+    end
+    function section:ClearMessage()
+        self.cleared = (self.cleared or 0) + 1
+        self.MessageText:SetText("")
+        self.messages = {}
+    end
+    return section
+end
+
 -- ---------------------------------------------------------------------------
 -- Delayed completion updates an already-open Settings page via listener
 -- ---------------------------------------------------------------------------
@@ -628,12 +654,7 @@ setActive(delayedProfile)
 local sessionPanel = {
     shown = true,
     __sfSections = {
-        session = {
-            messages = {},
-            SetMessage = function(self, text, kind)
-                self.messages[#self.messages + 1] = { tostring(text), kind }
-            end,
-        },
+        session = makeSessionSection(),
     },
     IsShown = function(self) return self.shown end,
     HookScript = function(self, event, fn)
@@ -769,17 +790,7 @@ resetDB()
 local profileA = makeProfile("Scope A")
 local profileB = makeProfile("Scope B")
 setActive(profileA)
-local scopeSection = {
-    messages = {},
-    cleared = 0,
-    SetMessage = function(self, text, kind)
-        self.messages[#self.messages + 1] = { tostring(text), kind }
-    end,
-    ClearMessage = function(self)
-        self.cleared = self.cleared + 1
-        self.messages = {}
-    end,
-}
+local scopeSection = makeSessionSection()
 sessionPanel.__sfSections.session = scopeSection
 sessionPanel.shown = true
 sessionPanel.hooks.OnShow()
@@ -811,6 +822,7 @@ sessionPanel.hooks.OnHide()
 scopeSection.cleared = 0
 -- Keep ownership so reopen can distinguish stale Raid Check text from other controls.
 scopeSection.messages = { { aSummary, "success" } }
+scopeSection.MessageText:SetText(aSummary)
 scopeSection.__sfRaidCheckOwnedMessage = aSummary
 resetPrintCapture()
 sessionPanel.hooks.OnShow()
@@ -855,19 +867,20 @@ assertEq(delayedScopeRun.profileId, profileA:GetProfileId(), "in-flight run stay
 setActive(profileB)
 scopeSection.cleared = 0
 scopeSection.messages = { { startedOwned, "info" } }
+scopeSection.MessageText:SetText(startedOwned)
 scopeSection.__sfRaidCheckOwnedMessage = startedOwned
 sessionPanel.hooks.OnHide()
 sessionPanel.hooks.OnShow()
 assertTrue(scopeSection.cleared >= 1, "switching to B before completion clears A's started text")
-assertEq(#scopeSection.messages, 0, "profile B does not display A's in-flight started status")
+assertEq(scopeSection.MessageText:GetText(), "", "profile B does not display A's in-flight started status")
 
 -- B shows newer Session Control feedback; A's delayed completion must not erase it.
 scopeSection.cleared = 0
 scopeSection:ClearMessage()
 scopeSection.__sfRaidCheckOwnedMessage = nil
 scopeSection:SetMessage("Session started successfully", "success")
-assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
-    "profile B Session Control feedback is visible")
+assertEq(scopeSection.MessageText:GetText(), "Session started successfully",
+    "profile B Session Control feedback is visible on MessageText")
 local sessionControlClears = scopeSection.cleared
 delayedScopeRun.classified = true
 delayedScopeRun.classifiedResults = {
@@ -883,7 +896,7 @@ RC:_GetInspectState().adhocRun = nil
 assertEq(countPrinted("success", "[Raid Check] Complete: 1 Prepared · 0 Unprepared · 0 Inspection Failed"), 1,
     "delayed A completion still prints exactly once while B is active")
 assertEq(RC:GetLastUiStatus().profileId, profileA:GetProfileId(), "delayed completion remains bound to profile A")
-assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
+assertEq(scopeSection.MessageText:GetText(), "Session started successfully",
     "A's delayed completion does not erase B Session Control feedback")
 assertEq(scopeSection.cleared, sessionControlClears,
     "rejected Raid Check status does not ClearMessage over unrelated Session feedback")
@@ -893,10 +906,10 @@ assertTrue(scopeSection.__sfRaidCheckOwnedMessage == nil,
 -- Refresh/reopen must preserve newer unrelated feedback instead of replaying A.
 sessionPanel.hooks.OnHide()
 sessionPanel.hooks.OnShow()
-assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
+assertEq(scopeSection.MessageText:GetText(), "Session started successfully",
     "Session reopen preserves unrelated Session Control feedback")
 registeredPages.lootHelperSession:Refresh(sessionPanel)
-assertEq(scopeSection.messages[#scopeSection.messages][1], "Session started successfully",
+assertEq(scopeSection.MessageText:GetText(), "Session started successfully",
     "Session Refresh does not replay an older Raid Check result over Session Control feedback")
 
 -- Same-profile live Raid Check completion may still replace Session Control feedback.
@@ -922,9 +935,118 @@ local liveRun = {
 }
 resetPrintCapture()
 RC:_ApplyCheckConsequences(liveRun)
-assertTrue(scopeSection.messages[#scopeSection.messages][1]:find("Complete:", 1, true),
+assertTrue(scopeSection.MessageText:GetText():find("Complete:", 1, true),
     "live Raid Check completion for the displayed profile still updates Session status")
 assertEq(countPrinted("success", "Complete:"), 1, "live same-profile completion prints exactly once")
+
+-- Ordering: completion first, then newer Session Control — refresh/reopen keep Control.
+resetDB()
+local orderProfile = makeProfile("Order Newer Control")
+setActive(orderProfile)
+scopeSection = makeSessionSection()
+sessionPanel.__sfSections.session = scopeSection
+sessionPanel.shown = true
+sessionPanel.hooks.OnShow()
+RC:_ApplyCheckConsequences({
+    id = "order-complete-first",
+    profileId = orderProfile:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    },
+    targetIds = { "Admin-Garona" },
+    groupMemberIds = { "Admin-Garona" },
+    rosterMemberIds = orderProfile:GetMemberIds(),
+    players = { ["Admin-Garona"] = { guid = "g-order-1" } },
+    mode = "raid",
+    cfg = orderProfile:GetRaidCheckConfig(),
+})
+assertTrue(scopeSection.MessageText:GetText():find("Complete:", 1, true),
+    "ordering fixture shows completion before Session Control")
+local completedSeq = RC:GetLastUiStatus().seq
+scopeSection:SetMessage("Session ended successfully", "success")
+assertTrue((scopeSection.__sfSessionMessageSeq or 0) > (completedSeq or 0),
+    "Session Control write receives a newer shared message seq than completion")
+assertEq(scopeSection.MessageText:GetText(), "Session ended successfully",
+    "Session Control replaces completion on the MessageText surface")
+resetPrintCapture()
+sessionPanel.hooks.OnHide()
+sessionPanel.hooks.OnShow()
+assertEq(scopeSection.MessageText:GetText(), "Session ended successfully",
+    "reopen after completion-then-Control preserves newer Session Control feedback")
+registeredPages.lootHelperSession:Refresh(sessionPanel)
+assertEq(scopeSection.MessageText:GetText(), "Session ended successfully",
+    "refresh after completion-then-Control preserves newer Session Control feedback")
+registeredPages.lootHelperSession:Refresh(sessionPanel)
+assertEq(scopeSection.MessageText:GetText(), "Session ended successfully",
+    "repeated refresh does not replay older Raid Check status over Session Control")
+assertEq(countPrinted("success", "Complete:"), 0, "repeated refresh does not duplicate completion chat")
+
+-- Ordering: Session Control while running, hide, complete while hidden — reopen shows completion.
+resetDB()
+orderProfile = makeProfile("Order Hidden Complete")
+setActive(orderProfile)
+scopeSection = makeSessionSection()
+sessionPanel.__sfSections.session = scopeSection
+sessionPanel.shown = true
+sessionPanel.hooks.OnShow()
+Sync.state.active = true
+Sync.state.sessionId = "SES-ORDER"
+Sync.state.profileId = orderProfile:GetProfileId()
+Sync.state._sessionAnnounced = "SES-ORDER"
+local origShouldSettleOrder = CheckRun.ShouldSettle
+function CheckRun.ShouldSettle()
+    return false, "test_hold_order"
+end
+resetPrintCapture()
+assertEq(RC:BeginCheck("raid"), "started", "hidden-completion fixture starts a held check")
+CheckRun.ShouldSettle = origShouldSettleOrder
+local startedSeq = RC:GetLastUiStatus().seq
+assertTrue(scopeSection.MessageText:GetText():find("started", 1, true),
+    "hidden-completion fixture shows started on MessageText")
+scopeSection:SetMessage("Session started successfully", "success")
+local controlSeq = scopeSection.__sfSessionMessageSeq
+assertTrue((controlSeq or 0) > (startedSeq or 0),
+    "Session Control while running is newer than started status")
+local hiddenRun = RC:_GetInspectState().adhocRun
+assertTrue(hiddenRun ~= nil, "hidden-completion fixture keeps the in-flight run")
+sessionPanel.shown = false
+sessionPanel.hooks.OnHide()
+assertEq(RC:CountUiStatusListeners(), beforeListeners,
+    "closing Session unregisters the listener before hidden completion")
+hiddenRun.classified = true
+hiddenRun.classifiedResults = {
+    ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+}
+hiddenRun.targetIds = { "Admin-Garona" }
+hiddenRun.groupMemberIds = { "Admin-Garona" }
+hiddenRun.rosterMemberIds = orderProfile:GetMemberIds()
+hiddenRun.players = { ["Admin-Garona"] = { guid = "g-order-hidden" } }
+resetPrintCapture()
+RC:_ApplyCheckConsequences(hiddenRun)
+RC:_GetInspectState().adhocRun = nil
+local hiddenUi = RC:GetLastUiStatus()
+assertEq(hiddenUi.status, "completed", "hidden completion records completed UI status")
+assertTrue((hiddenUi.seq or 0) > (controlSeq or 0),
+    "hidden completion seq is newer than Session Control feedback")
+assertEq(countPrinted("success", "[Raid Check] Complete: 1 Prepared · 0 Unprepared · 0 Inspection Failed"), 1,
+    "hidden completion prints exactly once")
+assertEq(scopeSection.MessageText:GetText(), "Session started successfully",
+    "hidden completion does not update the row while the page is closed")
+sessionPanel.shown = true
+sessionPanel.hooks.OnShow()
+assertTrue(scopeSection.MessageText:GetText():find("Complete:", 1, true),
+    "reopening after hidden same-profile completion shows the newer completion")
+assertEq(scopeSection.__sfRaidCheckOwnedMessage, scopeSection.MessageText:GetText(),
+    "reopened completion is marked Raid Check owned on MessageText")
+resetPrintCapture()
+registeredPages.lootHelperSession:Refresh(sessionPanel)
+sessionPanel.hooks.OnHide()
+sessionPanel.hooks.OnShow()
+assertTrue(scopeSection.MessageText:GetText():find("Complete:", 1, true),
+    "repeated reopen keeps the newer same-profile completion")
+assertEq(countPrinted("success", "Complete:"), 0, "repeated reopen after hidden completion does not duplicate chat")
 
 -- Missing-profile failure: current attempt error still displays with no active profile.
 resetDB()
@@ -960,26 +1082,38 @@ assertTrue(messages[1][1]:find("could not be started", 1, true),
     "missing-profile Settings shows the current attempt failure")
 assertEq(messages[1][2], "error", "missing-profile Settings kind is error")
 
--- Localized started status for both check modes (distinct translated values).
+-- Localized started/failure/cancel/completion for both check modes.
 resetDB()
 local localeProfile = makeProfile("Locale Started")
 setActive(localeProfile)
 local origLocaleText = SF.LocaleText
-function SF.LocaleText(key, default)
-    if key == "RAID_CHECK_UI_STARTED" then
-        return "LOC_STARTED:%s"
+local function installLocaleOverrides()
+    function SF.LocaleText(key, default)
+        if key == "RAID_CHECK_UI_STARTED" then
+            return "LOC_STARTED:%s"
+        end
+        if key == "RAID_CHECK_UI_START_FAILED" then
+            return "LOC_FAIL:%s"
+        end
+        if key == "RAID_CHECK_UI_CANCELLED" then
+            return "LOC_CANCEL:%s"
+        end
+        if key == "RAID_CHECK_COMPLETION_SUMMARY" then
+            return "[%s] LOC_COMPLETE: %d/%d/%d"
+        end
+        if key == "RAID_CHECK_MODE_RAID" then
+            return "LOC_RAID"
+        end
+        if key == "RAID_CHECK_MODE_PRE" then
+            return "LOC_PRE"
+        end
+        if origLocaleText then
+            return origLocaleText(key, default)
+        end
+        return default
     end
-    if key == "RAID_CHECK_MODE_RAID" then
-        return "LOC_RAID"
-    end
-    if key == "RAID_CHECK_MODE_PRE" then
-        return "LOC_PRE"
-    end
-    if origLocaleText then
-        return origLocaleText(key, default)
-    end
-    return default
 end
+installLocaleOverrides()
 Sync.state.active = true
 Sync.state.sessionId = "SES-LOC"
 Sync.state.profileId = localeProfile:GetProfileId()
@@ -988,7 +1122,7 @@ local origShouldSettleLoc = CheckRun.ShouldSettle
 function CheckRun.ShouldSettle()
     return false, "test_hold_locale"
 end
-scopeSection.messages = {}
+scopeSection = makeSessionSection()
 sessionPanel.__sfSections.session = scopeSection
 sessionPanel.shown = true
 sessionPanel.hooks.OnShow()
@@ -997,47 +1131,121 @@ local raidStarted = RC:BeginCheck("raid")
 assertEq(raidStarted, "started", "localized raid check starts")
 assertEq(RC:GetLastUiStatus().message, "LOC_STARTED:LOC_RAID",
     "stored raid started status uses localized template and mode label")
-assertEq(scopeSection.messages[#scopeSection.messages][1], "LOC_STARTED:LOC_RAID",
-    "listener receives localized raid started status")
+assertEq(scopeSection.MessageText:GetText(), "LOC_STARTED:LOC_RAID",
+    "listener receives localized raid started status on MessageText")
 RC:_GetInspectState().adhocRun = nil
-scopeSection.messages = {}
+scopeSection:ClearMessage()
 local preStarted = RC:BeginCheck("pre")
 assertEq(preStarted, "started", "localized pre-raid check starts")
 assertEq(RC:GetLastUiStatus().message, "LOC_STARTED:LOC_PRE",
     "stored pre-raid started status uses localized template and mode label")
-assertEq(scopeSection.messages[#scopeSection.messages][1], "LOC_STARTED:LOC_PRE",
-    "listener receives localized pre-raid started status")
+assertEq(scopeSection.MessageText:GetText(), "LOC_STARTED:LOC_PRE",
+    "listener receives localized pre-raid started status on MessageText")
 CheckRun.ShouldSettle = origShouldSettleLoc
-SF.LocaleText = origLocaleText
 RC:_GetInspectState().adhocRun = nil
+
+-- Failure statuses use localized mode labels for both modes.
+SF.lootHelperDB.activeProfile = nil
+SF.lootHelperDB.activeProfileId = nil
+assertEq(RC:BeginCheck("raid"), "error", "localized raid failure without profile")
+assertEq(RC:GetLastUiStatus().message, "LOC_FAIL:LOC_RAID",
+    "stored raid failure uses localized template and mode label")
+assertEq(RC:BeginCheck("pre"), "error", "localized pre-raid failure without profile")
+assertEq(RC:GetLastUiStatus().message, "LOC_FAIL:LOC_PRE",
+    "stored pre-raid failure uses localized template and mode label")
+
+-- Cancellation statuses use localized mode labels for both modes.
+resetDB()
+localeProfile = makeProfile("Locale Cancel")
+setActive(localeProfile)
+installLocaleOverrides()
+Sync.state.active = false
+local cancelRaid, cancelPre
+function SF.SettingsUI.Dialogs:ConfirmChoice(_msg, _yes, _no, onYes, onNo, onCancel)
+    cancelRaid = onCancel
+    return true
+end
+assertEq(RC:BeginCheck("raid"), "prompt", "localized raid cancel opens prompt")
+cancelRaid()
+assertEq(RC:GetLastUiStatus().message, "LOC_CANCEL:LOC_RAID",
+    "stored raid cancellation uses localized template and mode label")
+function SF.SettingsUI.Dialogs:ConfirmChoice(_msg, _yes, _no, onYes, onNo, onCancel)
+    cancelPre = onCancel
+    return true
+end
+assertEq(RC:BeginCheck("pre"), "prompt", "localized pre-raid cancel opens prompt")
+cancelPre()
+assertEq(RC:GetLastUiStatus().message, "LOC_CANCEL:LOC_PRE",
+    "stored pre-raid cancellation uses localized template and mode label")
+
+-- Completion summary uses localized mode labels for both modes.
+resetDB()
+localeProfile = makeProfile("Locale Complete")
+setActive(localeProfile)
+installLocaleOverrides()
+resetPrintCapture()
+RC:_ApplyCheckConsequences({
+    id = "locale-raid-complete",
+    profileId = localeProfile:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    },
+    targetIds = { "Admin-Garona" },
+    groupMemberIds = { "Admin-Garona" },
+    rosterMemberIds = localeProfile:GetMemberIds(),
+    players = { ["Admin-Garona"] = { guid = "g-loc-raid" } },
+    mode = "raid",
+    cfg = localeProfile:GetRaidCheckConfig(),
+})
+assertEq(
+    countPrinted("success", "[LOC_RAID] LOC_COMPLETE: 1/0/0"),
+    1,
+    "raid completion summary uses localized template and mode label"
+)
+assertEq(RC:GetLastUiStatus().message, "[LOC_RAID] LOC_COMPLETE: 1/0/0",
+    "stored raid completion uses localized template and mode label")
+resetPrintCapture()
+RC:_ApplyCheckConsequences({
+    id = "locale-pre-complete",
+    profileId = localeProfile:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        ["Admin-Garona"] = { class = CheckRun.CLASS.PREPARED, verified = CheckRun.VERIFIED.FRESH },
+    },
+    targetIds = { "Admin-Garona" },
+    groupMemberIds = { "Admin-Garona" },
+    rosterMemberIds = localeProfile:GetMemberIds(),
+    players = { ["Admin-Garona"] = { guid = "g-loc-pre" } },
+    mode = "pre",
+    cfg = localeProfile:GetRaidCheckConfig(),
+})
+assertEq(
+    countPrinted("success", "[LOC_PRE] LOC_COMPLETE: 1/0/0"),
+    1,
+    "pre-raid completion summary uses localized template and mode label"
+)
+assertEq(RC:GetLastUiStatus().message, "[LOC_PRE] LOC_COMPLETE: 1/0/0",
+    "stored pre-raid completion uses localized template and mode label")
+
 messages = {}
 function RC:RunRaidCheck()
     local state = self:_GetInspectState()
     state.uiStatusGeneration = (state.uiStatusGeneration or 0) + 1
+    state.sharedMessageSeq = (state.sharedMessageSeq or 0) + 1
     state.lastUiStatus = {
         status = "started",
         message = "LOC_STARTED:LOC_RAID",
         kind = "info",
         generation = state.uiStatusGeneration,
+        seq = state.sharedMessageSeq,
         profileId = activeProfileId(),
     }
     return "started"
 end
-function SF.LocaleText(key, default)
-    if key == "RAID_CHECK_UI_STARTED" then
-        return "LOC_STARTED:%s"
-    end
-    if key == "RAID_CHECK_MODE_RAID" then
-        return "LOC_RAID"
-    end
-    if key == "RAID_CHECK_MODE_PRE" then
-        return "LOC_PRE"
-    end
-    if origLocaleText then
-        return origLocaleText(key, default)
-    end
-    return default
-end
+installLocaleOverrides()
 raidCheckOnClick(ctx)
 assertEq(messages[1][1], "LOC_STARTED:LOC_RAID", "button path shows localized started status")
 RC.RunRaidCheck = origRunRaidCheck
