@@ -2416,51 +2416,61 @@ local function CreditRedriveMatch(record, body, opts)
     return matchItem
 end
 
-local function ScheduleCreditRedriveContinuation(record, opts)
-    if type(record) ~= "table" then
-        return
-    end
+--- Merge an incoming redrive wake into continuation filters (#459).
+-- Broader filters clear any mid-wave snapshot so newly eligible work is included.
+-- @return table cont, boolean broadened
+local function MergeCreditRedriveWake(record, opts)
     local cont = creditRedriveContinuation[record]
     if type(cont) ~= "table" then
         cont = { opts = opts or {}, scheduled = false }
         creditRedriveContinuation[record] = cont
-    else
-        -- Coalesce wakes: broaden filters toward a full drain when mixed.
-        local prev = cont.opts or {}
-        local merged = {}
-        for k, v in pairs(prev) do
-            merged[k] = v
+        return cont, false
+    end
+    local prev = cont.opts or {}
+    local merged = {}
+    for k, v in pairs(prev) do
+        merged[k] = v
+    end
+    local broadened = false
+    if opts then
+        if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
+            merged.eventId = nil
+            broadened = true
+        elseif opts.eventId and not prev.eventId and not prev.itemId then
+            merged.eventId = opts.eventId
+        elseif opts.eventId and prev.itemId and not prev.eventId then
+            merged.eventId = opts.eventId
         end
-        local broadened = false
-        if opts then
-            if opts.eventId and prev.eventId and opts.eventId ~= prev.eventId then
-                merged.eventId = nil
-                broadened = true
-            elseif opts.eventId and not prev.eventId and not prev.itemId then
-                merged.eventId = opts.eventId
-            elseif opts.eventId and prev.itemId and not prev.eventId then
-                merged.eventId = opts.eventId
-            end
-            if opts.itemId and prev.itemId and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
-                merged.itemId = nil
-                merged.eventId = nil
-                broadened = true
-            elseif opts.itemId and not (prev.eventId or prev.itemId) then
+        if opts.itemId and prev.itemId and tonumber(opts.itemId) ~= tonumber(prev.itemId) then
+            merged.itemId = nil
+            merged.eventId = nil
+            broadened = true
+        elseif opts.itemId and not (prev.eventId or prev.itemId) then
+            merged.itemId = opts.itemId
+        elseif opts.itemId then
+            -- Narrow item filter while a broader (nil) filter is active keeps broad.
+            if prev.itemId or prev.eventId then
                 merged.itemId = opts.itemId
-            elseif opts.itemId then
-                merged.itemId = opts.itemId
-            end
-            if opts.maxAttempts then
-                merged.maxAttempts = opts.maxAttempts
             end
         end
-        cont.opts = merged
-        -- Broader wake must rebuild the snapshot; mid-wave index is invalid.
-        if broadened then
-            cont.snapshot = nil
-            cont.index = nil
+        if opts.maxAttempts then
+            merged.maxAttempts = opts.maxAttempts
         end
     end
+    cont.opts = merged
+    -- Broader wake must rebuild the snapshot; mid-wave index is invalid.
+    if broadened then
+        cont.snapshot = nil
+        cont.index = nil
+    end
+    return cont, broadened
+end
+
+local function ScheduleCreditRedriveContinuation(record, opts)
+    if type(record) ~= "table" then
+        return
+    end
+    local cont = MergeCreditRedriveWake(record, opts)
     if cont.scheduled then
         return
     end
@@ -2472,7 +2482,9 @@ local function ScheduleCreditRedriveContinuation(record, opts)
         end
         state.scheduled = false
         if GS.RedrivePendingContributorCorrections then
-            GS.RedrivePendingContributorCorrections(record, state.opts)
+            -- Pass nil so Redrive merges against current cont.opts (preserves
+            -- wakes coalesced while this timer was queued).
+            GS.RedrivePendingContributorCorrections(record, nil)
         end
     end
     if C_Timer and C_Timer.After then
@@ -2483,7 +2495,6 @@ local function ScheduleCreditRedriveContinuation(record, opts)
 end
 
 function GS.RedrivePendingContributorCorrections(record, opts)
-    opts = opts or {}
     if type(opts) == "string" then
         opts = { eventId = opts }
     end
@@ -2498,13 +2509,10 @@ function GS.RedrivePendingContributorCorrections(record, opts)
     if type(ops.pending) ~= "table" then
         return 0, 0
     end
-    local cont = creditRedriveContinuation[record]
-    if type(cont) ~= "table" then
-        cont = { opts = opts, scheduled = false }
-        creditRedriveContinuation[record] = cont
-    else
-        cont.opts = opts or cont.opts
-    end
+    -- Always merge the incoming wake; never overwrite cont.opts with a narrow
+    -- filter while an existing snapshot drains (A/B/C interleaving).
+    local cont = MergeCreditRedriveWake(record, opts)
+    local waveOpts = cont.opts or opts or {}
     -- Deletion-safe wave: snapshot eligible ids once; resume by index into that
     -- snapshot (skip entries already removed by successful admission).
     local snapshot = cont.snapshot
@@ -2518,7 +2526,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
                 and type(body.target) == "string" then
                 local reason = entry.reason
                 if reason ~= "untrusted_relay" and reason ~= "evidence" then
-                    if CreditRedriveMatch(record, body, opts) then
+                    if CreditRedriveMatch(record, body, waveOpts) then
                         ids[#ids + 1] = id
                     end
                 end
@@ -2532,7 +2540,7 @@ function GS.RedrivePendingContributorCorrections(record, opts)
     end
     local promoted = 0
     local attempts = 0
-    local maxAttempts = tonumber(opts.maxAttempts) or 32
+    local maxAttempts = tonumber(waveOpts.maxAttempts) or 32
     creditRedriveDepth = creditRedriveDepth + 1
     local i = startIndex
     while i <= #snapshot do
@@ -2570,15 +2578,34 @@ function GS.RedrivePendingContributorCorrections(record, opts)
     if i <= #snapshot then
         cont.snapshot = snapshot
         cont.index = i
-        cont.opts = opts
+        cont.opts = waveOpts
         cont.scheduled = false
-        ScheduleCreditRedriveContinuation(record, opts)
+        ScheduleCreditRedriveContinuation(record, nil)
     else
-        -- Wave complete: every snapshotted id was attempted. Idle until a new wake.
+        -- Wave complete. If a broader wake cleared and rebuilt mid-flight we
+        -- already drained that snapshot; start a fresh wave only when pending
+        -- still matches current filters (covers wakes merged after last id).
         creditRedriveContinuation[record] = {
-            opts = opts,
+            opts = waveOpts,
             scheduled = false,
         }
+        local still = false
+        for _, entry in pairs(ops.pending) do
+            local body = entry and entry.body
+            if type(body) == "table"
+                and body.kind == (GS.KIND and GS.KIND.CORRECT_CONTRIBUTOR)
+                and type(body.target) == "string"
+                and entry.reason ~= "untrusted_relay"
+                and entry.reason ~= "evidence"
+                and type(entry.sender) == "string"
+                and CreditRedriveMatch(record, body, waveOpts) then
+                still = true
+                break
+            end
+        end
+        if still then
+            ScheduleCreditRedriveContinuation(record, nil)
+        end
     end
     return promoted, attempts
 end
@@ -5385,7 +5412,55 @@ local function TotalsAllNonNegative(totals)
     return true
 end
 
---- Scan live+archive once into durable baseline totals and an id index.
+--- Sum of negative totals (0 when all nonnegative). Higher is better when pruning.
+local function TotalsNegScore(totals)
+    local score = 0
+    for _, total in pairs(totals) do
+        if total < 0 then
+            score = score + total
+        end
+    end
+    return score
+end
+
+--- Index a ledger event under id, txnId, and trusted registry aliases (#459).
+local function IndexCreditEventKeys(byId, record, event)
+    if type(byId) ~= "table" or type(event) ~= "table" then
+        return
+    end
+    if type(event.id) == "string" and event.id ~= "" then
+        byId[event.id] = event
+    end
+    local txnId = type(event.txnId) == "string" and event.txnId or nil
+    if txnId and txnId ~= "" then
+        byId[txnId] = event
+    end
+    local cfg = record and record.accounting and record.accounting._consumables
+    if type(cfg) ~= "table" or type(FindRegistryByTxn) ~= "function" then
+        return
+    end
+    local key = txnId or event.id
+    if type(key) ~= "string" or key == "" then
+        return
+    end
+    local reg = FindRegistryByTxn(cfg, key)
+    if type(reg) ~= "table" then
+        return
+    end
+    if type(reg.txnId) == "string" and reg.txnId ~= "" then
+        byId[reg.txnId] = event
+    end
+    if type(reg.aliases) == "table" then
+        for i = 1, #reg.aliases do
+            local alias = reg.aliases[i]
+            if type(alias) == "string" and alias ~= "" then
+                byId[alias] = event
+            end
+        end
+    end
+end
+
+--- Scan live+archive once into durable baseline totals and an id/alias index.
 -- Returns totals, byId, rowVisits, relationshipsReady. Callers apply correction
 -- deltas in O(1).
 local function BuildDurableCreditFloorBaseline(record)
@@ -5400,9 +5475,7 @@ local function BuildDurableCreditFloorBaseline(record)
             return
         end
         visits = visits + 1
-        if type(event.id) == "string" and event.id ~= "" then
-            byId[event.id] = event
-        end
+        IndexCreditEventKeys(byId, record, event)
         if GS.EventCountsTowardLiveProgress
             and not GS.EventCountsTowardLiveProgress(record, event) then
             return
@@ -5440,6 +5513,22 @@ local function BuildDurableCreditFloorBaseline(record)
     if type(archived) == "table" then
         for i = 1, #archived do
             consider(archived[i])
+        end
+    end
+    -- One registry pass: map alias pointer rows onto already-indexed events.
+    local cfg = record.accounting and record.accounting._consumables
+    local registry = cfg and cfg.txnRegistry
+    if type(registry) == "table" then
+        for i = 1, #registry do
+            local row = registry[i]
+            visits = visits + 1
+            if type(row) == "table" and row.status == "alias"
+                and type(row.txnId) == "string" and type(row.aliasOf) == "string" then
+                local primary = byId[row.aliasOf]
+                if primary then
+                    byId[row.txnId] = primary
+                end
+            end
         end
     end
     return totals, byId, visits, relationshipsReady
@@ -5527,12 +5616,15 @@ end
 -- Deterministic active-head policy:
 --   1) LWW winner per canonical event
 --   2) Activate *all* production-credited winners that bind
---   3) While personal floors fail, deactivate the oldest active winner
---      (ascending timestamp, id) — keeps jointly required corrections together
---      (e.g. two +10→Bob with Bob−15) while preferring newer heads when a set
---      is overconstrained (cross-entry / later-adjustment conflicts).
--- Floor checks use one durable ledger baseline plus O(1) deltas per head
--- (no nested full-ledger rescans per candidate).
+--   3) While personal floors fail, deactivate the active head whose removal
+--      maximizes TotalsNegScore (sum of min(0,total)); tie-break newer-first
+--      so a transfer supporting an accepted deduction is kept when a newer
+--      conflicting transfer can be dropped instead. Jointly required heads
+--      (two +10→Bob with Bob−15) stay active because dropping either worsens
+--      the score. Never publish an empty/negative map as verified success.
+-- Floor checks use one durable ledger baseline plus O(1) deltas per head.
+-- Alias targets resolve through the baseline id/txn/registry index (no
+-- per-candidate full-ledger FindLedgerEventById scans).
 -- @param extraOp table|nil op not yet in ops.records (apply-time preview)
 -- @return boolean ok, string|nil err, table|nil details { activeIds, rowVisits, deactivations }
 function GS.RebuildCreditCorrectionProjection(record, extraOp)
@@ -5540,6 +5632,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         return false, "invalid_value"
     end
     GS._creditProjectionRowVisits = 0
+    GS._creditProjectionLookupMisses = 0
     GS._creditProjectionDeactivations = 0
     local ops = record.operations
     local candidates = {}
@@ -5587,20 +5680,39 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             activeIds = {},
             rowVisits = 0,
             deactivations = 0,
+            lookupMisses = 0,
         }
     end
     local totals, byId, rowVisits, relationshipsReady = BuildDurableCreditFloorBaseline(record)
     GS._creditProjectionRowVisits = rowVisits
-    -- Group by canonical event id; keep LWW winner. Resolve via one-pass index
-    -- first, then alias-aware FindLedgerEventById only on miss.
+    -- Group by canonical event id; keep LWW winner. Resolve via baseline index
+    -- (id + txnId + trusted aliases). Fall back to FindLedgerEventById only on
+    -- true miss, caching both canonical and the immutable alias target.
     local winners = {}
+    local lookupMisses = 0
     for i = 1, #candidates do
         local op = candidates[i]
         local event = byId[op.target]
-        if not event then
+        if event == false then
+            event = nil
+        elseif not event then
+            -- True miss: trusted index lacked the target. Count the miss and the
+            -- full-list scan cost so production measurements include alias gaps.
+            lookupMisses = lookupMisses + 1
+            local lists = CreditEventLists(record)
+            for li = 1, #lists do
+                local list = lists[li]
+                if type(list) == "table" then
+                    rowVisits = rowVisits + #list
+                end
+            end
+            GS._creditProjectionRowVisits = rowVisits
             event = GS.FindLedgerEventById(record, op.target)
-            if event and type(event.id) == "string" then
-                byId[event.id] = event
+            if event then
+                IndexCreditEventKeys(byId, record, event)
+                byId[op.target] = event
+            else
+                byId[op.target] = false
             end
         end
         if event then
@@ -5618,6 +5730,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             end
         end
     end
+    GS._creditProjectionLookupMisses = lookupMisses
     local ordered = {}
     for canonical, entry in pairs(winners) do
         ordered[#ordered + 1] = {
@@ -5626,7 +5739,6 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             event = entry.event,
         }
     end
-    -- Oldest-first order for deterministic deactivation (prefer keeping newer).
     table.sort(ordered, function(a, b)
         local ta = tonumber(a.op.timestamp) or 0
         local tb = tonumber(b.op.timestamp) or 0
@@ -5638,7 +5750,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
     local activeMap = {}
     local activeIds = {}
     local bound = {}
-    -- Activate every bindable production-credited winner, then prune.
+    -- Activate every bindable production-credited winner, then prune by impact.
     for i = 1, #ordered do
         local entry = ordered[i]
         local op = entry.op
@@ -5661,24 +5773,71 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
             end
         end
     end
-    local deactivateIdx = 1
-    while not TotalsAllNonNegative(totals) and deactivateIdx <= #bound do
-        local entry = bound[deactivateIdx]
-        deactivateIdx = deactivateIdx + 1
-        if entry and activeMap[entry.event.id] then
-            ApplyCorrectionFloorDelta(
-                record, totals, entry.event, entry.newName, entry.newGuid,
-                relationshipsReady, -1)
-            activeMap[entry.event.id] = nil
-            activeIds[entry.op.id] = nil
-            GS._creditProjectionDeactivations =
-                (tonumber(GS._creditProjectionDeactivations) or 0) + 1
+    -- Conflict rule: drop the head whose removal most improves personal floors
+    -- (TotalsNegScore). Require strict score improvement. When scores tie,
+    -- deactivate the older head (prefer keeping newer) — but a transfer that
+    -- already supports an accepted deduction wins on score when dropping it
+    -- would leave that identity negative (e.g. older D1→Bob + Bob−10 vs newer
+    -- D2→Carol). Jointly required heads stay because dropping either does not
+    -- improve the score.
+    while not TotalsAllNonNegative(totals) do
+        local currentScore = TotalsNegScore(totals)
+        local bestIdx, bestScore, bestTs, bestId = nil, nil, nil, nil
+        for i = 1, #bound do
+            local entry = bound[i]
+            if entry and activeMap[entry.event.id] then
+                ApplyCorrectionFloorDelta(
+                    record, totals, entry.event, entry.newName, entry.newGuid,
+                    relationshipsReady, -1)
+                local score = TotalsNegScore(totals)
+                ApplyCorrectionFloorDelta(
+                    record, totals, entry.event, entry.newName, entry.newGuid,
+                    relationshipsReady, 1)
+                if score > currentScore then
+                    local ts = tonumber(entry.op.timestamp) or 0
+                    local id = tostring(entry.op.id)
+                    local take = false
+                    if not bestIdx then
+                        take = true
+                    elseif score > bestScore then
+                        take = true
+                    elseif score == bestScore then
+                        -- Prefer deactivating older when scores tie.
+                        if ts < bestTs or (ts == bestTs and id < bestId) then
+                            take = true
+                        end
+                    end
+                    if take then
+                        bestIdx, bestScore, bestTs, bestId = i, score, ts, id
+                    end
+                end
+            end
         end
+        if not bestIdx then
+            break
+        end
+        local entry = bound[bestIdx]
+        ApplyCorrectionFloorDelta(
+            record, totals, entry.event, entry.newName, entry.newGuid,
+            relationshipsReady, -1)
+        activeMap[entry.event.id] = nil
+        activeIds[entry.op.id] = nil
+        bound[bestIdx] = nil
+        GS._creditProjectionDeactivations =
+            (tonumber(GS._creditProjectionDeactivations) or 0) + 1
     end
-    -- Final invariant: never publish a negative projection.
+    -- Final invariant: never mark a negative projection verified.
     if not TotalsAllNonNegative(totals) then
-        activeMap = {}
-        activeIds = {}
+        creditProjectionCache[record] = {
+            stamp = CreditProjectionDependencyStamp(record),
+            ok = false,
+        }
+        return false, "player_negative", {
+            activeIds = activeIds,
+            rowVisits = rowVisits,
+            deactivations = GS._creditProjectionDeactivations,
+            lookupMisses = lookupMisses,
+        }
     end
     local nActive = 0
     for _ in pairs(activeMap) do
@@ -5696,6 +5855,7 @@ function GS.RebuildCreditCorrectionProjection(record, extraOp)
         activeIds = activeIds,
         rowVisits = rowVisits,
         deactivations = GS._creditProjectionDeactivations,
+        lookupMisses = lookupMisses,
     }
 end
 
