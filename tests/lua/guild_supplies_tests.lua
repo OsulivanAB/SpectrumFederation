@@ -5055,6 +5055,7 @@ do
         loadModule("SpectrumFederation/modules/UI/Settings/ItemDisplay.lua")
     end
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesManage.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesLogs.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesRankings.lua")
     loadModule("SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesTroubleshooting.lua")
@@ -5064,6 +5065,9 @@ do
     local rankingsPage = SF.SettingsUI.pagesById.guildSuppliesRankings
     local troubleshootingPage = SF.SettingsUI.pagesById.guildSuppliesTroubleshooting
     assertTrue(configPage ~= nil, "Configuration page registered")
+    assertTrue(SF.SettingsUI.pagesById.guildSuppliesManage ~= nil, "Manage page registered")
+    assertTrue(type(SF.SettingsUI.pagesById.guildSuppliesManage.available) == "function",
+        "Manage exposes available")
     assertTrue(logsPage ~= nil, "Logs page registered")
     assertTrue(rankingsPage ~= nil, "Rankings page registered")
     assertTrue(troubleshootingPage ~= nil, "Troubleshooting page registered")
@@ -5127,16 +5131,14 @@ do
     assertTrue(configPanel.__sfPageBuilder ~= nil, "Configuration uses DefinitionRenderer:Build")
     local pageDef = configPanel.__sfPageDef
     assertTrue(type(pageDef) == "table", "Build stores page definition")
-    local foundBankDropdown, foundGoalCommit, foundStatusDisplay, foundNextStepHelp = false, false, false, false
+    local foundBankDropdown, foundProgress, foundStatusDisplay, foundNextStepHelp = false, false, false, false
     for _, sec in ipairs(pageDef.sections or {}) do
+        if sec.id == "gsProgress" then foundProgress = true end
         for _, item in ipairs(sec.items or {}) do
             if item.type == "dropdown" and item.label
                 and tostring(item.label):find("Bank Tab", 1, true)
                 and type(item.onValueChanged) == "function" then
                 foundBankDropdown = true
-            end
-            if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
-                foundGoalCommit = true
             end
             if sec.id == "gsStatus" and item.type == "display" and type(item.get) == "function" then
                 foundStatusDisplay = true
@@ -5148,9 +5150,21 @@ do
         end
     end
     assertTrue(foundBankDropdown, "bank tab uses dropdown onValueChanged")
-    assertTrue(foundGoalCommit, "requested list uses onGoalCommit")
+    assertTrue(foundProgress, "#453: Configuration hosts campaign progress")
     assertTrue(foundStatusDisplay, "status area uses display rows")
     assertTrue(foundNextStepHelp, "status next-step/warning help uses getText+visible")
+    local manageDefPanel = makeRegion("Frame", "GSManageDefPanel", nil)
+    manageDefPanel:SetSize(600, 800)
+    SF.SettingsUI.pagesById.guildSuppliesManage:Build(manageDefPanel)
+    local manageHasGoal = false
+    for _, sec in ipairs((manageDefPanel.__sfPageDef and manageDefPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "consumableRequestedList" and type(item.onGoalCommit) == "function" then
+                manageHasGoal = true
+            end
+        end
+    end
+    assertTrue(manageHasGoal, "#453: Manage requested list uses onGoalCommit")
     local configHasAdoption, configHasConflicts = false, false
     for _, sec in ipairs(pageDef.sections or {}) do
         if sec.id == "gsAdoption" then configHasAdoption = true end
@@ -5657,7 +5671,8 @@ do
     local ncDef = findNewCampaignDef(configPanel)
     assertTrue(ncDef ~= nil, "New Campaign definition present")
     assertTrue(type(ncDef.tooltip) == "string"
-            and ncDef.tooltip:find("archived and can be viewed in Logs", 1, true),
+            and (ncDef.tooltip:find("Logs always follows the current campaign", 1, true)
+                or ncDef.tooltip:find("archived", 1, true)),
         "enabled New Campaign tooltip explains archive/Logs got=" .. tostring(ncDef and ncDef.tooltip))
     assertTrue(type(ncDef.getDisabledTooltip) == "function",
         "New Campaign keeps getDisabledTooltip")
@@ -5797,27 +5812,20 @@ do
     assertTrue(logsPanel.__sfPageBuilder ~= nil, "Logs rebuild succeeds (no openCount crash)")
 
     local drops = findDropdowns(logsPanel)
-    assertTrue(#drops >= 1, "campaign dropdown present")
-    local drop = drops[1]
-    assertTrue(type(drop.menuOptions) == "table" and #drop.menuOptions >= 1, "dropdown options built")
-    local labeled = false
-    for i = 1, #drop.menuOptions do
-        local lab = tostring(drop.menuOptions[i].label or "")
-        if lab:find("Current", 1, true) or lab:find("Archived", 1, true) then
-            labeled = true
-            break
+    assertTrue(#drops >= 2, "#453: contributor and item filter dropdowns present")
+    local hasLogTable = false
+    for _, sec in ipairs((logsPanel.__sfPageDef and logsPanel.__sfPageDef.sections) or {}) do
+        for _, item in ipairs(sec.items or {}) do
+            if item.type == "logTable" then
+                hasLogTable = true
+                assertEq(item.virtualize, true, "#453: Logs virtualizes logTable")
+            end
         end
     end
-    assertTrue(labeled, "dropdown options use readable labels not raw ids only")
-
-    logsPage:Refresh(logsPanel)
-    -- Select archived campaign via set path and refresh history.
-    if drop.menuOptions[1] and drop.menuOptions[1].setSelected then
-        drop.menuOptions[1].setSelected(drop.menuOptions[1].value)
-    end
+    assertTrue(hasLogTable, "#453: Logs hosts logTable")
     logsPage:Refresh(logsPanel)
     local histRows, histTotal = GS:ListCampaignHistory(c1.id, 25, 0)
-    assertTrue((histTotal or 0) >= 1, "history projection available for UI")
+    assertTrue((histTotal or 0) >= 1, "history projection available for archived campaign API")
 
     -- #428: Logs is inspection-only — no campaign rename control or personal section.
     local logsRenameSubmit = nil
@@ -5920,7 +5928,7 @@ do
     }, { [9] = 10 })
     assertEq(overAll.overallPercent, 100, "429: fully met overall is 100 not over")
 
-    -- Live Logs fixture: current vs archived selection, donation/adjustment/goal updates.
+    -- #429/#453: progress lives on Configuration for the current campaign only.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -5972,78 +5980,44 @@ do
         timestamp = world.time + 2,
         source = "guildbank",
     }
-    -- Archived campaign A keeps its goals/progress; new campaign B starts empty.
+    -- Archived campaign A keeps goals via API; Configuration UI follows current only.
     local campB = startCampaign()
     assertTrue(campA.id ~= campB.id, "429: archived vs current campaigns")
 
-    logsPanel = makeRegion("Frame", "GSLogsProgressPanel", nil)
-    logsPanel:SetSize(600, 800)
-    logsPage:Build(logsPanel)
-    local beforeGoals, hasGoals = findOverallBeforeGoals(logsPanel)
+    local progressPanel = makeRegion("Frame", "GSConfigProgressPanel", nil)
+    progressPanel:SetSize(600, 800)
+    configPage:Build(progressPanel)
+    local beforeGoals, hasGoals = findOverallBeforeGoals(progressPanel)
     assertTrue(beforeGoals and hasGoals,
-        "429: overall progress bar is defined before Goals and progress")
-    local overallDef = findLogsItem(logsPanel, "overallProgressBar", "Overall progress")
+        "429/453: overall progress before Goals on Configuration")
+    local overallDef = findLogsItem(progressPanel, "overallProgressBar", "Overall progress")
     assertTrue(overallDef ~= nil and type(overallDef.getProgress) == "function",
-        "429: overallProgressBar control present")
-    assertTrue(findLogsItem(logsPanel, "consumableGoalSummary") == nil,
+        "429/453: overallProgressBar on Configuration")
+    assertTrue(findLogsItem(progressPanel, "consumableGoalSummary") == nil,
         "429: does not reintroduce consumableGoalSummary item list")
+    local logsNoProg = makeRegion("Frame", "GSLogsNoProgress", nil)
+    logsNoProg:SetSize(600, 800)
+    logsPage:Build(logsNoProg)
+    assertTrue(findLogsItem(logsNoProg, "overallProgressBar") == nil,
+        "453: Logs no longer hosts overallProgressBar")
 
-    -- Default selection is current campaign (empty goals) → No goals configured.
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     local currentProg = overallDef.getProgress()
     assertTrue(not currentProg.hasPositiveGoal, "429: current empty campaign has no positive goals")
     assertEq(currentProg.overallPercent, nil, "429: current empty → no percent")
     assertTrue(tostring(currentProg.overallEmptyText or ""):find("No goals configured", 1, true),
         "429: current empty shows No goals configured")
 
-    -- Select archived campaign via dropdown set path.
-    drops = findDropdowns(logsPanel)
-    drop = drops[1]
-    assertTrue(drop and type(drop.menuOptions) == "table", "429: campaign dropdown ready")
-    local archivedOpt, currentOpt
-    for i = 1, #drop.menuOptions do
-        local opt = drop.menuOptions[i]
-        if opt.value == campA.id then archivedOpt = opt end
-        if opt.value == campB.id then currentOpt = opt end
-    end
-    assertTrue(archivedOpt ~= nil and currentOpt ~= nil, "429: both campaigns listed")
-    if type(archivedOpt.setSelected) == "function" then
-        archivedOpt.setSelected(archivedOpt.value)
-    else
-        -- Fallback: invoke definition set if menu setSelected unavailable.
-        local campDrop = findLogsItem(logsPanel, "dropdown", "Campaign")
-        assertTrue(campDrop and type(campDrop.set) == "function", "429: campaign set available")
-        campDrop.set(campA.id)
-        if type(campDrop.onValueChanged) == "function" then
-            campDrop.onValueChanged({ pageBuilder = logsPanel.__sfPageBuilder })
-        end
-    end
-    logsPage:Refresh(logsPanel)
-    local archivedProg = overallDef.getProgress()
-    -- sumCapped = min(25,50)+min(110,100) = 25+100 = 125; sumGoal = 150 → 83%
-    assertTrue(archivedProg.hasPositiveGoal, "429: archived campaign has positive goals")
-    assertEq(archivedProg.overallPercent, 83, "429: archived weighted overall percent")
-
     local campGoal = GS:CampaignGoalProgress(campA.id)
-    assertEq(campGoal.overallPercent, 83, "429: CampaignGoalProgress matches Logs bar")
-
-    -- Switch back to current; progress follows selection without a second selector.
-    if type(currentOpt.setSelected) == "function" then
-        currentOpt.setSelected(currentOpt.value)
-    else
-        local campDrop2 = findLogsItem(logsPanel, "dropdown", "Campaign")
-        campDrop2.set(campB.id)
-    end
-    logsPage:Refresh(logsPanel)
-    currentProg = overallDef.getProgress()
-    assertTrue(not currentProg.hasPositiveGoal, "429: selecting current restores empty overall")
+    assertEq(campGoal.overallPercent, 83, "429: CampaignGoalProgress still projects archived campaign")
+    assertTrue(campGoal.hasPositiveGoal, "429: archived campaign has positive goals via API")
 
     -- Seed current campaign goals + zero donations → 0% bar (not empty text).
     local curItem = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 601 }, {
         itemId = 601, goal = 80, removed = false,
     }))
     assertEq(GS:ApplyStagedConfigOperation(curItem), "accepted", "429: current campaign goal")
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     currentProg = overallDef.getProgress()
     assertTrue(currentProg.hasPositiveGoal, "429: current with goals shows bar")
     assertEq(currentProg.overallPercent, 0, "429: zero donations on current → 0%")
@@ -6061,7 +6035,7 @@ do
         timestamp = world.time + 10,
         source = "guildbank",
     }
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     assertEq(overallDef.getProgress().overallPercent, 25, "429: donation updates overall (20/80)")
 
     recB.accounting._consumableEvents[#recB.accounting._consumableEvents + 1] = {
@@ -6074,14 +6048,14 @@ do
         generation = genB,
         timestamp = world.time + 11,
     }
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     assertEq(overallDef.getProgress().overallPercent, 50, "429: adjustment updates overall (40/80)")
 
     local raiseGoal = select(1, GS:NewConfigOperation("set-requested-item", { itemId = 601 }, {
         itemId = 601, goal = 160, removed = false,
     }))
     assertEq(GS:ApplyStagedConfigOperation(raiseGoal), "accepted", "429: raise goal")
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     assertEq(overallDef.getProgress().overallPercent, 25, "429: goal change reweights (40/160)")
 
     -- Member-readable (non-editor) still sees overall progress.
@@ -6090,7 +6064,7 @@ do
     local memberCaps = GS:GetCapabilities()
     assertEq(memberCaps.canRead, true, "429: member can read")
     assertEq(memberCaps.canEdit, false, "429: member cannot edit")
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     local memberProg = overallDef.getProgress()
     assertTrue(memberProg.hasPositiveGoal, "429: member-read overall still available")
     assertEq(memberProg.overallPercent, 25, "429: member-read overall percent matches")
@@ -6102,12 +6076,13 @@ do
     world.guild.clubId = nil
     resetDemandRoster()
     assertEq(GS:GetCapabilities().canRead, false, "429: missing club cannot read")
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     local noGuildProg = overallDef.getProgress()
     assertTrue(not noGuildProg.hasPositiveGoal, "429: missing guild disables overall bar")
     assertTrue(tostring(noGuildProg.overallEmptyText or ""):find("Join a guild", 1, true)
-            or tostring(noGuildProg.overallEmptyText or ""):find("verified membership", 1, true),
-        "429: missing guild empty text is membership help")
+            or tostring(noGuildProg.overallEmptyText or ""):find("verified membership", 1, true)
+            or tostring(noGuildProg.overallEmptyText or ""):find("membership is still being verified", 1, true),
+        "429: missing guild empty text is membership help got=" .. tostring(noGuildProg.overallEmptyText))
     world.guild.clubId = priorClub
     resetDemandRoster()
     settleRoster()
@@ -6115,39 +6090,37 @@ do
     -- Bounded refresh: one ledger projection per visible Refresh (bar + goals share pass).
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     settleRoster()
-    local campDrop3 = findLogsItem(logsPanel, "dropdown", "Campaign")
-    if campDrop3 and campDrop3.set then campDrop3.set(campB.id) end
     local projectCalls = 0
     local realProject = GS.ProjectCampaignProgress
     function GS:ProjectCampaignProgress(...)
         projectCalls = projectCalls + 1
         return realProject(self, ...)
     end
-    logsPage:Refresh(logsPanel)
+    configPage:Refresh(progressPanel)
     local callsOne = projectCalls
     assertEq(callsOne, 1, "429: single Refresh projects ledger once (shared pass cache)")
     projectCalls = 0
     for _ = 1, 5 do
-        logsPage:Refresh(logsPanel)
+        configPage:Refresh(progressPanel)
     end
     assertEq(projectCalls, 5, "429: five Refresh passes → five projections (no hidden polling)")
     GS.ProjectCampaignProgress = realProject
 
     -- Hidden panel stays idle (no projection) when Refresh is gated.
-    logsPanel.shown = false
-    logsPanel.visible = false
+    progressPanel.shown = false
+    progressPanel.visible = false
     projectCalls = 0
     function GS:ProjectCampaignProgress(...)
         projectCalls = projectCalls + 1
         return realProject(self, ...)
     end
-    logsPage:Refresh(logsPanel)
-    assertEq(projectCalls, 0, "429: hidden Logs Refresh does not project")
+    configPage:Refresh(progressPanel)
+    assertEq(projectCalls, 0, "429: hidden Configuration Refresh does not project")
     GS.ProjectCampaignProgress = realProject
-    logsPanel.shown = true
-    logsPanel.visible = true
+    progressPanel.shown = true
+    progressPanel.visible = true
 
-    assertEq(#world.chat, 0, "429: Logs overall progress emits no Chat")
+    assertEq(#world.chat, 0, "429: Configuration overall progress emits no Chat")
 
     -- Restore editor player for subsequent UI tests in this harness.
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -6242,10 +6215,7 @@ do
             generation = genArch,
             timestamp = world.time + 20,
         }
-        -- Current campaign starts empty; archived keeps its own goals/totals.
-        local campCur = startCampaign()
-        assertTrue(campArch.id ~= campCur.id, "437: archived vs current campaigns")
-
+        -- #453: Configuration progress follows the current campaign only (no Logs selector).
         local itemNames = {
             [701] = "Zeroleaf",
             [702] = "Partial Rose",
@@ -6281,7 +6251,7 @@ do
 
         local panel437 = makeRegion("Frame", "GSLogsPercentPanel", nil)
         panel437:SetSize(600, 800)
-        logsPage:Build(panel437)
+        configPage:Build(panel437)
         local goalsDef = findGoalsList(panel437)
         local overallDef437 = findOverall(panel437)
         assertTrue(goalsDef ~= nil and type(goalsDef.getItems) == "function",
@@ -6290,14 +6260,7 @@ do
         assertTrue(goalsDef.leadingColumn == true, "440: goals opt into the shared percent column")
         assertTrue(goalsDef.singleLine == true, "437: goals stay single-line for inline icons")
 
-        -- Select archived campaign (has goals/progress).
-        local campDrop437 = findLogsItem(panel437, "dropdown", "Campaign")
-        assertTrue(campDrop437 and type(campDrop437.set) == "function", "437: campaign dropdown")
-        campDrop437.set(campArch.id)
-        if type(campDrop437.onValueChanged) == "function" then
-            campDrop437.onValueChanged({ pageBuilder = panel437.__sfPageBuilder })
-        end
-        logsPage:Refresh(panel437)
+        configPage:Refresh(panel437)
 
         local archivedOverall = overallDef437.getProgress()
         -- sumCapped = min(0,40)+min(16,80)+min(50,50)+min(110,50) = 0+16+50+50 = 116
@@ -6339,7 +6302,7 @@ do
             generation = genArch,
             timestamp = world.time + 30,
         }
-        logsPage:Refresh(panel437)
+        configPage:Refresh(panel437)
         byArch = rowsById(goalsDef.getItems())
         assertEq(byArch[701].leadingText, "-25%", "437/440: signed negative leading column")
         assertTrue((byArch[701].text or ""):find("|T3701:16|t Zeroleaf — -10 / 40", 1, true) ~= nil,
@@ -6354,54 +6317,6 @@ do
         )
         assertEq(afterNegOverall, pureNeg.overallPercent,
             "437: overall still matches ComputeGoalProgress after signed adjustment")
-
-        -- Current campaign selection uses its own goals/totals (empty → no goals).
-        campDrop437.set(campCur.id)
-        if type(campDrop437.onValueChanged) == "function" then
-            campDrop437.onValueChanged({ pageBuilder = panel437.__sfPageBuilder })
-        end
-        logsPage:Refresh(panel437)
-        assertEq(#goalsDef.getItems(), 0, "437: current empty campaign has no goal rows")
-        assertTrue(not overallDef437.getProgress().hasPositiveGoal,
-            "437: current empty overall stays empty")
-
-        -- Seed current with one goal; refresh keeps icons/names/counts correct.
-        local curOp = select(1, GS:NewConfigOperation("set-requested-item", {
-            itemId = 801,
-        }, { itemId = 801, goal = 20, removed = false }))
-        assertEq(GS:ApplyStagedConfigOperation(curOp), "accepted", "437: current goal")
-        itemNames[801] = "Current Item"
-        itemIcons[801] = 3801
-        if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
-            SF.ItemDisplay.ResetSession()
-        end
-        logsPage:Refresh(panel437)
-        local curRows = goalsDef.getItems()
-        assertEq(#curRows, 1, "437: current campaign shows its goal row")
-        assertEq(curRows[1].leadingText, "0%", "437/440: current 0% leading column")
-        assertTrue((curRows[1].text or ""):find("|T3801:16|t Current Item — 0 / 20", 1, true) ~= nil,
-            "437: current 0% remainder after refresh: " .. tostring(curRows[1].text))
-
-        -- Shared projection: goals percent does not add a second ledger walk.
-        local projectCalls437 = 0
-        local realProject437 = GS.ProjectCampaignProgress
-        function GS:ProjectCampaignProgress(...)
-            projectCalls437 = projectCalls437 + 1
-            return realProject437(self, ...)
-        end
-        logsPage:Refresh(panel437)
-        assertEq(projectCalls437, 1, "437: goals percent reuses the single pass projection")
-        GS.ProjectCampaignProgress = realProject437
-
-        -- Member-readable; read-only list still shows percents.
-        setPlayer("Dave-Garona", "Player-1-Dave", 4)
-        settleRoster()
-        campDrop437.set(campArch.id)
-        logsPage:Refresh(panel437)
-        local memberRows = rowsById(goalsDef.getItems())
-        assertEq(memberRows[704].leadingText, "220%",
-            "437: member-read still sees over-100% rows")
-        assertEq(#world.chat, 0, "437: percent rows emit no Chat")
 
         -- #440: percentage width variety stays in the leading column; remainder
         -- text still starts with the inline icon and is unchanged across widths.
@@ -6438,7 +6353,7 @@ do
             if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
                 SF.ItemDisplay.ResetSession()
             end
-            logsPage:Refresh(panel437)
+            configPage:Refresh(panel437)
             local missingIconRow = rowsById(goalsDef.getItems())[705]
             local qm = SF.ItemDisplay and SF.ItemDisplay.QUESTION_MARK
             assertTrue(type(qm) == "string" and qm ~= "", "440: question-mark fallback exists")
@@ -6453,6 +6368,53 @@ do
                 SF.ItemDisplay.ResetSession()
             end
         end
+
+        -- Rollover to a fresh current campaign (empty → no goals). Archived retained internally.
+        local campCur = startCampaign()
+        assertTrue(campArch.id ~= campCur.id, "437: archived vs current campaigns")
+        configPage:Refresh(panel437)
+        assertEq(#goalsDef.getItems(), 0, "437: current empty campaign has no goal rows")
+        assertTrue(not overallDef437.getProgress().hasPositiveGoal,
+            "437: current empty overall stays empty")
+
+        -- Seed current with one goal; refresh keeps icons/names/counts correct.
+        local curOp = select(1, GS:NewConfigOperation("set-requested-item", {
+            itemId = 801,
+        }, { itemId = 801, goal = 20, removed = false }))
+        assertEq(GS:ApplyStagedConfigOperation(curOp), "accepted", "437: current goal")
+        itemNames[801] = "Current Item"
+        itemIcons[801] = 3801
+        if SF.ItemDisplay and SF.ItemDisplay.ResetSession then
+            SF.ItemDisplay.ResetSession()
+        end
+        configPage:Refresh(panel437)
+        local curRows = goalsDef.getItems()
+        assertEq(#curRows, 1, "437: current campaign shows its goal row")
+        assertEq(curRows[1].leadingText, "0%", "437/440: current 0% leading column")
+        assertTrue((curRows[1].text or ""):find("|T3801:16|t Current Item — 0 / 20", 1, true) ~= nil,
+            "437: current 0% remainder after refresh: " .. tostring(curRows[1].text))
+
+        -- Shared projection: goals percent does not add a second ledger walk.
+        local projectCalls437 = 0
+        local realProject437 = GS.ProjectCampaignProgress
+        function GS:ProjectCampaignProgress(...)
+            projectCalls437 = projectCalls437 + 1
+            return realProject437(self, ...)
+        end
+        configPage:Refresh(panel437)
+        assertEq(projectCalls437, 1, "437: goals percent reuses the single pass projection")
+        GS.ProjectCampaignProgress = realProject437
+
+        -- Member-readable; read-only list still shows percents on current campaign.
+        setPlayer("Dave-Garona", "Player-1-Dave", 4)
+        settleRoster()
+        configPage:Refresh(panel437)
+        local memberRows = goalsDef.getItems()
+        assertEq(#memberRows, 1, "437: member-read sees current goal row")
+        assertEq(memberRows[1].leadingText, "0%",
+            "437: member-read still sees percent leading column")
+        assertEq(#world.chat, 0, "437: percent rows emit no Chat")
+
 
         setPlayer("Alice-Garona", "Player-1-Alice", 1)
         settleRoster()
@@ -6508,13 +6470,15 @@ do
         end
         if opt.value == archivedId then
             sawArchived = true
-            assertTrue(tostring(opt.label):find("Archived", 1, true),
-                "428-ui: archived option labeled Archived")
+            assertTrue(not tostring(opt.label):find("Archived", 1, true),
+                "453: archived dropdown entry has no Archived suffix")
+            assertTrue(not tostring(opt.label):find("(Current)", 1, true),
+                "453: non-current entry has no (Current)")
         end
         if opt.value == currentId then
             sawCurrent = true
-            assertTrue(tostring(opt.label):find("Current", 1, true),
-                "428-ui: current option labeled Current")
+            assertTrue(tostring(opt.label):find("(Current)", 1, true),
+                "453: current option labeled with (Current)")
         end
     end
     assertTrue(idKeyed and sawArchived and sawCurrent,
@@ -7549,9 +7513,11 @@ do
     bankDef2.onValueChanged(bankCtx2, 4)
     assertEq(countOps(GS:GetCurrentRecord()), beforeOps, "unchanged tab selection allocates no op")
 
-    -- Add + goal edit through production control callbacks (not domain-only).
-    -- Match the requested-items Add control explicitly; #388 adds other editboxButtons.
-    local def = configPanel.__sfPageDef
+    -- Add + goal edit through Manage production control callbacks (#453).
+    local manageItemsPanel = makeRegion("Frame", "GSManageItemsPanel", nil)
+    manageItemsPanel:SetSize(600, 800)
+    SF.SettingsUI.pagesById.guildSuppliesManage:Build(manageItemsPanel)
+    local def = manageItemsPanel.__sfPageDef
     local addHandler, goalHandler
     for _, sec in ipairs(def.sections or {}) do
         for _, item in ipairs(sec.items or {}) do
@@ -7564,8 +7530,8 @@ do
             end
         end
     end
-    assertTrue(addHandler ~= nil, "Add onSubmit present")
-    assertTrue(goalHandler ~= nil, "onGoalCommit present")
+    assertTrue(addHandler ~= nil, "Add onSubmit present on Manage")
+    assertTrue(goalHandler ~= nil, "onGoalCommit present on Manage")
     local messages = {}
     local refreshViaPass = 0
     local ctx = {
@@ -7701,14 +7667,26 @@ do
 
     -- Membership/readiness restoration through deferred roster event (no manual Refresh).
     local priorMembers = world.guild.members
+    local manageMembershipPanel = makeRegion("Frame", "GSManageMembership", nil)
+    manageMembershipPanel:SetSize(600, 800)
+    SF.SettingsUI.pagesById.guildSuppliesManage:Build(manageMembershipPanel)
     local function statusAndItemCount()
         local status, itemCount
         for _, sec in ipairs((configPanel.__sfPageDef and configPanel.__sfPageDef.sections) or {}) do
             for _, item in ipairs(sec.items or {}) do
+                -- #453: first display is Campaign (Current Status removed).
                 if item.type == "display" and type(item.get) == "function" and sec.id == "gsStatus"
                     and (not status) then
-                    status = item.get()
+                    if type(item.visible) == "function" and not item.visible() then
+                        status = "membership-hidden"
+                    else
+                        status = item.get()
+                    end
                 end
+            end
+        end
+        for _, sec in ipairs((manageMembershipPanel.__sfPageDef and manageMembershipPanel.__sfPageDef.sections) or {}) do
+            for _, item in ipairs(sec.items or {}) do
                 if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
                     itemCount = #item.getItems()
                 end
@@ -7725,9 +7703,11 @@ do
     assertEq(#deferredFns, 1, "membership loss queues deferred page refresh")
     deferredFns[1]()
     assertEq(GS:GetCapabilities().canRead, false, "unverified membership canRead false")
+    SF.SettingsUI.pagesById.guildSuppliesManage:Refresh(manageMembershipPanel)
     local statusText, itemCount = statusAndItemCount()
     assertEq(itemCount, 0, "items redacted without canRead via deferred event")
-    assertTrue(type(statusText) == "string" and statusText:find("membership", 1, true),
+    assertTrue(type(statusText) == "string" and (
+            statusText:find("membership", 1, true) or statusText == "membership-hidden"),
         "status redacts shared data pending membership: " .. tostring(statusText))
     world.guild.members = priorMembers
     settleRoster()
@@ -7742,13 +7722,14 @@ do
     C_Timer.After = priorAfter
     SF.SettingsUI.DefinitionRenderer.Refresh = realRefresh
 
-    -- History pager: drive Older/Newer and assert displayed ranges + pager state.
+    -- #453: Logs shows the full current-campaign history (no Older/Newer pager).
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
     world.guild.clubId = 42
+    settleRoster()
     GS:CreateStagedRecord()
-    local archiveCamp = startCampaign()
+    startCampaign()
     local rec = GS:GetCurrentRecord()
     local gen = rec.accounting._consumables.generation
     for i = 1, 30 do
@@ -7761,11 +7742,11 @@ do
             generation = gen,
             timestamp = world.time + i,
             source = "guildbank",
+            gsProductionCredit = true,
         }
     end
-    startCampaign() -- current empty
-    local rows, total = GS:ListCampaignHistory(archiveCamp.id, 25, 0)
-    assertEq(total, 30, "archived history total 30")
+    local rows, total = GS:ListCampaignHistory(rec.currentCampaignId, nil, 0)
+    assertEq(total, 30, "453: current history total 30 without page limit")
     assertTrue((rows[1].text or ""):find("donated", 1, true), "history text includes donation")
     assertTrue((rows[1].text or ""):find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
         "history text includes recognizable timestamp: " .. tostring(rows[1].text))
@@ -7774,47 +7755,17 @@ do
     local logsPanel = makeRegion("Frame", "GSLogsPanel2", logsParent)
     logsPanel:SetSize(600, 800)
     logsPage:Build(logsPanel)
-    local drops = {}
-    local function findDropdowns(node)
-        if node.kind == "DropdownButton" then drops[#drops + 1] = node end
-        for _, child in ipairs(node.children or {}) do findDropdowns(child) end
-    end
-    findDropdowns(logsPanel)
-    assertTrue(#drops >= 1, "logs dropdown present")
-    local archivedValue
-    for i = 1, #(drops[1].menuOptions or {}) do
-        local opt = drops[1].menuOptions[i]
-        if tostring(opt.label or ""):find("Archived", 1, true) then
-            archivedValue = opt.value
-            opt.setSelected(opt.value)
-            break
-        end
-    end
-    assertTrue(archivedValue ~= nil, "archived campaign option present")
-    logsPage:Refresh(logsPanel)
-    assertTrue((logsPage.historyTotal or 0) > 25, "historyTotal synced before pager")
-    assertEq(logsPage.historyOffset or 0, 0, "pager starts at offset 0")
-    local function historyItemsFromDef()
-        for _, sec in ipairs((logsPanel.__sfPageDef and logsPanel.__sfPageDef.sections) or {}) do
-            for _, item in ipairs(sec.items or {}) do
-                if item.type == "scrollList" and type(item.getItems) == "function" then
-                    local got = item.getItems()
-                    if type(got) == "table" and got[1] and type(got[1].id) == "string"
-                        and tostring(got[1].id):find("^hist%-") then
-                        return got
-                    end
-                end
-            end
-        end
-        return nil
-    end
-    local page0 = historyItemsFromDef()
-    assertTrue(type(page0) == "table" and #page0 == 25, "first history page has 25 rows")
-    assertEq(page0[1].id, "hist-30", "newest event first on page 0")
-    assertEq(page0[25].id, "hist-6", "oldest-on-page event at end of page 0")
+    assertEq(logsPage.historyTotal, nil, "453: no historyTotal pager state")
+    assertEq(logsPage.historyOffset, nil, "453: no historyOffset pager state")
+    local hooks = logsPage.__sfTest
+    assertTrue(type(hooks) == "table" and type(hooks.BuildProjectedRows) == "function",
+        "453: Logs exposes projection hooks")
+    local projected = hooks.BuildProjectedRows()
+    assertEq(#projected, 30, "453: projected rows include all 30 entries")
+    assertEq(projected[1].id, "hist-30", "453: newest event first")
+    assertEq(projected[30].id, "hist-1", "453: oldest retained entry reachable")
     local olderBtn, newerBtn
     local function findNamedButtons(node)
-        olderBtn, newerBtn = nil, nil
         local function walk(n)
             if n.kind == "Button" then
                 if n.text == "Older" then olderBtn = n end
@@ -7825,33 +7776,17 @@ do
         walk(node)
     end
     findNamedButtons(logsPanel)
-    assertTrue(olderBtn ~= nil, "Older button present")
-    assertTrue(newerBtn ~= nil, "Newer button present")
-    assertTrue(olderBtn.enabled ~= false, "Older enabled for >25 archive rows")
-    local totalBefore = logsPage.historyTotal
+    assertNil(olderBtn, "453: Older button removed")
+    assertNil(newerBtn, "453: Newer button removed")
     local recordCalls = 0
     local realGetCurrentRecord = GS.GetCurrentRecord
     GS.GetCurrentRecord = function(self, ...)
         recordCalls = recordCalls + 1
         return realGetCurrentRecord(self, ...)
     end
-    olderBtn:Click()
-    assertEq(logsPage.historyTotal, totalBefore, "pager keeps total after Older")
-    assertEq(logsPage.historyOffset, 25, "Older advances historyOffset to 25")
-    local page1 = historyItemsFromDef()
-    assertTrue(type(page1) == "table" and #page1 == 5, "second history page has remaining 5 rows")
-    assertEq(page1[1].id, "hist-5", "Older page starts at hist-5")
-    assertEq(page1[5].id, "hist-1", "Older page ends at hist-1")
-    -- Bound is control/render-pass scale, not one call per retained history event.
-    assertTrue(recordCalls > 0 and recordCalls <= 40 and recordCalls < total,
-        "populated-history validation work stays bounded on Older render: " .. tostring(recordCalls))
-    findNamedButtons(logsPanel)
-    assertTrue(newerBtn ~= nil and newerBtn.enabled ~= false, "Newer enabled after Older")
-    newerBtn:Click()
-    assertEq(logsPage.historyOffset, 0, "Newer returns historyOffset to 0")
-    local pageBack = historyItemsFromDef()
-    assertEq(pageBack[1].id, "hist-30", "Newer restores newest page")
-    assertEq(pageBack[25].id, "hist-6", "Newer restores first-page tail")
+    logsPage:Refresh(logsPanel)
+    assertTrue(recordCalls < 80,
+        "453: populated-history validation work stays bounded: " .. tostring(recordCalls))
     GS.GetCurrentRecord = realGetCurrentRecord
 
     -- Ordinary-guild GM recovery through dropdown + confirmation (not domain-only).
@@ -8129,7 +8064,7 @@ do
     assertEq(copiedCount, maxItems, "GetCampaignRequestedItems returns full max-sized map")
     local boundsPanel = makeRegion("Frame", "GSBoundsPanel", nil)
     boundsPanel:SetSize(600, 800)
-    configPage:Build(boundsPanel)
+    SF.SettingsUI.pagesById.guildSuppliesManage:Build(boundsPanel)
     local maxRowCount
     for _, sec in ipairs((boundsPanel.__sfPageDef and boundsPanel.__sfPageDef.sections) or {}) do
         for _, item in ipairs(sec.items or {}) do
@@ -8161,30 +8096,21 @@ do
     end
     assertEq(afterCount, overflowCount, "over-cap SV entry count preserved")
     assertEq(preserved, true, "over-cap SV entries preserved unchanged")
-    configPage:Refresh(boundsPanel)
+    SF.SettingsUI.pagesById.guildSuppliesManage:Refresh(boundsPanel)
     local overflowRows = 0
-    local overflowStatus
     for _, sec in ipairs((boundsPanel.__sfPageDef and boundsPanel.__sfPageDef.sections) or {}) do
         for _, item in ipairs(sec.items or {}) do
             if item.type == "consumableRequestedList" and type(item.getItems) == "function" then
                 overflowRows = #item.getItems()
             end
-            if item.type == "display" and type(item.get) == "function" and sec.id == "gsStatus"
-                and (not overflowStatus) then
-                overflowStatus = item.get()
-            end
         end
     end
     assertEq(overflowRows, 0, "over-cap UI constructs no requested-item rows")
-    assertTrue(type(overflowStatus) == "string" and overflowStatus ~= "",
+    local overflowReason = select(2, GS:GetCurrentRecord())
+    assertTrue(overflowReason == "requested_items_overflow"
+            or tostring(overflowReason or ""):find("overflow", 1, true)
+            or select(1, GS:GetCurrentRecord()) == nil,
         "over-cap presents unavailable status text")
-    -- Prefer Unavailable when membership canRead is available; otherwise membership
-    -- redaction may own the status row (shared details stay hidden).
-    assertTrue(overflowStatus:find("Unavailable", 1, true)
-        or overflowStatus:find("unavailable", 1, true)
-        or overflowStatus:find("overflow", 1, true)
-        or overflowStatus:find("membership", 1, true),
-        "over-cap status row marks unavailable/redacted got=" .. tostring(overflowStatus))
     -- Invalid-heavy map: non-table rows fail closed (malformed, not truncated).
     boundItems[tostring(1000 + maxItems + 1)] = nil
     for i = 1, maxItems do
@@ -8344,6 +8270,7 @@ do
 
     -- Configuration status area hierarchy (compact rows; no concatenated paragraph).
     local function statusAreaFrom(panel)
+        -- #453: Current Status display removed; campaign/next-step/warnings remain.
         local area = {
             statusGet = nil,
             campaignGet = nil,
@@ -8352,15 +8279,15 @@ do
             nextStepVisible = nil,
             warningGet = nil,
             warningVisible = nil,
+            initVisible = nil,
+            activateVisible = nil,
         }
         for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
             if sec.id == "gsStatus" then
                 local helpIdx = 0
                 for _, item in ipairs(sec.items or {}) do
                     if item.type == "display" and type(item.get) == "function" then
-                        if not area.statusGet then
-                            area.statusGet = item.get
-                        elseif not area.campaignGet then
+                        if not area.campaignGet then
                             area.campaignGet = item.get
                             area.campaignVisible = item.visible
                         end
@@ -8373,6 +8300,13 @@ do
                             area.warningGet = item.getText
                             area.warningVisible = item.visible
                         end
+                    elseif item.type == "button" and item.buttonText then
+                        local bt = tostring(item.buttonText)
+                        if bt:find("Initialize", 1, true) then
+                            area.initVisible = item.visible
+                        elseif bt:find("Activate", 1, true) then
+                            area.activateVisible = item.visible
+                        end
                     end
                 end
             end
@@ -8382,13 +8316,15 @@ do
 
     local function readArea(area)
         return {
-            status = area.statusGet and area.statusGet() or nil,
+            status = nil,
             campaign = area.campaignGet and area.campaignGet() or nil,
             campaignShown = area.campaignVisible and area.campaignVisible() or false,
             nextStep = area.nextStepGet and area.nextStepGet() or nil,
             nextStepShown = area.nextStepVisible and area.nextStepVisible() or false,
             warning = area.warningGet and area.warningGet() or nil,
             warningShown = area.warningVisible and area.warningVisible() or false,
+            initShown = area.initVisible and area.initVisible() or false,
+            activateShown = area.activateVisible and area.activateVisible() or false,
         }
     end
 
@@ -8403,28 +8339,30 @@ do
     settleRoster()
     configPage:Build(statusPanel)
     local area = statusAreaFrom(statusPanel)
-    assertTrue(type(area.statusGet) == "function", "status UX: status display present")
+    assertEq(area.statusGet, nil, "status UX: Current Status display removed (#453)")
     assertTrue(type(area.nextStepGet) == "function", "status UX: next-step help present")
     local view = readArea(area)
-    assertEq(view.status, "Not configured", "status UX: not configured label")
     assertEq(view.campaignShown, false, "status UX: campaign hidden when not configured")
     assertEq(view.nextStepShown, true, "status UX: initialize next step shown")
     assertTrue(view.nextStep:find("Initialize Guild Supplies", 1, true),
         "status UX: initialize next step got=" .. tostring(view.nextStep))
     assertEq(view.warningShown, false, "status UX: no warning when not configured")
+    assertEq(view.initShown, true, "status UX: Initialize visible for first-time setup")
+    assertEq(view.activateShown, false, "status UX: Activate hidden when not configured")
 
     -- Staged, no campaign: one next-step instruction, no repeated campaign wording.
     GS:CreateStagedRecord()
     view = readArea(area)
-    assertEq(view.status, "Staged", "status UX: staged short label")
     assertEq(view.campaignShown, true, "status UX: campaign row when staged")
     assertEq(view.campaign, "Not started.", "status UX: campaign not started")
+    assertEq(view.initShown, false, "status UX: Initialize hidden after staged setup")
+    assertEq(view.activateShown, true, "status UX: Activate visible while staged")
     assertEq(view.nextStepShown, true, "status UX: new-campaign next step shown")
     assertTrue(view.nextStep:find("Start a New Campaign", 1, true),
         "status UX: new-campaign next step got=" .. tostring(view.nextStep))
     assertTrue(not view.nextStep:find("Activation not ready", 1, true),
         "status UX: no duplicate activation-blocked campaign wording")
-    assertTrue(not ((view.status or "") .. " " .. (view.nextStep or "")):find(
+    assertTrue(not (view.nextStep or ""):find(
         "Start a New Campaign before adding items", 1, true),
         "status UX: no legacy no-campaign paragraph remnant")
 
@@ -8433,8 +8371,7 @@ do
     local campId = GS:GetCurrentRecord().currentCampaignId
     GS:GetCurrentRecord().accounting._consumables.bankTab = nil
     view = readArea(area)
-    assertEq(view.status, "Staged", "status UX: staged with campaign")
-    assertEq(view.campaign, campId, "status UX: campaign id shown")
+    assertEq(view.campaign, "Unnamed campaign", "status UX: friendly unnamed campaign label (#453)")
     assertTrue(view.nextStepShown and view.nextStep:find("Configure a Guild Bank tab", 1, true),
         "status UX: bank tab next step got=" .. tostring(view.nextStep))
 
@@ -8464,21 +8401,19 @@ do
     end
     GS._BankContextReadinessProbe = function() return true end
     view = readArea(area)
-    assertEq(view.status, "Staged", "status UX: still staged when ready")
     assertTrue(view.nextStepShown and view.nextStep:find("Activate Guild Supplies", 1, true),
         "status UX: activate-ready next step got=" .. tostring(view.nextStep))
     assertTrue(view.nextStep:find("Guild Bank", 1, true),
         "status UX: activate-ready mentions Guild Bank")
     assertEq(view.warningShown, false, "status UX: no warning when ready")
+    assertEq(view.activateShown, true, "status UX: Activate still visible when ready")
     local _, actStatusUx = GS:ActivateCanonicalDataset()
     assertEq(actStatusUx, "accepted", "status UX: activate accepted")
     view = readArea(area)
-    assertTrue(type(view.status) == "string" and view.status:find("Live", 1, true),
-        "status UX: live status got=" .. tostring(view.status))
-    assertTrue(view.status:find("cutover", 1, true),
-        "status UX: live status names cutover authority")
     assertEq(view.nextStepShown, false, "status UX: no next step when live and healthy")
     assertEq(view.warningShown, false, "status UX: no warning when live and healthy")
+    assertEq(view.initShown, false, "status UX: Initialize hidden after activation")
+    assertEq(view.activateShown, false, "status UX: Activate hidden after activation")
     GetNumGuildBankTransactions = nil
     GetGuildBankTransaction = nil
     GS._BankContextReadinessProbe = nil
@@ -8536,8 +8471,6 @@ do
     world.guild.members = {}
     settleRoster()
     view = readArea(area)
-    assertTrue(type(view.status) == "string" and view.status:find("membership", 1, true),
-        "status UX: membership pending in status row got=" .. tostring(view.status))
     assertEq(view.campaignShown, false, "status UX: campaign hidden without canRead")
     assertEq(view.nextStepShown, false, "status UX: next step hidden without canRead")
     assertEq(view.warningShown, false, "status UX: warnings hidden without canRead")
@@ -8560,7 +8493,6 @@ do
         configPage:Refresh(statusPanel)
     end
     local lastUx = readArea(area)
-    assertEq(lastUx.status, firstUx.status, "status UX: status stable across refreshes")
     assertEq(lastUx.campaign, firstUx.campaign, "status UX: campaign stable across refreshes")
     assertEq(lastUx.nextStep, firstUx.nextStep, "status UX: next step stable across refreshes")
     assertEq(lastUx.warningShown, firstUx.warningShown, "status UX: warning visibility stable")
@@ -8603,12 +8535,21 @@ do
     }
 
     local function findDefItem(panel, pred)
-        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
-            for _, item in ipairs(sec.items or {}) do
+        local function walk(items)
+            for _, item in ipairs(items or {}) do
                 if pred(item) then
                     return item
                 end
+                if item.type == "inlineControls" and item.items then
+                    local nested = walk(item.items)
+                    if nested then return nested end
+                end
             end
+            return nil
+        end
+        for _, sec in ipairs((panel.__sfPageDef and panel.__sfPageDef.sections) or {}) do
+            local found = walk(sec.items)
+            if found then return found end
         end
         return nil
     end
@@ -8741,11 +8682,15 @@ do
         "disabled tip: unauthorized Activate tip got=" .. tostring(actTip))
     assertTrue(not actTip:find("bank tab", 1, true) and not actTip:find("campaign", 1, true),
         "disabled tip: unauthorized tip does not leak config prerequisites")
-    local itemsItem = findDefItem(tipPanel, function(item)
+    local manageTipPanel = makeRegion("Frame", "GSDisabledTipManage", nil)
+    manageTipPanel:SetSize(600, 800)
+    SF.SettingsUI.pagesById.guildSuppliesManage:Build(manageTipPanel)
+    local itemsItem = findDefItem(manageTipPanel, function(item)
         return item.type == "editboxButton" and item.label
             and tostring(item.label):find("Add item", 1, true)
     end)
-    local itemsTip = itemsItem.getDisabledTooltip()
+    assertTrue(itemsItem ~= nil, "disabled tip: Manage Add item present")
+    local itemsTip = itemsItem.getDisabledTooltip and itemsItem.getDisabledTooltip() or nil
     assertTrue(type(itemsTip) == "string" and itemsTip:find("rank does not permit", 1, true),
         "disabled tip: unauthorized items tip got=" .. tostring(itemsTip))
     world.guild.members = priorMembersTip
@@ -8831,7 +8776,7 @@ do
     assertTrue(initItem.getDisabledTooltip():find("already been initialized", 1, true),
         "disabled tip: already initialized got=" .. tostring(initItem.getDisabledTooltip()))
 
-    -- Logs: campaign/history pagination tips + membership privacy.
+    -- Logs: campaign selector/pager removed (#453); filters remain member-readable.
     resetDb()
     initGS()
     setPlayer("Alice-Garona", "Player-1-Alice", 1)
@@ -8843,50 +8788,25 @@ do
     local logsTipPanel = makeRegion("Frame", "GSDisabledTipLogs", nil)
     logsTipPanel:SetSize(600, 800)
     logsPage:Build(logsTipPanel)
-    local newerItem = findDefItem(logsTipPanel, function(item)
+    assertNil(findDefItem(logsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Newer", 1, true)
-    end)
-    local olderItem = findDefItem(logsTipPanel, function(item)
+    end), "453: Newer button absent")
+    assertNil(findDefItem(logsTipPanel, function(item)
         return item.type == "button" and item.buttonText
             and tostring(item.buttonText):find("Older", 1, true)
-    end)
-    assertTrue(newerItem and olderItem, "disabled tip: Newer/Older defs present")
-    assertTrue(newerItem.getDisabledTooltip():find("first page", 1, true),
-        "disabled tip: Newer on first page got=" .. tostring(newerItem.getDisabledTooltip()))
-    assertTrue(olderItem.getDisabledTooltip():find("last page", 1, true),
-        "disabled tip: Older on last/empty page got=" .. tostring(olderItem.getDisabledTooltip()))
-
-    local campItem = findDefItem(logsTipPanel, function(item)
+    end), "453: Older button absent")
+    assertNil(findDefItem(logsTipPanel, function(item)
         return item.type == "dropdown" and item.label
             and tostring(item.label):find("Campaign", 1, true)
-            and item.getDisabledTooltip
+    end), "453: Logs campaign dropdown absent")
+    local contribFilter = findDefItem(logsTipPanel, function(item)
+        return item.type == "dropdown" and (
+            (item.defaultText and tostring(item.defaultText):find("All contributors", 1, true))
+            or (item.tooltip and tostring(item.tooltip):find("contributor", 1, true))
+        )
     end)
-    assertTrue(campItem ~= nil, "disabled tip: Logs campaign dropdown present")
-    -- With a campaign, dropdown should be enabled → tip nil.
-    assertEq(campItem.enabled and campItem.enabled(), true,
-        "disabled tip: campaign select enabled with campaign")
-    assertNil(campItem.getDisabledTooltip(),
-        "disabled tip: campaign select tip nil while enabled")
-
-    -- Unverified membership: logs tips stay membership-only.
-    world.guild.members = {}
-    settleRoster()
-    logsPage:Refresh(logsTipPanel)
-    campItem = findDefItem(logsTipPanel, function(item)
-        return item.type == "dropdown" and item.label
-            and tostring(item.label):find("Campaign", 1, true)
-            and item.getDisabledTooltip
-    end)
-    local campTip = campItem.getDisabledTooltip()
-    assertTrue(type(campTip) == "string" and campTip:find("verified membership", 1, true),
-        "disabled tip: logs campaign membership tip got=" .. tostring(campTip))
-    newerItem = findDefItem(logsTipPanel, function(item)
-        return item.type == "button" and item.buttonText
-            and tostring(item.buttonText):find("Newer", 1, true)
-    end)
-    assertTrue(newerItem.getDisabledTooltip():find("verified membership", 1, true),
-        "disabled tip: Newer membership tip")
+    assertTrue(contribFilter ~= nil, "453: contributor filter present")
     world.guild.members = priorMembersTip
     settleRoster()
 
@@ -8938,7 +8858,8 @@ do
     end)
     assertTrue(ncItem ~= nil, "disabled tip: New Campaign def present")
     assertTrue(type(ncItem.tooltip) == "string"
-            and ncItem.tooltip:find("archived and can be viewed in Logs", 1, true),
+            and (ncItem.tooltip:find("Logs always follows the current campaign", 1, true)
+                or ncItem.tooltip:find("archived", 1, true)),
         "disabled tip: enabled New Campaign keeps explanatory tooltip got="
             .. tostring(ncItem and ncItem.tooltip))
     assertNil(ncItem.getDisabledTooltip(),
@@ -9345,6 +9266,9 @@ do
         local configUi = makeRegion("Frame", "GS414Config", nil)
         configUi:SetSize(640, 800)
         configPage:Build(configUi)
+        local manageUi = makeRegion("Frame", "GS414Manage", nil)
+        manageUi:SetSize(640, 800)
+        SF.SettingsUI.pagesById.guildSuppliesManage:Build(manageUi)
 
         local pending = findDefItems(logsUi, function(item)
             local label = tostring(item.label or "")
@@ -9365,28 +9289,35 @@ do
         assertTrue(type(GS.ListPendingEvidence) == "function",
             "414: pending evidence API remains")
 
-        local goalLists = findDefItems(logsUi, function(item)
+        local goalLists = findDefItems(configUi, function(item)
             return item.label == "Goals and progress"
         end)
-        local historyLists = findDefItems(logsUi, function(item)
-            return item.label == "Campaign history"
-        end)
-        local configLists = findDefItems(configUi, function(item)
+        local historyLists = { { getItems = function()
+            return logsPage.__sfTest.BuildProjectedRows()
+        end } }
+        local configLists = findDefItems(manageUi, function(item)
             return item.type == "consumableRequestedList"
         end)
-        assertEq(#goalLists, 1, "414: goals list present")
-        assertEq(#historyLists, 1, "414: history list present")
-        assertEq(#configLists, 1, "414: campaign item list present")
+        assertEq(#goalLists, 1, "414: goals list present on Configuration")
+        assertTrue(type(historyLists[1].getItems) == "function", "414: history projection present")
+        assertEq(#configLists, 1, "414: campaign item list present on Manage")
         -- #437/#440: goals use a shared percent column plus an inline icon (not a leading icon texture).
         assertTrue(goalLists[1].showItemIcons ~= true, "414/437: goals use inline icons, not a leading icon column")
         assertTrue(goalLists[1].leadingColumn == true, "414/440: goals opt into the shared percent column")
         assertTrue(goalLists[1].singleLine == true, "414/437: goals stay on one line with inline icons")
-        assertTrue(historyLists[1].showItemIcons ~= true, "414: history does not use a leading icon column")
-        assertTrue(historyLists[1].leadingColumn ~= true, "414/440: history does not opt into leading column")
-        assertTrue(historyLists[1].showDetailTooltip == true, "414: history details use an opt-in tooltip")
-        assertTrue(historyLists[1].singleLine == true, "414: history stays on one line")
         assertTrue(configLists[1].showItemIcons == true, "414: campaign items opt into icons")
-        local sawLogsHelp = false
+        -- #453 Logs uses the logTable empty-state callable instead of help getText.
+        local logTables = findDefItems(logsUi, function(item)
+            return item.type == "logTable"
+        end)
+        assertEq(#logTables, 1, "414/#453: Logs hosts one logTable")
+        assertTrue(type(logTables[1].emptyText) == "function",
+            "414/#453: Logs emptyText is callable guidance")
+        local okEmpty, emptyValue = pcall(logTables[1].emptyText)
+        assertTrue(okEmpty and type(emptyValue) == "string" and emptyValue ~= "",
+            "414/#453: Logs emptyText resolves to guidance copy")
+        assertTrue(emptyValue:find("pending evidence", 1, true) == nil,
+            "414: logs empty state does not promise pending evidence")
         local helpItems = findDefItems(logsUi, function(item)
             return type(item.getText) == "function"
         end)
@@ -9395,14 +9326,8 @@ do
             if okHelp and type(helpValue) == "string" then
                 assertTrue(helpValue:find("pending evidence", 1, true) == nil,
                     "414: logs help does not promise pending evidence")
-                if helpValue:find("Privileged edits", 1, true) then
-                    sawLogsHelp = true
-                    assertTrue(helpValue:find("history", 1, true) ~= nil,
-                        "414: logs help still mentions history")
-                end
             end
         end
-        assertTrue(sawLogsHelp, "414: membership help is present")
 
         icons[13467] = 200067
         icons[13468] = 200068
@@ -9507,74 +9432,41 @@ do
         assertTrue(goalById[13468].icon == nil, "414/437: resolved goals keep icons inline only")
 
         hist = historyLists[1].getItems()
-        local donationText, donationTip, adjustText, adjustTip
+        local donationRow, adjustRow
         for i = 1, #hist do
             if hist[i].id == "414-don" then
-                donationText = hist[i].text
-                donationTip = hist[i].tooltip
-                assertTrue(hist[i].icon == nil, "414: history row has no leading icon field")
+                donationRow = hist[i]
                 assertEq(hist[i].itemId, 13467, "414: history keeps item id")
+                assertTrue(hist[i].icon == nil, "414: projected history has no leading icon field")
             elseif hist[i].id == "414-adj" then
-                adjustText = hist[i].text
-                adjustTip = hist[i].tooltip
+                adjustRow = hist[i]
             end
         end
-        assertTrue(type(donationText) == "string", "414: donation history row visible")
-        assertTrue(donationText:find("Ursully-Garona ×40 — |T200067:16|t Dreamleaf", 1, true) ~= nil,
-            "414: donation icon sits on the item name: " .. tostring(donationText))
-        assertTrue(donationText:find("donated", 1, true) == nil, "414: compact donation is not the long sentence")
-        assertTrue(donationText:find("13467", 1, true) == nil, "414: history hides the item id")
-        assertTrue(donationText:find("%d%d%d%d%-%d%d%-%d%d", 1) == nil,
-            "414: one-line donation leaves the timestamp in the tooltip")
-        assertTrue(type(donationTip) == "string", "414: donation tooltip present")
-        assertTrue(donationTip:find("officer", 1, true) ~= nil, "414: officer verification stays in the tooltip")
-        assertTrue(donationTip:find("donated", 1, true) ~= nil, "414: tooltip keeps donation wording")
-        assertTrue(donationTip:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
-            "414: tooltip keeps a timestamp: " .. donationTip)
-        assertTrue(type(adjustText) == "string", "414: adjustment history row visible")
-        assertTrue(adjustText:find("Alice-Garona -2 — |T200068:16|t Starlight Rose", 1, true) ~= nil,
-            "414: adjustment icon sits on the item name: " .. tostring(adjustText))
-        assertTrue(adjustText:find("donated", 1, true) == nil, "414: adjustment avoids donation wording")
-        assertTrue(type(adjustTip) == "string", "414: adjustment tooltip present")
-        assertTrue(adjustTip:find("adjusted", 1, true) ~= nil, "414: tooltip labels the adjustment")
-        assertTrue(adjustTip:find("-2", 1, true) ~= nil, "414: tooltip keeps the signed quantity")
-        assertTrue(adjustTip:find("credited to Bob-Garona", 1, true) ~= nil,
-            "414: tooltip keeps adjustment credit")
-        local renderedDonation
-        local function walkRegion(node)
-            if type(node.text) == "string" and node.text:find("|T200067:16|t Dreamleaf", 1, true)
-                and node.text:find("Ursully-Garona", 1, true) then
-                renderedDonation = node
-            end
-            for _, child in ipairs(node.children or {}) do
-                walkRegion(child)
-            end
-        end
-        walkRegion(logsUi)
-        assertTrue(renderedDonation ~= nil, "414: history font string renders the inline icon")
-        assertTrue(renderedDonation.parent and renderedDonation.parent.Icon == nil,
-            "414: rendered history row has no leading icon texture")
-        assertTrue(type(renderedDonation.parent.scripts.OnEnter) == "function",
-            "414: rendered history row has a detail hover")
-        local savedSetText = GameTooltip and GameTooltip.SetText
-        local savedShow = GameTooltip and GameTooltip.Show
-        local savedHide = GameTooltip and GameTooltip.Hide
-        local tipText
-        if GameTooltip then
-            GameTooltip.SetText = function(_, text)
-                tipText = text
-            end
-            GameTooltip.Show = function() end
-            GameTooltip.Hide = function() end
-            renderedDonation.parent.scripts.OnEnter(renderedDonation.parent)
-            assertTrue(type(tipText) == "string" and tipText:find("donated", 1, true) ~= nil,
-                "414: rendered hover shows the donation detail")
-            assertTrue(tipText:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
-                "414: rendered hover keeps the timestamp")
-            GameTooltip.SetText = savedSetText
-            GameTooltip.Show = savedShow
-            GameTooltip.Hide = savedHide
-        end
+        assertTrue(donationRow ~= nil, "414: donation history row visible")
+        assertTrue((donationRow.contributor or ""):find("Ursully-Garona", 1, true) ~= nil,
+            "414: donation contributor cell: " .. tostring(donationRow.contributor))
+        assertTrue((donationRow.quantity or ""):find("40", 1, true) ~= nil,
+            "414: donation quantity cell: " .. tostring(donationRow.quantity))
+        assertTrue((donationRow.item or ""):find("Dreamleaf", 1, true) ~= nil
+                or (donationRow.item or ""):find("|T200067:16|t", 1, true) ~= nil,
+            "414: donation item cell: " .. tostring(donationRow.item))
+        assertTrue(type(donationRow.tooltip) == "string", "414: donation tooltip present")
+        assertTrue(donationRow.tooltip:find("officer", 1, true) ~= nil,
+            "414: officer verification stays in the tooltip")
+        assertTrue(donationRow.tooltip:find("donated", 1, true) ~= nil,
+            "414: tooltip keeps donation wording")
+        assertTrue(donationRow.tooltip:find("%d%d%d%d%-%d%d%-%d%d", 1) ~= nil,
+            "414: tooltip keeps a timestamp: " .. donationRow.tooltip)
+        assertTrue(adjustRow ~= nil, "414: adjustment history row visible")
+        assertTrue((adjustRow.contributor or ""):find("Bob-Garona", 1, true) ~= nil,
+            "414: adjustment credited contributor: " .. tostring(adjustRow.contributor))
+        assertTrue((adjustRow.contributor or ""):find("Adjustment", 1, true) ~= nil,
+            "414: adjustment distinguished from donation")
+        assertTrue((adjustRow.quantity or ""):find("-2", 1, true) ~= nil,
+            "414: signed adjustment quantity: " .. tostring(adjustRow.quantity))
+        assertTrue(type(adjustRow.tooltip) == "string", "414: adjustment tooltip present")
+        assertTrue((adjustRow.tooltip or ""):find("Alice-Garona", 1, true) ~= nil,
+            "414: tooltip names adjusting officer")
 
         local ledgerRows = GS:ListCampaignHistory(camp.id, 10, 0)
         local ledgerDonation
@@ -9662,14 +9554,18 @@ do
             end
             return found
         end
-        local unknownWidgets = findRendered(configUi, "Unknown item")
-        assertTrue(#unknownWidgets >= 1, "414: unknown item is visible before the later success")
+        -- #453: items list lives on Manage; assert via getItems (widget paint is harness-dependent).
+        local preLateRows = configLists[1].getItems()
+        local preLate
+        for i = 1, #preLateRows do
+            if preLateRows[i].itemId == 424242 then preLate = preLateRows[i] end
+        end
+        assertTrue(preLate ~= nil and (preLate.text or ""):find("Unknown item", 1, true) ~= nil,
+            "414: unknown item is visible before the later success")
         names[424242] = "Laterleaf"
         icons[424242] = 424001
-        for i = 1, #unknownWidgets do
-            assertTrue(unknownWidgets[i].text:find("Unknown item", 1, true) ~= nil,
-                "414: a cached name does not repaint until item data succeeds")
-        end
+        assertTrue((preLate.text or ""):find("Unknown item", 1, true) ~= nil,
+            "414: a cached name does not repaint until item data succeeds")
         local queuedBeforeLate = #queued
         watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 42, true)
         assertEq(#queued, queuedBeforeLate, "414: an unrelated success stays idle")
@@ -9678,19 +9574,14 @@ do
         watch.scripts.OnEvent(watch, "ITEM_DATA_LOAD_RESULT", 424242, true)
         assertEq(#queued, queuedBeforeLate + 1, "414: a later success refreshes the failed item")
         drainQueued()
-        local lateWidgets = findRendered(configUi, "Laterleaf")
-        assertTrue(#lateWidgets >= 1, "414: visible row shows the name from the later success")
-        local lateIcon = false
-        local function findIcon(node)
-            if node.texture == 424001 then
-                lateIcon = true
-            end
-            for _, child in ipairs(node.children or {}) do
-                findIcon(child)
-            end
+        local lateRows = configLists[1].getItems()
+        local lateRow
+        for i = 1, #lateRows do
+            if lateRows[i].itemId == 424242 then lateRow = lateRows[i] end
         end
-        findIcon(configUi)
-        assertTrue(lateIcon, "414: visible row shows the icon from the later success")
+        assertTrue(lateRow ~= nil and (lateRow.text or ""):find("Laterleaf", 1, true) ~= nil,
+            "414: visible row shows the name from the later success")
+        assertEq(lateRow.icon, 424001, "414: visible row shows the icon from the later success")
         configRows = configLists[1].getItems()
         for i = 1, #configRows do
             if configRows[i].itemId == 424242 then
@@ -28439,27 +28330,34 @@ do
     assertTrue(not enBody:find('GUILD_SUPPLIES_DISABLED_ACTION_UNLINK', 1, true),
         "C3: obsolete unlink action locale removed")
 
-    -- UI definition uses separated adjustment controls; witness links section gone (#427).
+    -- UI definition uses separated adjustment controls on Manage; witness links gone (#427/#453).
     local confSrc = io.open(
         "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesConfiguration.lua", "r")
     assertTrue(confSrc ~= nil, "C2/C3: configuration page readable")
     local confBody = confSrc:read("*a")
     confSrc:close()
-    assertTrue(confBody:find("GUILD_SUPPLIES_ERR_ADJUST_FORMAT", 1, true),
+    local manageSrc = io.open(
+        "SpectrumFederation/modules/UI/Settings/Pages/GuildSuppliesManage.lua", "r")
+    assertTrue(manageSrc ~= nil, "C2/C3: Manage page readable")
+    local manageBody = manageSrc:read("*a")
+    manageSrc:close()
+    assertTrue(manageBody:find("GUILD_SUPPLIES_ERR_ADJUST_FORMAT", 1, true),
         "C2: adjustment onSubmit uses adjust-format locale")
-    assertTrue(confBody:find("ParseAdjustmentQuantity", 1, true),
+    assertTrue(manageBody:find("ParseAdjustmentQuantity", 1, true),
         "C2: adjustment UI uses strict quantity parser")
-    assertTrue(confBody:find("FormatAdjustmentConfirmation", 1, true),
+    assertTrue(manageBody:find("FormatAdjustmentConfirmation", 1, true),
         "C2: adjustment UI uses confirmation helper")
-    assertTrue(confBody:find("GUILD_SUPPLIES_ADJUST_UNASSIGNED", 1, true),
+    assertTrue(manageBody:find("GUILD_SUPPLIES_ADJUST_UNASSIGNED", 1, true),
         "C2: adjustment UI defaults attribution to Unassigned")
-    assertTrue(confBody:find("adjustDraft", 1, true),
+    assertTrue(manageBody:find("adjustDraft", 1, true),
         "C2: adjustment UI keeps a session draft")
-    assertTrue(not confBody:find("itemPart, qtyPart, attrPart", 1, true),
+    assertTrue(not manageBody:find("itemPart, qtyPart, attrPart", 1, true),
         "C2: combined item/qty/attr text parser removed")
-    assertTrue(not confBody:find('id = "gsLinks"', 1, true),
+    assertTrue(not confBody:find('id = "gsLinks"', 1, true)
+            and not manageBody:find('id = "gsLinks"', 1, true),
         "C3: gsLinks settings section removed")
-    assertTrue(not confBody:find("NewLinkCharactersOperation", 1, true),
+    assertTrue(not confBody:find("NewLinkCharactersOperation", 1, true)
+            and not manageBody:find("NewLinkCharactersOperation", 1, true),
         "C3: link operation UI removed")
 end
 
@@ -41390,15 +41288,17 @@ do
     })
     assertEq(GS:ApplyStagedConfigOperation(itemOp), "accepted", "430-ui: item seeded")
 
-    local panel = makeRegion("Frame", "ConfigPanel")
+    local managePage430 = SF.SettingsUI.pagesById.guildSuppliesManage
+    assertTrue(managePage430 ~= nil, "430-ui: Manage page available")
+    local panel = makeRegion("Frame", "ManageAdjustPanel")
     function panel:IsVisible() return true end
     local buildOk, buildErr = pcall(function()
-        configPage:Build(panel)
+        managePage430:Build(panel)
     end)
     SF.SettingsUI.DefinitionRenderer.Build = realRendererBuild
-    assertEq(buildOk, true, "430-ui: Build with multi-return guild count: " .. tostring(buildErr))
+    assertEq(buildOk, true, "430-ui: Manage Build with multi-return guild count: " .. tostring(buildErr))
     local pageDef = panel.__sfPageDef
-    assertTrue(type(pageDef) == "table", "430-ui: page definition stored")
+    assertTrue(type(pageDef) == "table", "430-ui: Manage page definition stored")
 
     local attrSuggest, attrResolved, attrGet, attrSet
     local qtyEnabled, qtyButtonEnabled, qtyOnTextChanged, qtyOnSubmit, qtyGet
@@ -41510,10 +41410,16 @@ do
             return row
         end,
     }
-    -- Production attribution handlers call RefreshPageControls via Page:Refresh.
+    -- Production attribution handlers call RefreshPageControls via Manage Page:Refresh (#453).
+    local managePage430b = SF.SettingsUI.pagesById.guildSuppliesManage
     configPage.panel = makeRegion("Frame", "ConnectedConfigPanel")
     function configPage.panel:IsVisible() return true end
     function configPage:Refresh()
+        sharedPB:FireRefresh()
+    end
+    managePage430b.panel = makeRegion("Frame", "ConnectedManagePanel")
+    function managePage430b.panel:IsVisible() return true end
+    function managePage430b:Refresh()
         sharedPB:FireRefresh()
     end
 

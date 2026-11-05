@@ -2,6 +2,14 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.18-beta.5] - 2026-11-04
+
+### Changed
+- Raid Supply UI adjustments (#453)
+
+### Fixed
+- Fix Mouse Tracer Edge Softness hitch and soft-edge rendering (#454)
+
 ## [1.5.18-beta.4] - 2026-11-04
 
 ### Fixed

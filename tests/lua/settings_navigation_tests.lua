@@ -183,8 +183,21 @@ local function productionFixture()
             navLabel = "Configuration",
             contentHeading = "Raid Supplies Configuration",
             group = "Raid Tools",
-            description = "Fresh guild setup, bank tab, requested items, and New Campaign.",
+            description = "Fresh guild setup, bank tab, campaign progress, and New Campaign.",
             order = 19.1,
+        }),
+        page({
+            id = "guildSuppliesManage",
+            categoryId = "guildSupplies",
+            name = "Manage",
+            navLabel = "Manage",
+            contentHeading = "Raid Supplies Manage",
+            group = "Raid Tools",
+            description = "Officer tools for requested items and quantity adjustments.",
+            order = 19.15,
+            available = function()
+                return true
+            end,
         }),
         page({
             id = "guildSuppliesLogs",
@@ -193,16 +206,16 @@ local function productionFixture()
             navLabel = "Logs",
             contentHeading = "Raid Supplies Logs",
             group = "Raid Tools",
-            description = "Inspect current and archived campaign goals, progress, and history.",
+            description = "Review current-campaign donations and quantity adjustments.",
             order = 19.2,
         }),
         page({
             id = "guildSuppliesTroubleshooting",
             categoryId = "guildSupplies",
             name = "Troubleshooting",
+            group = "Raid Tools",
             navLabel = "Troubleshooting",
             contentHeading = "Raid Supplies Troubleshooting",
-            group = "Raid Tools",
             description = "Recover from staged dataset mismatches and resolve configuration conflicts.",
             order = 19.3,
         }),
@@ -614,8 +627,8 @@ assertEq(showGuildSettingsPage.pageId, "guildInfoMainAlt", "ShowPage(guildInfoMa
 
 assertDeepEq(
     idsOf(Model.GetContentPages(registry, "guildSupplies")),
-    { "guildSuppliesConfiguration", "guildSuppliesLogs", "guildSuppliesTroubleshooting" },
-    "Raid Supplies keeps Configuration, Logs, then Troubleshooting"
+    { "guildSuppliesConfiguration", "guildSuppliesManage", "guildSuppliesLogs", "guildSuppliesTroubleshooting" },
+    "Raid Supplies keeps Configuration, Manage, Logs, then Troubleshooting"
 )
 assertEq(registry.pagesById.lootHelperConsumables, nil,
     "legacy Loot Helper Consumables page is not registered")
