@@ -7132,6 +7132,236 @@ do
     local restoredOk, restoredErr = GS._ValidateGuildRecordStructure(ctx2.guildKey, record2)
     assertTrue(restoredOk, "459-G1b: alias restore recovers without manual bump got "
         .. tostring(restoredErr))
+
+    -- G1c: losing-history retention must refuse when durable map cannot store
+    -- a new binding and every slot is owned by retained corrections.
+    local record3 = seedLiveCampaignWithItem(9907, 80)
+    local cfg3 = record3.accounting._consumables
+    local ctx3 = select(1, GS:GetCurrentContext())
+    local maxA = tonumber(GS.MAX_CREDIT_EVENT_ALIASES) or 2048
+    cfg3.creditEventAliases = {}
+    record3.operations.records = record3.operations.records or {}
+    record3.operations.order = record3.operations.order or {}
+    -- Fill the durable map with bindings required by retained correction bodies
+    -- so unused-binding reclaim cannot free a slot. Bodies are shape-valid;
+    -- their canons are intentionally absent from the ledger so Rebuild skips.
+    for i = 1, maxA do
+        local alias = string.format("ctx:g1c-req-alias-%04d", i)
+        local canon = string.format("ctx:g1c-req-canon-%04d", i)
+        cfg3.creditEventAliases[alias] = canon
+        local opId = string.format("g1c-req-corr-%04d", i)
+        record3.operations.records[opId] = {
+            schemaVersion = GS.OP_SCHEMA_VERSION,
+            id = opId,
+            guildKey = ctx3.guildKey,
+            datasetId = record3.datasetId,
+            campaignId = record3.currentCampaignId,
+            kind = GS.KIND.CORRECT_CONTRIBUTOR,
+            target = alias,
+            value = {
+                eventId = alias,
+                eventKind = "donation",
+                attributed = "Bob-Garona",
+                attributedGuid = "Player-1-Bob",
+                baseAttributed = "Alice-Garona",
+                baseAttributedGuid = "Player-1-Alice",
+                itemId = 9907,
+            },
+            actorGuid = "Player-1-Alice",
+            actorName = "Alice-Garona",
+            timestamp = world.time,
+            baseTargetRevision = record3.datasetId,
+            basePolicyRevision = record3.permission and record3.permission.revisionId,
+            baseCampaignId = record3.currentCampaignId,
+        }
+        record3.operations.order[#record3.operations.order + 1] = opId
+    end
+    if GS._BumpOpsValidationGen then
+        GS._BumpOpsValidationGen(record3.operations)
+    end
+    local winDon = injectProductionDonation(record3, {
+        id = "ctx:g1c-win-canon", itemId = 9907, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    winDon.txnId = "ctx:g1c-win-canon"
+    local winCorr = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "g1c-win-corr",
+        guildKey = ctx3.guildKey,
+        datasetId = record3.datasetId,
+        campaignId = record3.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:g1c-win-canon",
+        value = {
+            eventId = "ctx:g1c-win-canon",
+            eventKind = "donation",
+            attributed = "Carol-Garona",
+            attributedGuid = "Player-1-Carol",
+            baseAttributed = "Alice-Garona",
+            baseAttributedGuid = "Player-1-Alice",
+            itemId = 9907,
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 50,
+        baseTargetRevision = record3.datasetId,
+        basePolicyRevision = record3.permission and record3.permission.revisionId,
+        baseCampaignId = record3.currentCampaignId,
+    }
+    local stWin, rWin = GS:AdmitRemoteOperation(winCorr, {
+        sender = "Alice-Garona", offlineRecord = record3, preserveAttribution = true,
+    })
+    local guardW = 0
+    while stWin == "pending" and guardW < 200 do
+        if not runOneDueTimer() then break end
+        stWin, rWin = GS:AdmitRemoteOperation(winCorr, {
+            sender = "Alice-Garona", offlineRecord = record3, preserveAttribution = true,
+        })
+        guardW = guardW + 1
+    end
+    flushTimers()
+    assertTrue(stWin == "accepted" or stWin == "duplicate",
+        "459-G1c: canonical winner accepted st=" .. tostring(stWin) .. "/" .. tostring(rWin))
+    assertTrue(record3.operations.records["g1c-win-corr"] ~= nil,
+        "459-G1c: winner body retained")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record3, winDon)), "Carol-Garona",
+        "459-G1c: winner credit Carol")
+    -- Registry alias that cannot fit the durable map.
+    assertTrue(GS._AddTxnAlias(record3, "ctx:g1c-win-canon", "ctx:g1c-lose-alias", winDon),
+        "459-G1c: registry alias registered")
+    assertNil(cfg3.creditEventAliases["ctx:g1c-lose-alias"],
+        "459-G1c: durable map still full for new alias")
+    local loseCorr = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "g1c-lose-corr",
+        guildKey = ctx3.guildKey,
+        datasetId = record3.datasetId,
+        campaignId = record3.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:g1c-lose-alias",
+        value = {
+            eventId = "ctx:g1c-lose-alias",
+            eventKind = "donation",
+            attributed = "Bob-Garona",
+            attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona",
+            baseAttributedGuid = "Player-1-Alice",
+            itemId = 9907,
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 10,
+        baseTargetRevision = record3.datasetId,
+        basePolicyRevision = record3.permission and record3.permission.revisionId,
+        baseCampaignId = record3.currentCampaignId,
+    }
+    local stLose, rLose = GS:AdmitRemoteOperation(loseCorr, {
+        sender = "Alice-Garona", offlineRecord = record3, preserveAttribution = true,
+    })
+    assertTrue(stLose ~= "accepted",
+        "459-G1c: saturated loser refused st=" .. tostring(stLose) .. "/" .. tostring(rLose))
+    assertEq(rLose, "full", "459-G1c: refuse reason full")
+    assertNil(record3.operations.records["g1c-lose-corr"],
+        "459-G1c: loser body not retained without durable binding")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record3, winDon)), "Carol-Garona",
+        "459-G1c: winner credit unchanged after loser refuse")
+
+    -- Positive loser path with reclaimable spare capacity: binding survives eviction.
+    local record4 = seedLiveCampaignWithItem(9908, 40)
+    local cfg4 = record4.accounting._consumables
+    local ctx4 = select(1, GS:GetCurrentContext())
+    local winDon4 = injectProductionDonation(record4, {
+        id = "ctx:g1d-canon", itemId = 9908, quantity = 4,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    winDon4.txnId = "ctx:g1d-canon"
+    cfg4.txnRegistry = {
+        {
+            txnId = "ctx:g1d-canon", status = "verified", committed = true,
+            aliases = { "ctx:g1d-alias" }, itemId = 9908, quantity = 4,
+            donor = "Alice-Garona",
+        },
+        {
+            txnId = "ctx:g1d-alias", status = "alias", aliasOf = "ctx:g1d-canon",
+            committed = true,
+        },
+    }
+    -- Pad map with reclaimable junk, leaving room after prune.
+    cfg4.creditEventAliases = {}
+    for i = 1, maxA - 1 do
+        cfg4.creditEventAliases[string.format("ctx:g1d-junk-%04d", i)] =
+            string.format("ctx:g1d-junk-canon-%04d", i)
+    end
+    local win4 = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "g1d-win",
+        guildKey = ctx4.guildKey,
+        datasetId = record4.datasetId,
+        campaignId = record4.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:g1d-canon",
+        value = {
+            eventId = "ctx:g1d-canon", eventKind = "donation",
+            attributed = "Carol-Garona", attributedGuid = "Player-1-Carol",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9908,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 40,
+        baseTargetRevision = record4.datasetId,
+        basePolicyRevision = record4.permission and record4.permission.revisionId,
+        baseCampaignId = record4.currentCampaignId,
+    }
+    assertEq(select(1, GS:AdmitRemoteOperation(win4, {
+        sender = "Alice-Garona", offlineRecord = record4, preserveAttribution = true,
+    })), "accepted", "459-G1d: winner accepted")
+    local lose4 = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "g1d-lose",
+        guildKey = ctx4.guildKey,
+        datasetId = record4.datasetId,
+        campaignId = record4.currentCampaignId,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "ctx:g1d-alias",
+        value = {
+            eventId = "ctx:g1d-alias", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9908,
+        },
+        actorGuid = "Player-1-Alice", actorName = "Alice-Garona",
+        timestamp = world.time + 5,
+        baseTargetRevision = record4.datasetId,
+        basePolicyRevision = record4.permission and record4.permission.revisionId,
+        baseCampaignId = record4.currentCampaignId,
+    }
+    assertEq(select(1, GS:AdmitRemoteOperation(lose4, {
+        sender = "Alice-Garona", offlineRecord = record4, preserveAttribution = true,
+    })), "accepted", "459-G1d: loser retained with durable binding")
+    assertEq(cfg4.creditEventAliases["ctx:g1d-alias"], "ctx:g1d-canon",
+        "459-G1d: durable loser binding stored")
+    assertTrue(record4.operations.records["g1d-lose"] ~= nil, "459-G1d: loser body retained")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record4, winDon4)), "Carol-Garona",
+        "459-G1d: winner credit unchanged")
+    cfg4.txnRegistry = {}
+    if GS._ClearOpsValidationCache then
+        GS._ClearOpsValidationCache(record4.operations)
+    end
+    local cold4, cold4Err = GS._ValidateGuildRecordStructure(ctx4.guildKey, record4)
+    assertTrue(cold4, "459-G1d: cold validate after eviction got " .. tostring(cold4Err))
+    assertEq(GS.CanonicalCreditEventId(record4, "ctx:g1d-alias"), "ctx:g1d-canon",
+        "459-G1d: loser alias resolves after eviction")
+    -- Source-accepted adoption replay still finds the canonical donation.
+    local replay = {}
+    for k, v in pairs(lose4) do replay[k] = v end
+    local stReplay, rReplay = GS:AdmitRemoteOperation(replay, {
+        sender = "Alice-Garona", offlineRecord = record4, preserveAttribution = true,
+        adoptionReplay = true,
+        sourceAcceptedSet = { ["g1d-lose"] = true },
+    })
+    assertTrue(stReplay == "accepted" or stReplay == "duplicate",
+        "459-G1d: adoption replay resolves after eviction st="
+            .. tostring(stReplay) .. "/" .. tostring(rReplay))
 end
 
 do
@@ -7493,7 +7723,8 @@ do
         },
     }), { sender = "Alice-Garona", offlineRecord = record, preserveAttribution = true }))
     assertEq(stLate, "accepted", "459-G4: later LWW winner accepted")
-    -- Prepared-before-rollover: prepare under campaign A, rollover, then apply.
+
+    -- Local prepare → genuine rollover → Apply must reject; credit unchanged.
     injectProductionDonation(record, {
         id = "g4-roll-don", itemId = 9905, quantity = 6,
         actor = "Alice-Garona", actorGuid = "Player-1-Alice",
@@ -7510,10 +7741,120 @@ do
     local rollEv = GS.FindLedgerEventById(record, "g4-roll-don")
     assertTrue(rollEv ~= nil, "459-G4: donation still findable after rollover")
     assertEq(rollEv.campaignId, oldCampaign, "459-G4: event keeps old campaignId")
-    assertEq(GS:ApplyStagedConfigOperation(prepared), "accepted",
-        "459-G4: prepared-before-rollover apply accepted")
-    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, rollEv)), "Bob-Garona",
-        "459-G4: credit after prepared-before-rollover")
+    local stLocal, rLocal = GS:ApplyStagedConfigOperation(prepared)
+    assertTrue(stLocal ~= "accepted",
+        "459-G4: local apply after rollover rejected st="
+            .. tostring(stLocal) .. "/" .. tostring(rLocal))
+    assertNil(record.operations.records[prepared.id],
+        "459-G4: local prepared body not accepted after rollover")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(record, rollEv)), "Alice-Garona",
+        "459-G4: credit unchanged after rejected local apply")
+
+    -- Already-accepted historical remote catch-up: accept while A is current on
+    -- a source peer, then receiver replays after its own rollover.
+    local source = seedLiveCampaignWithItem(9909, 40)
+    local srcDon = injectProductionDonation(source, {
+        id = "g4-hist-don", itemId = 9909, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local srcCamp = source.currentCampaignId
+    local srcCtx = select(1, GS:GetCurrentContext())
+    local histOp = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "g4-hist-corr",
+        guildKey = srcCtx.guildKey,
+        datasetId = source.datasetId,
+        campaignId = srcCamp,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "g4-hist-don",
+        value = {
+            eventId = "g4-hist-don", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9909,
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 3,
+        baseTargetRevision = source.datasetId,
+        basePolicyRevision = source.permission and source.permission.revisionId,
+        baseCampaignId = srcCamp,
+    }
+    assertEq(select(1, GS:AdmitRemoteOperation(histOp, {
+        sender = "Alice-Garona", offlineRecord = source, preserveAttribution = true,
+    })), "accepted", "459-G4: source accepts while campaign A current")
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(source, srcDon)), "Bob-Garona",
+        "459-G4: source credit Bob before rollover")
+    -- Receiver already rolled over but still holds the archived donation + must
+    -- replay the already-accepted historical body.
+    local receiver = seedLiveCampaignWithItem(9910, 40)
+    -- Plant the same donation under campaign A, then rollover receiver.
+    local recvDon = injectProductionDonation(receiver, {
+        id = "g4-hist-don", itemId = 9910, quantity = 5,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local recvCampA = receiver.currentCampaignId
+    recvDon.campaignId = recvCampA
+    startCampaign()
+    assertTrue(receiver.currentCampaignId ~= recvCampA, "459-G4: receiver rolled over")
+    local histReplay = {
+        schemaVersion = GS.OP_SCHEMA_VERSION,
+        id = "g4-hist-corr",
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = receiver.datasetId,
+        campaignId = recvCampA,
+        kind = GS.KIND.CORRECT_CONTRIBUTOR,
+        target = "g4-hist-don",
+        value = {
+            eventId = "g4-hist-don", eventKind = "donation",
+            attributed = "Bob-Garona", attributedGuid = "Player-1-Bob",
+            baseAttributed = "Alice-Garona", baseAttributedGuid = "Player-1-Alice",
+            itemId = 9910,
+        },
+        actorGuid = "Player-1-Alice",
+        actorName = "Alice-Garona",
+        timestamp = world.time + 3,
+        baseTargetRevision = receiver.datasetId,
+        basePolicyRevision = receiver.permission and receiver.permission.revisionId,
+        baseCampaignId = recvCampA,
+    }
+    local stHist, rHist = GS:AdmitRemoteOperation(histReplay, {
+        sender = "Alice-Garona", offlineRecord = receiver, preserveAttribution = true,
+        adoptionReplay = true,
+        sourceAcceptedSet = { ["g4-hist-corr"] = true },
+    })
+    assertTrue(stHist == "accepted" or stHist == "duplicate",
+        "459-G4: historical remote replay after rollover st="
+            .. tostring(stHist) .. "/" .. tostring(rHist))
+    assertEq(select(1, GS.ResolveEffectiveCreditIdentity(receiver, recvDon)), "Bob-Garona",
+        "459-G4: receiver credit Bob after historical replay")
+
+    -- Pending local save cancels when campaign rolls over (Continue validity).
+    local cancelRec = seedLiveCampaignWithItem(9911, 40)
+    injectProductionDonation(cancelRec, {
+        id = "g4-cancel-don", itemId = 9911, quantity = 3,
+        actor = "Alice-Garona", actorGuid = "Player-1-Alice",
+    })
+    local cancelOp = select(1, GS:NewContributorCorrectionOperation(
+        "g4-cancel-don", "Bob-Garona", "Player-1-Bob"))
+    assertTrue(type(cancelOp) == "table", "459-G4: cancel-case prepare")
+    local cancelCamp = cancelRec.currentCampaignId
+    assertTrue(GS.RetainLocalContributorCorrectionSave(cancelRec, cancelOp, {
+        guildKey = select(1, GS:GetCurrentContext()).guildKey,
+        datasetId = cancelRec.datasetId,
+        campaignId = cancelCamp,
+    }), "459-G4: local save retained before rollover")
+    assertTrue(GS.GetLocalContributorCorrectionSave(cancelRec) ~= nil,
+        "459-G4: retain present before rollover")
+    startCampaign()
+    assertTrue(cancelRec.currentCampaignId ~= cancelCamp, "459-G4: cancel-case rolled over")
+    local contOk, contErr = GS.ContinueLocalContributorCorrectionSave(cancelRec)
+    assertTrue(not contOk, "459-G4: continue after rollover fails")
+    assertEq(contErr, "stale_campaign", "459-G4: continue reason stale_campaign")
+    assertNil(GS.GetLocalContributorCorrectionSave(cancelRec),
+        "459-G4: pending local save cancelled on rollover")
+    assertNil(cancelRec.operations.records[cancelOp.id],
+        "459-G4: cancelled local save never accepted")
 end
 
 do

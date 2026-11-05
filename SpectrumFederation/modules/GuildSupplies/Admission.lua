@@ -8117,8 +8117,9 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                     and admissionCtx.sourceAcceptedSet[stored.id] == true
             end
             if allowRetain then
+                local scopeEvent = nil
                 if GS.ValidateContributorCorrectionScope then
-                    local scopeOk, scopeErr = GS.ValidateContributorCorrectionScope(
+                    local scopeOk, scopeErr, scopedEvent = GS.ValidateContributorCorrectionScope(
                         record, stored, {
                             allowMissingEvent = true,
                             remoteAdmit = true,
@@ -8133,6 +8134,16 @@ function GS:AdmitRemoteOperation(op, admissionCtx)
                             return "pending", scopeErr
                         end
                         return "rejected", scopeErr or classReason or "stale_credit"
+                    end
+                    scopeEvent = scopedEvent
+                end
+                -- Durable alias binding before every accepted retention path,
+                -- including LWW losers (#459 G1 / review-5791986976).
+                if GS.EnsureContributorCorrectionDurableAliases then
+                    local aliasOk, aliasErr = GS.EnsureContributorCorrectionDurableAliases(
+                        record, stored, scopeEvent)
+                    if not aliasOk then
+                        return "rejected", aliasErr or "full"
                     end
                 end
                 local newlyRetained = not (ops.records and ops.records[stored.id])

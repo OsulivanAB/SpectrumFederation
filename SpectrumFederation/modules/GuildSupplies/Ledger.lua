@@ -5420,6 +5420,37 @@ local function WriteCreditEventAlias(record, aliasId, canonicalId)
     return true, true
 end
 
+--- Ensure durable alias→canonical bindings required to retain/accept a
+-- correction that may target alias ids. Reclaims unused map entries first; if
+-- capacity is still exhausted by bindings required by already-retained
+-- corrections, refuse without mutating other retained bindings (#459 G1).
+-- @param event table resolved canonical ledger event
+-- @return boolean ok, string|nil err
+function GS.EnsureContributorCorrectionDurableAliases(record, op, event)
+    if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
+        return true
+    end
+    if type(op) ~= "table" then
+        return true
+    end
+    local function requireAlias(aliasId)
+        if type(aliasId) ~= "string" or aliasId == "" or aliasId == event.id then
+            return true
+        end
+        local wrote = WriteCreditEventAlias(record, aliasId, event.id)
+        return wrote and true or false
+    end
+    local targetId = op.target
+    if not requireAlias(targetId) then
+        return false, "full"
+    end
+    local valueEventId = op.value and op.value.eventId
+    if not requireAlias(valueEventId) then
+        return false, "full"
+    end
+    return true
+end
+
 --- Persist a trusted alias→canonical credit-event binding that outlives the
 -- bounded txn registry (#459). Re-confirm clears a cached ops validation miss
 -- without requiring a manual ops-generation bump when the binding is unchanged.
@@ -8517,8 +8548,7 @@ function GS.ValidateContributorCorrectionScope(record, op, opts)
     return true, nil, event
 end
 
--- opts.localPrepare: require production credit + expected match (not current-campaign
--- rewrite — that stays on New/Build so prepared-before-rollover apply can proceed).
+-- opts.localPrepare: require current campaign + production credit + expected match.
 -- opts.skipExpected: remote LWW apply (still checks floors against current→new).
 -- opts.allowMissingEvent: return pending_event instead of missing_event.
 -- opts.skipFloor: remote apply defers floors to RebuildCreditCorrectionProjection.
@@ -8547,6 +8577,14 @@ function GS.ValidateContributorCorrectionPrepare(record, op, opts)
     -- Corrections never grant production credit to pending/uncredited/staged rows.
     if event.gsProductionCredit ~= true then
         return false, "not_credited"
+    end
+    -- Local authoring/commit is current-campaign-only; remote historical replay
+    -- uses Scope event-campaign match without this guard (#459 G4).
+    if opts.localPrepare then
+        if type(record.currentCampaignId) ~= "string"
+            or event.campaignId ~= record.currentCampaignId then
+            return false, "stale_campaign"
+        end
     end
     local curName, curGuid, _, creditStatus = GS.ResolveEffectiveCreditIdentity(record, event)
     -- Remote/skipFloor apply rebuilds projection itself; do not reject while a
@@ -8723,32 +8761,13 @@ function GS.ApplyContributorCorrectionMutation(record, op, opts)
     end
     -- Durable alias binding required for alias-targeted acceptance; refuse when
     -- the binding cannot be retained under the bounded map (#459 G1).
-    if type(event) == "table" and type(event.id) == "string" then
-        local function requireAlias(aliasId)
-            if type(aliasId) ~= "string" or aliasId == "" or aliasId == event.id then
-                return true
-            end
-            local wrote = WriteCreditEventAlias(record, aliasId, event.id)
-            if not wrote then
-                return false
-            end
-            return true
+    local aliasOk, aliasErr = GS.EnsureContributorCorrectionDurableAliases(record, op, event)
+    if not aliasOk then
+        if isLocal then
+            DiscardSpeculativeCreditProjectionResume(record, op)
         end
-        if not requireAlias(eventId) then
-            if isLocal then
-                DiscardSpeculativeCreditProjectionResume(record, op)
-            end
-            GS.RebuildCreditCorrectionProjection(record, nil)
-            return false, "full"
-        end
-        local valueEventId = op.value and op.value.eventId
-        if not requireAlias(valueEventId) then
-            if isLocal then
-                DiscardSpeculativeCreditProjectionResume(record, op)
-            end
-            GS.RebuildCreditCorrectionProjection(record, nil)
-            return false, "full"
-        end
+        GS.RebuildCreditCorrectionProjection(record, nil)
+        return false, aliasErr or "full"
     end
     return true, "accepted"
 end
