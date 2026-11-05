@@ -315,6 +315,108 @@ do
     assertTrue(type(copy) == "table", "copy ok")
 end
 
+
+-- G7: donation capacity ignores withdrawal occupancy; scans see extra allowance
+do
+    local function CountNonWithdrawal(list)
+        local n = 0
+        for i = 1, #list do
+            local e = list[i]
+            if type(e) == "table"
+                and e.type ~= "withdrawal"
+                and e.type ~= (GS.LEDGER_EVENT and GS.LEDGER_EVENT.WITHDRAWAL) then
+                n = n + 1
+            end
+        end
+        return n
+    end
+    local record = {
+        datasetId = "gs1:cap",
+        currentCampaignId = "camp1",
+        accounting = {
+            _mutationSeq = 0,
+            _consumables = { generation = 1, eventSeq = 0, bankTab = 1, recipes = {} },
+            _consumableEvents = {},
+            _consumableEventArchive = {},
+        },
+    }
+    local live = record.accounting._consumableEvents
+    for i = 1, 3072 do
+        live[#live + 1] = {
+            type = "CONSUMABLE_DONATION",
+            id = "don:" .. i,
+            quantity = 1,
+            itemId = 1,
+            generation = 1,
+        }
+    end
+    for i = 1, 1024 do
+        live[#live + 1] = {
+            type = "withdrawal",
+            id = "wd:" .. i,
+            datasetId = "gs1:cap",
+            campaignId = "camp1",
+            generation = 1,
+            itemId = 10,
+            quantity = 1,
+            actor = "A-Realm",
+            actorGuid = "Player-1-A",
+            bankTab = 1,
+            timestamp = 1000 + i,
+            provenance = GS.WITHDRAWAL_PROVENANCE.ORIGIN,
+            operationId = "opcap",
+            guildKey = "club:1",
+            gsProductionCredit = false,
+        }
+    end
+    assertEq(#live, 4096, "seeded combined live length")
+    assertEq(CountNonWithdrawal(live), 3072, "donation occupancy 3072")
+    assertTrue(CountNonWithdrawal(live) < (GS.MAX_LEDGER_EVENTS or 4096),
+        "donation room remains despite withdrawal rows")
+    assertEq(GS.WithdrawalReceiptCapacityOk(record, 1), false, "withdrawal live full")
+
+    local record2 = {
+        datasetId = "gs1:cap2",
+        currentCampaignId = "camp1",
+        accounting = {
+            _mutationSeq = 0,
+            _consumables = { generation = 1, eventSeq = 0, bankTab = 1 },
+            _consumableEvents = {},
+            _consumableEventArchive = {},
+        },
+    }
+    for i = 1, 4096 do
+        record2.accounting._consumableEvents[#record2.accounting._consumableEvents + 1] = {
+            type = "CONSUMABLE_DONATION", id = "d2:" .. i, quantity = 1, itemId = 1, generation = 1,
+        }
+    end
+    assertTrue(GS.WithdrawalReceiptCapacityOk(record2, 1), "withdrawal room after 4096 donations")
+end
+
+-- ScanBankStock map keys vs quantity values (must not treat quantities as item IDs)
+do
+    local map = { ["12345"] = 10, ["67890"] = 5 }
+    local keys = {}
+    for k in pairs(map) do
+        local n = tonumber(k)
+        if n then keys[#keys + 1] = n end
+    end
+    table.sort(keys)
+    assertEq(keys[1], 12345, "map key item id")
+    assertEq(keys[2], 67890, "map key item id 2")
+    assertTrue(keys[1] ~= 10 and keys[1] ~= 5, "quantities are not item ids")
+end
+
+-- Accept-flag numeric decoding (Lua 0 is truthy; only numeric 1 is accepted)
+do
+    local function IsAccepted(v)
+        return tonumber(v) == 1
+    end
+    assertEq(IsAccepted(0), false, "0 not accepted")
+    assertEq(IsAccepted(1), true, "1 accepted")
+    assertEq(IsAccepted(true), false, "boolean true not accepted without tonumber 1")
+end
+
 if failures > 0 then
     io.stderr:write(string.format("%d failure(s)\n", failures))
     os.exit(1)

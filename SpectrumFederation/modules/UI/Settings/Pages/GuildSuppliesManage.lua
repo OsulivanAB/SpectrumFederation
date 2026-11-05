@@ -653,13 +653,59 @@ local recipeEditorDraft = {
 	contextKey = nil,
 	outputItemId = nil,
 	isExisting = false,
+	-- Bound at open for stale Save/Delete protection.
+	boundGuildKey = nil,
+	boundDatasetId = nil,
+	boundCampaignId = nil,
+	boundConfigSeq = nil,
+	boundRecipeRevision = nil, -- Canonical fingerprint of reagents at open
 	reagentTexts = {},
+	-- Saved reagents that are no longer in the requested-item list; keep until
+	-- the editor explicitly clears/repairs them.
+	orphanReagentIds = {},
 }
 local recipeEditorUi = nil
 local recipeEditorSection = nil
 
+-- Forward declaration: CommitConfig is defined later with the shared Manage
+-- mutation path; Delete must call it without a lexical upvalue hole.
+local CommitConfig
+
 local function RecipeDraftContextKey()
-	return AdjustDraftContextKey()
+	local rec = CurrentRecord()
+	if not rec then
+		return "none"
+	end
+	local cfg = rec.accounting and rec.accounting._consumables
+	local g = GS()
+	local guildKey = rec._guildKey or (g and g.GetCurrentContext and select(1, g:GetCurrentContext()) and g:GetCurrentContext().guildKey)
+	if type(guildKey) ~= "string" then
+		local ctx = g and g.GetCurrentContext and g:GetCurrentContext()
+		guildKey = ctx and ctx.guildKey
+	end
+	return table.concat({
+		tostring(guildKey or ""),
+		tostring(rec.datasetId or ""),
+		tostring(rec.currentCampaignId or ""),
+		tostring(cfg and cfg.configSeq or ""),
+	}, "|")
+end
+
+local function RecipeFingerprint(reagents)
+	if type(reagents) ~= "table" then
+		return ""
+	end
+	local keys = {}
+	for k in pairs(reagents) do
+		keys[#keys + 1] = tostring(k)
+	end
+	table.sort(keys)
+	local parts = {}
+	for i = 1, #keys do
+		local k = keys[i]
+		parts[#parts + 1] = k .. "=" .. tostring(tonumber(reagents[k]) or 0)
+	end
+	return table.concat(parts, ";")
 end
 
 local function SyncRecipeEditorContext()
@@ -673,6 +719,12 @@ local function SyncRecipeEditorContext()
 		recipeEditorDraft.outputItemId = nil
 		recipeEditorDraft.isExisting = false
 		recipeEditorDraft.reagentTexts = {}
+		recipeEditorDraft.orphanReagentIds = {}
+		recipeEditorDraft.boundGuildKey = nil
+		recipeEditorDraft.boundDatasetId = nil
+		recipeEditorDraft.boundCampaignId = nil
+		recipeEditorDraft.boundConfigSeq = nil
+		recipeEditorDraft.boundRecipeRevision = nil
 		recipeEditorDraft.contextKey = key
 		if recipeEditorUi and recipeEditorUi.frame then
 			recipeEditorUi.frame:Hide()
@@ -707,7 +759,8 @@ local function RecipeAvailabilityWarning(record, recipe)
 	if not g or not g.RecipeAvailability or type(recipe) ~= "table" then
 		return nil
 	end
-	local ok, err, missing = g:RecipeAvailability(record, recipe)
+	-- Dot call: RecipeAvailability is a plain function, not a method.
+	local ok, err, missing = g.RecipeAvailability(record, recipe)
 	if ok then
 		return nil
 	end
@@ -741,7 +794,8 @@ local function RecipeRows()
 	if not g or not g.ListCampaignRecipes then
 		return rows
 	end
-	local list = g:ListCampaignRecipes(record)
+	-- Dot call: ListCampaignRecipes is a plain function, not a method.
+	local list = g.ListCampaignRecipes(record)
 	for i = 1, #list do
 		local entry = list[i]
 		local itemId = tonumber(entry and entry.itemId)
@@ -762,6 +816,79 @@ local function RecipeRows()
 		end
 	end
 	return rows
+end
+
+--- Editor rows = current requested reagents + preserved unavailable orphans.
+local function RecipeEditorIngredientRows()
+	local rows = RequestedItemRows()
+	local out = {}
+	local seen = {}
+	for i = 1, #rows do
+		local itemId = tonumber(rows[i] and rows[i].itemId)
+		if itemId then
+			seen[itemId] = true
+			out[#out + 1] = { itemId = itemId, orphan = false }
+		end
+	end
+	local orphans = recipeEditorDraft.orphanReagentIds or {}
+	local keys = {}
+	for k in pairs(orphans) do
+		keys[#keys + 1] = tostring(k)
+	end
+	table.sort(keys)
+	for i = 1, #keys do
+		local itemId = tonumber(keys[i])
+		if itemId and not seen[itemId] then
+			out[#out + 1] = { itemId = itemId, orphan = true }
+		end
+	end
+	return out
+end
+
+local function RecipeSaveTargetStillValid(bound)
+	if type(bound) ~= "table" then
+		return false, "stale"
+	end
+	if not RecipeCanEdit() then
+		return false, "unauthorized"
+	end
+	local rec = CurrentRecord()
+	if not rec then
+		return false, "stale"
+	end
+	local cfg = rec.accounting and rec.accounting._consumables
+	if tostring(rec.datasetId or "") ~= tostring(bound.datasetId or "") then
+		return false, "dataset_changed"
+	end
+	if tostring(rec.currentCampaignId or "") ~= tostring(bound.campaignId or "") then
+		return false, "campaign_changed"
+	end
+	if tostring(cfg and cfg.configSeq or "") ~= tostring(bound.configSeq or "") then
+		return false, "config_changed"
+	end
+	local g = GS()
+	local ctx = g and g.GetCurrentContext and g:GetCurrentContext()
+	if tostring(ctx and ctx.guildKey or rec._guildKey or "") ~= tostring(bound.guildKey or "") then
+		return false, "guild_changed"
+	end
+	local outputId = tonumber(bound.outputItemId)
+	if not outputId then
+		return false, "stale"
+	end
+	local live = FindSavedRecipe(outputId)
+	if bound.isExisting then
+		if type(live) ~= "table" then
+			return false, "recipe_deleted"
+		end
+		if RecipeFingerprint(live.reagents) ~= tostring(bound.recipeRevision or "") then
+			return false, "recipe_changed"
+		end
+	else
+		if type(live) == "table" then
+			return false, "recipe_exists"
+		end
+	end
+	return true
 end
 
 local function RecipesHelpText()
@@ -816,7 +943,7 @@ end
 local function BuildRecipeReagentsFromDraft()
 	CaptureRecipeEditorDraftFromUi()
 	local reagents = {}
-	local rows = RequestedItemRows()
+	local rows = RecipeEditorIngredientRows()
 	for i = 1, #rows do
 		local itemId = tonumber(rows[i] and rows[i].itemId)
 		if itemId then
@@ -998,10 +1125,13 @@ local function RefreshRecipeEditor()
 	ui.delete:SetShown(recipeEditorDraft.isExisting == true)
 
 	local record = CurrentRecord()
-	local rows = RequestedItemRows()
+	local rows = RecipeEditorIngredientRows()
+	-- Drop stale edit-box identity map; rebind each visible row to its item ID.
+	ui.reagentEdits = {}
 	local y = 0
 	for i = 1, #rows do
 		local itemId = tonumber(rows[i].itemId)
+		local isOrphan = rows[i].orphan == true
 		if itemId then
 			if not ui.reagentRows[i] then
 				local r = CreateFrame("Frame", nil, ui.content)
@@ -1022,9 +1152,6 @@ local function RefreshRecipeEditor()
 				edit:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 				edit:SetNumeric(true)
 				edit:SetMaxLetters(5)
-				edit:SetScript("OnTextChanged", function(self)
-					recipeEditorDraft.reagentTexts[tostring(itemId)] = self:GetText() or ""
-				end)
 				r.Edit = edit
 				local warn = r:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 				warn:SetPoint("TOPLEFT", name, "BOTTOMLEFT", 0, -2)
@@ -1032,23 +1159,43 @@ local function RefreshRecipeEditor()
 				warn:SetJustifyH("LEFT")
 				r.Warning = warn
 				ui.reagentRows[i] = r
-				ui.reagentEdits[itemId] = edit
 			end
+			local row = ui.reagentRows[i]
+			row._boundItemId = itemId
+			-- Rebind OnTextChanged to the currently displayed item ID every layout.
+			row.Edit:SetScript("OnTextChanged", function(self)
+				local boundId = row._boundItemId
+				if boundId then
+					recipeEditorDraft.reagentTexts[tostring(boundId)] = self:GetText() or ""
+				end
+			end)
+			ui.reagentEdits[itemId] = row.Edit
 			local qtyText = recipeEditorDraft.reagentTexts[tostring(itemId)]
 			if qtyText == nil then
 				qtyText = "0"
+				recipeEditorDraft.reagentTexts[tostring(itemId)] = qtyText
 			end
 			local perCraft = ParseRecipeReagentQty(qtyText) or 0
 			local rowRecipe = { itemId = outputId, reagents = { [tostring(itemId)] = perCraft } }
 			local warnText = nil
-			if perCraft > 0 then
+			if isOrphan then
+				warnText = Loc("GUILD_SUPPLIES_RECIPE_ORPHAN_REAGENT",
+					"No longer a requested reagent — clear the quantity or restore the requested item.")
+			elseif perCraft > 0 then
 				warnText = RecipeAvailabilityWarning(record, rowRecipe)
 			end
-			y = y + LayoutRecipeEditorReagentRow(ui.reagentRows[i], y, itemId, qtyText, warnText)
+			y = y + LayoutRecipeEditorReagentRow(row, y, itemId, qtyText, warnText)
 		end
 	end
 	for j = #rows + 1, #ui.reagentRows do
-		ui.reagentRows[j]:Hide()
+		local stale = ui.reagentRows[j]
+		if stale then
+			stale._boundItemId = nil
+			if stale.Edit then
+				stale.Edit:SetScript("OnTextChanged", nil)
+			end
+			stale:Hide()
+		end
 	end
 	ui.content:SetHeight(math.max(1, y))
 end
@@ -1071,7 +1218,18 @@ local function CommitRecipeEditorSave()
 	SyncRecipeEditorContext()
 	CaptureRecipeEditorDraftFromUi()
 	local outputId = tonumber(recipeEditorDraft.outputItemId)
-	if not outputId or not RecipeCanEdit() or not RecipeHasRequestedReagents() then
+	local bound = {
+		contextKey = recipeEditorDraft.contextKey,
+		guildKey = recipeEditorDraft.boundGuildKey,
+		datasetId = recipeEditorDraft.boundDatasetId,
+		campaignId = recipeEditorDraft.boundCampaignId,
+		configSeq = recipeEditorDraft.boundConfigSeq,
+		recipeRevision = recipeEditorDraft.boundRecipeRevision,
+		isExisting = recipeEditorDraft.isExisting,
+		outputItemId = outputId,
+	}
+	local okTarget, targetWhy = RecipeSaveTargetStillValid(bound)
+	if not okTarget then
 		ctx.section:SetMessage(
 			Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
 				"the page is out of date — refresh and try again"),
@@ -1080,7 +1238,13 @@ local function CommitRecipeEditorSave()
 		RefreshPageControls()
 		return
 	end
-	local boundContext = recipeEditorDraft.contextKey
+	if not RecipeHasRequestedReagents() and not next(recipeEditorDraft.orphanReagentIds or {}) then
+		ctx.section:SetMessage(
+			Loc("GUILD_SUPPLIES_RECIPES_EMPTY",
+				"Add requested items to the current campaign before configuring recipes."),
+			"warn")
+		return
+	end
 	local reagents, badId = BuildRecipeReagentsFromDraft()
 	if reagents == nil then
 		ctx.section:SetMessage(
@@ -1092,7 +1256,8 @@ local function CommitRecipeEditorSave()
 	end
 	local g = GS()
 	if g and g.NormalizeRecipeValue then
-		local normalized, normErr = g:NormalizeRecipeValue({
+		-- Dot call: NormalizeRecipeValue is a plain function, not a method.
+		local normalized, normErr = g.NormalizeRecipeValue({
 			itemId = outputId,
 			reagents = reagents,
 		})
@@ -1113,8 +1278,9 @@ local function CommitRecipeEditorSave()
 		end
 		reagents = normalized.reagents
 	end
-	local live = g and select(1, g:GetCurrentRecord())
-	if not live or RecipeDraftContextKey() ~= boundContext or not RecipeCanEdit() then
+	-- Re-check bound target immediately before mutation (authority + concurrent edit).
+	okTarget, targetWhy = RecipeSaveTargetStillValid(bound)
+	if not okTarget or RecipeDraftContextKey() ~= bound.contextKey then
 		ctx.section:SetMessage(
 			Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
 				"the page is out of date — refresh and try again"),
@@ -1149,10 +1315,20 @@ local function CommitRecipeEditorDelete()
 	if not outputId or not recipeEditorDraft.isExisting then
 		return
 	end
-	local boundContext = recipeEditorDraft.contextKey
+	local bound = {
+		contextKey = recipeEditorDraft.contextKey,
+		guildKey = recipeEditorDraft.boundGuildKey,
+		datasetId = recipeEditorDraft.boundDatasetId,
+		campaignId = recipeEditorDraft.boundCampaignId,
+		configSeq = recipeEditorDraft.boundConfigSeq,
+		recipeRevision = recipeEditorDraft.boundRecipeRevision,
+		isExisting = true,
+		outputItemId = outputId,
+	}
 	local accept = function()
 		SyncRecipeEditorContext()
-		if RecipeDraftContextKey() ~= boundContext or not RecipeCanEdit() then
+		local okTarget = RecipeSaveTargetStillValid(bound)
+		if not okTarget or RecipeDraftContextKey() ~= bound.contextKey then
 			ctx.section:SetMessage(
 				Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
 					"the page is out of date — refresh and try again"),
@@ -1199,22 +1375,34 @@ local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
 		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")
 		return
 	end
+	local rec = CurrentRecord()
+	local cfg = rec and rec.accounting and rec.accounting._consumables
+	local g = GS()
+	local ctxInfo = g and g.GetCurrentContext and g:GetCurrentContext()
 	recipeEditorSection = ctx
 	recipeEditorDraft.open = true
 	recipeEditorDraft.contextKey = RecipeDraftContextKey()
 	recipeEditorDraft.outputItemId = itemId
 	recipeEditorDraft.isExisting = type(existingRecipe) == "table"
+	recipeEditorDraft.boundGuildKey = (ctxInfo and ctxInfo.guildKey) or (rec and rec._guildKey)
+	recipeEditorDraft.boundDatasetId = rec and rec.datasetId
+	recipeEditorDraft.boundCampaignId = rec and rec.currentCampaignId
+	recipeEditorDraft.boundConfigSeq = cfg and cfg.configSeq
 	local texts = {}
+	local orphans = {}
 	local saved = existingRecipe
 	if type(saved) ~= "table" then
 		saved = FindSavedRecipe(itemId)
 		recipeEditorDraft.isExisting = type(saved) == "table"
 	end
 	local reagentMap = saved and saved.reagents
+	recipeEditorDraft.boundRecipeRevision = RecipeFingerprint(reagentMap)
+	local requested = {}
 	local rows = RequestedItemRows()
 	for i = 1, #rows do
 		local rid = tonumber(rows[i].itemId)
 		if rid then
+			requested[rid] = true
 			local qty = 0
 			if type(reagentMap) == "table" then
 				qty = tonumber(reagentMap[tostring(rid)]) or 0
@@ -1222,7 +1410,19 @@ local function OpenRecipeEditor(ctx, outputItemId, existingRecipe)
 			texts[tostring(rid)] = tostring(qty)
 		end
 	end
+	-- Preserve unavailable saved ingredients until the editor repairs them.
+	if type(reagentMap) == "table" then
+		for k, v in pairs(reagentMap) do
+			local rid = tonumber(k)
+			local qty = tonumber(v) or 0
+			if rid and qty > 0 and not requested[rid] then
+				orphans[tostring(rid)] = true
+				texts[tostring(rid)] = tostring(qty)
+			end
+		end
+	end
 	recipeEditorDraft.reagentTexts = texts
+	recipeEditorDraft.orphanReagentIds = orphans
 	ui.save:SetScript("OnClick", CommitRecipeEditorSave)
 	ui.delete:SetScript("OnClick", CommitRecipeEditorDelete)
 	ui.frame:Show()
@@ -1307,7 +1507,7 @@ local function ItemsHelpText()
 		"Start a New Campaign before adding requested items.")
 end
 
-local function CommitConfig(ctx, kind, target, value)
+CommitConfig = function(ctx, kind, target, value)
 	local g = GS()
 	if not g then
 		ctx.section:SetMessage(Loc("GUILD_SUPPLIES_ERR_UNAVAILABLE", "Guild Supplies is unavailable."), "error")

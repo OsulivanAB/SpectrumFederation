@@ -184,9 +184,19 @@ function WR.ScanBankStock(bankTab, itemIds)
     bankTab = tonumber(bankTab)
     local wanted = {}
     if type(itemIds) == "table" then
-        for k, v in pairs(itemIds) do
-            local n = tonumber(k) or tonumber(v)
-            if n then wanted[n] = true end
+        -- Quantity maps use itemId keys; array lists use numeric values.
+        -- Prefer keys for maps so quantities are never mistaken for item IDs.
+        local arrayLen = #itemIds
+        if arrayLen > 0 then
+            for i = 1, arrayLen do
+                local n = tonumber(itemIds[i])
+                if n then wanted[n] = true end
+            end
+        else
+            for k in pairs(itemIds) do
+                local n = tonumber(k)
+                if n then wanted[n] = true end
+            end
         end
     end
     local Runtime = Host()

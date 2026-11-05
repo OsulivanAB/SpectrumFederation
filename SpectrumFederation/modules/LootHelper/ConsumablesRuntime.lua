@@ -1775,6 +1775,73 @@ function Runtime:RebuildReview()
     self:SyncMobileButton()
 end
 
+function Runtime:FormatQuickWithdrawSettlement(result)
+    result = type(result) == "table" and result or {}
+    local function SumMap(m)
+        local n = 0
+        if type(m) ~= "table" then return 0 end
+        for _, v in pairs(m) do
+            n = n + (tonumber(v) or 0)
+        end
+        return n
+    end
+    local requested = SumMap(result.requested)
+    local confirmed = SumMap(result.confirmed)
+    local remaining = SumMap(result.remaining)
+    local unresolved = result.unresolved and true or false
+    local parts = {
+        Loc("GUILD_SUPPLIES_WITHDRAW_SETTLE_FMT",
+            "Withdraw settled: requested %d, confirmed %d, remaining %d.")
+            :format(requested, confirmed, remaining),
+    }
+    if unresolved then
+        parts[#parts + 1] = Loc("GUILD_SUPPLIES_WITHDRAW_UNRESOLVED",
+            "Some movements are unresolved and were not retried.")
+    end
+    if result.receiptError then
+        parts[#parts + 1] = Loc("GUILD_SUPPLIES_WITHDRAW_RECEIPT_FAILED_FMT",
+            "Movement finished, but recording failed (%s). History was not repaired by another withdrawal.")
+            :format(tostring(result.receiptError))
+    end
+    return table.concat(parts, " ")
+end
+
+function Runtime:SetQuickWithdrawStatus(text)
+    self._quickWithdrawStatus = text
+    if self.review and self.review.Status and type(text) == "string" then
+        self.review.Status:SetText(text)
+    end
+end
+
+function Runtime:QuickWithdrawHasPositiveDraft(ctx)
+    local WR = SF.ConsumablesWithdrawRuntime
+    local GS = SF.GuildSupplies
+    if not WR or not WR.craftDrafts or not ctx then return false end
+    for k, v in pairs(WR.craftDrafts) do
+        if (tonumber(v) or 0) > 0 then
+            local recipe = ctx.recipes and ctx.recipes[tostring(k)]
+            if recipe and GS and GS.RecipeAvailability
+                and GS.RecipeAvailability(ctx.record, recipe) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Runtime:SyncQuickWithdrawButton(actionRow, ctx, access)
+    local WR = SF.ConsumablesWithdrawRuntime
+    if not actionRow or not actionRow.Button then return end
+    local busy = (WR and WR.IsBusy and WR.IsBusy())
+        or self.depositWork or self.depositIntent
+    local anyPositive = self:QuickWithdrawHasPositiveDraft(ctx)
+    if busy or not anyPositive or (access and not access.canWithdraw) then
+        actionRow.Button:Disable()
+    else
+        actionRow.Button:Enable()
+    end
+end
+
 function Runtime:AppendQuickWithdrawSection(frame, y, index)
     local WR = SF.ConsumablesWithdrawRuntime
     if not WR or not WR.ShouldShowHelper then
@@ -1798,10 +1865,28 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
     if header.Progress then header.Progress:Hide() end
     header.Edit:Hide()
     header.Edit:SetScript("OnEnterPressed", nil)
+    header.Edit:SetScript("OnTextChanged", nil)
     header.Button:Hide()
     header.Button:SetScript("OnClick", nil)
     if header.GoalMet then header.GoalMet:Hide() end
     y = y + 22
+
+    if type(self._quickWithdrawStatus) == "string" and self._quickWithdrawStatus ~= "" then
+        index = index + 1
+        local statusRow = self:AcquireRow(index)
+        statusRow:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+        statusRow.Text:SetText(self._quickWithdrawStatus)
+        statusRow.Text:Show()
+        statusRow.boundItemId = nil
+        if statusRow.IconButton then statusRow.IconButton:Hide() end
+        if statusRow.Progress then statusRow.Progress:Hide() end
+        statusRow.Edit:Hide()
+        statusRow.Edit:SetScript("OnTextChanged", nil)
+        statusRow.Button:Hide()
+        statusRow.Button:SetScript("OnClick", nil)
+        if statusRow.GoalMet then statusRow.GoalMet:Hide() end
+        y = y + 22
+    end
 
     if access and access.reason == "allowance_exhausted" then
         index = index + 1
@@ -1810,10 +1895,13 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
         note.Text:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_ALLOWANCE",
             "Daily withdrawal allowance exhausted."))
         note.Text:Show()
+        note.boundItemId = nil
         if note.IconButton then note.IconButton:Hide() end
         if note.Progress then note.Progress:Hide() end
         note.Edit:Hide()
+        note.Edit:SetScript("OnTextChanged", nil)
         note.Button:Hide()
+        note.Button:SetScript("OnClick", nil)
         if note.GoalMet then note.GoalMet:Hide() end
         y = y + 22
         return y, index
@@ -1822,6 +1910,7 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
     local GS = SF.GuildSupplies
     local recipes = GS and GS.ListCampaignRecipes and GS.ListCampaignRecipes(ctx.record) or {}
     local maxRows = 512
+    local actionRow = nil
     for i = 1, #recipes do
         if index >= maxRows then break end
         local recipe = recipes[i]
@@ -1835,6 +1924,10 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
         end
         index = index + 1
         local row = self:AcquireRow(index)
+        -- Clear pooled deposit/withdraw handlers before rebinding.
+        row.Button:SetScript("OnClick", nil)
+        row.Edit:SetScript("OnEnterPressed", nil)
+        row.Edit:SetScript("OnTextChanged", nil)
         row:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
         row.Text:Hide()
         if row.IconButton then
@@ -1862,15 +1955,21 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
             row.Edit:SetText(tostring(draft or 0))
         end
         row._qwDraftKey = draftKey
+        row._qwAvailable = available
         row.Edit:SetScript("OnTextChanged", function(edit)
-            if not available then return end
+            if not row._qwAvailable then return end
+            local key = row._qwDraftKey
+            if not key then return end
             local n = tonumber(edit:GetText()) or 0
             if n < 0 then n = 0 end
             WR.craftDrafts = WR.craftDrafts or {}
-            WR.craftDrafts[draftKey] = math.floor(n)
+            WR.craftDrafts[key] = math.floor(n)
+            -- Enable/disable Withdraw immediately when craft counts change.
+            if actionRow then
+                self:SyncQuickWithdrawButton(actionRow, ctx, access)
+            end
         end)
         row.Button:Hide()
-        row.Button:SetScript("OnClick", nil)
         if row.GoalMet then
             if available then
                 row.GoalMet:Hide()
@@ -1889,36 +1988,19 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
     end
 
     index = index + 1
-    local action = self:AcquireRow(index)
-    action:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
-    action.Text:Hide()
-    if action.IconButton then action.IconButton:Hide() end
-    if action.Progress then action.Progress:Hide() end
-    action.Edit:Hide()
-    if action.GoalMet then action.GoalMet:Hide() end
-    action.Button:Show()
-    action.Button:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_BUTTON", "Withdraw"))
-    local busy = (WR.IsBusy and WR.IsBusy())
-        or self.depositWork or self.depositIntent
-    local anyPositive = false
-    if WR.craftDrafts then
-        for k, v in pairs(WR.craftDrafts) do
-            if (tonumber(v) or 0) > 0 then
-                local recipe = ctx.recipes[tostring(k)]
-                if recipe and GS and GS.RecipeAvailability
-                    and GS.RecipeAvailability(ctx.record, recipe) then
-                    anyPositive = true
-                    break
-                end
-            end
-        end
-    end
-    if busy or not anyPositive or (access and not access.canWithdraw) then
-        action.Button:Disable()
-    else
-        action.Button:Enable()
-    end
-    action.Button:SetScript("OnClick", function()
+    actionRow = self:AcquireRow(index)
+    actionRow:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
+    actionRow.Text:Hide()
+    actionRow.boundItemId = nil
+    if actionRow.IconButton then actionRow.IconButton:Hide() end
+    if actionRow.Progress then actionRow.Progress:Hide() end
+    actionRow.Edit:Hide()
+    actionRow.Edit:SetScript("OnTextChanged", nil)
+    if actionRow.GoalMet then actionRow.GoalMet:Hide() end
+    actionRow.Button:Show()
+    actionRow.Button:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_BUTTON", "Withdraw"))
+    self:SyncQuickWithdrawButton(actionRow, ctx, access)
+    actionRow.Button:SetScript("OnClick", function()
         self:BeginQuickWithdraw()
     end)
     y = y + 26
@@ -1936,9 +2018,11 @@ function Runtime:AppendQuickWithdrawSection(frame, y, index)
             pending.Text:SetText(Loc("GUILD_SUPPLIES_TRADE_PENDING_SHORT",
                 "Pending trade handoff active."))
             pending.Text:Show()
+            pending.boundItemId = nil
             if pending.IconButton then pending.IconButton:Hide() end
             if pending.Progress then pending.Progress:Hide() end
             pending.Edit:Hide()
+            pending.Edit:SetScript("OnTextChanged", nil)
             pending.Button:Show()
             pending.Button:SetText(Loc("GUILD_SUPPLIES_TRADE_CLEAR", "Clear"))
             pending.Button:Enable()
@@ -1962,17 +2046,34 @@ function Runtime:BeginQuickWithdraw()
             selections[tostring(k)] = tonumber(v) or 0
         end
     end
-    local ok, err, plan = WR.BeginWithdraw(selections, {
-        onSettle = function(result)
-            local status = result and result.reason or "done"
-            if self.review and self.review.Status then
-                self.review.Status:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_RESULT",
-                    "Withdraw: %s"):format(tostring(status)))
-            end
-        end,
-    })
-    if ok then
+    local boundSelections = selections
+    local boundDataset = nil
+    local boundCampaign = nil
+    local boundConfigSeq = nil
+    do
+        local ctx = WR.CurrentContext and select(1, WR.CurrentContext())
+        if ctx then
+            boundDataset = ctx.datasetId
+            boundCampaign = ctx.campaignId
+            boundConfigSeq = ctx.configSeq
+        end
+    end
+    local function SettleHandler(result)
+        self:SetQuickWithdrawStatus(self:FormatQuickWithdrawSettlement(result))
         self:RebuildReview()
+    end
+    local function StartWithdraw(opts)
+        opts = opts or {}
+        opts.onSettle = SettleHandler
+        local ok, err, plan = WR.BeginWithdraw(boundSelections, opts)
+        if ok then
+            self:RebuildReview()
+            return true
+        end
+        return false, err, plan
+    end
+    local ok, err, plan = StartWithdraw({})
+    if ok then
         return
     end
     if err == "shortage" and plan and SF.SettingsUI and SF.SettingsUI.Dialogs then
@@ -1987,25 +2088,39 @@ function Runtime:BeginQuickWithdraw()
             lines[#lines + 1] = string.format("%s: %d / %d (missing %d)",
                 name, s.available, s.requested, s.missing)
         end
+        local shortageFingerprint = table.concat(lines, "\n")
         if Dialogs.ConfirmChoice then
             Dialogs:ConfirmChoice({
                 title = Loc("GUILD_SUPPLIES_WITHDRAW_SHORTAGE_TITLE",
                     "There aren’t enough reagents to fulfill your request."),
-                message = table.concat(lines, "\n"),
+                message = shortageFingerprint,
                 confirmText = Loc("GUILD_SUPPLIES_WITHDRAW_ANYWAY", "Withdraw anyway"),
                 cancelText = Loc("GUILD_SUPPLIES_WITHDRAW_EDIT", "Edit quantities"),
                 onConfirm = function()
-                    WR.BeginWithdraw(selections, { allowPartial = true })
-                    self:RebuildReview()
+                    -- Re-read stock/context; reject stale shortage confirmation.
+                    local ctx = WR.CurrentContext and select(1, WR.CurrentContext())
+                    if not ctx
+                        or ctx.datasetId ~= boundDataset
+                        or ctx.campaignId ~= boundCampaign
+                        or ctx.configSeq ~= boundConfigSeq then
+                        self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_REASON_STALE_HANDLE",
+                            "the page is out of date — refresh and try again"))
+                        self:RebuildReview()
+                        return
+                    end
+                    local freshOk, freshErr, freshPlan = StartWithdraw({ allowPartial = true })
+                    if not freshOk then
+                        self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
+                            "Withdraw blocked: %s"):format(tostring(freshErr or "unknown")))
+                        self:RebuildReview()
+                    end
                 end,
             })
         end
         return
     end
-    if self.review and self.review.Status then
-        self.review.Status:SetText(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
-            "Withdraw blocked: %s"):format(tostring(err or "unknown")))
-    end
+    self:SetQuickWithdrawStatus(Loc("GUILD_SUPPLIES_WITHDRAW_BLOCKED",
+        "Withdraw blocked: %s"):format(tostring(err or "unknown")))
 end
 
 function Runtime:Commit(profile, token, events)

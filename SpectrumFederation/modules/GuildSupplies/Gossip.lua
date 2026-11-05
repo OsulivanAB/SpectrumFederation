@@ -2791,6 +2791,16 @@ local function ValidateAndApply(record, ctx)
         if localRecord.campaignArchives[body.campaignId] and body.kind == "campaign-archive"
             and type(body.requestedItems) == "table" then
             local existing = localRecord.campaignArchives[body.campaignId]
+            -- Normalize missing recipes to {} so pre-#457 archives equal upgraded peers.
+            local existingNorm = {
+                schemaVersion = existing.schemaVersion,
+                campaignId = existing.campaignId,
+                datasetId = existing.datasetId,
+                requestedItems = existing.requestedItems,
+                recipes = type(existing.recipes) == "table" and existing.recipes or {},
+                generation = existing.generation,
+                archivedAt = existing.archivedAt,
+            }
             local inline = {
                 schemaVersion = body.schemaVersion or GS.SCHEMA_VERSION,
                 campaignId = body.campaignId,
@@ -2800,7 +2810,7 @@ local function ValidateAndApply(record, ctx)
                 generation = body.generation,
                 archivedAt = body.archivedAt,
             }
-            if GS._DeepEqualOps and GS._DeepEqualOps(existing, inline) then
+            if GS._DeepEqualOps and GS._DeepEqualOps(existingNorm, inline) then
                 ClearArchivePageBuffer(body.campaignId)
                 return "duplicate", "duplicate"
             end
